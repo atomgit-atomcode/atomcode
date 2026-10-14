@@ -116,6 +116,101 @@ async fn run_turn(project: &std::path::Path, command: &str, rules: PermissionRul
     Outcome { prompted, denied }
 }
 
+fn write_project_permissions(project: &std::path::Path, value: serde_json::Value) {
+    let dirs = atomcode_coding::config::product_dirs_from_env();
+    let settings = dirs.project(project).join("settings.local.json");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(settings, serde_json::to_vec(&value).unwrap()).unwrap();
+}
+
+// This criterion executes a real OS subprocess. A paused runtime advances the
+// Bash timeout before that process can finish; matcher and catalog/lifecycle
+// criteria use virtual time where no process must run.
+#[tokio::test(flavor = "current_thread")]
+async fn json_permissions_allow_commands_and_deny_a_narrower_command_without_prompting() {
+    let project = tempfile::tempdir().unwrap();
+    for name in ["allowed", "blocked"] {
+        std::fs::create_dir(project.path().join(name)).unwrap();
+    }
+    write_project_permissions(
+        project.path(),
+        serde_json::json!({"permissions": {
+            "allow": ["Bash(rm -rf *)"], "deny": ["Bash(rm -rf blocked)"]
+        }}),
+    );
+    let allowed = run_turn(project.path(), "rm -rf allowed", PermissionRules::default()).await;
+    assert!(!allowed.prompted);
+    assert!(!allowed.denied);
+    assert!(!project.path().join("allowed").exists());
+    let denied = run_turn(project.path(), "rm -rf blocked", PermissionRules::default()).await;
+    assert!(!denied.prompted);
+    assert!(denied.denied);
+    assert!(project.path().join("blocked").exists());
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn json_bare_denies_hide_web_tools_and_reject_calls_even_when_approval_is_bypassed() {
+    let project = tempfile::tempdir().unwrap();
+    write_project_permissions(
+        project.path(),
+        serde_json::json!({"permissions": {"deny": ["WebSearch", "WebFetch"]}}),
+    );
+    let cfg = CodingAgentConfig::new(
+        "k",
+        "http://unused",
+        "test-model",
+        project.path(),
+        atomcode_coding::config::product_dirs_from_env(),
+    );
+    let mut options = prepare_options();
+    options.web = true;
+    let parts = prepare(&cfg, options.clone()).await.unwrap();
+    parts
+        .bypass_mode
+        .store(true, std::sync::atomic::Ordering::Release);
+    let provider = Arc::new(RecordingProvider::new(vec![
+        vec![
+            StreamEvent::ToolCall(ToolCall {
+                id: "web".into(),
+                name: "web_fetch".into(),
+                arguments: r#"{"url":"http://127.0.0.1:1"}"#.into(),
+            }),
+            StreamEvent::Done { truncated: false },
+        ],
+        vec![
+            StreamEvent::TextDelta("done".into()),
+            StreamEvent::Done { truncated: false },
+        ],
+    ]));
+    let mut mounted = mount_parts(&parts, &cfg, &options, provider.clone()).await;
+    let catalog = mounted
+        .context()
+        .require::<atomcode_harness::seams::ToolsSvc>()
+        .unwrap();
+    assert!(catalog.get("web_fetch").is_none());
+    assert!(catalog.get("web_search").is_none());
+    assert!(catalog.get("bash").is_some());
+    assert!(catalog.turn_on("web_fetch").is_empty());
+    catalog
+        .register_from(
+            "late-web",
+            Arc::new(atomcode_capabilities::tools::WebFetchTool),
+        )
+        .unwrap();
+    assert!(catalog.get("web_fetch").is_none());
+    let outcome = support::turn(&mut mounted.handle, "fetch", None).await;
+    assert!(outcome.asked.is_empty());
+    assert!(outcome
+        .tool_results
+        .iter()
+        .any(|result| result.call_id == "web" && result.is_error));
+    assert!(provider.recorded()[0]
+        .1
+        .iter()
+        .all(|tool| tool.name != "web_fetch" && tool.name != "web_search"));
+    mounted.shutdown().await;
+}
+
 fn rules(allow: &[&str], deny: &[&str]) -> PermissionRules {
     let allow: Vec<String> = allow.iter().map(|s| s.to_string()).collect();
     let deny: Vec<String> = deny.iter().map(|s| s.to_string()).collect();

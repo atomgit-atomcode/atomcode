@@ -720,6 +720,7 @@ impl Plugin for GrantsHostPlugin {
 /// rebuilt catalog starts where the old one left off.
 pub(crate) struct ToolsHostPlugin {
     pub(crate) switches: Arc<atomcode_harness::seams::ToolSwitches>,
+    pub(crate) permissions: Option<crate::permission_settings::PermissionSettings>,
     /// Where to publish the catalog once built, for a runtime that has to
     /// answer a front end about it. `None` for a host that only wants the
     /// switches to survive.
@@ -741,11 +742,23 @@ impl Plugin for ToolsHostPlugin {
         "the live tool catalog, over the runtime's own on/off switches"
     }
     async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
-        atomcode_harness::plugins::registries::mount_catalog(
+        atomcode_harness::plugins::registries::mount_catalog_with_permissions(
             ctx,
             config,
             Some(self.switches.clone()),
+            self.permissions
+                .as_ref()
+                .map(|settings| settings.rules.clone())
+                .unwrap_or_default(),
         )?;
+        if let Some(settings) = &self.permissions {
+            atomcode_harness::plugins::self_knowledge::describes(
+                ctx,
+                "permission-settings",
+                21,
+                settings.describe(),
+            );
+        }
         if let Some(slot) = self.slot.clone() {
             let catalog = ctx
                 .require::<atomcode_harness::seams::ToolsSvc>()

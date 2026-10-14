@@ -56,6 +56,7 @@ pub mod front_end;
 pub mod host;
 pub mod on_harness;
 pub mod parts;
+pub mod permission_settings;
 pub mod persona;
 pub mod plan_mode;
 pub mod plugin_hooks;

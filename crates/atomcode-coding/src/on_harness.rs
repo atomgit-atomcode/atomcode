@@ -997,6 +997,7 @@ pub fn tools_host_row(
     crate::host_rows::ToolsHostPlugin {
         switches,
         slot: None,
+        permissions: None,
     }
 }
 
@@ -1576,6 +1577,8 @@ pub struct HostState {
     /// tree being rebuilt (`tools-host`). Absent means the catalog's switches
     /// live and die with the tree, which is right for a tree nobody rebuilds.
     pub tool_switches: Option<Arc<atomcode_harness::seams::ToolSwitches>>,
+    /// The runtime's per-mount permission projection, shared by the catalog and gate.
+    pub permission_settings: Option<crate::permission_settings::PermissionSettings>,
     /// Where `tools-host` publishes the catalog it built, for a host that has
     /// to answer a front end about what the model can call.
     pub tool_catalog_slot: Arc<std::sync::RwLock<Option<Arc<atomcode_harness::seams::ToolBox>>>>,
@@ -2092,6 +2095,7 @@ fn compose_hosted(
         registry.register(Arc::new(crate::host_rows::ToolsHostPlugin {
             switches,
             slot: Some(host.tool_catalog_slot.clone()),
+            permissions: host.permission_settings.clone(),
         }));
     }
     registry.register(Arc::new(crate::host_rows::KernelHooksPlugin(

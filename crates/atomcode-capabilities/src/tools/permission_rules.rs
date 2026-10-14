@@ -153,6 +153,9 @@ impl PermissionRule {
             return None;
         }
         let Some(open) = raw.find('(') else {
+            if raw.contains(')') {
+                return None;
+            }
             return Some(Self {
                 tool: canonical_tool(raw),
                 pattern: None,
@@ -200,6 +203,26 @@ pub struct PermissionRules {
 }
 
 impl PermissionRules {
+    /// Merge another configuration scope. Deny remains dominant across every scope.
+    pub fn extend(&mut self, other: Self) {
+        self.allow.extend(other.allow);
+        self.deny.extend(other.deny);
+    }
+
+    /// A bare deny forbids every call of this tool, so it can be omitted from the
+    /// model's catalog. Argument-specific rules must keep the tool available.
+    pub fn denies_tool(&self, tool: &str) -> bool {
+        self.deny
+            .iter()
+            .any(|rule| rule.pattern.is_none() && rule.matches(tool, &[]))
+    }
+
+    /// Whether this set can exclude any tool from a catalog. Allows and
+    /// argument-specific denies leave the catalog open.
+    pub fn has_tool_denies(&self) -> bool {
+        self.deny.iter().any(|rule| rule.pattern.is_none())
+    }
+
     /// Parse both lists. Malformed rules are SKIPPED and returned as the second element so
     /// the caller can warn — a typo must never silently widen or narrow the policy.
     pub fn parse(allow: &[String], deny: &[String]) -> (Self, Vec<String>) {
@@ -364,6 +387,38 @@ mod tests {
 
     fn bash_args(cmd: &str) -> String {
         serde_json::json!({ "command": cmd }).to_string()
+    }
+
+    #[test]
+    fn merged_scopes_keep_denies_dominant_and_only_bare_denies_hide_tools() {
+        let mut merged = rules(&["WebSearch", "Bash(python3 *)"], &["WebFetch"]);
+        merged.extend(rules(
+            &["WebFetch"],
+            &["WebSearch", "Bash(python3 blocked.py)", "Read(private/**)"],
+        ));
+        assert!(merged.denies_tool("web_search"));
+        assert!(merged.denies_tool("WEB_FETCH"));
+        assert!(!merged.denies_tool("bash"));
+        assert!(!merged.denies_tool("read_file"));
+        assert_eq!(
+            merged.decide(
+                &crate::tools::sensitive_path::test_guard(),
+                "bash",
+                &bash_args("python3 blocked.py"),
+                &cwd()
+            ),
+            RuleDecision::Deny
+        );
+        assert_eq!(
+            merged.decide(
+                &crate::tools::sensitive_path::test_guard(),
+                "bash",
+                &bash_args("python3 /tmp/allowed.py"),
+                &cwd()
+            ),
+            RuleDecision::Allow
+        );
+        assert!(rules(&[], &["*"]).denies_tool("mcp__server__tool"));
     }
 
     #[test]
@@ -692,11 +747,12 @@ mod tests {
                 "Bash(git *".to_string(),
                 "".to_string(),
                 "Bash()".to_string(),
+                "Bash)".to_string(),
             ],
             &[],
         );
         assert!(rules.is_empty());
-        assert_eq!(invalid.len(), 3);
+        assert_eq!(invalid.len(), 4);
     }
 
     #[test]

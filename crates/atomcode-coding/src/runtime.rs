@@ -9586,6 +9586,7 @@ fn harness_host_state(
         skills: parts.skill_registry(),
         runtime_commands: parts.runtime_commands.clone(),
         tool_switches: Some(parts.tool_switches()),
+        permission_settings: None,
         tool_catalog_slot: parts.tool_catalog_slot(),
         mcp,
         // Both halves or neither: the events only exist when this assembly has
@@ -9720,6 +9721,17 @@ fn tree_inputs(
     config: &CodingAgentConfig,
     prepare: &PrepareOptions,
 ) -> Result<TreeInputs, String> {
+    // All drivers, directory changes and provider/session rebuilds use this
+    // boundary. Retain only the TOML baseline in RuntimeResources: JSON grants
+    // belong to this mount's working directory, never to the previous project.
+    let permissions = crate::permission_settings::load(
+        &config.permission_rules,
+        &config.dirs,
+        &config.working_dir,
+    )?;
+    let mut effective = config.clone();
+    effective.permission_rules = permissions.rules.clone();
+    let config = &effective;
     // Presence follows the same rule the overlay uses: a person who can answer
     // means asking, nobody means fencing.
     let presence = if config.is_attended() {
@@ -9745,7 +9757,8 @@ fn tree_inputs(
             providers,
             current: config.provider_name.clone(),
         });
-    let host = harness_host_state(parts, config, prepare).map_err(|error| error.to_string())?;
+    let mut host = harness_host_state(parts, config, prepare).map_err(|error| error.to_string())?;
+    host.permission_settings = Some(permissions);
     Ok(TreeInputs {
         presence,
         models,

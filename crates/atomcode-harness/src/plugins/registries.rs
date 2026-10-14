@@ -69,12 +69,23 @@ pub fn mount_catalog(
     config: &Value,
     switches: Option<Arc<crate::seams::ToolSwitches>>,
 ) -> Result<(), String> {
+    mount_catalog_with_permissions(ctx, config, switches, Arc::default())
+}
+
+/// The same catalog, with static permission denies. Keep the row's include /
+/// exclude policy and session switches; neither can reopen a denied tool.
+pub fn mount_catalog_with_permissions(
+    ctx: &Context,
+    config: &Value,
+    switches: Option<Arc<crate::seams::ToolSwitches>>,
+    permissions: Arc<atomcode_capabilities::tools::PermissionRules>,
+) -> Result<(), String> {
     let row: ToolsRow = if config.is_null() {
         ToolsRow::default()
     } else {
         serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
     };
-    let policy = ToolPolicy::new(row.include, row.exclude);
+    let policy = ToolPolicy::new(row.include, row.exclude).with_permissions(permissions);
     let open = policy.is_open();
     // Switches a host holds outlive this catalog; without one they live and die
     // with it, which is the ordinary case for a tree nobody rebuilds.

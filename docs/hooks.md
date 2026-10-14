@@ -208,9 +208,16 @@ atomcode hooks test <NAME>    # dry-run a hook with a synthetic payload
 
 ## Security notes
 
-1. Hooks **cannot bypass the permission system** — a `PreToolUse` deny does not
-   override a user's stored allow, and an allow is convenience, never consent for
-   a security boundary.
+Plugin hook scripts run as subprocesses after plugin trust; they are not Bash
+tool calls. Use `atomcode plugin trust <plugin>` to trust a plugin's hooks.
+`permissions.allow = ["Bash(python3 *)"]` preauthorizes matching **model tool
+calls**, and does not change hook-script authorization. Likewise, a tool deny
+does not prohibit a trusted hook script from launching that command. JSON
+`settings.json` / `settings.local.json` permission loading reads only
+`permissions`; it does not load hooks from those files.
+
+1. Hooks **cannot bypass hard safety boundaries** — a `PreToolUse` deny blocks
+   the tool call; an allow is convenience, never consent for a security boundary.
 2. Commands run with **your** permissions — mind the command's own safety.
 3. **Fail-open:** a timeout or crash is treated as "proceed", not "block".
 4. On Windows the command runs under `cmd /C`: use an explicit interpreter,

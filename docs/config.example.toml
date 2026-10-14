@@ -304,6 +304,29 @@ eager = "auto"
 # [permissions]
 # allow = ["Bash(git *)", "Bash(cargo test*)", "Read(src/**)"]
 # deny  = ["Bash(rm -rf *)"]
+#
+# 也支持 Claude Code 格式的 JSON 权限文件（只读取 permissions，不加载其他字段）：
+#   ~/.atomcode/settings.json、~/.atomcode/settings.local.json
+#   <工作目录>/.claude/settings.json、.claude/settings.local.json
+#   <工作目录>/.atomcode/settings.json、.atomcode/settings.local.json
+# 用户目录遵循 ATOMCODE_HOME；项目文件只查当前工作目录，不向上查找。
+# settings.json 适合提交到仓库共享，settings.local.json 适合个人本地配置。
+#
+# {
+#   "permissions": {
+#     "allow": ["Bash(python3 *)", "Bash(python *)"],
+#     "deny": ["WebSearch", "WebFetch"]
+#   }
+# }
+#
+# TOML 和所有 JSON 文件的列表合并，任意来源的 deny 都优先于 allow；空列表不会清空
+# 其他来源的规则。裸工具 deny 同时从模型工具目录移除工具，/tools on 也不能重新启用；
+# Bash(...) / Read(...) 等带参数的 deny 只拒绝匹配的调用，保留工具供其他调用使用。
+# 文件缺失正常；JSON、permissions 字段或规则格式错误，以及读取失败，会让本次启动 /
+# 重建明确失败，不静默忽略 deny。运行中的工具树不监视文件；新会话、重启或完整工具树
+# 重建（如切换工作目录）时重新读取；/model 的 provider 替换和仅技能的快速 reload
+# 保留当前策略，不重读权限文件。配置权限只管工具调用，不预批准插件 hook 子进程；
+# 插件 hook 用 atomcode plugin trust <plugin> 的信任机制。
 
 # =============================================================================
 # Subagent 设置（`task` / `team` 工具：主 agent 把子任务派发给隔离上下文的子 agent）

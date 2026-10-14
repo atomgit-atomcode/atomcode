@@ -599,6 +599,171 @@ fn env() -> Env {
 
 // ---- scenarios -----------------------------------------------------------
 
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
+async fn json_permissions_follow_sessions_and_directories_and_survive_a_model_patch() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let dirs = atomcode_coding::config::product_dirs_from_env();
+    let first_settings = dirs.project(env.project.path()).join("settings.local.json");
+    std::fs::create_dir_all(first_settings.parent().unwrap()).unwrap();
+    std::fs::write(&first_settings, r#"{"permissions":{"deny":["Read"]}}"#).unwrap();
+    let mut input = start(env.project.path(), &recorder, SessionMode::Fresh);
+    input.agent.permission_rules =
+        Arc::new(atomcode_capabilities::tools::PermissionRules::parse(&[], &["Grep".into()]).0);
+    let next_provider = input.agent.clone();
+    let mut runtime = CodingRuntime::start(input).await.unwrap();
+    let original_session = runtime.session.as_ref().unwrap().id.clone();
+    for text in ["first", "fresh", "resume", "provider"] {
+        match text {
+            "fresh" => {
+                runtime.handle.fresh_session().await.unwrap();
+            }
+            "resume" => {
+                runtime
+                    .handle
+                    .resume_session(original_session.clone())
+                    .await
+                    .unwrap();
+            }
+            "provider" => {
+                runtime
+                    .handle
+                    .reassemble_provider(next_provider.clone())
+                    .await
+                    .unwrap();
+            }
+            _ => {}
+        }
+        turn(&mut runtime, text).await;
+        let offered = recorder.tools.lock().unwrap().last().cloned().unwrap();
+        assert!(
+            !offered
+                .iter()
+                .any(|name| name == "read_file" || name == "grep"),
+            "{text}: {offered:?}"
+        );
+        assert!(offered.iter().any(|name| name == "write_file"));
+    }
+
+    // A /model patch keeps the existing tool tree, even after a file edit.
+    std::fs::write(&first_settings, r#"{"permissions":{"deny":["Write"]}}"#).unwrap();
+    runtime
+        .handle
+        .reassemble_provider(next_provider.clone())
+        .await
+        .unwrap();
+    turn(&mut runtime, "policy before rebuild").await;
+    let offered = recorder.tools.lock().unwrap().last().cloned().unwrap();
+    assert!(!offered.iter().any(|name| name == "read_file"));
+    assert!(offered.iter().any(|name| name == "write_file"));
+    // An explicit full config reprepare reloads the edited policy.
+    runtime
+        .handle
+        .reprepare_config(next_provider.clone())
+        .await
+        .unwrap();
+    turn(&mut runtime, "policy after rebuild").await;
+    let offered = recorder.tools.lock().unwrap().last().cloned().unwrap();
+    assert!(offered.iter().any(|name| name == "read_file"));
+    assert!(!offered
+        .iter()
+        .any(|name| name == "write_file" || name == "grep"));
+
+    turn(&mut runtime, "describe operations").await;
+    let said = last_tool_result(&recorder);
+    assert!(said.contains("PERMISSION SETTINGS"), "{said}");
+    assert!(
+        said.contains(&first_settings.display().to_string()),
+        "{said}"
+    );
+
+    let other = tempfile::tempdir().unwrap();
+    let settings = dirs.project(other.path()).join("settings.json");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(&settings, r#"{"permissions":{"deny":["Edit"]}}"#).unwrap();
+    runtime
+        .handle
+        .change_directory(other.path().to_path_buf())
+        .await
+        .unwrap();
+    turn(&mut runtime, "other project").await;
+    let offered = recorder.tools.lock().unwrap().last().cloned().unwrap();
+    assert!(
+        offered.iter().any(|name| name == "read_file"),
+        "old project deny must be gone: {offered:?}"
+    );
+    assert!(
+        offered.iter().any(|name| name == "write_file"),
+        "old project deny must be gone: {offered:?}"
+    );
+    assert!(
+        !offered
+            .iter()
+            .any(|name| name == "edit_file" || name == "grep"),
+        "new project deny and TOML baseline: {offered:?}"
+    );
+    turn(&mut runtime, "describe operations").await;
+    let said = last_tool_result(&recorder);
+    assert!(
+        said.contains(
+            &settings
+                .parent()
+                .unwrap()
+                .canonicalize()
+                .unwrap()
+                .display()
+                .to_string()
+        ),
+        "{said}"
+    );
+    assert!(
+        !said.contains(&first_settings.display().to_string()),
+        "stale permission source: {said}"
+    );
+
+    let broken = tempfile::tempdir().unwrap();
+    let broken_settings = dirs.project(broken.path()).join("settings.local.json");
+    std::fs::create_dir_all(broken_settings.parent().unwrap()).unwrap();
+    std::fs::write(&broken_settings, r#"{"permissions":{"deny":["Bash("]}}"#).unwrap();
+    let error = runtime
+        .handle
+        .change_directory(broken.path().to_path_buf())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("settings.local.json"), "{error}");
+    turn(&mut runtime, "still in other project").await;
+    assert_eq!(recorder.tools.lock().unwrap().last().unwrap(), &offered);
+    runtime.handle.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
+async fn invalid_json_permissions_fail_start_even_without_a_provider() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let dirs = atomcode_coding::config::product_dirs_from_env();
+    let settings = dirs.project(env.project.path()).join("settings.local.json");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(&settings, r#"{"permissions":{"deny":"WebSearch"}}"#).unwrap();
+    for bootstrap in [
+        atomcode_coding::ProviderBootstrap::Required,
+        atomcode_coding::ProviderBootstrap::Unavailable(
+            atomcode_coding::ProviderUnavailableReason::AuthenticationRequired,
+        ),
+    ] {
+        let result = CodingRuntime::start_with_bootstrap(
+            start(env.project.path(), &recorder, SessionMode::Fresh),
+            bootstrap,
+        )
+        .await;
+        match result {
+            Err(error) => assert!(error.to_string().contains("settings.local.json"), "{error}"),
+            Ok(_) => panic!("invalid permissions must fail start"),
+        }
+    }
+}
+
 /// The turn is in the native store by the time the driver hears it finished.
 ///
 /// A driver that reacts to `TurnFinished` — the catalog refreshing, an undo, a

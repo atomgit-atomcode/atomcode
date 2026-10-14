@@ -88,21 +88,41 @@ plexus_service!(GrantsSvc => dyn atomcode_capabilities::tools::PermissionStore, 
 pub struct ToolPolicy {
     include: Vec<String>,
     exclude: Vec<String>,
+    permission_rules: Arc<atomcode_capabilities::tools::PermissionRules>,
 }
 
 impl ToolPolicy {
     pub fn new(include: Vec<String>, exclude: Vec<String>) -> Self {
-        Self { include, exclude }
+        Self {
+            include,
+            exclude,
+            ..Self::default()
+        }
+    }
+
+    /// Apply unconditional permission denies to every contributor, including
+    /// tools an MCP server publishes after the catalog is mounted.
+    pub fn with_permissions(
+        mut self,
+        rules: Arc<atomcode_capabilities::tools::PermissionRules>,
+    ) -> Self {
+        self.permission_rules = rules;
+        self
     }
 
     /// Nothing named, nothing to enforce — the ordinary case, and worth asking
     /// about before a caller pays for a match.
     pub fn is_open(&self) -> bool {
-        self.include.is_empty() && self.exclude.is_empty()
+        self.include.is_empty()
+            && self.exclude.is_empty()
+            && !self.permission_rules.has_tool_denies()
     }
 
     /// `owner` is the row offering the tool, as the config tree names it.
     pub fn admits(&self, owner: &str, name: &str) -> bool {
+        if self.permission_rules.denies_tool(name) {
+            return false;
+        }
         if self.exclude.iter().any(|p| names(p, owner, name)) {
             return false;
         }
@@ -1166,6 +1186,41 @@ pub struct DelegationLane {
 #[cfg(test)]
 mod tool_policy_tests {
     use super::ToolPolicy;
+
+    #[test]
+    fn allow_and_argument_deny_rules_leave_the_tool_catalog_open() {
+        let rules = atomcode_capabilities::tools::PermissionRules::parse(
+            &["Bash(python3 *)".into()],
+            &["Bash(rm *)".into()],
+        )
+        .0;
+        let policy = ToolPolicy::default().with_permissions(std::sync::Arc::new(rules));
+        assert!(policy.is_open());
+        assert!(policy.admits("tool-bash", "bash"));
+    }
+
+    #[test]
+    fn static_permissions_cannot_be_reopened_by_an_include_or_session_switch() {
+        use super::{ToolBox, ToolState, ToolSwitches};
+        use atomcode_capabilities::tools::{PermissionRules, WebFetchTool};
+        use std::sync::Arc;
+        let rules = PermissionRules::parse(
+            &["WebFetch".into()],
+            &["WebFetch".into(), "Bash(rm *)".into()],
+        )
+        .0;
+        let policy = ToolPolicy::new(vec!["web_fetch".into(), "bash".into()], vec![])
+            .with_permissions(Arc::new(rules));
+        assert!(!policy.admits("late-mcp", "WebFetch"));
+        assert!(policy.admits("tool-bash", "bash"));
+        let tools = ToolBox::with_policy_and_switches(policy, ToolSwitches::new());
+        tools
+            .register_from("late-web", Arc::new(WebFetchTool))
+            .unwrap();
+        assert!(tools.get("web_fetch").is_none());
+        assert!(tools.turn_on("web_fetch").is_empty());
+        assert_eq!(tools.listing()[0].state, ToolState::ExcludedByConfig);
+    }
 
     fn policy(exclude: &[&str]) -> ToolPolicy {
         ToolPolicy::new(vec![], exclude.iter().map(|s| s.to_string()).collect())
