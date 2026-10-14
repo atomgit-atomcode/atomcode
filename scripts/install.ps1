@@ -4,7 +4,7 @@
 #
 # Env overrides:
 #   $env:ATOMCODE_VERSION   release tag to install (default: latest release,
-#                             auto-detected from the AtomGit API)
+#                             auto-detected from the AtomGit API or release manifest)
 #   $env:ATOMCODE_PREFIX    install dir (default: %LOCALAPPDATA%\AtomCode)
 # IMPORTANT: when changing install paths, registry edits, or filenames here,
 # also update scripts/uninstall.ps1 AND
@@ -22,10 +22,9 @@ if (-not $Invite) {
   $Invite = $env:ATOMCODE_INVITE
 }
 
-# Fallback version used only when $env:ATOMCODE_VERSION is unset and the API lookup fails.
-$DefaultVersion = "v5.0.2"
 $RepoBase = "https://atomgit.com/atomgit_atomcode/atomcode/releases/download"
 $RepoLatestApi = "https://api.atomgit.com/api/v5/repos/atomgit_atomcode/atomcode/releases/latest"
+$RepoLatestManifest = "https://raw.atomgit.com/atomgit_atomcode/atomcode/raw/main/latest.json"
 
 # --- detect arch ---
 # Prefer PROCESSOR_ARCHITEW6432 (set only when a 32-bit process runs on a 64-bit
@@ -48,7 +47,7 @@ switch ($RealArch) {
 
 # --- resolve version ---
 # Honor $env:ATOMCODE_VERSION if set; otherwise auto-detect the latest release
-# tag from the API, falling back to $DefaultVersion if the lookup yields nothing.
+# tag from the API, then the published manifest. Never silently pin an old release.
 if ($env:ATOMCODE_VERSION) {
     $Version = $env:ATOMCODE_VERSION
 } else {
@@ -58,10 +57,23 @@ if ($env:ATOMCODE_VERSION) {
         $ProgressPreference = 'SilentlyContinue'
         $Latest = Invoke-RestMethod -Uri $RepoLatestApi -UseBasicParsing -TimeoutSec 10
         $Version = $Latest.tag_name
+        if ($Version -isnot [string] -or $Version -cnotmatch '^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?(\+[A-Za-z0-9.-]+)?\z') { $Version = $null }
     } catch {
         $Version = $null
     }
-    if (-not $Version) { $Version = $DefaultVersion }
+    if (-not $Version) {
+        Write-Host "==> Release API unavailable; checking release manifest"
+        try {
+            $Manifest = Invoke-RestMethod -Uri $RepoLatestManifest -UseBasicParsing -TimeoutSec 10
+            $Version = $Manifest.version
+            if ($Version -isnot [string] -or $Version -cnotmatch '^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?(\+[A-Za-z0-9.-]+)?\z') { $Version = $null }
+        } catch {
+            $Version = $null
+        }
+    }
+    if (-not $Version) {
+        throw "Could not determine the latest release. Retry or set ATOMCODE_VERSION to a release tag."
+    }
 }
 
 $BinName = "atomcode-$Version-windows-$ArchTag.exe"

@@ -5,7 +5,7 @@
 #
 # Env overrides:
 #   ATOMCODE_VERSION   release tag to install (default: latest release, auto-detected
-#                        from the AtomGit API)
+#                        from the AtomGit API or release manifest)
 #   ATOMCODE_PREFIX    install dir (absolute path; default: /usr/local/bin if writable,
 #                        else ~/.local/bin). On HarmonyOS as non-root, default is ~/.local/bin.
 # IMPORTANT: when changing install paths, the PATH-rc edit format, or filenames here,
@@ -14,10 +14,9 @@
 # the manifest, but binary path / rc-edit format are not checked.
 set -eu
 
-# Fallback version used only when ATOMCODE_VERSION is unset and the API lookup fails.
-DEFAULT_VERSION="v5.0.2"
 REPO_BASE="https://atomgit.com/atomgit_atomcode/atomcode/releases/download"
 REPO_LATEST_API="https://api.atomgit.com/api/v5/repos/atomgit_atomcode/atomcode/releases/latest"
+REPO_LATEST_MANIFEST="https://raw.atomgit.com/atomgit_atomcode/atomcode/raw/main/latest.json"
 
 # --- detect platform ---
 uname_s=$(uname -s)
@@ -108,7 +107,7 @@ DEST="$TMP/atomcode${ext}"
 # Pick download tool: $_fetch streams a URL to stdout (for the API lookup),
 # $_down saves a URL to a file (for the binary).
 if command -v curl >/dev/null 2>&1; then
-    _fetch="curl -sL --connect-timeout 5 --max-time 10"
+    _fetch="curl -fsSL --connect-timeout 5 --max-time 10"
     _down="curl -fL --progress-bar -o"
 elif command -v wget >/dev/null 2>&1; then
     _fetch="wget -qO- --timeout=10 --tries=1"
@@ -118,15 +117,35 @@ else
     exit 1
 fi
 
+# Extract a release tag without introducing a Python/jq dependency. Reject
+# malformed metadata rather than treating it as a download path.
+release_tag() {
+    sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
+        grep -E '^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?(\+[A-Za-z0-9.-]+)?$' |
+        head -n 1 || true  # No matching tag is normal, including under bash pipefail.
+}
+
 # --- resolve version ---
 # Honor ATOMCODE_VERSION if set; otherwise auto-detect the latest release tag
-# from the API, falling back to DEFAULT_VERSION if the lookup yields nothing.
+# from the API, then the published manifest. Never silently pin an old release.
 if [ -n "${ATOMCODE_VERSION:-}" ]; then
     VERSION="$ATOMCODE_VERSION"
 else
     echo "==> Detecting latest version"
-    VERSION=$($_fetch "$REPO_LATEST_API" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-    [ -n "$VERSION" ] || VERSION="$DEFAULT_VERSION"
+    VERSION=""
+    if metadata=$($_fetch "$REPO_LATEST_API"); then
+        VERSION=$(printf '%s\n' "$metadata" | release_tag tag_name)
+    fi
+    if [ -z "$VERSION" ]; then
+        echo "==> Release API unavailable; checking release manifest"
+        if metadata=$($_fetch "$REPO_LATEST_MANIFEST"); then
+            VERSION=$(printf '%s\n' "$metadata" | release_tag version)
+        fi
+    fi
+    if [ -z "$VERSION" ]; then
+        echo "Error: could not determine the latest release. Retry or set ATOMCODE_VERSION to a release tag." >&2
+        exit 1
+    fi
 fi
 
 BIN_NAME="atomcode-${VERSION}-${os}-${arch}${ext}"
