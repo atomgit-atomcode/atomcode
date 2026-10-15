@@ -35,3 +35,17 @@ Cygwin 的 `disable_pcon` 路径存在根据 Windows console code page 转换原
 先将同类诊断补入 AtomCode `--probe-terminal`：实际 input/output code page、stdin/stdout/stderr 的文件类型和 console mode、Windows API 获得的终端尺寸以及 disable_pcon 状态。不添加猜测性的编码转码或 CMD 启动层。下一步需对照同机 Codex 表现，以及直接启动/CMD 启动的句柄诊断，确认实际发生转码的边界。
 
 用户继续实测 Codex CLI 0.162.1：直接启动返回 `os error 6`（Win32 ERROR_INVALID_HANDLE），错误消息也乱码，无法进入 TUI。这不是 Codex 已支持此场景的证据。诊断中进一步报告 GetConsoleMode 失败时的 Win32 错误码，供直接启动/CMD 启动对照；不把诊断增强当成乱码已修复。
+
+## 管道句柄实测与接管保护
+
+基线 `89600efc0`，工作区干净。直接启动的 stdin/stdout/stderr 全是 pipe，GetConsoleMode 报 ERROR_INVALID_HANDLE，码页 65001 仍乱码，Windows API 尺寸为 120×30。经 CMD 或 `winpty` 启动后句柄全为 character console，尺寸 206×59，16 个颜色均可读取；用户确认两种方式留在原 MobaXterm 标签页，winpty 下中文、布局、滚动与复制正常，滚动条外观与吉祥物颜色尚有问题。`winpty` 在该机器是 `/bin/conin.exe` 的 shell alias。仅在子进程环境移除 disable_pcon 无效，不能当成 ConPTY 已启用。
+
+此前将 shell 中的残留归因于 OSC 调色板回包不准确：本实现 Windows 的 query_terminal 只读控制台 API，不发送 OSC。截图包含鼠标报告形态的 M 片段，reset 后恢复复制；残留的具体来源尚未证明。已证实的边界错误是 Windows crossterm 可以对附带的隐藏控制台做 raw/input/size 操作，但可见终端的标准流却仍为管道。
+
+改动限定在 surface：全屏接管前检查真实 stdin/stdout 均支持 GetConsoleMode，否则返回 Unsupported 与 winpty 启动提示，尚未写 alternate-screen/mouse escapes；不把管道当成可用的控制台事件输入。诊断在 Windows 不进入/退出 raw 模式、不启用 VT，不再把隐藏控制台的尺寸报告成当前窗口尺寸。UTF-8 初始化只设置对应标准句柄确实属于控制台的代码页。Unix 诊断保留调用前已有的 raw 模式。
+
+这不是原生 Windows 管道 TUI 传输的实现，也没有自动解析 shell alias 或拼接 CMD 命令。当前有实测依据的 MobaXterm 运行路径是 `winpty atomcode.exe`；吉祥物和滚动条外观须单独验收，不能以适配器诊断正常宣称全部解决。
+
+CLI 在会话解析、MCP 与 runtime 创建之前对交互启动调用相同检查，覆盖 rows/classic 两种屏幕；`-p` / `--prompt-file`、诊断、子命令和 ACP 不受此限制。顶层错误清理在 Windows 非控制台路径同样跳过，避免检查报错后又恢复隐藏控制台的 raw mode。未改 runtime、持久化或会话 owner。
+
+本轮验证：TUI 1668 项、CLI 568 项测试全部通过；编译闸门、fmt 和 diff 检查通过。新增 Win32 helper 通过 MSVC 目标元数据编译；当前机器仍无完整 Windows C SDK，未构建并运行 Windows 可执行文件。用户确认的是前一构建通过 winpty 的正常行为，新加的接管保护仍需 Windows 实机验证。

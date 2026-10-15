@@ -137,6 +137,12 @@ fn restore_terminal_if_tui() {
     if HEADLESS_MODE.load(Ordering::Relaxed) {
         return;
     }
+    // Startup can reject a Windows pipe transport before either screen takes
+    // over. Cleanup must not then change its unrelated hidden console's mode.
+    #[cfg(windows)]
+    if atomcode_tui::surface::validate_interactive_io().is_err() {
+        return;
+    }
     atomcode_tuix::panic_restore_terminal();
     let _ = crossterm::terminal::disable_raw_mode();
 }
@@ -2253,6 +2259,9 @@ async fn run() -> Result<i32> {
     // Determine if we're running in headless mode BEFORE loading MCP.
     // Headless mode requires MCP tools immediately; TUI can load them in background.
     let is_headless = cli.prompt.is_some() || cli.prompt_file.is_some();
+    if !is_headless {
+        atomcode_tui::surface::validate_interactive_io()?;
+    }
 
     // Continue the previous session only when the user explicitly opts
     // in via `-c` / `--continue`. Bare `atomcode` starts a fresh

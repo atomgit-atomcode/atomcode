@@ -896,6 +896,7 @@ impl Terminal {
 ///
 /// For a caller that only needs the flag on; [`Terminal::enter`] needs the
 /// answer too and asks [`console_speaks_ansi`] directly.
+#[cfg(unix)]
 fn enable_vt_output() {
     let _ = console_speaks_ansi();
 }
@@ -959,6 +960,28 @@ pub fn ensure_console_utf8() -> bool {
     }
 }
 
+#[cfg(any(windows, test))]
+fn require_console_io(supported: bool) -> std::io::Result<()> {
+    if supported {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Windows interactive mode requires console input and output; this terminal provides pipes. \
+             In MobaXterm, launch with `winpty atomcode.exe` (for a local build: \
+             `winpty ./target/release/atomcode.exe`), or use Windows Terminal.",
+        ))
+    }
+}
+
+/// Check the input/output transport before launching either Windows screen.
+/// Headless callers do not need console records and should skip this check.
+pub fn validate_interactive_io() -> std::io::Result<()> {
+    #[cfg(windows)]
+    require_console_io(win_console::has_console_io())?;
+    Ok(())
+}
+
 /// The kernel32 calls for console modes, encoding and palette. kernel32 is
 /// linked by the standard library on Windows already, so declaring them costs
 /// no new dependency.
@@ -967,6 +990,7 @@ mod win_console {
     type Handle = *mut core::ffi::c_void;
     /// `(DWORD)-11`.
     const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5;
+    const STD_INPUT_HANDLE: u32 = 0xFFFF_FFF6;
     const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
     const ENABLE_WRAP_AT_EOL_OUTPUT: u32 = 0x0002;
 
@@ -991,12 +1015,30 @@ mod win_console {
         // Zero means no attached console, so there is no code page to change.
         unsafe {
             let input = GetConsoleCP();
-            if input != 0 && input != UTF8 {
+            if is_console(STD_INPUT_HANDLE) && input != 0 && input != UTF8 {
                 SetConsoleCP(UTF8);
             }
             let output = GetConsoleOutputCP();
-            output != 0 && output != UTF8 && SetConsoleOutputCP(UTF8) != 0
+            is_console(STD_OUTPUT_HANDLE)
+                && output != 0
+                && output != UTF8
+                && SetConsoleOutputCP(UTF8) != 0
         }
+    }
+
+    fn is_console(which: u32) -> bool {
+        // Inspect the actual standard handle. Opening CONIN$/CONOUT$ instead
+        // can succeed against a hidden console unrelated to the visible PTY.
+        // SAFETY: the handle is borrowed; the API only writes the local mode.
+        unsafe {
+            let handle = GetStdHandle(which);
+            let mut mode = 0;
+            !handle.is_null() && handle as isize != -1 && GetConsoleMode(handle, &mut mode) != 0
+        }
+    }
+
+    pub(super) fn has_console_io() -> bool {
+        is_console(STD_INPUT_HANDLE) && is_console(STD_OUTPUT_HANDLE)
     }
 
     pub(super) fn diagnostics() -> Vec<String> {
@@ -1170,6 +1212,10 @@ impl Terminal {
         mouse: bool,
         overrides: crate::caps::Overrides,
     ) -> std::io::Result<Self> {
+        // The Windows event reader consumes console records, not PTY bytes.
+        // Reject a split transport before enabling mouse reports or touching
+        // a hidden console's modes. Otherwise reports reach the shell unread.
+        validate_interactive_io()?;
         ensure_console_utf8();
         // Before a single byte is written: a console that will not execute
         // the sequences gets none of them, rather than a screenful of text.
@@ -2001,11 +2047,16 @@ pub fn probe_report(theme: Option<Theme>) -> String {
     let palette = match theme {
         Some(theme) => Palette::assumed(theme),
         None => {
-            // Same reason as `enter`: the palette probe writes OSC queries,
-            // which a legacy Windows console would echo as text without this.
+            // Only Unix sends queries and needs raw input. Windows reads the
+            // console palette directly: raw-mode APIs can touch a hidden
+            // console even when the visible terminal is connected by pipes.
+            #[cfg(unix)]
             enable_vt_output();
-            let raw = crossterm::terminal::enable_raw_mode().is_ok();
+            #[cfg(unix)]
+            let raw = !crossterm::terminal::is_raw_mode_enabled().unwrap_or(true)
+                && crossterm::terminal::enable_raw_mode().is_ok();
             let palette = measure_palette();
+            #[cfg(unix)]
             if raw {
                 let _ = crossterm::terminal::disable_raw_mode();
             }
@@ -2037,11 +2088,16 @@ pub fn probe_report(theme: Option<Theme>) -> String {
         for line in win_console::diagnostics() {
             let _ = writeln!(out, "{line}");
         }
-        let _ = writeln!(
-            out,
-            "  Windows terminal size: {:?}",
-            crossterm::terminal::size()
-        );
+        if win_console::has_console_io() {
+            let _ = writeln!(
+                out,
+                "  Windows terminal size: {:?}",
+                crossterm::terminal::size()
+            );
+        } else {
+            let _ = writeln!(out, "  Windows terminal size: unavailable (standard handles are not console input/output)");
+            let _ = writeln!(out, "  Interactive mode: unsupported pipes; use winpty atomcode.exe or Windows Terminal");
+        }
         let legacy = std::env::var("CYGWIN")
             .is_ok_and(|v| v.split_whitespace().any(|flag| flag == "disable_pcon"));
         let _ = writeln!(out, "  CYGWIN disable_pcon: {legacy}");
@@ -2831,6 +2887,13 @@ pub fn from_crossterm(event: crossterm::event::Event) -> Option<Input> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_windows_pipe_transport_is_rejected_before_screen_takeover() {
+        let error = require_console_io(false).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("winpty"));
+        assert!(require_console_io(true).is_ok());
+    }
     /// A console's table is in its own order and ANSI swaps red and blue; the
     /// background and text colour are the attribute's two halves. PowerShell's
     /// window is the case: navy ground (index 5, remapped), near-white text
