@@ -191,6 +191,10 @@ pub fn installed_plugin_cc_hooks(dirs: &ProductDirs) -> Vec<PluginCcHook> {
         }
         let hash = crate::plugin::hook_trust::plugin_hook_set_hash(&hooks);
         let id = crate::plugin::hook_trust::plugin_id(&assets.plugin, &assets.marketplace);
+        if hash.starts_with("invalid:") {
+            tracing::warn!(plugin = %id, reason = %hash, "Plugin hooks withheld: incompatible configuration; repair script entry points or disable the plugin");
+            continue;
+        }
         if crate::plugin::hook_trust::is_trusted(&trust, &id, &hash) {
             out.extend(hooks);
         }
@@ -572,6 +576,7 @@ mod tests {
         let work = tempfile::tempdir().unwrap().keep();
         let repo = work.join("hp");
         std::fs::create_dir_all(repo.join("hooks")).unwrap();
+        std::fs::write(repo.join("echo"), "").unwrap();
         std::fs::write(
             repo.join("hooks/hooks.json"),
             r#"{"SessionStart":[{"hooks":[{"type":"command","command":"echo hi"}]}]}"#,
@@ -626,7 +631,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn grandfather_blesses_existing_then_new_installs_stay_untrusted() {
+    fn migration_never_grants_content_trust_without_user_authorization() {
         use crate::plugin::hook_trust::ensure_migrated;
         let _home = crate::plugin::test_support::isolated_home();
         let dirs = _home.dirs();
@@ -635,6 +640,7 @@ mod tests {
             let work = tempfile::tempdir().unwrap().keep();
             let repo = work.join(name);
             std::fs::create_dir_all(repo.join("hooks")).unwrap();
+            std::fs::write(repo.join("echo"), "").unwrap();
             std::fs::write(
                 repo.join("hooks/hooks.json"),
                 format!(
@@ -667,12 +673,12 @@ mod tests {
             "untrusted before migration"
         );
 
-        // Upgrade boundary → grandfather blesses the existing plugin.
+        // The migration boundary must not grant new content authorization.
         ensure_migrated(&dirs);
         assert_eq!(
             installed_plugin_cc_hooks(&dirs).len(),
-            1,
-            "existing plugin grandfathered"
+            0,
+            "existing plugins require explicit content authorization"
         );
 
         // A NEW plugin installed AFTER migration stays untrusted (marker set).
@@ -684,7 +690,7 @@ mod tests {
         let loaded = installed_plugin_cc_hooks(&dirs);
         assert_eq!(
             loaded.len(),
-            1,
+            0,
             "new post-migration plugin NOT auto-trusted"
         );
         assert!(loaded.iter().all(|h| h.command == "echo one"));
@@ -698,6 +704,7 @@ mod tests {
         let work = tempfile::tempdir().unwrap().keep();
         let repo = work.join("cp");
         std::fs::create_dir_all(repo.join("cfg")).unwrap();
+        std::fs::write(repo.join("echo"), "").unwrap();
         std::fs::write(
             repo.join("plugin.json"),
             r#"{"name":"cp","hooks":"cfg/h.json"}"#,

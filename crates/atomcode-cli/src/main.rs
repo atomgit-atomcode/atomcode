@@ -1215,8 +1215,7 @@ fn launch_warnings(
 
 /// 现在有哪些装着的插件带着还没被信任的钩子。
 ///
-/// 先跑一次迁移:装在这条规矩之前的插件是被顺延信任的,不先迁移就会把它们
-/// 全列出来 —— 一句关于并不存在的问题的提醒。
+/// 内容授权必须明确授予；旧的仅命令授权不顺延。
 fn untrusted_plugin_hooks() -> Vec<String> {
     atomcode_capabilities::plugin::hook_trust::ensure_migrated(
         &atomcode_coding::config::product_dirs_from_env(),
@@ -1226,7 +1225,16 @@ fn untrusted_plugin_hooks() -> Vec<String> {
     )
     .into_iter()
     .filter(|status| !status.trusted)
-    .map(|status| status.plugin)
+    .map(|status| {
+        if status.hash.starts_with("invalid:") {
+            format!(
+                "{} — incompatible hook: {}; repair its script entry point or disable the plugin",
+                status.plugin_id, status.hash
+            )
+        } else {
+            status.plugin
+        }
+    })
     .collect()
 }
 
@@ -4242,6 +4250,10 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
             if !untrusted.is_empty() {
                 println!("Untrusted plugin hooks (not loaded):");
                 for s in &untrusted {
+                    if s.hash.starts_with("invalid:") {
+                        println!("  {} — incompatible hooks: {} · repair the script entry point or disable this plugin", s.plugin_id, s.hash);
+                        continue;
+                    }
                     println!(
                         "  {} — {} hook(s) [{}] · run: atomcode plugin trust {}",
                         s.plugin,

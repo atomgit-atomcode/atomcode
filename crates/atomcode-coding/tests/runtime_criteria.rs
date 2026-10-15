@@ -1549,6 +1549,7 @@ async fn a_persons_hooks_and_a_plugins_hooks_both_run() {
             command: format!("touch {}", from_plugin.display()),
             timeout_ms: 5_000,
             plugin_root: None,
+            plugin_content_hash: None,
         },
     ]));
     let mut runtime = CodingRuntime::start(start).await.unwrap();

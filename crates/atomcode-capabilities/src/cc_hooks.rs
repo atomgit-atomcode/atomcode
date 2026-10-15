@@ -1,11 +1,6 @@
 //! Claude-Code-compatible EXTERNAL hooks for the new (kernel) stack.
 //!
-//! The legacy `atomcode-core` engine shipped a full CC-parity hook engine
-//! (spawn an external command per lifecycle event, speak CC's stdin/stdout JSON
-//! contract). The new default v2/kernel engine never ran it — it lives in core,
-//! which L1 may not depend on. This module PORTS that executor onto the kernel's
-//! seams ([`LifecycleHooks`] + [`ToolMiddleware`]) so user/plugin CC hooks run on
-//! the default engine again.
+//! User and plugin hook commands run on the kernel lifecycle/tool seams.
 //!
 //! ONE [`CCExternalHooks`] instance implements BOTH traits — register it as a
 //! lifecycle hook AND as a tool middleware (it carries the same loaded config):
@@ -13,10 +8,9 @@
 //!   plus `turn_complete` (mapped to the CC `Stop` / `StopFailure` terminal events)
 //! - [`ToolMiddleware`]: `before` (PreToolUse) / `after` (PostToolUse)
 //!
-//! SCOPE (M2a): user (`$ATOMCODE_HOME/hooks.json`) + project (`<root>/.hooks.json`).
-//! Plugin-contributed inline CC hooks need the plugin loader (still in core) and
-//! land in a later slice; the [`HookConfig::plugin_root`] field is already wired so
-//! that port is additive.
+//! User/project hooks retain shell semantics. Plugin hooks require explicitly
+//! authorized bundle content and a checked entry point; invalid configurations
+//! are withheld by the loader. Runtime content-verification failures fail closed.
 //!
 //! GRACEFUL BY DESIGN: a hook that times out, fails to spawn, or emits garbage is a
 //! silent continue — a broken hook never wedges the turn. Only an explicit `deny` /
@@ -113,6 +107,8 @@ pub struct HookConfig {
     /// `ATOMCODE_PLUGIN_ROOT` so a plugin script can locate resources alongside
     /// its manifest. We never substitute it into the command (injection-safe).
     pub plugin_root: Option<PathBuf>,
+    /// Content authorized when this runtime loaded the plugin.
+    pub plugin_content_hash: Option<String>,
 }
 
 impl HookConfig {
@@ -135,6 +131,10 @@ impl HookConfig {
             timeout_ms: timeout_secs
                 .map(|s| s.saturating_mul(1000))
                 .unwrap_or_else(default_timeout_ms),
+            plugin_content_hash: Some(
+                crate::plugin::hook_trust::plugin_content_hash(&plugin_root)
+                    .unwrap_or_else(|_| "unverifiable".into()),
+            ),
             plugin_root: Some(plugin_root),
         })
     }
@@ -229,6 +229,7 @@ fn read_hooks_file(path: &Path) -> (Vec<HookConfig>, HooksFileStatus) {
             command: entry.command,
             timeout_ms: entry.timeout_ms,
             plugin_root: None,
+            plugin_content_hash: None,
         });
     }
     let status = HooksFileStatus::Loaded {
@@ -408,6 +409,15 @@ fn plugin_hook_command(hook: &HookConfig) -> Result<tokio::process::Command, Str
         .strip_prefix("node -e \"require(require('path').join(process.env.CLAUDE_PLUGIN_ROOT.split(String.fromCharCode(92)).join('/'), '")
         .and_then(|rest| rest.strip_suffix("'))\""))
         .map(|path| format!("node \"${{CLAUDE_PLUGIN_ROOT}}/{path}\""));
+    if let Some(expected) = &hook.plugin_content_hash {
+        let current = crate::plugin::hook_trust::plugin_content_hash(root)
+            .map_err(|error| format!("plugin content cannot be verified: {error:#}"))?;
+        if &current != expected {
+            return Err(
+                "plugin content changed since authorization; reload and re-trust the plugin".into(),
+            );
+        }
+    }
     let text = normalized.as_deref().unwrap_or(original);
     let stripped = text
         .replace("${CLAUDE_PLUGIN_ROOT}", "")
@@ -508,6 +518,17 @@ fn plugin_hook_command(hook: &HookConfig) -> Result<tokio::process::Command, Str
     if !script.starts_with(&root) || !script.is_file() {
         return Err("plugin hook script escapes its plugin directory or is not a file".into());
     }
+    if script
+        .strip_prefix(&root)
+        .expect("contained script")
+        .components()
+        .any(|part| part.as_os_str() == ".git")
+    {
+        return Err(
+            "plugin hook entry points cannot reside in Git metadata outside the trusted bundle"
+                .into(),
+        );
+    }
     let mut command = if let Some(interpreter) = interpreter {
         #[cfg(windows)]
         let interpreter = plugin_interpreter(&interpreter)?;
@@ -525,7 +546,29 @@ fn plugin_hook_command(hook: &HookConfig) -> Result<tokio::process::Command, Str
         tokio::process::Command::new(&script)
     };
     command.args(words);
+    // Python imports must not mutate the authorized bundle by creating pyc
+    // files during the first invocation.
+    command.env("PYTHONDONTWRITEBYTECODE", "1");
     Ok(command)
+}
+
+pub(crate) fn validate_plugin_hook(
+    hook: &crate::plugin::loader::PluginCcHook,
+) -> Result<(), String> {
+    let Some(event) = HookEvent::parse(&hook.event) else {
+        return Ok(());
+    };
+    // The caller already hashes the bundle once. Preflight checks the entry
+    // point without repeatedly reading every bundle file for each hook.
+    let config = HookConfig {
+        event,
+        matcher: hook.matcher.clone(),
+        command: hook.command.clone(),
+        timeout_ms: default_timeout_ms(),
+        plugin_root: Some(hook.plugin_root.clone()),
+        plugin_content_hash: None,
+    };
+    plugin_hook_command(&config).map(|_| ())
 }
 
 async fn run_command_hook(
@@ -536,10 +579,28 @@ async fn run_command_hook(
     use std::process::Stdio;
     use tokio::io::AsyncWriteExt;
 
-    let mut cmd = match plugin_hook_command(hook) {
+    // Bundle verification can read many files; keep it off the async runtime.
+    // Dropping the waiter cannot launch a child: spawning happens below, only
+    // after verification has returned successfully.
+    let prepared = if hook.plugin_root.is_some() {
+        let owned = hook.clone();
+        match tokio::time::timeout(
+            Duration::from_millis(hook.timeout_ms),
+            tokio::task::spawn_blocking(move || plugin_hook_command(&owned)),
+        )
+        .await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => Err(format!("plugin verification failed: {error}")),
+            Err(_) => Err("plugin verification timed out; hook was not executed".into()),
+        }
+    } else {
+        plugin_hook_command(hook)
+    };
+    let mut cmd = match prepared {
         Ok(command) => command,
         Err(reason) => {
-            let reason = format!("plugin hook rejected: {reason}");
+            let reason = format!("plugin hook rejected: {}", reason.escape_debug());
             tracing::warn!("{reason}");
             // A deliberate rejection, not a missing/failed hook: gate callers
             // must see the block instead of silently proceeding.
@@ -1422,6 +1483,7 @@ mod tests {
             ),
             timeout_ms: 5_000,
             plugin_root: None,
+            plugin_content_hash: None,
         };
         let cc = CCExternalHooks::new(
             vec![
@@ -1506,6 +1568,7 @@ mod tests {
             ),
             timeout_ms: 5_000,
             plugin_root: None,
+            plugin_content_hash: None,
         };
         CCExternalHooks::new(vec![single], "/tmp")
             .with_transcript_path(transcript_s.clone())
@@ -1527,6 +1590,7 @@ mod tests {
             ),
             timeout_ms: 5_000,
             plugin_root: None,
+            plugin_content_hash: None,
         };
         CCExternalHooks::new(vec![hook(&m_a_s), hook(&m_b_s)], "/tmp")
             .turn_complete(&convo, &StopReason::Stopped, &ctx)
@@ -1711,6 +1775,19 @@ mod tests {
     }
 
     #[test]
+    fn a_loaded_plugin_cannot_execute_changed_content() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("entry.py"), "import helper").unwrap();
+        std::fs::write(root.path().join("helper.py"), "safe = True").unwrap();
+        let config = plugin_config(root.path(), "python3 entry.py");
+        assert!(plugin_hook_command(&config).is_ok());
+        std::fs::write(root.path().join("helper.py"), "safe = False").unwrap();
+        assert!(plugin_hook_command(&config)
+            .unwrap_err()
+            .contains("content changed"));
+    }
+
+    #[test]
     fn node_path_wrapper_is_a_checked_script_entry_point() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("check.js"), "").unwrap();
@@ -1740,7 +1817,10 @@ mod tests {
     fn plugin_entry_points_reject_shell_and_escape_paths() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("check.sh"), "exit 0").unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        std::fs::write(root.path().join(".git/check.sh"), "exit 0").unwrap();
         for command in [
+            "sh .git/check.sh",
             "",
             "echo hello",
             "sh -c 'echo hello'",
@@ -1821,6 +1901,7 @@ mod tests {
             command: r#"echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"x"}}'"#.into(),
             timeout_ms: 5_000,
             plugin_root: None,
+            plugin_content_hash: None,
         };
         let cc = CCExternalHooks::new(vec![hook], "/tmp");
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1845,6 +1926,7 @@ mod tests {
             command: "echo hooktest-ok".into(),
             timeout_ms: 5_000,
             plugin_root: None,
+            plugin_content_hash: None,
         };
         let out = run_hook_for_test(
             &hook,
@@ -1872,6 +1954,7 @@ mod tests {
             command: r#"echo '{"hookSpecificOutput":{"permissionDecision":"ask"}}'"#.into(),
             timeout_ms: 5_000,
             plugin_root: None,
+            plugin_content_hash: None,
         };
         let cc = CCExternalHooks::new(vec![hook], "/tmp");
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1902,6 +1985,7 @@ mod tests {
             command: r#"echo '{"decision":"block","reason":"banned"}'"#.into(),
             timeout_ms: 5_000,
             plugin_root: None,
+            plugin_content_hash: None,
         };
         let cc = CCExternalHooks::new(vec![hook], "/tmp");
         let mut text = "hello".to_string();
@@ -1917,6 +2001,7 @@ mod tests {
             command: r#"echo '{"hookSpecificOutput":{"additionalContext":"CTX"}}'"#.into(),
             timeout_ms: 5_000,
             plugin_root: None,
+            plugin_content_hash: None,
         };
         let cc = CCExternalHooks::new(vec![hook], "/tmp");
         let mut text = "hi".to_string();
@@ -1944,6 +2029,7 @@ mod tests {
             command: r#"printf '{"hookSpecificOutput":{"additionalContext":"cwd=%s|a=%s|c=%s"}}' "$(pwd -P)" "$ATOMCODE_PROJECT_DIR" "$CLAUDE_PROJECT_DIR""#.into(),
             timeout_ms: 5_000,
             plugin_root: None,
+            plugin_content_hash: None,
         };
         let cc = CCExternalHooks::new(vec![hook], dir.clone());
         let mut text = "hi".to_string();
@@ -1981,6 +2067,7 @@ mod tests {
             command: command.into(),
             timeout_ms: 5_000,
             plugin_root: None,
+            plugin_content_hash: None,
         };
         let cc = CCExternalHooks::new(
             vec![
@@ -2009,6 +2096,7 @@ mod tests {
             command: r#"echo '{"hookSpecificOutput":{"additionalContext":"STILL-RAN"}}'"#.into(),
             timeout_ms: 5_000,
             plugin_root: None,
+            plugin_content_hash: None,
         };
         let cc = CCExternalHooks::new(vec![hook], "/nonexistent/atomcode-project-dir");
         let mut text = "hi".to_string();
@@ -2025,6 +2113,7 @@ mod tests {
                 .into(),
             timeout_ms: 5_000,
             plugin_root: None,
+            plugin_content_hash: None,
         };
         let cc = CCExternalHooks::new(vec![hook], "/tmp");
         let mut convo = Conversation::new();
@@ -2063,6 +2152,7 @@ mod tests {
             command: "exit 1".into(),
             timeout_ms: 5_000,
             plugin_root: None,
+            plugin_content_hash: None,
         };
         let cc = CCExternalHooks::new(vec![hook], "/tmp");
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2087,6 +2177,7 @@ mod tests {
             command: cmd.into(),
             timeout_ms: 5_000,
             plugin_root: None,
+            plugin_content_hash: None,
         };
         let cc = CCExternalHooks::new(vec![hook], "/tmp");
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2120,6 +2211,7 @@ mod tests {
             command,
             timeout_ms: 5_000,
             plugin_root: None,
+            plugin_content_hash: None,
         };
         let _guard = crate::process_utils::EnvVarGuard::new(&["LC_ALL", "LANG", "LC_CTYPE"]);
         std::env::set_var("LC_ALL", "C");
@@ -2284,6 +2376,7 @@ mod tests {
             command: r#"echo '{"hookSpecificOutput":{"updatedToolOutput":"REWRITTEN"}}'"#.into(),
             timeout_ms: 5_000,
             plugin_root: None,
+            plugin_content_hash: None,
         };
         let cc = CCExternalHooks::new(vec![hook], "/tmp");
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2340,6 +2433,7 @@ mod tests {
             command: r#"echo '{"hookSpecificOutput":{"updatedToolOutput":"OK-REWRITE"}}'"#.into(),
             timeout_ms: 5_000,
             plugin_root: None,
+            plugin_content_hash: None,
         };
         let fail_hook = HookConfig {
             event: HookEvent::PostToolUseFailure,
@@ -2347,6 +2441,7 @@ mod tests {
             command: r#"echo '{"hookSpecificOutput":{"updatedToolOutput":"FAIL-REWRITE"}}'"#.into(),
             timeout_ms: 5_000,
             plugin_root: None,
+            plugin_content_hash: None,
         };
         let cc = CCExternalHooks::new(vec![ok_hook, fail_hook], "/tmp");
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2402,6 +2497,7 @@ mod tests {
             command: r#"grep -q '"session_id":"sess-xyz"' && echo MATCHED"#.into(),
             timeout_ms: 5_000,
             plugin_root: None,
+            plugin_content_hash: None,
         };
         let cc = CCExternalHooks::new(vec![hook], "/tmp").with_session_id("sess-xyz");
         let mut text = "hi".to_string();
@@ -2424,6 +2520,7 @@ mod tests {
                 .into(),
             timeout_ms: 5_000,
             plugin_root: None,
+            plugin_content_hash: None,
         };
         let cc = CCExternalHooks::new(vec![hook], "/tmp");
         let mut call = ToolCall {
@@ -2445,6 +2542,7 @@ mod tests {
             command: cmd.into(),
             timeout_ms: 5_000,
             plugin_root: None,
+            plugin_content_hash: None,
         }
     }
 

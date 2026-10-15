@@ -68,6 +68,30 @@ retained after loading, so you cannot address a hook by it (see the CLI section)
 
 ## How the command runs
 
+Execution depends on the source:
+
+| Source | Execution |
+|---|---|
+| User project/user hooks | Shell command, retaining pipes, quoting and variable expansion. |
+| Plugin hooks | Validated plugin-relative script entry point, directly executed with literal arguments. Optional interpreters: `python`, `python3`, `node`, `sh`, `bash`. |
+
+Plugin examples: `python3 "${CLAUDE_PLUGIN_ROOT}/hooks/check.py"` or
+`node "${CLAUDE_PLUGIN_ROOT}/hooks/check.js"`. Move pipelines and inline `-e`/`-c`
+programs into scripts. Direct `.cmd`/`.bat` entry points are unsupported.
+Plugin-root placeholders are resolved as paths; arbitrary shell expansion is not
+performed. Invalid plugin configurations are withheld at load and cannot be
+trusted; inspect `atomcode hooks list`, repair the command or disable the plugin.
+A script's explicit `decision:block`, or exit 2 with a deliberate reason, still
+blocks. Other nonzero exits and launch failures are not business block decisions.
+
+Trust now includes plugin bundle contents (excluding Git metadata), not just
+commands. Script/helper changes require explicit `atomcode plugin trust <name>`.
+It does not sandbox external dependencies, protect external environment/PATH, or
+make validation and execution atomic against concurrent filesystem mutation.
+
+The remainder of this section describes **user-authored hooks**.
+
+
 `command` is handed to the shell as one line — `sh -c` on Linux/macOS, `cmd /C`
 on Windows — so pipes, `&&` and quoting work as they would in a terminal.
 
