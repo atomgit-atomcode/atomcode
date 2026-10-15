@@ -1060,8 +1060,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("Marketplace sync skipped (chat unaffected): {detail}").into(),
         Msg::OfflineModeActive =>
             "Offline mode: web tools, telemetry, and auto-update are disabled.".into(),
-        Msg::PluginHooksUntrusted { count, names } => format!(
-            "Hooks from {count} plugin(s) are not trusted ({names}) and will not run. Enter /plugin trust <name> to authorize them."
+        Msg::PluginHooksUntrusted { count, names: _ } => format!(
+            "Hooks from {count} plugin(s) need authorization and will not run. Enter /plugin to review and trust."
+        ).into(),
+        Msg::PluginHooksIncompatible { count } => format!(
+            "Hooks from {count} plugin(s) are incompatible and will not run. Run atomcode hooks list for details; trusting again will not fix them."
         ).into(),
         Msg::PluginInstalling { plugin, marketplace } =>
             format!("installing `{plugin}@{marketplace}`…").into(),

@@ -1031,8 +1031,11 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("插件市场同步已跳过（不影响对话）：{detail}").into(),
         Msg::OfflineModeActive =>
             "离线模式：已停用联网工具、遥测与自动更新。".into(),
-        Msg::PluginHooksUntrusted { count, names } => format!(
-            "{count} 个插件的 hook 尚未获信任（{names}），这些 hook 不会运行。输入 /plugin trust <插件名> 授权。"
+        Msg::PluginHooksUntrusted { count, names: _ } => format!(
+            "{count} 个插件的 hook 待重新授权，暂不运行。输入 /plugin 查看并授权。"
+        ).into(),
+        Msg::PluginHooksIncompatible { count } => format!(
+            "{count} 个插件的 hook 配置不兼容，暂不运行。运行 atomcode hooks list 查看原因；重新授权不能解决。"
         ).into(),
         Msg::PluginInstalling { plugin, marketplace } =>
             format!("正在安装 `{plugin}@{marketplace}`…").into(),

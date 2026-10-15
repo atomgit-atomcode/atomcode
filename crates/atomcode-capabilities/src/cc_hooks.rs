@@ -408,6 +408,9 @@ fn plugin_hook_command(hook: &HookConfig) -> Result<tokio::process::Command, Str
     let normalized = original
         .strip_prefix("node -e \"require(require('path').join(process.env.CLAUDE_PLUGIN_ROOT.split(String.fromCharCode(92)).join('/'), '")
         .and_then(|rest| rest.strip_suffix("'))\""))
+        .or_else(|| original
+            .strip_prefix("node -e \"import(require('node:url').pathToFileURL(require('node:path').join(process.env.CLAUDE_PLUGIN_ROOT,'")
+            .and_then(|rest| rest.strip_suffix("')).href)\"")))
         .map(|path| format!("node \"${{CLAUDE_PLUGIN_ROOT}}/{path}\""));
     if let Some(expected) = &hook.plugin_content_hash {
         let current = crate::plugin::hook_trust::plugin_content_hash(root)
@@ -470,7 +473,7 @@ fn plugin_hook_command(hook: &HookConfig) -> Result<tokio::process::Command, Str
     if words.is_empty() {
         return Err("empty plugin hook command".into());
     }
-    let interpreter = match words[0].as_str() {
+    let mut interpreter = match words[0].as_str() {
         "python" | "python3" | "node" | "sh" | "bash" => Some(words.remove(0)),
         _ => None,
     };
@@ -528,6 +531,23 @@ fn plugin_hook_command(hook: &HookConfig) -> Result<tokio::process::Command, Str
             "plugin hook entry points cannot reside in Git metadata outside the trusted bundle"
                 .into(),
         );
+    }
+    // A batch/bash polyglot is a checked bash script, not a cmd /C command.
+    if interpreter.is_none()
+        && script
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd"))
+    {
+        use std::io::Read;
+        let marker = b": << 'CMDBLOCK'";
+        let mut prefix = vec![0; marker.len()];
+        if std::fs::File::open(&script)
+            .and_then(|mut file| file.read_exact(&mut prefix))
+            .is_ok()
+            && prefix == marker
+        {
+            interpreter = Some("bash".into());
+        }
     }
     let mut command = if let Some(interpreter) = interpreter {
         #[cfg(windows)]
@@ -1785,6 +1805,40 @@ mod tests {
         assert!(plugin_hook_command(&config)
             .unwrap_err()
             .contains("content changed"));
+    }
+
+    #[test]
+    fn channel_import_wrappers_and_polyglot_batch_files_use_checked_interpreters() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("start.js"), "export {};").unwrap();
+        std::fs::write(
+            root.path().join("run-hook.cmd"),
+            ": << 'CMDBLOCK'\n@echo off\nCMDBLOCK\nexit 0\n",
+        )
+        .unwrap();
+        let hook = plugin_config(root.path(), "node -e \"import(require('node:url').pathToFileURL(require('node:path').join(process.env.CLAUDE_PLUGIN_ROOT,'start.js')).href)\"");
+        let command = plugin_hook_command(&hook).unwrap();
+        assert_eq!(
+            command.as_std().get_args().collect::<Vec<_>>(),
+            [std::fs::canonicalize(root.path().join("start.js"))
+                .unwrap()
+                .as_os_str()]
+        );
+        let hook = plugin_config(
+            root.path(),
+            "\"${CLAUDE_PLUGIN_ROOT}/run-hook.cmd\" session-start",
+        );
+        let command = plugin_hook_command(&hook).unwrap();
+        assert!(command
+            .as_std()
+            .get_program()
+            .to_string_lossy()
+            .contains("bash"));
+        assert_eq!(command.as_std().get_args().last().unwrap(), "session-start");
+        std::fs::write(root.path().join("ordinary.cmd"), "@echo off\necho no").unwrap();
+        assert!(plugin_hook_command(&plugin_config(root.path(), "ordinary.cmd")).is_err());
+        let escape = hook.command.replace("run-hook.cmd", "../run-hook.cmd");
+        assert!(plugin_hook_command(&plugin_config(root.path(), &escape)).is_err());
     }
 
     #[test]

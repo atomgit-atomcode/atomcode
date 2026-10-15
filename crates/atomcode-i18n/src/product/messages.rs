@@ -1257,6 +1257,10 @@ pub enum Msg<'a> {
         count: usize,
         names: &'a str,
     },
+    /// Startup summary; detailed configuration errors belong in hooks list.
+    PluginHooksIncompatible {
+        count: usize,
+    },
     PluginInstalling {
         plugin: &'a str,
         marketplace: &'a str,

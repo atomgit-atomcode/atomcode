@@ -235,7 +235,7 @@ atomcode plugin marketplace remove|update|list</code></pre>
         <li><code>${CLAUDE_PLUGIN_ROOT}</code> — absolute path of the plugin install directory (CC compatible).</li>
         <li><code>${ATOMCODE_PLUGIN_ROOT}</code> — same thing, atomcode alias.</li>
       </ul>
-      <p>Plugin hooks accept checked plugin-relative scripts and literal arguments, optionally using python, python3, node, sh or bash. Plugin-root placeholders resolve as paths without a shell. Move pipelines, redirections and inline code into scripts. Direct .cmd/.bat entry points are unsupported. Only user-authored hooks retain shell expansion.</p>
+      <p>Plugin hooks accept checked plugin-relative scripts and literal arguments, optionally using python, python3, node, sh or bash. Plugin-root placeholders resolve as paths without a shell. Move pipelines, redirections and inline code into scripts. Known Node path wrappers normalize to scripts; recognized batch/bash polyglot .cmd wrappers run through bash. Ordinary .cmd/.bat files remain unsupported. Only user-authored hooks retain shell expansion.</p>
 
 <p>Trust includes plugin contents (excluding Git metadata). Script/helper changes require explicit <code>atomcode plugin trust name</code>. Incompatible configurations are withheld at load with a diagnostic; repair the entry point or disable the plugin. This is not a sandbox, does not cover external dependencies/environment, and does not guarantee atomic execution against concurrent file mutation.</p>
       <h2 id="marketplace-management">Marketplace management</h2>

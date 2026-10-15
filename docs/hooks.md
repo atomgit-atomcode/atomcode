@@ -77,7 +77,9 @@ Execution depends on the source:
 
 Plugin examples: `python3 "${CLAUDE_PLUGIN_ROOT}/hooks/check.py"` or
 `node "${CLAUDE_PLUGIN_ROOT}/hooks/check.js"`. Move pipelines and inline `-e`/`-c`
-programs into scripts. Direct `.cmd`/`.bat` entry points are unsupported.
+programs into scripts. Known Node path-only wrappers are normalized to their
+script entry point. Recognized batch/bash polyglot `.cmd` wrappers run through
+bash with literal arguments; ordinary `.cmd`/`.bat` files remain unsupported.
 Plugin-root placeholders are resolved as paths; arbitrary shell expansion is not
 performed. Invalid plugin configurations are withheld at load and cannot be
 trusted; inspect `atomcode hooks list`, repair the command or disable the plugin.

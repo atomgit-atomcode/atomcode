@@ -1216,26 +1216,42 @@ fn launch_warnings(
 /// 现在有哪些装着的插件带着还没被信任的钩子。
 ///
 /// 内容授权必须明确授予；旧的仅命令授权不顺延。
-fn untrusted_plugin_hooks() -> Vec<String> {
-    atomcode_capabilities::plugin::hook_trust::ensure_migrated(
-        &atomcode_coding::config::product_dirs_from_env(),
-    );
-    atomcode_capabilities::plugin::installed_plugin_hook_trust_status(
-        &atomcode_coding::config::product_dirs_from_env(),
-    )
-    .into_iter()
-    .filter(|status| !status.trusted)
-    .map(|status| {
-        if status.hash.starts_with("invalid:") {
-            format!(
-                "{} — incompatible hook: {}; repair its script entry point or disable the plugin",
-                status.plugin_id, status.hash
-            )
-        } else {
-            status.plugin
-        }
-    })
-    .collect()
+fn plugin_hook_notices() -> Vec<String> {
+    let dirs = atomcode_coding::config::product_dirs_from_env();
+    atomcode_capabilities::plugin::hook_trust::ensure_migrated(&dirs);
+    let statuses = atomcode_capabilities::plugin::installed_plugin_hook_trust_status(&dirs);
+    hook_status_notices(&statuses)
+}
+
+fn hook_status_notices(statuses: &[atomcode_capabilities::plugin::PluginHookTrust]) -> Vec<String> {
+    use atomcode_i18n::product::{t, Msg};
+    let pending = statuses
+        .iter()
+        .filter(|status| !status.trusted && !status.hash.starts_with("invalid:"))
+        .count();
+    let incompatible = statuses
+        .iter()
+        .filter(|status| status.hash.starts_with("invalid:"))
+        .count();
+    let mut out = Vec::new();
+    if pending > 0 {
+        out.push(
+            t(Msg::PluginHooksUntrusted {
+                count: pending,
+                names: "",
+            })
+            .into_owned(),
+        );
+    }
+    if incompatible > 0 {
+        out.push(
+            t(Msg::PluginHooksIncompatible {
+                count: incompatible,
+            })
+            .into_owned(),
+        );
+    }
+    out
 }
 
 /// 这一趟启动,开场要说的全部。
@@ -2448,8 +2464,11 @@ async fn run() -> Result<i32> {
             cli.dangerously_skip_permissions,
             is_admin,
             atomcode_config::config::offline::is_offline_active(),
-            &untrusted_plugin_hooks(),
-        ),
+            &[],
+        )
+        .into_iter()
+        .chain(plugin_hook_notices())
+        .collect(),
     );
     // The first interactive launch on a new release says, in one line, what it
     // brought and where to read the rest; never a headless one, which would spend
@@ -5196,7 +5215,7 @@ mod tests {
     use super::{
         apply_cli_runtime_overrides, atomcode_log_path, close_thinking_chunk,
         format_thinking_chunk, format_verbose_tool_chunk, headless_completion_exit_code,
-        headless_completion_notify_reason, headless_denial_exit_code,
+        headless_completion_notify_reason, headless_denial_exit_code, hook_status_notices,
         interactive_provider_bootstrap, is_completion_invocation, launch_warnings,
         merge_startup_notices, print_shell_completion, resolve_in_catalog, resolve_working_dir,
         resume_candidates, resume_hint_line, runtime_config_from, should_fork_busy_continue,
@@ -5537,6 +5556,33 @@ mod tests {
     /// 把这个函数写成「永远都说」照样全绿 —— 而那样每一次普通启动都会顶着
     /// 四条警告开场,人两天之后就不再看它们,于是真的那一次也漏掉。
     #[test]
+    fn hook_startup_notices_separate_authorization_from_incompatibility() {
+        use atomcode_capabilities::plugin::{InstallScope, PluginHookTrust};
+        let status = |plugin: &str, hash: &str, trusted| PluginHookTrust {
+            plugin: plugin.into(),
+            marketplace: "test".into(),
+            scope: InstallScope::User,
+            plugin_id: format!("{plugin}@test"),
+            hook_count: 1,
+            events: vec!["SessionStart".into()],
+            hash: hash.into(),
+            trusted,
+        };
+        let notices = hook_status_notices(&[
+            status("pending", "digest", false),
+            status("broken", "invalid:long-command-and-hash", false),
+            status("ready", "digest", true),
+        ]);
+        assert_eq!(notices.len(), 2);
+        assert!(notices[0].contains("/plugin"));
+        assert!(notices[1].contains("atomcode hooks list"));
+        assert!(notices.iter().all(|line| !line.contains("invalid:")
+            && !line.contains("long-command")
+            && !line.contains("broken")));
+        assert!(hook_status_notices(&[status("ready", "digest", true)]).is_empty());
+    }
+
+    #[test]
     fn a_launch_says_how_it_differs_from_the_ordinary_one_and_otherwise_says_nothing() {
         assert!(
             launch_warnings(false, false, false, &[]).is_empty(),
@@ -5545,9 +5591,12 @@ mod tests {
 
         let all = launch_warnings(true, true, true, &["a".into(), "b".into()]);
         assert_eq!(all.len(), 4, "四件事各一句:{all:?}");
-        // 插件那句要说出是哪几个 —— 「有插件没被信任」而不说哪个,人无从下手。
+        // 启动只显示数量和操作入口，插件详情留在列表里。
         let plugins = all.last().expect("four lines");
-        assert!(plugins.contains('a') && plugins.contains('b'), "{plugins}");
+        assert!(
+            plugins.contains('2') && plugins.contains("/plugin"),
+            "{plugins}"
+        );
 
         // 各说各的:只有一件成立时,另外三句不许跟着出来。
         assert_eq!(launch_warnings(true, false, false, &[]).len(), 1);

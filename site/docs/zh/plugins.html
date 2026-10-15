@@ -235,7 +235,7 @@ atomcode plugin marketplace remove|update|list</code></pre>
         <li><code>${CLAUDE_PLUGIN_ROOT}</code> —— plugin 安装目录绝对路径(CC 兼容)。</li>
         <li><code>${ATOMCODE_PLUGIN_ROOT}</code> —— 同上,atomcode 别名。</li>
       </ul>
-      <p>插件 hook 只接受插件目录内受检的脚本入口和字面量参数，可选 python、python3、node、sh、bash 解释器。插件根占位符作为路径解析，不经过 shell；管道、重定向和内联代码应迁移到脚本中，直接 .cmd/.bat 入口不受支持。用户自定义 hook 才保留 shell 展开语义。</p>
+      <p>插件 hook 只接受插件目录内受检的脚本入口和字面量参数，可选 python、python3、node、sh、bash 解释器。插件根占位符作为路径解析，不经过 shell；管道、重定向和内联代码应迁移到脚本中，已知的 Node 路径包装会转换为直接脚本入口，batch/bash 双格式 .cmd 包装使用 bash 执行；普通 .cmd/.bat 文件不受支持。用户自定义 hook 才保留 shell 展开语义。</p>
 
       <h2 id="marketplace-管理">Marketplace 管理</h2>
       <pre><code># 列出已注册的 marketplace
