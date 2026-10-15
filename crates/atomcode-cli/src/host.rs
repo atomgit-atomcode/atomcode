@@ -39,8 +39,14 @@ pub trait HostConfig: Send + Sync {
     /// The agent configuration for `model`, as the host's configuration
     /// resolves that id now.
     fn for_model(&self, model: &str) -> Result<CodingAgentConfig, String>;
-    /// The agent configuration as configured now — what signing in again reads.
+    /// The agent configuration as configured now, including launch overrides.
     fn current(&self) -> Result<CodingAgentConfig, String>;
+
+    /// Interactive login adopts the persisted selection, rather than a model
+    /// override supplied when the process started.
+    fn after_sign_in(&self) -> Result<CodingAgentConfig, String> {
+        self.current()
+    }
 
     /// What the configuration *is* right now, as a value that changes when it
     /// changes — a hash of the file, a modification time, a revision.
@@ -375,6 +381,7 @@ pub(crate) fn attach(
                     }
                 }
                 CodingRuntimeEvent::ProviderChanged { .. }
+                | CodingRuntimeEvent::Reconfigured { .. }
                 | CodingRuntimeEvent::ReasoningEffortChanged { .. } => watched.redescribe(),
                 // How much the session may do without asking is session state,
                 // not a fact in the log — so a screen draws it from here or not
@@ -2678,11 +2685,28 @@ impl HostControl for RuntimeControl {
                 self.addressed(&session)?;
                 let next = match self.host_config.clone() {
                     Some(source) => source
-                        .current()
+                        .after_sign_in()
                         .map_err(|message| HostError::Failed { message })?,
                     None => self.config.lock().expect("config poisoned").clone(),
                 };
-                self.reconfigure(next).await
+                // Login also refreshes account settings, permissions and tools.
+                // Always apply them, even if the file's bytes did not change.
+                let changed = self
+                    .handle
+                    .reprepare_config(next.clone())
+                    .await
+                    .map_err(refused)?;
+                *self.config.lock().expect("config poisoned") = next;
+                *self.fingerprint.lock().expect("fingerprint poisoned") = self
+                    .host_config
+                    .as_ref()
+                    .and_then(|source| source.fingerprint());
+                match self.changed(changed.session_id)? {
+                    HostReply::SessionChanged { session: now } if now == session => {
+                        Ok(HostReply::Done)
+                    }
+                    other => Ok(other),
+                }
             }
             HostCommand::Autonomy { session } => {
                 self.addressed(&session)?;

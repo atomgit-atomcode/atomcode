@@ -497,6 +497,10 @@ pub mod tui_front {
             self.resolve(self.provider_override.as_deref())
         }
 
+        fn after_sign_in(&self) -> Result<CodingAgentConfig, String> {
+            self.resolve(None)
+        }
+
         /// The settings catalog, with what the file says each is set to.
         ///
         /// The same catalog `/config` in the settings UI reads and the one the
@@ -1082,6 +1086,13 @@ model = "vendor-b"
             )
             .unwrap();
             assert_eq!(file.current().unwrap().model, "vendor-b");
+
+            let pinned = ConfigFile {
+                provider_override: Some("custom/a".into()),
+                ..file
+            };
+            assert_eq!(pinned.current().unwrap().model, "vendor-a");
+            assert_eq!(pinned.after_sign_in().unwrap().model, "vendor-b");
         }
     }
 
