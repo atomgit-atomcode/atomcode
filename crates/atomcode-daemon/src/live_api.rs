@@ -1279,6 +1279,105 @@ fn provider_reload_required(
     active != requested || active_fingerprint != requested_fingerprint
 }
 
+/// Config persistence and application to an existing live runtime are separate
+/// outcomes. This additive response never claims that a busy/invalid binding
+/// has adopted the configuration just saved.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct LiveProviderSync {
+    status: &'static str,
+    provider: Option<String>,
+    message: Option<String>,
+}
+
+fn configured_live_fingerprint(config: &Config, provider: &str) -> Result<String, String> {
+    if !config.selection_exists(provider) {
+        return Err(format!(
+            "Provider {provider:?} is no longer configured. Select an available model in chat before continuing."
+        ));
+    }
+    crate::native_live::provider_fingerprint(config, provider)
+}
+
+fn configured_message_provider(
+    config: &Config,
+    active: &str,
+    requested: Option<&str>,
+) -> Result<(String, String), String> {
+    let provider = requested.unwrap_or(active);
+    Ok((
+        provider.to_string(),
+        configured_live_fingerprint(config, provider)?,
+    ))
+}
+
+pub(crate) async fn sync_live_provider_config(
+    config: &Config,
+    telemetry: Arc<Telemetry>,
+) -> LiveProviderSync {
+    let binding = match crate::native_live::binding() {
+        Ok(binding) => binding,
+        Err(crate::live_hub::HubError::Unbound) => {
+            return LiveProviderSync {
+                status: "unbound",
+                provider: None,
+                message: None,
+            }
+        }
+        Err(error) => {
+            return LiveProviderSync {
+                status: "failed",
+                provider: None,
+                message: Some(format!(
+                    "Config saved, but live provider synchronization failed: {error:?}"
+                )),
+            }
+        }
+    };
+    let mut result = LiveProviderSync {
+        status: "unchanged",
+        provider: Some(binding.provider.clone()),
+        message: None,
+    };
+    match configured_live_fingerprint(config, &binding.provider) {
+        Err(message) => {
+            result.status = "invalid";
+            result.message = Some(message);
+        }
+        Ok(fingerprint) if fingerprint == binding.provider_fingerprint => {}
+        Ok(fingerprint) => {
+            let next = crate::kernel_runtime::coding_config_from_runtime(&chat_runtime_config(
+                config,
+                &binding.provider,
+                &binding.working_dir,
+                telemetry,
+            ));
+            match crate::native_live::reload_provider(&binding, next, fingerprint).await {
+                Ok(_) => result.status = "reloaded",
+                Err(crate::live_hub::HubError::ActiveTurn) => {
+                    result.status = "pending";
+                    result.message = Some("Config saved. The active turn keeps its current provider; the updated configuration will be checked on the next message or explicit model switch.".into());
+                }
+                Err(error) => {
+                    result.status = "failed";
+                    result.message = Some(format!(
+                        "Config saved, but live provider reload failed: {error:?}"
+                    ));
+                }
+            }
+        }
+    }
+    if let Some(message) = &result.message {
+        // Existing view notices reach every connected chat without forging a
+        // ProviderChanged event for a transition that never happened.
+        if crate::native_live::binding().is_ok_and(|current| {
+            current.id == binding.id && current.generation == binding.generation
+        }) {
+            let _ = crate::native_live::publish_command_output(message.clone());
+        }
+    }
+    result
+}
+
 /// GET /live 查询参数。`session_id` 可选：提供时绑定到该 native session。
 #[derive(serde::Deserialize, Default)]
 pub(crate) struct LiveStreamQuery {
@@ -1774,7 +1873,9 @@ pub(crate) async fn live_message(
     let active_provider = join.binding.provider.clone();
     let mut provider_name = active_provider.clone();
     let mut provider_change_applied = true;
-    if let Some(requested_provider) = requested_provider {
+    {
+        // An omitted provider still has to validate the live selection against
+        // current config; reuse must not keep deleted credentials alive.
         let config = match Config::load(&Config::default_path()) {
             Ok(config) => config,
             Err(error) => {
@@ -1784,19 +1885,16 @@ pub(crate) async fn live_message(
                 }));
             }
         };
-        if !config.selection_exists(&requested_provider) {
-            return Json(serde_json::json!({
-                "accepted": false,
-                "error": format!("provider {requested_provider:?} not found"),
-            }));
-        }
-        let requested_fingerprint =
-            match crate::native_live::provider_fingerprint(&config, &requested_provider) {
-                Ok(fingerprint) => fingerprint,
-                Err(error) => {
-                    return Json(serde_json::json!({ "accepted": false, "error": error }));
-                }
-            };
+        let (requested_provider, requested_fingerprint) = match configured_message_provider(
+            &config,
+            &active_provider,
+            requested_provider.as_deref(),
+        ) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                return Json(serde_json::json!({ "accepted": false, "error": error }));
+            }
+        };
         if provider_reload_required(
             &active_provider,
             &join.binding.provider_fingerprint,
@@ -2998,6 +3096,59 @@ mod tests {
         // 不带 provider 的请求体默认 None。
         let req2: LiveMessageReq = serde_json::from_str(r#"{"message":"hi"}"#).unwrap();
         assert_eq!(req2.provider, None);
+    }
+
+    fn live_provider_config() -> Config {
+        let mut config = Config::default();
+        config.providers.insert(
+            "test".into(),
+            serde_json::from_value(serde_json::json!({
+                "type": "openai", "model": "model", "base_url": "https://example.invalid/v1"
+            }))
+            .unwrap(),
+        );
+        config
+    }
+
+    #[test]
+    fn implicit_live_selection_is_checked_against_saved_config() {
+        let mut config = live_provider_config();
+        let (_, before) = configured_message_provider(&config, "test", None).unwrap();
+        config.providers.get_mut("test").unwrap().api_key = Some("replacement-secret".into());
+        let (name, after) = configured_message_provider(&config, "test", None).unwrap();
+        assert_eq!(name, "test");
+        assert!(provider_reload_required("test", &before, &name, &after));
+        assert!(!after.contains("replacement-secret"));
+    }
+
+    #[test]
+    fn deleting_and_recreating_a_provider_requires_explicit_selection() {
+        let mut config = live_provider_config();
+        let provider = config.providers.remove("test").unwrap();
+        config.providers.insert("ofox-anthropic".into(), provider);
+        for requested in [None, Some("test")] {
+            let error = configured_message_provider(&config, "test", requested).unwrap_err();
+            assert!(error.contains("test") && error.contains("Select an available model"));
+        }
+        assert_eq!(
+            configured_message_provider(&config, "test", Some("ofox-anthropic"))
+                .unwrap()
+                .0,
+            "ofox-anthropic"
+        );
+    }
+
+    #[test]
+    fn unchanged_live_selection_does_not_require_reassembly() {
+        let config = live_provider_config();
+        let fingerprint = configured_live_fingerprint(&config, "test").unwrap();
+        let (name, current) = configured_message_provider(&config, "test", None).unwrap();
+        assert!(!provider_reload_required(
+            "test",
+            &fingerprint,
+            &name,
+            &current
+        ));
     }
 
     #[test]

@@ -1963,8 +1963,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       openSessionSidebar: () => { pushCommandNotice(t('cmd.resume.openHint')); },
       // reloadConfig: POST /config/reload。
       reloadConfig: async () => {
-        await postConfigReload();
-        pushCommandNotice(t('cmd.reload.done'));
+        const result = await postConfigReload();
+        pushCommandNotice(result.live_provider_sync?.message ?? t('cmd.reload.done'));
       },
       openSlashSkillsMenu: () => {
         // Open a pure SKILLS browser (not the full '/' command list — that's what

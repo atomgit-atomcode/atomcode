@@ -268,15 +268,29 @@ pub(crate) async fn get_config() -> impl IntoResponse {
     Json(config_response(&config)).into_response()
 }
 
-/// POST /config/reload - Reloads config from disk and returns it.
-pub(crate) async fn reload_config() -> impl IntoResponse {
+#[derive(serde::Serialize)]
+struct ConfigReloadResponse {
+    #[serde(flatten)]
+    config: ConfigResponse,
+    live_provider_sync: crate::live_api::LiveProviderSync,
+}
+
+/// POST /config/reload - Refresh config and reconcile the existing live provider.
+pub(crate) async fn reload_config(
+    axum::extract::State(state): axum::extract::State<crate::AppState>,
+) -> impl IntoResponse {
     let config = match load_config() {
         Ok(c) => c,
         Err(e) => {
             return json_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
         }
     };
-    Json(config_response(&config)).into_response()
+    let live = crate::live_api::sync_live_provider_config(&config, state.telemetry.clone()).await;
+    Json(ConfigReloadResponse {
+        config: config_response(&config),
+        live_provider_sync: live,
+    })
+    .into_response()
 }
 
 #[cfg(test)]

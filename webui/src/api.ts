@@ -558,12 +558,20 @@ export async function getConfig(): Promise<ConfigInfo> {
 }
 
 /** Trigger a hot-reload of config from disk (POST /config/reload). */
-export async function postConfigReload(): Promise<void> {
+export interface ConfigReloadResult extends ConfigInfo {
+  live_provider_sync?: {
+    status: 'unbound' | 'unchanged' | 'reloaded' | 'pending' | 'invalid' | 'failed';
+    provider: string | null;
+    message: string | null;
+  };
+}
+
+export async function postConfigReload(): Promise<ConfigReloadResult> {
   const resp = await fetch('/config/reload', {
     method: 'POST',
     headers: authHeaders(),
   });
-  if (!resp.ok) throw new Error(`config reload failed: ${resp.status}`);
+  return readJson(resp);
 }
 
 // --- Projects types ---

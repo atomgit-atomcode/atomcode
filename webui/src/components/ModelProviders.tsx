@@ -9,6 +9,7 @@
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import {
   getConfig,
+  postConfigReload,
   ConfigInfo,
   ProviderInfo,
   ProviderAccountInfo,
@@ -141,11 +142,25 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
     { kind: 'account'; id: string; name: string; n: number } | { kind: 'model'; id: string; name: string } | null
   >(null);
 
-  const reload = () => {
+  const reload = async (applyLive = false) => {
     setLoadError(null);
-    return getConfig()
-      .then(setConfig)
-      .catch((e: unknown) => setLoadError(e instanceof Error ? e.message : String(e)));
+    if (applyLive) {
+      try {
+        const result = await postConfigReload();
+        setConfig(result);
+        setActionError(result.live_provider_sync?.message ?? null);
+        return;
+      } catch (e) {
+        // Persistence already succeeded. Keep the new settings visible even
+        // if applying them to the live runtime failed.
+        setActionError(e instanceof Error ? e.message : String(e));
+      }
+    }
+    try {
+      setConfig(await getConfig());
+    } catch (e) {
+      setLoadError(e instanceof Error ? e.message : String(e));
+    }
   };
   useEffect(() => {
     void reload();
@@ -175,7 +190,7 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
     setActionError(null);
     try {
       await run();
-      await reload();
+      await reload(true);
     } catch (error) {
       setActionError(errorText(error, t));
     }
@@ -189,7 +204,7 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
     } catch (error) {
       throw new Error(errorText(error, t));
     }
-    await reload();
+    await reload(true);
   }
 
   const toggle = (next: Panel) => setPanel((cur) => (samePanel(cur, next) ? null : next));
@@ -259,7 +274,7 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
                         onClosePanel={() => setPanel(null)}
                         onSaved={async (selection) => {
                           setPanel(null);
-                          await reload();
+                          await reload(true);
                           if (account.probeable) void probe(account.id, selection);
                         }}
                         onProbe={() => void probe(account.id, modelsOf(config, account)[0]?.name)}
@@ -290,7 +305,7 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
                       onCancel={() => setPanel(null)}
                       onCreated={async (account, models, probeable) => {
                         setPanel(null);
-                        await reload();
+                        await reload(true);
                         if (probeable) void probe(account, models[0]);
                       }}
                     />

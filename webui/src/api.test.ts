@@ -606,3 +606,25 @@ test('a live switch to a session held elsewhere says which copy it opened', asyn
     },
   );
 });
+
+test('config reload returns pending or invalid live application separately from persistence', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    const { postConfigReload } = await import('./api.ts');
+    for (const status of ['pending', 'invalid', 'failed', 'reloaded']) {
+      globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+        assert.equal(String(url), '/config/reload');
+        assert.equal(init?.method, 'POST');
+        return new Response(JSON.stringify({
+          providers: [],
+          live_provider_sync: { status, provider: 'test', message: 'saved configuration status' },
+        }), { status: 200 });
+      }) as typeof fetch;
+      const result = await postConfigReload();
+      assert.equal(result.live_provider_sync?.status, status);
+      assert.equal(result.live_provider_sync?.provider, 'test');
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
