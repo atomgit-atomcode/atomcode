@@ -778,6 +778,7 @@ fn set_in_row(line: &Line, lead: Span, w: u16) -> Line {
     // width it was given, whatever the reason. Asked before cutting, because
     // `Line::truncate` copies unconditionally and this is a row of a frame.
     let mut out = Line::from_spans(spans);
+    out.background = line.background;
     if out.width() > w as usize {
         out = out.truncate(w as usize);
     }
@@ -7616,6 +7617,16 @@ fn waiting(queued: &[crate::moment::Queued]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn setting_in_a_code_row_preserves_its_paint_only_surface() {
+        let row = Line::raw("  key: value")
+            .with_background(crate::frame::Color::role(crate::theme::Role::PanelBg));
+        let drawn = set_in_row(&row, Span::raw("  "), 40);
+        assert_eq!(drawn.background, row.background);
+        assert_eq!(drawn.plain(), "    key: value");
+        assert_eq!(row.plain(), "  key: value");
+    }
+
     use super::*;
 
     use crate::conformance;

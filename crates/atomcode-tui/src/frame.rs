@@ -255,6 +255,8 @@ impl Span {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Line {
     pub spans: Vec<Span>,
+    /// Paint-only row surface; never padding in the logical text.
+    pub background: Option<Color>,
 }
 
 impl Line {
@@ -265,17 +267,27 @@ impl Line {
     pub fn raw(text: impl Into<String>) -> Self {
         Self {
             spans: vec![Span::raw(text)],
+            background: None,
         }
     }
 
     pub fn styled(text: impl Into<String>, style: Style) -> Self {
         Self {
             spans: vec![Span::styled(text, style)],
+            background: None,
         }
     }
 
     pub fn from_spans(spans: Vec<Span>) -> Self {
-        Self { spans }
+        Self {
+            spans,
+            background: None,
+        }
+    }
+
+    pub fn with_background(mut self, color: Color) -> Self {
+        self.background = Some(color);
+        self
     }
 
     pub fn push(&mut self, span: Span) {
@@ -313,7 +325,10 @@ impl Line {
                 out.push(span.recut(cut));
             }
         }
-        Line { spans: out }
+        Line {
+            spans: out,
+            background: self.background,
+        }
     }
 }
 
@@ -367,7 +382,10 @@ impl Line {
                 }
             }
         }
-        Line { spans: out }
+        Line {
+            spans: out,
+            background: self.background,
+        }
     }
 }
 
@@ -458,6 +476,12 @@ impl Frame {
                     break;
                 }
                 let mut x = part.rect.x as usize;
+                if line.background.is_some() {
+                    let end = (x + part.rect.w as usize).min(grid[y].len());
+                    if x < end {
+                        grid[y][x..end].fill(' ');
+                    }
+                }
                 for ch in line.truncate(part.rect.w as usize).plain().chars() {
                     let cw = crate::width::char_width(ch);
                     if x >= grid[y].len() {
@@ -624,6 +648,9 @@ impl Frame {
             let Some(line) = part.lines.get((y - rect.y) as usize) else {
                 continue;
             };
+            if line.background.is_some() && x < rect.right() {
+                found = None;
+            }
             let mut at = rect.x as usize;
             for span in &line.truncate(rect.w as usize).spans {
                 let end = at + crate::width::str_width(&span.text);
@@ -675,6 +702,31 @@ impl Frame {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_surface_clears_covered_text_and_links_without_changing_source() {
+        let mut frame = Frame::new(10, 1);
+        frame.place(
+            "old",
+            Rect::new(0, 0, 10, 1),
+            vec![Line::from_spans(vec![Span::linked(
+                "abcdefghij",
+                Style::new(),
+                "https://example.invalid",
+            )])],
+        );
+        let row = Line::raw("X").with_background(Color::role(crate::theme::Role::PanelBg));
+        frame.place("new", Rect::new(2, 0, 5, 1), vec![row.clone()]);
+        assert_eq!(frame.rows(), vec!["abX    hij"]);
+        assert_eq!(frame.link_at(4, 0), None);
+        assert!(frame.link_at(8, 0).is_some());
+        assert_eq!(row.plain(), "X");
+        assert_eq!(row.truncate(0).background, row.background);
+        assert_eq!(
+            row.restyle(0, 1, |style| style.bold()).background,
+            row.background
+        );
+    }
+
     use super::*;
 
     /// A click finds the link on the text drawn where it landed: on either

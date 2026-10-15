@@ -17,8 +17,7 @@ use crate::width;
 
 mod table;
 
-/// Markdown's one decoration: the rule, under a heading and around a fenced
-/// block, and under a table's header.
+/// Markdown's horizontal decoration: the rule under a heading or table header.
 ///
 /// Named once, and for a reason beyond tidiness: `caps::downgrade` rewrites it
 /// to `-` at paint time on a terminal that cannot show it, so what matters is
@@ -819,14 +818,21 @@ pub(crate) fn wrap_spans(spans: &[Span], w: u16, prefix: &str, prefix_style: Sty
 /// source free of printable decoration: terminal selection copies every glyph,
 /// including a gutter bar, into commands and indentation-sensitive code.
 fn code_block(lines: &[String], lang: &str, w: u16) -> Vec<Line> {
+    let background = Color::role(Role::PanelBg);
     let mut out = Vec::new();
     if !lang.is_empty() {
         out.push(
-            Line::from_spans(vec![Span::styled(lang.to_string(), code())]).truncate(w as usize),
+            Line::from_spans(vec![Span::styled(lang.to_string(), fence().bold())])
+                .truncate(w as usize)
+                .with_background(background),
         );
     }
     for line in lines {
-        out.extend(wrap_spans(&highlight(line, lang), w, "", fence()));
+        out.extend(
+            wrap_spans(&highlight(line, lang), w, "", fence())
+                .into_iter()
+                .map(|row| row.with_background(background)),
+        );
     }
     out
 }
@@ -1623,10 +1629,14 @@ mod tests {
     }
 
     #[test]
-    fn the_fence_language_is_coloured_without_a_gutter() {
+    fn the_fence_header_and_body_share_a_surface_without_a_gutter() {
         let out = render("```bash\nls\n```", 30, Style::new());
         assert_eq!(out[0].plain(), "bash");
-        assert_eq!(out[0].spans[0].style.fg, Some(Color::role(Role::Accent)));
+        assert_eq!(out[0].spans[0].style.fg, Some(Color::role(Role::Muted)));
+        assert!(out[0].spans[0].style.bold);
+        assert!(out
+            .iter()
+            .all(|line| line.background == Some(Color::role(Role::PanelBg))));
         assert_eq!(out[1].plain(), "ls");
     }
 

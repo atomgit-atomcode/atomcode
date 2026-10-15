@@ -487,6 +487,22 @@ fn sgr(style: &Style, caps: crate::caps::Caps) -> String {
 /// is a row that stays wrong.
 fn write_line(out: &mut String, line: &Line, width: u16, caps: crate::caps::Caps) {
     let mut left = width as usize;
+    let surface = line
+        .background
+        .filter(|_| caps.cell_background)
+        .map(|color| Style::new().bg(color))
+        .unwrap_or_default();
+    if line.background.is_some() && width > 0 {
+        // ECH paints erased cells without writing padding into copied source.
+        // Unlike EL it is bounded by this part's width, including in overlays.
+        if caps.colors != crate::caps::Colors::None {
+            out.push_str(&sgr(&surface, caps));
+        }
+        out.push_str(&format!("\x1b[{width}X"));
+        if caps.colors != crate::caps::Colors::None {
+            out.push_str("\x1b[0m");
+        }
+    }
     for span in &line.spans {
         if left == 0 {
             break;
@@ -504,7 +520,7 @@ fn write_line(out: &mut String, line: &Line, width: u16, caps: crate::caps::Caps
         let codes = if plain {
             String::new()
         } else {
-            sgr(&span.style, caps)
+            sgr(&span.style.under(surface), caps)
         };
         // OSC 8 wraps the run this span actually drew (after clipping), so a
         // supporting terminal makes exactly the visible text clickable and one
@@ -770,6 +786,58 @@ pub fn encode(frame: &Frame) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_row_surface_paints_without_printable_padding() {
+        let row = Line::raw("abc").with_background(Color::role(crate::theme::Role::PanelBg));
+        let mut caps = crate::caps::Caps::default();
+        let painted = transcript(&[row.clone()], 8, caps);
+        assert!(painted.contains("\x1b[8X"));
+        assert!(!painted.contains("abc "));
+        caps.colors = crate::caps::Colors::None;
+        assert_eq!(transcript(&[row.clone()], 8, caps), "\x1b[8Xabc\x1b[0m\r\n");
+        assert_eq!(row.plain(), "abc");
+        assert_eq!(transcript(&[row], 0, caps), "\x1b[0m\r\n");
+    }
+
+    #[test]
+    fn row_surfaces_inherit_onto_text_and_follow_background_capability() {
+        let row = Line::raw("abc").with_background(Color::role(crate::theme::Role::PanelBg));
+        let mut caps = crate::caps::Caps::default();
+        let painted = transcript(&[row.clone()], 8, caps);
+        assert_eq!(
+            painted.matches("48;").count(),
+            2,
+            "surface and text both carry the background"
+        );
+        caps.cell_background = false;
+        let plain_ground = transcript(&[row], 8, caps);
+        assert!(!plain_ground.contains("48;"));
+        assert!(plain_ground.contains("abc"));
+    }
+
+    #[test]
+    fn a_surface_only_change_invalidates_the_cached_row() {
+        let caps = crate::caps::Caps::default();
+        let mut frame = Frame::new(8, 1);
+        frame.place("body", Rect::sized(8, 1), vec![Line::raw("abc")]);
+        let old = Lines::of(&frame, caps, None);
+        frame.parts[0].lines[0].background = Some(Color::role(crate::theme::Role::PanelBg));
+        let raised = Lines::of(&frame, caps, Some(&old));
+        assert!(raised.patch_from(Some(&old)).contains("\x1b[8X"));
+        frame.parts[0].lines[0].background = None;
+        let flat = Lines::of(&frame, caps, Some(&raised));
+        let patch = flat.patch_from(Some(&raised));
+        assert!(!patch.is_empty(), "removing a background must also repaint");
+        assert!(!patch.contains("48;"));
+    }
+
+    #[test]
+    fn a_blank_source_row_still_has_its_surface() {
+        let row = Line::empty().with_background(Color::role(crate::theme::Role::PanelBg));
+        assert!(transcript(&[row.clone()], 12, crate::caps::Caps::default()).contains("\x1b[12X"));
+        assert_eq!(row.plain(), "");
+    }
+
     /// `ATOMCODE_TERM_SKIP` takes out exactly the modes it names, from the
     /// opening and from the way back from `/raw`, and nothing else.
     #[test]
@@ -871,6 +939,7 @@ mod tests {
             Rect::new(0, 0, 60, 1),
             vec![Line {
                 spans: vec![Span::linked("issue 1565", Style::new().underline(), url)],
+                background: None,
             }],
         );
         let s = encode(&f);
@@ -909,6 +978,7 @@ mod tests {
                     Style::new().underline(),
                     "http://a\x1b]0;pwned\x07b",
                 )],
+                background: None,
             }],
         );
         let s = encode(&f);

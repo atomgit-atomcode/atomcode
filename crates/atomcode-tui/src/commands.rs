@@ -5607,6 +5607,14 @@ mod tests {
         (app, all, surface)
     }
 
+    #[tokio::test]
+    async fn copy_code_keeps_yaml_source_without_its_surface_or_header() {
+        let source = "services:\n  api:\n    image: server:latest\n\n    environment:\n      - WORKER_CONCURRENCY=2";
+        let (app, all, surface) = answered(&format!("```yaml\n{source}\n```"));
+        let _ = all.dispatch("/copy code", &app.context()).await;
+        assert_eq!(surface.clipboard_text().as_deref(), Some(source));
+    }
+
     /// `/copy code` takes the code out of the last answer and nothing else —
     /// not the prose around it, not the fences. Bare, it is the last block;
     /// the old spellings (`/copy N`, `/copy all`) still work, in any case.
