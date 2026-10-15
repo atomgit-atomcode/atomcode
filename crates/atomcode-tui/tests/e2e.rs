@@ -5217,6 +5217,41 @@ async fn the_todo_panel_shows_the_plan_the_model_sent() {
         !panel.contains("todowrite"),
         "the call is not the plan:\n{panel}"
     );
+    s.term.type_line("/todo show");
+    s.quiet().await;
+    let keyboard_open = s
+        .term
+        .last()
+        .unwrap()
+        .part("todo")
+        .unwrap()
+        .lines
+        .iter()
+        .map(|line| line.plain())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        keyboard_open.contains("读代码"),
+        "keyboard expansion: {keyboard_open}"
+    );
+    s.term.type_line("/todo hide");
+    s.quiet().await;
+    let keyboard_closed = s
+        .term
+        .last()
+        .unwrap()
+        .part("todo")
+        .unwrap()
+        .lines
+        .iter()
+        .map(|line| line.plain())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !keyboard_closed.contains("读代码"),
+        "keyboard collapse: {keyboard_closed}"
+    );
+
     // Placed *and* painted: `part` says the host gave it a rect, and only the
     // flattened grid — the same one a screenshot and the exit dump come from —
     // says the row reached the screen.

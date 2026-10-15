@@ -2425,12 +2425,9 @@ impl UserInterface for Tui {
                             Click::WheelUp => -WHEEL_LINES,
                             _ => WHEEL_LINES,
                         };
-                        if self.host.expanded_todo_at(x, y) {
-                            let total = crate::modules::todo::plan_count(&self.client.events());
-                            if self.host.todo_wheel(x, y, by, total) {
-                                stale = true;
-                                continue;
-                            }
+                        if self.host.todo_wheel(x, y, by) {
+                            stale = true;
+                            continue;
                         }
                         if self.host.settings_wheel(x, y, by) {
                             stale = true;
@@ -8301,6 +8298,16 @@ impl Tui {
                     self.host
                         .say_for(t(Msg::ReasoningNotReceived).into_owned(), false, 5_000);
                 }
+                return false;
+            }
+            Action::ToggleFold("todo") => {
+                m.todo_expanded = !m.todo_expanded;
+                m.todo_offset = 0;
+                return false;
+            }
+            Action::SetFold("todo", to) => {
+                m.todo_expanded = matches!(to, crate::host::Showing::Open);
+                m.todo_offset = 0;
                 return false;
             }
             Action::ToggleFold(kind) => {

@@ -206,15 +206,6 @@ pub(crate) fn plan_text(events: &[atomcode_kernel::session::LoggedEvent]) -> Str
     out
 }
 
-pub(crate) fn plan_count(events: &[atomcode_kernel::session::LoggedEvent]) -> usize {
-    let mut plan = Plan::default();
-    for logged in events {
-        plan.absorb(&logged.event);
-    }
-    plan.fold(&atomcode_kernel::session::undone_turns(events))
-        .len()
-}
-
 /// The calls, folded into a list, leaving out the turns that were taken back.
 fn fold_calls(state: &State, undone: &std::collections::BTreeSet<u64>) -> Vec<TodoItem> {
     let mut items = state.plan.fold(undone);
