@@ -944,7 +944,22 @@ fn speaks_ansi_given(crossterm_said: bool, console_vt: Option<bool>) -> bool {
     console_vt.unwrap_or(crossterm_said)
 }
 
-/// The two kernel32 calls it takes to read a console's mode. kernel32 is
+/// Keep the console's byte encoding aligned with the UTF-8 this surface writes.
+/// Code pages are shared with child processes, so startup alone cannot keep
+/// this true after a native/Cygwin tool has used the same console. Returns true
+/// when output encoding was repaired and an existing frame needs repainting.
+pub fn ensure_console_utf8() -> bool {
+    #[cfg(windows)]
+    {
+        win_console::ensure_utf8()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// The kernel32 calls for console modes, encoding and palette. kernel32 is
 /// linked by the standard library on Windows already, so declaring them costs
 /// no new dependency.
 #[cfg(windows)]
@@ -962,6 +977,24 @@ mod win_console {
         fn SetConsoleMode(console: Handle, mode: u32) -> i32;
         fn GetConsoleScreenBufferInfoEx(console: Handle, info: *mut ScreenBufferInfoEx) -> i32;
         fn GetOEMCP() -> u32;
+        fn GetConsoleCP() -> u32;
+        fn GetConsoleOutputCP() -> u32;
+        fn SetConsoleCP(code_page: u32) -> i32;
+        fn SetConsoleOutputCP(code_page: u32) -> i32;
+    }
+
+    pub(super) fn ensure_utf8() -> bool {
+        const UTF8: u32 = 65001;
+        // SAFETY: these APIs read/set only this process's console code pages.
+        // Zero means no attached console, so there is no code page to change.
+        unsafe {
+            let input = GetConsoleCP();
+            if input != 0 && input != UTF8 {
+                SetConsoleCP(UTF8);
+            }
+            let output = GetConsoleOutputCP();
+            output != 0 && output != UTF8 && SetConsoleOutputCP(UTF8) != 0
+        }
     }
 
     /// Whether the system's console code page is Chinese, Japanese or Korean —
@@ -1097,6 +1130,7 @@ impl Terminal {
         mouse: bool,
         overrides: crate::caps::Overrides,
     ) -> std::io::Result<Self> {
+        ensure_console_utf8();
         // Before a single byte is written: a console that will not execute
         // the sequences gets none of them, rather than a screenful of text.
         if !console_speaks_ansi() {
@@ -2185,6 +2219,9 @@ impl Surface for Terminal {
         if self.showing_transcript() {
             return;
         }
+        if ensure_console_utf8() {
+            self.painted.forget();
+        }
         let patch = self.patch(frame);
         let mut out = std::io::stdout();
         if !patch.is_empty() {
@@ -2302,6 +2339,7 @@ impl Surface for Terminal {
     /// lands in the terminal's own scrollback.
     fn show_transcript(&self, text: &str) -> bool {
         use std::sync::atomic::Ordering;
+        ensure_console_utf8();
         if self.away.swap(true, Ordering::SeqCst) {
             return true;
         }
@@ -2323,6 +2361,7 @@ impl Surface for Terminal {
     }
     fn back_from_transcript(&self) {
         use std::sync::atomic::Ordering;
+        ensure_console_utf8();
         if !self.away.swap(false, Ordering::SeqCst) {
             return;
         }

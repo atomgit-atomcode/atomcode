@@ -505,7 +505,14 @@ pub fn colors_for(env: &dyn Fn(&str) -> Option<String>, windows: bool) -> Colors
         Colors::None
     } else if env("COLORTERM").is_some_and(|v| v.contains("truecolor") || v.contains("24bit")) {
         Colors::True
-    } else if term.contains("256") || term.contains("kitty") || env("WT_SESSION").is_some() {
+    } else if term.contains("256")
+        || term.contains("kitty")
+        || env("WT_SESSION").is_some()
+        // A Windows VT console can display the colour cube even when a local
+        // Unix-style launcher (MobaXterm) leaves TERM at plain xterm. Treating
+        // it as sixteen colours turns the mascot's orange into yellow.
+        || (windows && term == "xterm")
+    {
         Colors::Ansi256
     } else if term.is_empty() {
         if windows {
@@ -1355,6 +1362,14 @@ mod tests {
 
         let wt = with(&[("WT_SESSION", "abc")]);
         assert_eq!(colors_for(&wt, true), Colors::Ansi256);
+
+        let xterm = with(&[("TERM", "xterm")]);
+        assert_eq!(colors_for(&xterm, true), Colors::Ansi256);
+        assert_eq!(colors_for(&xterm, false), Colors::Ansi16);
+        assert_eq!(
+            colors_for(&with(&[("TERM", "xterm"), ("NO_COLOR", "1")]), true),
+            Colors::None
+        );
 
         let refused = with(&[("NO_COLOR", "1")]);
         assert_eq!(colors_for(&refused, true), Colors::None);

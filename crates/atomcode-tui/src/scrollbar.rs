@@ -77,23 +77,20 @@ impl Bar {
         (0..self.track.h)
             .map(|row| {
                 let selected = (self.start..self.start + self.thumb).contains(&row);
-                let glyph = if selected {
-                    crate::caps::Glyph::Thumb
-                } else {
-                    crate::caps::Glyph::Track
-                };
-                Line::styled(
-                    if selected && caps.unicode {
-                        "┃"
-                    } else {
-                        caps.g(glyph)
-                    },
-                    crate::theme::fg(if selected {
-                        crate::theme::Role::Accent
-                    } else {
-                        crate::theme::Role::Border
-                    }),
-                )
+                // A box-drawing glyph may occupy two cells in a CJK terminal.
+                // The track has only one: paint a space's background instead,
+                // so neither the thumb nor the track can spill into its neighbour.
+                if caps.colors != crate::caps::Colors::None {
+                    return Line::styled(
+                        " ",
+                        crate::theme::bg(if selected {
+                            crate::theme::Role::Accent
+                        } else {
+                            crate::theme::Role::PanelBg
+                        }),
+                    );
+                }
+                Line::raw(if selected { "#" } else { "|" })
             })
             .collect()
     }
@@ -169,6 +166,46 @@ mod tests {
         let lines = bar.lines(&caps);
         assert!(lines.iter().any(|l| l.plain() == "#"));
         assert!(lines.iter().any(|l| l.plain() == "|"));
+    }
+    #[test]
+    fn coloured_scrollbars_use_only_single_cell_spaces() {
+        use crate::caps::{Caps, Colors};
+        use crate::frame::Color;
+        use crate::theme::Role;
+        let bar = Bar::new(Rect::new(79, 0, 1, 20), 100, 50, 20).unwrap();
+        for colors in [Colors::Ansi16, Colors::Ansi256, Colors::True] {
+            let lines = bar.lines(&Caps {
+                colors,
+                ..Default::default()
+            });
+            assert!(lines.iter().all(|line| line.plain() == " "));
+            let backgrounds: Vec<_> = lines.iter().map(|line| line.spans[0].style.bg).collect();
+            assert!(backgrounds.contains(&Some(Color::Role(Role::Accent))));
+            assert!(backgrounds.contains(&Some(Color::Role(Role::PanelBg))));
+        }
+    }
+    #[test]
+    fn the_thumb_stays_distinct_when_a_theme_uses_the_same_cyan_for_borders_and_accents() {
+        use crate::caps::{Caps, Colors};
+        use crate::frame::Color;
+        use crate::theme::{Palette, Role, Theme};
+        for colors in [Colors::Ansi16, Colors::Ansi256, Colors::True] {
+            for theme in [Theme::Dark, Theme::Light] {
+                let caps = Caps {
+                    colors,
+                    palette: Palette::assumed(theme)
+                        .with_slot(6, (0, 255, 255))
+                        .with_slot(14, (0, 255, 255)),
+                    ..Default::default()
+                };
+                let rendered = |role| match crate::theme::resolve(role, caps).unwrap() {
+                    Color::Ansi(n) => caps.palette.rendered(n),
+                    Color::Rgb(r, g, b) => (r, g, b),
+                    other => panic!("unresolved scrollbar colour: {other:?}"),
+                };
+                assert_ne!(rendered(Role::Accent), rendered(Role::PanelBg));
+            }
+        }
     }
     #[test]
     fn clicks_reach_both_ends_and_drag_keeps_the_grabbed_thumb_cell() {

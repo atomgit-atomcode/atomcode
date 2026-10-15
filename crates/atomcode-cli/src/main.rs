@@ -1120,6 +1120,23 @@ const UPGRADED_FROM_ENV: &str = atomcode::tui_opening::UPGRADED_FROM_ENV;
 /// parent can be Ctrl+C'd without cancelling the download.
 const INTERNAL_PREPARE_UPGRADE_ENV: &str = "ATOMCODE_INTERNAL_PREPARE_UPGRADE";
 
+fn warn_console_encoding() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Globalization::CP_UTF8;
+        use windows_sys::Win32::System::Console::{GetConsoleCP, GetConsoleOutputCP};
+        // SAFETY: neither API takes arguments or retains pointers.
+        let (input, output) = unsafe { (GetConsoleCP(), GetConsoleOutputCP()) };
+        if input != CP_UTF8 || output != CP_UTF8 {
+            eprintln!(
+                "Console code pages: input {input}, output {output} (expected UTF-8 / 65001).\n\
+                 CJK input/output may be garbled. Use Windows Terminal, or launch with:\n\
+                 cmd.exe /c \"chcp 65001 >nul & atomcode\""
+            );
+        }
+    }
+}
+
 fn main() {
     // `NSPasteboard` is not safe on the Tokio/blocking workers where the TUI
     // asks for clipboard images. A re-exec'd helper stops here, on the actual
@@ -1134,6 +1151,10 @@ fn main() {
     if try_print_shell_completion() {
         return;
     }
+
+    // Before normal-launch I/O, logging or the Tokio runtime. Clipboard and
+    // completion helpers above must not change the containing shell's encoding.
+    atomcode_tui::surface::ensure_console_utf8();
 
     // Settle where the config tree is before anything reads it, so all eight
     // resolvers — and every child process that inherits our environment —
@@ -1291,33 +1312,7 @@ async fn async_main() {
     // Wire `tracing::` diagnostics to `<config_dir>/logs/atomcode.log` (file-only,
     // TUI-safe). Must run before anything that emits traces so nothing is lost.
     init_file_logging();
-    // Set Windows console to UTF-8 so CJK and other multi-byte characters
-    // render correctly instead of showing garbled output (mojibake).
-    #[cfg(target_os = "windows")]
-    {
-        use windows_sys::Win32::Globalization::CP_UTF8;
-        use windows_sys::Win32::System::Console::{
-            GetConsoleCP, GetConsoleOutputCP, SetConsoleCP, SetConsoleOutputCP,
-        };
-        unsafe {
-            SetConsoleOutputCP(CP_UTF8);
-            SetConsoleCP(CP_UTF8);
-
-            // Also check output code page, same best-effort as input.
-            let actual_cp = GetConsoleCP();
-            let actual_out_cp = GetConsoleOutputCP();
-            if actual_cp != CP_UTF8 || actual_out_cp != CP_UTF8 {
-                let _ = eprintln!(
-                    "\n⚠  Console code pages — input: {} (expected 65001/UTF-8), output: {}.\n\
-                       Chinese/Japanese/Korean IME input/output may show garbled text.\n\
-                       → Use Windows Terminal for native UTF-8 support.\n\
-                       → Or enable Beta: Use Unicode UTF-8 in Region settings.\n",
-                    actual_cp, actual_out_cp,
-                );
-            }
-        }
-    }
-
+    warn_console_encoding();
     // Detached upgrade-prep worker mode. The parent atomcode spawns a
     // subprocess with this env var set; that subprocess does one full
     // download + verify + `pending.json` write, then exits. Because the
