@@ -880,6 +880,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::MenuCopyAllAbout => "把输入框写到剪贴板".into(),
         Msg::MenuPaste => "粘贴".into(),
         Msg::MenuPasteAbout => "从剪贴板插入".into(),
+        Msg::MenuNewline => "换行".into(),
+        Msg::MenuNewlineAbout => "在光标处换行（Ctrl+J）".into(),
         Msg::MenuClear => "清空".into(),
         Msg::MenuClearAbout => "丢掉草稿和附件".into(),
         Msg::MenuSend => "发送".into(),

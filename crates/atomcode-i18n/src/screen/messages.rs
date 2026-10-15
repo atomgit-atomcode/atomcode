@@ -1490,6 +1490,8 @@ pub enum Msg<'a> {
     MenuCopyAllAbout,
     MenuPaste,
     MenuPasteAbout,
+    MenuNewline,
+    MenuNewlineAbout,
     MenuClear,
     MenuClearAbout,
     MenuSend,

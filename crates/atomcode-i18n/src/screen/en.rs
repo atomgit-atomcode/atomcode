@@ -941,6 +941,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::MenuCopyAllAbout => "put the composer on the clipboard".into(),
         Msg::MenuPaste => "paste".into(),
         Msg::MenuPasteAbout => "insert from the clipboard".into(),
+        Msg::MenuNewline => "new line".into(),
+        Msg::MenuNewlineAbout => "insert a line break at the caret (Ctrl+J)".into(),
         Msg::MenuClear => "clear".into(),
         Msg::MenuClearAbout => "throw away the draft and what is attached".into(),
         Msg::MenuSend => "send".into(),

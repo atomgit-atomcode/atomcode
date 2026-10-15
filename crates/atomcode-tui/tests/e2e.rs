@@ -3794,7 +3794,7 @@ fn right_click(s: &Session, x: u16, y: u16) {
         .pointer(atomcode_tui::surface::Click::RightPress, x, y);
 }
 
-/// Right-click on the composer, where its four items live.
+/// Right-click on the composer, where its editing items live.
 ///
 /// The field's rect is read off the last frame rather than guessed at a row: the
 /// composer's position depends on what is above it, and where the press lands
@@ -4069,7 +4069,7 @@ async fn the_menu_s_send_hands_the_line_to_the_model() {
     s.quiet().await;
     right_click_composer(&s);
     s.quiet().await;
-    for _ in 0..3 {
+    for _ in 0..4 {
         s.term.press(KeyPress::plain(Key::Down));
     }
     s.term.press(KeyPress::plain(Key::Enter));

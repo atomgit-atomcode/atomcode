@@ -7092,6 +7092,17 @@ impl Tui {
         match action {
             Action::Quit => return true,
             Action::Submit => {
+                // Continuation works even when the terminal cannot distinguish
+                // modified Enter keys. Only the slash immediately before the
+                // caret is consumed; text after the caret stays in place.
+                let at = m.caret.min(m.input.len());
+                if m.input[..at].ends_with('\\') {
+                    m.input.replace_range(at - 1..at, "\n");
+                    m.caret = at;
+                    m.history_at = None;
+                    m.suggestion = None;
+                    return false;
+                }
                 // A recap of the last turn landing now would go under this new
                 // prompt.
                 self.drop_recap();
@@ -8874,7 +8885,7 @@ impl Tui {
     /// text it landed on — offering them there would be a menu whose items
     /// belong to a box that is not under the pointer. So outside the composer
     /// the menu keeps the one thing that is still true of the press: copying
-    /// what is selected. Inside it, the four the composer has.
+    /// what is selected. Inside it, the composer also offers editing and sending.
     ///
     /// The press is answered from the last painted frame (`Host::field_rect`)
     /// rather than from a fresh compose: which rect the field had is what was on
@@ -8902,6 +8913,8 @@ impl Tui {
             vec![
                 copy,
                 crate::menu::Item::new("paste", t(Msg::MenuPaste)).about(t(Msg::MenuPasteAbout)),
+                crate::menu::Item::new("newline", t(Msg::MenuNewline))
+                    .about(t(Msg::MenuNewlineAbout)),
                 crate::menu::Item::new("clear", t(Msg::MenuClear)).about(t(Msg::MenuClearAbout)),
                 crate::menu::Item::new("send", t(Msg::MenuSend)).about(t(Msg::MenuSendAbout)),
             ]
@@ -9040,6 +9053,7 @@ impl Tui {
             }
             "paste" => self.paste_clipboard_text(client),
             "clear" => self.act(Action::Clear, client),
+            "newline" => self.act(Action::Newline, client),
             "send" => self.act(Action::Submit, client),
             _ => false,
         }
@@ -13033,6 +13047,50 @@ mod paste_habit_tests {
 
     fn typed(host: &Host) -> String {
         host.moment.read().expect("moment poisoned").input.clone()
+    }
+
+    #[test]
+    fn backslash_enter_continues_at_the_caret_without_sending() {
+        for (text, caret, expected) in [
+            ("hello\\", 6, "hello\n"),
+            ("中文\\后文", 7, "中文\n后文"),
+            ("\\", 1, "\n"),
+            ("hello\\\\", 7, "hello\\\n"),
+        ] {
+            let (host, tui) = screen();
+            {
+                let mut m = host.moment.write().unwrap();
+                m.input = text.into();
+                m.caret = caret;
+            }
+            assert!(!tui.act(Action::Submit, &tui.client));
+            let m = host.moment.read().unwrap();
+            assert_eq!(m.input, expected);
+            assert_eq!(m.caret, caret);
+            assert!(!m.turn_open);
+        }
+    }
+
+    #[test]
+    fn the_composer_menu_inserts_a_newline_at_the_caret() {
+        let (host, tui) = screen();
+        {
+            let mut m = host.moment.write().unwrap();
+            m.input = "前后".into();
+            m.caret = "前".len();
+        }
+        host.compose((60, 24));
+        let field = host.field_rect().unwrap();
+        tui.open_composer_menu(field.x, field.y);
+        let frame = host.compose((60, 24));
+        let menu = frame.part("context-menu").unwrap();
+        assert!(menu
+            .lines
+            .iter()
+            .any(|line| line.plain().contains(&*t(Msg::MenuNewline))));
+        assert!(!tui.run_menu_item("newline", &tui.client));
+        assert_eq!(typed(&host), "前\n后");
+        assert_eq!(host.moment.read().unwrap().caret, "前\n".len());
     }
 
     #[test]
