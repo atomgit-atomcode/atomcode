@@ -446,7 +446,8 @@ fn compact(items: &[TodoItem], rows: usize) -> Vec<Row> {
         .collect();
     open.sort_by_key(|(_, item)| item.status != TodoStatus::InProgress);
     let budget = rows.saturating_sub(1);
-    let limit = budget.min(3);
+    // Use the overflow row for the final item when it fits in the same space.
+    let limit = budget.min(if open.len() == 4 { 4 } else { 3 });
     let more = open.len() > limit && budget > 1;
     let visible = if more { limit.min(budget - 1) } else { limit };
     let mut out: Vec<_> = open
@@ -596,7 +597,7 @@ mod tests {
     #[test]
     fn a_compact_plan_keeps_three_open_items_with_the_running_one_first() {
         let state = fold(&[plan(
-            r#"{"todos":[{"content":"done","status":"completed"},{"content":"next","status":"pending"},{"content":"working","status":"in_progress"},{"content":"later","status":"pending"},{"content":"last","status":"pending"}]}"#,
+            r#"{"todos":[{"content":"done","status":"completed"},{"content":"next","status":"pending"},{"content":"working","status":"in_progress"},{"content":"later","status":"pending"},{"content":"last","status":"pending"},{"content":"extra","status":"pending"}]}"#,
         )]);
         let moment = Moment::default();
         assert_eq!(Todo::height(&state, &moment, 80), Height::Hug(6));
@@ -615,6 +616,23 @@ mod tests {
         let full = Todo::render(&state, &Viewport::new(Rect::sized(100, 10), &expanded));
         assert!(full.iter().any(|line| line.plain().contains("done")));
         assert!(full.iter().any(|line| line.plain().contains("last")));
+    }
+
+    #[test]
+    fn four_open_items_use_the_overflow_row_for_the_last_item() {
+        let state = fold(&[plan(
+            r#"{"todos":[{"content":"done","status":"completed"},{"content":"first","status":"pending"},{"content":"second","status":"pending"},{"content":"third","status":"pending"},{"content":"fourth","status":"pending"}]}"#,
+        )]);
+        let moment = Moment::default();
+        assert_eq!(Todo::height(&state, &moment, 80), Height::Hug(6));
+        let rows = Todo::render(&state, &Viewport::new(Rect::sized(100, 6), &moment));
+        assert_eq!(rows.len(), 6);
+        assert!(rows.last().unwrap().plain().contains("fourth"));
+        assert!(!rows.iter().any(|row| row.plain().contains("done")));
+        // A shorter viewport must still reserve space for the overflow hint.
+        let short = Todo::render(&state, &Viewport::new(Rect::sized(100, 5), &moment));
+        assert_eq!(short.len(), 5);
+        assert!(!short.iter().any(|row| row.plain().contains("fourth")));
     }
 
     #[test]
