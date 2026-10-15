@@ -981,6 +981,8 @@ mod win_console {
         fn GetConsoleOutputCP() -> u32;
         fn SetConsoleCP(code_page: u32) -> i32;
         fn SetConsoleOutputCP(code_page: u32) -> i32;
+        fn GetFileType(file: Handle) -> u32;
+        fn GetLastError() -> u32;
     }
 
     pub(super) fn ensure_utf8() -> bool {
@@ -994,6 +996,44 @@ mod win_console {
             }
             let output = GetConsoleOutputCP();
             output != 0 && output != UTF8 && SetConsoleOutputCP(UTF8) != 0
+        }
+    }
+
+    pub(super) fn diagnostics() -> Vec<String> {
+        // Read the actual standard handles, not CONOUT$: a Cygwin pipe and an
+        // attached hidden console can coexist but have different output paths.
+        // SAFETY: the APIs only inspect borrowed handles and write to locals.
+        unsafe {
+            let mut lines = vec![format!(
+                "  Windows console code pages: input={} output={}",
+                GetConsoleCP(),
+                GetConsoleOutputCP()
+            )];
+            for (label, which) in [
+                ("stdin", 0xFFFF_FFF6),
+                ("stdout", STD_OUTPUT_HANDLE),
+                ("stderr", 0xFFFF_FFF4),
+            ] {
+                let handle = GetStdHandle(which);
+                if handle.is_null() || handle as isize == -1 {
+                    lines.push(format!("  {label}: unavailable"));
+                    continue;
+                }
+                let kind = match GetFileType(handle) {
+                    1 => "disk",
+                    2 => "character",
+                    3 => "pipe",
+                    _ => "unknown",
+                };
+                let mut mode = 0;
+                let detail = if GetConsoleMode(handle, &mut mode) != 0 {
+                    format!("0x{mode:08x}")
+                } else {
+                    format!("unavailable (win32-error={})", GetLastError())
+                };
+                lines.push(format!("  {label}: type={kind} console-mode={detail}"));
+            }
+            lines
         }
     }
 
@@ -1992,6 +2032,20 @@ pub fn probe_report(theme: Option<Theme>) -> String {
         "  colours: {:?}   unicode: {}",
         caps.colors, caps.unicode
     );
+    #[cfg(windows)]
+    {
+        for line in win_console::diagnostics() {
+            let _ = writeln!(out, "{line}");
+        }
+        let _ = writeln!(
+            out,
+            "  Windows terminal size: {:?}",
+            crossterm::terminal::size()
+        );
+        let legacy = std::env::var("CYGWIN")
+            .is_ok_and(|v| v.split_whitespace().any(|flag| flag == "disable_pcon"));
+        let _ = writeln!(out, "  CYGWIN disable_pcon: {legacy}");
+    }
     let bg = palette.background();
     let _ = writeln!(
         out,

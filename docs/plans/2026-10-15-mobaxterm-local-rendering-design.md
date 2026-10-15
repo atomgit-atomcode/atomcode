@@ -25,3 +25,13 @@ Cygwin 的 `disable_pcon` 路径存在根据 Windows console code page 转换原
 ## 提交前审计
 
 审计将轨道背景由 Border 改为 PanelBg，避免用户把 cyan/bright-cyan 配成同一颜色时轨道与滑块融在一起。新增判据比较实际渲染 RGB，覆盖深浅主题及 16/256/truecolor，而不只比较颜色索引。保留 clipboard 与补全命令的纯快速返回，不在它们执行时修改共用控制台编码。
+
+## 3eaafc911 构建的实机反馈与 Codex 对照
+
+用户使用 `3eaafc911+dirty` 测试：吉祥物变为橙色，但直接启动中文与边框仍乱码。`--probe-terminal` 没有出现代码页失败警告，报告 `Ansi256`、`unicode: false`，报告中非 ASCII 分隔符仍乱码。因此不能把调用 SetConsoleCP/SetConsoleOutputCP 成功视为解决了外层 Cygwin 转码问题；编码修复仍未完成。
+
+本地 Codex `806d9732c9` 对照：`tui/src/tui.rs::ensure_virtual_terminal_processing` 检查 stdout/stderr 的真实标准句柄，只对控制台句柄设置 processed-output/VT；`cli/src/doctor.rs::windows_console_details` 同时报告代码页和标准句柄模式。未找到 MobaXterm/disable_pcon 专用修复或 CMD 自动重启逻辑。`d52478c52e` 处理的是 batch alias 的 Unicode 可执行路径，不是正文输出。
+
+先将同类诊断补入 AtomCode `--probe-terminal`：实际 input/output code page、stdin/stdout/stderr 的文件类型和 console mode、Windows API 获得的终端尺寸以及 disable_pcon 状态。不添加猜测性的编码转码或 CMD 启动层。下一步需对照同机 Codex 表现，以及直接启动/CMD 启动的句柄诊断，确认实际发生转码的边界。
+
+用户继续实测 Codex CLI 0.162.1：直接启动返回 `os error 6`（Win32 ERROR_INVALID_HANDLE），错误消息也乱码，无法进入 TUI。这不是 Codex 已支持此场景的证据。诊断中进一步报告 GetConsoleMode 失败时的 Win32 错误码，供直接启动/CMD 启动对照；不把诊断增强当成乱码已修复。
