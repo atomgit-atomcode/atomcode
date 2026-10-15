@@ -7390,6 +7390,30 @@ async fn a_refused_submit_hands_the_words_back_and_says_why_in_words() {
 const SHELL_ROW_LAYER: &str = "[[insert]]\nname = \"tui-shell\"\n";
 
 #[tokio::test]
+async fn deleting_forward_or_to_end_exits_history_and_restores_completion() {
+    for key in [KeyPress::plain(Key::Delete), KeyPress::ctrl('k')] {
+        let dir = scratch("history-delete-completion");
+        let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+        let task = s.open().await;
+        s.term.type_line("/context");
+        s.quiet().await;
+        s.term.press(KeyPress::plain(Key::Up));
+        s.quiet().await;
+        s.term.press(KeyPress::plain(Key::End));
+        s.term.press(KeyPress::plain(Key::Left));
+        s.term.press(key);
+        s.quiet().await;
+        assert!(composer_text(&s).contains("/contex"));
+        assert!(
+            s.term.last().unwrap().part("menu").is_some(),
+            "editing history restores completion: {}",
+            s.screen()
+        );
+        task.abort();
+    }
+}
+
+#[tokio::test]
 async fn a_hook_rejected_prompt_returns_to_the_composer_without_overwriting_a_draft() {
     let dir = scratch("hook-refused");
     let (s, agent) = start_with_agent_events(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
@@ -10249,6 +10273,46 @@ async fn ctrl_p_over_the_slash_menu_recalls_and_closes_it() {
     assert!(
         composer_text(&s).contains("RECALL-ME"),
         "the recalled prompt is on the line:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+#[tokio::test]
+async fn recalled_slash_history_waits_for_an_edit_before_opening_the_menu() {
+    let dir = scratch("slash-history-menu");
+    let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    let task = s.open().await;
+
+    s.term.type_line("/context");
+    s.quiet().await;
+
+    s.term.press(KeyPress::plain(Key::Up));
+    s.quiet().await;
+    assert!(
+        composer_text(&s).contains("/context"),
+        "the slash command was not recalled:\n{}",
+        s.screen()
+    );
+    assert!(
+        s.term.last().unwrap().part("menu").is_none(),
+        "browsing history opened command completion:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::plain(Key::End));
+    s.term.press(KeyPress::plain(Key::Backspace));
+    s.quiet().await;
+    assert!(
+        composer_text(&s).contains("/contex"),
+        "editing did not keep the recalled command:\n{}",
+        s.screen()
+    );
+    assert!(
+        s.term.last().unwrap().part("menu").is_some(),
+        "editing a recalled slash command did not restore completion:\n{}",
         s.screen()
     );
 

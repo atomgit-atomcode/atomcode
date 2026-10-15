@@ -7083,6 +7083,9 @@ impl Tui {
             action,
             Action::Insert(_)
                 | Action::Backspace
+                | Action::DeleteForward
+                | Action::DeleteToEnd
+                | Action::Clear
                 | Action::DeleteWord
                 | Action::Paste(_)
                 | Action::AttachImage
@@ -7460,10 +7463,15 @@ impl Tui {
                     if first {
                         drop(m);
                         self.ask_for_older_history();
+                        self.refresh_menu();
                         return false;
                     }
                 } else {
                     recall_forward(&mut m);
+                }
+                if !inside {
+                    drop(m);
+                    self.refresh_menu();
                 }
                 return false;
             }
@@ -8472,19 +8480,14 @@ impl Tui {
     /// cursor to the first of them — the row that was lit a keystroke ago is not
     /// the same command once the list has narrowed.
     fn refresh_menu(&self) {
-        // A `Ctrl+R` search owns the composer while it is up: what the field
-        // shows is a query, not a command being typed — a history search for
-        // `/model` must list the lines that said it, not open the command menu
-        // over them. And the search's matches are drawn in the menu's place.
-        let searching = self
-            .host
-            .moment
-            .read()
-            .expect("moment poisoned")
-            .search
-            .is_some();
-        let prefix = if searching { None } else { self.slash_prefix() };
-        let skill = if searching || prefix.is_some() {
+        // Reverse search and history browsing show existing text, not a command
+        // being typed. Their rows own the arrows/Enter until the person edits.
+        let browsing = {
+            let moment = self.host.moment.read().expect("moment poisoned");
+            moment.search.is_some() || moment.history_at.is_some()
+        };
+        let prefix = if browsing { None } else { self.slash_prefix() };
+        let skill = if browsing || prefix.is_some() {
             None
         } else {
             let input = self
@@ -9655,7 +9658,7 @@ fn recall_back(m: &mut crate::moment::Moment) {
     };
     m.history_at = Some(at);
     m.input = m.history[at].clone();
-    m.caret = m.input.len();
+    m.caret = 0;
 }
 
 /// Forward one entry, and out the far side to the draft that was set aside.
@@ -9666,11 +9669,12 @@ fn recall_forward(m: &mut crate::moment::Moment) {
     if at + 1 < m.history.len() {
         m.history_at = Some(at + 1);
         m.input = m.history[at + 1].clone();
+        m.caret = 0;
     } else {
         m.history_at = None;
         m.input = std::mem::take(&mut m.draft);
+        m.caret = m.input.len();
     }
-    m.caret = m.input.len();
 }
 
 /// 前台替一个后台会话答的那一下没送到时，屏幕上说的那句（设计 §7）。
@@ -10328,7 +10332,10 @@ mod history_tests {
         assert_eq!(m.input, "first");
         recall_back(&mut m);
         assert_eq!(m.input, "first", "the oldest is the end of the road");
-        assert_eq!(m.caret, m.input.len(), "the caret follows to the end");
+        assert_eq!(
+            m.caret, 0,
+            "a recalled entry starts before its first letter"
+        );
     }
 
     #[test]
@@ -10337,9 +10344,11 @@ mod history_tests {
         let mut m = said(&["old"], "half a thought");
         recall_back(&mut m);
         assert_eq!(m.input, "old");
+        assert_eq!(m.caret, 0, "history opens at its start");
         recall_forward(&mut m);
         assert_eq!(m.input, "half a thought", "the draft came back");
         assert_eq!(m.history_at, None, "and we are composing again");
+        assert_eq!(m.caret, m.input.len(), "the draft resumes at its end");
     }
 
     #[test]
@@ -13202,6 +13211,34 @@ mod skills_menu_tests {
         let mut m = host.moment.write().expect("moment poisoned");
         m.input = line.into();
         m.caret = line.len();
+    }
+
+    #[test]
+    fn all_deletion_actions_leave_history_browsing() {
+        for action in [Action::DeleteForward, Action::DeleteToEnd, Action::Clear] {
+            let (host, tui) = screen();
+            type_line(&host, "/skills");
+            host.moment.write().unwrap().history_at = Some(0);
+            tui.act(action, &tui.client);
+            assert_eq!(host.moment.read().unwrap().history_at, None);
+        }
+    }
+
+    #[test]
+    fn vertical_history_recall_clears_a_previous_completion_menu() {
+        let (host, tui) = screen();
+        type_line(&host, "/skills ");
+        tui.refresh_menu();
+        assert!(host.menu_selected().is_some());
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.history = vec!["/init".into(), "/skills ".into()];
+            moment.history_at = Some(1);
+            moment.caret = 0;
+        }
+        tui.act(Action::CaretUp, &tui.client);
+        assert_eq!(host.moment.read().unwrap().input, "/init");
+        assert!(host.menu_selected().is_none());
     }
 
     #[test]
