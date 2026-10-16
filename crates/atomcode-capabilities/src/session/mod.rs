@@ -25,6 +25,7 @@ pub mod context;
 // session subsystem. Re-exported here so `session::instructions::…` still resolves.
 pub use crate::instructions;
 pub mod events;
+pub mod handoff;
 pub mod manager;
 pub mod presentation;
 pub mod recall;
@@ -36,6 +37,7 @@ pub mod transcript;
 mod usage_provider;
 pub mod worklog;
 pub use context::SessionContextHook;
+pub use handoff::SessionHandoffHook;
 pub use manager::{
     aggregate_session_cost, CatalogDiagnostic, CatalogDiagnosticKind, CatalogEntry,
     CatalogLocation, CatalogPresence, CatalogScan, DetachedUsageRecorder, ForkInfo, ImportInfo,

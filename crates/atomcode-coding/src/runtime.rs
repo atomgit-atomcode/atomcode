@@ -9399,6 +9399,20 @@ fn harness_host_state(
         "status-reminder",
         Arc::new(atomcode_capabilities::session::StatusReminderHook::new()),
     );
+    // The one-shot note a PREVIOUS session in this project left behind (`atomcode
+    // handoff <dir>`): `/cd` is a new session by design — the context block, the
+    // catalog and the project instructions are all frozen in the cached head — so
+    // this is what carries continuity across the restart. Consumed once, then
+    // deleted; a no-op when nothing is pending (the common case).
+    hooks.insert(
+        "session-handoff",
+        Arc::new(
+            atomcode_capabilities::session::SessionHandoffHook::for_project(
+                config.working_dir.clone(),
+                config.dirs.clone(),
+            ),
+        ),
+    );
     if let Some(snapshot) = parts.snapshot_hook() {
         hooks.insert("native-snapshot", snapshot);
     }

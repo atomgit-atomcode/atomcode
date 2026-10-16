@@ -947,6 +947,23 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+    /// Leave a note for the next session in another project, read from stdin.
+    ///
+    /// `/cd` starts a NEW session — the working directory determines the project
+    /// instructions, the skill catalog and the context block, all of which are
+    /// frozen in the cached prompt head and cannot be rewritten mid-session. This
+    /// is how continuity crosses that restart: write what you were doing, and the
+    /// first session started in `DIR` picks it up ONCE and deletes it.
+    ///
+    ///     printf 'building the export page; schema is done' | atomcode handoff ~/work/proj
+    ///
+    /// The note is stored under the config tree, keyed by project — never inside
+    /// the repository, so it cannot shadow `AGENTS.md`, dirty `git status`, or be
+    /// pushed to anyone else. Unread notes expire.
+    Handoff {
+        /// Project directory the note is for — the directory the user will `/cd` to.
+        dir: std::path::PathBuf,
+    },
     /// Roll back to the previous version (swap with .bak on disk)
     Rollback,
     /// Hidden alias for `atomcode login` — kept so existing scripts /
@@ -1767,6 +1784,49 @@ async fn run() -> Result<i32> {
         }
     }
     // ── End askpass early exit ────────────────────────────────────────────────
+
+    // Same shape, same reason: a pure filesystem write with no runtime, no
+    // telemetry and no provider. Reads the note from stdin so it never appears in
+    // a process listing or the shell history — a handoff can quote code.
+    if let Some(Commands::Handoff { dir }) = &cli.command {
+        use std::io::Read;
+        let mut note = String::new();
+        if std::io::stdin().read_to_string(&mut note).is_err() {
+            eprintln!("handoff: could not read the note from stdin");
+            return Ok(1);
+        }
+        if note.trim().is_empty() {
+            eprintln!("handoff: refusing to store an empty note");
+            return Ok(1);
+        }
+        // Canonicalize so the session bucket id matches the one the reading
+        // session computes from its own working directory — `.` and a symlinked
+        // path would otherwise key different files for the same project.
+        let target =
+            atomcode_capabilities::pathnorm::canonicalize(dir).unwrap_or_else(|_| dir.clone());
+        if !target.is_dir() {
+            eprintln!("handoff: not a directory: {}", target.display());
+            return Ok(1);
+        }
+        // Pin the project's session bucket first (best-effort) so the handoff
+        // lands in the SAME bucket the reading session will use, even across a
+        // later folder rename.
+        let dirs = atomcode_coding::config::product_dirs_from_env();
+        atomcode_capabilities::session::SessionManager::ensure_project_marker(&target, &dirs);
+        return match atomcode_capabilities::session::handoff::write(&target, &dirs, &note) {
+            Ok(_) => {
+                println!(
+                    "已记下交接，下一次在 {} 开启的会话会读到它。",
+                    target.display()
+                );
+                Ok(0)
+            }
+            Err(error) => {
+                eprintln!("handoff: could not store the note: {error}");
+                Ok(1)
+            }
+        };
+    }
 
     // `--tui --audit` / `--tui --demo` look at the screen alone: no config, no
     // provider, no session, no terminal.
@@ -4102,6 +4162,9 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
             // flow and falling through to the TUI. This arm is
             // unreachable in normal execution but kept defensive.
             unreachable!("Login is handled inline in run() before handle_command")
+        }
+        Commands::Handoff { .. } => {
+            unreachable!("handoff is handled early in run() before handle_command")
         }
         Commands::Resume { .. } => {
             // Resume falls through to the TUI/headless launch in run() before
