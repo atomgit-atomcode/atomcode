@@ -828,7 +828,7 @@
       {
         "id": "配置",
         "heading": "配置",
-        "body": "在 ~/.atomcode/config.toml 中调整子代理池： [subagent] max_concurrent = 3 # 同时并行的子代理数（最小 1） timeout_secs = 900 # 每个子任务的墙钟超时，秒（最小 30） max_rounds = 200 # 每个子任务的模型轮次上限（0 = 不限） 键 默认 含义 max_concurrent 3 并行运行的子代理数 timeout_secs 900 每个子任务的墙钟超时（下限 30 秒） max_rounds 200 每个子任务的模型轮次上限； 0 = 不限 环境变量覆盖： ATOMCODE_SUBAGENT_TIMEOUT 和 ATOMCODE_SUBAGENT_MAX_ROUNDS 优先于配置值。"
+        "body": "在 ~/.atomcode/config.toml 中调整子代理池： [subagent] max_concurrent = 3 # 同时并行的子代理数（最小 1） max_rounds = 0 # 每个子任务的模型轮次上限（0 = 不限） 默认不限制子任务轮数；已有配置中的正数预算会保留。要取消旧的 200 轮限制，请设置 [subagent] max_rounds = 0 ，或使用环境变量 ATOMCODE_SUBAGENT_MAX_ROUNDS=0 。正数预算耗尽时最多增加一次纯文本收尾；并发数、取消和重复调用保护独立生效。外部 Codex/Claude 子代理使用各自的运行策略。 键 默认 含义 max_concurrent 3 并行运行的子代理数 max_rounds 0 每个子任务的模型轮次上限； 0 = 不限 环境变量覆盖： ATOMCODE_SUBAGENT_MAX_ROUNDS 优先于配置值。"
       },
       {
         "id": "自定义团队角色",

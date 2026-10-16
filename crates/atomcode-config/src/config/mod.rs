@@ -281,7 +281,7 @@ impl Default for LoopConfig {
 pub struct SubAgentConfig {
     /// Max parallel subagents the `task` tool runs at once (floored to 1). Default 3.
     pub max_concurrent: usize,
-    /// Per-subtask model-round high-water mark. Default 200; `0` means unbounded.
+    /// Per-subtask model-round high-water mark. Default 0 (unbounded); positive values opt into a budget.
     /// Overridden by `ATOMCODE_SUBAGENT_MAX_ROUNDS` when set.
     pub max_rounds: u32,
     /// Convenience switch for a built-in Codex subagent, editable from `/config`:
@@ -310,7 +310,7 @@ impl Default for SubAgentConfig {
     fn default() -> Self {
         Self {
             max_concurrent: 3,
-            max_rounds: 200,
+            max_rounds: 0,
             codex: default_subagent_level(),
             claude: default_subagent_level(),
             external: Vec::new(),
@@ -424,7 +424,7 @@ pub struct Config {
     #[serde(default)]
     pub lsp: LspConfig,
     /// `task` subagent tool policy. Missing from older configs uses the defaults in
-    /// [`SubAgentConfig`], including a configurable 200-round high-water mark.
+    /// [`SubAgentConfig`], including an optional per-subtask round budget (default unbounded).
     #[serde(default)]
     pub subagent: SubAgentConfig,
     /// Persistent team roster policy. This is independent of task execution
@@ -4161,6 +4161,20 @@ reflection_cadence = 7
 [providers]
 "#;
         let _cfg: Config = toml::from_str(toml_text).expect("legacy field ignored");
+    }
+
+    #[test]
+    fn subagent_round_budget_defaults_to_unbounded_and_preserves_explicit_limits() {
+        for input in ["", "[subagent]", "[subagent]\nmax_rounds = 0"] {
+            let cfg: Config = toml::from_str(input).unwrap();
+            assert_eq!(cfg.subagent.max_rounds, 0);
+            assert_eq!(cfg.subagent.max_concurrent, 3);
+        }
+        let cfg: Config = toml::from_str("[subagent]\nmax_rounds = 200").unwrap();
+        assert_eq!(
+            cfg.subagent.max_rounds, 200,
+            "existing explicit budgets survive"
+        );
     }
 
     #[test]

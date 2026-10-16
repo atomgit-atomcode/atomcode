@@ -678,7 +678,7 @@ fn default_tools() -> Vec<String> {
 }
 
 fn default_rounds() -> u32 {
-    12
+    0
 }
 
 fn default_concurrent() -> usize {

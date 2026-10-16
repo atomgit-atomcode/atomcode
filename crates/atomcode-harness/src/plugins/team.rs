@@ -1660,7 +1660,7 @@ fn default_members() -> usize {
 }
 
 fn default_rounds() -> u32 {
-    24
+    0
 }
 
 impl Default for TeamRow {

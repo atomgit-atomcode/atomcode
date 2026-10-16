@@ -412,7 +412,7 @@ pub fn describe_config_file_for(
          the ordinary approval rules (`off`).\n\
          - `[loop_config]` `max_rounds`: how many passes a `/loop` may run (default 100; \
          0 = no cap).\n\
-         - `[subagent]` `max_concurrent` (default 3) and `max_rounds` (default 200) for \
+         - `[subagent]` `max_concurrent` (default 3) and `max_rounds` (default 0 = unbounded) for \
          delegated execution; `[team]` `max_members` (default 6) limits the persistent \
          roster, including idle members; `codex` / `claude` = `off` | `read-only` | `accept-edits` | \
          `auto`, and `[[subagent.external]]` entries (`name`, `kind` = `codex` | \

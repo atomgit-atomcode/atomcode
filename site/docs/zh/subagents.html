@@ -109,19 +109,18 @@
       <p>在 <code>~/.atomcode/config.toml</code> 中调整子代理池：</p>
       <pre><code>[subagent]
 max_concurrent = 3     # 同时并行的子代理数（最小 1）
-timeout_secs   = 900   # 每个子任务的墙钟超时，秒（最小 30）
-max_rounds     = 200   # 每个子任务的模型轮次上限（0 = 不限）</code></pre>
+max_rounds     = 0     # 每个子任务的模型轮次上限（0 = 不限）</code></pre>
+      <p>默认不限制子任务轮数；已有配置中的正数预算会保留。要取消旧的 200 轮限制，请设置 <code>[subagent] max_rounds = 0</code>，或使用环境变量 <code>ATOMCODE_SUBAGENT_MAX_ROUNDS=0</code>。正数预算耗尽时最多增加一次纯文本收尾；并发数、取消和重复调用保护独立生效。外部 Codex/Claude 子代理使用各自的运行策略。</p>
       <table>
         <thead>
           <tr><th>键</th><th>默认</th><th>含义</th></tr>
         </thead>
         <tbody>
           <tr><td><code>max_concurrent</code></td><td>3</td><td>并行运行的子代理数</td></tr>
-          <tr><td><code>timeout_secs</code></td><td>900</td><td>每个子任务的墙钟超时（下限 30 秒）</td></tr>
-          <tr><td><code>max_rounds</code></td><td>200</td><td>每个子任务的模型轮次上限；<code>0</code> = 不限</td></tr>
+          <tr><td><code>max_rounds</code></td><td>0</td><td>每个子任务的模型轮次上限；<code>0</code> = 不限</td></tr>
         </tbody>
       </table>
-      <p>环境变量覆盖：<code>ATOMCODE_SUBAGENT_TIMEOUT</code> 和 <code>ATOMCODE_SUBAGENT_MAX_ROUNDS</code> 优先于配置值。</p>
+      <p>环境变量覆盖：<code>ATOMCODE_SUBAGENT_MAX_ROUNDS</code> 优先于配置值。</p>
 
       <h2 id="自定义团队角色">自定义团队角色</h2>
       <p>团队（<code>team</code>）派活时按<strong>角色</strong>挑成员。除了内置角色，你可以用 Markdown 文件自己定义，放在下面两个目录之一：</p>

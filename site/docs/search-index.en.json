@@ -828,7 +828,7 @@
       {
         "id": "configuration",
         "heading": "Configuration",
-        "body": "Tune the subagent pool in ~/.atomcode/config.toml : [subagent] max_concurrent = 3 # parallel subagents at once (min 1) timeout_secs = 900 # per-subtask wall-clock limit, seconds (min 30) max_rounds = 200 # per-subtask model-round cap (0 = unbounded) Key Default Meaning max_concurrent 3 How many subagents run in parallel timeout_secs 900 Wall-clock timeout per subtask (floored to 30s) max_rounds 200 Model-round high-water mark per subtask; 0 = unbounded Environment overrides: ATOMCODE_SUBAGENT_TIMEOUT and ATOMCODE_SUBAGENT_MAX_ROUNDS take precedence over the config values."
+        "body": "Tune the subagent pool in ~/.atomcode/config.toml : [subagent] max_concurrent = 3 # parallel subagents at once (min 1) max_rounds = 0 # per-subtask model-round cap (0 = unbounded) Child rounds are unlimited by default; existing explicit positive budgets are preserved. Set [subagent] max_rounds = 0 or ATOMCODE_SUBAGENT_MAX_ROUNDS=0 to remove an old 200-round limit. Positive budgets allow at most one extra text-only closing request. Concurrency, cancellation and repetition guards remain independent. External Codex/Claude agents retain their own execution policies. Key Default Meaning max_concurrent 3 How many subagents run in parallel max_rounds 0 Model-round high-water mark per subtask; 0 = unbounded Environment overrides: ATOMCODE_SUBAGENT_MAX_ROUNDS take precedence over the config values."
       },
       {
         "id": "custom-team-roles",

@@ -1,0 +1,3 @@
+# Subagent round default
+
+Baseline release/v5.2.4 at 160def108, clean worktree. Config owns the default, coding parts resolves the environment override and runtime patches both task and persistent team rows. Default each child to zero (unbounded) consistently across config and both harness rows. Preserve explicit positive limits, including existing saved 200, cancellation, repetition protection and concurrency 3. External Codex/Claude process profiles retain their own timeout and budget semantics. No migration of explicit values. Existing child-round cap already supports zero and text-only closing at positive budgets. Validate parsing, env overrides, config/coding/harness suites and compile gate.
