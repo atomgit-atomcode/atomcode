@@ -377,6 +377,12 @@ impl Keymap for Default_ {
         vec![
             (KeyPress::plain(Key::Enter), Action::Submit),
             (KeyPress::plain(Key::Backspace), Action::Backspace),
+            // Some terminal/IME paths retain Shift on the physical erase key.
+            // It still removes the character before the caret.
+            (
+                KeyPress::new(Key::Backspace, Mods::SHIFT),
+                Action::Backspace,
+            ),
             (KeyPress::plain(Key::Esc), Action::Escape),
             (KeyPress::ctrl('c'), Action::Cancel),
             // 中断并把排队的话立刻发出去。这一下曾经是 `esc` 的承诺
@@ -645,6 +651,16 @@ mod tests {
             Some(Action::Escape)
         );
         assert_eq!(keys.resolve(KeyPress::ctrl('c')), Some(Action::Cancel));
+    }
+
+    #[test]
+    fn shift_backspace_erases_instead_of_becoming_an_unbound_chord() {
+        let keys = Keys::new();
+        keys.add(&Default_).unwrap();
+        assert_eq!(
+            keys.resolve(KeyPress::new(Key::Backspace, Mods::SHIFT)),
+            Some(Action::Backspace)
+        );
     }
 
     /// What SSH and PuTTY send instead. Unbound, backspace stops working over

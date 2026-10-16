@@ -2777,12 +2777,14 @@ pub const BURST_ACTIVE: std::time::Duration = std::time::Duration::from_millis(4
 /// The most characters gathered into one synthesised paste.
 pub const BURST_CAP: usize = 8192;
 
-/// `Some(true)` for a bare ↑ press, `Some(false)` for a bare ↓, `None` for
+/// `Some(true)` for a bare ↑ press/repeat, `Some(false)` for a bare ↓, `None` for
 /// anything else — the keys a terminal turns the wheel into (`pump_input`).
 pub fn bare_arrow(event: &crossterm::event::Event) -> Option<bool> {
     use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
     let Event::Key(k) = event else { return None };
-    if k.kind != KeyEventKind::Press || k.modifiers != KeyModifiers::NONE {
+    if !matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+        || k.modifiers != KeyModifiers::NONE
+    {
         return None;
     }
     match k.code {
@@ -2845,6 +2847,25 @@ pub fn is_paste_burst(chars: &[char]) -> bool {
     !(lines >= 3 && printed <= lines)
 }
 
+/// Only repeat editing/navigation keys. Repeating Enter or a command chord
+/// must not submit again, quit, or toggle a panel. Keep modifiers intact so
+/// the normal keymap still decides what an accepted key means.
+fn repeats_editing(code: crossterm::event::KeyCode, mods: crossterm::event::KeyModifiers) -> bool {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    match code {
+        KeyCode::Backspace
+        | KeyCode::Delete
+        | KeyCode::Left
+        | KeyCode::Right
+        | KeyCode::Up
+        | KeyCode::Down
+        | KeyCode::Home
+        | KeyCode::End => (mods & !KeyModifiers::SHIFT).is_empty(),
+        KeyCode::Char('h' | '?') => mods == KeyModifiers::CONTROL,
+        _ => false,
+    }
+}
+
 pub fn from_crossterm(event: crossterm::event::Event) -> Option<Input> {
     use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
     use crossterm::event::{MouseButton, MouseEventKind};
@@ -2891,7 +2912,10 @@ pub fn from_crossterm(event: crossterm::event::Event) -> Option<Input> {
             };
             Some(Input::Mouse(click, m.column, m.row))
         }
-        Event::Key(k) if k.kind == KeyEventKind::Press => {
+        Event::Key(k)
+            if k.kind == KeyEventKind::Press
+                || (k.kind == KeyEventKind::Repeat && repeats_editing(k.code, k.modifiers)) =>
+        {
             let key = match k.code {
                 KeyCode::Char(c) => Key::Char(c),
                 KeyCode::Enter => Key::Enter,
@@ -2931,6 +2955,71 @@ pub fn from_crossterm(event: crossterm::event::Event) -> Option<Input> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn editing_key_repeats_preserve_modifiers_and_releases_stay_ignored() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+        for code in [
+            KeyCode::Backspace,
+            KeyCode::Delete,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Home,
+            KeyCode::End,
+        ] {
+            for mods in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+                let press = KeyEvent::new(code, mods);
+                let mut repeat = press;
+                repeat.kind = KeyEventKind::Repeat;
+                assert!(from_crossterm(Event::Key(repeat)).is_some(), "{repeat:?}");
+                assert_eq!(
+                    from_crossterm(Event::Key(repeat)),
+                    from_crossterm(Event::Key(press))
+                );
+                let mut release = press;
+                release.kind = KeyEventKind::Release;
+                assert_eq!(from_crossterm(Event::Key(release)), None);
+            }
+        }
+        for c in ['h', '?'] {
+            let mut key = KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+            let press = from_crossterm(Event::Key(key));
+            key.kind = KeyEventKind::Repeat;
+            assert_eq!(from_crossterm(Event::Key(key)), press);
+        }
+    }
+
+    #[test]
+    fn command_key_repeats_cannot_submit_quit_or_toggle_panels() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+        for (code, mods) in [
+            (KeyCode::Enter, KeyModifiers::NONE),
+            (KeyCode::Enter, KeyModifiers::SHIFT),
+            (KeyCode::Esc, KeyModifiers::NONE),
+            (KeyCode::Tab, KeyModifiers::NONE),
+            (KeyCode::F(2), KeyModifiers::NONE),
+            (KeyCode::Char('c'), KeyModifiers::CONTROL),
+            (KeyCode::Char('d'), KeyModifiers::CONTROL),
+            (KeyCode::Char('o'), KeyModifiers::CONTROL),
+            (KeyCode::Char('x'), KeyModifiers::CONTROL),
+            (KeyCode::Char('x'), KeyModifiers::NONE),
+            (
+                KeyCode::Char('h'),
+                KeyModifiers::ALT | KeyModifiers::CONTROL,
+            ),
+            (KeyCode::Backspace, KeyModifiers::SUPER),
+        ] {
+            let mut key = KeyEvent::new(code, mods);
+            assert!(
+                from_crossterm(Event::Key(key)).is_some(),
+                "press still works: {key:?}"
+            );
+            key.kind = KeyEventKind::Repeat;
+            assert_eq!(from_crossterm(Event::Key(key)), None, "{key:?}");
+        }
+    }
+
     #[test]
     fn a_windows_pipe_transport_is_rejected_before_screen_takeover() {
         let error = require_console_io(false).unwrap_err();

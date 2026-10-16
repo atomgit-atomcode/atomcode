@@ -11679,11 +11679,121 @@ mod paste_burst_tests {
         seen
     }
 
+    /// Zero-gap scripts check event ordering, not a wall-clock threshold.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn chinese_first_character_can_be_erased_after_burst_with_shift_and_repeat() {
+        use crossterm::event::KeyEventKind;
+        for (code, mods, kind) in [
+            (KeyCode::Backspace, KeyModifiers::NONE, KeyEventKind::Press),
+            (KeyCode::Backspace, KeyModifiers::SHIFT, KeyEventKind::Press),
+            (KeyCode::Backspace, KeyModifiers::NONE, KeyEventKind::Repeat),
+            (
+                KeyCode::Backspace,
+                KeyModifiers::SHIFT,
+                KeyEventKind::Repeat,
+            ),
+            (
+                KeyCode::Char('h'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Repeat,
+            ),
+        ] {
+            let mut erase = KeyEvent::new(code, mods);
+            erase.kind = kind;
+            let mut release = KeyEvent::new(KeyCode::Char('中'), KeyModifiers::NONE);
+            release.kind = KeyEventKind::Release;
+            let seen = pumped(vec![
+                (0, press('中')),
+                (0, Event::Key(release)),
+                (0, press('文')),
+                (0, Event::Key(erase)),
+                (0, Event::Key(erase)),
+                (0, Event::Key(erase)),
+                (0, press('字')),
+            ])
+            .await;
+            assert_eq!(seen.len(), 6, "{erase:?}: {seen:?}");
+            let (host, tui) = assemble(Headless::new(60, 24));
+            let keys = Keys::new();
+            keys.add(&crate::keymap::Default_).unwrap();
+            for (input, expected) in seen.into_iter().zip(["中", "中文", "中", "", "", "字"]) {
+                let Input::Key(press) = input else {
+                    panic!("typing became a paste")
+                };
+                let action = keys.resolve(press).expect("editing key must be bound");
+                assert!(!tui.act(action, &tui.client));
+                let m = host.moment.read().unwrap();
+                assert_eq!(m.input, expected, "{erase:?}");
+                assert_eq!(m.caret, expected.len());
+                assert!(!m.pending_working);
+                assert!(!m.turn_open);
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn buffered_chinese_paste_precedes_backspace_and_repeat_across_newline() {
+        use crossterm::event::KeyEventKind;
+        let text = "中文\n后文";
+        let erase = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+        let mut repeated = erase;
+        repeated.kind = KeyEventKind::Repeat;
+        let mut script: Vec<_> = text
+            .chars()
+            .map(|c| (0, if c == '\n' { enter() } else { press(c) }))
+            .collect();
+        script.push((0, Event::Key(erase)));
+        script.extend((0..4).map(|_| (0, Event::Key(repeated))));
+        let seen = pumped(script).await;
+        assert_eq!(seen.first(), Some(&Input::Paste(text.into())));
+        assert_eq!(seen.len(), 6);
+        let (host, tui) = assemble(Headless::new(60, 24));
+        let keys = Keys::new();
+        keys.add(&crate::keymap::Default_).unwrap();
+        for (input, expected) in
+            seen.into_iter()
+                .zip([text, "中文\n后", "中文\n", "中文", "中", ""])
+        {
+            let action = match input {
+                Input::Paste(text) => Action::Paste(text),
+                Input::Key(press) => keys.resolve(press).expect("erase key"),
+                other => panic!("unexpected input {other:?}"),
+            };
+            tui.act(action, &tui.client);
+            let m = host.moment.read().unwrap();
+            assert_eq!(m.input, expected);
+            assert_eq!(m.caret, expected.len());
+            assert!(!m.pending_working);
+        }
+    }
+
     fn arrow(up: bool) -> Event {
         Event::Key(KeyEvent::new(
             if up { KeyCode::Up } else { KeyCode::Down },
             KeyModifiers::NONE,
         ))
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn editing_arrow_repeats_keep_the_pointer_handoff_routing() {
+        use crossterm::event::KeyEventKind;
+        let Event::Key(mut repeated) = arrow(true) else {
+            unreachable!()
+        };
+        repeated.kind = KeyEventKind::Repeat;
+        let script = vec![
+            (0, arrow(true)),
+            (0, Event::Key(repeated)),
+            (0, Event::Key(repeated)),
+        ];
+        assert_eq!(
+            pumped_with(script.clone(), false).await,
+            vec![Input::Key(KeyPress::plain(Key::Up)); 3]
+        );
+        assert_eq!(
+            pumped_with(script, true).await,
+            vec![Input::ArrowBurst { up: true, n: 3 }]
+        );
     }
 
     /// **The wheel, turned into arrows by the terminal.** With the pointer
@@ -13082,6 +13192,35 @@ mod paste_habit_tests {
 
     fn typed(host: &Host) -> String {
         host.moment.read().expect("moment poisoned").input.clone()
+    }
+
+    #[test]
+    fn backspace_erases_the_first_chinese_character_on_a_wrapped_visual_row() {
+        let (host, tui) = screen();
+        let text = "中文".repeat(45);
+        for c in text.chars() {
+            tui.act(Action::Insert(c), &tui.client);
+        }
+        host.compose((60, 24));
+        let width = host.field_rect().unwrap().w;
+        let start = text
+            .char_indices()
+            .find(|(at, _)| crate::modules::input::caret_row(&text, *at, width).0 == 1)
+            .unwrap()
+            .0;
+        assert!(start > 0);
+        let end = start + text[start..].chars().next().unwrap().len_utf8();
+        tui.act(Action::CaretHome, &tui.client);
+        for _ in text[..end].chars() {
+            tui.act(Action::CaretRight, &tui.client);
+        }
+        assert_eq!(host.moment.read().unwrap().caret, end);
+        tui.act(Action::Backspace, &tui.client);
+        let mut expected = text.clone();
+        expected.replace_range(start..end, "");
+        let m = host.moment.read().unwrap();
+        assert_eq!(m.input, expected);
+        assert_eq!(m.caret, start);
     }
 
     #[test]
