@@ -153,24 +153,18 @@ impl Default for AtomGitToolConfig {
     }
 }
 
-/// Which screen `atomcode` opens (`[ui] screen`).
-///
-/// Two screens exist while the row-assembled one replaces the other
-/// (`docs/adr/0012`, `docs/tui-replaces-tuix-plan.md` M6): same runtime, same
-/// sessions, same configuration — only what draws them differs. The setting is
-/// what makes the switch a decision a person makes once, rather than a flag
-/// they have to remember on every launch, and it is what keeps an escape hatch
-/// after the default moves.
+/// Screen preferences from existing configuration files. Only the row-assembled
+/// TUI is shipped. `Classic` is retained as an input compatibility value; the CLI
+/// reports its retirement and uses the supported screen.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Screen {
-    /// The screen this build opens by default. Since 2026-09-22 that is the
-    /// row-assembled one; the classic one stays behind `--classic`.
+    /// The screen this build opens by default: the row-assembled UI.
     #[default]
     Default,
     /// The screen assembled from plugin rows (`atomcode --tui`).
     Rows,
-    /// The classic screen.
+    /// Retired input value, accepted for existing configuration files only.
     Classic,
 }
 
@@ -613,9 +607,8 @@ pub struct UiConfig {
     /// configs see no behaviour change.
     #[serde(default)]
     pub theme: UiTheme,
-    /// Which screen `atomcode` opens. Missing means this build's default, so
-    /// nobody's launch changes by upgrading into this field; `--tui` and
-    /// `--classic` still win over it for one launch.
+    /// Existing screen preference. All values use the row-assembled UI;
+    /// `classic` is accepted only as a retired input alias with a CLI notice.
     #[serde(default)]
     pub screen: Screen,
     /// Report the pointer for in-app mouse — click-to-fold a tool call, the copy

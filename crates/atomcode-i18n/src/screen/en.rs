@@ -1261,16 +1261,6 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::OnboardSignedInConfigNotWritten { error } => format!("signed in, but the config was not written: {error}").into(),
         Msg::CmdAboutOnboarding => "set this machine up to work: language, sign in, and a look at the result".into(),
         Msg::CmdAboutOnboardingFinished => "the walkthrough is done".into(),
-        Msg::ClassicOnlyForNow { command } => format!(
-            "/{command} is only on the classic screen for now: quit and run `atomcode --classic` \
-             (same sessions). It is coming to this screen."
-        )
-        .into(),
-        Msg::CmdAboutClassicOnly => "only on the classic screen for now".into(),
-        Msg::LivesInTheCli { command, run } => {
-            format!("/{command} belongs to the command line: quit and run `{run}`.").into()
-        }
-        Msg::CmdAboutInTheCli => "belongs to the command line".into(),
         Msg::RollbackConfirmSwitch => "AtomCode switches to the previous version and starts again in this directory.".into(),
         Msg::RollbackConfirmNoUpdates => {
             "Automatic updates stay off afterwards; to go back to the newer version, run /upgrade (or `atomcode upgrade` on the command line).".into()

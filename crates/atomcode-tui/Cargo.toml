@@ -53,7 +53,7 @@ base64 = "0.22"
 qrcode = { version = "0.14", default-features = false }
 unicode-width = "0.2"
 unicode-segmentation = "1"
-# Picking which tips to open a session with. The same version `atomcode-tuix` uses:
+# Picking which welcome tips to show at startup:
 # two front ends on two major versions would put two copies of `rand` in one build
 # and buy nothing. Only the *selection* is random — the seed comes from the working
 # directory, so one directory picks the same tips every render (see

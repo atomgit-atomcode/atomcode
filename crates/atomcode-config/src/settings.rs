@@ -104,7 +104,7 @@ const SUBAGENT_LEVELS: &[&str] = &["off", "read-only", "accept-edits", "auto"];
 const MODE_SWITCH_KEYS: &[&str] = &["shift_tab", "tab"];
 const SCROLLBARS: &[&str] = &["auto", "always", "hidden"];
 /// `default` is this build's, which is what a person gets back by unsetting it.
-const SCREENS: &[&str] = &["default", "rows", "classic"];
+const SCREENS: &[&str] = &["default", "rows"];
 
 pub static SETTINGS: &[SettingSpec] = &[
     bool_setting(

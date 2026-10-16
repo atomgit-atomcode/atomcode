@@ -549,8 +549,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "未选中会话".into(),
         Msg::SessionPickerHint =>
             "↑↓ 移动 · Enter 打开 · Ctrl+D×2 删除 · 输入内容搜索 · Esc 取消".into(),
-        Msg::ClassicScreenFallback =>
-            "当前控制台不支持新界面所需的终端控制序列，已改用经典界面。在 Windows Terminal 中运行可使用新界面。".into(),
+        Msg::AnsiTerminalRequired =>
+            "当前终端不支持 TUI 所需的 ANSI 功能。请使用 Windows Terminal 等支持 ANSI 的终端，或通过 -p 使用无界面模式。".into(),
+        Msg::ClassicScreenRetired =>
+            "经典界面已退役，现使用当前 TUI；请移除 --classic 或将 [ui] screen 改为 rows。".into(),
         Msg::PasswordPromptHint =>
             "🔒 命令在请求密码 · 输入不显示、不留存 · Enter 提交 · Esc 取消".into(),
         Msg::SessionPickerTitle { n, total, project } =>

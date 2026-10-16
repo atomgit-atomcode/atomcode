@@ -1470,7 +1470,7 @@ fn console_mouse(on: bool) {
 /// unconditionally — disabling reporting that was never enabled costs a few
 /// bytes, and tracking the flag from a global would be one more thing to keep
 /// in step for no gain.
-fn emergency_restore() {
+pub fn emergency_restore() {
     use std::sync::atomic::Ordering;
     if !SCREEN_HELD.swap(false, Ordering::SeqCst) {
         return;

@@ -651,7 +651,7 @@ atomcode/
     atomcode-capabilities/  # Providers, tools, MCP, skills, sessions, memory
     atomcode-coding/        # Coding specialization and CodingRuntime lifecycle
     atomcode-review/        # Review specialization
-    atomcode-tuix/          # Terminal UI
+    atomcode-tui/           # Terminal UI
     atomcode-cli/           # TUI and headless entry point
     atomcode-daemon/        # HTTP/SSE/WebSocket transport + legacy session importer
 ```
@@ -735,7 +735,7 @@ cargo test
 
 # Run tests for a specific crate
 cargo test -p atomcode-capabilities
-cargo test -p atomcode-tuix
+cargo test -p atomcode-tui
 
 # Run a specific test
 cargo test -p atomcode-capabilities test_name
@@ -809,7 +809,7 @@ Contributions are welcome! AtomCode is in active development.
 
 - **Add a new tool** — implement the `Tool` trait in `crates/atomcode-capabilities/src/tools/`
 - **Add a new provider** — implement `LlmProvider` in `crates/atomcode-capabilities/src/provider/`
-- **Improve the UI** — rendering lives in `crates/atomcode-tuix/src/render/`
+- **Improve the UI** — rendering lives in `crates/atomcode-tui/src/`
 - **Fix bugs** — check [Issues](https://atomgit.com/atomgit_atomcode/atomcode/issues) for open bugs
 
 ### Non-Rust Contributions

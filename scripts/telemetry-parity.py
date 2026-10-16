@@ -31,8 +31,7 @@ by the wire golden and by `a_failed_mcp_connection_is_metered` instead.
 
 `use_command` needs a terminal: it is reported by a front end, not by a
 headless run. That half is pinned by `atomcode-tui/src/command.rs`,
-`atomcode-cli/src/tui_command_meter.rs` and
-`atomcode-tuix/tests/use_command_oracle.rs`.
+`atomcode-cli/src/tui_command_meter.rs`.
 
 Compaction is deliberately NOT a scenario. It would be reachable (a tiny
 `context_window` plus a large tool result), but what it measures is not parity:

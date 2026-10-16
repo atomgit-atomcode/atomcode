@@ -577,8 +577,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "No session selected".into(),
         Msg::SessionPickerHint =>
             "↑↓ move · Enter open · Ctrl+D×2 delete · Type to search · Esc cancel".into(),
-        Msg::ClassicScreenFallback =>
-            "This console cannot draw the new screen (no escape-sequence support); opening the classic screen. Windows Terminal runs the new one.".into(),
+        Msg::AnsiTerminalRequired =>
+            "This terminal cannot display the TUI. Use an ANSI-capable terminal such as Windows Terminal, or run with -p for headless mode.".into(),
+        Msg::ClassicScreenRetired =>
+            "The classic screen has been retired. Using the current TUI; remove --classic or change [ui] screen to rows.".into(),
         Msg::PasswordPromptHint =>
             "🔒 A command is asking for a password · not shown, not kept · Enter send · Esc cancel".into(),
         Msg::SessionPickerTitle { n, total, project } =>

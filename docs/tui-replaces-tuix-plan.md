@@ -1,3 +1,6 @@
+> 历史迁移计划：其中的经典界面、旧默认值和逃生口不再是当前实现前提。
+> 本次实际目录删除、兼容输入与验证清单见 [退役记录](plans/2026-10-16-retire-tuix.md)。
+
 # tui 接进 atomcode、替换 tuix:执行计划
 
 状态: 定稿(2026-09-17)。按 ADR [0021](adr/0021-front-end-contracts-split-by-layer.md)–

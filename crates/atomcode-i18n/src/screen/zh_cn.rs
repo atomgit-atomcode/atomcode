@@ -1191,16 +1191,6 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::OnboardSignedInConfigNotWritten { error } => format!("登录成了，但配置没写成：{error}").into(),
         Msg::CmdAboutOnboarding => "把这台机器配到能干活：语言、登录、看一眼结果".into(),
         Msg::CmdAboutOnboardingFinished => "引导走完了".into(),
-        Msg::ClassicOnlyForNow { command } => format!(
-            "/{command} 暂时只在经典界面里有：退出后用 `atomcode --classic` 打开（会话是同一份）。\
-             新界面的版本在做。"
-        )
-        .into(),
-        Msg::CmdAboutClassicOnly => "暂时只在经典界面里有".into(),
-        Msg::LivesInTheCli { command, run } => {
-            format!("/{command} 归命令行：退出后运行 `{run}`。").into()
-        }
-        Msg::CmdAboutInTheCli => "归命令行".into(),
         Msg::RollbackConfirmSwitch => "会切换到上一版本,并在这个目录里重新启动 AtomCode。".into(),
         Msg::RollbackConfirmNoUpdates => {
             "之后不再自动升级;想回到新版本时运行 /upgrade(或命令行 `atomcode upgrade`)。".into()

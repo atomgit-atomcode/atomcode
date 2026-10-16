@@ -18,7 +18,7 @@ path = "src/lib.rs"
 
 [features]
 default = []
-distro-pm = ["atomcode-updater/distro-pm", "atomcode-tuix/distro-pm"]
+distro-pm = ["atomcode-updater/distro-pm"]
 # Official-release signing is owned by the final binary. Keep the open-source
 # default unsigned while giving the release pipeline an explicit, core-free
 # feature entry point.
@@ -35,7 +35,6 @@ atomcode-config = { path = "../atomcode-config" }
 atomcode-i18n = { path = "../atomcode-i18n" }
 # Self-update mechanics (leaf crate, extracted from core).
 atomcode-updater = { path = "../atomcode-updater" }
-atomcode-tuix = { path = "../atomcode-tuix" }
 # `atomcode --tui`: the full-screen UI assembled from rows, driving the same runtime
 # through the two front-end contracts (docs/adr/0021, docs/adr/0022).
 atomcode-tui = { path = "../atomcode-tui" }

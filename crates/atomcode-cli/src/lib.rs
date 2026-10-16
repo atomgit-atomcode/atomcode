@@ -32,7 +32,6 @@ pub mod relay;
 pub mod tui_bg;
 pub mod tui_changelog;
 pub mod tui_command_meter;
-pub mod tui_elsewhere;
 pub mod tui_login;
 pub mod tui_mcp;
 pub mod tui_onboarding;
@@ -289,7 +288,6 @@ pub mod tui_front {
             crate::tui_shell::row_layer(),
             crate::tui_upgrade::row_layer(),
             crate::tui_changelog::row_layer(),
-            crate::tui_elsewhere::row_layer(),
             crate::tui_proxy::row_layer(),
             crate::tui_schedule::row_layer(),
             crate::tui_openrouter::row_layer(),
@@ -330,7 +328,6 @@ pub mod tui_front {
             Arc::new(crate::tui_shell::ShellRow {
                 working_dir: working_dir.clone(),
             }),
-            Arc::new(crate::tui_elsewhere::ElsewhereRow),
             Arc::new(crate::tui_proxy::ProxyRow {
                 config_path: config_path.clone(),
             }),
@@ -385,34 +382,6 @@ pub mod tui_front {
         pub skip_permissions: bool,
         /// A launch-time `--provider`, which signing in again keeps.
         pub provider_override: Option<String>,
-    }
-
-    /// Which screen this launch opens: what was asked for now, else what the
-    /// configuration says, else this build's default
-    /// (`docs/tui-replaces-tuix-plan.md` M6.2).
-    ///
-    /// One place rather than a condition at the launch site, because the two
-    /// halves — the flag and the setting — are what makes the default movable:
-    /// the setting is a decision a person makes once, the flag is the escape
-    /// hatch for one launch, and `Screen::Default` is the only thing that has to
-    /// change when the default moves.
-    pub fn screen_for(
-        asked_for_rows: bool,
-        asked_for_classic: bool,
-        configured: atomcode_config::config::Screen,
-    ) -> atomcode_config::config::Screen {
-        use atomcode_config::config::Screen;
-        if asked_for_rows {
-            return Screen::Rows;
-        }
-        if asked_for_classic {
-            return Screen::Classic;
-        }
-        match configured {
-            // What this build opens when nobody said. It moves once, here.
-            Screen::Default => Screen::Rows,
-            chosen => chosen,
-        }
     }
 
     impl ConfigFile {
@@ -984,28 +953,6 @@ model = "vendor-b"
                 unchanged.contains(r#"default_model = "custom/b""#),
                 "a runtime-only selection is not persisted: {unchanged}"
             );
-        }
-
-        /// Which screen opens: the flag beats the setting, the setting beats the
-        /// build's default, and `--classic` is the escape hatch that keeps
-        /// working after the default moves
-        /// (`docs/tui-replaces-tuix-plan.md` M6.2).
-        #[test]
-        fn what_was_asked_for_beats_what_was_configured() {
-            use atomcode_config::config::Screen;
-            // Nobody said anything: this build's default.
-            assert_eq!(
-                screen_for(false, false, Screen::Default),
-                Screen::Rows,
-                "the default this build opens"
-            );
-            // The setting decides once.
-            assert_eq!(screen_for(false, false, Screen::Rows), Screen::Rows);
-            assert_eq!(screen_for(false, false, Screen::Classic), Screen::Classic);
-            // A flag decides this launch, either way — including against a
-            // setting that says the opposite, which is what an escape hatch is.
-            assert_eq!(screen_for(true, false, Screen::Classic), Screen::Rows);
-            assert_eq!(screen_for(false, true, Screen::Rows), Screen::Classic);
         }
 
         /// What a reload compares: the same file reads the same, an edited one

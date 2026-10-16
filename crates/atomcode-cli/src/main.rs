@@ -143,7 +143,7 @@ fn restore_terminal_if_tui() {
     if atomcode_tui::surface::validate_interactive_io().is_err() {
         return;
     }
-    atomcode_tuix::panic_restore_terminal();
+    atomcode_tui::surface::emergency_restore();
     let _ = crossterm::terminal::disable_raw_mode();
 }
 
@@ -704,10 +704,8 @@ struct Cli {
     #[arg(long, conflicts_with = "headless_input")]
     pub tui: bool,
 
-    /// Open the classic screen for this launch, whatever `[ui] screen` says —
-    /// the escape hatch. `[ui] screen = "classic"` makes it the one that opens
-    /// without the flag.
-    #[arg(long, conflicts_with = "tui")]
+    /// Deprecated compatibility alias for the only supported TUI.
+    #[arg(long, hide = true, conflicts_with = "tui")]
     pub classic: bool,
 
     /// On the row-assembled screen: show the mascot.
@@ -2239,7 +2237,7 @@ async fn run() -> Result<i32> {
     // self-upgrade) used to fire here synchronously, blocking the
     // input box for 1–3s on a warm path (and 5–10s on first clone).
     // Both now run as a detached `spawn_blocking` from inside
-    // `atomcode_tuix::run` after the skill registry is constructed —
+    // the screen after the skill registry is constructed —
     // see lib.rs near `spawn_plugin_bootstrap`. Newly-installed skills
     // are picked up by a `skill_registry.reload()` + wake pulse the
     // background task fires on completion, so the slash menu refreshes
@@ -2363,37 +2361,29 @@ async fn run() -> Result<i32> {
         !is_headless,
     );
     runtime_cfg.next_prompt_suggestions = !is_headless;
-    let model_name = runtime_cfg.model.clone();
     let provider_bootstrap = if is_headless {
         atomcode_coding::ProviderBootstrap::Required
     } else {
         interactive_provider_bootstrap(&runtime_cfg)
     };
     let runtime_start = std::time::Instant::now();
-    // `--tui` reaches the runtime through a front end fed from inside its Apps.
-    // What was asked for now, else what the configuration says — one rule, in
-    // one place (`atomcode::tui_front::screen_for`).
-    //
-    // The new screen draws in escape sequences, and a Windows console too old
-    // to execute them would print every one as text; the classic screen draws
-    // there through the console API. So such a console gets the classic screen
-    // whatever was asked — asking also turns the sequences on where the console
-    // has them and they were merely off (a plain Windows 10 PowerShell window).
-    let asked_for_rows = atomcode::tui_front::screen_for(cli.tui, cli.classic, config.ui.screen)
-        == atomcode_config::config::Screen::Rows;
-    let console_draws_rows = is_headless || atomcode_tui::surface::console_speaks_ansi();
-    if asked_for_rows && !console_draws_rows {
-        // Said, not silent: someone who asked for the new screen (or got it as
-        // the default) and sees the old one should be told why and where the
-        // new one runs.
-        eprintln!(
-            "{}",
-            atomcode_config::i18n::t(atomcode_config::i18n::Msg::ClassicScreenFallback)
-        );
+    // One screen and one runtime owner. Older classic inputs remain readable,
+    // but never select a second frontend or a fallback runtime.
+    if !is_headless {
+        if cli.classic || config.ui.screen == atomcode_config::config::Screen::Classic {
+            eprintln!(
+                "{}",
+                atomcode_config::i18n::t(atomcode_config::i18n::Msg::ClassicScreenRetired)
+            );
+        }
+        if !atomcode_tui::surface::console_speaks_ansi() {
+            anyhow::bail!(
+                "{}",
+                atomcode_config::i18n::t(atomcode_config::i18n::Msg::AnsiTerminalRequired)
+            );
+        }
     }
-    let rows_screen = asked_for_rows && console_draws_rows;
-    let tui_front_end =
-        (rows_screen && !is_headless).then(atomcode_coding::front_end::FrontEnd::new);
+    let tui_front_end = (!is_headless).then(atomcode_coding::front_end::FrontEnd::new);
     // Bound to the background sessions once the screen is up (`tui_front::run`);
     // until then — and on any other screen — `code_review` runs inline.
     let review_home = atomcode::background::ReviewHome::new();
@@ -2422,24 +2412,6 @@ async fn run() -> Result<i32> {
         total_ms = run_start.elapsed().as_millis() as u64,
         "startup stage completed"
     );
-    // TUI replay remains a presentation projection during S4; runtime resume above
-    // has already converged and loaded the native snapshot under one lease.
-    let resume_project_bucket = atomcode_capabilities::session::SessionManager::project_hash(
-        &working_dir,
-        &atomcode_coding::config::product_dirs_from_env(),
-    );
-    let session_to_continue = match continued_session
-        .as_ref()
-        .map(|session| session.id.as_str())
-    {
-        Some(id) => atomcode_daemon::legacy_convert::load_catalog_session_view_in_project(
-            &resume_project_bucket,
-            id,
-        )?,
-        None => None,
-    }
-    .map(atomcode_tuix::session::Session::from_catalog_view)
-    .transpose()?;
     let session_startup_notice = continued_session
         .as_ref()
         .and_then(|session| {
@@ -2474,12 +2446,10 @@ async fn run() -> Result<i32> {
         .chain(plugin_hook_notices())
         .collect(),
     );
-    // The first interactive launch on a new release says, in one line, what it
-    // brought and where to read the rest; never a headless one, which would spend
-    // the notice where nobody reads it. Only on the row-assembled screen: the
-    // notice points at `/changelog`, which the classic screen does not have.
+    // Tell interactive launches about a new release; headless runs never emit
+    // screen-only release notices.
     // Last among the notices: it is news, not something wrong with this launch.
-    let whats_new = (!is_headless && rows_screen).then(|| {
+    let whats_new = (!is_headless).then(|| {
         atomcode::tui_changelog::Launch::decide(
             config.ui.whats_new,
             had_config,
@@ -2505,39 +2475,6 @@ async fn run() -> Result<i32> {
         (Some(native_runtime), None)
     } else {
         (None, Some((native_runtime, native_coding_cfg)))
-    };
-
-    // Spawner for in-TUI session switches (/session, /bg, disk /resume): each one
-    // builds a fresh native runtime from the CURRENT in-process config. A launch-time
-    // `--provider` is applied to that config above, so the override remains authoritative
-    // for live views and subsequent runtime respawns without being persisted to disk.
-    let runtime_spawn_override: atomcode_tuix::RuntimeSpawnOverride = {
-        let tel = telemetry.clone();
-        // Capture the bypass flag so in-TUI re-spawns also honor
-        // --dangerously-skip-permissions — not just the launch handle.
-        let skip_perms = cli.dangerously_skip_permissions;
-        std::sync::Arc::new(
-            move |config: &atomcode_config::config::Config,
-                  working_dir: &std::path::Path,
-                  session: &atomcode_tuix::session::Session| {
-                let mut runtime_cfg = runtime_config_from(
-                    config,
-                    working_dir,
-                    None,
-                    Some(tel.clone()),
-                    skip_perms,
-                    // In-TUI re-spawns (/session, /bg, /resume) are always interactive.
-                    true,
-                );
-                // TUI-only: a `max_rounds` hit becomes the interactive
-                // continue/stop checkpoint (the render arm lives in the TUI
-                // event loop). `spawn_deferred_tui_runtime` is only ever the
-                // in-TUI respawn factory, so this is never a headless path.
-                runtime_cfg.round_cap_checkpoint = true;
-                runtime_cfg.next_prompt_suggestions = true;
-                spawn_deferred_tui_runtime(runtime_cfg, session)
-            },
-        )
     };
 
     // Resolve effective prompt: --prompt-file reads from disk; -p is inline.
@@ -2587,8 +2524,8 @@ async fn run() -> Result<i32> {
     // own session id. Events the screen itself reports — `use_command` — are
     // scoped per dispatch by `tui_command_meter`, which reads the session off
     // the screen's own seam and so follows `/new` and `/resume` on its own.
-    if let Some(ref s) = session_to_continue {
-        if let Ok(uuid) = uuid::Uuid::parse_str(s.id.as_str()) {
+    if let Some(id) = &active_session_id {
+        if let Ok(uuid) = uuid::Uuid::parse_str(id) {
             telemetry.set_session_id(uuid);
         }
     }
@@ -2684,13 +2621,13 @@ async fn run() -> Result<i32> {
             // actual errors in their shell/CI output.
             redirect_stderr_to_log_file();
 
-            // The runtime task already runs the engine behind this handle; the TUI
-            // drives it. In-TUI /session and /resume spawn via
-            // runtime_spawn_override.
+            // The existing screen/host connection owns session switching;
+            // no frontend-specific runtime wrapper is built here.
             let (runtime, coding_cfg) = native_tui_runtime
                 .take()
                 .expect("native TUI runtime built above");
-            if let Some(front_end) = tui_front_end {
+            let front_end = tui_front_end.expect("interactive startup creates the frontend");
+            {
                 let screen = atomcode_tui::launch::Screen {
                     mascot: cli.mascot,
                     theme: screen_theme(cli.theme.as_deref(), config.ui.theme),
@@ -2782,11 +2719,8 @@ async fn run() -> Result<i32> {
                     &screen,
                     config_path.clone(),
                     Some(telemetry.clone()),
-                    // Cloned rather than moved: the classic arm below still
-                    // takes it by value, and which arm runs is decided at
-                    // `screen_for`, not here.
-                    startup_notice.clone(),
-                    whats_new.clone(),
+                    startup_notice,
+                    whats_new,
                     Some(spawn),
                     Some(review_home.clone()),
                 )
@@ -2847,47 +2781,6 @@ async fn run() -> Result<i32> {
                 }
                 return result;
             }
-            let provider_selection = coding_cfg.provider_name.clone();
-            let tui_runtime = into_tui_native_runtime(runtime, coding_cfg);
-            // Same as the headless arm: don't `?` — a TUI run that ends in an
-            // error must still reach the shutdown/flush below. Ok(()) → exit 0;
-            // the error propagates only after telemetry is drained.
-            // A running session owns its resolved provider/model. Shared config
-            // changes only define the default for sessions opened afterwards;
-            // they must not retarget an already-open runtime.
-            let provider_selection_mode = atomcode_tuix::ProviderSelectionMode::Pinned;
-            tracing::info!(
-                target: "atomcode::startup",
-                stage = "tui_enter",
-                total_ms = run_start.elapsed().as_millis() as u64,
-                "handing control to TUI"
-            );
-            let tui_result = match atomcode_tuix::run(
-                config,
-                provider_selection,
-                model_name,
-                provider_selection_mode,
-                atomcode_config::ConfigStore::new(config_path.clone()),
-                tui_runtime,
-                runtime_spawn_override,
-                working_dir,
-                session_to_continue,
-                startup_notice,
-                telemetry.clone(),
-                cli.dangerously_skip_permissions,
-                is_admin,
-            )
-            .await
-            {
-                Ok(()) => Ok(0),
-                Err(e) => Err(e.into()),
-            };
-            // Codex-style resume hint to STDOUT, after the TUI restored the
-            // terminal, so `atomcode resume <id>` is discoverable on exit.
-            if let Some(id) = &active_session_id {
-                let _ = print_exit_resume_hints(&[resume_hint_line(id, false, hint_zh)]);
-            }
-            tui_result
         };
 
         // Flush telemetry on EVERY exit path — Ok and Err alike. Both session
@@ -2903,80 +2796,6 @@ async fn run() -> Result<i32> {
     .await;
 
     result
-}
-
-fn spawn_deferred_tui_runtime(
-    cfg: atomcode_coding::CodingRuntimeConfig,
-    session: &atomcode_tuix::session::Session,
-) -> atomcode_tuix::SpawnedRuntime {
-    let session_id = session.id.as_str().to_string();
-    let snapshot = session.to_conversation_snapshot();
-    // Base agent config for the VL preprocessor's one-off provider builds,
-    // derived from this runtime's config before `cfg` is moved into the spawn.
-    let vl_base = cfg.agent_config();
-    let (native_control, mut events, runtime_state) =
-        atomcode_daemon::spawn_native_runtime_for_session_deferred_with_preprocessor(
-            cfg,
-            session_id.clone(),
-            snapshot,
-            Some(std::sync::Arc::new(
-                crate::vision::VlImagePreprocessor::new(
-                    atomcode_daemon::coding_provider_factory(),
-                    vl_base,
-                ),
-            )),
-        );
-    let control = atomcode_tuix::RuntimeControl::deferred(native_control, runtime_state);
-    let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
-    tokio::spawn(async move {
-        while let Some(event) = events.recv().await {
-            if event_tx
-                .send(atomcode_tuix::RuntimeEventPayload::SequencedNative(event))
-                .is_err()
-            {
-                break;
-            }
-        }
-    });
-    atomcode_tuix::SpawnedRuntime {
-        endpoint: atomcode_tuix::RuntimeEndpoint { native: control },
-        event_rx,
-        session_id: Some(session_id),
-    }
-}
-
-fn into_tui_native_runtime(
-    runtime: atomcode_coding::CodingRuntime,
-    _coding_cfg: atomcode_coding::CodingAgentConfig,
-) -> atomcode_tuix::SpawnedRuntime {
-    let session_id = runtime.session.as_ref().map(|session| session.id.clone());
-    let atomcode_coding::CodingRuntime {
-        handle,
-        mut events,
-        task,
-        ..
-    } = runtime;
-    let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
-    let control =
-        atomcode_tuix::RuntimeControl::ready_with_event_tx(handle.clone(), event_tx.clone());
-    let control_for_events = control.clone();
-    tokio::spawn(async move {
-        while let Some(event) = events.recv().await {
-            if event_tx
-                .send(atomcode_tuix::RuntimeEventPayload::SequencedNative(event))
-                .is_err()
-            {
-                break;
-            }
-        }
-        let _ = task.await;
-        control_for_events.detach_delivery_event_tx();
-    });
-    atomcode_tuix::SpawnedRuntime {
-        endpoint: atomcode_tuix::RuntimeEndpoint { native: control },
-        event_rx,
-        session_id,
-    }
 }
 
 /// On macOS the NSPasteboard runtime prints deprecation warnings to
@@ -6047,5 +5866,21 @@ mod tests {
             buf,
             "[thinking] I should check the file\n[tool→ read_file]\n"
         );
+    }
+}
+
+#[cfg(test)]
+mod retired_screen_tests {
+    use super::Cli;
+    use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn the_retired_flag_still_parses_without_selecting_a_second_backend() {
+        let cli = Cli::try_parse_from(["atomcode", "--classic", "-p", "hello"]).unwrap();
+        assert!(cli.classic);
+        assert_eq!(cli.prompt.as_deref(), Some("hello"));
+        let help = Cli::command().render_long_help().to_string();
+        assert!(!help.contains("--classic"));
+        assert!(help.contains("--tui"));
     }
 }

@@ -527,13 +527,9 @@ async fn what_this_launch_has_to_say_is_said_and_the_welcome_still_opens() {
     let _ = tokio::time::timeout(Duration::from_secs(5), running).await;
 }
 
-/// The commands only the classic screen has yet (`/webui`, `/sync`, `/app`,
-/// `/desktop`), typed on this one after the default moved: each says where it
-/// still lives instead of "no such command" — and none is recommended, so the
-/// menu never offers something that can only answer "go elsewhere"
-/// (`docs/plans/2026-09-19-remaining-gaps.md`, decision 10).
+/// Invalid upgrade arguments are handled locally, without model or network work.
 #[tokio::test]
-async fn a_command_only_the_classic_screen_has_says_where_it_lives() {
+async fn invalid_upgrade_arguments_are_reported_on_the_screen() {
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("ATOMCODE_HOME", home.path());
     let project = tempfile::tempdir().unwrap();
@@ -577,45 +573,6 @@ async fn a_command_only_the_classic_screen_has_says_where_it_lives() {
     let running = tokio::spawn(async move {
         let _ = ui.run(&ctx, None).await;
     });
-
-    for (name, run) in atomcode::tui_elsewhere::IN_THE_CLI {
-        term.type_line(&format!("/{name}"));
-        let expected = format!("/{name} 归命令行");
-        let mut screen_text = String::new();
-        for _ in 0..200 {
-            screen_text = term.text();
-            if screen_text.contains(&expected) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        assert!(
-            screen_text.contains(&expected) && screen_text.contains(run),
-            "/{name} says how to run it instead:\n{screen_text}"
-        );
-    }
-
-    for name in atomcode::tui_elsewhere::CLASSIC_ONLY {
-        term.type_line(&format!("/{name}"));
-        let expected = format!("/{name} 暂时只在经典界面里有");
-        let mut screen_text = String::new();
-        for _ in 0..200 {
-            screen_text = term.text();
-            if screen_text.contains(&expected) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        assert!(
-            screen_text.contains(&expected) && screen_text.contains("atomcode --classic"),
-            "/{name} says where it still lives:\n{screen_text}"
-        );
-        assert_eq!(
-            count.0.load(Ordering::SeqCst),
-            0,
-            "and it is not sent to the model as a prompt"
-        );
-    }
 
     // `/upgrade` is answered on this screen now (`tui_upgrade`), not pointed at
     // the CLI. An argument it does not take is refused in the classic screen's
@@ -1118,6 +1075,78 @@ async fn the_launchers_own_commands_are_in_the_menu() {
             "`/{name}` is mounted: {offered:?}"
         );
     }
+}
+
+/// The retired screen's command table is a frozen input, not a second catalog.
+/// Run the event loop: runtime-owned commands arrive through Described events.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_retired_command_has_a_live_replacement() {
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("ATOMCODE_HOME", home.path());
+    let project = tempfile::tempdir().unwrap();
+    let count = Arc::new(Count::default());
+    let _locale = atomcode_config::i18n::test_lock();
+    let front_end = FrontEnd::new();
+    let (mut start, config) = start(
+        project.path(),
+        &count,
+        SessionMode::Fresh,
+        Some(front_end.clone()),
+    );
+    // The product enables memory; the minimal host-test fixture normally does not.
+    start.prepare.memory = true;
+    let runtime = CodingRuntime::start(start).await.unwrap();
+    let screen = Screen {
+        headless: Some((160, 60)),
+        ..Screen::default()
+    };
+    let mounted = tui_front::mount(
+        runtime,
+        front_end,
+        config,
+        None,
+        &screen,
+        home.path().join("config.toml"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let ctx = mounted.app.context();
+    let commands = ctx.service::<atomcode_tui::plugin::CommandsSvc>().unwrap();
+    let term = ctx
+        .service::<atomcode_tui::plugin::SurfaceSvc>()
+        .unwrap()
+        .as_any_headless()
+        .unwrap();
+    let ui = mounted.ui.clone();
+    let running = tokio::spawn(async move { ui.run(&ctx, None).await });
+    let mut retired: Vec<String> =
+        serde_json::from_str(include_str!("fixtures/retired-tuix-commands.json")).unwrap();
+    retired.extend(["new".into(), "exit".into()]);
+    let mut missing = Vec::new();
+    for _ in 0..200 {
+        missing = retired
+            .iter()
+            .filter(|name| commands.find(name).is_none())
+            .cloned()
+            .collect();
+        if missing.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    term.press(atomcode_tui::surface::KeyPress::ctrl('d'));
+    let _ = running.await;
+    assert!(
+        missing.is_empty(),
+        "retired commands without live replacements: {missing:?}"
+    );
+    assert_eq!(
+        count.0.load(Ordering::SeqCst),
+        0,
+        "catalog discovery never calls the model"
+    );
 }
 
 /// `/language` reaches the menu: the glosses the runtime's rows put on their

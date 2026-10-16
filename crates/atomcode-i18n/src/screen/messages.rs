@@ -1992,19 +1992,6 @@ pub enum Msg<'a> {
     },
     CmdAboutOnboarding,
     CmdAboutOnboardingFinished,
-    /// A command the classic screen has and this one does not have yet — typed
-    /// here, it says where it still lives rather than "no such command".
-    ClassicOnlyForNow {
-        command: &'a str,
-    },
-    CmdAboutClassicOnly,
-    /// A command this screen does not have because it belongs to the command
-    /// line — `/upgrade` replaces the binary, which a screen inside it cannot.
-    LivesInTheCli {
-        command: &'a str,
-        run: &'a str,
-    },
-    CmdAboutInTheCli,
     /// The confirmation before a rollback (titled by the product's
     /// `UpgradeOptRollback`).
     RollbackConfirmSwitch,

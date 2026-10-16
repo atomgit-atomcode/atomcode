@@ -627,7 +627,7 @@ atomcode/
     atomcode-capabilities/  # provider、tools、MCP、skills、session、memory
     atomcode-coding/        # coding 专业化与 CodingRuntime 生命周期
     atomcode-review/        # 代码评审专业化
-    atomcode-tuix/          # 终端 UI
+    atomcode-tui/           # 终端 UI
     atomcode-cli/           # TUI 与 headless 入口
     atomcode-daemon/        # HTTP/SSE/WebSocket 传输层及历史 session importer
 ```
@@ -711,7 +711,7 @@ cargo test
 
 # 运行指定 crate 的测试
 cargo test -p atomcode-capabilities
-cargo test -p atomcode-tuix
+cargo test -p atomcode-tui
 
 # 运行指定的用例
 cargo test -p atomcode-capabilities test_name
@@ -785,7 +785,7 @@ cargo install --path crates/atomcode-cli
 
 - **新增工具** —— 在 `crates/atomcode-capabilities/src/tools/` 下实现 `Tool` trait
 - **新增模型提供方** —— 在 `crates/atomcode-capabilities/src/provider/` 下实现 `LlmProvider`
-- **改进 UI** —— 渲染相关代码在 `crates/atomcode-tuix/src/render/`
+- **改进 UI** —— 渲染相关代码在 `crates/atomcode-tui/src/`
 - **修 Bug** —— 到 [Issues](https://atomgit.com/atomgit_atomcode/atomcode/issues) 上挑一个
 
 ### 非 Rust 贡献者
