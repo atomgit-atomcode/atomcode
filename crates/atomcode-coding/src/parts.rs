@@ -461,6 +461,24 @@ pub struct SessionBinding {
     staged_fresh: Option<(SessionMeta, SessionHeader)>,
 }
 
+/// A live binding carries its storage owner across rebuilds. An importer only
+/// transfers a lease, which must still match the requested project's manager.
+pub(crate) enum SessionLeaseSource {
+    Existing {
+        manager: Arc<SessionManager>,
+        lease: SessionLease,
+    },
+    Transferred(SessionLease),
+}
+
+impl SessionLeaseSource {
+    fn lease(&self) -> &SessionLease {
+        match self {
+            Self::Existing { lease, .. } | Self::Transferred(lease) => lease,
+        }
+    }
+}
+
 struct McpWorkGuard {
     registry: Option<Arc<McpRegistry>>,
     publication_enabled: Arc<std::sync::atomic::AtomicBool>,
@@ -662,7 +680,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     cfg: &CodingAgentConfig,
     opts: PrepareOptions,
     plugin_cc_hooks: Vec<HookConfig>,
-    reuse_lease: Option<SessionLease>,
+    reuse_lease: Option<SessionLeaseSource>,
     stage_fresh: bool,
 ) -> io::Result<CodingParts> {
     let tools_started = std::time::Instant::now();
@@ -980,8 +998,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             // adoption for a project that already has one, a no-op change for a
             // brand-new one — see `SessionManager::ensure_project_marker`.
             SessionManager::ensure_project_marker(&cfg.working_dir, &cfg.dirs);
-            let manager = Arc::new(SessionManager::for_project(&cfg.working_dir, &cfg.dirs));
-            let lease = session_lease(&manager, &id, reuse_lease.as_ref())?;
+            let (manager, lease) = session_storage(cfg, &id, reuse_lease.as_ref())?;
             let now = atomcode_capabilities::session::now_ms();
             let working_dir = cfg.working_dir.to_string_lossy().into_owned();
             let mut meta = SessionMeta::new(&id, working_dir.as_str(), now);
@@ -1009,8 +1026,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             })
         }
         SessionMode::Resume(id) => {
-            let manager = Arc::new(SessionManager::for_project(&cfg.working_dir, &cfg.dirs));
-            let lease = session_lease(&manager, id, reuse_lease.as_ref())?;
+            let (manager, lease) = session_storage(cfg, id, reuse_lease.as_ref())?;
             // Resume is a native-only boundary. Legacy/unconfirmed data must first
             // converge through a driver importer; accepting a lone snapshot here
             // would bypass ownership and manufacture an incomplete native session.
@@ -1034,8 +1050,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         }
         SessionMode::ExternalSnapshot { id, snapshot } => {
             check_snapshot_version(snapshot)?;
-            let manager = Arc::new(SessionManager::for_project(&cfg.working_dir, &cfg.dirs));
-            let lease = session_lease(&manager, id, reuse_lease.as_ref())?;
+            let (manager, lease) = session_storage(cfg, id, reuse_lease.as_ref())?;
             manager.open_as_events(&lease).map_err(io::Error::from)?;
             let loaded = manager.load_native_session(id).map_err(io::Error::from)?;
             check_snapshot_version(&loaded.snapshot)?;
@@ -1273,7 +1288,7 @@ pub(crate) async fn prepare_with_plugin_hook_source_reusing_lease(
     cfg: &CodingAgentConfig,
     opts: PrepareOptions,
     source: &dyn PluginHookSource,
-    reuse_lease: Option<SessionLease>,
+    reuse_lease: Option<SessionLeaseSource>,
     stage_fresh: bool,
 ) -> io::Result<CodingParts> {
     let started = std::time::Instant::now();
@@ -1283,20 +1298,27 @@ pub(crate) async fn prepare_with_plugin_hook_source_reusing_lease(
     prepare_with_plugin_hooks_reusing_lease(cfg, opts, hooks, reuse_lease, stage_fresh).await
 }
 
-fn session_lease(
-    manager: &SessionManager,
+fn session_storage(
+    cfg: &CodingAgentConfig,
     id: &str,
-    reuse_lease: Option<&SessionLease>,
-) -> io::Result<SessionLease> {
-    match reuse_lease.filter(|lease| lease.id() == id) {
-        Some(lease) => {
+    reuse: Option<&SessionLeaseSource>,
+) -> io::Result<(Arc<SessionManager>, SessionLease)> {
+    let reuse = reuse.filter(|source| source.lease().id() == id);
+    let manager = match reuse {
+        Some(SessionLeaseSource::Existing { manager, .. }) => Arc::clone(manager),
+        _ => Arc::new(SessionManager::for_project(&cfg.working_dir, &cfg.dirs)),
+    };
+    let lease = match reuse {
+        Some(source) => {
+            let lease = source.lease();
             manager
                 .validate_active_lease(lease)
                 .map_err(io::Error::from)?;
-            Ok(lease.clone())
+            lease.clone()
         }
-        None => manager.acquire_lease(id).map_err(Into::into),
-    }
+        None => manager.acquire_lease(id).map_err(io::Error::from)?,
+    };
+    Ok((manager, lease))
 }
 
 impl SessionBinding {

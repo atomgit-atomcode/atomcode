@@ -40,7 +40,7 @@ use crate::controllers::{
     GoalPhase, GoalProgress, GoalResult, GoalState, GoalTerminal, LoopProgress, LoopState,
     ScheduleWakeupTool, WakeupRequest, MAX_UNPRODUCTIVE,
 };
-use crate::parts::prepare_with_plugin_hook_source_reusing_lease;
+use crate::parts::{prepare_with_plugin_hook_source_reusing_lease, SessionLeaseSource};
 #[cfg(test)]
 use crate::prepare_with_plugin_hook_source;
 use crate::{CodingAgentConfig, CodingProviderFactory, PluginHookSource, PrepareOptions};
@@ -3031,7 +3031,7 @@ impl CodingRuntime {
                 &agent,
                 prepare.clone(),
                 plugin_hooks.as_ref(),
-                session_lease,
+                session_lease.map(SessionLeaseSource::Transferred),
                 true,
             )
             .await
@@ -7009,7 +7009,7 @@ fn spawn_runtime_owner_with_optional_agent(
 
                         // Preflight the complete capability graph while the current agent is
                         // still alive. A prepare failure must leave the old runtime untouched.
-                        let reuse_lease = prepared_lease.or_else(|| {
+                        let reuse_lease = prepared_lease.map(SessionLeaseSource::Transferred).or_else(|| {
                             matching_session_lease(&runtime.parts, &input.prepare.session)
                         });
                         let prepare_candidate = prepare_with_plugin_hook_source_reusing_lease(
@@ -9330,6 +9330,13 @@ fn resolve_reprepare_input(
             )))
         }
         ReprepareTarget::ReloadConfig(config) => {
+            if runtime.parts.session.is_some() && config.dirs != runtime.config.dirs {
+                return Err(RuntimeError::ReconfigureFailed(
+                    "cannot change product data directories while keeping an active session; \
+                     restart with the intended data directory and explicitly resume the session"
+                        .to_string(),
+                ));
+            }
             let mut prepare = runtime.prepare.clone();
             prepare.session = match runtime.parts.session.as_ref() {
                 Some(binding) => crate::SessionMode::Resume(binding.id.clone()),
@@ -9460,7 +9467,7 @@ fn resolve_reprepare_input(
 fn matching_session_lease(
     parts: &crate::CodingParts,
     target: &crate::SessionMode,
-) -> Option<SessionLease> {
+) -> Option<SessionLeaseSource> {
     let target_id = match target {
         crate::SessionMode::Resume(id) | crate::SessionMode::ExternalSnapshot { id, .. } => id,
         crate::SessionMode::Fresh | crate::SessionMode::Disabled => return None,
@@ -9469,7 +9476,10 @@ fn matching_session_lease(
         .session
         .as_ref()
         .filter(|binding| binding.id == *target_id)
-        .map(|binding| binding.lease.clone())
+        .map(|binding| SessionLeaseSource::Existing {
+            manager: Arc::clone(&binding.manager),
+            lease: binding.lease.clone(),
+        })
 }
 
 fn discard_uncommitted_session(
@@ -18780,6 +18790,208 @@ mod tests {
             .iter()
             .any(|message| message.text == "persisted before reprepare"));
         runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[serial_test::serial(atomcode_home)]
+    async fn session_storage_survives_config_cwd_change_and_capability_reload() {
+        use atomcode_capabilities::session::SessionManager;
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let dirs = crate::config::product_dirs_from_env();
+        let original = SessionManager::for_project(project.path(), &dirs);
+        let elsewhere = SessionManager::for_project(other.path(), &dirs);
+        let id = "same-id-in-two-buckets";
+        persist_native_session(
+            &original,
+            id,
+            project.path(),
+            &SessionSnapshot::new(vec![Message::user("original history")]),
+        );
+        persist_native_session(
+            &elsewhere,
+            id,
+            other.path(),
+            &SessionSnapshot::new(vec![Message::user("unrelated history")]),
+        );
+        let unrelated = elsewhere.load_snapshot(id).unwrap();
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.prepare.session = crate::SessionMode::Resume(id.into());
+        start.provider_factory = Arc::new(FailSecondBuildFactory {
+            builds: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut next = start.agent.clone();
+        next.working_dir = other.path().to_path_buf();
+        let mut runtime = CodingRuntime::start(start).await.unwrap();
+        let before = runtime.handle.status();
+        assert!(
+            matches!(runtime.handle.reprepare_config(next.clone()).await,
+            Err(RuntimeError::ReconfigureFailed(message)) if message.contains("candidate provider failed"))
+        );
+        assert_eq!(runtime.handle.status(), before);
+        assert_eq!(
+            runtime.handle.context_stats().await.unwrap().working_dir,
+            project.path()
+        );
+        assert!(matches!(
+            original.acquire_lease(id),
+            Err(SessionStoreError::SessionInUse { .. })
+        ));
+        let changed = runtime.handle.reprepare_config(next).await.unwrap();
+        assert_eq!(changed.session_id.as_deref(), Some(id));
+        assert_eq!(changed.working_dir, other.path());
+        runtime
+            .handle
+            .reload_capabilities_with_plugin_skills(Some(Vec::new()))
+            .await
+            .unwrap();
+        let snapshot = runtime.handle.snapshot().await.unwrap();
+        assert!(snapshot
+            .messages
+            .iter()
+            .any(|m| m.text == "original history"));
+        assert!(!snapshot
+            .messages
+            .iter()
+            .any(|m| m.text == "unrelated history"));
+        assert!(matches!(
+            original.acquire_lease(id),
+            Err(SessionStoreError::SessionInUse { .. })
+        ));
+        assert!(elsewhere.acquire_lease(id).is_ok());
+        runtime
+            .handle
+            .submit(UserInput::from("after bucket change"))
+            .await
+            .unwrap();
+        wait_for_turn_finished(&mut runtime).await;
+        runtime.handle.shutdown().await.unwrap();
+        let persisted = original.load_snapshot(id).unwrap();
+        assert!(persisted
+            .messages
+            .iter()
+            .any(|m| m.text == "after bucket change"));
+        assert_eq!(elsewhere.load_snapshot(id).unwrap(), unrelated);
+        assert!(original.acquire_lease(id).is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[serial_test::serial(atomcode_home)]
+    async fn session_storage_survives_a_changed_project_bucket_marker() {
+        use atomcode_capabilities::session::SessionManager;
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let dirs = crate::config::product_dirs_from_env();
+        let original = SessionManager::for_project(project.path(), &dirs);
+        let id = "changed-marker";
+        persist_native_session(
+            &original,
+            id,
+            project.path(),
+            &SessionSnapshot::new(vec![Message::user("before marker change")]),
+        );
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.prepare.session = crate::SessionMode::Resume(id.into());
+        let next = start.agent.clone();
+        let runtime = CodingRuntime::start(start).await.unwrap();
+        SessionManager::pin_project_bucket(
+            project.path(),
+            &dirs,
+            &SessionManager::project_hash(other.path(), &dirs),
+        );
+        let relocated = SessionManager::for_project(project.path(), &dirs);
+        assert_ne!(original.root(), relocated.root());
+        runtime
+            .handle
+            .reload_capabilities_with_plugin_skills(Some(Vec::new()))
+            .await
+            .unwrap();
+        runtime.handle.reprepare_config(next).await.unwrap();
+        assert!(runtime
+            .handle
+            .snapshot()
+            .await
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| m.text == "before marker change"));
+        assert!(!relocated.root().join(format!("{id}.events")).exists());
+        assert!(matches!(
+            original.acquire_lease(id),
+            Err(SessionStoreError::SessionInUse { .. })
+        ));
+        runtime.handle.shutdown().await.unwrap();
+        assert!(original.acquire_lease(id).is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[serial_test::serial(atomcode_home)]
+    async fn session_storage_rejects_data_directory_change_without_replacing_runtime() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let other_home = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.prepare.session = crate::SessionMode::Fresh;
+        let mut next = start.agent.clone();
+        next.dirs = atomcode_capabilities::ProductDirs::new(other_home.path(), "other-product");
+        let mut runtime = CodingRuntime::start(start).await.unwrap();
+        let before = runtime.handle.status();
+        assert!(matches!(runtime.handle.reprepare_config(next).await,
+            Err(RuntimeError::ReconfigureFailed(message)) if message.contains("restart")));
+        assert_eq!(runtime.handle.status().generation, before.generation);
+        assert_eq!(runtime.handle.status().phase, before.phase);
+        runtime
+            .handle
+            .submit(UserInput::from("still usable after rejected reload"))
+            .await
+            .unwrap();
+        wait_for_turn_finished(&mut runtime).await;
+        assert!(runtime
+            .handle
+            .snapshot()
+            .await
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| m.text == "still usable after rejected reload"));
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[serial_test::serial(atomcode_home)]
+    async fn session_storage_still_rejects_a_transferred_lease_from_another_bucket() {
+        use atomcode_capabilities::session::SessionManager;
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let dirs = crate::config::product_dirs_from_env();
+        let id = "wrong-bucket-transfer";
+        let elsewhere = SessionManager::for_project(other.path(), &dirs);
+        let lease = elsewhere.acquire_lease(id).unwrap();
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.prepare.session = crate::SessionMode::Resume(id.into());
+        let error = match CodingRuntime::start_with_session_lease(
+            start,
+            ProviderBootstrap::Required,
+            lease,
+        )
+        .await
+        {
+            Ok(_) => panic!("a transferred lease must match the requested storage"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("expected"), "{error}");
+        assert!(elsewhere.acquire_lease(id).is_ok());
     }
 
     #[tokio::test]
