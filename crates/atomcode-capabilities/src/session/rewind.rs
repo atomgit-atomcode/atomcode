@@ -265,6 +265,13 @@ pub(crate) struct WorkspaceRestorePlan {
     pub files: Vec<String>,
 }
 
+/// Missing root objects, retaining the original IDs for diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct MissingRewindPoint {
+    pub turn_id: u64,
+    pub objects: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RewindTransactionJournal {
     pub version: u32,
@@ -314,6 +321,37 @@ pub struct WorkspaceCheckpoint {
     git_dir: PathBuf,
     lock: Mutex<()>,
     process_lock: fs::File,
+}
+
+/// Owns a temporary reachability root until the consumer has finished using it.
+/// A crash can leave a conservative pin behind; never guess that another process'
+/// live capture is abandoned. Such pins remain subject to the store size budget.
+pub(super) struct WorkspaceCapturePin {
+    checkpoint: std::sync::Arc<WorkspaceCheckpoint>,
+    reference: String,
+}
+
+impl WorkspaceCapturePin {
+    pub(super) fn capture(&self) -> Result<Option<String>, WorkspaceCheckpointError> {
+        self.checkpoint.capture_bounded_inner(
+            DISK_FLOOR_BYTES,
+            STORE_BUDGET_BYTES,
+            Some(&self.reference),
+        )
+    }
+}
+
+impl Drop for WorkspaceCapturePin {
+    fn drop(&mut self) {
+        let _guard = self.checkpoint.guard();
+        if let Err(error) = self.checkpoint.with_process_lock(|| {
+            self.checkpoint
+                .run_owned(["update-ref".into(), "-d".into(), self.reference.clone()])
+                .map(|_| ())
+        }) {
+            tracing::warn!(%error, "could not release temporary rewind capture reference");
+        }
+    }
 }
 
 impl WorkspaceCheckpoint {
@@ -518,6 +556,22 @@ impl WorkspaceCheckpoint {
         }
     }
 
+    pub(super) fn capture_pin(self: &std::sync::Arc<Self>) -> std::sync::Arc<WorkspaceCapturePin> {
+        static NEXT_PIN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = NEXT_PIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::sync::Arc::new(WorkspaceCapturePin {
+            checkpoint: self.clone(),
+            reference: format!(
+                "refs/atomcode/capture/{}-{at}-{sequence}",
+                std::process::id()
+            ),
+        })
+    }
+
     pub fn capture(&self) -> Result<Option<String>, WorkspaceCheckpointError> {
         self.capture_bounded(DISK_FLOOR_BYTES, STORE_BUDGET_BYTES)
     }
@@ -539,6 +593,15 @@ impl WorkspaceCheckpoint {
         &self,
         floor: u64,
         budget: u64,
+    ) -> Result<Option<String>, WorkspaceCheckpointError> {
+        self.capture_bounded_inner(floor, budget, None)
+    }
+
+    fn capture_bounded_inner(
+        &self,
+        floor: u64,
+        budget: u64,
+        pin: Option<&str>,
     ) -> Result<Option<String>, WorkspaceCheckpointError> {
         // Invariant A: physical disk floor. Unknown free space → skip.
         // This check is read-only and safe to perform outside the lock.
@@ -577,6 +640,9 @@ impl WorkspaceCheckpoint {
                 }
             }
             let tree = self.capture_locked()?;
+            if let Some(reference) = pin {
+                self.run_owned(["update-ref".into(), reference.into(), tree.clone()])?;
+            }
             Ok(Some(tree))
         })?;
         Ok(tree)
@@ -609,7 +675,9 @@ impl WorkspaceCheckpoint {
                     continue;
                 }
                 // Never delete an in-flight recovery ref (see retain_points).
-                if reference.starts_with("refs/atomcode/recovery/") {
+                if reference.starts_with("refs/atomcode/recovery/")
+                    || reference.starts_with("refs/atomcode/capture/")
+                {
                     continue;
                 }
                 transaction.push_str(&format!("delete {reference}\n"));
@@ -684,6 +752,8 @@ impl WorkspaceCheckpoint {
         self.ensure_restore_disk_floor()?;
         let _guard = self.guard();
         self.with_process_lock(|| {
+            self.validate_tree_closure_locked(before)?;
+            self.validate_tree_closure_locked(after)?;
             let recovery_tree = self.capture_locked()?;
             let files = self.changed_files_locked(before, after)?;
             let conflicts = self.conflicts_locked(after, &recovery_tree, &files)?;
@@ -722,6 +792,8 @@ impl WorkspaceCheckpoint {
         self.ensure_restore_disk_floor()?;
         let _guard = self.guard();
         self.with_process_lock(|| {
+            self.validate_tree_closure_locked(before)?;
+            self.validate_tree_closure_locked(after)?;
             let recovery_tree = self.capture_locked()?;
             // Pin the loose recovery tree with a ref so that any gc that runs between
             // now and the transaction's commit/compensate cannot prune the object.
@@ -787,6 +859,8 @@ impl WorkspaceCheckpoint {
         self.ensure_restore_disk_floor()?;
         let _guard = self.guard();
         self.with_process_lock(|| {
+            self.validate_tree_closure_locked(&plan.target_tree)?;
+            self.validate_tree_closure_locked(&plan.recovery_tree)?;
             let current = self.capture_locked()?;
             let conflicts = self.conflicts_locked(&plan.recovery_tree, &current, &plan.files)?;
             if !conflicts.is_empty() {
@@ -820,9 +894,121 @@ impl WorkspaceCheckpoint {
         self.with_process_lock(|| self.restore_files_locked(recovery_tree, files))
     }
 
+    /// Inspect roots without changing references, used when reopening a ledger.
+    pub(super) fn missing_points(
+        &self,
+        points: &[RewindPoint],
+    ) -> Result<Vec<MissingRewindPoint>, WorkspaceCheckpointError> {
+        let _guard = self.guard();
+        self.with_process_lock(|| self.missing_points_locked(points))
+    }
+
+    fn missing_points_locked(
+        &self,
+        points: &[RewindPoint],
+    ) -> Result<Vec<MissingRewindPoint>, WorkspaceCheckpointError> {
+        let mut roots = BTreeSet::new();
+        for point in points {
+            if let (Some(before), Some(after)) = (&point.before_tree, &point.after_tree) {
+                for tree in [before, after] {
+                    validate_object_id(tree)?;
+                    roots.insert(tree.as_str());
+                }
+            }
+        }
+        if roots.is_empty() {
+            return Ok(Vec::new());
+        }
+        let input = roots
+            .iter()
+            .map(|tree| format!("{tree}\n"))
+            .collect::<String>();
+        let output = self.run_with_input(
+            ["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+            input.as_bytes(),
+        )?;
+        // cat-file may report a corrupt loose object as "missing" while still
+        // exiting zero. Its diagnostic is not proof of ordinary object absence.
+        if !output.stderr.is_empty() {
+            return Err(WorkspaceCheckpointError::Git {
+                operation: "inspect rewind roots",
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            });
+        }
+        let output = String::from_utf8_lossy(&output.stdout);
+        let rows = output.lines().collect::<Vec<_>>();
+        if rows.len() != roots.len() {
+            return Err(WorkspaceCheckpointError::Git {
+                operation: "inspect rewind roots",
+                stderr: "unexpected cat-file response count".into(),
+            });
+        }
+        let mut missing = BTreeSet::new();
+        for (tree, row) in roots.iter().zip(rows) {
+            if row == format!("{tree} missing") {
+                missing.insert(*tree);
+            } else if row != format!("{tree} tree") {
+                return Err(WorkspaceCheckpointError::Git {
+                    operation: "inspect rewind roots",
+                    stderr: format!("unexpected cat-file response: {row}"),
+                });
+            }
+        }
+        Ok(points
+            .iter()
+            .filter_map(|point| {
+                let objects = [&point.before_tree, &point.after_tree]
+                    .into_iter()
+                    .filter_map(|tree| tree.as_ref())
+                    .filter(|tree| missing.contains(tree.as_str()))
+                    .cloned()
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                (!objects.is_empty()).then_some(MissingRewindPoint {
+                    turn_id: point.turn_id,
+                    objects,
+                })
+            })
+            .collect())
+    }
+
     pub fn retain_points(&self, points: &[RewindPoint]) -> Result<(), WorkspaceCheckpointError> {
+        self.retain_points_inner(points, false).map(|_| ())
+    }
+
+    /// Pin available roots without letting an absent old root abort the whole batch.
+    /// Existing point records are not rewritten; callers own their availability projection.
+    pub(super) fn retain_points_report(
+        &self,
+        points: &[RewindPoint],
+    ) -> Result<Vec<MissingRewindPoint>, WorkspaceCheckpointError> {
+        self.retain_points_inner(points, true)
+    }
+
+    fn retain_points_inner(
+        &self,
+        points: &[RewindPoint],
+        allow_missing: bool,
+    ) -> Result<Vec<MissingRewindPoint>, WorkspaceCheckpointError> {
         let _guard = self.guard();
         self.with_process_lock(|| {
+            let report = self.missing_points_locked(points)?;
+            // The public all-or-error API stays strict. Only the hook's report
+            // API can quarantine roots, because it also updates availability.
+            if !allow_missing && !report.is_empty() {
+                return Err(WorkspaceCheckpointError::Git {
+                    operation: "retain rewind roots",
+                    stderr: format!(
+                        "workspace snapshot objects are missing for turn {}",
+                        report[0].turn_id
+                    ),
+                });
+            }
+            let missing = report
+                .iter()
+                .flat_map(|point| point.objects.iter())
+                .collect::<BTreeSet<_>>();
             let mut wanted = BTreeSet::new();
             let mut updates = Vec::new();
             for point in points {
@@ -834,10 +1020,14 @@ impl WorkspaceCheckpoint {
                 validate_object_id(after_tree)?;
                 let before_ref = format!("refs/atomcode/turn-{}/before", point.turn_id);
                 let after_ref = format!("refs/atomcode/turn-{}/after", point.turn_id);
-                updates.push(format!("update {before_ref} {before_tree}\n"));
-                updates.push(format!("update {after_ref} {after_tree}\n"));
-                wanted.insert(before_ref);
-                wanted.insert(after_ref);
+                // Keep an available half even when its partner is missing. It may
+                // be shared by another point and remains useful diagnostic evidence.
+                for (reference, tree) in [(before_ref, before_tree), (after_ref, after_tree)] {
+                    if !missing.contains(tree) {
+                        updates.push(format!("update {reference} {tree}\n"));
+                        wanted.insert(reference);
+                    }
+                }
             }
             let existing = self.run(["for-each-ref", "--format=%(refname)", "refs/atomcode/"])?;
             let mut had_deletions = false;
@@ -849,7 +1039,9 @@ impl WorkspaceCheckpoint {
                 // tree written by prepare_restore between journal-save and commit/compensate.
                 // Pruning it would break crash recovery on the dangerous path where
                 // had_deletions is true (restoring an older turn drops later-turn refs).
-                if reference.starts_with("refs/atomcode/recovery/") {
+                if reference.starts_with("refs/atomcode/recovery/")
+                    || reference.starts_with("refs/atomcode/capture/")
+                {
                     continue;
                 }
                 updates.push(format!("delete {reference}\n"));
@@ -866,7 +1058,7 @@ impl WorkspaceCheckpoint {
             if had_deletions {
                 let _ = self.gc_prune_now();
             }
-            Ok(())
+            Ok(report)
         })
     }
 
@@ -1266,12 +1458,68 @@ impl WorkspaceCheckpoint {
         Ok(current.into_iter().collect())
     }
 
+    /// Validate all descendant trees and blob availability before any file write.
+    /// Gitlinks refer to another repository and deliberately are not traversed.
+    /// This checks readability/availability, not a full cryptographic fsck.
+    fn validate_tree_closure_locked(&self, tree: &str) -> Result<(), WorkspaceCheckpointError> {
+        validate_object_id(tree)?;
+        let listing = self.run_owned([
+            "ls-tree".into(),
+            "-r".into(),
+            "-t".into(),
+            "-z".into(),
+            tree.into(),
+        ])?;
+        let mut objects = std::collections::BTreeMap::new();
+        objects.insert(tree.to_string(), "tree".to_string());
+        for entry in listing
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+        {
+            let header = entry
+                .split(|byte| *byte == b'\t')
+                .next()
+                .unwrap_or_default();
+            let header = String::from_utf8_lossy(header);
+            let fields = header.split_whitespace().collect::<Vec<_>>();
+            if fields.len() != 3 || !matches!(fields[1], "tree" | "blob" | "commit") {
+                return Err(WorkspaceCheckpointError::Git {
+                    operation: "validate rewind objects",
+                    stderr: "unexpected tree entry".into(),
+                });
+            }
+            if fields[1] != "commit" {
+                objects.insert(fields[2].to_string(), fields[1].to_string());
+            }
+        }
+        let input = objects
+            .keys()
+            .map(|id| format!("{id}\n"))
+            .collect::<String>();
+        let output = self.run_with_input(
+            ["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+            input.as_bytes(),
+        )?;
+        let expected = objects
+            .iter()
+            .map(|(id, kind)| format!("{id} {kind}\n"))
+            .collect::<String>();
+        if output.stdout != expected.as_bytes() || !output.stderr.is_empty() {
+            return Err(WorkspaceCheckpointError::Git {
+                operation: "validate rewind objects",
+                stderr: format!("snapshot {tree} contains missing or unreadable objects; workspace was not restored"),
+            });
+        }
+        Ok(())
+    }
+
     fn restore_files_locked(
         &self,
         tree: &str,
         files: &[String],
     ) -> Result<(), WorkspaceCheckpointError> {
-        validate_object_id(tree)?;
+        self.validate_tree_closure_locked(tree)?;
         for file in files {
             validate_relative_path(file)?;
             let present = self
@@ -1342,24 +1590,41 @@ impl WorkspaceCheckpoint {
                 path: self.worktree.clone(),
                 source,
             })?;
-        child
-            .stdin
-            .take()
-            .expect("piped git stdin")
-            .write_all(input)
-            .map_err(|source| WorkspaceCheckpointError::Io {
+        let mut stdin = child.stdin.take().expect("piped git stdin");
+        // Batch inspection has output for every input line. Drain stdout/stderr
+        // while feeding stdin, including on Windows' small anonymous pipes.
+        std::thread::scope(|scope| {
+            let writer = match std::thread::Builder::new()
+                .name("rewind-git-input".into())
+                .spawn_scoped(scope, move || stdin.write_all(input))
+            {
+                Ok(writer) => writer,
+                Err(source) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(WorkspaceCheckpointError::Io {
+                        path: self.worktree.clone(),
+                        source,
+                    });
+                }
+            };
+            let output = child.wait_with_output();
+            let written = writer.join().map_err(|_| WorkspaceCheckpointError::Git {
+                operation: "workspace checkpoint git input",
+                stderr: "Git input worker panicked".into(),
+            })?;
+            let output = output.map_err(|source| WorkspaceCheckpointError::Io {
                 path: self.worktree.clone(),
                 source,
             })?;
-        checked(
-            child
-                .wait_with_output()
-                .map_err(|source| WorkspaceCheckpointError::Io {
-                    path: self.worktree.clone(),
-                    source,
-                })?,
-            "workspace checkpoint git command",
-        )
+            // Preserve Git's actual error instead of replacing it with BrokenPipe.
+            let output = checked(output, "workspace checkpoint git command")?;
+            written.map_err(|source| WorkspaceCheckpointError::Io {
+                path: self.worktree.clone(),
+                source,
+            })?;
+            Ok(output)
+        })
     }
 
     fn list_user_files<const N: usize>(
@@ -1549,6 +1814,115 @@ mod tests {
         let checkpoint =
             WorkspaceCheckpoint::with_store(worktree.path(), store.path().join("git")).unwrap();
         (worktree, store, checkpoint)
+    }
+
+    #[test]
+    fn capture_pins_survive_other_handles_retention_and_purge_until_released() {
+        let (worktree, store, checkpoint) = fixture();
+        let checkpoint = std::sync::Arc::new(checkpoint);
+        let pin = checkpoint.capture_pin();
+        fs::write(
+            worktree.path().join("only-in-capture.txt"),
+            "unpinned previously",
+        )
+        .unwrap();
+        let tree = pin.capture().unwrap().unwrap();
+        let other =
+            WorkspaceCheckpoint::with_store(worktree.path(), store.path().join("git")).unwrap();
+        other.retain_points(&[]).unwrap();
+        other.purge().unwrap();
+        other.gc_prune_now().unwrap();
+        other.validate_tree_closure_locked(&tree).unwrap();
+        drop(pin);
+        other.gc_prune_now().unwrap();
+        assert!(other
+            .run([
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/atomcode/capture/"
+            ])
+            .unwrap()
+            .stdout
+            .is_empty());
+        // Git may keep recently packed unreachable objects; releasing the root,
+        // rather than immediate physical deletion, is the ownership contract.
+    }
+
+    #[test]
+    fn released_capture_is_kept_by_its_durable_turn_reference() {
+        let (worktree, _store, checkpoint) = fixture();
+        let checkpoint = std::sync::Arc::new(checkpoint);
+        let pin = checkpoint.capture_pin();
+        fs::write(worktree.path().join("new.txt"), "new object").unwrap();
+        let tree = pin.capture().unwrap().unwrap();
+        let point = RewindPoint {
+            turn_id: 1,
+            prompt_number: 1,
+            prompt_preview: String::new(),
+            before_tree: Some(tree.clone()),
+            after_tree: Some(tree.clone()),
+            files: vec![],
+        };
+        checkpoint.retain_points(&[point]).unwrap();
+        drop(pin);
+        checkpoint.gc_prune_now().unwrap();
+        checkpoint.validate_tree_closure_locked(&tree).unwrap();
+        assert!(checkpoint
+            .run([
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/atomcode/capture/"
+            ])
+            .unwrap()
+            .stdout
+            .is_empty());
+    }
+
+    fn remove_loose_object(checkpoint: &WorkspaceCheckpoint, id: &str) {
+        fs::remove_file(
+            checkpoint
+                .git_dir
+                .join("objects")
+                .join(&id[..2])
+                .join(&id[2..]),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn missing_descendants_refuse_restore_before_changing_any_file() {
+        for missing_tree in [false, true] {
+            let (worktree, _store, checkpoint) = fixture();
+            fs::create_dir(worktree.path().join("nested")).unwrap();
+            fs::write(worktree.path().join("a.txt"), "old first").unwrap();
+            fs::write(worktree.path().join("nested/z.txt"), "old last").unwrap();
+            let before = checkpoint.capture().unwrap().unwrap();
+            let spec = if missing_tree {
+                format!("{before}:nested")
+            } else {
+                format!("{before}:nested/z.txt")
+            };
+            let id = String::from_utf8(checkpoint.run(["rev-parse", &spec]).unwrap().stdout)
+                .unwrap()
+                .trim()
+                .to_string();
+            fs::write(worktree.path().join("a.txt"), "new first").unwrap();
+            fs::write(worktree.path().join("nested/z.txt"), "new last").unwrap();
+            let after = checkpoint.capture().unwrap().unwrap();
+            let plan = checkpoint.prepare_restore(&before, &after).unwrap();
+            remove_loose_object(&checkpoint, &id);
+            assert!(checkpoint.restore(&before, &after).is_err());
+            assert!(checkpoint.prepare_restore(&before, &after).is_err());
+            assert!(checkpoint.apply_prepared_restore(&plan).is_err());
+            assert_eq!(
+                fs::read_to_string(worktree.path().join("a.txt")).unwrap(),
+                "new first"
+            );
+            assert_eq!(
+                fs::read_to_string(worktree.path().join("nested/z.txt")).unwrap(),
+                "new last"
+            );
+        }
     }
 
     #[test]
@@ -1907,6 +2281,129 @@ mod tests {
             "one\n"
         );
         assert!(!worktree.path().join("second.txt").exists());
+    }
+
+    #[test]
+    fn a_missing_old_root_does_not_block_new_points_or_prune_available_roots() {
+        let (worktree, _store, checkpoint) = fixture();
+        fs::write(worktree.path().join("tracked.txt"), "old before\n").unwrap();
+        let old_before = checkpoint.capture().unwrap().unwrap();
+        fs::write(worktree.path().join("tracked.txt"), "old after\n").unwrap();
+        let old_after = checkpoint.capture().unwrap().unwrap();
+        let old = RewindPoint {
+            turn_id: 786,
+            prompt_number: 1,
+            prompt_preview: "old".into(),
+            before_tree: Some(old_before.clone()),
+            after_tree: Some(old_after.clone()),
+            files: Vec::new(),
+        };
+        checkpoint
+            .retain_points(std::slice::from_ref(&old))
+            .unwrap();
+        fs::remove_file(
+            checkpoint
+                .git_dir
+                .join("objects")
+                .join(&old_before[..2])
+                .join(&old_before[2..]),
+        )
+        .unwrap();
+        fs::write(worktree.path().join("tracked.txt"), "new after\n").unwrap();
+        let new_after = checkpoint.capture().unwrap().unwrap();
+        let new = RewindPoint {
+            turn_id: 787,
+            prompt_number: 2,
+            prompt_preview: "new".into(),
+            before_tree: Some(old_after.clone()),
+            after_tree: Some(new_after.clone()),
+            files: Vec::new(),
+        };
+        let points = vec![old, new];
+        assert!(
+            checkpoint.retain_points(&points).is_err(),
+            "the public strict API cannot claim full retention"
+        );
+        let report = checkpoint.retain_points_report(&points).unwrap();
+        assert_eq!(
+            report,
+            vec![MissingRewindPoint {
+                turn_id: 786,
+                objects: vec![old_before.clone()]
+            }]
+        );
+        assert_eq!(
+            points[0].before_tree.as_deref(),
+            Some(old_before.as_str()),
+            "original diagnostic IDs survive"
+        );
+        checkpoint.run(["gc", "--prune=now", "--quiet"]).unwrap();
+        assert!(!checkpoint.diff(&old_after, &new_after).unwrap().is_empty());
+        assert_eq!(checkpoint.missing_points(&points).unwrap(), report);
+        assert_eq!(
+            String::from_utf8_lossy(
+                &checkpoint
+                    .run(["rev-parse", "refs/atomcode/turn-787/after"])
+                    .unwrap()
+                    .stdout
+            )
+            .trim(),
+            new_after
+        );
+    }
+
+    #[test]
+    fn a_full_ledger_is_inspected_in_one_bounded_batch() {
+        let (_worktree, _store, checkpoint) = fixture();
+        let points = (1..=100)
+            .map(|turn| RewindPoint {
+                turn_id: turn,
+                prompt_number: turn as usize,
+                prompt_preview: String::new(),
+                before_tree: Some(format!("{:040x}", turn * 2)),
+                after_tree: Some(format!("{:040x}", turn * 2 + 1)),
+                files: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let missing = checkpoint.missing_points(&points).unwrap();
+        assert_eq!(missing.len(), 100);
+        assert!(missing.iter().all(|point| point.objects.len() == 2));
+        assert_eq!(missing[0].turn_id, 1);
+        assert_eq!(missing[99].turn_id, 100);
+    }
+
+    #[test]
+    fn corrupt_objects_are_errors_not_silently_quarantined_as_missing() {
+        let (worktree, _store, checkpoint) = fixture();
+        fs::write(worktree.path().join("tracked.txt"), "unique corrupt root\n").unwrap();
+        let tree = checkpoint.capture().unwrap().unwrap();
+        let point = RewindPoint {
+            turn_id: 1,
+            prompt_number: 1,
+            prompt_preview: "old".into(),
+            before_tree: Some(tree.clone()),
+            after_tree: Some(tree.clone()),
+            files: Vec::new(),
+        };
+        checkpoint
+            .retain_points(std::slice::from_ref(&point))
+            .unwrap();
+        let object_path = checkpoint
+            .git_dir
+            .join("objects")
+            .join(&tree[..2])
+            .join(&tree[2..]);
+        // Git loose objects are read-only; replace only this temporary fixture object.
+        fs::remove_file(&object_path).unwrap();
+        fs::write(&object_path, b"not a Git object").unwrap();
+        assert!(checkpoint.retain_points_report(&[point]).is_err());
+        assert!(
+            checkpoint
+                .git_dir
+                .join("refs/atomcode/turn-1/before")
+                .exists(),
+            "failed inspection cannot delete refs"
+        );
     }
 
     #[test]
