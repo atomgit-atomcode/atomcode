@@ -148,6 +148,20 @@
         </tbody>
       </table>
 
+      <h2 id="team-panel">Team panel</h2>
+      <table>
+        <thead>
+          <tr><th>Command</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/team</code> · <code>/team toggle</code></td><td>Expand / collapse the team panel (toggle). Collapsed, it keeps only its header row — member rows are not drawn and the keyboard no longer lands on them</td></tr>
+          <tr><td><code>/team show</code> · <code>/team open</code></td><td>Expand the team panel. With no members and no background tasks it answers "No team members or background tasks; there is no team panel to show."</td></tr>
+          <tr><td><code>/team hide</code> · <code>/team fold</code> · <code>/team close</code></td><td>Collapse the team panel (members keep running in the background; none is cancelled), answering "Team panel collapsed."</td></tr>
+          <tr><td>Anything else</td><td>Refused with the usage line — those three states are all <code>/team</code> takes (<code>status</code>, <code>clear</code> and the like are not among them)</td></tr>
+        </tbody>
+      </table>
+      <p>All three subcommands only change what is drawn: the acknowledgement appears as a notice for about five seconds, does not enter the conversation, and does not call the model; none of them starts, cancels or waits for a member. The panel's header gives the member and background-task counts, and each member row says what it was asked to do, how long it has run and how much context it holds; members come from the agent delegating through the <code>team</code> tool (several in parallel, each with a role and scope). See also <a href="./subagents.html">Subagents</a> (short-lived subtasks via the <code>task</code> tool).</p>
+
       <h2 id="persistent-memory">Persistent memory</h2>
       <table>
         <thead>

@@ -148,6 +148,20 @@
         </tbody>
       </table>
 
+      <h2 id="团队面板">团队面板</h2>
+      <table>
+        <thead>
+          <tr><th>命令</th><th>作用</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/team</code> · <code>/team toggle</code></td><td>展开 / 收起团队面板(切换)。收起后只留一行表头,成员行不再绘制,键盘焦点也不再落到它们上面</td></tr>
+          <tr><td><code>/team show</code> · <code>/team open</code></td><td>展开团队面板。没有成员也没有后台任务时回执「当前没有团队成员或后台任务,暂无可展示的团队面板。」</td></tr>
+          <tr><td><code>/team hide</code> · <code>/team fold</code> · <code>/team close</code></td><td>收起团队面板(成员照常在后台继续,不取消任何成员),回执「团队面板已收起。」</td></tr>
+          <tr><td>其它参数</td><td>拒绝并回显用法 —— <code>/team</code> 只认这三态(<code>status</code>、<code>clear</code> 等不在其中)</td></tr>
+        </tbody>
+      </table>
+      <p>三个子命令都只改显示:回执以提示行出现、约 5 秒后消失,不写进会话记录,也不调用模型;它们不会启动、取消或等待成员。面板表头给出成员数与后台任务数,成员行标注它被要求做什么、已运行多久与上下文占用;成员由 agent 通过 <code>team</code> 工具委派产生(多成员并行、各带角色与 scope)。另见 <a href="./subagents.html">子代理</a>(<code>task</code> 工具的短生命周期子任务)。</p>
+
       <h2 id="永久记忆">永久记忆</h2>
       <table>
         <thead>
