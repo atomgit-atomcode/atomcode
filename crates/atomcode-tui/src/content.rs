@@ -1067,6 +1067,19 @@ pub struct ToolCallBlock {
 }
 
 impl ToolCallBlock {
+    /// Only the exact no-output/running result emitted by bash_poll is noise.
+    /// New output, terminal states, errors and pending calls remain independent.
+    pub(crate) fn idle_poll_job(&self) -> Option<String> {
+        if self.name != "bash_poll"
+            || !matches!(&self.outcome, Outcome::Ok(text) if text == "status: running")
+        {
+            return None;
+        }
+        let args: serde_json::Value = serde_json::from_str(&self.args).ok()?;
+        let job = args.get("job_id")?.as_str()?;
+        (!job.is_empty()).then(|| job.to_owned())
+    }
+
     /// Only the editor's explicit no-match result is recoverable here. Permission,
     /// encoding, IO and ambiguous-match failures retain their ordinary display.
     pub(crate) fn edit_text_mismatch(&self) -> bool {
@@ -1479,6 +1492,17 @@ impl ToolCallBlock {
         live: bool,
         w: u16,
     ) -> Vec<Line> {
+        if let Some(job) = last.idle_poll_job() {
+            let caps = Caps::default();
+            return vec![Line::from_spans(vec![
+                Span::styled(format!("{} ", caps.g(Glyph::ToolMark)), fold()),
+                Span::styled(
+                    t(Msg::BackgroundPolls { job: &job, count }).into_owned(),
+                    muted(),
+                ),
+            ])
+            .truncate(w as usize)];
+        }
         if live {
             let caps = Caps::default();
             let lead = format!("{}{} ", " ".repeat(GUTTER), caps.g(Glyph::Gutter));
@@ -3302,6 +3326,7 @@ fn turn_end_note(stop: StopReason, done_index: usize, open_items: usize) -> (Gly
         Timeout => (Glyph::Fail, t(Msg::StopTimeout).into_owned(), bad()),
         // A failure, with the provider's own sentence folded in below.
         ProviderError => (Glyph::Fail, t(Msg::StopCancelled).into_owned(), bad()),
+        InternalError => (Glyph::Fail, t(Msg::StopInternalError).into_owned(), bad()),
         // Not a failed request: the log cannot explain what reached the model,
         // and from here resume, fork and compaction are unsound. A person is
         // owed that in words rather than sharing a sentence with a dead
@@ -4544,6 +4569,8 @@ mod tests {
             "three reasons, three sentences: {said:?}"
         );
 
+        let internal = drawn(StopReason::InternalError);
+        assert!(internal.contains("内部错误"), "{internal}");
         let unsound = drawn(StopReason::InvariantViolated);
         assert!(
             unsound.contains("不宜再续"),

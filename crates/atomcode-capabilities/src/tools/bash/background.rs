@@ -472,7 +472,9 @@ impl Tool for BashPollTool {
     fn description(&self) -> &str {
         "Read output produced by a background `bash_start` job since your last poll, plus \
          whether it is still running or has exited. Poll repeatedly until it reports it exited. \
-         Read-only."
+         When a poll has no new output and still reports running, avoid repeated waiting \
+         narration or a new status update for each check. Report meaningful new output, \
+         completion, failure, or a changed plan instead. Read-only."
     }
     fn parameters_schema(&self) -> Value {
         json!({

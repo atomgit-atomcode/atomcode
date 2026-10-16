@@ -29,6 +29,7 @@ pub mod agent;
 pub mod bundle;
 pub mod commands;
 pub mod control;
+pub mod diagnostics;
 pub mod events;
 pub mod exec;
 pub mod feed;

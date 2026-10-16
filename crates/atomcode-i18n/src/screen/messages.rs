@@ -1475,6 +1475,7 @@ pub enum Msg<'a> {
     /// Said once, after a turn whose reasoning is off the screen: the key that
     /// brings it back, since nothing on screen says there is any.
     ReasoningHiddenHint,
+    ReasoningNotReceived,
     NoProviderPanel,
     NoPluginPanel,
     NoToolPanel,
@@ -1601,6 +1602,7 @@ pub enum Msg<'a> {
     StopRateLimited,
     StopTimeout,
     StopInvariantViolated,
+    StopInternalError,
     StopMaxContinuations,
     /// A turn the model ended on its own while the task list it kept still had
     /// open items: not a failure, and not a finish either.
@@ -2139,6 +2141,15 @@ pub enum Msg<'a> {
     },
     /// Copy cannot be confirmed: OSC 52 has no acknowledgement.
     CopyHandedOver,
+    CopyRemoteHandedOver,
+    CopySendFailed,
+    BackgroundPolls {
+        job: &'a str,
+        count: usize,
+    },
+    CopyTooLarge,
+    ClipboardRemoteText,
+    ClipboardRemoteImage,
     /// Local Linux clipboard backends failed, with an actionable fallback.
     CopyLocalUnavailable,
     /// A background copy could not be queued.

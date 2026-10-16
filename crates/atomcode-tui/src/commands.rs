@@ -1423,7 +1423,7 @@ impl CommandSet for SessionCommands {
                 };
                 // The levels THIS model takes, when it says: the same answer the
                 // `/model` picker offers (`ModelRow::effort_pick`). A model that
-                // declares nothing is not restricted — there is nothing to go by.
+                // declares nothing offers no switchable levels.
                 // Offering every level regardless sent a `max` to a model that only
                 // takes `low`/`medium`, and the endpoint refused the turn.
                 let supported: Option<Vec<String>> = ctx
@@ -1439,9 +1439,20 @@ impl CommandSet for SessionCommands {
                         port.rows()
                             .with_current(live.as_deref())
                             .live_row()
-                            .and_then(crate::providers::ModelRow::effort_pick)
+                            .map(|row| row.effort_pick().unwrap_or_default())
                     })
                     .map(|levels| levels.into_iter().filter(|l| l != "default").collect());
+                // Embedders without a providers catalog may declare levels through
+                // the live description; never fall back to the full vocabulary.
+                let supported = supported.or_else(|| {
+                    if ctx.service::<crate::plugin::ProvidersSvc>().is_some() {
+                        None
+                    } else {
+                        client
+                            .described()
+                            .map(|description| description.effort_levels)
+                    }
+                });
                 let all: Vec<&str> = atomcode_harness::REASONING_EFFORT_LEVELS.to_vec();
                 let levels: Vec<&str> = match &supported {
                     Some(only) => all
@@ -1449,7 +1460,7 @@ impl CommandSet for SessionCommands {
                         .copied()
                         .filter(|level| only.iter().any(|o| o == level))
                         .collect(),
-                    None => all.clone(),
+                    None => Vec::new(),
                 };
                 // With nothing after it, the command reports rather than opens a
                 // modal: the levels are offered inline in the slash menu (one row
@@ -4170,7 +4181,7 @@ mod tests {
     /// 今天这个样子。
     #[tokio::test]
     async fn reasoning_save_failures_are_visible_for_effort_and_thinking() {
-        for command in ["/effort high", "/think on"] {
+        for command in ["/effort default", "/think on"] {
             let host = Arc::new(Recording::default());
             let (app, _client, all) = following(&host);
             host.replies
@@ -4209,7 +4220,7 @@ mod tests {
     /// 没声明的,一句「模型 → X」就够,不多问。
     /// `/effort` offers and takes only the levels the model on screen takes —
     /// the ones `/model` offers for it — and says which when asked for another;
-    /// `auto` is `default`. A model that declares nothing is not restricted.
+    /// `auto` is `default`. Undeclared levels are not offered.
     #[tokio::test]
     async fn effort_keeps_to_the_levels_the_model_takes() {
         struct Rows;
@@ -4305,13 +4316,13 @@ mod tests {
         );
 
         let (host, app, all) = on("plain");
-        let _ = all.dispatch("/effort max", &app.context()).await;
+        assert!(matches!(
+            all.dispatch("/effort max", &app.context()).await,
+            Outcome::Refused(_)
+        ));
         assert!(
-            matches!(
-                host.asked.lock().unwrap().last(),
-                Some(HostCommand::SetReasoningEffort { level: Some(_), .. })
-            ),
-            "a model that declares nothing is not restricted"
+            host.asked.lock().unwrap().is_empty(),
+            "undeclared levels never reach the endpoint"
         );
     }
 
@@ -4338,7 +4349,8 @@ mod tests {
                     vec![
                         row("glm", vec!["low".into(), "high".into()], None),
                         row("plain", Vec::new(), None),
-                        // 声明了吃思考强度、却没截短档位的:全量档位都递上来。
+                        row("auto-only", Vec::new(), Some("auto".into())),
+                        // A fixed value does not declare any other supported levels.
                         row("reasons", Vec::new(), Some("high".into())),
                         // id 自己带空格:尾巴不是一档时不许拆。
                         row("my model", vec!["low".into()], None),
@@ -4401,17 +4413,24 @@ mod tests {
             other => panic!("{other:?}"),
         }
 
-        // 吃思考强度、没截短档位的:全量档位一档一行,default 收尾。
+        match all.dispatch("/model auto-only", &app.context()).await {
+            Outcome::Said(said) => assert!(said.contains("auto-only"), "{said}"),
+            other => panic!("auto must not open a level picker: {other:?}"),
+        }
+        let before = host.asked.lock().unwrap().len();
+        assert!(matches!(
+            all.dispatch("/effort high", &app.context()).await,
+            Outcome::Refused(_)
+        ));
+        assert_eq!(
+            host.asked.lock().unwrap().len(),
+            before,
+            "an undeclared level must not reach host control"
+        );
+
+        // A fixed configured value is kept without inventing a full level catalog.
         match all.dispatch("/model reasons", &app.context()).await {
-            Outcome::Do(Action::PickEffort { model, levels, .. }) => {
-                assert_eq!(model, "reasons");
-                let mut want: Vec<String> = atomcode_harness::REASONING_EFFORT_LEVELS
-                    .iter()
-                    .map(|level| level.to_string())
-                    .collect();
-                want.push("default".into());
-                assert_eq!(levels, want);
-            }
+            Outcome::Said(said) => assert!(said.contains("reasons"), "{said}"),
             other => panic!("{other:?}"),
         }
 

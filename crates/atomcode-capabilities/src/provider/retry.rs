@@ -46,6 +46,17 @@ where
     next
 }
 
+/// Preserve a typed idle failure for the owner's progress-aware recovery.
+/// The adapter must not replay a request after deltas reached its consumer.
+pub(crate) fn stream_idle_error() -> atomcode_kernel::stream::ProviderError {
+    atomcode_kernel::stream::ProviderError {
+        code: Some(atomcode_kernel::stream::STREAM_IDLE_TIMEOUT_CODE.into()),
+        message: "stream idle timeout".into(),
+        retryable: false,
+        ..Default::default()
+    }
+}
+
 /// Whether replaying the whole provider request could duplicate user-visible output
 /// or a tool side effect. Observational metadata is deliberately replay-safe.
 pub(crate) fn is_replay_sensitive_event(event: &StreamEvent) -> bool {
@@ -514,6 +525,18 @@ fn random_jitter_fraction() -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_failure_is_typed_for_continuation_not_blind_replay() {
+        let error = stream_idle_error();
+        assert_eq!(
+            error.code.as_deref(),
+            Some(atomcode_kernel::stream::STREAM_IDLE_TIMEOUT_CODE)
+        );
+        assert!(!error.retryable);
+        assert_eq!(error.http_status, None);
+    }
+
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
 
     #[test]

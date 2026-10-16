@@ -31647,30 +31647,17 @@ fn persist_reasoning_effort(ctx: &mut LoopCtx) {
 }
 
 pub(crate) fn reasoning_effort_applicable_on_provider(ctx: &LoopCtx) -> bool {
-    let selection = ctx.config.effective_model_selection().unwrap_or_default();
-    let Some(provider) = ctx.config.provider_config_for_selection(&selection) else {
-        return false;
-    };
-    // Drive the control from the endpoint's CONFIG (an explicit effort, or a non-empty
-    // server-advertised `reasoning_effort_levels`) — never a hardcoded model name. Single
-    // source of truth shared with the webui selector and the wire capability.
-    atomcode_config::config::endpoint_supports_reasoning_effort(
-        provider.reasoning_effort.as_deref(),
-        provider.reasoning_effort_levels.as_deref(),
-    )
+    !selection_allowed_efforts(ctx).is_empty()
 }
 
-/// The reasoning-effort levels the current selection exposes (canonical order),
-/// from its `reasoning_effort_levels` declaration. `None`/empty ⇒ all levels. The
-/// single source of truth the Ctrl+T cycle and `/effort` both consult so neither
-/// offers a level the endpoint rejects.
+/// Only explicitly declared levels may be offered by the control.
 pub(crate) fn selection_allowed_efforts(ctx: &LoopCtx) -> Vec<&'static str> {
     let selection = ctx.config.effective_model_selection().unwrap_or_default();
     let levels = ctx
         .config
         .provider_config_for_selection(&selection)
         .and_then(|p| p.reasoning_effort_levels);
-    atomcode_config::config::allowed_effort_levels(levels.as_deref())
+    atomcode_config::config::declared_effort_levels(levels.as_deref())
 }
 
 /// Install a [`crate::modals::password::PasswordModal`] as the active modal on

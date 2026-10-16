@@ -7483,7 +7483,10 @@ impl Tui {
                     {
                         return self.paste_clipboard_text(client);
                     }
-                    self.say_refused(&t(no_clipboard_picture(Msg::ClipboardHasNoImage)));
+                    self.say_refused(&t(no_clipboard_picture(
+                        Msg::ClipboardHasNoImage,
+                        self.surface.remote_clipboard(),
+                    )));
                     return false;
                 };
                 // Refused only when there is no model at all; a text-only model
@@ -7510,7 +7513,11 @@ impl Tui {
                 drop(m);
                 let found = match from.as_deref() {
                     None => crate::attach::from_clipboard(self.surface.as_ref()).ok_or_else(|| {
-                        t(no_clipboard_picture(Msg::ClipboardHasNothing)).into_owned()
+                        t(no_clipboard_picture(
+                            Msg::ClipboardHasNothing,
+                            self.surface.remote_clipboard(),
+                        ))
+                        .into_owned()
                     }),
                     // Already placed by the command: `client.root()` here is
                     // the session id, not a directory to resolve against.
@@ -8215,6 +8222,14 @@ impl Tui {
                 self.surface.forget();
                 return false;
             }
+            Action::ToggleFold("reasoning") => {
+                drop(m);
+                if self.host.toggle_reasoning() {
+                    self.host
+                        .say_for(t(Msg::ReasoningNotReceived).into_owned(), false, 5_000);
+                }
+                return false;
+            }
             Action::ToggleFold(kind) => {
                 drop(m);
                 self.host
@@ -8851,8 +8866,15 @@ impl Tui {
         let Some(text) = self.surface.clipboard_text().filter(|t| !t.is_empty()) else {
             // A refusal of the gesture, so it belongs on the tip row with the
             // rest of them rather than in the conversation.
-            self.host
-                .say(t(Msg::ClipboardHasNoTextShort).into_owned(), true);
+            self.host.say(
+                t(if self.surface.remote_clipboard() {
+                    Msg::ClipboardRemoteText
+                } else {
+                    Msg::ClipboardHasNoTextShort
+                })
+                .into_owned(),
+                true,
+            );
             return false;
         };
         self.act(Action::Paste(text), client)
@@ -9178,8 +9200,10 @@ impl McpPhase for Phases {
 /// clipboard this process can read at all — so "the clipboard is empty" would
 /// send the person off to copy the picture again; say what works instead
 /// (`/paste <path>`). Elsewhere, `otherwise`.
-fn no_clipboard_picture(otherwise: Msg<'static>) -> Msg<'static> {
-    if cfg!(target_env = "ohos") {
+fn no_clipboard_picture(otherwise: Msg<'static>, remote: bool) -> Msg<'static> {
+    if remote {
+        Msg::ClipboardRemoteImage
+    } else if cfg!(target_env = "ohos") {
         Msg::ClipboardImageUnsupportedHere
     } else {
         otherwise

@@ -360,6 +360,7 @@ impl Plugin for KernelHooksPlugin {
         let bridge = Arc::new(Bridge {
             ctx: ctx.clone(),
             hook,
+            hook_name: row.hook,
             host: self.0.clone(),
             session_started: AtomicBool::new(false),
             turn_started: Mutex::new(None),
@@ -374,6 +375,7 @@ impl Plugin for KernelHooksPlugin {
 struct Bridge {
     ctx: Context,
     hook: Arc<dyn LifecycleHooks>,
+    hook_name: String,
     /// The table the hook came from, which keeps the request's log view.
     host: Arc<HostHooks>,
     session_started: AtomicBool,
@@ -431,6 +433,7 @@ impl Bridge {
 
 #[async_trait]
 impl Waterfall<PreStep> for Bridge {
+    #[tracing::instrument(name = "lifecycle_hook", level = "debug", skip_all, fields(hook = %self.hook_name))]
     async fn handle(&self, decision: &mut StepDecision, next: Next<'_, PreStep>) -> StepDecision {
         let Some(agent) = self.root_agent() else {
             return next.run(decision).await;
@@ -438,9 +441,13 @@ impl Waterfall<PreStep> for Bridge {
         if !self.session_started.swap(true, Ordering::SeqCst) {
             let mut convo = self.conversation(&agent);
             let before = convo.messages.len();
+            let mut timing =
+                atomcode_harness::diagnostics::PhaseTiming::start("native_session_start");
             self.hook
                 .session_start(&mut convo, agent.seed_len() > 0)
                 .await;
+            timing.returned();
+            drop(timing);
             for message in convo.messages.drain(before..) {
                 decision
                     .injections
@@ -449,7 +456,12 @@ impl Waterfall<PreStep> for Bridge {
         }
         if decision.step == 1 {
             if let Some(text) = &mut decision.message {
-                if let Err(reason) = self.hook.user_prompt_submit(text).await {
+                let mut timing =
+                    atomcode_harness::diagnostics::PhaseTiming::start("native_user_prompt_submit");
+                let submitted = self.hook.user_prompt_submit(text).await;
+                timing.returned();
+                drop(timing);
+                if let Err(reason) = submitted {
                     decision.rejected = Some(reason);
                     return decision.clone();
                 }
@@ -497,6 +509,7 @@ fn with_logged_meta(messages: &[Message], logged: &[Message]) -> Vec<Message> {
 
 #[async_trait]
 impl Waterfall<AgentRequest> for Bridge {
+    #[tracing::instrument(name = "lifecycle_hook", level = "debug", skip_all, fields(hook = %self.hook_name))]
     async fn handle(
         &self,
         req: &mut ModelRequest,
@@ -513,7 +526,10 @@ impl Waterfall<AgentRequest> for Bridge {
         };
         if first {
             let mut convo = self.conversation(&agent);
+            let mut timing = atomcode_harness::diagnostics::PhaseTiming::start("hook_turn_start");
             self.hook.turn_start(&mut convo).await;
+            timing.returned();
+            drop(timing);
             // Which checkpoint this turn started from, in the log beside it:
             // what a rewind of the workspace to before it restores.
             if let Some(id) = self.hook.checkpoint_taken() {
@@ -534,16 +550,26 @@ impl Waterfall<AgentRequest> for Bridge {
         let mut proposed = with_logged_meta(&req.messages, &logged);
         let handed = proposed.clone();
         let before = proposed.len();
+        let mut timing = atomcode_harness::diagnostics::PhaseTiming::start("hook_pre_request");
         self.hook.pre_request(&mut proposed, &ctx).await;
+        timing.returned();
+        drop(timing);
         if proposed.len() > before && proposed[..before] == handed[..] {
             req.messages.extend(proposed.drain(before..));
         }
+        let mut timing =
+            atomcode_harness::diagnostics::PhaseTiming::start("hook_pre_request_options");
         self.hook
             .pre_request_options(&req.messages, &mut req.options, &ctx)
             .await;
+        timing.returned();
+        drop(timing);
+        let mut timing = atomcode_harness::diagnostics::PhaseTiming::start("hook_on_request");
         self.hook
             .on_request(&req.messages, &req.tools, &req.options, &ctx)
             .await;
+        timing.returned();
+        drop(timing);
 
         // The span a `MessageMeta` calls `elapsed_ms`: the request, from handing
         // it on to getting an answer back. The same one `agent_loop`'s
@@ -585,6 +611,9 @@ impl Waterfall<AgentRequest> for Bridge {
                     ..MessageMeta::default()
                 });
                 self.hook.on_model_response(&mut message).await;
+                if let Some(id) = self.hook.checkpoint_taken() {
+                    commit_checkpoint_once(agent.ctx(), &agent.session(), req.turn, id);
+                }
 
                 if response.tool_calls.is_empty() && !response.truncated {
                     let mut messages = req.messages.clone();
@@ -1908,10 +1937,17 @@ impl Plugin for NativeCompactionCheckpointPlugin {
         &["agents", "system-prompt"]
     }
     fn description(&self) -> &'static str {
-        "write a committed compaction to the coding runtime's native session store"
+        "keep native session checkpoints and wait for workspace capture before local tools"
     }
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
         let hook = self.0.clone();
+        let barrier = Arc::new(WorkspaceCaptureBarrier {
+            ctx: ctx.clone(),
+            hook: hook.clone(),
+        });
+        let _ =
+            ctx.on_waterfall::<atomcode_harness::events::ToolsExecuteBatch>(barrier.clone(), true);
+        let _ = ctx.on_parallel::<TurnFinishing>(barrier);
         let listener_ctx = ctx.clone();
         let _ = ctx.on_emit::<atomcode_harness::events::SessionEventCommitted>(
             move |committed: &atomcode_harness::session::Committed| {
@@ -1942,6 +1978,61 @@ impl Plugin for NativeCompactionCheckpointPlugin {
             },
         );
         Ok(())
+    }
+}
+
+/// Append the completed baseline once, whether tools or turn completion joined it.
+fn commit_checkpoint_once(ctx: &Context, log: &SessionLog, turn: u64, id: String) {
+    if log.events().iter().any(|item| matches!(&item.event, SessionEvent::Checkpointed { turn: existing, id: existing_id } if *existing == turn && existing_id == &id)) {
+        return;
+    }
+    atomcode_harness::session::commit(ctx, log, SessionEvent::Checkpointed { turn, id });
+}
+
+struct WorkspaceCaptureBarrier {
+    ctx: Context,
+    hook: Arc<atomcode_capabilities::session::SnapshotHook>,
+}
+
+impl WorkspaceCaptureBarrier {
+    async fn join(&self, turn: u64) {
+        if let Some(id) = self.hook.wait_for_checkpoint().await {
+            let scoped = atomcode_harness::agent::scoped(&self.ctx);
+            if let Some(agent) = scoped
+                .service::<SessionSvc>()
+                .and_then(|log| self.ctx.service::<AgentsSvc>()?.by_session(log.id()))
+            {
+                if agent.parent().is_none() {
+                    commit_checkpoint_once(agent.ctx(), &agent.session(), turn, id);
+                }
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl Waterfall<atomcode_harness::events::ToolsExecuteBatch> for WorkspaceCaptureBarrier {
+    async fn handle(
+        &self,
+        batch: &mut atomcode_harness::events::ToolBatch,
+        next: Next<'_, atomcode_harness::events::ToolsExecuteBatch>,
+    ) -> Vec<atomcode_kernel::tool::ToolResult> {
+        self.join(batch.turn).await;
+        next.run(batch).await
+    }
+}
+
+#[async_trait]
+impl Listener<TurnFinishing> for WorkspaceCaptureBarrier {
+    async fn call(&self, outcome: &TurnOutcome) -> Option<()> {
+        let scoped = atomcode_harness::agent::scoped(&self.ctx);
+        let agent = scoped
+            .service::<SessionSvc>()
+            .and_then(|log| self.ctx.service::<AgentsSvc>()?.by_session(log.id()))?;
+        if agent.parent().is_none() && outcome.steps > 0 {
+            self.join(outcome.turn).await;
+        }
+        None
     }
 }
 

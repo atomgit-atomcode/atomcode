@@ -1727,6 +1727,7 @@ pub async fn mount_hosted(
     host: HostState,
     extra_layers: &[Layer],
 ) -> Result<(AgentHandle, App, Arc<ProviderSlots>), String> {
+    let compose_started = std::time::Instant::now();
     let (registry, tree, providers) = compose_hosted(
         working_dir,
         dirs,
@@ -1736,8 +1737,16 @@ pub async fn mount_hosted(
         host,
         extra_layers,
     )?;
+    crate::runtime::record_startup_phase("compose", compose_started.elapsed(), None);
     let mut app = App::new(registry, tree);
-    app.start().await.map_err(|e| e.to_string())?;
+    let mount_started = std::time::Instant::now();
+    let mounted = app.start().await;
+    crate::runtime::record_startup_phase(
+        "app_start",
+        mount_started.elapsed(),
+        Some(mounted.is_ok()),
+    );
+    mounted.map_err(|e| e.to_string())?;
     let handle = app
         .context()
         .service::<atomcode_harness::seams::AgentHandleSvc>()
@@ -2640,9 +2649,13 @@ impl atomcode_plexus::Waterfall<atomcode_harness::events::AgentRequest> for Data
             request_id: req.round as u64,
             ..Default::default()
         };
+        let mut timing =
+            atomcode_harness::diagnostics::PhaseTiming::start("datalog_record_request");
         self.sink
             .record_request(&req.messages, &req.tools, &req.options, &ctx)
             .await;
+        timing.returned();
+        drop(timing);
         let answered = next.run(req).await;
         match &answered {
             Ok(response) => {
@@ -2848,7 +2861,11 @@ impl atomcode_plexus::Waterfall<atomcode_harness::events::PreStep> for CcHooks {
         use atomcode_kernel::hook::LifecycleHooks;
         if !self.started.swap(true, std::sync::atomic::Ordering::SeqCst) {
             let mut convo = atomcode_kernel::message::Conversation::new();
+            let mut timing =
+                atomcode_harness::diagnostics::PhaseTiming::start("hook_session_start");
             self.engine.session_start(&mut convo, false).await;
+            timing.returned();
+            drop(timing);
             for message in convo.messages {
                 decision.injections.push((
                     message.text,
@@ -2857,7 +2874,12 @@ impl atomcode_plexus::Waterfall<atomcode_harness::events::PreStep> for CcHooks {
             }
         }
         if let Some(text) = &mut decision.message {
-            if let Err(reason) = self.engine.user_prompt_submit(text).await {
+            let mut timing =
+                atomcode_harness::diagnostics::PhaseTiming::start("hook_user_prompt_submit");
+            let submitted = self.engine.user_prompt_submit(text).await;
+            timing.returned();
+            drop(timing);
+            if let Err(reason) = submitted {
                 // The person's hook said no. `rejected` ends the turn without a
                 // step, which is what "block this prompt" means here.
                 decision.rejected = Some(reason);
@@ -3009,12 +3031,10 @@ pub(crate) fn mount_cc_hooks(
     let _ = ctx.on_emit::<atomcode_harness::events::TurnEnd>(
         move |outcome: &atomcode_harness::seams::TurnOutcome| {
             use atomcode_harness::seams::StopReason as Harness;
-            // The one branch CC actually reads off this value is Stop vs
-            // StopFailure, and `stop_is_failure` keys on a provider/stream
-            // failure — so that is the distinction worth carrying across two
-            // enums neither crate owns.
+            // CC observes Stop versus StopFailure. Preserve provider and task
+            // failures instead of reducing them to a successful completion.
             let reason = match outcome.stop {
-                Harness::ProviderError => atomcode_kernel::event::StopReason::ProviderError,
+                Harness::ProviderError | Harness::InternalError => outcome.stop,
                 _ => atomcode_kernel::event::StopReason::Stopped,
             };
             let engine = ended.engine.clone();

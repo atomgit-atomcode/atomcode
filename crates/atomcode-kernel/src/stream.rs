@@ -42,6 +42,11 @@ pub const OPEN_TIMEOUT_CODE: &str = "open_timeout";
 /// code never authorizes replaying a request or executing incomplete calls.
 pub const STREAM_TRANSPORT_INTERRUPTED_CODE: &str = "stream_transport_interrupted";
 
+/// No new stream data arrived within the configured idle deadline. Like a
+/// transport interruption, this may authorize bounded continuation from saved
+/// progress, never blind replay of partial output or incomplete tool calls.
+pub const STREAM_IDLE_TIMEOUT_CODE: &str = "stream_idle_timeout";
+
 /// A streaming failure surfaced by the provider. `retryable=true` =
 /// 429/5xx/timeout (the loop MAY retry later); `false` = terminal
 /// (auth/400/bad-request). A partial request is never replayed; the kernel may

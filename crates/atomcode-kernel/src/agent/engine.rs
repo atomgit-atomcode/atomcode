@@ -914,9 +914,9 @@ pub struct Outcome {
     pub stop: StopReason,
     /// The last error surfaced during the run, if any (None on a clean stop).
     pub error: Option<String>,
-    /// STRUCTURED error code for the last error: HTTP status + provider code (both
-    /// `None` for kernel-internal errors / a clean stop). Lets a batch consumer branch
-    /// on the code instead of string-matching `error`.
+    /// Structured cause: HTTP status and provider code, or a stable internal
+    /// failure code. Both are `None` on a clean stop, so batch consumers need
+    /// not classify errors by matching their human-readable messages.
     pub http_status: Option<u16>,
     pub error_code: Option<String>,
     /// Provider-classified retryability for the last error. Kept separate
@@ -926,6 +926,32 @@ pub struct Outcome {
     /// preserve it so their parent tool can lift the same structured recovery
     /// contract instead of reducing it to an ordinary string failure.
     pub policy_intervention: Option<PolicyIntervention>,
+}
+
+/// Channel closure is not a completion contract. Keep partial work, but never
+/// let a missing terminal or a failed task inherit Outcome's successful default.
+fn finish_one_shot(
+    mut outcome: Outcome,
+    terminal: bool,
+    joined: Result<(), tokio::task::JoinError>,
+) -> Outcome {
+    let failure = match joined {
+        Err(error) if error.is_panic() => Some(format!("agent task panicked: {error}")),
+        Err(error) => Some(format!("agent task cancelled or aborted: {error}")),
+        Ok(()) if !terminal => Some("agent task ended without a TurnComplete event".into()),
+        Ok(()) => None,
+    };
+    if let Some(failure) = failure {
+        outcome.stop = StopReason::InternalError;
+        outcome.error = Some(match outcome.error.take() {
+            Some(previous) => format!("{failure}; previous error: {previous}"),
+            None => failure,
+        });
+        outcome.http_status = None;
+        outcome.error_code = Some("internal_error".into());
+        outcome.provider_retryable = None;
+    }
+    outcome
 }
 
 /// Auto-response policy for the one-shot adapter (no human in the loop).
@@ -1150,7 +1176,23 @@ impl Agent {
             images: vec![],
         });
         let mut outcome = Outcome::default();
-        while let Some(ev) = handle.events.recv().await {
+        let mut terminal = false;
+        let mut joined = None;
+        loop {
+            let ev = tokio::select! {
+                // Drain queued output and the terminal before observing task
+                // completion. A retained RequestCtx must not keep a failed
+                // task waiting forever for its event channel to close.
+                biased;
+                ev = handle.events.recv() => ev,
+                result = &mut handle.task => {
+                    joined = Some(result);
+                    break;
+                }
+            };
+            let Some(ev) = ev else {
+                break;
+            };
             match ev {
                 AgentEvent::TextDelta(t) => outcome.text.push_str(&t),
                 AgentEvent::ToolResult { result } => outcome.tool_results.push(result),
@@ -1179,14 +1221,18 @@ impl Agent {
                 }
                 AgentEvent::TurnComplete { reason, .. } => {
                     outcome.stop = reason;
+                    terminal = true;
                     let _ = handle.commands.send(AgentCommand::Shutdown);
                     break;
                 }
                 _ => {}
             }
         }
-        let _ = handle.task.await;
-        outcome
+        let joined = match joined {
+            Some(result) => result,
+            None => handle.task.await,
+        };
+        finish_one_shot(outcome, terminal, joined)
     }
 }
 
@@ -3111,9 +3157,11 @@ impl RunningAgent {
                         // Transport recovery is a new continuation from saved
                         // progress, sharing the idle-timeout budget. A call delta
                         // counts as tool output even before a complete call exists.
-                        let continue_progress = e.code.as_deref()
-                            == Some(crate::stream::STREAM_TRANSPORT_INTERRUPTED_CODE)
-                            && e.http_status.is_none()
+                        let continue_progress = matches!(
+                            e.code.as_deref(),
+                            Some(crate::stream::STREAM_TRANSPORT_INTERRUPTED_CODE)
+                                | Some(crate::stream::STREAM_IDLE_TIMEOUT_CODE)
+                        ) && e.http_status.is_none()
                             && (!assistant_text.trim().is_empty() || last_batch_confirmed)
                             && !saw_tool_stream
                             && partial_stream_recoveries < MAX_PARTIAL_STREAM_RECOVERIES;
@@ -3143,17 +3191,22 @@ impl RunningAgent {
                             retry_is_partial_continuation = true;
                             break;
                         }
+                        let stop =
+                            if e.code.as_deref() == Some(crate::stream::STREAM_IDLE_TIMEOUT_CODE) {
+                                StopReason::Timeout
+                            } else {
+                                StopReason::ProviderError
+                            };
                         self.hooks.on_error(&e.message).await;
                         self.rt.emit(AgentEvent::Error {
                             message: e.message,
                             http_status: e.http_status,
                             code: e.code,
                             retryable: Some(e.retryable),
-                            // 同上:紧接着 finish_turn(ProviderError)。
+                            // The error terminates this turn with the classified stop reason.
                             ends_turn: true,
                         });
-                        self.finish_turn(convo, StopReason::ProviderError, &turn_ctx)
-                            .await;
+                        self.finish_turn(convo, stop, &turn_ctx).await;
                         return;
                     }
                     // The adapter dropped an unparseable chunk. Note it (to flavor the
@@ -6531,5 +6584,41 @@ mod synthetic_send_tests {
 
         handle.commands.send(AgentCommand::Shutdown).unwrap();
         let _ = handle.task.await;
+    }
+}
+
+#[cfg(test)]
+mod one_shot_task_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelled_tasks_and_missing_terminals_cannot_be_success() {
+        let task = tokio::spawn(std::future::pending::<()>());
+        task.abort();
+        let failed = finish_one_shot(Outcome::default(), false, task.await);
+        assert_eq!(failed.stop, StopReason::InternalError);
+        assert!(failed.error.unwrap().contains("cancelled"));
+        assert_eq!(failed.error_code.as_deref(), Some("internal_error"));
+        let missing = finish_one_shot(Outcome::default(), false, Ok(()));
+        assert_eq!(missing.stop, StopReason::InternalError);
+        assert!(missing.error.unwrap().contains("TurnComplete"));
+    }
+
+    #[tokio::test]
+    async fn a_task_panic_after_a_terminal_still_reports_failure_and_keeps_progress() {
+        let task = tokio::spawn(async { panic!("panic after terminal") });
+        let failed = finish_one_shot(
+            Outcome {
+                text: "saved text".into(),
+                error: Some("earlier error".into()),
+                ..Default::default()
+            },
+            true,
+            task.await,
+        );
+        assert_eq!(failed.stop, StopReason::InternalError);
+        assert_eq!(failed.text, "saved text");
+        let error = failed.error.unwrap();
+        assert!(error.contains("panic after terminal") && error.contains("earlier error"));
     }
 }

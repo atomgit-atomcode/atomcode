@@ -119,6 +119,17 @@ impl LinkPointer {
             self.update(writer, over_link)
         }
     }
+    /// Repaint and mouse-mode recovery can invalidate AppKit's visible cursor
+    /// without another cell-motion event. Re-arm cmux only after those writes;
+    /// ordinary unchanged frames retain the cheap cached update.
+    pub(super) fn update_after_terminal_write(
+        &self,
+        writer: &mut impl Write,
+        over_link: bool,
+    ) -> io::Result<()> {
+        self.update_after_motion(writer, over_link)
+    }
+
     pub(super) fn restore(&self, writer: &mut impl Write) -> io::Result<()> {
         let bytes = self.restore_bytes();
         if bytes.is_empty() {
@@ -232,6 +243,39 @@ mod tests {
     }
 
     #[test]
+    fn cmux_terminal_writes_rearm_without_motion_and_stop_after_leaving_link() {
+        for terminal in [
+            TerminalKind::Cmux,
+            TerminalKind::Ghostty,
+            TerminalKind::Kitty,
+        ] {
+            let pointer = LinkPointer::new();
+            pointer.configure(terminal);
+            let mut bytes = Vec::new();
+            pointer.update(&mut bytes, true).unwrap();
+            bytes.clear();
+            pointer
+                .update_after_terminal_write(&mut bytes, true)
+                .unwrap();
+            if terminal == TerminalKind::Cmux {
+                assert_eq!(bytes, b"\x1b]22;default\x1b\\\x1b]22;pointer\x1b\\");
+            } else {
+                assert!(bytes.is_empty());
+            }
+            bytes.clear();
+            pointer
+                .update_after_terminal_write(&mut bytes, false)
+                .unwrap();
+            assert_eq!(bytes, b"\x1b]22;default\x1b\\");
+            bytes.clear();
+            pointer
+                .update_after_terminal_write(&mut bytes, false)
+                .unwrap();
+            assert!(bytes.is_empty());
+        }
+    }
+
+    #[test]
     fn cmux_motion_rearms_a_native_cursor_that_was_reset_without_a_shape_change() {
         #[derive(Default)]
         struct NativeCursor {
@@ -267,6 +311,11 @@ mod tests {
             let len = native.bytes.len();
             p.update(&mut native, true).unwrap();
             assert_eq!(native.bytes.len(), len, "repaints do not re-arm the cursor");
+            // An AppKit reset following a repaint or DECSET happens without
+            // cell motion; the surface must explicitly re-arm on that path.
+            native.visible_hand = false;
+            p.update_after_terminal_write(&mut native, true).unwrap();
+            assert!(native.visible_hand);
         }
         p.update_after_motion(&mut native, false).unwrap();
         assert!(!native.visible_hand);

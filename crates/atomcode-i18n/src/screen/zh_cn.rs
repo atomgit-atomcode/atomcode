@@ -256,7 +256,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
 
         // ── what each command is for (`commands.rs`) ──
         Msg::CmdAboutQuit => "退出".into(),
-        Msg::CmdAboutReasoning => "思考:一行、全文、收起,循环".into(),
+        Msg::CmdAboutReasoning => "思考:展开或隐藏已收到的内容".into(),
         Msg::CmdAboutTools => "工具输出:全部、单个摘要、成组摘要;不带参数则循环".into(),
         Msg::CmdAboutShowInject => "环境注入:收起、只留标签、全文,循环;不带名字则全部".into(),
         Msg::CmdAboutMouse => "把鼠标交还终端,或收回来".into(),
@@ -394,7 +394,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
     拖动选中                        选中并复制
     Esc                             取消选中
     点击折叠行                      展开或收起思考 / 工具调用那一条
-    Ctrl+O / Alt+R                  思考：一行 / 全文 / 收起，循环
+    Ctrl+O / Alt+R                  思考：直接展开 / 隐藏，支持实时内容
     Ctrl+T                          工具输出：全部 / 单个摘要 / 成组摘要，循环（展开那一档连同答完的审批）
     Ctrl+L                          重画屏幕
     Ctrl+G / /mouse                 把鼠标交还终端（改用终端自己的框选；这时滚轮/↑↓ 滚动对话）
@@ -865,7 +865,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::MouseUnreportedAtStart => "这个终端不上报鼠标 · 直接拖选 · 滚轮或 Fn+↑/↓ 翻页 · /raw 跨屏选 · ↑↓ 历史 · ctrl+t 展开 · ctrl+o 思考".into(),
         Msg::MouseUnreported => "这个终端不上报鼠标,鼠标留给终端 · 直接拖选 · 滚轮或 Fn+↑/↓ 翻页".into(),
         Msg::MouseHandedBackAtStart => "鼠标在终端手里 · ctrl+g 收回 · /raw 跨屏选 · 滚轮滚动 · ctrl+p/n 历史 · ctrl+t 展开 · ctrl+o 思考".into(),
-        Msg::ReasoningHiddenHint => "思考过程已收起 · ctrl-o 展开(再按看全文) · 工具输出用 ctrl-t".into(),
+        Msg::ReasoningNotReceived => "尚未收到思考内容；收到后会实时展示。".into(),
+        Msg::ReasoningHiddenHint => "思考过程已收起 · ctrl-o 展开/隐藏 · 工具输出用 ctrl-t".into(),
         Msg::NoProviderPanel => "这个屏幕没有 provider 面板:启动器没有提供 `tui-panel-providers`".into(),
         Msg::NoPluginPanel => "这个屏幕没有插件面板:启动器没有提供 `tui-panel-plugins`".into(),
         Msg::NoToolPanel => "这个屏幕没有工具面板:启动器没有提供 `tui-panel-tools`".into(),
@@ -952,6 +953,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StopPolicyDenied => "已中断 · 安全策略拦下了这一步".into(),
         Msg::StopRateLimited => "已暂停 · 触发限流".into(),
         Msg::StopTimeout => "已中断 · 模型长时间没有回应".into(),
+        Msg::StopInternalError => "内部错误".into(),
         Msg::StopInvariantViolated => "已中断 · 内部不变量被破坏,这条会话不宜再续".into(),
         Msg::StopMaxContinuations => "已中断 · 自动续跑次数用完了".into(),
         Msg::StopWithOpenItems { count } => {
@@ -1311,6 +1313,12 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::RemoteRan { command } => format!("（另一端执行了 {command}）").into(),
         Msg::RemoteDesktopOnly => "这条得在这台机器上敲。另一端能用的是：".into(),
         Msg::UsageUnknown { why } => format!("问不到还剩多少：{why}").into(),
+        Msg::BackgroundPolls { job, count } => format!("等待后台任务 {job} · 已检查 {count} 次 · 点击展开").into(),
+        Msg::CopySendFailed => "复制请求发送失败；可按 Ctrl+G 后重新拖选，用终端复制。".into(),
+        Msg::CopyTooLarge => "选区超过终端复制限制（100,000 字节），未发送；请缩小选区或按 Ctrl+G 使用终端复制。".into(),
+        Msg::CopyRemoteHandedOver => "SSH 复制请求未确认；若粘贴无效，按 Ctrl+G 后重新拖选，用终端复制（Mac：Cmd+C）。".into(),
+        Msg::ClipboardRemoteText => "SSH 无法读取本地剪贴板；请用终端粘贴（Mac：Cmd+V）。".into(),
+        Msg::ClipboardRemoteImage => "SSH 无法读取本地图片剪贴板；请上传图片到远端后用 /paste <路径>。".into(),
         Msg::CopyHandedOver => "已发送复制请求，请粘贴确认。".into(),
         Msg::CopyCouldNotStart => "复制未开始，请稍后重试。".into(),
         Msg::CopyLocalUnavailable => "无法确认复制成功。Ubuntu Wayland 下请安装 wl-clipboard（sudo apt install wl-clipboard）后重试；也可按 Ctrl+G 释放鼠标，使用终端复制。".into(),

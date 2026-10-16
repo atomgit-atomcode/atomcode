@@ -1,6 +1,6 @@
 {
   "name": "site",
-  "version": "1.0.0",
+  "version": "5.2.3",
   "main": "index.js",
   "scripts": {
     "build:css": "tailwindcss -c tailwind.config.js -i input.css -o dist.css --minify",

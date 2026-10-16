@@ -3458,13 +3458,12 @@ fn models_from_config(config: &Config) -> Vec<ModelInfo> {
                 model: p.model.clone(),
                 provider_type: p.provider_type.clone(),
                 is_default: id == &default_selection,
-                // Driven by CONFIG — an explicit effort, or a non-empty server-advertised
-                // `reasoning_effort_levels` — never a hardcoded model name. Single source of
-                // truth shared with the TUI `/effort` and the wire capability.
-                effort_applicable: atomcode_config::config::endpoint_supports_reasoning_effort(
-                    p.reasoning_effort.as_deref(),
+                // A selector needs known choices, not just a default or fixed value.
+                // The wire can still send a configured fixed value without a selector.
+                effort_applicable: !atomcode_config::config::declared_effort_levels(
                     p.reasoning_effort_levels.as_deref(),
-                ),
+                )
+                .is_empty(),
                 // Clamp to the allowed levels so the webui trigger never shows a
                 // level the dropdown hides (then drop the `auto` sentinel).
                 reasoning_effort: atomcode_config::config::clamp_effort_to_levels(
@@ -3472,7 +3471,7 @@ fn models_from_config(config: &Config) -> Vec<ModelInfo> {
                     p.reasoning_effort_levels.as_deref(),
                 )
                 .filter(|effort| !effort.eq_ignore_ascii_case("auto")),
-                effort_levels: atomcode_config::config::allowed_effort_levels(
+                effort_levels: atomcode_config::config::declared_effort_levels(
                     p.reasoning_effort_levels.as_deref(),
                 )
                 .into_iter()
@@ -3738,6 +3737,7 @@ pub(crate) fn stop_reason_wire(reason: atomcode_kernel::event::StopReason) -> &'
         StopReason::ToolLoopDetected => "tool_loop_detected",
         StopReason::MaxContinuations => "max_continuations",
         StopReason::ProviderError => "provider_error",
+        StopReason::InternalError => "internal_error",
         StopReason::Timeout => "timeout",
         StopReason::Cancelled => "cancelled",
         StopReason::PromptRejected => "prompt_rejected",
@@ -3749,6 +3749,13 @@ pub(crate) fn stop_reason_wire(reason: atomcode_kernel::event::StopReason) -> &'
 
 #[cfg(test)]
 mod chat_event_type_tests {
+    #[test]
+    fn internal_agent_failure_has_a_distinct_wire_reason() {
+        assert_eq!(
+            super::stop_reason_wire(atomcode_kernel::event::StopReason::InternalError),
+            "internal_error"
+        );
+    }
     use super::{ChatEvent, ChatRuntimeProjector};
 
     #[test]
@@ -7464,7 +7471,9 @@ mod tests {
                     "account": "AtomGit", "model": "qwen3.8-27b",
                     "reasoning_effort_levels": ["low", "medium", "xhigh"]
                 },
-                "AtomGit-GLM-5.2": { "account": "AtomGit", "model": "GLM-5.2" }
+                "AtomGit-GLM-5.2": { "account": "AtomGit", "model": "GLM-5.2" },
+                "custom-auto": { "account": "AtomGit", "model": "custom-auto", "reasoning_effort": "auto" },
+                "custom-fixed": { "account": "AtomGit", "model": "custom-fixed", "reasoning_effort": "high" }
             }
         }))
         .unwrap();
@@ -7487,6 +7496,20 @@ mod tests {
         assert!(
             !glm.effort_applicable,
             "a model with no effort levels must not show the selector"
+        );
+        for model in ["custom-auto", "custom-fixed"] {
+            let row = models.iter().find(|m| m.model == model).unwrap();
+            assert!(!row.effort_applicable);
+            assert!(row.effort_levels.is_empty());
+        }
+        assert_eq!(
+            models
+                .iter()
+                .find(|m| m.model == "custom-fixed")
+                .unwrap()
+                .reasoning_effort
+                .as_deref(),
+            Some("high")
         );
     }
 

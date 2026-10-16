@@ -353,6 +353,11 @@ pub trait Surface: Send + Sync {
         None
     }
 
+    /// A remote process cannot read the client terminal’s system clipboard.
+    fn remote_clipboard(&self) -> bool {
+        false
+    }
+
     /// Take an image off the system clipboard, as the value the model sees.
     ///
     /// The same seam as [`Surface::copy`], for the same reason and in the other
@@ -2189,7 +2194,12 @@ impl Surface for Terminal {
         if link_pointer::POINTER.enabled() && self.mouse() {
             let mut hover = self.link_hover.lock().expect("link hover poisoned");
             hover.paint(frame);
-            let _ = link_pointer::POINTER.update(&mut out, hover.over_link());
+            if !patch.is_empty() {
+                let _ =
+                    link_pointer::POINTER.update_after_terminal_write(&mut out, hover.over_link());
+            } else {
+                let _ = link_pointer::POINTER.update(&mut out, hover.over_link());
+            }
         }
     }
     fn observe_input(&self, input: &Input) {
@@ -2277,6 +2287,10 @@ impl Surface for Terminal {
         let _ = out.write_all(self.pointer_mode().escape().as_bytes());
         let _ = out.flush();
         console_mouse(self.pointer_mode() != ansi::Pointer::Terminal);
+        if link_pointer::POINTER.enabled() {
+            let hover = self.link_hover.lock().expect("link hover poisoned");
+            let _ = link_pointer::POINTER.update_after_terminal_write(&mut out, hover.over_link());
+        }
     }
     fn forget(&self) {
         self.painted.forget();
@@ -2405,9 +2419,7 @@ impl Surface for Terminal {
         // always works locally and is the wrong machine over ssh. Doing both
         // means the copy lands whichever of those is true; writing the same
         // text to the same clipboard twice costs nothing.
-        let mut out = std::io::stdout();
-        let _ = out.write_all(ansi::set_clipboard(text).as_bytes());
-        let _ = out.flush();
+        let terminal_result = send_clipboard(std::io::stdout().lock(), text);
         #[cfg(target_os = "linux")]
         if std::env::var_os("SSH_CONNECTION").is_none() && std::env::var_os("SSH_TTY").is_none() {
             // GNOME does not expose the data-control protocol used by native
@@ -2431,23 +2443,38 @@ impl Surface for Terminal {
             return if local_clipboard(text) {
                 Copied::Here
             } else {
-                Copied::LocalUnavailable
+                terminal_result.err().unwrap_or(Copied::LocalUnavailable)
             };
+        }
+        if self.remote_clipboard() {
+            return terminal_result.err().unwrap_or(Copied::RemoteHandedOver);
         }
         // 这一句是唯一能确认的那一半 —— OSC 52 写出去了不等于终端收下了。
         match local_clipboard(text) {
             true => Copied::Here,
-            false => Copied::HandedOver,
+            false => terminal_result.err().unwrap_or(Copied::HandedOver),
         }
     }
+    fn remote_clipboard(&self) -> bool {
+        std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some()
+    }
     fn clipboard_image(&self) -> Option<atomcode_kernel::message::ImageContent> {
+        if self.remote_clipboard() {
+            return None;
+        }
         read_clipboard_image()
     }
     fn clipboard_image_mark(&self) -> Option<u64> {
+        if self.remote_clipboard() {
+            return None;
+        }
         let (width, height, rgba) = clipboard_rgba()?;
         Some(pixel_fingerprint(width, height, &rgba))
     }
     fn clipboard_text(&self) -> Option<String> {
+        if self.remote_clipboard() {
+            return None;
+        }
         read_clipboard_text()
     }
     fn restore(&self) {
@@ -2489,6 +2516,12 @@ pub enum Copied {
     Here,
     /// 只交给了终端。成没成只有终端知道,而它不说。
     HandedOver,
+    /// OSC 52 was sent over SSH, without acknowledging clipboard access.
+    RemoteHandedOver,
+    /// Terminal output failed before copying could be requested.
+    SendFailed,
+    /// The full terminal payload exceeds the limit; never truncate a selection.
+    TooLarge,
     /// Local clipboard access failed; the terminal request remains unconfirmed.
     LocalUnavailable,
 }
@@ -2499,12 +2532,29 @@ impl Copied {
         let said = said.into();
         match self {
             Copied::Here => said,
+            Copied::SendFailed => crate::i18n::t(crate::i18n::Msg::CopySendFailed).into_owned(),
+            Copied::TooLarge => crate::i18n::t(crate::i18n::Msg::CopyTooLarge).into_owned(),
             Copied::HandedOver => crate::i18n::t(crate::i18n::Msg::CopyHandedOver).into_owned(),
+            Copied::RemoteHandedOver => {
+                crate::i18n::t(crate::i18n::Msg::CopyRemoteHandedOver).into_owned()
+            }
             Copied::LocalUnavailable => {
                 crate::i18n::t(crate::i18n::Msg::CopyLocalUnavailable).into_owned()
             }
         }
     }
+}
+
+/// Bound only the terminal payload; native clipboard writes keep the full text.
+const OSC52_MAX_RAW_BYTES: usize = 100_000;
+
+fn send_clipboard(mut out: impl std::io::Write, text: &str) -> Result<(), Copied> {
+    if text.len() > OSC52_MAX_RAW_BYTES {
+        return Err(Copied::TooLarge);
+    }
+    out.write_all(ansi::set_clipboard(text).as_bytes())
+        .and_then(|()| out.flush())
+        .map_err(|_| Copied::SendFailed)
 }
 
 /// Translate a crossterm event. `None` for events this UI has no use for.
@@ -2777,6 +2827,57 @@ mod tests {
     ///
     /// 反面才是理由,所以这条钉的是**两句话不一样**:把不能确认的那半也
     /// 原样返回,这条就红 —— 而屏幕上一切照旧。
+    #[test]
+    fn terminal_copy_limits_utf8_bytes_without_truncating() {
+        let mut out = Vec::new();
+        let at_limit = "x".repeat(OSC52_MAX_RAW_BYTES);
+        assert_eq!(send_clipboard(&mut out, &at_limit), Ok(()));
+        assert_eq!(out, ansi::set_clipboard(&at_limit).as_bytes());
+        out.clear();
+        assert_eq!(
+            send_clipboard(&mut out, &"中".repeat(33_334)),
+            Err(Copied::TooLarge)
+        );
+        assert!(
+            out.is_empty(),
+            "oversized copies must not emit partial escape sequences"
+        );
+    }
+
+    #[test]
+    fn terminal_copy_reports_both_write_and_flush_failures() {
+        struct Fails {
+            flush: bool,
+        }
+        impl std::io::Write for Fails {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.flush {
+                    Ok(bytes.len())
+                } else {
+                    Err(std::io::ErrorKind::BrokenPipe.into())
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        for flush in [false, true] {
+            assert_eq!(
+                send_clipboard(Fails { flush }, "hello"),
+                Err(Copied::SendFailed)
+            );
+        }
+    }
+
+    #[test]
+    fn remote_copy_explains_the_native_selection_fallback() {
+        let message = Copied::RemoteHandedOver.words("已复制");
+        assert!(!message.starts_with("已复制"));
+        assert!(message.contains("SSH"));
+        assert!(message.contains("Ctrl+G"));
+        assert!(message.contains("Cmd+C"));
+    }
+
     #[test]
     fn a_copy_that_cannot_be_confirmed_does_not_say_it_was_copied() {
         let done = Copied::Here.words("已复制");

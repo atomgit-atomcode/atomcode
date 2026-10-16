@@ -287,7 +287,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
 
         // ── what each command is for (`commands.rs`) ──
         Msg::CmdAboutQuit => "quit".into(),
-        Msg::CmdAboutReasoning => "reasoning: one line, in full, folded — cycles".into(),
+        Msg::CmdAboutReasoning => "reasoning: show or hide received content".into(),
         Msg::CmdAboutTools => "tool output: all of it, one summary each, summarised in groups; cycles with no argument".into(),
         Msg::CmdAboutShowInject => "injected context: folded, label only, in full — cycles; all of them with no name".into(),
         Msg::CmdAboutMouse => "hand the mouse back to the terminal, or take it back".into(),
@@ -431,7 +431,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
     drag                            select and copy
     Esc                             drop the selection
     click a fold                    open or fold that thought / tool call
-    Ctrl+O / Alt+R                  reasoning: one line / in full / folded, cycles
+    Ctrl+O / Alt+R                  reasoning: show / hide received content, including live updates
     Ctrl+T                          tool output: all / one summary each / summarised in groups, cycles (the opening step opens answered approvals too)
     Ctrl+L                          redraw the screen
     Ctrl+G / /mouse                 hand the mouse back to the terminal (use its own selection; wheel/↑↓ then scroll)
@@ -926,7 +926,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::MouseUnreportedAtStart => "this terminal reports no mouse · drag to select · wheel or Fn+Up/Down scroll · /raw select across screens · Up/Down history · ctrl+t open · ctrl+o thinking".into(),
         Msg::MouseUnreported => "this terminal reports no mouse, so it keeps it · drag to select · wheel or Fn+Up/Down scroll".into(),
         Msg::MouseHandedBackAtStart => "the terminal has the mouse · ctrl+g take it · /raw select across screens · wheel/↑↓ scroll · ctrl+p/n history · ctrl+t open · ctrl+o thinking".into(),
-        Msg::ReasoningHiddenHint => "reasoning is hidden · ctrl-o shows it (again for all of it) · tool output: ctrl-t".into(),
+        Msg::ReasoningNotReceived => "No reasoning received yet; incoming content will appear live.".into(),
+        Msg::ReasoningHiddenHint => "reasoning is hidden · ctrl-o shows/hides it · tool output: ctrl-t".into(),
         Msg::NoProviderPanel => "this screen has no provider panel: the launcher provided no `tui-panel-providers`".into(),
         Msg::NoPluginPanel => "this screen has no plugin panel: the launcher provided no `tui-panel-plugins`".into(),
         Msg::NoToolPanel => "this screen has no tool panel: the launcher provided no `tui-panel-tools`".into(),
@@ -1018,6 +1019,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StopPolicyDenied => "stopped · a security policy blocked this step".into(),
         Msg::StopRateLimited => "paused · rate limited".into(),
         Msg::StopTimeout => "stopped · the model did not answer for a long time".into(),
+        Msg::StopInternalError => "Internal error".into(),
         Msg::StopInvariantViolated => "stopped · an internal invariant was broken; this session should not be carried on".into(),
         Msg::StopMaxContinuations => "stopped · the automatic continuations ran out".into(),
         Msg::StopWithOpenItems { count } => format!(
@@ -1416,6 +1418,12 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "That one has to be typed on this machine. From there you can use:".into()
         }
         Msg::UsageUnknown { why } => format!("Could not find out what is left: {why}").into(),
+        Msg::BackgroundPolls { job, count } => format!("Waiting for background task {job} · checked {count} times · click to expand").into(),
+        Msg::CopySendFailed => "Copy request could not be sent. Press Ctrl+G, select again, and copy through the terminal.".into(),
+        Msg::CopyTooLarge => "Selection exceeds the terminal copy limit (100,000 bytes); nothing sent. Select less text or use Ctrl+G to copy through the terminal.".into(),
+        Msg::CopyRemoteHandedOver => "SSH copy is unconfirmed. If paste fails, press Ctrl+G, select again, and copy in the terminal (Mac: Cmd+C).".into(),
+        Msg::ClipboardRemoteText => "SSH cannot read your local clipboard. Paste through the terminal (Mac: Cmd+V).".into(),
+        Msg::ClipboardRemoteImage => "SSH cannot read your local image clipboard. Upload the image and use /paste <path>.".into(),
         Msg::CopyHandedOver => "Copy request sent. Paste to confirm.".into(),
         Msg::CopyCouldNotStart => "Copy could not start. Please retry after the current copy finishes.".into(),
         Msg::CopyLocalUnavailable => "Could not confirm copying. On Ubuntu Wayland, install wl-clipboard (sudo apt install wl-clipboard), then retry; or use Ctrl+G to release the mouse and copy through the terminal.".into(),

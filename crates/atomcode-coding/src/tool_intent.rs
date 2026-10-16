@@ -68,8 +68,7 @@ pub const INTENT_ARG: &str = "intent";
 /// Short on purpose: this text is repeated once per tool in every request, so a
 /// sentence here costs its length times the size of the catalog. The convention
 /// itself is stated once, in [`INTENT_GUIDE`].
-const INTENT_PROPERTY: &str =
-    "One sentence on why you are making THIS call. Shown to the person — not to the tool.";
+const INTENT_PROPERTY: &str = "Purpose of this call.";
 
 /// The convention, said once in the system prompt.
 const INTENT_GUIDE: &str = "Every tool call carries an `intent` argument: one short sentence \

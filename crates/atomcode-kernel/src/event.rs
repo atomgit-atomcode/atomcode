@@ -112,6 +112,8 @@ pub enum StopReason {
     ToolLoopDetected,
     /// The provider failed to open the stream OR errored mid-stream.
     ProviderError,
+    /// The agent task panicked, was aborted, or ended without a turn terminal.
+    InternalError,
     /// A liveness `stream_timeout` elapsed waiting for the next stream event.
     Timeout,
     /// The turn was cooperatively cancelled (`AgentCommand::Cancel`).

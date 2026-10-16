@@ -1,8 +1,8 @@
 //! AtomGit LLM gateway identification and request-signing primitives.
 //!
-//! This lives below core/bridge so every runtime and provider adapter shares one gateway
-//! boundary. Official builds enable `codingplan-crypto`; source builds expose the same API but
-//! return an unavailable signer.
+//! Every runtime and provider adapter shares this gateway boundary. Signing
+//! requires both the `codingplan-crypto` feature and a nonzero algorithm version;
+//! enabling the feature with the public placeholder still leaves signing unavailable.
 
 use thiserror::Error;
 
@@ -60,6 +60,11 @@ struct RealSigner;
 #[cfg(feature = "codingplan-crypto")]
 impl RequestSigner for RealSigner {
     fn sign(&self, req: SignInput<'_>) -> Result<SignOutput, SignError> {
+        // Feature selection alone does not prove the official overlay is present.
+        // Refuse before entering the public placeholder's panic-only sign_v1.
+        if self.algorithm_version() == 0 {
+            return Err(SignError::Unavailable);
+        }
         Ok(SignOutput {
             headers: atomcode_codingplan_crypto::sign_v1(
                 req.method,
@@ -89,7 +94,7 @@ pub fn signer() -> &'static dyn RequestSigner {
 
 #[cfg(feature = "codingplan-crypto")]
 pub fn signer_available() -> bool {
-    true
+    atomcode_codingplan_crypto::ALGORITHM_VERSION != 0
 }
 
 #[cfg(not(feature = "codingplan-crypto"))]
@@ -167,6 +172,32 @@ mod tests {
             canonical_chat_completions_path("https://llm-api.atomgit.com/v1/chat/completions"),
             "/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn availability_agrees_with_the_linked_algorithm() {
+        assert_eq!(signer_available(), signer().algorithm_version() != 0);
+    }
+
+    #[cfg(feature = "codingplan-crypto")]
+    #[test]
+    fn enabling_the_feature_with_the_public_stub_cannot_panic() {
+        if atomcode_codingplan_crypto::ALGORITHM_VERSION != 0 {
+            return; // This test's failure mode specifically requires the public stub.
+        }
+        assert!(!signer_available());
+        assert!(matches!(
+            signer().sign(SignInput {
+                method: "POST",
+                path: "/v1/chat/completions",
+                body: b"{}",
+                oauth_token: "test-token",
+                user_id: "test-user",
+                timestamp_unix: 1,
+                nonce: [0; 16],
+            }),
+            Err(SignError::Unavailable)
+        ));
     }
 
     #[cfg(not(feature = "codingplan-crypto"))]

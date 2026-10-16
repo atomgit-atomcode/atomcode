@@ -45,6 +45,47 @@ use crate::parts::prepare_with_plugin_hook_source_reusing_lease;
 use crate::prepare_with_plugin_hook_source;
 use crate::{CodingAgentConfig, CodingProviderFactory, PluginHookSource, PrepareOptions};
 
+/// Metadata only; ordinary timings stay quiet unless diagnostics are enabled.
+pub(crate) fn record_startup_phase(
+    phase: &'static str,
+    elapsed: std::time::Duration,
+    success: Option<bool>,
+) {
+    let elapsed_ms = elapsed.as_millis() as u64;
+    let outcome = match success {
+        Some(true) => "ok",
+        Some(false) => "error",
+        None => "finished",
+    };
+    if elapsed >= std::time::Duration::from_millis(100) || success == Some(false) {
+        tracing::info!(target: "atomcode_coding::startup", phase, elapsed_ms, outcome, "startup phase finished");
+    } else {
+        tracing::debug!(target: "atomcode_coding::startup", phase, elapsed_ms, outcome, "startup phase finished");
+    }
+}
+
+/// Timing only: this guard owns no runtime state and reports failed exits too.
+struct StartupPhase {
+    phase: &'static str,
+    started: std::time::Instant,
+}
+
+impl StartupPhase {
+    fn new(phase: &'static str) -> Self {
+        tracing::debug!(target: "atomcode_coding::startup", phase, "runtime startup phase started");
+        Self {
+            phase,
+            started: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for StartupPhase {
+    fn drop(&mut self) {
+        record_startup_phase(self.phase, self.started.elapsed(), None);
+    }
+}
+
 /// Runtime facts emitted by the coding engine without depending on the legacy
 /// `atomcode-core` driver protocol.
 #[non_exhaustive]
@@ -1755,6 +1796,12 @@ impl CodingRuntimeHandle {
         };
         let control = match command {
             DriverCommand::Submit(input) => {
+                tracing::debug!(
+                    phase = "driver_submit_dispatch",
+                    generation,
+                    process_id = std::process::id(),
+                    "request preparation timing"
+                );
                 let (done, _result) = oneshot::channel();
                 CodingRuntimeControl::Submit {
                     generation,
@@ -1914,6 +1961,7 @@ impl CodingRuntimeHandle {
         receipt: Option<atomcode_kernel::event::CommandId>,
         input: UserInput,
     ) -> Result<SubmitReceipt, RuntimeError> {
+        let mut timing = atomcode_harness::diagnostics::PhaseTiming::start("runtime_deliver");
         let state = self.state.load(Ordering::Acquire);
         let (done, result) = oneshot::channel();
         self.tx
@@ -1925,7 +1973,9 @@ impl CodingRuntimeHandle {
                 done,
             })
             .map_err(|_| RuntimeError::Unavailable)?;
-        result.await.map_err(|_| RuntimeError::Unavailable)?
+        let result = result.await.map_err(|_| RuntimeError::Unavailable)?;
+        timing.returned();
+        result
     }
 
     /// Tell this runtime something a session it does not hold said: a job this
@@ -2892,15 +2942,18 @@ impl CodingRuntime {
         }
         let (wakeup_tx, wakeup_rx) = mpsc::unbounded_channel();
         let loop_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let mut parts = prepare_with_plugin_hook_source_reusing_lease(
-            &agent,
-            prepare.clone(),
-            plugin_hooks.as_ref(),
-            session_lease,
-            true,
-        )
-        .await
-        .map_err(runtime_start_prepare_error)?;
+        let mut parts = {
+            let _phase = StartupPhase::new("prepare");
+            prepare_with_plugin_hook_source_reusing_lease(
+                &agent,
+                prepare.clone(),
+                plugin_hooks.as_ref(),
+                session_lease,
+                true,
+            )
+            .await
+            .map_err(runtime_start_prepare_error)?
+        };
         parts.register_extra_tool(Arc::new(ScheduleWakeupTool::new(
             wakeup_tx.clone(),
             Arc::clone(&loop_active),
@@ -2932,9 +2985,14 @@ impl CodingRuntime {
             match bootstrap {
                 ProviderBootstrap::Unavailable(reason) => (None, Some(reason)),
                 ProviderBootstrap::Required | ProviderBootstrap::RecoverAuthentication => {
-                    match provider_factory.build(&agent, session_id) {
+                    let built = {
+                        let _phase = StartupPhase::new("provider_build");
+                        provider_factory.build(&agent, session_id)
+                    };
+                    match built {
                         Ok(provider) => (
                             Some({
+                                let _phase = StartupPhase::new("mount");
                                 let mounted =
                                     mount(&parts, &agent, &prepare, provider).await.map_err(
                                         |e| RuntimeStartError::Assemble(std::io::Error::other(e)),
@@ -2968,9 +3026,12 @@ impl CodingRuntime {
             check_mount(&parts, &agent, &prepare)
                 .map_err(|e| RuntimeStartError::Assemble(std::io::Error::other(e)))?;
         }
-        parts
-            .publish_staged_session()
-            .map_err(runtime_start_prepare_error)?;
+        {
+            let _phase = StartupPhase::new("session_publish");
+            parts
+                .publish_staged_session()
+                .map_err(runtime_start_prepare_error)?;
+        }
         if matches!(prepare.session, crate::SessionMode::Resume(_)) {
             parts.take_up_resumed_session();
         }
@@ -4493,6 +4554,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         from,
                         done,
                     }) => {
+                        tracing::debug!(phase = "runtime_submit_received", generation = request_generation, process_id = std::process::id(), "request preparation timing");
                         if !native_protocol || request_generation != generation {
                             let _ = done.send(Err(RuntimeError::Unavailable));
                             continue;

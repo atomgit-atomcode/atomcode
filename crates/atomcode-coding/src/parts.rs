@@ -664,6 +664,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     reuse_lease: Option<SessionLease>,
     stage_fresh: bool,
 ) -> io::Result<CodingParts> {
+    let tools_started = std::time::Instant::now();
     let mut registry = ToolRegistry::new();
     let mut names: Vec<String> = Vec::new();
     // Tools a tree takes from here as they are (see `CodingParts::host_only_tools`):
@@ -844,8 +845,12 @@ async fn prepare_with_plugin_hooks_reusing_lease(
 
     // Build the context hook once so skill-catalog ranking and later context
     // injection observe the exact same instruction-file precedence and bytes.
+    crate::runtime::record_startup_phase("tools", tools_started.elapsed(), None);
+    let context_started = std::time::Instant::now();
     let session_context_hook = Arc::new(SessionContextHook::new(&cfg.working_dir, cfg.dirs.user()));
     let instruction_text = session_context_hook.instruction_text();
+    crate::runtime::record_startup_phase("instructions", context_started.elapsed(), None);
+    let skills_started = std::time::Instant::now();
 
     // Skills: standard home+project precedence unless the caller supplied dirs.
     let skill_dirs = if opts.tools {
@@ -913,6 +918,8 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         );
     }
 
+    crate::runtime::record_startup_phase("skills", skills_started.elapsed(), None);
+
     // MCP readiness is supplemental: start connections now, but never await them on
     // the session candidate path. `mount()` publishes each connected server's tools
     // atomically for the next turn, then publishes once more when the initial pass
@@ -961,6 +968,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     let mcp_tool_names = Arc::new(std::sync::RwLock::new(Vec::new()));
 
     // Session binding: the id's single owner.
+    let session_started = std::time::Instant::now();
     let session = match &opts.session {
         SessionMode::Disabled => None,
         SessionMode::Fresh => {
@@ -1054,6 +1062,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             })
         }
     };
+    crate::runtime::record_startup_phase("session_binding", session_started.elapsed(), None);
 
     if let Some(b) = &session {
         registry.register(Arc::new(RecallTool::new(b.manager.root())));
@@ -1260,9 +1269,10 @@ pub(crate) async fn prepare_with_plugin_hook_source_reusing_lease(
     reuse_lease: Option<SessionLease>,
     stage_fresh: bool,
 ) -> io::Result<CodingParts> {
-    let hooks = source
-        .load()
-        .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+    let started = std::time::Instant::now();
+    let loaded = source.load();
+    crate::runtime::record_startup_phase("plugin_hooks", started.elapsed(), Some(loaded.is_ok()));
+    let hooks = loaded.map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
     prepare_with_plugin_hooks_reusing_lease(cfg, opts, hooks, reuse_lease, stage_fresh).await
 }
 
