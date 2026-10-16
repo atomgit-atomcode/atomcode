@@ -2255,6 +2255,13 @@ pub enum Msg<'a> {
     // is the argument hint a menu draws beside the name.
     CmdCatalogWorktree,
     CmdCatalogWorktreeUsage,
+    WorktreeReturned {
+        path: &'a str,
+    },
+    WorktreeDirty {
+        name: &'a str,
+    },
+    WorktreeHelp,
     CmdCatalogInit,
     CmdCatalogWorklog,
     CmdCatalogWorklogUsage,

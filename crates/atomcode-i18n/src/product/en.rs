@@ -1413,7 +1413,10 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
 
         // ── the agent catalog's own commands, as a front end draws them ──
         Msg::CmdCatalogWorktree =>
-            "Work on a branch and checkout of your own; `list` shows them, `done` returns to the main checkout, `cleanup` removes one".into(),
+            "Work on a branch and checkout of your own; `list` shows them, `done` only returns to the main checkout (no commit or merge); confirm work is merged before `cleanup`".into(),
+        Msg::WorktreeReturned { path } => format!("Returned to the main checkout: {path}. This only changes directories; it does not commit or merge. Changes and commits remain in the original worktree. Confirm your work is committed and merged before cleanup.").into(),
+        Msg::WorktreeDirty { name } => format!("`{name}` has uncommitted changes; cleanup refused. Preserve your work and confirm it is merged first. `/worktree cleanup {name} --force` discards uncommitted content.").into(),
+        Msg::WorktreeHelp => "Usage: `/worktree [create] <name> [base]` creates and enters a checkout; `/worktree list` lists them; `/worktree done` only returns to the main checkout, without committing or merging; `/worktree cleanup <name> [--force]` removes one. Confirm work is merged first; --force discards uncommitted content.".into(),
         Msg::CmdCatalogWorktreeUsage =>
             "[create] <name> [base] | list | done | cleanup <name> [--force]".into(),
         Msg::CmdCatalogInit =>

@@ -2411,12 +2411,15 @@ async fn run_worktree(
     // is therefore unreachable — tuix read it the same way, and the alternative
     // is a command whose subcommands depend on the repository.
     match parts.first().copied() {
-        None => Err(WORKTREE_USAGE.into()),
+        None => Err(t(Msg::WorktreeHelp).into_owned()),
         Some("list") => list_worktrees(root),
         Some("done") => {
             let at = main_checkout(root)?;
             runtime.change_directory(at.clone()).await?;
-            Ok(format!("回到 {} 干活", at.display()))
+            Ok(t(Msg::WorktreeReturned {
+                path: &at.display().to_string(),
+            })
+            .into_owned())
         }
         Some("cleanup") => {
             let name = parts
@@ -2453,11 +2456,6 @@ fn worktree_target<'a>(parts: &[&'a str]) -> Option<(&'a str, Option<&'a str>)> 
     };
     Some((*rest.first()?, rest.get(1).copied()))
 }
-
-const WORKTREE_USAGE: &str =
-    "用法:`/worktree [create] <名字> [基准]` 开一个自己的 checkout 并进去 · \
-     `/worktree list` 看有哪些 · `/worktree done` 回主检出 · \
-     `/worktree cleanup <名字> [--force]` 清掉";
 
 /// What `list` answers: every worktree git has, the person's own place marked.
 ///
@@ -2542,7 +2540,7 @@ fn remove_worktree(root: &std::path::Path, name: &str, force: bool) -> Result<()
                 .iter()
                 .any(|word| error.contains(word));
         return Err(if dirty {
-            format!("`{name}` 里还有没提交的改动;要清掉就 `/worktree cleanup {name} --force`")
+            t(Msg::WorktreeDirty { name }).into_owned()
         } else {
             format!("清不掉 `{name}`:{error}")
         });
@@ -4109,10 +4107,16 @@ mod tests {
     async fn done_goes_back_to_the_main_checkout() {
         let (_dir, root) = a_repository();
         let at = worktree(&root, "somewhere-else", None).expect("a worktree");
+        let main_head = git(&root, &["rev-parse", "HEAD"]);
+        std::fs::write(at.join("committed-result.txt"), "committed work").unwrap();
+        git(&at, &["add", "committed-result.txt"]);
+        git(&at, &["commit", "-qm", "child work"]);
+        let child_head = git(&at, &["rev-parse", "HEAD"]);
+        std::fs::write(at.join("pending-result.txt"), "pending work").unwrap();
         let runtime = pointed();
         let runtime_dyn: Arc<dyn crate::runtime::RuntimeCommands> = runtime.clone();
 
-        super::run_worktree(&at, "done", &runtime_dyn)
+        let said = super::run_worktree(&at, "done", &runtime_dyn)
             .await
             .expect("going back");
 
@@ -4120,6 +4124,19 @@ mod tests {
             where_it_went(&runtime),
             vec![root.clone()],
             "asked from inside a worktree, `done` still points at the main checkout"
+        );
+        assert_eq!(git(&root, &["rev-parse", "HEAD"]), main_head);
+        assert_eq!(git(&at, &["rev-parse", "HEAD"]), child_head);
+        assert!(!root.join("committed-result.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(at.join("pending-result.txt")).unwrap(),
+            "pending work"
+        );
+        assert_eq!(
+            said,
+            atomcode_config::i18n::t(atomcode_config::i18n::Msg::WorktreeReturned {
+                path: &root.display().to_string(),
+            })
         );
     }
 

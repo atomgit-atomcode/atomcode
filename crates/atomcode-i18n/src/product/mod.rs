@@ -913,3 +913,32 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod worktree_message_tests {
+    use super::*;
+
+    #[test]
+    fn worktree_messages_explain_return_and_cleanup_in_both_languages() {
+        for (locale, no_merge, lost) in [
+            (Locale::ZhCn, "不提交或合并", "丢弃未提交内容"),
+            (
+                Locale::En,
+                "does not commit or merge",
+                "discards uncommitted content",
+            ),
+        ] {
+            let returned = t_with(
+                locale,
+                Msg::WorktreeReturned {
+                    path: "/repo/main-checkout",
+                },
+            );
+            assert!(returned.contains("/repo/main-checkout"));
+            assert!(returned.contains(no_merge));
+            let dirty = t_with(locale, Msg::WorktreeDirty { name: "topic" });
+            assert!(dirty.contains("topic") && dirty.contains(lost));
+            assert!(t_with(locale, Msg::WorktreeHelp).contains("--force"));
+        }
+    }
+}

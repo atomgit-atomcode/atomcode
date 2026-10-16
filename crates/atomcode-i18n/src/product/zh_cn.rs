@@ -1373,7 +1373,10 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
 
         // ── 能力行自己挂的命令，菜单怎么画 ──
         Msg::CmdCatalogWorktree =>
-            "开一个自己的分支与 checkout 并进去干活;`list` 看有哪些,`done` 回主检出,`cleanup` 清掉".into(),
+            "开一个自己的分支与 checkout 并进去干活;`list` 看有哪些,`done` 仅回主检出（不提交或合并）,`cleanup` 清理前请确认成果已合并".into(),
+        Msg::WorktreeReturned { path } => format!("已切回主检出：{path}。本操作仅切换目录，不提交或合并；原 worktree 的改动和提交仍保留在原处。请确认成果已提交并合并后再清理 worktree。").into(),
+        Msg::WorktreeDirty { name } => format!("`{name}` 里仍有未提交改动，清理已拒绝。请先处理并确认成果已合并；`/worktree cleanup {name} --force` 会丢弃未提交内容。").into(),
+        Msg::WorktreeHelp => "用法：`/worktree [create] <名字> [基准]` 创建并进入；`/worktree list` 查看；`/worktree done` 仅切回主检出，不提交或合并；`/worktree cleanup <名字> [--force]` 清理前请确认成果已合并，--force 会丢弃未提交内容。".into(),
         Msg::CmdCatalogWorktreeUsage =>
             "[create] <名字> [基准] | list | done | cleanup <名字> [--force]".into(),
         Msg::CmdCatalogInit =>
