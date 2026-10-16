@@ -25,6 +25,12 @@ codegen-units = 1      # Single codegen unit — better optimization, slower bui
 strip = true           # Strip symbols automatically
 panic = "abort"        # Remove panic unwinding code — saves ~200-500KB
 
+# Opt-in Windows crash diagnosis; preserves release optimization and abort behavior.
+[profile.clipboard-diagnostic]
+inherits = "release"
+debug = 2
+strip = "none"
+
 [profile.test]
 debug = "line-tables-only" # Smaller binaries, faster linker
 

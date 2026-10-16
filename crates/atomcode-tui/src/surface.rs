@@ -1744,6 +1744,41 @@ fn pixel_fingerprint(width: usize, height: usize, bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
+/// Opt-in, synchronous breadcrumbs survive native exceptions that bypass panic hooks.
+/// The host/tester supplies the destination; no clipboard contents are recorded.
+fn clipboard_diagnostic<T>(stage: &str, operation: impl FnOnce() -> T) -> T {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let Some(path) = std::env::var_os("ATOMCODE_CLIPBOARD_DIAGNOSTICS") else {
+        return operation();
+    };
+    let call = NEXT.fetch_add(1, Ordering::Relaxed);
+    let record = |event: &str| {
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let line = format!(
+                "at={at} pid={} thread={:?} call={call} stage={stage} event={event}\n",
+                std::process::id(),
+                std::thread::current().id()
+            );
+            let _ = file.write_all(line.as_bytes());
+            let _ = file.sync_data();
+        }
+    };
+    record("begin");
+    let result = operation();
+    record("end");
+    result
+}
+
 /// The picture on the clipboard as `(width, height, RGBA8)`, or `None`.
 ///
 /// Through `arboard` first; on Windows, when it cannot decode what is there,
@@ -1753,15 +1788,21 @@ fn pixel_fingerprint(width: usize, height: usize, bytes: &[u8]) -> u64 {
 /// masks that `arboard` rejects, so without it a screenshot read as "no image"
 /// — to the paste and to the hint that offers one alike.
 fn clipboard_rgba_direct() -> Option<(usize, usize, Vec<u8>)> {
-    let from_arboard = arboard::Clipboard::new()
+    let from_arboard = clipboard_diagnostic("arboard_open", arboard::Clipboard::new)
         .ok()
-        .and_then(|mut clipboard| clipboard.get_image().ok())
+        .and_then(|mut clipboard| {
+            let image = clipboard_diagnostic("arboard_get_image", || clipboard.get_image()).ok();
+            clipboard_diagnostic("arboard_drop", || drop(clipboard));
+            image
+        })
         .map(|img| (img.width, img.height, img.bytes.into_owned()));
     #[cfg(windows)]
     {
         from_arboard.or_else(|| {
-            let dib = read_raw_cf_dib()?;
-            let (w, h, rgba) = atomcode_capabilities::image_normalize::dib_to_rgba(&dib)?;
+            let dib = clipboard_diagnostic("read_cf_dib", read_raw_cf_dib)?;
+            let (w, h, rgba) = clipboard_diagnostic("decode_cf_dib", || {
+                atomcode_capabilities::image_normalize::dib_to_rgba(&dib)
+            })?;
             Some((w as usize, h as usize, rgba))
         })
     }
@@ -1873,12 +1914,13 @@ fn read_clipboard_image() -> Option<atomcode_kernel::message::ImageContent> {
     use base64::Engine as _;
 
     let (width, height, rgba) = clipboard_rgba()?;
-    let png = encode_rgba_png(width, height, &rgba)?;
+    let png = clipboard_diagnostic("encode_png", || encode_rgba_png(width, height, &rgba))?;
     // Downscale/re-encode an oversized paste (longest edge > 1568px or > ~1.5 MB) so a
     // big screenshot can't blow the per-request body — the image is re-sent every turn.
     // Falls back to the original PNG on any decode failure. See image_normalize.
-    let (media_type, data) = match atomcode_capabilities::image_normalize::normalize_image_raw(&png)
-    {
+    let (media_type, data) = match clipboard_diagnostic("normalize_image", || {
+        atomcode_capabilities::image_normalize::normalize_image_raw(&png)
+    }) {
         Some((mt, out)) => (mt, base64::engine::general_purpose::STANDARD.encode(out)),
         None => (
             "image/png".to_string(),
@@ -2611,20 +2653,22 @@ impl Surface for Terminal {
         if self.remote_clipboard() {
             return None;
         }
-        read_clipboard_image()
+        clipboard_diagnostic("paste_image", read_clipboard_image)
     }
     fn clipboard_image_mark(&self) -> Option<u64> {
         if self.remote_clipboard() {
             return None;
         }
-        let (width, height, rgba) = clipboard_rgba()?;
-        Some(pixel_fingerprint(width, height, &rgba))
+        clipboard_diagnostic("image_mark", || {
+            let (width, height, rgba) = clipboard_rgba()?;
+            Some(pixel_fingerprint(width, height, &rgba))
+        })
     }
     fn clipboard_text(&self) -> Option<String> {
         if self.remote_clipboard() {
             return None;
         }
-        read_clipboard_text()
+        clipboard_diagnostic("paste_text", read_clipboard_text)
     }
     fn restore(&self) {
         self.painted.forget();
