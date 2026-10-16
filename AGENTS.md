@@ -152,6 +152,11 @@ bash gates/compile.sh     # 主检出热态 20.7s(2026-09-23 实测)
 
 ### 提交前必须核 `Cargo.lock`（本机会反复污染它）
 
+**前提（2026-10-12 实测补）**：污染只在**实现版 overlay 在场**时发生。本 clone 检出的是公开 stub
+（`crates/atomcode-codingplan-crypto/Cargo.toml` 的 `[dependencies]` 为空），连跑多轮 `cargo test` 后
+清掉标志核 `git diff Cargo.lock` 为空 —— 也就是**这棵树构建不污染 lock**。下面的止血因此只在实现版
+在场时才需要；本机常态（跑开发/测试）用不着标志位，挂了反而会挡住切换（见下面「三件要知道的」）。
+
 **本机每跑一次 `cargo build`，`Cargo.lock` 都会被写进一批公开仓库不该有的私有依赖。**
 
 成因：`crates/atomcode-codingplan-crypto/` 在公开仓库里是**只有签名没有实现的 stub**，而本机放的是**实现版**——它的 `Cargo.toml` 声明了 `hmac`/`sha2`/`hkdf`/`zeroize`/`subtle`。根 `Cargo.toml` 的 `workspace.members = ["crates/*"]` 是 glob，把这个目录收成了 member，cargo 解析 workspace 时把这些依赖写进 lock。（**把它移出 member 名单并不解决问题**——真正让它们进 lock 的是 `atomcode-auth` 那条 optional path 依赖，见本节末尾的实测。）
@@ -173,7 +178,7 @@ git update-index --skip-worktree Cargo.lock
 三件要知道的：
 
 - **只对这个 clone 生效**（那个位存在 `.git/index` 里）。换机器、重新 clone、`.worktrees/` 下的每个 worktree 都要各设一次。
-- **上游真改了 lock 时它会挡住 pull**。那时：`git update-index --no-skip-worktree Cargo.lock` → `git checkout -- Cargo.lock` → `git pull` → 再设回去。
+- **它挡住的是「任何改动 lock 的工作树操作」，与工作树脏不脏无关**：`git checkout` / `git switch` / `git pull` 在目标分支的 lock 与当前不同时（`main` 与各 release 分支常态差十几行）一律被拒，报的正是「您对下列文件的本地修改将被检出操作覆盖：Cargo.lock」。（2026-10-12 实测：标志为 `S` 时切换被拒；清掉标志后 `git diff Cargo.lock` 为空、切换立即成功。）修法：`git update-index --no-skip-worktree Cargo.lock` → 切换/拉取 → 需要时再设回；**第二步不必 `git checkout -- Cargo.lock`**（没真脏时清掉标志就够了，不丢任何东西）。**`assume-unchanged`（`h`）不是替代品**——它能放行切换，但会被 checkout 自己清掉（实测设 `h` 后两次切换就变回 `H`）；**要守门又不挡切换**就把守门挪到提交边界（`.git/hooks/pre-commit` 拦下暂存里含 `hkdf` / `hmac` / `zeroize_derive` 的 lock，此时不需要任何标志位）。
 - 撤销就是 `--no-skip-worktree`。
 
 没设这个位、或者不确定设没设的时候，push 前照旧核一遍：
@@ -181,6 +186,8 @@ git update-index --skip-worktree Cargo.lock
 ```bash
 grep -c 'name = "hkdf"\|name = "hmac"\|name = "zeroize_derive"' Cargo.lock   # 必须是 0
 ```
+
+（判据只数这三个名字；仓库版 lock 里本来就有合法的 `subtle` / `zeroize` 各 1 个，别把它们加进判据 —— 2026-10-12 实测踩过一次假阳性。）
 
 非 0 就用干净基线重来（`git show <干净 commit>:Cargo.lock > Cargo.lock`，再把该提交之后**合法的**依赖变化补回，例如 `atomcode-tui` 新增的 `atomcode-coding`），确认 `git diff Cargo.lock` 只剩你要删的那些行。**不要**用 `cargo update` 或 `cargo generate-lockfile` 去「修」它——它们只会把私有依赖写回来。
 
