@@ -581,7 +581,7 @@
       {
         "id": "browse-scroll",
         "heading": "Browse & scroll",
-        "body": "Key Action Shift+↑ / Shift+↓ Scroll one line PageUp / PageDown Scroll one page (10 lines) Alt+↑ / Alt+↓ Jump to previous / next message (macOS Apple Terminal: enable Settings → Profiles → Keyboard → \"Use Option as Meta key\" first) Ctrl+↑ / Ctrl+↓ Jump to previous / next user message Home / End Jump to top / bottom of the conversation Mouse wheel Scroll inside the chat area (atomcode captures the wheel)"
+        "body": "Key Action PageUp / PageDown Page by the visible conversation height, keeping one overlap row Mouse wheel Scroll the conversation /read Open a read-only conversation snapshot with expanded tool output; no GUI or clipboard required ↑ / ↓ / j / k Reader: scroll one line PgUp / PgDn / Ctrl+B / Ctrl+F Reader: page up / down Ctrl+U / Ctrl+D Reader: half-page up / down Home / End Reader: jump to beginning / end Esc Leave the reader, preserving the draft and main scroll position; reopen /read to refresh the snapshot"
       },
       {
         "id": "selection-copy",

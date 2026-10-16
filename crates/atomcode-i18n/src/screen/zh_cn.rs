@@ -281,6 +281,9 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SuspendUnsupported => {
             "这里没法挂起(Ctrl+Z):Windows 没有,或启动方设成了不许挂起。单条命令可以用 !命令,或另开一个终端。".into()
         }
+        Msg::CmdAboutRead => "在终端内阅读对话和展开的工具输出".into(),
+        Msg::ReadLegend => "Esc 返回 · ↑↓/jk · PgUp/Dn/^B/F 翻页 · ^U/D 半页 · Home/End 首尾".into(),
+        Msg::ReadUnavailable => "当前界面未挂载阅读面板。".into(),
         Msg::CmdAboutRaw => "把整段对话原样打到终端里,用终端自己的拖选、滚动、搜索;按任意键回来".into(),
         Msg::CmdAboutKeys => "列出快捷键".into(),
         Msg::CmdAboutTodo => "列出计划清单;`add <任务>` 加一项、`clear` 清空;`show`/`hide` 开关面板".into(),
@@ -390,7 +393,9 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
     Ctrl+C                          清空输入；再按一次退出
 
   ── 翻看与显示 ──
-    PgUp / PgDn / 滚轮              滚动对话
+    PgUp / PgDn                     按屏翻页（保留一行重叠）
+    /read                           终端内阅读对话及完整工具输出；Esc 返回草稿
+    滚轮                            逐行滚动对话
     拖动选中                        选中并复制
     Esc                             取消选中
     点击折叠行                      展开或收起思考 / 工具调用那一条

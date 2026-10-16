@@ -111,12 +111,14 @@
           <tr><th>Key</th><th>Action</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>Shift+↑ / Shift+↓</code></td><td>Scroll one line</td></tr>
-          <tr><td><code>PageUp / PageDown</code></td><td>Scroll one page (10 lines)</td></tr>
-          <tr><td><code>Alt+↑ / Alt+↓</code></td><td>Jump to previous / next message (macOS Apple Terminal: enable Settings → Profiles → Keyboard → "Use Option as Meta key" first)</td></tr>
-          <tr><td><code>Ctrl+↑ / Ctrl+↓</code></td><td>Jump to previous / next <strong>user</strong> message</td></tr>
-          <tr><td><code>Home / End</code></td><td>Jump to top / bottom of the conversation</td></tr>
-          <tr><td>Mouse wheel</td><td>Scroll inside the chat area (atomcode captures the wheel)</td></tr>
+          <tr><td><code>PageUp / PageDown</code></td><td>Page by the visible conversation height, keeping one overlap row</td></tr>
+          <tr><td><code>Mouse wheel</code></td><td>Scroll the conversation</td></tr>
+          <tr><td><code>/read</code></td><td>Open a read-only conversation snapshot with expanded tool output; no GUI or clipboard required</td></tr>
+          <tr><td><code>↑ / ↓ / j / k</code></td><td>Reader: scroll one line</td></tr>
+          <tr><td><code>PgUp / PgDn / Ctrl+B / Ctrl+F</code></td><td>Reader: page up / down</td></tr>
+          <tr><td><code>Ctrl+U / Ctrl+D</code></td><td>Reader: half-page up / down</td></tr>
+          <tr><td><code>Home / End</code></td><td>Reader: jump to beginning / end</td></tr>
+          <tr><td><code>Esc</code></td><td>Leave the reader, preserving the draft and main scroll position; reopen /read to refresh the snapshot</td></tr>
         </tbody>
       </table>
 

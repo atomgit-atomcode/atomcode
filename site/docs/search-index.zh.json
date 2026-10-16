@@ -581,7 +581,7 @@
       {
         "id": "浏览与滚动",
         "heading": "浏览与滚动",
-        "body": "按键 动作 Shift+↑ / Shift+↓ 翻一行 PageUp / PageDown 翻一页(10 行) Alt+↑ / Alt+↓ 跳到上 / 下一条消息(macOS Apple Terminal 需先在 Settings → Profiles → Keyboard 启用 \"Use Option as Meta key\") Ctrl+↑ / Ctrl+↓ 跳到上 / 下一条 自己发的 消息 Home / End 跳到对话最顶端 / 最底端 鼠标滚轮 在聊天区上下滚(atomcode 接管)"
+        "body": "按键 动作 PageUp / PageDown 主界面按可见高度翻页，保留一行重叠 鼠标滚轮 逐行滚动对话 /read 打开终端内只读对话副本，展开工具输出，不依赖 GUI 或剪贴板 ↑ / ↓ / j / k 阅读模式：逐行滚动 PgUp / PgDn / Ctrl+B / Ctrl+F 阅读模式：翻页 Ctrl+U / Ctrl+D 阅读模式：翻半页 Home / End 阅读模式：跳到首尾 Esc 退出阅读模式，保留原输入草稿和主界面阅读位置；重新运行 /read 更新副本"
       },
       {
         "id": "选区与复制",

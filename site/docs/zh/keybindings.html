@@ -111,12 +111,14 @@
           <tr><th>按键</th><th>动作</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>Shift+↑ / Shift+↓</code></td><td>翻一行</td></tr>
-          <tr><td><code>PageUp / PageDown</code></td><td>翻一页(10 行)</td></tr>
-          <tr><td><code>Alt+↑ / Alt+↓</code></td><td>跳到上 / 下一条消息(macOS Apple Terminal 需先在 Settings → Profiles → Keyboard 启用 "Use Option as Meta key")</td></tr>
-          <tr><td><code>Ctrl+↑ / Ctrl+↓</code></td><td>跳到上 / 下一条<strong>自己发的</strong>消息</td></tr>
-          <tr><td><code>Home / End</code></td><td>跳到对话最顶端 / 最底端</td></tr>
-          <tr><td>鼠标滚轮</td><td>在聊天区上下滚(atomcode 接管)</td></tr>
+          <tr><td><code>PageUp / PageDown</code></td><td>主界面按可见高度翻页，保留一行重叠</td></tr>
+          <tr><td><code>鼠标滚轮</code></td><td>逐行滚动对话</td></tr>
+          <tr><td><code>/read</code></td><td>打开终端内只读对话副本，展开工具输出，不依赖 GUI 或剪贴板</td></tr>
+          <tr><td><code>↑ / ↓ / j / k</code></td><td>阅读模式：逐行滚动</td></tr>
+          <tr><td><code>PgUp / PgDn / Ctrl+B / Ctrl+F</code></td><td>阅读模式：翻页</td></tr>
+          <tr><td><code>Ctrl+U / Ctrl+D</code></td><td>阅读模式：翻半页</td></tr>
+          <tr><td><code>Home / End</code></td><td>阅读模式：跳到首尾</td></tr>
+          <tr><td><code>Esc</code></td><td>退出阅读模式，保留原输入草稿和主界面阅读位置；重新运行 /read 更新副本</td></tr>
         </tbody>
       </table>
 

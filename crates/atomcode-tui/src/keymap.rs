@@ -55,6 +55,7 @@ pub enum Action {
     Cancel,
     Quit,
     Scroll(i32),
+    PageScroll(i32),
     ScrollToBottom,
     /// A click landed on this cell. What it means is decided by what is drawn
     /// there — a caret in the composer, a fold on a tool call, the way back
@@ -69,6 +70,7 @@ pub enum Action {
     /// `/raw`: the whole conversation on the terminal's own screen, for its
     /// own selection, scrolling and search; any key comes back.
     ShowTranscript,
+    ReadTranscript,
     /// Forget what is believed to be on screen and paint all of it again.
     Redraw,
     /// A line break inside what is being typed, rather than sending it.
@@ -428,8 +430,8 @@ impl Keymap for Default_ {
             (KeyPress::plain(Key::Right), Action::CaretRight),
             (KeyPress::plain(Key::Home), Action::CaretHome),
             (KeyPress::plain(Key::End), Action::CaretEnd),
-            (KeyPress::plain(Key::PageUp), Action::Scroll(-10)),
-            (KeyPress::plain(Key::PageDown), Action::Scroll(10)),
+            (KeyPress::plain(Key::PageUp), Action::PageScroll(-1)),
+            (KeyPress::plain(Key::PageDown), Action::PageScroll(1)),
             // The arrows belong to the field, the way they do in every other
             // text input. Scrolling the conversation is pgup/pgdn and the
             // wheel — which now moves a line a notch, so nothing was lost.

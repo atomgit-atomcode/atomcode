@@ -40,6 +40,7 @@ fn screen_catalogue() -> Vec<Command> {
         Command::said("showinject", t(Msg::CmdAboutShowInject)),
         Command::said("mouse", t(Msg::CmdAboutMouse)),
         Command::said("raw", t(Msg::CmdAboutRaw)),
+        Command::said("read", t(Msg::CmdAboutRead)),
         Command::said("keys", t(Msg::CmdAboutKeys)),
         // Taking its row stops on the line (`/todo `) for `add <task>` and the
         // rest to be typed; enter on the bare name still prints the plan. Run
@@ -79,6 +80,7 @@ impl CommandSet for ScreenCommands {
             },
             "mouse" => Outcome::Do(Action::ToggleMouse),
             "raw" => Outcome::Do(Action::ShowTranscript),
+            "read" => Outcome::Do(Action::ReadTranscript),
             // The two panels a person toggles by name. Same gesture the fold
             // keys are, so a command and a key share one implementation — and
             // with a state named, the flat setter, because a toggle means the

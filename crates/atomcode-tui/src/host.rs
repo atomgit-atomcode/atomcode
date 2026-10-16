@@ -4449,12 +4449,17 @@ impl Host {
     /// "scroll to the end" are measured in (`crate::sheet::read_room`). Before
     /// the first frame, the most it ever draws.
     fn sheet_room(&self) -> usize {
-        self.hits
+        let height = self
+            .hits
             .lock()
             .expect("hits poisoned")
             .sheet
-            .map(|rect| crate::sheet::read_room(rect.h as usize))
-            .unwrap_or(crate::sheet::READ_ROWS)
+            .map(|rect| rect.h);
+        let m = self.moment.read().expect("moment poisoned");
+        match (height, m.sheet.as_ref()) {
+            (Some(height), Some(sheet)) => crate::sheet::room_for(sheet, height as usize),
+            _ => crate::sheet::READ_ROWS,
+        }
     }
 
     /// How wide the sheet was last drawn: a document page wraps to it, so how
@@ -6941,6 +6946,29 @@ impl Host {
         .total
     }
 
+    /// A stable reading copy: expand tools without changing the live screen's folds.
+    pub fn reading_text(&self, moment: &Moment) -> String {
+        let stream = self.stream.read().expect("stream poisoned");
+        let pres = self.presentation.read().expect("presentation poisoned");
+        let ctx = crate::block::RenderCtx {
+            width: 120,
+            caps: crate::block::ShapeCaps::of(&moment.caps),
+        };
+        let mut text = String::new();
+        for slot in stream.slots() {
+            let block = slot.block();
+            let kind = block.kind();
+            if (pres.is_rewound(block.at.turn) && !tells_of_the_turn(kind))
+                || (kind != "tool_call" && pres.is_hidden(kind))
+            {
+                continue;
+            }
+            text.push_str(&block.content.reading_text(&ctx));
+            text.push_str("\n\n");
+        }
+        text
+    }
+
     /// Every row of the conversation's blocks at `width`, top to bottom — what
     /// `/raw` prints. The painter's own rows (`stream_lines`), so it reads as
     /// the screen does; drawn in slices because a rect is at most `u16` rows
@@ -7774,6 +7802,28 @@ mod tests {
             .find(|l| l.plain().contains("a.rs"))
             .and_then(|l| l.spans.first())
             .map(|s| s.style.fg)?
+    }
+
+    #[test]
+    fn reading_expands_tools_without_changing_the_live_presentation() {
+        let h = host();
+        emit_call(
+            &h,
+            Some(crate::content::Outcome::Ok(
+                "READ-TOOL-FIRST\nREAD-TOOL-LAST".into(),
+            )),
+        );
+        h.presentation
+            .write()
+            .unwrap()
+            .set_tool_output(ToolOutput::Group);
+        let revision = h.presentation.read().unwrap().revision;
+        let m = h.moment.read().unwrap().clone();
+        let text = h.reading_text(&m);
+        assert!(text.contains("READ-TOOL-FIRST") && text.contains("READ-TOOL-LAST"));
+        assert_eq!(h.presentation.read().unwrap().revision, revision);
+        h.presentation.write().unwrap().rewound.insert(0);
+        assert!(!h.reading_text(&m).contains("READ-TOOL-FIRST"));
     }
 
     fn emit_call(h: &Host, outcome: Option<crate::content::Outcome>) {

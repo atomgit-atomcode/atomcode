@@ -458,6 +458,9 @@ pub enum Msg<'a> {
     /// suspending switched off.
     SuspendUnsupported,
     CmdAboutRaw,
+    CmdAboutRead,
+    ReadLegend,
+    ReadUnavailable,
     CmdAboutKeys,
     CmdAboutTodo,
     CmdAboutTeam,

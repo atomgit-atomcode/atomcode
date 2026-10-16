@@ -661,6 +661,10 @@ impl Content for RecapBlock {
 }
 
 impl Content for UserSaid {
+    fn reading_text(&self, _ctx: &RenderCtx) -> String {
+        self.0.clone()
+    }
+
     fn kind(&self) -> &'static str {
         "user"
     }
@@ -919,6 +923,10 @@ impl ModelSaid {
 }
 
 impl Content for ModelSaid {
+    fn reading_text(&self, _ctx: &RenderCtx) -> String {
+        self.0.clone()
+    }
+
     fn kind(&self) -> &'static str {
         "assistant"
     }
@@ -1909,6 +1917,15 @@ fn clip(s: &str, cells: usize) -> String {
 }
 
 impl Content for ToolCallBlock {
+    fn reading_text(&self, _ctx: &RenderCtx) -> String {
+        let (mark, _) = self.mark();
+        let body = match &self.outcome {
+            Outcome::Ok(text) | Outcome::Failed(text) => text.as_str(),
+            _ => "",
+        };
+        format!("{mark} {}({})\n{body}", self.name, self.args)
+    }
+
     fn kind(&self) -> &'static str {
         "tool_call"
     }

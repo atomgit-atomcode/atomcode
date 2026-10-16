@@ -11021,3 +11021,35 @@ async fn a_long_answer_ends_with_a_recap_and_a_short_one_does_not() {
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
+
+/// Long output stays readable over SSH without a GUI, a clipboard or a mouse.
+#[tokio::test]
+async fn read_opens_a_terminal_reader_and_esc_returns_to_the_composer() {
+    let dir = scratch("read-conversation");
+    let reply = (0..100)
+        .map(|i| format!("READ-OUTPUT-{i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let script = format!("{{ text = {} }}", serde_json::to_string(&reply).unwrap());
+    let s = start(tree(&dir, &replay(&script), &[])).await;
+    let task = s.open().await;
+    s.term.type_line("produce a long reply");
+    until(&s, "READ-OUTPUT-99").await;
+    s.term.type_line("/read");
+    until(&s, "Esc 返回").await;
+    assert!(s.term.last().unwrap().part("sheet").is_some());
+    until(&s, "READ-OUTPUT-0").await;
+    s.term.press(KeyPress::ctrl('f'));
+    s.quiet().await;
+    let before_end = s.screen();
+    assert!(!before_end.contains("READ-OUTPUT-0"));
+    s.term.press(KeyPress::plain(Key::End));
+    until(&s, "READ-OUTPUT-99").await;
+    s.term.press(KeyPress::plain(Key::Esc));
+    s.quiet().await;
+    assert!(s.term.last().unwrap().part("sheet").is_none());
+    s.term.type_text("a draft after reading");
+    until(&s, "a draft after reading").await;
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}

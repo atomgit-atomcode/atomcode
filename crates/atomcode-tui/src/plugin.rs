@@ -3042,8 +3042,11 @@ impl UserInterface for Tui {
                 {
                     // Only as a scroll: a keymap that rebinds the key to
                     // something else has not made it the question's business.
-                    if let Some(action @ (Action::Scroll(_) | Action::ScrollToBottom)) =
-                        self.keys.resolve(press)
+                    if let Some(
+                        action @ (Action::Scroll(_)
+                        | Action::PageScroll(_)
+                        | Action::ScrollToBottom),
+                    ) = self.keys.resolve(press)
                     {
                         quit = self.act(action, &client);
                     }
@@ -6975,6 +6978,16 @@ impl Tui {
 
     /// Apply one action. Returns `true` to quit.
     fn act(&self, action: Action, client: &AgentClient) -> bool {
+        let action = if let Action::PageScroll(direction) = action {
+            let m = self.host.moment.read().expect("moment poisoned");
+            let rows = self
+                .host
+                .block_view(self.surface.size(), &m)
+                .map_or(1, |view| view.rect.h.saturating_sub(1).max(1));
+            Action::Scroll(direction.saturating_mul(i32::from(rows)))
+        } else {
+            action
+        };
         let mut m = self.host.moment.write().expect("moment poisoned");
         // Any action other than a repeat Ctrl+C disarms the "press again to quit"
         // latch, and takes the exit hint below the box down with it: an accidental
@@ -7013,7 +7026,10 @@ impl Tui {
         // the view does not move it off its words — and keeping it is what lets
         // a person scroll to see the rest of what they picked.
         let kept_by_scroll = m.stream_selection.is_some()
-            && matches!(action, Action::Scroll(_) | Action::ScrollToBottom);
+            && matches!(
+                action,
+                Action::Scroll(_) | Action::PageScroll(_) | Action::ScrollToBottom
+            );
         if !kept_by_scroll
             && !matches!(
                 action,
@@ -7810,6 +7826,20 @@ impl Tui {
             // get back — the terminal's own screen has no status row.
             // Those two are not cut to the width: wrapping is the terminal's
             // again out there, so a narrow window wraps them instead.
+            Action::PageScroll(_) => unreachable!("page actions are resolved before locking"),
+            Action::ReadTranscript => {
+                let text = self.host.reading_text(&m);
+                drop(m);
+                let doc = crate::sheet::Doc::new(
+                    "read",
+                    Vec::new(),
+                    vec![crate::sheet::DocTab::plain(text)],
+                );
+                if !self.host.open_sheet(crate::sheet::Sheet::doc(doc)) {
+                    self.host.say(t(Msg::ReadUnavailable).into_owned(), true);
+                }
+                return false;
+            }
             Action::ShowTranscript => {
                 let (w, _) = self.surface.size();
                 let caps = self.surface.caps();
@@ -13047,6 +13077,61 @@ mod paste_habit_tests {
 
     fn typed(host: &Host) -> String {
         host.moment.read().expect("moment poisoned").input.clone()
+    }
+
+    #[test]
+    fn reading_and_paging_preserve_the_draft_and_live_scroll() {
+        let (host, tui) = screen();
+        host.modules
+            .add_view(Arc::new(crate::module::Mounted::<
+                crate::modules::sheet::SheetView,
+            >::new()))
+            .unwrap();
+        host.modules
+            .add_producer(crate::modules::transcript::Transcript::new())
+            .unwrap();
+        host.absorb(&atomcode_kernel::session::SessionEvent::AssistantMessage {
+            turn: 1,
+            round: 0,
+            text: (0..200)
+                .map(|i| format!("READ-LINE-{i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            reasoning: String::new(),
+            tool_calls: Vec::new(),
+            reasoning_blocks: Vec::new(),
+            meta: None,
+        });
+        {
+            let mut m = host.moment.write().unwrap();
+            m.input = "草稿保留".into();
+            m.caret = 3;
+        }
+        host.compose((60, 24));
+        let expected = {
+            let m = host.moment.read().unwrap();
+            host.block_view((60, 24), &m)
+                .unwrap()
+                .rect
+                .h
+                .saturating_sub(1)
+                .max(1) as usize
+        };
+        tui.act(Action::PageScroll(-1), &tui.client);
+        assert_eq!(host.moment.read().unwrap().scroll.0, expected);
+        tui.act(Action::ReadTranscript, &tui.client);
+        let frame = host.compose((60, 24));
+        assert!(frame.part("sheet").is_some());
+        assert!(host.sheet_open());
+        host.sheet_key(crate::surface::KeyPress::plain(crate::surface::Key::End));
+        let end = host.compose((60, 24));
+        assert!(end.rows().join("\n").contains("READ-LINE-199"));
+        host.sheet_key(crate::surface::KeyPress::plain(crate::surface::Key::Esc));
+        let m = host.moment.read().unwrap();
+        assert!(m.sheet.is_none());
+        assert_eq!(m.input, "草稿保留");
+        assert_eq!(m.caret, 3);
+        assert_eq!(m.scroll.0, expected);
     }
 
     #[test]

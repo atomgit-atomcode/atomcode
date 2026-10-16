@@ -180,6 +180,16 @@ pub trait Content: Send + Sync + std::fmt::Debug {
     /// See `docs/adr/0025`.
     fn lines(&self, ctx: &RenderCtx) -> Vec<Line>;
 
+    /// Readable source for the terminal reader. Blocks with original prose or
+    /// tool output override this to avoid copying width-clipped screen rows.
+    fn reading_text(&self, ctx: &RenderCtx) -> String {
+        self.lines(ctx)
+            .into_iter()
+            .map(|line| line.plain().trim_end().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Presentation-only context for a user prompt that has scrolled above the view.
     fn prompt_header(&self, _width: u16) -> Option<Line> {
         None

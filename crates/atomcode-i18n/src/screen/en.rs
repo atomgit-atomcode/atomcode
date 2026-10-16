@@ -316,6 +316,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SuspendUnsupported => {
             "Suspending (Ctrl+Z) is not available here — not on Windows, or whatever started this switched it off. Run one command with !cmd, or open another terminal.".into()
         }
+        Msg::CmdAboutRead => "read the conversation and expanded tool output in the terminal".into(),
+        Msg::ReadLegend => "Esc back · ↑↓/jk · PgUp/Dn/^B/F page · ^U/D half · Home/End".into(),
+        Msg::ReadUnavailable => "The reading panel is not available in this interface.".into(),
         Msg::CmdAboutRaw => "print the whole conversation into the terminal, for its own selection, scrolling and search; any key comes back".into(),
         Msg::CmdAboutKeys => "list the key bindings".into(),
         Msg::CmdAboutTodo => "print the plan; `add <task>`, `clear`; `show`/`hide` the panel".into(),
@@ -427,7 +430,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
     Ctrl+C                          clear the composer, again to quit
 
   ── Reading & display ──
-    PgUp / PgDn / wheel             scroll the conversation
+    PgUp / PgDn                     page through the conversation
+    /read                           read conversation and tool output; Esc returns
+    Mouse wheel                     scroll the conversation
     drag                            select and copy
     Esc                             drop the selection
     click a fold                    open or fold that thought / tool call
