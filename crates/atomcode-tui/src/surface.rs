@@ -1726,6 +1726,7 @@ fn give_back_stderr(_held: &StderrHeld) {}
 /// evenly spread 128-byte windows of it. Sampling throughout tells apart two
 /// same-sized screenshots whose top and bottom chrome match, and keeps a look
 /// at a 4K picture to a couple of KB of hashing. `atomcode-tuix`'s, kept.
+#[cfg(any(not(windows), test))]
 fn pixel_fingerprint(width: usize, height: usize, bytes: &[u8]) -> u64 {
     use std::hash::{Hash, Hasher};
     const SAMPLES: usize = 16;
@@ -1742,6 +1743,32 @@ fn pixel_fingerprint(width: usize, height: usize, bytes: &[u8]) -> u64 {
         }
     }
     hasher.finish()
+}
+
+// Windows opens clipboard handles with a null owner. Do not let independent
+// handles in this process overlap. The captured access violation was inside
+// get_vec/memcpy while a paste and the background image probe overlapped.
+#[cfg(any(windows, test))]
+static WINDOWS_CLIPBOARD_ACCESS: Mutex<()> = Mutex::new(());
+
+#[cfg(any(windows, test))]
+fn windows_clipboard_guard() -> std::sync::MutexGuard<'static, ()> {
+    WINDOWS_CLIPBOARD_ACCESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Availability queries never request or decode the clipboard's pixel data.
+#[cfg(windows)]
+fn windows_clipboard_image_mark() -> Option<u64> {
+    let _guard = windows_clipboard_guard();
+    let before = clipboard_win::seq_num()?;
+    let image_available = clipboard_win::is_format_avail(clipboard_win::formats::CF_DIB)
+        || clipboard_win::is_format_avail(clipboard_win::formats::CF_DIBV5)
+        || clipboard_win::register_format("PNG")
+            .is_some_and(|format| clipboard_win::is_format_avail(format.get()));
+    let after = clipboard_win::seq_num()?;
+    (image_available && before == after).then_some(u64::from(after.get()))
 }
 
 /// Opt-in, synchronous breadcrumbs survive native exceptions that bypass panic hooks.
@@ -1788,6 +1815,8 @@ fn clipboard_diagnostic<T>(stage: &str, operation: impl FnOnce() -> T) -> T {
 /// masks that `arboard` rejects, so without it a screenshot read as "no image"
 /// — to the paste and to the hint that offers one alike.
 fn clipboard_rgba_direct() -> Option<(usize, usize, Vec<u8>)> {
+    #[cfg(windows)]
+    let _guard = windows_clipboard_guard();
     let from_arboard = clipboard_diagnostic("arboard_open", arboard::Clipboard::new)
         .ok()
         .and_then(|mut clipboard| {
@@ -1890,6 +1919,7 @@ pub fn run_clipboard_helper_if_requested() -> bool {
 
 /// The raw `CF_DIB` bytes on the Windows clipboard, when there is any bitmap.
 #[cfg(windows)]
+// Caller holds WINDOWS_CLIPBOARD_ACCESS across both arboard and this fallback.
 fn read_raw_cf_dib() -> Option<Vec<u8>> {
     let clip = clipboard_win::Clipboard::new_attempts(10).ok()?;
     let mut dib = Vec::new();
@@ -1961,6 +1991,8 @@ fn encode_rgba_png(width: usize, height: usize, rgba: &[u8]) -> Option<Vec<u8>> 
 /// line, and collapsing them here means no caller has to decide what to say
 /// about a paste of nothing.
 fn read_clipboard_text() -> Option<String> {
+    #[cfg(windows)]
+    let _guard = windows_clipboard_guard();
     #[cfg(target_os = "macos")]
     {
         let bytes = macos_clipboard_helper("text")?;
@@ -1985,6 +2017,8 @@ fn local_clipboard(text: &str) -> bool {
     if std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some() {
         return false;
     }
+    #[cfg(windows)]
+    let _guard = windows_clipboard_guard();
     // Windows: the clipboard API itself, in UTF-16. `clip.exe` reads its input
     // in the system's ANSI code page, so Chinese piped to it as UTF-8 arrived
     // garbled; it stays as the fallback.
@@ -2660,8 +2694,15 @@ impl Surface for Terminal {
             return None;
         }
         clipboard_diagnostic("image_mark", || {
-            let (width, height, rgba) = clipboard_rgba()?;
-            Some(pixel_fingerprint(width, height, &rgba))
+            #[cfg(windows)]
+            {
+                windows_clipboard_image_mark()
+            }
+            #[cfg(not(windows))]
+            {
+                let (width, height, rgba) = clipboard_rgba()?;
+                Some(pixel_fingerprint(width, height, &rgba))
+            }
         })
     }
     fn clipboard_text(&self) -> Option<String> {
@@ -3680,6 +3721,19 @@ mod tests {
             body.contains("probes_colours("),
             "the probe writes to the terminal without asking whether this one              can be asked"
         );
+    }
+
+    #[test]
+    fn native_clipboard_access_excludes_other_threads_until_the_operation_finishes() {
+        let guard = windows_clipboard_guard();
+        let blocked = std::thread::spawn(|| WINDOWS_CLIPBOARD_ACCESS.try_lock().is_err());
+        assert!(blocked.join().unwrap());
+        drop(guard);
+        std::thread::spawn(|| {
+            let _guard = windows_clipboard_guard();
+        })
+        .join()
+        .unwrap();
     }
 
     #[cfg(target_os = "macos")]

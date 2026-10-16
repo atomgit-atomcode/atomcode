@@ -17,15 +17,15 @@ pub const SHOWN_FOR: Duration = Duration::from_secs(6);
 
 /// The least time between two looks at the clipboard.
 ///
-/// A look copies the picture's pixels out (tens of MB for a 4K screenshot), so
-/// it is not done on every keystroke. A person who pasted a picture and types
+/// A look may copy pixels on platforms without a cheap clipboard change token;
+/// Windows only checks formats and the sequence number. A person who pastes and types
 /// straight on is seen within this.
 pub const LOOK_EVERY: Duration = Duration::from_millis(1500);
 
 /// The clipboard as last seen, and the offer about it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ClipHint {
-    /// The picture last seen there — a fingerprint of its pixels — or `None`.
+    /// The picture last seen: a change token or pixel fingerprint, or `None`.
     seen: Option<u64>,
     /// When the offer about [`seen`](Self::seen) comes down; `None` when there
     /// is no offer up.
@@ -36,7 +36,7 @@ pub struct ClipHint {
     /// carries the count it started at, so one that raced a paste — the key
     /// that pastes starts a look of its own — can tell.
     takes: u64,
-    /// The picture last taken onto the line, fingerprinted as the clipboard held
+    /// The picture last taken onto the line, identified as the clipboard held
     /// it at that moment.
     ///
     /// The look after a paste is reading that same picture: a paste is not a
