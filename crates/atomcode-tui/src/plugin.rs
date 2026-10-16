@@ -7704,6 +7704,10 @@ impl Tui {
                 return m.cancel_idle();
             }
             Action::Scroll(by) => {
+                // Manual navigation supersedes a drag's edge timer, even when
+                // a terminal lost the release or the viewport cannot move.
+                // Keep the selection; a fresh drag can arm the timer again.
+                m.edge_scroll = None;
                 crate::scrollbar::touch(&mut m);
                 // Bounded by what is left to read, not by how much there is:
                 // scrolling past the oldest line would empty the region rather
@@ -7713,6 +7717,7 @@ impl Tui {
                 m.scroll = crate::moment::ScrollPos(next.clamp(0, max as i64) as usize);
             }
             Action::ScrollToBottom => {
+                m.edge_scroll = None;
                 crate::scrollbar::touch(&mut m);
                 m.scroll = crate::moment::ScrollPos::BOTTOM;
             }
@@ -13551,6 +13556,68 @@ mod conversation_mouse_tests {
         assert!(matches!(one,Wake::Copied {message,..} if message=="first copied"));
         assert!(matches!(two,Wake::Copied {message,..} if message=="second copied"));
     }
+    #[test]
+    fn manual_scrolling_stops_an_unreleased_edge_drag_but_keeps_the_selection() {
+        for action in [
+            Action::Scroll(-1),
+            Action::Scroll(1),
+            Action::Scroll(0),
+            Action::PageScroll(-1),
+            Action::PageScroll(1),
+            Action::ScrollToBottom,
+        ] {
+            let (host, tui) = assemble(crate::surface::Headless::new(80, 24));
+            host.modules
+                .add_producer(crate::modules::transcript::Transcript::new())
+                .unwrap();
+            host.absorb(&atomcode_kernel::session::SessionEvent::AssistantMessage {
+                turn: 1,
+                round: 0,
+                text: (0..200)
+                    .map(|i| format!("line {i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                reasoning: String::new(),
+                tool_calls: Vec::new(),
+                reasoning_blocks: Vec::new(),
+                meta: None,
+            });
+            host.moment.write().unwrap().scroll = crate::moment::ScrollPos(20);
+            host.compose((80, 24));
+            let rect = {
+                let m = host.moment.read().unwrap();
+                host.block_view((80, 24), &m).unwrap().rect
+            };
+            tui.act(Action::SelectFrom(rect.x + 2, rect.y + 2), &tui.client);
+            tui.act(Action::SelectTo(rect.x + 2, rect.y), &tui.client);
+            let selected = {
+                let m = host.moment.read().unwrap();
+                assert!(
+                    m.edge_scroll.is_some(),
+                    "dragging at the edge arms automatic scrolling"
+                );
+                m.stream_selection
+            };
+            // No release arrives. The wheel / page key still takes precedence.
+            tui.act(action.clone(), &tui.client);
+            {
+                let m = host.moment.read().unwrap();
+                assert!(
+                    m.edge_scroll.is_none(),
+                    "{action:?} must stop the edge timer"
+                );
+                assert_eq!(
+                    m.stream_selection, selected,
+                    "{action:?} keeps the selected text"
+                );
+                assert!(m.selection.is_some());
+            }
+            // A fresh real drag can resume edge scrolling.
+            tui.act(Action::SelectTo(rect.x + 2, rect.y), &tui.client);
+            assert!(host.moment.read().unwrap().edge_scroll.is_some());
+        }
+    }
+
     #[test]
     fn scrollbar_click_and_drag_move_history_without_starting_a_selection() {
         let (host, tui) = assemble(crate::surface::Headless::new(80, 24));
