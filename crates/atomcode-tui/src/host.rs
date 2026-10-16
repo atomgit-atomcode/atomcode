@@ -228,6 +228,7 @@ impl Presentation {
             // recognition is the model's crutch for a picture it cannot see, not
             // the conversation, so it stays out of the way until a click asks.
             ("vl_caption", Showing::Folded),
+            ("provider_diagnostic", Showing::Folded),
             // A slash invocation is the visible request; its expanded SKILL.md
             // remains available under a compact `⎿ Skill: name` lid.
             ("skill", Showing::Folded),
@@ -610,7 +611,8 @@ impl Presentation {
 /// by default to `● 后台「…」的结果回来了  点击展开`, with the conversation that
 /// started the job answering under it — and, left out of this list, a row that
 /// promised a click and answered none.
-const CLICKABLE: [&str; 7] = [
+const CLICKABLE: [&str; 8] = [
+    "provider_diagnostic",
     "tool_call",
     "reasoning",
     "vl_caption",
@@ -697,7 +699,12 @@ fn blank_between(upper: &str, lower: &str, calls_apart: bool) -> bool {
     // background job, a member's report — are each their own paragraph: not
     // the turn above them and not the reply that follows. Pressed together
     // they read as one block of three different things (2026-10-09).
-    let apart = |kind: &str| matches!(kind, "recap" | "injected:background" | "injected:peer");
+    let apart = |kind: &str| {
+        matches!(
+            kind,
+            "recap" | "injected:background" | "injected:peer" | "provider_diagnostic"
+        )
+    };
     if apart(upper) || apart(lower) {
         return true;
     }
@@ -14425,6 +14432,34 @@ mod tests {
     /// recognition of a few thousand characters — the reported
     /// `● VL 识别图片成功，返回 2257 chars  qwen3.8-27b  点击展开` — had no way onto
     /// the screen at all.
+    #[test]
+    fn a_provider_error_is_concise_until_its_details_are_clicked() {
+        let h = host();
+        h.absorb(&SessionEvent::TurnStart { turn: 1 });
+        h.absorb(&SessionEvent::TurnEnd {
+            turn: 1,
+            stop: atomcode_harness::seams::StopReason::ProviderError,
+            error: Some("HTTP 503: litellm.original-diagnostic".into()),
+        });
+        let size = (100, 40);
+        let folded = h.compose(size).rows().join("\n");
+        assert!(folded.contains("503"), "{folded}");
+        assert!(!folded.contains("litellm.original-diagnostic"), "{folded}");
+        let rect = h.compose(size).part("stream").unwrap().rect;
+        let (id, kind) = (rect.y..rect.bottom())
+            .filter_map(|y| h.block_at(2, y))
+            .find(|(_, kind)| *kind == "provider_diagnostic")
+            .expect("provider details answer clicks");
+        h.toggle_block(id, kind);
+        assert!(h
+            .compose(size)
+            .rows()
+            .join("\n")
+            .contains("litellm.original-diagnostic"));
+        h.toggle_block(id, kind);
+        assert_eq!(h.compose(size).rows().join("\n"), folded);
+    }
+
     #[test]
     fn clicking_a_vl_caption_opens_the_recognition() {
         let h = host();

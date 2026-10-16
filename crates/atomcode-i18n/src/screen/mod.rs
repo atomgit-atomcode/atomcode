@@ -140,3 +140,45 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod provider_message_tests {
+    use super::*;
+    #[test]
+    fn provider_stop_and_retry_are_localized_without_a_global_locale_change() {
+        for (locale, stopped, denied, retry_word) in [
+            (Locale::ZhCn, "模型服务错误", "模型服务拒绝了请求", "重试"),
+            (
+                Locale::En,
+                "Model service error",
+                "Model service denied the request",
+                "retry",
+            ),
+        ] {
+            assert!(t_with(locale, Msg::StopProviderError).contains(stopped));
+            let reason = t_with(locale, Msg::ProviderAccessDenied);
+            assert_eq!(reason, denied);
+            let reason = t_with(
+                locale,
+                Msg::ProviderErrorStatus {
+                    reason: &reason,
+                    status: 403,
+                },
+            );
+            let text = t_with(
+                locale,
+                Msg::TranscriptProviderRetry {
+                    reason: &reason,
+                    seconds: 6,
+                    attempt: 2,
+                    max: 2,
+                },
+            );
+            assert!(text.contains(retry_word));
+            assert!(text.contains("403") && text.contains("2/2"));
+            assert!(!text.contains("litellm"));
+            assert!(!t_with(locale, Msg::ProviderCheckAccess).is_empty());
+            assert!(!t_with(locale, Msg::ProviderErrorDetails).is_empty());
+        }
+    }
+}

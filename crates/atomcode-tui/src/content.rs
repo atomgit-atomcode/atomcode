@@ -3342,7 +3342,7 @@ fn turn_end_note(stop: StopReason, done_index: usize, open_items: usize) -> (Gly
         // A failure: the stream went silent and retrying did not bring it back.
         Timeout => (Glyph::Fail, t(Msg::StopTimeout).into_owned(), bad()),
         // A failure, with the provider's own sentence folded in below.
-        ProviderError => (Glyph::Fail, t(Msg::StopCancelled).into_owned(), bad()),
+        ProviderError => (Glyph::Fail, t(Msg::StopProviderError).into_owned(), bad()),
         InternalError => (Glyph::Fail, t(Msg::StopInternalError).into_owned(), bad()),
         // Not a failed request: the log cannot explain what reached the model,
         // and from here resume, fork and compaction are unsound. A person is
@@ -4486,7 +4486,7 @@ mod tests {
             .map(|l| l.plain())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("已中断"), "{text}");
+        assert!(text.contains("模型服务错误"), "{text}");
         assert!(
             text.contains("nodename nor servname"),
             "the cause must reach the screen:\n{text}"
@@ -4512,7 +4512,7 @@ mod tests {
         };
         let lines = short.lines(&crate::block::RenderCtx::bare(100));
         assert_eq!(lines.len(), 2, "{lines:?}");
-        assert!(lines[0].plain().contains("已中断"));
+        assert!(lines[0].plain().contains("模型服务错误"));
         assert!(!lines[0].plain().contains("quota reached"));
         assert_eq!(lines[1].plain().trim_end(), "  ⎿ quota reached");
         let cause = lines[1]
@@ -4576,8 +4576,8 @@ mod tests {
             "and the other two are not, whatever the loop calls them: {said:?}"
         );
         assert!(
-            said[2].contains("没挂停止策略"),
-            "the fuse says the actionable thing: nothing was watching: {}",
+            said[2].contains("执行循环安全上限"),
+            "the fuse identifies the safety limit: {}",
             said[2]
         );
         assert_eq!(
@@ -4613,7 +4613,7 @@ mod tests {
         );
 
         let failed = drawn(StopReason::ProviderError);
-        assert!(failed.contains("已中断"), "{failed}");
+        assert!(failed.contains("模型服务错误"), "{failed}");
 
         // Every reason is one of two outcomes, and the mark says which. The clean
         // end wears the `✻` sparkle; nothing cut short does.
@@ -4729,7 +4729,7 @@ mod tests {
         let lines = block.lines(&crate::block::RenderCtx::bare(80));
         assert_eq!(lines.len(), 1, "nothing to say means no extra row");
         let text = drawn(&block, 80);
-        assert!(text.contains("已中断"), "{text:?}");
+        assert!(text.contains("模型服务错误"), "{text:?}");
         for absent in ["轮", "工具", "tokens", "缓存"] {
             assert!(!text.contains(absent), "{absent} in {text:?}");
         }

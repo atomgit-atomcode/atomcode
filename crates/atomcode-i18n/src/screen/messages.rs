@@ -383,8 +383,8 @@ pub enum Msg<'a> {
     TranscriptShortened {
         count: usize,
     },
-    /// A provider request failed and is being sent again. `reason` is the
-    /// provider's own error, verbatim.
+    /// A provider request failed and is being sent again. The caller supplies
+    /// a short localized reason; original diagnostics belong in expandable details.
     TranscriptProviderRetry {
         reason: &'a str,
         seconds: u64,
@@ -423,6 +423,7 @@ pub enum Msg<'a> {
     CmdAboutQuit,
     CmdAboutReasoning,
     CmdAboutTools,
+    CmdAboutErrors,
     CmdAboutShowInject,
     CmdAboutMouse,
     /// `/provider`'s model picker: the listing had nothing the account lacks.
@@ -1598,6 +1599,26 @@ pub enum Msg<'a> {
     SessionCached {
         pct: u64,
     },
+    StopProviderError,
+    ProviderBusy,
+    ProviderUnavailable,
+    ProviderAccessDenied,
+    ProviderAuthenticationFailed,
+    ProviderRateLimitError,
+    ProviderConnectionError,
+    ProviderUnknownError,
+    ProviderErrorStatus {
+        reason: &'a str,
+        status: u16,
+    },
+    ProviderTryAgain,
+    ProviderCheckAccess,
+    ProviderCheckCredentials,
+    ProviderCheckConnection,
+    ProviderCheckRequest,
+    ProviderNoFallback,
+    ProviderErrorDetails,
+    ProviderRetryDetailsHint,
     StopCancelled,
     StopMaxRounds,
     StopByPolicy,

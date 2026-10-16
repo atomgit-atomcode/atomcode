@@ -73,6 +73,7 @@ pub mod overlay;
 pub mod places;
 pub mod plugin;
 pub mod plugins;
+mod provider_notice;
 pub mod providers;
 pub mod qr;
 pub mod raster;

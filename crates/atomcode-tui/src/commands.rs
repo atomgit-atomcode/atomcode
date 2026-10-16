@@ -37,6 +37,11 @@ fn screen_catalogue() -> Vec<Command> {
             "[full|head|each|group]".into(),
             t(Msg::CmdAboutTools),
         ),
+        Command::said_taking(
+            "errors",
+            "[show|hide|toggle]".into(),
+            t(Msg::CmdAboutErrors),
+        ),
         Command::said("showinject", t(Msg::CmdAboutShowInject)),
         Command::said("mouse", t(Msg::CmdAboutMouse)),
         Command::said("raw", t(Msg::CmdAboutRaw)),
@@ -70,6 +75,24 @@ impl CommandSet for ScreenCommands {
         match name {
             "quit" | "exit" => Outcome::Do(Action::Quit),
             "reasoning" => Outcome::Do(Action::ToggleFold("reasoning")),
+            "errors" => match args.trim().to_ascii_lowercase().as_str() {
+                "" | "toggle" => Outcome::Do(Action::ToggleFold("provider_diagnostic")),
+                "show" | "open" => Outcome::Do(Action::SetFold(
+                    "provider_diagnostic",
+                    crate::host::Showing::Open,
+                )),
+                "hide" | "fold" | "close" => Outcome::Do(Action::SetFold(
+                    "provider_diagnostic",
+                    crate::host::Showing::Folded,
+                )),
+                other => Outcome::Refused(
+                    t(Msg::FoldUsage {
+                        name: "errors",
+                        other,
+                    })
+                    .into_owned(),
+                ),
+            },
             "tools" => match tool_output(&args.to_ascii_lowercase()) {
                 Ok(action) => Outcome::Do(action),
                 Err(why) => Outcome::Refused(why),
@@ -6298,6 +6321,35 @@ mod tests {
     /// states are the other half — `show` has to mean show, and a toggle means
     /// the opposite of itself every other time, which is unusable from a script
     /// or from a session just resumed onto another screen.
+    #[tokio::test]
+    async fn error_details_are_accessible_without_a_pointer() {
+        let app = bare();
+        let all = Arc::new(Commands::new());
+        let _ = all.add(Arc::new(ScreenCommands));
+        assert!(matches!(
+            all.dispatch("/errors", &app.context()).await,
+            Outcome::Do(Action::ToggleFold("provider_diagnostic"))
+        ));
+        assert!(matches!(
+            all.dispatch("/errors show", &app.context()).await,
+            Outcome::Do(Action::SetFold(
+                "provider_diagnostic",
+                crate::host::Showing::Open
+            ))
+        ));
+        assert!(matches!(
+            all.dispatch("/errors hide", &app.context()).await,
+            Outcome::Do(Action::SetFold(
+                "provider_diagnostic",
+                crate::host::Showing::Folded
+            ))
+        ));
+        assert!(matches!(
+            all.dispatch("/errors typo", &app.context()).await,
+            Outcome::Refused(_)
+        ));
+    }
+
     #[tokio::test]
     async fn team_and_todo_take_a_named_state_and_refuse_anything_else() {
         use crate::host::Showing;

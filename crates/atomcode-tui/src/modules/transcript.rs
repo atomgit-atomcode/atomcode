@@ -507,24 +507,45 @@ impl Producer for Transcript {
                 // (`host_rows::RateLimitCoding`); said here in the person's
                 // language, as the classic screen says it. A provider retry
                 // carries its numbers apart from the provider's error, so it is
-                // said the same way. Anything else — and a retry logged before
-                // the numbers were kept — is shown as it was written.
+                // said the same way. Older retries without structured counters
+                // keep their raw text in details without inventing retry numbers.
+                let raw_detail = detail.clone();
                 let detail = match (notice, retry) {
                     (atomcode_harness::session::NoticeKind::RateLimited, _) => {
                         rate_limit_wait(detail).unwrap_or_else(|| detail.clone())
                     }
                     (atomcode_harness::session::NoticeKind::ProviderRetry, Some(retry)) => {
                         t(Msg::TranscriptProviderRetry {
-                            reason: detail,
+                            reason: &crate::provider_notice::reason(detail),
                             seconds: retry.backoff_secs,
                             attempt: retry.attempt,
                             max: retry.max_attempts,
                         })
                         .into_owned()
                     }
+                    (atomcode_harness::session::NoticeKind::ProviderRetry, None) => {
+                        crate::provider_notice::reason(detail)
+                    }
                     _ => detail.clone(),
                 };
-                out.emit(at, Arc::new(NoticeBlock { detail }));
+                let detail =
+                    if matches!(notice, atomcode_harness::session::NoticeKind::ProviderRetry) {
+                        format!("{detail} · {}", t(Msg::ProviderRetryDetailsHint))
+                    } else {
+                        detail
+                    };
+                let summary = Arc::new(NoticeBlock { detail });
+                if matches!(notice, atomcode_harness::session::NoticeKind::ProviderRetry) {
+                    out.emit(
+                        at,
+                        Arc::new(crate::provider_notice::DiagnosticBlock {
+                            summary,
+                            detail: raw_detail,
+                        }),
+                    );
+                } else {
+                    out.emit(at, summary);
+                }
             }
 
             // ---- things the harness did that change what the model sees -----
@@ -759,21 +780,37 @@ impl Producer for Transcript {
                     }
                     idx
                 };
-                out.emit(
-                    at,
-                    Arc::new(TurnEndBlock {
-                        // The typed reason, not a rendering of it: how the turn
-                        // ended is what the block draws, and a `{:?}` here would
-                        // put a Rust identifier on the screen (see
-                        // `content::turn_end_note`).
-                        stop: *stop,
-                        error: error.clone(),
-                        stats,
-                        done_index,
-                        open_items,
-                        ended_at: crate::content::clock_of(logged.at),
-                    }),
-                );
+                let block = TurnEndBlock {
+                    // The typed reason, not a rendering of it: how the turn
+                    // ended is what the block draws, and a `{:?}` here would
+                    // put a Rust identifier on the screen (see
+                    // `content::turn_end_note`).
+                    stop: *stop,
+                    error: if matches!(stop, atomcode_harness::seams::StopReason::ProviderError) {
+                        error.as_deref().map(crate::provider_notice::advice)
+                    } else {
+                        error.clone()
+                    },
+                    stats,
+                    done_index,
+                    open_items,
+                    ended_at: crate::content::clock_of(logged.at),
+                };
+                if matches!(stop, atomcode_harness::seams::StopReason::ProviderError) {
+                    if let Some(detail) = error {
+                        out.emit(
+                            at,
+                            Arc::new(crate::provider_notice::DiagnosticBlock {
+                                summary: Arc::new(block),
+                                detail: detail.clone(),
+                            }),
+                        );
+                    } else {
+                        out.emit(at, Arc::new(block));
+                    }
+                } else {
+                    out.emit(at, Arc::new(block));
+                }
             }
 
             // What the turn cost, in the two facts that carry it. `step` and
@@ -1116,7 +1153,7 @@ mod tests {
         ]);
         let drawn = said(&s);
         let said_once = t(Msg::TranscriptProviderRetry {
-            reason: "connection refused",
+            reason: &crate::provider_notice::reason("connection refused"),
             seconds: 3,
             attempt: 1,
             max: 2,

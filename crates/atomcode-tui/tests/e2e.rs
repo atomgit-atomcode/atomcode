@@ -1937,17 +1937,21 @@ async fn a_turn_the_model_never_answers_says_so_and_stops_spinning() {
     s.quiet().await;
 
     let screen = s.screen();
-    assert!(screen.contains("已中断"), "the outcome:\n{screen}");
+    assert!(screen.contains("模型服务错误"), "the outcome:\n{screen}");
     assert!(
-        screen.contains("nodename nor servname"),
+        screen.contains("无法连接模型服务"),
         "the cause, wrapped rather than dropped:\n{screen}"
+    );
+    assert!(
+        !screen.contains("nodename nor servname"),
+        "raw error starts folded"
     );
     // And exactly once. 这句话有两条通道：带 `ends_turn` 标记的事件（消费端认它，抑制
     // 自己那一份）和回合收尾块（画事实，`TurnEnd::error`）。两边都画，读起来就像两件事。
     // 反过来也在这儿钉住：生产者若在一条**没有**收尾事实的路径上标了这个标记，两份都不画，
     // 计数会掉到 0。
     assert_eq!(
-        screen.matches("nodename nor servname").count(),
+        screen.matches("无法连接模型服务").count(),
         1,
         "the cause is said exactly once:\n{screen}"
     );
