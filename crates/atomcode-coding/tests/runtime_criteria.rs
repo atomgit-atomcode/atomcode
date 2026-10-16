@@ -2457,7 +2457,11 @@ async fn a_round_budget_ends_the_turn() {
         Some(atomcode_kernel::event::StopReason::MaxRounds),
         ""
     );
-    assert_eq!(recorder.requests.lock().unwrap().len(), 1, "");
+    assert_eq!(
+        recorder.requests.lock().unwrap().len(),
+        2,
+        "work plus text-only closing"
+    );
     runtime.handle.shutdown().await.unwrap();
 }
 
@@ -4400,7 +4404,7 @@ async fn a_turn_ending_on_its_last_allowed_round_is_not_cut_off() {
 }
 
 /// With the checkpoint on, a turn at its round budget asks before it is cut off:
-/// going on buys another budget, stopping ends it at the cap.
+/// going on buys another budget, stopping allows only a text-only closing request.
 async fn the_round_budget_asks_before_it_cuts_a_turn_off() {
     let env = env();
     std::fs::write(env.project.path().join("marker.txt"), "marked\n").unwrap();
@@ -4444,8 +4448,8 @@ async fn the_round_budget_asks_before_it_cuts_a_turn_off() {
     );
     assert_eq!(
         recorder.requests.lock().unwrap().len(),
-        before + 1,
-        "a round ran past a stop"
+        before + 2,
+        "one work round and one text-only closing request"
     );
     runtime.handle.shutdown().await.unwrap();
 }

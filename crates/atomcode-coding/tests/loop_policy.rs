@@ -92,7 +92,10 @@ async fn the_round_budget_is_a_row_and_the_loop_only_has_a_fuse() {
     let app = start(tree(&dir, &script, &[capped])).await;
     let outcome = run_turn(&app, "go").await.unwrap();
     assert_eq!(outcome.stop, StopReason::MaxRounds);
-    assert_eq!(outcome.rounds, 3);
+    assert_eq!(
+        outcome.rounds, 4,
+        "three work rounds and one text-only closing request"
+    );
     drop(app);
 
     // Without it: the loop's own fuse is what stops it, named differently so a
@@ -132,8 +135,8 @@ async fn the_round_budget_is_reconfigurable_while_the_process_runs() {
     let outcome = run_turn(&app, "go").await.unwrap();
     assert_eq!(outcome.stop, StopReason::MaxRounds);
     assert_eq!(
-        outcome.rounds, 4,
-        "the patched budget, not the 1000 it was mounted with"
+        outcome.rounds, 5,
+        "four work rounds plus closing, not the 1000 it was mounted with"
     );
 }
 
@@ -847,5 +850,187 @@ id = "tool-loop-guard"
     assert!(
         !app.context().service_names().contains(&"compaction"),
         "the compaction seam goes with its only provider"
+    );
+}
+
+struct BudgetBatchProbe(Arc<AtomicU32>);
+
+#[async_trait]
+impl Waterfall<atomcode_harness::events::ToolsExecuteBatch> for BudgetBatchProbe {
+    async fn handle(
+        &self,
+        batch: &mut atomcode_harness::events::ToolBatch,
+        next: Next<'_, atomcode_harness::events::ToolsExecuteBatch>,
+    ) -> Vec<atomcode_kernel::tool::ToolResult> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        next.run(batch).await
+    }
+}
+
+struct BudgetProbe {
+    seen: Arc<AtomicU32>,
+    work: u32,
+    fail_closing: bool,
+    closing_started: Option<Arc<tokio::sync::Notify>>,
+}
+
+#[async_trait]
+impl Waterfall<AgentRequest> for BudgetProbe {
+    async fn handle(
+        &self,
+        req: &mut ModelRequest,
+        _: Next<'_, AgentRequest>,
+    ) -> Result<ModelResponse, RequestError> {
+        use atomcode_kernel::{provider::ToolChoice, tool::ToolCall};
+        let n = self.seen.fetch_add(1, Ordering::SeqCst);
+        if req.options.tool_choice == ToolChoice::None {
+            if let Some(started) = &self.closing_started {
+                started.notify_one();
+                return std::future::pending().await;
+            }
+            assert!(req.tools.is_empty());
+            assert!(req
+                .messages
+                .iter()
+                .any(|m| m.text.contains("configured round budget")));
+            if self.fail_closing {
+                return Err(fatal("closing failed"));
+            }
+            return Ok(ModelResponse {
+                text: "Budget reached. Read completed; more work remains.".into(),
+                // A provider that ignores tool_choice must never apply this write.
+                tool_calls: vec![ToolCall {
+                    id: "forbidden".into(),
+                    name: "write_file".into(),
+                    arguments: r#"{"file_path":"forbidden.txt","content":"bad"}"#.into(),
+                }],
+                ..Default::default()
+            });
+        }
+        if n >= self.work {
+            return Ok(ModelResponse {
+                text: "finished".into(),
+                ..Default::default()
+            });
+        }
+        Ok(ModelResponse {
+            text: "working".into(),
+            tool_calls: vec![ToolCall {
+                id: format!("read-{n}"),
+                name: "read_file".into(),
+                arguments: r#"{"file_path":"a.txt"}"#.into(),
+            }],
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_round_budget_closes_once_without_executing_tools_even_if_the_provider_ignores_it() {
+    for fail_closing in [false, true] {
+        let dir = scratch("budget-closing");
+        std::fs::write(dir.join("a.txt"), "ok").unwrap();
+        let app = start(tree(
+            &dir,
+            NEVER_STOPS,
+            &["[[patch]]\nid = \"round-cap\"\nconfig = { max_rounds = 1 }"],
+        ))
+        .await;
+        let seen = Arc::new(AtomicU32::new(0));
+        let batches = Arc::new(AtomicU32::new(0));
+        let _batch_guard = app
+            .context()
+            .on_waterfall::<atomcode_harness::events::ToolsExecuteBatch>(
+                Arc::new(BudgetBatchProbe(batches.clone())),
+                Default::default(),
+            );
+        let _guard = app.context().on_waterfall::<AgentRequest>(
+            Arc::new(BudgetProbe {
+                seen: seen.clone(),
+                work: 10,
+                fail_closing,
+                closing_started: None,
+            }),
+            Default::default(),
+        );
+        let result = run_turn(&app, "go").await.unwrap();
+        assert_eq!(seen.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            batches.load(Ordering::SeqCst),
+            1,
+            "only the work request may enter tool execution, regardless of tool approval"
+        );
+        assert!(!dir.join("forbidden.txt").exists());
+        assert_eq!(
+            result.stop,
+            if fail_closing {
+                StopReason::ProviderError
+            } else {
+                StopReason::MaxRounds
+            }
+        );
+        if !fail_closing {
+            assert!(result.text.contains("more work remains"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_unlimited_coding_turn_can_pass_three_hundred_rounds() {
+    assert_eq!(atomcode_coding::on_harness::RUNAWAY_FUSE_ROUNDS, 0);
+    let dir = scratch("unlimited-301");
+    std::fs::write(dir.join("a.txt"), "ok").unwrap();
+    let rows = "[[patch]]\nid = \"agent-loop\"\nconfig = { max_rounds = 0 }\n\n[[remove]]\nid = \"tool-loop-guard\"\n\n[[remove]]\nid = \"repeat-fuse\"";
+    let app = start(tree(&dir, NEVER_STOPS, &[rows])).await;
+    let seen = Arc::new(AtomicU32::new(0));
+    let _guard = app.context().on_waterfall::<AgentRequest>(
+        Arc::new(BudgetProbe {
+            seen: seen.clone(),
+            work: 301,
+            fail_closing: false,
+            closing_started: None,
+        }),
+        Default::default(),
+    );
+    let result = run_turn(&app, "go").await.unwrap();
+    assert_eq!(result.stop, StopReason::Stopped);
+    assert_eq!(result.rounds, 302);
+    assert_eq!(seen.load(Ordering::SeqCst), 302);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn closing_is_cancellable_and_does_not_consume_queued_input() {
+    let dir = scratch("cancel-closing");
+    std::fs::write(dir.join("a.txt"), "ok").unwrap();
+    let app = start(tree(
+        &dir,
+        NEVER_STOPS,
+        &["[[patch]]\nid = \"round-cap\"\nconfig = { max_rounds = 1 }"],
+    ))
+    .await;
+    let seen = Arc::new(AtomicU32::new(0));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let _guard = app.context().on_waterfall::<AgentRequest>(
+        Arc::new(BudgetProbe {
+            seen,
+            work: 10,
+            fail_closing: false,
+            closing_started: Some(started.clone()),
+        }),
+        Default::default(),
+    );
+    let agent = atomcode_harness::create_agent(&app).await.unwrap();
+    agent.send("go");
+    let drive = atomcode_harness::drive(&app, &agent);
+    let cancel = async {
+        started.notified().await;
+        agent.send("next request");
+        agent.cancel();
+    };
+    let (result, _) = tokio::join!(drive, cancel);
+    assert_eq!(result.unwrap().stop, StopReason::Cancelled);
+    assert_eq!(
+        agent.inbox().claim().message.as_deref(),
+        Some("next request")
     );
 }

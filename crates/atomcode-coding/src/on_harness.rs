@@ -116,26 +116,9 @@ pub const CODING_DEFAULTS: &str = r#"
 # patches this row back to the configured budget when that budget is not `0`.
 # So in the shipped runtime this `0` is the default, not the last word.
 #
-# ALSO worth knowing, and this one is a divergence: `agent-loop` carries a
-# second, coarser stop — `infra` sets `config = { max_rounds = 100 }`, and
-# `agent_loop.rs` ends the turn with `StopReason::RunawayFuse` at that round.
-# The engine's counterpart is `cfg.max_rounds` → the kernel fuse, whose comment
-# reads "`0` leaves the neutral kernel fuse unwired" — i.e. the engine ships it
-# **off** and relies on the repetition guards, which is what this assembly's
-# `tool-loop-guard` + `repeat-fuse` rows are.
-#
-# Matching that here would mean setting the fuse to `0`, and that is not one
-# change: `agent_loop.rs` compares `step >= self.max_rounds`, so a bare `0` stops
-# the turn before its first request (the same trap `round-cap` had). The
-# corresponding statement in that direction is [`RUNAWAY_FUSE_ROUNDS`].
-#
-# The fuse stays ON — a turn that nothing else is watching must still end — but
-# its number is this product's, not `infra`'s 100 and not a serde default:
-# [`RUNAWAY_FUSE_ROUNDS`]. Every patch this crate aims at `agent-loop` carries
-# the field, because `Op::Patch` **replaces a row's whole config**: a patch that
-# says only `working_dir` does not leave the fuse alone, it drops it back to
-# `LoopRow::default()` — which is how a `--dump-config` reading 100 came to mean
-# nothing in particular.
+# The product disables the separate agent-loop fuse (0 = unlimited).
+# `round-cap` is the configurable budget; reaching it allows one text-only
+# closing request. Repeat guards, deadlines and cancellation remain independent.
 [[patch]]
 id = "round-cap"
 config = { max_rounds = 0 }
@@ -377,27 +360,10 @@ name = "telemetry"
 disabled = true
 "#;
 
-/// The coarse fuse `agent-loop` ends a turn on, in rounds.
-///
-/// Not `infra`'s 100 and not `LoopRow::default()`: the number a person reads in
-/// `--dump-config` has to be the number in force. The row's own default lives in
-/// `harness/plugins/agent_loop.rs`, and a `[[patch]]` replaces a row's whole
-/// config, so a patch carrying only `working_dir` silently reverts this to that
-/// default. Both of this crate's `agent-loop` patches therefore state it:
-/// `AgentLoopOptionsPatch` (the runtime's own option rows) and `AgentLoopPatch`
-/// (the layer `mount_hosted` scopes, which is the last word on the
-/// `mount_swappable` path, where no runtime option rows exist).
-///
-/// It is the *fuse*, not the budget: `round-cap` owns the turn's round budget,
-/// and the fuse exists so a turn terminates even when no `turn-stopping`
-/// listener does. Raising it moves the round at which a tree with no stopping
-/// policy gives up; it does not by itself make a turn run longer than the budget
-/// allows.
-///
-/// Public for the reason [`CODING_DEFAULTS`] is: a host that stacks that list and
-/// then patches `agent-loop` itself has to state the same number, or the value
-/// it reverts to is `LoopRow::default()` and nobody chose it.
-pub const RUNAWAY_FUSE_ROUNDS: u32 = 300;
+/// The product leaves the separate loop fuse disabled. The round-cap policy
+/// owns configured budgets; repetition guards and cancellation remain active.
+/// Every agent-loop patch carries this value because patches replace config.
+pub const RUNAWAY_FUSE_ROUNDS: u32 = 0;
 
 // ---- the shapes this product patches rows with ------------------------------
 //

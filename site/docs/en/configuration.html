@@ -270,7 +270,7 @@ base_url = "http://localhost:11434"</code></pre>
       <h2 id="turn-round-limit">Turn round limit</h2>
       <pre><code>[coding]
 max_rounds = 200</code></pre>
-      <p>When the limit is reached, the TUI asks whether to continue or stop instead of dropping the task. Set it to <code>0</code> for no limit.</p>
+      <p>The default <code>0</code> means unlimited, with no additional fixed 300-round cap. A positive value limits work rounds. If work remains at the cap, at most one additional text-only model request summarizes progress, remaining work and next steps; it is billed and counted as a round. Interactive checkpoints, when enabled, can extend the budget first. Cancellation, timeout or provider errors can interrupt closing. Repetition guards remain independent.</p>
 
       <h2 id="todo-eagerness">Todo eagerness</h2>
       <pre><code>[tools.todo]

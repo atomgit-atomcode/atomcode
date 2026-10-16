@@ -1017,7 +1017,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StopCancelled => "stopped".into(),
         Msg::StopMaxRounds => "stopped · the rounds ran out".into(),
         Msg::StopByPolicy => "stopped · a stopping policy ended it (a deadline or a budget)".into(),
-        Msg::StopRunawayFuse => "stopped · the backstop fuse blew; this tree has no stopping policy at all".into(),
+        Msg::StopRunawayFuse => "stopped · execution loop safety limit reached".into(),
         Msg::StopToolLoop => {
             "stopped · the model kept repeating the same step with no progress — send a new \
              message (rephrase or add a hint) to continue"

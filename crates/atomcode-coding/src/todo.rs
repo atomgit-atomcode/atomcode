@@ -322,7 +322,7 @@ impl LifecycleHooks for TodoEagerHook {
         options: &mut ChatOptions,
         ctx: &TurnCtx,
     ) {
-        if self.should_hard_force(messages, ctx) {
+        if options.tool_choice != ToolChoice::None && self.should_hard_force(messages, ctx) {
             options.tool_choice = ToolChoice::Specific("todowrite".to_string());
         }
     }
@@ -1275,6 +1275,18 @@ mod tests {
         assert_eq!(
             options.tool_choice,
             ToolChoice::Specific("todowrite".into())
+        );
+
+        let mut closing_options = ChatOptions {
+            tool_choice: ToolChoice::None,
+            ..Default::default()
+        };
+        hook.pre_request_options(&messages, &mut closing_options, &ctx)
+            .await;
+        assert_eq!(
+            closing_options.tool_choice,
+            ToolChoice::None,
+            "explicit text-only closing must take precedence over eager planning"
         );
 
         let with_list = vec![

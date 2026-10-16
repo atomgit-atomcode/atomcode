@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use atomcode_kernel::message::Message;
-use atomcode_kernel::provider::{ChatOptions, LlmProvider};
+use atomcode_kernel::provider::{ChatOptions, LlmProvider, ToolChoice};
 use atomcode_kernel::stream::StreamEvent;
 use atomcode_kernel::tool::{ToolCall, ToolDef, ToolResult};
 use atomcode_plexus::{Context, Plugin};
@@ -40,8 +40,8 @@ use crate::session::{
 
 #[derive(Debug, Deserialize)]
 struct LoopRow {
-    /// The runaway fuse, not a policy. A tree with no `agent/turn-stopping`
-    /// listener still terminates; a tree that has one should hit that first.
+    /// Optional runaway fuse (0 disables it), independent of turn policy.
+    /// A positive value bounds trees without a stopping listener.
     #[serde(default = "default_max_rounds")]
     max_rounds: u32,
     #[serde(default)]
@@ -164,6 +164,7 @@ impl PluginAgentLoop {
         mut req: ModelRequest,
     ) -> Result<ModelResponse, RequestError> {
         let ctx = agent_ctx.clone();
+        let text_only = req.options.tool_choice == ToolChoice::None;
         let request_started = std::time::Instant::now();
         let mut timing = crate::diagnostics::PhaseTiming::start("request_pipeline");
         let result = agent_ctx
@@ -180,8 +181,17 @@ impl PluginAgentLoop {
                 let ctx = ctx.clone();
                 let session = session.clone();
                 let messages = req.messages.clone();
-                let tools = req.tools.clone();
-                let options = req.options.clone();
+                let tools = if text_only {
+                    Vec::new()
+                } else {
+                    req.tools.clone()
+                };
+                let mut options = req.options.clone();
+                // A request hook may adjust normal options, but cannot turn a
+                // budget-closing request back into a tool request.
+                if text_only {
+                    options.tool_choice = ToolChoice::None;
+                }
                 let idle = self.stream_idle;
                 let first_content = self.stream_first_content;
                 Box::pin(async move {
@@ -469,12 +479,17 @@ impl PluginAgentLoop {
         let started_at = std::time::Instant::now();
         let mut used_tokens = 0u32;
         let mut step: u32 = 0;
+        let mut closing: Option<StopReason> = None;
 
         loop {
             // Claim one message plus whatever context queued alongside it. On
             // later passes this is what folds a mid-turn message into the turn
             // already running instead of making it wait for the next one.
-            let claimed = agent.inbox().claim();
+            let claimed = if closing.is_some() {
+                crate::agent::Claimed::default()
+            } else {
+                agent.inbox().claim()
+            };
             // The receipt is answered once the turn has kept the message, not
             // here: a stop can still overtake it (below).
             let answering = match (&claimed.receipt, claimed.message.is_some()) {
@@ -670,7 +685,19 @@ impl PluginAgentLoop {
             outcome.rounds = step;
             self.commit(&session, SessionEvent::StepStart { turn, step });
 
-            let (messages, tools) = self.assemble(&session, &ctx);
+            if closing.is_some() {
+                self.commit(&session, SessionEvent::Injected {
+                    turn,
+                    text: format!("The configured round budget has been reached after {} rounds. Tools are disabled for this closing request only; a later user request may resume work. Respond with text only: explain that the round limit was reached, summarize verified progress, list unfinished work and suggest next steps. Do not claim unfinished work is complete.", step - 1),
+                    origin: InjectionOrigin::InternalNudge,
+                });
+            }
+            let (messages, mut tools) = self.assemble(&session, &ctx);
+            let mut options = ChatOptions::default();
+            if closing.is_some() {
+                tools.clear();
+                options.tool_choice = ToolChoice::None;
+            }
 
             if self.verify_log_invariant {
                 if let Err(unexplained) =
@@ -716,7 +743,7 @@ impl PluginAgentLoop {
                 ModelRequest {
                     messages,
                     tools,
-                    options: ChatOptions::default(),
+                    options,
                     turn,
                     round: step,
                     answering_a_nudge,
@@ -800,7 +827,14 @@ impl PluginAgentLoop {
             outcome.tool_calls += tool_count;
             // No calls, nothing to schedule: dispatching an empty batch would
             // make every listener reason about a round that did not happen.
-            let results = if tool_count == 0 {
+            let results = if closing.is_some() {
+                response.tool_calls.into_iter().map(|call| ToolResult {
+                    call_id: call.id,
+                    content: "Tool not executed: the round budget was reached; this request is text-only.".into(),
+                    is_error: true,
+                    images: Vec::new(),
+                }).collect()
+            } else if tool_count == 0 {
                 Vec::new()
             } else {
                 self.execute_batch(&ctx, agent, response.tool_calls, turn, step)
@@ -846,6 +880,10 @@ impl PluginAgentLoop {
                 break;
             }
 
+            if let Some(stop) = closing.take() {
+                outcome.stop = stop;
+                break;
+            }
             let owes_a_request = tool_count > 0 || response.truncated;
             // Asked on the agent's own context: a delegated agent's budget is a
             // listener on its realm, which the tree cannot see — asked on the
@@ -863,6 +901,10 @@ impl PluginAgentLoop {
                 })
                 .await
             {
+                if stop == StopReason::MaxRounds && owes_a_request {
+                    closing = Some(stop);
+                    continue;
+                }
                 outcome.stop = stop;
                 break;
             }
@@ -883,7 +925,7 @@ impl PluginAgentLoop {
                 break;
             }
 
-            if step >= self.max_rounds {
+            if self.max_rounds > 0 && step >= self.max_rounds {
                 outcome.stop = StopReason::RunawayFuse;
                 break;
             }
