@@ -112,7 +112,7 @@ pub struct Team;
 /// Here rather than folded into [`targets`] alone because the keyboard and the
 /// pointer ask the same question through `targets`: an empty answer is what
 /// keeps `Tab` from giving the keyboard to a panel nobody drew.
-fn running(moment: &Moment) -> bool {
+pub(crate) fn running(moment: &Moment) -> bool {
     moment.members.iter().any(|m| !m.gone)
         || !background(moment).is_empty()
         || moment.team_return.is_some()
@@ -172,7 +172,7 @@ pub fn is_background(moment: &Moment, session: &str) -> bool {
 /// or a press would land on the agent below the one it hit.
 pub fn targets(moment: &Moment) -> Vec<String> {
     let main = main_target(moment);
-    if main.is_empty() || !running(moment) {
+    if main.is_empty() || !running(moment) || moment.team_collapsed {
         return Vec::new();
     }
     let mut targets: Vec<String> = std::iter::once(main.to_string())
@@ -328,6 +328,19 @@ impl View for Team {
         }
         let caps = vp.moment.caps;
         let muted = theme::fg(Role::Muted);
+        if vp.moment.team_collapsed {
+            let background = rows.iter().filter(|row| row.background).count();
+            return vec![Line::styled(
+                width::take_width(
+                    &t(Msg::TeamHeader {
+                        count: rows.len() - background,
+                        background,
+                    }),
+                    w as usize,
+                ),
+                muted,
+            )];
+        }
         if all_resting(&rows, vp.moment) {
             return vec![Line::styled(
                 width::take_width(&t(Msg::TeamHeaderAllIdle { count: rows.len() }), w as usize),
@@ -530,7 +543,7 @@ impl View for Team {
             return Height::Hug(0);
         }
         let rows = rows(state, moment);
-        if all_resting(&rows, moment) {
+        if moment.team_collapsed || all_resting(&rows, moment) {
             return Height::Hug(1);
         }
         Height::Hug(
@@ -755,6 +768,28 @@ mod tests {
             .map(|l| l.plain())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn a_collapsed_team_keeps_only_its_header_and_no_hidden_navigation_targets() {
+        let state = State::default();
+        let mut moment = Moment::default()
+            .with_lead("lead")
+            .with_members(vec![MemberNow {
+                name: "scout".into(),
+                session: "lead/scout".into(),
+                activity: Activity::Working,
+                ..Default::default()
+            }]);
+        assert!(drew(&state, &moment).contains("scout"));
+        moment.team_collapsed = true;
+        assert_eq!(Team::height(&state, &moment, 60), Height::Hug(1));
+        assert_eq!(drew(&state, &moment).lines().count(), 1);
+        assert!(!drew(&state, &moment).contains("scout"));
+        assert!(targets(&moment).is_empty());
+        moment.team_collapsed = false;
+        assert!(drew(&state, &moment).contains("scout"));
+        assert_eq!(targets(&moment), vec!["lead", "lead/scout"]);
     }
 
     /// A subagent the `task` tool made is listed by what it was asked to do —

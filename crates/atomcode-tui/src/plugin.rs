@@ -3403,9 +3403,7 @@ impl Tui {
             return false;
         }
         let m = self.host.moment.read().expect("moment poisoned");
-        m.history_at.is_none()
-            && m.scroll.is_at_bottom()
-            && !crate::modules::team::targets(&m).is_empty()
+        m.history_at.is_none() && m.scroll.is_at_bottom() && crate::modules::team::running(&m)
     }
 
     /// Whether one ↑/↓ would move the caret inside a draft of several rows
@@ -8344,6 +8342,26 @@ impl Tui {
                     self.host
                         .say_for(t(Msg::ReasoningNotReceived).into_owned(), false, 5_000);
                 }
+                return false;
+            }
+            Action::ToggleFold("team") | Action::SetFold("team", _) => {
+                m.team_collapsed = match action {
+                    Action::SetFold(_, to) => !matches!(to, crate::host::Showing::Open),
+                    _ => !m.team_collapsed,
+                };
+                if m.team_collapsed {
+                    m.team_keyboard = false;
+                    m.team_cursor = None;
+                }
+                let message = if m.team_collapsed {
+                    Msg::TeamPanelCollapsed
+                } else if !crate::modules::team::running(&m) {
+                    Msg::TeamPanelEmpty
+                } else {
+                    Msg::TeamPanelExpanded
+                };
+                drop(m);
+                self.host.say_for(t(message).into_owned(), false, 5_000);
                 return false;
             }
             Action::ToggleFold("todo") => {

@@ -182,3 +182,19 @@ mod provider_message_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod team_panel_message_tests {
+    use super::*;
+    #[test]
+    fn team_panel_feedback_is_available_in_both_languages() {
+        for (locale, empty, expanded, collapsed) in [
+            (Locale::ZhCn, "当前没有团队成员", "已展开", "已收起"),
+            (Locale::En, "No team members", "expanded", "collapsed"),
+        ] {
+            assert!(t_with(locale, Msg::TeamPanelEmpty).contains(empty));
+            assert!(t_with(locale, Msg::TeamPanelExpanded).contains(expanded));
+            assert!(t_with(locale, Msg::TeamPanelCollapsed).contains(collapsed));
+        }
+    }
+}

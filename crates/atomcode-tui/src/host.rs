@@ -2047,6 +2047,10 @@ impl Host {
     /// when there is no team to switch between.
     pub fn focus_team(&self) -> bool {
         let mut m = self.moment.write().expect("moment poisoned");
+        if !crate::modules::team::running(&m) {
+            return false;
+        }
+        m.team_collapsed = false;
         let targets = crate::modules::team::targets(&m);
         if targets.is_empty() {
             return false;
@@ -16013,7 +16017,10 @@ mod tests {
         use atomcode_host_api::BackgroundState as S;
         h.moment.write().unwrap().lead = "lead".into();
         h.show_bg(review(S::Running));
+        h.moment.write().unwrap().team_collapsed = true;
+        assert!(crate::modules::team::targets(&h.moment.read().unwrap()).is_empty());
         assert!(h.focus_team());
+        assert!(!h.moment.read().unwrap().team_collapsed);
         assert!(h.team_focused());
         h.show_bg(review(S::Done));
         assert!(!h.team_focused(), "nothing left to point at");

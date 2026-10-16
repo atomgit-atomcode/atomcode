@@ -847,6 +847,8 @@ pub struct Moment {
     /// a row and stops there; a stored fact (a question waiting, below) can take
     /// the keyboard without being asked for, but a mouse move is not that.
     pub team_keyboard: bool,
+    /// Local disclosure state; folding keeps the team header and hides member rows.
+    pub team_collapsed: bool,
     /// Local disclosure state for the task panel; plans start compact.
     pub todo_expanded: bool,
     pub todo_offset: usize,

@@ -5042,6 +5042,44 @@ async fn a_member_s_own_conversation_stays_off_the_lead_s_screen() {
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
 
+#[tokio::test]
+async fn idle_team_commands_acknowledge_an_empty_panel_without_calling_the_model() {
+    let dir = scratch("empty-team-commands");
+    let s = start(tree(
+        &dir,
+        &replay(r#"{ text = "MODEL-MUST-NOT-RUN" }"#),
+        &[],
+    ))
+    .await;
+    let task = s.open().await;
+    for (command, expected) in [
+        ("/team show", "当前没有团队成员或后台任务"),
+        ("/team hide", "团队面板已收起"),
+        ("/team", "当前没有团队成员或后台任务"),
+    ] {
+        s.term.type_line(command);
+        s.quiet().await;
+        let screen = s.screen();
+        assert!(screen.contains(expected), "{command}: {screen}");
+        assert!(!screen.contains("MODEL-MUST-NOT-RUN"), "{screen}");
+        let frame = s.term.last().unwrap();
+        let input = frame
+            .part("input")
+            .unwrap()
+            .lines
+            .iter()
+            .map(|l| l.plain())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !input.contains("/team"),
+            "the submitted command must leave the input: {input}"
+        );
+    }
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
 /// The other half of the same rule: what the screen *may* show of a member.
 ///
 /// The panel is the lead's own knowledge, drawn where it can be glanced at —
@@ -5365,7 +5403,8 @@ async fn an_approval_asked_for_by_a_member_says_which_member() {
     s.term.type_line("have someone write the notes");
     // Delegating is itself a risky call, so the lead's own `team` card comes
     // first. Allow it, and the member's card is the next one up.
-    until(&s, "team").await;
+    // The running tool line already says `team`, before its approval is ready.
+    until(&s, "1) 允许一次").await;
     s.term.press(KeyPress::ch('1'));
     // Not `quiet`: the turn is deliberately stuck on a question, which is the
     // state under test. Settle on the card being up instead.
