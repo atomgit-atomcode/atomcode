@@ -580,7 +580,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::AnsiTerminalRequired =>
             "This terminal cannot display the TUI. Use an ANSI-capable terminal such as Windows Terminal, or run with -p for headless mode.".into(),
         Msg::ClassicScreenRetired =>
-            "The classic screen has been retired. Using the current TUI; remove --classic or change [ui] screen to rows.".into(),
+            "The classic screen has been retired. Using the current TUI; change [ui] screen to rows.".into(),
         Msg::PasswordPromptHint =>
             "🔒 A command is asking for a password · not shown, not kept · Enter send · Esc cancel".into(),
         Msg::SessionPickerTitle { n, total, project } =>

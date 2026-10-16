@@ -704,10 +704,6 @@ struct Cli {
     #[arg(long, conflicts_with = "headless_input")]
     pub tui: bool,
 
-    /// Deprecated compatibility alias for the only supported TUI.
-    #[arg(long, hide = true, conflicts_with = "tui")]
-    pub classic: bool,
-
     /// On the row-assembled screen: show the mascot.
     #[arg(long)]
     pub mascot: bool,
@@ -2370,7 +2366,7 @@ async fn run() -> Result<i32> {
     // One screen and one runtime owner. Older classic inputs remain readable,
     // but never select a second frontend or a fallback runtime.
     if !is_headless {
-        if cli.classic || config.ui.screen == atomcode_config::config::Screen::Classic {
+        if config.ui.screen == atomcode_config::config::Screen::Classic {
             eprintln!(
                 "{}",
                 atomcode_config::i18n::t(atomcode_config::i18n::Msg::ClassicScreenRetired)
@@ -5875,10 +5871,11 @@ mod retired_screen_tests {
     use clap::{CommandFactory, Parser};
 
     #[test]
-    fn the_retired_flag_still_parses_without_selecting_a_second_backend() {
-        let cli = Cli::try_parse_from(["atomcode", "--classic", "-p", "hello"]).unwrap();
-        assert!(cli.classic);
-        assert_eq!(cli.prompt.as_deref(), Some("hello"));
+    fn the_retired_flag_is_an_unknown_argument() {
+        let error = Cli::try_parse_from(["atomcode", "--classic", "-p", "hello"])
+            .err()
+            .expect("the retired flag must be rejected");
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
         let help = Cli::command().render_long_help().to_string();
         assert!(!help.contains("--classic"));
         assert!(help.contains("--tui"));

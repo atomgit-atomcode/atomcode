@@ -552,7 +552,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::AnsiTerminalRequired =>
             "当前终端不支持 TUI 所需的 ANSI 功能。请使用 Windows Terminal 等支持 ANSI 的终端，或通过 -p 使用无界面模式。".into(),
         Msg::ClassicScreenRetired =>
-            "经典界面已退役，现使用当前 TUI；请移除 --classic 或将 [ui] screen 改为 rows。".into(),
+            "经典界面已退役，现使用当前 TUI；请将 [ui] screen 改为 rows。".into(),
         Msg::PasswordPromptHint =>
             "🔒 命令在请求密码 · 输入不显示、不留存 · Enter 提交 · Esc 取消".into(),
         Msg::SessionPickerTitle { n, total, project } =>

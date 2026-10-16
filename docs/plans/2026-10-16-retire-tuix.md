@@ -120,3 +120,10 @@ HTML 重新生成索引，保留新 worktree 说明及本次 classic /copy 文�
 `cargo check -p atomcode --all-targets --features distro-pm` 通过；updater 的包管理器
 升级策略保持，未保留 tuix feature 入口。远端 release 基线为 84690d30c。
 Windows 原生终端、真实 OAuth、手机/浏览器及在线升级仍不属于已执行的实机验证。
+
+### 后续调整：移除 --classic 参数
+
+用户要求不再保留 --classic 别名。CLI 参数字段和该分支已删除，传入 --classic
+现在返回 UnknownArgument；回归判据改为验证拒绝该参数。旧配置 screen=classic
+仍可读并提示使用 rows，提示文案不再提已删除的参数。上文关于隐藏参数的说明仅记录
+最初退役阶段，不代表当前行为；daemon 历史会话 importer 未修改。
