@@ -2540,6 +2540,13 @@ body {
 .remote-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .remote-warn { color: var(--app-warning-accent); }
 
+/* Keep each picker section at its natural height. Otherwise the browser's
+   hidden overflow clips the create row when recent projects fill the modal. */
+.cwd-picker .modal-body { min-height: 0; }
+.cwd-picker .modal-body > * { flex-shrink: 0; }
+.cwd-recent-list { max-height: 180px; overflow-y: auto; }
+.cwd-picker .dir-breadcrumb { overflow-wrap: anywhere; }
+
 /* Directory browser */
 .dir-browser {
   border: 1px solid var(--app-input-border);
