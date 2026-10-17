@@ -624,6 +624,9 @@ pub enum ScrollbarMode {
 /// Terminal UI preferences, persisted as a top-level `[ui]` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiConfig {
+    /// User overrides for composer shortcuts; omitted actions keep defaults.
+    #[serde(default)]
+    pub keybindings: UiKeybindings,
     /// Colour palette to use for markdown / code-block / chrome
     /// rendering. `dark` keeps the legacy palette (designed for dark
     /// terminals); `light` swaps in darker saturated variants that hit
@@ -717,9 +720,19 @@ pub struct UiConfig {
     pub cd_bookmarks: Vec<String>,
 }
 
+/// Shortcut names are interpreted by the terminal driver, not the runtime.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UiKeybindings {
+    /// None restores shipped bindings; an empty list disables the chords.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub newline: Option<Vec<String>>,
+}
+
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
+            keybindings: UiKeybindings::default(),
             theme: UiTheme::default(),
             screen: Screen::default(),
             mouse: default_mouse(),

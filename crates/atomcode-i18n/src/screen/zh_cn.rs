@@ -371,6 +371,13 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ClipboardHasNothing => "剪贴板里没有能贴的东西;`/paste 路径` 可以贴一个文件 —— 是图就当附件,别的当文字".into(),
         Msg::FileIsEmpty { path } => format!("{path} 是空的").into(),
         Msg::FileUnreadable { path, error } => format!("读不了 {path}:{error}").into(),
+        Msg::KeybindingsMenu => "换行快捷键 · ↑/↓选择 · Enter/A添加 · M手动填写\nDelete移除 · Ctrl+D恢复默认 · Esc返回".into(),
+        Msg::KeybindingsCapture => "请按下组合键… Esc取消，Tab手动填写。\n支持 F1–F24、Alt+J 等；冲突时提示。\n若按键被IDE拦截，请在IDE中放行，或手动填写名称。".into(),
+        Msg::KeybindingsConfirm { key } => format!("已识别：{key} · Enter保存 · Esc取消").into(),
+        Msg::KeybindingsManual => "输入按键名称，用逗号分隔（f3, alt+j）\n支持 F1–F24、Alt+J 等；冲突时提示。\nEnter保存 · Esc取消 · Ctrl+U清空".into(),
+        Msg::KeybindingsEmpty => "未绑定换行组合键；仍可使用反斜杠 + Enter换行".into(),
+        Msg::KeybindingsError { error } => format!("快捷键未更新：{error}").into(),
+        Msg::KeysHelpWithNewline { keys } => zh_cn(Msg::KeysHelp).replace("Shift+Enter / Ctrl+J", keys).into(),
         Msg::KeysHelp => r#"
   键盘快捷键
 

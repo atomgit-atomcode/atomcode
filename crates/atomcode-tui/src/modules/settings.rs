@@ -128,6 +128,10 @@ impl View for Settings {
                     value,
                     caret,
                 } => edit_line(&label, &value, caret, w, vp.moment.caps),
+                Row::Keybinding(text) => Line::styled(
+                    width::take_width(&format!("  {text}"), w),
+                    theme::fg(Role::Accent),
+                ),
                 Row::Nothing => Line::styled(
                     width::take_width(&t(Msg::SettingsNoMatch), w),
                     theme::fg(Role::Muted),
@@ -164,7 +168,17 @@ impl View for Settings {
         }
         // The same number [`layout`] pads to, from the same function, so the
         // report and the drawing cannot disagree about how tall the panel is.
-        Height::Hug(anchor(&moment.settings).min(u16::MAX as usize) as u16)
+        let editor_height = moment
+            .settings_panel
+            .as_ref()
+            .filter(|panel| panel.keybindings.is_some())
+            .map(|panel| rows_for(&moment.settings, panel, None, None).len())
+            .unwrap_or(0);
+        Height::Hug(
+            anchor(&moment.settings)
+                .max(editor_height)
+                .min(u16::MAX as usize) as u16,
+        )
     }
 }
 
@@ -177,6 +191,7 @@ impl View for Settings {
 /// step.
 #[derive(Clone, Debug, PartialEq)]
 enum Row {
+    Keybinding(String),
     /// The panel's name and its pages, on one row: `设置  Config  Status …`.
     ///
     /// One row, not two. The name and the pages answer the same question —
@@ -335,6 +350,11 @@ fn rows_for(
     // what the panel is, and which page of it, before anything it has to say.
     let mut rows = vec![Row::Header];
     rows.push(Row::Rule);
+    if let Some(editor) = panel.keybindings.as_ref() {
+        rows.extend(editor.lines().into_iter().map(Row::Keybinding));
+        rows.push(Row::Rule);
+        return rows;
+    }
 
     // The other pages are not the settings list, so the search box goes with
     // them: a filter with nothing to filter would be a box that collects
@@ -2179,6 +2199,49 @@ pub fn value_column(row: &crate::settings::SettingRow) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shortcut_capture_is_visible_and_hides_catalog_click_targets() {
+        let view = SettingsView::new(vec![row(
+            crate::settings::NEWLINE_KEYS,
+            "Newline",
+            "default",
+            SettingKind::Text,
+        )]);
+        let mut panel = Panel::new();
+        crate::settings::key(
+            &view,
+            &mut panel,
+            crate::surface::KeyPress::plain(Key::Enter),
+        );
+        crate::settings::key(
+            &view,
+            &mut panel,
+            crate::surface::KeyPress::plain(Key::Enter),
+        );
+        crate::settings::key(
+            &view,
+            &mut panel,
+            crate::keymap::parse_chord("alt+j").unwrap(),
+        );
+        let m = moment(Some(panel), view);
+        let text = drawn(&m, 80, 16).join("\n");
+        assert!(text.contains("alt+j"), "{text}");
+        assert!(text.contains("Enter"), "{text}");
+        assert!(lines(&m, 80, 16)
+            .iter()
+            .all(|line| crate::width::str_width(&line.plain()) <= 80));
+        assert!(!layout(
+            &m.settings,
+            m.settings_panel.as_ref().unwrap(),
+            None,
+            None,
+            80,
+            16
+        )
+        .iter()
+        .any(|row| matches!(row, Row::Setting { .. })));
+    }
+
     use crate::frame::Rect;
     use crate::module::{Mounted, ViewObject};
     use crate::settings::{Applies, Edit, SettingRow};

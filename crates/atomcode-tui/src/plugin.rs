@@ -2907,6 +2907,12 @@ impl UserInterface for Tui {
                 // A paste while the providers panel is up belongs to the field
                 // it is working in: the composer is off screen, so falling
                 // through would be typing into something nobody can see.
+                Wake::Input(Input::Paste(text)) if self.host.settings_open() => {
+                    let mut moment = self.host.moment.write().expect("moment poisoned");
+                    if let Some(panel) = moment.settings_panel.as_mut() {
+                        stale |= crate::settings::paste(panel, &text);
+                    }
+                }
                 Wake::Input(Input::Paste(text)) if self.host.providers_open() => {
                     stale |= self.host.providers_paste(&text);
                 }
@@ -3545,6 +3551,20 @@ impl Tui {
             return false;
         };
         let view = port.rows();
+        let value = view
+            .rows()
+            .iter()
+            .find(|row| row.id == crate::settings::NEWLINE_KEYS)
+            .map(|row| row.value.as_str())
+            .unwrap_or("default");
+        if let Err(error) = crate::keymap::parse_newline_bindings(value)
+            .and_then(|keys| self.keys.set_newline_bindings(keys))
+        {
+            self.host.say(
+                t(Msg::KeybindingsError { error: &error }).into_owned(),
+                true,
+            );
+        }
         let mut moment = self.host.moment.write().expect("moment poisoned");
         if moment.settings == view {
             return false;
@@ -5473,8 +5493,38 @@ impl Tui {
             match done {
                 Ok(()) => {
                     self.refresh_settings();
+                    if matches!(&step, crate::settings::Step::Set { id, .. } | crate::settings::Step::Reset { id } if id == crate::settings::NEWLINE_KEYS)
+                    {
+                        if let Some(panel) = self
+                            .host
+                            .moment
+                            .write()
+                            .expect("moment poisoned")
+                            .settings_panel
+                            .as_mut()
+                        {
+                            let value = match &step {
+                                crate::settings::Step::Set { value, .. } => value.as_str(),
+                                _ => "default",
+                            };
+                            panel.keybindings =
+                                Some(crate::settings::KeybindingEditor::opening(value));
+                        }
+                    }
                 }
-                Err(why) => self.host.say(&why, true),
+                Err(why) => {
+                    let mut moment = self.host.moment.write().expect("moment poisoned");
+                    if let Some(editor) = moment
+                        .settings_panel
+                        .as_mut()
+                        .and_then(|panel| panel.keybindings.as_mut())
+                    {
+                        editor.error = Some(why);
+                    } else {
+                        drop(moment);
+                        self.host.say(&why, true);
+                    }
+                }
             }
             return true;
         }
@@ -5502,7 +5552,13 @@ impl Tui {
         let Some(port) = ctx.service::<crate::plugin::SettingsSvc>() else {
             return Err(t(Msg::NoSettingsPort).into_owned());
         };
-        port.set(id, value)?;
+        if id == crate::settings::NEWLINE_KEYS {
+            let keys = crate::keymap::parse_newline_bindings(value)?;
+            self.keys
+                .configure_newline(keys, || port.set(id, value).map(|_| ()))?;
+        } else {
+            port.set(id, value)?;
+        }
         self.reload_if_a_change_needs_it(id)
     }
 
@@ -5518,7 +5574,12 @@ impl Tui {
         let Some(port) = ctx.service::<crate::plugin::SettingsSvc>() else {
             return Err(t(Msg::NoSettingsPort).into_owned());
         };
-        port.reset(id)?;
+        if id == crate::settings::NEWLINE_KEYS {
+            self.keys
+                .configure_newline(None, || port.reset(id).map(|_| ()))?;
+        } else {
+            port.reset(id)?;
+        }
         self.reload_if_a_change_needs_it(id)
     }
 
@@ -13876,5 +13937,54 @@ mod memory_tab_tests {
         assert_eq!(doc.top, 20);
         assert!(doc.show(1));
         assert_eq!(doc.top, 5);
+    }
+}
+
+#[cfg(test)]
+mod newline_settings_tests {
+    use super::*;
+    use crate::settings::{Applies, SettingKind, SettingRow, Settings, SettingsView, NEWLINE_KEYS};
+    use atomcode_plexus::{App, ConfigTree, PluginRegistry};
+
+    struct Port(Mutex<String>);
+    impl Settings for Port {
+        fn rows(&self) -> SettingsView {
+            SettingsView::new(vec![SettingRow {
+                id: NEWLINE_KEYS.into(),
+                label: "Newline".into(),
+                value: self.0.lock().unwrap().clone(),
+                kind: SettingKind::Text,
+                applies: Applies::Immediately,
+            }])
+        }
+        fn set(&self, _: &str, value: &str) -> Result<SettingsView, String> {
+            *self.0.lock().unwrap() = value.into();
+            Ok(self.rows())
+        }
+        fn reset(&self, id: &str) -> Result<SettingsView, String> {
+            self.set(id, "default")
+        }
+    }
+
+    #[test]
+    fn settings_apply_newline_without_rebuilding_the_runtime() {
+        let (_, tui) = assemble(crate::surface::Headless::new(80, 24));
+        tui.keys.add(&crate::keymap::Default_).unwrap();
+        let port = Arc::new(Port(Mutex::new("default".into())));
+        let app = App::new(PluginRegistry::new(), ConfigTree::default());
+        let _ = app.context().provide::<SettingsSvc>(port.clone()).unwrap();
+        *tui.ctx.lock().unwrap() = Some(app.context());
+        tui.refresh_settings();
+        tui.apply_setting(NEWLINE_KEYS, "alt+j").unwrap();
+        assert_eq!(tui.keys.newline_names(), vec!["alt+j"]);
+        assert!(tui.apply_setting(NEWLINE_KEYS, "enter").is_err());
+        assert_eq!(*port.0.lock().unwrap(), "alt+j");
+        assert_eq!(tui.keys.newline_names(), vec!["alt+j"]);
+        // A hand edit must not replace a usable map with a conflicting one.
+        *port.0.lock().unwrap() = "ctrl+c".into();
+        tui.refresh_settings();
+        assert_eq!(tui.keys.newline_names(), vec!["alt+j"]);
+        tui.reset_setting(NEWLINE_KEYS).unwrap();
+        assert!(tui.keys.newline_names().contains(&"ctrl+j".into()));
     }
 }

@@ -105,6 +105,13 @@
         </tbody>
       </table>
 
+      <h2 id="custom-newline">Custom newline shortcuts</h2>
+      <p>Open <code>/config</code>, search for “newline”, and select “Keyboard shortcuts / Newline”. Press <code>Enter</code> or <code>A</code> to add a chord, press that chord, then press <code>Enter</code> to confirm. Press <code>M</code> to type comma-separated names such as <code>alt+j, ctrl+j</code>; <code>Tab</code> also switches capture to manual entry. <code>Delete</code> removes the selected binding, <code>Ctrl+D</code> restores defaults, and <code>Esc</code> goes back.</p>
+      <pre><code>[ui.keybindings]
+newline = ["alt+j", "ctrl+j"]</code></pre>
+      <p>The list replaces the default newline chords. Changes apply immediately and <code>/keys</code> shows the effective bindings. <code>\</code> + <code>Enter</code> remains available. Use <code>newline = []</code> to disable the chords, or remove the <code>newline</code> entry to restore defaults. Conflicts with existing actions or reserved keys, duplicate chords, and invalid names are rejected without changing the active bindings.</p>
+      <p>Plain printable characters cannot be shortcuts. Names accept <code>ctrl</code>, <code>alt</code>, <code>shift</code>, and <code>cmd</code> modifiers, letters, digits, <code>enter</code>, <code>space</code>, arrows, and <code>f1</code>–<code>f24</code>. AtomCode cannot detect or release shortcuts intercepted by the terminal or IDE; verify that manually entered chords reach the app.</p>
+
       <h2 id="browse-scroll">Browse &amp; scroll</h2>
       <table>
         <thead>

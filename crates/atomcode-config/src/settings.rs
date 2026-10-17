@@ -289,6 +289,15 @@ pub static SETTINGS: &[SettingSpec] = &[
         apply: ApplyPolicy::NextStartup,
     },
     SettingSpec {
+        id: "ui.keybindings.newline",
+        path: &["ui", "keybindings", "newline"],
+        label_en: "Keyboard shortcuts / Newline",
+        label_zh: "快捷键 / 换行",
+        aliases: &["keybindings", "newline", "shortcut", "换行", "快捷键"],
+        kind: SettingKind::Text,
+        apply: ApplyPolicy::ImmediateUi,
+    },
+    SettingSpec {
         id: "ui.mode_switch_key",
         path: &["ui", "mode_switch_key"],
         label_en: "Mode switch key",
@@ -488,6 +497,13 @@ impl SettingSpec {
             "ui.scrollbar" => format!("{:?}", config.ui.scrollbar).to_lowercase(),
             "ui.mouse" => config.ui.mouse.to_string(),
             "ui.theme" => format!("{:?}", config.ui.theme).to_lowercase(),
+            "ui.keybindings.newline" => config
+                .ui
+                .keybindings
+                .newline
+                .as_ref()
+                .map(|keys| keys.join(", "))
+                .unwrap_or_else(|| "default".into()),
             "ui.mode_switch_key" => match config.ui.mode_switch_key {
                 crate::config::ModeSwitchKey::ShiftTab => "shift_tab",
                 crate::config::ModeSwitchKey::Tab => "tab",
@@ -526,6 +542,21 @@ impl SettingSpec {
     }
 
     pub fn patch(&self, document: &mut DocumentMut, input: &str) -> Result<()> {
+        if self.id == "ui.keybindings.newline" {
+            if input.trim() == "default" {
+                self.reset(document);
+            } else {
+                let mut keys = toml_edit::Array::new();
+                if !input.trim().is_empty() {
+                    for key in input.split(',').map(str::trim) {
+                        anyhow::ensure!(!key.is_empty(), "empty shortcut name");
+                        keys.push(key);
+                    }
+                }
+                set_path(document, self.path, value(keys));
+            }
+            return Ok(());
+        }
         // `history_replay_max_rows = 0` was the legacy way to disable the cap.
         // When the user explicitly enables the new switch, remove only that
         // legacy sentinel; positive custom caps remain untouched.

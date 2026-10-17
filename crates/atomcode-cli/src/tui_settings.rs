@@ -192,6 +192,9 @@ impl Settings for ConfigSettings {
     /// — which is why its refusal is passed through verbatim instead of being
     /// second-guessed here.
     fn set(&self, id: &str, value: &str) -> Result<SettingsView, String> {
+        if id == atomcode_tui::settings::NEWLINE_KEYS {
+            atomcode_tui::keymap::validate_newline_bindings(value)?;
+        }
         if id == RETRY {
             write_retry(&self.path, Some(value))?;
             return Ok(self.read());
@@ -297,6 +300,47 @@ fn applies_of(policy: atomcode_config::settings::ApplyPolicy) -> Applies {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn newline_shortcuts_are_arrays_and_conflicts_do_not_touch_disk() {
+        let path = scratch("newline-shortcuts");
+        std::fs::write(&path, "# keep me\n[ui]\nmode_switch_key = \"shift_tab\"\n").unwrap();
+        let port = ConfigSettings::new(path.clone());
+        port.set(atomcode_tui::settings::NEWLINE_KEYS, "alt+j, ctrl+j")
+            .unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("# keep me"));
+        let config = atomcode_config::config::Config::load(&path).unwrap();
+        assert_eq!(
+            config.ui.keybindings.newline,
+            Some(vec!["alt+j".into(), "ctrl+j".into()])
+        );
+        for value in ["enter", "ctrl+c", "alt+j, alt+j", "alt+j,"] {
+            assert!(port
+                .set(atomcode_tui::settings::NEWLINE_KEYS, value)
+                .is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
+        }
+        port.set(atomcode_tui::settings::NEWLINE_KEYS, "").unwrap();
+        assert_eq!(
+            atomcode_config::config::Config::load(&path)
+                .unwrap()
+                .ui
+                .keybindings
+                .newline,
+            Some(vec![])
+        );
+        port.reset(atomcode_tui::settings::NEWLINE_KEYS).unwrap();
+        assert_eq!(
+            atomcode_config::config::Config::load(&path)
+                .unwrap()
+                .ui
+                .keybindings
+                .newline,
+            None
+        );
+        let _ = std::fs::remove_file(path);
+    }
 
     /// The one the whole thing is for: `/language` moves the **screen**.
     ///

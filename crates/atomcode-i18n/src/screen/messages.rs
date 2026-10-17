@@ -579,6 +579,19 @@ pub enum Msg<'a> {
         error: &'a str,
     },
     KeysHelp,
+    KeysHelpWithNewline {
+        keys: &'a str,
+    },
+    KeybindingsMenu,
+    KeybindingsCapture,
+    KeybindingsConfirm {
+        key: &'a str,
+    },
+    KeybindingsManual,
+    KeybindingsEmpty,
+    KeybindingsError {
+        error: &'a str,
+    },
     ToolOutputUnknown {
         what: &'a str,
     },

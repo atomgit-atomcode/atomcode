@@ -408,6 +408,13 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ClipboardHasNothing => "there is nothing on the clipboard to paste; `/paste <path>` takes a file instead — a picture attaches, anything else goes in as text".into(),
         Msg::FileIsEmpty { path } => format!("{path} is empty").into(),
         Msg::FileUnreadable { path, error } => format!("cannot read {path}: {error}").into(),
+        Msg::KeybindingsMenu => "Newline shortcuts · ↑/↓ select · Enter/A add · M type names\nDelete remove · Ctrl+D restore defaults · Esc back".into(),
+        Msg::KeybindingsCapture => "Press a shortcut… Esc cancels; Tab types its name.\nF1–F24, Alt+J, etc. supported; conflicts are reported.\nIf the IDE intercepts it, release the IDE shortcut or use manual entry.".into(),
+        Msg::KeybindingsConfirm { key } => format!("Detected: {key} · Enter saves · Esc cancels").into(),
+        Msg::KeybindingsManual => "Type names separated by commas (f3, alt+j)\nF1–F24, Alt+J, etc. supported; conflicts are reported.\nEnter saves · Esc cancels · Ctrl+U clears".into(),
+        Msg::KeybindingsEmpty => "No newline chords; backslash + Enter still inserts a newline".into(),
+        Msg::KeybindingsError { error } => format!("Shortcut unchanged: {error}").into(),
+        Msg::KeysHelpWithNewline { keys } => en(Msg::KeysHelp).replace("Shift+Enter / Ctrl+J", keys).into(),
         Msg::KeysHelp => r#"
   Keyboard shortcuts
 

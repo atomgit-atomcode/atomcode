@@ -177,7 +177,18 @@ impl CommandSet for ScreenCommands {
             },
             "config" => Outcome::Do(Action::ToggleSettings),
             "provider" => Outcome::Do(Action::ToggleProviders),
-            "keys" => Outcome::Said(t(Msg::KeysHelp).into_owned()),
+            "keys" => {
+                let names = ctx
+                    .service::<crate::plugin::KeysSvc>()
+                    .map(|keys| keys.newline_names())
+                    .unwrap_or_else(crate::keymap::default_newline_names);
+                let names = if names.is_empty() {
+                    "∅".into()
+                } else {
+                    names.join(" / ")
+                };
+                Outcome::Said(t(Msg::KeysHelpWithNewline { keys: &names }).into_owned())
+            }
             _ => Outcome::Quiet,
         }
     }

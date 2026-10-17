@@ -43,6 +43,190 @@ pub const STATUS_DOT: &str = "ui.terminal_status_glyph";
 /// terminal but the phone can send.
 pub const MODE_SWITCH_KEY: &str = "ui.mode_switch_key";
 
+/// Config catalog id interpreted only as a shortcut editing gesture.
+pub const NEWLINE_KEYS: &str = "ui.keybindings.newline";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KeybindingMode {
+    List,
+    Capture,
+    Confirm(crate::surface::KeyPress),
+    Manual(Edit),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeybindingEditor {
+    pub keys: Vec<String>,
+    pub cursor: usize,
+    pub mode: KeybindingMode,
+    pub error: Option<String>,
+}
+
+impl KeybindingEditor {
+    pub(crate) fn opening(value: &str) -> Self {
+        Self {
+            keys: if value == "default" {
+                crate::keymap::default_newline_names()
+            } else {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            },
+            cursor: 0,
+            mode: KeybindingMode::List,
+            error: None,
+        }
+    }
+
+    pub fn lines(&self) -> Vec<String> {
+        let mut out = vec![t(Msg::KeybindingsMenu).into_owned()];
+        if self.keys.is_empty() {
+            out.push(t(Msg::KeybindingsEmpty).into_owned());
+        }
+        for (i, key) in self.keys.iter().enumerate() {
+            out.push(format!(
+                "{} {key}",
+                if i == self.cursor { ">" } else { " " }
+            ));
+        }
+        match &self.mode {
+            KeybindingMode::List => {}
+            KeybindingMode::Capture => out.push(t(Msg::KeybindingsCapture).into_owned()),
+            KeybindingMode::Confirm(key) => out.push(
+                t(Msg::KeybindingsConfirm {
+                    key: &crate::keymap::chord_name(*key),
+                })
+                .into_owned(),
+            ),
+            KeybindingMode::Manual(edit) => {
+                out.push(t(Msg::KeybindingsManual).into_owned());
+                out.push(format!(
+                    "{}|{}",
+                    &edit.value[..edit.caret],
+                    &edit.value[edit.caret..]
+                ));
+            }
+        }
+        if let Some(error) = self.error.as_deref() {
+            out.push(t(Msg::KeybindingsError { error }).into_owned());
+        }
+        out.into_iter()
+            .flat_map(|line| line.lines().map(str::to_owned).collect::<Vec<_>>())
+            .collect()
+    }
+
+    fn save(&mut self, value: String) -> Step {
+        match crate::keymap::validate_newline_bindings(&value) {
+            Ok(()) => Step::Set {
+                id: NEWLINE_KEYS.into(),
+                value,
+            },
+            Err(error) => {
+                self.error = Some(error);
+                Step::Stay
+            }
+        }
+    }
+
+    fn key(&mut self, press: crate::surface::KeyPress) -> Step {
+        use crate::surface::{Key, Mods};
+        self.error = None;
+        match self.mode.clone() {
+            KeybindingMode::Capture => {
+                if press.key == Key::Esc {
+                    self.mode = KeybindingMode::List;
+                } else if press.key == Key::Tab {
+                    self.mode = KeybindingMode::Manual(Edit::opening(
+                        NEWLINE_KEYS.into(),
+                        self.keys.join(", "),
+                    ));
+                } else {
+                    let name = crate::keymap::chord_name(press);
+                    if let Err(error) = crate::keymap::validate_newline_bindings(&name) {
+                        self.error = Some(error);
+                    } else {
+                        self.mode = KeybindingMode::Confirm(press);
+                    }
+                }
+            }
+            KeybindingMode::Confirm(key) => {
+                if press.key == Key::Esc {
+                    self.mode = KeybindingMode::Capture;
+                } else if press.key == Key::Enter {
+                    let name = crate::keymap::chord_name(key);
+                    if self.keys.contains(&name) {
+                        self.error = Some(format!("duplicate shortcut {name}"));
+                    } else {
+                        let mut keys = self.keys.clone();
+                        keys.push(name);
+                        return self.save(keys.join(", "));
+                    }
+                }
+            }
+            KeybindingMode::Manual(mut edit) => {
+                match (press.key, press.mods) {
+                    (Key::Esc, _) => {
+                        self.mode = KeybindingMode::List;
+                        return Step::Stay;
+                    }
+                    (Key::Enter, _) => return self.save(edit.value),
+                    (Key::Char('u'), Mods::CTRL) => {
+                        edit.value.clear();
+                        edit.caret = 0;
+                    }
+                    (Key::Backspace, _) => {
+                        crate::text::backspace_at(&mut edit.value, &mut edit.caret)
+                    }
+                    (Key::Delete, _) => crate::text::delete_at(&mut edit.value, &mut edit.caret),
+                    (Key::Left, _) => {
+                        edit.caret = crate::text::step_caret(&edit.value, edit.caret, false)
+                    }
+                    (Key::Right, _) => {
+                        edit.caret = crate::text::step_caret(&edit.value, edit.caret, true)
+                    }
+                    (Key::Home, _) => edit.caret = 0,
+                    (Key::End, _) => edit.caret = edit.value.len(),
+                    (Key::Char(c), Mods::NONE) | (Key::Char(c), Mods::SHIFT) => {
+                        crate::text::insert_at(&mut edit.value, &mut edit.caret, c)
+                    }
+                    _ => {}
+                }
+                self.mode = KeybindingMode::Manual(edit);
+            }
+            KeybindingMode::List => match (press.key, press.mods) {
+                (Key::Enter, _) | (Key::Char('a'), Mods::NONE) => {
+                    self.mode = KeybindingMode::Capture
+                }
+                (Key::Char('m'), Mods::NONE) => {
+                    self.mode = KeybindingMode::Manual(Edit::opening(
+                        NEWLINE_KEYS.into(),
+                        self.keys.join(", "),
+                    ))
+                }
+                (Key::Up, _) => self.cursor = self.cursor.saturating_sub(1),
+                (Key::Down, _) => {
+                    self.cursor = (self.cursor + 1).min(self.keys.len().saturating_sub(1))
+                }
+                (Key::Delete, _) if self.cursor < self.keys.len() => {
+                    let mut keys = self.keys.clone();
+                    keys.remove(self.cursor);
+                    return self.save(keys.join(", "));
+                }
+                (Key::Char('d'), Mods::CTRL) => {
+                    return Step::Reset {
+                        id: NEWLINE_KEYS.into(),
+                    }
+                }
+                _ => {}
+            },
+        }
+        Step::Stay
+    }
+}
+
 /// The id of the setting that decides whether a turn the person was away from
 /// (or that ran long) gets a `※ recap:` line. Here for the reason
 /// [`STATUS_DOT`] is; no row at all is this build's default, on.
@@ -362,6 +546,7 @@ pub struct Panel {
     pub query_caret: usize,
     /// The row being typed into, when one is.
     pub editing: Option<Edit>,
+    pub keybindings: Option<KeybindingEditor>,
     /// The setting one more Delete would put back to the build's answer.
     ///
     /// Two presses, not one: unsetting is the one gesture here that throws
@@ -408,6 +593,7 @@ impl Panel {
         }
         self.tab = tab;
         self.editing = None;
+        self.keybindings = None;
         // A new page starts at its top. Carrying the offset over would open a
         // short page part-way down, at an offset that was about a different
         // page's rows.
@@ -689,8 +875,39 @@ fn step_arrow(panel: &mut Panel, rows: usize, by: i32) {
     };
 }
 
+/// Paste is text entry, never a sequence of panel commands.
+pub fn paste(panel: &mut Panel, text: &str) -> bool {
+    let edit = if let Some(editor) = panel.keybindings.as_mut() {
+        match &mut editor.mode {
+            KeybindingMode::Manual(edit) => Some(edit),
+            _ => return false,
+        }
+    } else {
+        panel.editing.as_mut()
+    };
+    if let Some(edit) = edit {
+        for c in text.chars().filter(|c| !c.is_control()) {
+            crate::text::insert_at(&mut edit.value, &mut edit.caret, c);
+        }
+    } else {
+        for c in text.chars().filter(|c| !c.is_control()) {
+            crate::text::insert_at(&mut panel.query, &mut panel.query_caret, c);
+        }
+        panel.cursor = 0;
+    }
+    !text.is_empty()
+}
+
 pub fn key(view: &SettingsView, panel: &mut Panel, press: crate::surface::KeyPress) -> Step {
     use crate::surface::{Key, Mods};
+
+    if let Some(editor) = panel.keybindings.as_mut() {
+        if press.key == Key::Esc && editor.mode == KeybindingMode::List {
+            panel.keybindings = None;
+            return Step::Stay;
+        }
+        return editor.key(press);
+    }
 
     if panel.editing.is_some() {
         return match (press.key, press.mods) {
@@ -879,6 +1096,10 @@ pub fn key(view: &SettingsView, panel: &mut Panel, press: crate::surface::KeyPre
             let Some(row) = shown.get(panel.cursor) else {
                 return Step::Stay;
             };
+            if row.id == NEWLINE_KEYS {
+                panel.keybindings = Some(KeybindingEditor::opening(&row.value));
+                return Step::Stay;
+            }
             if row.kind.needs_typing() {
                 panel.editing = Some(Edit::opening(row.id.clone(), row.value.clone()));
                 Step::Stay
@@ -933,6 +1154,63 @@ pub trait Settings: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn newline_editor_records_then_confirms_and_refuses_conflicts() {
+        use crate::surface::{Key, KeyPress};
+        let mut editor = KeybindingEditor::opening("default");
+        assert_eq!(editor.key(KeyPress::plain(Key::Enter)), Step::Stay);
+        editor.key(KeyPress::plain(Key::Enter)); // reserved submit
+        assert!(editor.error.is_some());
+        assert_eq!(editor.mode, KeybindingMode::Capture);
+        editor.key(crate::keymap::parse_chord("alt+j").unwrap());
+        assert!(matches!(editor.mode, KeybindingMode::Confirm(_)));
+        let Step::Set { id, value } = editor.key(KeyPress::plain(Key::Enter)) else {
+            panic!("save")
+        };
+        assert_eq!(id, NEWLINE_KEYS);
+        assert!(value.contains("alt+j"));
+        assert!(value.contains("ctrl+j"));
+        editor.mode = KeybindingMode::Manual(Edit::opening(NEWLINE_KEYS.into(), "enter".into()));
+        assert_eq!(editor.key(KeyPress::plain(Key::Enter)), Step::Stay);
+        assert!(editor.error.is_some());
+    }
+
+    #[test]
+    fn shortcut_paste_only_edits_manual_text_and_escape_preserves_settings() {
+        use crate::surface::{Key, KeyPress};
+        let mut panel = Panel {
+            keybindings: Some(KeybindingEditor::opening("alt+j")),
+            ..Panel::default()
+        };
+        assert!(!paste(&mut panel, "malt+j"));
+        key(
+            &SettingsView::default(),
+            &mut panel,
+            KeyPress::plain(Key::Char('m')),
+        );
+        panel.keybindings.as_mut().unwrap().key(KeyPress::ctrl('u'));
+        assert!(paste(&mut panel, "alt+j, ctrl+j"));
+        let Step::Set { value, .. } = key(
+            &SettingsView::default(),
+            &mut panel,
+            KeyPress::plain(Key::Enter),
+        ) else {
+            panic!("save")
+        };
+        assert_eq!(value, "alt+j, ctrl+j");
+        key(
+            &SettingsView::default(),
+            &mut panel,
+            KeyPress::plain(Key::Esc),
+        );
+        key(
+            &SettingsView::default(),
+            &mut panel,
+            KeyPress::plain(Key::Esc),
+        );
+        assert!(panel.keybindings.is_none());
+    }
 
     /// The search box's caret is a public byte offset. One that lands inside a
     /// Chinese character (byte 1 of the three in "模") must be snapped, not

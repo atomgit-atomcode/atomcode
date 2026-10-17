@@ -11096,3 +11096,51 @@ async fn read_opens_a_terminal_reader_and_esc_returns_to_the_composer() {
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
+
+/// The configured chord reaches the composer; the old newline chord yields,
+/// and /keys describes the map this screen actually runs.
+#[tokio::test]
+async fn custom_newline_chords_are_loaded_and_shown_in_keys() {
+    let dir = scratch("newline-chords");
+    let s = start_with_connection_and_settings(
+        tree(&dir, &replay(r#"{ text = "ok" }"#), &[]),
+        Some(Arc::new(OneSetting(
+            atomcode_tui::settings::NEWLINE_KEYS,
+            "alt+j",
+        ))),
+    )
+    .await;
+    let task = s.open().await;
+    s.quiet().await;
+    let keys = s.app.service::<atomcode_tui::plugin::KeysSvc>().unwrap();
+    assert_eq!(keys.newline_names(), vec!["alt+j"]);
+    s.term.type_text("first");
+    s.term.press(KeyPress::new(
+        Key::Char('j'),
+        atomcode_tui::surface::Mods::ALT,
+    ));
+    s.term.type_text("second");
+    s.quiet().await;
+    s.term.press(KeyPress::plain(Key::Enter));
+    s.quiet().await;
+    assert!(s
+        .client()
+        .events()
+        .iter()
+        .any(|logged| matches!(&logged.event,
+        SessionEvent::UserMessage { text, .. } if text == "first\nsecond")));
+
+    s.term.type_text("/keys");
+    s.term.press(KeyPress::plain(Key::Enter));
+    s.quiet().await;
+    use atomcode_tui::command::CommandSet;
+    let atomcode_tui::command::Outcome::Said(help) = atomcode_tui::commands::ScreenCommands
+        .run("keys", "", &s.app)
+        .await
+    else {
+        panic!("keys help")
+    };
+    assert!(help.contains("alt+j"), "{help}");
+    assert!(!help.contains("Shift+Enter / Ctrl+J"), "{help}");
+    task.abort();
+}

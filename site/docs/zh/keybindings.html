@@ -105,6 +105,13 @@
         </tbody>
       </table>
 
+      <h2 id="custom-newline">自定义换行快捷键</h2>
+      <p>在 <code>/config</code> 中搜索“换行”，选择“快捷键 / 换行”。按 <code>Enter</code> 或 <code>A</code> 添加，按下想绑定的组合键后再按 <code>Enter</code> 确认。按 <code>M</code> 可手动填写逗号分隔的按键名（例如 <code>alt+j, ctrl+j</code>）；录入时也可按 <code>Tab</code> 切到手动填写。<code>Delete</code> 移除选中绑定，<code>Ctrl+D</code> 恢复默认，<code>Esc</code> 返回。</p>
+      <pre><code>[ui.keybindings]
+newline = ["alt+j", "ctrl+j"]</code></pre>
+      <p>此列表替换默认的换行组合键。保存后立即生效，<code>/keys</code> 展示实际绑定；<code>\</code> + <code>Enter</code> 始终保留。设置空列表 <code>newline = []</code> 可禁用换行组合键，删除 <code>newline</code> 配置项则恢复默认。与现有动作或保留按键冲突、重复或格式错误时拒绝保存并保留原绑定。</p>
+      <p>普通字符不能单独用作快捷键。支持 <code>ctrl</code>、<code>alt</code>、<code>shift</code>、<code>cmd</code> 修饰符，字母、数字、<code>enter</code>、<code>space</code>、方向键和 <code>f1</code>–<code>f24</code> 等按键名。终端或 IDE 拦截的组合键无法由 AtomCode 检测或释放；手动填写后仍须验证宿主能把它传入。</p>
+
       <h2 id="浏览与滚动">浏览与滚动</h2>
       <table>
         <thead>
