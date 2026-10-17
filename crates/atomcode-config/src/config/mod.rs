@@ -176,6 +176,30 @@ pub struct ToolsConfig {
     pub atomgit: AtomGitToolConfig,
     #[serde(skip_serializing_if = "OutputToolConfig::is_default")]
     pub output: OutputToolConfig,
+    #[serde(skip_serializing_if = "McpToolConfig::is_default")]
+    pub mcp: McpToolConfig,
+}
+
+/// How model-facing MCP schemas are offered; transport and approval are unchanged.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpToolSearchMode {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpToolConfig {
+    pub tool_search: McpToolSearchMode,
+}
+
+impl McpToolConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 /// `[tools.output]` — how an oversized tool result reaches the model.
@@ -3621,6 +3645,7 @@ model = "missing-type"
                 output: OutputToolConfig {
                     threshold_bytes: Some(204_800),
                 },
+                mcp: Default::default(),
             },
             vision_preprocessor_provider: None,
             language: None,

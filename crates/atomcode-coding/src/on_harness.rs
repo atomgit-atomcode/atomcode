@@ -839,7 +839,12 @@ pub fn names_sessions_with_a_model(cfg: &crate::CodingAgentConfig) -> bool {
 pub fn config_rows(cfg: &crate::CodingAgentConfig) -> Result<Layer, String> {
     use atomcode_capabilities::tools::CredentialShellPolicy;
 
-    let mut out = model_rows(cfg)?;
+    let mut out = model_rows(cfg)?
+        .patch(
+            "mcp",
+            serde_json::json!({"tool_search": cfg.mcp_tool_search}),
+        )
+        .map_err(|e| e.to_string())?;
     // `[ui] ai_session_naming`(或 `ATOMCODE_AI_SESSION_NAMING`)选的是**哪一个
     // 命名器**填 `session-title` 这条缝:默认那个读第一句话、不问模型;开了之后
     // 换成问工具模型的那个。两者都把答案作为一条 `Titled` 事实提交,所以会话

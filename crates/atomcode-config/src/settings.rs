@@ -123,6 +123,15 @@ pub static SETTINGS: &[SettingSpec] = &[
         &["cancel", "undo"],
         ApplyPolicy::AgentReassemble,
     ),
+    SettingSpec {
+        id: "tools.mcp.tool_search",
+        path: &["tools", "mcp", "tool_search"],
+        label_en: "MCP tool schema search",
+        label_zh: "MCP 工具 schema 按需加载",
+        aliases: &["lazy", "defer", "schema"],
+        kind: SettingKind::Choice(&["auto", "on", "off"]),
+        apply: ApplyPolicy::CapabilityReprepare,
+    },
     bool_setting(
         "tools.todo.enabled",
         &["tools", "todo", "enabled"],
@@ -456,6 +465,7 @@ impl SettingSpec {
         match self.id {
             "auto_update" => config.auto_update.to_string(),
             "keep_interrupted_context" => config.keep_interrupted_context.to_string(),
+            "tools.mcp.tool_search" => format!("{:?}", config.tools.mcp.tool_search).to_lowercase(),
             "tools.todo.enabled" => config.tools.todo.enabled.to_string(),
             "tools.atomgit.enabled" => config.tools.atomgit.enabled.to_string(),
             "tools.todo.eager" => format!("{:?}", config.tools.todo.eager).to_lowercase(),
@@ -706,6 +716,28 @@ pub fn patch_selection_retry_max_attempts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_schema_search_is_editable_and_defaults_to_auto() {
+        let setting = SETTINGS
+            .iter()
+            .find(|s| s.id == "tools.mcp.tool_search")
+            .unwrap();
+        let mut document = "# keep\n".parse::<DocumentMut>().unwrap();
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(setting.value(&config), "auto");
+        for mode in ["on", "off", "auto"] {
+            setting.patch(&mut document, mode).unwrap();
+            let config: Config = toml::from_str(&document.to_string()).unwrap();
+            assert_eq!(setting.value(&config), mode);
+        }
+        assert!(setting.patch(&mut document, "invalid").is_err());
+        assert!(toml::from_str::<Config>("[tools.mcp]\ntool_search='invalid'").is_err());
+        assert!(!toml::to_string(&config).unwrap().contains("[tools.mcp]"));
+        setting.reset(&mut document);
+        assert!(!document.to_string().contains("tool_search"));
+        assert!(document.to_string().contains("# keep"));
+    }
 
     /// Provider config, model selection and credentials have their own deliberate UIs and must
     /// never be editable through this generic catalog.

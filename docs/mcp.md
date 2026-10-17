@@ -197,6 +197,44 @@ OAuth 登录要把令牌存进宿主的文档时用 `login_mcp_oauth_saving_to`�
 
 ---
 
+## MCP 工具 schema 按需加载
+
+大型 MCP server 的完整工具定义不必每轮全部发给模型。配置在用户 `config.toml`，
+也可以在 `/config` 搜索 `tools.mcp.tool_search`：
+
+```toml
+[tools.mcp]
+tool_search = "auto" # 默认；也可选 "on" 或 "off"
+```
+
+- `auto`：按工具定义的 JSON 字节数 / 4 估算 token；MCP 定义合计超过当前模型上下文
+  窗口的 10% 时，改为按需加载。小目录继续完整提供定义。
+- `on`：始终按需加载 MCP 定义。
+- `off`：恢复每轮完整提供 MCP 定义，不挂载搜索工具。
+
+设置修改后经能力重载生效。CLI、TUI、WebUI/daemon、ACP 使用同一个 coding runtime
+实现；没有 Anthropic 专有 API 或 `tool_reference` 依赖。
+
+按需加载时，模型先调用普通工具 `mcp_search`，用 server 名、工具名或描述中的关键词
+查找工具；空 `query` 浏览目录，`offset` 翻页，`limit` 为 1–5。返回值只有工具名、短描述、
+大小与加载状态，**不把完整 schema 写进对话**。下一轮 `tools` 数组才放入已选工具的完整
+schema，模型按原 `mcp__<server>__<tool>` 名称调用，审批、plan mode 和执行路径照常。
+每次成功搜索替换上次选择，最多加载 5 个工具，定义合计限制在上述 10% 预算内；搜索失败
+保留上次成功选择。无需为先前用过的全部工具持续付 schema 开销。
+
+搜索只看调用方当前目录里未被排除或关闭的工具，子 agent 读取自己的受限目录。重连后的
+定义取当前版本；撤销权限或关闭的工具不能被历史搜索结果重新加载。会话恢复从已配对的
+搜索结果推导选择；若压缩移除了结果，模型可重新搜索。若策略禁止了 `mcp_search` 本身，
+保留完整定义，避免全部工具不可发现；需要限制 schema 的受限角色应同时允许该搜索工具。
+
+已知边界：大小是估算，不是实际计费 token；模型窗口未知时按 128k 估算。单个完整定义
+超过加载预算时，会在结果中明确标为未加载并说明原因，不截断 JSON schema。可先尝试
+`limit=1` 或更精确的查询；若单个定义仍超限，可调整 MCP server 的定义或显式关闭按需加载。
+原生工具 schema、MCP server instructions、工具实际输出和历史对话不受这个预算控制。
+该功能减少重复定义，不能保证任意会话都不超上下文。
+
+---
+
 ## 6. 协议细节
 
 - **协议修订**：`initialize` 请求 `2025-11-25`（`types.rs::MCP_PROTOCOL_VERSION`），并接受服务器协商降级到更早修订。

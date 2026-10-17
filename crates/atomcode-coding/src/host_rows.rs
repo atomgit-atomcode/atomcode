@@ -1740,10 +1740,16 @@ impl Plugin for McpHostPlugin {
     fn description(&self) -> &'static str {
         "the MCP servers the coding runtime connected, their tools published as they come up"
     }
-    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+    async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
+        let row: atomcode_config::config::McpToolConfig = if config.is_null() {
+            Default::default()
+        } else {
+            serde_json::from_value(config.clone()).map_err(|e| format!("bad MCP config: {e}"))?
+        };
         let Some(publication) = self.0.lock().unwrap_or_else(|e| e.into_inner()).take() else {
             return Err("mcp-host mounted twice from one publication".into());
         };
+        crate::mcp_tool_search::mount(ctx, row.tool_search)?;
         // The harness `mcp` row this displaces told the agent servers are entries
         // on its row config — which nothing in this runtime reads. This is where
         // the runtime's servers actually come from.

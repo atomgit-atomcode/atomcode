@@ -57,6 +57,8 @@ pub struct CodingAgentConfig {
     /// `[tools.output] threshold_bytes`: spill a tool result above this many
     /// bytes instead of the default. `None` leaves the row as the tree mounts it.
     pub tool_output_threshold_bytes: Option<usize>,
+    /// `[tools.mcp] tool_search`: model-facing schema projection, not permissions.
+    pub mcp_tool_search: atomcode_config::config::McpToolSearchMode,
     /// Stable config/provider registry key exposed to drivers. This is distinct
     /// from `provider_type`, which selects the adapter implementation.
     pub provider_name: String,
@@ -269,6 +271,8 @@ pub struct CodingRuntimeConfig {
     pub atomgit_enabled: bool,
     /// See `CodingAgentConfig::tool_output_threshold_bytes`.
     pub tool_output_threshold_bytes: Option<usize>,
+    /// `[tools.mcp] tool_search`: model-facing schema projection, not permissions.
+    pub mcp_tool_search: atomcode_config::config::McpToolSearchMode,
     pub provider_name: String,
     pub working_dir: PathBuf,
     pub context_window: u32,
@@ -419,6 +423,8 @@ pub fn describe_config_file_for(
          `claude-code`, `model`, `permission`, `timeout_secs`, `enabled`), add the Codex \
          or Claude Code CLI as a delegate where the front end allows it.\n\
          - `[tools.todo]` `enabled`, and `eager` = `auto` | `preferred` | `always`.\n\
+         - `[tools.mcp]` `tool_search`: `auto` (default), `on`, or `off`; \
+         lazily expose large MCP schemas through `mcp_search`, without changing approvals.\n\
          - `[tools.output]` `threshold_bytes`: a tool result larger than this (default \
          51200, clamped to 46080..=4194304) is saved whole and shown as a head + tail \
          preview that `fetch_output` reads past; `ATOMCODE_TOOL_OUTPUT_THRESHOLD_BYTES` \
@@ -527,6 +533,7 @@ impl CodingRuntimeConfig {
                 config.tools.atomgit.enabled,
             ),
             tool_output_threshold_bytes: config.tools.output.threshold_bytes,
+            mcp_tool_search: config.tools.mcp.tool_search,
             provider_name: r.map(|r| r.selection_id.clone()).unwrap_or_default(),
             working_dir: working_dir.to_path_buf(),
             context_window: r.map(|r| r.context_window as u32).unwrap_or(128_000),
@@ -598,6 +605,7 @@ impl CodingRuntimeConfig {
         config.todo = self.todo.clone();
         config.atomgit_enabled = self.atomgit_enabled;
         config.tool_output_threshold_bytes = self.tool_output_threshold_bytes;
+        config.mcp_tool_search = self.mcp_tool_search;
         config.provider_name = self.provider_name.clone();
         config.chat_options.max_tokens = self.max_tokens;
         config.telemetry = self.telemetry.clone();
@@ -1077,6 +1085,7 @@ impl CodingAgentConfig {
             todo: Default::default(),
             atomgit_enabled: true,
             tool_output_threshold_bytes: None,
+            mcp_tool_search: Default::default(),
             working_dir: working_dir.into(),
             context_window: 128_000,
             stream_timeout: default_stream_timeout(),

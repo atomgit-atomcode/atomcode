@@ -76,6 +76,7 @@ mod execution_policy;
 pub mod host_rows;
 mod init_prompt;
 mod mcp_instructions;
+mod mcp_tool_search;
 pub mod native_log;
 mod next_prompt_suggestion;
 mod rate_limit;

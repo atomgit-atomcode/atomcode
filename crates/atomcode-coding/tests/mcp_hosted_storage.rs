@@ -93,6 +93,7 @@ impl DocumentStore for Sealed {
 struct Recorder {
     offered: Mutex<Vec<Vec<String>>>,
     steps: Mutex<VecDeque<Vec<StreamEvent>>>,
+    requests: Mutex<Vec<(Vec<ToolDef>, Vec<Message>)>>,
 }
 
 impl Recorder {
@@ -115,10 +116,15 @@ impl LlmProvider for Model {
     }
     async fn chat_stream(
         &self,
-        _: &[Message],
+        messages: &[Message],
         tools: &[ToolDef],
         _: &ChatOptions,
     ) -> Result<futures::stream::BoxStream<'static, StreamEvent>, ProviderError> {
+        self.0
+            .requests
+            .lock()
+            .unwrap()
+            .push((tools.to_vec(), messages.to_vec()));
         self.0
             .offered
             .lock()
@@ -150,6 +156,23 @@ impl CodingProviderFactory for Factory {
 
 /// One `echo` tool; each start is a line in `spawns`.
 fn write_mcp_server(dir: &std::path::Path, spawns: &std::path::Path) -> std::path::PathBuf {
+    write_mcp_server_with_tools(
+        dir,
+        spawns,
+        json!([{
+            "name":"echo", "description":"echo back",
+            "inputSchema":{"type":"object","properties":{}}
+        }]),
+    )
+}
+
+fn write_mcp_server_with_tools(
+    dir: &std::path::Path,
+    spawns: &std::path::Path,
+    tools: Value,
+) -> std::path::PathBuf {
+    let tools_file = dir.join("tools.json");
+    std::fs::write(&tools_file, tools.to_string()).unwrap();
     let script = dir.join("server.sh");
     std::fs::write(
         &script,
@@ -162,7 +185,9 @@ while IFS= read -r line; do
     *'"method":"initialize"'*)
       printf '{{"jsonrpc":"2.0","id":%s,"result":{{"protocolVersion":"2025-11-05","capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"u","version":"0"}}}}}}\n' "$id" ;;
     *'"method":"tools/list"'*)
-      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"tools":[{{"name":"echo","description":"echo back","inputSchema":{{"type":"object","properties":{{}}}}}}]}}}}\n' "$id" ;;
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"tools":' "$id"
+      cat "{tools_file}"
+      printf '}}}}\n' ;;
     *'"method":"tools/call"'*)
       printf '{{"jsonrpc":"2.0","id":%s,"result":{{"content":[{{"type":"text","text":"echo:from-server"}}]}}}}\n' "$id" ;;
     *'"id":'*)
@@ -170,7 +195,8 @@ while IFS= read -r line; do
   esac
 done
 "#,
-            spawns = spawns.display()
+            spawns = spawns.display(),
+            tools_file = tools_file.display()
         ),
     )
     .unwrap();
@@ -512,4 +538,116 @@ async fn a_host_kept_config_that_cannot_be_read_fails_and_is_left_as_it_is() {
     assert_eq!(*user_config.updates.lock().unwrap(), 0);
     env.user_file_untouched();
     runtime.handle.shutdown().await.unwrap();
+}
+
+/// Real runtime + stdio discovery: schemas stay off the first provider request,
+/// search exposes one on the next round, and execution still uses the MCP alias.
+/// Wall-clock test because it coordinates an actual subprocess over pipes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_large_mcp_catalog_is_searched_then_called_without_schema_history_bloat() {
+    use atomcode_kernel::tool::ToolCall;
+    let env = Env::new();
+    let recorder = Arc::new(Recorder::default());
+    let tools = (0..34).map(|n| json!({
+        "name": format!("inspect_{n:02}"), "description":"inspect reverse engineering function",
+        "inputSchema":{"type":"object","properties":{"address":{"type":"string","description":"x".repeat(12_000)}}}
+    })).collect::<Vec<_>>();
+    let script = write_mcp_server_with_tools(env.scratch.path(), &env.spawns(), json!(tools));
+    let user_config = Sealed::holding(
+        &json!({"mcpServers":{"rea":{"command":"sh","args":[script],"trust":true}}}).to_string(),
+    );
+    let tokens = Sealed::holding("");
+    for (id, name, arguments) in [
+        (
+            "discover",
+            "mcp_search",
+            r#"{"query":"mcp__rea__inspect_17","limit":1}"#,
+        ),
+        ("inspect", "mcp__rea__inspect_17", r#"{"address":"0x1234"}"#),
+    ] {
+        recorder.steps.lock().unwrap().push_back(vec![
+            StreamEvent::ToolCall(ToolCall {
+                id: id.into(),
+                name: name.into(),
+                arguments: arguments.into(),
+            }),
+            StreamEvent::Done { truncated: false },
+        ]);
+    }
+    let mut runtime = started(env.start(&recorder, &user_config, &tokens)).await;
+    runtime
+        .handle
+        .wait_mcp_ready(std::time::Duration::from_secs(10))
+        .await
+        .unwrap();
+    turn(&mut runtime, "inspect the function with RE tools").await;
+    let requests = recorder.requests.lock().unwrap().clone();
+    assert!(
+        requests.len() >= 3,
+        "discovery, execution, answer: {}",
+        requests.len()
+    );
+    assert!(requests[0].0.iter().any(|t| t.name == "mcp_search"));
+    assert!(!requests[0]
+        .0
+        .iter()
+        .any(|t| t.name.starts_with("mcp__rea__")));
+    let selected = requests[1]
+        .0
+        .iter()
+        .filter(|t| t.name.starts_with("mcp__rea__"))
+        .collect::<Vec<_>>();
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0].name, "mcp__rea__inspect_17");
+    assert!(selected[0].parameters.to_string().len() > 12_000);
+    let search_result = requests[1]
+        .1
+        .iter()
+        .find(|m| m.tool_call_id.as_deref() == Some("discover"))
+        .unwrap();
+    assert!(!search_result.is_error, "{}", search_result.text);
+    assert!(search_result.text.len() < 2_048);
+    assert!(requests[2]
+        .1
+        .iter()
+        .any(|m| m.tool_call_id.as_deref() == Some("inspect")
+            && !m.is_error
+            && m.text.contains("echo:from-server")));
+    assert_eq!(
+        runtime
+            .handle
+            .mcp_rows()
+            .await
+            .unwrap()
+            .rows
+            .iter()
+            .find(|row| row.name == "rea")
+            .unwrap()
+            .tool_count,
+        34
+    );
+    let mut eager = env.agent();
+    eager.mcp_tool_search = atomcode_config::config::McpToolSearchMode::Off;
+    runtime.handle.reprepare_config(eager).await.unwrap();
+    runtime
+        .handle
+        .wait_mcp_ready(std::time::Duration::from_secs(10))
+        .await
+        .unwrap();
+    turn(&mut runtime, "now use eager tools").await;
+    assert_eq!(
+        recorder
+            .last_offered()
+            .iter()
+            .filter(|name| name.starts_with("mcp__rea__"))
+            .count(),
+        34
+    );
+    assert!(!recorder
+        .last_offered()
+        .iter()
+        .any(|name| name == "mcp_search"));
+    runtime.handle.shutdown().await.unwrap();
+    runtime.task.await.unwrap();
+    env.user_file_untouched();
 }
