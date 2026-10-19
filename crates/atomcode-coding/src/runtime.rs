@@ -4698,10 +4698,12 @@ fn spawn_runtime_owner_with_optional_agent(
                             continue;
                         }
                         if cancel_pending {
+                            tracing::warn!(generation, reason = "cancellation_pending", "runtime submit refused");
                             let _ = done.send(Err(RuntimeError::Busy));
                             continue;
                         }
                         if pending_policy_intervention.is_some() {
+                            tracing::warn!(generation, reason = "policy_intervention_pending", "runtime submit refused");
                             let _ = done.send(Err(RuntimeError::Busy));
                             continue;
                         }

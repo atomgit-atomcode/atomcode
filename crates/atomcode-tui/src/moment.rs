@@ -753,6 +753,9 @@ pub struct Moment {
     /// turn events. While it has, its end is still coming and is where a stop
     /// settles; the agent's status going idle is not.
     pub turn_open: bool,
+    /// The kernel acknowledged cancellation; runtime persistence has not yet
+    /// reported its terminal. An idle kernel status cannot close this gap.
+    pub cancellation_pending: bool,
     /// 人自己跑过的 `!` 命令与它们的输出,等着跟下一条消息一起给模型。
     ///
     /// 攒着而不是当场发:跑一条 `!git status` 不是在对模型说话,不该因此开

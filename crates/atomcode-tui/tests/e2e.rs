@@ -6236,6 +6236,111 @@ async fn the_waiting_row_rises_even_when_the_turns_start_arrives_late() {
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
 
+/// The kernel cancellation acknowledgement is not the runtime terminal.
+#[tokio::test]
+async fn cancellation_keeps_its_live_line_until_runtime_completion() {
+    use atomcode_kernel::event::{AgentEvent, StopReason};
+    let dir = scratch("cancel-before-runtime-completion");
+    let stalling = "[[patch]]\nid = \"llm\"\nname = \"test-stalling-llm\"\n";
+    let (s, agent) =
+        start_with_agent_events(tree(&dir, &replay(r#"{ text = "unused" }"#), &[stalling])).await;
+    let task = s.open().await;
+    s.term.type_line("keep working");
+    until(&s, "keep working").await;
+    for _ in 0..100 {
+        if part_text(&s, "live").contains("正在等待模型") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(part_text(&s, "live").contains("正在等待模型"));
+    agent.send(AgentEvent::Cancelled).unwrap();
+    until(&s, "正在停止").await;
+    agent
+        .send(AgentEvent::StatusChanged {
+            session: s.client().root(),
+            status: atomcode_kernel::agent::AgentStatus::Idle,
+        })
+        .unwrap();
+    // A barrier through the same event channel: the idle status was handled.
+    agent
+        .send(AgentEvent::Error {
+            message: "cancellation snapshot still pending".into(),
+            http_status: None,
+            code: None,
+            retryable: None,
+            ends_turn: false,
+        })
+        .unwrap();
+    until(&s, "cancellation snapshot still pending").await;
+    assert!(part_text(&s, "live").contains("正在停止"));
+    agent
+        .send(AgentEvent::TurnComplete {
+            turn: None,
+            reason: StopReason::Cancelled,
+        })
+        .unwrap();
+    for _ in 0..100 {
+        if !part_text(&s, "live").contains("正在停止") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!part_text(&s, "live").contains("正在停止"));
+    task.abort();
+}
+
+/// A stale screen terminal must not hide messages queued to a working agent.
+#[tokio::test]
+async fn a_working_agent_keeps_follow_up_messages_visible_in_the_queue() {
+    use atomcode_kernel::event::{AgentEvent, StopReason};
+    let dir = scratch("working-agent-stale-screen");
+    let stalling = "[[patch]]\nid = \"llm\"\nname = \"test-stalling-llm\"\n";
+    let (s, agent) =
+        start_with_agent_events(tree(&dir, &replay(r#"{ text = "unused" }"#), &[stalling])).await;
+    let task = s.open().await;
+    s.term.type_line("first request");
+    until(&s, "first request").await;
+    for _ in 0..100 {
+        if part_text(&s, "live").contains("正在等待模型") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(part_text(&s, "live").contains("正在等待模型"));
+    agent
+        .send(AgentEvent::TurnComplete {
+            turn: None,
+            reason: StopReason::Stopped,
+        })
+        .unwrap();
+    agent
+        .send(AgentEvent::Error {
+            message: "screen terminal delivered".into(),
+            http_status: None,
+            code: None,
+            retryable: None,
+            ends_turn: false,
+        })
+        .unwrap();
+    until(&s, "screen terminal delivered").await;
+    s.term.type_line("follow up while still working");
+    for _ in 0..100 {
+        if part_text(&s, "steering").contains("follow up while still working") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        part_text(&s, "steering").contains("follow up while still working"),
+        "{}",
+        s.screen()
+    );
+    assert!(!s.screen().contains("coding runtime is busy"));
+    assert!(part_text(&s, "live").contains("正在等待模型"));
+    task.abort();
+}
+
 /// An error is said without taking the line off work that is still running.
 ///
 /// Not every error ends a turn: a `/cancel-all` refused by an idle member, a
@@ -10334,7 +10439,16 @@ async fn ctrl_p_over_the_slash_menu_recalls_and_closes_it() {
     s.quiet().await;
 
     s.term.type_text("/co");
-    until(&s, "/compact").await;
+    // The welcome banner also contains /compact; wait for the menu itself.
+    for _ in 0..100 {
+        if s.term
+            .last()
+            .is_some_and(|frame| frame.part("menu").is_some())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert!(
         s.term.last().unwrap().part("menu").is_some(),
         "{}",

@@ -6361,6 +6361,10 @@ impl Tui {
                     }
                     return true;
                 }
+                // A rejected send is not still waiting in the model inbox.
+                // Restore the text belonging to this receipt, not the most
+                // recent send when several messages were submitted in a row.
+                let rejected_text = self.host.remove_queued(&command);
                 // A send that never became a turn produces no message fact to
                 // take the `正在识别图片` line down; do it here.
                 self.host.stop_recognizing();
@@ -6371,7 +6375,7 @@ impl Tui {
                 {
                     let mut m = self.host.moment.write().expect("moment poisoned");
                     if m.input.is_empty() {
-                        if let Some(sent) = m.last_sent.clone() {
+                        if let Some(sent) = rejected_text.or_else(|| m.last_sent.clone()) {
                             m.input = sent;
                             m.caret = m.input.len();
                             m.history_at = None;
@@ -6492,7 +6496,16 @@ impl Tui {
                         self.settle_withdrawn();
                         changed = true;
                     }
-                } else if on_screen && status == AgentStatus::Idle && self.client.settled() {
+                } else if on_screen
+                    && status == AgentStatus::Idle
+                    && self.client.settled()
+                    && !self
+                        .host
+                        .moment
+                        .read()
+                        .expect("moment poisoned")
+                        .cancellation_pending
+                {
                     // The lead's own line is moved by its turn events, which say
                     // more than a status does — but only while they arrive. When
                     // one does not, the claim on screen (正在停止, most of all)
@@ -6572,6 +6585,7 @@ impl Tui {
             AgentEvent::TurnStarted { .. } => {
                 let mut m = self.host.moment.write().expect("moment poisoned");
                 m.turn_open = true;
+                m.cancellation_pending = false;
                 // A row the pointer lit last turn is let go of, unless the keys
                 // are on the panel: it is what keeps a team panel open that a
                 // person opened, and once a new turn runs, a team that goes
@@ -6631,6 +6645,7 @@ impl Tui {
                             }
                         }
                         m.turn_open = false;
+                        m.cancellation_pending = false;
                         if let Some(retract) = m.retract.as_mut() {
                             retract.ended = true;
                         }
@@ -6674,14 +6689,29 @@ impl Tui {
                 // the only fact left to take the line down. `stop_turn` covers
                 // the person's stop; this covers every other way a turn ends.
                 let _ = self.host.stop_compacting();
-                self.set_activity(Activity::Idle)
-                    | matches!(
-                        event,
-                        AgentEvent::TurnComplete {
-                            reason: atomcode_kernel::event::StopReason::PromptRejected,
-                            ..
-                        }
-                    )
+                // Cancelled only acknowledges the kernel stop. The runtime's
+                // TurnComplete follows after its snapshot has settled; until
+                // then a new submit can still be refused as busy.
+                let closing = matches!(event, AgentEvent::Cancelled)
+                    && self.host.moment.read().expect("moment poisoned").turn_open;
+                if closing {
+                    self.host
+                        .moment
+                        .write()
+                        .expect("moment poisoned")
+                        .cancellation_pending = true;
+                }
+                self.set_activity(if closing {
+                    Activity::Stopping
+                } else {
+                    Activity::Idle
+                }) | matches!(
+                    event,
+                    AgentEvent::TurnComplete {
+                        reason: atomcode_kernel::event::StopReason::PromptRejected,
+                        ..
+                    }
+                )
             }
             // A summary is being written and the request waits on it. Only the
             // slow tier announces this (a cheap fold is instant), so this is the
@@ -6745,7 +6775,14 @@ impl Tui {
                     self.client.status_of(&self.client.session()),
                     Some(AgentStatus::Working) | Some(AgentStatus::Stopping)
                 );
-                if !working {
+                if !working
+                    && !self
+                        .host
+                        .moment
+                        .read()
+                        .expect("moment poisoned")
+                        .cancellation_pending
+                {
                     self.set_activity(Activity::Idle);
                     // An error that has taken the turn down takes the compaction
                     // line with it: nothing is waiting on that summary any more.
@@ -7037,6 +7074,7 @@ impl Tui {
 
     /// Apply one action. Returns `true` to quit.
     fn act(&self, action: Action, client: &AgentClient) -> bool {
+        use crate::moment::Activity;
         let action = if let Action::PageScroll(direction) = action {
             let m = self.host.moment.read().expect("moment poisoned");
             let rows = self
@@ -7293,6 +7331,10 @@ impl Tui {
                     // goes back by turns, and would take this one with it.
                     m.retract = None;
                     m.turn_in_flight()
+                        || matches!(
+                            client.status_of(&client.session()),
+                            Some(AgentStatus::Working | AgentStatus::Stopping)
+                        )
                 };
                 // A picture bound for a text-only model is turned into text by the
                 // VL helper before the turn opens; show `正在识别图片` until the
@@ -7328,6 +7370,20 @@ impl Tui {
                 }
                 if steering {
                     self.host.add_steering(&id, &text);
+                    if self.host.moment.read().expect("moment poisoned").activity == Activity::Idle
+                    {
+                        if let Some(status) = client.status_of(&client.session()) {
+                            match status {
+                                AgentStatus::Working => {
+                                    self.set_activity(Activity::Working);
+                                }
+                                AgentStatus::Stopping => {
+                                    self.set_activity(Activity::Stopping);
+                                }
+                                AgentStatus::Idle => {}
+                            }
+                        }
+                    }
                 }
                 return false;
             }
@@ -13039,6 +13095,38 @@ mod midturn_command_tests {
             .unwrap()
             .text
             .contains("1/1"));
+    }
+
+    #[test]
+    fn a_refused_queued_send_returns_its_own_text_and_keeps_other_sends() {
+        let (host, tui, _) = screen();
+        host.add_steering("first", "first message");
+        host.add_steering("second", "second message");
+        host.moment.write().unwrap().last_sent = Some("second message".into());
+        tui.on_event(AgentEvent::Rejected {
+            command: "first".into(),
+            error: atomcode_kernel::event::CommandError::Busy {
+                reason: "closing".into(),
+            },
+        });
+        let moment = host.moment.read().unwrap();
+        assert_eq!(moment.input, "first message");
+        assert_eq!(moment.steering, "second message");
+        assert_eq!(moment.queued.len(), 1);
+        assert_eq!(moment.queued[0].id, "second");
+        drop(moment);
+        // A newer draft must never be overwritten by another refusal.
+        host.moment.write().unwrap().input = "new draft".into();
+        tui.on_event(AgentEvent::Rejected {
+            command: "second".into(),
+            error: atomcode_kernel::event::CommandError::Busy {
+                reason: "closing".into(),
+            },
+        });
+        let moment = host.moment.read().unwrap();
+        assert_eq!(moment.input, "new draft");
+        assert!(moment.queued.is_empty());
+        assert!(moment.steering.is_empty());
     }
 
     #[test]

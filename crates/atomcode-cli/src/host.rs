@@ -835,6 +835,7 @@ async fn run(
 ) -> Answered {
     let refused = |error: RuntimeError| {
         let message = match error {
+            RuntimeError::Busy => tr(SMsg::RuntimeBusy).into_owned(),
             // The same sentence the screen was told when the provider went,
             // in the person's language — not the runtime's English `Display`.
             RuntimeError::ProviderUnavailable(reason) => match readiness_for(Some(reason)) {

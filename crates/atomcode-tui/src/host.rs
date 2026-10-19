@@ -1930,6 +1930,7 @@ impl Host {
         m.resend_withdrawn = false;
         m.stopping = false;
         m.turn_open = false;
+        m.cancellation_pending = false;
         // The `正在识别图片` line belongs to a picture sent into the view being
         // left; carried across it would claim the arriving conversation is
         // recognising one it never saw. (Its own message fact clears it in the
@@ -2742,17 +2743,19 @@ impl Host {
     /// was taken (one this screen did not queue — a member's, a turn it did not
     /// start), and the panel does not change.
     pub fn claimed(&self, id: &str) -> bool {
-        let rest = {
+        self.remove_queued(id).is_some()
+    }
+
+    /// Remove one accepted or rejected send by receipt, returning its own text.
+    pub(crate) fn remove_queued(&self, id: &str) -> Option<String> {
+        let (text, rest) = {
             let mut m = self.moment.write().expect("moment poisoned");
-            let before = m.queued.len();
-            m.queued.retain(|queued| queued.id != id);
-            if m.queued.len() == before {
-                return false;
-            }
-            waiting(&m.queued)
+            let at = m.queued.iter().position(|queued| queued.id == id)?;
+            let text = m.queued.remove(at).text;
+            (text, waiting(&m.queued))
         };
         self.set_steering(rest);
-        true
+        Some(text)
     }
 
     /// A queued line the runtime has withdrawn (`id` is the receipt it was sent

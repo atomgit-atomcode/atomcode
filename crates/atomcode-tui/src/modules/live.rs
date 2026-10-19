@@ -451,10 +451,17 @@ fn doing(state: &State, moment: &Moment) -> Option<String> {
     // The elapsed clock rides the parenthesised figures group like the turn's own
     // does (`parts`), so 正在识别图片 （耗时 2s） reads exactly like 正在思考
     // （耗时 1s） — one style, not a bare ` · 2s`.
+    // The event log can close before the runtime finishes cancellation and
+    // snapshot persistence. Stopping is a live claim, not a historical turn.
+    if moment.activity == Activity::Stopping {
+        return Some(t(Msg::LiveStopping).into_owned());
+    }
     if state.turn.is_none() {
-        return moment
-            .recognizing_image
-            .then(|| t(Msg::LiveRecognizingImage).into_owned());
+        if moment.recognizing_image {
+            return Some(t(Msg::LiveRecognizingImage).into_owned());
+        }
+        return (moment.turn_open && moment.activity == Activity::Working)
+            .then(|| t(Msg::LiveWaiting).into_owned());
     }
     match moment.activity {
         Activity::Idle => None,
@@ -1098,6 +1105,22 @@ mod tests {
         assert_eq!(short(59_999), "59s");
         assert_eq!(short(65_000), "1m05s");
         assert_eq!(short(3_723_000), "1h02m");
+    }
+
+    #[test]
+    fn a_closed_log_does_not_hide_runtime_cancellation() {
+        let state = State::default();
+        let mut moment = Moment::default().at_tick(0);
+        moment.turn_open = true;
+        moment.activity = Activity::Stopping;
+        assert!(draw(&state, &moment, 80, 2).join(" ").contains("正在停止"));
+        moment.activity = Activity::Working;
+        assert!(draw(&state, &moment, 80, 2)
+            .join(" ")
+            .contains("正在等待模型"));
+        moment.turn_open = false;
+        moment.activity = Activity::Idle;
+        assert!(showing(&state, &moment).is_none());
     }
 
     #[test]
