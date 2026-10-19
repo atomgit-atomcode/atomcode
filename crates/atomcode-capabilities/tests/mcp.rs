@@ -530,3 +530,72 @@ async fn manual_reconnect_reloads_the_selected_servers_approval_config() {
     assert!(registry.is_server_trusted("neighbor"));
     assert!(registry.is_tool_auto_approved("mcp__neighbor__echo"));
 }
+
+/// Notifications and late responses must never become the current tool's result.
+// Real subprocess I/O must progress before the operation deadline.
+#[tokio::test]
+async fn stdio_correlates_replies_past_notifications_and_stale_ids() {
+    for framing in ["MCP_TEST_NDJSON", "MCP_TEST_CONTENT_LENGTH"] {
+        let registry = McpRegistry::new(NO_TREE);
+        registry
+            .add_server(test_server_config_with_env(
+                "correlated",
+                BTreeMap::from([
+                    ("MCP_TEST_NOTIFY_BEFORE_RESPONSE".into(), "1".into()),
+                    ("MCP_TEST_STALE_RESPONSE".into(), "1".into()),
+                    ("MCP_TEST_SERVER_REQUEST".into(), "1".into()),
+                    (framing.into(), "1".into()),
+                ]),
+            ))
+            .await
+            .unwrap();
+        for message in ["first", "second"] {
+            let result = registry
+                .call_tool("correlated", "echo", serde_json::json!({"message":message}))
+                .await
+                .unwrap();
+            assert_eq!(result, format!("echo:{message}"));
+        }
+    }
+}
+
+// Real subprocess I/O must progress before the operation deadline.
+#[tokio::test]
+async fn malformed_stdio_result_is_not_replayed_or_received_by_the_next_call() {
+    for failure_mode in ["MCP_TEST_MALFORMED_ONCE", "MCP_TEST_INVALID_UTF8_ONCE"] {
+        let temp = tempfile::tempdir().unwrap();
+        let calls = temp.path().join("calls");
+        let registry = McpRegistry::new(NO_TREE);
+        registry
+            .add_server(test_server_config_with_env(
+                "broken",
+                BTreeMap::from([
+                    (
+                        failure_mode.into(),
+                        temp.path().join("once").display().to_string(),
+                    ),
+                    (
+                        "MCP_TEST_TOOL_CALL_COUNTER".into(),
+                        calls.display().to_string(),
+                    ),
+                ]),
+            ))
+            .await
+            .unwrap();
+        let first = registry
+            .call_tool("broken", "echo", serde_json::json!({"message":"first"}))
+            .await;
+        assert!(first.is_err());
+        assert!(format!("{:#}", first.unwrap_err()).contains("result is unknown"));
+        let second = registry
+            .call_tool("broken", "echo", serde_json::json!({"message":"second"}))
+            .await
+            .unwrap();
+        assert_eq!(second, "echo:second");
+        assert_eq!(
+            spawn_count(&calls),
+            2,
+            "one execution per explicit call, no hidden replay"
+        );
+    }
+}

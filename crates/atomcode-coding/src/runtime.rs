@@ -9869,6 +9869,7 @@ fn launch_goal_evaluation(
     };
     let condition = state.condition.clone();
     let summary = summarize_for_goal(&snapshot.messages, state.last_reason.as_deref());
+    let user_directions = crate::controllers::goal_user_directions(&snapshot.messages);
     let cancel = state.work_cancel.clone();
     let timeout =
         std::time::Duration::from_secs(state.recovery_policy.evaluator_timeout_secs.clamp(1, 3600));
@@ -9881,6 +9882,7 @@ fn launch_goal_evaluation(
             provider,
             condition,
             summary,
+            user_directions,
             cancel,
             timeout,
         ));

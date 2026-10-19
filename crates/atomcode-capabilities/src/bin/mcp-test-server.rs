@@ -107,6 +107,44 @@ fn main() -> io::Result<()> {
                     .and_then(|value| value.as_str())
                     .unwrap_or("");
                 sleep_from_env("MCP_TEST_TOOL_RESPONSE_DELAY_MS")?;
+                if std::env::var_os("MCP_TEST_SERVER_REQUEST").is_some() {
+                    write_frame(
+                        &mut writer,
+                        &serde_json::json!({"jsonrpc":"2.0", "id":"server-request", "method":"roots/list"}),
+                    )?;
+                    let reply = read_frame(&mut reader)?;
+                    if reply["id"] != "server-request" || reply["error"]["code"] != -32601 {
+                        return Err(io::Error::other("expected unsupported-client-method reply"));
+                    }
+                }
+                if std::env::var_os("MCP_TEST_NOTIFY_BEFORE_RESPONSE").is_some() {
+                    write_frame(
+                        &mut writer,
+                        &serde_json::json!({"jsonrpc":"2.0", "method":"notifications/progress", "params":{"progressToken":"echo", "progress":1}}),
+                    )?;
+                }
+                if std::env::var_os("MCP_TEST_STALE_RESPONSE").is_some() {
+                    write_frame(
+                        &mut writer,
+                        &serde_json::json!({"jsonrpc":"2.0", "id":999999, "result":{"content":[{"type":"text","text":"STALE_RESULT"}]}}),
+                    )?;
+                }
+                if let Some(marker) = std::env::var_os("MCP_TEST_INVALID_UTF8_ONCE") {
+                    let marker = std::path::PathBuf::from(marker);
+                    if !marker.exists() {
+                        std::fs::write(marker, b"executed")?;
+                        writer.write_all(&[0xff, b'\n'])?;
+                        writer.flush()?;
+                    }
+                }
+                if let Some(marker) = std::env::var_os("MCP_TEST_MALFORMED_ONCE") {
+                    let marker = std::path::PathBuf::from(marker);
+                    if !marker.exists() {
+                        std::fs::write(marker, b"executed")?;
+                        writeln!(writer, "{{broken JSON}}")?;
+                        writer.flush()?;
+                    }
+                }
                 id.map(|id| {
                     serde_json::json!({
                         "jsonrpc": "2.0",
@@ -183,11 +221,12 @@ fn sleep_from_env_when_marker_exists(marker_name: &str, delay_name: &str) -> io:
 
 /// MCP stdio: newline-delimited JSON (NDJSON).
 fn write_frame<W: Write>(writer: &mut W, payload: &serde_json::Value) -> io::Result<()> {
-    writeln!(
-        writer,
-        "{}",
-        serde_json::to_string(payload).map_err(io::Error::other)?
-    )?;
+    let body = serde_json::to_string(payload).map_err(io::Error::other)?;
+    if std::env::var_os("MCP_TEST_CONTENT_LENGTH").is_some() {
+        write!(writer, "Content-Length: {}\r\n\r\n{}", body.len(), body)?;
+    } else {
+        writeln!(writer, "{body}")?;
+    }
     writer.flush()?;
     Ok(())
 }

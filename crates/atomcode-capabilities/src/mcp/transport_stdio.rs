@@ -8,8 +8,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
+use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, Notify};
@@ -82,6 +83,18 @@ impl std::fmt::Display for StdioConnectionClosed {
 }
 
 impl std::error::Error for StdioConnectionClosed {}
+
+#[derive(Debug)]
+struct StdioProtocolError(String);
+impl std::fmt::Display for StdioProtocolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for StdioProtocolError {}
+fn protocol_error(error: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::Error::new(StdioProtocolError(error.to_string()))
+}
 
 #[derive(Debug)]
 struct RequestAttemptError {
@@ -279,7 +292,7 @@ impl StdioClient {
         }
 
         // The write, flush, and read phases use one operation deadline.
-        let result = tokio::time::timeout_at(deadline, self.recv_jsonrpc_response())
+        let result = tokio::time::timeout_at(deadline, self.recv_jsonrpc_response(id))
             .await
             .with_context(|| {
                 format!(
@@ -569,8 +582,13 @@ impl McpClient for StdioClient {
 }
 
 impl StdioClient {
-    /// Read one JSON-RPC response (NDJSON per MCP stdio spec, or legacy `Content-Length` framing).
-    async fn recv_jsonrpc_response(&self) -> Result<super::types::JsonRpcResponse> {
+    /// Read the matching response, dispatching notifications/server requests and
+    /// ignoring stale IDs under the caller's single deadline. Both NDJSON and
+    /// legacy `Content-Length` framing use the same envelope validation.
+    async fn recv_jsonrpc_response(
+        &self,
+        expected_id: u64,
+    ) -> Result<super::types::JsonRpcResponse> {
         let mut reader = self.reader.lock().await;
         let reader = reader
             .as_mut()
@@ -598,25 +616,54 @@ impl StdioClient {
             };
 
             let body = line.trim_end_matches(['\r', '\n']).trim_start();
-            if body.starts_with('{') || body.starts_with('[') {
-                return serde_json::from_str(body)
-                    .context("Failed to parse NDJSON MCP message as JSON-RPC");
+            let frame: Value = if body.starts_with('{') || body.starts_with('[') {
+                serde_json::from_str(body).map_err(protocol_error)?
+            } else if strip_prefix_ci(body, "content-length:").is_some() {
+                read_content_length_message(reader, line).await?
+            } else {
+                skipped_lines += 1;
+                if skipped_lines > MAX_SKIP_LINES {
+                    return Err(protocol_error("MCP stdio: too many non-protocol lines"));
+                }
+                continue;
+            };
+            let object = frame
+                .as_object()
+                .ok_or_else(|| protocol_error("MCP frame is not an object"))?;
+            if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+                return Err(protocol_error("MCP frame has invalid JSON-RPC version"));
             }
-            if strip_prefix_ci(body, "content-length:").is_some() {
-                return read_content_length_message(reader, line).await;
+            if let Some(method) = object.get("method") {
+                if !method.is_string()
+                    || object.contains_key("result")
+                    || object.contains_key("error")
+                {
+                    return Err(protocol_error("MCP frame has invalid request envelope"));
+                }
+                if let Some(id) = object.get("id") {
+                    // We do not advertise server-request capabilities. Reject requests
+                    // explicitly rather than mistaking them for our pending response.
+                    let reply = serde_json::json!({"jsonrpc":"2.0", "id":id,
+                        "error":{"code":-32601,"message":"Client method not supported"}});
+                    let mut stdin = self.stdin.lock().await;
+                    let stdin = stdin.as_mut().ok_or_else(|| {
+                        anyhow::Error::new(StdioConnectionClosed("MCP stdin closed"))
+                    })?;
+                    stdin.write_all(format!("{reply}\n").as_bytes()).await?;
+                    stdin.flush().await?;
+                }
+                continue;
             }
-
-            // Some third-party MCP servers incorrectly print status logs to stdout
-            // after initialization. MCP requires stdout to contain only protocol
-            // messages, but skipping plain-text lines keeps otherwise usable tools
-            // available while still failing on malformed JSON-RPC frames above.
-            skipped_lines += 1;
-            if skipped_lines > MAX_SKIP_LINES {
-                bail!(
-                    "MCP stdio: too many non-protocol lines (>{MAX_SKIP_LINES}), last line: {}",
-                    body.chars().take(80).collect::<String>()
-                );
+            if !object.contains_key("id")
+                || object.contains_key("result") == object.contains_key("error")
+            {
+                return Err(protocol_error("MCP frame has invalid response envelope"));
             }
+            if object.get("id").and_then(Value::as_u64) != Some(expected_id) {
+                // A late reply must never become the result of another operation.
+                continue;
+            }
+            return serde_json::from_value(frame).map_err(protocol_error);
         }
     }
 
@@ -678,7 +725,8 @@ fn is_reconnectable_stdio_error(error: &anyhow::Error) -> bool {
     use std::io::ErrorKind;
 
     error.chain().any(|cause| {
-        if cause.downcast_ref::<StdioConnectionClosed>().is_some()
+        if cause.downcast_ref::<StdioProtocolError>().is_some()
+            || cause.downcast_ref::<StdioConnectionClosed>().is_some()
             || cause
                 .downcast_ref::<tokio::time::error::Elapsed>()
                 .is_some()
@@ -693,6 +741,9 @@ fn is_reconnectable_stdio_error(error: &anyhow::Error) -> bool {
                     | ErrorKind::ConnectionReset
                     | ErrorKind::NotConnected
                     | ErrorKind::UnexpectedEof
+                    // read_line rejects invalid UTF-8 before JSON decoding. The
+                    // response stream is uncertain just as for malformed JSON.
+                    | ErrorKind::InvalidData
                     | ErrorKind::TimedOut
             )
         })
@@ -702,7 +753,7 @@ fn is_reconnectable_stdio_error(error: &anyhow::Error) -> bool {
 async fn read_content_length_message(
     reader: &mut BufReader<ChildStdout>,
     mut line: String,
-) -> Result<super::types::JsonRpcResponse> {
+) -> Result<Value> {
     let mut content_length: Option<usize> = None;
     loop {
         let t = line.trim_end_matches(['\r', '\n']).trim();
@@ -710,7 +761,7 @@ async fn read_content_length_message(
             break;
         }
         if let Some(rest) = strip_prefix_ci(t, "content-length:") {
-            content_length = Some(rest.trim().parse().context("Invalid Content-Length")?);
+            content_length = Some(rest.trim().parse().map_err(protocol_error)?);
         }
         line.clear();
         let n = reader.read_line(&mut line).await?;
@@ -721,10 +772,10 @@ async fn read_content_length_message(
         }
     }
 
-    let length = content_length.context("Missing Content-Length header")?;
+    let length = content_length.ok_or_else(|| protocol_error("Missing Content-Length header"))?;
     let mut body = vec![0u8; length];
     reader.read_exact(&mut body).await?;
-    serde_json::from_slice(&body).context("Failed to parse JSON-RPC response")
+    serde_json::from_slice(&body).map_err(protocol_error)
 }
 
 /// On Windows, commands like `npx`, `npm`, `yarn`, `pnpm` are actually

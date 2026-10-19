@@ -251,6 +251,7 @@ mod evaluator_liveness_tests {
                 Arc::new(StuckSetup(entered.clone())),
                 "finish".into(),
                 "work done".into(),
+                String::new(),
                 cancel.clone(),
                 Duration::from_secs(600),
             ));
@@ -310,6 +311,7 @@ mod evaluator_liveness_tests {
                 }),
                 "finish".into(),
                 "work done".into(),
+                String::new(),
                 CancellationToken::new(),
                 Duration::from_secs(600),
             )
