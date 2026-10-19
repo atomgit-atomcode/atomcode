@@ -1500,9 +1500,45 @@ fn format_output(stdout: &str, stderr: &str, code: Option<i32>) -> ToolResult {
             s.push_str("[process terminated by signal]");
         }
     }
+    append_git_auth_hint(&mut s, code, is_git_auth_failure(&stderr));
     // The bash invocation itself ran; a non-zero exit is reported in-band (the model
     // reads the exit code) rather than as a tool error.
     ok(s)
+}
+
+/// Match Git's fatal HTTP credential diagnostics, not arbitrary programs'
+/// "Authentication failed" messages. This remains a diagnostic heuristic, not
+/// proof of why credentials are unavailable or a request to refresh AtomCode login.
+fn is_git_auth_failure(stderr: &str) -> bool {
+    stderr.lines().any(|line| {
+        let Some(message) = line.trim_start().strip_prefix("fatal: ") else {
+            return false;
+        };
+        [
+            "could not read Username for ",
+            "could not read Password for ",
+            "Authentication failed for ",
+        ]
+        .iter()
+        .any(|prefix| {
+            message.strip_prefix(prefix).is_some_and(|remote| {
+                let remote = remote.trim_start_matches(['\'', '"']);
+                remote.starts_with("https://") || remote.starts_with("http://")
+            })
+        })
+    })
+}
+
+/// Keep the same in-band exit status and never retry or inject credentials.
+/// `auth_failure` must come from stderr, including retained background chunks.
+fn append_git_auth_hint(output: &mut String, code: Option<i32>, auth_failure: bool) {
+    if !code.is_some_and(|code| code != 0) || !auth_failure {
+        return;
+    }
+    if !output.is_empty() && !output.ends_with('\n') {
+        output.push('\n');
+    }
+    output.push_str("[hint] Git reported a credential failure. With GIT_TERMINAL_PROMPT=0, Git cannot prompt for credentials. Check or refresh this remote's Git credential helper/PAT in an external terminal before retrying.");
 }
 
 /// Whether a `git checkout` operand is (heuristically) a FILE pathspec rather than a
@@ -3988,6 +4024,87 @@ mod tests {
             decode_output(&output.stdout).replace("\r\n", "\n"),
             "10\n2\n1\nFOUND ./x.txt\n"
         );
+    }
+
+    /// A git auth failure on a non-zero exit gets the explanatory hint, so the
+    /// model can diagnose `could not read Username` instead of retrying blindly
+    /// (issue #1645).
+    #[test]
+    fn format_output_appends_hint_on_git_auth_failure() {
+        let stderr =
+            "fatal: could not read Username for 'https://atomgit.com': terminal prompts disabled\n";
+        let r = format_output("", stderr, Some(128));
+        assert!(!r.is_error);
+        assert!(
+            r.content.contains("could not read Username"),
+            "{:?}",
+            r.content
+        );
+        assert!(r.content.contains("[hint]"), "{:?}", r.content);
+        assert!(
+            r.content.contains("GIT_TERMINAL_PROMPT=0"),
+            "{:?}",
+            r.content
+        );
+    }
+
+    /// The hint fires for every auth-failure signature git emits, not just the
+    /// `Username` variant.
+    #[test]
+    fn format_output_appends_hint_for_each_git_auth_signature() {
+        for stderr in [
+            "fatal: could not read Password for 'https://example.com': terminal prompts disabled\n",
+            "fatal: Authentication failed for 'https://example.com/repo.git'\n",
+        ] {
+            let r = format_output("", stderr, Some(1));
+            assert!(
+                r.content.contains("[hint]"),
+                "stderr={stderr:?}, content={:?}",
+                r.content
+            );
+        }
+    }
+
+    /// A successful command (exit 0) never gets the hint even if stderr mentions
+    /// an auth-failure phrase — git sometimes writes warnings to stderr on success.
+    #[test]
+    fn format_output_never_hints_on_exit_zero() {
+        let r = format_output("ok\n", "could not read Username", Some(0));
+        assert!(!r.content.contains("[hint]"), "{:?}", r.content);
+    }
+
+    /// A non-zero exit that is NOT an auth failure (e.g. a merge conflict) stays
+    /// untouched — the hint is specific to credential problems.
+    #[test]
+    fn format_output_leaves_unrelated_git_failures_alone() {
+        let stderr = "error: Your local changes would be overwritten by merge.\n";
+        let r = format_output("", stderr, Some(1));
+        assert!(!r.content.contains("[hint]"), "{:?}", r.content);
+    }
+
+    #[test]
+    fn git_auth_hint_requires_a_real_failure_and_git_diagnostic() {
+        let diagnostic = "fatal: Authentication failed for 'https://example.com/repo.git'";
+        let signaled = format_output("", diagnostic, None);
+        assert!(signaled.content.contains("[process terminated by signal]"));
+        assert!(!signaled.content.contains("[hint]"));
+        for unrelated in [
+            "Authentication failed",
+            "ssh: Authentication failed",
+            "terminal prompts disabled",
+            "warning: could not read Username",
+            "fatal: Authentication failed for user alice",
+        ] {
+            assert!(
+                !format_output("", unrelated, Some(1))
+                    .content
+                    .contains("[hint]"),
+                "{unrelated}"
+            );
+        }
+        assert!(!format_output(diagnostic, "", Some(128))
+            .content
+            .contains("[hint]"));
     }
 
     #[test]

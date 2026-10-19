@@ -28,7 +28,7 @@
 
 use super::{check_destructive_command, shell_always_grant_scope, LocalShell};
 use crate::tools::{err, ok};
-use crate::world::{Exit, Process, Shell, SpawnOptions};
+use crate::world::{Chunk, Exit, Process, Shell, SpawnOptions};
 use async_trait::async_trait;
 use atomcode_kernel::tool::{RiskLevel, Tool, ToolContext, ToolResult};
 use serde::Deserialize;
@@ -105,6 +105,10 @@ impl Buf {
 struct Shared {
     output: Mutex<Buf>,
     status: Mutex<Status>,
+    /// Diagnostic facts survive incremental polling without retaining unbounded stderr.
+    git_auth_failure: std::sync::atomic::AtomicBool,
+    /// Do not mistake a folded signal code (128 + signal) for a normal failed exit.
+    known_failed_exit: std::sync::atomic::AtomicBool,
     /// The shell has exited but something it started still holds its output open. The
     /// job stays in the store — and `bash_kill` can still reach the tree — until it is gone.
     left_running: std::sync::atomic::AtomicBool,
@@ -180,10 +184,17 @@ pub(crate) async fn start(
             total: 0,
         }),
         status: Mutex::new(Status::Running),
+        git_auth_failure: std::sync::atomic::AtomicBool::new(false),
+        known_failed_exit: std::sync::atomic::AtomicBool::new(false),
         left_running: std::sync::atomic::AtomicBool::new(false),
     });
     let (kill_tx, kill_rx) = tokio::sync::mpsc::unbounded_channel();
-    tokio::spawn(reader_task(process, Arc::clone(&shared), kill_rx));
+    tokio::spawn(reader_task(
+        process,
+        Arc::clone(&shared),
+        kill_rx,
+        Arc::clone(world),
+    ));
 
     let id = next_id();
     store().lock().unwrap().insert(
@@ -213,6 +224,15 @@ pub(crate) fn poll(job_id: &str) -> Result<PollResult, String> {
     let status = job.shared.status.lock().unwrap().clone();
     let left_running = job.shared.left_running();
     let world = Arc::clone(&job.world);
+    let diagnostic_code = match status {
+        Status::Exited(code)
+            if !left_running && job.shared.known_failed_exit.load(Ordering::Acquire) =>
+        {
+            Some(code)
+        }
+        _ => None,
+    };
+    let auth_failure = job.shared.git_auth_failure.load(Ordering::Acquire);
     if !matches!(status, Status::Running) && !left_running {
         // Terminal status is only set AFTER the reader finalizes, and `left_running` only
         // clears once the output has ended, so everything is delivered by the `since`
@@ -221,7 +241,8 @@ pub(crate) fn poll(job_id: &str) -> Result<PollResult, String> {
     }
     // The world decodes (non-UTF8/GBK/UTF-16 is *its* code page); the ANSI/CSI strip is
     // ours, so a color- or cursor-emitting long-runner doesn't flood the model with escapes.
-    let text = super::sanitize_terminal_output(&world.decode(&raw));
+    let mut text = super::sanitize_terminal_output(&world.decode(&raw));
+    super::append_git_auth_hint(&mut text, diagnostic_code, auth_failure);
     Ok(PollResult {
         text,
         truncated,
@@ -261,8 +282,28 @@ pub(crate) fn kill(job_id: &str) -> Result<String, String> {
 /// Drain the process's output into `shared` until its pipes close. Arrival order across
 /// both pipes is whatever the world hands back — the same interleaving the old two-pipe
 /// `select!` produced.
-async fn pump(process: Arc<dyn Process>, shared: Arc<Shared>) {
+async fn pump(process: Arc<dyn Process>, shared: Arc<Shared>, world: Arc<dyn Shell>) {
+    // Retain only a small overlapping window for diagnostics split across chunks.
+    // Once matched, retain a boolean, even if subsequent output evicts the message.
+    const DIAGNOSTIC_WINDOW: usize = 8 * 1024;
+    let mut stderr_tail = Vec::new();
     while let Some(chunk) = process.next_chunk().await {
+        if let Chunk::Stderr(bytes) = &chunk {
+            if !shared.git_auth_failure.load(Ordering::Acquire) {
+                for part in bytes.chunks(DIAGNOSTIC_WINDOW / 2) {
+                    stderr_tail.extend_from_slice(part);
+                    let decoded = super::sanitize_terminal_output(&world.decode(&stderr_tail));
+                    if super::is_git_auth_failure(&decoded) {
+                        shared.git_auth_failure.store(true, Ordering::Release);
+                        stderr_tail.clear();
+                        break;
+                    }
+                    if stderr_tail.len() > DIAGNOSTIC_WINDOW {
+                        stderr_tail.drain(..stderr_tail.len() - DIAGNOSTIC_WINDOW);
+                    }
+                }
+            }
+        }
         shared.output.lock().unwrap().append(chunk.bytes());
     }
 }
@@ -290,8 +331,9 @@ async fn reader_task(
     process: Arc<dyn Process>,
     shared: Arc<Shared>,
     mut kill_rx: UnboundedReceiver<()>,
+    world: Arc<dyn Shell>,
 ) {
-    let mut pump = tokio::spawn(pump(Arc::clone(&process), Arc::clone(&shared)));
+    let mut pump = tokio::spawn(pump(Arc::clone(&process), Arc::clone(&shared), world));
     let mut killed = false;
     let code = loop {
         tokio::select! {
@@ -300,7 +342,13 @@ async fn reader_task(
                 killed = true;
                 process.kill().await;
             }
-            exit = process.wait() => break exit_code_of(exit),
+            exit = process.wait() => {
+                shared.known_failed_exit.store(
+                    exit.as_ref().ok().and_then(|exit| exit.code).is_some_and(|code| code != 0),
+                    Ordering::Release,
+                );
+                break exit_code_of(exit);
+            },
         }
     };
     // A normal fast exit closes its pipes, so the pump completes at once and no time is
@@ -672,6 +720,168 @@ mod tests {
         assert_eq!(out, "ran elsewhere");
         assert_eq!(status, Status::Exited(0));
         assert_eq!(*world.0.lock().unwrap(), vec!["echo local".to_string()]);
+    }
+
+    struct AuthProcess {
+        chunks: Mutex<std::collections::VecDeque<crate::world::Chunk>>,
+        drained: tokio::sync::Notify,
+        finish: tokio_util::sync::CancellationToken,
+        exit: Exit,
+    }
+
+    #[async_trait]
+    impl Process for AuthProcess {
+        async fn next_chunk(&self) -> Option<crate::world::Chunk> {
+            let chunk = self.chunks.lock().unwrap().pop_front();
+            if chunk.is_some() {
+                return chunk;
+            }
+            self.drained.notify_one();
+            self.finish.cancelled().await;
+            None
+        }
+        async fn wait(&self) -> Result<Exit, String> {
+            self.finish.cancelled().await;
+            Ok(self.exit)
+        }
+        async fn kill(&self) {
+            self.finish.cancel();
+        }
+    }
+
+    struct AuthWorld(Arc<AuthProcess>);
+    #[async_trait]
+    impl Shell for AuthWorld {
+        fn describe(&self) -> String {
+            "scripted Git output".into()
+        }
+        async fn spawn(
+            &self,
+            _: &str,
+            _: &SpawnOptions,
+        ) -> Result<Arc<dyn Process>, crate::world::SpawnError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    async fn auth_job(chunks: Vec<crate::world::Chunk>, exit: Exit) -> (String, Arc<AuthProcess>) {
+        let process = Arc::new(AuthProcess {
+            chunks: Mutex::new(chunks.into()),
+            drained: tokio::sync::Notify::new(),
+            finish: tokio_util::sync::CancellationToken::new(),
+            exit,
+        });
+        let world: Arc<dyn Shell> = Arc::new(AuthWorld(process.clone()));
+        let id = start(&world, "git push", &ctx(Path::new(".")))
+            .await
+            .unwrap();
+        process.drained.notified().await;
+        (id, process)
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn git_auth_hint_survives_split_stderr_and_earlier_truncated_polls() {
+        use crate::world::Chunk;
+        let (id, process) = auth_job(
+            vec![
+                Chunk::Stderr([vec![b'z'; 32 * 1024], vec![b'\n']].concat()),
+                Chunk::Stderr(b"fatal: could not read User".to_vec()),
+                Chunk::Stderr(
+                    b"name for 'https://example.com': terminal prompts disabled\n".to_vec(),
+                ),
+                Chunk::Stdout(vec![b'x'; MAX_OUTPUT_BYTES + 100]),
+            ],
+            Exit {
+                code: Some(128),
+                signal: None,
+            },
+        )
+        .await;
+        let early = poll(&id).unwrap();
+        assert!(early.truncated);
+        assert_eq!(early.status, Status::Running);
+        assert!(!early.text.contains("[hint]"));
+        process.finish.cancel();
+        let (text, status) = drain(&id).await;
+        assert_eq!(status, Status::Exited(128));
+        assert_eq!(text.matches("[hint]").count(), 1, "{text}");
+        assert!(text.contains("Git credential"), "{text}");
+        assert!(poll(&id).is_err(), "a finished job is reaped");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn background_git_auth_hints_require_stderr_and_a_known_failed_exit() {
+        use crate::world::Chunk;
+        let diagnostic = b"fatal: Authentication failed for 'https://example.com/repo.git'\n";
+        for (chunk, exit, cancelled) in [
+            (
+                Chunk::Stdout(diagnostic.to_vec()),
+                Exit {
+                    code: Some(128),
+                    signal: None,
+                },
+                false,
+            ),
+            (
+                Chunk::Stderr(b"Authentication failed\n".to_vec()),
+                Exit {
+                    code: Some(1),
+                    signal: None,
+                },
+                false,
+            ),
+            (
+                Chunk::Stderr(diagnostic.to_vec()),
+                Exit {
+                    code: Some(0),
+                    signal: None,
+                },
+                false,
+            ),
+            (
+                Chunk::Stderr(diagnostic.to_vec()),
+                Exit {
+                    code: None,
+                    signal: Some(9),
+                },
+                false,
+            ),
+            (
+                Chunk::Stderr(diagnostic.to_vec()),
+                Exit {
+                    code: None,
+                    signal: None,
+                },
+                false,
+            ),
+            (
+                Chunk::Stderr(diagnostic.to_vec()),
+                Exit {
+                    code: Some(128),
+                    signal: None,
+                },
+                true,
+            ),
+        ] {
+            let (id, process) = auth_job(vec![chunk], exit).await;
+            let early = poll(&id).unwrap();
+            assert!(!early.text.contains("[hint]"));
+            if cancelled {
+                kill(&id).unwrap();
+            } else {
+                process.finish.cancel();
+            }
+            let (text, status) = drain(&id).await;
+            assert!(!text.contains("[hint]"), "{status:?}: {text}");
+            assert_eq!(
+                status,
+                if cancelled {
+                    Status::Killed
+                } else {
+                    Status::Exited(exit.code_or_signal())
+                }
+            );
+        }
     }
 
     #[tokio::test]
