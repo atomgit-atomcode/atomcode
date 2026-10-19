@@ -20,6 +20,7 @@ async function main() {
     'auth-status.test.ts',
     'daemon-process-env.test.ts',
     'daemon-identity.test.ts',
+    'daemon-connection.test.ts',
     'provider-queue-regression.test.ts',
     'mode-state.test.ts',
     'mode-selector-style.test.ts',

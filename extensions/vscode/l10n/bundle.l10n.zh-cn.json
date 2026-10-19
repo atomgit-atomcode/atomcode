@@ -65,5 +65,7 @@
   "Unable to reload config: {message}": "无法重新加载配置：{message}",
   "New session": "新建会话",
   "IDE language bridge enabled. Connection configuration copied; merge it into your AtomCode config and reopen the session.": "IDE 语言服务桥接已启用。连接配置已复制，请合并到 AtomCode 配置文件后重新打开会话。",
-  "Could not enable the IDE language bridge. Open a trusted filesystem workspace and try again.": "无法启用 IDE 语言服务桥接。请打开可信的本地文件工作区后重试。"
+  "Could not enable the IDE language bridge. Open a trusted filesystem workspace and try again.": "无法启用 IDE 语言服务桥接。请打开可信的本地文件工作区后重试。",
+  "No compatible AtomCode daemon is available. Existing services were left running. Check the daemon binary or configure another daemon port.": "未找到兼容的 AtomCode daemon，已有服务均未被关闭。请检查 daemon 二进制文件，或配置其他 daemon 端口。",
+  "AtomCode: using port {0}; existing services on port {1} were left running.": "AtomCode：已使用端口 {0}；端口 {1} 上的已有服务未被关闭。"
 }

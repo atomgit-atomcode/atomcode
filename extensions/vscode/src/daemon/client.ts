@@ -110,11 +110,23 @@ export class DaemonClient {
    * until the daemon has written its file — and is invalidated on a 401 so a
    * restarted daemon's fresh token is picked up. Avoids a disk read per request. */
   private cachedToken: string | undefined;
+  private connectionRevision = 0;
 
   constructor(port: number) {
     this.port = port;
     this.host = '127.0.0.1';
     this.baseUrl = `http://${this.host}:${this.port}`;
+  }
+
+  getPort(): number { return this.port; }
+
+  /** Changing endpoint must never carry the previous daemon's credential with it. */
+  setPort(port: number): void {
+    if (this.port === port) return;
+    this.port = port;
+    this.connectionRevision++;
+    this.baseUrl = `http://${this.host}:${port}`;
+    this.invalidateToken();
   }
 
   /** Daemon token, read from disk once and cached. Re-reads while absent. */
@@ -133,7 +145,11 @@ export class DaemonClient {
   // ── REST helpers ──────────────────────────────────────────────
 
   private request<T>(method: string, path: string, body?: unknown): Promise<T> {
+    const revision = this.connectionRevision;
     return this.requestOnce<T>(method, path, body).catch(async (err) => {
+      if (revision !== this.connectionRevision) {
+        throw new Error('AtomCode daemon endpoint changed; retry the operation.');
+      }
       // Stale token (daemon restarted → new token, or file not yet read): a 401
       // is rejected by the auth middleware BEFORE the handler runs, so replaying
       // is safe for any method. Invalidate the cache and retry once.
@@ -156,7 +172,7 @@ export class DaemonClient {
     });
   }
 
-  private requestOnce<T>(method: string, path: string, body?: unknown): Promise<T> {
+  private requestOnce<T>(method: string, path: string, body?: unknown, timeout = REST_TIMEOUT): Promise<T> {
     return new Promise((resolve, reject) => {
       const payload = body ? JSON.stringify(body) : undefined;
       const token = this.token();
@@ -171,7 +187,8 @@ export class DaemonClient {
           ...(token ? { Authorization: `Bearer ${token}` } : {}),
           ...(payload ? { 'Content-Length': Buffer.byteLength(payload) } : {}),
         },
-        timeout: REST_TIMEOUT,
+        timeout,
+        ...(path === '/health' ? { signal: AbortSignal.timeout(timeout) } : {}),
       };
 
       const req = http.request(options, (res) => {
@@ -255,7 +272,12 @@ export class DaemonClient {
   }
 
   health(): Promise<HealthResponse> {
-    return this.get<HealthResponse>('/health');
+    return this.requestOnce<HealthResponse>('GET', '/health', undefined, 1000).then((health) => {
+      if (!health || health.service !== 'atomcode-daemon' || typeof health.version !== 'string') {
+        throw new Error('The service on this port is not an AtomCode daemon');
+      }
+      return health;
+    });
   }
 
   // ── Shutdown ───────────────────────────────────────────────────

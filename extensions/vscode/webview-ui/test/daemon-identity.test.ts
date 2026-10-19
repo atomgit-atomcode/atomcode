@@ -28,7 +28,7 @@ assert.equal(
 assert.equal(
   daemonIdentityMatches({ version: '5.0.3' }, expected),
   false,
-  'a daemon that cannot prove the expected bundled hash must be replaced',
+  'a daemon that cannot prove the expected bundled hash must not be reused',
 );
 
 assert.equal(
