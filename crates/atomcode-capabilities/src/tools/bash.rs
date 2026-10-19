@@ -1538,7 +1538,7 @@ fn append_git_auth_hint(output: &mut String, code: Option<i32>, auth_failure: bo
     if !output.is_empty() && !output.ends_with('\n') {
         output.push('\n');
     }
-    output.push_str("[hint] Git reported a credential failure. With GIT_TERMINAL_PROMPT=0, Git cannot prompt for credentials. Check or refresh this remote's Git credential helper/PAT in an external terminal before retrying.");
+    output.push_str("[hint] Git reported a credential failure. With GIT_TERMINAL_PROMPT=0, Git cannot prompt in the terminal. Check or refresh this remote's Git credential helper/PAT in an external terminal before retrying.");
 }
 
 /// Whether a `git checkout` operand is (heuristically) a FILE pathspec rather than a
