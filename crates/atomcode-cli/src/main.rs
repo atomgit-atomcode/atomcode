@@ -807,6 +807,9 @@ enum Commands {
         /// 不自动打开浏览器（脚本/桌面客户端集成场景）；访问 URL 仍会打印
         #[arg(long)]
         no_open: bool,
+        /// 仅本机访问，不连接中继服务
+        #[arg(long)]
+        local: bool,
     },
     /// Telemetry controls
     Telemetry {
@@ -1518,6 +1521,7 @@ fn set_env_command(env: &str) -> String {
 }
 
 async fn run() -> Result<i32> {
+    let _webui_relay = atomcode::webui_relay::ShutdownGuard;
     let run_start = std::time::Instant::now();
     // -- Pre-parse --lang to set locale BEFORE clap renders --help --
     // clap help text is generated during parse, so we must resolve
@@ -1877,6 +1881,7 @@ async fn run() -> Result<i32> {
                 port,
                 host,
                 no_open,
+                local,
             } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
                 // Fail before binding a port and opening a browser: without the
@@ -1886,8 +1891,15 @@ async fn run() -> Result<i32> {
                     eprint!("{}", atomcode_daemon::webui::NOT_BUILT_HELP);
                     return Ok(1);
                 }
-                let msg =
-                    atomcode_daemon::ensure_server_and_open(&host, port, false, !no_open).await;
+                let launched = atomcode::webui_relay::launch(
+                    &host,
+                    port,
+                    false,
+                    !no_open,
+                    !local && host == "127.0.0.1",
+                )
+                .await;
+                let msg = launched.message;
                 eprintln!("{msg}");
                 // Nothing is listening: say so and exit non-zero. Waiting on
                 // Ctrl+C anyway is what left a launcher script piling up idle
@@ -1915,10 +1927,12 @@ async fn run() -> Result<i32> {
                     };
                     tokio::select! {
                         _ = ctrl_c => {
+                            atomcode::webui_relay::stop();
                             tracing::info!(target: "atomcode::webui", "atomcode webui exiting: Ctrl+C");
                             0
                         }
                         _ = stopped => {
+                            atomcode::webui_relay::stop();
                             tracing::error!(target: "atomcode::webui", "atomcode webui exiting: the server stopped");
                             eprintln!(
                                 "{}",

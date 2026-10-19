@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>Remote Access · AtomCode Docs</title>
-<meta name="description" content="Reach the AtomCode webui from your phone over the 蒲公英 (Oray PGY) private network — install, bind the virtual IP, scan to connect, and security notes.">
+<meta name="description" content="AtomCode WebUI relay access for phone browsers, without VPN setup.">
 <link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
 <link rel="stylesheet" href="../docs.css">
 <script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
@@ -75,82 +75,17 @@
   </aside>
 
   <main class="dmain prose-docs">
-<h1 id="remote-access">Remote Access</h1>
-      <p class="lede">By default the AtomCode webui only listens on loopback (<code>127.0.0.1</code>), so your phone and other devices can't reach it. With a virtual LAN built by <strong>蒲公英 (Oray PGY)</strong> you can open the webui from a phone or tablet securely — no public IP, nothing exposed to the internet. This page walks through the full connection flow and the security notes.</p>
-
-      <h2 id="how-it-works">How it works</h2>
-      <p>蒲公英 is a remote-networking tool. Once it's installed on both this machine and your phone, signed into the <strong>same account</strong> and joined to the <strong>same network</strong>, the two devices sit on one virtual LAN and can talk over a <code>蒲公英 virtual IP</code>. As long as the webui is bound to that virtual IP, your phone can reach it. The whole link is a private peer-to-peer network — <strong>your machine is never exposed to the public internet</strong>.</p>
-
-      <div class="callout callout-warn">
-        <strong>Why not just open it to the internet</strong>
-        <p>The webui / daemon has no built-in authentication; whoever reaches it effectively gains execution rights for every tool on your machine (including <code>bash</code>, <code>write</code>, <code>edit</code>). So do <strong>not</strong> use <code>--host 0.0.0.0</code> to expose it to the public internet or an open LAN. The 蒲公英 virtual LAN plus a one-time access token is the safe remote path intended for regular users.</p>
-      </div>
-
-      <h2 id="prerequisites">Prerequisites</h2>
-      <ul>
-        <li>You can already launch the AtomCode webui on this machine.</li>
-        <li><strong>蒲公英</strong> is installed on both this machine and your phone: <a href="https://pgy.oray.com" target="_blank" rel="noopener">https://pgy.oray.com</a>.</li>
-        <li>Both devices are signed into the <strong>same 蒲公英 account</strong> and joined to the <strong>same network</strong>.</li>
-      </ul>
-
-      <h2 id="steps">Steps</h2>
-
-      <h3 id="1-connect-蒲公英-and-get-the-virtual-ip">1. Connect 蒲公英 and get the virtual IP</h3>
-      <p>Sign in and join the network in the 蒲公英 client on this machine, then note the <strong>virtual IP</strong> assigned to it (looks like <code>10.x.x.x</code>). On the phone, just sign into the same account and join the same network — no IP to remember.</p>
-
-      <h3 id="2-bind-the-webui-to-the-virtual-ip">2. Bind the webui to the virtual IP</h3>
-      <p>By default the webui binds loopback only, which your phone can't reach. In the AtomCode TUI, relaunch the webui with <code>--host</code> pointed at the 蒲公英 virtual IP:</p>
-      <pre><code>/webui --host 10.x.x.x</code></pre>
-      <p>Replace <code>10.x.x.x</code> with the virtual IP you noted above. Once bound, the webui is reachable from any device on the same virtual LAN.</p>
-
-      <h3 id="3-scan-to-connect-from-the-remote-access-panel">3. Scan to connect from the Remote Access panel</h3>
-      <p>Open the <strong>Remote Access</strong> panel (the phone icon) in the top-right of the webui. AtomCode detects the 蒲公英 status and produces:</p>
-      <ul>
-        <li>a ready-to-open <strong>remote URL</strong> (already carrying the access token);</li>
-        <li>a matching <strong>QR code</strong>.</li>
-      </ul>
-      <p>Scan the QR with your phone, or copy the URL into the phone's browser. The phone must be signed into the same 蒲公英 account and on the same network.</p>
-
-      <div class="callout callout-warn">
-        <strong>The access token is a password</strong>
-        <p>The remote URL carries a one-time access token (<code>?token=…</code>) that is <strong>equivalent to a password</strong>: anyone who gets the full link can operate your machine. Don't post it in chats, screenshot it out, or paste it on a public page.</p>
-      </div>
-
-      <h2 id="troubleshooting">Troubleshooting</h2>
-      <p>The Remote Access panel shows different hints depending on what it detects. Map them as follows:</p>
-      <table>
-        <thead>
-          <tr><th>Panel hint</th><th>Meaning</th><th>What to do</th></tr>
-        </thead>
-        <tbody>
-          <tr>
-            <td>蒲公英 not detected</td>
-            <td>蒲公英 isn't installed, or the client isn't running.</td>
-            <td>Install and sign into 蒲公英 on both machine and phone, join the same network, then hit "Re-check".</td>
-          </tr>
-          <tr>
-            <td>No virtual IP yet</td>
-            <td>蒲公英 is installed but hasn't joined a network.</td>
-            <td>Connect / join the network in the 蒲公英 client, get a virtual IP, then "Re-check".</td>
-          </tr>
-          <tr>
-            <td>webui bound to localhost only</td>
-            <td>蒲公英 is detected, but the webui still listens on loopback.</td>
-            <td>Relaunch with <code>/webui --host &lt;virtual IP&gt;</code> as in step 2, then refresh this page.</td>
-          </tr>
-          <tr>
-            <td>Phone can't open it / hangs</td>
-            <td>The two ends aren't on the same network, or a firewall blocks it.</td>
-            <td>Confirm both devices share the same 蒲公英 account and network; check that the machine's firewall allows the webui port.</td>
-          </tr>
-        </tbody>
-      </table>
-
-      <h2 id="next">Next</h2>
-      <ul>
-        <li><a href="./headless-daemon.html">Headless &amp; Daemon</a> — the daemon and HTTP/SSE API behind the webui</li>
-        <li><a href="./faq.html">FAQ</a> — common remote / login gotchas</li>
-      </ul>
+<h1 id="remote-access">Remote access</h1>
+<p class="lede">Run <code>/webui</code> and scan the relay QR code with your phone browser. No VPN or public listening port is needed.</p>
+<h2 id="connect">Connect</h2>
+<ol><li>Keep AtomCode running and run <code>/webui</code>. It opens the local browser and prints a phone link and QR code.</li><li>Scan with your phone browser, or copy the relay link from the WebUI Remote access dialog. The devices may use different networks.</li><li>The phone and TUI share the same conversation. <code>/webui stop</code>, signing out in the terminal, or exiting AtomCode stops relay sharing.</li></ol>
+<p>Standalone: <code>atomcode webui</code>. Local only: <code>/webui --local</code> or <code>atomcode webui --local</code>. Explicit <code>/webui lan</code> or <code>--host &lt;address&gt;</code> uses the local network instead of automatically connecting a relay.</p>
+<h2 id="troubleshooting">Connection failures</h2>
+<p>Local access remains available if relay setup fails. The terminal and Remote access dialog explain the failure. If WebUI is unsupported, upgrade the relay server and install the matching WebUI assets, then retry <code>/webui</code>. Use <code>ATOMCODE_APP_RELAY</code> for a self-hosted relay and <code>ATOMCODE_ENABLE_RELAY=0</code> to disable relay access.</p>
+<h2 id="security">Security and lifetime</h2>
+<p>The link grants access: keep it private. HTTPS protects transport; the local WebUI still checks its access token. The relay can process traffic; this is not end-to-end encryption. Pairing credentials survive reload in tab-scoped sessionStorage and are cleared when the tab closes. Network disconnects reconnect automatically. Access stops while the computer is asleep, offline, or AtomCode has exited.</p>
+<h2 id="lan">Local network alternative</h2>
+<p><code>/webui lan</code> remains available on the same Wi-Fi. <code>/webui --host &lt;virtual IP&gt;</code> also works with an existing VPN. These local HTTP connections require a trusted network.</p>
 
     <footer class="dftr">
       <span data-i18n="ftr.copy">© 2026 AtomCode · MIT</span>

@@ -1285,8 +1285,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         )
         .into(),
         Msg::ShareNoModel => "no model is configured yet — run /login or /model first".into(),
-        Msg::CmdAboutWebui => "share this session with a browser (lan to expose it; stop to end)".into(),
-        Msg::WebuiTakes => "[lan | --host <addr>] [--port <port>] [--no-open] | stop".into(),
+        Msg::CmdAboutWebui => "share in a browser; scan for phone relay access (--local for local only; stop to end)".into(),
+        Msg::WebuiTakes => "[--local | lan | --host <addr>] [--port <port>] [--no-open] | stop".into(),
         Msg::WebuiInvalidArguments { argument } => format!("Invalid /webui argument near `{argument}`. Usage: /webui [lan | --host <addr>] [--port <0-65535>] [--no-open], or /webui stop.").into(),
         Msg::CmdAboutSync => "share this session without opening anything (off to stop)".into(),
         Msg::SyncTakes => "[off]".into(),

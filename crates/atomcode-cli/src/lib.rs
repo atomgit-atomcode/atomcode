@@ -52,6 +52,7 @@ pub mod tui_tools;
 pub mod tui_upgrade;
 pub mod tui_welcome_words;
 pub mod uninstall;
+pub mod webui_relay;
 
 /// ACP (Agent Client Protocol) stdio server — lets atomcode be driven by Zed /
 /// multi-agent orchestrators over stdin/stdout. Wired up by the `atomcode acp`

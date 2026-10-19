@@ -5735,6 +5735,8 @@ struct WebuiHandle {
     host: String,
     /// server task 的 abort handle；用于 `/webui stop` 停止。
     abort: tokio::task::AbortHandle,
+    relay_url: Option<String>,
+    relay_error: Option<String>,
 }
 
 static WEBUI: std::sync::Mutex<Option<WebuiHandle>> = std::sync::Mutex::new(None);
@@ -5750,6 +5752,31 @@ pub fn webui_port() -> Option<u16> {
         .as_ref()
         .filter(|handle| !handle.abort.is_finished())
         .map(|handle| handle.port)
+}
+
+/// Host-owned tunnel presentation; never used as an authentication bypass.
+pub fn set_webui_relay_access(
+    target: &WebuiRelayTarget,
+    url: Option<String>,
+    error: Option<String>,
+) {
+    let mut guard = WEBUI.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(handle) = guard
+        .as_mut()
+        .filter(|h| h.port == target.port && h.tokens.is_valid(&target.token))
+    {
+        handle.relay_url = url;
+        handle.relay_error = error;
+    }
+}
+
+/// Clear presentation when the host has retired its tunnel.
+pub fn clear_webui_relay_access() {
+    let mut guard = WEBUI.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(handle) = guard.as_mut() {
+        handle.relay_url = None;
+        handle.relay_error = None;
+    }
 }
 
 /// What to try when a port cannot be bound for a reason other than being in
@@ -5852,8 +5879,17 @@ pub const WEBUI_DEFAULT_PORT: u16 = atomcode_config::distribution::WEBUI_PORT;
 /// Launch feedback for a frontend. URLs contain credentials; do not log them.
 pub struct WebuiLaunch {
     pub message: String,
-    /// Same authenticated URL as the text, only when reachable off loopback.
+    /// Usable phone URL. The local launcher requires a non-loopback address;
+    /// the host may replace it with an authenticated relay URL.
     pub qr_url: Option<String>,
+    /// Authenticated local endpoint for a host-owned relay. Never log credentials.
+    pub relay_target: Option<WebuiRelayTarget>,
+}
+
+pub struct WebuiRelayTarget {
+    pub port: u16,
+    pub endpoint: String,
+    pub token: String,
 }
 
 /// 确保进程内 webui server 已起（已停止则重启），mint 一次性 token；`open_browser`
@@ -5907,6 +5943,7 @@ pub async fn launch_webui(host: &str, port: u16, sync: bool, open_browser: bool)
                         bind_failure_hint(&e)
                     ),
                     qr_url: None,
+                    relay_target: None,
                 };
             }
         };
@@ -5956,6 +5993,8 @@ pub async fn launch_webui(host: &str, port: u16, sync: bool, open_browser: bool)
                 port: actual_port,
                 host: host.to_string(),
                 abort: task.abort_handle(),
+                relay_url: None,
+                relay_error: None,
             });
         }
         (tokens, actual_port, host.to_string())
@@ -6027,6 +6066,11 @@ pub async fn launch_webui(host: &str, port: u16, sync: bool, open_browser: bool)
     WebuiLaunch {
         message: msg,
         qr_url: webui_qr_url(&open_host, local_url),
+        relay_target: Some(WebuiRelayTarget {
+            port: actual_port,
+            endpoint: format!("http://{open_host}:{actual_port}"),
+            token,
+        }),
     }
 }
 
@@ -6169,13 +6213,15 @@ struct PgyInfo {
 
 #[derive(serde::Serialize)]
 struct TunnelStatus {
+    mode: &'static str,
+    relay_error: Option<String>,
     /// server 绑定地址（127.0.0.1=仅本机；0.0.0.0/具体 IP=可被其它设备访问）。
     bind_host: String,
     port: u16,
-    /// 是否绑定到非回环地址（手机/其它设备可达的前提）。
+    /// 是否可通过中继或非回环监听地址远程访问。
     reachable: bool,
     pgy: PgyInfo,
-    /// 推荐的远程访问 URL（蒲公英 IP + 当前 token）；不可用时 None。
+    /// 推荐的已鉴权远程 URL（中继优先）；不可用时 None。
     remote_url: Option<String>,
     /// remote_url 的二维码（SVG 字符串）；不可用时 None。
     qr_svg: Option<String>,
@@ -6301,6 +6347,37 @@ async fn get_tunnel_status(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
+    let relay = {
+        let guard = WEBUI.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .as_ref()
+            .filter(|h| h.port == state.bind_port)
+            .map(|h| (h.relay_url.clone(), h.relay_error.clone()))
+    };
+    if let Some((url, error)) = relay.filter(|(url, error)| url.is_some() || error.is_some()) {
+        let qr_svg = url
+            .as_ref()
+            .and_then(|url| qrcode::QrCode::new(url.as_bytes()).ok())
+            .map(|code| {
+                code.render::<qrcode::render::svg::Color>()
+                    .min_dimensions(200, 200)
+                    .quiet_zone(true)
+                    .build()
+            });
+        return Json(TunnelStatus {
+            mode: "relay",
+            relay_error: error,
+            bind_host: state.bind_host.clone(),
+            port: state.bind_port,
+            reachable: url.is_some(),
+            pgy: PgyInfo {
+                installed: false,
+                ipv4: None,
+            },
+            remote_url: url,
+            qr_svg,
+        });
+    }
     let pgy = tokio::task::spawn_blocking(pgy_probe)
         .await
         .unwrap_or(PgyInfo {
@@ -6348,6 +6425,8 @@ async fn get_tunnel_status(
     };
 
     Json(TunnelStatus {
+        mode: "lan",
+        relay_error: None,
         bind_host: state.bind_host.clone(),
         port: state.bind_port,
         reachable,

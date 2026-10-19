@@ -456,8 +456,9 @@ fn stop_for_phone() -> bool {
 /// 尽力做完,返回是否真有东西被收掉。
 pub fn stop_all_sharing() -> bool {
     let phone = stop_for_phone();
+    let webui = crate::webui_relay::stop();
     let bound = detach().unwrap_or(false);
-    phone || bound
+    phone || webui || bound
 }
 
 // ---- 命令 -------------------------------------------------------------------
@@ -580,6 +581,7 @@ impl atomcode_tui::command::CommandSet for ShareCommands {
                 Err(why) => Outcome::Refused(why),
             },
             "webui" if args == "stop" => {
+                crate::webui_relay::stop();
                 let said = atomcode_daemon::stop_server();
                 let _ = detach();
                 Outcome::Said(said)
@@ -594,11 +596,12 @@ impl atomcode_tui::command::CommandSet for ShareCommands {
                 if let Err(why) = attach(&self.config_path).await {
                     return Outcome::Refused(why);
                 }
-                let launched = atomcode_daemon::launch_webui(
+                let launched = crate::webui_relay::launch(
                     &options.host,
                     options.port,
                     true, // sync
                     options.open_browser,
+                    options.remote,
                 )
                 .await;
                 let ui = ctx.require::<atomcode_harness::seams::UiSvc>().ok();
@@ -634,18 +637,21 @@ struct WebuiOptions {
     host: String,
     port: u16,
     open_browser: bool,
+    remote: bool,
 }
 
 fn webui_options(args: &str) -> Result<WebuiOptions, String> {
     let mut host = None;
     let mut port = None;
     let mut open_browser = true;
+    let mut remote = true;
     let mut tokens = args.split_whitespace();
     let invalid = |argument: &str| tr(SMsg::WebuiInvalidArguments { argument }).into_owned();
     while let Some(token) = tokens.next() {
         match token {
             "lan" | "0.0.0.0" if host.is_none() => host = Some("0.0.0.0".to_string()),
             "--no-open" => open_browser = false,
+            "--local" => remote = false,
             _ if token == "--host" || token.starts_with("--host=") => {
                 let value = token
                     .strip_prefix("--host=")
@@ -669,7 +675,9 @@ fn webui_options(args: &str) -> Result<WebuiOptions, String> {
             _ => return Err(invalid(token)),
         }
     }
+    remote &= host.is_none();
     Ok(WebuiOptions {
+        remote,
         host: host.unwrap_or_else(|| "127.0.0.1".to_string()),
         port: port.unwrap_or(atomcode_daemon::WEBUI_DEFAULT_PORT),
         open_browser,
@@ -742,6 +750,7 @@ mod tests {
             atomcode_daemon::WebuiLaunch {
                 message: message.clone(),
                 qr_url: Some(url.into()),
+                relay_target: None,
             },
             Some(&ui),
         );
@@ -763,6 +772,7 @@ mod tests {
                 atomcode_daemon::WebuiLaunch {
                     message: "original report".into(),
                     qr_url,
+                    relay_target: None,
                 },
                 if has_ui { Some(&ui) } else { None },
             );
@@ -861,6 +871,15 @@ mod tests {
     }
 
     #[test]
+    fn webui_uses_relay_by_default_but_explicit_local_and_lan_do_not() {
+        assert!(webui_options("").unwrap().remote);
+        assert!(webui_options("--no-open").unwrap().remote);
+        for args in ["--local", "lan", "--host 127.0.0.1", "--host 192.168.1.9"] {
+            assert!(!webui_options(args).unwrap().remote, "{args}");
+        }
+    }
+
+    #[test]
     fn webui_passes_explicit_ports_and_browser_options() {
         assert_eq!(
             webui_options("").unwrap().port,
@@ -876,6 +895,7 @@ mod tests {
                     host: "127.0.0.1".to_string(),
                     port: 20001,
                     open_browser: false,
+                    remote: false,
                 }
             );
         }

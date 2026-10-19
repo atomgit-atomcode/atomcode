@@ -270,7 +270,8 @@ const zh = {
 
   // Remote access (蒲公英 / Oray PGY) dialog
   'remote.title': '远程访问',
-  'remote.intro': '通过蒲公英私有网络，从手机等设备安全访问本机 webui（虚拟局域网、不暴露公网）。',
+  'remote.intro': '使用中继链接从手机浏览器访问，无需组网；也可手动使用局域网。',
+  'remote.relayReady': '中继已就绪，手机扫码即可访问，无需安装组网软件。',
   'remote.loading': '检测中…',
   'remote.ready': '已就绪，用手机扫码或打开下面的地址（手机需登录同一蒲公英账号、加入同一网络）：',
   'remote.notReachable': '已检测到蒲公英，但 webui 仅绑定了本机。请在 TUI 运行 /webui --host {ip} 后刷新本页。',
@@ -832,7 +833,8 @@ const en: Record<MsgKey, string> = {
   'settings.notifications.unsupported': 'Browser notifications are unavailable on this address (use 127.0.0.1/localhost)',
 
   'remote.title': 'Remote access',
-  'remote.intro': 'Reach this webui from your phone or other devices over the 蒲公英 (Oray PGY) private network — a virtual LAN, nothing exposed publicly.',
+  'remote.intro': 'Open this WebUI on your phone through the relay, or use a local network manually.',
+  'remote.relayReady': 'Relay ready — scan with your phone browser. No VPN required.',
   'remote.loading': 'Checking…',
   'remote.ready': 'Ready — scan the QR or open the URL below on your phone (it must be signed into the same 蒲公英 account and joined to the same network):',
   'remote.notReachable': '蒲公英 detected, but the webui is bound to localhost only. Run /webui --host {ip} in the TUI, then refresh this page.',

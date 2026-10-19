@@ -277,7 +277,8 @@ export function RemoteAccessDialog({ onClose }: { onClose: () => void }) {
         {!loading && status && (
           <>
             {/* 1) 未装 / 未连蒲公英 */}
-            {(!pgy?.installed || !pgy?.ipv4) && (
+            {status.mode === 'relay' && status.relay_error && <p>{status.relay_error}</p>}
+            {status.mode !== 'relay' && !status.remote_url && (!pgy?.installed || !pgy?.ipv4) && (
               <div class="remote-state">
                 <p>{pgy?.installed ? t('remote.notConnected') : t('remote.notInstalled')}</p>
                 <a
@@ -302,7 +303,7 @@ export function RemoteAccessDialog({ onClose }: { onClose: () => void }) {
             {/* 3) 就绪：二维码 + URL */}
             {status.remote_url && (
               <div class="remote-state remote-ready">
-                <p>{t('remote.ready')}</p>
+                <p>{t(status.mode === 'relay' ? 'remote.relayReady' : 'remote.ready')}</p>
                 {status.qr_svg && (
                   <div
                     class="remote-qr"

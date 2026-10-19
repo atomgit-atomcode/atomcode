@@ -375,6 +375,11 @@
         "body": "手动编辑 —— 直接用你喜欢的编辑器打开 ~/.atomcode/config.toml 。 TUI 内 /config —— 可直接搜索和修改安全配置。其中动态的“最大重试次数（当前模型）”会把 retry_max_attempts 写入当前模型；连续按两次 Delete 可恢复默认值。 TUI 内 /provider —— 交互式管理供应商账号及其模型，改动会自动落盘。"
       },
       {
+        "id": "ui-keybindings",
+        "heading": "TUI 快捷键",
+        "body": "在 [ui.keybindings] 下设置 newline = [\"alt+j\", \"ctrl+j\"] 自定义换行组合键。也可在 /config 搜索“换行”，通过按键录入或手动填写配置，保存后立即生效。详见 自定义换行快捷键 。"
+      },
+      {
         "id": "下一步",
         "heading": "下一步",
         "body": "登录方式 —— 如果不想手动管理 API Key,用 AtomGit OAuth 一步到位。 基本使用 —— 看看 CLI 参数如何一次性覆盖配置。 © 2026 AtomCode · MIT 报告问题"
@@ -523,7 +528,7 @@
       {
         "id": "webui-与同步",
         "heading": "WebUI 与同步",
-        "body": "命令 作用 /webui 启动浏览器界面并自动打开浏览器(默认绑定 127.0.0.1:13457 ,仅本机)。当前 TUI 会话会自动接入实时同步 /webui --host <addr> 把服务绑定到指定地址; /webui lan 等价于 --host 0.0.0.0 (暴露到局域网)。可用的局域网访问地址会同时显示文字链接和二维码，手机扫码即可打开。配合蒲公英虚拟 IP 可远程访问,见 远程访问指南 /webui stop 关闭 webui 服务 /sync 把当前 TUI 接入正在运行的 webui 会话(需先 /webui )。两端实时双向同步,多个浏览器 / 终端可同时围观同一会话 /sync off 退出同步,回到独立会话 /app 把当前会话通过官方中继暴露给 手机 App :终端里直接吐出一个二维码,用 App 扫码即可配对,在手机上实时查看并接管这段对话(与 /webui 同源共用同一段会话,双向实时同步;区别是不开浏览器、走中继而非局域网)。需先 /login 登录 /app stop 停止 App 远程访问,断开中继并回到本地会话 详细见 WebUI 界面 与 远程访问指南 。"
+        "body": "命令 作用 /webui 启动本机浏览器并生成手机中继二维码，无需组网； --local 仅本机。当前 TUI 会话自动实时同步 /webui --host <addr> 把服务绑定到指定地址; /webui lan 等价于 --host 0.0.0.0 (暴露到局域网)。可用的局域网访问地址会同时显示文字链接和二维码，手机扫码即可打开。跨网络访问使用默认 /webui 的中继二维码,见 远程访问指南 /webui stop 关闭 webui 服务 /sync 把当前 TUI 接入正在运行的 webui 会话(需先 /webui )。两端实时双向同步,多个浏览器 / 终端可同时围观同一会话 /sync off 退出同步,回到独立会话 /app 把当前会话通过官方中继暴露给 手机 App :终端里直接吐出一个二维码,用 App 扫码即可配对,在手机上实时查看并接管这段对话(与 /webui 同源共用同一段会话,双向实时同步;区别是 App 扫码配对，不打开浏览器)。需先 /login 登录 /app stop 停止 App 远程访问,断开中继并回到本地会话 详细见 WebUI 界面 与 远程访问指南 。"
       },
       {
         "id": "配置与帮助",
@@ -582,6 +587,11 @@
         "id": "输入编辑",
         "heading": "输入编辑",
         "body": "按键 动作 Enter 发送消息 \\ 后接 Enter 换行(所有终端通用 — 行尾反斜杠会被识别为续行) Alt+Enter 换行(多数终端可用;macOS Apple Terminal 需在 Settings → Profiles → Keyboard 启用 \"Use Option as Meta key\";Windows Terminal 默认占用,可在设置里释放) Shift+Enter 换行(仅以下终端区分 Shift+Enter 与 Enter :Kitty / WezTerm / iTerm2(需启用 Report Modifiers)/ Windows Terminal / Ghostty / Warp。Apple Terminal、xterm、GNOME Terminal、VS Code 集成终端不支持,请用 \\ + Enter ) Ctrl+Enter 换行(需启用 Kitty 键盘协议的终端,如 Kitty、WezTerm 等) Ctrl+J 换行(终端能区分该组合键时) Esc 清空当前输入 / 打断正在流式输出的回复 Esc Esc 输入框空闲且为空时撤销上一轮 ↑ / ↓ 浏览输入历史 → 将暗色的下一步提示填入空输入框(仍需单独按 Enter 发送) Ctrl+R 反向搜索输入历史(输入关键字实时过滤;再次按 Ctrl+R 跳到下一个更旧的匹配; Enter 选中填入, Esc 取消) Tab 接受斜杠命令、Skill 或文件补全 Shift+Tab 无补全菜单时切换到下一个执行模式（流式输出期间也可切换） Ctrl+D 删除当前字符；空闲且输入为空时，两秒内连按两次退出 Ctrl+B / Ctrl+F 前移 / 后移一个字符 Ctrl+U 删除从当前行首到光标的内容 Ctrl+W 删除一个单词 Ctrl+K 删除从光标到行尾的内容 Ctrl+A 光标移到行首 Ctrl+E 光标移到行尾"
+      },
+      {
+        "id": "custom-newline",
+        "heading": "自定义换行快捷键",
+        "body": "在 /config 中搜索“换行”，选择“快捷键 / 换行”。按 Enter 或 A 添加，按下想绑定的组合键后再按 Enter 确认。按 M 可手动填写逗号分隔的按键名（例如 alt+j, ctrl+j ）；录入时也可按 Tab 切到手动填写。 Delete 移除选中绑定， Ctrl+D 恢复默认， Esc 返回。 [ui.keybindings] newline = [\"alt+j\", \"ctrl+j\"] 此列表替换默认的换行组合键。保存后立即生效， /keys 展示实际绑定； \\ + Enter 始终保留。设置空列表 newline = [] 可禁用换行组合键，删除 newline 配置项则恢复默认。与现有动作或保留按键冲突、重复或格式错误时拒绝保存并保留原绑定。 普通字符不能单独用作快捷键。支持 ctrl 、 alt 、 shift 、 cmd 修饰符，字母、数字、 enter 、 space 、方向键和 f1 – f24 等按键名。终端或 IDE 拦截的组合键无法由 AtomCode 检测或释放；手动填写后仍须验证宿主能把它传入。"
       },
       {
         "id": "浏览与滚动",
@@ -1332,52 +1342,32 @@
     "slug": "webui-remote-access",
     "title": "远程访问指南",
     "group": "进阶",
-    "lede": "AtomCode 的 webui 默认只监听本机回环地址（ 127.0.0.1 ），手机等其他设备访问不到。借助 蒲公英（Oray PGY） 组建的虚拟局域网，你可以在不暴露公网、无需公网 IP 的前提下，从手机/平板安全地打开本机 webui。本页讲解完整的连接流程与安全须知。",
+    "lede": "在 AtomCode 运行 /webui ，手机浏览器扫描中继二维码即可访问，无需蒲公英组网，也无需让电脑监听公网端口。",
     "sections": [
       {
         "id": "远程访问指南",
         "heading": "远程访问指南",
-        "body": "AtomCode 的 webui 默认只监听本机回环地址（ 127.0.0.1 ），手机等其他设备访问不到。借助 蒲公英（Oray PGY） 组建的虚拟局域网，你可以在不暴露公网、无需公网 IP 的前提下，从手机/平板安全地打开本机 webui。本页讲解完整的连接流程与安全须知。"
+        "body": "在 AtomCode 运行 /webui ，手机浏览器扫描中继二维码即可访问，无需蒲公英组网，也无需让电脑监听公网端口。"
       },
       {
-        "id": "工作原理",
-        "heading": "工作原理",
-        "body": "蒲公英是一个异地组网工具：在本机和手机上安装并登录 同一账号 、加入 同一网络 后，两台设备就处在同一个虚拟局域网里，彼此可以用一个 蒲公英虚拟 IP 直接通信。webui 只要绑定到这个虚拟 IP，手机就能通过它访问。整个链路是点对点的私有网络， 不会把你的本机暴露到公网 。 为什么不直接开放公网 webui / daemon 没有内置鉴权，访问者相当于拿到本机所有工具的执行权（包括 bash 、 write 、 edit ）。所以请 不要 用 --host 0.0.0.0 把它直接暴露到公网或开放局域网。蒲公英虚拟局域网 + 一次性访问令牌（token），是为普通用户准备的安全远程方案。"
+        "id": "使用方式",
+        "heading": "使用方式",
+        "body": "电脑保持 AtomCode 运行，执行 /webui 。本机浏览器会打开，终端同时显示手机链接和二维码。 用手机浏览器扫码，或在电脑 WebUI 的“远程访问”面板复制中继链接。手机和电脑可使用不同网络。 TUI 与手机同步查看和回答同一会话。执行 /webui stop 、退出 AtomCode 或在终端登出会停止中继共享。 独立启动可用 atomcode webui ；仅本机访问用 /webui --local 或 atomcode webui --local 。显式指定 /webui lan 或 --host <地址> 时使用局域网地址，不自动连接中继。"
       },
       {
-        "id": "前置条件",
-        "heading": "前置条件",
-        "body": "本机已经能正常启动 AtomCode 的 webui。 本机与手机都安装了 蒲公英 客户端： https://pgy.oray.com 。 两台设备登录 同一蒲公英账号 ，并加入 同一网络 。"
+        "id": "连接失败",
+        "heading": "连接失败",
+        "body": "中继连接失败时本机 WebUI 仍可使用，终端和远程访问面板会说明原因。若提示中继未启用 WebUI，需升级中继服务端并部署当前版本的 WebUI 资源，再执行 /webui 重试。可通过 ATOMCODE_APP_RELAY 指定自建中继， ATOMCODE_ENABLE_RELAY=0 禁用中继。"
       },
       {
-        "id": "操作步骤",
-        "heading": "操作步骤",
-        "body": ""
+        "id": "安全与生命周期",
+        "heading": "安全与生命周期",
+        "body": "链接等同于访问密码，请勿外传。请求经 HTTPS 中继到本机，继续校验 WebUI 令牌；中继可以处理传输内容，不提供端到端加密。浏览器把配对凭据保存在当前标签页的 sessionStorage，用于刷新重连，关闭标签页后清除。网络中断时客户端自动重连；电脑休眠、离线或 AtomCode 退出后不可访问。"
       },
       {
-        "id": "1-连接蒲公英拿到虚拟-ip",
-        "heading": "1. 连接蒲公英，拿到虚拟 IP",
-        "body": "在本机的蒲公英客户端里完成登录与组网，记下分配给本机的 虚拟 IP （形如 10.x.x.x ）。手机端同样登录同一账号、加入同一网络即可，无需记 IP。"
-      },
-      {
-        "id": "2-让-webui-绑定到虚拟-ip",
-        "heading": "2. 让 webui 绑定到虚拟 IP",
-        "body": "默认 webui 只绑回环地址，手机访问不到。在 AtomCode 的 TUI 里用 --host 指定蒲公英虚拟 IP 重新启动 webui： /webui --host 10.x.x.x 把 10.x.x.x 换成上一步记下的本机虚拟 IP。绑定成功后，webui 就会在这个地址上对同一虚拟局域网内的设备开放。"
-      },
-      {
-        "id": "3-在远程访问面板扫码连接",
-        "heading": "3. 在「远程访问」面板扫码连接",
-        "body": "打开 webui 右上角的 远程访问 （手机图标）面板，AtomCode 会自动检测蒲公英状态并生成： 一个可直接打开的 远程地址 （已带上访问令牌）； 对应的 二维码 。 用手机扫码，或把地址复制到手机浏览器打开即可。手机需登录同一蒲公英账号、处于同一网络。 访问令牌 = 密码 远程地址中带有一次性访问令牌（ ?token=… ）， 等同于密码 ：任何拿到这条完整链接的人都能操作你的本机。请勿把它发到群里、截图外传或贴到公开页面。"
-      },
-      {
-        "id": "排错",
-        "heading": "排错",
-        "body": "「远程访问」面板会根据检测结果给出不同提示，对应处理如下： 面板提示 含义 怎么办 未检测到蒲公英 本机没装蒲公英，或客户端未运行。 在本机与手机都安装并登录蒲公英，加入同一网络后回到面板「重新检测」。 本机还没分配虚拟 IP 装了蒲公英但还没组网成功。 在蒲公英客户端里连接 / 加入网络，拿到虚拟 IP 后再「重新检测」。 webui 仅绑定了本机 检测到蒲公英，但 webui 还监听在回环地址。 按步骤 2 用 /webui --host <虚拟 IP> 重启 webui，再刷新本页。 手机打不开 / 一直转圈 两端不在同一网络，或防火墙拦截。 确认手机与本机登录同一蒲公英账号、加入同一网络；检查本机防火墙是否放行 webui 端口。"
-      },
-      {
-        "id": "下一步",
-        "heading": "下一步",
-        "body": "Headless 与 Daemon —— 了解 webui 背后的 daemon 与 HTTP/SSE 接口 常见问题 —— 远程 / 登录相关的常见坑 © 2026 AtomCode · MIT 报告问题"
+        "id": "局域网备选",
+        "heading": "局域网备选",
+        "body": "仍可使用 /webui lan 在同一 Wi-Fi 内访问，或 /webui --host <虚拟 IP> 配合已有 VPN。此时需自行确保网络可信，本地 HTTP 不提供传输加密。 © 2026 AtomCode · MIT 报告问题"
       }
     ]
   },

@@ -375,6 +375,11 @@
         "body": "Hand-edit — open ~/.atomcode/config.toml in your favourite editor. /config in the TUI — search and edit safe settings in place. The dynamic Retry attempts (current model) row writes retry_max_attempts to the active model; press Delete twice to restore the default. /provider in the TUI — interactively manage provider accounts and their models; changes are written back to disk."
       },
       {
+        "id": "ui-keybindings",
+        "heading": "TUI shortcuts",
+        "body": "Set newline = [\"alt+j\", \"ctrl+j\"] under [ui.keybindings] to customize newline chords. You can also search for “newline” in /config and record a chord or type its name. Changes apply immediately. See Custom newline shortcuts ."
+      },
+      {
         "id": "next-steps",
         "heading": "Next steps",
         "body": "Login Methods — skip manual key management with AtomGit OAuth. Basic Usage — see how CLI flags can override config for one run. © 2026 AtomCode · MIT 报告问题"
@@ -523,7 +528,7 @@
       {
         "id": "web-ui-sync",
         "heading": "Web UI & sync",
-        "body": "Command What it does /webui Launch the browser interface and open it (binds 127.0.0.1:13457 by default — local only). The current TUI session is attached to live sync automatically /webui --host <addr> Bind the server to a given address; /webui lan equals --host 0.0.0.0 (exposes it to the LAN). A usable LAN address is shown as both a text link and a QR code for your phone. Pair with a 蒲公英 virtual IP for remote access — see Remote Access /webui stop Stop the webui server /sync Attach the current TUI to a running webui session (run /webui first). Both ends sync live in both directions; multiple browsers / terminals can watch the same session /sync off Leave sync and return to a standalone session /app Expose the current session to the mobile App via the official relay: a QR code is printed right in the terminal, scan it with the App to pair, then view and drive this conversation live from your phone (same source as /webui — one shared session, two-way live sync; the difference is no browser, and it goes over the relay rather than the LAN). Requires /login first /app stop Stop App remote access, disconnect the relay, and return to a local session More in Web UI and the Remote Access guide."
+        "body": "Command What it does /webui Open the local browser and show a phone relay QR; no VPN needed. Use --local for local access only. The current TUI session is attached to live sync automatically /webui --host <addr> Bind the server to a given address; /webui lan equals --host 0.0.0.0 (exposes it to the LAN). A usable LAN address is shown as both a text link and a QR code for your phone. Use the default /webui relay QR for remote access — see Remote Access /webui stop Stop the webui server /sync Attach the current TUI to a running webui session (run /webui first). Both ends sync live in both directions; multiple browsers / terminals can watch the same session /sync off Leave sync and return to a standalone session /app Expose the current session to the mobile App via the official relay: a QR code is printed right in the terminal, scan it with the App to pair, then view and drive this conversation live from your phone (same source as /webui — one shared session, two-way live sync; the difference is no browser, and it goes over the relay rather than the LAN). Requires /login first /app stop Stop App remote access, disconnect the relay, and return to a local session More in Web UI and the Remote Access guide."
       },
       {
         "id": "config-help",
@@ -582,6 +587,11 @@
         "id": "input-editing",
         "heading": "Input editing",
         "body": "Key Action Enter Send the message \\ then Enter Insert newline (universal — a trailing backslash makes the line a continuation, works in every terminal) Alt+Enter Insert newline (most terminals; macOS Apple Terminal needs \"Use Option as Meta key\" enabled under Settings → Profiles → Keyboard; Windows Terminal reserves it by default — release in settings) Shift+Enter Insert newline (only terminals that disambiguate the modifier: Kitty / WezTerm / iTerm2 with Report Modifiers / Windows Terminal / Ghostty / Warp. Apple Terminal, xterm, GNOME Terminal, VS Code integrated terminal all collapse it to Enter — use \\ + Enter instead) Ctrl+Enter Insert newline (requires a Kitty-keyboard-protocol terminal such as Kitty or WezTerm) Ctrl+J Insert newline when the terminal distinguishes the chord Esc Clear current input / interrupt streaming output Esc Esc Undo the previous turn when the prompt is idle and empty ↑ / ↓ Browse input history → Fill a faint next-prompt suggestion into an empty input (press Enter separately to send) Ctrl+R Reverse-search input history (type to filter live; Ctrl+R again jumps to the next older match; Enter accepts into the input, Esc cancels) Tab Accept slash-command, skill, or file completion Shift+Tab Cycle to the next execution mode when no completion menu is open (also works while streaming) Ctrl+D Delete forward; when idle and empty, press twice within two seconds to quit Ctrl+B / Ctrl+F Move one character left / right Ctrl+U Delete to the start of the current line Ctrl+W Delete a word Ctrl+K Delete from cursor to end of line Ctrl+A Move cursor to line start Ctrl+E Move cursor to line end"
+      },
+      {
+        "id": "custom-newline",
+        "heading": "Custom newline shortcuts",
+        "body": "Open /config , search for “newline”, and select “Keyboard shortcuts / Newline”. Press Enter or A to add a chord, press that chord, then press Enter to confirm. Press M to type comma-separated names such as alt+j, ctrl+j ; Tab also switches capture to manual entry. Delete removes the selected binding, Ctrl+D restores defaults, and Esc goes back. [ui.keybindings] newline = [\"alt+j\", \"ctrl+j\"] The list replaces the default newline chords. Changes apply immediately and /keys shows the effective bindings. \\ + Enter remains available. Use newline = [] to disable the chords, or remove the newline entry to restore defaults. Conflicts with existing actions or reserved keys, duplicate chords, and invalid names are rejected without changing the active bindings. Plain printable characters cannot be shortcuts. Names accept ctrl , alt , shift , and cmd modifiers, letters, digits, enter , space , arrows, and f1 – f24 . AtomCode cannot detect or release shortcuts intercepted by the terminal or IDE; verify that manually entered chords reach the app."
       },
       {
         "id": "browse-scroll",
@@ -1332,52 +1342,32 @@
     "slug": "webui-remote-access",
     "title": "Remote Access",
     "group": "进阶",
-    "lede": "By default the AtomCode webui only listens on loopback ( 127.0.0.1 ), so your phone and other devices can't reach it. With a virtual LAN built by 蒲公英 (Oray PGY) you can open the webui from a phone or tablet securely — no public IP, nothing exposed to the internet. This page walks through the full connection flow and the security notes.",
+    "lede": "Run /webui and scan the relay QR code with your phone browser. No VPN or public listening port is needed.",
     "sections": [
       {
         "id": "remote-access",
-        "heading": "Remote Access",
-        "body": "By default the AtomCode webui only listens on loopback ( 127.0.0.1 ), so your phone and other devices can't reach it. With a virtual LAN built by 蒲公英 (Oray PGY) you can open the webui from a phone or tablet securely — no public IP, nothing exposed to the internet. This page walks through the full connection flow and the security notes."
+        "heading": "Remote access",
+        "body": "Run /webui and scan the relay QR code with your phone browser. No VPN or public listening port is needed."
       },
       {
-        "id": "how-it-works",
-        "heading": "How it works",
-        "body": "蒲公英 is a remote-networking tool. Once it's installed on both this machine and your phone, signed into the same account and joined to the same network , the two devices sit on one virtual LAN and can talk over a 蒲公英 virtual IP . As long as the webui is bound to that virtual IP, your phone can reach it. The whole link is a private peer-to-peer network — your machine is never exposed to the public internet . Why not just open it to the internet The webui / daemon has no built-in authentication; whoever reaches it effectively gains execution rights for every tool on your machine (including bash , write , edit ). So do not use --host 0.0.0.0 to expose it to the public internet or an open LAN. The 蒲公英 virtual LAN plus a one-time access token is the safe remote path intended for regular users."
-      },
-      {
-        "id": "prerequisites",
-        "heading": "Prerequisites",
-        "body": "You can already launch the AtomCode webui on this machine. 蒲公英 is installed on both this machine and your phone: https://pgy.oray.com . Both devices are signed into the same 蒲公英 account and joined to the same network ."
-      },
-      {
-        "id": "steps",
-        "heading": "Steps",
-        "body": ""
-      },
-      {
-        "id": "1-connect-蒲公英-and-get-the-virtual-ip",
-        "heading": "1. Connect 蒲公英 and get the virtual IP",
-        "body": "Sign in and join the network in the 蒲公英 client on this machine, then note the virtual IP assigned to it (looks like 10.x.x.x ). On the phone, just sign into the same account and join the same network — no IP to remember."
-      },
-      {
-        "id": "2-bind-the-webui-to-the-virtual-ip",
-        "heading": "2. Bind the webui to the virtual IP",
-        "body": "By default the webui binds loopback only, which your phone can't reach. In the AtomCode TUI, relaunch the webui with --host pointed at the 蒲公英 virtual IP: /webui --host 10.x.x.x Replace 10.x.x.x with the virtual IP you noted above. Once bound, the webui is reachable from any device on the same virtual LAN."
-      },
-      {
-        "id": "3-scan-to-connect-from-the-remote-access-panel",
-        "heading": "3. Scan to connect from the Remote Access panel",
-        "body": "Open the Remote Access panel (the phone icon) in the top-right of the webui. AtomCode detects the 蒲公英 status and produces: a ready-to-open remote URL (already carrying the access token); a matching QR code . Scan the QR with your phone, or copy the URL into the phone's browser. The phone must be signed into the same 蒲公英 account and on the same network. The access token is a password The remote URL carries a one-time access token ( ?token=… ) that is equivalent to a password : anyone who gets the full link can operate your machine. Don't post it in chats, screenshot it out, or paste it on a public page."
+        "id": "connect",
+        "heading": "Connect",
+        "body": "Keep AtomCode running and run /webui . It opens the local browser and prints a phone link and QR code. Scan with your phone browser, or copy the relay link from the WebUI Remote access dialog. The devices may use different networks. The phone and TUI share the same conversation. /webui stop , signing out in the terminal, or exiting AtomCode stops relay sharing. Standalone: atomcode webui . Local only: /webui --local or atomcode webui --local . Explicit /webui lan or --host <address> uses the local network instead of automatically connecting a relay."
       },
       {
         "id": "troubleshooting",
-        "heading": "Troubleshooting",
-        "body": "The Remote Access panel shows different hints depending on what it detects. Map them as follows: Panel hint Meaning What to do 蒲公英 not detected 蒲公英 isn't installed, or the client isn't running. Install and sign into 蒲公英 on both machine and phone, join the same network, then hit \"Re-check\". No virtual IP yet 蒲公英 is installed but hasn't joined a network. Connect / join the network in the 蒲公英 client, get a virtual IP, then \"Re-check\". webui bound to localhost only 蒲公英 is detected, but the webui still listens on loopback. Relaunch with /webui --host <virtual IP> as in step 2, then refresh this page. Phone can't open it / hangs The two ends aren't on the same network, or a firewall blocks it. Confirm both devices share the same 蒲公英 account and network; check that the machine's firewall allows the webui port."
+        "heading": "Connection failures",
+        "body": "Local access remains available if relay setup fails. The terminal and Remote access dialog explain the failure. If WebUI is unsupported, upgrade the relay server and install the matching WebUI assets, then retry /webui . Use ATOMCODE_APP_RELAY for a self-hosted relay and ATOMCODE_ENABLE_RELAY=0 to disable relay access."
       },
       {
-        "id": "next",
-        "heading": "Next",
-        "body": "Headless & Daemon — the daemon and HTTP/SSE API behind the webui FAQ — common remote / login gotchas © 2026 AtomCode · MIT 报告问题"
+        "id": "security",
+        "heading": "Security and lifetime",
+        "body": "The link grants access: keep it private. HTTPS protects transport; the local WebUI still checks its access token. The relay can process traffic; this is not end-to-end encryption. Pairing credentials survive reload in tab-scoped sessionStorage and are cleared when the tab closes. Network disconnects reconnect automatically. Access stops while the computer is asleep, offline, or AtomCode has exited."
+      },
+      {
+        "id": "lan",
+        "heading": "Local network alternative",
+        "body": "/webui lan remains available on the same Wi-Fi. /webui --host <virtual IP> also works with an existing VPN. These local HTTP connections require a trusted network. © 2026 AtomCode · MIT 报告问题"
       }
     ]
   },
