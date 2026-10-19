@@ -150,14 +150,12 @@ pub enum Action {
     /// ahead of the caret was to step over it and press backspace.
     DeleteForward,
     DeleteWord,
-    /// Take out everything from the caret to the end.
-    ///
-    /// To the end of the **buffer**, which is where [`Action::CaretEnd`] goes —
-    /// the pair has to agree, or `ctrl-k` deletes to somewhere `ctrl-e` does not
-    /// go and neither key can be reasoned about. (A multi-line draft is one
-    /// buffer here; `Home`/`End` answer the same way, and changing that is a
-    /// change to those keys, not something to smuggle in with this one.)
+    /// Delete to the end of the current logical line, or its newline at the end.
     DeleteToEnd,
+    /// Delete to the beginning of the current logical line.
+    DeleteToStart,
+    /// Delete forward in a draft; confirm exit only when idle and empty.
+    EndOfInput,
     Clear,
     CaretLeft,
     CaretRight,
@@ -617,16 +615,11 @@ impl Keymap for Default_ {
             (KeyPress::new(Key::Enter, Mods::SHIFT), Action::Newline),
             (KeyPress::new(Key::Enter, Mods::ALT), Action::Newline),
             (KeyPress::ctrl('j'), Action::Newline),
-            (KeyPress::ctrl('d'), Action::Quit),
-            (KeyPress::ctrl('u'), Action::Clear),
+            (KeyPress::ctrl('d'), Action::EndOfInput),
+            (KeyPress::ctrl('u'), Action::DeleteToStart),
             (KeyPress::ctrl('w'), Action::DeleteWord),
-            // The rest of the line-editing reflexes every shell has. They were
-            // missing, so the muscle memory landed on nothing: ctrl-a and
-            // ctrl-e are documented in the keys help as "go to the start / the
-            // end" everywhere else a person types, and ctrl-k is how a line is
-            // cut short. Bound to the SAME actions `Home` and `End` already
-            // use, rather than to line-relative ones — two answers to "where
-            // does the caret go" is how they stop agreeing.
+            (KeyPress::ctrl('b'), Action::CaretLeft),
+            (KeyPress::ctrl('f'), Action::CaretRight),
             (KeyPress::ctrl('a'), Action::CaretHome),
             (KeyPress::ctrl('e'), Action::CaretEnd),
             (KeyPress::ctrl('k'), Action::DeleteToEnd),
@@ -903,6 +896,13 @@ mod tests {
         let keys = Keys::new();
         keys.add(&Default_).unwrap();
 
+        assert_eq!(keys.resolve(KeyPress::ctrl('d')), Some(Action::EndOfInput));
+        assert_eq!(keys.resolve(KeyPress::ctrl('b')), Some(Action::CaretLeft));
+        assert_eq!(keys.resolve(KeyPress::ctrl('f')), Some(Action::CaretRight));
+        assert_eq!(
+            keys.resolve(KeyPress::ctrl('u')),
+            Some(Action::DeleteToStart)
+        );
         let home = keys.resolve(KeyPress::plain(Key::Home));
         let end = keys.resolve(KeyPress::plain(Key::End));
         assert_eq!(keys.resolve(KeyPress::ctrl('a')), home, "ctrl-a is Home");
@@ -1090,7 +1090,7 @@ mod tests {
         assert_eq!(keys.resolve(KeyPress::ch('x')), Some(Action::Insert('x')));
         assert_eq!(keys.resolve(KeyPress::ch('中')), Some(Action::Insert('中')));
         // A bound char still wins.
-        assert_eq!(keys.resolve(KeyPress::ctrl('d')), Some(Action::Quit));
+        assert_eq!(keys.resolve(KeyPress::ctrl('d')), Some(Action::EndOfInput));
     }
 
     /// A downstream build can rebind one press without re-declaring the other

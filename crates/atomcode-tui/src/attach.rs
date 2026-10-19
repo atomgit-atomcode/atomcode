@@ -142,6 +142,11 @@ impl Default for Attachments {
 }
 
 impl Attachments {
+    /// Whether there are no pending images in the composer.
+    pub fn is_empty(&self) -> bool {
+        self.images.is_empty()
+    }
+
     pub fn new() -> Self {
         Self {
             images: Vec::new(),
@@ -232,7 +237,7 @@ impl Attachments {
 
     /// Drop everything, markers in the text or not.
     ///
-    /// For "clear the composer" (Ctrl+U), which throws away the text
+    /// For "clear the composer", which throws away the text
     /// and therefore every marker in it. Keeping the images would leave the
     /// composer holding pictures no line accounts for, and the next submit would
     /// have to re-derive that they are gone; dropping them here keeps the state

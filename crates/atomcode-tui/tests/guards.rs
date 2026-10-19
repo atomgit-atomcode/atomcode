@@ -63,7 +63,7 @@ fn the_adjustable_layout_is_gone() {
     assert!(found.is_empty(), "{found:#?}");
 }
 
-/// No key rearranges the screen: `ctrl-f` (a preset) is unbound, `ctrl-z` —
+/// No key rearranges the screen: `ctrl-f` moves the caret, `ctrl-z` —
 /// once "undo a layout change" — may only be the shell's suspend again
 /// (2026-10-06: what it is in every program a shell runs), and `ctrl-n` — once
 /// "toggle the mascot" — may only be the history's forward step again
@@ -73,10 +73,12 @@ fn the_adjustable_layout_is_gone() {
 #[test]
 fn no_key_rearranges_the_screen() {
     let bindings = Default_.bindings();
-    let bound: Vec<KeyPress> = bindings.iter().map(|(k, _)| *k).collect();
     assert!(
-        !bound.contains(&KeyPress::ctrl('f')),
-        "ctrl-f is bound again"
+        bindings.contains(&(
+            KeyPress::ctrl('f'),
+            atomcode_tui::keymap::Action::CaretRight,
+        )),
+        "ctrl-f must only move the caret"
     );
     for (key, action) in &bindings {
         if *key == KeyPress::ctrl('z') {

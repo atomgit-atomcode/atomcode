@@ -624,6 +624,8 @@ pub struct Moment {
     /// — a `below` [`Notice`] on [`Moment::notice`] — is still up; see
     /// [`Moment::cancel_idle`] and [`Moment::exit_hint_live`].
     pub quit_armed: bool,
+    /// Empty-composer Ctrl+D confirmation; independent of Ctrl+C.
+    pub eof_armed: bool,
     /// When the last Escape was pressed, while a second one would still mean
     /// "open the rewind panel".
     ///
@@ -1178,6 +1180,7 @@ impl Moment {
     /// A copy/paste notice (`below == false`) is left where it is.
     pub fn disarm_quit(&mut self) {
         self.quit_armed = false;
+        self.eof_armed = false;
         if self.notice.as_ref().is_some_and(|n| n.below) {
             self.notice = None;
         }

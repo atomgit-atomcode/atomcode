@@ -43,6 +43,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
 
         // ── the moment ──
         Msg::MomentQuitAgain => "press Ctrl+C again to quit".into(),
+        Msg::MomentEofAgain => "press Ctrl+D again to quit".into(),
 
         // ── overlays ──
         Msg::OverlayEmptyFile => "  (empty file)".into(),
@@ -422,7 +423,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
     Enter                           send the message
     Shift+Enter / Ctrl+J            insert a new line
     Ctrl+W                          delete the previous word
-    Ctrl+D                          quit
+    Ctrl+D                          delete forward; when idle and empty, press twice to quit
+    Ctrl+B / Ctrl+F                 move one character left / right
+    Ctrl+A / Ctrl+E                 start / end of the current line
+    Ctrl+U / Ctrl+K                 delete to line start / end
     Ctrl+Z                          suspend to the shell, fg to return (not on Windows)
     Up / Down                       move the caret, and page through history once at the end
     Ctrl+P / Ctrl+N                 page through history (with the mouse handed back, ↑↓ scroll instead)

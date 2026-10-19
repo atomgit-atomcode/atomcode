@@ -581,7 +581,7 @@
       {
         "id": "输入编辑",
         "heading": "输入编辑",
-        "body": "按键 动作 Enter 发送消息 \\ 后接 Enter 换行(所有终端通用 — 行尾反斜杠会被识别为续行) Alt+Enter 换行(多数终端可用;macOS Apple Terminal 需在 Settings → Profiles → Keyboard 启用 \"Use Option as Meta key\";Windows Terminal 默认占用,可在设置里释放) Shift+Enter 换行(仅以下终端区分 Shift+Enter 与 Enter :Kitty / WezTerm / iTerm2(需启用 Report Modifiers)/ Windows Terminal / Ghostty / Warp。Apple Terminal、xterm、GNOME Terminal、VS Code 集成终端不支持,请用 \\ + Enter ) Ctrl+Enter 换行(需启用 Kitty 键盘协议的终端,如 Kitty、WezTerm 等) Ctrl+J 换行(终端能区分该组合键时) Esc 清空当前输入 / 打断正在流式输出的回复 Esc Esc 输入框空闲且为空时撤销上一轮 ↑ / ↓ 浏览输入历史 → 将暗色的下一步提示填入空输入框(仍需单独按 Enter 发送) Ctrl+R 反向搜索输入历史(输入关键字实时过滤;再次按 Ctrl+R 跳到下一个更旧的匹配; Enter 选中填入, Esc 取消) Tab 接受斜杠命令、Skill 或文件补全 Shift+Tab 无补全菜单时切换到下一个执行模式（流式输出期间也可切换） Ctrl+U 清空整行 Ctrl+W 删除一个单词 Ctrl+K 删除从光标到行尾的内容 Ctrl+A 光标移到行首 Ctrl+E 光标移到行尾"
+        "body": "按键 动作 Enter 发送消息 \\ 后接 Enter 换行(所有终端通用 — 行尾反斜杠会被识别为续行) Alt+Enter 换行(多数终端可用;macOS Apple Terminal 需在 Settings → Profiles → Keyboard 启用 \"Use Option as Meta key\";Windows Terminal 默认占用,可在设置里释放) Shift+Enter 换行(仅以下终端区分 Shift+Enter 与 Enter :Kitty / WezTerm / iTerm2(需启用 Report Modifiers)/ Windows Terminal / Ghostty / Warp。Apple Terminal、xterm、GNOME Terminal、VS Code 集成终端不支持,请用 \\ + Enter ) Ctrl+Enter 换行(需启用 Kitty 键盘协议的终端,如 Kitty、WezTerm 等) Ctrl+J 换行(终端能区分该组合键时) Esc 清空当前输入 / 打断正在流式输出的回复 Esc Esc 输入框空闲且为空时撤销上一轮 ↑ / ↓ 浏览输入历史 → 将暗色的下一步提示填入空输入框(仍需单独按 Enter 发送) Ctrl+R 反向搜索输入历史(输入关键字实时过滤;再次按 Ctrl+R 跳到下一个更旧的匹配; Enter 选中填入, Esc 取消) Tab 接受斜杠命令、Skill 或文件补全 Shift+Tab 无补全菜单时切换到下一个执行模式（流式输出期间也可切换） Ctrl+D 删除当前字符；空闲且输入为空时，两秒内连按两次退出 Ctrl+B / Ctrl+F 前移 / 后移一个字符 Ctrl+U 删除从当前行首到光标的内容 Ctrl+W 删除一个单词 Ctrl+K 删除从光标到行尾的内容 Ctrl+A 光标移到行首 Ctrl+E 光标移到行尾"
       },
       {
         "id": "浏览与滚动",

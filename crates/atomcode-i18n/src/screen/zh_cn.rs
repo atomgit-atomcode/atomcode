@@ -29,6 +29,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
 
         // ── 当下 ──
         Msg::MomentQuitAgain => "再按 Ctrl+C 退出".into(),
+        Msg::MomentEofAgain => "再按 Ctrl+D 退出".into(),
 
         // ── 浮层 ──
         Msg::OverlayEmptyFile => "  (空文件)".into(),
@@ -385,7 +386,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
     Enter                           发送消息
     Shift+Enter / Ctrl+J            插入换行
     Ctrl+W                          删除前一个单词
-    Ctrl+D                          退出
+    Ctrl+D                          删除当前字符；空闲且输入为空时连按两次退出
+    Ctrl+B / Ctrl+F                 前移 / 后移一个字符
+    Ctrl+A / Ctrl+E                 到当前行首 / 行尾
+    Ctrl+U / Ctrl+K                 删除到当前行首 / 行尾
     Ctrl+Z                          挂起回到 shell，fg 回来（Windows 不支持）
     Up / Down                       在输入里移动游标，到头则翻历史
     Ctrl+P / Ctrl+N                 翻历史（鼠标交还终端时 ↑↓ 用来滚动对话）

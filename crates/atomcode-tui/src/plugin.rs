@@ -5804,7 +5804,6 @@ impl Tui {
             (Key::Esc, _) | (Key::Tab, _) | (Key::BackTab, _) => {
                 self.host.unfocus_team();
             }
-            (Key::Char('d'), Mods::CTRL) => return true,
             _ => {}
         }
         false
@@ -7086,6 +7085,34 @@ impl Tui {
             action
         };
         let mut m = self.host.moment.write().expect("moment poisoned");
+        // Resolve EOF before editing bookkeeping, so deletion follows exactly the
+        // same selection, history and attachment handling as the Delete key.
+        let action = if action == Action::EndOfInput {
+            if !m.input.is_empty() || !m.attachments.is_empty() {
+                Action::DeleteForward
+            } else {
+                m.disarm_escape();
+                if m.turn_in_flight() || m.stopping || !client.settled() {
+                    m.disarm_quit();
+                    return false;
+                }
+                if m.eof_armed && m.exit_hint_live() {
+                    return true;
+                }
+                m.disarm_quit();
+                m.eof_armed = true;
+                m.notice = Some(
+                    crate::moment::Notice::for_ms(t(Msg::MomentEofAgain), false, m.now, 2000)
+                        .below(),
+                );
+                return false;
+            }
+        } else {
+            action
+        };
+        if m.eof_armed {
+            m.disarm_quit();
+        }
         // Any action other than a repeat Ctrl+C disarms the "press again to quit"
         // latch, and takes the exit hint below the box down with it: an accidental
         // first press followed by real work must never leave the terminal one
@@ -7158,6 +7185,7 @@ impl Tui {
             Action::Backspace
             | Action::DeleteForward
             | Action::DeleteWord
+            | Action::DeleteToStart
             | Action::DeleteToEnd => m.completion_held = true,
             Action::Insert(_) | Action::Paste(_) | Action::Submit | Action::Clear => {
                 m.completion_held = false
@@ -7194,6 +7222,7 @@ impl Tui {
             Action::Insert(_)
                 | Action::Backspace
                 | Action::DeleteForward
+                | Action::DeleteToStart
                 | Action::DeleteToEnd
                 | Action::Clear
                 | Action::DeleteWord
@@ -7204,6 +7233,7 @@ impl Tui {
         }
         match action {
             Action::Quit => return true,
+            Action::EndOfInput => unreachable!("EOF resolved before editing"),
             Action::Submit => {
                 // Continuation works even when the terminal cannot distinguish
                 // modified Enter keys. Only the slash immediately before the
@@ -7438,8 +7468,21 @@ impl Tui {
             }
             Action::DeleteToEnd => {
                 let at = m.caret.min(m.input.len());
-                m.input.truncate(at);
+                let end = m.input[at..].find('\n').map_or(m.input.len(), |n| {
+                    if n == 0 {
+                        at + 1
+                    } else {
+                        at + n
+                    }
+                });
+                m.input.replace_range(at..end, "");
                 m.caret = at;
+            }
+            Action::DeleteToStart => {
+                let at = m.caret.min(m.input.len());
+                let start = m.input[..at].rfind('\n').map_or(0, |n| n + 1);
+                m.input.replace_range(start..at, "");
+                m.caret = start;
             }
             Action::CycleModel { forward } => {
                 drop(m);
@@ -7557,8 +7600,12 @@ impl Tui {
                     m.caret = at;
                 }
             }
-            Action::CaretHome => m.caret = 0,
-            Action::CaretEnd => m.caret = m.input.len(),
+            Action::CaretHome => m.caret = m.input[..m.caret].rfind('\n').map_or(0, |n| n + 1),
+            Action::CaretEnd => {
+                m.caret += m.input[m.caret..]
+                    .find('\n')
+                    .unwrap_or(m.input.len() - m.caret)
+            }
 
             // Inside the text they move the caret; at its edge they hand over
             // to the history. That is what an arrow key does in a shell, and
@@ -8549,9 +8596,6 @@ impl Tui {
     /// one implementation rather than two that agree until one changes.
     fn answer_question(&self, press: crate::surface::KeyPress) -> bool {
         use crate::surface::{Key, Mods};
-        if (press.key, press.mods) == (Key::Char('d'), Mods::CTRL) {
-            return true;
-        }
         if self.panel_mounted() {
             if let Some((id, step)) = self.host.ask_key(press) {
                 self.deliver_answer(id, step);
@@ -9771,6 +9815,7 @@ fn dismisses_suggestion(action: &Action) -> bool {
             | Action::Backspace
             | Action::DeleteForward
             | Action::DeleteWord
+            | Action::DeleteToStart
             | Action::DeleteToEnd
             | Action::Clear
             | Action::CaretLeft
@@ -13672,6 +13717,77 @@ mod skills_menu_tests {
         let mut m = host.moment.write().expect("moment poisoned");
         m.input = line.into();
         m.caret = line.len();
+    }
+
+    #[test]
+    fn eof_deletes_unicode_and_does_not_exit_at_draft_end() {
+        let (host, tui) = screen();
+        type_line(&host, "甲乙\n丙");
+        host.moment.write().unwrap().caret = 0;
+        assert!(!tui.act(Action::EndOfInput, &tui.client));
+        assert_eq!(host.moment.read().unwrap().input, "乙\n丙");
+        host.moment.write().unwrap().caret = "乙\n丙".len();
+        for _ in 0..3 {
+            assert!(!tui.act(Action::EndOfInput, &tui.client));
+        }
+        assert_eq!(host.moment.read().unwrap().input, "乙\n丙");
+    }
+
+    #[test]
+    fn eof_requires_its_own_second_press_and_editing_disarms_it() {
+        let (_host, tui) = screen();
+        assert!(!tui.act(Action::EndOfInput, &tui.client));
+        assert!(tui.act(Action::EndOfInput, &tui.client));
+        tui.act(Action::Insert('x'), &tui.client);
+        tui.act(Action::Backspace, &tui.client);
+        assert!(!tui.act(Action::EndOfInput, &tui.client));
+        assert!(!tui.act(Action::Cancel, &tui.client));
+        assert!(!tui.act(Action::EndOfInput, &tui.client));
+    }
+
+    #[test]
+    fn eof_confirmation_expires_and_attachments_protect_the_draft() {
+        let (host, tui) = screen();
+        assert!(!tui.act(Action::EndOfInput, &tui.client));
+        host.moment.write().unwrap().now = Timestamp::millis(3000);
+        assert!(!tui.act(Action::EndOfInput, &tui.client));
+        {
+            let mut m = host.moment.write().unwrap();
+            m.attachments.add(atomcode_kernel::message::ImageContent {
+                media_type: "image/png".into(),
+                data: "test".into(),
+            });
+        }
+        for _ in 0..3 {
+            assert!(!tui.act(Action::EndOfInput, &tui.client));
+        }
+        assert!(!host.moment.read().unwrap().eof_armed);
+    }
+
+    #[test]
+    fn eof_does_not_exit_while_running_or_answering() {
+        let (host, tui) = screen();
+        host.moment.write().unwrap().stopping = true;
+        for _ in 0..3 {
+            assert!(!tui.act(Action::EndOfInput, &tui.client));
+        }
+        assert!(!tui.answer_question(crate::surface::KeyPress::ctrl('d')));
+        assert!(!tui.team_key(crate::surface::KeyPress::ctrl('d')));
+    }
+
+    #[test]
+    fn emacs_line_editing_keeps_other_lines() {
+        let (host, tui) = screen();
+        type_line(&host, "first\n甲乙\nlast");
+        host.moment.write().unwrap().caret = "first\n甲".len();
+        tui.act(Action::CaretHome, &tui.client);
+        assert_eq!(host.moment.read().unwrap().caret, 6);
+        tui.act(Action::CaretEnd, &tui.client);
+        assert_eq!(host.moment.read().unwrap().caret, "first\n甲乙".len());
+        tui.act(Action::DeleteToStart, &tui.client);
+        assert_eq!(host.moment.read().unwrap().input, "first\n\nlast");
+        tui.act(Action::DeleteToEnd, &tui.client);
+        assert_eq!(host.moment.read().unwrap().input, "first\nlast");
     }
 
     #[test]
