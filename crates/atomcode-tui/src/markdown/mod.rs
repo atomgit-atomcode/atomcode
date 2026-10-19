@@ -822,7 +822,7 @@ fn code_block(lines: &[String], lang: &str, w: u16) -> Vec<Line> {
     let mut out = Vec::new();
     if !lang.is_empty() {
         out.push(
-            Line::from_spans(vec![Span::styled(lang.to_string(), fence().bold())])
+            Line::from_spans(vec![Span::styled(lang.to_string(), heading())])
                 .truncate(w as usize)
                 .with_background(background),
         );
@@ -1632,7 +1632,7 @@ mod tests {
     fn the_fence_header_and_body_share_a_surface_without_a_gutter() {
         let out = render("```bash\nls\n```", 30, Style::new());
         assert_eq!(out[0].plain(), "bash");
-        assert_eq!(out[0].spans[0].style.fg, Some(Color::role(Role::Muted)));
+        assert_eq!(out[0].spans[0].style.fg, Some(Color::role(Role::Accent)));
         assert!(out[0].spans[0].style.bold);
         assert!(out
             .iter()
