@@ -495,6 +495,7 @@ export interface ProviderAccountInfo {
   type: string;
   base_url?: string;
   has_api_key: boolean;
+  header_names?: string[];
   model_ids: string[];
   legacy: boolean;
   managed: boolean;
@@ -685,6 +686,7 @@ export async function getTunnelStatus(): Promise<TunnelStatus> {
 // --- Provider CRUD ---
 
 export async function discoverProviderModels(body: {
+  headers?: Record<string, string | null>;
   type: string;
   base_url: string;
   api_key?: string;
@@ -740,6 +742,7 @@ export interface NewModelBody {
 }
 
 export interface CreateAccountBody {
+  headers?: Record<string, string | null>;
   /** Required for a custom protocol; a vendor preset defaults to its own id. */
   id?: string;
   /** A vendor preset id or a protocol id. */
@@ -757,6 +760,7 @@ export function createAccount(body: CreateAccountBody) {
 }
 
 export interface EditAccountBody {
+  headers?: Record<string, string | null>;
   /** Empty clears the name. */
   display_name?: string;
   /** Empty falls back to the protocol's own endpoint. */

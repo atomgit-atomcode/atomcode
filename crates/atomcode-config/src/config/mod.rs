@@ -1226,6 +1226,7 @@ impl Config {
                     .or_else(|| preset.default_base_url.map(str::to_string)),
                 api_key: resolve_account_api_key(account, preset),
                 user_agent: account.user_agent.clone(),
+                headers: account.headers.clone(),
                 skip_tls_verify: account.skip_tls_verify,
             });
         }
@@ -1235,6 +1236,7 @@ impl Config {
             base_url: legacy.base_url.clone(),
             api_key: legacy.resolved_api_key(),
             user_agent: legacy.user_agent.clone(),
+            headers: legacy.headers.clone(),
             skip_tls_verify: legacy.skip_tls_verify,
         })
     }
@@ -1286,6 +1288,7 @@ impl Config {
             max_tokens: model.max_tokens,
             system_prompt: model.system_prompt.clone(),
             user_agent: account.user_agent.clone(),
+            headers: account.headers.clone(),
             skip_tls_verify: account.skip_tls_verify,
             thinking_type: model.thinking_type.clone(),
             thinking_keep: model.thinking_keep.clone(),
@@ -1422,6 +1425,7 @@ pub struct AccountEndpoint {
     pub base_url: Option<String>,
     pub api_key: Option<String>,
     pub user_agent: Option<String>,
+    pub headers: crate::provider_headers::ProviderHeaders,
     pub skip_tls_verify: bool,
 }
 
@@ -1774,6 +1778,7 @@ fn project_legacy_account(p: &ProviderConfig) -> ProviderAccountConfig {
         api_key: p.api_key.clone(),
         base_url: p.base_url.clone(),
         user_agent: p.user_agent.clone(),
+        headers: p.headers.clone(),
         skip_tls_verify: p.skip_tls_verify,
         enterprise_url: None,
         ephemeral: p.ephemeral,
@@ -2358,6 +2363,7 @@ impl Config {
 
     pub(crate) fn parse_disk_content(content: &str, path: &Path) -> Result<Self> {
         let mut config: Config = toml::from_str(content)
+            .map_err(|e: toml::de::Error| anyhow::anyhow!("{}", e.message()))
             .with_context(|| format!("Failed to parse config: {}", path.display()))?;
         migrate_legacy_lsp_default(&mut config);
         migrate_legacy_coding_round_default(&mut config);
@@ -2370,6 +2376,7 @@ impl Config {
         path: &Path,
     ) -> Result<(Self, Vec<String>)> {
         let mut document: toml::Value = toml::from_str(content)
+            .map_err(|e: toml::de::Error| anyhow::anyhow!("{}", e.message()))
             .with_context(|| format!("Failed to parse config: {}", path.display()))?;
         let mut warnings = Vec::new();
         let mut quarantined: std::collections::BTreeMap<String, toml::Value> =
@@ -3682,6 +3689,7 @@ model = "missing-type"
                 system_prompt: None,
                 supports_vision: None,
                 user_agent: None,
+                headers: Default::default(),
                 context_window: 16000,
                 max_tokens: None,
                 thinking_type: None,
@@ -3901,6 +3909,7 @@ model = "missing-type"
                 system_prompt: None,
                 supports_vision: None,
                 user_agent: None,
+                headers: Default::default(),
                 context_window: 16000,
                 max_tokens: None,
                 thinking_type: None,
@@ -4001,6 +4010,7 @@ model = "missing-type"
                 system_prompt: None,
                 supports_vision: None,
                 user_agent: None,
+                headers: Default::default(),
                 context_window: 8000,
                 max_tokens: None,
                 thinking_type: None,
@@ -4136,6 +4146,7 @@ model = "missing-type"
                 system_prompt: None,
                 supports_vision: None,
                 user_agent: None,
+                headers: Default::default(),
                 context_window: 8000,
                 max_tokens: None,
                 thinking_type: None,
@@ -4390,6 +4401,7 @@ capable_model = 5
                 api_key: Some("sk-runtime-only".into()),
                 base_url: None,
                 user_agent: None,
+                headers: Default::default(),
                 skip_tls_verify: false,
                 enterprise_url: None,
                 ephemeral: true,
@@ -4443,6 +4455,7 @@ capable_model = 5
                 api_key: None,
                 base_url: None, // …and none supplied → error
                 user_agent: None,
+                headers: Default::default(),
                 skip_tls_verify: false,
                 enterprise_url: None,
                 ephemeral: false,
@@ -4639,6 +4652,7 @@ context_window = 131072
                 api_key: None,
                 base_url: None,
                 user_agent: None,
+                headers: Default::default(),
                 skip_tls_verify: false,
                 enterprise_url: None,
                 ephemeral: false,

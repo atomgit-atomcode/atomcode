@@ -124,6 +124,7 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                 ac.effort_levels = cfg.effort_levels.clone();
                 ac.thinking = cfg.thinking_enabled.unwrap_or(false);
                 ac.user_agent = Some(ua.clone());
+                ac.headers = cfg.headers.clone();
                 ac.skip_tls_verify = cfg.skip_tls_verify;
                 ac.retry = retry_policy_for(cfg.retry_max_attempts)?;
                 Arc::new(
@@ -147,6 +148,7 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                 oc.effort_levels = cfg.effort_levels.clone();
                 oc.think = cfg.thinking_enabled.unwrap_or(false);
                 oc.user_agent = Some(ua.clone());
+                oc.headers = cfg.headers.clone();
                 oc.skip_tls_verify = cfg.skip_tls_verify;
                 oc.retry = retry_policy_for(cfg.retry_max_attempts)?;
                 Arc::new(
@@ -170,10 +172,16 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                     ReasoningPolicy::from_config(cfg.reasoning_history.as_deref())
                         .map_err(ProviderBuildError::Adapter)?;
                 pc.user_agent = Some(ua);
+                pc.headers = cfg.headers.clone();
                 pc.skip_tls_verify = cfg.skip_tls_verify;
                 pc.retry = retry_policy_for(cfg.retry_max_attempts)?;
                 if let Some(authenticator) = &self.authenticator {
                     pc.request_signer = authenticator.request_signer(&cfg.base_url, &cfg.dirs)?;
+                    if pc.request_signer.is_some() && !pc.headers.is_empty() {
+                        return Err(ProviderBuildError::Authentication(
+                            "Managed signed accounts do not support custom HTTP headers".into(),
+                        ));
+                    }
                 }
                 Arc::new(
                     ResponsesProvider::new(pc)
@@ -199,10 +207,16 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                 pc.thinking_type = cfg.thinking_type.clone();
                 pc.thinking_keep = cfg.thinking_keep.clone();
                 pc.user_agent = Some(ua);
+                pc.headers = cfg.headers.clone();
                 pc.skip_tls_verify = cfg.skip_tls_verify;
                 pc.retry = retry_policy_for(cfg.retry_max_attempts)?;
                 if let Some(authenticator) = &self.authenticator {
                     pc.request_signer = authenticator.request_signer(&cfg.base_url, &cfg.dirs)?;
+                    if pc.request_signer.is_some() && !pc.headers.is_empty() {
+                        return Err(ProviderBuildError::Authentication(
+                            "Managed signed accounts do not support custom HTTP headers".into(),
+                        ));
+                    }
                 }
                 Arc::new(
                     OpenAiCompatProvider::new(pc)
@@ -281,9 +295,7 @@ pub fn derive_tier_config(
     if let Some(base_url) = &provider.base_url {
         tier.base_url = base_url.clone();
     }
-    if let Some(api_key) = provider.resolved_api_key() {
-        tier.api_key = api_key;
-    }
+    tier.api_key = provider.resolved_api_key().unwrap_or_default();
     tier.provider_type = provider.provider_type.clone();
     tier.context_window = provider.context_window as u32;
     tier.chat_options.max_tokens = provider.max_tokens.map(|value| value as u32);
@@ -303,6 +315,7 @@ pub fn derive_tier_config(
     );
     tier.thinking_enabled = provider.thinking_enabled;
     tier.user_agent = provider.user_agent.clone();
+    tier.headers = provider.headers.clone();
     tier.skip_tls_verify = provider.skip_tls_verify;
     tier.retry_max_attempts = provider.retry_max_attempts;
     tier.subagent_fast_provider = None;
@@ -342,9 +355,7 @@ pub fn derive_tier_config_from_resolved(
     if let Some(base_url) = &resolved.base_url {
         tier.base_url = base_url.clone();
     }
-    if let Some(api_key) = &resolved.api_key {
-        tier.api_key = api_key.clone();
-    }
+    tier.api_key = resolved.api_key.clone().unwrap_or_default();
     tier.provider_type = resolved.provider_type.clone();
     tier.context_window = resolved.context_window as u32;
     tier.chat_options.max_tokens = resolved.max_tokens.map(|value| value as u32);
@@ -364,6 +375,7 @@ pub fn derive_tier_config_from_resolved(
     );
     tier.thinking_enabled = resolved.thinking_enabled;
     tier.user_agent = resolved.user_agent.clone();
+    tier.headers = resolved.headers.clone();
     tier.skip_tls_verify = resolved.skip_tls_verify;
     tier.retry_max_attempts = resolved.retry_max_attempts;
     tier.subagent_fast_provider = None;
@@ -563,6 +575,30 @@ mod tests {
         assert!(!supports_reasoning_effort(&cfg));
         cfg.supports_reasoning_effort = true;
         assert!(supports_reasoning_effort(&cfg));
+    }
+
+    #[test]
+    fn a_header_only_tier_never_inherits_its_parents_credentials() {
+        let catalog: atomcode_config::config::Config = serde_json::from_value(serde_json::json!({
+            "providers": { "target": { "type": "ollama", "model": "test", "base_url": "http://localhost:11434", "headers": { "X-Target-Token": "target-secret" } } }
+        })).unwrap();
+        let mut base = config("openai");
+        base.api_key = "parent-secret".into();
+        base.headers =
+            serde_json::from_value(serde_json::json!({"X-Parent-Token":"parent-header-secret"}))
+                .unwrap();
+        let resolved = catalog.resolve_model(Some("target")).unwrap();
+        for tier in [
+            derive_tier_config(&base, "target", &catalog.providers["target"]),
+            derive_tier_config_from_resolved(&base, &resolved),
+        ] {
+            assert!(tier.api_key.is_empty());
+            assert_eq!(tier.headers.names(), vec!["x-target-token"]);
+            assert_eq!(
+                tier.headers.iter().next(),
+                Some(("x-target-token", "target-secret"))
+            );
+        }
     }
 
     #[test]

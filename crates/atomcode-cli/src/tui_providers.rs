@@ -278,12 +278,13 @@ fn protocol_label(ty: provider_preset::ProviderType) -> String {
 /// A bool, and only a bool: this is the whole of what the screen is told about a
 /// key, so "there is one" can be drawn without the key ever leaving the file.
 fn has_stored_key(account: &atomcode_config::config::provider::ProviderAccountConfig) -> bool {
-    !account
-        .api_key
-        .as_deref()
-        .unwrap_or_default()
-        .trim()
-        .is_empty()
+    !account.headers.is_empty()
+        || !account
+            .api_key
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
 }
 
 /// What to call an account on screen — the rule the web page uses too.
@@ -325,6 +326,7 @@ impl Providers for ConfigProviders {
     fn add_account(&self, draft: &AccountDraft) -> Result<String, String> {
         self.book()
             .add_account(&AccountInput {
+                headers: None,
                 name: &draft.name,
                 protocol: &draft.protocol,
                 display_name: None,
@@ -340,6 +342,7 @@ impl Providers for ConfigProviders {
             .edit_account(
                 id,
                 &AccountEdit {
+                    headers: None,
                     protocol: &draft.protocol,
                     endpoint: &draft.endpoint,
                     key: draft.key.as_deref(),
@@ -413,6 +416,7 @@ impl Providers for ConfigProviders {
         let wire = endpoint.provider_type.clone();
         discovery_protocol(&wire)?;
         let transport = DiscoveryTransport {
+            headers: endpoint.headers.clone(),
             api_key: endpoint.api_key.clone(),
             user_agent: endpoint.user_agent.clone(),
             skip_tls_verify: endpoint.skip_tls_verify,
@@ -453,6 +457,7 @@ impl Providers for ConfigProviders {
                 (
                     resolved.provider_type.clone(),
                     ProbeTarget {
+                        headers: resolved.headers.clone(),
                         base_url: resolved.base_url.clone()?,
                         api_key: resolved.api_key.clone(),
                         model: Some(resolved.model.clone()),
@@ -466,6 +471,7 @@ impl Providers for ConfigProviders {
                 (
                     endpoint.provider_type.clone(),
                     ProbeTarget {
+                        headers: endpoint.headers.clone(),
                         base_url: endpoint.base_url.clone()?,
                         api_key: endpoint.api_key.clone(),
                         model: None,

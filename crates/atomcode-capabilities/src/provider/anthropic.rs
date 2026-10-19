@@ -83,6 +83,7 @@ pub struct AnthropicConfig {
     /// driver injects `atomcode/<version>` for gateway attribution. See the
     /// `OpenAiCompatConfig::user_agent` doc for why a local const won't do.
     pub user_agent: Option<String>,
+    pub headers: atomcode_config::provider_headers::ProviderHeaders,
     /// Disable TLS certificate verification (self-signed / internal gateways).
     /// Mirrors core's `ProviderConfig::skip_tls_verify`. Default false.
     pub skip_tls_verify: bool,
@@ -118,6 +119,7 @@ impl AnthropicConfig {
             connect_timeout: Duration::from_secs(30),
             retry: RetryPolicy::default(),
             user_agent: None,
+            headers: Default::default(),
             skip_tls_verify: false,
             effort_levels: Vec::new(),
             wire_dump_dir: None,
@@ -137,14 +139,19 @@ pub struct AnthropicProvider {
 
 impl AnthropicProvider {
     pub fn new(cfg: AnthropicConfig) -> Result<Self, ProviderError> {
+        let custom_headers = !cfg.headers.is_empty();
         let connect_timeout = cfg.connect_timeout;
         let user_agent = cfg.user_agent.clone();
         let skip_tls_verify = cfg.skip_tls_verify;
-        let client = std::sync::Arc::new(super::openai_compat::SwappableClient::new(
-            false,
-            move |_| {
+        let client = std::sync::Arc::new(
+            super::openai_compat::SwappableClient::new(false, move |_| {
                 let mut builder =
                     crate::proxy::apply_async_proxy_policy(reqwest::Client::builder())
+                        .redirect(if custom_headers {
+                            reqwest::redirect::Policy::none()
+                        } else {
+                            reqwest::redirect::Policy::default()
+                        })
                         .connect_timeout(connect_timeout)
                         // Reap idle keep-alives before the server does (see POOL_IDLE_TIMEOUT).
                         .pool_idle_timeout(retry::POOL_IDLE_TIMEOUT)
@@ -158,8 +165,9 @@ impl AnthropicProvider {
                     message: format!("http client build failed: {e}"),
                     ..Default::default()
                 })
-            },
-        )?);
+            })?
+            .with_headers(cfg.headers.clone()),
+        );
         let url = format!("{}/v1/messages", cfg.base_url.trim_end_matches('/'));
         Ok(Self {
             cfg,
@@ -356,7 +364,11 @@ impl LlmProvider for AnthropicProvider {
             }
         };
 
-        Ok(s.boxed())
+        let headers = self.cfg.headers.clone();
+        Ok(
+            s.map(move |event| super::redact_header_error(event, &headers))
+                .boxed(),
+        )
     }
 }
 
@@ -426,10 +438,13 @@ async fn open_stream_attempts(
         let http = client.get();
         let mut req = http
             .post(url)
-            .header("x-api-key", api_key)
             .header("anthropic-version", anthropic_version)
             .json(body);
+        if !api_key.is_empty() {
+            req = req.header("x-api-key", api_key);
+        }
         req = with_session_headers(req, url, session_id);
+        req = super::apply_account_headers(req, &client.headers)?;
         // TTFB watchdog for THIS attempt (mirrors openai_compat): bounds only the
         // silent-gateway wait, never a slow streaming body.
         let send = match tokio::time::timeout(open_timeout, req.send()).await {
@@ -492,7 +507,9 @@ async fn open_stream_attempts(
                     // authoritative rate-limit countdown for the self-heal (vs scraping text).
                     let retry_after_secs =
                         retry::parse_retry_after(resp.headers()).map(|d| d.as_secs());
-                    let text = resp.text().await.unwrap_or_default();
+                    let text = client
+                        .headers
+                        .redact(&resp.text().await.unwrap_or_default());
                     let envelope = serde_json::from_str::<serde_json::Value>(&text).ok();
                     let err_obj = envelope.as_ref().and_then(|v| v.get("error"));
                     let detail = err_obj

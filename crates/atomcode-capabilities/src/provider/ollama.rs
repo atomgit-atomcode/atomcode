@@ -79,6 +79,7 @@ pub struct OllamaConfig {
     /// User-Agent sent on every request. `None` ⇒ [`super::DEFAULT_USER_AGENT`]; the
     /// driver injects `atomcode/<version>` for gateway attribution.
     pub user_agent: Option<String>,
+    pub headers: atomcode_config::provider_headers::ProviderHeaders,
     /// Disable TLS certificate verification (self-signed / internal gateways).
     /// Mirrors core's `ProviderConfig::skip_tls_verify`. Default false.
     pub skip_tls_verify: bool,
@@ -108,6 +109,7 @@ impl OllamaConfig {
             connect_timeout: Duration::from_secs(30),
             retry: RetryPolicy::default(),
             user_agent: None,
+            headers: Default::default(),
             skip_tls_verify: false,
             effort_levels: Vec::new(),
             wire_dump_dir: None,
@@ -128,6 +130,11 @@ pub struct OllamaProvider {
 impl OllamaProvider {
     pub fn new(cfg: OllamaConfig) -> Result<Self, ProviderError> {
         let mut builder = crate::proxy::apply_async_proxy_policy(reqwest::Client::builder())
+            .redirect(if !cfg.headers.is_empty() {
+                reqwest::redirect::Policy::none()
+            } else {
+                reqwest::redirect::Policy::default()
+            })
             .connect_timeout(cfg.connect_timeout)
             // Reap idle keep-alives before the server does (see POOL_IDLE_TIMEOUT).
             .pool_idle_timeout(retry::POOL_IDLE_TIMEOUT)
@@ -193,6 +200,7 @@ impl LlmProvider for OllamaProvider {
         let client = self.client.clone();
         let url = self.url.clone();
         let api_key = self.cfg.api_key.clone();
+        let headers = self.cfg.headers.clone();
         // Snapshot the session id once; reused across the open and any mid-stream reopen.
         let session_id = self.session_id.get().cloned().unwrap_or_default();
         let idle = self.cfg.idle_timeout;
@@ -203,6 +211,7 @@ impl LlmProvider for OllamaProvider {
             &url,
             &body,
             &api_key,
+            &headers,
             &session_id,
             &policy,
             rate_limit_retry_owner,
@@ -263,7 +272,7 @@ impl LlmProvider for OllamaProvider {
                                 // Brief, esc-interruptible backoff before reopening so an
                                 // immediate retry does not slam a gateway resetting under load.
                                 tokio::time::sleep(retry::compute_backoff(stream_attempt, &policy)).await;
-                                if let Ok(fresh) = open_stream(&client, &url, &body, &api_key, &session_id, &policy, rate_limit_retry_owner).await {
+                                if let Ok(fresh) = open_stream(&client, &url, &body, &api_key, &headers, &session_id, &policy, rate_limit_retry_owner).await {
                                     stream_attempt += 1;
                                     resp = fresh;
                                     continue 'reopen;
@@ -312,7 +321,11 @@ impl LlmProvider for OllamaProvider {
             }
         };
 
-        Ok(s.boxed())
+        let headers = self.cfg.headers.clone();
+        Ok(
+            s.map(move |event| super::redact_header_error(event, &headers))
+                .boxed(),
+        )
     }
 }
 
@@ -323,6 +336,7 @@ async fn open_stream(
     url: &str,
     body: &Value,
     api_key: &str,
+    headers: &atomcode_config::provider_headers::ProviderHeaders,
     session_id: &str,
     policy: &RetryPolicy,
     rate_limit_retry_owner: atomcode_kernel::provider::RateLimitRetryOwner,
@@ -337,6 +351,7 @@ async fn open_stream(
         if !session_id.is_empty() {
             req = req.header("x-atomcode-session-id", session_id);
         }
+        req = super::apply_account_headers(req, headers)?;
         match req.send().await {
             Ok(resp) => {
                 let code = resp.status().as_u16();
@@ -354,7 +369,7 @@ async fn open_stream(
                     // authoritative rate-limit countdown for the self-heal (vs scraping text).
                     let retry_after_secs =
                         retry::parse_retry_after(resp.headers()).map(|d| d.as_secs());
-                    let text = resp.text().await.unwrap_or_default();
+                    let text = headers.redact(&resp.text().await.unwrap_or_default());
                     // Ollama errors are `{"error":"..."}` (a STRING).
                     let detail = serde_json::from_str::<Value>(&text)
                         .ok()

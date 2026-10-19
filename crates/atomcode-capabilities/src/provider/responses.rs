@@ -60,17 +60,19 @@ impl ResponsesProvider {
         let user_agent = cfg.user_agent.clone();
         let url = format!("{}/responses", cfg.base_url.trim_end_matches('/'));
         let initial_tls12 = atomcode_config::tls::should_cap_url(&url);
-        let client = std::sync::Arc::new(super::openai_compat::SwappableClient::new(
-            initial_tls12,
-            move |tls12| {
-                super::openai_compat::build_http_client(
+        let custom_headers = !cfg.headers.is_empty();
+        let client = std::sync::Arc::new(
+            super::openai_compat::SwappableClient::new(initial_tls12, move |tls12| {
+                super::openai_compat::build_account_http_client(
                     connect_timeout,
                     skip_tls_verify,
                     user_agent.clone(),
                     tls12,
+                    custom_headers,
                 )
-            },
-        )?);
+            })?
+            .with_headers(cfg.headers.clone()),
+        );
         Ok(Self {
             cfg,
             client,
@@ -887,7 +889,11 @@ impl LlmProvider for ResponsesProvider {
             }
         };
 
-        Ok(s.boxed())
+        let headers = self.cfg.headers.clone();
+        Ok(
+            s.map(move |event| super::redact_header_error(event, &headers))
+                .boxed(),
+        )
     }
 }
 

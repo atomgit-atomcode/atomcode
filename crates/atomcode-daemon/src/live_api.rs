@@ -340,6 +340,7 @@ pub(crate) fn chat_runtime_config(
         ),
         permission_rules: std::sync::Arc::new(permission_rules),
         user_agent: p.and_then(|p| p.user_agent.clone()),
+        headers: p.map(|p| p.headers.clone()).unwrap_or_default(),
         skip_tls_verify: p.map(|p| p.skip_tls_verify).unwrap_or(false),
         retry_max_attempts: p.and_then(|p| p.retry_max_attempts),
         upstream_retry_max_attempts: config.network.upstream_retry_max_attempts,

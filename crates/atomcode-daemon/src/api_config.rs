@@ -101,6 +101,7 @@ pub(crate) fn config_response(config: &Config) -> ConfigResponse {
                         discoverable: crate::api_provider::discovery_protocol(wire).is_some(),
                         probeable: wire == "openai",
                         id: id.clone(),
+                        header_names: account.headers.names(),
                         provider: account.provider,
                         display_name: account.display_name,
                         provider_type: preset.provider_type.wire().to_string(),
@@ -299,6 +300,7 @@ mod tests {
 
     fn provider(base_url: &str) -> ProviderConfig {
         ProviderConfig {
+            headers: Default::default(),
             provider_type: "openai".into(),
             api_key: None,
             model: "model".into(),
@@ -375,7 +377,8 @@ mod tests {
                 "taotoken": {
                     "provider": "openai",
                     "base_url": "https://taotoken.net/api/v1",
-                    "api_key": "must-not-leave-daemon"
+                    "api_key": "must-not-leave-daemon",
+                    "headers": { "X-Custom-Auth": "header-must-not-leave-daemon" }
                 }
             },
             "models": {
@@ -391,6 +394,7 @@ mod tests {
             .find(|account| account.id == "taotoken")
             .unwrap();
         assert!(account.has_api_key);
+        assert_eq!(account.header_names, ["x-custom-auth"]);
         assert_eq!(account.model_ids, ["taotoken/model-a"]);
         let json = serde_json::to_string(&response).unwrap();
         assert!(!json.contains("must-not-leave-daemon"));

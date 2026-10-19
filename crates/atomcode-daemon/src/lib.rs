@@ -200,6 +200,8 @@ pub(crate) struct ProviderAccountInfo {
     pub provider_type: String,
     pub base_url: Option<String>,
     pub has_api_key: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub header_names: Vec<String>,
     pub model_ids: Vec<String>,
     pub legacy: bool,
     pub managed: bool,
@@ -8399,6 +8401,7 @@ mod tests {
         base_url: String,
     ) -> atomcode_config::config::provider::ProviderConfig {
         atomcode_config::config::provider::ProviderConfig {
+            headers: Default::default(),
             provider_type: "openai".into(),
             api_key: Some("test-key".into()),
             model: model.into(),

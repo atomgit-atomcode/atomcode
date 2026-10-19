@@ -226,6 +226,7 @@ pub struct OpenAiCompatConfig {
     /// slicing). This crate is versioned independently of the product, so the real version
     /// MUST be injected here rather than read from a local `CARGO_PKG_VERSION`.
     pub user_agent: Option<String>,
+    pub headers: atomcode_config::provider_headers::ProviderHeaders,
     /// Disable TLS certificate verification (self-signed / internal gateways).
     /// Mirrors core's `ProviderConfig::skip_tls_verify`. Default false.
     pub skip_tls_verify: bool,
@@ -313,6 +314,7 @@ impl OpenAiCompatConfig {
             retry: RetryPolicy::default(),
             request_signer: None,
             user_agent: None,
+            headers: Default::default(),
             skip_tls_verify: false,
             supports_vision,
             effort_levels: Vec::new(),
@@ -367,9 +369,19 @@ impl OpenAiCompatProvider {
         let user_agent = cfg.user_agent.clone();
         let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
         let initial_tls12 = atomcode_config::tls::should_cap_url(&url);
-        let client = std::sync::Arc::new(SwappableClient::new(initial_tls12, move |tls12| {
-            build_http_client(connect_timeout, skip_tls_verify, user_agent.clone(), tls12)
-        })?);
+        let custom_headers = !cfg.headers.is_empty();
+        let client = std::sync::Arc::new(
+            SwappableClient::new(initial_tls12, move |tls12| {
+                build_account_http_client(
+                    connect_timeout,
+                    skip_tls_verify,
+                    user_agent.clone(),
+                    tls12,
+                    custom_headers,
+                )
+            })?
+            .with_headers(cfg.headers.clone()),
+        );
         Ok(Self {
             cfg,
             policy,
@@ -386,11 +398,28 @@ impl OpenAiCompatProvider {
 /// Extracted so [`SwappableClient`] can rebuild an identical client with an EMPTY
 /// connection pool when a pooled connection goes stale. `pub(crate)`: the
 /// Responses-API adapter reuses the identical client policy.
+#[cfg(test)]
 pub(crate) fn build_http_client(
     connect_timeout: std::time::Duration,
     skip_tls_verify: bool,
     user_agent: Option<String>,
     force_tls12: bool,
+) -> Result<reqwest::Client, ProviderError> {
+    build_account_http_client(
+        connect_timeout,
+        skip_tls_verify,
+        user_agent,
+        force_tls12,
+        false,
+    )
+}
+
+pub(crate) fn build_account_http_client(
+    connect_timeout: std::time::Duration,
+    skip_tls_verify: bool,
+    user_agent: Option<String>,
+    force_tls12: bool,
+    custom_headers: bool,
 ) -> Result<reqwest::Client, ProviderError> {
     // First attempt: webpki base + OS native store + SSL_CERT_FILE (add_trusted_roots).
     match build_http_client_inner(
@@ -399,6 +428,7 @@ pub(crate) fn build_http_client(
         user_agent.clone(),
         force_tls12,
         true,
+        custom_headers,
     ) {
         Ok(client) => Ok(client),
         Err(first) => {
@@ -420,6 +450,7 @@ pub(crate) fn build_http_client(
                 user_agent,
                 force_tls12,
                 false,
+                custom_headers,
             )
         }
     }
@@ -434,8 +465,14 @@ fn build_http_client_inner(
     user_agent: Option<String>,
     force_tls12: bool,
     trust_os_roots: bool,
+    custom_headers: bool,
 ) -> Result<reqwest::Client, ProviderError> {
     let mut builder = crate::proxy::apply_async_proxy_policy(reqwest::Client::builder())
+        .redirect(if custom_headers {
+            reqwest::redirect::Policy::none()
+        } else {
+            reqwest::redirect::Policy::default()
+        })
         .connect_timeout(connect_timeout)
         // Drop idle keep-alive connections before the gateway LB does, so
         // we don't reuse a server-closed socket (the "error sending
@@ -549,18 +586,28 @@ pub(crate) fn add_trusted_roots(mut builder: reqwest::ClientBuilder) -> reqwest:
 /// once a keep-alive connection is silently half-closed, only a fresh pool recovers,
 /// because every reuse of the old pool re-hands-out the dead socket.
 pub(crate) struct SwappableClient {
+    pub(crate) headers: atomcode_config::provider_headers::ProviderHeaders,
     current: std::sync::RwLock<reqwest::Client>,
     #[allow(clippy::type_complexity)]
     build: Box<dyn Fn(bool) -> Result<reqwest::Client, ProviderError> + Send + Sync>,
 }
 
 impl SwappableClient {
+    pub(crate) fn with_headers(
+        mut self,
+        headers: atomcode_config::provider_headers::ProviderHeaders,
+    ) -> Self {
+        self.headers = headers;
+        self
+    }
+
     pub(crate) fn new(
         force_tls12: bool,
         build: impl Fn(bool) -> Result<reqwest::Client, ProviderError> + Send + Sync + 'static,
     ) -> Result<Self, ProviderError> {
         let initial = build(force_tls12)?;
         Ok(Self {
+            headers: Default::default(),
             current: std::sync::RwLock::new(initial),
             build: Box::new(build),
         })
@@ -1069,7 +1116,9 @@ async fn open_stream_attempts(
                 Some(auth)
             }
             None => {
-                req = req.bearer_auth(api_key);
+                if !api_key.is_empty() {
+                    req = req.bearer_auth(api_key);
+                }
                 None
             }
         };
@@ -1081,6 +1130,9 @@ async fn open_stream_attempts(
         // OpenCode Zen requires its own `x-opencode-session` (same stable id); host-gated.
         req = apply_opencode_session(url, req, session_id);
         req = apply_openrouter_attribution(url, req);
+        if signer.is_none() {
+            req = super::apply_account_headers(req, &client.headers)?;
+        }
         let was_capped = tls12_probe || atomcode_config::tls::should_cap_url(url);
         // TTFB watchdog for THIS attempt. `send()` resolves as soon as the response
         // HEAD arrives, so wrapping it never truncates a slow streaming body — it only
@@ -1192,7 +1244,9 @@ async fn open_stream_attempts(
                     // authoritative rate-limit countdown for the self-heal (vs scraping text).
                     let retry_after_secs =
                         retry::parse_retry_after(resp.headers()).map(|d| d.as_secs());
-                    let text = resp.text().await.unwrap_or_default();
+                    let text = client
+                        .headers
+                        .redact(&resp.text().await.unwrap_or_default());
                     // Standard multi-shape extraction (detail / error / top-level message)
                     // so a clean human message surfaces for EVERY vendor — not just the
                     // OpenAI `error` object. GLM returns top-level `{"code","message"}`.

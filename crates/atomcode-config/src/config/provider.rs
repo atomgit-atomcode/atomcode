@@ -18,6 +18,11 @@ pub struct ProviderConfig {
     /// Defaults to `atomcode/<version>` if not set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_agent: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::provider_headers::ProviderHeaders::is_empty"
+    )]
+    pub headers: crate::provider_headers::ProviderHeaders,
     /// Maximum tokens to use for context (system prompt + messages).
     /// The windowing algorithm fits messages within this budget,
     /// condensing old tool results to save space.
@@ -117,6 +122,11 @@ pub struct ProviderAccountConfig {
     pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_agent: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::provider_headers::ProviderHeaders::is_empty"
+    )]
+    pub headers: crate::provider_headers::ProviderHeaders,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub skip_tls_verify: bool,
     /// Enterprise/self-hosted control-plane URL for OAuth-style providers
@@ -247,6 +257,7 @@ pub struct ResolvedModelConfig {
     pub max_tokens: Option<usize>,
     pub system_prompt: Option<String>,
     pub user_agent: Option<String>,
+    pub headers: crate::provider_headers::ProviderHeaders,
     pub skip_tls_verify: bool,
     pub thinking_type: Option<String>,
     pub thinking_keep: Option<String>,
@@ -293,6 +304,7 @@ impl ResolvedModelConfig {
             system_prompt: self.system_prompt.clone(),
             supports_vision: Some(self.supports_vision),
             user_agent: self.user_agent.clone(),
+            headers: self.headers.clone(),
             context_window: self.context_window,
             max_tokens: self.max_tokens,
             thinking_type: self.thinking_type.clone(),
@@ -603,6 +615,7 @@ mod tests {
             system_prompt: None,
             supports_vision: None,
             user_agent: None,
+            headers: Default::default(),
             context_window: 128000,
             max_tokens: None,
             thinking_type: None,
@@ -634,6 +647,7 @@ mod tests {
             system_prompt: None,
             supports_vision: None,
             user_agent: None,
+            headers: Default::default(),
             context_window: 128000,
             max_tokens: None,
             thinking_type: None,
@@ -713,6 +727,7 @@ mod tests {
             system_prompt: None,
             supports_vision: None,
             user_agent: None,
+            headers: Default::default(),
             context_window: 128000,
             max_tokens: None,
             thinking_type: None,
@@ -743,6 +758,7 @@ mod tests {
             system_prompt: None,
             supports_vision: None,
             user_agent: None,
+            headers: Default::default(),
             context_window: 128000,
             max_tokens: None,
             thinking_type: None,
@@ -773,6 +789,7 @@ mod tests {
             system_prompt: None,
             supports_vision: None,
             user_agent: None,
+            headers: Default::default(),
             context_window: 128000,
             max_tokens: None,
             thinking_type: None,

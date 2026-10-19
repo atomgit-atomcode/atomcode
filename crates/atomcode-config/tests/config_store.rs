@@ -4,6 +4,7 @@ use atomcode_config::{Config, ConfigStore, ProviderConfig};
 
 fn provider(model: &str) -> ProviderConfig {
     ProviderConfig {
+        headers: Default::default(),
         provider_type: "openai".into(),
         api_key: None,
         model: model.into(),

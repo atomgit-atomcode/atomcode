@@ -333,6 +333,7 @@ pub(crate) struct DiscoverModelsRequest {
     pub base_url: String,
     pub api_key: Option<String>,
     pub provider_name: Option<String>,
+    pub headers: Option<atomcode_config::provider_headers::ProviderHeaders>,
 }
 
 #[derive(Debug, Serialize)]
@@ -394,6 +395,7 @@ fn stored_discovery_transport(
         return Some(DiscoveryTransport {
             api_key: provider.resolved_api_key(),
             user_agent: provider.user_agent,
+            headers: provider.headers.clone(),
             skip_tls_verify: provider.skip_tls_verify,
         });
     }
@@ -415,6 +417,7 @@ fn stored_discovery_transport(
     Some(DiscoveryTransport {
         api_key: account.api_key.filter(|key| !key.trim().is_empty()),
         user_agent: account.user_agent,
+        headers: account.headers.clone(),
         skip_tls_verify: account.skip_tls_verify,
     })
 }
@@ -582,6 +585,9 @@ pub(crate) async fn discover_models(Json(req): Json<DiscoverModelsRequest>) -> i
         transport.api_key = Some(api_key);
     }
 
+    if let Some(headers) = req.headers {
+        transport.headers = headers;
+    }
     let body = match fetch_discovery_body(url, protocol, &transport, DISCOVERY_TIMEOUT).await {
         Ok(body) => body,
         Err(DiscoveryRequestError::Timeout) => {
@@ -756,6 +762,7 @@ pub(crate) async fn create_provider(Json(req): Json<CreateProviderRequest>) -> i
         .unwrap_or_else(|| default_context_window_for(&req.provider_type));
 
     let provider = ProviderConfig {
+        headers: Default::default(),
         provider_type: req.provider_type,
         api_key: req.api_key,
         model: req.model,
@@ -1785,6 +1792,7 @@ mod tests {
             url,
             "openai",
             &DiscoveryTransport {
+                headers: Default::default(),
                 api_key: Some("secret-value".into()),
                 user_agent: Some("AtomCode-Test/1".into()),
                 skip_tls_verify: false,

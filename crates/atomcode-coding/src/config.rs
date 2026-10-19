@@ -194,6 +194,7 @@ pub struct CodingAgentConfig {
     /// can attribute/slice traffic by version. Restores parity with v1's
     /// `build_http_client`, which the v2 adapters had dropped.
     pub user_agent: Option<String>,
+    pub headers: atomcode_config::provider_headers::ProviderHeaders,
     /// Disable TLS certificate verification (self-signed / internal gateways).
     /// Sourced from `ProviderConfig::skip_tls_verify`; default false.
     pub skip_tls_verify: bool,
@@ -297,6 +298,7 @@ pub struct CodingRuntimeConfig {
     /// Parsed `[permissions]` allow/deny rules (see `CodingAgentConfig::permission_rules`).
     pub permission_rules: std::sync::Arc<atomcode_capabilities::tools::PermissionRules>,
     pub user_agent: Option<String>,
+    pub headers: atomcode_config::provider_headers::ProviderHeaders,
     pub skip_tls_verify: bool,
     /// Max attempts (including the first request) for provider OPEN retries;
     /// when set, also caps kernel-owned HTTP 429 recovery. `None` preserves
@@ -400,7 +402,8 @@ pub fn describe_config_file_for(
          - Model: `default_model` names a `[models.<id>]` entry (`account`, `model`, and \
          optional `context_window`, `max_tokens`, `supports_vision`, `reasoning_effort`, \
          `capable_model`, `note`) whose `account` is a `[provider_accounts.<id>]` entry \
-         (`provider`, `api_key`, `base_url`). The legacy form is `default_provider` naming \
+         (`provider`, `api_key`, `base_url`, optional `headers` map). Headers can authenticate \
+         with an empty API key; custom names override defaults. Header values are secrets. The legacy form is `default_provider` naming \
          a `[providers.<name>]` entry (`type`, `model`, `api_key`, `base_url`, …); \
          `default_model` wins. An `api_key` may be written `${{VAR}}`. `capable_model` \
          ranks models for `task` and `team`: the lowest rank is the fast tier, the \
@@ -558,6 +561,7 @@ impl CodingRuntimeConfig {
             ),
             permission_rules: std::sync::Arc::new(permission_rules),
             user_agent: r.and_then(|r| r.user_agent.clone()),
+            headers: r.map(|r| r.headers.clone()).unwrap_or_default(),
             skip_tls_verify: r.map(|r| r.skip_tls_verify).unwrap_or(false),
             retry_max_attempts: r.and_then(|r| r.retry_max_attempts),
             upstream_retry_max_attempts: config.network.upstream_retry_max_attempts,
@@ -620,6 +624,7 @@ impl CodingRuntimeConfig {
         config.thinking_type = self.thinking_type.clone();
         config.thinking_keep = self.thinking_keep.clone();
         config.user_agent = self.user_agent.clone();
+        config.headers = self.headers.clone();
         config.skip_tls_verify = self.skip_tls_verify;
         config.retry_max_attempts = self.retry_max_attempts;
         config.upstream_retry_max_attempts = self.upstream_retry_max_attempts;
@@ -687,6 +692,7 @@ pub fn apply_provider_config(
     config.thinking_type = provider.thinking_type.clone();
     config.thinking_keep = provider.thinking_keep.clone();
     config.user_agent = provider.user_agent.clone();
+    config.headers = provider.headers.clone();
     config.skip_tls_verify = provider.skip_tls_verify;
     config.retry_max_attempts = provider.retry_max_attempts;
 }
@@ -1117,6 +1123,7 @@ impl CodingAgentConfig {
             credential_shell_policy: Default::default(),
             permission_rules: Default::default(),
             user_agent: None,
+            headers: Default::default(),
             skip_tls_verify: false,
             retry_max_attempts: None,
             upstream_retry_max_attempts: None,

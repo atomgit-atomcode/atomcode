@@ -55,6 +55,7 @@ pub(crate) struct CreateAccountRequest {
     pub display_name: Option<String>,
     pub base_url: Option<String>,
     pub api_key: Option<String>,
+    pub headers: Option<atomcode_config::provider_headers::HeaderChanges>,
     pub models: Vec<NewModelRequest>,
     /// Make the first model the one new sessions start on.
     #[serde(default)]
@@ -70,6 +71,7 @@ pub(crate) struct EditAccountRequest {
     pub base_url: Option<String>,
     /// Empty keeps the stored key.
     pub api_key: Option<String>,
+    pub headers: Option<atomcode_config::provider_headers::HeaderChanges>,
     /// A preset or protocol id. Left out, the account speaks what it spoke.
     pub provider: Option<String>,
 }
@@ -389,6 +391,7 @@ pub(crate) async fn create_account(Json(mut req): Json<CreateAccountRequest>) ->
             display_name: req.display_name.as_deref(),
             endpoint: req.base_url.as_deref().unwrap_or_default(),
             key: req.api_key.as_deref(),
+            headers: req.headers.as_ref(),
             exact_id,
         },
         &models,
@@ -440,6 +443,7 @@ pub(crate) async fn edit_account(
             protocol: &protocol,
             endpoint: &endpoint,
             key: req.api_key.as_deref(),
+            headers: req.headers.as_ref(),
             display_name,
         },
     ) {
@@ -671,6 +675,7 @@ fn probe_target(
                     api_key: resolved.api_key.clone(),
                     model: Some(resolved.model.clone()),
                     user_agent: resolved.user_agent.clone(),
+                    headers: resolved.headers.clone(),
                     skip_tls_verify: resolved.skip_tls_verify,
                 },
             ))
@@ -684,6 +689,7 @@ fn probe_target(
                     api_key: endpoint.api_key.clone(),
                     model: None,
                     user_agent: endpoint.user_agent.clone(),
+                    headers: endpoint.headers.clone(),
                     skip_tls_verify: endpoint.skip_tls_verify,
                 },
             ))
@@ -790,6 +796,7 @@ mod tests {
             .json(&serde_json::json!({
                 "provider": "deepseek",
                 "api_key": "sk-ds",
+                "headers": { "X-Custom-Auth": "account-header-secret", "Version": "v1" },
                 "set_default": true,
                 "models": [
                     { "model": "deepseek-v4-flash", "display_name": "Flash", "context_window": 1000000,
@@ -803,9 +810,14 @@ mod tests {
         assert_eq!(created.status(), StatusCode::CREATED);
         let body: serde_json::Value = created.json().await.unwrap();
         assert_eq!(body["account"], "deepseek");
+        assert!(!body.to_string().contains("account-header-secret"));
         assert!(body["config"]["provider_accounts"].is_array());
         let after = config();
         assert_eq!(after.provider_accounts["deepseek"].provider, "deepseek");
+        assert_eq!(
+            after.provider_accounts["deepseek"].headers.names(),
+            vec!["version", "x-custom-auth"]
+        );
         assert_eq!(
             after.default_model.as_deref(),
             Some("deepseek/deepseek-v4-flash")
@@ -816,6 +828,33 @@ mod tests {
             flash.reasoning_effort_levels.as_ref().map(Vec::len),
             Some(2)
         );
+
+        // Header-only authentication can be saved without inventing an API key.
+        let header_only = http.post(format!("{base}/provider-accounts"))
+            .json(&serde_json::json!({ "id":"header-only", "provider":"openai-compatible", "base_url":"https://gateway.example/v1", "headers":{"X-Token":"header-only-secret"}, "models":[{"model":"test"}] }))
+            .send().await.unwrap();
+        assert_eq!(header_only.status(), StatusCode::CREATED);
+        assert!(!header_only
+            .text()
+            .await
+            .unwrap()
+            .contains("header-only-secret"));
+        let reloaded = config();
+        assert!(reloaded.provider_accounts["header-only"].api_key.is_none());
+        assert_eq!(
+            reloaded
+                .resolve_model(Some("header-only/test"))
+                .unwrap()
+                .headers
+                .names(),
+            vec!["x-token"]
+        );
+        let removed = http
+            .delete(format!("{base}/provider-accounts/header-only"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(removed.status(), StatusCode::OK);
 
         // A custom protocol needs an id, and a taken one is a conflict.
         let no_id = http
@@ -844,7 +883,7 @@ mod tests {
 
         let renamed = http
             .patch(format!("{base}/provider-accounts/deepseek"))
-            .json(&serde_json::json!({ "display_name": "公司账号" }))
+            .json(&serde_json::json!({ "display_name": "公司账号", "headers": { "x-custom-auth": null } }))
             .send()
             .await
             .unwrap();
@@ -854,6 +893,26 @@ mod tests {
         assert_eq!(account.display_name.as_deref(), Some("公司账号"));
         assert_eq!(account.api_key.as_deref(), Some("sk-ds"), "kept");
         assert_eq!(account.base_url, None, "not pinned");
+        assert_eq!(
+            account.headers.iter().collect::<Vec<_>>(),
+            vec![("x-custom-auth", "account-header-secret")]
+        );
+        let invalid = http
+            .patch(format!("{base}/provider-accounts/deepseek"))
+            .json(&serde_json::json!({ "headers": { "X-Bad": "private\r\ninjection" } }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(!invalid.text().await.unwrap().contains("private"));
+        let cleared = http
+            .patch(format!("{base}/provider-accounts/deepseek"))
+            .json(&serde_json::json!({ "headers": {} }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cleared.status(), StatusCode::OK);
+        assert!(config().provider_accounts["deepseek"].headers.is_empty());
 
         let added = http
             .post(format!("{base}/provider-accounts/deepseek/models"))

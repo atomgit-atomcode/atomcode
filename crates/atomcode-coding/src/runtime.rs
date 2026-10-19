@@ -9549,6 +9549,7 @@ fn build_goal_evaluator_provider(
                 evaluator.reasoning_history = resolved.reasoning_history.clone();
                 evaluator.thinking_enabled = resolved.thinking_enabled;
                 evaluator.user_agent = resolved.user_agent.clone();
+                evaluator.headers = resolved.headers.clone();
                 evaluator.skip_tls_verify = resolved.skip_tls_verify;
                 evaluator.subagent_fast_provider = None;
                 evaluator.subagent_capable_provider = None;
@@ -12626,6 +12627,7 @@ mod tests {
 
     fn tier_provider(model: &str, rank: i64) -> atomcode_config::config::provider::ProviderConfig {
         atomcode_config::config::provider::ProviderConfig {
+            headers: Default::default(),
             provider_type: "openai".into(),
             api_key: Some("key".into()),
             model: model.into(),

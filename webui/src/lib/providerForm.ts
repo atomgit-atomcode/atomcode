@@ -108,6 +108,7 @@ export function emptyModelDraft(model = ''): ModelDraft {
 
 /** The add form, in either mode. */
 export interface ProviderDraft {
+  headers?: import("./providerHeaders").HeaderRow[];
   mode: 'preset' | 'custom';
   /** Preset id (preset mode) or protocol id (custom mode). */
   provider: string;
