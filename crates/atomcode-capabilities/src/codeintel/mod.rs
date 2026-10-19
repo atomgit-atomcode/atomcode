@@ -110,6 +110,8 @@ pub struct LspServerSetting {
 /// binaries; `auto_detect` only enables the built-in mapping to locally installed ones.
 #[derive(Debug, Clone)]
 pub struct LspSettings {
+    /// Host-provided, opt-in discovery directory; contains private per-window files.
+    pub ide_discovery_dir: Option<PathBuf>,
     /// Explicit window binding; only a path, never bridge credentials.
     pub ide_connection_file: Option<PathBuf>,
     pub enabled: bool,
@@ -121,6 +123,7 @@ pub struct LspSettings {
 impl Default for LspSettings {
     fn default() -> Self {
         Self {
+            ide_discovery_dir: None,
             ide_connection_file: None,
             enabled: false,
             auto_detect: false,
@@ -134,7 +137,10 @@ impl Default for LspSettings {
 /// it. Returns whether registration occurred so callers only mount an existing tool.
 #[cfg(feature = "lsp")]
 pub fn register_lsp_tool(reg: &mut ToolRegistry, settings: &LspSettings) -> bool {
-    if !settings.enabled && settings.ide_connection_file.is_none() {
+    if !settings.enabled
+        && settings.ide_connection_file.is_none()
+        && settings.ide_discovery_dir.is_none()
+    {
         return false;
     }
     let mut servers = if settings.auto_detect {
@@ -153,10 +159,11 @@ pub fn register_lsp_tool(reg: &mut ToolRegistry, settings: &LspSettings) -> bool
         );
     }
     let manager = LspManager::with_registry_and_delay(servers, settings.settle_delay_ms);
-    reg.register(Arc::new(LspTool::new(Arc::new(manager)).with_ide_binding(
-        settings.ide_connection_file.clone(),
-        settings.enabled,
-    )));
+    reg.register(Arc::new(
+        LspTool::new(Arc::new(manager))
+            .with_ide_discovery(settings.ide_discovery_dir.clone())
+            .with_ide_binding(settings.ide_connection_file.clone(), settings.enabled),
+    ));
     true
 }
 
@@ -234,7 +241,7 @@ mod ide_registration_tests {
         let mut settings = LspSettings::default();
         assert!(!register_lsp_tool(&mut registry, &settings));
         assert!(registry.mount(&["lsp"]).get("lsp").is_none());
-        settings.ide_connection_file = Some(PathBuf::from("/private/window.json"));
+        settings.ide_discovery_dir = Some(PathBuf::from("/private/windows"));
         assert!(register_lsp_tool(&mut registry, &settings));
         assert!(!settings.enabled);
         assert!(registry
@@ -242,6 +249,6 @@ mod ide_registration_tests {
             .get("lsp")
             .unwrap()
             .description()
-            .contains("bound IDE"));
+            .contains("configured IDE"));
     }
 }

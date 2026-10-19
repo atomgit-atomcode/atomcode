@@ -34,6 +34,11 @@ export async function startBridge(directory: string, roots: string[], host: Edit
       request.resume();
       return;
     }
+    if (request.method === 'POST' && request.url === '/status') {
+      reply(disposed ? 503 : 200, { status: disposed ? 'disconnected' : 'ready' });
+      request.resume();
+      return;
+    }
     if (request.method !== 'POST' || request.url !== '/query') {
       reply(404, { status: 'not_found' });
       request.resume();
@@ -104,6 +109,10 @@ export async function startBridge(directory: string, roots: string[], host: Edit
     const address = server.address();
     if (!address || typeof address === 'string') throw new Error('Bridge could not bind loopback.');
     await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+    const directoryMetadata = await fs.lstat(directory);
+    if (!directoryMetadata.isDirectory() || (process.platform !== 'win32' && (directoryMetadata.mode & 0o077) !== 0)) {
+      throw new Error('Bridge directory must be private and must not be a symlink.');
+    }
     connectionFile = path.join(directory, `${windowId}.json`);
     const output = await fs.open(connectionFile, 'wx', 0o600);
     createdFile = true;
@@ -126,6 +135,7 @@ export async function startBridge(directory: string, roots: string[], host: Edit
   });
   return {
     connectionFile,
+    windowId,
     get active() { return !disposed; },
     async dispose() {
       if (disposed) return;

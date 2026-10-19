@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as path from 'node:path';
 import { Document, EditorHost, Position, QueryError, QueryOperation } from './query';
 import { startBridge } from './server';
+import { atomcodeHome } from '../paths';
 
 const LIMIT = 200;
 function range(r: vscode.Range) {
@@ -76,16 +77,32 @@ export function registerLanguageBridge(context: vscode.ExtensionContext) {
   let bridge: Awaited<ReturnType<typeof startBridge>> | undefined;
   let starting: Promise<Awaited<ReturnType<typeof startBridge>>> | undefined;
   let epoch = 0;
+  let disposed = false;
+  const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 95);
+  statusBar.command = 'atomcode.languageBridgeStatus';
+  const updateStatus = () => {
+    if (disposed) return;
+    const enabled = bridge?.active;
+    statusBar.text = `$(plug) ${vscode.l10n.t(enabled ? 'IDE bridge: ready' : bridge ? 'IDE bridge: disconnected' : starting ? 'IDE bridge: starting' : 'IDE bridge: off')}`;
+    statusBar.tooltip = vscode.l10n.t('Show IDE language bridge status and connection options');
+    statusBar.show();
+  };
+  updateStatus();
+  const refreshStatus = setInterval(updateStatus, 5000);
+  refreshStatus.unref();
   const stop = async () => {
     epoch++;
     const pending = starting;
     starting = undefined;
     const current = bridge;
     bridge = undefined;
+    updateStatus();
     await current?.dispose();
     if (pending) await pending.then(value => value.dispose(), () => {});
   };
   context.subscriptions.push(
+    statusBar,
+    { dispose: () => clearInterval(refreshStatus) },
     vscode.commands.registerCommand('atomcode.enableLanguageBridge', async () => {
       let pending: typeof starting;
       try {
@@ -95,22 +112,45 @@ export function registerLanguageBridge(context: vscode.ExtensionContext) {
         if (bridge && !bridge.active) bridge = undefined;
         if (!bridge) {
           const generation = epoch;
-          if (!starting) starting = startBridge(path.join(context.globalStorageUri.fsPath, 'language-bridge'), roots.map(uri => uri.fsPath), new VscodeHost(), vscode.env.appName);
+          if (!starting) starting = startBridge(path.resolve(atomcodeHome(), 'ide-bridge'), roots.map(uri => uri.fsPath), new VscodeHost(), vscode.env.appName);
           pending = starting;
+          updateStatus();
           const value = await pending;
           if (generation !== epoch) { await value.dispose(); return; }
           bridge = value;
           if (starting === pending) starting = undefined;
         }
-        await vscode.env.clipboard.writeText(`[lsp]\nide_connection_file = ${JSON.stringify(bridge.connectionFile)}\n`);
+        updateStatus();
+        await vscode.env.clipboard.writeText(`[lsp]\nide_discovery_dir = ${JSON.stringify(path.dirname(bridge.connectionFile))}\n`);
         void vscode.window.showInformationMessage(vscode.l10n.t('IDE language bridge enabled. Connection configuration copied; merge it into your AtomCode config and reopen the session.'));
       } catch {
         if (starting === pending) starting = undefined;
-        void vscode.window.showErrorMessage(vscode.l10n.t('Could not enable the IDE language bridge. Open a trusted filesystem workspace and try again.'));
+        updateStatus();
+        void vscode.window.showErrorMessage(vscode.l10n.t('Could not enable the IDE language bridge. Check workspace trust, filesystem access and bridge directory permissions.'));
       }
     }),
     vscode.commands.registerCommand('atomcode.disableLanguageBridge', stop),
+    vscode.commands.registerCommand('atomcode.copyLanguageBridgeBinding', async () => {
+      if (!bridge?.active) {
+        void vscode.window.showInformationMessage(vscode.l10n.t('Enable the IDE language bridge in this window first.'));
+        return;
+      }
+      await vscode.env.clipboard.writeText(`[lsp]\nide_connection_file = ${JSON.stringify(bridge.connectionFile)}\n`);
+      void vscode.window.showInformationMessage(vscode.l10n.t('Current IDE window binding copied. It takes precedence over automatic discovery.'));
+    }),
+    vscode.commands.registerCommand('atomcode.languageBridgeStatus', async () => {
+      updateStatus();
+      const choices = [
+        { label: vscode.l10n.t('Enable bridge and copy discovery configuration'), command: 'atomcode.enableLanguageBridge' },
+        { label: vscode.l10n.t('Copy binding for this IDE window'), command: 'atomcode.copyLanguageBridgeBinding' },
+        { label: vscode.l10n.t('Disable bridge in this IDE window'), command: 'atomcode.disableLanguageBridge' },
+      ];
+      const selected = await vscode.window.showQuickPick(choices, { title: bridge?.active
+        ? vscode.l10n.t('IDE bridge ready · window {0}', bridge.windowId)
+        : vscode.l10n.t('IDE bridge is off. Enable it in a trusted workspace.') });
+      if (selected) await vscode.commands.executeCommand(selected.command);
+    }),
     vscode.workspace.onDidChangeWorkspaceFolders(() => { void stop(); }),
-    { dispose: () => { void stop(); } },
+    { dispose: () => { disposed = true; void stop(); } },
   );
 }

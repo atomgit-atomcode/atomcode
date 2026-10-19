@@ -345,7 +345,9 @@ max_members = 6         # 每个 lead 最多保留的成员数；空闲成员也
 # LSP（语言服务器协议）
 # =============================================================================
 [lsp]
-# Optional: bind one IDE window using the private path copied by the VS Code extension.
+# Optional: discover live IDE windows; copy this directory from the VS Code extension.
+# ide_discovery_dir = "/absolute/private/path/ide-bridge"
+# An explicit window binding takes precedence over discovery:
 # Does not enable local language-server processes. See docs/ide-language-bridge.md.
 # ide_connection_file = "/absolute/private/path/window-id.json"
 enabled = false

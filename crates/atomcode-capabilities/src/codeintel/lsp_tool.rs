@@ -19,6 +19,7 @@ const MAX_DOCUMENT_BYTES: usize = 4 * 1024 * 1024;
 pub struct LspTool {
     manager: Arc<LspManager>,
     ide_binding: Option<PathBuf>,
+    ide_discovery: Option<PathBuf>,
     local_enabled: bool,
 }
 
@@ -27,8 +28,16 @@ impl LspTool {
         Self {
             manager,
             ide_binding: None,
+            ide_discovery: None,
             local_enabled: true,
         }
+    }
+    pub fn with_ide_discovery(mut self, directory: Option<PathBuf>) -> Self {
+        self.ide_discovery = directory;
+        self
+    }
+    fn has_ide(&self) -> bool {
+        self.ide_binding.is_some() || self.ide_discovery.is_some()
     }
     pub fn with_ide_binding(mut self, path: Option<PathBuf>, local_enabled: bool) -> Self {
         self.ide_binding = path;
@@ -46,6 +55,7 @@ enum Operation {
     Diagnostics,
     DocumentSymbols,
     Inspect,
+    Status,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -60,7 +70,10 @@ enum Backend {
 #[derive(Debug, Deserialize, Serialize)]
 struct Args {
     operation: Operation,
+    #[serde(default)]
     file_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    window_id: Option<String>,
     #[serde(default)]
     backend: Backend,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -84,15 +97,15 @@ impl Tool for LspTool {
     }
 
     fn description(&self) -> &str {
-        if self.ide_binding.is_some() {
-            "Read-only semantic queries through the explicitly bound IDE window: hover, definition, references, diagnostics, document_symbols, or inspect (hover+definition+references in one request). Uses current editor buffers; positions are one-based UTF-16 columns, or line+symbol with occurrence for ambiguous matches. Reports document version/dirty state; diagnostics are editor snapshots, not build verification. Empty results do not prove lack of support. No writes. If unavailable, do not retry blindly; explicitly choose a configured local backend or text/AST tools (not semantic equivalents)."
+        if self.has_ide() {
+            "Read-only semantic queries through the configured IDE bridge: status (list live windows; select with window_id when ambiguous), hover, definition, references, diagnostics, document_symbols, or inspect (hover+definition+references in one request). Uses current editor buffers; positions are one-based UTF-16 columns, or line+symbol with occurrence for ambiguous matches. Reports document version/dirty state; diagnostics are editor snapshots, not build verification. Empty results do not prove lack of support. Explicit connection-file bindings take precedence over directory discovery. No writes. If unavailable, do not retry blindly; explicitly choose a configured local backend or text/AST tools (not semantic equivalents)."
         } else {
             "Query a locally installed Language Server for semantic definition, references, hover, or diagnostics. Starts the matching server lazily. Read-only; if unavailable, fall back to read_symbol/find_references/search instead of retrying."
         }
     }
 
     fn parameters_schema(&self) -> Value {
-        let operations = if self.ide_binding.is_some() {
+        let operations = if self.has_ide() {
             vec![
                 "definition",
                 "references",
@@ -100,6 +113,7 @@ impl Tool for LspTool {
                 "diagnostics",
                 "document_symbols",
                 "inspect",
+                "status",
             ]
         } else {
             vec!["definition", "references", "hover", "diagnostics"]
@@ -108,16 +122,17 @@ impl Tool for LspTool {
             "type": "object",
             "properties": {
                 "operation": { "type": "string", "enum": operations },
-                "backend": { "type": "string", "enum": ["auto", "ide", "local"], "description": "auto uses the explicitly bound IDE if configured; local requires lsp.enabled. No silent fallback." },
+                "backend": { "type": "string", "enum": ["auto", "ide", "local"], "description": "auto uses the configured IDE bridge; local requires lsp.enabled. No silent fallback." },
+                "window_id": { "type": "string", "description": "IDE window ID from status; required to disambiguate multiple live matches. Explicit binding still wins." },
                 "symbol": { "type": "string", "description": "IDE only: literal symbol on line instead of character. Uses the editor buffer." },
                 "occurrence": { "type": "integer", "minimum": 1, "description": "IDE only: one-based match number, required for ambiguous symbols." },
                 "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 120, "description": "IDE request deadline (default 20 seconds)." },
-                "file_path": { "type": "string", "description": "File path relative to the workspace or absolute within it" },
+                "file_path": { "type": "string", "description": "Required except for status: file path relative to the workspace or absolute within it" },
                 "line": { "type": "integer", "minimum": 1, "description": "One-based line for position queries; omit for diagnostics/document_symbols" },
                 "character": { "type": "integer", "minimum": 1, "description": "One-based character (UTF-16 for IDE); or use symbol in IDE mode" },
                 "severity": { "type": "string", "enum": ["error", "warning", "all"], "description": "Diagnostics filter (default: error)" }
             },
-            "required": ["operation", "file_path"]
+            "required": if self.has_ide() { vec!["operation"] } else { vec!["operation", "file_path"] }
         })
     }
 
@@ -126,15 +141,16 @@ impl Tool for LspTool {
             Ok(args) => args,
             Err(error) => return err(format!("lsp: invalid arguments: {error}")),
         };
-        if args.file_path.trim().is_empty() {
+        if !matches!(args.operation, Operation::Status) && args.file_path.trim().is_empty() {
             return err("lsp: file_path must not be empty");
         }
-        let use_ide = matches!(args.backend, Backend::Ide)
-            || (matches!(args.backend, Backend::Auto) && self.ide_binding.is_some());
+        if matches!(args.operation, Operation::Status) && matches!(args.backend, Backend::Local) {
+            return err("lsp: status inspects IDE connections; use backend ide or auto");
+        }
+        let use_ide = matches!(args.operation, Operation::Status)
+            || matches!(args.backend, Backend::Ide)
+            || (matches!(args.backend, Backend::Auto) && self.has_ide());
         if use_ide {
-            let Some(binding) = &self.ide_binding else {
-                return ok(json!({"source":"ide", "status":"unavailable", "message":"No IDE window is bound. Configure lsp.ide_connection_file."}).to_string());
-            };
             let timeout = args.timeout_secs.unwrap_or(20);
             if !(1..=120).contains(&timeout)
                 || args.occurrence == Some(0)
@@ -156,7 +172,7 @@ impl Tool for LspTool {
             }
             if !matches!(
                 args.operation,
-                Operation::Diagnostics | Operation::DocumentSymbols
+                Operation::Diagnostics | Operation::DocumentSymbols | Operation::Status
             ) && (args.line.is_none() || (args.character.is_none() && args.symbol.is_none()))
             {
                 return err("lsp: IDE position requires line and character or symbol");
@@ -168,16 +184,42 @@ impl Tool for LspTool {
             {
                 return err("lsp: invalid diagnostic severity");
             }
+            if args
+                .window_id
+                .as_ref()
+                .is_some_and(|id| id.is_empty() || id.len() > 128)
+            {
+                return err("lsp: invalid IDE window_id");
+            }
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout);
+            let selected = tokio::select! {
+                _ = ctx.cancel.cancelled() => Err(json!({"source":"ide", "status":"cancelled"})),
+                result = tokio::time::timeout_at(deadline, super::ide_bridge::resolve(
+                    self.ide_binding.as_deref(), self.ide_discovery.as_deref(), &ctx.working_dir,
+                    args.window_id.as_deref(), matches!(args.operation, Operation::Status), &ctx.cancel)) => result.unwrap_or_else(|_| Err(json!({"source":"ide", "status":"timeout", "message":"IDE discovery timed out; check the selected IDE window."}))),
+            };
+            let (binding, status) = match selected {
+                Ok(selected) => selected,
+                Err(status) => return ok(status.to_string()),
+            };
+            if matches!(args.operation, Operation::Status) {
+                return ok(status.to_string());
+            }
             let requested = resolve_path(&args.file_path, &ctx.working_dir);
-            let result = super::ide_bridge::query(
-                binding,
+            let request = super::ide_bridge::query(
+                &binding,
                 &ctx.working_dir,
                 &requested,
-                serde_json::to_value(&args).expect("LSP arguments are serializable"),
+                {
+                    let mut wire =
+                        serde_json::to_value(&args).expect("LSP arguments are serializable");
+                    wire["window_id"] = status["window_id"].clone();
+                    wire
+                },
                 timeout,
                 &ctx.cancel,
-            )
-            .await;
+            );
+            let result = tokio::time::timeout_at(deadline, request).await.unwrap_or_else(|_| json!({"source":"ide", "status":"timeout", "message":"IDE discovery and query exceeded the shared deadline."}));
             return ok(result.to_string());
         }
         if !self.local_enabled {
@@ -185,7 +227,7 @@ impl Tool for LspTool {
         }
         if matches!(
             args.operation,
-            Operation::DocumentSymbols | Operation::Inspect
+            Operation::DocumentSymbols | Operation::Inspect | Operation::Status
         ) {
             return ok(json!({"source":"local", "status":"unsupported", "message":"This operation requires an explicitly bound IDE backend."}).to_string());
         }
@@ -206,7 +248,7 @@ impl Tool for LspTool {
                 }
             }
             Operation::Diagnostics => None,
-            Operation::DocumentSymbols | Operation::Inspect => {
+            Operation::DocumentSymbols | Operation::Inspect | Operation::Status => {
                 unreachable!("IDE-only operations handled above")
             }
         };
@@ -272,7 +314,10 @@ impl Tool for LspTool {
                         .hover(&root, &path, &content, line, character, &ctx.cancel)
                         .await
                         .map(render_hover),
-                    Operation::Diagnostics | Operation::DocumentSymbols | Operation::Inspect => {
+                    Operation::Diagnostics
+                    | Operation::DocumentSymbols
+                    | Operation::Inspect
+                    | Operation::Status => {
                         unreachable!()
                     }
                 };
@@ -281,7 +326,7 @@ impl Tool for LspTool {
                 }
                 degradable(result)
             }
-            Operation::DocumentSymbols | Operation::Inspect => {
+            Operation::DocumentSymbols | Operation::Inspect | Operation::Status => {
                 unreachable!("IDE-only operations handled above")
             }
             Operation::Diagnostics => {
@@ -480,6 +525,42 @@ mod tests {
             },
         );
         LspTool::new(Arc::new(LspManager::with_registry(registry)))
+    }
+
+    // This exercises real filesystem I/O underneath the tool deadline.
+    #[tokio::test(flavor = "current_thread")]
+    async fn status_needs_no_source_file_and_does_not_start_local_servers() {
+        let root = tempfile::tempdir().unwrap();
+        let tool = unavailable_tool();
+        let result = tool
+            .execute(r#"{"operation":"status"}"#, &ctx(root.path()))
+            .await;
+        assert!(!result.is_error);
+        assert_eq!(
+            serde_json::from_str::<Value>(&result.content).unwrap()["status"],
+            "not_enabled"
+        );
+        let tool = tool.with_ide_discovery(Some(root.path().join("missing")));
+        let result = tool
+            .execute(r#"{"operation":"status"}"#, &ctx(root.path()))
+            .await;
+        assert!(!result.is_error);
+        assert_eq!(
+            serde_json::from_str::<Value>(&result.content).unwrap()["status"],
+            "not_enabled"
+        );
+        assert!(tool.parameters_schema()["properties"]["operation"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|op| op == "status"));
+        let result = tool
+            .execute(
+                r#"{"operation":"hover","symbol":"x","line":1}"#,
+                &ctx(root.path()),
+            )
+            .await;
+        assert!(result.is_error);
     }
 
     #[tokio::test]

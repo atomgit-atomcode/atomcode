@@ -93,6 +93,14 @@
       {
         "command": "atomcode.disableLanguageBridge",
         "title": "%atomcode.commands.disableLanguageBridge.title%"
+      },
+      {
+        "command": "atomcode.languageBridgeStatus",
+        "title": "%atomcode.commands.languageBridgeStatus.title%"
+      },
+      {
+        "command": "atomcode.copyLanguageBridgeBinding",
+        "title": "%atomcode.commands.copyLanguageBridgeBinding.title%"
       }
     ],
     "viewsContainers": {

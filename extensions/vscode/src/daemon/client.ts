@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as http from 'http';
-import * as os from 'os';
+import { atomcodeHome } from '../paths';
 import * as path from 'path';
 import {
   ChatRequest,
@@ -31,12 +31,6 @@ import {
   AppendSessionMessagesRequest,
   AppendSessionMessagesResponse,
 } from './types';
-
-/** `$ATOMCODE_HOME` or `~/.atomcode` — mirrors process.ts's `atomcodeHome()`. */
-function atomcodeHome(): string {
-  const env = process.env.ATOMCODE_HOME;
-  return env && env.length > 0 ? env : path.join(os.homedir(), '.atomcode');
-}
 
 /**
  * Read the local daemon token from `<atomcodeHome()>/daemon-<port>.json`.

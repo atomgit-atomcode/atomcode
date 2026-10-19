@@ -101,6 +101,193 @@ fn failed(status: &str, message: &str) -> Value {
         "fallback":"Do not retry blindly. Select another backend explicitly; text search is not semantic references."})
 }
 
+/// Resolve only explicitly opted-in files/directories. Never infer a product home here.
+pub(super) async fn resolve(
+    binding: Option<&Path>,
+    directory: Option<&Path>,
+    root: &Path,
+    window_id: Option<&str>,
+    check_explicit: bool,
+    cancel: &CancellationToken,
+) -> Result<(PathBuf, Value), Value> {
+    use futures::{stream, StreamExt};
+    if cancel.is_cancelled() {
+        return Err(failed("cancelled", "IDE discovery cancelled."));
+    }
+    let root = tokio::fs::canonicalize(root)
+        .await
+        .map_err(|_| failed("wrong_workspace", "Working directory cannot be resolved."))?;
+    let mut paths = Vec::new();
+    if let Some(binding) = binding {
+        paths.push(binding.to_owned());
+    } else if let Some(directory) = directory {
+        if !directory.is_absolute() {
+            return Err(failed(
+                "invalid_binding",
+                "IDE discovery directory must be absolute.",
+            ));
+        }
+        let meta = tokio::fs::symlink_metadata(directory).await
+            .map_err(|_| failed("not_enabled", "IDE discovery directory is unavailable. Enable the bridge in the IDE and check ide_discovery_dir."))?;
+        if !meta.is_dir() {
+            return Err(failed(
+                "invalid_binding",
+                "IDE discovery directory must be a real directory.",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if meta.permissions().mode() & 0o077 != 0 {
+                return Err(failed(
+                    "invalid_binding",
+                    "IDE discovery directory must be private (mode 0700).",
+                ));
+            }
+        }
+        let mut entries = tokio::fs::read_dir(directory)
+            .await
+            .map_err(|_| failed("unavailable", "Cannot read IDE discovery directory."))?;
+        let mut scanned = 0;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|_| failed("unavailable", "Cannot list IDE windows."))?
+        {
+            scanned += 1;
+            if scanned > 128 {
+                return Err(failed("too_many_windows", "IDE discovery directory exceeds 128 entries. Remove obsolete bindings or use an explicit connection file."));
+            }
+            if entry.path().extension().is_some_and(|ext| ext == "json") {
+                paths.push(entry.path());
+                if paths.len() > 32 {
+                    return Err(failed("too_many_windows", "More than 32 IDE bindings found. Remove obsolete bindings or use an explicit connection file."));
+                }
+            }
+        }
+    } else {
+        return Err(failed("not_enabled", "No IDE bridge is configured. Enable it in the IDE and configure ide_discovery_dir or ide_connection_file."));
+    }
+    paths.sort();
+    let explicit = binding.is_some();
+    let candidates = stream::iter(paths.into_iter().map(|path| {
+        let root = &root;
+        async move {
+            let to_load = path.clone();
+            let connection = tokio::task::spawn_blocking(move || load(&to_load))
+                .await
+                .ok()
+                .and_then(Result::ok);
+            let Some(connection) = connection else {
+                return (path, None, false, false);
+            };
+            if !explicit && path.file_stem().and_then(|s| s.to_str()) != Some(&connection.window_id)
+            {
+                return (path, None, false, false);
+            }
+            let mut matches = false;
+            for workspace in &connection.workspace_roots {
+                if workspace.is_absolute() {
+                    if let Ok(workspace) = tokio::fs::canonicalize(workspace).await {
+                        matches |= root.starts_with(workspace);
+                    }
+                }
+            }
+            let live = if explicit && !check_explicit {
+                true
+            } else {
+                probe(&connection).await
+            };
+            (path, Some(connection), matches, live)
+        }
+    }))
+    .buffered(8)
+    .collect::<Vec<_>>();
+    let candidates = tokio::select! {
+        _ = cancel.cancelled() => return Err(failed("cancelled", "IDE discovery cancelled.")),
+        values = candidates => values,
+    };
+    let mut windows = Vec::new();
+    let mut selected = Vec::new();
+    let mut invalid = 0;
+    for (path, connection, matches, live) in candidates {
+        let Some(connection) = connection else {
+            invalid += 1;
+            continue;
+        };
+        if matches && live && window_id.is_none_or(|id| id == connection.window_id) {
+            selected.push((path, connection.window_id.clone()));
+        }
+        windows.push(json!({"window_id":connection.window_id, "ide":connection._ide.chars().take(256).collect::<String>(),
+            "workspace_roots":connection.workspace_roots.iter().take(3).map(|p| crate::pathnorm::strip_verbatim_path(p).to_string_lossy().chars().take(256).collect::<String>()).collect::<Vec<_>>(),
+            "workspace_match":matches, "connection_status":if live {"ready"} else {"disconnected"}}));
+    }
+    let mut report = if selected.len() > 1 {
+        failed("ambiguous_window", "Multiple live IDE windows match this working directory. Choose window_id from windows, or copy the current-window binding from the IDE.")
+    } else if selected.is_empty() {
+        if explicit && invalid > 0 {
+            failed("invalid_binding", "Explicit IDE binding is invalid or unavailable. Enable the bridge and copy a fresh current-window binding; discovery will not replace it.")
+        } else if window_id.is_some() {
+            failed("window_unavailable", "The selected IDE window is disconnected or does not match this working directory. Check windows or copy a fresh binding.")
+        } else if windows.iter().any(|w| w["workspace_match"] == true) {
+            failed("disconnected", "Matching IDE windows are disconnected. Re-enable their bridge and remove obsolete bindings if necessary.")
+        } else if !windows.is_empty() {
+            failed("wrong_workspace", "No IDE window contains this working directory. Open the project in the IDE and enable its bridge.")
+        } else {
+            failed("not_enabled", "No valid IDE windows were found. Enable the bridge in a trusted IDE workspace and check the discovery directory.")
+        }
+    } else {
+        json!({"source":"ide", "status":"ready", "window_id":selected[0].1})
+    };
+    report["windows"] = json!(windows);
+    report["invalid_entries"] = json!(invalid);
+    match selected.len() {
+        1 => Ok((selected.remove(0).0, report)),
+        _ => Err(report),
+    }
+}
+
+/// Health probes have no editor/provider side effects and never follow redirects or proxies.
+async fn probe(connection: &Connection) -> bool {
+    let Ok(client) = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_millis(800))
+        .build()
+    else {
+        return false;
+    };
+    let endpoint = connection.endpoint.trim_end_matches("/query").to_owned() + "/status";
+    let Ok(mut response) = client
+        .post(endpoint)
+        .bearer_auth(&connection.token)
+        .send()
+        .await
+    else {
+        return false;
+    };
+    if !response.status().is_success() || response.content_length().is_some_and(|n| n > 8192) {
+        return false;
+    }
+    let mut bytes = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) if bytes.len().saturating_add(chunk.len()) <= 8192 => {
+                bytes.extend_from_slice(&chunk)
+            }
+            Ok(None) => break,
+            _ => return false,
+        }
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    value["protocol_version"] == 1
+        && value["source"] == "ide"
+        && value["window_id"] == connection.window_id
+        && value["status"] == "ready"
+}
+
 pub(super) async fn query(
     binding: &Path,
     root: &Path,
@@ -133,6 +320,15 @@ async fn query_inner(
         Ok(Err(message)) => return failed("unavailable", message),
         Err(_) => return failed("unavailable", "Cannot load IDE connection binding."),
     };
+    if args["window_id"]
+        .as_str()
+        .is_some_and(|id| id != connection.window_id)
+    {
+        return failed(
+            "window_unavailable",
+            "IDE binding changed during selection; query status again.",
+        );
+    }
     let root = match tokio::fs::canonicalize(root).await {
         Ok(root) => root,
         Err(_) => return failed("wrong_workspace", "Working directory cannot be resolved."),
@@ -362,8 +558,14 @@ mod tests {
         assert_eq!(value["message"], "[redacted]");
         let received = server.received_requests().await.unwrap();
         let body: Value = serde_json::from_slice(&received[0].body).unwrap();
-        assert_eq!(body["workspace_root"], canonical.to_str().unwrap());
-        assert_eq!(body["file_path"], source.to_str().unwrap());
+        assert_eq!(
+            body["workspace_root"],
+            json!(crate::pathnorm::strip_verbatim_path(&canonical))
+        );
+        assert_eq!(
+            body["file_path"],
+            json!(crate::pathnorm::strip_verbatim_path(&source))
+        );
         assert!(!body.to_string().contains("not sent to the IDE"));
     }
 
@@ -512,5 +714,365 @@ mod tests {
                 }
             );
         }
+    }
+    fn discovery_binding(directory: &Path, root: &Path, endpoint: &str, id: &str) -> PathBuf {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let file = directory.join(format!("{id}.json"));
+        std::fs::write(
+            &file,
+            json!({"protocol_version":1,"window_id":id,"endpoint":endpoint,
+            "token":"a".repeat(64),"workspace_roots":[root],"ide":"fixture IDE"})
+            .to_string(),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        file
+    }
+
+    async fn health(server: &MockServer, id: &str) {
+        Mock::given(method("POST"))
+            .and(path("/status"))
+            .and(header(
+                "authorization",
+                format!("Bearer {}", "a".repeat(64)),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "protocol_version":1,"source":"ide","window_id":id,"status":"ready"
+            })))
+            .mount(server)
+            .await;
+    }
+
+    // Real loopback transport/OS file access: pausing Tokio would race the HTTP deadline.
+    #[tokio::test(flavor = "current_thread")]
+    async fn discovery_uses_only_live_matching_windows_and_reports_ambiguity() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let unicode = project.path().join("仓颉 空格");
+        std::fs::create_dir(&unicode).unwrap();
+        let first = MockServer::start().await;
+        health(&first, "first").await;
+        let first_file = discovery_binding(
+            directory.path(),
+            project.path(),
+            &format!("{}/query", first.uri()),
+            "first",
+        );
+        discovery_binding(
+            directory.path(),
+            project.path(),
+            "http://127.0.0.1:1/query",
+            "dead",
+        );
+        std::fs::write(
+            directory.path().join("invalid.json"),
+            "private invalid content",
+        )
+        .unwrap();
+        let cancel = CancellationToken::new();
+        let (selected, report) =
+            resolve(None, Some(directory.path()), &unicode, None, true, &cancel)
+                .await
+                .unwrap();
+        assert_eq!(selected, first_file);
+        assert_eq!(report["window_id"], "first");
+        assert_eq!(report["invalid_entries"], 1);
+        assert!(report["windows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["connection_status"] == "disconnected"));
+        assert!(!report.to_string().contains(&"a".repeat(64)));
+        assert!(!report.to_string().contains("private invalid content"));
+        let second = MockServer::start().await;
+        health(&second, "second").await;
+        discovery_binding(
+            directory.path(),
+            project.path(),
+            &format!("{}/query", second.uri()),
+            "second",
+        );
+        let report = resolve(
+            None,
+            Some(directory.path()),
+            project.path(),
+            None,
+            true,
+            &cancel,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(report["status"], "ambiguous_window");
+        let (_, report) = resolve(
+            None,
+            Some(directory.path()),
+            project.path(),
+            Some("second"),
+            true,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report["window_id"], "second");
+        assert_eq!(
+            resolve(
+                None,
+                Some(directory.path()),
+                project.path(),
+                Some("dead"),
+                true,
+                &cancel
+            )
+            .await
+            .unwrap_err()["status"],
+            "window_unavailable"
+        );
+        // An explicit file wins, including when discovery would otherwise be ambiguous.
+        assert_eq!(
+            resolve(
+                Some(&first_file),
+                Some(directory.path()),
+                project.path(),
+                None,
+                true,
+                &cancel
+            )
+            .await
+            .unwrap()
+            .1["window_id"],
+            "first"
+        );
+        assert_eq!(
+            resolve(
+                Some(&directory.path().join("missing.json")),
+                Some(directory.path()),
+                project.path(),
+                None,
+                true,
+                &cancel
+            )
+            .await
+            .unwrap_err()["status"],
+            "invalid_binding"
+        );
+        let other = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve(
+                None,
+                Some(directory.path()),
+                other.path(),
+                None,
+                true,
+                &cancel
+            )
+            .await
+            .unwrap_err()["status"],
+            "wrong_workspace"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn old_explicit_bridge_queries_do_not_require_new_health_endpoint() {
+        let root = tempfile::tempdir().unwrap();
+        let server = MockServer::start().await;
+        let file = binding(root.path(), &format!("{}/query", server.uri()));
+        let cancel = CancellationToken::new();
+        assert!(
+            resolve(Some(&file), None, root.path(), None, false, &cancel)
+                .await
+                .is_ok()
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert_eq!(
+            resolve(Some(&file), None, root.path(), None, true, &cancel)
+                .await
+                .unwrap_err()["status"],
+            "disconnected"
+        );
+        assert_eq!(
+            resolve(
+                Some(&file),
+                None,
+                root.path(),
+                Some("different"),
+                false,
+                &cancel
+            )
+            .await
+            .unwrap_err()["status"],
+            "window_unavailable"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn discovery_rejects_redirected_or_wrong_window_health() {
+        for redirect in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let server = MockServer::start().await;
+            discovery_binding(
+                directory.path(),
+                root.path(),
+                &format!("{}/query", server.uri()),
+                "first",
+            );
+            let response = if redirect {
+                ResponseTemplate::new(302).insert_header("location", "http://example.com/status")
+            } else {
+                ResponseTemplate::new(200).set_body_json(json!({"protocol_version":1,"source":"ide","window_id":"another","status":"ready"}))
+            };
+            Mock::given(method("POST"))
+                .respond_with(response)
+                .expect(1)
+                .mount(&server)
+                .await;
+            assert_eq!(
+                resolve(
+                    None,
+                    Some(directory.path()),
+                    root.path(),
+                    None,
+                    true,
+                    &CancellationToken::new()
+                )
+                .await
+                .unwrap_err()["status"],
+                "disconnected"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn discovery_is_cancellable_while_health_is_pending() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let server = MockServer::start().await;
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let signal = entered.clone();
+        discovery_binding(
+            directory.path(),
+            root.path(),
+            &format!("{}/query", server.uri()),
+            "first",
+        );
+        Mock::given(method("POST"))
+            .respond_with(move |_: &wiremock::Request| {
+                signal.notify_one();
+                ResponseTemplate::new(200).set_delay(Duration::from_secs(60))
+            })
+            .mount(&server)
+            .await;
+        let cancel = CancellationToken::new();
+        let (result, ()) = tokio::join!(
+            resolve(
+                None,
+                Some(directory.path()),
+                root.path(),
+                None,
+                true,
+                &cancel
+            ),
+            async {
+                tokio::time::timeout(Duration::from_secs(5), entered.notified())
+                    .await
+                    .expect("health probe was not reached");
+                cancel.cancel();
+            }
+        );
+        assert_eq!(result.unwrap_err()["status"], "cancelled");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn discovery_without_configuration_and_precancel_are_explicit() {
+        let root = tempfile::tempdir().unwrap();
+        let cancel = CancellationToken::new();
+        assert_eq!(
+            resolve(None, None, root.path(), None, true, &cancel)
+                .await
+                .unwrap_err()["status"],
+            "not_enabled"
+        );
+        cancel.cancel();
+        assert_eq!(
+            resolve(None, None, Path::new("/missing"), None, true, &cancel)
+                .await
+                .unwrap_err()["status"],
+            "cancelled"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn discovery_rejects_shared_or_symlink_directories_and_excess_entries() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let alias = root.path().join("alias");
+        symlink(directory.path(), &alias).unwrap();
+        let cancel = CancellationToken::new();
+        assert_eq!(
+            resolve(None, Some(&alias), root.path(), None, true, &cancel)
+                .await
+                .unwrap_err()["status"],
+            "invalid_binding"
+        );
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            resolve(
+                None,
+                Some(directory.path()),
+                root.path(),
+                None,
+                true,
+                &cancel
+            )
+            .await
+            .unwrap_err()["status"],
+            "invalid_binding"
+        );
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        for n in 0..33 {
+            std::fs::write(directory.path().join(format!("{n}.json")), "invalid").unwrap();
+        }
+        assert_eq!(
+            resolve(
+                None,
+                Some(directory.path()),
+                root.path(),
+                None,
+                true,
+                &cancel
+            )
+            .await
+            .unwrap_err()["status"],
+            "too_many_windows"
+        );
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn binding_replacement_cannot_change_the_selected_window() {
+        let root = tempfile::tempdir().unwrap();
+        let server = MockServer::start().await;
+        let file = binding(root.path(), &format!("{}/query", server.uri()));
+        let source = root.path().join("main.cj");
+        std::fs::write(&source, "x").unwrap();
+        let result = query(
+            &file,
+            root.path(),
+            &source,
+            json!({"operation":"hover","window_id":"previous-window"}),
+            20,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(result["status"], "window_unavailable");
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 }

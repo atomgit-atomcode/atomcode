@@ -60,6 +60,15 @@ async function main() {
     req.end(JSON.stringify(payload));
   });
   try {
+    const statusUrl = binding.endpoint.replace(/\/query$/u, '/status');
+    assert.equal((await send({}, 'wrong', undefined, statusUrl)).code, 401);
+    assert.equal((await send({}, binding.token, 'http://evil.example', statusUrl)).code, 401);
+    const beforeHealth = calls.length;
+    const health = await send({}, binding.token, undefined, statusUrl);
+    assert.equal(health.body.status, 'ready');
+    assert.equal(health.body.window_id, binding.window_id);
+    assert.equal(calls.length, beforeHealth, 'health must not invoke a language provider');
+    assert.ok(!JSON.stringify(health).includes(binding.token));
     assert.equal((await send(q(), 'wrong')).code, 401);
     assert.equal((await send(q(), binding.token, 'http://evil.example')).code, 401);
     const result = await send(q({ file_path: file, workspace_root: directory, operation: 'inspect' }));
@@ -95,14 +104,27 @@ async function main() {
       }
       entered = undefined;
       assert.equal(queue.length, 4);
+      const saturatedHealth = await send({}, slowBinding.token, undefined, slowBinding.endpoint.replace(/\/query$/u, '/status'));
+      assert.equal(saturatedHealth.body.status, 'ready', 'stalled providers must not block discovery');
+      assert.equal(queue.length, 4);
       assert.equal((await send(request, slowBinding.token, undefined, slowBinding.endpoint)).body.status, 'not_ready');
     } finally {
       for (const finish of queue) finish([]);
       await slow.dispose();
     }
 
+    if (process.platform !== 'win32') {
+      const publicDirectory = path.join(directory, 'public');
+      await fs.mkdir(publicDirectory, { mode: 0o755 });
+      await assert.rejects(startBridge(publicDirectory, [directory], host, 'fixture'), /private/);
+      const alias = path.join(directory, 'alias');
+      await fs.symlink(path.join(directory, 'private'), alias);
+      await assert.rejects(startBridge(alias, [directory], host, 'fixture'), /private/);
+    }
   } finally {
     await bridge.dispose();
+    await bridge.dispose();
+    assert.equal(bridge.active, false);
     await assert.rejects(fs.stat(bridge.connectionFile));
     await fs.rm(directory, { recursive: true, force: true });
   }

@@ -26,5 +26,7 @@
   "atomcode.configuration.fontSize.description": "Font size in chat panel",
   "atomcode.configuration.showInlineHints.description": "Show inline diff hints when AI edits files",
   "atomcode.commands.enableLanguageBridge.title": "AtomCode: Enable IDE Language Bridge (Copy Configuration)",
-  "atomcode.commands.disableLanguageBridge.title": "AtomCode: Disable IDE Language Bridge"
+  "atomcode.commands.disableLanguageBridge.title": "AtomCode: Disable IDE Language Bridge",
+  "atomcode.commands.languageBridgeStatus.title": "AtomCode: IDE Language Bridge Status",
+  "atomcode.commands.copyLanguageBridgeBinding.title": "AtomCode: Copy Current IDE Window Binding"
 }
