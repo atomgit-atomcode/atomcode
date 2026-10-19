@@ -549,7 +549,7 @@ impl atomcode_tui::command::CommandSet for ShareCommands {
         &self,
         name: &str,
         args: &str,
-        _ctx: &atomcode_plexus::Context,
+        ctx: &atomcode_plexus::Context,
     ) -> atomcode_tui::command::Outcome {
         use atomcode_tui::command::Outcome;
         let args = args.trim();
@@ -594,21 +594,36 @@ impl atomcode_tui::command::CommandSet for ShareCommands {
                 if let Err(why) = attach(&self.config_path).await {
                     return Outcome::Refused(why);
                 }
-                Outcome::Said(
-                    atomcode_daemon::ensure_server_and_open(
-                        &options.host,
-                        options.port,
-                        true, // sync
-                        options.open_browser,
-                    )
-                    .await,
+                let launched = atomcode_daemon::launch_webui(
+                    &options.host,
+                    options.port,
+                    true, // sync
+                    options.open_browser,
                 )
+                .await;
+                let ui = ctx.require::<atomcode_harness::seams::UiSvc>().ok();
+                webui_feedback(launched, ui.as_deref())
             }
             // 配对屏自己关掉时交回来的那一行——不是人打的命令,所以只说一句
             // 「码给出去了」,别的什么都不做:中继还在跑,配对照旧。
             PAIRED => Outcome::Said(tr(SMsg::AppPaired).into_owned()),
             _ => Outcome::Quiet,
         }
+    }
+}
+
+/// Keep the original report before the picture, including on narrow terminals
+/// where the renderer omits a QR that cannot fit without cropping.
+fn webui_feedback(
+    launched: atomcode_daemon::WebuiLaunch,
+    ui: Option<&dyn atomcode_harness::seams::UserInterface>,
+) -> atomcode_tui::command::Outcome {
+    if let (Some(url), Some(ui)) = (launched.qr_url.as_deref(), ui) {
+        ui.say(&launched.message);
+        ui.show_qr(url);
+        atomcode_tui::command::Outcome::Quiet
+    } else {
+        atomcode_tui::command::Outcome::Said(launched.message)
     }
 }
 
@@ -698,6 +713,65 @@ mod tests {
     use atomcode_tui::command::CommandSet;
     use atomcode_tui::overlay::{Overlay, Step};
     use atomcode_tui::surface::{Key, KeyPress};
+
+    #[derive(Default)]
+    struct QrRecording(std::sync::Mutex<Vec<(String, String)>>);
+
+    #[async_trait::async_trait]
+    impl atomcode_harness::seams::UserInterface for QrRecording {
+        fn describe(&self) -> String {
+            "recording".into()
+        }
+        async fn run(&self, _: &atomcode_plexus::Context, _: Option<String>) -> Result<(), String> {
+            Ok(())
+        }
+        fn say(&self, text: &str) {
+            self.0.lock().unwrap().push(("text".into(), text.into()));
+        }
+        fn show_qr(&self, url: &str) {
+            self.0.lock().unwrap().push(("qr".into(), url.into()));
+        }
+    }
+
+    #[test]
+    fn webui_qr_keeps_the_full_text_address_before_the_picture() {
+        let url = "http://192.168.1.9:20001/?token=test-token&sync=1";
+        let message = format!("webui: {url}\nnetwork notice");
+        let ui = QrRecording::default();
+        let outcome = webui_feedback(
+            atomcode_daemon::WebuiLaunch {
+                message: message.clone(),
+                qr_url: Some(url.into()),
+            },
+            Some(&ui),
+        );
+        assert!(matches!(outcome, atomcode_tui::command::Outcome::Quiet));
+        assert_eq!(
+            *ui.0.lock().unwrap(),
+            vec![("text".into(), message), ("qr".into(), url.into())]
+        );
+    }
+
+    #[test]
+    fn webui_without_a_qr_or_ui_keeps_the_original_report() {
+        for (qr_url, has_ui) in [
+            (None, true),
+            (Some("http://192.168.1.9/?token=test".into()), false),
+        ] {
+            let ui = QrRecording::default();
+            let outcome = webui_feedback(
+                atomcode_daemon::WebuiLaunch {
+                    message: "original report".into(),
+                    qr_url,
+                },
+                if has_ui { Some(&ui) } else { None },
+            );
+            assert!(
+                matches!(outcome, atomcode_tui::command::Outcome::Said(text) if text == "original report")
+            );
+            assert!(ui.0.lock().unwrap().is_empty());
+        }
+    }
 
     /// 中继给的是一个地址,拨号要 ws、手机要 https ——从同一个地址推出来,而不是
     /// 让人配两遍。

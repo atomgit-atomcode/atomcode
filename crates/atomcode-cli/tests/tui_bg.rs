@@ -489,8 +489,9 @@ impl Rig {
     }
 
     async fn quit(self) {
-        self.term.press(KeyPress::ctrl('d'));
-        let _ = tokio::time::timeout(Duration::from_secs(5), self.running).await;
+        self.running.abort();
+        let _ = self.running.await;
+        self.host.shutdown_all().await;
     }
 }
 
@@ -1059,7 +1060,7 @@ async fn quitting_after_a_review_came_home_names_the_conversation() {
     );
 
     let host = rig.host.clone();
-    rig.term.press(KeyPress::ctrl('d'));
+    rig.term.type_line("/quit");
     rig.until("the screen quit", |rig| rig.running.is_finished())
         .await;
     host.shutdown_all().await;
@@ -1132,7 +1133,7 @@ async fn quitting_before_a_task_came_home_names_it() {
     );
 
     let question = t(Msg::BgQuitQuestion { count: 1 }).into_owned();
-    rig.term.press(KeyPress::ctrl('d'));
+    rig.term.type_line("/quit");
     rig.until_screen(&question).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     rig.term.press(KeyPress::plain(Key::Enter));
@@ -1455,7 +1456,7 @@ async fn foreground_is_refused_while_the_current_session_waits_for_an_answer() {
     rig.quit().await;
 }
 
-/// **Quitting with background sessions still running asks first.** ctrl+d
+/// **Quitting with background sessions still running asks first.** /quit
 /// puts the question up instead of leaving; "stay" (Esc) leaves everything
 /// running and the screen up; saying yes quits, and the background runtime is
 /// stopped — its held turn never finishes even once the model lets go.
@@ -1480,7 +1481,7 @@ async fn quitting_with_background_sessions_running_asks_first() {
     })
     .await;
     let question = t(Msg::BgQuitQuestion { count: 1 }).into_owned();
-    rig.term.press(KeyPress::ctrl('d'));
+    rig.term.type_line("/quit");
     rig.until_screen(&question).await;
     assert!(!rig.running.is_finished(), "asked, not gone");
 
@@ -1497,7 +1498,7 @@ async fn quitting_with_background_sessions_running_asks_first() {
     assert_eq!(list[0].state, BackgroundState::Running);
 
     // Asked again, and this time yes.
-    rig.term.press(KeyPress::ctrl('d'));
+    rig.term.type_line("/quit");
     rig.until_screen(&question).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     rig.term.press(KeyPress::plain(Key::Enter));
@@ -1527,7 +1528,7 @@ async fn quitting_with_nothing_running_does_not_ask() {
     .await;
     rig.until_screen(&t(Msg::BgStarted { slot: 1 })).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
-    rig.term.press(KeyPress::ctrl('d'));
+    rig.term.type_line("/quit");
     rig.until("the screen quit", |rig| rig.running.is_finished())
         .await;
 }
@@ -1615,7 +1616,7 @@ async fn quitting_says_how_to_resume_the_background_sessions_it_stopped() {
     })
     .await;
     let question = t(Msg::BgQuitQuestion { count: 1 }).into_owned();
-    rig.term.press(KeyPress::ctrl('d'));
+    rig.term.type_line("/quit");
     rig.until_screen(&question).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     rig.term.press(KeyPress::plain(Key::Enter));
@@ -1685,7 +1686,7 @@ async fn the_resume_line_on_exit_names_the_session_in_front_then() {
     rig.until_screen("hello there").await;
     assert_eq!(rig.client.root(), fresh, "still on the new foreground");
 
-    rig.term.press(KeyPress::ctrl('d'));
+    rig.term.type_line("/quit");
     rig.until_screen(&t(Msg::BgQuitQuestion { count: 1 })).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     rig.term.press(KeyPress::plain(Key::Enter));

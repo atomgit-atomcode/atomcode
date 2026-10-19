@@ -5849,12 +5849,19 @@ fn primary_lan_ipv4() -> Option<String> {
 /// （webui 的访问 URL 是生成的，端口号对用户无感；被占时仍会向上扫描）。
 pub const WEBUI_DEFAULT_PORT: u16 = atomcode_config::distribution::WEBUI_PORT;
 
+/// Launch feedback for a frontend. URLs contain credentials; do not log them.
+pub struct WebuiLaunch {
+    pub message: String,
+    /// Same authenticated URL as the text, only when reachable off loopback.
+    pub qr_url: Option<String>,
+}
+
 /// 确保进程内 webui server 已起（已停止则重启），mint 一次性 token；`open_browser`
 /// 为 `true` 时自动打开浏览器，`false` 时跳过（脚本/桌面客户端集成场景），URL 仍随状态串返回。
 ///
 /// 返回给用户展示的状态串。在 `atomcode` 主程序（已有 tokio runtime）内调用。
 /// `host` 为绑定地址（默认 `127.0.0.1`；`0.0.0.0` 暴露到局域网/外网）。
-/// `port` 为首选端口（CLI 子命令可自定义；TUI 传 13456）；被占用时自动向上扫描。
+/// `port` 为首选端口（CLI 子命令可自定义；TUI 默认 13457）；被占用时自动向上扫描。
 ///
 /// 不再轮询等待绑定：先在本函数内同步绑定端口（亚毫秒级，且借此拿到真实端口、
 /// 支持动态端口），再把已绑定的 listener 交给后台 `run_server`。浏览器随即打开，
@@ -5865,6 +5872,12 @@ pub async fn ensure_server_and_open(
     sync: bool,
     open_browser: bool,
 ) -> String {
+    launch_webui(host, port, sync, open_browser).await.message
+}
+
+/// Start/reuse the embedded server and return its actual access URL separately
+/// from presentation text, so frontends never need to parse a translated report.
+pub async fn launch_webui(host: &str, port: u16, sync: bool, open_browser: bool) -> WebuiLaunch {
     // 1) 短临界区判定能否复用仍在运行的 server（std Mutex guard 不可跨 .await）。
     //    复用时连同其绑定地址一起取出：换绑需先 /webui stop。
     let reuse = {
@@ -5888,10 +5901,13 @@ pub async fn ensure_server_and_open(
                 // script prints the answer where nobody reads it, and a failed
                 // start used to leave nothing in `atomcode.log` at all.
                 tracing::error!(target: "atomcode::webui", %host, port, error = %format!("{e:#}"), "webui failed to bind");
-                return format!(
-                    "webui 启动失败：{host}:{port} 起的端口绑定失败（{e:#}）{}",
-                    bind_failure_hint(&e)
-                );
+                return WebuiLaunch {
+                    message: format!(
+                        "webui 启动失败：{host}:{port} 起的端口绑定失败（{e:#}）{}",
+                        bind_failure_hint(&e)
+                    ),
+                    qr_url: None,
+                };
             }
         };
         if actual_port != port {
@@ -6008,7 +6024,31 @@ pub async fn ensure_server_and_open(
         }
     }
 
-    msg
+    WebuiLaunch {
+        message: msg,
+        qr_url: webui_qr_url(&open_host, local_url),
+    }
+}
+
+fn webui_qr_url(host: &str, url: String) -> Option<String> {
+    (!is_loopback_authority(host) && host != "0.0.0.0" && host != "::").then_some(url)
+}
+
+#[cfg(test)]
+mod webui_qr_tests {
+    use super::*;
+
+    #[test]
+    fn mobile_qr_requires_an_actual_non_loopback_access_address() {
+        for host in ["127.0.0.1", "localhost", "::1", "0.0.0.0", "::"] {
+            assert!(webui_qr_url(host, "unused".into()).is_none(), "{host}");
+        }
+        let url = "http://192.168.1.9:20001/?token=test-token&sync=1";
+        assert_eq!(
+            webui_qr_url("192.168.1.9", url.into()).as_deref(),
+            Some(url)
+        );
+    }
 }
 
 /// 停止进程内 webui server（若在运行）。返回状态串。

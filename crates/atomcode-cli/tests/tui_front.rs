@@ -1114,11 +1114,6 @@ async fn every_retired_command_has_a_live_replacement() {
     .unwrap();
     let ctx = mounted.app.context();
     let commands = ctx.service::<atomcode_tui::plugin::CommandsSvc>().unwrap();
-    let term = ctx
-        .service::<atomcode_tui::plugin::SurfaceSvc>()
-        .unwrap()
-        .as_any_headless()
-        .unwrap();
     let ui = mounted.ui.clone();
     let running = tokio::spawn(async move { ui.run(&ctx, None).await });
     let mut retired: Vec<String> =
@@ -1136,7 +1131,7 @@ async fn every_retired_command_has_a_live_replacement() {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    term.press(atomcode_tui::surface::KeyPress::ctrl('d'));
+    running.abort();
     let _ = running.await;
     assert!(
         missing.is_empty(),
