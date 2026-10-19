@@ -57,11 +57,17 @@ impl AtomgitClient {
             .await
             .map_err(|e| format!("AtomGit request failed: {e}"))?;
         let status = resp.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        if status == reqwest::StatusCode::UNAUTHORIZED {
             return Err(format!(
                 "AtomGit authentication failed ({}) — run `atomcode login` again",
                 status.as_u16()
             ));
+        }
+        if status == reqwest::StatusCode::FORBIDDEN {
+            return Err("AtomGit access denied (403): check account permissions and token scopes; signing in again may not grant access.".into());
+        }
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err("AtomGit returned 404 Not Found: the target may not exist, may be inaccessible to this account, or may not be supported by this API. Verify the API path, account access and target type. For repository lookups, check the exact owner/repo; this error alone does not establish whether issues are supported.".into());
         }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();

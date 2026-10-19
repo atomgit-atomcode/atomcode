@@ -795,7 +795,7 @@
       {
         "id": "atomgit",
         "heading": "AtomGit integration (3)",
-        "body": "After /login , the model can operate AtomGit directly through these built-in tools. Describe the outcome in natural language; there is no /issue slash command. Tool Purpose Confirmation? atomgit_repo List, inspect, create, delete, fork, or clone repositories; create tags and manage project labels Writes: yes atomgit_pr List, inspect, create, close, and comment on pull requests; link or unlink related Issues Writes: yes atomgit_issue List or inspect Issues; create an Issue and view, add, edit, or delete comments Writes: yes Ask: Create an AtomGit issue for this bug, including the reproduction steps and environment."
+        "body": "After /login , the model can operate AtomGit directly through these built-in tools. Describe the outcome in natural language; there is no /issue slash command. Tool Purpose Confirmation? atomgit_repo List current-account repositories (not public search); inspect code repositories by owner/repo or repository URL; create, delete, fork, clone, create tags and manage labels. An empty personal list does not mean a public repository is missing. Model/dataset sites are outside this URL lookup scope. Writes: yes atomgit_pr List, inspect, create, close, and comment on pull requests; link or unlink related Issues Writes: yes atomgit_issue List or inspect Issues; create an Issue and view, add, edit, or delete comments Writes: yes Ask: Create an AtomGit issue for this bug, including the reproduction steps and environment."
       },
       {
         "id": "large-tool-outputs",

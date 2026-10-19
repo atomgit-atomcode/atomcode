@@ -795,7 +795,7 @@
       {
         "id": "atomgit",
         "heading": "AtomGit 集成（3 个）",
-        "body": "执行 /login 后，模型可以通过以下内置工具直接操作 AtomGit。你只需用自然语言描述目标，不再使用 /issue 斜杠命令。 工具 作用 需要确认 atomgit_repo 列出、查看、创建、删除、Fork 或 Clone 仓库，创建 Tag 并管理项目标签 写操作：是 atomgit_pr 列出、查看、创建或关闭 PR，管理 PR 评论，并关联或取消关联 Issue 写操作：是 atomgit_issue 列出或查看 Issue，创建 Issue，以及查看、新增、编辑或删除评论 写操作：是 示例：为这个 Bug 创建一个 AtomGit Issue，并附上复现步骤和环境信息。"
+        "body": "执行 /login 后，模型可以通过以下内置工具直接操作 AtomGit。你只需用自然语言描述目标，不再使用 /issue 斜杠命令。 工具 作用 需要确认 atomgit_repo 列出当前账号仓库（非公开搜索）；按 owner/repo 或仓库 URL 查看代码仓库；创建、删除、Fork、Clone、创建 Tag 并管理项目标签。个人列表为空不代表公开仓库不存在，模型/数据集站点不属于此 URL 查询范围 写操作：是 atomgit_pr 列出、查看、创建或关闭 PR，管理 PR 评论，并关联或取消关联 Issue 写操作：是 atomgit_issue 列出或查看 Issue，创建 Issue，以及查看、新增、编辑或删除评论 写操作：是 示例：为这个 Bug 创建一个 AtomGit Issue，并附上复现步骤和环境信息。"
       },
       {
         "id": "大型工具输出",
