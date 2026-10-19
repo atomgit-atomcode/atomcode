@@ -784,7 +784,7 @@ impl Waterfall<AgentRequest> for BreaksMidStream {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn a_broken_stream_keeps_what_it_produced() {
     let dir = scratch("partial");
     let app = start(tree(&dir, &[])).await;
@@ -1070,7 +1070,7 @@ async fn shipping_rows_bound_recovery_and_keep_both_partial_replies() {
             vec![StreamEvent::TextDelta("second partial".into()), transport()],
             finished(),
         ],
-        &[],
+        &["[[patch]]\nid = \"llm-stream-recovery\"\nconfig = { max_recoveries = 1 }"],
     )
     .await;
     assert_eq!(
@@ -1235,7 +1235,7 @@ async fn shipping_transport_and_idle_failures_share_one_continuation_budget() {
             ],
             finished(),
         ],
-        &[],
+        &["[[patch]]\nid = \"llm-stream-recovery\"\nconfig = { max_recoveries = 1 }"],
     )
     .await;
     assert_eq!(
@@ -1325,7 +1325,7 @@ async fn shipping_provider_idle_refuses_pending_tools_and_bounds_continuation() 
             ],
             finished(),
         ],
-        &[],
+        &["[[patch]]\nid = \"llm-stream-recovery\"\nconfig = { max_recoveries = 1 }"],
     )
     .await;
     assert_eq!(
@@ -1354,7 +1354,7 @@ async fn shipping_provider_idle_refuses_pending_tools_and_bounds_continuation() 
             ],
             finished(),
         ],
-        &[],
+        &["[[patch]]\nid = \"llm-stream-recovery\"\nconfig = { max_recoveries = 1 }"],
     )
     .await;
     assert_eq!(
@@ -1637,5 +1637,184 @@ async fn coding_rate_limit_pauses_keep_timing_without_becoming_error_facts() {
         .unwrap();
         drop(handle);
         let _ = done.await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn shipping_default_recovers_three_times_with_backoff_and_preserves_each_partial() {
+    use atomcode_kernel::stream::StreamEvent;
+    for breaks in [3usize, 4] {
+        let mut scripts: Vec<_> = (0..breaks)
+            .map(|i| {
+                vec![
+                    StreamEvent::TextDelta(format!("partial-{i}")),
+                    if i % 2 == 0 {
+                        transport()
+                    } else {
+                        provider_idle()
+                    },
+                ]
+            })
+            .collect();
+        scripts.push(finished());
+        let (app, provider, _) = streamed_app(scripts, &[]).await;
+        let began = Instant::now();
+        let outcome = run_turn(&app, "go").await.unwrap();
+        assert_eq!(
+            provider.recorded().len(),
+            4,
+            "one original request plus three continuations"
+        );
+        assert_eq!(
+            began.elapsed(),
+            Duration::from_secs(7),
+            "1/2/4s shared backoff budget"
+        );
+        assert_eq!(
+            outcome.stop,
+            if breaks == 3 {
+                StopReason::Stopped
+            } else {
+                StopReason::Timeout
+            }
+        );
+        let session = app.context().only_session().unwrap();
+        let messages = session.derive_messages();
+        for i in 0..breaks {
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|m| m.text == format!("partial-{i}"))
+                    .count(),
+                1
+            );
+        }
+        if breaks == 4 {
+            let events = session.events();
+            let dump = format!("{events:?}");
+            assert!(dump.contains("3"));
+            let expected =
+                atomcode_config::i18n::t(atomcode_config::i18n::Msg::StreamRecoveryExhausted {
+                    max_recoveries: 3,
+                });
+            assert!(
+                dump.contains(expected.as_ref()),
+                "terminal must explain exhaustion: {dump}"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn cancelling_stream_recovery_backoff_never_opens_another_request() {
+    use atomcode_kernel::stream::StreamEvent;
+    let (app, provider, _) = streamed_app(
+        vec![
+            vec![
+                StreamEvent::TextDelta("saved before cancellation".into()),
+                transport(),
+            ],
+            finished(),
+        ],
+        &[],
+    )
+    .await;
+    let agent = atomcode_harness::create_agent(&app).await.unwrap();
+    agent.send("go");
+    let (outcome, ()) = tokio::join!(atomcode_harness::drive(&app, &agent), async {
+        loop {
+            let noticed = app
+                .context()
+                .only_session()
+                .unwrap()
+                .events()
+                .iter()
+                .any(|e| {
+                    matches!(
+                        &e.event,
+                        SessionEvent::Notice {
+                            notice: atomcode_harness::session::NoticeKind::ProviderRetry,
+                            ..
+                        }
+                    )
+                });
+            if noticed {
+                agent.interrupt();
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    });
+    assert_eq!(outcome.unwrap().stop, StopReason::Cancelled);
+    assert_eq!(provider.recorded().len(), 1);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn confirmed_tool_receipts_survive_all_three_text_continuations() {
+    use atomcode_kernel::stream::StreamEvent;
+    let (app, provider, count) = streamed_app(
+        vec![
+            completed_call("first", "count"),
+            vec![StreamEvent::TextDelta("one".into()), transport()],
+            vec![StreamEvent::TextDelta("two".into()), transport()],
+            vec![StreamEvent::TextDelta("three".into()), transport()],
+            completed_call("repeat", "count"),
+            finished(),
+        ],
+        &[],
+    )
+    .await;
+    assert_eq!(
+        run_turn(&app, "go").await.unwrap().stop,
+        StopReason::Stopped
+    );
+    assert_eq!(provider.recorded().len(), 6);
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        1,
+        "saved confirmed tool must not run again after multiple recoveries"
+    );
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn stream_recovery_terminal_reports_why_it_cannot_continue() {
+    use atomcode_config::i18n::{t, Msg};
+    use atomcode_kernel::stream::StreamEvent;
+    let cases = [
+        (
+            vec![StreamEvent::TextDelta("saved".into()), transport()],
+            Some("[[patch]]\nid = \"llm-stream-recovery\"\nconfig = { max_recoveries = 0 }"),
+            Msg::StreamRecoveryExhausted { max_recoveries: 0 },
+        ),
+        (
+            vec![StreamEvent::Reasoning("thinking only".into()), transport()],
+            None,
+            Msg::StreamRecoveryNoProgress,
+        ),
+        (
+            vec![
+                StreamEvent::TextDelta("saved".into()),
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("unfinished".into()),
+                    name: Some("count".into()),
+                    arguments: "{".into(),
+                },
+                transport(),
+            ],
+            None,
+            Msg::StreamRecoveryUnsafeTools,
+        ),
+    ];
+    for (script, patch, reason) in cases {
+        let patches: Vec<_> = patch.into_iter().collect();
+        let (app, provider, _) = streamed_app(vec![script, finished()], &patches).await;
+        assert_eq!(
+            run_turn(&app, "go").await.unwrap().stop,
+            StopReason::ProviderError
+        );
+        assert_eq!(provider.recorded().len(), 1);
+        let events = app.context().only_session().unwrap().events();
+        assert!(format!("{events:?}").contains(t(reason).as_ref()));
     }
 }

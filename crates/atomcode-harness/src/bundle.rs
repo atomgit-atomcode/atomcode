@@ -147,7 +147,7 @@ config = { max_continuations = 4 }
 
 [[insert]]
 name = "llm-stream-recovery"
-config = { max_recoveries = 1 }
+config = { max_recoveries = 3 }
 
 # Images a tool returned stay in the log and ride every later request: the
 # oldest are left out of a request past this many bytes, and a request the

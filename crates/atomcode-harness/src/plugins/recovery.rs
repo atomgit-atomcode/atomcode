@@ -522,7 +522,7 @@ impl Default for StreamRow {
 }
 
 fn default_recoveries() -> u32 {
-    1
+    3
 }
 
 const RESUME_NUDGE: &str = "\
@@ -553,129 +553,119 @@ impl Waterfall<AgentRequest> for StreamRecovery {
         req: &mut ModelRequest,
         next: Next<'_, AgentRequest>,
     ) -> Result<ModelResponse, RequestError> {
-        match next.run(req).await {
-            Ok(response) => Ok(response),
-            Err(error) => {
-                let Some(session) = crate::agent::scoped(&self.ctx).service::<SessionSvc>() else {
-                    return Err(error);
-                };
-                let confirmed = self.progress.confirmed(&session);
-                let transport = error.code.as_deref()
-                    == Some(atomcode_kernel::stream::STREAM_TRANSPORT_INTERRUPTED_CODE);
-                let idle = error.code.as_deref() == Some(super::agent_loop::STREAM_IDLE_CODE);
-                let has_text = error
-                    .partial
-                    .as_ref()
-                    .is_some_and(|p| !p.text.trim().is_empty());
-                let eligible = error.http_status.is_none()
-                    && (transport || idle)
-                    && !error.unexecuted_tool_output
-                    && (has_text || confirmed);
-                let turn = session.current_turn();
-                // Preserve safe text even when the budget is exhausted or tools
-                // were incomplete. Never commit unexecuted calls as real work.
-                if let Some(partial) = &error.partial {
-                    if !partial.text.is_empty() || !partial.reasoning.is_empty() {
-                        crate::session::commit(
+        let mut recovered = false;
+        loop {
+            let mut error = match next.run(req).await {
+                Ok(response) => {
+                    if recovered {
+                        notice(
                             &self.ctx,
-                            &session,
-                            SessionEvent::AssistantMessage {
-                                turn,
-                                round: req.round,
-                                text: partial.text.clone(),
-                                reasoning: partial.reasoning.clone(),
-                                tool_calls: Vec::new(),
-                                reasoning_blocks: Vec::new(),
-                                meta: None,
-                            },
+                            NoticeKind::StreamRecovered,
+                            atomcode_config::i18n::t(
+                                atomcode_config::i18n::Msg::StreamRecoverySucceeded,
+                            )
+                            .into_owned(),
                         );
                     }
+                    return Ok(response);
                 }
-                if !eligible
-                    || !self
-                        .progress
-                        .recover(&session, self.max_recoveries, confirmed)
-                {
-                    if idle || transport {
-                        tracing::warn!(
-                            turn,
-                            max_recoveries = self.max_recoveries,
-                            eligible,
-                            unexecuted_tool_output = error.unexecuted_tool_output,
-                            "stream continuation not available or budget exhausted"
-                        );
-                    }
-                    return Err(error);
-                }
-                tracing::info!(
-                    turn,
-                    max_recoveries = self.max_recoveries,
-                    confirmed,
-                    "continuing stream from preserved progress"
-                );
-                crate::session::commit(
-                    &self.ctx,
-                    &session,
-                    SessionEvent::Injected {
-                        turn,
-                        text: RESUME_NUDGE.to_string(),
-                        origin: crate::session::InjectionOrigin::Continuation,
-                    },
-                );
-                notice(
-                    &self.ctx,
-                    NoticeKind::ProviderRetry,
-                    atomcode_config::i18n::t(atomcode_config::i18n::Msg::StreamRecoveryPreserved {
-                        max_recoveries: self.max_recoveries,
-                    })
-                    .into_owned(),
-                );
-
-                // Re-project so the retry carries the preserved message.
-                let mut messages: Vec<Message> = req
-                    .messages
-                    .iter()
-                    .take_while(|m| {
-                        m.role == atomcode_kernel::message::Role::System && !m.synthetic
-                    })
-                    .cloned()
-                    .collect();
-                messages.extend(session.derive_messages());
-                req.messages = messages;
-                let result = next.run(req).await;
-                tracing::info!(
-                    turn,
-                    recovered = result.is_ok(),
-                    "stream continuation finished"
-                );
-                match &result {
-                    Ok(_) => notice(
+                Err(error) => error,
+            };
+            let Some(session) = crate::agent::scoped(&self.ctx).service::<SessionSvc>() else {
+                return Err(error);
+            };
+            let confirmed = self.progress.confirmed(&session);
+            let transport = error.code.as_deref()
+                == Some(atomcode_kernel::stream::STREAM_TRANSPORT_INTERRUPTED_CODE);
+            let idle = error.code.as_deref() == Some(super::agent_loop::STREAM_IDLE_CODE);
+            let has_text = error
+                .partial
+                .as_ref()
+                .is_some_and(|p| !p.text.trim().is_empty());
+            let eligible = error.http_status.is_none()
+                && (transport || idle)
+                && !error.unexecuted_tool_output
+                && (has_text || confirmed);
+            let turn = session.current_turn();
+            // Each failed attempt is preserved once, including the final failure.
+            if let Some(partial) = &error.partial {
+                if !partial.text.is_empty() || !partial.reasoning.is_empty() {
+                    crate::session::commit(
                         &self.ctx,
-                        NoticeKind::StreamRecovered,
-                        "continued from saved progress".into(),
-                    ),
-                    Err(failure) => {
-                        if let Some(partial) = &failure.partial {
-                            if !partial.text.is_empty() || !partial.reasoning.is_empty() {
-                                crate::session::commit(
-                                    &self.ctx,
-                                    &session,
-                                    SessionEvent::AssistantMessage {
-                                        turn,
-                                        round: req.round,
-                                        text: partial.text.clone(),
-                                        reasoning: partial.reasoning.clone(),
-                                        tool_calls: Vec::new(),
-                                        reasoning_blocks: Vec::new(),
-                                        meta: None,
-                                    },
-                                );
-                            }
-                        }
-                    }
+                        &session,
+                        SessionEvent::AssistantMessage {
+                            turn,
+                            round: req.round,
+                            text: partial.text.clone(),
+                            reasoning: partial.reasoning.clone(),
+                            tool_calls: Vec::new(),
+                            reasoning_blocks: Vec::new(),
+                            meta: None,
+                        },
+                    );
                 }
-                result
             }
+            let attempt = eligible
+                .then(|| {
+                    self.progress
+                        .recover(&session, self.max_recoveries, confirmed)
+                })
+                .flatten();
+            let Some(attempt) = attempt else {
+                if error.http_status.is_none() && (transport || idle) {
+                    use atomcode_config::i18n::{t, Msg};
+                    let why = if error.unexecuted_tool_output {
+                        Msg::StreamRecoveryUnsafeTools
+                    } else if !has_text && !confirmed {
+                        Msg::StreamRecoveryNoProgress
+                    } else {
+                        Msg::StreamRecoveryExhausted {
+                            max_recoveries: self.max_recoveries,
+                        }
+                    };
+                    tracing::warn!(
+                        turn,
+                        max_recoveries = self.max_recoveries,
+                        eligible,
+                        unexecuted_tool_output = error.unexecuted_tool_output,
+                        "stream continuation stopped"
+                    );
+                    error.message = format!("{}\n{}", t(why), error.message);
+                }
+                return Err(error);
+            };
+            let delay_secs = (1u64 << (attempt - 1).min(3)).min(8);
+            notice(
+                &self.ctx,
+                NoticeKind::ProviderRetry,
+                atomcode_config::i18n::t(atomcode_config::i18n::Msg::StreamRecoveryRetry {
+                    attempt,
+                    max_recoveries: self.max_recoveries,
+                    delay_secs,
+                })
+                .into_owned(),
+            );
+            // The agent loop owns cancellation and drops this entire waterfall,
+            // including its sleep, before another request can be started.
+            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+            crate::session::commit(
+                &self.ctx,
+                &session,
+                SessionEvent::Injected {
+                    turn,
+                    text: RESUME_NUDGE.to_string(),
+                    origin: crate::session::InjectionOrigin::Continuation,
+                },
+            );
+            let mut messages: Vec<Message> = req
+                .messages
+                .iter()
+                .take_while(|m| m.role == atomcode_kernel::message::Role::System && !m.synthetic)
+                .cloned()
+                .collect();
+            messages.extend(session.derive_messages());
+            req.messages = messages;
+            recovered = true;
         }
     }
 }

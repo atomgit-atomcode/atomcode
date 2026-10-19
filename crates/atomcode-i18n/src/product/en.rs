@@ -1652,6 +1652,11 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         )
         .into(),
         Msg::StreamRecoveryPreserved { max_recoveries } => format!("Model response interrupted. Received content was preserved; attempting to continue (up to {max_recoveries} automatic recoveries per turn).").into(),
+        Msg::StreamRecoveryRetry { attempt, max_recoveries, delay_secs } => format!("Connection interrupted; progress preserved. Continuing in {delay_secs}s ({attempt}/{max_recoveries}); press Esc to cancel.").into(),
+        Msg::StreamRecoveryExhausted { max_recoveries: 0 } => "Automatic recovery is disabled. Safely preservable content was kept. Check the connection or model service, then send 'continue'.".into(),
+        Msg::StreamRecoveryExhausted { max_recoveries } => format!("Automatic recovery reached this turn's limit ({max_recoveries}). Safely preservable content was kept. Check the connection or model service, then send 'continue'.").into(),
+        Msg::StreamRecoveryUnsafeTools => "Response interrupted with incomplete or unconfirmed tool output; automatic recovery stopped to avoid duplicate execution. Safely preservable content was kept. Check tool results before continuing.".into(),
+        Msg::StreamRecoveryNoProgress => "Response interrupted without enough safe progress to continue; no automatic continuation was attempted. Check the connection or model service and retry.".into(),
         Msg::StreamRecoverySucceeded => "✓ recovered from the interrupted stream".into(),
         Msg::ContextFromPeer => "said to the agent by".into(),
         Msg::ContextFromMemory => "from memory".into(),

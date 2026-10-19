@@ -1606,6 +1606,11 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         )
         .into(),
         Msg::StreamRecoveryPreserved { max_recoveries } => format!("模型响应中断，已保留收到的内容，正在尝试继续（本轮最多自动恢复 {max_recoveries} 次）。").into(),
+        Msg::StreamRecoveryRetry { attempt, max_recoveries, delay_secs } => format!("连接中断，已保留进度，{delay_secs} 秒后尝试继续（{attempt}/{max_recoveries}）；可按 Esc 取消。").into(),
+        Msg::StreamRecoveryExhausted { max_recoveries: 0 } => "自动恢复已禁用。已保留可安全保存的内容，请检查连接或模型服务后回复「继续」。".into(),
+        Msg::StreamRecoveryExhausted { max_recoveries } => format!("自动恢复已达到本轮上限（{max_recoveries} 次）。已保留可安全保存的内容，请检查连接或模型服务后回复「继续」。").into(),
+        Msg::StreamRecoveryUnsafeTools => "响应中断，工具调用未完成或执行状态无法确认，为避免重复执行已停止自动恢复。已保留可安全保存的内容，请核对工具结果后再继续。".into(),
+        Msg::StreamRecoveryNoProgress => "响应中断，没有足够的安全进度可用于续接；本次未自动续接。请检查连接或模型服务后重试。".into(),
         Msg::StreamRecoverySucceeded => "✓ 已从流中断处恢复".into(),
         Msg::ContextFromPeer => "对 agent 说".into(),
         Msg::ContextFromMemory => "来自记忆".into(),

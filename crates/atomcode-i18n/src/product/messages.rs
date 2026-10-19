@@ -2168,6 +2168,16 @@ pub enum Msg<'a> {
         max_attempts: u32,
     },
     StreamRecoverySucceeded,
+    StreamRecoveryRetry {
+        attempt: u32,
+        max_recoveries: u32,
+        delay_secs: u64,
+    },
+    StreamRecoveryExhausted {
+        max_recoveries: u32,
+    },
+    StreamRecoveryUnsafeTools,
+    StreamRecoveryNoProgress,
     /// Notice when received output is preserved and bounded continuation begins.
     StreamRecoveryPreserved {
         max_recoveries: u32,
