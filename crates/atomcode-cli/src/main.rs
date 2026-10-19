@@ -3142,6 +3142,17 @@ pub(crate) async fn spawn_native_cli_runtime(
         (Some(home), Some(front_end)) => Some(home.delegate_for(front_end)),
         _ => None,
     };
+    #[cfg(unix)]
+    if front_end.is_some() && !no_tools && !ephemeral {
+        atomcode::peers::install(
+            &mut prepare,
+            atomcode_coding::config::product_dirs_from_env()
+                .user()
+                .join("peers"),
+            front_end.as_ref().expect("front end checked above"),
+        )
+        .map_err(anyhow::Error::msg)?;
+    }
     prepare.front_end = front_end;
     let start = atomcode_coding::CodingRuntimeStart {
         agent: agent.clone(),

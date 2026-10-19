@@ -973,9 +973,13 @@ impl Background {
             // `Busy` 是那段对话正在收尾一次取消或一次策略介入,过一会儿就收得下:等一等
             // 再投,而不是把结果扔了。别的拒绝(runtime 没了、换了代)不重试 —— 那时
             // 这个 handle 背后未必还是发起它的那段对话;结果仍在 /bg 面板里。
+            // 选中接收方以后仍可能切会话;由 runtime owner 在投递时再核对原会话。
             const TRIES: u32 = 10;
             for attempt in 1..=TRIES {
-                match handle.note(sender.clone(), frame.clone()).await {
+                match handle
+                    .note_to_session(origin.clone(), sender.clone(), frame.clone())
+                    .await
+                {
                     Ok(_) => {
                         // 排上队不等于收下了:那段对话正忙时这是一次 steer。等它真进了
                         // 那段对话的日志再标。等不到(退出了、那段对话没了)就不标 ——

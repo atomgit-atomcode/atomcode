@@ -153,17 +153,18 @@ impl Transcript {
 
 /// What an injected block says about where it came from.
 ///
-/// The kind, not the sender's id: a peer's message already names the sender
-/// in its own text, and a session id on screen is an identifier nobody reads.
-/// Debug-formatting the origin put `peer { from: "1789…/scout" }` in front of
-/// every report, which is a struct dump, not a label.
+/// Team notes name their role; messages from outside this tree also name the
+/// sending session so independent terminal sessions can be distinguished.
+/// Keep this readable rather than dumping the origin's debug representation.
 fn origin_label(origin: &InjectionOrigin) -> String {
     match origin {
-        // A sender this tree has never held is a job run elsewhere reporting
-        // back. Calling it `peer` would put it in the same breath as a team
-        // member, and the person reading the block has no way to tell the two
-        // apart — the log has always been able to say which it was.
-        InjectionOrigin::Peer { outside: true, .. } => t(Msg::InjectedFromBackground).into_owned(),
+        // A sender outside this tree may be a background job reporting back
+        // or another independent terminal session. Both retain their source
+        // identity rather than being labelled as the team's lead.
+        InjectionOrigin::Peer {
+            outside: true,
+            from,
+        } => t(Msg::InjectedFromSession { from }).into_owned(),
         // On a member's screen this is its lead assigning or steering the work.
         // Reports in the other direction use the result presentation below,
         // whose heading already names the member.
@@ -952,6 +953,21 @@ fn wait_left(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_outside_peer_is_labelled_with_its_session_identity() {
+        let label = origin_label(&InjectionOrigin::Peer {
+            from: "other-instance:session".into(),
+            outside: true,
+        });
+        assert!(label.contains("other-instance:session"));
+        assert_eq!(
+            label,
+            t(Msg::InjectedFromSession {
+                from: "other-instance:session"
+            })
+        );
+    }
 
     #[test]
     fn work_sent_to_a_member_is_labelled_as_coming_from_main() {
