@@ -318,7 +318,8 @@ pub(crate) fn attach(
                             met,
                         });
                     }
-                    let ended = progress.terminal.is_some();
+                    let ended = progress.terminal.is_some()
+                        && progress.phase != atomcode_coding::GoalPhase::PausedAtCap;
                     watched.announce(HostEvent::Autonomy {
                         session,
                         running: (!ended).then(|| running_of_goal(progress)),
@@ -580,6 +581,7 @@ fn reply(out: &mpsc::UnboundedSender<AgentEvent>, receipt: Option<CommandId>, an
                 code: None,
                 retryable: None,
                 // 一条被拒的命令:没有回合收尾会再说一遍它。
+                retry_after_secs: None,
                 ends_turn: false,
             });
         }
@@ -983,18 +985,43 @@ fn without_a_log(apps_fed: u64) -> Result<(), HostError> {
 /// A goal, as the contract says a self-driving session.
 fn running_of_goal(goal: atomcode_coding::GoalProgress) -> atomcode_host_api::Running {
     atomcode_host_api::Running {
+        recovering: goal.recovery.is_some(),
         kind: "goal".into(),
         what: goal.condition,
         round: goal.round,
         of: goal.max_rounds,
         elapsed_secs: goal.elapsed_secs,
-        paused: (!goal.active).then(|| format!("{:?}", goal.phase)),
+        paused: goal
+            .recovery
+            .as_ref()
+            .map(|recovery| {
+                let message = match recovery.kind {
+                    atomcode_coding::GoalRecoveryKind::Provider => SMsg::GoalProviderRecovery {
+                        attempt: recovery.attempt,
+                        max: recovery.max_attempts,
+                        secs: recovery.retry_in_secs,
+                    },
+                    atomcode_coding::GoalRecoveryKind::Evaluator => SMsg::GoalEvaluatorRecovery {
+                        attempt: recovery.attempt,
+                        max: recovery.max_attempts,
+                        secs: recovery.retry_in_secs,
+                    },
+                };
+                tr(message).into_owned()
+            })
+            .or_else(|| {
+                (!goal.active).then(|| {
+                    goal.last_reason
+                        .unwrap_or_else(|| format!("{:?}", goal.phase))
+                })
+            }),
     }
 }
 
 /// A loop, the same way. No `of`: a loop repeats until it is stopped.
 fn running_of_loop(looping: atomcode_coding::LoopProgress) -> atomcode_host_api::Running {
     atomcode_host_api::Running {
+        recovering: false,
         kind: "loop".into(),
         what: looping.label,
         round: looping.round,
@@ -1176,7 +1203,11 @@ fn translate(event: CodingRuntimeEvent) -> Option<AgentEvent> {
                 TurnCompletion::Completed { reason, .. }
                 | TurnCompletion::SnapshotUnavailable { reason, .. } => reason,
             };
-            Some(AgentEvent::TurnComplete { turn: None, reason })
+            Some(AgentEvent::TurnComplete {
+                turn: None,
+                reason,
+                provider_failure: None,
+            })
         }
         CodingRuntimeEvent::CompactionStarted { trigger } => {
             Some(AgentEvent::CompactionStarted { trigger })
@@ -1205,6 +1236,7 @@ fn translate(event: CodingRuntimeEvent) -> Option<AgentEvent> {
             code: None,
             retryable: None,
             // 警告:回合照跑,收尾块不会再说它一遍。
+            retry_after_secs: None,
             ends_turn: false,
         }),
         // 识图失败。此前屏上只剩一个 `[图片识别失败]` 标记,原因和怎么
@@ -1356,6 +1388,7 @@ fn said(message: std::borrow::Cow<'_, str>) -> AgentEvent {
         code: None,
         retryable: None,
         // 一句"给人看的话"(识图失败、压缩被打断…):它不是回合的收尾错误。
+        retry_after_secs: None,
         ends_turn: false,
     }
 }
@@ -3087,6 +3120,7 @@ pub fn refused(error: RuntimeError) -> HostError {
             RuntimeError::RewindPointUnavailable { turn_id } => {
                 HostError::RewindPointNotFound { turn: turn_id }
             }
+            RuntimeError::GoalUnavailable(message) => HostError::Failed { message },
             RuntimeError::CodeRewindUnavailable(message) => {
                 HostError::CodeRewindUnavailable { message }
             }
@@ -3361,6 +3395,9 @@ mod tests {
         use atomcode_coding::{GoalPhase, GoalProgress, GoalTerminal};
         let ended = |terminal, last_reason| {
             goal_ending(&GoalProgress {
+                report: Default::default(),
+                evaluation_ready: false,
+                recovery: None,
                 active: false,
                 terminal: Some(terminal),
                 phase: GoalPhase::Pursuing,

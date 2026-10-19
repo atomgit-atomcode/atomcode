@@ -1841,7 +1841,7 @@ async fn every_turn_started_is_closed_once_under_its_number() {
     let closed: Vec<(Option<u64>, StopReason)> = all
         .iter()
         .filter_map(|e| match e {
-            AgentEvent::TurnComplete { turn, reason } => Some((*turn, *reason)),
+            AgentEvent::TurnComplete { turn, reason, .. } => Some((*turn, *reason)),
             _ => None,
         })
         .collect();

@@ -1230,8 +1230,16 @@ impl Moment {
         crate::text::ghost(&self.input, &self.history, self.history_at.is_some())
     }
 
+    pub fn goal_recovering(&self) -> bool {
+        self.viewing == self.lead
+            && self
+                .autonomy
+                .as_ref()
+                .is_some_and(|running| running.kind == "goal" && running.recovering)
+    }
+
     pub fn turn_in_flight(&self) -> bool {
-        self.activity != Activity::Idle || self.pending_working
+        self.activity != Activity::Idle || self.pending_working || self.goal_recovering()
     }
 
     /// Put this project's older history in front of what this session has said,
@@ -1481,6 +1489,30 @@ mod tests {
         assert!(m.turn_in_flight());
         m.activity = Activity::Stopping;
         assert!(m.turn_in_flight());
+    }
+
+    #[test]
+    fn goal_evaluation_and_cooldown_remain_stoppable_only_from_the_lead() {
+        let mut m = Moment::default();
+        m.autonomy = Some(atomcode_host_api::Running {
+            kind: "goal".into(),
+            recovering: true,
+            what: "finish".into(),
+            round: 1,
+            of: None,
+            elapsed_secs: 0,
+            paused: Some("evaluating".into()),
+        });
+        assert_eq!(m.activity, Activity::Idle);
+        assert!(m.turn_in_flight());
+        m.autonomy.as_mut().unwrap().recovering = false;
+        assert!(!m.turn_in_flight(), "a paused goal is not busy");
+        m.autonomy.as_mut().unwrap().recovering = true;
+        m.viewing = "member".into();
+        assert!(
+            !m.turn_in_flight(),
+            "lead recovery must not cancel a viewed member"
+        );
     }
 
     #[test]

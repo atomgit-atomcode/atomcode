@@ -228,6 +228,16 @@ pub enum Msg<'a> {
     },
     StatusStopping,
     StatusGoal,
+    GoalProviderRecovery {
+        attempt: u32,
+        max: u32,
+        secs: u64,
+    },
+    GoalEvaluatorRecovery {
+        attempt: u32,
+        max: u32,
+        secs: u64,
+    },
     StatusLoop,
     /// `kind` is already localised — [`Msg::StatusGoal`] or [`Msg::StatusLoop`].
     StatusRoundsHeld {

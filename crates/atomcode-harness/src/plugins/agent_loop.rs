@@ -473,6 +473,7 @@ impl PluginAgentLoop {
         let turn = session.next_turn();
         self.commit(&session, SessionEvent::TurnStart { turn });
         let mut outcome = TurnOutcome {
+            session_id: session.id().to_string(),
             turn,
             ..Default::default()
         };
@@ -768,6 +769,7 @@ impl PluginAgentLoop {
                 }
                 Err(error) => {
                     if let Some(pause) = error.rate_limit_pause.clone() {
+                        outcome.provider_error = Some(error.clone());
                         // Not a failure: the turn stops cleanly and says when to
                         // come back.
                         self.commit(&session, SessionEvent::RateLimitPaused { turn, pause });
@@ -780,6 +782,7 @@ impl PluginAgentLoop {
                         StopReason::ProviderError
                     };
                     outcome.error = Some(error.to_string());
+                    outcome.provider_error = Some(error);
                     break;
                 }
             };

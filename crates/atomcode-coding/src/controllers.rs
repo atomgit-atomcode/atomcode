@@ -5,7 +5,8 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 use async_trait::async_trait;
 use atomcode_kernel::message::{Message, Role};
@@ -18,7 +19,10 @@ use serde_json::json;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
-pub(crate) const MAX_UNPRODUCTIVE: u32 = 5;
+mod recovery;
+pub(crate) use recovery::transient_provider_failure;
+use recovery::RetryBudget;
+pub use recovery::{GoalRecoveryKind, GoalRecoveryProgress};
 
 /// Stop the loop after this many CONSECUTIVE "not met" rounds that made no forward
 /// progress (zero tool calls). A round that only emits text without touching a tool
@@ -27,7 +31,6 @@ pub(crate) const MAX_UNPRODUCTIVE: u32 = 5;
 /// verifiable objective (e.g. an empty/vague goal like "需要"), which otherwise burned
 /// every round up to `max_rounds`. Any tool-call round resets the counter.
 pub(crate) const MAX_STALLED_ROUNDS: u32 = 3;
-const EVALUATOR_TIMEOUT: Duration = Duration::from_secs(30);
 
 const EVALUATOR_SYSTEM_PROMPT: &str = r#"You are a strict goal evaluator for an autonomous coding agent.
 
@@ -54,7 +57,22 @@ const EVALUATOR_USER_TEMPLATE: &str = r#"<<<GOAL>>>
 
 Reply with the single Verdict line now."#;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Observed work, not estimates of unobserved activity while the process was down.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct GoalRunReport {
+    pub provider_recoveries: u32,
+    pub evaluator_attempts: u32,
+    pub tool_calls: u64,
+    pub tokens: u64,
+    pub waiting_secs: u64,
+    pub time_limit_secs: u64,
+    /// Remaining budget in the current human-authorized window; None is unlimited.
+    /// Older checkpoints fall back to time_limit_secs minus elapsed time.
+    pub remaining_time_secs: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GoalProgress {
     pub active: bool,
     pub terminal: Option<GoalTerminal>,
@@ -64,9 +82,14 @@ pub struct GoalProgress {
     pub elapsed_secs: u64,
     pub condition: String,
     pub last_reason: Option<String>,
+    pub recovery: Option<GoalRecoveryProgress>,
+    #[serde(default)]
+    pub report: GoalRunReport,
+    #[serde(default)]
+    pub evaluation_ready: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum GoalTerminal {
     Met,
     Stopped,
@@ -74,7 +97,7 @@ pub enum GoalTerminal {
     Cancelled,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum GoalPhase {
     Pursuing,
     /// Explicitly paused by the user. The goal remains registered and resumes
@@ -106,6 +129,11 @@ pub struct WakeupRequest {
 
 #[derive(Debug)]
 pub(crate) struct GoalState {
+    pub report: GoalRunReport,
+    pub evaluation_ready: bool,
+    pub evaluation_only: bool,
+    recovery_wait_started: Option<Instant>,
+    elapsed_before: u64,
     pub id: u64,
     pub condition: String,
     pub active: bool,
@@ -117,10 +145,8 @@ pub(crate) struct GoalState {
     pub tokens_used: u64,
     pub max_rounds: Option<u32>,
     deadline: Option<Instant>,
-    pub unproductive: u32,
     /// Consecutive "not met" rounds that made no forward progress (zero tool calls).
-    /// Distinct from `unproductive` (which counts provider errors/timeouts and is reset
-    /// whenever the evaluator runs): this survives across evaluate rounds so an
+    /// This survives across evaluated rounds so an
     /// unpursuable goal trips [`MAX_STALLED_ROUNDS`] instead of spinning to `max_rounds`.
     pub no_progress: u32,
     pub cancel: CancellationToken,
@@ -133,12 +159,35 @@ pub(crate) struct GoalState {
     /// failures. Hard round/time caps use the same public phase but must not rewrite
     /// an unrelated user `/compact` focus as a failure recovery request.
     recovery_pause: bool,
+    pub recovery_policy: atomcode_config::config::GoalRecoveryConfig,
+    provider_budget: RetryBudget,
+    evaluator_budget: RetryBudget,
+    pub recovery: Option<GoalRecoveryProgress>,
+    retry_at: Option<Instant>,
+    pub async_epoch: u64,
+    pub work_cancel: CancellationToken,
+}
+
+impl Drop for GoalState {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        self.work_cancel.cancel();
+    }
 }
 
 impl GoalState {
     pub fn new(id: u64, condition: String, max_rounds: u32, max_duration_secs: u64) -> Self {
         let started_at = Instant::now();
+        let cancel = CancellationToken::new();
         Self {
+            report: GoalRunReport {
+                time_limit_secs: max_duration_secs,
+                ..Default::default()
+            },
+            evaluation_ready: false,
+            evaluation_only: false,
+            recovery_wait_started: None,
+            elapsed_before: 0,
             id,
             condition,
             active: true,
@@ -151,13 +200,54 @@ impl GoalState {
             max_rounds: (max_rounds != 0).then_some(max_rounds),
             deadline: (max_duration_secs != 0)
                 .then(|| started_at + Duration::from_secs(max_duration_secs)),
-            unproductive: 0,
             no_progress: 0,
-            cancel: CancellationToken::new(),
+            work_cancel: cancel.child_token(),
+            cancel,
             max_duration_secs,
             progress_recap: None,
             recovery_pause: false,
+            recovery_policy: Default::default(),
+            provider_budget: Default::default(),
+            evaluator_budget: Default::default(),
+            recovery: None,
+            retry_at: None,
+            async_epoch: 0,
         }
+    }
+
+    pub fn resume_paused_for_evaluation(&mut self) {
+        self.cancel = CancellationToken::new();
+        self.invalidate_work();
+        self.active = true;
+        self.phase = GoalPhase::Pursuing;
+        self.terminal = None;
+        self.last_reason = Some("仅重新评估已完成的工作".into());
+    }
+
+    pub fn restore_paused(id: u64, progress: &GoalProgress) -> Self {
+        let remaining = progress.report.remaining_time_secs.unwrap_or_else(|| {
+            progress
+                .report
+                .time_limit_secs
+                .saturating_sub(progress.elapsed_secs)
+        });
+        let mut state = Self::new(
+            id,
+            progress.condition.clone(),
+            progress.max_rounds.unwrap_or(0),
+            remaining,
+        );
+        state.max_duration_secs = progress.report.time_limit_secs;
+        state.elapsed_before = progress.elapsed_secs;
+        state.report = progress.report.clone();
+        state.tokens_used = progress.report.tokens;
+        state.round = progress.round;
+        state.evaluation_ready = progress.evaluation_ready;
+        state.pause("目标已恢复并暂停；先核对工作进度，再发送消息继续；已完成主工作可用 /goal recheck 仅重评估。");
+        if progress.report.time_limit_secs > 0 && remaining == 0 {
+            state.pause_at_cap("恢复的目标已达到原时间上限；明确续接后才会获得新预算。");
+        }
+        state
     }
 
     pub fn progress(&self) -> GoalProgress {
@@ -171,13 +261,125 @@ impl GoalState {
             phase: self.phase,
             round: self.round,
             max_rounds: self.max_rounds,
-            elapsed_secs: self.started_at.elapsed().as_secs(),
+            elapsed_secs: self
+                .elapsed_before
+                .saturating_add(self.started_at.elapsed().as_secs()),
+            report: GoalRunReport {
+                tokens: self.tokens_used,
+                remaining_time_secs: self.deadline.map(|at| {
+                    let remaining = at.saturating_duration_since(Instant::now());
+                    remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0)
+                }),
+                waiting_secs: self.report.waiting_secs.saturating_add(
+                    self.recovery_wait_started
+                        .map(|at| at.elapsed().as_secs())
+                        .unwrap_or(0),
+                ),
+                ..self.report.clone()
+            },
+            evaluation_ready: self.evaluation_ready,
             condition: self.condition.clone(),
             last_reason: self.last_reason.clone(),
+            recovery: self.recovery.clone().map(|mut progress| {
+                progress.retry_in_secs = self
+                    .retry_at
+                    .map(|at| {
+                        let remaining = at.saturating_duration_since(Instant::now());
+                        remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0)
+                    })
+                    .unwrap_or(0);
+                progress
+            }),
         }
     }
 
+    /// Invalidate a pending timer or evaluator, including results already queued.
+    pub fn invalidate_work(&mut self) {
+        if let Some(at) = self.recovery_wait_started.take() {
+            self.report.waiting_secs = self
+                .report
+                .waiting_secs
+                .saturating_add(at.elapsed().as_secs());
+        }
+        self.work_cancel.cancel();
+        self.work_cancel = self.cancel.child_token();
+        self.async_epoch = self.async_epoch.wrapping_add(1);
+        self.recovery = None;
+        self.retry_at = None;
+    }
+
+    pub fn begin_evaluation(&mut self) {
+        self.evaluation_ready = true;
+        self.report.evaluator_attempts = self.report.evaluator_attempts.saturating_add(1);
+        self.invalidate_work();
+        self.provider_budget.reset();
+        self.evaluator_budget.reset();
+        self.recovery = Some(GoalRecoveryProgress {
+            kind: GoalRecoveryKind::Evaluator,
+            attempt: 0,
+            max_attempts: self.recovery_policy.evaluator_max_attempts.min(10),
+            retry_in_secs: 0,
+        });
+    }
+
+    pub fn begin_retry_attempt(&mut self) {
+        if self
+            .recovery
+            .as_ref()
+            .is_some_and(|p| p.kind == GoalRecoveryKind::Provider)
+        {
+            self.report.provider_recoveries = self.report.provider_recoveries.saturating_add(1);
+        }
+        if self
+            .recovery
+            .as_ref()
+            .is_some_and(|p| p.kind == GoalRecoveryKind::Evaluator)
+        {
+            self.report.evaluator_attempts = self.report.evaluator_attempts.saturating_add(1);
+        }
+        let progress = self.recovery.clone();
+        self.invalidate_work();
+        self.recovery = progress;
+    }
+
+    pub fn recovery_window_open(&self, kind: GoalRecoveryKind) -> bool {
+        match kind {
+            GoalRecoveryKind::Provider => &self.provider_budget,
+            GoalRecoveryKind::Evaluator => &self.evaluator_budget,
+        }
+        .within_window(&self.recovery_policy)
+    }
+
+    pub fn schedule_recovery(
+        &mut self,
+        kind: GoalRecoveryKind,
+        retry_after: Option<u64>,
+    ) -> Option<Duration> {
+        let budget = match kind {
+            GoalRecoveryKind::Provider => &mut self.provider_budget,
+            GoalRecoveryKind::Evaluator => &mut self.evaluator_budget,
+        };
+        let progress = budget.next(&self.recovery_policy, kind, retry_after)?;
+        let delay = Duration::from_secs(progress.retry_in_secs);
+        if self
+            .deadline
+            .is_some_and(|at| at.saturating_duration_since(Instant::now()) <= delay)
+        {
+            return None;
+        }
+        self.invalidate_work();
+        self.last_reason = Some(format!(
+            "recovering {:?}: attempt {}/{}, retry in {}s",
+            kind, progress.attempt, progress.max_attempts, progress.retry_in_secs
+        ));
+        self.recovery_wait_started = Some(Instant::now());
+        self.retry_at = Some(Instant::now() + delay);
+        self.recovery = Some(progress);
+        Some(delay)
+    }
+
     pub fn finish(&mut self, terminal: GoalTerminal, reason: impl Into<String>) {
+        self.invalidate_work();
         self.active = false;
         self.phase = match terminal {
             GoalTerminal::Met => GoalPhase::Satisfied,
@@ -188,6 +390,7 @@ impl GoalState {
     }
 
     pub fn mark_satisfied(&mut self, verdict: impl Into<String>) {
+        self.invalidate_work();
         self.active = false;
         self.phase = GoalPhase::Satisfied;
         self.terminal = Some(GoalTerminal::Met);
@@ -195,6 +398,7 @@ impl GoalState {
     }
 
     pub fn pause_at_cap(&mut self, note: impl Into<String>) {
+        self.invalidate_work();
         self.active = false;
         self.phase = GoalPhase::PausedAtCap;
         self.terminal = Some(GoalTerminal::Stopped);
@@ -203,6 +407,7 @@ impl GoalState {
     }
 
     pub fn pause_for_recovery(&mut self, note: impl Into<String>) {
+        self.invalidate_work();
         self.active = false;
         self.phase = GoalPhase::PausedAtCap;
         self.terminal = Some(GoalTerminal::Stopped);
@@ -211,6 +416,7 @@ impl GoalState {
     }
 
     pub fn pause(&mut self, note: impl Into<String>) {
+        self.invalidate_work();
         self.cancel.cancel();
         self.active = false;
         self.phase = GoalPhase::Paused;
@@ -227,9 +433,10 @@ impl GoalState {
         self.terminal = None;
         self.last_reason = None;
         self.recovery_pause = false;
-        // Reset no-progress counter so accumulated unproductive rounds before the
-        // cap don't immediately trip MAX_UNPRODUCTIVE on the first resumed round.
-        self.unproductive = 0;
+        // A user granting another window gets fresh recovery attempt budgets.
+        self.provider_budget.reset();
+        self.evaluator_budget.reset();
+        self.invalidate_work();
         // Fresh window for the stall guard too — a user granting more rounds wants
         // another shot, not an instant re-stop from the prior window's tally.
         self.no_progress = 0;
@@ -245,6 +452,7 @@ impl GoalState {
         self.cancel = CancellationToken::new();
         self.active = true;
         self.phase = GoalPhase::Pursuing;
+        self.invalidate_work();
         self.terminal = None;
         self.last_reason = None;
         // Recovery context is consumed once at re-engage (captured before this
@@ -433,11 +641,16 @@ pub(crate) enum GoalResult {
     /// to judge, so the runtime must not mark the goal `Failed` or spam the UI.
     Inconclusive(String),
     Error(String),
+    RetryableError {
+        message: String,
+        retry_after_secs: Option<u64>,
+    },
 }
 
 pub(crate) struct EvalOutcome {
     pub generation: u64,
     pub controller_id: u64,
+    pub async_epoch: u64,
     pub result: GoalResult,
     pub usage: Option<TokenUsage>,
 }
@@ -445,10 +658,12 @@ pub(crate) struct EvalOutcome {
 pub(crate) async fn evaluate_goal(
     generation: u64,
     controller_id: u64,
+    async_epoch: u64,
     provider: Arc<dyn LlmProvider>,
     condition: String,
     summary: String,
     cancel: CancellationToken,
+    timeout: Duration,
 ) -> EvalOutcome {
     let user = EVALUATOR_USER_TEMPLATE
         .replace("{condition}", &sanitize_for_sentinel(&condition))
@@ -462,39 +677,65 @@ pub(crate) async fn evaluate_goal(
         tool_choice: ToolChoice::None,
         ..ChatOptions::default()
     };
-    let result = match provider.chat_stream(&messages, &[], &options).await {
-        Ok(mut stream) => {
-            let mut text = String::new();
-            let mut usage = None;
-            let collected = loop {
-                tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => break Err("evaluator cancelled by user".to_owned()),
-                    event = tokio::time::timeout(EVALUATOR_TIMEOUT, stream.next()) => match event {
-                        Ok(Some(StreamEvent::TextDelta(chunk))) => text.push_str(&chunk),
-                        Ok(Some(StreamEvent::Usage(value))) => usage = Some(value),
-                        Ok(Some(StreamEvent::Done { .. })) | Ok(None) => break Ok(()),
-                        Ok(Some(StreamEvent::Error(error))) => break Err(format!("evaluator provider error: {error:?}")),
-                        Ok(Some(_)) => {}
-                        Err(_) => break Err(format!("evaluator stream timed out after {}s", EVALUATOR_TIMEOUT.as_secs())),
+    let mut usage = None;
+    let request = async {
+        let mut stream = match provider.chat_stream(&messages, &[], &options).await {
+            Ok(stream) => stream,
+            Err(error) => return evaluator_error(error),
+        };
+        let mut text = String::new();
+        while let Some(event) = stream.next().await {
+            match event {
+                StreamEvent::TextDelta(chunk) => {
+                    if text.len().saturating_add(chunk.len()) > 32_768 {
+                        return GoalResult::Inconclusive(
+                            "evaluator response exceeded verdict budget".into(),
+                        );
                     }
+                    text.push_str(&chunk);
                 }
-            };
-            match collected {
-                Ok(()) => (parse_evaluator_response(&text), usage),
-                Err(error) => (GoalResult::Error(error), usage),
+                StreamEvent::Usage(value) => usage = Some(value),
+                StreamEvent::Error(error) => return evaluator_error(error),
+                StreamEvent::Done { truncated: false } => return parse_evaluator_response(&text),
+                StreamEvent::Done { truncated: true } => {
+                    return GoalResult::Inconclusive("evaluator response was truncated".into())
+                }
+                _ => {}
             }
         }
-        Err(error) => (
-            GoalResult::Error(format!("evaluator chat_stream setup failed: {error:?}")),
-            None,
-        ),
+        // A stream without a terminal event cannot certify completion.
+        GoalResult::Inconclusive("evaluator stream ended without terminal event".into())
+    };
+    let result = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => GoalResult::Error("evaluator cancelled by user".into()),
+        result = tokio::time::timeout(timeout, request) => match result {
+            Ok(result) => result,
+            Err(_) => GoalResult::RetryableError { message: "evaluator attempt timed out".into(), retry_after_secs: None },
+        }
     };
     EvalOutcome {
         generation,
         controller_id,
-        result: result.0,
-        usage: result.1,
+        async_epoch,
+        result,
+        usage,
+    }
+}
+
+fn evaluator_error(error: atomcode_kernel::stream::ProviderError) -> GoalResult {
+    if transient_provider_failure(
+        Some(error.retryable),
+        error.http_status,
+        error.code.as_deref(),
+        error.retry_after_secs,
+    ) {
+        GoalResult::RetryableError {
+            message: format!("evaluator provider error: {error:?}"),
+            retry_after_secs: error.retry_after_secs,
+        }
+    } else {
+        GoalResult::Error(format!("evaluator provider error: {error:?}"))
     }
 }
 
@@ -699,11 +940,21 @@ fn parse_evaluator_response(text: &str) -> GoalResult {
     }
     let lower = line.to_ascii_lowercase();
     for (prefix, met) in [("verdict: yes", true), ("verdict: no", false)] {
-        if lower.starts_with(prefix) {
+        if lower.starts_with(prefix)
+            && line[prefix.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| c.is_whitespace() || matches!(c, ':' | '-' | '—'))
+        {
             let reason = line[prefix.len()..]
                 .trim_start_matches([':', ' ', '\t', '-', '—'])
                 .trim()
                 .to_owned();
+            if reason.is_empty() {
+                return GoalResult::Inconclusive(
+                    "evaluator verdict has no supporting reason".into(),
+                );
+            }
             return if met {
                 GoalResult::Met(reason)
             } else {
@@ -711,7 +962,7 @@ fn parse_evaluator_response(text: &str) -> GoalResult {
             };
         }
     }
-    GoalResult::Error(format!(
+    GoalResult::Inconclusive(format!(
         "evaluator returned malformed verdict line: {:?}",
         line.chars().take(200).collect::<String>()
     ))
@@ -826,12 +1077,14 @@ mod tests {
         let outcome = evaluate_goal(
             1,
             2,
+            0,
             Arc::new(OptionsRecordingProvider {
                 options: options.clone(),
             }),
             "finish".into(),
             "done".into(),
             CancellationToken::new(),
+            Duration::from_secs(600),
         )
         .await;
 
@@ -876,7 +1129,7 @@ mod tests {
         );
         assert!(matches!(
             parse_evaluator_response("YES"),
-            GoalResult::Error(_)
+            GoalResult::Inconclusive(_)
         ));
         // An empty / whitespace-only evaluator response is "could not determine",
         // NOT a hard error — issue #17: the agent's completed work must not be
@@ -957,7 +1210,9 @@ mod tests {
     fn explicit_pause_resume_preserves_progress_and_budget() {
         let mut goal = GoalState::new(3, "finish".into(), 10, 600);
         goal.round = 4;
-        goal.unproductive = 2;
+        assert!(goal
+            .schedule_recovery(GoalRecoveryKind::Provider, None)
+            .is_some());
         let deadline = goal.deadline;
 
         goal.pause("paused by user");
@@ -967,7 +1222,10 @@ mod tests {
         assert_eq!(goal.phase, GoalPhase::Pursuing);
         assert!(goal.active);
         assert_eq!(goal.round, 4);
-        assert_eq!(goal.unproductive, 2);
+        assert!(goal
+            .schedule_recovery(GoalRecoveryKind::Provider, None)
+            .is_some());
+        assert_eq!(goal.progress().recovery.unwrap().attempt, 2);
         assert_eq!(goal.max_rounds, Some(10));
         assert_eq!(goal.deadline, deadline);
         assert!(!goal.cancel.is_cancelled());
@@ -1009,18 +1267,22 @@ mod tests {
         assert!(!g3.active);
     }
 
-    // Fix #1: resume() resets the no-progress counter so accumulated unproductive
-    // rounds before the cap don't immediately trip MAX_UNPRODUCTIVE after resume.
     #[test]
-    fn resume_resets_unproductive_counter() {
+    fn resume_grants_a_fresh_recovery_attempt_budget() {
         let mut state = GoalState::new(1, "x".into(), 10, 0);
-        state.unproductive = 4;
-        state.pause_at_cap("已达轮数预算（10 轮）");
+        state.recovery_policy.max_attempts = 1;
+        assert!(state
+            .schedule_recovery(GoalRecoveryKind::Provider, None)
+            .is_some());
+        assert!(state
+            .schedule_recovery(GoalRecoveryKind::Provider, None)
+            .is_none());
+        state.pause_at_cap("round budget reached");
         state.resume(10);
-        assert_eq!(
-            state.unproductive, 0,
-            "resume() must clear unproductive so the next window starts fresh"
-        );
+        assert!(state
+            .schedule_recovery(GoalRecoveryKind::Provider, None)
+            .is_some());
+        assert_eq!(state.progress().recovery.unwrap().attempt, 1);
     }
 
     #[test]
@@ -1200,5 +1462,27 @@ mod tests {
         goal.pause("user paused");
         goal.resume_paused();
         assert_eq!(goal.recovery_context(), None);
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_budget_audit_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn checkpoint_restores_the_current_renewed_time_window() {
+        let mut state = GoalState::new(1, "finish".into(), 10, 600);
+        tokio::time::advance(Duration::from_secs(600)).await;
+        state.pause_at_cap("time limit");
+        state.resume(10);
+        tokio::time::advance(Duration::from_secs(100)).await;
+        let progress = state.progress();
+        assert_eq!(progress.elapsed_secs, 700);
+        let mut restored = GoalState::restore_paused(2, &progress);
+        assert_eq!(restored.phase, GoalPhase::Paused);
+        restored.resume_paused();
+        assert!(restored.cap_reached().is_none());
+        tokio::time::advance(Duration::from_secs(500)).await;
+        assert!(restored.cap_reached().is_some());
     }
 }

@@ -1482,6 +1482,8 @@ mod tests {
                 generation: 1,
                 sequence: 1,
                 event: CodingRuntimeEvent::GoalChanged(GoalProgress {
+                    report: Default::default(),
+                    evaluation_ready: false,
                     active: true,
                     terminal: None,
                     phase: GoalPhase::Pursuing,
@@ -1490,6 +1492,7 @@ mod tests {
                     elapsed_secs: 12,
                     condition: "finish the task".into(),
                     last_reason: None,
+                    recovery: None,
                 }),
             },
         )
@@ -1510,6 +1513,8 @@ mod tests {
         hub.seed_goal_progress(
             &binding,
             GoalProgress {
+                report: Default::default(),
+                evaluation_ready: false,
                 active: true,
                 terminal: None,
                 phase: GoalPhase::Pursuing,
@@ -1518,6 +1523,7 @@ mod tests {
                 elapsed_secs: 0,
                 condition: "finish".into(),
                 last_reason: None,
+                recovery: None,
             },
         )
         .unwrap();
@@ -1528,6 +1534,8 @@ mod tests {
                 generation: 1,
                 sequence: 0,
                 event: CodingRuntimeEvent::GoalChanged(GoalProgress {
+                    report: Default::default(),
+                    evaluation_ready: false,
                     active: true,
                     terminal: None,
                     phase: GoalPhase::Pursuing,
@@ -1536,6 +1544,7 @@ mod tests {
                     elapsed_secs: 1,
                     condition: "finish".into(),
                     last_reason: None,
+                    recovery: None,
                 }),
             },
         )

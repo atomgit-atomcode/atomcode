@@ -1286,6 +1286,7 @@ mod tests {
         assert!(!idle.contains("轮"), "nothing is running: {idle:?}");
 
         m.autonomy = Some(atomcode_host_api::Running {
+            recovering: false,
             kind: "goal".into(),
             what: "把量化器搬到 NPU".into(),
             round: 4,
@@ -1303,6 +1304,7 @@ mod tests {
         // Registered but not running is the state somebody would otherwise sit
         // and wait through, so it is said.
         m.autonomy = Some(atomcode_host_api::Running {
+            recovering: false,
             kind: "loop".into(),
             what: "跑测试".into(),
             round: 2,

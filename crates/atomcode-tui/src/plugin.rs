@@ -6850,8 +6850,10 @@ impl Tui {
         // said line rather than as an event of its own (`CompactionCompletion::
         // Interrupted`), so the stop itself is what takes 正在压缩 down.
         let _ = self.host.stop_compacting();
-        let working = self.host.moment.read().expect("moment poisoned").activity
-            == crate::moment::Activity::Working;
+        let working = {
+            let moment = self.host.moment.read().expect("moment poisoned");
+            moment.activity == crate::moment::Activity::Working || moment.goal_recovering()
+        };
         if working {
             self.host.set_activity(crate::moment::Activity::Stopping);
         }
@@ -10886,6 +10888,7 @@ mod autonomy_tests {
 
     fn running(round: u32) -> atomcode_host_api::Running {
         atomcode_host_api::Running {
+            recovering: false,
             kind: "goal".into(),
             what: "测试全绿".into(),
             round,

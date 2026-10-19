@@ -1,3 +1,5 @@
+import { useSkills, refreshSkills, invalidateSkills } from '../skills';
+import type { LiveGoalProgress } from '../api';
 // Task 13 — Chat view with streaming rendering
 // Task 15 — sessionId + cwd lifted to App
 //
@@ -25,7 +27,6 @@
 //   • P3  !ts 守卫把 ts=0 误判无效                  → 23fb3db4  formatMsgTime 改为 ts == null || !Number.isFinite(ts)
 // 我们愿意根据再审意见继续优化。
 
-import { useSkills, refreshSkills, invalidateSkills } from '../skills';
 import { VNode } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, listDir, searchFiles, changeDir, postConfigReload, postCommand, postLiveCompact, postUserInputAnswer, postLivePolicyInterventionResolution, openWorkspaceFile, type CommandResult, type RoutedUserInputRequest, type PolicyInterventionEvent, type TurnStats } from '../api';
@@ -451,6 +452,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   // IME 候选窗的按键）。输入值本身始终受控同步，见 handleInput。
   const composingRef = useRef(false);
   const [busy, setBusyState] = useState(false);
+  const [goalProgress, setGoalProgress] = useState<LiveGoalProgress | null>(null);
   // Mirror of `busy` in a ref so pushCommandNotice can read it synchronously
   // without a stale closure (refs always reflect the latest render value).
   const busyRef = useRef(false);
@@ -595,6 +597,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   const [sync, setSync] = useState<boolean>(() => {
     try { return new URLSearchParams(location.search).get('sync') === '1'; } catch { return false; }
   });
+  useEffect(() => { if (!sync) setGoalProgress(null); }, [sync]);
   const syncRef = useRef(sync);
   syncRef.current = sync;
   // Pending live-session permission request (shown as PermissionCard, calls /live/permission).
@@ -1474,8 +1477,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
 
   // ── Live event handler ──
   function onLiveEvent(e: LiveWireEvent) {
+    if (e.type === 'goal_changed') {
+      setGoalProgress(e);
+      return;
+    }
     // snapshot：确立实时会话 id 并把视图切到它（连上即对齐）。
     if (e.type === 'snapshot') {
+      setGoalProgress(e.goal ?? null);
       liveSessionIdRef.current = e.session_id || null;
       // Historical timestamps come from the daemon's native transcript projection.
       // Older sessions may not have transcript records; leave those timestamps absent
@@ -3317,7 +3325,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
             onDefaultChange={followDefaultProvider}
           />
           <div class="input-turn-controls">
-            {busy || recoveryPolicy.allowStop ? (
+            {busy || recoveryPolicy.allowStop || Boolean(goalProgress?.recovery) ? (
               <>
                 {/* /live folds this into the active turn; /chat queues it for the next turn. */}
                 {recoveryPolicy.allowSend && (input.trim() || pendingImages.length > 0) && (
@@ -3809,6 +3817,18 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         </div>
       )}
       <div class="input-container">
+        {goalProgress?.recovery && (
+          <div class="goal-recovery-status" role="status" aria-live="polite">
+            {t(goalProgress.recovery.retry_in_secs === 0 ? 'goal.recovery.running' : goalProgress.recovery.kind === 'evaluator' ? 'goal.recovery.evaluator' : 'goal.recovery.provider', {
+              attempt: goalProgress.recovery.attempt,
+              max: goalProgress.recovery.max_attempts,
+              secs: goalProgress.recovery.retry_in_secs,
+            })}
+          </div>
+        )}
+        {goalProgress?.phase === 'paused_at_cap' && !goalProgress.recovery && (
+          <div class="goal-recovery-status" role="status">{t('goal.recovery.paused')} {goalProgress.last_reason}</div>
+        )}
         {todoPanelVisible && (todoPreview ?? todoItems).length > 0 && (
           <TodoProgressPanel items={todoPreview ?? todoItems} />
         )}

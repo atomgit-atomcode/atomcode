@@ -3,6 +3,10 @@
 //! The runtime owns the replaceable kernel [`AgentHandle`] so native controls and
 //! events never need to traverse a legacy driver adapter.
 
+mod goal_checkpoint;
+#[cfg(test)]
+mod goal_recovery_tests;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
@@ -36,9 +40,9 @@ use atomcode_kernel::provider::LlmProvider;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::controllers::{
-    evaluate_goal, goal_cap_stop_note, goal_continuation_message, summarize_for_goal, EvalOutcome,
-    GoalPhase, GoalProgress, GoalResult, GoalState, GoalTerminal, LoopProgress, LoopState,
-    ScheduleWakeupTool, WakeupRequest, MAX_UNPRODUCTIVE,
+    evaluate_goal, goal_cap_stop_note, goal_continuation_message, summarize_for_goal,
+    transient_provider_failure, EvalOutcome, GoalPhase, GoalProgress, GoalRecoveryKind, GoalResult,
+    GoalState, GoalTerminal, LoopProgress, LoopState, ScheduleWakeupTool, WakeupRequest,
 };
 use crate::parts::{prepare_with_plugin_hook_source_reusing_lease, SessionLeaseSource};
 #[cfg(test)]
@@ -890,6 +894,12 @@ pub trait RuntimeCommands: Send + Sync {
     async fn start_goal(&self, condition: String) -> Result<(), String>;
     /// Stop the goal that is running.
     async fn stop_goal(&self) -> Result<(), String>;
+    async fn recheck_goal(&self) -> Result<(), String> {
+        Err("goal recheck is unavailable".into())
+    }
+    async fn goal_report(&self) -> Result<String, String> {
+        Err("goal report is unavailable".into())
+    }
     /// Leave the goal where it is; it can be taken up again.
     async fn pause_goal(&self) -> Result<(), String>;
     /// Run `prompt` again and again until it is stopped.
@@ -946,6 +956,7 @@ pub enum SubmitReceipt {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeError {
+    GoalUnavailable(String),
     Busy,
     Cancelled,
     SessionInUse { id: String },
@@ -966,6 +977,7 @@ pub enum RuntimeError {
 impl fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::GoalUnavailable(message) => f.write_str(message),
             Self::Busy => f.write_str("coding runtime is busy"),
             Self::Cancelled => f.write_str("coding runtime operation was cancelled"),
             Self::SessionInUse { id } => {
@@ -1062,6 +1074,7 @@ struct RuntimeEventEmitter {
     /// [`Self::withdraw_unclaimed`] answers it: without that, the driver holding
     /// the receipt waits for an answer that is never coming.
     unclaimed: Mutex<Vec<atomcode_kernel::event::CommandId>>,
+    latest_goal: Mutex<Option<GoalProgress>>,
 }
 
 fn project_team_event(
@@ -1092,6 +1105,7 @@ impl RuntimeEventEmitter {
             tagged,
             generation,
             unclaimed: Mutex::new(Vec::new()),
+            latest_goal: Mutex::new(None),
         }
     }
 
@@ -1123,6 +1137,9 @@ impl RuntimeEventEmitter {
     }
 
     fn send(&self, event: CodingRuntimeEvent) -> Result<(), ()> {
+        if let CodingRuntimeEvent::GoalChanged(progress) = &event {
+            *self.latest_goal.lock().expect("goal projection poisoned") = Some(progress.clone());
+        }
         if let CodingRuntimeEvent::Agent(
             AgentEvent::Accepted { command, .. } | AgentEvent::Rejected { command, .. },
         ) = &event
@@ -2874,6 +2891,30 @@ impl CodingRuntimeHandle {
         result.await.map_err(|_| RuntimeError::Unavailable)?
     }
 
+    pub async fn goal_report(&self) -> Result<String, RuntimeError> {
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::GoalReport { done })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+    pub async fn recheck_goal(&self) -> Result<(), RuntimeError> {
+        if self.status().phase != RuntimePhase::Ready {
+            return Err(RuntimeError::Busy);
+        }
+        let generation = runtime_state_generation(self.state.load(Ordering::Acquire));
+        let receipt = self.snapshot_with_revision().await?;
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::RecheckGoal {
+                generation,
+                receipt,
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
     pub async fn start_goal(&self, condition: impl Into<UserInput>) -> Result<(), RuntimeError> {
         let state = self.state.load(Ordering::Acquire);
         let (done, result) = oneshot::channel();
@@ -3573,6 +3614,14 @@ pub enum CodingRuntimeControl {
         snapshot: SessionSnapshot,
         done: oneshot::Sender<Result<SessionChanged, RuntimeError>>,
     },
+    GoalReport {
+        done: oneshot::Sender<Result<String, RuntimeError>>,
+    },
+    RecheckGoal {
+        generation: u64,
+        receipt: RuntimeSnapshotReceipt,
+        done: oneshot::Sender<Result<(), RuntimeError>>,
+    },
     StartGoal {
         generation: u64,
         condition: String,
@@ -3983,6 +4032,7 @@ fn spawn_runtime_owner_with_optional_agent(
     let (_closed_wakeup_tx, closed_wakeup_rx) = mpsc::unbounded_channel();
     let mut wakeup_rx = wakeup_rx.unwrap_or(closed_wakeup_rx);
     let (goal_eval_tx, mut goal_eval_rx) = mpsc::unbounded_channel::<EvalOutcome>();
+    let (goal_retry_tx, mut goal_retry_rx) = mpsc::unbounded_channel::<(u64, u64, u64)>();
     let (loop_fire_tx, mut loop_fire_rx) = mpsc::unbounded_channel::<(u64, u64, WakeupRequest)>();
     let (next_prompt_tx, mut next_prompt_rx) =
         mpsc::unbounded_channel::<NextPromptSuggestionOutcome>();
@@ -4043,6 +4093,8 @@ fn spawn_runtime_owner_with_optional_agent(
         // arrives, otherwise a prompt can be accepted as a steer and then cleared by
         // the kernel's cancel path.
         let mut cancel_pending = false;
+        let mut main_failure_retryable = None;
+        let mut main_retry_after_secs = None;
         let mut turn_stats = RuntimeTurnStats::default();
         let mut turn_started_at: Option<std::time::Instant> = None;
         let mut pending_steer_acknowledgements = VecDeque::new();
@@ -4050,6 +4102,7 @@ fn spawn_runtime_owner_with_optional_agent(
         let mut pending_local_context = Vec::new();
         let mut next_controller_id = 0u64;
         let mut goal: Option<GoalState> = None;
+        let mut goal_checkpoints = goal_checkpoint::GoalCheckpoints::default();
         let mut loop_state: Option<LoopState> = None;
         let mut pending_wakeup: Option<WakeupRequest> = None;
         let mut held_turn: Option<(u64, StopReason, Arc<SessionSnapshot>, RuntimeTurnStats)> = None;
@@ -4082,6 +4135,49 @@ fn spawn_runtime_owner_with_optional_agent(
             });
         }
         loop {
+            if let Err(error) = goal_checkpoints.sync(
+                resources.as_ref(),
+                &mut goal,
+                &mut next_controller_id,
+                &runtime_event_tx,
+            ) {
+                if let Some(mut state) = goal.take() {
+                    state.finish(
+                        GoalTerminal::Failed,
+                        format!("目标检查点不可用，自动续接已停止：{error}"),
+                    );
+                    let _ =
+                        runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                    fail_close_pending_requests(
+                        &agent,
+                        &mut pending_requests,
+                        active_turn.is_some(),
+                    );
+                    if held_turn.is_none() && active_turn.is_some() {
+                        cancel_pending = true;
+                        let _ = send_agent_command(&agent, AgentCommand::Cancel);
+                    }
+                }
+                if let Some((turn_id, reason, snapshot, stats)) = held_turn.take() {
+                    active_turn = None;
+                    terminal_reason = None;
+                    let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(
+                        TurnCompletion::Completed {
+                            turn_id,
+                            reason,
+                            snapshot,
+                            stats,
+                        },
+                    ));
+                    controls.state.store(
+                        runtime_phase_state(generation, RuntimePhase::Ready),
+                        Ordering::Release,
+                    );
+                }
+                let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(format!(
+                    "目标恢复状态不可用：{error}"
+                )));
+            }
             // No agent, no inbox: whatever was still waiting in the one that
             // went is answered now (a stop-and-rebuild answers it itself, in
             // `stop_current_agent`; this is every other way an agent is lost).
@@ -4363,6 +4459,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             CompactionInterruption::RuntimeShutdown,
                         );
                         let _ = done.send(());
+                        if let Err(error) = goal_checkpoints.flush(&runtime_event_tx) { let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(format!("目标检查点保存失败：{error}"))); }
                         shutdown_was_handled = true;
                         exit_reason = RuntimeExitReason::ShutdownRequested;
                         break;
@@ -4399,7 +4496,7 @@ fn spawn_runtime_owner_with_optional_agent(
                 outcome = goal_eval_rx.recv(), if native_protocol => {
                     let Some(outcome) = outcome else { continue };
                     if outcome.generation != generation
-                        || goal.as_ref().map(|state| state.id) != Some(outcome.controller_id)
+                        || !goal.as_ref().is_some_and(|state| state.id == outcome.controller_id && state.async_epoch == outcome.async_epoch && state.active)
                         || held_turn.is_none()
                     {
                         continue;
@@ -4422,6 +4519,13 @@ fn spawn_runtime_owner_with_optional_agent(
                             // starts another.
                             if let Some(state) = goal.as_mut() {
                                 state.mark_satisfied(verdict);
+                                let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                            }
+                            finish_reason = Some(StopReason::Stopped);
+                        }
+                        GoalResult::NotMet(verdict) if goal.as_ref().is_some_and(|s| s.evaluation_only) => {
+                            if let Some(state) = goal.as_mut() {
+                                state.pause_for_recovery(format!("仅重评估：目标尚未达成。{verdict}。核对后发送消息继续主任务。"));
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                             }
                             finish_reason = Some(StopReason::Stopped);
@@ -4465,19 +4569,20 @@ fn spawn_runtime_owner_with_optional_agent(
                                 }
                             }
                         }
-                        GoalResult::Inconclusive(reason) => {
-                            // The evaluator returned no usable verdict (e.g. an
-                            // empty stream). This is NOT a failure of the agent's
-                            // work and NOT a provider error: the evaluator simply
-                            // produced nothing to judge. End the goal as Stopped
-                            // (not Failed) and skip the red ControllerWarning —
-                            // repeatedly yelling about an empty verdict made the
-                            // agent spin in pointless retries (issue #17).
+                        result @ (GoalResult::Inconclusive(_) | GoalResult::RetryableError { .. }) => {
+                            let (detail, retry_after) = match &result {
+                                GoalResult::Inconclusive(reason) => (reason.as_str(), None),
+                                GoalResult::RetryableError { message, retry_after_secs } => (message.as_str(), *retry_after_secs),
+                                _ => unreachable!(),
+                            };
                             if let Some(state) = goal.as_mut() {
-                                state.finish(
-                                    GoalTerminal::Stopped,
-                                    format!("goal evaluation inconclusive: {reason}"),
-                                );
+                                if let Some(delay) = state.schedule_recovery(GoalRecoveryKind::Evaluator, retry_after) {
+                                    arm_goal_retry(&goal_retry_tx, generation, state, delay);
+                                    let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                                    tracing::info!(generation, goal_id=state.id, delay_secs=delay.as_secs(), "goal evaluator recovery scheduled");
+                                    continue;
+                                }
+                                state.pause_for_recovery(format!("evaluation recovery budget exhausted; goal retained: {detail}"));
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                             }
                             finish_reason = Some(StopReason::Stopped);
@@ -4499,11 +4604,19 @@ fn spawn_runtime_owner_with_optional_agent(
                             active_turn = None;
                             // Every verdict that ends the goal closes it — Met included.
                             // The GoalChanged above already said which terminal it was.
-                            goal = None;
+                            if !goal.as_ref().is_some_and(|state| state.phase == GoalPhase::PausedAtCap) {
+                                goal = None;
+                            }
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed { turn_id, reason, snapshot, stats }));
                             controls.state.store(runtime_phase_state(generation, RuntimePhase::Ready), Ordering::Release);
                         }
                     } else if let Some(text) = continuation {
+                        if let Some(state) = goal.as_mut() {
+                            state.invalidate_work();
+                            state.evaluation_ready = false;
+                            state.evaluation_only = false;
+                            let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                        }
                         if send_agent_command(&agent, AgentCommand::SendSyntheticMessage { text }) {
                             held_turn = None;
                             terminal_reason = None;
@@ -4534,6 +4647,63 @@ fn spawn_runtime_owner_with_optional_agent(
                                     },
                                 ));
                             }
+                            controls.state.store(runtime_phase_state(generation, RuntimePhase::Failed), Ordering::Release);
+                        }
+                    }
+                }
+                retry = goal_retry_rx.recv(), if native_protocol => {
+                    let Some((retry_generation, controller_id, epoch)) = retry else { continue };
+                    let Some(state) = goal.as_mut().filter(|state| state.active && state.id == controller_id && state.async_epoch == epoch && state.recovery.is_some()) else { continue };
+                    if retry_generation != generation || held_turn.is_none() { continue; }
+                    if !agent_available || persistence_failure.is_some() || pending_policy_intervention.is_some() {
+                        state.pause_for_recovery("automatic recovery blocked; resolve the runtime or pending policy first");
+                        let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                        if let Some((turn_id, reason, snapshot, stats)) = held_turn.take() {
+                            active_turn = None;
+                            terminal_reason = None;
+                            let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed { turn_id, reason, snapshot, stats }));
+                        }
+                        controls.state.store(runtime_phase_state(generation, if agent_available && persistence_failure.is_none() { RuntimePhase::Ready } else { RuntimePhase::Failed }), Ordering::Release);
+                        continue;
+                    }
+                    let kind = state.recovery.as_ref().expect("recovery present").kind;
+                    if state.cap_reached().is_some() || !state.recovery_window_open(kind) {
+                        if let Some(why) = state.cap_reached() {
+                            state.pause_at_cap(goal_cap_stop_note(why, state.max_rounds));
+                        } else {
+                            state.pause_for_recovery("recovery time budget exhausted; goal retained");
+                        }
+                        let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                        if let Some((turn_id, reason, snapshot, stats)) = held_turn.take() {
+                            active_turn = None;
+                            terminal_reason = None;
+                            let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed { turn_id, reason, snapshot, stats }));
+                            controls.state.store(runtime_phase_state(generation, RuntimePhase::Ready), Ordering::Release);
+                        }
+                        continue;
+                    }
+                    state.begin_retry_attempt();
+                    state.last_reason = Some("automatic goal recovery in progress".into());
+                    let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                    if kind == GoalRecoveryKind::Evaluator {
+                        let snapshot = &held_turn.as_ref().expect("held turn present").2;
+                        launch_goal_evaluation(generation, state, snapshot, resources.as_ref(), &goal_eval_tx);
+                    } else {
+                        state.round = state.round.saturating_add(1);
+                        let text = goal_continuation_message(state.last_reason.as_deref().unwrap_or("provider recovered"), &state.condition);
+                        if send_agent_command(&agent, AgentCommand::SendSyntheticMessage { text }) {
+                            held_turn = None;
+                            terminal_reason = None;
+                            turn_stats = RuntimeTurnStats::default();
+                            let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                        } else {
+                            state.finish(GoalTerminal::Failed, "continuation dispatch failed");
+                            let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                            if let Some((turn_id, _, snapshot, stats)) = held_turn.take() {
+                                active_turn = None;
+                                let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed { turn_id, reason: StopReason::ProviderError, snapshot, stats }));
+                            }
+                            agent_available = false;
                             controls.state.store(runtime_phase_state(generation, RuntimePhase::Failed), Ordering::Release);
                         }
                     }
@@ -4806,6 +4976,15 @@ fn spawn_runtime_owner_with_optional_agent(
                         // dropping it would stop the loop rather than interrupt a round.
                         // Its own receipt is handled below (no steer acknowledgement is
                         // registered while a turn is held, because no `Steered` is coming).
+                        if from.is_none() {
+                            if let Some(state) = goal.as_mut().filter(|state| state.active) {
+                                let recovering = state.recovery.is_some();
+                                state.invalidate_work();
+                                state.evaluation_ready = false;
+                                state.evaluation_only = false;
+                                if recovering { let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress())); }
+                            }
+                        }
                         let goal_holds_the_turn = goal.as_ref().is_some_and(|state| state.active);
                         if let Some((turn_id, held_reason, snapshot, stats)) =
                             goal_holds_the_turn.then(|| held_turn.take()).flatten()
@@ -5702,7 +5881,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 runtime_phase_state(generation, RuntimePhase::Ready),
                                 Ordering::Release,
                             );
-                            let _ = done.send(Ok(()));
+                            let _ = done.send(goal_checkpoints.commit(&runtime_event_tx));
                         } else if held_turn.is_some() {
                         // A turn the agent opened under the hold is not what
                         // this stops: the person asked for the controller to
@@ -5710,10 +5889,10 @@ fn spawn_runtime_owner_with_optional_agent(
                         // the turn now running is the one this owner accounts
                         // for, and its own end reports it.
                             held_turn = None;
-                            let _ = done.send(Ok(()));
+                            let _ = done.send(goal_checkpoints.commit(&runtime_event_tx));
                         } else if active_turn.is_none() {
                             cancel_pending = false;
-                            let _ = done.send(Ok(()));
+                            let _ = done.send(goal_checkpoints.commit(&runtime_event_tx));
                         } else {
                             for id in pending_requests.keys().copied() {
                                 let _ = send_agent_command(&agent, AgentCommand::Respond {
@@ -5729,7 +5908,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                     runtime_phase_state(generation, RuntimePhase::InTurn),
                                     Ordering::Release,
                                 );
-                                let _ = done.send(Ok(()));
+                                let _ = done.send(goal_checkpoints.commit(&runtime_event_tx));
                             } else {
                                 if let Some(mut state) = goal.take() {
                                     state.finish(
@@ -6574,6 +6753,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                                 http_status: None,
                                                 code: None,
                                                 retryable: None,
+                    retry_after_secs: None,
                     ends_turn: false,
                                             }),
                                         );
@@ -7364,6 +7544,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                             http_status: None,
                                             code: None,
                                             retryable: None,
+                    retry_after_secs: None,
                     ends_turn: false,
                                         },
                                     ));
@@ -7518,6 +7699,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                             http_status: None,
                                             code: None,
                                             retryable: None,
+                    retry_after_secs: None,
                     ends_turn: false,
                                         },
                                     ));
@@ -7552,6 +7734,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                                     http_status: None,
                                                     code: None,
                                                     retryable: None,
+                    retry_after_secs: None,
                     ends_turn: false,
                                                 }),
                                             );
@@ -7792,6 +7975,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                             http_status: None,
                                             code: None,
                                             retryable: None,
+                    retry_after_secs: None,
                     ends_turn: false,
                                         },
                                     ));
@@ -7826,6 +8010,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                                     http_status: None,
                                                     code: None,
                                                     retryable: None,
+                    retry_after_secs: None,
                     ends_turn: false,
                                                 }),
                                             );
@@ -7842,7 +8027,50 @@ fn spawn_runtime_owner_with_optional_agent(
                             }
                         }
                     }
+                    Some(CodingRuntimeControl::GoalReport { done }) => {
+                        let result = goal_checkpoints.available().and_then(|_| {
+                            let progress = goal.as_ref().map(GoalState::progress).or_else(|| runtime_event_tx.latest_goal.lock().expect("goal projection poisoned").clone());
+                            progress.as_ref().map(goal_checkpoint::report).ok_or_else(|| RuntimeError::GoalUnavailable("当前会话没有目标运行报告。".into()))
+                        });
+                        let _ = done.send(result);
+                    }
+                    Some(CodingRuntimeControl::RecheckGoal { generation: requested, receipt, done }) => {
+                        if !native_protocol || requested != generation || receipt.revision != conversation_revision || active_turn.is_some() || compactions.is_active() || compaction_suspended || pending_policy_intervention.is_some() || !pending_requests.is_empty() || !agent_available || persistence_failure.is_some() {
+                            let _ = done.send(Err(RuntimeError::Busy)); continue;
+                        }
+                        if let Err(error) = goal_checkpoints.available() { let _ = done.send(Err(error)); continue; }
+                        let prior = goal.as_ref().map(GoalState::progress).or_else(|| runtime_event_tx.latest_goal.lock().expect("goal projection poisoned").clone());
+                        let Some(prior) = prior.filter(|p| p.evaluation_ready && p.terminal != Some(GoalTerminal::Cancelled)) else {
+                            let _ = done.send(Err(RuntimeError::GoalUnavailable("没有可重新评估的已完成工作；请先核对并继续主任务。".into()))); continue;
+                        };
+                        if loop_state.as_ref().is_some_and(|l| l.active) { let _ = done.send(Err(RuntimeError::Busy)); continue; }
+                        if goal.is_none() { next_controller_id = next_controller_id.wrapping_add(1); goal = Some(GoalState::restore_paused(next_controller_id, &prior)); }
+                        let state = goal.as_mut().expect("goal present");
+                        state.resume_paused_for_evaluation();
+                        if let Some(registry) = resources.as_ref().and_then(|r| r.config.subagent_config.as_ref()) { state.recovery_policy = registry.goal.recovery.clone(); }
+                        next_turn_id = next_turn_id.wrapping_add(1);
+                        active_turn = Some(next_turn_id);
+                        state.begin_evaluation();
+                        state.evaluation_only = true;
+                        held_turn = Some((next_turn_id, StopReason::Stopped, receipt.snapshot.clone(), RuntimeTurnStats::default()));
+                        controls.state.store(runtime_phase_state(generation, RuntimePhase::InTurn), Ordering::Release);
+                        let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                        if let Err(error) = goal_checkpoints.commit(&runtime_event_tx) {
+                            state.finish(GoalTerminal::Failed, error.to_string());
+                            let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                            if let Some((turn_id, reason, snapshot, stats)) = held_turn.take() {
+                                active_turn = None;
+                                let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed { turn_id, reason, snapshot, stats }));
+                                controls.state.store(runtime_phase_state(generation, RuntimePhase::Ready), Ordering::Release);
+                            }
+                            goal = None;
+                            let _ = done.send(Err(error)); continue;
+                        }
+                        launch_goal_evaluation(generation, state, &receipt.snapshot, resources.as_ref(), &goal_eval_tx);
+                        let _ = done.send(Ok(()));
+                    }
                     Some(CodingRuntimeControl::StartGoal { generation: request_generation, condition, images, done, recovery_tx }) => {
+                        if let Err(error) = goal_checkpoints.available() { let _ = done.send(Err(error)); continue; }
                         if !native_protocol || request_generation != generation || compaction_suspended {
                             let _ = done.send(Err(RuntimeError::Busy));
                             continue;
@@ -7887,13 +8115,23 @@ fn spawn_runtime_owner_with_optional_agent(
                             // scales per plan (Pro 1000 → 300, Lite 800 → 240) from the account's
                             // live request quota, resolved OFF the loop and applied via a self-sent
                             // AdjustGoalRounds; env override wins and any miss keeps the default.
-                            let next = GoalState::new(
+                            let mut next = GoalState::new(
                                 controller_id,
                                 condition.clone(),
                                 runtime.config.goal_max_rounds,
                                 runtime.config.goal_max_duration_secs,
                             );
+                            if let Some(registry) = runtime.config.subagent_config.as_ref() {
+                                next.recovery_policy = registry.goal.recovery.clone();
+                            }
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(next.progress()));
+                            if let Err(error) = goal_checkpoints.flush(&runtime_event_tx) {
+                                next.finish(GoalTerminal::Failed, format!("目标检查点写入失败：{error}"));
+                                let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(next.progress()));
+                                goal = None;
+                                let _ = done.send(Err(RuntimeError::GoalUnavailable(error)));
+                                continue;
+                            }
                             goal = Some(next);
                             let _ = done.send(Ok(()));
                             // The first round is this one. Every later round
@@ -7990,7 +8228,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 continue;
                             }
                         }
-                        let _ = done.send(Ok(()));
+                        let _ = done.send(goal_checkpoints.commit(&runtime_event_tx));
                     }
                     Some(CodingRuntimeControl::StartLoop { generation: request_generation, prompt, every, done, recovery_tx }) => {
                         if !native_protocol || request_generation != generation || compaction_suspended {
@@ -8265,6 +8503,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                     http_status: None,
                                     code: None,
                                     retryable: None,
+                    retry_after_secs: None,
                     ends_turn: false,
                                 },
                             ));
@@ -8351,7 +8590,11 @@ fn spawn_runtime_owner_with_optional_agent(
                                     },
                                 ));
                             }
-                            AgentEvent::TurnComplete { reason, .. } => {
+                            AgentEvent::TurnComplete { reason, provider_failure, .. } => {
+                                if let Some(failure) = provider_failure {
+                                    main_failure_retryable = Some(transient_provider_failure(Some(failure.retryable), failure.http_status, failure.code.as_deref(), failure.retry_after_secs));
+                                    main_retry_after_secs = failure.retry_after_secs;
+                                }
                                 kernel_turn_open = false;
                                 // The tree carries the real cause; this protocol's
                                 // drivers match on the folded set.
@@ -8413,6 +8656,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                             http_status: None,
                                             code: None,
                                             retryable: None,
+                    retry_after_secs: None,
                     ends_turn: false,
                                         },
                                     ));
@@ -8535,11 +8779,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                     let turn_id = active_turn.unwrap_or_default();
                                     let mut completion_reason = reason;
                                     if let Some(state) = goal.as_mut().filter(|state| state.active) {
-                                        if let Some(meta) = stats.last_usage.as_ref() {
-                                            state.tokens_used = state.tokens_used.saturating_add(
-                                                (meta.tokens.prompt + meta.tokens.completion) as u64,
-                                            );
-                                        }
+                                        state.tokens_used = state.tokens_used.saturating_add(stats.prompt_tokens.saturating_add(stats.completion_tokens) as u64);
                                         // Keep one bounded runtime-owned recap. It survives
                                         // replacement of the conversation and is attached once
                                         // to a real recovery submit; it is deliberately not copied
@@ -8548,6 +8788,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                             &snapshot.messages,
                                             state.last_reason.as_deref(),
                                         ));
+                                        state.report.tool_calls = state.report.tool_calls.saturating_add(stats.tool_call_count as u64);
                                         let stop_reason = state.cap_reached();
                                         let evaluate = matches!(
                                             reason,
@@ -8555,10 +8796,11 @@ fn spawn_runtime_owner_with_optional_agent(
                                                 | StopReason::MaxContinuations
                                                 | StopReason::MaxRounds
                                         );
-                                        let recoverable = matches!(
-                                            reason,
-                                            StopReason::Timeout | StopReason::ProviderError
-                                        );
+                                        let recoverable = match reason {
+                                            StopReason::Timeout => main_failure_retryable != Some(false),
+                                            StopReason::ProviderError | StopReason::RateLimited => main_failure_retryable == Some(true),
+                                            _ => false,
+                                        };
                                         let mut keep_goal_registered = false;
                                         if let Some(why) = stop_reason {
                                             // A cap fired (round budget, or the optional time cap).
@@ -8576,113 +8818,24 @@ fn spawn_runtime_owner_with_optional_agent(
                                             let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                                             let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(format!("goal {note}")));
                                         } else if evaluate {
-                                            state.unproductive = 0;
-                                            let condition = state.condition.clone();
-                                            let controller_id = state.id;
-                                            let cancel = state.cancel.clone();
-                                            let summary = summarize_for_goal(
-                                                &snapshot.messages,
-                                                state.last_reason.as_deref(),
-                                            );
-                                            let provider = resources.as_ref().and_then(|runtime| {
-                                                let session_id = runtime.parts.session.as_ref().map(|binding| binding.id.as_str());
-                                                build_goal_evaluator_provider(
-                                                    &runtime.provider_factory,
-                                                    &runtime.config,
-                                                    session_id,
-                                                )
-                                                .ok()
-                                            });
+                                            state.begin_evaluation();
+                                            let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                                             held_turn = Some((turn_id, reason, snapshot.clone(), stats));
-                                            let tx = goal_eval_tx.clone();
-                                            if let Some(provider) = provider {
-                                                tokio::spawn(async move {
-                                                    let inner = tokio::spawn(async move {
-                                                        evaluate_goal(generation, controller_id, provider, condition, summary, cancel).await
-                                                    });
-                                                    let outcome = match inner.await {
-                                                        Ok(outcome) => outcome,
-                                                        Err(_) => EvalOutcome {
-                                                            generation,
-                                                            controller_id,
-                                                            result: GoalResult::Error(
-                                                                "evaluator task failed".into(),
-                                                            ),
-                                                            usage: None,
-                                                        },
-                                                    };
-                                                    let _ = tx.send(outcome);
-                                                });
-                                                continue;
-                                            }
-                                            let _ = tx.send(EvalOutcome {
-                                                generation,
-                                                controller_id,
-                                                result: GoalResult::Error("could not build evaluator provider".into()),
-                                                usage: None,
-                                            });
+                                            launch_goal_evaluation(generation, state, &snapshot, resources.as_ref(), &goal_eval_tx);
                                             continue;
                                         } else if recoverable {
-                                            state.unproductive = state.unproductive.saturating_add(1);
-                                            if state.unproductive < MAX_UNPRODUCTIVE {
-                                                state.round = state.round.saturating_add(1);
-                                                state.last_reason = Some(format!("round ended: {reason:?}"));
-                                                let text = goal_continuation_message(
-                                                    state.last_reason.as_deref().unwrap_or("round failed"),
-                                                    &state.condition,
-                                                );
-                                                held_turn = None;
-                                                if send_agent_command(
-                                                    &agent,
-                                                    AgentCommand::SendSyntheticMessage { text },
-                                                ) {
-                                                    let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
-                                                    continue;
-                                                }
-                                                agent_available = false;
-                                                state.cancel.cancel();
-                                                state.finish(
-                                                    GoalTerminal::Failed,
-                                                    "continuation dispatch failed",
-                                                );
+                                            if let Some(delay) = state.schedule_recovery(GoalRecoveryKind::Provider, main_retry_after_secs) {
+                                                held_turn = Some((turn_id, reason, snapshot.clone(), stats));
+                                                arm_goal_retry(&goal_retry_tx, generation, state, delay);
                                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
-                                                let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(
-                                                    "goal stopped: continuation dispatch failed".into(),
-                                                ));
-                                                goal = None;
-                                                active_turn = None;
-                                                let _ = runtime_event_tx.send(
-                                                    CodingRuntimeEvent::TurnFinished(
-                                                        TurnCompletion::Completed {
-                                                            turn_id,
-                                                            reason: StopReason::ProviderError,
-                                                            snapshot,
-                                                            stats,
-                                                        },
-                                                    ),
-                                                );
-                                                controls.state.store(
-                                                    runtime_phase_state(
-                                                        generation,
-                                                        RuntimePhase::Failed,
-                                                    ),
-                                                    Ordering::Release,
-                                                );
+                                                tracing::info!(generation, goal_id=state.id, delay_secs=delay.as_secs(), "goal provider recovery scheduled");
                                                 continue;
-                                            } else {
-                                                // The stop reason does not distinguish a full context
-                                                // from network/provider failures. Preserve the goal and
-                                                // describe both recovery paths instead of falsely
-                                                // prescribing `/compact` for every provider outage.
-                                                state.pause_for_recovery(
-                                                    "paused after repeated provider/timeout failures; check provider/network status, or run /compact if the context is full, then send a message to continue",
-                                                );
-                                                keep_goal_registered = true;
-                                                held_turn = None;
-                                                completion_reason = StopReason::ProviderError;
-                                                let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
-                                                let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning("goal paused after repeated provider/timeout failures — check provider/network status, or run /compact if context is full, then continue".into()));
                                             }
+                                            state.pause_for_recovery("provider recovery budget exhausted; goal retained; check provider/network and send a message to continue");
+                                            keep_goal_registered = true;
+                                            held_turn = None;
+                                            completion_reason = StopReason::ProviderError;
+                                            let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                                         } else {
                                             state.finish(
                                                 GoalTerminal::Failed,
@@ -8789,7 +8942,16 @@ fn spawn_runtime_owner_with_optional_agent(
                                     );
                                 }
                             }
+                            event @ AgentEvent::Error { .. } => {
+                                if let AgentEvent::Error { retryable, http_status, ref code, retry_after_secs, ends_turn: true, .. } = event {
+                                    main_failure_retryable = Some(transient_provider_failure(retryable, http_status, code.as_deref(), retry_after_secs));
+                                    main_retry_after_secs = retry_after_secs;
+                                }
+                                let _ = runtime_event_tx.send(CodingRuntimeEvent::Agent(event));
+                            }
                             AgentEvent::TurnStarted { .. } => {
+                                main_failure_retryable = None;
+                                main_retry_after_secs = None;
                                 if let Some(intervention) = pending_policy_intervention.take() {
                                     let _ = runtime_event_tx.send(
                                         CodingRuntimeEvent::PolicyInterventionCleared {
@@ -8967,6 +9129,17 @@ fn spawn_runtime_owner_with_optional_agent(
                 Ordering::Release,
             );
         }
+        if let Some(state) = goal.as_mut().filter(|s| s.active) {
+            state.pause("运行时已退出，目标已保留；恢复会话后核对进度再续接。");
+            let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+        }
+        if let Err(error) = goal_checkpoints.flush(&runtime_event_tx) {
+            let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(format!(
+                "目标检查点保存失败：{error}"
+            )));
+        }
+        drop(goal);
+        drop(goal_checkpoints);
         // Release the active-session lease before publishing the shutdown terminal,
         // so a caller may safely start a replacement immediately after `shutdown`.
         drop(resources);
@@ -9023,6 +9196,13 @@ fn reject_runtime_control_with_error(
     error: RuntimeError,
 ) {
     match control {
+        CodingRuntimeControl::GoalReport { done } => {
+            let _ = done.send(Err(error));
+        }
+        CodingRuntimeControl::RecheckGoal { done, .. } => {
+            let _ = done.send(Err(error));
+        }
+
         CodingRuntimeControl::Compact { focus, .. } => {
             emit_compaction_interrupted(runtime_event_tx, CompactTrigger::Manual { focus }, reason)
         }
@@ -9537,6 +9717,80 @@ fn runtime_prepare_error(error: io::Error) -> RuntimeError {
         Some(id) => RuntimeError::SessionInUse { id },
         None => RuntimeError::ReconfigureFailed(error.to_string()),
     }
+}
+
+fn arm_goal_retry(
+    tx: &mpsc::UnboundedSender<(u64, u64, u64)>,
+    generation: u64,
+    state: &GoalState,
+    delay: std::time::Duration,
+) {
+    let tx = tx.clone();
+    let id = state.id;
+    let epoch = state.async_epoch;
+    let cancel = state.work_cancel.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {},
+            _ = tokio::time::sleep(delay) => { let _ = tx.send((generation, id, epoch)); }
+        }
+    });
+}
+
+fn launch_goal_evaluation(
+    generation: u64,
+    state: &mut GoalState,
+    snapshot: &SessionSnapshot,
+    resources: Option<&RuntimeResources>,
+    tx: &mpsc::UnboundedSender<EvalOutcome>,
+) {
+    let controller_id = state.id;
+    let async_epoch = state.async_epoch;
+    let provider = resources.and_then(|runtime| {
+        let session_id = runtime
+            .parts
+            .session
+            .as_ref()
+            .map(|binding| binding.id.as_str());
+        build_goal_evaluator_provider(&runtime.provider_factory, &runtime.config, session_id).ok()
+    });
+    let Some(provider) = provider else {
+        let _ = tx.send(EvalOutcome {
+            generation,
+            controller_id,
+            async_epoch,
+            result: GoalResult::Error("could not build evaluator provider".into()),
+            usage: None,
+        });
+        return;
+    };
+    let condition = state.condition.clone();
+    let summary = summarize_for_goal(&snapshot.messages, state.last_reason.as_deref());
+    let cancel = state.work_cancel.clone();
+    let timeout =
+        std::time::Duration::from_secs(state.recovery_policy.evaluator_timeout_secs.clamp(1, 3600));
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let inner = tokio::spawn(evaluate_goal(
+            generation,
+            controller_id,
+            async_epoch,
+            provider,
+            condition,
+            summary,
+            cancel,
+            timeout,
+        ));
+        let outcome = inner.await.unwrap_or_else(|_| EvalOutcome {
+            generation,
+            controller_id,
+            async_epoch,
+            result: GoalResult::Error("evaluator task failed".into()),
+            usage: None,
+        });
+        let _ = tx.send(outcome);
+    });
 }
 
 fn build_goal_evaluator_provider(
@@ -10334,6 +10588,16 @@ fn reload_skills_live(runtime: &RuntimeResources) -> Result<usize, ()> {
 
 #[async_trait::async_trait]
 impl RuntimeCommands for CodingRuntimeHandle {
+    async fn recheck_goal(&self) -> Result<(), String> {
+        CodingRuntimeHandle::recheck_goal(self)
+            .await
+            .map_err(|e| e.to_string())
+    }
+    async fn goal_report(&self) -> Result<String, String> {
+        CodingRuntimeHandle::goal_report(self)
+            .await
+            .map_err(|e| e.to_string())
+    }
     async fn start_goal(&self, condition: String) -> Result<(), String> {
         CodingRuntimeHandle::start_goal(self, condition)
             .await
@@ -11353,6 +11617,7 @@ fn fail_close_after_stopped_persistence(
         http_status: None,
         code: None,
         retryable: None,
+        retry_after_secs: None,
         ends_turn: false,
     }));
     Some(RuntimeError::ReconfigureFailed(message))
@@ -11424,6 +11689,7 @@ fn fail_close_after_forced_provider_stop(
         http_status: None,
         code: None,
         retryable: None,
+        retry_after_secs: None,
         ends_turn: false,
     }));
 }
@@ -12818,7 +13084,7 @@ mod tests {
         runtime.handle.shutdown().await.unwrap();
     }
 
-    fn native_start(fail_provider: bool) -> CodingRuntimeStart {
+    pub(super) fn native_start(fail_provider: bool) -> CodingRuntimeStart {
         CodingRuntimeStart {
             agent: CodingAgentConfig::new(
                 "key",
@@ -12964,7 +13230,7 @@ mod tests {
         )
     }
 
-    async fn controller_test_runtime(
+    pub(super) async fn controller_test_runtime(
         provider_factory: Arc<dyn CodingProviderFactory>,
     ) -> (
         CodingRuntimeHandle,
@@ -12979,7 +13245,7 @@ mod tests {
         controller_test_runtime_with_config(provider_factory, config).await
     }
 
-    async fn controller_test_runtime_with_config(
+    pub(super) async fn controller_test_runtime_with_config(
         provider_factory: Arc<dyn CodingProviderFactory>,
         config: CodingAgentConfig,
     ) -> (
@@ -13058,6 +13324,7 @@ mod tests {
                     );
                     let event = match terminal {
                         ShutdownPersistenceTerminal::TurnComplete => AgentEvent::TurnComplete {
+                            provider_failure: None,
                             turn: None,
                             reason: StopReason::Cancelled,
                         },
@@ -13291,6 +13558,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Stopped,
             })
@@ -13440,6 +13708,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::MaxRounds,
             })
@@ -13818,6 +14087,7 @@ mod tests {
 
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Stopped,
             })
@@ -13867,7 +14137,7 @@ mod tests {
         handle.shutdown().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn empty_evaluator_response_ends_goal_stopped_without_warning_spam() {
         // Regression for issue #17: when the goal evaluator returns an EMPTY
         // stream, the goal must end as `Stopped` (the agent's work is not failed)
@@ -13892,6 +14162,7 @@ mod tests {
 
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Stopped,
             })
@@ -13908,7 +14179,7 @@ mod tests {
 
         let mut saw_stopped_goal = false;
         let mut saw_failed_goal = false;
-        let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(3600), async {
             loop {
                 match runtime_events.recv().await {
                     Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
@@ -13957,8 +14228,12 @@ mod tests {
         handle.shutdown().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn recoverable_failures_resume_with_context_even_when_compact_fails() {
+        let mut config = native_start(false).agent;
+        let mut registry = atomcode_config::config::Config::default();
+        registry.goal.recovery.max_elapsed_secs = 86400;
+        config.subagent_config = Some(Arc::new(registry));
         let (
             handle,
             mut kernel_commands,
@@ -13967,7 +14242,11 @@ mod tests {
             _wakeup_tx,
             _loop_active,
             _adapter,
-        ) = controller_test_runtime(Arc::new(GoalNotMetProviderFactory::default())).await;
+        ) = controller_test_runtime_with_config(
+            Arc::new(GoalNotMetProviderFactory::default()),
+            config,
+        )
+        .await;
 
         handle.start_goal("tests pass").await.unwrap();
         assert!(matches!(
@@ -13986,8 +14265,9 @@ mod tests {
         // synthetic prompt. The runtime stores one bounded copy for recovery compact.
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
-                reason: StopReason::ProviderError,
+                reason: StopReason::Timeout,
             })
             .unwrap();
         assert!(matches!(
@@ -14003,7 +14283,7 @@ mod tests {
             })
             .unwrap();
         let continuation =
-            tokio::time::timeout(std::time::Duration::from_secs(2), kernel_commands.recv())
+            tokio::time::timeout(std::time::Duration::from_secs(3600), kernel_commands.recv())
                 .await
                 .expect("recoverable failure did not dispatch a continuation");
         assert!(matches!(
@@ -14012,12 +14292,13 @@ mod tests {
                 if !text.contains("Progress so far")
         ));
 
-        // Drive the remaining recoverable failures to exhaust MAX_UNPRODUCTIVE.
-        for round in 2..=MAX_UNPRODUCTIVE {
+        // Drive the remaining recoverable failures to exhaust (atomcode_config::config::GoalRecoveryConfig::default().max_attempts + 1).
+        for round in 2..=(atomcode_config::config::GoalRecoveryConfig::default().max_attempts + 1) {
             kernel_events
                 .send(AgentEvent::TurnComplete {
+                    provider_failure: None,
                     turn: None,
-                    reason: StopReason::ProviderError,
+                    reason: StopReason::Timeout,
                 })
                 .unwrap();
             assert!(matches!(
@@ -14032,11 +14313,13 @@ mod tests {
                     ]),
                 })
                 .unwrap();
-            if round < MAX_UNPRODUCTIVE {
-                let _ =
-                    tokio::time::timeout(std::time::Duration::from_secs(2), kernel_commands.recv())
-                        .await
-                        .expect("recoverable failure did not dispatch a continuation");
+            if round < (atomcode_config::config::GoalRecoveryConfig::default().max_attempts + 1) {
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(3600),
+                    kernel_commands.recv(),
+                )
+                .await
+                .expect("recoverable failure did not dispatch a continuation");
             }
         }
 
@@ -14045,7 +14328,7 @@ mod tests {
         // re-run after the user compacts and continues.
         let mut saw_paused_at_cap = false;
         let mut saw_turn_finished = false;
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        tokio::time::timeout(std::time::Duration::from_secs(3600), async {
             loop {
                 match runtime_events.recv().await {
                     Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
@@ -14095,7 +14378,7 @@ mod tests {
                 ),
             })
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        tokio::time::timeout(std::time::Duration::from_secs(3600), async {
             loop {
                 if matches!(
                     runtime_events.recv().await,
@@ -14159,6 +14442,7 @@ mod tests {
         for attempt in 0..2 {
             kernel_events
                 .send(AgentEvent::TurnComplete {
+                    provider_failure: None,
                     turn: None,
                     reason: StopReason::Stopped,
                 })
@@ -14252,6 +14536,7 @@ mod tests {
             .expect("loop wakeup was not registered");
             kernel_events
                 .send(AgentEvent::TurnComplete {
+                    provider_failure: None,
                     turn: None,
                     reason: StopReason::Stopped,
                 })
@@ -14352,6 +14637,7 @@ mod tests {
         .expect("the wakeup was not registered");
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Stopped,
             })
@@ -14406,6 +14692,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Cancelled,
             })
@@ -14461,6 +14748,7 @@ mod tests {
         let _ = runtime_events.recv().await;
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Stopped,
             })
@@ -14516,6 +14804,7 @@ mod tests {
         drop(kernel_commands);
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Stopped,
             })
@@ -14573,6 +14862,7 @@ mod tests {
         drop(kernel_commands);
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Stopped,
             })
@@ -14632,6 +14922,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Stopped,
             })
@@ -14687,6 +14978,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::MaxRounds,
             })
@@ -14746,6 +15038,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::ToolLoopDetected,
             })
@@ -14846,6 +15139,7 @@ mod tests {
 
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Stopped,
             })
@@ -16264,6 +16558,7 @@ mod tests {
             .unwrap();
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Stopped,
             })
@@ -16411,6 +16706,7 @@ mod tests {
         .expect("the wakeup was not registered");
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Stopped,
             })
@@ -16452,6 +16748,7 @@ mod tests {
 
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Stopped,
             })
@@ -16662,6 +16959,7 @@ mod tests {
 
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Cancelled,
             })
@@ -16738,7 +17036,7 @@ mod tests {
         let CodingRuntimeStart {
             agent: config,
             prepare,
-            provider_factory,
+            provider_factory: _,
             plugin_hooks,
             ..
         } = native_start(false);
@@ -16749,7 +17047,7 @@ mod tests {
         let resources = RuntimeResources {
             config,
             prepare,
-            provider_factory,
+            provider_factory: Arc::new(TestProviderFactory { fail: true }),
             plugin_hooks,
             parts,
             harness_app: None,
@@ -16783,6 +17081,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Stopped,
             })
@@ -17320,7 +17619,7 @@ mod tests {
         assert!(saw_failed, "runtime must emit VisionPreprocessFailed");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn recoverable_goal_continuation_send_failure_deactivates_goal_and_fails_runtime() {
         let (agent, mut kernel_commands, kernel_events) = fake_agent();
         let (handle, controls) = coding_runtime_control_channel();
@@ -17365,8 +17664,9 @@ mod tests {
         let _ = kernel_commands.recv().await;
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
-                reason: StopReason::ProviderError,
+                reason: StopReason::Timeout,
             })
             .unwrap();
         assert!(matches!(
@@ -17382,7 +17682,7 @@ mod tests {
             .unwrap();
 
         let mut inactive_goal = false;
-        let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(3600), async {
             loop {
                 match runtime_events.recv().await {
                     Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
@@ -17458,6 +17758,7 @@ mod tests {
         let _ = kernel_commands.recv().await;
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Cancelled,
             })
@@ -17548,6 +17849,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Stopped,
             })
@@ -17662,6 +17964,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Stopped,
             })
@@ -17675,6 +17978,14 @@ mod tests {
                 snapshot: SessionSnapshot::new(vec![Message::user("persisted")]),
             })
             .unwrap();
+
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
+                recovery: Some(crate::GoalRecoveryProgress { attempt: 0, .. }),
+                ..
+            }))
+        ));
 
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
@@ -17845,6 +18156,7 @@ mod tests {
         let _ = runtime_events.recv().await;
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Stopped,
             })
@@ -18438,6 +18750,7 @@ mod tests {
                 if matches!(command, AgentCommand::Shutdown) {
                     if emit_verified_terminal {
                         let _ = event_tx.send(AgentEvent::TurnComplete {
+                            provider_failure: None,
                             turn: None,
                             reason: StopReason::Cancelled,
                         });
@@ -20671,6 +20984,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Stopped,
             })
@@ -20745,6 +21059,7 @@ mod tests {
         for attempt in 0..2 {
             kernel_events
                 .send(AgentEvent::TurnComplete {
+                    provider_failure: None,
                     turn: None,
                     reason: StopReason::Stopped,
                 })
@@ -20839,6 +21154,7 @@ mod tests {
         for attempt in 0..2 {
             kernel_events
                 .send(AgentEvent::TurnComplete {
+                    provider_failure: None,
                     turn: None,
                     reason: StopReason::Stopped,
                 })
@@ -21047,6 +21363,7 @@ mod tests {
                                           // which never answers.
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Stopped,
             })
@@ -21133,6 +21450,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Stopped,
             })

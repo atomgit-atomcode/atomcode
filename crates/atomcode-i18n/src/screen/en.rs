@@ -162,6 +162,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         // ── the status bar ──
         Msg::StatusMember { name } => format!("member {name}").into(),
         Msg::StatusStopping => "stopping".into(),
+        Msg::GoalEvaluatorRecovery { attempt: 0, .. } => "evaluating goal".into(),
+        Msg::GoalProviderRecovery { secs: 0, .. } => "retrying model request".into(),
+        Msg::GoalEvaluatorRecovery { secs: 0, .. } => "retrying goal evaluation".into(),
+        Msg::GoalProviderRecovery { attempt, max, secs } => format!("provider recovery {attempt}/{max} · {secs}s").into(),
+        Msg::GoalEvaluatorRecovery { attempt, max, secs } => format!("evaluation recovery {attempt}/{max} · {secs}s").into(),
         Msg::StatusGoal => "goal".into(),
         Msg::StatusLoop => "loop".into(),
         Msg::StatusRoundsHeld { kind, rounds, why } => {

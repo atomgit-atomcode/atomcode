@@ -1139,6 +1139,10 @@ pub enum Decision {
 
 #[derive(Clone, Debug, Default)]
 pub struct TurnOutcome {
+    /// Identity for listeners above more than one agent realm.
+    pub session_id: String,
+    /// Final provider failure, live metadata rather than another stored fact.
+    pub provider_error: Option<crate::events::RequestError>,
     pub text: String,
     /// Which turn this was, 1-based within the session.
     pub turn: u64,

@@ -47,6 +47,7 @@ pub(crate) struct LiveGoalSnapshot {
     terminal: Option<String>,
     phase: String,
     last_reason: Option<String>,
+    recovery: Option<atomcode_coding::GoalRecoveryProgress>,
 }
 
 /// 读取当前生效的审批模式。`pub(crate)` 以便 `/chat` 路径（非 sync webui）也据此
@@ -390,6 +391,7 @@ fn send_chat_runtime_error(
             http_status: None,
             code: None,
             retryable: None,
+            retry_after_secs: None,
             ends_turn: false,
         },
     ));
@@ -723,6 +725,7 @@ pub(crate) enum LiveWireEvent {
         terminal: Option<String>,
         phase: String,
         last_reason: Option<String>,
+        recovery: Option<atomcode_coding::GoalRecoveryProgress>,
     },
     /// 斜杠命令的文本输出（如 /status 报告）。`text` 首行即 `/cmd` 标头，
     /// 前端整体显示为一条系统消息即可。
@@ -1119,6 +1122,7 @@ impl NativeLiveWireProjector {
                     }
                     .into(),
                     last_reason: progress.last_reason,
+                    recovery: progress.recovery,
                 }
             }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::ProviderChanged {
@@ -1256,6 +1260,7 @@ fn goal_snapshot(progress: &atomcode_coding::GoalProgress) -> LiveGoalSnapshot {
         }
         .into(),
         last_reason: progress.last_reason.clone(),
+        recovery: progress.recovery.clone(),
     }
 }
 

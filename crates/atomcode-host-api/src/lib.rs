@@ -674,6 +674,9 @@ pub struct Running {
     /// `goal` or `loop`. A word rather than an enum: a host with a third kind
     /// of autonomy should not need this contract changed to say so.
     pub kind: String,
+    /// Work is retained while the agent itself is idle (evaluation or recovery).
+    #[serde(default)]
+    pub recovering: bool,
     /// The condition being worked towards, or the prompt being repeated.
     pub what: String,
     pub round: u32,
@@ -1845,6 +1848,7 @@ mod tests {
             },
             HostReply::Autonomy {
                 running: Some(Running {
+                    recovering: false,
                     kind: "goal".into(),
                     what: "the tests pass".into(),
                     round: 3,
@@ -2035,6 +2039,7 @@ mod tests {
             HostEvent::Autonomy {
                 session: "b".into(),
                 running: Some(Running {
+                    recovering: false,
                     kind: "goal".into(),
                     what: "测试全绿".into(),
                     round: 3,

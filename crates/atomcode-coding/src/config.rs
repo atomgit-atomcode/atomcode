@@ -409,6 +409,16 @@ pub fn describe_config_file_for(
          ranks models for `task` and `team`: the lowest rank is the fast tier, the \
          highest the capable one.\n\
          - `evaluator_provider`: the model that judges whether a `/goal` is met.\n\
+         - `[goal.recovery]`: transient goal outage recovery, using the selected model. \
+         `max_attempts` (default 12) and `max_elapsed_secs` (1800) bound new retries; \
+         `base_delay_secs` (30) / `max_delay_secs` (300) set backoff. \
+         `evaluator_max_attempts` (3) retries only the verdict, with \
+         `evaluator_timeout_secs` (600) per attempt. Zero attempts disables that tier. \
+         Optional `[goal.recovery.long_wait]` adds low-frequency main retries after that: \
+         `max_attempts` (32), `max_elapsed_secs` (28800), `interval_secs` (900). \
+         Omit the table to disable long waits; zero short attempts disables both stages. \
+         Existing goal caps and permissions still apply. Automatic retries stop on process exit; \
+         native persistent sessions restore unfinished goals paused for review.\n\
          - `[permissions]` `allow` / `deny`: rules such as `Bash(git *)`, `Read(<path>)` or \
          `mcp__<server>__<tool>`. `deny` wins, and `allow` never opens a sensitive path.\n\
          - `[coding]` `max_rounds` (per turn; 0 = no cap; `ATOMCODE_TURN_MAX_ROUNDS` wins), \

@@ -1800,7 +1800,11 @@ mod tests {
     #[test]
     fn how_a_turn_ended_is_what_the_panel_says() {
         let mut track = Track::default();
-        let ended = |reason| AgentEvent::TurnComplete { turn: None, reason };
+        let ended = |reason| AgentEvent::TurnComplete {
+            turn: None,
+            reason,
+            provider_failure: None,
+        };
         track.saw(&ended(StopReason::Cancelled));
         assert_eq!(track.ended, Some(BackgroundState::Cancelled));
         track.saw(&ended(StopReason::ProviderError));
@@ -1930,6 +1934,7 @@ mod tests {
         });
         assert!(track.pending.is_some());
         track.saw(&AgentEvent::TurnComplete {
+            provider_failure: None,
             turn: None,
             reason: StopReason::Stopped,
         });

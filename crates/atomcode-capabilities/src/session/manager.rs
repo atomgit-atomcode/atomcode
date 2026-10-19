@@ -1242,6 +1242,45 @@ impl SessionManager {
     pub fn meta_path(&self, id: &str) -> SessionResult<PathBuf> {
         self.format_path(id, "index", "meta")
     }
+    /// Non-conversation controller data. Only the lease owner may write it;
+    /// the event log remains the authority for conversation and tool results.
+    pub fn write_controller_checkpoint<T: Serialize>(
+        &self,
+        lease: &SessionLease,
+        value: &T,
+    ) -> SessionResult<()> {
+        self.validate_active_lease(lease)?;
+        if !self.is_event_session(lease.id()) {
+            return Err(SessionStoreError::Corrupt {
+                kind: "controller checkpoint",
+                message: "controller checkpoints require a native event session".into(),
+            });
+        }
+        let bytes = serialize_bounded(value, "controller checkpoint", 128 * 1024)?;
+        atomic_write(&self.path_for(lease.id(), "controller")?, &bytes)
+    }
+
+    pub fn read_controller_checkpoint<T: serde::de::DeserializeOwned>(
+        &self,
+        lease: &SessionLease,
+    ) -> SessionResult<Option<T>> {
+        self.validate_active_lease(lease)?;
+        if !self.is_event_session(lease.id()) {
+            return Err(SessionStoreError::Corrupt {
+                kind: "controller checkpoint",
+                message: "controller checkpoints require a native event session".into(),
+            });
+        }
+        let path = self.path_for(lease.id(), "controller")?;
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(io_at(&path, error)),
+        }
+        let bytes = read_regular_file_bounded(&path, "controller checkpoint", 128 * 1024)?;
+        deserialize(&bytes, "controller checkpoint").map(Some)
+    }
+
     /// Todo-list sidecar path: `<root>/<id>.todos.json` (sibling of meta/snapshot),
     /// `<id>.todos` for an event session.
     pub fn todo_sidecar_path(&self, id: &str) -> SessionResult<PathBuf> {
@@ -3273,6 +3312,7 @@ impl SessionManager {
             self.path_for(id, "rewind")?,
             self.path_for(id, "rewind.txn")?,
             self.path_for(id, "todos")?,
+            self.path_for(id, "controller")?,
             self.path_for(id, "index")?,
         ];
         for path in &targets {

@@ -251,7 +251,9 @@ mod tests {
             C::DeactivateProvider { .. } => Heard::Nothing,
             // Opens a transaction `FinishRewind` commits; told there.
             C::BeginRewind { .. } => Heard::Nothing,
-            C::Shutdown { .. }
+            C::GoalReport { .. }
+            | C::RecheckGoal { .. }
+            | C::Shutdown { .. }
             | C::Snapshot { .. }
             | C::ContextStats { .. }
             | C::Mode { .. }

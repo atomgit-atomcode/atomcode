@@ -6304,6 +6304,7 @@ async fn cancellation_keeps_its_live_line_until_runtime_completion() {
             http_status: None,
             code: None,
             retryable: None,
+            retry_after_secs: None,
             ends_turn: false,
         })
         .unwrap();
@@ -6311,6 +6312,7 @@ async fn cancellation_keeps_its_live_line_until_runtime_completion() {
     assert!(part_text(&s, "live").contains("正在停止"));
     agent
         .send(AgentEvent::TurnComplete {
+            provider_failure: None,
             turn: None,
             reason: StopReason::Cancelled,
         })
@@ -6345,6 +6347,7 @@ async fn a_working_agent_keeps_follow_up_messages_visible_in_the_queue() {
     assert!(part_text(&s, "live").contains("正在等待模型"));
     agent
         .send(AgentEvent::TurnComplete {
+            provider_failure: None,
             turn: None,
             reason: StopReason::Stopped,
         })
@@ -6355,6 +6358,7 @@ async fn a_working_agent_keeps_follow_up_messages_visible_in_the_queue() {
             http_status: None,
             code: None,
             retryable: None,
+            retry_after_secs: None,
             ends_turn: false,
         })
         .unwrap();
@@ -6402,6 +6406,7 @@ async fn an_error_mid_turn_does_not_take_the_working_line_away() {
             code: None,
             retryable: None,
             // 回合中的告警:回合还没有收尾,所以没有第二处会画它。
+            retry_after_secs: None,
             ends_turn: false,
         })
         .unwrap();
@@ -6425,6 +6430,7 @@ async fn an_error_mid_turn_does_not_take_the_working_line_away() {
             http_status: None,
             code: None,
             retryable: None,
+            retry_after_secs: None,
             ends_turn: true,
         })
         .unwrap();
@@ -7640,6 +7646,7 @@ async fn a_hook_rejected_prompt_returns_to_the_composer_without_overwriting_a_dr
     s.quiet().await;
     agent
         .send(atomcode_kernel::event::AgentEvent::TurnComplete {
+            provider_failure: None,
             turn: None,
             reason: atomcode_kernel::event::StopReason::PromptRejected,
         })
@@ -7651,6 +7658,7 @@ async fn a_hook_rejected_prompt_returns_to_the_composer_without_overwriting_a_dr
     let draft = composer_text(&s);
     agent
         .send(atomcode_kernel::event::AgentEvent::TurnComplete {
+            provider_failure: None,
             turn: None,
             reason: atomcode_kernel::event::StopReason::PromptRejected,
         })

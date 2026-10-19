@@ -5173,6 +5173,7 @@ mod tests {
         host.replies.lock().unwrap().extend([
             Ok(HostReply::Autonomy {
                 running: Some(atomcode_host_api::Running {
+                    recovering: false,
                     kind: "goal".into(),
                     what: "测试全过".into(),
                     round: 3,
@@ -5183,6 +5184,7 @@ mod tests {
             }),
             Ok(HostReply::Autonomy {
                 running: Some(atomcode_host_api::Running {
+                    recovering: false,
                     kind: "loop".into(),
                     what: "再看一遍".into(),
                     round: 9,

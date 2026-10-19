@@ -9,6 +9,11 @@
 export type Lang = 'zh' | 'en';
 
 const zh = {
+  'goal.recovery.provider': '目标仍在进行：等待模型恢复 · 第 {attempt}/{max} 次 · 计划等待 {secs} 秒后自动尝试',
+  'goal.recovery.evaluator': '工作进度已保留：等待重新评估 · 第 {attempt}/{max} 次 · 计划等待 {secs} 秒后自动尝试',
+  'goal.recovery.running': '目标仍在进行：正在请求模型或评估目标，可随时停止。',
+  'goal.recovery.paused': '目标已保留并暂停，请处理原因后发送消息继续。',
+
   // Header
   'header.menu': '菜单',
   'header.sessionList': '会话列表',
@@ -593,6 +598,11 @@ const zh = {
 export type MsgKey = keyof typeof zh;
 
 const en: Record<MsgKey, string> = {
+  'goal.recovery.provider': 'Goal retained: waiting for model recovery · attempt {attempt}/{max} · scheduled wait {secs}s before retry',
+  'goal.recovery.evaluator': 'Progress retained: waiting to reassess · attempt {attempt}/{max} · scheduled wait {secs}s before retry',
+  'goal.recovery.running': 'Goal in progress: requesting the model or evaluating the goal. You can stop at any time.',
+  'goal.recovery.paused': 'Goal retained and paused. Resolve the cause, then send a message to continue.',
+
   'compat.oldBrowser': 'This browser engine is older than this page was built for, so parts of it may look wrong. Chrome / Edge {version} or newer is recommended.',
   'compat.dismiss': "Don't show again",
   'auth.required.title': 'Open it from the terminal',

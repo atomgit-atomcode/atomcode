@@ -4014,4 +4014,11 @@ body {
 .compaction-history-records pre { white-space: pre-wrap; overflow-wrap: anywhere; font-family: inherit; }
 .compaction-history-records article { border-bottom: 1px solid var(--app-border-subtle); padding-block: .75rem; }
 
+.goal-recovery-status {
+  padding: 8px 12px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .effort-selector .model-selector-trigger:disabled { opacity: 0.55; cursor: not-allowed; }

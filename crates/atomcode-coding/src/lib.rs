@@ -94,7 +94,10 @@ pub use config::{
     CodingRuntimeConfig, SubagentModelProviders, SubagentModelResolver, SubagentProvider,
     TierProvider,
 };
-pub use controllers::{GoalPhase, GoalProgress, GoalTerminal, LoopProgress};
+pub use controllers::{
+    GoalPhase, GoalProgress, GoalRecoveryKind, GoalRecoveryProgress, GoalRunReport, GoalTerminal,
+    LoopProgress,
+};
 pub use init_prompt::{build_init_prompt, INIT_PROMPT, INIT_PROMPT_ZH_CN};
 pub use parts::{
     prepare, prepare_from_config, prepare_with_plugin_hook_source, prepare_with_plugin_hooks,

@@ -376,6 +376,64 @@ pub struct ExternalSubagentConfig {
     pub enabled: bool,
 }
 
+/// Recovery policy for an in-process autonomous goal.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GoalConfig {
+    pub recovery: GoalRecoveryConfig,
+}
+impl GoalConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GoalRecoveryConfig {
+    /// Optional additional low-frequency main-provider recovery after short retries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub long_wait: Option<GoalLongWaitConfig>,
+    /// Additional main-agent attempts per transient outage; 0 disables them.
+    pub max_attempts: u32,
+    /// Outage budget includes cooldowns and subsequent requests.
+    pub max_elapsed_secs: u64,
+    pub base_delay_secs: u64,
+    pub max_delay_secs: u64,
+    /// Additional tool-free evaluator attempts, independent of main rounds.
+    pub evaluator_max_attempts: u32,
+    pub evaluator_timeout_secs: u64,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GoalLongWaitConfig {
+    pub max_attempts: u32,
+    pub max_elapsed_secs: u64,
+    pub interval_secs: u64,
+}
+impl Default for GoalLongWaitConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: 32,
+            max_elapsed_secs: 28_800,
+            interval_secs: 900,
+        }
+    }
+}
+impl Default for GoalRecoveryConfig {
+    fn default() -> Self {
+        Self {
+            long_wait: None,
+            max_attempts: 12,
+            max_elapsed_secs: 1800,
+            base_delay_secs: 30,
+            max_delay_secs: 300,
+            evaluator_max_attempts: 3,
+            evaluator_timeout_secs: 600,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Legacy default selection (a `[providers.*]` key). `#[serde(default)]` so a
@@ -387,6 +445,8 @@ pub struct Config {
     /// Falls back to `default_provider` when not set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evaluator_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "GoalConfig::is_default")]
+    pub goal: GoalConfig,
     /// The daemon's default working directory: written by a `/cd` request that
     /// asks for `set_default`, read when the daemon starts (a launch-time
     /// directory, as `atomcode webui` passes, wins over it). The terminal UI
@@ -921,6 +981,7 @@ impl Default for Config {
         let mut cfg = Self {
             default_provider: String::new(),
             evaluator_provider: None,
+            goal: GoalConfig::default(),
             default_workdir: None,
             providers: HashMap::new(),
             provider_accounts: HashMap::new(),
@@ -3640,6 +3701,7 @@ model = "missing-type"
         let mut cfg = Config {
             default_provider: "p".to_string(),
             evaluator_provider: None,
+            goal: GoalConfig::default(),
             default_workdir: None,
             providers: HashMap::new(),
             provider_accounts: HashMap::new(),
@@ -5140,5 +5202,33 @@ api_key = "sk-old"
         assert!(super::atomgit_enabled_from_env(Some(""), true));
         assert!(super::atomgit_enabled_from_env(Some("maybe"), true));
         assert!(!super::atomgit_enabled_from_env(Some("maybe"), false));
+    }
+}
+
+#[cfg(test)]
+mod goal_recovery_policy_tests {
+    use super::*;
+    #[test]
+    fn old_configs_keep_defaults_and_explicit_recovery_policy_survives_roundtrip() {
+        let original = Config::default();
+        let old = toml::to_string(&original).unwrap();
+        assert!(!old.contains("[goal"));
+        let restored: Config = toml::from_str(&old).unwrap();
+        assert_eq!(restored.goal.recovery, GoalRecoveryConfig::default());
+        let configured = format!("{old}\n[goal.recovery]\nmax_attempts = 0\nmax_elapsed_secs = 900\nevaluator_max_attempts = 2\nevaluator_timeout_secs = 800\n");
+        let restored: Config = toml::from_str(&configured).unwrap();
+        assert_eq!(restored.goal.recovery.max_attempts, 0);
+        assert_eq!(restored.goal.recovery.base_delay_secs, 30);
+        assert_eq!(restored.goal.recovery.evaluator_timeout_secs, 800);
+        let again: Config = toml::from_str(&toml::to_string(&restored).unwrap()).unwrap();
+        assert_eq!(again.goal, restored.goal);
+        let overnight: Config =
+            toml::from_str(&format!("{old}\n[goal.recovery.long_wait]\n")).unwrap();
+        assert_eq!(
+            overnight.goal.recovery.long_wait,
+            Some(GoalLongWaitConfig::default())
+        );
+        let roundtrip: Config = toml::from_str(&toml::to_string(&overnight).unwrap()).unwrap();
+        assert_eq!(roundtrip.goal, overnight.goal);
     }
 }

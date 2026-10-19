@@ -2001,9 +2001,14 @@ impl Waterfall<AgentRequest> for RateLimitCoding {
             };
             let quiet_first =
                 verdict.is_none() && hint.retry_after_secs.is_none() && !hint.terminal;
+            let host_decided = verdict.is_some();
             let decision = verdict.unwrap_or_else(|| RateLimitDecision::from_hint(&hint));
             let pause = |reset_at_display: String, reset_label: String, secs: Option<u64>| {
                 Err(RequestError {
+                    retryable: error.retryable
+                        && !hint.terminal
+                        && !host_decided
+                        && error.partial.is_none(),
                     rate_limit_pause: Some(atomcode_harness::events::RateLimitPause {
                         reset_at_display,
                         reset_label,
@@ -3144,7 +3149,7 @@ async fn run_goal(
             // 问「怎么用」的绝不能把东西跑起来,见 `means_help`。
             word if means_help(word) => Ok("/goal <要达成的条件> —— 自己干到它成立为止。\n\
                  /goal stop(或 off/clear/cancel/reset/none)—— 收工。\n\
-                 /goal pause —— 先搁着,接着说话就继续。\n\
+                 /goal pause —— 先搁着,接着说话就继续。\n/goal recheck —— 只重新评估已完成的工作。\n/goal report —— 查看运行报告。\n\
                  干到哪一轮了,状态行一直在说。"
                 .into()),
             // 收工的几种说法都认。一个人想停下自主循环的时候,不该还要先想起
@@ -3157,6 +3162,8 @@ async fn run_goal(
                 runtime.stop_goal().await?;
                 Ok("目标停了。".into())
             }
+            "recheck" => { runtime.recheck_goal().await?; Ok("正在仅重新评估，不会重跑主任务。".into()) }
+            "report" => runtime.goal_report().await,
             "pause" => {
                 runtime.pause_goal().await?;
                 Ok("目标先搁着,还可以接着干。".into())
@@ -3879,6 +3886,23 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn goal_report_and_recheck_route_without_starting_main_work() {
+        let runtime: Arc<dyn crate::runtime::RuntimeCommands> = pointed();
+        for word in ["report", "recheck"] {
+            let error = super::run_goal(&runtime, word)
+                .await
+                .expect_err("fake explicitly does not support this control");
+            assert!(!error.is_empty());
+            let condition = format!("{word} 输出符合要求");
+            let call = std::panic::AssertUnwindSafe(super::run_goal(&runtime, &condition));
+            assert!(
+                futures::FutureExt::catch_unwind(call).await.is_err(),
+                "a real condition must still start a goal"
+            );
+        }
+    }
+
     /// `/loop 5m <每轮要做的事>` 的解析,包括它**不**该认的那些。
     ///
     /// 反面才是理由:名单要是宽到吃掉第一个词,`/loop 5m 之内把测试跑绿` 里的
@@ -4390,5 +4414,68 @@ mod tests {
             panic!("usage");
         };
         assert!(zh.contains("用法") && en.contains("Usage"), "{zh} / {en}");
+    }
+}
+
+#[cfg(test)]
+mod goal_rate_limit_classification_tests {
+    use super::*;
+    struct Limited(bool);
+    #[async_trait]
+    impl Waterfall<AgentRequest> for Limited {
+        async fn handle(
+            &self,
+            _: &mut ModelRequest,
+            _: Next<'_, AgentRequest>,
+        ) -> Result<ModelResponse, RequestError> {
+            Err(RequestError {
+                retryable: true,
+                http_status: Some(429),
+                code: Some("rate_limit_exceeded".into()),
+                retry_after: Some(std::time::Duration::from_secs(901)),
+                partial: self.0.then(|| {
+                    Box::new(ModelResponse {
+                        text: "already shown".into(),
+                        ..Default::default()
+                    })
+                }),
+                ..RequestError::message("limited")
+            })
+        }
+    }
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn default_long_reset_keeps_timing_but_partial_output_forbids_replay() {
+        for partial in [false, true] {
+            let app = atomcode_plexus::App::new(
+                atomcode_plexus::PluginRegistry::new(),
+                atomcode_plexus::ConfigTree::empty(),
+            );
+            let ctx = app.context();
+            let _failure = ctx.on_waterfall::<AgentRequest>(Arc::new(Limited(partial)), false);
+            let _rate = ctx.on_waterfall::<AgentRequest>(
+                Arc::new(RateLimitCoding {
+                    ctx: ctx.clone(),
+                    hook: crate::rate_limit::RateLimitHook::new("https://example.test/v1".into()),
+                }),
+                true,
+            );
+            let mut request = ModelRequest {
+                messages: vec![],
+                tools: vec![],
+                options: Default::default(),
+                turn: 1,
+                round: 1,
+                answering_a_nudge: false,
+            };
+            let error = ctx
+                .waterfall::<AgentRequest, _>(&mut request, |_| {
+                    Box::pin(async { panic!("the injected failure must handle this request") })
+                })
+                .await
+                .unwrap_err();
+            assert!(error.rate_limit_pause.is_some());
+            assert_eq!(error.retry_after, Some(std::time::Duration::from_secs(901)));
+            assert_eq!(error.retryable, !partial);
+        }
     }
 }

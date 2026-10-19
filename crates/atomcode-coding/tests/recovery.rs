@@ -1469,3 +1469,173 @@ async fn a_long_stream_without_a_total_deadline_remains_cancellable() {
     assert_eq!(outcome.unwrap().stop, StopReason::Cancelled);
     assert_eq!(started.elapsed(), Duration::from_secs(1));
 }
+
+/// The shipped handle must preserve the final request classification, rather
+/// than making the runtime guess from the human-readable TurnEnd string.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn final_provider_metadata_survives_the_real_handle_projection() {
+    use atomcode_harness::plugins::handle::{self, NoAnswers};
+    use atomcode_kernel::event::{AgentCommand, AgentEvent};
+    for status in [429, 503, 401] {
+        let dir = scratch("terminal-metadata");
+        let app = start(tree(&dir, &["[[patch]]\nid = \"llm-retry\"\ndisabled = true\n[[patch]]\nid = \"llm-rate-limit\"\ndisabled = true\n"])).await;
+        let _guard = app.context().on_waterfall::<AgentRequest>(
+            Arc::new(Failing {
+                seen: Arc::new(AtomicU32::new(0)),
+                fail_times: 1,
+                error: RequestError {
+                    retryable: status != 401,
+                    http_status: Some(status),
+                    code: Some("upstream_busy".into()),
+                    retry_after: Some(Duration::from_secs(901)),
+                    ..RequestError::message("temporarily unavailable")
+                },
+                sizes: Default::default(),
+            }),
+            false,
+        );
+        let driven = handle::spawn(
+            &app.context(),
+            handle::wire(),
+            Arc::new(NoAnswers),
+            atomcode_harness::agent::CreateAgent::root(&app.context()),
+        )
+        .await
+        .unwrap();
+        let handle::Driven {
+            mut handle, done, ..
+        } = driven;
+        for failed in [true, false] {
+            handle
+                .commands
+                .send(AgentCommand::SendMessage {
+                    text: "go".into(),
+                    images: vec![],
+                })
+                .unwrap();
+            let mut errors = 0;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while let Some(event) = handle.events.recv().await {
+                    match event {
+                        AgentEvent::Error {
+                            http_status,
+                            retryable,
+                            retry_after_secs,
+                            code,
+                            ends_turn: true,
+                            ..
+                        } => {
+                            errors += 1;
+                            assert!(failed);
+                            assert_eq!(http_status, Some(status));
+                            assert_eq!(retryable, Some(status != 401));
+                            assert_eq!(retry_after_secs, Some(901));
+                            assert_eq!(code.as_deref(), Some("upstream_busy"));
+                        }
+                        AgentEvent::TurnComplete { reason, .. } => {
+                            assert_eq!(
+                                reason,
+                                if failed {
+                                    StopReason::ProviderError
+                                } else {
+                                    StopReason::Stopped
+                                }
+                            );
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+                panic!("missing terminal");
+            })
+            .await
+            .unwrap();
+            assert_eq!(errors, u32::from(failed));
+        }
+        drop(handle);
+        let _ = done.await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn coding_rate_limit_pauses_keep_timing_without_becoming_error_facts() {
+    use atomcode_harness::plugins::handle::{self, NoAnswers};
+    use atomcode_kernel::event::{AgentCommand, AgentEvent};
+    for retryable in [true, false] {
+        let dir = scratch("pause-metadata");
+        let app = start(tree(&dir, &["[[patch]]\nid = \"llm-retry\"\ndisabled = true\n[[patch]]\nid = \"llm-rate-limit\"\ndisabled = true\n"])).await;
+        let _guard = app.context().on_waterfall::<AgentRequest>(
+            Arc::new(Failing {
+                seen: Arc::new(AtomicU32::new(0)),
+                fail_times: 1,
+                error: RequestError {
+                    rate_limit_pause: Some(atomcode_harness::events::RateLimitPause {
+                        reset_at_display: String::new(),
+                        reset_label: String::new(),
+                        secs_until_reset: Some(901),
+                        server_message: None,
+                    }),
+                    retryable,
+                    http_status: Some(429),
+                    code: Some(
+                        if retryable {
+                            "rate_limit_exceeded"
+                        } else {
+                            "insufficient_quota"
+                        }
+                        .into(),
+                    ),
+                    retry_after: Some(Duration::from_secs(901)),
+                    ..RequestError::message("limited")
+                },
+                sizes: Default::default(),
+            }),
+            false,
+        );
+        let driven = handle::spawn(
+            &app.context(),
+            handle::wire(),
+            Arc::new(NoAnswers),
+            atomcode_harness::agent::CreateAgent::root(&app.context()),
+        )
+        .await
+        .unwrap();
+        let handle::Driven {
+            mut handle, done, ..
+        } = driven;
+        handle
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: "go".into(),
+                images: vec![],
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(event) = handle.events.recv().await {
+                match event {
+                    AgentEvent::Error { .. } => {
+                        panic!("a rate-limit pause must not become an error fact")
+                    }
+                    AgentEvent::TurnComplete {
+                        reason,
+                        provider_failure,
+                        ..
+                    } => {
+                        assert_eq!(reason, StopReason::RateLimited);
+                        let failure = provider_failure.expect("lost pause classification");
+                        assert_eq!(failure.retryable, retryable);
+                        assert_eq!(failure.retry_after_secs, Some(901));
+                        assert_eq!(failure.http_status, Some(429));
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            panic!("missing terminal");
+        })
+        .await
+        .unwrap();
+        drop(handle);
+        let _ = done.await;
+    }
+}

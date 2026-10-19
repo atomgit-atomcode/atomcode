@@ -3835,6 +3835,7 @@ mod chat_event_type_tests {
             http_status: None,
             code: None,
             retryable: None,
+            retry_after_secs: None,
             ends_turn: false,
         });
         assert!(projector.unterminated_reason().contains("already in use"));
@@ -4042,6 +4043,7 @@ mod chat_event_type_tests {
                 http_status: Some(500),
                 code: None,
                 retryable: Some(true),
+                retry_after_secs: None,
                 ends_turn: false,
             }),
             "session-1",

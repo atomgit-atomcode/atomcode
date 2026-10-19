@@ -139,6 +139,11 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         // ── 状态栏 ──
         Msg::StatusMember { name } => format!("成员 {name}").into(),
         Msg::StatusStopping => "停止中".into(),
+        Msg::GoalEvaluatorRecovery { attempt: 0, .. } => "正在评估目标".into(),
+        Msg::GoalProviderRecovery { secs: 0, .. } => "正在重试模型请求".into(),
+        Msg::GoalEvaluatorRecovery { secs: 0, .. } => "正在重试目标评估".into(),
+        Msg::GoalProviderRecovery { attempt, max, secs } => format!("模型恢复 {attempt}/{max} · {secs}s").into(),
+        Msg::GoalEvaluatorRecovery { attempt, max, secs } => format!("评估恢复 {attempt}/{max} · {secs}s").into(),
         Msg::StatusGoal => "目标".into(),
         Msg::StatusLoop => "循环".into(),
         Msg::StatusRoundsHeld { kind, rounds, why } => {

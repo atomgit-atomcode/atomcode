@@ -76,6 +76,7 @@ struct OpenBatch {
 /// closes when the step that ran them ends. Everything else is a straight
 /// rename.
 struct Projector {
+    terminal_error: Option<(u64, crate::events::RequestError)>,
     /// Resolved live, so a tool mounted mid-session is classified correctly.
     tools: Option<Arc<ToolBox>>,
     ctx_window: u32,
@@ -107,6 +108,23 @@ struct Projector {
     /// changed. The facts alone cannot say: a cut names a boundary, not a size.
     /// `None` for a replay, which reports no sizes.
     log: Option<Arc<crate::session::SessionLog>>,
+}
+
+struct TerminalMetadata {
+    session: String,
+    projector: Arc<Mutex<Projector>>,
+}
+#[async_trait]
+impl atomcode_plexus::Listener<crate::events::TurnFinishing> for TerminalMetadata {
+    async fn call(&self, outcome: &crate::seams::TurnOutcome) -> Option<()> {
+        if outcome.session_id == self.session {
+            self.projector
+                .lock()
+                .expect("projector poisoned")
+                .terminal_error = outcome.provider_error.clone().map(|e| (outcome.turn, e));
+        }
+        None
+    }
 }
 
 impl Projector {
@@ -182,6 +200,7 @@ impl Projector {
     ) -> Vec<AgentEvent> {
         match event {
             SessionEvent::TurnStart { turn } => {
+                self.terminal_error = None;
                 self.stepped_this_turn = false;
                 vec![AgentEvent::TurnStarted { turn: Some(*turn) }]
             }
@@ -443,14 +462,18 @@ impl Projector {
 
             SessionEvent::TurnEnd { turn, stop, error } => {
                 let mut out = Vec::new();
+                let metadata = self.terminal_error.take()
+                    .filter(|(id, failure)| id == turn && (error.as_deref() == Some(failure.message.as_str()) || (*stop == crate::seams::StopReason::RateLimited && error.is_none())))
+                    .map(|(_, failure)| failure);
                 if let Some(message) = error {
                     out.push(AgentEvent::Error {
                         message: message.clone(),
-                        http_status: None,
-                        code: None,
-                        retryable: None,
+                        http_status: metadata.as_ref().and_then(|e| e.http_status),
+                        code: metadata.as_ref().and_then(|e| e.code.clone()),
+                        retryable: metadata.as_ref().map(|e| e.retryable),
                         // 这就是那次收尾的错误(`TurnEnd::error` 的同一句话):画了回合
                         // 结尾的前端不必再画这一条,否则同一段文字会出现两次。
+                        retry_after_secs: metadata.as_ref().and_then(|e| e.retry_after.map(|d| d.as_secs())),
                         ends_turn: true,
                     });
                 }
@@ -458,6 +481,10 @@ impl Projector {
                     out.push(AgentEvent::Cancelled);
                 }
                 out.push(AgentEvent::TurnComplete {
+                    provider_failure: metadata.map(|e| atomcode_kernel::event::ProviderFailure {
+                        retryable: e.retryable, http_status: e.http_status, code: e.code,
+                        retry_after_secs: e.retry_after.map(|d| d.as_secs()),
+                    }),
                     turn: Some(*turn),
                     reason: *stop,
                 });
@@ -1308,6 +1335,7 @@ async fn pump(
             code: None,
             retryable: Some(false),
             // 连回合都跑不起来:不会有哪次收尾再说它一遍。
+            retry_after_secs: None,
             ends_turn: false,
         });
         return;
@@ -2042,6 +2070,7 @@ fn attach(
     let session_id = agent.session_id().to_string();
     let manual_compaction = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let projector = Arc::new(Mutex::new(Projector {
+        terminal_error: None,
         tools: ctx.service::<ToolsSvc>(),
         ctx_window: ctx
             .service::<LlmSvc>()
@@ -2057,6 +2086,11 @@ fn attach(
         log: Some(agent.session()),
     }));
 
+    let terminal_metadata =
+        ctx.on_parallel::<crate::events::TurnFinishing>(Arc::new(TerminalMetadata {
+            session: session_id.clone(),
+            projector: projector.clone(),
+        }));
     let out = events.clone();
     let fold = projector.clone();
     // Sessions a driver subscribed to, pushed as they happen. Attached before
@@ -2099,6 +2133,7 @@ fn attach(
         // lets the event channel close, so a driver reading to the end sees
         // the end. Dropping only the local handles would hang it forever.
         stream.dispose();
+        terminal_metadata.dispose();
         for listener in feeding {
             listener.dispose();
         }
@@ -2301,6 +2336,7 @@ async fn mount_handle(ctx: &Context, config: &Value, approvals: bool) -> Result<
 /// produces, because it is the same fold.
 pub fn replay(events: &[SessionEvent], ctx_window: u32) -> Vec<AgentEvent> {
     let mut projector = Projector {
+        terminal_error: None,
         tools: None,
         ctx_window,
         batch: None,

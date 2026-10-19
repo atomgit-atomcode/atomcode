@@ -375,3 +375,23 @@ theme = "auto"
 # Transport/proxy headers cannot be overridden. Signed managed accounts do
 # not accept custom headers. The WebUI returns names only; leave a saved value
 # blank to preserve it, or delete its row to remove the header.
+
+# Autonomous goals: bounded recovery while this runtime remains alive.
+# Existing goal round/time caps still apply. 0 attempts disables that retry tier.
+# Recovery does not bypass permissions, quota limits, or uncertain persistence.
+# The time budget controls scheduling; an already running model request may finish.
+# [goal.recovery]
+# max_attempts = 12
+# max_elapsed_secs = 1800
+# base_delay_secs = 30
+# max_delay_secs = 300
+# evaluator_max_attempts = 3
+# evaluator_timeout_secs = 600
+
+# Optional low-frequency goal recovery after the short retry budget is exhausted.
+# Omit this table to keep the default 30-minute recovery window.
+# This may incur further model costs. Goal round/time caps still apply.
+# [goal.recovery.long_wait]
+# max_attempts = 32
+# max_elapsed_secs = 28800
+# interval_secs = 900

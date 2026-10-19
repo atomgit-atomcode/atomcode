@@ -1009,8 +1009,22 @@ export interface PolicyInterventionEvent {
   actions: PolicyRecoveryAction[];
 }
 
+export interface GoalRecoveryProgress {
+  kind: 'provider' | 'evaluator';
+  attempt: number;
+  max_attempts: number;
+  retry_in_secs: number;
+}
+export interface LiveGoalProgress {
+  active: boolean;
+  phase: string;
+  last_reason: string | null;
+  recovery?: GoalRecoveryProgress | null;
+}
+
 export type LiveWireEvent =
-  | { type: 'snapshot'; messages: SessionMessage[]; session_id: string; project_hash: string; provider: string; mode: ApprovalMode }
+  | { type: 'snapshot'; messages: SessionMessage[]; session_id: string; project_hash: string; provider: string; mode: ApprovalMode; goal?: LiveGoalProgress | null }
+  | ({ type: 'goal_changed' } & LiveGoalProgress)
   | { type: 'provider'; provider: string }
   | { type: 'reasoning_effort'; provider: string; effort: string | null; applicable: boolean }
   | { type: 'mode'; mode: ApprovalMode }
