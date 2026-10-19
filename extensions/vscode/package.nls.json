@@ -24,5 +24,7 @@
   "atomcode.configuration.autoSave.description": "Auto-save files before AI reads them",
   "atomcode.configuration.sendWithCtrlEnter.description": "Use Ctrl+Enter instead of Enter to send messages",
   "atomcode.configuration.fontSize.description": "Font size in chat panel",
-  "atomcode.configuration.showInlineHints.description": "Show inline diff hints when AI edits files"
+  "atomcode.configuration.showInlineHints.description": "Show inline diff hints when AI edits files",
+  "atomcode.commands.enableLanguageBridge.title": "AtomCode: Enable IDE Language Bridge (Copy Configuration)",
+  "atomcode.commands.disableLanguageBridge.title": "AtomCode: Disable IDE Language Bridge"
 }

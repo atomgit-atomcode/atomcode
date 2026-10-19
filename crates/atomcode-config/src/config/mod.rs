@@ -1950,7 +1950,10 @@ pub struct NetworkConfig {
 /// in their config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LspConfig {
-    /// Master switch for read-only LSP code intelligence. Off by default — opt-in only.
+    /// Private connection-file path selecting an IDE window; no token in config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ide_connection_file: Option<std::path::PathBuf>,
+    /// Enable locally managed language servers. IDE window binding is independent.
     #[serde(default)]
     pub enabled: bool,
     /// Automatically detect and start language servers from the built-in
@@ -1976,6 +1979,7 @@ fn default_diagnostics_settle_delay_ms() -> u64 {
 impl Default for LspConfig {
     fn default() -> Self {
         Self {
+            ide_connection_file: None,
             enabled: false,
             auto_detect: false,
             servers: Default::default(),
@@ -2009,7 +2013,8 @@ fn migrate_legacy_lsp_default(cfg: &mut Config) {
     let looks_auto_written = cfg.lsp.enabled
         && cfg.lsp.auto_detect
         && cfg.lsp.diagnostics_settle_delay_ms == 150
-        && cfg.lsp.servers.is_empty();
+        && cfg.lsp.servers.is_empty()
+        && cfg.lsp.ide_connection_file.is_none();
     if looks_auto_written {
         cfg.lsp = LspConfig::default();
     }
@@ -3431,6 +3436,23 @@ model = "missing-type"
         assert!(super::request_user_input_enabled_from_env(Some("on")));
     }
 
+    #[test]
+    fn explicit_ide_binding_survives_config_migration_without_enabling_local_lsp() {
+        let mut config: Config =
+            toml::from_str("[lsp]\nide_connection_file = '/private/window.json'\n").unwrap();
+        migrate_legacy_lsp_default(&mut config);
+        assert!(!config.lsp.enabled);
+        assert_eq!(
+            config.lsp.ide_connection_file.as_deref(),
+            Some(std::path::Path::new("/private/window.json"))
+        );
+        config.lsp.enabled = true;
+        config.lsp.auto_detect = true;
+        migrate_legacy_lsp_default(&mut config);
+        assert!(config.lsp.ide_connection_file.is_some());
+        assert!(config.lsp.enabled);
+    }
+
     /// Migration: on-disk config that looks like it was auto-written by
     /// the OLD setup wizard (enabled=true + auto_detect=true + delay=150
     /// + no custom servers) must be silently reset to disabled. Without
@@ -3439,6 +3461,7 @@ model = "missing-type"
     #[test]
     fn migrate_resets_auto_written_lsp_to_disabled() {
         let mut cfg = blank_config_with_lsp(LspConfig {
+            ide_connection_file: None,
             enabled: true,
             auto_detect: true,
             servers: Default::default(),
@@ -3468,6 +3491,7 @@ model = "missing-type"
             },
         );
         let mut cfg = blank_config_with_lsp(LspConfig {
+            ide_connection_file: None,
             enabled: true,
             auto_detect: true,
             servers,
@@ -3478,6 +3502,7 @@ model = "missing-type"
 
         // Case 2: tuned settle delay.
         let mut cfg2 = blank_config_with_lsp(LspConfig {
+            ide_connection_file: None,
             enabled: true,
             auto_detect: true,
             servers: Default::default(),
@@ -3489,6 +3514,7 @@ model = "missing-type"
         // Case 3: auto_detect=false but enabled=true (explicit narrow
         // setup with `servers` listed) — already deviates, keep.
         let mut cfg3 = blank_config_with_lsp(LspConfig {
+            ide_connection_file: None,
             enabled: true,
             auto_detect: false,
             servers: Default::default(),

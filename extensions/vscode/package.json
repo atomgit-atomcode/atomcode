@@ -85,6 +85,14 @@
         "command": "atomcode.stop",
         "title": "%atomcode.commands.stop.title%",
         "icon": "$(stop-circle)"
+      },
+      {
+        "command": "atomcode.enableLanguageBridge",
+        "title": "%atomcode.commands.enableLanguageBridge.title%"
+      },
+      {
+        "command": "atomcode.disableLanguageBridge",
+        "title": "%atomcode.commands.disableLanguageBridge.title%"
       }
     ],
     "viewsContainers": {
@@ -239,5 +247,8 @@
     "marked": "^12.0.0",
     "react": "^19.2.5",
     "react-dom": "^19.2.5"
-  }
+  },
+  "extensionKind": [
+    "workspace"
+  ]
 }

@@ -345,6 +345,9 @@ max_members = 6         # 每个 lead 最多保留的成员数；空闲成员也
 # LSP（语言服务器协议）
 # =============================================================================
 [lsp]
+# Optional: bind one IDE window using the private path copied by the VS Code extension.
+# Does not enable local language-server processes. See docs/ide-language-bridge.md.
+# ide_connection_file = "/absolute/private/path/window-id.json"
 enabled = false
 auto_detect = false
 diagnostics_settle_delay_ms = 150

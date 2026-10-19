@@ -24,5 +24,7 @@
   "atomcode.configuration.autoSave.description": "AI 读取文件前自动保存",
   "atomcode.configuration.sendWithCtrlEnter.description": "使用 Ctrl+Enter 发送消息，而不是 Enter",
   "atomcode.configuration.fontSize.description": "聊天面板字体大小",
-  "atomcode.configuration.showInlineHints.description": "AI 编辑文件时显示内联 diff 提示"
+  "atomcode.configuration.showInlineHints.description": "AI 编辑文件时显示内联 diff 提示",
+  "atomcode.commands.enableLanguageBridge.title": "AtomCode：启用 IDE 语言服务桥接（复制配置）",
+  "atomcode.commands.disableLanguageBridge.title": "AtomCode：停用 IDE 语言服务桥接"
 }

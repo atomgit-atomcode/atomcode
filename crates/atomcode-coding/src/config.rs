@@ -332,6 +332,7 @@ pub fn lsp_settings_from_config(
     config: &atomcode_config::config::LspConfig,
 ) -> atomcode_capabilities::codeintel::LspSettings {
     atomcode_capabilities::codeintel::LspSettings {
+        ide_connection_file: config.ide_connection_file.clone(),
         enabled: config.enabled,
         auto_detect: config.auto_detect,
         settle_delay_ms: config.diagnostics_settle_delay_ms,
@@ -442,7 +443,7 @@ pub fn describe_config_file_for(
          51200, clamped to 46080..=4194304) is saved whole and shown as a head + tail \
          preview that `fetch_output` reads past; `ATOMCODE_TOOL_OUTPUT_THRESHOLD_BYTES` \
          wins.\n\
-         - `[lsp]` `enabled`, `auto_detect`, and `[lsp.servers.<extension>]` = \
+         - `[lsp]` `enabled`, `auto_detect`, `ide_connection_file` (private IDE window binding path), and `[lsp.servers.<extension>]` = \
          `{{ command, args, root_markers }}`.\n\
          - `[web_search]` `provider` = `exa` | `duckduckgo`, and `api_key` for Exa; the \
          `ATOMCODE_WEB_SEARCH_PROVIDER` and `EXA_API_KEY` environment variables win.\n\
@@ -1258,6 +1259,7 @@ mod tests {
         let mut config = atomcode_config::config::Config::default();
         assert!(!config.lsp.enabled);
         config.lsp.enabled = true;
+        config.lsp.ide_connection_file = Some(std::path::PathBuf::from("/private/ide-window.json"));
         config.lsp.auto_detect = false;
         config.lsp.diagnostics_settle_delay_ms = 725;
         config.lsp.servers.insert(
@@ -1276,6 +1278,10 @@ mod tests {
             None,
             false,
             false,
+        );
+        assert_eq!(
+            runtime.lsp.ide_connection_file,
+            config.lsp.ide_connection_file
         );
         assert!(runtime.lsp.enabled);
         assert!(!runtime.lsp.auto_detect);

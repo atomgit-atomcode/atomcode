@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { registerLanguageBridge } from './languageBridge/vscode';
 import { DaemonClient } from './daemon/client';
 import { DaemonProcess } from './daemon/process';
 import { ChatViewProvider } from './chat/provider';
@@ -20,6 +21,7 @@ class ExtensionState {
 const extensionState = new ExtensionState();
 
 export async function activate(context: vscode.ExtensionContext) {
+  registerLanguageBridge(context);
   const config = getConfig();
 
   // 1. Initialize daemon client and process manager

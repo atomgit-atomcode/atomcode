@@ -63,5 +63,7 @@
   "Unable to read config: {message}": "无法读取配置：{message}",
   "Reloaded config. Default provider: {provider}.": "已重新加载配置。默认 Provider：{provider}。",
   "Unable to reload config: {message}": "无法重新加载配置：{message}",
-  "New session": "新建会话"
+  "New session": "新建会话",
+  "IDE language bridge enabled. Connection configuration copied; merge it into your AtomCode config and reopen the session.": "IDE 语言服务桥接已启用。连接配置已复制，请合并到 AtomCode 配置文件后重新打开会话。",
+  "Could not enable the IDE language bridge. Open a trusted filesystem workspace and try again.": "无法启用 IDE 语言服务桥接。请打开可信的本地文件工作区后重试。"
 }

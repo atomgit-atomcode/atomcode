@@ -37,6 +37,8 @@ pub mod trace_chain;
 #[cfg(feature = "lsp")]
 pub mod diagnostics;
 #[cfg(feature = "lsp")]
+mod ide_bridge;
+#[cfg(feature = "lsp")]
 pub mod lsp;
 #[cfg(feature = "lsp")]
 pub mod lsp_tool;
@@ -108,6 +110,8 @@ pub struct LspServerSetting {
 /// binaries; `auto_detect` only enables the built-in mapping to locally installed ones.
 #[derive(Debug, Clone)]
 pub struct LspSettings {
+    /// Explicit window binding; only a path, never bridge credentials.
+    pub ide_connection_file: Option<PathBuf>,
     pub enabled: bool,
     pub auto_detect: bool,
     pub servers: HashMap<String, LspServerSetting>,
@@ -117,6 +121,7 @@ pub struct LspSettings {
 impl Default for LspSettings {
     fn default() -> Self {
         Self {
+            ide_connection_file: None,
             enabled: false,
             auto_detect: false,
             servers: HashMap::new(),
@@ -129,7 +134,7 @@ impl Default for LspSettings {
 /// it. Returns whether registration occurred so callers only mount an existing tool.
 #[cfg(feature = "lsp")]
 pub fn register_lsp_tool(reg: &mut ToolRegistry, settings: &LspSettings) -> bool {
-    if !settings.enabled {
+    if !settings.enabled && settings.ide_connection_file.is_none() {
         return false;
     }
     let mut servers = if settings.auto_detect {
@@ -148,7 +153,10 @@ pub fn register_lsp_tool(reg: &mut ToolRegistry, settings: &LspSettings) -> bool
         );
     }
     let manager = LspManager::with_registry_and_delay(servers, settings.settle_delay_ms);
-    reg.register(Arc::new(LspTool::new(Arc::new(manager))));
+    reg.register(Arc::new(LspTool::new(Arc::new(manager)).with_ide_binding(
+        settings.ide_connection_file.clone(),
+        settings.enabled,
+    )));
     true
 }
 
@@ -214,5 +222,26 @@ pub(crate) fn err(content: impl Into<String>) -> ToolResult {
         content: content.into(),
         is_error: true,
         images: vec![],
+    }
+}
+
+#[cfg(all(test, feature = "lsp"))]
+mod ide_registration_tests {
+    use super::*;
+    #[test]
+    fn binding_alone_mounts_the_tool_without_opt_in_to_local_servers() {
+        let mut registry = ToolRegistry::default();
+        let mut settings = LspSettings::default();
+        assert!(!register_lsp_tool(&mut registry, &settings));
+        assert!(registry.mount(&["lsp"]).get("lsp").is_none());
+        settings.ide_connection_file = Some(PathBuf::from("/private/window.json"));
+        assert!(register_lsp_tool(&mut registry, &settings));
+        assert!(!settings.enabled);
+        assert!(registry
+            .mount(&["lsp"])
+            .get("lsp")
+            .unwrap()
+            .description()
+            .contains("bound IDE"));
     }
 }
