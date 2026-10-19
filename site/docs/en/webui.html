@@ -82,7 +82,7 @@
 
       <h2 id="start-stop">Start &amp; stop</h2>
       <p>Run these in the AtomCode TUI input box:</p>
-      <pre><code># Launch the webui and open the browser (binds 127.0.0.1:13457 by default — local only)
+      <pre><code># Launch the webui and open the browser (local server binds 127.0.0.1:13457; phones connect through the relay)
 /webui
 
 # Stop the webui server
@@ -90,8 +90,8 @@
       <p>On launch, AtomCode starts a local HTTP server and opens your browser to a URL like <code>http://127.0.0.1:13457/?token=&lt;one-time token&gt;</code>. The <code>token</code> in the URL is the credential — it's <strong>equivalent to a password</strong>, so don't share it. The current TUI session is also attached to live sync automatically (see <a href="#live-sync">Live sync across devices</a> below).</p>
 
       <div class="callout callout-warn">
-        <strong>Localhost only by default</strong>
-        <p>The webui binds <code>127.0.0.1</code>, reachable only from this machine. To open it from a phone, do <strong>not</strong> expose it with <code>--host 0.0.0.0</code>; use the 蒲公英 virtual-LAN approach instead — see <a href="./webui-remote-access.html">Remote Access</a>.</p>
+        <strong>Phone access through the relay</strong>
+        <p>The local webui binds <code>127.0.0.1</code> and connects to the HTTPS relay at <code>https://relay-atomcode.atomgit.com</code>. Scan the QR in the terminal or Remote access dialog with your phone; no VPN is needed. Add <code>--local</code> for local-only access. See <a href="./webui-remote-access.html">Remote Access</a>.</p>
       </div>
 
       <h3 id="two-ways-to-run">Two ways to run it, and when each stops</h3>
@@ -163,11 +163,11 @@ atomcode webui --port 13457 --host 127.0.0.1</code></pre>
       <p>When the agent needs a decision from you mid-task, an <strong>interactive question</strong> card appears (single choice, multiple choice, or free text) and the turn pauses until you answer. See <a href="./interactive-questions.html">Interactive Questions</a> for the full behaviour.</p>
 
       <h2 id="remote-access">Remote access</h2>
-      <p>Want to open the webui from a phone without exposing it publicly? Use a 蒲公英 (Oray PGY) virtual LAN: bind the server to the virtual IP with <code>/webui --host &lt;virtual IP&gt;</code>, then scan the QR in the Remote Access panel. Full walkthrough in <a href="./webui-remote-access.html">Remote Access</a>.</p>
+      <p>Run <code>/webui</code> (or <code>atomcode webui</code> standalone), then scan the relay QR with your phone browser to open the same conversation. The devices may use different networks. See <a href="./webui-remote-access.html">Remote Access</a>.</p>
 
       <h2 id="next">Next</h2>
       <ul>
-        <li><a href="./webui-remote-access.html">Remote Access</a> — open the webui from a phone over 蒲公英, safely</li>
+        <li><a href="./webui-remote-access.html">Remote Access</a> — open the webui from your phone through the HTTPS relay</li>
         <li><a href="./headless-daemon.html">Headless &amp; Daemon</a> — the daemon and HTTP/SSE API behind the webui</li>
         <li><a href="./slash-commands.html">Slash Commands</a> — quick reference for <code>/webui</code>, <code>/sync</code> and more</li>
       </ul>

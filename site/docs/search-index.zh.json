@@ -1304,7 +1304,7 @@
       {
         "id": "启动与关闭",
         "heading": "启动与关闭",
-        "body": "在 AtomCode 的 TUI 输入框里运行： # 启动 webui 并自动打开浏览器（默认绑定 127.0.0.1:13457，仅本机可访问） /webui # 关闭 webui 服务 /webui stop 启动后 AtomCode 会在本机起一个 HTTP 服务，并自动打开浏览器到形如 http://127.0.0.1:13457/?token=<一次性令牌> 的地址。URL 里带的 token 用于鉴权， 等同于密码 ，请勿外传。同时，当前 TUI 会话会自动接入实时同步（见下文 多端实时同步 ）。 默认只监听本机 webui 默认绑定 127.0.0.1 ，只有本机能访问。要让手机等设备访问， 不要 直接用 --host 0.0.0.0 暴露到公网，请走蒲公英虚拟局域网方案 —— 见 远程访问指南 。"
+        "body": "在 AtomCode 的 TUI 输入框里运行： # 启动 webui 并自动打开浏览器（本机服务绑定 127.0.0.1:13457，手机通过中继访问） /webui # 关闭 webui 服务 /webui stop 启动后 AtomCode 会在本机起一个 HTTP 服务，并自动打开浏览器到形如 http://127.0.0.1:13457/?token=<一次性令牌> 的地址。URL 里带的 token 用于鉴权， 等同于密码 ，请勿外传。同时，当前 TUI 会话会自动接入实时同步（见下文 多端实时同步 ）。 手机通过中继访问 webui 本地服务默认绑定 127.0.0.1 ，同时连接 https://relay-atomcode.atomgit.com 中继。手机扫描终端或「远程访问」面板的二维码即可访问，无需组网。仅本机使用可加 --local 。详见 远程访问指南 。"
       },
       {
         "id": "两种启动方式与生命周期",
@@ -1329,12 +1329,12 @@
       {
         "id": "远程访问",
         "heading": "远程访问",
-        "body": "想从手机等设备打开 webui，又不暴露公网？借助蒲公英（Oray PGY）组建的虚拟局域网，用 /webui --host <虚拟 IP> 把服务绑定到虚拟 IP，再在「远程访问」面板扫码即可。完整流程见 远程访问指南 。"
+        "body": "在终端运行 /webui （独立启动用 atomcode webui ），手机浏览器扫描中继二维码即可打开同一会话，手机和电脑可使用不同网络。完整流程见 远程访问指南 。"
       },
       {
         "id": "下一步",
         "heading": "下一步",
-        "body": "远程访问指南 —— 用蒲公英从手机安全打开 webui Headless 与 Daemon —— webui 背后的 daemon 与 HTTP/SSE 接口 斜杠命令 —— /webui 、 /sync 等命令速查 © 2026 AtomCode · MIT 报告问题"
+        "body": "远程访问指南 —— 通过 HTTPS 中继从手机打开 webui Headless 与 Daemon —— webui 背后的 daemon 与 HTTP/SSE 接口 斜杠命令 —— /webui 、 /sync 等命令速查 © 2026 AtomCode · MIT 报告问题"
       }
     ]
   },
@@ -1358,6 +1358,11 @@
         "id": "连接失败",
         "heading": "连接失败",
         "body": "中继连接失败时本机 WebUI 仍可使用，终端和远程访问面板会说明原因。若提示中继未启用 WebUI，需升级中继服务端并部署当前版本的 WebUI 资源，再执行 /webui 重试。可通过 ATOMCODE_APP_RELAY 指定自建中继， ATOMCODE_ENABLE_RELAY=0 禁用中继。"
+      },
+      {
+        "id": "中继地址",
+        "heading": "中继地址",
+        "body": "默认使用线上 HTTPS 中继 https://relay-atomcode.atomgit.com ，无需额外配置。手机请打开 AtomCode 生成的配对链接或扫描二维码。"
       },
       {
         "id": "安全与生命周期",

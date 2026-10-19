@@ -232,7 +232,7 @@ export function NotificationsDialog({ onClose }: { onClose: () => void }) {
   );
 }
 
-/** 远程访问（蒲公英 / Oray PGY）：检测状态，给出可扫码的私网 URL。 */
+/** 远程访问：展示中继或局域网链接和二维码。 */
 export function RemoteAccessDialog({ onClose }: { onClose: () => void }) {
   const { t, lang } = useSettings();
   const [status, setStatus] = useState<TunnelStatus | null>(null);
@@ -248,18 +248,8 @@ export function RemoteAccessDialog({ onClose }: { onClose: () => void }) {
   };
   useEffect(() => { reload(); }, []);
 
-  const pgy = status?.pgy;
-  // 服务端未给 remote_url（绑回环）时，展示一个「示意」地址。注意：token 现在只存在
-  // 于 HttpOnly Cookie 中，前端 JS 读不到（防插件拦截，CWE-598），所以这里无法拼出
-  // 可直接登录的链接——要可分享的真实链接需把 webui 绑到局域网，由服务端下发
-  // remote_url（带 token）。回环示意地址因此不带 token。
-  const fallbackUrl =
-    pgy?.ipv4 && status
-      ? `http://${pgy.ipv4}:${status.port}/?sync=1`
-      : null;
-
   function copy() {
-    const url = status?.remote_url ?? fallbackUrl;
+    const url = status?.remote_url;
     if (!url) return;
     navigator.clipboard?.writeText(url).then(() => {
       setCopied(true);
@@ -276,31 +266,14 @@ export function RemoteAccessDialog({ onClose }: { onClose: () => void }) {
 
         {!loading && status && (
           <>
-            {/* 1) 未装 / 未连蒲公英 */}
             {status.mode === 'relay' && status.relay_error && <p>{status.relay_error}</p>}
-            {status.mode !== 'relay' && !status.remote_url && (!pgy?.installed || !pgy?.ipv4) && (
+            {status.mode !== 'relay' && !status.remote_url && (
               <div class="remote-state">
-                <p>{pgy?.installed ? t('remote.notConnected') : t('remote.notInstalled')}</p>
-                <a
-                  class="btn btn-primary"
-                  href="https://pgy.oray.com"
-                  target="_blank"
-                  rel="noreferrer"
-                >
-                  {t('remote.installLink')}
-                </a>
+                <p>{t('remote.startRelay')}</p>
               </div>
             )}
 
-            {/* 2) 已装+有 IP，但 server 仅绑回环 → 提示改绑 */}
-            {pgy?.installed && pgy?.ipv4 && !status.remote_url && (
-              <div class="remote-state">
-                <p>{t('remote.notReachable', { ip: pgy.ipv4 })}</p>
-                {fallbackUrl && <code class="remote-url">{fallbackUrl}</code>}
-              </div>
-            )}
-
-            {/* 3) 就绪：二维码 + URL */}
+            {/* 就绪：二维码 + URL */}
             {status.remote_url && (
               <div class="remote-state remote-ready">
                 <p>{t(status.mode === 'relay' ? 'remote.relayReady' : 'remote.ready')}</p>

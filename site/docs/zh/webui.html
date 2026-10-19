@@ -82,7 +82,7 @@
 
       <h2 id="启动与关闭">启动与关闭</h2>
       <p>在 AtomCode 的 TUI 输入框里运行：</p>
-      <pre><code># 启动 webui 并自动打开浏览器（默认绑定 127.0.0.1:13457，仅本机可访问）
+      <pre><code># 启动 webui 并自动打开浏览器（本机服务绑定 127.0.0.1:13457，手机通过中继访问）
 /webui
 
 # 关闭 webui 服务
@@ -90,8 +90,8 @@
       <p>启动后 AtomCode 会在本机起一个 HTTP 服务，并自动打开浏览器到形如 <code>http://127.0.0.1:13457/?token=&lt;一次性令牌&gt;</code> 的地址。URL 里带的 <code>token</code> 用于鉴权，<strong>等同于密码</strong>，请勿外传。同时，当前 TUI 会话会自动接入实时同步（见下文 <a href="#多端实时同步">多端实时同步</a>）。</p>
 
       <div class="callout callout-warn">
-        <strong>默认只监听本机</strong>
-        <p>webui 默认绑定 <code>127.0.0.1</code>，只有本机能访问。要让手机等设备访问，<strong>不要</strong>直接用 <code>--host 0.0.0.0</code> 暴露到公网，请走蒲公英虚拟局域网方案 —— 见 <a href="./webui-remote-access.html">远程访问指南</a>。</p>
+        <strong>手机通过中继访问</strong>
+        <p>webui 本地服务默认绑定 <code>127.0.0.1</code>，同时连接 <code>https://relay-atomcode.atomgit.com</code> 中继。手机扫描终端或「远程访问」面板的二维码即可访问，无需组网。仅本机使用可加 <code>--local</code>。详见 <a href="./webui-remote-access.html">远程访问指南</a>。</p>
       </div>
 
       <h3 id="两种启动方式与生命周期">两种启动方式与生命周期</h3>
@@ -163,11 +163,11 @@ atomcode webui --port 13457 --host 127.0.0.1</code></pre>
       <p>当 agent 在任务中途需要你拍板时,会弹出一张<strong>交互提问</strong>卡片(单选、多选或自由文本),回合会暂停到你作答为止。完整行为见 <a href="./interactive-questions.html">交互提问</a>。</p>
 
       <h2 id="远程访问">远程访问</h2>
-      <p>想从手机等设备打开 webui，又不暴露公网？借助蒲公英（Oray PGY）组建的虚拟局域网，用 <code>/webui --host &lt;虚拟 IP&gt;</code> 把服务绑定到虚拟 IP，再在「远程访问」面板扫码即可。完整流程见 <a href="./webui-remote-access.html">远程访问指南</a>。</p>
+      <p>在终端运行 <code>/webui</code>（独立启动用 <code>atomcode webui</code>），手机浏览器扫描中继二维码即可打开同一会话，手机和电脑可使用不同网络。完整流程见 <a href="./webui-remote-access.html">远程访问指南</a>。</p>
 
       <h2 id="下一步">下一步</h2>
       <ul>
-        <li><a href="./webui-remote-access.html">远程访问指南</a> —— 用蒲公英从手机安全打开 webui</li>
+        <li><a href="./webui-remote-access.html">远程访问指南</a> —— 通过 HTTPS 中继从手机打开 webui</li>
         <li><a href="./headless-daemon.html">Headless 与 Daemon</a> —— webui 背后的 daemon 与 HTTP/SSE 接口</li>
         <li><a href="./slash-commands.html">斜杠命令</a> —— <code>/webui</code>、<code>/sync</code> 等命令速查</li>
       </ul>

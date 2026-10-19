@@ -82,6 +82,8 @@
 <p>独立启动可用 <code>atomcode webui</code>；仅本机访问用 <code>/webui --local</code> 或 <code>atomcode webui --local</code>。显式指定 <code>/webui lan</code> 或 <code>--host &lt;地址&gt;</code> 时使用局域网地址，不自动连接中继。</p>
 <h2 id="连接失败">连接失败</h2>
 <p>中继连接失败时本机 WebUI 仍可使用，终端和远程访问面板会说明原因。若提示中继未启用 WebUI，需升级中继服务端并部署当前版本的 WebUI 资源，再执行 <code>/webui</code> 重试。可通过 <code>ATOMCODE_APP_RELAY</code> 指定自建中继，<code>ATOMCODE_ENABLE_RELAY=0</code> 禁用中继。</p>
+<h2 id="中继地址">中继地址</h2>
+<p>默认使用线上 HTTPS 中继 <code>https://relay-atomcode.atomgit.com</code>，无需额外配置。手机请打开 AtomCode 生成的配对链接或扫描二维码。</p>
 <h2 id="安全与生命周期">安全与生命周期</h2>
 <p>链接等同于访问密码，请勿外传。请求经 HTTPS 中继到本机，继续校验 WebUI 令牌；中继可以处理传输内容，不提供端到端加密。浏览器把配对凭据保存在当前标签页的 sessionStorage，用于刷新重连，关闭标签页后清除。网络中断时客户端自动重连；电脑休眠、离线或 AtomCode 退出后不可访问。</p>
 <h2 id="局域网备选">局域网备选</h2>
