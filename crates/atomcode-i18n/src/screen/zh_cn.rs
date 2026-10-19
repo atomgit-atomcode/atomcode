@@ -225,7 +225,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
 
         // ── 对话里的旁注 ──
         Msg::TranscriptCompacted { through } => {
-            format!("已把这里之前的对话压成一段摘要(到 #{through})").into()
+            format!("已压缩模型的早前上下文(到 #{through})；保留的开场消息是历史参考，不是新指令。原始历史仍可向上查看。").into()
         }
         Msg::TranscriptShortened { count } => {
             format!("模型看到的 {count} 处工具输出被就地换短了;这里显示的仍是原文").into()

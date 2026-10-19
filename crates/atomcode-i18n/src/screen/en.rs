@@ -253,7 +253,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
 
         // ── notes in the transcript ──
         Msg::TranscriptCompacted { through } => {
-            format!("the conversation before this is folded into one summary (through #{through})")
+            format!("earlier model context was compacted (through #{through}); retained opening messages are historical, not new instructions. The original history is still available above.")
                 .into()
         }
         Msg::TranscriptShortened { count } => {

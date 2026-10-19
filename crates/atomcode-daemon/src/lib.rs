@@ -949,7 +949,7 @@ impl MessageInfo {
         let mut content = if user_interruption {
             String::new()
         } else {
-            msg.text.clone()
+            msg.display_text().to_string()
         };
         let mut images = (!msg.images.is_empty()).then(|| {
             msg.images
@@ -974,7 +974,11 @@ impl MessageInfo {
             role: role.into(),
             content,
             synthetic: msg.synthetic,
-            internal_origin: if user_interruption {
+            internal_origin: if msg.internal_origin.as_deref()
+                == Some(atomcode_kernel::message::COMPACTION_RETAINED_MODEL_ORIGIN)
+            {
+                Some(atomcode_kernel::message::COMPACTION_RETAINED_ORIGIN.into())
+            } else if user_interruption {
                 Some(atomcode_kernel::message::USER_INTERRUPTION_ORIGIN.to_string())
             } else {
                 msg.internal_origin.clone()
@@ -2335,7 +2339,7 @@ async fn get_session_detail(Path((hash, id)): Path<(String, String)>) -> impl In
 }
 
 /// The full, never-compacted per-turn trajectory of a session — the same ground
-/// truth the `recall` tool reads (`<id>.jsonl`), turn-granular and UNAFFECTED by
+/// truth the `recall` tool reads (the native event log), turn-granular and UNAFFECTED by
 /// compaction, so a UI can surface history the runtime snapshot dropped.
 #[derive(serde::Serialize)]
 struct SessionTranscript {
@@ -9488,6 +9492,34 @@ done
             info.images.as_deref(),
             Some([ImageData { missing: true, .. }])
         ));
+    }
+
+    #[test]
+    fn retained_history_has_the_same_original_text_on_live_and_disk_display_paths() {
+        use atomcode_kernel::message::{
+            Message, COMPACTION_RETAINED_FRAMING, COMPACTION_RETAINED_MODEL_ORIGIN,
+            COMPACTION_RETAINED_ORIGIN,
+        };
+        let mut original = Message::user("old task");
+        original.internal_origin = Some(COMPACTION_RETAINED_ORIGIN.into());
+        let mut model = original.clone();
+        model.text.insert_str(0, COMPACTION_RETAINED_FRAMING);
+        model.internal_origin = Some(COMPACTION_RETAINED_MODEL_ORIGIN.into());
+        for message in [&original, &model] {
+            let shown = MessageInfo::from_kernel(message);
+            assert_eq!(shown.content, "old task");
+            assert_eq!(
+                shown.internal_origin.as_deref(),
+                Some(COMPACTION_RETAINED_ORIGIN)
+            );
+            assert!(!shown.synthetic);
+        }
+        // A human may literally quote the framing; raw display must preserve it.
+        original.text = COMPACTION_RETAINED_FRAMING.into();
+        assert_eq!(
+            MessageInfo::from_kernel(&original).content,
+            COMPACTION_RETAINED_FRAMING
+        );
     }
 
     #[test]

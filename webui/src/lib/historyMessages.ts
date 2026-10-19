@@ -96,3 +96,8 @@ export function sessionMessagesToMarkdownLines(
   }
   return lines;
 }
+
+/** Provenance is explicit; matching text alone must never reclassify a user. */
+export function isRetainedHistoryUserMessage(msg: SessionMessage): boolean {
+  return msg.role === 'user' && (msg.internal_origin ?? msg.internalOrigin) === 'compaction_retained_user';
+}

@@ -495,7 +495,9 @@ fn with_logged_meta(messages: &[Message], logged: &[Message]) -> Vec<Message> {
         return out;
     };
     let lines_up = span.iter().zip(logged).all(|(sent, kept)| {
-        sent.role == kept.role && sent.text == kept.text && sent.tool_calls == kept.tool_calls
+        sent.role == kept.role
+            && sent.display_text() == kept.display_text()
+            && sent.tool_calls == kept.tool_calls
     });
     if lines_up {
         for (sent, kept) in span.iter_mut().zip(logged) {
@@ -3381,6 +3383,34 @@ impl atomcode_harness::commands::CatalogCommand for PolicyCommand {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn historical_framing_keeps_logged_stats_aligned_without_accepting_changed_text() {
+        use atomcode_kernel::message::{
+            Message, MessageMeta, COMPACTION_RETAINED_FRAMING, COMPACTION_RETAINED_MODEL_ORIGIN,
+            COMPACTION_RETAINED_ORIGIN,
+        };
+        let mut original = Message::user("original task");
+        original.internal_origin = Some(COMPACTION_RETAINED_ORIGIN.into());
+        let mut assistant = Message::assistant("reply", vec![]);
+        assistant.meta = Some(MessageMeta {
+            elapsed_ms: 42,
+            ..Default::default()
+        });
+        let logged = vec![original.clone(), assistant];
+        let mut framed = original;
+        framed.text.insert_str(0, COMPACTION_RETAINED_FRAMING);
+        framed.internal_origin = Some(COMPACTION_RETAINED_MODEL_ORIGIN.into());
+        let mut sent = vec![framed, Message::assistant("reply", vec![])];
+        let enriched = super::with_logged_meta(&sent, &logged);
+        assert_eq!(enriched[1].meta.as_ref().unwrap().elapsed_ms, 42);
+        assert_eq!(
+            enriched[0].text, sent[0].text,
+            "the request framing stays intact"
+        );
+        sent[0].text.push_str("different task");
+        assert!(super::with_logged_meta(&sent, &logged)[1].meta.is_none());
+    }
+
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_cancelled_mcp_discovery_releases_the_reconnect_guard() {
         let jobs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));

@@ -1113,7 +1113,7 @@ mod tests {
         ]);
         let drawn = said(&s);
         assert!(
-            drawn.contains("压成一段摘要") && drawn.contains("#7"),
+            drawn.contains("已压缩模型") && drawn.contains("#7") && drawn.contains("不是新指令"),
             "the compaction says how far it reached:\n{drawn}"
         );
         assert!(

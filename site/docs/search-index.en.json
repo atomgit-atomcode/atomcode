@@ -1299,7 +1299,7 @@
       {
         "id": "web-ui",
         "heading": "Web UI",
-        "body": "Besides the terminal TUI, AtomCode ships a built-in browser interface : type /webui in the TUI to launch it, then chat, browse session history, add/edit/delete model providers, and upload images in the browser — and use /sync to mirror one session live between the terminal and the browser. It reuses this machine's login, models, and session history, so there's nothing extra to configure."
+        "body": "Besides the terminal TUI, AtomCode ships a built-in browser interface : type /webui in the TUI to launch it, then chat, browse session history, add/edit/delete model providers, and upload images in the browser — and use /sync to mirror one session live between the terminal and the browser. It reuses this machine's login, models, and session history, so there's nothing extra to configure. After context compaction, retained historical user messages are labeled as historical rather than new requests. Use “View full history” above the conversation to read original turns, reasoning and tool records without changing the current task or draft. Refreshing reloads the session view; /reload reloads configuration and does not compact context."
       },
       {
         "id": "start-stop",

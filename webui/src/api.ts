@@ -960,6 +960,21 @@ export async function getSession(
   return resp.json();
 }
 
+export interface TranscriptTurn {
+  turn_id: number;
+  user: string;
+  assistant: string;
+  reasoning?: string;
+  tools?: { name: string; args: string; result: string; is_error: boolean }[];
+  undone: boolean;
+}
+
+export async function getSessionTranscript(projectHash: string, sessionId: string, signal?: AbortSignal): Promise<{ session_id: string; turns: TranscriptTurn[] }> {
+  const resp = await apiFetch(`/projects/${encodeURIComponent(projectHash)}/sessions/${encodeURIComponent(sessionId)}/transcript`, { headers: authHeaders(), signal });
+  if (!resp.ok) throw new Error(`history request failed: ${resp.status}`);
+  return resp.json();
+}
+
 // --- Live session (multi-tab real-time sync) ---
 
 /** Approval mode: 'build' = interactive approval, 'plan' = read-only exploration,

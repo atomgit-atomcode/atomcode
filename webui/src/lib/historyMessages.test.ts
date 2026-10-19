@@ -119,3 +119,12 @@ test('sessionMessagesToMarkdownLines keeps verify cadence assistants with tool c
   assert.match(markdown, /Running verification/);
   assert.match(markdown, /### Tool: bash/);
 });
+
+ test('retained user provenance does not hide the original human message', async () => {
+  const { isRetainedHistoryUserMessage } = await import('./historyMessages.ts');
+  const historical = { role: 'user', content: 'original task', synthetic: false, internal_origin: 'compaction_retained_user' };
+  assert.equal(isRetainedHistoryUserMessage(historical), true);
+  assert.equal(isInternalHistoryUserMessage(historical.content, historical.synthetic), false);
+  assert.equal(isRetainedHistoryUserMessage({ ...historical, internal_origin: undefined }), false);
+  assert.equal(isRetainedHistoryUserMessage({ ...historical, role: 'assistant' }), false);
+ });

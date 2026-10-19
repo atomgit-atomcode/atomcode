@@ -40,6 +40,8 @@ import { resolvePendingAfterDecision } from '../lib/pendingPermission';
 import { isDuplicateTrailingNotice } from '../lib/notices';
 import { beginModeSwitch, completeModeSwitch, failModeSwitch, initModeState, modeForQueuedPrompt } from '../lib/modeSwitch';
 import { Markdown } from './Markdown';
+import { isRetainedHistoryUserMessage } from '../lib/historyMessages';
+import { CompactionHistory } from './CompactionHistory';
 import { ModelSelector } from './ModelSelector';
 import { ModeSelector } from './ModeSelector';
 import { AttachMenu } from './AttachMenu';
@@ -106,6 +108,7 @@ import { disposeNotifications, maybeNotifyTurnFinished } from '../lib/notificati
 import { artifactsByAssistantIndex, type TurnArtifact } from '../lib/turnArtifacts';
 
 interface Message {
+  retainedHistory?: boolean;
   role: 'user' | 'assistant' | 'system';
   parts: MsgPart[];
   images?: ImageData[];
@@ -1359,6 +1362,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
           parts: [{ kind: 'text', text: stripVisionAnnotation(msg.content ?? '') }],
           images: msg.images && msg.images.length ? msg.images : undefined,
           ts: msg.created_at,
+          retainedHistory: isRetainedHistoryUserMessage(msg),
         });
       } else if (msg.role === 'assistant') {
         if (isInternalHistoryAssistantMessage(msg)) continue;
@@ -3542,6 +3546,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       {/* Message timeline */}
       <div class="messages-container" ref={scrollRef} onScroll={recomputeAtBottom}>
         <div class="timeline-inner">
+        {sessionId && activeSession?.id === sessionId && activeSession.project_hash && <CompactionHistory
+          key={`${activeSession.project_hash}/${sessionId}`}
+          projectHash={activeSession.project_hash} sessionId={sessionId}
+        />}
         {messages.length === 0 && !historyHint && !restoring && loading && (
           <div class="messages-empty">
             <div>
@@ -4178,6 +4186,7 @@ function UserMessageView({
     return (
       <div class={wrapperClass} ref={searchRef}>
         {images}
+        {msg.retainedHistory && <div class="retained-history-badge">{t('chat.retainedHistory')}</div>}
         <button
           class="skill-badge"
           onClick={() => setExpanded(true)}
@@ -4198,6 +4207,7 @@ function UserMessageView({
 
   return (
     <div class={wrapperClass} ref={searchRef}>
+      {msg.retainedHistory && <div class="retained-history-badge">{t('chat.retainedHistory')}</div>}
       <div class={'user-message-bubble' + (skillTitle ? ' is-markdown' : '')}>
         {images}
         {skillTitle && (
