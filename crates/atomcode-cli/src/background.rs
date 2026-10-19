@@ -1273,20 +1273,30 @@ impl Background {
     }
 
     async fn spawn_at(&self, working_dir: PathBuf, shown: bool) -> Result<Live, HostError> {
+        let (live, pumps) = self.prepare_at(working_dir, shown).await?;
+        pumps.pump(self.me.clone());
+        Ok(live)
+    }
+
+    /// Keep a candidate's events private until its session is ready to display.
+    async fn prepare_at(
+        &self,
+        working_dir: PathBuf,
+        shown: bool,
+    ) -> Result<(Live, Pumps), HostError> {
         let spawned = (self.spawn)(working_dir)
             .await
             .map_err(|message| HostError::Failed { message })?;
         let id = self.next.fetch_add(1, Ordering::SeqCst);
         let (live, pumps) = attach(id, spawned, self.host_config.clone(), shown)
             .map_err(|message| HostError::Failed { message })?;
-        pumps.pump(self.me.clone());
         if live.control.session_id().is_empty() {
             stop(live).await;
             return Err(HostError::Failed {
                 message: "the new runtime has no session".into(),
             });
         }
-        Ok(live)
+        Ok((live, pumps))
     }
 
     fn full() -> HostError {
@@ -1347,6 +1357,15 @@ impl Background {
 
     async fn foreground(&self, session: String, target: String) -> Result<HostReply, HostError> {
         let _op = self.op.lock().await;
+        self.foreground_locked(session, target).await
+    }
+
+    /// Caller holds the slot-operation lock, including when entered via /resume.
+    async fn foreground_locked(
+        &self,
+        session: String,
+        target: String,
+    ) -> Result<HostReply, HostError> {
         let (closed, mark) = {
             let mut state = self.state.lock().expect("background poisoned");
             if state.front.control.session_id() != session {
@@ -1380,6 +1399,85 @@ impl Background {
             stop(empty).await;
         }
         Ok(HostReply::SessionChanged { session: target })
+    }
+
+    /// A running foreground keeps its runtime and lease while another session
+    /// is prepared privately. Failed preparation never changes the slot table.
+    async fn resume(&self, session: String, target: String) -> Result<HostReply, HostError> {
+        let _op = self.op.lock().await;
+        let front = {
+            let state = self.state.lock().expect("background poisoned");
+            if state.front.control.session_id() != session {
+                return Err(HostError::NotFound);
+            }
+            Self::may_move(&state.front)?;
+            state.front.control.clone()
+        };
+        if self.in_background(&target) {
+            return self.foreground_locked(session, target).await;
+        }
+        if target == session || !in_turn(&self.state.lock().expect("background poisoned").front) {
+            return front.call(HostCommand::Resume { session, target }).await;
+        }
+        if self.state.lock().expect("background poisoned").slots.len() >= MOST {
+            return Err(Self::full());
+        }
+        let working_dir = front.working_dir_now().await;
+        let (mut incoming, mut pumps) = self.prepare_at(working_dir, false).await?;
+        let reply = match incoming
+            .control
+            .call(HostCommand::Resume {
+                session: incoming.control.session_id(),
+                target,
+            })
+            .await
+        {
+            Ok(reply) => reply,
+            Err(error) => {
+                stop(incoming).await;
+                return Err(error);
+            }
+        };
+        let resumed = incoming.control.session_id();
+        incoming.origin = resumed.clone();
+        // The hidden control already announced its fresh -> resumed transition.
+        // Publish exactly one foreground transition, naming the actual old view.
+        while pumps.said.try_recv().is_ok() {}
+        while let Ok(event) = pumps.events.try_recv() {
+            // Preserve a request that appeared during preparation: subscribing
+            // to the committed foreground must still bring that question back.
+            pumps.track.lock().expect("track poisoned").saw(&event);
+        }
+        let mut incoming = Some(incoming);
+        let switched = {
+            // Match record_exit_front's lock order: an exit already recorded
+            // during preparation must not acquire a replacement foreground.
+            let exiting = self.exit_front.lock().expect("exit poisoned");
+            let mut state = self.state.lock().expect("background poisoned");
+            if exiting.is_some()
+                || state.front.control.runtime().is_stopped()
+                || state.front.control.session_id() != session
+            {
+                Err(HostError::NotFound)
+            } else if let Err(error) = Self::may_move(&state.front) {
+                Err(error)
+            } else {
+                let outgoing = self.put_in_front(&mut state, incoming.take().expect("candidate"));
+                state.slots.push(outgoing);
+                Ok(())
+            }
+        };
+        if let Err(error) = switched {
+            stop(incoming.expect("uncommitted candidate")).await;
+            return Err(error);
+        }
+        pumps.pump(self.me.clone());
+        self.announce(HostEvent::SessionChanged {
+            session: resumed,
+            previous: Some(session),
+        });
+        self.announce_list();
+        Ok(reply)
     }
 
     async fn start(&self, text: String, scope: Option<String>) -> Result<HostReply, HostError> {
@@ -1623,11 +1721,7 @@ impl HostControl for Background {
             HostCommand::DropBackground { target } => self.drop_one(target).await,
             HostCommand::BackgroundQuestion { target } => self.question(target),
             HostCommand::AnswerBackground { target, id, value } => self.answer(target, id, value),
-            // 恢复一个正在后台跑的会话,就是把它带回来:租约本来就不让同一个会话
-            // 开两份,与其答「在用」,不如照人的意思做。
-            HostCommand::Resume { session, target } if self.in_background(&target) => {
-                self.foreground(session, target).await
-            }
+            HostCommand::Resume { session, target } => self.resume(session, target).await,
             other => {
                 let front = self.front_control();
                 front.call(other).await

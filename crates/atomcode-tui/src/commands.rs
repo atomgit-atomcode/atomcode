@@ -1148,9 +1148,9 @@ impl CommandSet for SessionCommands {
             control.ok_or_else(|| Outcome::Refused(t(Msg::NoHost).into_owned()))
         };
         // A command that replaces the conversation (a new session, another
-        // session, another directory, a reload) or rewinds it, typed while the
-        // lead's turn runs. The runtime refuses it until the turn is over, and
-        // its own word for that is "busy" — which says neither why nor what to
+        // directory, a reload) or rewinds it, typed while the lead's turn runs.
+        // The runtime refuses it until the turn is over, and its own word for
+        // that is "busy" — which says neither why nor what to
         // do. Said here instead, before anything is asked: wait for the turn, or
         // stop it with Esc.
         let waits_for_the_turn = |command: &str| {
@@ -1431,11 +1431,8 @@ impl CommandSet for SessionCommands {
                         Err(error) => Outcome::Refused(refusal(error)),
                     };
                 }
-                // The list above is only a look and is fine mid-turn; going to
-                // another session is not.
-                if let Some(refused) = waits_for_the_turn(name) {
-                    return refused;
-                }
+                // The terminal host can keep the running session in a background
+                // slot. It owns admission, preparation and any refusal.
                 match control
                     .call(HostCommand::Resume {
                         session: root.clone(),
@@ -3863,7 +3860,6 @@ mod tests {
         for line in [
             "/clear",
             "/session",
-            "/resume other",
             "/cd /tmp",
             "/undo",
             "/rewind",
