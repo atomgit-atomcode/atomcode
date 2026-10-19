@@ -1024,6 +1024,7 @@ enum Wake {
         message: String,
     },
     Fact,
+    SessionReferences,
     Foreground {
         request: u64,
         session: String,
@@ -1296,6 +1297,14 @@ impl TeamRoster for Roster {
     }
 }
 
+/// Cached metadata for asynchronous session reference discovery.
+#[derive(Default)]
+struct SessionSuggestions {
+    entries: Vec<atomcode_capabilities::session::CatalogEntry>,
+    checked: Option<std::time::Instant>,
+    loading: bool,
+}
+
 /// The assembled UI. Public so a test can drive exactly what ships.
 pub struct Tui {
     client: Arc<AgentClient>,
@@ -1338,6 +1347,8 @@ pub struct Tui {
     /// one owner, and this is that owner. The root travels with it so a `/cd`
     /// re-points it rather than silently answering from the old tree.
     files: Mutex<Option<(std::path::PathBuf, FileIndex)>>,
+    mention_kind: Mutex<u8>,
+    session_references: Arc<Mutex<SessionSuggestions>>,
     /// Where the button went down, so a release can tell a click from a drag.
     pressed_at: Mutex<Option<(u16, u16)>>,
     scroll_drag: Mutex<Option<crate::scrollbar::Drag>>,
@@ -2072,6 +2083,18 @@ impl UserInterface for Tui {
                 // A command's answer arrives this way, after the command ran —
                 // so a `/model` that moved the selection id is marked here,
                 // whichever order its reply and its description came in.
+                Wake::SessionReferences => {
+                    // Escape stays closed; asynchronous arrivals do not replace
+                    // the row the person is about to choose.
+                    if self.host.menu_open() {
+                        let selected = self.host.menu_selected();
+                        self.refresh_menu();
+                        if let Some(value) = selected {
+                            self.host.menu_select_value(&value);
+                        }
+                        stale = true;
+                    }
+                }
                 Wake::Fact => {
                     stale = true;
                     if client.take_remark() {
@@ -8713,6 +8736,105 @@ impl Tui {
     /// menu's cursor survive: this recomputes the items, and the host resets the
     /// cursor to the first of them — the row that was lit a keystroke ago is not
     /// the same command once the list has narrowed.
+    fn mention_rows(&self, cwd: &str, query: &str) -> Vec<crate::menu::Item> {
+        use atomcode_capabilities::session::SessionManager;
+        let kind = *self.mention_kind.lock().expect("mention kind poisoned");
+        let mut rows = Vec::new();
+        if kind != 2 {
+            rows.extend(paths_under(
+                &self.files,
+                cwd,
+                query,
+                self.host.project_dir_name(),
+            ));
+        }
+        if kind != 1 {
+            let mut cache = self
+                .session_references
+                .lock()
+                .expect("session suggestions poisoned");
+            if !cache.loading && cache.checked.is_none_or(|t| t.elapsed().as_secs() >= 5) {
+                if let Some(dirs) = self.host.dirs.get() {
+                    let root = SessionManager::sessions_root(dirs.user());
+                    cache.loading = true;
+                    let shared = self.session_references.clone();
+                    let wake = self.wake.lock().expect("wake poisoned").clone();
+                    std::thread::spawn(move || {
+                        let entries = SessionManager::scan_catalog(&root).entries;
+                        {
+                            let mut held = shared.lock().expect("session suggestions poisoned");
+                            held.entries = entries;
+                            held.checked = Some(std::time::Instant::now());
+                            held.loading = false;
+                        }
+                        if let Some(wake) = wake {
+                            let _ = wake.send(Wake::SessionReferences);
+                        }
+                    });
+                }
+            }
+            let query = query.to_lowercase();
+            let current = self.client.session();
+            let mut candidates: Vec<_> = cache
+                .entries
+                .iter()
+                .filter(|e| {
+                    atomcode_capabilities::session::reference::available(e)
+                        && (e.id != current || e.working_dir != std::path::Path::new(cwd))
+                        && format!("{} {}", e.name, e.working_dir.display())
+                            .to_lowercase()
+                            .contains(&query)
+                })
+                .collect();
+            candidates.sort_by_key(|e| {
+                (
+                    e.working_dir != std::path::Path::new(cwd),
+                    std::cmp::Reverse(e.updated_at_ms),
+                )
+            });
+            for e in candidates.into_iter().take(12) {
+                let reference = atomcode_capabilities::session::reference::SessionReference {
+                    bucket: e.project_bucket.clone(),
+                    id: e.id.clone(),
+                };
+                rows.push(
+                    crate::menu::Item::new(
+                        reference.spelling(&e.name),
+                        format!("{}: {}", t(Msg::MentionSessions), e.name),
+                    )
+                    .about(format!(
+                        "{} · {} · {}",
+                        e.working_dir.display(),
+                        chrono::DateTime::from_timestamp_millis(e.updated_at_ms)
+                            .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+                            .unwrap_or_default(),
+                        e.id
+                    ))
+                    .sigil("@"),
+                );
+            }
+        }
+        for (i, (key, label)) in [
+            ("all", t(Msg::MentionAll)),
+            ("files", t(Msg::MentionFiles)),
+            ("sessions", t(Msg::MentionSessions)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            rows.push(
+                crate::menu::Item::new(format!("@\0mention-filter:{key}"), label)
+                    .about(if kind as usize == i {
+                        t(Msg::MentionSelected)
+                    } else {
+                        t(Msg::MentionFilter)
+                    })
+                    .sigil("@"),
+            );
+        }
+        rows
+    }
+
     fn refresh_menu(&self) {
         // Reverse search and history browsing show existing text, not a command
         // being typed. Their rows own the arrows/Enter until the person edits.
@@ -8847,9 +8969,7 @@ impl Tui {
                 // the middle of a sentence is a mention too. The classic
                 // screen's rule, from the same place.
                 match atomcode_capabilities::file_index::detect_at_mention(&typed, caret) {
-                    Some(token) => {
-                        paths_under(&self.files, &cwd, &token, self.host.project_dir_name())
-                    }
+                    Some(token) => self.mention_rows(&cwd, &token),
                     None => Vec::new(),
                 }
             }
@@ -9021,6 +9141,15 @@ impl Tui {
     /// and the menu goes away. Nothing is sent — what is typed around the path
     /// is still the message being written.
     fn complete_path(&self, picked: &str) {
+        if let Some(kind) = picked.strip_prefix("@\0mention-filter:") {
+            *self.mention_kind.lock().expect("mention kind poisoned") = match kind {
+                "files" => 1,
+                "sessions" => 2,
+                _ => 0,
+            };
+            self.refresh_menu();
+            return;
+        }
         put_path(
             &mut self.host.moment.write().expect("moment poisoned"),
             picked,
@@ -10200,6 +10329,8 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
             asks_ledger: Mutex::new(crate::ask::Ledger::default()),
             history_asked: Mutex::new(false),
             files: Mutex::new(None),
+            mention_kind: Mutex::new(0),
+            session_references: Arc::new(Mutex::new(SessionSuggestions::default())),
             pressed_at: Mutex::new(None),
             scroll_drag: Mutex::new(None),
             copy_worker: Mutex::new(None),
@@ -14193,5 +14324,47 @@ mod newline_settings_tests {
         assert_eq!(tui.keys.newline_names(), vec!["alt+j"]);
         tui.reset_setting(NEWLINE_KEYS).unwrap();
         assert!(tui.keys.newline_names().contains(&"ctrl+j".into()));
+    }
+}
+
+#[cfg(test)]
+mod session_mention_tests {
+    #[test]
+    fn picking_a_session_keeps_surrounding_text_and_closes_completion() {
+        let mut moment = crate::moment::Moment::default();
+        moment.input = "compare @old suffix".into();
+        moment.caret = "compare @o".len();
+        let reference = atomcode_capabilities::session::reference::SessionReference {
+            bucket: "0123456789abcdef".into(),
+            id: "stable-id".into(),
+        }
+        .spelling("会话 同名");
+        assert!(super::put_path(&mut moment, &reference));
+        assert_eq!(moment.input, format!("compare {reference}  suffix"));
+        assert!(
+            atomcode_capabilities::file_index::detect_at_mention(&moment.input, moment.caret)
+                .is_none()
+        );
+        assert_eq!(
+            atomcode_capabilities::session::reference::parse(&moment.input).unwrap()[0].id,
+            "stable-id"
+        );
+    }
+    #[test]
+    fn real_file_names_cannot_activate_an_internal_category() {
+        let (host, tui) = super::assemble(crate::surface::Headless::new(80, 24));
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.input = "read @atom".into();
+            moment.caret = moment.input.len();
+        }
+        tui.complete_path("@atomcode-filter:files");
+        assert_eq!(
+            host.moment.read().unwrap().input,
+            "read @atomcode-filter:files "
+        );
+        assert_eq!(*tui.mention_kind.lock().unwrap(), 0);
+        tui.complete_path("@\0mention-filter:sessions");
+        assert_eq!(*tui.mention_kind.lock().unwrap(), 2);
     }
 }

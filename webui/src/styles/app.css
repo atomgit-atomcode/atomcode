@@ -4022,3 +4022,11 @@ body {
 }
 
 .effort-selector .model-selector-trigger:disabled { opacity: 0.55; cursor: not-allowed; }
+
+.at-tabs { display: flex; gap: 4px; padding: 6px; border-bottom: 1px solid var(--app-input-border); }
+.at-tabs button { border: 0; border-radius: 5px; padding: 5px 12px; background: transparent; color: inherit; cursor: pointer; }
+.at-tabs button.active { background: var(--app-command-menu-active-background); font-weight: 600; }
+.at-session-meta { font-size: 11px; color: var(--app-secondary-foreground); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 55%; }
+.session-reference-chips { display: flex; flex-wrap: wrap; gap: 6px; padding: 4px 0; }
+.session-reference-chip { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--app-input-border); border-radius: 8px; padding: 3px 8px; font-size: 12px; }
+.session-reference-chip button { border: 0; background: transparent; color: inherit; cursor: pointer; }

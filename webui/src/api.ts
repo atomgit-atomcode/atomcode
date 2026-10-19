@@ -337,6 +337,14 @@ export interface SessionDetail {
 // For a project's full history use listProjectSessions; for finding a session
 // anywhere use searchSessions. This capped list is only for cross-project
 // lookups where 50 is enough (e.g. URL-restore of a recent session).
+/** Bounded native-only metadata, ranked by project. Timestamps use epoch seconds. */
+export async function sessionReferenceCandidates(q: string, cwd: string, signal?: AbortSignal): Promise<SessionMetaWithProject[]> {
+  const resp = await apiFetch(`/sessions/references?q=${encodeURIComponent(q)}&cwd=${encodeURIComponent(cwd)}`, {
+    headers: authHeaders(), signal,
+  });
+  return readJson(resp);
+}
+
 export async function listSessions(): Promise<SessionMetaWithProject[]> {
   const resp = await apiFetch('/sessions', { headers: authHeaders() });
   return readJson(resp);

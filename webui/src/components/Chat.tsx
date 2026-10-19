@@ -27,6 +27,8 @@ import type { LiveGoalProgress } from '../api';
 //   • P3  !ts 守卫把 ts=0 误判无效                  → 23fb3db4  formatMsgTime 改为 ts == null || !Number.isFinite(ts)
 // 我们愿意根据再审意见继续优化。
 
+import { rankSessionReferences, sessionReferenceToken, sessionReferenceTokens } from '../lib/sessionReferences';
+import { sessionReferenceCandidates } from '../api';
 import { VNode } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, listDir, searchFiles, changeDir, postConfigReload, postCommand, postLiveCompact, postUserInputAnswer, postLivePolicyInterventionResolution, openWorkspaceFile, type CommandResult, type RoutedUserInputRequest, type PolicyInterventionEvent, type TurnStats } from '../api';
@@ -579,6 +581,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   // browser is showing; cleared as soon as the user types (normal mixed filtering).
   const [slashSkillsOnly, setSlashSkillsOnly] = useState(false);
   const [atOpen, setAtOpen] = useState(false);
+  const [atKind, setAtKind] = useState<'all' | 'files' | 'sessions'>('all');
+  const [atSessions, setAtSessions] = useState<SessionMetaWithProject[]>([]);
+  const [atSessionsFor, setAtSessionsFor] = useState<string | null>(null);
+  const [atSessionError, setAtSessionError] = useState(false);
   const [atQuery, setAtQuery] = useState('');
   const [atIndex, setAtIndex] = useState(0);
   const [atItems, setAtItems] = useState<{ name: string; is_dir: boolean }[]>([]);
@@ -1131,6 +1137,23 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     return () => document.removeEventListener('mousedown', h);
   }, [atOpen]);
 
+  const atSessionKey = JSON.stringify([atQuery, cwd, sessionId, activeSession?.project_hash]);
+  useEffect(() => {
+    if (!atOpen || atKind === 'files') { setAtSessionsFor(null); return; }
+    let cancelled = false;
+    const controller = new AbortController();
+    setAtSessionsFor(null);
+    setAtSessionError(false);
+    setAtSessions([]);
+    const timer = window.setTimeout(() => {
+      sessionReferenceCandidates(atQuery, cwd, controller.signal).then(sessions => {
+        if (!cancelled) setAtSessions(rankSessionReferences(sessions, cwd, sessionId, activeSession?.project_hash));
+      }).catch(() => { if (!cancelled) setAtSessionError(true); })
+        .finally(() => { if (!cancelled) setAtSessionsFor(atSessionKey); });
+    }, 150);
+    return () => { cancelled = true; controller.abort(); window.clearTimeout(timer); };
+  }, [atOpen, atKind, atQuery, cwd, sessionId, activeSession?.project_hash]);
+
   // @ 文件菜单：把 @ 后文本拆成「目录段 + 过滤词」，以支持进入子目录 / 返回上级。
   // 例如 "examples/fo" → 列 cwd/examples 的内容，并按前缀 "fo" 过滤。
   const { scopeDir: atDirPart, filter: atFilter } = splitAtToken(atQuery);
@@ -1193,16 +1216,21 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   //    相对/绝对路径，`full` 让 chooseAtRow 直接整体插入（不再拼 atDirPart）。
   //  · 下钻模式（无过滤词）：进入子目录后首行「..」返回上级；其余是该层内容。
   const searchMode = atFilter !== '';
-  const atRows: { name: string; is_dir: boolean; up?: boolean; full?: string }[] = [];
+  const atRows: { name: string; is_dir: boolean; up?: boolean; full?: string; session?: SessionMetaWithProject }[] = [];
   if (searchMode) {
     for (const m of atSearchItems) atRows.push({ name: m.path, is_dir: m.is_dir, full: m.path });
   } else {
     if (atDirPart) atRows.push({ name: '..', is_dir: true, up: true });
     for (const it of atItems) atRows.push(it);
   }
+  if (atKind === 'sessions') atRows.length = 0;
+  if (atKind !== 'files') for (const session of atSessions) {
+    atRows.push({ name: session.name, is_dir: false, session });
+  }
   // 搜索结果尚未对上当前 token（首次进入 / 键入中，debounce+请求在途）即视为加载中，避免
   // 闪现上一次 query 的旧结果或过早的 "No files found"。下钻模式沿用 listDir 的 atLoading。
-  const atMenuLoading = searchMode ? atSearchFor !== atQuery : atLoading;
+  const atMenuLoading = (atKind !== 'files' && atSessionsFor !== atSessionKey)
+    || (atKind !== 'sessions' && (searchMode ? atSearchFor !== atQuery : atLoading));
 
   useEffect(() => {
     if (!atOpen) return;
@@ -2808,9 +2836,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
 
     // @ 菜单导航
     if (atOpen) {
+      if (atMenuLoading && (e.key === 'Enter' || e.key === 'Tab')) {
+        e.preventDefault();
+        return;
+      }
       if (e.key === 'ArrowDown') {
         e.preventDefault();
-        setAtIndex((i) => Math.min(i + 1, atRows.length - 1));
+        setAtIndex((i) => Math.max(0, Math.min(i + 1, atRows.length - 1)));
         return;
       }
       if (e.key === 'ArrowUp') {
@@ -2821,7 +2853,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       // Enter/Tab：目录→进入，文件→选定。Tab 便于逐级深入。
       if ((e.key === 'Enter' || e.key === 'Tab') && atRows.length > 0) {
         e.preventDefault();
-        chooseAtRow(atRows[Math.min(atIndex, atRows.length - 1)]);
+        chooseAtRow(atRows[Math.max(0, Math.min(atIndex, atRows.length - 1))]);
         return;
       }
       if (e.key === 'Escape') {
@@ -2912,7 +2944,19 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
 
   // 选择 @ 菜单某一行：「..」返回上级；搜索结果整体插入其完整相对路径（`full`）；
   // 下钻行则拼上当前目录段。目录插入后保留 `/` 可继续下钻。
-  function chooseAtRow(row: { name: string; is_dir: boolean; up?: boolean; full?: string }) {
+  function chooseAtRow(row: { name: string; is_dir: boolean; up?: boolean; full?: string; session?: SessionMetaWithProject }) {
+    if (row.session) {
+      const ta = textareaRef.current;
+      if (!ta) return;
+      const range = detectAtMentionRange(ta.value, ta.selectionStart ?? ta.value.length);
+      if (!range) return;
+      const token = sessionReferenceToken(row.session) + ' ';
+      const next = ta.value.slice(0, range.start) + token + ta.value.slice(range.end);
+      setInput(next);
+      setAtOpen(false);
+      requestAnimationFrame(() => { ta.focus(); ta.setSelectionRange(range.start + token.length, range.start + token.length); });
+      return;
+    }
     if (row.up) {
       const trimmed = atDirPart.replace(/\/+$/, '');
       const idx = trimmed.lastIndexOf('/');
@@ -3209,12 +3253,28 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
           ))}
         </div>
       )}
+      {sessionReferenceTokens(input).length > 0 && <div class="session-reference-chips">
+        {sessionReferenceTokens(input).map(ref => <span class="session-reference-chip" key={ref.start} title={`${t('mention.readOnly')} · ${ref.bucket}/${ref.id}`}>
+          💬 {ref.label}<button type="button" aria-label={t('mention.remove')} onClick={() => {
+            setInput(input.slice(0, ref.start) + input.slice(ref.end));
+            textareaRef.current?.focus();
+          }}>×</button>
+        </span>)}
+      </div>}
       {atOpen && (
         <div class="at-popover" ref={atRef}>
+          <div class="at-tabs" role="tablist" aria-label={t('mention.title')}>
+            {(['all', 'files', 'sessions'] as const).map(kind => <button type="button" role="tab"
+              aria-selected={atKind === kind} class={atKind === kind ? 'active' : ''}
+              onClick={() => { setAtKind(kind); setAtIndex(0); }}
+              onMouseDown={e => { e.preventDefault(); e.stopPropagation(); setAtKind(kind); setAtIndex(0); }}
+              >{t(`mention.${kind}`)}</button>)}
+          </div>
+          {atKind !== 'files' && atSessionError && <div class="at-empty">{t('mention.error')}</div>}
           {atMenuLoading && <div class="at-loading">Loading...</div>}
           {!atMenuLoading && atRows.map((item, i) => (
             <button
-              key={(item.up ? 'up:' : item.is_dir ? 'd:' : 'f:') + item.name}
+              key={item.session ? `s:${item.session.project_hash}/${item.session.id}` : (item.up ? 'up:' : item.is_dir ? 'd:' : 'f:') + item.name}
               class={'at-row' + (i === atIndex ? ' active' : '')}
               // stopPropagation: this mousedown is an INSIDE click. Without it the
               // event bubbles to the document click-outside handler, whose
@@ -3225,14 +3285,15 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
               onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); chooseAtRow(item); }}
               onMouseEnter={() => setAtIndex(i)}
               type="button"
-              title={item.up ? '..' : (item.full ?? atDirPart + item.name + (item.is_dir ? '/' : ''))}
+              title={item.session ? `${item.session.working_dir} · ${item.session.id}` : item.up ? '..' : (item.full ?? atDirPart + item.name + (item.is_dir ? '/' : ''))}
             >
-              <span class="at-icon">{item.up ? '⬆' : item.is_dir ? '📁' : '📄'}</span>
-              <span class="at-name">{item.up ? '..' : (item.full ?? atDirPart + item.name + (item.is_dir ? '/' : ''))}</span>
+              <span class="at-icon">{item.session ? '💬' : item.up ? '⬆' : item.is_dir ? '📁' : '📄'}</span>
+              <span class="at-name">{item.session ? item.session.name : item.up ? '..' : (item.full ?? atDirPart + item.name + (item.is_dir ? '/' : ''))}</span>
+              {item.session && <small class="at-session-meta">{item.session.working_dir} · {new Date(item.session.updated_at * 1000).toLocaleString()}</small>}
             </button>
           ))}
           {!atMenuLoading && atRows.length === 0 && (
-            <div class="at-empty">No files found</div>
+            <div class="at-empty">{t('mention.empty')}</div>
           )}
         </div>
       )}

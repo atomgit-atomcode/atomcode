@@ -9,18 +9,7 @@ use std::borrow::Cow;
 
 pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
     match msg {
-        Msg::PeersHeld { id, from, preview } => format!("来自 {from} 的消息待批准：{preview} · {id} · /peers pending").into(),
         Msg::InjectedFromSession { from } => format!("来自其他会话 {from}").into(),
-        Msg::PeersAbout => "同机在线会话和待批准消息".into(),
-        Msg::PeersUnsupported => "此平台暂不支持同机跨会话消息。".into(),
-        Msg::PeersUnavailable => "当前会话没有在线消息端点。".into(),
-        Msg::PeersUsage => "/peers list · pending · approve <消息ID> · deny <消息ID> · mode accept|hold|refuse".into(),
-        Msg::PeersSelf => "本会话：".into(),
-        Msg::PeersEmpty => "没有其他在线会话。".into(),
-        Msg::PeersNoPending => "没有待批准消息。".into(),
-        Msg::PeersReceipt => "投递回执（不代表任务完成）：".into(),
-        Msg::PeersDenied => "已拒绝这条消息。".into(),
-        Msg::PeersModeSet => "已更改本次运行的接收策略。accept 不自动放行已有消息；refuse 会丢弃待批准消息。".into(),
         Msg::MemoryEmpty => Cow::Borrowed("这一范围暂无记忆。"),
 
         // ── 命令分发 ──
@@ -64,6 +53,11 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ViewPickerEmpty => "这里还没有能看的文件".into(),
 
         // ── 补全菜单与策略介入 ──
+        Msg::MentionAll => "全部".into(),
+        Msg::MentionFiles => "文件".into(),
+        Msg::MentionSessions => "会话".into(),
+        Msg::MentionSelected => "已选中".into(),
+        Msg::MentionFilter => "切换类别 · Enter / Tab".into(),
         Msg::MenuFolder => "目录".into(),
 
         // ── 模型提供方面板 ──

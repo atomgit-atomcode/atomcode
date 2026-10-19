@@ -2911,6 +2911,58 @@ fn search_sessions_by_name_in_root(
         .collect())
 }
 
+#[derive(Deserialize)]
+struct SessionReferenceQuery {
+    #[serde(default)]
+    q: String,
+    #[serde(default)]
+    cwd: String,
+}
+
+/// Metadata only: neither migrate a legacy session nor read its transcript.
+async fn session_reference_candidates(
+    Query(query): Query<SessionReferenceQuery>,
+) -> impl IntoResponse {
+    let root = NativeSessionManager::sessions_root(
+        atomcode_coding::config::product_dirs_from_env().user(),
+    );
+    let result = tokio::task::spawn_blocking(move || {
+        let keyword = query.q.to_lowercase();
+        let mut entries: Vec<_> = catalog_scan_in_root(&root)?
+            .entries
+            .into_iter()
+            .filter(atomcode_capabilities::session::reference::available)
+            .filter(|e| {
+                format!("{} {} {}", e.name, e.working_dir.display(), e.id)
+                    .to_lowercase()
+                    .contains(&keyword)
+            })
+            .collect();
+        entries.sort_by_key(|e| {
+            (
+                e.working_dir != std::path::Path::new(&query.cwd),
+                std::cmp::Reverse(e.updated_at_ms),
+            )
+        });
+        Ok::<_, std::io::Error>(
+            entries
+                .iter()
+                .take(100)
+                .map(catalog_entry_with_project)
+                .collect::<Vec<_>>(),
+        )
+    })
+    .await;
+    match result {
+        Ok(Ok(entries)) => (StatusCode::OK, Json(entries)).into_response(),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json("Could not read session references"),
+        )
+            .into_response(),
+    }
+}
+
 /// GET /sessions/search?q=keyword - Search sessions by name
 async fn search_sessions(Query(query): Query<SearchQuery>) -> impl IntoResponse {
     if query.q.trim().is_empty() {
@@ -6985,6 +7037,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/sessions", get(get_all_sessions).post(create_session))
         .route("/sessions/by-working-dir", get(get_sessions_by_working_dir))
         .route("/sessions/search", get(search_sessions))
+        .route("/sessions/references", get(session_reference_candidates))
         .route("/sessions/resolve/:id", get(resolve_session))
         // Current project state (working directory)
         .route("/project", get(get_project_state))

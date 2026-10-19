@@ -494,6 +494,13 @@ impl Slash {
         self.items.get(self.cursor)
     }
 
+    /// Restore a highlighted identity after asynchronous discovery adds rows.
+    pub fn select_value(&mut self, value: &str) {
+        if let Some(index) = self.items.iter().position(|item| item.value == value) {
+            self.cursor = index;
+        }
+    }
+
     /// Move the cursor by `delta`, clamped to the list.
     ///
     /// Returns whether it moved, so a caller can tell a key that changed the
@@ -1396,5 +1403,21 @@ mod tests {
                 .all(|l| l.spans.iter().all(|s| s.style.bg.is_some())),
             "a row shows the screen through its own panel"
         );
+    }
+}
+
+#[cfg(test)]
+mod discovery_selection_tests {
+    use super::*;
+    #[test]
+    fn a_discovery_refresh_preserves_the_chosen_identity() {
+        let mut menu = Slash::new(vec![
+            Item::new("new", "new arrival"),
+            Item::new("kept", "renamed title"),
+        ]);
+        menu.select_value("kept");
+        assert_eq!(menu.selected().unwrap().value, "kept");
+        menu.select_value("missing");
+        assert_eq!(menu.selected().unwrap().value, "kept");
     }
 }

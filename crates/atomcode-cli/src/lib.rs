@@ -64,7 +64,6 @@ pub mod acp;
 /// Lives here because this binary is the host (`docs/architecture-target.md`
 /// §2.4), and a Product crate must not carry a front-end contract.
 pub mod host;
-pub mod peers;
 
 /// The line printed after the screen is gone: how to come back to a session.
 ///
@@ -292,7 +291,6 @@ pub mod tui_front {
             crate::tui_changelog::row_layer(),
             crate::tui_proxy::row_layer(),
             crate::tui_schedule::row_layer(),
-            crate::peers::row_layer(),
             crate::tui_openrouter::row_layer(),
             crate::tui_places::row_layer(),
             crate::tui_share::row_layer(),
@@ -335,7 +333,6 @@ pub mod tui_front {
                 config_path: config_path.clone(),
             }),
             Arc::new(crate::tui_schedule::ScheduleRow),
-            Arc::new(crate::peers::PeerRow),
             Arc::new(crate::tui_openrouter::OpenRouterRow {
                 config_path: config_path.clone(),
             }),

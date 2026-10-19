@@ -5370,6 +5370,13 @@ impl Host {
         *self.menu.write().expect("menu poisoned") = crate::menu::Slash::new(items);
     }
 
+    pub fn menu_select_value(&self, value: &str) {
+        self.menu
+            .write()
+            .expect("menu poisoned")
+            .select_value(value);
+    }
+
     /// Whether the slash menu has anything to offer.
     pub fn menu_open(&self) -> bool {
         !self.menu.read().expect("menu poisoned").is_empty()

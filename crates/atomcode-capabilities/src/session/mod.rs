@@ -28,6 +28,7 @@ pub mod events;
 pub mod manager;
 pub mod presentation;
 pub mod recall;
+pub mod reference;
 pub mod rewind;
 pub mod session_list;
 pub mod snapshot;

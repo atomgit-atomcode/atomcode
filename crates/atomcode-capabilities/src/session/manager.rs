@@ -1695,11 +1695,18 @@ impl SessionManager {
     }
 
     pub fn load_snapshot(&self, id: &str) -> SessionResult<SessionSnapshot> {
+        self.load_snapshot_bounded(id, usize::MAX)
+    }
+
+    fn load_snapshot_bounded(&self, id: &str, limit: usize) -> SessionResult<SessionSnapshot> {
         if self.is_event_session(id) {
-            return self.project_snapshot(id);
+            return self.project_snapshot_bounded(id, limit);
         }
-        let bytes =
-            read_regular_file_bounded(&self.snapshot_path(id)?, "snapshot", MAX_SNAPSHOT_BYTES)?;
+        let bytes = read_regular_file_bounded(
+            &self.snapshot_path(id)?,
+            "snapshot",
+            limit.min(MAX_SNAPSHOT_BYTES),
+        )?;
         let snapshot: SessionSnapshot = deserialize(&bytes, "snapshot")?;
         validate_snapshot(&snapshot)?;
         Ok(snapshot)
@@ -2116,10 +2123,14 @@ impl SessionManager {
     }
 
     pub fn read_presentation(&self, id: &str) -> SessionResult<PresentationFile> {
+        self.read_presentation_bounded(id, usize::MAX)
+    }
+
+    fn read_presentation_bounded(&self, id: &str, limit: usize) -> SessionResult<PresentationFile> {
         let bytes = read_regular_file_bounded(
             &self.presentation_path(id)?,
             "presentation",
-            MAX_PRESENTATION_BYTES,
+            limit.min(MAX_PRESENTATION_BYTES),
         )?;
         let presentation: PresentationFile = deserialize(&bytes, "presentation")?;
         presentation.validate()?;
@@ -2133,8 +2144,34 @@ impl SessionManager {
         self.with_meta_lock(id, || self.load_native_session_unlocked(id))
     }
 
+    /// The same strict native aggregate, with a caller-specific per-content-file
+    /// ceiling enforced on the open reader (including growth during a read).
+    /// Metadata retains its existing independent MAX_META_BYTES bound.
+    pub fn load_native_session_bounded(
+        &self,
+        id: &str,
+        limit: usize,
+    ) -> SessionResult<LoadedSession> {
+        self.with_meta_lock(id, || self.load_native_session_unlocked_bounded(id, limit))
+    }
+
     fn load_native_session_unlocked(&self, id: &str) -> SessionResult<LoadedSession> {
+        self.load_native_session_unlocked_bounded(id, usize::MAX)
+    }
+
+    fn load_native_session_unlocked_bounded(
+        &self,
+        id: &str,
+        limit: usize,
+    ) -> SessionResult<LoadedSession> {
         let meta = self.read_meta(id)?;
+        if meta.needs_newer_version() {
+            return Err(SessionStoreError::FutureSchema {
+                kind: "session events",
+                found: meta.format_version,
+                supported: atomcode_kernel::session::SESSION_FORMAT_VERSION,
+            });
+        }
         if meta.owner != StorageOwner::Native {
             return Err(SessionStoreError::OwnershipConflict {
                 id: id.to_string(),
@@ -2142,8 +2179,8 @@ impl SessionManager {
                 operation: "load native session",
             });
         }
-        let snapshot = self.load_snapshot(id)?;
-        let presentation = match self.read_presentation(id) {
+        let snapshot = self.load_snapshot_bounded(id, limit)?;
+        let presentation = match self.read_presentation_bounded(id, limit) {
             // An event session has display-only entries only if something added
             // them.
             Err(error) if self.is_event_session(id) && error.kind() == io::ErrorKind::NotFound => {

@@ -1546,8 +1546,13 @@ async fn pump(
                 images,
                 context,
             } => {
-                agent.inject(context, crate::session::InjectionOrigin::Continuation);
-                agent.send_receipted(text, MessageOrigin::User, images, receipt.clone());
+                agent.send_contextual(
+                    text,
+                    MessageOrigin::User,
+                    images,
+                    receipt.clone(),
+                    (context, crate::session::InjectionOrigin::Continuation),
+                );
             }
             AgentCommand::SendSyntheticMessage { text } => {
                 agent.send_receipted(text, MessageOrigin::Harness, Vec::new(), receipt.clone());

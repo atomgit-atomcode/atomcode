@@ -7,24 +7,9 @@
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Msg<'a> {
-    PeersAbout,
     InjectedFromSession {
         from: &'a str,
     },
-    PeersHeld {
-        id: &'a str,
-        from: &'a str,
-        preview: &'a str,
-    },
-    PeersUnsupported,
-    PeersUnavailable,
-    PeersUsage,
-    PeersSelf,
-    PeersEmpty,
-    PeersNoPending,
-    PeersReceipt,
-    PeersDenied,
-    PeersModeSet,
     MemoryEmpty,
 
     // ── the command dispatcher (`command.rs`) ──
@@ -96,6 +81,11 @@ pub enum Msg<'a> {
     // ── completion menu and policy interventions (`plugin.rs`) ──
     /// The one-word note beside a directory in the `@`-completion menu.
     MenuFolder,
+    MentionAll,
+    MentionFiles,
+    MentionSessions,
+    MentionSelected,
+    MentionFilter,
 
     // ── the providers panel (`providers.rs`) ──
 

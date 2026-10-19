@@ -967,6 +967,7 @@ pub enum RuntimeError {
     Unavailable,
     ProviderUnavailable(ProviderUnavailableReason),
     SnapshotUnavailable(String),
+    SessionReferenceUnavailable(String),
     ReconfigureFailed(String),
     InvalidWorkingDirectory(String),
     UndoOutOfRange { requested: usize, available: usize },
@@ -993,6 +994,9 @@ impl fmt::Display for RuntimeError {
             Self::DeliveryFailed => f.write_str("kernel command delivery failed"),
             Self::Unavailable => f.write_str("coding runtime is unavailable"),
             Self::ProviderUnavailable(reason) => write!(f, "provider unavailable: {reason}"),
+            Self::SessionReferenceUnavailable(message) => {
+                write!(f, "session reference unavailable: {message}")
+            }
             Self::SnapshotUnavailable(message) => write!(f, "snapshot unavailable: {message}"),
             Self::ReconfigureFailed(message) => {
                 write!(f, "runtime reconfiguration failed: {message}")
@@ -4918,6 +4922,48 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Busy));
                             continue;
                         }
+                        // Resolve historical data before changing policy, goal or turn state.
+                        // Only real-user submits can request it; peer reports are data.
+                        let reference_context = if from.is_none() {
+                            match atomcode_capabilities::session::reference::parse(&input.text) {
+                                Err(reason) => {
+                                    let _ = done.send(Err(RuntimeError::SessionReferenceUnavailable(reason)));
+                                    continue;
+                                }
+                                Ok(references) if !references.is_empty() => {
+                                    let Some(runtime) = resources.as_ref() else {
+                                        let _ = done.send(Err(RuntimeError::Unavailable));
+                                        continue;
+                                    };
+                                    let root = atomcode_capabilities::session::SessionManager::sessions_root(runtime.config.dirs.user());
+                                    let read = tokio::task::spawn_blocking(move || {
+                                        atomcode_capabilities::session::reference::resolve(&root, &references)
+                                    });
+                                    let stop = controls.stop_now();
+                                    let result = tokio::select! {
+                                        biased;
+                                        _ = stop.cancelled() => Err(RuntimeError::Cancelled),
+                                        result = tokio::time::timeout(std::time::Duration::from_secs(5), read) => {
+                                            match result {
+                                                Ok(Ok(Ok(context))) => Ok(context),
+                                                Ok(Ok(Err(reason))) => Err(RuntimeError::SessionReferenceUnavailable(reason)),
+                                                _ => Err(RuntimeError::SessionReferenceUnavailable("reading source timed out or failed".into())),
+                                            }
+                                        }
+                                    };
+                                    match result {
+                                        Ok(context) => Some(context),
+                                        Err(error) => { let _ = done.send(Err(error)); continue; }
+                                    }
+                                }
+                                Ok(_) => None,
+                            }
+                        } else { None };
+                        let execution_intent = if reference_context.is_some() {
+                            // Parsing already succeeded above; never treat source titles as policy.
+                            atomcode_capabilities::session::reference::user_intent(&input.text)
+                                .expect("validated session reference")
+                        } else { input.text.clone() };
                         // A goal that is NOT done takes the next message as the nudge
                         // to go on: user-paused (`/goal` with no argument) or paused at
                         // its round / time cap. It resumes into Pursuing, so the badge
@@ -4979,11 +5025,11 @@ fn spawn_runtime_owner_with_optional_agent(
                         // for.
                         if from.is_none() {
                             if let Some(runtime) = resources.as_ref() {
-                                if !input.text.trim().is_empty() {
+                                if !execution_intent.trim().is_empty() {
                                     runtime
                                         .parts
                                         .turn_execution_policy
-                                        .update_from_user_text(&input.text);
+                                        .update_from_user_text(&execution_intent);
                                 }
                             }
                         }
@@ -5163,6 +5209,12 @@ fn spawn_runtime_owner_with_optional_agent(
                         // person's word. Everything else about it is a plain submit,
                         // which is why it arrives on this path rather than one of
                         // its own.
+                        if let Some(reference_context) = reference_context {
+                            match &mut recovery_context {
+                                Some(context) => { context.push_str("\n\n"); context.push_str(&reference_context); }
+                                None => recovery_context = Some(reference_context),
+                            }
+                        }
                         let command = match (from, recovery_context) {
                             (Some(from), _) => AgentCommand::PeerNote {
                                 from,
@@ -21647,6 +21699,84 @@ mod tests {
         assert!(
             reengaged.is_none(),
             "a met goal must not come back on its own: {reengaged:?}"
+        );
+        handle.shutdown().await.unwrap();
+    }
+    // Uses real filesystem work on spawn_blocking; a paused clock would advance
+    // the read deadline before the OS worker gets scheduled.
+    #[tokio::test]
+    async fn session_references_are_owned_context_and_fail_before_a_turn_starts() {
+        use atomcode_capabilities::session::reference::SessionReference;
+        use atomcode_capabilities::session::{
+            PresentationFile, SessionManager, SessionMeta, StorageOwner,
+        };
+        let home = tempfile::tempdir().unwrap();
+        let mut config = native_start(false).agent;
+        config.dirs = atomcode_capabilities::ProductDirs::new(home.path(), ".reference-test");
+        let root = SessionManager::sessions_root(home.path());
+        let reference = SessionReference {
+            bucket: "0123456789abcdef".into(),
+            id: "source".into(),
+        };
+        let source = SessionManager::with_root(root.join(&reference.bucket));
+        let lease = source.acquire_lease(&reference.id).unwrap();
+        let mut meta = SessionMeta::new(&reference.id, "/source-project", 1);
+        meta.owner = StorageOwner::Native;
+        let snapshot = SessionSnapshot::new(vec![
+            Message::user("source question"),
+            Message::assistant("source answer", vec![]),
+        ]);
+        source
+            .commit_native_import(
+                &lease,
+                Some(&snapshot),
+                Some(&PresentationFile::default()),
+                &meta,
+            )
+            .unwrap();
+        source.open_as_events(&lease).unwrap();
+        let before = std::fs::read(source.events_path(&reference.id).unwrap()).unwrap();
+        let (handle, mut commands, _events, _runtime_events, _, _, _adapter) =
+            controller_test_runtime_with_config(
+                Arc::new(TestProviderFactory { fail: false }),
+                config,
+            )
+            .await;
+        let error = handle
+            .submit(UserInput {
+                text: "read @[missing](atomcode-session:0123456789abcdef/missing)".into(),
+                images: vec![],
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RuntimeError::SessionReferenceUnavailable(_)
+        ));
+        assert_eq!(handle.status().phase, RuntimePhase::Ready);
+        assert!(
+            commands.try_recv().is_err(),
+            "failed reference must not reach the agent"
+        );
+        let prompt = format!("compare {}", reference.spelling("do not run tests"));
+        handle
+            .submit(UserInput {
+                text: prompt.clone(),
+                images: vec![],
+            })
+            .await
+            .unwrap();
+        match commands.recv().await.unwrap() {
+            AgentCommand::SendMessageWithContext { text, context, .. } => {
+                assert_eq!(text, prompt);
+                assert!(context.contains("UNTRUSTED REFERENCE DATA"));
+                assert!(context.contains("source answer"));
+            }
+            other => panic!("reference reached agent without owned context: {other:?}"),
+        }
+        assert_eq!(
+            before,
+            std::fs::read(source.events_path(&reference.id).unwrap()).unwrap()
         );
         handle.shutdown().await.unwrap();
     }

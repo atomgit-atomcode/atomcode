@@ -9,6 +9,15 @@
 export type Lang = 'zh' | 'en';
 
 const zh = {
+  'mention.title': '引用文件或会话',
+  'mention.all': '全部',
+  'mention.files': '文件',
+  'mention.sessions': '会话',
+  'mention.empty': '没有匹配项',
+  'mention.error': '会话列表读取失败，请重新打开重试',
+  'mention.remove': '移除会话引用',
+  'mention.readOnly': '只读引用 · 最多 4 个会话 · 每个最多 8000 字符',
+
   'goal.recovery.provider': '目标仍在进行：等待模型恢复 · 第 {attempt}/{max} 次 · 计划等待 {secs} 秒后自动尝试',
   'goal.recovery.evaluator': '工作进度已保留：等待重新评估 · 第 {attempt}/{max} 次 · 计划等待 {secs} 秒后自动尝试',
   'goal.recovery.running': '目标仍在进行：正在请求模型或评估目标，可随时停止。',
@@ -598,6 +607,15 @@ const zh = {
 export type MsgKey = keyof typeof zh;
 
 const en: Record<MsgKey, string> = {
+  'mention.title': 'Reference files or sessions',
+  'mention.all': 'All',
+  'mention.files': 'Files',
+  'mention.sessions': 'Sessions',
+  'mention.empty': 'No matches',
+  'mention.error': 'Could not load sessions. Reopen to retry.',
+  'mention.remove': 'Remove session reference',
+  'mention.readOnly': 'Read-only · up to 4 sessions · 8000 characters each',
+
   'goal.recovery.provider': 'Goal retained: waiting for model recovery · attempt {attempt}/{max} · scheduled wait {secs}s before retry',
   'goal.recovery.evaluator': 'Progress retained: waiting to reassess · attempt {attempt}/{max} · scheduled wait {secs}s before retry',
   'goal.recovery.running': 'Goal in progress: requesting the model or evaluating the goal. You can stop at any time.',

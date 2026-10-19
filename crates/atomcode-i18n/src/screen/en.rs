@@ -21,18 +21,7 @@ use std::borrow::Cow;
 
 pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
     match msg {
-        Msg::PeersHeld { id, from, preview } => format!("Message from {from} held: {preview} · {id} · /peers pending").into(),
         Msg::InjectedFromSession { from } => format!("from another session {from}").into(),
-        Msg::PeersAbout => "online local sessions and held messages".into(),
-        Msg::PeersUnsupported => "Local session messaging is not supported on this platform yet.".into(),
-        Msg::PeersUnavailable => "This session has no online messaging endpoint.".into(),
-        Msg::PeersUsage => "/peers list · pending · approve <message-id> · deny <message-id> · mode accept|hold|refuse".into(),
-        Msg::PeersSelf => "This session:".into(),
-        Msg::PeersEmpty => "No other sessions are online.".into(),
-        Msg::PeersNoPending => "No held messages.".into(),
-        Msg::PeersReceipt => "Delivery receipt (not task completion):".into(),
-        Msg::PeersDenied => "Message denied.".into(),
-        Msg::PeersModeSet => "Inbound mode changed for this runtime. Accept does not release held messages; refuse discards them.".into(),
         Msg::MemoryEmpty => Cow::Borrowed("No memory in this scope yet."),
 
         // ── the command dispatcher ──
@@ -78,6 +67,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ViewPickerEmpty => "no files here to read yet".into(),
 
         // ── completion menu and policy interventions ──
+        Msg::MentionAll => "All".into(),
+        Msg::MentionFiles => "Files".into(),
+        Msg::MentionSessions => "Sessions".into(),
+        Msg::MentionSelected => "Selected".into(),
+        Msg::MentionFilter => "Filter · Enter / Tab".into(),
         Msg::MenuFolder => "folder".into(),
 
         // ── the providers panel ──

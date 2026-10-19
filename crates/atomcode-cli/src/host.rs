@@ -240,23 +240,10 @@ pub(crate) fn attach(
         }),
     });
 
-    #[cfg(unix)]
-    let peer_guard = match crate::peers::bind(&front_end, &control) {
-        Ok(guard) => guard,
-        Err(error) => {
-            let _ = front_end.events().send(AgentEvent::Warning(format!(
-                "Local session messaging unavailable: {error}"
-            )));
-            None
-        }
-    };
-
     // Runtime events, as the handle protocol says them.
     let out = front_end.events();
     let watched = control.clone();
     tokio::spawn(async move {
-        #[cfg(unix)]
-        let _peer_guard = peer_guard;
         let _task = task;
         while let Some(sequenced) = runtime_events.recv().await {
             // 共享着的话,网页端照这条事件画。挂没挂在那一侧判断,这里不设第二个
@@ -3133,7 +3120,8 @@ pub fn refused(error: RuntimeError) -> HostError {
             RuntimeError::RewindPointUnavailable { turn_id } => {
                 HostError::RewindPointNotFound { turn: turn_id }
             }
-            RuntimeError::GoalUnavailable(message) => HostError::Failed { message },
+            RuntimeError::GoalUnavailable(message)
+            | RuntimeError::SessionReferenceUnavailable(message) => HostError::Failed { message },
             RuntimeError::CodeRewindUnavailable(message) => {
                 HostError::CodeRewindUnavailable { message }
             }
