@@ -1420,7 +1420,7 @@ pub struct ReasoningFieldsMut<'a> {
 /// See [`Config::account_endpoint`]. `Debug` redacts the key.
 #[derive(Clone)]
 pub struct AccountEndpoint {
-    /// The wire type (`openai`, `responses`, `anthropic`, `ollama`).
+    /// The wire type (`openai`, `responses`, `anthropic`, `deepseek-messages`, `ollama`).
     pub provider_type: String,
     pub base_url: Option<String>,
     pub api_key: Option<String>,
@@ -1466,6 +1466,7 @@ fn resolve_account_api_key(
         }
     }
     let wire_env = match preset.provider_type {
+        provider_preset::ProviderType::DeepSeekMessages => "DEEPSEEK_API_KEY",
         provider_preset::ProviderType::Anthropic => "ANTHROPIC_API_KEY",
         provider_preset::ProviderType::Ollama => "OLLAMA_API_KEY",
         provider_preset::ProviderType::OpenAi => "OPENAI_API_KEY",
@@ -1492,6 +1493,7 @@ fn resolve_account_api_key(
 fn legacy_provider_to_preset_id(provider_type: &str) -> &'static str {
     match provider_type {
         "claude" | "anthropic" => "anthropic",
+        "deepseek-messages" => "deepseek-messages",
         "ollama" => "ollama",
         // OpenAI Responses API wire — distinct protocol from chat/completions,
         // so it must resolve to the Responses preset, not the generic OpenAI one.
@@ -4831,6 +4833,45 @@ context_window = 131072
         assert_eq!(r.model, "deepseek-chat");
         assert_eq!(r.context_window, 128000);
         assert_eq!(r.capable_model, Some(3));
+    }
+
+    #[test]
+    fn deepseek_messages_survives_new_and_legacy_config_resolution() {
+        for input in [
+            r#"default_model = "native/flash"
+[provider_accounts.native]
+provider = "deepseek-messages"
+api_key = "test-key"
+[models."native/flash"]
+account = "native"
+model = "deepseek-flash"
+context_window = 1000000
+thinking_enabled = true
+reasoning_effort = "high"
+reasoning_effort_levels = ["low", "high", "max"]
+"#,
+            r#"default_provider = "native"
+[providers.native]
+type = "deepseek-messages"
+api_key = "test-key"
+base_url = "https://api.deepseek.com/anthropic"
+model = "deepseek-flash"
+context_window = 1000000
+thinking_enabled = true
+reasoning_effort = "high"
+reasoning_effort_levels = ["low", "high", "max"]
+"#,
+        ] {
+            let config: Config = toml::from_str(input).unwrap();
+            let resolved = config.resolve_model(None).unwrap();
+            assert_eq!(resolved.provider_type, "deepseek-messages");
+            assert_eq!(
+                resolved.base_url.as_deref(),
+                Some("https://api.deepseek.com/anthropic")
+            );
+            assert_eq!(resolved.thinking_enabled, Some(true));
+            assert_eq!(resolved.reasoning_effort.as_deref(), Some("high"));
+        }
     }
 
     #[test]

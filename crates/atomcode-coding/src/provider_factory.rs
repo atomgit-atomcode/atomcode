@@ -113,8 +113,9 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
             .clone()
             .unwrap_or_else(|| self.default_user_agent.clone());
         let provider: Arc<dyn LlmProvider> = match cfg.provider_type.as_str() {
-            "claude" | "anthropic" => {
+            "claude" | "anthropic" | "deepseek-messages" => {
                 let mut ac = AnthropicConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
+                ac.deepseek_messages = cfg.provider_type == "deepseek-messages";
                 ac.wire_dump_dir = Some(cfg.dirs.user().join("wire-dump"));
                 ac.context_window = cfg.context_window;
                 ac.idle_timeout = cfg.stream_timeout;
@@ -521,12 +522,34 @@ mod tests {
     #[test]
     fn dispatches_all_supported_provider_types() {
         let factory = DefaultCodingProviderFactory::new("fallback-agent");
-        for kind in ["openai", "claude", "ollama"] {
+        for kind in ["openai", "claude", "ollama", "deepseek-messages"] {
             assert!(
                 factory.build(&config(kind), None).is_ok(),
                 "provider type {kind}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn deepseek_messages_dispatch_does_not_fall_back_to_openai() {
+        let mut cfg = config("deepseek-messages");
+        cfg.model = "deepseek-flash".into();
+        cfg.thinking_enabled = Some(true);
+        let provider = DefaultCodingProviderFactory::new("test")
+            .build(&cfg, None)
+            .unwrap();
+        let options = atomcode_kernel::provider::ChatOptions {
+            reasoning_effort: Some(atomcode_kernel::provider::ReasoningEffort::Medium),
+            ..Default::default()
+        };
+        let Err(error) = provider.chat_stream(&[], &[], &options).await else {
+            panic!("invalid effort accepted")
+        };
+        assert_eq!(
+            error.message,
+            "DeepSeek Messages supports reasoning effort low, high or max"
+        );
+        assert!(!error.retryable);
     }
 
     #[test]

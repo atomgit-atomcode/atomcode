@@ -363,6 +363,7 @@ impl ProviderConfig {
         let env_var = match self.provider_type.as_str() {
             "openai" | "openai-compat" | "openai_compat" | "responses" => "OPENAI_API_KEY",
             "claude" | "anthropic" => "ANTHROPIC_API_KEY",
+            "deepseek-messages" => "DEEPSEEK_API_KEY",
             "ollama" => "OLLAMA_API_KEY",
             "opencode" => "OPENCODE_API_KEY",
             _ => "",

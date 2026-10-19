@@ -86,15 +86,16 @@ pub fn row_layer() -> String {
 
 /// The protocols the add/edit form cycles through, in display order.
 ///
-/// The four `tuix` offers: the two generic custom endpoints, the keyless local
-/// one, and OpenAI's newer wire. A vendor preset is *not* in here — a person
+/// The generic endpoints, local Ollama, Responses and DeepSeek Messages.
+/// Other vendor presets are offered on the account list — a person
 /// adding "deepseek" reaches it as an offer on the account list, and putting
 /// forty vendors in a left-right toggle would make the toggle useless.
-const PROTOCOLS: [&str; 4] = [
+const PROTOCOLS: [&str; 5] = [
     "openai-compatible",
     "anthropic-compatible",
     "ollama",
     "openai-responses",
+    "deepseek-messages",
 ];
 
 /// Where the providers live, and how to write them.
@@ -266,6 +267,7 @@ fn protocols() -> Vec<Protocol> {
 fn protocol_label(ty: provider_preset::ProviderType) -> String {
     match ty {
         provider_preset::ProviderType::Anthropic => "Anthropic",
+        provider_preset::ProviderType::DeepSeekMessages => "DeepSeek Messages",
         provider_preset::ProviderType::Ollama => "Ollama",
         provider_preset::ProviderType::OpenAi => "OpenAI",
         provider_preset::ProviderType::Responses => "OpenAI Responses",
@@ -523,6 +525,23 @@ fn said(error: BookError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn editing_a_deepseek_messages_account_preserves_its_protocol() {
+        let config: Config = toml::from_str(
+            r#"
+[provider_accounts.native]
+provider = "deepseek-messages"
+api_key = "key"
+"#,
+        )
+        .unwrap();
+        let rows = accounts(&config);
+        let native = rows.iter().find(|row| row.id == "native").unwrap().clone();
+        let view = ProvidersView::new(rows, models(&config), protocols(), vec![]);
+        let form = atomcode_tui::providers::AccountForm::edit(&view, &native);
+        assert_eq!(form.protocol_label(&view), "DeepSeek Messages");
+    }
 
     /// A file in the shape a real one is in: one legacy flat entry, one
     /// new-schema account with two models under it, and a default.
