@@ -238,6 +238,12 @@ export function resolveUserInputRequest<T extends { request_id: number }>(
   return current?.request_id === resolvedRequestId ? null : current;
 }
 
+/** HTTP completion belongs to the submitted card instance. Native ids can be
+ * reused after a runtime/session replacement, so id equality is insufficient. */
+export function completeUserInputRequest<T>(current: T | null, submitted: T): T | null {
+  return current === submitted ? null : current;
+}
+
 /**
  * Whether a runtime failure is a session another atomcode holds (a terminal
  * window, VS Code). The session store's own wording is all the wire carries,

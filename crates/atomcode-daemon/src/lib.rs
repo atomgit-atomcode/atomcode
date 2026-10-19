@@ -3667,6 +3667,9 @@ pub enum ChatEvent {
         #[serde(flatten)]
         payload: serde_json::Value,
     },
+    /// The request was answered or declined through the runtime boundary.
+    #[serde(rename = "user_input_resolved")]
+    UserInputResolved { request_id: u64 },
     /// A security policy stopped the turn and offers only driver-owned, safe
     /// recovery actions. Rejected commands and credentials are never included.
     #[serde(rename = "policy_intervention")]
@@ -3925,6 +3928,36 @@ mod chat_event_type_tests {
                 ..
             }] if session_id == "session-1" && call_id == "call-42" && tool_name == "bash"
         ));
+    }
+
+    #[test]
+    fn native_user_input_resolution_reaches_chat_before_turn_completion() {
+        let mut projector = ChatRuntimeProjector::default();
+        let events = projector.project_runtime(
+            atomcode_coding::CodingRuntimeEvent::RequestResolved {
+                id: 77,
+                kind: atomcode_capabilities::tools::request_user_input::REQUEST_USER_INPUT_KIND
+                    .into(),
+            },
+            "session-1",
+        );
+        assert_eq!(
+            serde_json::to_value(&events[0]).unwrap(),
+            serde_json::json!({"type": "user_input_resolved", "request_id": 77})
+        );
+        assert!(
+            !projector.terminal_seen,
+            "answering the question must not finish the turn"
+        );
+        assert!(projector
+            .project_runtime(
+                atomcode_coding::CodingRuntimeEvent::RequestResolved {
+                    id: 78,
+                    kind: "unknown-kind".into()
+                },
+                "session-1"
+            )
+            .is_empty());
     }
 
     #[test]
@@ -4372,6 +4405,14 @@ impl ChatRuntimeProjector {
 
         match event {
             CodingRuntimeEvent::Agent(event) => self.project_agent(event),
+            CodingRuntimeEvent::RequestResolved { id, kind } => {
+                if kind == atomcode_capabilities::tools::request_user_input::REQUEST_USER_INPUT_KIND
+                {
+                    vec![ChatEvent::UserInputResolved { request_id: id }]
+                } else {
+                    Vec::new()
+                }
+            }
             CodingRuntimeEvent::Request(request) => {
                 use atomcode_capabilities::tools::{
                     request_user_input::REQUEST_USER_INPUT_KIND, ApprovalRequest, APPROVAL_KIND,

@@ -12,6 +12,7 @@ import {
   reduceChatRecovery,
   reduceLiveLifecycle,
   resolveUserInputRequest,
+  completeUserInputRequest,
   restoreLiveSnapshot,
   sessionHeldElsewhere,
   syncAttachDisposition,
@@ -229,4 +230,14 @@ test('a session another atomcode holds is told apart from other failures', () =>
   );
   assert.equal(sessionHeldElsewhere('HTTP 500'), false);
   assert.equal(sessionHeldElsewhere(undefined), false);
+});
+
+test('late HTTP completion preserves replacement prompts even when native ids repeat', () => {
+  const submitted = { request_id: 42 };
+  const replacement = { request_id: 42 };
+  const next = { request_id: 43 };
+  assert.equal(completeUserInputRequest(submitted, submitted), null);
+  assert.equal(completeUserInputRequest(replacement, submitted), replacement);
+  assert.equal(completeUserInputRequest(next, submitted), next);
+  assert.equal(completeUserInputRequest(null, submitted), null);
 });

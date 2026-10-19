@@ -84,6 +84,7 @@ import {
   reduceChatRecovery,
   reduceLiveLifecycle,
   resolveUserInputRequest,
+  completeUserInputRequest,
   restoreLiveSnapshot,
   sessionHeldElsewhere,
   syncAttachDisposition,
@@ -598,7 +599,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   const [livePending, setLivePending] = useState<{ tool_name: string; reason: string; call_id: string; arguments: string; allow_all_bash?: boolean } | null>(null);
   // Pending structured input from either transport. The event's optional session_id
   // selects `/chat/user-input`; live requests answer the bound `/live` runtime.
-  const [userInputReq, setUserInputReq] = useState<RoutedUserInputRequest | null>(null);
+  const userInputVersionRef = useRef(0);
+  const [userInputReq, setUserInputReq] = useState<(RoutedUserInputRequest & { viewKey: number }) | null>(null);
   const [policyIntervention, setPolicyIntervention] = useState<PolicyInterventionEvent | null>(null);
   const [todoItems, setTodoItems] = useState<TodoItem[]>([]);
   const [todoPreview, setTodoPreview] = useState<TodoItem[] | null>(null);
@@ -1721,7 +1723,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       }
       case 'user_input_request': {
         // Show the UserInputCard for the bound live runtime.
-        setUserInputReq({ ...e, response_transport: 'live' });
+        setUserInputReq({ ...e, response_transport: 'live', viewKey: ++userInputVersionRef.current });
         break;
       }
       case 'user_input_resolved': {
@@ -2288,7 +2290,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         break;
 
       case 'user_input_request':
-        setUserInputReq({ ...event, response_transport: 'chat' });
+        setUserInputReq({ ...event, response_transport: 'chat', viewKey: ++userInputVersionRef.current });
+        break;
+
+      case 'user_input_resolved':
+        setUserInputReq((current) => resolveUserInputRequest(current, event.request_id));
         break;
 
       case 'policy_intervention':
@@ -3419,8 +3425,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   // Shared structured-input card for `/chat` and `/live`.
   const userInputCard = userInputReq && (
     <UserInputCard
+      key={userInputReq.viewKey}
       req={userInputReq}
-      onDone={() => setUserInputReq(null)}
+      onDone={() => setUserInputReq((current) => completeUserInputRequest(current, userInputReq))}
       submitAnswer={(body) => postUserInputAnswer(userInputReq, body)}
     />
   );

@@ -934,6 +934,18 @@ impl LiveViewHub {
         state.last_runtime_sequence = Some(envelope.sequence);
 
         let event = envelope.event;
+        if let CodingRuntimeEvent::RequestResolved { id, kind } = &event {
+            // A terminal/TUI response bypasses the HTTP response route. Retire
+            // its replay entry here too; the route may already have done so.
+            if state
+                .pending_requests
+                .get(id)
+                .is_some_and(|pending| pending.kind == *kind)
+            {
+                self.resolve_request_locked(&mut state, *id)?;
+            }
+            return Ok(());
+        }
         // ProviderChanged may be observed both from the runtime event stream and
         // from the TUI's successful reload acknowledgement.  Treat an identical
         // projection as idempotent so the explicit acknowledgement path can make
@@ -1816,6 +1828,94 @@ mod tests {
             None,
             "an answered request is no longer something an answer can act on"
         );
+    }
+
+    #[test]
+    fn terminal_answer_retires_only_its_request_and_reconnect_replay() {
+        let hub = LiveViewHub::new();
+        let (control, _) = control();
+        let binding = hub
+            .bind("session-1", PathBuf::from("/one"), snapshot("one"), control)
+            .unwrap();
+        let kind = atomcode_capabilities::tools::request_user_input::REQUEST_USER_INPUT_KIND;
+        for (sequence, id) in [(1, 42), (2, 43)] {
+            hub.publish(
+                &binding,
+                SequencedRuntimeEvent {
+                    generation: 1,
+                    sequence,
+                    event: CodingRuntimeEvent::Request(atomcode_coding::RuntimeRequest {
+                        id,
+                        kind: kind.into(),
+                        payload: serde_json::json!({"question": "Pick one"}),
+                        snapshot: None,
+                    }),
+                },
+            )
+            .unwrap();
+        }
+        let mut browser = hub.join().unwrap();
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 3,
+                event: CodingRuntimeEvent::RequestResolved {
+                    id: 42,
+                    kind: kind.into(),
+                },
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            browser.receiver.try_recv().unwrap().event,
+            LiveViewEvent::RequestResolved { request_id: 42, .. }
+        ));
+        assert_eq!(hub.pending_of_kind(kind).unwrap().0, 43);
+        let replay = hub.join().unwrap().replay;
+        assert!(!replay.iter().any(|observation| matches!(&observation.event, LiveViewEvent::Runtime(CodingRuntimeEvent::Request(request)) if request.id == 42)));
+        assert!(replay.iter().any(|observation| matches!(&observation.event, LiveViewEvent::Runtime(CodingRuntimeEvent::Request(request)) if request.id == 43)));
+        // A duplicate or stale terminal must not dismiss the next question.
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 4,
+                event: CodingRuntimeEvent::RequestResolved {
+                    id: 42,
+                    kind: kind.into(),
+                },
+            },
+        )
+        .unwrap();
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 5,
+                event: CodingRuntimeEvent::RequestResolved {
+                    id: 43,
+                    kind: "another-kind".into(),
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            hub.publish(
+                &binding,
+                SequencedRuntimeEvent {
+                    generation: 0,
+                    sequence: 6,
+                    event: CodingRuntimeEvent::RequestResolved {
+                        id: 43,
+                        kind: kind.into()
+                    }
+                }
+            ),
+            Err(HubError::StaleEvent)
+        );
+        assert!(browser.receiver.try_recv().is_err());
+        assert_eq!(hub.pending_of_kind(kind).unwrap().0, 43);
     }
 
     #[test]

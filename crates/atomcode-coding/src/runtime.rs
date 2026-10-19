@@ -130,6 +130,12 @@ pub enum CodingRuntimeEvent {
     RuntimeStopped(RuntimeExit),
     /// Driver-correlated approval or other middleware request.
     Request(RuntimeRequest),
+    /// A response was accepted and delivered to the kernel. Every driver must
+    /// retire this request, including drivers that did not submit the answer.
+    RequestResolved {
+        id: RequestId,
+        kind: String,
+    },
     /// Exactly one terminal for an accepted foreground turn.
     TurnFinished(TurnCompletion),
     /// A driver acknowledged the runtime's pending security intervention.
@@ -5042,6 +5048,10 @@ fn spawn_runtime_owner_with_optional_agent(
                                 );
                                 let _ = done.send(Err(RuntimeError::DeliveryFailed));
                             } else {
+                                let _ = runtime_event_tx.send(CodingRuntimeEvent::RequestResolved {
+                                    id,
+                                    kind,
+                                });
                                 if pending_requests.is_empty() {
                                     controls.state.store(
                                         runtime_phase_state(generation, RuntimePhase::InTurn),
@@ -18137,6 +18147,77 @@ mod tests {
             "after 信任 the server is no longer held back"
         );
         handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn accepted_request_response_notifies_every_driver_once() {
+        let (agent, mut commands, events) = fake_agent();
+        let (handle, controls) = coding_runtime_control_channel();
+        let (tx, mut observations) = mpsc::unbounded_channel();
+        let _adapter =
+            spawn_runtime_owner_with_protocol(agent, controls, tx, true, true, None, None, None);
+        handle.submit(UserInput::from("question")).await.unwrap();
+        let _ = commands.recv().await;
+        events
+            .send(AgentEvent::Request {
+                id: 42,
+                kind: REQUEST_USER_INPUT_KIND.into(),
+                payload: serde_json::json!({"question": "Pick one"}),
+            })
+            .unwrap();
+        assert!(matches!(
+            observations.recv().await,
+            Some(CodingRuntimeEvent::Request(RuntimeRequest { id: 42, .. }))
+        ));
+        assert_eq!(
+            handle.respond(41, serde_json::Value::Null).await,
+            Err(RuntimeError::StaleRequest { id: 41 })
+        );
+        assert!(observations.try_recv().is_err());
+        let answer = serde_json::json!({"declined": false, "selected": ["Red"], "text": null});
+        handle.respond(42, answer.clone()).await.unwrap();
+        assert!(
+            matches!(commands.recv().await, Some(AgentCommand::Respond { id: 42, value }) if value == answer)
+        );
+        assert!(
+            matches!(observations.try_recv(), Ok(CodingRuntimeEvent::RequestResolved { id: 42, kind }) if kind == REQUEST_USER_INPUT_KIND)
+        );
+        assert_eq!(
+            handle.respond(42, serde_json::Value::Null).await,
+            Err(RuntimeError::StaleRequest { id: 42 })
+        );
+        assert!(
+            observations.try_recv().is_err(),
+            "a late second response cannot emit another terminal"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn failed_request_delivery_does_not_publish_successful_resolution() {
+        let (agent, commands, events) = fake_agent();
+        let (handle, controls) = coding_runtime_control_channel();
+        let (tx, mut observations) = mpsc::unbounded_channel();
+        let _adapter =
+            spawn_runtime_owner_with_protocol(agent, controls, tx, true, true, None, None, None);
+        events
+            .send(AgentEvent::Request {
+                id: 42,
+                kind: REQUEST_USER_INPUT_KIND.into(),
+                payload: serde_json::json!({"question": "Pick one"}),
+            })
+            .unwrap();
+        assert!(matches!(
+            observations.recv().await,
+            Some(CodingRuntimeEvent::Request(_))
+        ));
+        drop(commands);
+        assert_eq!(
+            handle.respond(42, serde_json::Value::Null).await,
+            Err(RuntimeError::DeliveryFailed)
+        );
+        while let Ok(event) = observations.try_recv() {
+            assert!(!matches!(event, CodingRuntimeEvent::RequestResolved { .. }));
+        }
     }
 
     #[tokio::test]

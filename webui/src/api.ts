@@ -74,6 +74,7 @@ export type SSEEvent =
   | { type: 'tokens'; prompt: number; completion: number; total: number }
   | { type: 'permission_request'; session_id: string; tool_name: string; reason: string; call_id: string; arguments: unknown; allow_all_bash?: boolean }
   | UserInputRequestEvent
+  | { type: 'user_input_resolved'; request_id: number }
   | { type: 'done'; tokens: unknown; tool_calls: unknown; session_id: string; stats?: TurnStats; stop_reason?: string; message?: string }
   | { type: 'stopped' }
   | { type: 'error'; message: string }
