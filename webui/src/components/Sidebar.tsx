@@ -2,9 +2,10 @@
 // new-conversation row, live-filtered session list, settings at the bottom;
 // collapses to an icon rail).
 
+import { useSkills, refreshSkills } from '../skills';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
-import { listSessions, listProjectSessions, searchSessions, getSkills, getMcpStatus, postLiveMcpTrust, getSession, getProjects, SkillInfo, McpStatusInfo, SessionMetaWithProject, ProjectInfo } from '../api';
+import { listSessions, listProjectSessions, searchSessions, getMcpStatus, postLiveMcpTrust, getSession, getProjects, McpStatusInfo, SessionMetaWithProject, ProjectInfo } from '../api';
 import { useT, useSettings, SettingsSection, Theme } from '../settings';
 import { MsgKey, Lang } from '../i18n';
 import { RenameDialog, DeleteDialog } from './SessionDialogs';
@@ -366,9 +367,8 @@ export function Sidebar({
   // Relative labels (for example, 59min -> 1h) update without refetching sessions.
   const [timeNow, setTimeNow] = useState(() => Date.now());
   // Skills menu: list fetched lazily; the count badge shows once loaded.
-  const [skills, setSkills] = useState<SkillInfo[] | null>(null);
-  const [skillsLoading, setSkillsLoading] = useState(false);
   const [skillsMenuOpen, setSkillsMenuOpen] = useState(false);
+  const { items: skills, loading: skillsLoading, failed: skillsFailed } = useSkills(skillsMenuOpen);
   const [skillsMenuPos, setSkillsMenuPos] = useState<{ top: number; left: number; width: number } | null>(null);
   const skillsMenuRef = useRef<HTMLDivElement | null>(null);
   const skillsBtnRef = useRef<HTMLButtonElement | null>(null);
@@ -768,17 +768,8 @@ export function Sidebar({
     onOpenSettings(section);
   }
 
-  // Fetch skills once (for the count badge + menu list).
-  function ensureSkills() {
-    if (skills !== null || skillsLoading) return;
-    setSkillsLoading(true);
-    getSkills()
-      .then(setSkills)
-      .catch(() => setSkills([]))
-      .finally(() => setSkillsLoading(false));
-  }
   useEffect(() => {
-    ensureSkills();
+    void refreshSkills();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -816,7 +807,6 @@ export function Sidebar({
       setSkillsMenuOpen(false);
       return;
     }
-    ensureSkills();
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
     setSkillsMenuPos({ top: rect.bottom + 4, left: rect.left, width: rect.width });
     setSkillsMenuOpen(true);
@@ -1087,8 +1077,9 @@ export function Sidebar({
               minWidth: `${Math.max(skillsMenuPos.width, 200)}px`,
             }}
           >
+            {skillsFailed && <button class="skills-menu-row" onClick={() => void refreshSkills()}>{t('skills.loadFailedRetry')}</button>}
             {skillsLoading && <div class="group-by-menu-title">{t('sidebar.skillsLoading')}</div>}
-            {!skillsLoading && (skills?.length ?? 0) === 0 && (
+            {!skillsLoading && !skillsFailed && (skills?.length ?? 0) === 0 && (
               <div class="group-by-menu-title">{t('sidebar.skillsEmpty')}</div>
             )}
             {!skillsLoading &&

@@ -4013,3 +4013,5 @@ body {
 .compaction-history-records { max-height: 60vh; overflow: auto; padding: 1rem; border: 1px solid var(--app-border-subtle); border-radius: .5rem; }
 .compaction-history-records pre { white-space: pre-wrap; overflow-wrap: anywhere; font-family: inherit; }
 .compaction-history-records article { border-bottom: 1px solid var(--app-border-subtle); padding-block: .75rem; }
+
+.effort-selector .model-selector-trigger:disabled { opacity: 0.55; cursor: not-allowed; }

@@ -1259,8 +1259,16 @@ export async function getApprovalMode(): Promise<ApprovalMode> {
   return body.mode;
 }
 
+export class ReasoningEffortError extends Error {
+  readonly activeTurn: boolean;
+  constructor(message: string, activeTurn = false) {
+    super(message);
+    this.activeTurn = activeTurn;
+  }
+}
+
 /** Set `reasoning_effort` for a provider endpoint. `effort` is
- *  'low' | 'medium' | 'high' | 'max' | null (clear → model default).
+ *  'low' | 'medium' | 'high' | 'xhigh' | 'max' | null (clear → model default).
  *  Persists to the provider config so the next turn (live or /chat) picks it up. */
 export async function postLiveReasoningEffort(
   effort: string | null,
@@ -1274,9 +1282,10 @@ export async function postLiveReasoningEffort(
       ...(provider ? { provider } : {}),
     }),
   });
-  if (!resp.ok) throw new Error(`set live reasoning effort failed: ${resp.status}`);
-  const body = await resp.json() as { ok?: boolean; error?: string };
-  if (!body.ok) throw new Error(body.error ?? 'live runtime rejected reasoning effort');
+  const body = await resp.json().catch(() => ({})) as { ok?: boolean; error?: string; active_turn?: boolean };
+  if (!resp.ok || !body.ok) {
+    throw new ReasoningEffortError(body.error ?? `set live reasoning effort failed: ${resp.status}`, body.active_turn === true);
+  }
 }
 
 export async function postLivePermission(

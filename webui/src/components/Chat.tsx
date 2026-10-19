@@ -25,9 +25,10 @@
 //   • P3  !ts 守卫把 ts=0 误判无效                  → 23fb3db4  formatMsgTime 改为 ts == null || !Number.isFinite(ts)
 // 我们愿意根据再审意见继续优化。
 
+import { useSkills, refreshSkills, invalidateSkills } from '../skills';
 import { VNode } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir, searchFiles, changeDir, postConfigReload, postCommand, postLiveCompact, postUserInputAnswer, postLivePolicyInterventionResolution, openWorkspaceFile, type CommandResult, type RoutedUserInputRequest, type PolicyInterventionEvent, type TurnStats } from '../api';
+import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, listDir, searchFiles, changeDir, postConfigReload, postCommand, postLiveCompact, postUserInputAnswer, postLivePolicyInterventionResolution, openWorkspaceFile, type CommandResult, type RoutedUserInputRequest, type PolicyInterventionEvent, type TurnStats } from '../api';
 import {
   parseSlashCommand,
   buildCommandMap,
@@ -568,9 +569,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   const [showFilePicker, setShowFilePicker] = useState(false);
   const [pendingImages, setPendingImages] = useState<ImageData[]>([]);
   const [attachError, setAttachError] = useState<string | null>(null);
-  const [slashSkills, setSlashSkills] = useState<SkillInfo[] | null>(null);
-  const [slashLoading, setSlashLoading] = useState(false);
   const [slashOpen, setSlashOpen] = useState(false);
+  const { items: slashSkills, loading: slashLoading, failed: slashFailed } = useSkills(slashOpen);
   const [slashQuery, setSlashQuery] = useState('');
   const [slashIndex, setSlashIndex] = useState(0);
   // The /skills command opens a pure skills browser (no commands). Set while that
@@ -1959,6 +1959,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       changeDir: async (path) => {
         const res = await changeDir(path);
         if (res.success) {
+          invalidateSkills();
           onCwdChanged?.(res.current_dir);
           pushCommandNotice(t('cmd.cd.done', { dir: res.current_dir }));
         } else {
@@ -1970,24 +1971,19 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       // reloadConfig: POST /config/reload。
       reloadConfig: async () => {
         const result = await postConfigReload();
+        invalidateSkills();
         pushCommandNotice(result.live_provider_sync?.message ?? t('cmd.reload.done'));
       },
       openSlashSkillsMenu: () => {
         // Open a pure SKILLS browser (not the full '/' command list — that's what
         // made running /skills look like it "reset to /"). Input stays '/', but the
         // menu shows only skills; typing anything drops back to normal filtering.
-        // Trigger the skills fetch if it hasn't been loaded yet.
+        // Opening refreshes skills; an already open browser can refresh explicitly.
         setInput('/');
         setSlashQuery('');
         setSlashIndex(0);
         setSlashSkillsOnly(true);
-        if (slashSkills === null && !slashLoading) {
-          setSlashLoading(true);
-          getSkills()
-            .then(setSlashSkills)
-            .catch(() => setSlashSkills([]))
-            .finally(() => setSlashLoading(false));
-        }
+        if (slashOpen) void refreshSkills();
         setSlashOpen(true);
         requestAnimationFrame(() => {
           const ta = textareaRef.current;
@@ -2123,7 +2119,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       t,
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [t, modeState, sync, onCwdChanged, slashSkills, slashLoading, sessionId, cwd, activeSession, provider, messages.length],
+    [t, modeState, sync, onCwdChanged, slashSkills, slashLoading, slashOpen, sessionId, cwd, activeSession, provider, messages.length],
   );
 
   // Append a non-fatal advisory as its OWN notice part (never merged into a text run,
@@ -2952,13 +2948,6 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     if (slashIdx >= 0 && (slashIdx === 0 || before[slashIdx - 1] === ' ')) {
       const query = before.slice(slashIdx + 1);
       if (!query.includes(' ') && query.length <= 30) {
-        if (slashSkills === null && !slashLoading) {
-          setSlashLoading(true);
-          getSkills()
-            .then(setSlashSkills)
-            .catch(() => setSlashSkills([]))
-            .finally(() => setSlashLoading(false));
-        }
         setAtOpen(false);
         setSlashQuery(query);
         setSlashIndex(0);
@@ -3241,6 +3230,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       )}
       {slashOpen && (
         <div class="slash-popover" ref={slashRef}>
+          {slashLoading && <div class="at-empty">{t('attach.skillsLoading')}</div>}
+          {slashFailed && <button class="slash-row" onMouseDown={(e) => { e.preventDefault(); void refreshSkills(); }}>{t('skills.loadFailedRetry')}</button>}
+          {!slashLoading && !slashFailed && slashSkillsOnly && slashSkills?.length === 0 && <div class="at-empty">{t('attach.skillsEmpty')}</div>}
           {buildSlashMenuItems(FRONTEND_COMMANDS, slashSkills ?? [], slashQuery, t as (k: string) => string, slashSkillsOnly).map((item, i) => (
             <button
               key={`${item.kind}:${item.name}`}
@@ -3317,6 +3309,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
             onChange={(m) => switchMode(m)}
           />
           <ModelSelector
+            busy={busy}
+            onError={pushCommandNotice}
             value={provider}
             liveEffort={reasoningEffort?.provider === provider ? reasoningEffort.effort : undefined}
             onChange={(p) => switchProvider(p)}

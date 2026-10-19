@@ -628,3 +628,20 @@ test('config reload returns pending or invalid live application separately from 
     globalThis.fetch = originalFetch;
   }
 });
+
+test('reasoning effort sends xhigh and exposes active-turn rejection for a visible hint', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    const { postLiveReasoningEffort, ReasoningEffortError } = await import('./api.ts');
+    globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+      assert.equal(String(url), '/live/reasoning_effort');
+      assert.deepEqual(JSON.parse(String(init?.body)), { reasoning_effort: 'xhigh', provider: 'custom/model' });
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    }) as typeof fetch;
+    await postLiveReasoningEffort('xhigh', 'custom/model');
+    globalThis.fetch = (async () => new Response(JSON.stringify({ ok: false, active_turn: true, error: 'busy' }), { status: 200 })) as typeof fetch;
+    await assert.rejects(postLiveReasoningEffort('high'), (error: unknown) => error instanceof ReasoningEffortError && error.activeTurn);
+    globalThis.fetch = (async () => new Response(JSON.stringify({ ok: false, error: 'unsupported' }), { status: 400 })) as typeof fetch;
+    await assert.rejects(postLiveReasoningEffort('xhigh'), (error: unknown) => error instanceof ReasoningEffortError && !error.activeTurn);
+  } finally { globalThis.fetch = originalFetch; }
+});

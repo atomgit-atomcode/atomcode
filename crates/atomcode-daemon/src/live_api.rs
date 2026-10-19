@@ -2272,6 +2272,23 @@ pub(crate) struct LiveReasoningEffortReq {
     pub reasoning_effort: Option<String>,
 }
 
+fn parse_live_reasoning_effort(raw: Option<&str>) -> Result<Option<String>, String> {
+    let Some(value) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    atomcode_config::config::REASONING_EFFORT_LEVELS
+        .iter()
+        .find(|level| level.eq_ignore_ascii_case(value))
+        .map(|level| Some((*level).to_string()))
+        .ok_or_else(|| format!("invalid reasoning_effort: {value}"))
+}
+
+/// POST /live/reasoning_effort — webui 设置当前模型实例的 reasoning_effort。
+///
+/// 与 /live/provider 同源：持久化进目标 provider 的 `config.reasoning_effort`，
+/// 下一轮 turn 经 `build_turn_parts` → `create_provider` 自动生效——live 与
+/// /chat 两条路径都现读 config，故两端都会跟随。模型实例必须由配置或内置
+/// CodingPlan 能力声明支持；服务端同时校验取值。
 /// POST /live/reasoning_effort — webui 设置当前模型实例的 reasoning_effort。
 ///
 /// 与 /live/provider 同源：持久化进目标 provider 的 `config.reasoning_effort`，
@@ -2282,19 +2299,12 @@ pub(crate) async fn live_reasoning_effort(
     State(state): State<AppState>,
     Json(req): Json<LiveReasoningEffortReq>,
 ) -> impl IntoResponse {
-    let effort = match req.reasoning_effort.as_deref().map(str::trim) {
-        None | Some("") => None,
-        Some(v) if v.eq_ignore_ascii_case("low") => Some("low".to_string()),
-        Some(v) if v.eq_ignore_ascii_case("medium") => Some("medium".to_string()),
-        Some(v) if v.eq_ignore_ascii_case("high") => Some("high".to_string()),
-        Some(v) if v.eq_ignore_ascii_case("max") => Some("max".to_string()),
-        Some(other) => {
+    let effort = match parse_live_reasoning_effort(req.reasoning_effort.as_deref()) {
+        Ok(effort) => effort,
+        Err(error) => {
             return (
                 axum::http::StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "ok": false,
-                    "error": format!("invalid reasoning_effort: {other}"),
-                })),
+                Json(serde_json::json!({ "ok": false, "error": error })),
             )
                 .into_response();
         }
@@ -2755,6 +2765,27 @@ pub(crate) async fn live_mcp_trust(State(state): State<AppState>) -> impl IntoRe
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn live_effort_parser_accepts_canonical_levels_without_loosening_endpoint_limits() {
+        for level in atomcode_config::config::REASONING_EFFORT_LEVELS {
+            let parsed =
+                super::parse_live_reasoning_effort(Some(&format!(" {} ", level.to_uppercase())))
+                    .unwrap();
+            assert_eq!(parsed.as_deref(), Some(level));
+            let declared = vec![level.to_string()];
+            for candidate in atomcode_config::config::REASONING_EFFORT_LEVELS {
+                let accepted = atomcode_config::config::clamp_effort_to_levels(
+                    Some(candidate),
+                    Some(&declared),
+                );
+                assert_eq!(accepted.is_some(), candidate == level);
+            }
+        }
+        assert_eq!(super::parse_live_reasoning_effort(None).unwrap(), None);
+        assert_eq!(super::parse_live_reasoning_effort(Some(" ")).unwrap(), None);
+        assert!(super::parse_live_reasoning_effort(Some("ultra")).is_err());
+    }
+
     use super::*;
     use atomcode_kernel::message::Message;
 

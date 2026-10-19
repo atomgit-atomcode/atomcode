@@ -1,3 +1,4 @@
+import { invalidateSkills } from '../skills';
 import { headerBody, headerProblem, type HeaderRow } from "../lib/providerHeaders";
 // Model settings: providers as accounts, with the models that hang off each.
 //
@@ -148,6 +149,7 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
     if (applyLive) {
       try {
         const result = await postConfigReload();
+        invalidateSkills();
         setConfig(result);
         setActionError(result.live_provider_sync?.message ?? null);
         return;
