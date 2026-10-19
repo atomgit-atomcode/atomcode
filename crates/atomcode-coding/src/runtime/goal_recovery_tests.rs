@@ -416,3 +416,98 @@ async fn policy_blocking_a_recovery_closes_the_foreground_and_clears_busy() {
     );
     handle.shutdown().await.unwrap();
 }
+
+async fn observe_work(
+    events: &mpsc::UnboundedSender<AgentEvent>,
+    output: &mut mpsc::UnboundedReceiver<CodingRuntimeEvent>,
+    prompt: u32,
+    completion: u32,
+) {
+    events
+        .send(AgentEvent::ToolStarted {
+            call: atomcode_kernel::tool::ToolCall {
+                id: format!("work-{prompt}"),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            },
+        })
+        .unwrap();
+    events
+        .send(AgentEvent::Usage(MessageMeta {
+            tokens: atomcode_kernel::stream::TokenUsage {
+                prompt,
+                completion,
+                ..Default::default()
+            },
+            ..Default::default()
+        }))
+        .unwrap();
+    while !matches!(
+        output.recv().await,
+        Some(CodingRuntimeEvent::Agent(AgentEvent::Usage(_)))
+    ) {}
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn live_pause_and_final_drain_retain_observed_work_without_double_counting() {
+    let (handle, mut commands, events, mut output, _, _, _adapter) =
+        controller_test_runtime(Arc::new(EvaluatorFactory::default())).await;
+    handle.start_goal("finish").await.unwrap();
+    commands.recv().await.unwrap();
+    observe_work(&events, &mut output, 100, 10).await;
+    let report = handle.goal_report().await.unwrap();
+    assert!(report.contains("工具调用：1 · tokens：110"), "{report}");
+    handle.pause_goal().await.unwrap();
+    assert!(matches!(commands.recv().await, Some(AgentCommand::Cancel)));
+    assert!(matches!(
+        commands.recv().await,
+        Some(AgentCommand::Snapshot)
+    ));
+    // A provider can publish its final usage while cancellation drains.
+    observe_work(&events, &mut output, 200, 20).await;
+    events
+        .send(AgentEvent::TurnComplete {
+            turn: None,
+            reason: StopReason::Cancelled,
+            provider_failure: None,
+        })
+        .unwrap();
+    events
+        .send(AgentEvent::Snapshot {
+            snapshot: SessionSnapshot::new(vec![]),
+        })
+        .unwrap();
+    while !matches!(
+        output.recv().await,
+        Some(CodingRuntimeEvent::TurnFinished(_))
+    ) {}
+    let report = handle.goal_report().await.unwrap();
+    assert!(report.contains("工具调用：2 · tokens：330"), "{report}");
+    // Unrelated agent work while the retained goal is idle must not be charged.
+    observe_work(&events, &mut output, 999, 1).await;
+    assert_eq!(handle.goal_report().await.unwrap(), report);
+    handle.submit(UserInput::from("continue")).await.unwrap();
+    commands.recv().await.unwrap();
+    observe_work(&events, &mut output, 300, 30).await;
+    close_kernel_turn(&events, &mut commands, StopReason::Stopped).await;
+    while !matches!(
+        output.recv().await,
+        Some(CodingRuntimeEvent::TurnFinished(_))
+    ) {}
+    let report = handle.goal_report().await.unwrap();
+    assert!(report.contains("工具调用：3 · tokens：660"), "{report}");
+    handle.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn cancelling_keeps_already_observed_statistics_in_the_terminal_report() {
+    let (handle, mut commands, events, mut output, _, _, _adapter) =
+        controller_test_runtime(Arc::new(EvaluatorFactory::default())).await;
+    handle.start_goal("finish").await.unwrap();
+    commands.recv().await.unwrap();
+    observe_work(&events, &mut output, 100, 10).await;
+    handle.cancel().await.unwrap();
+    let report = handle.goal_report().await.unwrap();
+    assert!(report.contains("工具调用：1 · tokens：110"), "{report}");
+    handle.shutdown().await.unwrap();
+}

@@ -8579,6 +8579,15 @@ fn spawn_runtime_owner_with_optional_agent(
                             AgentEvent::Usage(meta) => {
                                 observed_tokens = Some(meta.used_tokens as usize);
                                 turn_stats.record_usage(&meta);
+                                // Account each observed provider receipt once, before pause
+                                // makes the goal inactive. Its final usage may arrive while
+                                // the explicitly paused turn is draining cancellation.
+                                if let Some(state) = goal.as_mut().filter(|state| state.active || (cancel_pending && state.phase == GoalPhase::Paused)) {
+                                    state.tokens_used = state.tokens_used.saturating_add(u64::from(meta.tokens.prompt).saturating_add(u64::from(meta.tokens.completion)));
+                                    if !state.active {
+                                        let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                                    }
+                                }
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::Agent(
                                     AgentEvent::Usage(meta),
                                 ));
@@ -8816,7 +8825,6 @@ fn spawn_runtime_owner_with_optional_agent(
                                     let turn_id = active_turn.unwrap_or_default();
                                     let mut completion_reason = reason;
                                     if let Some(state) = goal.as_mut().filter(|state| state.active) {
-                                        state.tokens_used = state.tokens_used.saturating_add(stats.prompt_tokens.saturating_add(stats.completion_tokens) as u64);
                                         // Keep one bounded runtime-owned recap. It survives
                                         // replacement of the conversation and is attached once
                                         // to a real recovery submit; it is deliberately not copied
@@ -8825,7 +8833,6 @@ fn spawn_runtime_owner_with_optional_agent(
                                             &snapshot.messages,
                                             state.last_reason.as_deref(),
                                         ));
-                                        state.report.tool_calls = state.report.tool_calls.saturating_add(stats.tool_call_count as u64);
                                         let stop_reason = state.cap_reached();
                                         let evaluate = matches!(
                                             reason,
@@ -9021,6 +9028,12 @@ fn spawn_runtime_owner_with_optional_agent(
                             event @ AgentEvent::ToolStarted { .. } => {
                                 turn_stats.tool_call_count =
                                     turn_stats.tool_call_count.saturating_add(1);
+                                if let Some(state) = goal.as_mut().filter(|state| state.active || (cancel_pending && state.phase == GoalPhase::Paused)) {
+                                    state.report.tool_calls = state.report.tool_calls.saturating_add(1);
+                                    if !state.active {
+                                        let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                                    }
+                                }
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::Agent(event));
                             }
                             AgentEvent::Steered { count, inputs, .. } => {

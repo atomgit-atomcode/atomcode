@@ -458,6 +458,92 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn observed_work_is_saved_when_a_real_native_goal_is_paused_and_resumed() {
+        struct WorkProvider(std::sync::atomic::AtomicUsize);
+        #[async_trait::async_trait]
+        impl LlmProvider for WorkProvider {
+            fn model_name(&self) -> &str {
+                "observed-work"
+            }
+            async fn chat_stream(
+                &self,
+                _: &[Message],
+                _: &[atomcode_kernel::tool::ToolDef],
+                _: &atomcode_kernel::provider::ChatOptions,
+            ) -> Result<futures::stream::BoxStream<'static, StreamEvent>, ProviderError>
+            {
+                if self.0.fetch_add(1, Ordering::SeqCst) > 0 {
+                    return std::future::pending().await;
+                }
+                Ok(Box::pin(futures::stream::iter([
+                    StreamEvent::ToolCall(atomcode_kernel::tool::ToolCall {
+                        id: "read-evidence".into(),
+                        name: "read_file".into(),
+                        arguments: serde_json::json!({"file_path": "evidence.txt"}).to_string(),
+                    }),
+                    StreamEvent::Usage(TokenUsage {
+                        prompt: 11,
+                        completion: 3,
+                        ..Default::default()
+                    }),
+                    StreamEvent::Done { truncated: false },
+                ])))
+            }
+        }
+        struct WorkFactory(Arc<WorkProvider>);
+        impl CodingProviderFactory for WorkFactory {
+            fn build(
+                &self,
+                _: &CodingAgentConfig,
+                _: Option<&str>,
+            ) -> Result<Arc<dyn LlmProvider>, crate::ProviderBuildError> {
+                Ok(self.0.clone())
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let counts = Arc::new(Counts::default());
+        let provider = Arc::new(WorkProvider(Default::default()));
+        let mut start = input(root.path(), &counts, crate::SessionMode::Fresh);
+        std::fs::write(start.agent.working_dir.join("evidence.txt"), "evidence").unwrap();
+        start.provider_factory = Arc::new(WorkFactory(provider.clone()));
+        let mut runtime = CodingRuntime::start(start).await.unwrap();
+        let id = runtime.session.as_ref().unwrap().id.clone();
+        runtime.handle.start_goal("check evidence").await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            loop {
+                if matches!(
+                    runtime.events.recv().await.map(|e| e.event),
+                    Some(CodingRuntimeEvent::Agent(AgentEvent::ToolResult { .. }))
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        runtime.handle.pause_goal().await.unwrap();
+        finished(&mut runtime).await;
+        let report = runtime.handle.goal_report().await.unwrap();
+        assert!(report.contains("工具调用：1 · tokens：14"), "{report}");
+        runtime.handle.shutdown().await.unwrap();
+        runtime.task.await.unwrap();
+        let before = provider.0.load(Ordering::SeqCst);
+        let mut resumed = input(root.path(), &counts, crate::SessionMode::Resume(id));
+        resumed.provider_factory = Arc::new(WorkFactory(provider.clone()));
+        let runtime = CodingRuntime::start(resumed).await.unwrap();
+        let report = runtime.handle.goal_report().await.unwrap();
+        assert!(report.contains("Paused"), "{report}");
+        assert!(report.contains("工具调用：1 · tokens：14"), "{report}");
+        assert_eq!(
+            provider.0.load(Ordering::SeqCst),
+            before,
+            "restore must not replay tools"
+        );
+        runtime.handle.shutdown().await.unwrap();
+        runtime.task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_stale_snapshot_receipt_cannot_start_an_evaluator() {
         let root = tempfile::tempdir().unwrap();
         let counts = Arc::new(Counts::default());
