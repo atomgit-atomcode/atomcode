@@ -1015,10 +1015,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::LiveSilentFor { secs } => format!("已 {secs} 秒没有新内容").into(),
         Msg::LiveRunningTools { n } => format!("正在运行 {n} 个工具").into(),
         Msg::LiveElapsed { took } => format!("耗时 {took}").into(),
-        Msg::LiveIn { tokens } => format!("入 {tokens}").into(),
-        Msg::LiveOut { tokens } => format!("出 {tokens}").into(),
+        Msg::LiveIn { tokens } => format!("↑ {tokens}").into(),
+        Msg::LiveOut { tokens } => format!("↓ {tokens}").into(),
         Msg::LiveCached { hit } => format!("缓存 {hit}").into(),
-        Msg::LiveStep { step } => format!("第 {step} 步").into(),
+        Msg::LiveSpeed { rate } => format!("{rate} tok/s").into(),
         Msg::FoldedLines { hidden } => format!("⋯ 已折叠 {hidden} 行，点击展开").into(),
         Msg::MoreBelow { arrow, lines } => format!(" {arrow} 还有 {lines} 行 · 点击回到底部 ").into(),
 

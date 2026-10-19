@@ -1703,8 +1703,8 @@ pub enum Msg<'a> {
     LiveCached {
         hit: &'a str,
     },
-    LiveStep {
-        step: u32,
+    LiveSpeed {
+        rate: u64,
     },
     FoldedLines {
         hidden: usize,

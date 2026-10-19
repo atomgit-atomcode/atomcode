@@ -554,6 +554,8 @@ pub struct Moment {
     /// reason [`Moment::history`] is: it is not derivable, and two modules
     /// folding it separately would eventually give two answers.
     pub turn_started: Option<Timestamp>,
+    /// Current streamed generation estimate, stamped only by the live host.
+    pub generation: crate::generation::Generation,
     /// When something last arrived for the turn in flight, on the same clock as
     /// [`Moment::now`]. `None` between turns.
     ///

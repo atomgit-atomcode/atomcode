@@ -2763,7 +2763,7 @@ async fn the_live_line_says_what_the_turn_is_doing_while_it_runs() {
     // turn in flight: 100 tokens of context, 20 out of this round. Waiting for
     // the reading rather than assuming it beats the tool call — the row is drawn
     // from the log, and the log says which of the two came first.
-    until(&s, "入 100").await;
+    until(&s, "↑ 100").await;
     let live = s
         .term
         .last()
@@ -2776,7 +2776,7 @@ async fn the_live_line_says_what_the_turn_is_doing_while_it_runs() {
         "and says how long it has been running: {said}"
     );
     assert!(
-        said.contains("入 100") && said.contains("出 20"),
+        said.contains("↑ 100") && said.contains("↓ 20"),
         "and what it has cost so far: {said}"
     );
 

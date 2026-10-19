@@ -1085,10 +1085,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::LiveSilentFor { secs } => format!("nothing new for {secs}s").into(),
         Msg::LiveRunningTools { n } => format!("running {n} tools").into(),
         Msg::LiveElapsed { took } => format!("{took} elapsed").into(),
-        Msg::LiveIn { tokens } => format!("in {tokens}").into(),
-        Msg::LiveOut { tokens } => format!("out {tokens}").into(),
+        Msg::LiveIn { tokens } => format!("↑ {tokens}").into(),
+        Msg::LiveOut { tokens } => format!("↓ {tokens}").into(),
         Msg::LiveCached { hit } => format!("cached {hit}").into(),
-        Msg::LiveStep { step } => format!("step {step}").into(),
+        Msg::LiveSpeed { rate } => format!("{rate} tok/s").into(),
         Msg::FoldedLines { hidden } => format!("⋯ {hidden} lines folded — click to open").into(),
         Msg::MoreBelow { arrow, lines } => format!(" {arrow} {lines} more lines · click to go back to the bottom ").into(),
 

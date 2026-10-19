@@ -119,3 +119,5 @@ pub use surface::{Headless, Input, Key, KeyPress, Mods, Surface, Terminal};
 fn _tests_assert_in_chinese() {
     crate::i18n::set_locale(crate::i18n::Locale::ZhCn);
 }
+
+mod generation;

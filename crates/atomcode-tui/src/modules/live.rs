@@ -100,8 +100,6 @@ pub struct State {
     /// percentage of nothing anyone asked for.
     prompt: u32,
     cached: u32,
-    /// Which request of the turn is in flight.
-    step: u32,
     retry: Option<atomcode_harness::session::RetryAttempt>,
 }
 
@@ -127,7 +125,6 @@ impl View for Live {
             }
             SessionEvent::TurnEnd { .. } => state.turn = None,
 
-            SessionEvent::StepStart { step, .. } => state.step = *step,
             SessionEvent::RequestHeader { .. } => {
                 state.phase = Phase::Waiting;
                 state.retry = None;
@@ -226,11 +223,11 @@ impl View for Live {
 
         // The words and the clock first, then the figures — and nothing is cut
         // in half. A part that does not fit is left out whole: a timer clipped
-        // to `1` reads as a second, and `出 8` reads as a number nobody
+        // to `1` reads as a second, and `↓ 8` reads as a number nobody
         // measured, so which figure fits is decided before drawing rather than
         // by the last cell of the row.
         // The figures ride in one parenthesised group after the words:
-        // `正在运行 1 个工具 （耗时 8m54s · 入 78.2k · 出 8.0k …）`. The open comes
+        // `正在运行 1 个工具 （耗时 8m54s · ↑ 78.2k · ↓ 8.0k …）`. The open comes
         // before the first figure that fits, the close after the last — and the
         // close's width is reserved on every step, so a figure is never taken in
         // and then left with no room to close the group behind it.
@@ -524,13 +521,9 @@ fn doing(state: &State, moment: &Moment) -> Option<String> {
 ///
 /// The order is what a person does with them: the clock answers "is it stuck",
 /// the two token counts answer "is it getting anywhere", the cache share answers
-/// "is the context being re-sent or re-read", and the step number is context for
-/// all of them. That order is also the drop order at a narrow width — the last
-/// one is the first to go.
-///
-/// The step is left out at 1 because the turn opening *is* the first step —
-/// `第 1 步` on every turn would be a figure that never changes until suddenly it
-/// does.
+/// "is the context being re-sent or re-read". Estimated generation throughput
+/// follows the authoritative token counts and precedes the cache share. On a
+/// narrow screen, the trailing figures are dropped whole.
 ///
 /// Two of these are readings of the **last** request and two are sums over the
 /// turn, which is not an inconsistency but the only honest way to count them:
@@ -579,11 +572,11 @@ fn parts(state: &State, moment: &Moment) -> Vec<String> {
             .into_owned(),
         );
     }
+    if let Some(rate) = moment.generation.rate(moment.now) {
+        out.push(t(Msg::LiveSpeed { rate }).into_owned());
+    }
     if let Some(hit) = crate::content::cache_hit_rate(state.cached, state.prompt) {
         out.push(t(Msg::LiveCached { hit: &hit }).into_owned());
-    }
-    if state.step > 1 {
-        out.push(t(Msg::LiveStep { step: state.step }).into_owned());
     }
     out
 }
@@ -1171,7 +1164,7 @@ mod tests {
         assert!(drawn.contains("正在压缩"), "{line:?}");
         assert!(drawn.contains("耗时 4s"), "its own clock: {line:?}");
         assert!(
-            !drawn.contains("正在思考") && !drawn.contains("入 "),
+            !drawn.contains("正在思考") && !drawn.contains("↑ "),
             "the paused request's verb and figures stay out: {line:?}"
         );
 
@@ -1242,7 +1235,7 @@ mod tests {
     #[test]
     fn the_figures_count_this_turn_and_only_this_turn() {
         let mut state = fold(&a_turn());
-        assert!(working(&state, 0)[0].contains("出 80"));
+        assert!(working(&state, 0)[0].contains("↓ 80"));
 
         // A second turn opens its own budget: those 80 were the last one's.
         Live::absorb(&mut state, &SessionEvent::TurnStart { turn: 2 });
@@ -1261,7 +1254,7 @@ mod tests {
     #[test]
     fn the_context_is_the_last_round_and_the_output_is_the_whole_turn() {
         let mut state = fold(&a_turn());
-        assert!(working(&state, 0)[0].contains("入 1.2K"));
+        assert!(working(&state, 0)[0].contains("↑ 1.2K"));
         assert!(working(&state, 0)[0].contains("缓存 33.33%"));
 
         Live::absorb(
@@ -1278,14 +1271,14 @@ mod tests {
         );
         let said = working(&state, 0)[0].clone();
         assert!(
-            said.contains("入 2.0K"),
+            said.contains("↑ 2.0K"),
             "the latest context, not 1.2K + 2.0K: {said}"
         );
         assert!(
             !said.contains("3.2K"),
             "a sum of contexts counts the same tokens once per round: {said}"
         );
-        assert!(said.contains("出 100"), "the output adds up: {said}");
+        assert!(said.contains("↓ 100"), "the output adds up: {said}");
         assert!(
             said.contains("缓存 75.00%"),
             "the share comes off the same reading as the context: {said}"
@@ -1312,8 +1305,8 @@ mod tests {
             },
         );
         let said = working(&state, 0)[0].clone();
-        assert!(said.contains("入 900"), "{said}");
-        assert!(said.contains("出 12"), "{said}");
+        assert!(said.contains("↑ 900"), "{said}");
+        assert!(said.contains("↓ 12"), "{said}");
         assert!(!said.contains("缓存") && !said.contains('%'), "{said}");
     }
 
@@ -1380,7 +1373,7 @@ mod tests {
         moment.turn_started = Some(Timestamp::millis(0));
 
         let roomy = line_at(&state, &moment, 60);
-        for want in ["耗时 12s", "入 1.2K", "出 80", "缓存 33.33%"] {
+        for want in ["耗时 12s", "↑ 1.2K", "↓ 80", "缓存 33.33%"] {
             assert!(roomy.contains(want), "{want} missing from {roomy}");
         }
 
@@ -1419,14 +1412,53 @@ mod tests {
     }
 
     #[test]
-    fn a_step_count_appears_once_the_turn_is_past_its_first_request() {
+    fn live_generation_adds_only_speed_to_the_existing_figures() {
+        let mut state = fold(&a_turn());
+        state.prompt = 150_700;
+        state.output = 20_100;
+        state.cached = 145_413;
+        let mut moment = Moment::default().working();
+        moment.turn_started = Some(Timestamp::millis(0));
+        moment.now = Timestamp::millis(12_000);
+        moment.generation.absorb(
+            &SessionEvent::RequestHeader {
+                turn: 1,
+                round: 1,
+                model: "m".into(),
+                reason: atomcode_harness::session::HeaderReason::Append,
+            },
+            Timestamp::millis(0),
+        );
+        moment.generation.absorb(
+            &SessionEvent::AssistantChunk {
+                turn: 1,
+                round: 1,
+                delta: "a".repeat(400),
+                reasoning: true,
+            },
+            Timestamp::millis(10_000),
+        );
+        let line = line_at(&state, &moment, 180);
+        assert!(
+            line.contains("↑ 150.7K · ↓ 20.1K · 50 tok/s · 缓存 96.49%"),
+            "{line}"
+        );
+        assert!(!line.contains('≈'), "{line}");
+        assert!(!line.contains("第"), "{line}");
+        let narrow = line_at(&state, &moment, 20);
+        assert!(width::str_width(&narrow) <= 20);
+        assert!(!narrow.contains("tok/s"), "drop whole figures: {narrow}");
+    }
+
+    #[test]
+    fn request_count_is_not_shown_on_the_live_line() {
         let mut state = fold(&a_turn());
         assert!(
             !working(&state, 0)[0].contains("第"),
             "the turn opening is the first step: there is nothing to count"
         );
         Live::absorb(&mut state, &SessionEvent::StepStart { turn: 1, step: 2 });
-        assert!(working(&state, 0)[0].contains("第 2 步"));
+        assert!(!working(&state, 0)[0].contains("第 2 步"));
     }
 
     #[test]

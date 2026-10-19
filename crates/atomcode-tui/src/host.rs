@@ -1920,6 +1920,7 @@ impl Host {
         m.stream_selection = None;
         m.edge_scroll = None;
         m.turn_started = None;
+        m.generation = Default::default();
         m.quiet_since = None;
         m.provider_retry_started = None;
         m.steering.clear();
@@ -2249,6 +2250,11 @@ impl Host {
     /// see a screen whose stream already contains it.
     pub fn absorb_logged(&self, logged: &LoggedEvent) {
         let fact = &logged.event;
+        {
+            let mut m = self.moment.write().expect("moment poisoned");
+            let now = m.now;
+            m.generation.absorb(fact, now);
+        }
         // When a turn opened or closed, on the clock the host was handed. Here
         // rather than in a module because this is the one place that sees both
         // the fact and the reading — and a duration on screen is the difference
@@ -7659,6 +7665,39 @@ fn waiting(queued: &[crate::moment::Queued]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn live_chunks_measure_generation_and_turn_end_clears_it() {
+        let h = host();
+        h.absorb(&SessionEvent::TurnStart { turn: 1 });
+        h.absorb(&SessionEvent::RequestHeader {
+            turn: 1,
+            round: 1,
+            model: "m".into(),
+            reason: atomcode_harness::session::HeaderReason::Append,
+        });
+        h.moment.write().unwrap().now = crate::moment::Timestamp::millis(10_000);
+        h.absorb(&SessionEvent::AssistantChunk {
+            turn: 1,
+            round: 1,
+            delta: "a".repeat(400),
+            reasoning: true,
+        });
+        assert_eq!(
+            h.moment
+                .read()
+                .unwrap()
+                .generation
+                .rate(crate::moment::Timestamp::millis(12_000)),
+            Some(50)
+        );
+        h.absorb(&SessionEvent::TurnEnd {
+            turn: 1,
+            stop: atomcode_kernel::event::StopReason::Stopped,
+            error: None,
+        });
+        assert_eq!(h.moment.read().unwrap().generation.tokens(), 0);
+    }
+
     #[test]
     fn setting_in_a_code_row_preserves_its_paint_only_surface() {
         let row = Line::raw("  key: value")
