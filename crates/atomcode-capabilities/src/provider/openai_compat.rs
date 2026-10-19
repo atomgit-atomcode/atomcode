@@ -754,11 +754,11 @@ impl LlmProvider for OpenAiCompatProvider {
             Err(e) if !effort_known_unsupported && is_reasoning_effort_rejection(&e) => {
                 self.effort_unsupported
                     .store(true, std::sync::atomic::Ordering::Relaxed);
-                timing.open_failed();
+                timing.open_failed(&e);
                 return Err(effort_unsupported_error());
             }
             Err(e) => {
-                timing.open_failed();
+                timing.open_failed(&e);
                 return Err(e);
             }
         };
@@ -812,11 +812,12 @@ impl LlmProvider for OpenAiCompatProvider {
                         Err(_elapsed) => {
                             // Do not replay here: partial deltas may already be visible.
                             // The owner can continue from preserved safe progress.
+                            request_span.in_scope(|| tracing::warn!(error_origin = "stream_watchdog", stream_attempt, had_replay_sensitive_output = emitted_replay_sensitive, "provider stream diagnostic"));
                             yield StreamEvent::Error(retry::stream_idle_error());
                             return;
                         }
                         Ok(None) => {
-                            for ev in dec.finish() {
+                            for ev in request_span.in_scope(|| dec.finish()) {
                                 if !emitted_replay_sensitive && retry::is_attempt_metadata_event(&ev) {
                                     pending_metadata.push(ev);
                                     continue;
@@ -833,6 +834,11 @@ impl LlmProvider for OpenAiCompatProvider {
                             return;
                         }
                         Ok(Some(Err(e))) => {
+                            request_span.in_scope(|| tracing::warn!(error_origin = "body_read", stream_attempt,
+                                is_timeout = e.is_timeout(), is_decode = e.is_decode(), is_body = e.is_body(),
+                                is_connect = e.is_connect(), is_request = e.is_request(),
+                                had_replay_sensitive_output = emitted_replay_sensitive,
+                                "provider stream diagnostic"));
                             // Message already logically complete (a real, non-empty
                             // finish_reason arrived) AND the error is a benign transport
                             // drop — a gateway closing the keep-alive after the final
@@ -844,7 +850,7 @@ impl LlmProvider for OpenAiCompatProvider {
                             // finish_reason chunk and `[DONE]` otherwise killed a
                             // fully-generated 20-minute turn.
                             if dec.seen_finish() && retry::is_stale_connection_error(&e) {
-                                for ev in dec.finish() {
+                                for ev in request_span.in_scope(|| dec.finish()) {
                                     if !emitted_replay_sensitive && retry::is_attempt_metadata_event(&ev) {
                                         pending_metadata.push(ev);
                                         continue;
@@ -921,7 +927,7 @@ impl LlmProvider for OpenAiCompatProvider {
                                 logged_first_byte = true;
                             }
                             let mut saw_done = false;
-                            for ev in dec.feed(chunk.as_ref()) {
+                            for ev in request_span.in_scope(|| dec.feed(chunk.as_ref())) {
                                 if !emitted_replay_sensitive && retry::is_attempt_metadata_event(&ev) {
                                     pending_metadata.push(ev);
                                     continue;
@@ -947,6 +953,34 @@ impl LlmProvider for OpenAiCompatProvider {
 
         Ok(s.inspect(move |event| timing.observe(event)).boxed())
     }
+}
+
+#[cfg(test)]
+mod request_id_tests {
+    use super::*;
+    #[test]
+    fn correlation_headers_are_allowlisted_and_invalid_ids_fall_back_safely() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("authorization", "Bearer secret".parse().unwrap());
+        headers.insert("x-secret", "sensitive".parse().unwrap());
+        assert_eq!(upstream_request_id(&headers), None);
+        headers.insert("x-request-id", "https://host/?key=secret".parse().unwrap());
+        headers.insert("request-id", "req-safe-1".parse().unwrap());
+        assert_eq!(upstream_request_id(&headers), Some("req-safe-1"));
+        headers.insert("x-request-id", "req-preferred".parse().unwrap());
+        assert_eq!(upstream_request_id(&headers), Some("req-preferred"));
+    }
+}
+
+fn upstream_request_id(headers: &reqwest::header::HeaderMap) -> Option<&str> {
+    ["x-request-id", "request-id", "x-amzn-requestid", "cf-ray"]
+        .into_iter()
+        .find_map(|name| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .and_then(super::latency::correlation_id)
+        })
 }
 
 /// `url` as it is safe to show: no user, no password, no query, no fragment. A
@@ -1182,6 +1216,7 @@ async fn open_stream_attempts(
                     attempt,
                     pool_refreshed = timeout_pool_refreshed,
                     status = resp.status().as_u16(),
+                    upstream_request_id = upstream_request_id(resp.headers()),
                     "provider response headers received"
                 );
                 if tls12_probe {
@@ -2083,6 +2118,10 @@ impl SseDecoder {
                 if body.starts_with('{') || body.starts_with('[') {
                     let detail = extract_error_detail(body);
                     let (retryable, http_status) = json_error_retry(body);
+                    tracing::warn!(
+                        error_origin = "json_error_body",
+                        "provider stream diagnostic"
+                    );
                     out.push(StreamEvent::Error(ProviderError {
                         retryable,
                         http_status,
@@ -2100,6 +2139,10 @@ impl SseDecoder {
                     }));
                     return out;
                 }
+                tracing::warn!(
+                    error_origin = "not_an_event_stream",
+                    "provider stream diagnostic"
+                );
                 let suggestion = version_suggestion(&url);
                 let head: String = self.stray.chars().take(200).collect();
                 out.push(StreamEvent::Error(ProviderError {
@@ -2223,6 +2266,10 @@ impl SseDecoder {
         // non-retryable failure that terminates the turn.
         // (Previously such chunks were silently dropped.)
         if let Some(err) = &chunk.error {
+            tracing::warn!(
+                error_origin = "inband_error_object",
+                "provider stream diagnostic"
+            );
             let http_status = inband_error_http_status(err);
             out.push(StreamEvent::Error(ProviderError {
                 retryable: http_status.is_some_and(retry::is_retryable_status),

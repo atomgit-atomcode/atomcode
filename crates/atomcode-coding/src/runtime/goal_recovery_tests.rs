@@ -511,3 +511,58 @@ async fn cancelling_keeps_already_observed_statistics_in_the_terminal_report() {
     assert!(report.contains("工具调用：1 · tokens：110"), "{report}");
     handle.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn explicitly_unknown_evidence_pauses_without_dispatching_more_main_work() {
+    struct UnknownFactory;
+    impl CodingProviderFactory for UnknownFactory {
+        fn build(
+            &self,
+            _: &CodingAgentConfig,
+            _: Option<&str>,
+        ) -> Result<Arc<dyn LlmProvider>, crate::ProviderBuildError> {
+            Ok(Arc::new(atomcode_kernel::testkit::MockProvider::new(vec![
+                    vec![
+                        StreamEvent::TextDelta(
+                            "Verdict: unknown Build receipt absent".into()
+                        ),
+                        StreamEvent::Done { truncated: false },
+                    ];
+                    10
+                ])))
+        }
+    }
+    let (handle, mut commands, events, mut output, _, _, _adapter) =
+        controller_test_runtime(Arc::new(UnknownFactory)).await;
+    handle.start_goal("build passes").await.unwrap();
+    assert!(matches!(
+        commands.recv().await,
+        Some(AgentCommand::SendMessage { .. })
+    ));
+    close_kernel_turn(&events, &mut commands, StopReason::Stopped).await;
+    let mut stopped = false;
+    tokio::time::timeout(Duration::from_secs(3600), async {
+        loop {
+            match output.recv().await {
+                Some(CodingRuntimeEvent::GoalChanged(progress)) if !progress.active => {
+                    assert_ne!(progress.terminal, Some(GoalTerminal::Met));
+                    assert_ne!(progress.terminal, Some(GoalTerminal::Failed));
+                    stopped |= progress.terminal == Some(GoalTerminal::Stopped);
+                }
+                Some(CodingRuntimeEvent::TurnFinished(_)) => break,
+                Some(_) => {}
+                None => panic!("missing goal terminal"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(stopped);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), commands.recv())
+            .await
+            .is_err(),
+        "missing evidence must not submit synthetic main work"
+    );
+    handle.shutdown().await.unwrap();
+}
