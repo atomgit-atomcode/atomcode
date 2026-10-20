@@ -557,9 +557,10 @@ fn parts(state: &State, moment: &Moment) -> Vec<String> {
         out.push(t(Msg::LiveElapsed { took: &short(ms) }).into_owned());
     }
     append_usage(&mut out, state, moment);
-    if let Some(rate) = moment.generation.rate(moment.now) {
-        out.push(t(Msg::LiveSpeed { rate }).into_owned());
-    }
+    out.push(match moment.generation.rate(moment.now) {
+        Some(rate) => t(Msg::LiveSpeed { rate }).into_owned(),
+        None => t(Msg::LiveSpeedPending).into_owned(),
+    });
     out
 }
 
@@ -1780,5 +1781,14 @@ mod tests {
             Some(110_000),
             "one session ending cannot clear another's clock"
         );
+    }
+    #[test]
+    fn missing_sampling_shows_a_placeholder_instead_of_dropping_speed() {
+        let state = fold(&a_turn());
+        let mut moment = Moment::default().working();
+        moment.now = Timestamp::millis(62_000);
+        moment.turn_started = Some(Timestamp::millis(0));
+        let line = line_at(&state, &moment, 180);
+        assert!(line.contains("— tok/s"), "{line}");
     }
 }

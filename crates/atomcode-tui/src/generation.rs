@@ -12,6 +12,12 @@ struct Request {
 }
 
 impl Request {
+    fn measured(&self, now: Timestamp) -> bool {
+        self.ended.is_some()
+            && self.reported.is_some_and(|tokens| tokens > 0)
+            && self.reading(now).is_some()
+    }
+
     fn reading(&self, now: Timestamp) -> Option<(u64, u64)> {
         let started = self.started?;
         let ms = self
@@ -30,6 +36,7 @@ pub struct Generation {
     request: Option<Request>,
     completed_tokens: u64,
     completed_ms: u64,
+    completed_reported: bool,
 }
 
 impl Generation {
@@ -63,6 +70,7 @@ impl Generation {
                     if let Some((tokens, ms)) = request.reading(now) {
                         self.completed_tokens = self.completed_tokens.saturating_add(tokens);
                         self.completed_ms = self.completed_ms.saturating_add(ms);
+                        self.completed_reported |= request.measured(now);
                     }
                 }
                 self.turn = Some(*turn);
@@ -121,6 +129,21 @@ impl Generation {
         }
     }
 
+    /// The handle's live tool name/argument fragments share generation time
+    /// with prose and reasoning. Metadata-only frames do not start the clock.
+    pub fn tool_stream(&mut self, name: Option<&str>, arguments: &str, now: Timestamp) -> bool {
+        let chars = name.map_or(0, |name| name.chars().count()) + arguments.chars().count();
+        if chars == 0 {
+            return false;
+        }
+        if let Some(request) = self.request.as_mut().filter(|r| r.ended.is_none()) {
+            request.started.get_or_insert(now);
+            request.chars = request.chars.saturating_add(chars as u64);
+            return true;
+        }
+        false
+    }
+
     /// Streaming estimate only; provider usage corrects the rate at request end.
     pub fn tokens(&self) -> u64 {
         self.request.as_ref().map_or(0, |request| request.chars / 4)
@@ -136,7 +159,15 @@ impl Generation {
             .unwrap_or_default();
         let tokens = self.completed_tokens.saturating_add(tokens);
         let ms = self.completed_ms.saturating_add(ms);
-        (ms >= 1_000 && tokens > 0).then(|| (tokens as f64 * 1_000.0 / ms as f64).round() as u64)
+        (ms > 0
+            && tokens > 0
+            && (ms >= 1_000
+                || self.completed_reported
+                || self
+                    .request
+                    .as_ref()
+                    .is_some_and(|request| request.measured(now))))
+        .then(|| (tokens as f64 * 1_000.0 / ms as f64).round() as u64)
     }
 }
 
@@ -251,5 +282,71 @@ mod tests {
         at(&mut g, chunk(2, false, "abcd"), 101_000);
         at(&mut g, usage(2, 1), 101_000);
         assert_eq!(g.rate(Timestamp::millis(200_000)), None);
+    }
+    #[test]
+    fn pure_tool_output_measures_only_generation_and_holds_while_waiting() {
+        let mut g = Generation::default();
+        at(&mut g, header(1), 0);
+        assert!(!g.tool_stream(None, "", Timestamp::millis(50_000)));
+        assert_eq!(g.rate(Timestamp::millis(59_000)), None);
+        assert!(g.tool_stream(Some("read_file"), "{", Timestamp::millis(60_000)));
+        g.tool_stream(None, &"a".repeat(400), Timestamp::millis(61_000));
+        at(&mut g, usage(1, 94), 62_000);
+        assert_eq!(g.rate(Timestamp::millis(63_000)), Some(47));
+        assert!(!g.tool_stream(Some("late"), "late", Timestamp::millis(64_000)));
+        at(&mut g, header(2), 70_000);
+        assert_eq!(g.rate(Timestamp::millis(130_000)), Some(47));
+    }
+
+    #[test]
+    fn tool_fragments_and_text_share_one_duration_and_final_only_stays_unknown() {
+        let mut g = Generation::default();
+        at(&mut g, header(1), 0);
+        at(&mut g, chunk(1, true, &"a".repeat(400)), 10_000);
+        g.tool_stream(Some("f"), &"b".repeat(399), Timestamp::millis(11_000));
+        assert_eq!(g.rate(Timestamp::millis(12_000)), Some(100));
+        at(&mut g, usage(1, 400), 12_000);
+        assert_eq!(g.rate(Timestamp::millis(99_000)), Some(200));
+        at(&mut g, SessionEvent::TurnStart { turn: 2 }, 100_000);
+        at(
+            &mut g,
+            SessionEvent::RequestHeader {
+                turn: 2,
+                round: 1,
+                model: "m".into(),
+                reason: atomcode_harness::session::HeaderReason::Append,
+            },
+            100_000,
+        );
+        g.tool_stream(Some("f"), "{}", Timestamp::millis(120_000));
+        at(
+            &mut g,
+            SessionEvent::Usage {
+                turn: 2,
+                round: 1,
+                usage: TokenUsage {
+                    prompt: 1,
+                    completion: 94,
+                    cached: 0,
+                },
+            },
+            120_000,
+        );
+        assert_eq!(g.rate(Timestamp::millis(180_000)), None);
+    }
+    #[test]
+    fn final_usage_can_measure_a_fast_tool_response_without_a_one_second_wait() {
+        let mut g = Generation::default();
+        at(&mut g, header(1), 0);
+        g.tool_stream(Some("read_file"), "{", Timestamp::millis(60_000));
+        assert_eq!(
+            g.rate(Timestamp::millis(60_400)),
+            None,
+            "streaming estimates still need a stable interval"
+        );
+        at(&mut g, usage(1, 94), 60_500);
+        assert_eq!(g.rate(Timestamp::millis(61_000)), Some(188));
+        at(&mut g, header(2), 70_000);
+        assert_eq!(g.rate(Timestamp::millis(120_000)), Some(188));
     }
 }

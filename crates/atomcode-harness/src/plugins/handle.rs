@@ -2160,6 +2160,20 @@ fn attach(
         }
     });
 
+    let tool_session = agent.session_id().to_string();
+    let tool_out = events.clone();
+    let tool_stream =
+        ctx.on_emit::<crate::events::ToolCallChunk>(move |chunk: &crate::events::ToolChunk| {
+            if chunk.session == tool_session {
+                let _ = tool_out.send(AgentEvent::ToolCallStreaming {
+                    index: chunk.index,
+                    id: chunk.id.clone(),
+                    name: chunk.name.clone(),
+                    arguments: chunk.arguments.clone(),
+                });
+            }
+        });
+
     let (done_tx, done_rx) = oneshot::channel();
     let pump_ctx = ctx.clone();
     let pump_agent = agent.clone();
@@ -2180,6 +2194,7 @@ fn attach(
         // lets the event channel close, so a driver reading to the end sees
         // the end. Dropping only the local handles would hang it forever.
         stream.dispose();
+        tool_stream.dispose();
         terminal_metadata.dispose();
         for listener in feeding {
             listener.dispose();

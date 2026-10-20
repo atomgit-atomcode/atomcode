@@ -389,10 +389,26 @@ async fn stream_once(
                 out.reasoning.push_str(&text);
             }
             StreamEvent::ToolCall(call) => {
+                // Complete calls are not a first-token observation. Their
+                // fragments, if provided, have already been forwarded.
                 saw_tool_stream = true;
                 out.tool_calls.push(call);
             }
-            StreamEvent::ToolCallDelta { .. } => saw_tool_stream = true,
+            StreamEvent::ToolCallDelta {
+                index,
+                id,
+                name,
+                arguments,
+            } => {
+                saw_tool_stream = true;
+                ctx.emit::<crate::events::ToolCallChunk>(&crate::events::ToolChunk {
+                    session: session.id().into(),
+                    index,
+                    id,
+                    name,
+                    arguments,
+                });
+            }
             StreamEvent::Usage(usage) => out.usage = Some(usage),
             // Hand back what was already produced: the tokens were paid for,
             // and a retry that starts from nothing repeats work the model has
@@ -1317,5 +1333,115 @@ mod content_deadline_tests {
             _ = tokio::time::sleep(Duration::from_secs(10)) => {},
             _ = run(&provider) => panic!("the response must still be pending"),
         }
+    }
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn tool_fragments_are_live_observations_not_prose_or_persisted_facts() {
+        let app = atomcode_plexus::App::new(
+            atomcode_plexus::PluginRegistry::new(),
+            atomcode_plexus::ConfigTree::from_layers(Vec::new()).unwrap(),
+        );
+        let ctx = app.context();
+        let log = SessionLog::new("tool-observation");
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = seen.clone();
+        let _listener =
+            ctx.on_emit::<crate::events::ToolCallChunk>(move |chunk: &crate::events::ToolChunk| {
+                capture.lock().unwrap().push(chunk.clone())
+            });
+        let provider = TimedProvider(vec![
+            (
+                60,
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("c".into()),
+                    name: Some("read_file".into()),
+                    arguments: "{".into(),
+                },
+            ),
+            (
+                2,
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: None,
+                    name: None,
+                    arguments: "}".into(),
+                },
+            ),
+            (
+                0,
+                StreamEvent::ToolCall(atomcode_kernel::tool::ToolCall {
+                    id: "c".into(),
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                }),
+            ),
+        ]);
+        let out = stream_once(
+            &provider,
+            &ctx,
+            &log,
+            1,
+            0,
+            vec![],
+            vec![],
+            ChatOptions::default(),
+            Some(Duration::from_secs(120)),
+            Some(Duration::from_secs(600)),
+        )
+        .await
+        .unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen.len(),
+            2,
+            "the completed call must not duplicate streamed output"
+        );
+        assert!(seen.iter().all(|c| c.session == "tool-observation"));
+        assert_eq!(seen[0].arguments, "{");
+        assert_eq!(seen[1].arguments, "}");
+        assert!(out.text.is_empty() && out.reasoning.is_empty());
+        assert_eq!(out.tool_calls.len(), 1);
+        assert!(
+            log.events().is_empty(),
+            "observational arguments must never be persisted as assistant text"
+        );
+    }
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn completed_only_calls_do_not_invent_a_first_token_observation() {
+        let app = atomcode_plexus::App::new(
+            atomcode_plexus::PluginRegistry::new(),
+            atomcode_plexus::ConfigTree::from_layers(Vec::new()).unwrap(),
+        );
+        let ctx = app.context();
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = seen.clone();
+        let _listener =
+            ctx.on_emit::<crate::events::ToolCallChunk>(move |_: &crate::events::ToolChunk| {
+                count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            });
+        let provider = TimedProvider(vec![(
+            60,
+            StreamEvent::ToolCall(atomcode_kernel::tool::ToolCall {
+                id: "c".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            }),
+        )]);
+        let out = stream_once(
+            &provider,
+            &ctx,
+            &SessionLog::new("nonstreaming"),
+            1,
+            0,
+            vec![],
+            vec![],
+            ChatOptions::default(),
+            Some(Duration::from_secs(120)),
+            Some(Duration::from_secs(600)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.tool_calls.len(), 1);
+        assert_eq!(seen.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 }

@@ -2381,3 +2381,40 @@ async fn a_message_folded_into_a_turn_the_harness_opened_is_announced_as_steerin
         "a fold into a continuation-opened turn must be announced: {events:#?}"
     );
 }
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn live_tool_observations_belong_only_to_the_driven_session() {
+    let dir = scratch("tool-observation");
+    let app = start(tree(&dir, &replay(r#"{ text = "unused" }"#), &[])).await;
+    let mut handle = handle_of(&app);
+    let agents = app
+        .context()
+        .service::<atomcode_harness::seams::AgentsSvc>()
+        .unwrap();
+    let agent = agents.list().into_iter().next().unwrap();
+    let before = agent.session().events().len();
+    for session in [
+        "another-session".to_string(),
+        agent.session_id().to_string(),
+    ] {
+        agent.ctx().emit::<atomcode_harness::events::ToolCallChunk>(
+            &atomcode_harness::events::ToolChunk {
+                session,
+                index: 0,
+                id: Some("call".into()),
+                name: Some("read_file".into()),
+                arguments: "{}".into(),
+            },
+        );
+    }
+    let mut streamed = Vec::new();
+    while let Ok(event) = handle.events.try_recv() {
+        if let AgentEvent::ToolCallStreaming { arguments, .. } = event {
+            streamed.push(arguments);
+        }
+    }
+    assert_eq!(streamed, vec!["{}"]);
+    assert_eq!(agent.session().events().len(), before);
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    handle.task.await.unwrap();
+}

@@ -6486,6 +6486,26 @@ impl Tui {
                 self.ask_about_policy(intervention);
                 true
             }
+            AgentEvent::ToolCallStreaming {
+                name, arguments, ..
+            } => {
+                // Raw handle observations belong to the lead. A selected team
+                // member is projected from its own facts, never the lead's IO.
+                if self.client.session() != self.client.root() {
+                    return false;
+                }
+                let mut moment = self.host.moment.write().expect("moment poisoned");
+                let now = moment.now;
+                if moment
+                    .generation
+                    .tool_stream(name.as_deref(), &arguments, now)
+                {
+                    moment.quiet_since = Some(now);
+                    true
+                } else {
+                    false
+                }
+            }
             AgentEvent::ToolProgress { message, .. } => {
                 self.host.say_for(message, false, 1_500);
                 true
@@ -14780,5 +14800,47 @@ mod session_mention_tests {
         assert_eq!(*tui.mention_kind.lock().unwrap(), 0);
         tui.complete_path("@\0mention-filter:sessions");
         assert_eq!(*tui.mention_kind.lock().unwrap(), 2);
+    }
+}
+
+#[cfg(test)]
+mod tool_generation_tests {
+    use super::*;
+    #[test]
+    fn tool_observations_refresh_only_the_leads_active_generation() {
+        let (host, tui) = assemble(crate::surface::Headless::new(80, 24));
+        {
+            let mut view = tui.client.view.lock().unwrap();
+            view.root = "lead".into();
+            view.on_screen = "lead".into();
+        }
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.generation.absorb(
+                &atomcode_kernel::session::SessionEvent::RequestHeader {
+                    turn: 1,
+                    round: 1,
+                    model: "m".into(),
+                    reason: atomcode_kernel::session::HeaderReason::Append,
+                },
+                crate::moment::Timestamp::millis(0),
+            );
+            moment.now = crate::moment::Timestamp::millis(60_000);
+        }
+        let fragment = || AgentEvent::ToolCallStreaming {
+            index: 0,
+            id: Some("call".into()),
+            name: Some("read_file".into()),
+            arguments: "{}".into(),
+        };
+        assert!(tui.on_event(fragment()));
+        assert_eq!(
+            host.moment.read().unwrap().quiet_since,
+            Some(crate::moment::Timestamp::millis(60_000))
+        );
+        let before = host.moment.read().unwrap().generation.clone();
+        tui.client.view.lock().unwrap().on_screen = "member".into();
+        assert!(!tui.on_event(fragment()));
+        assert_eq!(host.moment.read().unwrap().generation, before);
     }
 }

@@ -1104,6 +1104,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::LiveIn { tokens } => format!("↑ {tokens}").into(),
         Msg::LiveOut { tokens } => format!("↓ {tokens}").into(),
         Msg::LiveCached { hit } => format!("cached {hit}").into(),
+        Msg::LiveSpeedPending => "— tok/s".into(),
         Msg::LiveSpeed { rate } => format!("{rate} tok/s").into(),
         Msg::FoldedLines { hidden } => format!("⋯ {hidden} lines folded — click to open").into(),
         Msg::MoreBelow { arrow, lines } => format!(" {arrow} {lines} more lines · click to go back to the bottom ").into(),

@@ -1034,6 +1034,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::LiveIn { tokens } => format!("↑ {tokens}").into(),
         Msg::LiveOut { tokens } => format!("↓ {tokens}").into(),
         Msg::LiveCached { hit } => format!("缓存 {hit}").into(),
+        Msg::LiveSpeedPending => "— tok/s".into(),
         Msg::LiveSpeed { rate } => format!("{rate} tok/s").into(),
         Msg::FoldedLines { hidden } => format!("⋯ 已折叠 {hidden} 行，点击展开").into(),
         Msg::MoreBelow { arrow, lines } => format!(" {arrow} 还有 {lines} 行 · 点击回到底部 ").into(),
