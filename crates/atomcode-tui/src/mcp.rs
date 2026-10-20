@@ -161,6 +161,16 @@ impl McpView {
         &self.rows
     }
 
+    /// 名单里还有没落定的吗——有的话,这一份就还可能变。
+    ///
+    /// 只有 `Connecting` 算:失败与断开是终态,再问也不会自己好;正在连的会。
+    /// 面板据此决定要不要自己再读一遍(`plugin.rs::poll_mcp_while_unsettled`)。
+    pub fn unsettled(&self) -> bool {
+        self.rows
+            .iter()
+            .any(|row| row.state == McpState::Connecting)
+    }
+
     pub fn detail(&self) -> Option<&McpDetail> {
         self.detail.as_ref()
     }
@@ -574,6 +584,34 @@ mod tests {
 
         // A second Esc, now on the list, is what closes it.
         assert_eq!(key(&view, &mut panel, press(Key::Esc)), Step::Close);
+    }
+
+    /// 名单里还有正在连的,这一份就还可能变;全是终态就不再问。
+    ///
+    /// 只有 `Connecting` 算「还没落定」:失败与断开再问也不会自己好。面板据此决定
+    /// 要不要自己再读一遍(`plugin.rs::poll_mcp_while_unsettled`)。
+    #[test]
+    fn a_view_is_unsettled_exactly_while_a_row_is_still_coming_up() {
+        let settled = view_of(&["alpha"]);
+        assert!(!settled.unsettled(), "连着的那一台是落定的");
+
+        let coming_up = McpView::new(vec![McpRow {
+            state: McpState::Connecting,
+            ..row("beta")
+        }]);
+        assert!(coming_up.unsettled(), "还有一台在连");
+
+        let failed = McpView::new(vec![McpRow {
+            state: McpState::Failed("refused".into()),
+            ..row("gamma")
+        }]);
+        assert!(!failed.unsettled(), "失败是终态");
+
+        let gone = McpView::new(vec![McpRow {
+            state: McpState::Disconnected,
+            ..row("delta")
+        }]);
+        assert!(!gone.unsettled(), "断开也是终态");
     }
 
     #[test]

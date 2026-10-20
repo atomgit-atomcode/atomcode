@@ -1334,6 +1334,10 @@ pub struct Tui {
     /// When the allowance was last asked about, so it is not asked again for
     /// [`ALLOWANCE_EVERY`]. `None` until the first turn ends.
     allowance_checked: Mutex<Option<std::time::Instant>>,
+    /// When the open MCP panel last re-read the directory on its own, so a row
+    /// that is still coming up is not asked about on every beat. `None` until
+    /// the first poll.
+    mcp_polled: Mutex<Option<std::time::Instant>>,
     /// Whether the "out of quota — here is `/openrouter`" line has been said.
     /// Once per screen: the account stays out until the window turns over, and a
     /// line that came back every turn would be one more thing to read past.
@@ -2300,14 +2304,18 @@ impl UserInterface for Tui {
                 }
                 Wake::PullBgQuestion => self.pour_bg_question(),
                 Wake::Tick => {
-                    let mut m = self.host.moment.write().expect("moment poisoned");
-                    if m.scrollbar_until
-                        .is_some_and(|t| t <= tokio::time::Instant::now())
                     {
-                        m.scrollbar_until = None;
+                        let mut m = self.host.moment.write().expect("moment poisoned");
+                        if m.scrollbar_until
+                            .is_some_and(|t| t <= tokio::time::Instant::now())
+                        {
+                            m.scrollbar_until = None;
+                        }
+                        m.tick = m.tick.wrapping_add(1);
                     }
-                    m.tick = m.tick.wrapping_add(1);
                     stale = true;
+                    // Nothing else tells an open panel that its servers settled.
+                    self.poll_mcp_while_unsettled();
                 }
                 // A drag held still at the conversation's edge: one more row.
                 Wake::EdgeScroll => {
@@ -3923,6 +3931,45 @@ impl Tui {
                 let _ = keys.send(Wake::Fact);
             }
         });
+    }
+
+    /// How often an open MCP panel re-reads the directory while a row is still
+    /// coming up. Low: this is catching up with something that takes seconds to
+    /// tens of seconds, not following a moving target.
+    const MCP_POLL_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// Keep an open MCP panel honest while its rows are still coming up.
+    ///
+    /// The panel reads the directory when it opens and after each action, never
+    /// per frame ([`Action::ToggleMcp`]). That leaves it holding the snapshot
+    /// taken the instant a rebuilding action started — every other server still
+    /// 「连接中」 — with nothing to move it on, and the question that settles them
+    /// is on the other side of the seam. So: while the panel is up AND at least
+    /// one row is unsettled, ask again, at most once per [`Self::MCP_POLL_EVERY`].
+    /// Once every row has settled, this stops asking: the panel is a report, not
+    /// a monitor.
+    fn poll_mcp_while_unsettled(&self) {
+        if !self.host.mcp_open() {
+            return;
+        }
+        let unsettled = self
+            .host
+            .moment
+            .read()
+            .expect("moment poisoned")
+            .mcp
+            .unsettled();
+        if !unsettled {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let mut polled = self.mcp_polled.lock().expect("mcp poll poisoned");
+        if polled.is_some_and(|at| now.duration_since(at) < Self::MCP_POLL_EVERY) {
+            return;
+        }
+        *polled = Some(now);
+        drop(polled);
+        self.refresh_mcp();
     }
 
     /// Ask what the MCP servers are, and put them on the panel.
@@ -10490,6 +10537,7 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
             ctx: Mutex::new(None),
             wake: Mutex::new(None),
             allowance_checked: Mutex::new(None),
+            mcp_polled: Mutex::new(None),
             allowance_nudged: Arc::new(AtomicBool::new(false)),
             reasoning_hinted: AtomicBool::new(false),
             asks_ledger: Mutex::new(crate::ask::Ledger::default()),
