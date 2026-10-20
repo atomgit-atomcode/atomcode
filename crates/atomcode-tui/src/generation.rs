@@ -1,72 +1,150 @@
-//! Ephemeral stream throughput. The host supplies time; replay does not invent it.
+//! Ephemeral turn-average throughput. The host supplies time; replay invents none.
 use crate::moment::Timestamp;
 use atomcode_harness::session::SessionEvent;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Generation {
-    request: Option<(u64, u32)>,
-    phase: Option<bool>,
+struct Request {
+    id: (u64, u32),
     started: Option<Timestamp>,
+    ended: Option<Timestamp>,
     chars: u64,
+    reported: Option<u32>,
+}
+
+impl Request {
+    fn reading(&self, now: Timestamp) -> Option<(u64, u64)> {
+        let started = self.started?;
+        let ms = self
+            .ended
+            .unwrap_or(now)
+            .as_millis()
+            .saturating_sub(started.as_millis());
+        let tokens = self.reported.map(u64::from).unwrap_or(self.chars / 4);
+        (ms > 0).then_some((tokens, ms))
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Generation {
+    turn: Option<u64>,
+    request: Option<Request>,
+    completed_tokens: u64,
+    completed_ms: u64,
 }
 
 impl Generation {
     pub fn absorb(&mut self, event: &SessionEvent, now: Timestamp) {
         match event {
-            SessionEvent::RequestHeader { turn, round, .. } => {
+            SessionEvent::TurnStart { turn } => {
                 *self = Self {
-                    request: Some((*turn, *round)),
+                    turn: Some(*turn),
                     ..Self::default()
                 };
             }
-            SessionEvent::AssistantChunk {
-                turn,
-                round,
-                delta,
-                reasoning,
-            } if self.request == Some((*turn, *round)) && !delta.is_empty() => {
-                if self.phase != Some(*reasoning) {
-                    self.phase = Some(*reasoning);
-                    self.started = Some(now);
-                    self.chars = 0;
+            SessionEvent::TurnEnd { turn, .. } if self.turn == Some(*turn) => {
+                *self = Self::default();
+            }
+            SessionEvent::RequestHeader { turn, round, .. }
+                if self.turn.is_none_or(|active| active == *turn) =>
+            {
+                let id = (*turn, *round);
+                if self
+                    .request
+                    .as_ref()
+                    .is_some_and(|request| request.id >= id)
+                {
+                    return;
                 }
-                self.chars = self.chars.saturating_add(delta.chars().count() as u64);
+                if let Some(request) = self
+                    .request
+                    .take()
+                    .filter(|request| request.ended.is_some())
+                {
+                    if let Some((tokens, ms)) = request.reading(now) {
+                        self.completed_tokens = self.completed_tokens.saturating_add(tokens);
+                        self.completed_ms = self.completed_ms.saturating_add(ms);
+                    }
+                }
+                self.turn = Some(*turn);
+                self.request = Some(Request {
+                    id,
+                    ..Request::default()
+                });
+            }
+            SessionEvent::AssistantChunk {
+                turn, round, delta, ..
+            } => {
+                if let Some(request) = self.request.as_mut().filter(|request| {
+                    request.id == (*turn, *round) && request.ended.is_none() && !delta.is_empty()
+                }) {
+                    request.started.get_or_insert(now);
+                    request.chars = request.chars.saturating_add(delta.chars().count() as u64);
+                }
+            }
+            SessionEvent::Usage { turn, round, usage } => {
+                if let Some(request) = self
+                    .request
+                    .as_mut()
+                    .filter(|request| request.id == (*turn, *round))
+                {
+                    request.reported = Some(usage.completion);
+                    request.ended.get_or_insert(now);
+                }
+            }
+            SessionEvent::AssistantMessage { turn, round, .. } => {
+                if let Some(request) = self
+                    .request
+                    .as_mut()
+                    .filter(|request| request.id == (*turn, *round))
+                {
+                    request.ended.get_or_insert(now);
+                }
             }
             SessionEvent::Notice {
+                turn,
                 notice: atomcode_harness::session::NoticeKind::ProviderRetry,
                 ..
-            } => {
-                self.phase = None;
-                self.started = None;
-                self.chars = 0;
-            }
-            SessionEvent::AssistantMessage { turn, round, .. }
-                if self.request == Some((*turn, *round)) =>
-            {
-                *self = Self::default();
-            }
-            SessionEvent::TurnStart { .. } | SessionEvent::TurnEnd { .. } => {
-                *self = Self::default();
+            } if self.turn == Some(*turn) => {
+                if let Some(request) = self
+                    .request
+                    .as_mut()
+                    .filter(|request| request.ended.is_none())
+                {
+                    // Discard the failed attempt, keeping successful earlier requests.
+                    *request = Request {
+                        id: request.id,
+                        ..Request::default()
+                    };
+                }
             }
             _ => {}
         }
     }
 
-    /// Same rough four characters/token estimate as classic tuix, never billing usage.
+    /// Streaming estimate only; provider usage corrects the rate at request end.
     pub fn tokens(&self) -> u64 {
-        self.chars / 4
+        self.request.as_ref().map_or(0, |request| request.chars / 4)
     }
 
+    /// Weighted turn average. First-token waits and gaps between requests do not
+    /// enter the denominator. Reasoning and prose belong to the same generation.
     pub fn rate(&self, now: Timestamp) -> Option<u64> {
-        let ms = now.as_millis().saturating_sub(self.started?.as_millis());
-        (ms >= 1_000 && self.tokens() > 0)
-            .then(|| (self.tokens() as f64 * 1_000.0 / ms as f64).round() as u64)
+        let (tokens, ms) = self
+            .request
+            .as_ref()
+            .and_then(|request| request.reading(now))
+            .unwrap_or_default();
+        let tokens = self.completed_tokens.saturating_add(tokens);
+        let ms = self.completed_ms.saturating_add(ms);
+        (ms >= 1_000 && tokens > 0).then(|| (tokens as f64 * 1_000.0 / ms as f64).round() as u64)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atomcode_kernel::stream::TokenUsage;
+
     fn header(round: u32) -> SessionEvent {
         SessionEvent::RequestHeader {
             turn: 1,
@@ -83,63 +161,95 @@ mod tests {
             reasoning,
         }
     }
-    #[test]
-    fn speed_counts_current_phase_and_excludes_waiting_and_old_requests() {
-        let mut g = Generation::default();
-        g.absorb(&header(1), Timestamp::millis(0));
-        assert_eq!(g.rate(Timestamp::millis(60_000)), None);
-        g.absorb(&chunk(1, true, &"a".repeat(400)), Timestamp::millis(60_000));
-        assert_eq!(g.tokens(), 100);
-        assert_eq!(g.rate(Timestamp::millis(60_999)), None);
-        assert_eq!(g.rate(Timestamp::millis(62_000)), Some(50));
-        g.absorb(&chunk(1, false, "abcdefgh"), Timestamp::millis(63_000));
-        assert_eq!(g.tokens(), 2);
-        assert_eq!(g.rate(Timestamp::millis(64_000)), Some(2));
-        g.absorb(&header(2), Timestamp::millis(90_000));
-        g.absorb(&chunk(1, true, "late chunk"), Timestamp::millis(91_000));
-        assert_eq!(g.tokens(), 0);
-        assert_eq!(g.rate(Timestamp::millis(92_000)), None);
+    fn usage(round: u32, completion: u32) -> SessionEvent {
+        SessionEvent::Usage {
+            turn: 1,
+            round,
+            usage: TokenUsage {
+                prompt: 100,
+                completion,
+                cached: 0,
+            },
+        }
+    }
+    fn message(round: u32) -> SessionEvent {
+        SessionEvent::AssistantMessage {
+            turn: 1,
+            round,
+            text: String::new(),
+            reasoning: String::new(),
+            tool_calls: vec![],
+            reasoning_blocks: vec![],
+            meta: None,
+        }
+    }
+    fn at(g: &mut Generation, event: SessionEvent, ms: u64) {
+        g.absorb(&event, Timestamp::millis(ms));
     }
     #[test]
-    fn completed_generation_and_retry_clear_the_display() {
+    fn averages_requests_and_holds_during_tools_and_first_token_waits() {
         let mut g = Generation::default();
-        g.absorb(&header(1), Timestamp::millis(0));
-        g.absorb(&chunk(1, true, "你好世界"), Timestamp::millis(100));
-        assert_eq!(g.tokens(), 1, "count characters, not UTF-8 bytes");
-        g.absorb(
-            &SessionEvent::Notice {
+        at(&mut g, header(1), 0);
+        assert_eq!(g.rate(Timestamp::millis(60_000)), None);
+        at(&mut g, chunk(1, true, &"a".repeat(400)), 60_000);
+        assert_eq!(g.rate(Timestamp::millis(60_999)), None);
+        at(&mut g, chunk(1, false, &"a".repeat(400)), 61_000);
+        assert_eq!(g.rate(Timestamp::millis(62_000)), Some(100));
+        at(&mut g, usage(1, 300), 62_000);
+        at(&mut g, message(1), 62_000);
+        assert_eq!(g.rate(Timestamp::millis(90_000)), Some(150));
+        at(&mut g, header(2), 90_000);
+        assert_eq!(g.rate(Timestamp::millis(150_000)), Some(150));
+        at(&mut g, chunk(1, true, "late chunk"), 150_000);
+        at(&mut g, usage(1, 999), 150_000);
+        at(&mut g, chunk(2, false, &"a".repeat(400)), 150_000);
+        at(&mut g, usage(2, 100), 154_000);
+        assert_eq!(
+            g.rate(Timestamp::millis(200_000)),
+            Some(67),
+            "400 tokens / 6 seconds, not the mean of request rates"
+        );
+    }
+    #[test]
+    fn retry_discards_partial_attempt_but_preserves_successful_requests() {
+        let mut g = Generation::default();
+        at(&mut g, header(1), 0);
+        at(&mut g, chunk(1, false, "你好世界"), 100);
+        assert_eq!(g.tokens(), 1, "characters, not UTF-8 bytes");
+        at(&mut g, usage(1, 100), 2_100);
+        at(&mut g, header(2), 3_000);
+        at(&mut g, chunk(2, true, &"a".repeat(400)), 4_000);
+        at(
+            &mut g,
+            SessionEvent::Notice {
                 turn: 1,
                 notice: atomcode_harness::session::NoticeKind::ProviderRetry,
                 detail: String::new(),
                 retry: None,
             },
-            Timestamp::millis(200),
+            5_000,
         );
         assert_eq!(g.tokens(), 0);
-        g.absorb(&chunk(1, false, "aabbccdd"), Timestamp::millis(10_000));
-        assert_eq!(
-            g.rate(Timestamp::millis(11_000)),
-            Some(2),
-            "retry may resume within the same request header"
-        );
-        g.absorb(
-            &SessionEvent::AssistantMessage {
-                turn: 1,
-                round: 1,
-                text: String::new(),
-                reasoning: String::new(),
-                tool_calls: vec![],
-                reasoning_blocks: vec![],
-                meta: None,
-            },
-            Timestamp::millis(11_000),
-        );
-        assert_eq!(g.tokens(), 0);
-        g.absorb(
-            &SessionEvent::TurnStart { turn: 2 },
-            Timestamp::millis(12_000),
-        );
-        assert_eq!(g.tokens(), 0);
-        assert_eq!(g.rate(Timestamp::millis(2_000)), None);
+        assert_eq!(g.rate(Timestamp::millis(100_000)), Some(50));
+        at(&mut g, chunk(2, false, &"a".repeat(400)), 100_000);
+        at(&mut g, message(2), 102_000);
+        // Also accept usage after the message without counting that request twice.
+        at(&mut g, usage(2, 300), 110_000);
+        assert_eq!(g.rate(Timestamp::millis(120_000)), Some(100));
+        at(&mut g, SessionEvent::TurnStart { turn: 2 }, 130_000);
+        at(&mut g, usage(2, 999), 131_000);
+        assert_eq!(g.rate(Timestamp::millis(140_000)), None);
+    }
+    #[test]
+    fn replay_and_zero_duration_do_not_invent_speed() {
+        let mut g = Generation::default();
+        at(&mut g, header(1), 0);
+        at(&mut g, usage(1, 100), 0);
+        at(&mut g, message(1), 0);
+        assert_eq!(g.rate(Timestamp::millis(100_000)), None);
+        at(&mut g, header(2), 100_000);
+        at(&mut g, chunk(2, false, "abcd"), 101_000);
+        at(&mut g, usage(2, 1), 101_000);
+        assert_eq!(g.rate(Timestamp::millis(200_000)), None);
     }
 }

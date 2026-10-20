@@ -3190,19 +3190,16 @@ pub const DONE_LABELS: &[&str] = &[
     "Tied off",
 ];
 
-/// The cached share of one request's context, as a percentage to two decimals.
+/// Cached tokens as a share of input tokens, to two decimals. Callers supply
+/// either one request's reading or totals over the same set of requests.
 ///
 /// `None` when the provider said nothing about caching: one that does not report
 /// it reports zero, and printing `0.00%` would state a fact we do not have — the
 /// same rule as the status line's dropped zero counter.
 ///
-/// **Two decimals, and one function.** The live line, the end of a turn and the
-/// figure a person compares them against all describe the same request, on the
-/// same screen; `98%` beside `98.15%` is a disagreement someone has to stop and
-/// resolve, and at a context of tens of thousands of tokens the whole integer
-/// part is 99 for a long stretch — the decimals are the only part of this number
-/// that moves.
-pub fn cache_hit_rate(cached: u32, prompt: u32) -> Option<String> {
+/// Keep two decimals wherever this share is rendered. With large contexts,
+/// the decimals often carry the only visible change in cache reuse.
+pub fn cache_hit_rate(cached: u64, prompt: u64) -> Option<String> {
     (cached > 0 && prompt > 0).then(|| format!("{:.2}%", cached as f64 * 100.0 / prompt as f64))
 }
 

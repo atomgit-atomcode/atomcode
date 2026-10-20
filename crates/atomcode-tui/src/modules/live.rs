@@ -22,12 +22,11 @@
 //! Nothing is invented. A figure with no fact behind it is left out rather than
 //! printed as zero: no reading yet means no number, not `0 tok`.
 //!
-//! The figures are counted the two ways the facts demand, and the line is where
-//! both are visible at once: `入` and `缓存` are the *latest* request's own
-//! readings — the context is re-sent whole every round, so summing would count
-//! the same tokens once per round — while `出` is summed over the turn, because
-//! each round's output is new. `耗时` is neither: it is the difference of two
-//! readings the host injected.
+//! Input shows the latest request's context size. Output, cache reuse and
+//! generation throughput describe the whole turn. Cache reuse weights every
+//! request's cached tokens by its input tokens; this measures reuse across the
+//! turn, rather than pretending the repeated inputs are a larger context.
+//! `耗时` remains the wall time injected by the host.
 //!
 //! Its place on screen is written once, by `host::composer`, rather than claimed
 //! with `LayoutOp::Show` the way the mascot and the team strip claim theirs: it
@@ -89,17 +88,11 @@ pub struct State {
     /// request re-sends a prefix of the same input — the trap `TurnStats` in
     /// `content` spells out.
     output: u32,
-    /// The context the turn's **last** reading sent, and the part of it that came
-    /// from cache.
-    ///
-    /// Last one wins rather than summed, for the reason `output` is the other way
-    /// round: request four re-sends requests one to three, so adding them up
-    /// counts the same tokens four times and reports a number about nothing.
-    /// Kept as a pair because the share is only a fact about the request they
-    /// were both read off: a ratio folded from two rounds' readings would be a
-    /// percentage of nothing anyone asked for.
+    /// Context size of the latest request, not the sum of repeated inputs.
     prompt: u32,
-    cached: u32,
+    /// All input and cached tokens reported in this turn, for weighted reuse.
+    cache_prompt: u64,
+    cached: u64,
     retry: Option<atomcode_harness::session::RetryAttempt>,
 }
 
@@ -163,10 +156,9 @@ impl View for Live {
             // nobody reading that number could tell whose work it was.
             SessionEvent::Usage { turn, usage, .. } if state.turn == Some(*turn) => {
                 state.output = state.output.saturating_add(usage.completion);
-                // Overwritten, not added to: this is what the *latest* request
-                // sent. The pair moves together or the share is nonsense.
                 state.prompt = usage.prompt;
-                state.cached = usage.cached;
+                state.cache_prompt = state.cache_prompt.saturating_add(u64::from(usage.prompt));
+                state.cached = state.cached.saturating_add(u64::from(usage.cached));
             }
             _ => {}
         }
@@ -525,13 +517,8 @@ fn doing(state: &State, moment: &Moment) -> Option<String> {
 /// follows the authoritative token counts and precedes the cache share. On a
 /// narrow screen, the trailing figures are dropped whole.
 ///
-/// Two of these are readings of the **last** request and two are sums over the
-/// turn, which is not an inconsistency but the only honest way to count them:
-/// `入` and `缓存` describe a context that is re-sent whole every round (so the
-/// latest reading *is* the current one), while `出` is work each round did once.
-/// A sum of `入` would be a number nothing measured, and a last-only `出` would
-/// throw away what the turn has produced. `耗时` is neither: it is a difference
-/// of two readings the host injected.
+/// Input is the latest context size; output, speed and cache reuse cover the
+/// whole turn. Elapsed time includes waiting and tools; generation time does not.
 fn parts(state: &State, moment: &Moment) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     // Compacting: its own clock and nothing else. Every other figure here
@@ -575,7 +562,7 @@ fn parts(state: &State, moment: &Moment) -> Vec<String> {
     if let Some(rate) = moment.generation.rate(moment.now) {
         out.push(t(Msg::LiveSpeed { rate }).into_owned());
     }
-    if let Some(hit) = crate::content::cache_hit_rate(state.cached, state.prompt) {
+    if let Some(hit) = crate::content::cache_hit_rate(state.cached, state.cache_prompt) {
         out.push(t(Msg::LiveCached { hit: &hit }).into_owned());
     }
     out
@@ -1248,11 +1235,10 @@ mod tests {
         }
     }
 
-    /// The two ways of counting sit next to each other on purpose, and this is
-    /// what says which is which: the context is re-sent whole every round, so
-    /// only the latest reading describes it, while each round's output is new.
+    /// Context size stays latest-only; output and weighted cache reuse cover
+    /// every request in the turn.
     #[test]
-    fn the_context_is_the_last_round_and_the_output_is_the_whole_turn() {
+    fn context_is_latest_while_output_and_cache_reuse_cover_the_turn() {
         let mut state = fold(&a_turn());
         assert!(working(&state, 0)[0].contains("↑ 1.2K"));
         assert!(working(&state, 0)[0].contains("缓存 33.33%"));
@@ -1280,9 +1266,31 @@ mod tests {
         );
         assert!(said.contains("↓ 100"), "the output adds up: {said}");
         assert!(
-            said.contains("缓存 75.00%"),
-            "the share comes off the same reading as the context: {said}"
+            said.contains("缓存 59.38%"),
+            "weighted reuse is (400 + 1500) / (1200 + 2000): {said}"
         );
+    }
+
+    #[test]
+    fn cumulative_cache_reuse_does_not_saturate_at_one_request_counter_width() {
+        let mut state = State::default();
+        Live::absorb(&mut state, &SessionEvent::TurnStart { turn: 1 });
+        for round in 1..=3 {
+            Live::absorb(
+                &mut state,
+                &SessionEvent::Usage {
+                    turn: 1,
+                    round,
+                    usage: TokenUsage {
+                        prompt: 2_000_000_000,
+                        cached: 1_000_000_000,
+                        completion: 1,
+                    },
+                },
+            );
+        }
+        let said = working(&state, 0)[0].clone();
+        assert!(said.contains("缓存 50.00%"), "{said}");
     }
 
     /// A provider that says nothing about caching has not told us the context
@@ -1416,6 +1424,7 @@ mod tests {
         let mut state = fold(&a_turn());
         state.prompt = 150_700;
         state.output = 20_100;
+        state.cache_prompt = 150_700;
         state.cached = 145_413;
         let mut moment = Moment::default().working();
         moment.turn_started = Some(Timestamp::millis(0));
@@ -1443,11 +1452,40 @@ mod tests {
             line.contains("↑ 150.7K · ↓ 20.1K · 50 tok/s · 缓存 96.49%"),
             "{line}"
         );
+        assert!(!line.contains("均速"), "{line}");
         assert!(!line.contains('≈'), "{line}");
         assert!(!line.contains("第"), "{line}");
         let narrow = line_at(&state, &moment, 20);
         assert!(width::str_width(&narrow) <= 20);
         assert!(!narrow.contains("tok/s"), "drop whole figures: {narrow}");
+
+        // Completion calibrates the estimate; tools and the next request's
+        // first-token wait retain it without adding wall time to generation.
+        for event in [
+            SessionEvent::Usage {
+                turn: 1,
+                round: 1,
+                usage: TokenUsage {
+                    prompt: 100,
+                    completion: 200,
+                    cached: 50,
+                },
+            },
+            SessionEvent::RequestHeader {
+                turn: 1,
+                round: 2,
+                model: "m".into(),
+                reason: HeaderReason::Append,
+            },
+        ] {
+            moment.generation.absorb(&event, moment.now);
+            Live::absorb(&mut state, &event);
+        }
+        moment.now = Timestamp::millis(120_000);
+        let waiting = line_at(&state, &moment, 180);
+        assert!(waiting.contains("正在等待模型"), "{waiting}");
+        assert!(waiting.contains("100 tok/s"), "{waiting}");
+        assert!(!waiting.contains("均速"), "{waiting}");
     }
 
     #[test]
