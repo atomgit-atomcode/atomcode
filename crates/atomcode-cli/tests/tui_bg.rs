@@ -1049,8 +1049,9 @@ async fn the_other_runtime_commands_work_after_a_history_session_is_resumed() {
     rig.until_screen("现在没有卡住的策略边界要你决定").await;
     rig.term.type_line("/worktree list");
     rig.until_screen("← 当前").await;
-    let project = rig.project.path().canonicalize().unwrap();
-    assert!(rig.term.text().contains(project.to_str().unwrap()));
+    let project =
+        atomcode_capabilities::pathnorm::to_display(&rig.project.path().canonicalize().unwrap());
+    assert!(rig.term.text().contains(&project));
 
     rig.term.type_line("/queue slow queued context");
     rig.until_screen("排好了").await;
@@ -1094,8 +1095,9 @@ async fn the_other_runtime_commands_work_after_a_history_session_is_resumed() {
     })
     .await;
     rig.term.type_line("/worktree list");
-    let other_path = other.path().canonicalize().unwrap();
-    rig.until_screen(other_path.to_str().unwrap()).await;
+    let other_path =
+        atomcode_capabilities::pathnorm::to_display(&other.path().canonicalize().unwrap());
+    rig.until_screen(&other_path).await;
     rig.until_screen("← 当前").await;
     rig.release();
     rig.quit().await;

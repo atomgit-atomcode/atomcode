@@ -706,11 +706,11 @@ async fn json_permissions_follow_sessions_and_directories_and_survive_a_model_pa
     turn(&mut runtime, "describe operations").await;
     let said = last_tool_result(&recorder);
     assert!(
+        // The rendered message shows the plain native path, while raw
+        // `canonicalize` on Windows answers with the `\\?\` verbatim prefix —
+        // strip it so the containment check compares like with like.
         said.contains(
-            &settings
-                .parent()
-                .unwrap()
-                .canonicalize()
+            &atomcode_capabilities::pathnorm::canonicalize(settings.parent().unwrap())
                 .unwrap()
                 .display()
                 .to_string()
@@ -959,8 +959,6 @@ async fn a_session_a_released_build_stored_is_converted_when_resumed() {
 /// A write to the session's log that fails stops the session: a log with a hole
 /// in it would replay into a conversation that never happened.
 async fn a_failed_write_to_the_log_stops_the_session() {
-    use std::os::unix::fs::PermissionsExt;
-
     let env = env();
     let recorder = Arc::new(Recorder::default());
     let mut runtime =
@@ -976,7 +974,12 @@ async fn a_failed_write_to_the_log_stops_the_session() {
     )
     .events_path(&id)
     .unwrap();
-    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o444)).unwrap();
+    // Cross-platform spelling of "drop every write bit" (0o444 on Unix, the
+    // read-only attribute on Windows): the session-store fail-close must hold
+    // on both.
+    let mut perms = std::fs::metadata(&log).unwrap().permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&log, perms).unwrap();
 
     runtime.handle.submit(UserInput::from("two")).await.unwrap();
     let mut stopped = false;
@@ -994,7 +997,9 @@ async fn a_failed_write_to_the_log_stops_the_session() {
             _ => {}
         }
     }
-    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let mut perms = std::fs::metadata(&log).unwrap().permissions();
+    perms.set_readonly(false);
+    std::fs::set_permissions(&log, perms).unwrap();
     assert!(
         stopped,
         "the runtime went on after its log could not be written"
@@ -1575,6 +1580,10 @@ async fn a_persons_hooks_and_a_plugins_hooks_both_run() {
 ///
 /// Negative control: send a refused call through `post_tool` in `CcHooks` and
 /// the failure log gains a `grep` entry.
+///
+/// The hook script is POSIX shell (`$(cat)`, `case … esac`); hook commands run
+/// under `cmd /C` on Windows, so this scenario is Unix-only by construction.
+#[cfg(unix)]
 async fn the_failure_hook_hears_what_ran_by_name_and_not_what_was_refused() {
     let env = env();
     let project = env.project.path();
@@ -6312,8 +6321,9 @@ async fn what_the_configuration_lost_is_said_when_the_runtime_starts() {
 /// environment (`ATOMCODE_HOME`, the offline verdict), which is also why each is
 /// its own process under `cargo nextest`.
 macro_rules! criteria {
-    ($($scenario:ident),* $(,)?) => {
+    ($($(#[$gate:meta])* $scenario:ident),* $(,)?) => {
         $(
+            $(#[$gate])*
             #[tokio::test]
             #[serial_test::serial(engine)]
             async fn $scenario() {
@@ -6361,6 +6371,7 @@ mod criteria {
         the_session_context_is_shown_and_its_git_snapshot_survives_a_resume,
         a_turn_is_transcribed_and_metered,
         a_persons_hooks_and_a_plugins_hooks_both_run,
+        #[cfg(unix)]
         the_failure_hook_hears_what_ran_by_name_and_not_what_was_refused,
         a_stop_hook_is_pointed_at_the_sessions_log,
         the_datalog_is_written_when_it_is_on,
@@ -6382,6 +6393,7 @@ mod criteria {
         the_ui_language_does_not_reach_the_persona,
         a_permission_rule_refuses_what_it_denies,
         a_round_budget_ends_the_turn,
+        #[cfg(unix)]
         what_the_model_is_told_about_mcp_only_names_ways_this_build_has,
         an_mcp_servers_tools_are_offered_and_run,
         reconnecting_one_mcp_keeps_its_neighbor_and_session,
@@ -6389,10 +6401,15 @@ mod criteria {
         a_slow_mcp_tool_discovery_can_be_cancelled_from_its_panel,
         shutdown_interrupts_a_slow_mcp_reconnect,
         withdrawing_mcp_takes_the_tools_off_the_model,
+        #[cfg(unix)]
         a_servers_instructions_are_in_the_system_prompt,
+        #[cfg(unix)]
         a_switched_session_keeps_the_mcp_tools,
+        #[cfg(unix)]
         always_allowing_an_mcp_tool_holds_for_the_session_and_is_written,
+        #[cfg(unix)]
         an_undo_or_a_restore_keeps_the_mcp_tools,
+        #[cfg(unix)]
         a_failed_mcp_connection_is_metered,
         a_model_round_reports_how_long_it_took,
         every_metered_event_says_which_turn_and_round_it_was,
@@ -6427,6 +6444,7 @@ mod criteria {
         a_picture_read_reaches_a_model_that_can_see_it,
         every_model_round_is_reported_even_without_usage,
         the_agent_is_told_where_its_session_really_is,
+        #[cfg(unix)]
         a_capability_the_runtime_mounts_itself_still_describes_itself,
         a_runtime_configured_from_a_file_describes_the_file,
         a_runtime_under_another_name_keeps_to_its_own_dirs,

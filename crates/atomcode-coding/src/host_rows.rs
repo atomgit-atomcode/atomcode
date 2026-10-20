@@ -3541,10 +3541,13 @@ mod tests {
     ///
     /// The root is canonicalized because git's answers are: on macOS a `/var`
     /// tempdir and git's `/private/var` are one place spelled two ways, and
-    /// every path compared below is one of git's.
+    /// every path compared below is one of git's. On Windows raw `canonicalize`
+    /// answers with the `\\?\` verbatim prefix git never prints, so the
+    /// capabilities `pathnorm` form strips it before anything is compared.
     fn a_repository() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path().canonicalize().expect("canonical root");
+        let root =
+            atomcode_capabilities::pathnorm::canonicalize(dir.path()).expect("canonical root");
         git(&root, &["init", "-q"]);
         git(&root, &["config", "user.email", "t@example.com"]);
         git(&root, &["config", "user.name", "t"]);
@@ -4229,7 +4232,10 @@ mod tests {
         assert_eq!(
             said,
             atomcode_config::i18n::t(atomcode_config::i18n::Msg::WorktreeReturned {
-                path: &root.display().to_string(),
+                // The message is a UI boundary: the production side renders the
+                // path in the display form (forward slashes on Windows), so the
+                // expectation is built the same way instead of `root.display()`.
+                path: &atomcode_capabilities::pathnorm::to_display(&root),
             })
         );
     }
