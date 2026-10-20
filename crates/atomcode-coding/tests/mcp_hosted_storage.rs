@@ -450,6 +450,17 @@ async fn the_runtime_edits_the_host_kept_documents_through_update() {
         json!(["echo"])
     );
 
+    // A disable and an enable in one session is a pair of switch flips: the
+    // server's tools are held back rather than taken off, so nothing is rebuilt
+    // and no server is dialled again. A rebuild would show up here as one more
+    // start in `spawns` — the same evidence the rebuild test counts.
+    let spawned = || {
+        std::fs::read_to_string(env.spawns())
+            .unwrap()
+            .lines()
+            .count()
+    };
+    let before = spawned();
     runtime
         .handle
         .mcp_act("u".into(), McpAction::Disable)
@@ -461,6 +472,11 @@ async fn the_runtime_edits_the_host_kept_documents_through_update() {
         .mcp_act("u".into(), McpAction::Enable)
         .await
         .expect("enable");
+    assert_eq!(
+        spawned(),
+        before,
+        "switching one server off and on rebuilds nothing"
+    );
     let config = user_config.json();
     assert!(
         config["mcpServers"]["u"].get("disabled").is_none(),

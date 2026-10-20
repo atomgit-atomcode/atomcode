@@ -1364,7 +1364,7 @@ struct PendingMcpReconnect {
     generation: u64,
     phase: RuntimePhase,
     flag: Arc<std::sync::atomic::AtomicBool>,
-    done: Option<oneshot::Sender<Result<(), RuntimeError>>>,
+    done: Option<oneshot::Sender<Result<McpActEffect, RuntimeError>>>,
 }
 impl Drop for PendingMcpReconnect {
     fn drop(&mut self) {
@@ -1497,6 +1497,38 @@ async fn apply_mcp_action(
             Ok(())
         }
     }
+}
+
+/// What one panel action did to the live tree, told back to
+/// [`CodingRuntimeHandle::mcp_act`] so it knows whether the change still has to
+/// reach the session through a capability reload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum McpActEffect {
+    /// The live tree already carries the change: a switch, or a reconnected
+    /// server's republished tools. No reload.
+    AppliedInPlace,
+    /// The change only reaches the session through a prepare.
+    NeedsReload,
+}
+
+/// Whether `action` still needs a capability reload before it reaches the
+/// session.
+///
+/// Every rebuilding action writes something the graph READS at prepare time, so
+/// writing it changes nothing until the graph is built again. `Enable` is the
+/// one exception, and only sometimes: `Disable` holds a server's tools back
+/// through the catalog's switches instead of taking them off, so
+/// [`crate::parts::release_after_enable`] is the whole change — **when this
+/// generation already published that server's tools**. A server disabled before
+/// this runtime was assembled has nothing mounted, so enabling it still needs
+/// the prepare that builds its tools.
+///
+/// `tools_mounted` is read from the published tool names, NOT from `holds`:
+/// `holds` is empty-entry both when the person had already switched every tool
+/// off themselves (in-place is complete) and when nothing was ever mounted (a
+/// prepare is required), and only the mounted set tells those two apart.
+fn needs_reload(action: crate::parts::McpAction, tools_mounted: bool) -> bool {
+    action.rebuilds() && !(action == crate::parts::McpAction::Enable && tools_mounted)
 }
 
 struct NextPromptSuggestionOutcome {
@@ -2381,10 +2413,16 @@ impl CodingRuntimeHandle {
     /// left behind.
     ///
     /// Trust and an enabled entry are read when the graph is prepared, and
-    /// untrust and sign-out take every MCP tool off; so every action but `Disable` and `Reconnect`
+    /// untrust and sign-out take every MCP tool off; so an action that rebuilds
     /// is followed by the same capability reload `/mcp reload` runs. Without it the
     /// panel would show the server exactly as it was — untrusted after 信任,
     /// disconnected after 启用 — and the person would take the action for a no-op.
+    ///
+    /// Which action that is comes back from the runtime as an [`McpActEffect`]
+    /// rather than from binding `Enable` here: `Enable` is in-place whenever this
+    /// generation already published that server's tools, so reloading for it
+    /// would re-prepare the whole graph — reconnecting every other server — to
+    /// undo a set of switches ([`needs_reload`]).
     ///
     /// Reconnect updates one connection in place. It and rebuilding actions answer
     /// [`RuntimeError::Busy`] while a turn is running (both the
@@ -2404,8 +2442,8 @@ impl CodingRuntimeHandle {
                 done,
             })
             .map_err(|_| RuntimeError::Unavailable)?;
-        result.await.map_err(|_| RuntimeError::Unavailable)??;
-        if !action.rebuilds() {
+        let effect = result.await.map_err(|_| RuntimeError::Unavailable)??;
+        if effect == McpActEffect::AppliedInPlace {
             return Ok(());
         }
         match self.reload_capabilities().await {
@@ -3555,11 +3593,13 @@ pub enum CodingRuntimeControl {
     /// uneditable config, OAuth failure) answers `ReconfigureFailed` carrying the
     /// reason verbatim; `Untrust` and `Logout` answer `Busy` while a turn is
     /// running, because they withdraw the tools before changing trust or auth.
+    /// `Ok` carries what the action did, which is how the caller learns whether
+    /// it still owes the session a reload ([`McpActEffect`]).
     McpAct {
         generation: u64,
         server: String,
         action: crate::parts::McpAction,
-        done: oneshot::Sender<Result<(), RuntimeError>>,
+        done: oneshot::Sender<Result<McpActEffect, RuntimeError>>,
     },
     WithdrawMcpTools {
         generation: u64,
@@ -4948,7 +4988,9 @@ fn spawn_runtime_owner_with_optional_agent(
                         match result {
                             Ok(Ok(())) => {
                                 if let Some(runtime) = resources.as_ref() { tell(runtime, Some(crate::told::mcp_acted(&pending.server, crate::parts::McpAction::Reconnect))); }
-                                Ok(())
+                                // A reconnect republishes one server's tools in
+                                // place; it never owes the session a rebuild.
+                                Ok(McpActEffect::AppliedInPlace)
                             }
                             Ok(Err(error)) => Err(RuntimeError::ReconfigureFailed(error)),
                             Err(error) => {
@@ -6539,7 +6581,9 @@ fn spawn_runtime_owner_with_optional_agent(
                                 let phase = pending_mcp_reconnect.take().expect("matching reconnect").cancel().await;
                                 controls.state.store(runtime_phase_state(generation, phase), Ordering::Release);
                             }
-                            let _ = done.send(Ok(()));
+                            // Cancelling a reconnect leaves the live tree as it
+                            // is; the caller owes the session no reload.
+                            let _ = done.send(Ok(McpActEffect::AppliedInPlace));
                             continue;
                         }
                         if action == crate::parts::McpAction::Reconnect {
@@ -6558,13 +6602,23 @@ fn spawn_runtime_owner_with_optional_agent(
                             continue;
                         }
                         let said = crate::told::mcp_acted(&server, action);
+                        // Read BEFORE the action: whether this generation
+                        // published the server's tools is what decides in-place
+                        // vs prepare, and `Disable` is about to change the tool
+                        // set this reads.
+                        let tools_mounted =
+                            !runtime.parts.mcp_tools_for_server(&server).is_empty();
                         let outcome =
                             apply_mcp_action(runtime, server, action, &mut mcp_disable_holds).await;
                         if outcome.is_ok() {
                             tell(runtime, Some(said));
                         }
                         let _ = done.send(match outcome {
-                            Ok(()) => Ok(()),
+                            Ok(()) => Ok(if needs_reload(action, tools_mounted) {
+                                McpActEffect::NeedsReload
+                            } else {
+                                McpActEffect::AppliedInPlace
+                            }),
                             Err(message) => Err(RuntimeError::ReconfigureFailed(message)),
                         });
                     }
@@ -18650,6 +18704,36 @@ mod tests {
 
         assert!(runtime_events.try_recv().is_err());
         handle.shutdown().await.unwrap();
+    }
+
+    /// `Enable` is in-place whenever this generation published the server's
+    /// tools, so it owes the session no rebuild; every other rebuilding action
+    /// still does, and enabling a server that was off before the runtime was
+    /// assembled has nothing mounted to release.
+    #[test]
+    fn only_an_enable_over_mounted_tools_skips_the_rebuild() {
+        use crate::parts::McpAction;
+        assert!(
+            !needs_reload(McpAction::Reconnect, true) && !needs_reload(McpAction::Reconnect, false),
+            "重连就地,永不重建"
+        );
+        assert!(
+            !needs_reload(McpAction::CancelReconnect, false),
+            "取消重连同理"
+        );
+        assert!(!needs_reload(McpAction::Disable, true), "停用是就地开关");
+        assert!(
+            !needs_reload(McpAction::Enable, true),
+            "工具已挂上:就地还回即可"
+        );
+        assert!(
+            needs_reload(McpAction::Enable, false),
+            "启动即禁用:要装配才能把工具建出来"
+        );
+        for action in [McpAction::Trust, McpAction::Untrust, McpAction::Logout] {
+            assert!(needs_reload(action, true), "信任与凭据只经装配生效");
+            assert!(needs_reload(action, false));
+        }
     }
 
     #[tokio::test]
