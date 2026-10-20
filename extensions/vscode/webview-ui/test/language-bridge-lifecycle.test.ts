@@ -15,7 +15,12 @@ async function main() {
   let clipboard = '';
   let nextChoice = '';
   let errors = 0;
+  let lastError = '';
   let trusted = true;
+  // Desktop VS Code reports `vscode-userdata` for extension storage on some versions
+  // (1.133.0 observed); both it and `file` name this host's local user-data directory.
+  let storageScheme = 'file';
+  let folders: Array<{ uri: { scheme: string; fsPath: string } }> = [{ uri: { scheme: 'file', fsPath: root } }];
   const bar = { text: '', tooltip: '', command: '', show() {}, dispose() {} };
   const mock = {
     StatusBarAlignment: { Right: 1 },
@@ -23,13 +28,13 @@ async function main() {
     env: { appName: 'fixture IDE', clipboard: { writeText: async (text: string) => { clipboard = text; } } },
     workspace: {
       get isTrusted() { return trusted; },
-      workspaceFolders: [{ uri: { scheme: 'file', fsPath: root } }],
+      get workspaceFolders() { return folders; },
       onDidChangeWorkspaceFolders: (callback: () => void) => { foldersChanged = callback; return { dispose() {} }; },
     },
     window: {
       createStatusBarItem: () => bar,
       showInformationMessage: async () => {},
-      showErrorMessage: async () => { errors++; },
+      showErrorMessage: async (message: string) => { errors++; lastError = message; },
       showQuickPick: async (choices: Array<{ command: string }>) => choices.find(choice => choice.command === nextChoice),
     },
     commands: {
@@ -46,21 +51,49 @@ async function main() {
   module._load = function(name: string, ...args: unknown[]) {
     return name === 'vscode' ? mock : previousLoad.call(this, name, ...args);
   };
+  const bridgeDir = path.join(root, 'ide-bridge');
+  const settle = async () => {
+    for (let attempt = 0; attempt < 20 && (await fs.readdir(bridgeDir)).length; attempt++) {
+      await new Promise(resolve => setImmediate(resolve));
+    }
+  };
   try {
     const { registerLanguageBridge } = await import('../../src/languageBridge/vscode');
-    registerLanguageBridge({ subscriptions, globalStorageUri: { scheme: 'file', fsPath: root } } as never);
+    registerLanguageBridge({ subscriptions, globalStorageUri: { get scheme() { return storageScheme; }, fsPath: root } } as never);
     assert.equal(atomcodeHome(), root);
     assert.match(bar.text, /off/u);
     const invoke = async (name: string) => { assert.ok(commands.has(name)); await commands.get(name)!(); };
     trusted = false;
     await invoke('atomcode.enableLanguageBridge');
     assert.equal(errors, 1);
-    await assert.rejects(fs.access(path.join(root, 'ide-bridge')));
+    assert.match(lastError, /Trust this workspace/u);
+    await assert.rejects(fs.access(bridgeDir));
+    // Enabling must not depend on the storage scheme being spelled `file`; a host that
+    // reports `vscode-userdata` owns the same local directory the connection file needs.
     trusted = true;
+    storageScheme = 'vscode-userdata';
+    await invoke('atomcode.enableLanguageBridge');
+    assert.match(bar.text, /ready/u);
+    await invoke('atomcode.disableLanguageBridge');
+    await settle();
+    assert.deepEqual(await fs.readdir(bridgeDir), []);
+    // A scheme with no local filesystem fails, and the dialog names that reason instead
+    // of the generic "check trust and permissions" wording.
+    storageScheme = 'webdav';
+    lastError = '';
+    await invoke('atomcode.enableLanguageBridge');
+    assert.match(lastError, /local filesystem/u);
+    // No folder at all is its own reason, not "not a filesystem".
+    storageScheme = 'file';
+    folders = [];
+    lastError = '';
+    await invoke('atomcode.enableLanguageBridge');
+    assert.match(lastError, /Open a folder/u);
+    folders = [{ uri: { scheme: 'file', fsPath: root } }];
     await Promise.all([invoke('atomcode.enableLanguageBridge'), invoke('atomcode.enableLanguageBridge')]);
     assert.match(bar.text, /ready/u);
     assert.match(clipboard, /ide_discovery_dir = /u);
-    const directory = path.join(root, 'ide-bridge');
+    const directory = bridgeDir;
     const files = await fs.readdir(directory);
     assert.equal(files.length, 1, 'concurrent enable must publish only one window');
     const connection = JSON.parse(await fs.readFile(path.join(directory, files[0]), 'utf8'));
@@ -91,9 +124,7 @@ async function main() {
     await invoke('atomcode.disableLanguageBridge');
     // Await the file removal triggered by workspace change rather than assuming
     // that a second, idempotent stop owns the preceding asynchronous cleanup.
-    for (let attempt = 0; attempt < 20 && (await fs.readdir(directory)).length; attempt++) {
-      await new Promise(resolve => setImmediate(resolve));
-    }
+    await settle();
     assert.deepEqual(await fs.readdir(directory), []);
     await Promise.all([invoke('atomcode.enableLanguageBridge'), invoke('atomcode.disableLanguageBridge')]);
     assert.deepEqual(await fs.readdir(directory), []);

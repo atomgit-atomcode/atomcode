@@ -79,5 +79,9 @@
   "IDE bridge ready · window {0}": "IDE 桥接已就绪 · 窗口 {0}",
   "IDE bridge is off. Enable it in a trusted workspace.": "IDE 桥接未启用，请在可信工作区中启用。",
   "Could not enable the IDE language bridge. Check workspace trust, filesystem access and bridge directory permissions.": "无法启用 IDE 语言服务桥接，请检查工作区信任、文件访问及桥接目录权限。",
-  "IDE bridge: disconnected": "IDE 桥接：已断开"
+  "IDE bridge: disconnected": "IDE 桥接：已断开",
+  "Trust this workspace before enabling the language bridge.": "请先信任此工作区，再启用 IDE 语言服务桥接。",
+  "Open a folder in this window before enabling the language bridge.": "请先在此窗口打开一个文件夹，再启用 IDE 语言服务桥接。",
+  "The language bridge needs a folder on this host's local filesystem.": "IDE 语言服务桥接需要本机文件系统上的文件夹。",
+  "This extension host has no local filesystem for the bridge connection file.": "当前扩展宿主没有可供桥接连接文件使用的本地文件系统。"
 }

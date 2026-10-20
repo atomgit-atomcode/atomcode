@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as path from 'node:path';
 import { Document, EditorHost, Position, QueryError, QueryOperation } from './query';
 import { startBridge } from './server';
+import { isLocalStorageScheme } from './environment';
 import { atomcodeHome } from '../paths';
 
 const LIMIT = 200;
@@ -106,9 +107,12 @@ export function registerLanguageBridge(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('atomcode.enableLanguageBridge', async () => {
       let pending: typeof starting;
       try {
-        if (!vscode.workspace.isTrusted) throw new Error('Trust this workspace before enabling the language bridge.');
-        const roots = vscode.workspace.workspaceFolders?.map(folder => folder.uri).filter(uri => uri.scheme === 'file') ?? [];
-        if (!roots.length || context.globalStorageUri.scheme !== 'file') throw new Error('A filesystem workspace is required on this extension host.');
+        if (!vscode.workspace.isTrusted) throw new Error(vscode.l10n.t('Trust this workspace before enabling the language bridge.'));
+        const folders = vscode.workspace.workspaceFolders ?? [];
+        if (!folders.length) throw new Error(vscode.l10n.t('Open a folder in this window before enabling the language bridge.'));
+        const roots = folders.map(folder => folder.uri).filter(uri => uri.scheme === 'file');
+        if (!roots.length) throw new Error(vscode.l10n.t("The language bridge needs a folder on this host's local filesystem."));
+        if (!isLocalStorageScheme(context.globalStorageUri.scheme)) throw new Error(vscode.l10n.t('This extension host has no local filesystem for the bridge connection file.'));
         if (bridge && !bridge.active) bridge = undefined;
         if (!bridge) {
           const generation = epoch;
@@ -123,10 +127,14 @@ export function registerLanguageBridge(context: vscode.ExtensionContext) {
         updateStatus();
         await vscode.env.clipboard.writeText(`[lsp]\nide_discovery_dir = ${JSON.stringify(path.dirname(bridge.connectionFile))}\n`);
         void vscode.window.showInformationMessage(vscode.l10n.t('IDE language bridge enabled. Connection configuration copied; merge it into your AtomCode config and reopen the session.'));
-      } catch {
+      } catch (error) {
         if (starting === pending) starting = undefined;
         updateStatus();
-        void vscode.window.showErrorMessage(vscode.l10n.t('Could not enable the IDE language bridge. Check workspace trust, filesystem access and bridge directory permissions.'));
+        // Name the failure that actually happened: the generic wording below sent a
+        // reporter to check trust and directory permissions while the real cause was
+        // the extension host's storage scheme.
+        const detail = error instanceof Error ? error.message.trim() : '';
+        void vscode.window.showErrorMessage(detail || vscode.l10n.t('Could not enable the IDE language bridge. Check workspace trust, filesystem access and bridge directory permissions.'));
       }
     }),
     vscode.commands.registerCommand('atomcode.disableLanguageBridge', stop),
