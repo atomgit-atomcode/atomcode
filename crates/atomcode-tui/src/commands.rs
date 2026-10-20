@@ -3180,6 +3180,9 @@ impl CommandSet for AgentCatalogCommands {
             .filter(|c| !described_command_is_skill(c))
             .map(|c| {
                 let is_skills = c.name == "skills";
+                // Picking /goal prepares its condition for editing. Its bare
+                // status/help behavior remains available on explicit submit.
+                let edit_goal = c.name == "goal";
                 Command {
                     name: c.name.into(),
                     about: c.summary.into(),
@@ -3195,7 +3198,7 @@ impl CommandSet for AgentCatalogCommands {
                     },
                     // Picking `/skills` enters that second level. With no skills
                     // installed it remains a bare command and can say so itself.
-                    require_arg: is_skills && !skill_options.is_empty(),
+                    require_arg: edit_goal || (is_skills && !skill_options.is_empty()),
                     // The agent's commands are described, not typed with keys.
                     secret_args: false,
                 }
@@ -3742,6 +3745,37 @@ mod tests {
         assert!(set.starts_turn("skills", "plugin:changelog task"));
         assert!(set.starts_turn("changelog", "task"));
         assert!(!set.starts_turn("skills", "unknown task"));
+    }
+
+    #[test]
+    fn picking_goal_leaves_room_for_its_condition() {
+        let client = Arc::new(crate::plugin::AgentClient::default());
+        client.follow("lead");
+        client.describe(&atomcode_kernel::agent::AgentDescription {
+            session: "lead".into(),
+            commands: vec![atomcode_kernel::agent::CommandDescription {
+                name: "goal".into(),
+                usage: Some("[condition]".into()),
+                summary: "Work toward a goal".into(),
+                target: atomcode_kernel::agent::CommandTarget::Session,
+            }],
+            ..Default::default()
+        });
+        let set = AgentCatalogCommands { client };
+        let goal = set
+            .commands()
+            .into_iter()
+            .find(|c| c.name == "goal")
+            .unwrap();
+        assert!(
+            goal.require_arg,
+            "a menu pick must complete instead of dispatching"
+        );
+        assert!(
+            goal.takes.is_some(),
+            "completion leaves a space for the condition"
+        );
+        assert!(goal.options.is_empty(), "the condition is free text");
     }
 
     #[test]
