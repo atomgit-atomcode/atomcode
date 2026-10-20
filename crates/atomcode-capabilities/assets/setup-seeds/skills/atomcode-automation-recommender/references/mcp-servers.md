@@ -13,7 +13,6 @@ MCP (Model Context Protocol) servers extend AtomCode's capabilities by connectin
 
 **Tip**: Check `.mcp.json` into git so your whole team gets the same MCP servers.
 
-**Debugging**: Use `atomcode --mcp-debug` to identify configuration issues.
 
 ## Documentation & Knowledge
 
