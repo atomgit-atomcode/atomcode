@@ -124,6 +124,7 @@ description: 发布一个新的 release tag,更新 changelog,并打包
 
       <h2 id="allowed-tools">工具预授权：allowed-tools</h2>
       <p><code>allowed-tools</code> 声明调用此 skill 的当前回合可以免去常规审批的工具。它不是排他白名单：未列出的工具仍可调用，继续按现有权限与审批规则处理。</p>
+      <p>推荐使用 <code>allowed-tools</code>；兼容下划线别名 <code>allowed_tools</code>，校验规则相同。重复声明该字段（包括两种写法混用）会拒绝加载。</p>
       <pre><code>---
 name: setup
 description: 安装 vibekeys-plugin 的 hidapi 依赖

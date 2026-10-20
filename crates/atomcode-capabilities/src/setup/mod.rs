@@ -300,6 +300,23 @@ impl SetupReport {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "skills")]
+    #[test]
+    fn installed_bundled_skill_keeps_its_tool_preauthorizations() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = ensure_seeds_extracted(root.path()).unwrap();
+        let target = root.path().join("skills");
+        let mut summary = InstalledSummary::default();
+        install_directory_skills_from_seeds(&cache, &target, &mut summary, false);
+        assert!(summary.failed.is_empty(), "{:?}", summary.failed);
+        let registry = crate::skills::SkillRegistry::load(&[target]);
+        let skill = registry.get("setup").expect("installed setup skill");
+        assert_eq!(
+            skill.allowed_tools,
+            ["Read", "Glob", "Grep", "Bash", "Write", "Edit"]
+        );
+    }
+
     #[test]
     fn render_includes_installed_count() {
         let _g = atomcode_config::i18n::test_lock();

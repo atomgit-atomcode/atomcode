@@ -97,9 +97,19 @@ async fn mount(
     scripts: Vec<Vec<StreamEvent>>,
     deny: &[String],
 ) -> (support::Mounted, Arc<AtomicUsize>) {
+    mount_with_key(root, "allowed-tools", allowed, scripts, deny).await
+}
+
+async fn mount_with_key(
+    root: &std::path::Path,
+    key: &str,
+    allowed: &str,
+    scripts: Vec<Vec<StreamEvent>>,
+    deny: &[String],
+) -> (support::Mounted, Arc<AtomicUsize>) {
     let skills = root.join("skills/setup");
     std::fs::create_dir_all(&skills).unwrap();
-    std::fs::write(skills.join("SKILL.md"), format!("---\nname: setup\ndescription: test setup\nallowed-tools: {allowed}\n---\nRun the requested probe.")).unwrap();
+    std::fs::write(skills.join("SKILL.md"), format!("---\nname: setup\ndescription: test setup\n{key}: {allowed}\n---\nRun the requested probe.")).unwrap();
     let mut cfg = CodingAgentConfig::new(
         "k",
         "http://unused",
@@ -178,6 +188,41 @@ async fn successful_use_skill_preauthorizes_only_its_invoking_turn() {
     );
     assert_eq!(count.load(Ordering::SeqCst), 1);
     mounted.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn underscore_alias_preauthorizes_only_its_turn_and_never_overrides_deny() {
+    for denied in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let deny = if denied {
+            vec!["risky_probe".to_owned()]
+        } else {
+            vec![]
+        };
+        let (mut mounted, count) = mount_with_key(
+            root.path(),
+            "allowed_tools",
+            "[risky_probe]",
+            vec![invoke(), probe(), done(), probe(), done()],
+            &deny,
+        )
+        .await;
+        let first = support::turn(&mut mounted.handle, "setup", None).await;
+        assert!(first.asked.is_empty(), "{first:?}");
+        assert_eq!(count.load(Ordering::SeqCst), usize::from(!denied));
+        assert_eq!(
+            first
+                .tool_results
+                .iter()
+                .any(|r| r.content.contains("executed") && !r.is_error),
+            !denied,
+            "{first:?}"
+        );
+        let next = support::turn(&mut mounted.handle, "next task", None).await;
+        assert_eq!(!next.asked.is_empty(), !denied, "{next:?}");
+        assert_eq!(count.load(Ordering::SeqCst), usize::from(!denied));
+        mounted.shutdown().await;
+    }
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]

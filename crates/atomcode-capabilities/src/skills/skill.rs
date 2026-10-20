@@ -354,6 +354,7 @@ fn parse_frontmatter(content: &str) -> (Frontmatter, String) {
     let block = &after_open[..close_pos];
     let body = &after_open[close_pos + skip..];
     let mut tools_block = false;
+    let mut tools_seen = false;
     for line in block.lines() {
         if tools_block && (line.trim().is_empty() || line.trim_start().starts_with('#')) {
             continue;
@@ -388,7 +389,19 @@ fn parse_frontmatter(content: &str) -> (Frontmatter, String) {
             fm.name = Some(fm_value(v));
         } else if let Some(v) = line.strip_prefix("description:") {
             fm.description = fm_value(v);
-        } else if let Some(v) = line.strip_prefix("allowed-tools:") {
+        } else if let Some(v) = line
+            .strip_prefix("allowed-tools:")
+            .or_else(|| line.strip_prefix("allowed_tools:"))
+        {
+            // Both spellings describe one grant. Do not silently choose or merge
+            // declarations when a skill supplies the field more than once.
+            if tools_seen {
+                fm.tools_error = Some(
+                    "duplicate allowed-tools declaration (including allowed_tools alias)".into(),
+                );
+                continue;
+            }
+            tools_seen = true;
             tools_block = without_yaml_comment(v).trim().is_empty();
             match tool_list(v) {
                 Ok(tools) => fm.allowed_tools = tools,
@@ -548,9 +561,12 @@ mod tests {
             "allowed-tools: # commands\n  - Bash(pip3 *) # install\n\n  # verify\n  - read_file",
             "allowed-tools:\n- Bash(pip3 *)\n- read_file",
         ] {
-            let (fm, _) = parse_frontmatter(&format!("---\n{declaration}\n---\nbody"));
-            assert!(fm.tools_error.is_none(), "{declaration}");
-            assert_eq!(fm.allowed_tools, ["Bash(pip3 *)", "read_file"]);
+            for key in ["allowed-tools", "allowed_tools"] {
+                let declaration = declaration.replace("allowed-tools", key);
+                let (fm, _) = parse_frontmatter(&format!("---\n{declaration}\n---\nbody"));
+                assert!(fm.tools_error.is_none(), "{declaration}");
+                assert_eq!(fm.allowed_tools, ["Bash(pip3 *)", "read_file"]);
+            }
         }
         let (fm, _) = parse_frontmatter("---\nallowed-tools:\n  - Bash\n---\nbody");
         assert_eq!(fm.allowed_tools, ["Bash"]);
@@ -568,9 +584,68 @@ mod tests {
             "[Bash(pip3 *) read_file]",
             "[Bash,,Read]",
         ] {
-            let (fm, _) =
-                parse_frontmatter(&format!("---\nallowed-tools: {declaration}\n---\nbody"));
-            assert!(fm.tools_error.is_some(), "{declaration}");
+            for key in ["allowed-tools", "allowed_tools"] {
+                let content = format!("---\n{key}: {declaration}\n---\nbody");
+                assert!(
+                    build_skill(
+                        &content,
+                        "test",
+                        Path::new("."),
+                        Path::new("SKILL.md"),
+                        None
+                    )
+                    .is_err(),
+                    "{content}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_tool_declarations_refuse_loading_instead_of_overriding_grants() {
+        for first in ["allowed-tools", "allowed_tools"] {
+            for second in ["allowed-tools", "allowed_tools"] {
+                for value in ["Read", "\n  - Read", "[Read"] {
+                    let content = format!("---\n{first}: {value}\n{second}: Bash\n---\nbody");
+                    let error = build_skill(
+                        &content,
+                        "test",
+                        Path::new("."),
+                        Path::new("SKILL.md"),
+                        None,
+                    )
+                    .unwrap_err();
+                    assert!(error.contains("duplicate allowed-tools"), "{error}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bundled_setup_skill_and_its_installed_legacy_spelling_keep_the_declared_tools() {
+        let content = include_str!(
+            "../../assets/setup-seeds/skills/atomcode-automation-recommender/SKILL.md"
+        );
+        assert!(content
+            .lines()
+            .any(|line| line.starts_with("allowed-tools:")));
+        for content in [
+            content.to_owned(),
+            content.replace("allowed-tools:", "allowed_tools:"),
+        ] {
+            let skill = build_skill(
+                &content,
+                "automation-recommender",
+                Path::new("."),
+                Path::new("SKILL.md"),
+                None,
+            )
+            .unwrap();
+            assert_eq!(skill.name, "setup");
+            assert_eq!(
+                skill.allowed_tools,
+                ["Read", "Glob", "Grep", "Bash", "Write", "Edit"]
+            );
         }
     }
 

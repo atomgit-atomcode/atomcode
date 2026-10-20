@@ -124,6 +124,7 @@ When the user says "ship a new version", "cut a release", or "tag it".
 
       <h2 id="allowed-tools">Tool preauthorization: allowed-tools</h2>
       <p><code>allowed-tools</code> preauthorizes matching tools for the turn that invokes a skill. It is not an exclusive tool whitelist: other tools remain available and follow normal permission and approval rules.</p>
+      <p>Prefer <code>allowed-tools</code>. The underscore alias <code>allowed_tools</code> accepts the same syntax and validation. Repeated declarations, including mixed spellings, refuse loading.</p>
       <pre><code>---
 name: setup
 description: Install hidapi for vibekeys-plugin
