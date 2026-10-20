@@ -3514,8 +3514,8 @@ impl Tui {
     /// this side's business. Costs one string compare a frame and writes
     /// nothing in the ordinary case.
     ///
-    /// The title carries a status dot — `🟢` idle, `🟡` working, `🔴` waiting on
-    /// the person (a question or approval) — then the session's name, or the
+    /// The title carries a status dot — `🟢` idle/success, `🟡` working or recovering,
+    /// `🔴` failed or waiting on the person (a question or approval) — then the session's name, or the
     /// project directory for a window not yet named. The dot is the "红绿灯" the
     /// reference and Claude Code put in the tab so a glance at the strip says
     /// which session wants you.
@@ -6644,6 +6644,7 @@ impl Tui {
             AgentEvent::TurnStarted { .. } => {
                 let mut m = self.host.moment.write().expect("moment poisoned");
                 m.turn_open = true;
+                m.last_turn_stop = None;
                 m.cancellation_pending = false;
                 // A row the pointer lit last turn is let go of, unless the keys
                 // are on the panel: it is what keeps a team panel open that a
@@ -6675,6 +6676,14 @@ impl Tui {
             // `已中断` note is not raised here: a self-cancel already marked it on
             // the key (`Action::Escape`), and an internal cancel must not.
             event @ (AgentEvent::TurnComplete { .. } | AgentEvent::Cancelled) => {
+                // Persistence can fail before a TurnEnd fact is committed. The
+                // runtime terminal still gives the displayed outcome in that case.
+                let outcome_changed = if let AgentEvent::TurnComplete { reason, .. } = &event {
+                    let mut m = self.host.moment.write().expect("moment poisoned");
+                    m.last_turn_stop.replace(*reason) != Some(*reason)
+                } else {
+                    false
+                };
                 // Lines a stop withdrew are settled once the turn is over:
                 // resubmitting now no longer meets `Busy`. The withdrawal
                 // receipts precede the turn's end on this connection, so every
@@ -6764,13 +6773,14 @@ impl Tui {
                     Activity::Stopping
                 } else {
                     Activity::Idle
-                }) | matches!(
-                    event,
-                    AgentEvent::TurnComplete {
-                        reason: atomcode_kernel::event::StopReason::PromptRejected,
-                        ..
-                    }
-                )
+                }) | outcome_changed
+                    | matches!(
+                        event,
+                        AgentEvent::TurnComplete {
+                            reason: atomcode_kernel::event::StopReason::PromptRejected,
+                            ..
+                        }
+                    )
             }
             // A summary is being written and the request waits on it. Only the
             // slow tier announces this (a cheap fold is instant), so this is the
@@ -13478,6 +13488,28 @@ mod midturn_command_tests {
     async fn answered(woken: &mut mpsc::UnboundedReceiver<Wake>) {
         let woke = tokio::time::timeout(std::time::Duration::from_secs(5), woken.recv()).await;
         assert!(matches!(woke, Ok(Some(Wake::Fact))), "the command answered");
+    }
+
+    #[test]
+    fn failed_runtime_terminal_is_red_without_a_committed_fact() {
+        use crate::text::Light;
+        use atomcode_kernel::event::StopReason;
+        let (host, tui, _) = screen();
+        assert!(tui.on_event(AgentEvent::TurnComplete {
+            provider_failure: None,
+            turn: Some(1),
+            reason: StopReason::ProviderError,
+        }));
+        assert_eq!(host.light(), Some(Light::Failed));
+        assert!(tui.on_event(AgentEvent::TurnComplete {
+            provider_failure: None,
+            turn: Some(2),
+            reason: StopReason::Stopped,
+        }));
+        assert_eq!(host.light(), Some(Light::Idle));
+        host.moment.write().unwrap().last_turn_stop = Some(StopReason::Timeout);
+        tui.on_event(AgentEvent::TurnStarted { turn: Some(3) });
+        assert_eq!(host.light(), Some(Light::Busy));
     }
 
     #[test]

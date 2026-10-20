@@ -760,6 +760,8 @@ pub struct Moment {
     /// turn events. While it has, its end is still coming and is where a stop
     /// settles; the agent's status going idle is not.
     pub turn_open: bool,
+    /// Last terminal outcome of the displayed conversation; cleared at its next turn.
+    pub last_turn_stop: Option<atomcode_kernel::event::StopReason>,
     /// The kernel acknowledged cancellation; runtime persistence has not yet
     /// reported its terminal. An idle kernel status cannot close this gap.
     pub cancellation_pending: bool,
@@ -1116,9 +1118,25 @@ impl Moment {
         // `Stopping` is a turn still in flight — the flag it is landing. Busy,
         // so the dot does not go quiet while the thing it is stopping is still
         // running.
-        match self.activity {
-            Activity::Working | Activity::Stopping => Light::Busy,
-            Activity::Idle => Light::Idle,
+        if self.turn_in_flight() {
+            return Light::Busy;
+        }
+        let goal_paused = self.viewing == self.lead
+            && self.autonomy.as_ref().is_some_and(|running| {
+                running.kind == "goal" && running.paused.is_some() && !running.recovering
+            });
+        if goal_paused
+            || self.last_turn_stop.is_some_and(|reason| {
+                !matches!(
+                    reason,
+                    atomcode_kernel::event::StopReason::Stopped
+                        | atomcode_kernel::event::StopReason::Cancelled
+                )
+            })
+        {
+            Light::Failed
+        } else {
+            Light::Idle
         }
     }
 
@@ -1528,7 +1546,18 @@ mod tests {
         });
         assert_eq!(m.activity, Activity::Idle);
         assert!(m.turn_in_flight());
+        m.last_turn_stop = Some(atomcode_kernel::event::StopReason::ProviderError);
+        assert_eq!(
+            m.light(),
+            crate::text::Light::Busy,
+            "automatic recovery stays yellow"
+        );
         m.autonomy.as_mut().unwrap().recovering = false;
+        assert_eq!(
+            m.light(),
+            crate::text::Light::Failed,
+            "a real pause needs attention"
+        );
         assert!(!m.turn_in_flight(), "a paused goal is not busy");
         m.autonomy.as_mut().unwrap().recovering = true;
         m.viewing = "member".into();

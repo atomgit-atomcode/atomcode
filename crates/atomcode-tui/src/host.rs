@@ -1922,6 +1922,7 @@ impl Host {
         m.turn_started = None;
         m.turn_started_unix_ms = None;
         m.generation = Default::default();
+        m.last_turn_stop = None;
         m.quiet_since = None;
         m.provider_retry_started = None;
         m.steering.clear();
@@ -2261,14 +2262,16 @@ impl Host {
         match fact {
             SessionEvent::TurnStart { .. } => {
                 let mut m = self.moment.write().expect("moment poisoned");
+                m.last_turn_stop = None;
                 let now = m.now;
                 m.provider_retry_started = None;
                 m.turn_started = Some(now);
                 m.turn_started_unix_ms = (logged.at > 0).then_some(logged.at);
                 m.quiet_since = Some(now);
             }
-            SessionEvent::TurnEnd { .. } => {
+            SessionEvent::TurnEnd { stop, .. } => {
                 let mut m = self.moment.write().expect("moment poisoned");
+                m.last_turn_stop = Some(*stop);
                 m.turn_started = None;
                 m.turn_started_unix_ms = None;
                 m.quiet_since = None;
@@ -7673,6 +7676,46 @@ fn waiting(queued: &[crate::moment::Queued]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn failed_turn_light_survives_idle_and_replay_but_not_a_view_switch() {
+        use crate::{moment::Activity, text::Light};
+        use atomcode_kernel::event::StopReason;
+        let h = host();
+        for reason in [
+            StopReason::ProviderError,
+            StopReason::Timeout,
+            StopReason::InternalError,
+            StopReason::RepeatLoop,
+            StopReason::PolicyDenied,
+        ] {
+            h.absorb(&SessionEvent::TurnEnd {
+                turn: 1,
+                stop: reason,
+                error: None,
+            });
+            h.set_activity(Activity::Idle);
+            assert_eq!(h.light(), Some(Light::Failed), "{reason:?}");
+            h.switch_view();
+            assert_eq!(h.light(), Some(Light::Idle));
+            h.absorb(&SessionEvent::TurnEnd {
+                turn: 1,
+                stop: reason,
+                error: None,
+            });
+            assert_eq!(h.light(), Some(Light::Failed));
+            h.absorb(&SessionEvent::TurnStart { turn: 2 });
+            h.set_activity(Activity::Working);
+            assert_eq!(h.light(), Some(Light::Busy));
+            h.absorb(&SessionEvent::TurnEnd {
+                turn: 2,
+                stop: StopReason::Stopped,
+                error: None,
+            });
+            h.set_activity(Activity::Idle);
+            assert_eq!(h.light(), Some(Light::Idle));
+        }
+    }
+
     #[test]
     fn switching_views_replays_the_original_committed_turn_start() {
         let h = host();

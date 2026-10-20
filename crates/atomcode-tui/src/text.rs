@@ -287,7 +287,7 @@ fn terminal_title_name(name: Option<&str>, fallback: &str) -> String {
 /// pixel of the screen being spent: the terminal has somewhere to put a
 /// title, and this is the smallest true thing to put in it.
 ///
-/// Three states, not four: "stopping" reads as busy, because the turn it is
+/// "Stopping" reads as busy, because the turn it is
 /// stopping is still the turn in flight, and a person who has just pressed
 /// escape does not need the tab to argue with them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -302,6 +302,8 @@ pub enum Light {
     /// session cannot get on without somebody, and the only one worth looking
     /// across a room for.
     Waiting,
+    /// Work stopped unsuccessfully; stays red until work starts again.
+    Failed,
 }
 
 impl Light {
@@ -310,7 +312,7 @@ impl Light {
         match self {
             Self::Idle => "🟢",
             Self::Busy => "🟡",
-            Self::Waiting => "🔴",
+            Self::Waiting | Self::Failed => "🔴",
         }
     }
 }
@@ -730,6 +732,7 @@ mod tests {
         assert_eq!(Light::Idle.dot(), "🟢");
         assert_eq!(Light::Busy.dot(), "🟡");
         assert_eq!(Light::Waiting.dot(), "🔴");
+        assert_eq!(Light::Failed.dot(), "🔴");
         assert_ne!(Light::Idle.dot(), Light::Busy.dot());
         assert_ne!(Light::Busy.dot(), Light::Waiting.dot());
     }
