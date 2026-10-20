@@ -1565,6 +1565,8 @@ mod tests {
         moment.viewing = "lead".into();
         let running = atomcode_host_api::Running {
             retry_in_secs: None,
+            goal_stage: None,
+            goal_detail: None,
             kind: "goal".into(),
             recovering: false,
             what: "finish".into(),
@@ -1613,6 +1615,8 @@ mod tests {
             what: "finish".into(),
             recovering: false,
             retry_in_secs: None,
+            goal_stage: None,
+            goal_detail: None,
             round: 1,
             of: None,
             elapsed_secs: 3_600,
@@ -1686,6 +1690,8 @@ mod tests {
                         what: "finish".into(),
                         recovering: false,
                         retry_in_secs: None,
+                        goal_stage: None,
+                        goal_detail: None,
                         round: 1,
                         of: None,
                         elapsed_secs: 3_600,
@@ -1731,6 +1737,8 @@ mod tests {
         });
         let lead = atomcode_host_api::Running {
             retry_in_secs: None,
+            goal_stage: None,
+            goal_detail: None,
             usage: None,
             kind: "goal".into(),
             what: "lead task".into(),

@@ -985,7 +985,35 @@ fn without_a_log(apps_fed: u64) -> Result<(), HostError> {
 
 /// A goal, as the contract says a self-driving session.
 fn running_of_goal(goal: atomcode_coding::GoalProgress) -> atomcode_host_api::Running {
+    use atomcode_host_api::GoalStage;
+    let stage = if matches!(
+        goal.phase,
+        atomcode_coding::GoalPhase::Satisfied | atomcode_coding::GoalPhase::Ended
+    ) {
+        None
+    } else {
+        Some(if !goal.active {
+            GoalStage::Paused
+        } else if let Some(recovery) = &goal.recovery {
+            match recovery.kind {
+                atomcode_coding::GoalRecoveryKind::Evaluator => GoalStage::Evaluating,
+                atomcode_coding::GoalRecoveryKind::Provider => GoalStage::Recovering,
+            }
+        } else if goal.round > 0 {
+            GoalStage::Continuing
+        } else {
+            GoalStage::Working
+        })
+    };
+    let paused = matches!(
+        goal.phase,
+        atomcode_coding::GoalPhase::Paused | atomcode_coding::GoalPhase::PausedAtCap
+    );
     atomcode_host_api::Running {
+        goal_stage: stage,
+        goal_detail: (stage == Some(GoalStage::Continuing))
+            .then(|| goal.last_reason.clone())
+            .flatten(),
         usage: goal
             .report
             .usage
@@ -1005,7 +1033,7 @@ fn running_of_goal(goal: atomcode_coding::GoalProgress) -> atomcode_host_api::Ru
         round: goal.round,
         of: goal.max_rounds,
         elapsed_secs: goal.elapsed_secs,
-        paused: (!goal.active).then(|| {
+        paused: paused.then(|| {
             goal.last_reason
                 .unwrap_or_else(|| format!("{:?}", goal.phase))
         }),
@@ -1018,6 +1046,8 @@ fn running_of_loop(looping: atomcode_coding::LoopProgress) -> atomcode_host_api:
         usage: None,
         recovering: false,
         retry_in_secs: None,
+        goal_stage: None,
+        goal_detail: None,
         kind: "loop".into(),
         what: looping.label,
         round: looping.round,
@@ -3438,18 +3468,52 @@ mod tests {
         assert!(running.recovering);
         assert_eq!(running.retry_in_secs, Some(30));
         assert_eq!(running.paused, None);
+        assert_eq!(
+            running.goal_stage,
+            Some(atomcode_host_api::GoalStage::Recovering)
+        );
+        goal.recovery.as_mut().unwrap().kind = GoalRecoveryKind::Evaluator;
+        assert_eq!(
+            running_of_goal(goal.clone()).goal_stage,
+            Some(atomcode_host_api::GoalStage::Evaluating)
+        );
         goal.recovery.as_mut().unwrap().retry_in_secs = 0;
         assert_eq!(running_of_goal(goal.clone()).retry_in_secs, Some(0));
-        goal.active = false;
         goal.recovery = None;
+        goal.last_reason = Some("coverage needs verification".into());
+        let continued = running_of_goal(goal.clone());
+        assert_eq!(
+            continued.goal_stage,
+            Some(atomcode_host_api::GoalStage::Continuing)
+        );
+        assert_eq!(
+            continued.goal_detail.as_deref(),
+            Some("coverage needs verification")
+        );
+        goal.round = 0;
+        assert_eq!(
+            running_of_goal(goal.clone()).goal_stage,
+            Some(atomcode_host_api::GoalStage::Working)
+        );
+        goal.active = false;
+        goal.phase = GoalPhase::PausedAtCap;
         goal.last_reason = Some("provider recovery budget exhausted".into());
-        let paused = running_of_goal(goal);
+        let paused = running_of_goal(goal.clone());
         assert!(!paused.recovering);
         assert_eq!(paused.retry_in_secs, None);
         assert_eq!(
             paused.paused.as_deref(),
             Some("provider recovery budget exhausted")
         );
+        for phase in [GoalPhase::Satisfied, GoalPhase::Ended] {
+            goal.phase = phase;
+            let ended = running_of_goal(goal.clone());
+            assert_eq!(
+                ended.goal_stage, None,
+                "a finished goal cannot still be paused"
+            );
+            assert_eq!(ended.paused, None);
+        }
     }
 
     /// 目标结束时,「达成」和「判不了算不算达成」不能长得一样。

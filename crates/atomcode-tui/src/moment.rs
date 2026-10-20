@@ -1518,6 +1518,8 @@ mod tests {
             kind: "goal".into(),
             recovering: true,
             retry_in_secs: None,
+            goal_stage: None,
+            goal_detail: None,
             what: "finish".into(),
             round: 1,
             of: None,

@@ -2173,12 +2173,11 @@ impl UserInterface for Tui {
                     }
                     stale = true;
                 }
-                // What the session is doing on its own. Kept, not said: a
-                // round landing is not news to read, it is a number to watch,
-                // and saying it every round would bury the conversation under
-                // its own progress bar.
+                // Keep clock/counter updates in the badge. Meaningful goal
+                // stage transitions get one neutral explanation so a later
+                // continuation failure cannot look like a failed prior reply.
                 Wake::Host(HostEvent::Autonomy { session, running }) => {
-                    stale |= took_autonomy(&self.host.moment, &session, running);
+                    stale |= took_goal_progress(&self.host, &session, running);
                 }
                 // How much the session may do without asking. Kept, not said:
                 // the mode is drawn on the status row, and a line of prose per
@@ -9764,6 +9763,66 @@ fn deliver(
     }
 }
 
+fn goal_stage_notice(
+    previous: Option<&atomcode_host_api::Running>,
+    current: &atomcode_host_api::Running,
+) -> Option<String> {
+    use atomcode_host_api::GoalStage;
+    if current.kind != "goal" {
+        return None;
+    }
+    let stage = current.goal_stage?;
+    if previous.is_some_and(|old| {
+        old.goal_stage == Some(stage)
+            && (stage != GoalStage::Continuing || old.round == current.round)
+    }) {
+        return None;
+    }
+    Some(match stage {
+        GoalStage::Working => return None,
+        GoalStage::Evaluating => t(Msg::GoalStageEvaluating).into_owned(),
+        GoalStage::Continuing => t(Msg::GoalStageContinuing {
+            detail: current.goal_detail.as_deref().unwrap_or("/goal report"),
+        })
+        .into_owned(),
+        GoalStage::Recovering => t(Msg::GoalStageRecovering).into_owned(),
+        GoalStage::Paused => t(Msg::GoalStagePaused {
+            detail: current.paused.as_deref().unwrap_or("/goal report"),
+        })
+        .into_owned(),
+    })
+}
+
+/// Phase notices are local presentation, never synthetic conversation input.
+fn took_goal_progress(
+    host: &crate::host::Host,
+    session: &str,
+    running: Option<atomcode_host_api::Running>,
+) -> bool {
+    let notice = {
+        let m = host.moment.read().expect("moment poisoned");
+        running
+            .as_ref()
+            .filter(|_| m.viewing == session)
+            .and_then(|current| {
+                goal_stage_notice(m.autonomy_samples.get(session).map(|(old, _)| old), current)
+            })
+    };
+    let changed = took_autonomy(&host.moment, session, running);
+    if let Some(detail) = notice {
+        host.stream
+            .write()
+            .expect("stream poisoned")
+            .writer("commands")
+            .emit(
+                crate::block::Coord::default(),
+                Arc::new(crate::content::NoticeBlock { detail }),
+            );
+        return true;
+    }
+    changed
+}
+
 /// Take the host's word for what a session is doing on its own.
 ///
 /// A separate function because the loop it is called from cannot be reached
@@ -11119,6 +11178,8 @@ mod autonomy_tests {
             usage: None,
             recovering: false,
             retry_in_secs: None,
+            goal_stage: None,
+            goal_detail: None,
             kind: "goal".into(),
             what: "测试全绿".into(),
             round,
@@ -11126,6 +11187,61 @@ mod autonomy_tests {
             elapsed_secs: 90,
             paused: None,
         }
+    }
+
+    #[test]
+    fn goal_stage_transitions_are_neutral_deduplicated_and_session_scoped() {
+        use atomcode_host_api::GoalStage;
+        let host = crate::host::Host::new(
+            std::sync::Arc::new(crate::module::Modules::new()),
+            crate::host::default_layout(),
+        );
+        {
+            let mut m = host.moment.write().unwrap();
+            m.lead = "lead".into();
+            m.viewing = "lead".into();
+        }
+        let mut progress = running(0);
+        progress.goal_stage = Some(GoalStage::Working);
+        super::took_goal_progress(&host, "lead", Some(progress.clone()));
+        assert_eq!(host.stream.read().unwrap().len(), 0);
+        progress.recovering = true;
+        progress.goal_stage = Some(GoalStage::Evaluating);
+        super::took_goal_progress(&host, "lead", Some(progress.clone()));
+        assert_eq!(host.stream.read().unwrap().len(), 1);
+        progress.elapsed_secs += 1;
+        super::took_goal_progress(&host, "lead", Some(progress.clone()));
+        assert_eq!(
+            host.stream.read().unwrap().len(),
+            1,
+            "a clock update repeated the stage announcement"
+        );
+        super::took_goal_progress(&host, "member", Some(progress.clone()));
+        assert_eq!(
+            host.stream.read().unwrap().len(),
+            1,
+            "background work polluted the visible transcript"
+        );
+        progress.recovering = false;
+        progress.round = 1;
+        progress.goal_stage = Some(GoalStage::Continuing);
+        progress.goal_detail = Some("coverage needs verification".into());
+        let notice = super::goal_stage_notice(None, &progress).unwrap();
+        assert!(notice.contains("coverage needs verification"));
+        super::took_goal_progress(&host, "lead", Some(progress.clone()));
+        assert_eq!(host.stream.read().unwrap().len(), 2);
+        progress.goal_stage = Some(GoalStage::Recovering);
+        progress.recovering = true;
+        super::took_goal_progress(&host, "lead", Some(progress.clone()));
+        assert_eq!(host.stream.read().unwrap().len(), 3);
+        progress.retry_in_secs = Some(30);
+        super::took_goal_progress(&host, "lead", Some(progress.clone()));
+        assert_eq!(host.stream.read().unwrap().len(), 3);
+        progress.recovering = false;
+        progress.goal_stage = Some(GoalStage::Paused);
+        progress.paused = Some("retry budget exhausted".into());
+        super::took_goal_progress(&host, "lead", Some(progress));
+        assert_eq!(host.stream.read().unwrap().len(), 4);
     }
 
     /// A status line can only move on its own if something pushes to it. The

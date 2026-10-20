@@ -239,6 +239,14 @@ pub enum Msg<'a> {
     },
     StatusStopping,
     StatusGoal,
+    GoalStageEvaluating,
+    GoalStageContinuing {
+        detail: &'a str,
+    },
+    GoalStageRecovering,
+    GoalStagePaused {
+        detail: &'a str,
+    },
     GoalProviderRecovery {
         attempt: u32,
         max: u32,

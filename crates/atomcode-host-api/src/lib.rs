@@ -664,6 +664,17 @@ pub enum HostReply {
     },
 }
 
+/// Presentation of the runtime-owned goal stage; not a second lifecycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalStage {
+    Working,
+    Evaluating,
+    Continuing,
+    Recovering,
+    Paused,
+}
+
 /// A session driving itself: what it is working towards, and how far it has got.
 ///
 /// One shape for a goal and a loop, because a front end draws them the same way
@@ -683,6 +694,12 @@ pub struct Running {
     /// recovery is in flight. Absent for ordinary execution and true pauses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_in_secs: Option<u64>,
+    /// Optional for hosts predating explicit goal stage presentation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_stage: Option<GoalStage>,
+    /// Runtime explanation for a continuation; not independently verified evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_detail: Option<String>,
     /// The condition being worked towards, or the prompt being repeated.
     pub what: String,
     pub round: u32,
@@ -1869,6 +1886,8 @@ mod tests {
                     usage: None,
                     recovering: false,
                     retry_in_secs: None,
+                    goal_stage: None,
+                    goal_detail: None,
                     kind: "goal".into(),
                     what: "the tests pass".into(),
                     round: 3,
@@ -2087,6 +2106,8 @@ mod tests {
                     usage: None,
                     recovering: false,
                     retry_in_secs: None,
+                    goal_stage: None,
+                    goal_detail: None,
                     kind: "goal".into(),
                     what: "测试全绿".into(),
                     round: 3,

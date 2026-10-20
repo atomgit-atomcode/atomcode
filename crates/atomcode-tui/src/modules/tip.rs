@@ -143,8 +143,13 @@ impl View for Tip {
                         Some(secs) if secs > 0 => {
                             (format!("Goal retrying · {secs}s"), Role::Warning)
                         }
+                        _ if goal.goal_stage == Some(atomcode_host_api::GoalStage::Evaluating) => {
+                            ("Goal evaluating".to_owned(), Role::Accent)
+                        }
                         _ => ("Goal recovering".to_owned(), Role::Accent),
                     }
+                } else if goal.goal_stage == Some(atomcode_host_api::GoalStage::Continuing) {
+                    ("Goal continuing".to_owned(), Role::Accent)
                 } else {
                     ("Goal active".to_owned(), Role::Accent)
                 };
@@ -243,6 +248,8 @@ mod tests {
             usage: None,
             recovering: false,
             retry_in_secs: None,
+            goal_stage: None,
+            goal_detail: None,
             kind: "goal".into(),
             what: "a long objective".into(),
             round: 1,
@@ -269,6 +276,8 @@ mod tests {
             usage: None,
             recovering: true,
             retry_in_secs: Some(30),
+            goal_stage: None,
+            goal_detail: None,
             kind: "goal".into(),
             what: "objective".into(),
             round: 1,
@@ -290,6 +299,9 @@ mod tests {
         let line = draw_at(&m, 100, 1)[0].plain();
         assert!(line.contains("Goal recovering"));
         assert!(!line.contains("paused"));
+        m.autonomy.as_mut().unwrap().goal_stage = Some(atomcode_host_api::GoalStage::Evaluating);
+        m.autonomy.as_mut().unwrap().retry_in_secs = Some(0);
+        assert!(draw_at(&m, 100, 1)[0].plain().contains("Goal evaluating"));
         let goal = m.autonomy.as_mut().unwrap();
         goal.recovering = false;
         goal.retry_in_secs = None;
