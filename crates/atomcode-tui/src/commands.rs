@@ -5209,7 +5209,6 @@ mod tests {
                 running: Some(atomcode_host_api::Running {
                     usage: None,
                     recovering: false,
-                    retry_in_secs: None,
                     kind: "goal".into(),
                     what: "测试全过".into(),
                     round: 3,
@@ -5222,7 +5221,6 @@ mod tests {
                 running: Some(atomcode_host_api::Running {
                     usage: None,
                     recovering: false,
-                    retry_in_secs: None,
                     kind: "loop".into(),
                     what: "再看一遍".into(),
                     round: 9,

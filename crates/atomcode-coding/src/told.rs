@@ -272,9 +272,7 @@ mod tests {
             | C::UndoTarget { .. }
             | C::Autonomy { .. }
             | C::Usage { .. }
-            | C::WorkspaceChanges { .. }
-            | C::PendingQuestions { .. }
-            | C::QuestionReplyFinished { .. } => Heard::Nothing,
+            | C::WorkspaceChanges { .. } => Heard::Nothing,
         }
     }
 

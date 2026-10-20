@@ -146,7 +146,6 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::AskReviewSend => "Submit answers".into(),
         Msg::AskReviewCancel => "Cancel".into(),
         Msg::AskUnanswered => "(not answered)".into(),
-        Msg::AskPending { id } => format!("Wait ended (#{id}) · /goal questions").into(),
         Msg::AskLegendToggle => "toggle".into(),
         Msg::AskLegendSwitch => "switch question".into(),
         Msg::AskLegendCaret => "move cursor".into(),

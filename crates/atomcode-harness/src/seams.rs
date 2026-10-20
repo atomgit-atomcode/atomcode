@@ -1022,22 +1022,6 @@ pub trait UserQuestions: Send + Sync {
     fn describe(&self) -> String;
     /// Put the question and wait. The returned string is an [`Answer::value`].
     async fn ask(&self, question: &Question) -> Option<String>;
-
-    /// Ordinary questions may finish their foreground wait while remaining
-    /// answerable. Approval callers continue to use their own decision path.
-    async fn ask_reply(&self, question: &Question, _call_id: Option<&str>) -> QuestionReply {
-        match self.ask(question).await {
-            Some(answer) => QuestionReply::Answered(answer),
-            None => QuestionReply::Unanswered,
-        }
-    }
-}
-
-pub enum QuestionReply {
-    Answered(String),
-    Unanswered,
-    Failed(String),
-    Pending(atomcode_capabilities::tools::request_user_input::PendingUserQuestion),
 }
 
 /// What a delegated task produced.

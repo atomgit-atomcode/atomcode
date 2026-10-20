@@ -679,10 +679,6 @@ pub struct Running {
     /// Work is retained while the agent itself is idle (evaluation or recovery).
     #[serde(default)]
     pub recovering: bool,
-    /// Remaining automatic retry delay at the time of this sample; zero means
-    /// recovery is in flight. Absent for ordinary execution and true pauses.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retry_in_secs: Option<u64>,
     /// The condition being worked towards, or the prompt being repeated.
     pub what: String,
     pub round: u32,
@@ -1868,7 +1864,6 @@ mod tests {
                 running: Some(Running {
                     usage: None,
                     recovering: false,
-                    retry_in_secs: None,
                     kind: "goal".into(),
                     what: "the tests pass".into(),
                     round: 3,
@@ -2086,7 +2081,6 @@ mod tests {
                 running: Some(Running {
                     usage: None,
                     recovering: false,
-                    retry_in_secs: None,
                     kind: "goal".into(),
                     what: "测试全绿".into(),
                     round: 3,

@@ -3582,13 +3582,6 @@ pub(crate) async fn run_native_headless(
                 }
             }
             CodingRuntimeEvent::Request(request) => {
-                if atomcode_capabilities::tools::request_user_input::is_continued_question(
-                    &request.kind,
-                    &request.payload,
-                ) {
-                    // An unattended driver has no new human answer to deliver.
-                    continue;
-                }
                 let response = if request.kind == APPROVAL_KIND {
                     serde_json::from_value::<ApprovalRequest>(request.payload)
                         .ok()

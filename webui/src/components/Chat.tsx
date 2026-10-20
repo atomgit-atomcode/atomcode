@@ -91,7 +91,6 @@ import {
   reduceLiveLifecycle,
   resolveUserInputRequest,
   completeUserInputRequest,
-  retainContinuedUserInput,
   restoreLiveSnapshot,
   sessionHeldElsewhere,
   syncAttachDisposition,
@@ -1719,7 +1718,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
           // 回合结束（idle）时不可能再有待批准项：清掉因对端(TUI)批准或回合收尾而
           // 残留的审批卡片，否则 webui 会一直挂着一张「等待批准…」的卡片直到刷新。
           setLivePending(null);
-          setUserInputReq((current) => retainContinuedUserInput(current, !terminal.discardQueued));
+          setUserInputReq(null);
           if (e.stop_reason !== 'policy_denied') setPolicyIntervention(null);
           // 回合结束：计算通知信息并触发浏览器提醒（若守卫通过）。
           finishTurnNotification({

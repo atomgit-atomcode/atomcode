@@ -1428,7 +1428,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdCatalogWorklogUsage => "[today|yesterday|M/D]".into(),
         Msg::CmdCatalogGoal =>
             "Keep working until the condition holds; `stop` finishes, `pause` sets it aside.".into(),
-        Msg::CmdCatalogGoalUsage => "<condition to meet> | stop | pause | recheck | report | questions | answer <id> <text>".into(),
+        Msg::CmdCatalogGoalUsage => "<condition to meet> | stop | pause | recheck | report".into(),
         Msg::CmdCatalogLoop =>
             "Do the same thing over and over, until `stop`.".into(),
         Msg::CmdCatalogLoopUsage => "<what to do each round> | stop".into(),

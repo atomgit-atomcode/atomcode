@@ -197,9 +197,6 @@ pub enum Msg<'a> {
     AskReviewCancel,
     /// A batch question with no answer yet, on the review page.
     AskUnanswered,
-    AskPending {
-        id: u64,
-    },
     AskLegendToggle,
     AskLegendSwitch,
     /// Left and right, on a typing row with words in it.

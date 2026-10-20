@@ -127,7 +127,6 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::AskReviewSend => "提交回答".into(),
         Msg::AskReviewCancel => "取消".into(),
         Msg::AskUnanswered => "（未回答）".into(),
-        Msg::AskPending { id } => format!("等待窗口已结束（#{id}）· /goal questions 查看当前待答").into(),
         Msg::AskLegendToggle => "勾选".into(),
         Msg::AskLegendSwitch => "切换题目".into(),
         Msg::AskLegendCaret => "移动光标".into(),

@@ -70,9 +70,6 @@ impl Tool for AskTool {
          \n\
          They may not answer — nobody is at the screen, or they declined. That is not consent \
          to anything: decide it yourself, say which way you went and why, and carry on.\n\
-         A host may return pending after a bounded wait. Pending is not an answer or \
-         authorization: continue only independent authorized work, do not repeat the question, \
-         and report the blocker if nothing can proceed. Late replies arrive as new user input.\n\
          \n\
          Example: {\"question\":\"`config.toml` has no `[telemetry]` section. Add one, or leave \
          telemetry off?\",\"options\":[\"add the section with defaults\",\"leave it off\"]}"
@@ -140,13 +137,9 @@ impl Tool for AskTool {
             asker: crate::agent::current_member_name(&self.ctx),
             about: None,
         };
-        match crate::agent::ask_person_reply(&self.ctx, asked, _ctx.progress.source_id()).await {
-            crate::seams::QuestionReply::Answered(answer) => {
-                ok(format!("The person answered: {answer}"))
-            }
-            crate::seams::QuestionReply::Unanswered => ok(NOBODY),
-            crate::seams::QuestionReply::Failed(error) => fail(error),
-            crate::seams::QuestionReply::Pending(pending) => pending.result(),
+        match crate::agent::ask_person(&self.ctx, asked).await {
+            Some(answer) => ok(format!("The person answered: {answer}")),
+            None => ok(NOBODY),
         }
     }
 }
@@ -272,42 +265,6 @@ mod tests {
         let result = tool.execute(args, &tool_ctx()).await;
         let seen = asked.lock().expect("asked poisoned").clone();
         (result, seen)
-    }
-
-    #[tokio::test]
-    async fn a_pending_wait_is_not_reported_as_a_human_answer() {
-        struct Deferred;
-        #[async_trait]
-        impl UserQuestions for Deferred {
-            fn describe(&self) -> String {
-                "deferred test driver".into()
-            }
-            async fn ask(&self, _: &Question) -> Option<String> {
-                panic!("tool must preserve the pending outcome");
-            }
-            async fn ask_reply(
-                &self,
-                _: &Question,
-                _: Option<&str>,
-            ) -> crate::seams::QuestionReply {
-                crate::seams::QuestionReply::Pending(
-                    atomcode_capabilities::tools::request_user_input::PendingUserQuestion::new(
-                        900,
-                        serde_json::json!({"question":"Which?","header":"Choice","mode":"text"}),
-                    ),
-                )
-            }
-        }
-        let (result, _) = ask_with(
-            Arc::new(Deferred),
-            r#"{"question":"Which?","options":["A","B"]}"#,
-        )
-        .await;
-        assert!(!result.is_error);
-        let content: Value = serde_json::from_str(&result.content).unwrap();
-        assert_eq!(content["pending"]["id"], 900);
-        assert!(!result.content.contains("The person answered"));
-        assert!(result.content.contains("NOT answered"));
     }
 
     #[tokio::test]
