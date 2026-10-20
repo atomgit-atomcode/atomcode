@@ -96,12 +96,34 @@ fn mobile_url(base: &str, route: &str, token: &str, sync: bool) -> String {
     )
 }
 
+/// Preparation and readiness share one deadline; stopping also interrupts a
+/// pending download rather than waiting for its HTTP request to finish.
+async fn startup_step<T>(
+    generation: &AtomicU64,
+    epoch: u64,
+    deadline: tokio::time::Instant,
+    operation: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    tokio::select! {
+        biased;
+        _ = async {
+            loop {
+                if generation.load(Ordering::SeqCst) != epoch { return; }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        } => Err("中继启动已取消".into()),
+        result = tokio::time::timeout_at(deadline, operation) =>
+            result.map_err(|_| "中继连接超时，请检查网络或接入口令".to_string())?,
+    }
+}
+
 async fn start(target: &WebuiRelayTarget, sync: bool) -> Result<String, String> {
     let epoch = EPOCH.load(Ordering::SeqCst);
     let _serial = START
         .get_or_init(|| tokio::sync::Mutex::new(()))
         .lock()
         .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let (ws, base) = relay_base(atomcode_config::endpoints::relay_url())?;
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
@@ -132,7 +154,13 @@ async fn start(target: &WebuiRelayTarget, sync: bool) -> Result<String, String> 
     let mut tunnel = match previous {
         Some(tunnel) => tunnel,
         None => {
-            let binary = crate::relay::ensure_relay_client_bin()?;
+            let binary = startup_step(
+                &EPOCH,
+                epoch,
+                deadline,
+                crate::relay::ensure_relay_client_bin(),
+            )
+            .await?;
             let route = format!(
                 "{}{}",
                 uuid::Uuid::new_v4().simple(),
@@ -171,7 +199,7 @@ async fn start(target: &WebuiRelayTarget, sync: bool) -> Result<String, String> 
             }
         }
     };
-    let ready = tokio::time::timeout(Duration::from_secs(15), async {
+    let ready = startup_step(&EPOCH, epoch, deadline, async {
         loop {
             if EPOCH.load(Ordering::SeqCst) != epoch {
                 return Err("中继启动已取消".to_string());
@@ -192,8 +220,7 @@ async fn start(target: &WebuiRelayTarget, sync: bool) -> Result<String, String> 
             tokio::time::sleep(Duration::from_millis(400)).await;
         }
     })
-    .await
-    .map_err(|_| "中继连接超时，请检查网络或接入口令".to_string())?;
+    .await;
     ready?;
     let url = mobile_url(&base, &tunnel.route, &target.token, sync);
     let mut slot = TUNNEL.lock().unwrap_or_else(|e| e.into_inner());
@@ -237,5 +264,53 @@ mod tests {
         ] {
             assert!(relay_base(bad).is_err(), "{bad}");
         }
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn preparation_and_readiness_share_one_deadline() {
+        let generation = AtomicU64::new(0);
+        let began = tokio::time::Instant::now();
+        let deadline = began + Duration::from_secs(15);
+        startup_step(&generation, 0, deadline, async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let result = startup_step(
+            &generation,
+            0,
+            deadline,
+            std::future::pending::<Result<(), String>>(),
+        )
+        .await;
+        assert!(result.unwrap_err().contains("超时"));
+        assert_eq!(began.elapsed(), Duration::from_secs(15));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn stop_interrupts_preparation_before_its_deadline() {
+        let generation = AtomicU64::new(0);
+        let began = tokio::time::Instant::now();
+        let cancel = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            generation.fetch_add(1, Ordering::SeqCst);
+        };
+        let (result, _) = tokio::join!(
+            startup_step(
+                &generation,
+                0,
+                began + Duration::from_secs(15),
+                std::future::pending::<Result<(), String>>()
+            ),
+            cancel
+        );
+        assert!(result.unwrap_err().contains("取消"));
+        assert!(began.elapsed() < Duration::from_secs(1));
     }
 }

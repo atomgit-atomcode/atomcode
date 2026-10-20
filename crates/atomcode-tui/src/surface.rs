@@ -1221,7 +1221,7 @@ impl Terminal {
         // the sequences gets none of them, rather than a screenful of text.
         if !console_speaks_ansi() {
             return Err(std::io::Error::other(
-                "this console cannot draw escape sequences; use `--classic`",
+                "this console cannot draw escape sequences; use an ANSI-capable terminal (such as Windows Terminal) or run `atomcode webui`",
             ));
         }
         crate::terminal_modes::take_input()?;

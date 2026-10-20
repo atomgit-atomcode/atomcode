@@ -110,8 +110,6 @@ impl Tool for GlobTool {
             return err("glob: cancelled before completion.");
         }
         let options = a.discovery.resolve(&self.options, ctx);
-        let scan_cancel = ctx.cancel.child_token();
-        let _stop_scan = scan_cancel.clone().drop_guard();
         let (base, match_pattern) = match split_absolute_base(&a.pattern) {
             Some((dir, rest)) => (dir, rest),
             None => {
@@ -119,126 +117,129 @@ impl Tool for GlobTool {
                 (resolve_path(&raw, &ctx.working_dir), a.pattern.clone())
             }
         };
-        match self.world.info(&base).await {
-            Ok(m) if m.is_dir => {}
-            // Denied is not missing — see the same note in `read`.
-            Err(e) => return err(format!("glob: {e}")),
-            _ => {
-                return err(format!(
-                    "glob: base directory does not exist: {}{}",
-                    crate::pathnorm::to_display(&base),
-                    not_found_hint(&base, &ctx.working_dir).await
-                ))
-            }
-        }
-
-        // A literal filename is an explicit lookup, not tree discovery. Like
-        // read_file and grep(path=file), it bypasses ignore/link traversal rules
-        // and never expands a missing filename into an expensive whole-tree walk.
-        if !match_pattern
-            .chars()
-            .any(|c| matches!(c, '*' | '?' | '[' | ']' | '{' | '}'))
-        {
-            if ctx.cancel.is_cancelled() {
-                return err("glob: cancelled before completion.");
-            }
-            let exact = resolve_path(&match_pattern, &base);
-            return match self.world.info(&exact).await {
-                Ok(info) if info.exists && !info.is_dir => ok(format!(
-                    "1 files found:\n{}",
-                    crate::pathnorm::to_display(
-                        exact.strip_prefix(&ctx.working_dir).unwrap_or(&exact)
-                    )
-                )),
-                Ok(_) => ok(format!(
-                    "No files matching \"{}\" at the exact path {}{}",
-                    a.pattern,
-                    crate::pathnorm::to_display(&exact),
-                    not_found_hint(&exact, &ctx.working_dir).await
-                )),
-                Err(e) => err(format!("glob: {e}")),
-            };
-        }
-
-        let matcher = match GlobBuilder::new(&match_pattern)
-            .literal_separator(true)
-            .build()
-        {
-            Ok(g) => g.compile_matcher(),
-            Err(e) => return err(format!("glob: invalid pattern '{}': {e}", a.pattern)),
-        };
-
-        let wd = ctx.working_dir.clone();
-        let pattern = a.pattern.clone();
-        let skip = crate::pathutil::search_skip_dir_for(&self.dirs, options.respect_gitignore);
+        let scope = crate::pathnorm::to_display(&base);
         ctx.progress.emit(format!(
-            "Searching {} (up to {}s / {} entries)",
-            crate::pathnorm::to_display(&base),
-            options.timeout_secs,
-            options.max_entries
+            "Searching {scope} (up to {}s / {} entries)",
+            options.timeout_secs, options.max_entries
         ));
-        let walked = tokio::select! {
-            biased;
-            _ = ctx.cancel.cancelled() => return err("glob: cancelled before completion."),
-            result = tokio::time::timeout(std::time::Duration::from_secs(options.timeout_secs),
-                self.world.walk_with_options(&base, &skip, &scan_cancel, &options)) => result,
-        };
-        let res = match walked {
-            Err(_) => {
-                return err(format!(
-                    "glob: search timed out after {}s in {}; scan incomplete. Narrow the path. {}",
-                    options.timeout_secs,
-                    crate::pathnorm::to_display(&base),
-                    options.filter_hint()
-                ))
-            }
-            Ok(result) => result,
-        }
-        .map(|walked| {
-            let mut hits = Vec::new();
-            for path in walked.files {
-                let rel = path.strip_prefix(&base).unwrap_or(&path);
-                if matcher.is_match(rel) {
-                    hits.push(crate::pathnorm::to_display(
-                        path.strip_prefix(&wd).unwrap_or(&path),
-                    ));
+        let timeout_secs = options.timeout_secs;
+        let timeout_hint = options.filter_hint();
+        let scan_cancel = ctx.cancel.child_token();
+        let _stop_scan = scan_cancel.clone().drop_guard();
+        let search = async {
+            match self.world.info(&base).await {
+                Ok(m) if m.is_dir => {}
+                // Denied is not missing — see the same note in `read`.
+                Err(e) => return err(format!("glob: {e}")),
+                _ => {
+                    return err(format!(
+                        "glob: base directory does not exist: {}{}",
+                        crate::pathnorm::to_display(&base),
+                        not_found_hint(&base, &ctx.working_dir).await
+                    ))
                 }
             }
-            hits.sort();
-            (hits, walked.scan)
-        });
 
-        // A walk that was stopped gives back what it had, and "no files matching"
-        // out of half a tree is a claim about the tree that is not true. Said the
-        // way `bash` says it.
-        if ctx.cancel.is_cancelled() {
-            return err("glob: cancelled before completion.".to_string());
-        }
-        match res {
-            Ok((hits, scan)) if hits.is_empty() => ok(format!(
-                "{}\n{}\n{}",
-                if scan.incomplete() {
-                    format!("No matching files collected in the scanned portion for \"{pattern}\"")
-                } else {
-                    format!("No files matching \"{pattern}\" under the active filters")
-                },
-                scan.summary(),
-                options.filter_hint()
-            )),
-            Ok((mut hits, scan)) => {
-                let total = hits.len();
-                let extra = total.saturating_sub(MAX_RESULTS);
-                if total > MAX_RESULTS {
-                    hits.truncate(MAX_RESULTS);
+            // A literal filename is an explicit lookup, not tree discovery. Like
+            // read_file and grep(path=file), it bypasses ignore/link traversal rules
+            // and never expands a missing filename into an expensive whole-tree walk.
+            if !match_pattern
+                .chars()
+                .any(|c| matches!(c, '*' | '?' | '[' | ']' | '{' | '}'))
+            {
+                if ctx.cancel.is_cancelled() {
+                    return err("glob: cancelled before completion.");
                 }
-                let mut out = format!("{total} files found:\n{}", hits.join("\n"));
-                if extra > 0 {
-                    out.push_str(&format!("\n[{extra} more files not shown]"));
-                }
-                out.push_str(&format!("\n{}", scan.summary()));
-                ok(out)
+                let exact = resolve_path(&match_pattern, &base);
+                return match self.world.info(&exact).await {
+                    Ok(info) if info.exists && !info.is_dir => ok(format!(
+                        "1 files found:\n{}",
+                        crate::pathnorm::to_display(
+                            exact.strip_prefix(&ctx.working_dir).unwrap_or(&exact)
+                        )
+                    )),
+                    Ok(_) => ok(format!(
+                        "No files matching \"{}\" at the exact path {}{}",
+                        a.pattern,
+                        crate::pathnorm::to_display(&exact),
+                        not_found_hint(&exact, &ctx.working_dir).await
+                    )),
+                    Err(e) => err(format!("glob: {e}")),
+                };
             }
-            Err(e) => err(format!("glob: {e}")),
+
+            let matcher = match GlobBuilder::new(&match_pattern)
+                .literal_separator(true)
+                .build()
+            {
+                Ok(g) => g.compile_matcher(),
+                Err(e) => return err(format!("glob: invalid pattern '{}': {e}", a.pattern)),
+            };
+
+            let wd = ctx.working_dir.clone();
+            let pattern = a.pattern.clone();
+            let skip = crate::pathutil::search_skip_dir_for(&self.dirs, options.respect_gitignore);
+            let res = self
+                .world
+                .walk_with_options(&base, &skip, &scan_cancel, &options)
+                .await
+                .map(|walked| {
+                    let mut hits = Vec::new();
+                    for path in walked.files {
+                        let rel = path.strip_prefix(&base).unwrap_or(&path);
+                        if matcher.is_match(rel) {
+                            hits.push(crate::pathnorm::to_display(
+                                path.strip_prefix(&wd).unwrap_or(&path),
+                            ));
+                        }
+                    }
+                    hits.sort();
+                    (hits, walked.scan)
+                });
+
+            // A walk that was stopped gives back what it had, and "no files matching"
+            // out of half a tree is a claim about the tree that is not true. Said the
+            // way `bash` says it.
+            if ctx.cancel.is_cancelled() {
+                return err("glob: cancelled before completion.".to_string());
+            }
+            match res {
+                Ok((hits, scan)) if hits.is_empty() => {
+                    ok(format!(
+                        "{}\n{}\n{}",
+                        if scan.incomplete() {
+                            format!("No matching files collected in the scanned portion for \"{pattern}\"")
+                        } else {
+                            format!("No files matching \"{pattern}\" under the active filters")
+                        },
+                        scan.summary(),
+                        options.filter_hint()
+                    ))
+                }
+                Ok((mut hits, scan)) => {
+                    let total = hits.len();
+                    let extra = total.saturating_sub(MAX_RESULTS);
+                    if total > MAX_RESULTS {
+                        hits.truncate(MAX_RESULTS);
+                    }
+                    let mut out = format!("{total} files found:\n{}", hits.join("\n"));
+                    if extra > 0 {
+                        out.push_str(&format!("\n[{extra} more files not shown]"));
+                    }
+                    out.push_str(&format!("\n{}", scan.summary()));
+                    ok(out)
+                }
+                Err(e) => err(format!("glob: {e}")),
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = ctx.cancel.cancelled() => err("glob: cancelled before completion."),
+            result = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), search) => {
+                result.unwrap_or_else(|_| err(format!(
+                    "glob: search timed out after {timeout_secs}s in {scope}; scan incomplete. Narrow the path. {timeout_hint}"
+                )))
+            }
         }
     }
 }

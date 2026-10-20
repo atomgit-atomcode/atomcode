@@ -279,7 +279,13 @@ async fn an_explicit_broken_link_reports_the_link_not_a_missing_file() {
     assert!(child.content.contains("broken symbolic link"));
 }
 
-struct WaitingWorld(LocalFs);
+#[derive(Clone, Copy)]
+enum WaitAt {
+    Walk,
+    Metadata,
+    AfterSlowMetadata,
+}
+struct WaitingWorld(LocalFs, WaitAt);
 #[async_trait::async_trait]
 impl FileSystem for WaitingWorld {
     fn describe(&self) -> String {
@@ -312,6 +318,13 @@ impl FileSystem for WaitingWorld {
         &self,
         p: &Path,
     ) -> Result<atomcode_capabilities::world::FileInfo, atomcode_capabilities::world::FsError> {
+        match self.1 {
+            WaitAt::Metadata => return std::future::pending().await,
+            WaitAt::AfterSlowMetadata => {
+                tokio::time::sleep(std::time::Duration::from_millis(600)).await
+            }
+            WaitAt::Walk => {}
+        }
         self.0.info(p).await
     }
     async fn canonicalize(
@@ -333,7 +346,7 @@ impl FileSystem for WaitingWorld {
 async fn a_blocked_world_times_out_without_claiming_files_do_not_exist() {
     let dir = tempfile::tempdir().unwrap();
     let c = context(dir.path());
-    let world = Arc::new(WaitingWorld(LocalFs::unfenced()));
+    let world = Arc::new(WaitingWorld(LocalFs::unfenced(), WaitAt::Walk));
     let options = WalkOptions {
         timeout_secs: 1,
         ..Default::default()
@@ -428,4 +441,69 @@ async fn literal_globs_do_not_depend_on_ignore_rules_or_scan_the_tree() {
         .await;
     assert!(missing.content.contains("at the exact path"));
     assert!(!missing.content.contains("entry limit"));
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn metadata_queries_are_bounded_and_cancellable_before_the_walk() {
+    let dir = tempfile::tempdir().unwrap();
+    for stage in [WaitAt::Metadata, WaitAt::AfterSlowMetadata] {
+        let world = Arc::new(WaitingWorld(LocalFs::unfenced(), stage));
+        let options = WalkOptions {
+            timeout_secs: 1,
+            ..Default::default()
+        };
+        for tool in [
+            Box::new(
+                GlobTool::with_world(world.clone(), dirs(dir.path())).with_options(options.clone()),
+            ) as Box<dyn Tool>,
+            Box::new(
+                GrepTool::with_world(world.clone(), dirs(dir.path())).with_options(options.clone()),
+            ),
+        ] {
+            for cancel in [false, true] {
+                let mut ctx = context(dir.path());
+                let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let captured = seen.clone();
+                ctx.progress = atomcode_kernel::tool::ProgressSink::new(Arc::new(move |msg| {
+                    captured.lock().unwrap().push(msg);
+                }));
+                let trigger = ctx.cancel.clone();
+                let action = async {
+                    if cancel {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        trigger.cancel();
+                    }
+                };
+                let began = tokio::time::Instant::now();
+                let (result, _) = tokio::join!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        tool.execute(r#"{"pattern":"needle.*"}"#, &ctx)
+                    ),
+                    action
+                );
+                let result = result.expect("the tool's own deadline/cancel must finish first");
+                assert!(result.is_error, "{}", result.content);
+                assert!(
+                    result
+                        .content
+                        .contains(if cancel { "cancelled" } else { "timed out" }),
+                    "{}",
+                    result.content
+                );
+                assert_eq!(
+                    began.elapsed(),
+                    if cancel {
+                        std::time::Duration::from_millis(10)
+                    } else {
+                        std::time::Duration::from_secs(1)
+                    }
+                );
+                assert!(
+                    !seen.lock().unwrap().is_empty(),
+                    "progress must precede metadata lookup"
+                );
+            }
+        }
+    }
 }

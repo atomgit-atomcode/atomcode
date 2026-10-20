@@ -386,7 +386,7 @@ async fn start_for_phone(config_path: &std::path::Path) -> Result<String, String
     let machine = std::env::var("HOSTNAME")
         .ok()
         .filter(|name| !name.is_empty());
-    let binary = crate::relay::ensure_relay_client_bin()?;
+    let binary = crate::relay::ensure_relay_client_bin().await?;
     let mut command = tokio::process::Command::new(&binary);
     command
         .arg("run")

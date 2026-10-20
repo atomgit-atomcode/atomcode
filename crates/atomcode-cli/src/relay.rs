@@ -73,15 +73,26 @@ struct RelayBinaryEntry {
     size: u64,
 }
 
+// Refreshing OAuth may perform blocking network I/O. Keep it off the async
+// worker so a startup deadline can still interrupt the caller.
+async fn relay_auth_token() -> Result<String, String> {
+    let user = atomcode_coding::config::product_dirs_from_env()
+        .user()
+        .to_path_buf();
+    tokio::task::spawn_blocking(move || atomcode_auth::oauth::get_valid_token(&user))
+        .await
+        .map_err(|_| tr(SMsg::RelayNeedsLogin).into_owned())?
+        .map_err(|_| tr(SMsg::RelayNeedsLogin).into_owned())
+}
+
 /// 获取 relay-client 远端版本清单。
 async fn fetch_relay_manifest() -> Result<RelayManifest, String> {
-    let token = atomcode_auth::oauth::get_valid_token(
-        atomcode_coding::config::product_dirs_from_env().user(),
-    )
-    .map_err(|_| tr(SMsg::RelayNeedsLogin).into_owned())?;
+    let token = relay_auth_token().await?;
 
     let client = reqwest::Client::builder()
         .user_agent(concat!("atomcode/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(60))
         .build()
         .map_err(|e| format!("http client: {e}"))?;
 
@@ -212,7 +223,7 @@ fn relay_client_cache_dir() -> PathBuf {
 
 /// 确保 relay-client 二进制可用。
 /// 先尝试本地查找（环境变量 → 同目录 → 缓存），都不存在则自动下载到缓存目录。
-pub fn ensure_relay_client_bin() -> Result<String, String> {
+pub async fn ensure_relay_client_bin() -> Result<String, String> {
     // 先尝试环境变量和同目录
     if let Some(bin) = resolve_relay_client_bin() {
         return Ok(bin);
@@ -253,9 +264,7 @@ pub fn ensure_relay_client_bin() -> Result<String, String> {
     }
 
     // 6) 获取远端版本清单（含最新版本号 + sha256）
-    let manifest = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(fetch_relay_manifest())
-    });
+    let manifest = fetch_relay_manifest().await;
     let manifest = match manifest {
         Ok(m) => m,
         Err(_) => {
@@ -316,24 +325,10 @@ pub fn ensure_relay_client_bin() -> Result<String, String> {
         RELAY_CLIENT_DOWNLOAD_BASE, manifest.version, filename
     );
 
-    // 使用 block_in_place 执行异步下载（当前在同步上下文中）
-    let download_result = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(download_relay_client(
-            &url,
-            &cache_path,
-            &entry.sha256,
-            entry.size,
-        ))
-    });
+    let download_result = download_relay_client(&url, &cache_path, &entry.sha256, entry.size).await;
 
     match download_result {
         Ok(()) => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ =
-                    std::fs::set_permissions(&cache_path, std::fs::Permissions::from_mode(0o755));
-            }
             // 写入缓存版本号
             let _ = std::fs::write(&version_path, manifest.version.as_bytes());
             Ok(cache_path.to_string_lossy().into_owned())
@@ -359,12 +354,6 @@ async fn download_relay_client(
     expected_sha256: &str,
     expected_size: u64,
 ) -> Result<(), String> {
-    use futures::StreamExt;
-    use tokio::io::AsyncWriteExt;
-
-    // SHA256 计算
-    use sha2::{Digest, Sha256};
-
     // 确保缓存目录存在
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
@@ -372,14 +361,13 @@ async fn download_relay_client(
     }
 
     // 获取 GitCode OAuth token（用户需先 /login）
-    let token = atomcode_auth::oauth::get_valid_token(
-        atomcode_coding::config::product_dirs_from_env().user(),
-    )
-    .map_err(|_| tr(SMsg::RelayNeedsLogin).into_owned())?;
+    let token = relay_auth_token().await?;
 
     // 构建 HTTP 客户端 + 添加鉴权头
     let client = reqwest::Client::builder()
         .user_agent(concat!("atomcode/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(60))
         .build()
         .map_err(|e| format!("http client: {e}"))?;
 
@@ -400,8 +388,29 @@ async fn download_relay_client(
         ));
     }
 
+    save_relay_download(resp, dest, expected_sha256, expected_size).await
+}
+
+async fn save_relay_download(
+    resp: reqwest::Response,
+    dest: &std::path::Path,
+    expected_sha256: &str,
+    expected_size: u64,
+) -> Result<(), String> {
+    use futures::StreamExt;
+    use tokio::io::AsyncWriteExt;
+
+    // SHA256 计算
+    use sha2::{Digest, Sha256};
+
     // 流式下载 + SHA256 累积
-    let mut file = tokio::fs::File::create(dest)
+    // An interrupted download must never become an executable cache hit.
+    // Keep this guard alive until the verified file is atomically published.
+    let pending = PendingDownload(dest.with_extension(format!("{}.part", uuid::Uuid::new_v4())));
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&pending.0)
         .await
         .map_err(|e| format!("creating the file: {e}"))?;
     let mut hasher = Sha256::new();
@@ -422,7 +431,6 @@ async fn download_relay_client(
 
     // 校验文件大小
     if expected_size > 0 && written != expected_size {
-        let _ = std::fs::remove_file(dest);
         return Err(format!(
             "size mismatch: expected {expected_size} bytes, got {written}"
         ));
@@ -431,11 +439,101 @@ async fn download_relay_client(
     // 校验 SHA256
     let got = hex_encode(&hasher.finalize());
     if !got.eq_ignore_ascii_case(expected_sha256) {
-        let _ = std::fs::remove_file(dest);
         return Err(format!(
             "sha256 mismatch: expected {expected_sha256}, got {got}"
         ));
     }
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&pending.0, std::fs::Permissions::from_mode(0o755))
+            .await
+            .map_err(|e| format!("making the verified download executable: {e}"))?;
+    }
+    tokio::fs::rename(&pending.0, dest)
+        .await
+        .map_err(|e| format!("publishing the verified download: {e}"))?;
     Ok(())
+}
+
+/// Synchronous cleanup also runs when an async download is dropped on timeout.
+struct PendingDownload(PathBuf);
+impl Drop for PendingDownload {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[cfg(test)]
+mod download_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn response(complete: bool) -> (reqwest::Response, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n")
+                .await
+                .unwrap();
+            if complete {
+                socket.write_all(b"data").await.unwrap();
+            } else {
+                std::future::pending::<()>().await;
+            }
+        });
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap();
+        (response, server)
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn interrupted_body_does_not_publish_an_executable_cache_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("client");
+        let (response, server) = response(false).await;
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            save_relay_download(response, &dest, "unused", 4)
+        )
+        .await
+        .is_err());
+        assert!(!dest.exists());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn only_a_verified_download_is_published() {
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("client");
+        for valid in [false, true] {
+            let (response, server) = response(true).await;
+            let digest = if valid {
+                hex_encode(&Sha256::digest(b"data"))
+            } else {
+                "invalid".into()
+            };
+            let result = save_relay_download(response, &dest, &digest, 4).await;
+            assert_eq!(result.is_ok(), valid);
+            assert_eq!(dest.exists(), valid);
+            assert_eq!(
+                std::fs::read_dir(dir.path()).unwrap().count(),
+                usize::from(valid)
+            );
+            server.await.unwrap();
+        }
+        assert_eq!(std::fs::read(dest).unwrap(), b"data");
+    }
 }

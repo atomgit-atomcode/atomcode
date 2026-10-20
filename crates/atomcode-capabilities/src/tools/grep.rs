@@ -122,156 +122,157 @@ impl Tool for GrepTool {
             return err("grep: cancelled before completion.");
         }
         let options = a.discovery.resolve(&self.options, ctx);
-        let scan_cancel = ctx.cancel.child_token();
-        let _stop_scan = scan_cancel.clone().drop_guard();
         let raw = a.path.clone().unwrap_or_else(|| ".".to_string());
         let root = resolve_path(&raw, &ctx.working_dir);
-        let walks_a_dir = match self.world.info(&root).await {
-            Ok(m) if m.exists => m.is_dir,
-            // Denied is not missing — see the same note in `read`.
-            Err(e) => return err(format!("grep: {e}")),
-            _ => {
-                return err(format!(
-                    "grep: path not found: {}{}",
-                    crate::pathnorm::to_display(&root),
-                    not_found_hint(&root, &ctx.working_dir).await
-                ))
-            }
-        };
-        let max = a
-            .max_results
-            .unwrap_or(DEFAULT_MAX_RESULTS)
-            .clamp(1, MAX_RESULTS_CAP);
-        let context = a.context.unwrap_or(DEFAULT_CONTEXT).min(MAX_CONTEXT);
-
-        // Smart-case + literal fallback. The decision is made here and the world
-        // gets a final pattern: what counts as a regex is the caller's, not a
-        // property of where the files live.
-        let has_upper = a.pattern.chars().any(|c| c.is_uppercase());
-        let case_insensitive = !has_upper;
-        let pattern = if RegexMatcherBuilder::new()
-            .case_insensitive(case_insensitive)
-            .build(&a.pattern)
-            .is_ok()
-        {
-            a.pattern.clone()
-        } else {
-            let literal = regex::escape(&a.pattern);
-            if let Err(e) = RegexMatcherBuilder::new()
-                .case_insensitive(case_insensitive)
-                .build(&literal)
-            {
-                return err(format!("grep: invalid pattern '{}': {e}", a.pattern));
-            }
-            literal
-        };
-
-        // A credential store in the user tree (`config.toml` with its api keys,
-        // `auth.toml`, …) is searched only when the call names it — and then the
-        // sensitive-path gate has already asked. A walk that merely passes through
-        // the home must not read it: `grep api_key ~/.atomcode` would otherwise
-        // hand over what `read_file ~/.atomcode/config.toml` asks about. Resolved
-        // on the first file the walk meets, on the walker's own thread.
-        let sensitive = super::sensitive_path::SensitivePaths::of(&self.dirs);
-        let explicitly_sensitive = sensitive
-            .references_in(
-                &json!({ "path": root }).to_string(),
-                &ctx.working_dir,
-                &*self.world,
-            )
-            .await;
-        let mut named_roots = vec![root.clone()];
-        if let Ok(real) = self.world.canonicalize(&root).await {
-            named_roots.push(real);
-        }
-        let credential_homes = std::sync::OnceLock::new();
-        let user_dir = self.dirs.user().to_path_buf();
-        let respect_ignored_logs = options.respect_gitignore && walks_a_dir;
-        let query = SearchQuery {
-            pattern,
-            case_insensitive,
-            context,
-            max_matches: max,
-            cancel: scan_cancel.clone(),
-            walk: options.clone(),
-            skip_dir: crate::pathutil::search_skip_dir_for(&self.dirs, options.respect_gitignore),
-            skip_file: Arc::new(move |path: &std::path::Path| {
-                (respect_ignored_logs
-                    && path
-                        .extension()
-                        .map(|x| x.eq_ignore_ascii_case("log"))
-                        .unwrap_or(false))
-                    || (walks_a_dir
-                        && sensitive.references(&json!({"path": path}).to_string())
-                        && !(explicitly_sensitive
-                            && named_roots.iter().any(|root| path.starts_with(root))))
-                    || (walks_a_dir
-                        && credential_homes
-                            .get_or_init(|| home_spellings(&user_dir))
-                            .iter()
-                            .any(|home| is_credential_path(path, home)))
-            }),
-        };
-        let base = ctx.working_dir.clone();
-        let display_path = raw.clone();
-        let shown_pattern = a.pattern.clone();
+        let scope = crate::pathnorm::to_display(&root);
         ctx.progress.emit(format!(
-            "Searching {} (up to {}s / {} entries)",
-            display_path, options.timeout_secs, options.max_entries
+            "Searching {scope} (up to {}s / {} entries)",
+            options.timeout_secs, options.max_entries
         ));
-        let waited = tokio::select! {
-            biased;
-            _ = ctx.cancel.cancelled() => return err("grep: cancelled before completion."),
-            result = tokio::time::timeout(std::time::Duration::from_secs(options.timeout_secs),
-                self.world.search(&root, &query)) => result,
-        };
-        let searched = match waited {
-            Ok(result) => result,
-            Err(_) => {
-                return err(format!(
-                    "grep: search timed out after {}s in {}; scan incomplete. Narrow the path. {}",
-                    options.timeout_secs,
-                    display_path,
-                    options.filter_hint()
-                ))
-            }
-        };
-        // The walk gives back what it had when it saw the stop, which is not an
-        // answer to what was asked: a "no matches" from a search that was cut
-        // short reads to the model as a fact about the tree. Said the way `bash`
-        // says it.
-        if ctx.cancel.is_cancelled() {
-            return err("grep: cancelled before completion.".to_string());
-        }
-        match searched {
-            Ok(result) if result.lines.is_empty() => ok(format!(
-                "{} for '{shown_pattern}' in {display_path} ({} files searched)\n{}\n{}",
-                if result.scan.incomplete() {
-                    "No matches collected in the scanned portion"
-                } else {
-                    "No matches found under the active filters"
-                },
-                result.files_searched,
-                result.scan.summary(),
-                options.filter_hint()
-            )),
-            Ok(result) => {
-                let lines: Vec<String> = result
-                    .lines
-                    .iter()
-                    .map(|line| render_search_line(line, &base))
-                    .collect();
-                // Cap on the real MATCH count — not total output rows, which also include
-                // context + `--` separators (that over-reported "capped" with any context).
-                let capped = result.matches >= max;
-                let mut out = lines.join("\n");
-                if capped {
-                    out.push_str(&format!("\n\n[Results capped at {max} matches]"));
+        let timeout_secs = options.timeout_secs;
+        let timeout_hint = options.filter_hint();
+        let scan_cancel = ctx.cancel.child_token();
+        let _stop_scan = scan_cancel.clone().drop_guard();
+        let search = async {
+            let walks_a_dir = match self.world.info(&root).await {
+                Ok(m) if m.exists => m.is_dir,
+                // Denied is not missing — see the same note in `read`.
+                Err(e) => return err(format!("grep: {e}")),
+                _ => {
+                    return err(format!(
+                        "grep: path not found: {}{}",
+                        crate::pathnorm::to_display(&root),
+                        not_found_hint(&root, &ctx.working_dir).await
+                    ))
                 }
-                out.push_str(&format!("\n{}", result.scan.summary()));
-                ok(out)
+            };
+            let max = a
+                .max_results
+                .unwrap_or(DEFAULT_MAX_RESULTS)
+                .clamp(1, MAX_RESULTS_CAP);
+            let context = a.context.unwrap_or(DEFAULT_CONTEXT).min(MAX_CONTEXT);
+
+            // Smart-case + literal fallback. The decision is made here and the world
+            // gets a final pattern: what counts as a regex is the caller's, not a
+            // property of where the files live.
+            let has_upper = a.pattern.chars().any(|c| c.is_uppercase());
+            let case_insensitive = !has_upper;
+            let pattern = if RegexMatcherBuilder::new()
+                .case_insensitive(case_insensitive)
+                .build(&a.pattern)
+                .is_ok()
+            {
+                a.pattern.clone()
+            } else {
+                let literal = regex::escape(&a.pattern);
+                if let Err(e) = RegexMatcherBuilder::new()
+                    .case_insensitive(case_insensitive)
+                    .build(&literal)
+                {
+                    return err(format!("grep: invalid pattern '{}': {e}", a.pattern));
+                }
+                literal
+            };
+
+            // A credential store in the user tree (`config.toml` with its api keys,
+            // `auth.toml`, …) is searched only when the call names it — and then the
+            // sensitive-path gate has already asked. A walk that merely passes through
+            // the home must not read it: `grep api_key ~/.atomcode` would otherwise
+            // hand over what `read_file ~/.atomcode/config.toml` asks about. Resolved
+            // on the first file the walk meets, on the walker's own thread.
+            let sensitive = super::sensitive_path::SensitivePaths::of(&self.dirs);
+            let explicitly_sensitive = sensitive
+                .references_in(
+                    &json!({ "path": root }).to_string(),
+                    &ctx.working_dir,
+                    &*self.world,
+                )
+                .await;
+            let mut named_roots = vec![root.clone()];
+            if let Ok(real) = self.world.canonicalize(&root).await {
+                named_roots.push(real);
             }
-            Err(e) => err(format!("grep: {e}")),
+            let credential_homes = std::sync::OnceLock::new();
+            let user_dir = self.dirs.user().to_path_buf();
+            let respect_ignored_logs = options.respect_gitignore && walks_a_dir;
+            let query = SearchQuery {
+                pattern,
+                case_insensitive,
+                context,
+                max_matches: max,
+                cancel: scan_cancel.clone(),
+                walk: options.clone(),
+                skip_dir: crate::pathutil::search_skip_dir_for(
+                    &self.dirs,
+                    options.respect_gitignore,
+                ),
+                skip_file: Arc::new(move |path: &std::path::Path| {
+                    (respect_ignored_logs
+                        && path
+                            .extension()
+                            .map(|x| x.eq_ignore_ascii_case("log"))
+                            .unwrap_or(false))
+                        || (walks_a_dir
+                            && sensitive.references(&json!({"path": path}).to_string())
+                            && !(explicitly_sensitive
+                                && named_roots.iter().any(|root| path.starts_with(root))))
+                        || (walks_a_dir
+                            && credential_homes
+                                .get_or_init(|| home_spellings(&user_dir))
+                                .iter()
+                                .any(|home| is_credential_path(path, home)))
+                }),
+            };
+            let base = ctx.working_dir.clone();
+            let display_path = raw.clone();
+            let shown_pattern = a.pattern.clone();
+            let searched = self.world.search(&root, &query).await;
+            // The walk gives back what it had when it saw the stop, which is not an
+            // answer to what was asked: a "no matches" from a search that was cut
+            // short reads to the model as a fact about the tree. Said the way `bash`
+            // says it.
+            if ctx.cancel.is_cancelled() {
+                return err("grep: cancelled before completion.".to_string());
+            }
+            match searched {
+                Ok(result) if result.lines.is_empty() => ok(format!(
+                    "{} for '{shown_pattern}' in {display_path} ({} files searched)\n{}\n{}",
+                    if result.scan.incomplete() {
+                        "No matches collected in the scanned portion"
+                    } else {
+                        "No matches found under the active filters"
+                    },
+                    result.files_searched,
+                    result.scan.summary(),
+                    options.filter_hint()
+                )),
+                Ok(result) => {
+                    let lines: Vec<String> = result
+                        .lines
+                        .iter()
+                        .map(|line| render_search_line(line, &base))
+                        .collect();
+                    // Cap on the real MATCH count — not total output rows, which also include
+                    // context + `--` separators (that over-reported "capped" with any context).
+                    let capped = result.matches >= max;
+                    let mut out = lines.join("\n");
+                    if capped {
+                        out.push_str(&format!("\n\n[Results capped at {max} matches]"));
+                    }
+                    out.push_str(&format!("\n{}", result.scan.summary()));
+                    ok(out)
+                }
+                Err(e) => err(format!("grep: {e}")),
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = ctx.cancel.cancelled() => err("grep: cancelled before completion."),
+            result = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), search) => {
+                result.unwrap_or_else(|_| err(format!(
+                    "grep: search timed out after {timeout_secs}s in {scope}; scan incomplete. Narrow the path. {timeout_hint}"
+                )))
+            }
         }
     }
 }

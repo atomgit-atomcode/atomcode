@@ -112,7 +112,13 @@ impl Plugin for SearchWorldToolsPlugin {
     fn description(&self) -> &'static str {
         "grep and glob, routed through the `fs` seam"
     }
-    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+    async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
+        let options: atomcode_capabilities::world::WalkOptions = if config.is_null() {
+            Default::default()
+        } else {
+            serde_json::from_value(config.clone())
+                .map_err(|e| format!("bad tool-search-world config: {e}"))?
+        };
         let fs = ctx.require::<FsSvc>().map_err(|e| e.to_string())?;
         let dirs = (*crate::product_dirs(ctx)?).clone();
         // These were the two tools a fenced world could not contain: they walked
@@ -122,8 +128,10 @@ impl Plugin for SearchWorldToolsPlugin {
         super::tools::mount(
             ctx,
             vec![
-                Arc::new(GrepTool::with_world(fs.clone(), dirs.clone())),
-                Arc::new(GlobTool::with_world(fs.clone(), dirs)),
+                Arc::new(
+                    GrepTool::with_world(fs.clone(), dirs.clone()).with_options(options.clone()),
+                ),
+                Arc::new(GlobTool::with_world(fs.clone(), dirs).with_options(options)),
             ],
         )?;
         super::tools::contribute_prompt(

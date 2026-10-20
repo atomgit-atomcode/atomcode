@@ -595,15 +595,67 @@ async fn search_defaults_reach_the_shipping_tools_and_project_overrides_are_scop
     )
     .agent_config();
     assert!(cfg.tool_search.include_hidden);
-    let dumped = support::mount(&cfg, quiet_options(), Arc::new(CannedProvider))
-        .await
-        .dump();
-    assert!(dumped.contains("\"respect_gitignore\": false"), "{dumped}");
-    assert!(dumped.contains("\"follow_symlinks\": true"), "{dumped}");
-    cfg.working_dir = elsewhere.path().into();
-    let dumped = support::mount(&cfg, quiet_options(), Arc::new(CannedProvider))
-        .await
-        .dump();
-    assert!(dumped.contains("\"respect_gitignore\": true"), "{dumped}");
-    assert!(dumped.contains("\"follow_symlinks\": false"), "{dumped}");
+    #[cfg(unix)]
+    let linked = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    std::fs::write(linked.path().join("linked.txt"), "needle").unwrap();
+    for root in [project.path(), elsewhere.path()] {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(linked.path(), root.join("linked")).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join(".hidden")).unwrap();
+        std::fs::write(root.join(".gitignore"), "ignored.txt\n").unwrap();
+        std::fs::write(root.join(".hidden/hidden.txt"), "needle").unwrap();
+        std::fs::write(root.join("ignored.txt"), "needle").unwrap();
+    }
+    for (root, includes_ignored) in [(project.path(), true), (elsewhere.path(), false)] {
+        cfg.working_dir = root.into();
+        let mounted = support::mount(&cfg, quiet_options(), Arc::new(CannedProvider)).await;
+        let tools = mounted
+            .context()
+            .service::<atomcode_harness::seams::ToolsSvc>()
+            .unwrap();
+        let ctx = atomcode_kernel::tool::ToolContext {
+            working_dir: root.into(),
+            cancel: Default::default(),
+            progress: Default::default(),
+            requester: None,
+        };
+        for (name, args) in [
+            ("glob", r#"{"pattern":"**/*.txt"}"#),
+            ("grep", r#"{"pattern":"needle","context":0}"#),
+        ] {
+            let tool = tools.get(name).unwrap();
+            let result = tool.execute(args, &ctx).await;
+            assert!(!result.is_error, "{}", result.content);
+            assert!(
+                result.content.contains("hidden.txt"),
+                "{name}: {}",
+                result.content
+            );
+            assert_eq!(
+                result.content.contains("ignored.txt"),
+                includes_ignored,
+                "{name}: {}",
+                result.content
+            );
+            #[cfg(unix)]
+            assert_eq!(
+                result.content.contains("linked.txt"),
+                includes_ignored,
+                "{name}: follow_symlinks must use the current project's setting: {}",
+                result.content
+            );
+            if !includes_ignored {
+                let args = if name == "glob" {
+                    r#"{"pattern":"**/*.txt","respect_gitignore":false}"#
+                } else {
+                    r#"{"pattern":"needle","respect_gitignore":false}"#
+                };
+                let result = tool.execute(args, &ctx).await;
+                assert!(result.content.contains("ignored.txt"), "{}", result.content);
+            }
+        }
+        mounted.shutdown().await;
+    }
 }
