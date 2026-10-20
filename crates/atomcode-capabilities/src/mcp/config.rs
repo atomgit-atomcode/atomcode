@@ -19,7 +19,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Map, Value};
 
 /// MCP server transport configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum McpTransportConfig {
     Stdio {
         command: String,
@@ -89,7 +89,7 @@ pub struct McpOAuthConfig {
 }
 
 /// MCP server configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct McpServerConfig {
     pub name: String,
     pub disabled: bool,

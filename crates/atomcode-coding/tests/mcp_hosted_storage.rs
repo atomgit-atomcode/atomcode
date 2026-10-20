@@ -504,6 +504,248 @@ async fn the_runtime_edits_the_host_kept_documents_through_update() {
     runtime.handle.shutdown().await.unwrap();
 }
 
+/// A retained connection is released without preparing the other servers again.
+#[tokio::test(flavor = "multi_thread")]
+async fn disable_then_enable_reuses_the_retained_connections() {
+    let env = Env::new();
+    let recorder = Arc::new(Recorder::default());
+    let mut config: Value = serde_json::from_str(&env.user_config()).unwrap();
+    config["mcpServers"]["neighbor"] = config["mcpServers"]["u"].clone();
+    let user_config = Sealed::holding(&config.to_string());
+    let tokens = Sealed::holding("");
+    let mut runtime = started(env.start(&recorder, &user_config, &tokens)).await;
+    runtime
+        .handle
+        .wait_mcp_ready(std::time::Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(env.spawns())
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+    runtime
+        .handle
+        .mcp_act("u".into(), McpAction::Disable)
+        .await
+        .unwrap();
+    turn(&mut runtime, "while disabled").await;
+    assert!(!recorder
+        .last_offered()
+        .contains(&"mcp__u__echo".to_string()));
+    assert!(recorder
+        .last_offered()
+        .contains(&"mcp__neighbor__echo".to_string()));
+    runtime
+        .handle
+        .mcp_act("u".into(), McpAction::Enable)
+        .await
+        .unwrap();
+    runtime
+        .handle
+        .wait_mcp_ready(std::time::Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(env.spawns())
+            .unwrap()
+            .lines()
+            .count(),
+        2,
+        "neither connection restarts"
+    );
+    turn(&mut runtime, "after enable").await;
+    assert!(recorder
+        .last_offered()
+        .contains(&"mcp__u__echo".to_string()));
+    runtime
+        .handle
+        .switch_tool("mcp__u__echo".into(), false)
+        .await
+        .unwrap();
+    runtime
+        .handle
+        .mcp_act("u".into(), McpAction::Disable)
+        .await
+        .unwrap();
+    runtime
+        .handle
+        .mcp_act("u".into(), McpAction::Enable)
+        .await
+        .unwrap();
+    turn(&mut runtime, "manual tool switch stays off").await;
+    assert!(!recorder
+        .last_offered()
+        .contains(&"mcp__u__echo".to_string()));
+    assert_eq!(
+        std::fs::read_to_string(env.spawns())
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+    env.user_file_untouched();
+    runtime.handle.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn enabling_a_server_disabled_at_start_still_prepares_it() {
+    let env = Env::new();
+    let recorder = Arc::new(Recorder::default());
+    let mut config: Value = serde_json::from_str(&env.user_config()).unwrap();
+    config["mcpServers"]["u"]["disabled"] = json!(true);
+    let user_config = Sealed::holding(&config.to_string());
+    let tokens = Sealed::holding("");
+    let mut runtime = started(env.start(&recorder, &user_config, &tokens)).await;
+    runtime
+        .handle
+        .wait_mcp_ready(std::time::Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert!(!env.spawns().exists());
+    runtime
+        .handle
+        .mcp_act("u".into(), McpAction::Enable)
+        .await
+        .unwrap();
+    runtime
+        .handle
+        .wait_mcp_ready(std::time::Duration::from_secs(10))
+        .await
+        .unwrap();
+    turn(&mut runtime, "after enable").await;
+    assert!(recorder
+        .last_offered()
+        .contains(&"mcp__u__echo".to_string()));
+    assert_eq!(
+        std::fs::read_to_string(env.spawns())
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn changed_config_and_reprepared_holds_are_not_reused() {
+    for reprepare in [false, true] {
+        let env = Env::new();
+        let recorder = Arc::new(Recorder::default());
+        let user_config = Sealed::holding(&env.user_config());
+        let tokens = Sealed::holding("");
+        let mut runtime = started(env.start(&recorder, &user_config, &tokens)).await;
+        runtime
+            .handle
+            .wait_mcp_ready(std::time::Duration::from_secs(10))
+            .await
+            .unwrap();
+        // An explicit on-exception to a broader manual off-pattern must
+        // survive restoring this Disable's own marks into a replacement.
+        runtime
+            .handle
+            .switch_tool("mcp__u__*".into(), false)
+            .await
+            .unwrap();
+        runtime
+            .handle
+            .switch_tool("mcp__u__echo".into(), true)
+            .await
+            .unwrap();
+        runtime
+            .handle
+            .mcp_act("u".into(), McpAction::Disable)
+            .await
+            .unwrap();
+        if reprepare {
+            runtime.handle.reload_capabilities().await.unwrap();
+            runtime
+                .handle
+                .wait_mcp_ready(std::time::Duration::from_secs(10))
+                .await
+                .unwrap();
+        } else {
+            let mut changed = user_config.json();
+            changed["mcpServers"]["u"]["env"]["TOKEN"] = json!("changed");
+            *user_config.stored.lock().unwrap() = Some(format!("{SEAL}{changed}"));
+        }
+        runtime
+            .handle
+            .mcp_act("u".into(), McpAction::Enable)
+            .await
+            .unwrap();
+        runtime
+            .handle
+            .wait_mcp_ready(std::time::Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(env.spawns())
+                .unwrap()
+                .lines()
+                .count(),
+            2,
+            "a replacement was connected: reprepare={reprepare}"
+        );
+        turn(&mut runtime, "after enable").await;
+        assert!(
+            recorder
+                .last_offered()
+                .contains(&"mcp__u__echo".to_string()),
+            "owned switch marks do not strand replacement tools"
+        );
+        runtime.handle.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn enabling_a_retained_server_rechecks_project_trust() {
+    let env = Env::new();
+    let recorder = Arc::new(Recorder::default());
+    let config: Value = serde_json::from_str(&env.user_config()).unwrap();
+    std::fs::write(
+        env.project.path().join(".mcp.json"),
+        json!({"mcpServers": {"p": config["mcpServers"]["u"].clone()}}).to_string(),
+    )
+    .unwrap();
+    atomcode_capabilities::mcp::trust::trust_project(env.project.path(), env.home.path()).unwrap();
+    let user_config = Sealed::holding(&config.to_string());
+    let tokens = Sealed::holding("");
+    let mut runtime = started(env.start(&recorder, &user_config, &tokens)).await;
+    runtime
+        .handle
+        .wait_mcp_ready(std::time::Duration::from_secs(10))
+        .await
+        .unwrap();
+    runtime
+        .handle
+        .mcp_act("p".into(), McpAction::Disable)
+        .await
+        .unwrap();
+    atomcode_capabilities::mcp::trust::untrust_project(env.project.path(), env.home.path())
+        .unwrap();
+    runtime
+        .handle
+        .mcp_act("p".into(), McpAction::Enable)
+        .await
+        .unwrap();
+    runtime
+        .handle
+        .wait_mcp_ready(std::time::Duration::from_secs(10))
+        .await
+        .unwrap();
+    turn(&mut runtime, "project trust was withdrawn").await;
+    assert!(!recorder
+        .last_offered()
+        .contains(&"mcp__p__echo".to_string()));
+    assert!(recorder
+        .last_offered()
+        .contains(&"mcp__u__echo".to_string()));
+    runtime.handle.shutdown().await.unwrap();
+}
+
 /// A host document the runtime cannot read is an error naming it, never an empty
 /// config: the runtime starts, nothing connects, the `/mcp` rows say why, and an
 /// edit stops before writing — the document is left as it was.

@@ -1626,6 +1626,20 @@ impl CodingParts {
         }
     }
 
+    /// Project guidance from exactly the tools visible after an in-place switch.
+    pub(crate) fn reproject_mcp_instructions(&self) {
+        if let (Some(registry), Some(catalog), Some(prompts)) = (
+            self.mcp_registry.as_ref(),
+            self.tool_catalog(),
+            self.mcp_prompts
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref(),
+        ) {
+            crate::mcp_instructions::project(prompts, registry, &catalog.names());
+        }
+    }
+
     pub(crate) fn mcp_tools_for_server(&self, server: &str) -> Vec<String> {
         let names = match self.mcp_tool_names.read() {
             Ok(names) => names,
@@ -1807,7 +1821,8 @@ pub enum McpAction {
 }
 
 impl McpAction {
-    /// Whether the change only reaches the session through a rebuild.
+    /// Whether the action may need a rebuild. Enable is resolved dynamically by
+    /// the runtime: a retained, unchanged connection can be restored in place.
     ///
     /// Trust and a config entry are both read when the graph is
     /// prepared, so writing them changes nothing until it is prepared again —

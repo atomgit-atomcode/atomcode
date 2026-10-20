@@ -164,7 +164,7 @@ impl McpView {
     /// 名单里还有没落定的吗——有的话,这一份就还可能变。
     ///
     /// 只有 `Connecting` 算:失败与断开是终态,再问也不会自己好;正在连的会。
-    /// 面板据此决定要不要自己再读一遍(`plugin.rs::poll_mcp_while_unsettled`)。
+    /// 面板据此决定要不要自己再读一遍(`plugin.rs::refresh_mcp_request`)。
     pub fn unsettled(&self) -> bool {
         self.rows
             .iter()
@@ -241,9 +241,35 @@ impl Busy {
     }
 }
 
+/// An async request belongs to one panel opening, view and revision.
+#[derive(Clone)]
+pub(crate) struct Request {
+    pub identity: std::sync::Arc<()>,
+    pub revision: u64,
+    pub lead: String,
+    pub viewing: String,
+    pub cwd: String,
+    pub detail: Option<String>,
+}
+impl Request {
+    pub fn matches(&self, moment: &crate::moment::Moment) -> bool {
+        self.lead == moment.lead
+            && self.viewing == moment.viewing
+            && self.cwd == moment.cwd
+            && moment.mcp_panel.as_ref().is_some_and(|panel| {
+                std::sync::Arc::ptr_eq(&self.identity, &panel.identity)
+                    && self.revision == panel.revision
+            })
+    }
+}
+
 /// 面板开着的时候。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Panel {
+    pub(crate) identity: std::sync::Arc<()>,
+    pub(crate) revision: u64,
+    pub(crate) pending: bool,
+    pub(crate) last_refresh: Option<crate::moment::Timestamp>,
     pub level: Level,
     /// 光标停在 *listed* 的第几行。
     pub cursor: usize,
@@ -335,14 +361,20 @@ impl Panel {
 /// 一次按键要面板的主人去做的事。凡是碰得到外面世界的都在这儿,不在 [`key`] 里。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Step {
+    Refresh,
     /// 面板自己动了,外面没有。
     Stay,
     /// 收起来。
     Close,
     /// 去取这一个服务器的详情。
-    OpenDetail { server: String },
+    OpenDetail {
+        server: String,
+    },
     /// 对这一个服务器做这一件事。
-    Act { server: String, action: Action },
+    Act {
+        server: String,
+        action: Action,
+    },
     /// 叫停正在跑的那一件(只有认证会发它)。停没停下来,由那一趟自己的回答说。
     Cancel,
 }
@@ -368,6 +400,9 @@ pub fn key(view: &McpView, panel: &mut Panel, press: KeyPress) -> Step {
         };
     }
 
+    if press.key == Key::Char('r') && press.mods == Mods::CTRL {
+        return Step::Refresh;
+    }
     if panel.level == Level::Detail {
         return detail_key(view, panel, press);
     }
@@ -527,6 +562,22 @@ mod tests {
         KeyPress::plain(key)
     }
 
+    #[test]
+    fn refresh_is_available_at_both_levels_but_not_during_an_action() {
+        let view = view_of(&["figma"]);
+        let mut panel = Panel::default();
+        let refresh = KeyPress {
+            key: Key::Char('r'),
+            mods: Mods::CTRL,
+        };
+        assert!(matches!(key(&view, &mut panel, refresh), Step::Refresh));
+        key(&view, &mut panel, press(Key::Enter));
+        assert_eq!(panel.level, Level::Detail);
+        assert!(matches!(key(&view, &mut panel, refresh), Step::Refresh));
+        panel.busy = Some(Busy::of(Action::Disable));
+        assert!(matches!(key(&view, &mut panel, refresh), Step::Stay));
+    }
+
     /// 一台服务器:连着,来源一样,只有名字是这一次要的。
     fn row(name: &str) -> McpRow {
         McpRow {
@@ -589,7 +640,7 @@ mod tests {
     /// 名单里还有正在连的,这一份就还可能变;全是终态就不再问。
     ///
     /// 只有 `Connecting` 算「还没落定」:失败与断开再问也不会自己好。面板据此决定
-    /// 要不要自己再读一遍(`plugin.rs::poll_mcp_while_unsettled`)。
+    /// 要不要自己再读一遍(`plugin.rs::refresh_mcp_request`)。
     #[test]
     fn a_view_is_unsettled_exactly_while_a_row_is_still_coming_up() {
         let settled = view_of(&["alpha"]);

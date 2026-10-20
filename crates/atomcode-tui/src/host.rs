@@ -1914,6 +1914,7 @@ impl Host {
             }
         }
         let mut m = self.moment.write().expect("moment poisoned");
+        m.mcp_panel = None;
         m.activity = crate::moment::Activity::Idle;
         m.scroll = crate::moment::ScrollPos::BOTTOM;
         m.selection = None;
@@ -5135,6 +5136,132 @@ impl Host {
             .is_some()
     }
 
+    /// At most one read and one sample per second. Navigation supersedes reads.
+    pub(crate) fn begin_mcp_request(
+        &self,
+        force: bool,
+        action: bool,
+    ) -> Option<crate::mcp::Request> {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let unsettled = m.mcp.unsettled()
+            || m.mcp
+                .detail()
+                .is_some_and(|d| d.state == crate::mcp::McpState::Connecting);
+        let now = m.now;
+        let scope = (m.lead.clone(), m.viewing.clone(), m.cwd.clone());
+        let panel = m.mcp_panel.as_mut()?;
+        if !action && panel.busy.is_some() {
+            return None;
+        }
+        if !force
+            && (panel.pending
+                || !unsettled
+                || panel
+                    .last_refresh
+                    .is_some_and(|last| now.as_millis().saturating_sub(last.as_millis()) < 1_000))
+        {
+            return None;
+        }
+        panel.revision = panel.revision.wrapping_add(1);
+        panel.pending = !action;
+        panel.last_refresh = Some(now);
+        Some(crate::mcp::Request {
+            identity: panel.identity.clone(),
+            revision: panel.revision,
+            lead: scope.0,
+            viewing: scope.1,
+            cwd: scope.2,
+            detail: (panel.level == crate::mcp::Level::Detail)
+                .then(|| panel.detail_for.clone())
+                .flatten(),
+        })
+    }
+
+    pub(crate) fn mcp_needs_poll(&self) -> bool {
+        let m = self.moment.read().expect("moment poisoned");
+        m.mcp_panel.as_ref().is_some_and(|p| p.busy.is_none())
+            && (m.mcp.unsettled()
+                || m.mcp
+                    .detail()
+                    .is_some_and(|d| d.state == crate::mcp::McpState::Connecting))
+    }
+
+    pub(crate) fn mcp_read_done(&self, request: &crate::mcp::Request) {
+        let mut m = self.moment.write().expect("moment poisoned");
+        if let Some(panel) = m.mcp_panel.as_mut().filter(|panel| {
+            std::sync::Arc::ptr_eq(&request.identity, &panel.identity)
+                && request.revision == panel.revision
+        }) {
+            // Release this read's slot even if its view scope changed. Its
+            // data is rejected separately, and the next scope may now retry.
+            panel.pending = false;
+        }
+    }
+
+    /// Apply under the scope-check lock so late replies cannot reach a new panel.
+    pub(crate) fn mcp_answer(
+        &self,
+        request: &crate::mcp::Request,
+        view: Option<crate::mcp::McpView>,
+        detail: Option<crate::mcp::McpDetail>,
+        error: Option<String>,
+        action: bool,
+    ) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        if !request.matches(&m) {
+            return false;
+        }
+        let mut panel = m.mcp_panel.take().expect("matched panel");
+        let selected = m
+            .mcp
+            .listed(&panel)
+            .get(panel.cursor)
+            .map(|row| row.name.clone());
+        if let Some(mut view) = view {
+            if view.detail().is_none() {
+                if let Some(old) = m
+                    .mcp
+                    .detail_for(panel.detail_for.as_deref())
+                    .filter(|_| panel.level == crate::mcp::Level::Detail)
+                {
+                    let mut kept = old.clone();
+                    if let Some(row) = view.rows().iter().find(|row| row.name == kept.name) {
+                        kept.state = row.state.clone();
+                        kept.tool_count = row.tool_count;
+                    }
+                    view = view.with_detail(kept);
+                }
+            }
+            m.mcp = view;
+        }
+        if let Some(detail) = detail.filter(|detail| {
+            panel.level == crate::mcp::Level::Detail
+                && panel.detail_for.as_deref() == Some(detail.name.as_str())
+        }) {
+            m.mcp = std::mem::take(&mut m.mcp).with_detail(detail);
+        }
+        if panel.level == crate::mcp::Level::List {
+            let listed = m.mcp.listed(&panel);
+            panel.cursor = selected
+                .and_then(|name| listed.iter().position(|row| row.name == name))
+                .unwrap_or(panel.cursor)
+                .min(listed.len().saturating_sub(1));
+        } else if let Some(detail) = m.mcp.detail_for(panel.detail_for.as_deref()) {
+            panel.cursor = panel
+                .cursor
+                .min(panel.actions(detail).len().saturating_sub(1));
+        }
+        if action {
+            panel.busy = None;
+        }
+        panel.pending = false;
+        if let Some(error) = error {
+            panel.note = Some(error);
+        }
+        m.mcp_panel = Some(panel);
+        true
+    }
+
     /// Put what the port answered into the moment. True when it changed.
     pub fn show_mcp(&self, view: crate::mcp::McpView) -> bool {
         let mut m = self.moment.write().expect("moment poisoned");
@@ -5264,6 +5391,13 @@ impl Host {
         // 过(鼠标点下去之后那一趟也走它,`run_mcp_key`),所以以后再加执行入口也不会漏。
         if panel.cursor != before.cursor || (before.busy.is_none() && panel.busy.is_some()) {
             panel.clicked = None;
+        }
+        if panel.level != before.level
+            || panel.detail_for != before.detail_for
+            || (before.busy.is_none() && panel.busy.is_some())
+        {
+            panel.revision = panel.revision.wrapping_add(1);
+            panel.pending = false;
         }
         let changed = *panel != before;
         match step {
@@ -11638,6 +11772,80 @@ mod tests {
             tool_count: 1,
             config_path: None,
         }
+    }
+
+    #[test]
+    fn mcp_polling_is_bounded_and_stops_when_connections_settle() {
+        let h = host_with_mcp();
+        let mut row = server_row("alpha");
+        row.state = crate::mcp::McpState::Connecting;
+        h.show_mcp(crate::mcp::McpView::new(vec![row]));
+        assert!(!h.mcp_needs_poll(), "closed panels never poll");
+        h.toggle_mcp();
+        assert!(h.mcp_needs_poll());
+        let first = h.begin_mcp_request(true, false).unwrap();
+        h.moment.write().unwrap().now = crate::moment::Timestamp::millis(1_000);
+        assert!(
+            h.begin_mcp_request(false, false).is_none(),
+            "one read at a time"
+        );
+        h.mcp_read_done(&first);
+        let next = h.begin_mcp_request(false, false).unwrap();
+        assert!(!h.mcp_answer(&first, None, None, Some("stale".into()), false));
+        assert!(h.mcp_answer(
+            &next,
+            Some(crate::mcp::McpView::new(vec![server_row("alpha")])),
+            None,
+            None,
+            false
+        ));
+        assert!(!h.mcp_needs_poll());
+        assert!(h.begin_mcp_request(false, false).is_none());
+        assert!(
+            h.begin_mcp_request(true, false).is_some(),
+            "manual refresh remains available"
+        );
+    }
+
+    #[test]
+    fn an_obsolete_mcp_scope_releases_its_own_read_slot() {
+        let h = host_with_mcp();
+        h.toggle_mcp();
+        let read = h.begin_mcp_request(true, false).unwrap();
+        h.moment.write().unwrap().cwd = "another project".into();
+        assert!(!h.mcp_answer(&read, None, None, Some("old".into()), false));
+        h.mcp_read_done(&read);
+        assert!(!h.moment.read().unwrap().mcp_panel.as_ref().unwrap().pending);
+    }
+
+    #[test]
+    fn mcp_replies_cannot_cross_panel_openings_or_view_switches() {
+        let h = host_with_mcp();
+        h.toggle_mcp();
+        let old = h.begin_mcp_request(true, true).unwrap();
+        h.toggle_mcp();
+        h.toggle_mcp();
+        h.mcp_busy(Some(crate::mcp::Busy::of(crate::mcp::Action::Disable)));
+        assert!(!h.mcp_answer(
+            &old,
+            Some(crate::mcp::McpView::default()),
+            None,
+            Some("old error".into()),
+            true
+        ));
+        assert!(h
+            .moment
+            .read()
+            .unwrap()
+            .mcp_panel
+            .as_ref()
+            .unwrap()
+            .busy
+            .is_some());
+        let new = h.begin_mcp_request(true, true).unwrap();
+        h.switch_view();
+        assert!(!h.mcp_answer(&new, None, None, None, true));
+        assert!(!h.mcp_open());
     }
 
     fn server_page(name: &str) -> crate::mcp::McpDetail {

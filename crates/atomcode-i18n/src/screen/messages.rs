@@ -1125,6 +1125,7 @@ pub enum Msg<'a> {
     McpActionDisable,
     /// The key legend: on the list, on the detail page, and while a round trip
     /// is out.
+    McpRefreshTimeout,
     McpLegendList,
     McpLegendDetail,
     McpLegendBusy,

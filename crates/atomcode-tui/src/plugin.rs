@@ -1321,8 +1321,26 @@ struct SessionSuggestions {
     loading: bool,
 }
 
+/// Own and abort superseded panel reads.
+struct McpReadJob(tokio::task::JoinHandle<()>);
+impl Drop for McpReadJob {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+struct McpReadFlight {
+    host: Arc<Host>,
+    request: crate::mcp::Request,
+}
+impl Drop for McpReadFlight {
+    fn drop(&mut self) {
+        self.host.mcp_read_done(&self.request);
+    }
+}
+
 /// The assembled UI. Public so a test can drive exactly what ships.
 pub struct Tui {
+    mcp_read: Mutex<Option<McpReadJob>>,
     client: Arc<AgentClient>,
     host: Arc<Host>,
     keys: Arc<Keys>,
@@ -1334,10 +1352,6 @@ pub struct Tui {
     /// When the allowance was last asked about, so it is not asked again for
     /// [`ALLOWANCE_EVERY`]. `None` until the first turn ends.
     allowance_checked: Mutex<Option<std::time::Instant>>,
-    /// When the open MCP panel last re-read the directory on its own, so a row
-    /// that is still coming up is not asked about on every beat. `None` until
-    /// the first poll.
-    mcp_polled: Mutex<Option<std::time::Instant>>,
     /// Whether the "out of quota — here is `/openrouter`" line has been said.
     /// Once per screen: the account stays out until the window turns over, and a
     /// line that came back every turn would be one more thing to read past.
@@ -1963,6 +1977,7 @@ impl UserInterface for Tui {
                 // absorb against whatever the last one was — a frame at most out
                 // of date, and the only reading available between commits.
                 clock.stamp(&mut self.host.moment.write().expect("moment poisoned"));
+                self.refresh_mcp_request(false);
                 self.refresh_members();
                 // A question that arrived while the loop was asleep is brought
                 // onto the moment here, before the frame it appears in is
@@ -2011,6 +2026,10 @@ impl UserInterface for Tui {
             {
                 let left = until.saturating_duration_since(now);
                 timer = Some(timer.map_or(left, |t| t.min(left)));
+            }
+            if self.host.mcp_needs_poll() {
+                let every = std::time::Duration::from_secs(1);
+                timer = Some(timer.map_or(every, |t| t.min(every)));
             }
             let woke = match replay.pop_front() {
                 Some(again) => again,
@@ -2314,8 +2333,6 @@ impl UserInterface for Tui {
                         m.tick = m.tick.wrapping_add(1);
                     }
                     stale = true;
-                    // Nothing else tells an open panel that its servers settled.
-                    self.poll_mcp_while_unsettled();
                 }
                 // A drag held still at the conversation's edge: one more row.
                 Wake::EdgeScroll => {
@@ -3933,45 +3950,6 @@ impl Tui {
         });
     }
 
-    /// How often an open MCP panel re-reads the directory while a row is still
-    /// coming up. Low: this is catching up with something that takes seconds to
-    /// tens of seconds, not following a moving target.
-    const MCP_POLL_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
-
-    /// Keep an open MCP panel honest while its rows are still coming up.
-    ///
-    /// The panel reads the directory when it opens and after each action, never
-    /// per frame ([`Action::ToggleMcp`]). That leaves it holding the snapshot
-    /// taken the instant a rebuilding action started — every other server still
-    /// 「连接中」 — with nothing to move it on, and the question that settles them
-    /// is on the other side of the seam. So: while the panel is up AND at least
-    /// one row is unsettled, ask again, at most once per [`Self::MCP_POLL_EVERY`].
-    /// Once every row has settled, this stops asking: the panel is a report, not
-    /// a monitor.
-    fn poll_mcp_while_unsettled(&self) {
-        if !self.host.mcp_open() {
-            return;
-        }
-        let unsettled = self
-            .host
-            .moment
-            .read()
-            .expect("moment poisoned")
-            .mcp
-            .unsettled();
-        if !unsettled {
-            return;
-        }
-        let now = std::time::Instant::now();
-        let mut polled = self.mcp_polled.lock().expect("mcp poll poisoned");
-        if polled.is_some_and(|at| now.duration_since(at) < Self::MCP_POLL_EVERY) {
-            return;
-        }
-        *polled = Some(now);
-        drop(polled);
-        self.refresh_mcp();
-    }
-
     /// Ask what the MCP servers are, and put them on the panel.
     ///
     /// Out on a task rather than awaited here, for the reason
@@ -3979,70 +3957,73 @@ impl Tui {
     /// the panel opens now — an empty table for the beat it takes, not a
     /// composer that will not take a key.
     fn refresh_mcp(&self) {
-        let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
-            self.host
-                .mcp_note(Some(t(Msg::ScreenNotConnectedAgent).into_owned()));
-            return;
-        };
-        let Some(port) = ctx.service::<crate::plugin::McpSvc>() else {
-            self.host.mcp_note(Some(t(Msg::NoMcpPort).into_owned()));
-            return;
-        };
-        let host = self.host.clone();
-        let keys = self.wake.lock().expect("wake poisoned").clone();
-        tokio::spawn(async move {
-            match port.list().await {
-                Ok(view) => {
-                    host.show_mcp(view);
-                }
-                // 读不到的目录说在面板上,不静默:一张空表读起来像「一台都没有」
-                // (设计 §6)。
-                Err(why) => {
-                    host.mcp_note(Some(why));
-                }
-            }
-            if let Some(keys) = keys {
-                let _ = keys.send(Wake::Fact);
-            }
-        });
+        self.refresh_mcp_request(true);
     }
 
-    /// [`refresh_mcp`](Self::refresh_mcp), then `server`'s page — in that
-    /// order, because putting the list in replaces the whole view, page and all:
-    /// fetched the other way round, the page could land first and be wiped.
-    fn refresh_mcp_on(&self, server: String) {
+    fn refresh_mcp_on(&self, _server: String) {
+        self.refresh_mcp();
+    }
+
+    /// Serialized, bounded reads. Superseding a read aborts its task; dropping
+    /// the TUI aborts it too. Replies also carry a panel/view/revision guard.
+    fn refresh_mcp_request(&self, force: bool) {
         let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
-            self.host
-                .mcp_note(Some(t(Msg::ScreenNotConnectedAgent).into_owned()));
+            if force {
+                self.host
+                    .mcp_note(Some(t(Msg::ScreenNotConnectedAgent).into_owned()));
+            }
             return;
         };
         let Some(port) = ctx.service::<crate::plugin::McpSvc>() else {
-            self.host.mcp_note(Some(t(Msg::NoMcpPort).into_owned()));
+            if force {
+                self.host.mcp_note(Some(t(Msg::NoMcpPort).into_owned()));
+            }
             return;
         };
-        let host = self.host.clone();
+        let Some(request) = self.host.begin_mcp_request(force, false) else {
+            return;
+        };
+        let mut slot = self.mcp_read.lock().expect("MCP read poisoned");
+        slot.take();
+        let flight = McpReadFlight {
+            host: self.host.clone(),
+            request,
+        };
         let keys = self.wake.lock().expect("wake poisoned").clone();
-        tokio::spawn(async move {
-            match port.list().await {
-                Ok(view) => {
-                    host.show_mcp(view);
+        *slot = Some(McpReadJob(tokio::spawn(async move {
+            let timeout = std::time::Duration::from_secs(5);
+            let (view, mut error) = match tokio::time::timeout(timeout, port.list()).await {
+                Ok(Ok(view)) => (Some(view), None),
+                Ok(Err(error)) => (None, Some(error)),
+                Err(_) => (None, Some(t(Msg::McpRefreshTimeout).into_owned())),
+            };
+            let detail = if view.is_some() {
+                if let Some(server) = &flight.request.detail {
+                    match tokio::time::timeout(timeout, port.detail(server)).await {
+                        Ok(Ok(detail)) => Some(detail),
+                        Ok(Err(why)) => {
+                            error = Some(why);
+                            None
+                        }
+                        Err(_) => {
+                            error = Some(t(Msg::McpRefreshTimeout).into_owned());
+                            None
+                        }
+                    }
+                } else {
+                    None
                 }
-                Err(why) => {
-                    host.mcp_note(Some(why));
-                }
-            }
-            match port.detail(&server).await {
-                Ok(detail) => {
-                    host.mcp_detail(detail);
-                }
-                Err(why) => {
-                    host.mcp_note(Some(why));
-                }
-            }
+            } else {
+                None
+            };
+            flight
+                .host
+                .mcp_answer(&flight.request, view, detail, error, false);
+            drop(flight);
             if let Some(keys) = keys {
                 let _ = keys.send(Wake::Fact);
             }
-        });
+        })));
     }
 
     /// Ask the host again whether a turn would be taken, and put its answer on
@@ -5018,7 +4999,29 @@ impl Tui {
     ///
     /// **True when a frame is owed.**
     fn run_mcp_key(&self, press: crate::surface::KeyPress) -> bool {
+        let was_detail = self
+            .host
+            .moment
+            .read()
+            .expect("moment poisoned")
+            .mcp_panel
+            .as_ref()
+            .is_some_and(|p| p.level == crate::mcp::Level::Detail);
         let (changed, asked) = self.host.mcp_key(press);
+        let now_list = self
+            .host
+            .moment
+            .read()
+            .expect("moment poisoned")
+            .mcp_panel
+            .as_ref()
+            .is_some_and(|p| p.level == crate::mcp::Level::List);
+        if !self.host.mcp_open() {
+            self.mcp_read.lock().expect("MCP read poisoned").take();
+        }
+        if was_detail && now_list {
+            self.refresh_mcp();
+        }
         let Some(step) = asked else {
             return changed;
         };
@@ -5038,6 +5041,10 @@ impl Tui {
     /// itself, and [`Host::mcp_key`] has already acted on them.
     fn apply_mcp_step(&self, step: crate::mcp::Step) {
         use crate::mcp::Step;
+        if matches!(step, Step::Refresh | Step::OpenDetail { .. }) {
+            self.refresh_mcp();
+            return;
+        }
         let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
             self.host.mcp_busy(None);
             self.host
@@ -5049,66 +5056,61 @@ impl Tui {
             self.host.mcp_note(Some(t(Msg::NoMcpPort).into_owned()));
             return;
         };
-        // A cancel is a word to the sign-in already out there, not a trip of its
-        // own: that trip answers for itself when it stops.
         if let Step::Cancel = step {
             port.cancel();
             return;
         }
+        let Step::Act { server, action } = step else {
+            return;
+        };
+        let Some(request) = self.host.begin_mcp_request(true, true) else {
+            return;
+        };
+        self.mcp_read.lock().expect("MCP read poisoned").take();
         let host = self.host.clone();
         let keys = self.wake.lock().expect("wake poisoned").clone();
         tokio::spawn(async move {
-            match step {
-                Step::OpenDetail { server } => match port.detail(&server).await {
-                    Ok(detail) => {
-                        host.mcp_detail(detail);
-                    }
-                    Err(why) => {
-                        host.mcp_note(Some(why));
-                    }
-                },
-                Step::Act { server, action } => {
-                    let done = port.act(&server, action).await;
-                    // The panel first: whatever happened, it is over.
-                    host.mcp_busy(None);
-                    match done {
-                        Ok(view) => {
-                            host.show_mcp(view);
-                            // 动作已经落在这一台上了,所以页面上那份详情是旧状态;
-                            // 而 `act` 答的是**目录**(不带详情),整个视图换掉之后
-                            // 这一页会变成空白的「正在取详情…」。面板要是还停在这一
-                            // 台,就再取一次,让人看见动作之后的样子。
-                            if host.mcp_awaiting_detail(&server) {
-                                match port.detail(&server).await {
-                                    Ok(detail) => {
-                                        host.mcp_detail(detail);
-                                    }
-                                    Err(why) => {
-                                        host.mcp_note(Some(why));
-                                    }
-                                }
-                            }
+            let done = port.act(&server, action).await;
+            if !request.matches(&host.moment.read().expect("moment poisoned")) {
+                return;
+            }
+            let (view, mut error) = match done {
+                Ok(view) => (Some(view), None),
+                Err(error) => {
+                    // A failed reconnect has withdrawn the old tools too.
+                    let view = if action == crate::mcp::Action::Reconnect {
+                        tokio::time::timeout(std::time::Duration::from_secs(5), port.list())
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                    } else {
+                        None
+                    };
+                    (view, Some(error))
+                }
+            };
+            let detail = if view.is_some() && request.detail.as_deref() == Some(server.as_str()) {
+                match tokio::time::timeout(std::time::Duration::from_secs(5), port.detail(&server))
+                    .await
+                {
+                    Ok(Ok(detail)) => Some(detail),
+                    Ok(Err(why)) => {
+                        if error.is_none() {
+                            error = Some(why);
                         }
-                        Err(why) => {
-                            // Reconnect withdraws the old tools before dialing.
-                            // Even failure changes live state; do not leave the
-                            // previous Connected page and tool count on screen.
-                            if action == crate::mcp::Action::Reconnect {
-                                if let Ok(view) = port.list().await {
-                                    host.show_mcp(view);
-                                    if host.mcp_awaiting_detail(&server) {
-                                        if let Ok(detail) = port.detail(&server).await {
-                                            host.mcp_detail(detail);
-                                        }
-                                    }
-                                }
-                            }
-                            host.mcp_note(Some(why));
+                        None
+                    }
+                    Err(_) => {
+                        if error.is_none() {
+                            error = Some(t(Msg::McpRefreshTimeout).into_owned());
                         }
+                        None
                     }
                 }
-                Step::Stay | Step::Close | Step::Cancel => {}
-            }
+            } else {
+                None
+            };
+            host.mcp_answer(&request, view, detail, error, true);
             if let Some(keys) = keys {
                 let _ = keys.send(Wake::Fact);
             }
@@ -10550,6 +10552,7 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
     (
         host.clone(),
         Tui {
+            mcp_read: Mutex::new(None),
             client: Arc::new(AgentClient::default()),
             host,
             keys,
@@ -10557,7 +10560,6 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
             ctx: Mutex::new(None),
             wake: Mutex::new(None),
             allowance_checked: Mutex::new(None),
-            mcp_polled: Mutex::new(None),
             allowance_nudged: Arc::new(AtomicBool::new(false)),
             reasoning_hinted: AtomicBool::new(false),
             asks_ledger: Mutex::new(crate::ask::Ledger::default()),
@@ -12151,6 +12153,100 @@ mod mcp_panel_tests {
         );
     }
 
+    struct HangingMcp;
+    #[async_trait]
+    impl crate::mcp::Mcp for HangingMcp {
+        async fn list(&self) -> Result<crate::mcp::McpView, String> {
+            std::future::pending().await
+        }
+        async fn detail(&self, _: &str) -> Result<crate::mcp::McpDetail, String> {
+            unreachable!()
+        }
+        async fn act(&self, _: &str, _: crate::mcp::Action) -> Result<crate::mcp::McpView, String> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn mcp_read_timeout_releases_the_pending_read_for_a_retry() {
+        let (host, tui, mut woken) = screen();
+        with_port_of(&tui, Arc::new(HangingMcp));
+        tui.act(Action::ToggleMcp, &tui.client);
+        tokio::task::yield_now().await;
+        assert!(
+            host.moment
+                .read()
+                .unwrap()
+                .mcp_panel
+                .as_ref()
+                .unwrap()
+                .pending
+        );
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        landed(&mut woken).await;
+        assert!(
+            !host
+                .moment
+                .read()
+                .unwrap()
+                .mcp_panel
+                .as_ref()
+                .unwrap()
+                .pending
+        );
+        assert!(note(&host).is_some());
+        with_port(&tui);
+        tui.refresh_mcp();
+        landed(&mut woken).await;
+        assert_eq!(host.moment.read().unwrap().mcp.rows().len(), 1);
+    }
+
+    struct SettlingMcp(std::sync::atomic::AtomicUsize);
+    #[async_trait]
+    impl crate::mcp::Mcp for SettlingMcp {
+        async fn list(&self) -> Result<crate::mcp::McpView, String> {
+            let call = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::mcp::McpView::new(vec![server(if call == 0 {
+                crate::mcp::McpState::Connecting
+            } else {
+                crate::mcp::McpState::Connected
+            })]))
+        }
+        async fn detail(&self, name: &str) -> Result<crate::mcp::McpDetail, String> {
+            Ok(page_of(name))
+        }
+        async fn act(&self, _: &str, _: crate::mcp::Action) -> Result<crate::mcp::McpView, String> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn an_open_mcp_panel_refreshes_unsettled_rows_and_stops_when_settled() {
+        let (host, tui, mut woken) = screen();
+        let port = Arc::new(SettlingMcp(std::sync::atomic::AtomicUsize::new(0)));
+        with_port_of(&tui, port.clone());
+        tui.act(Action::ToggleMcp, &tui.client);
+        landed(&mut woken).await;
+        assert!(host.mcp_needs_poll());
+        host.moment.write().unwrap().now = crate::moment::Timestamp::millis(999);
+        tui.refresh_mcp_request(false);
+        assert_eq!(port.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        host.moment.write().unwrap().now = crate::moment::Timestamp::millis(1_000);
+        tui.refresh_mcp_request(false);
+        landed(&mut woken).await;
+        assert_eq!(
+            host.moment.read().unwrap().mcp.rows()[0].state,
+            crate::mcp::McpState::Connected
+        );
+        assert!(!host.mcp_needs_poll());
+        host.moment.write().unwrap().now = crate::moment::Timestamp::millis(2_000);
+        tui.refresh_mcp_request(false);
+        assert_eq!(port.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+        host.toggle_mcp();
+        tui.refresh_mcp_request(false);
+        assert_eq!(port.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
     /// The command half is in `commands.rs` — it can only ask. This is the half
     /// that says the panel really rose, and on the directory the port answered.
     #[tokio::test]
@@ -12173,7 +12269,7 @@ mod mcp_panel_tests {
     }
 
     /// `Enter` on a server asks the port for its page, and the page is hung on
-    /// the rows the panel already has — the list is not asked for again.
+    /// the freshly read rows, keeping list and detail on the same refresh.
     #[tokio::test]
     async fn drilling_into_a_server_puts_its_detail_on_the_panel() {
         let (host, tui, mut woken) = screen();
