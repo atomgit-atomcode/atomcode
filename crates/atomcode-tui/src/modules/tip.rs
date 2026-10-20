@@ -121,17 +121,54 @@ impl View for Tip {
         // rename pill's position on the input rule. Preserve a tip on the left.
         if vp.moment.secret.is_none() {
             if let Some(goal) = vp.moment.autonomy.as_ref().filter(|a| a.kind == "goal") {
-                let (label, badge_role) = if goal.paused.is_some() {
-                    ("Goal paused", Role::Warning)
+                let (mut label, badge_role) = if goal.paused.is_some() && !goal.recovering {
+                    ("Goal paused · /goal report".to_owned(), Role::Warning)
+                } else if goal.recovering {
+                    let elapsed = vp
+                        .moment
+                        .autonomy_samples
+                        .get(&vp.moment.viewing)
+                        .filter(|(sample, _)| sample == goal)
+                        .or_else(|| {
+                            vp.moment
+                                .autonomy_samples
+                                .get(&vp.moment.lead)
+                                .filter(|(sample, _)| sample == goal)
+                        })
+                        .map(|(_, at)| {
+                            vp.moment.now.as_millis().saturating_sub(at.as_millis()) / 1000
+                        })
+                        .unwrap_or(0);
+                    match goal.retry_in_secs.map(|secs| secs.saturating_sub(elapsed)) {
+                        Some(secs) if secs > 0 => {
+                            (format!("Goal retrying · {secs}s"), Role::Warning)
+                        }
+                        _ => ("Goal recovering".to_owned(), Role::Accent),
+                    }
                 } else {
-                    ("Goal active", Role::Accent)
+                    ("Goal active".to_owned(), Role::Accent)
                 };
-                let badge_width = crate::width::str_width(label);
+                let text = if text.is_empty() && !goal.recovering {
+                    goal.paused.as_deref().unwrap_or(&text)
+                } else {
+                    &text
+                };
                 let available = w.saturating_sub(1) as usize;
+                if crate::width::str_width(&label) > available {
+                    label = if goal.recovering {
+                        "Goal recovering"
+                    } else if goal.paused.is_some() {
+                        "Goal paused"
+                    } else {
+                        "Goal active"
+                    }
+                    .to_owned();
+                }
+                let badge_width = crate::width::str_width(&label);
                 if available >= badge_width {
                     let room = available.saturating_sub(badge_width + 1);
                     let mut line = Line::from_spans(vec![crate::frame::Span::styled(
-                        text.clone(),
+                        text.to_owned(),
                         theme::fg(role),
                     )])
                     .truncate(room);
@@ -205,6 +242,7 @@ mod tests {
         m.autonomy = Some(atomcode_host_api::Running {
             usage: None,
             recovering: false,
+            retry_in_secs: None,
             kind: "goal".into(),
             what: "a long objective".into(),
             round: 1,
@@ -221,6 +259,47 @@ mod tests {
                 assert!(rows[0].plain().contains("Goal active"));
             }
         }
+    }
+
+    #[test]
+    fn recovery_counts_down_without_claiming_the_goal_is_paused() {
+        let mut m = Moment::default();
+        m.now = Timestamp::millis(1000);
+        m.autonomy = Some(atomcode_host_api::Running {
+            usage: None,
+            recovering: true,
+            retry_in_secs: Some(30),
+            kind: "goal".into(),
+            what: "objective".into(),
+            round: 1,
+            of: None,
+            elapsed_secs: 1,
+            // Older hosts used this field for recovery details too.
+            paused: Some("retrying provider".into()),
+        });
+        m.autonomy_samples
+            .insert(m.viewing.clone(), (m.autonomy.clone().unwrap(), m.now));
+        assert!(draw_at(&m, 100, 1)[0]
+            .plain()
+            .contains("Goal retrying · 30s"));
+        m.now = Timestamp::millis(11000);
+        assert!(draw_at(&m, 100, 1)[0]
+            .plain()
+            .contains("Goal retrying · 20s"));
+        m.now = Timestamp::millis(31000);
+        let line = draw_at(&m, 100, 1)[0].plain();
+        assert!(line.contains("Goal recovering"));
+        assert!(!line.contains("paused"));
+        let goal = m.autonomy.as_mut().unwrap();
+        goal.recovering = false;
+        goal.retry_in_secs = None;
+        goal.paused = Some("provider recovery budget exhausted".into());
+        let line = draw_at(&m, 140, 1)[0].plain();
+        assert!(line.contains("Goal paused"));
+        assert!(line.contains("provider recovery budget exhausted"));
+        assert!(line.contains("/goal report"));
+        m.autonomy.as_mut().unwrap().paused = None;
+        assert!(draw_at(&m, 100, 1)[0].plain().contains("Goal active"));
     }
 
     #[test]

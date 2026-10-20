@@ -740,6 +740,7 @@ mod tests {
             autonomy: Some(atomcode_host_api::Running {
                 usage: None,
                 recovering: false,
+                retry_in_secs: None,
                 kind: "goal".into(),
                 what: "分析当前项目死代码".into(),
                 round: 0,
@@ -786,6 +787,7 @@ mod tests {
             autonomy: Some(atomcode_host_api::Running {
                 usage: None,
                 recovering: false,
+                retry_in_secs: None,
                 kind: "goal".into(),
                 what: "ship it".into(),
                 round: 2,

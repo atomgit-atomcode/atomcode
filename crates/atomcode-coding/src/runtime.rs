@@ -4,6 +4,7 @@
 //! events never need to traverse a legacy driver adapter.
 
 mod goal_checkpoint;
+mod goal_questions;
 #[cfg(test)]
 mod goal_recovery_tests;
 
@@ -899,6 +900,12 @@ pub trait RuntimeCommands: Send + Sync {
     }
     async fn goal_report(&self) -> Result<String, String> {
         Err("goal report is unavailable".into())
+    }
+    async fn goal_questions(&self) -> Result<Vec<RuntimeRequest>, String> {
+        Err("goal questions are unavailable".into())
+    }
+    async fn answer_goal_question(&self, _id: RequestId, _text: String) -> Result<(), String> {
+        Err("goal questions are unavailable".into())
     }
     /// Leave the goal where it is; it can be taken up again.
     async fn pause_goal(&self) -> Result<(), String>;
@@ -1916,6 +1923,7 @@ impl CodingRuntimeHandle {
                     generation,
                     input,
                     receipt: None,
+                    extra_context: None,
                     from: None,
                     expected_session: None,
                     done,
@@ -2079,6 +2087,7 @@ impl CodingRuntimeHandle {
                 generation: runtime_state_generation(state),
                 input,
                 receipt,
+                extra_context: None,
                 from: None,
                 expected_session: None,
                 done,
@@ -2103,6 +2112,7 @@ impl CodingRuntimeHandle {
                 generation: runtime_state_generation(state),
                 input: UserInput::from(text),
                 receipt: None,
+                extra_context: None,
                 from: Some(from),
                 expected_session: None,
                 done,
@@ -2126,6 +2136,7 @@ impl CodingRuntimeHandle {
                 generation: runtime_state_generation(state),
                 input: UserInput::from(text),
                 receipt: None,
+                extra_context: None,
                 from: Some(from),
                 expected_session: Some(expected_session),
                 done,
@@ -2921,6 +2932,14 @@ impl CodingRuntimeHandle {
         result.await.map_err(|_| RuntimeError::Unavailable)?
     }
 
+    pub async fn goal_questions(&self) -> Result<Vec<RuntimeRequest>, RuntimeError> {
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::PendingQuestions { done })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)
+    }
+
     pub async fn goal_report(&self) -> Result<String, RuntimeError> {
         let (done, result) = oneshot::channel();
         self.tx
@@ -3379,6 +3398,7 @@ pub struct RuntimeExit {
 #[derive(Debug)]
 pub struct CodingRuntimeControlReceiver {
     rx: mpsc::UnboundedReceiver<CodingRuntimeControl>,
+    submit_tx: mpsc::WeakUnboundedSender<CodingRuntimeControl>,
     state: Arc<AtomicU64>,
     provider_unavailable_reason: Arc<AtomicU8>,
     terminal_tx: watch::Sender<Option<RuntimeExit>>,
@@ -3412,6 +3432,15 @@ impl CodingRuntimeControlReceiver {
 /// Drivers should use capability methods on [`CodingRuntimeHandle`].
 #[doc(hidden)]
 pub enum CodingRuntimeControl {
+    PendingQuestions {
+        done: oneshot::Sender<Vec<RuntimeRequest>>,
+    },
+    QuestionReplyFinished {
+        generation: u64,
+        id: RequestId,
+        result: Result<(), RuntimeError>,
+        done: oneshot::Sender<Result<(), RuntimeError>>,
+    },
     Compact {
         generation: u64,
         focus: Option<String>,
@@ -3422,6 +3451,8 @@ pub enum CodingRuntimeControl {
     Submit {
         generation: u64,
         input: UserInput,
+        /// Runtime-authored context admitted with this exact input.
+        extra_context: Option<String>,
         /// The driver's own id for this submit, when it has one. Carried into the
         /// harness so the turn can name the same message back: the fold
         /// (`AgentEvent::Accepted`) and what a stop withdrew
@@ -3731,6 +3762,7 @@ pub fn coding_runtime_control_channel() -> (CodingRuntimeHandle, CodingRuntimeCo
     let provider_unavailable_reason = Arc::new(AtomicU8::new(0));
     let stop = Arc::new(Mutex::new(CancellationToken::new()));
     let mcp_reconnecting = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let submit_tx = tx.downgrade();
     (
         CodingRuntimeHandle {
             tx,
@@ -3742,6 +3774,7 @@ pub fn coding_runtime_control_channel() -> (CodingRuntimeHandle, CodingRuntimeCo
         },
         CodingRuntimeControlReceiver {
             rx,
+            submit_tx,
             state,
             provider_unavailable_reason,
             terminal_tx,
@@ -4115,6 +4148,7 @@ fn spawn_runtime_owner_with_optional_agent(
         // Keep each request kind until its correlated response is delivered.
         // `request_user_input` image answers need runtime-owned preprocessing.
         let mut pending_requests = BTreeMap::new();
+        let mut goal_questions = goal_questions::GoalQuestions::default();
         let mut pending_policy_intervention: Option<PolicyIntervention> = None;
         let mut snapshot_waiters: Vec<RuntimeSnapshotWaiter> = Vec::new();
         let mut snapshot_in_flight = false;
@@ -4182,6 +4216,7 @@ fn spawn_runtime_owner_with_optional_agent(
                     fail_close_pending_requests(
                         &agent,
                         &mut pending_requests,
+                        &goal_questions,
                         active_turn.is_some(),
                     );
                     if held_turn.is_none() && active_turn.is_some() {
@@ -4220,8 +4255,86 @@ fn spawn_runtime_owner_with_optional_agent(
                     pending.cancel().await;
                 }
             }
+            if goal_questions.generation != generation {
+                goal_questions = goal_questions::GoalQuestions {
+                    generation,
+                    ..Default::default()
+                };
+            }
+            goal_questions
+                .waiting
+                .retain(|id, _| pending_requests.contains_key(id));
+            if !goal.as_ref().is_some_and(|state| state.active) {
+                goal_questions.waiting.clear();
+            }
+            goal_questions
+                .continued
+                .retain(|id, (_, queued)| *queued || pending_requests.contains_key(id));
+            goal_questions
+                .aliases
+                .retain(|_, id| goal_questions.continued.contains_key(id));
+            goal_questions
+                .awaiting_receipt
+                .retain(|id| goal_questions.continued.contains_key(id));
+            if !goal_questions.restored {
+                if resources
+                    .as_ref()
+                    .is_some_and(|runtime| goal_questions.restore_runtime(runtime))
+                {
+                    for request in goal_questions.list() {
+                        pending_requests.insert(request.id, request.kind.clone());
+                        let _ = runtime_event_tx.send(CodingRuntimeEvent::Request(request));
+                    }
+                }
+            }
+            let question_deadline = goal_questions.deadline();
             tokio::select! {
                 biased;
+                _ = tokio::time::sleep_until(question_deadline), if !goal_questions.waiting.is_empty() => {
+                    let due: Vec<_> = goal_questions.waiting.iter()
+                        .filter(|(_, (at, _))| *at <= tokio::time::Instant::now())
+                        .map(|(id, (_, payload))| (*id, payload.clone())).collect();
+                    for (id, payload) in due {
+                        goal_questions.waiting.remove(&id);
+                        if !pending_requests.contains_key(&id) { continue; }
+                        let late_id = ((uuid::Uuid::new_v4().as_u128() as u64) & ((1 << 51) - 1)) | (1 << 51);
+                        let question = atomcode_capabilities::tools::request_user_input::PendingUserQuestion::new(late_id, payload);
+                        let value = serde_json::to_value(&question).unwrap_or_default();
+                        if goal_questions.continued.len() >= 8 || pending_requests.contains_key(&late_id) {
+                            // Bound retained questions without choosing an answer.
+                            if !send_agent_command(&agent, AgentCommand::Respond { id, value: serde_json::json!({"question_error":"The pending question limit was reached. Do not repeat questions; work independently or explain what is blocked."}) }) {
+                                agent_available = false;
+                                controls.state.store(runtime_phase_state(generation, RuntimePhase::Failed), Ordering::Release);
+                                continue;
+                            }
+                            pending_requests.remove(&id);
+                            let _ = runtime_event_tx.send(CodingRuntimeEvent::RequestResolved {id, kind:REQUEST_USER_INPUT_KIND.into()});
+                            let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning("待答问题已达上限；本次问询未保留，未替用户选择答案。请处理 /goal questions 中的待答问题。".into()));
+                            continue;
+                        } else if send_agent_command(&agent, AgentCommand::Respond { id, value }) {
+                            goal_questions.continued.insert(late_id, (question.clone(), false));
+                            goal_questions.awaiting_receipt.insert(late_id);
+                            goal_questions.aliases.insert(id, late_id);
+                            pending_requests.insert(late_id, REQUEST_USER_INPUT_KIND.into());
+                            let _ = runtime_event_tx.send(CodingRuntimeEvent::Request(RuntimeRequest {
+                                id: late_id, kind: REQUEST_USER_INPUT_KIND.into(),
+                                payload: goal_questions::GoalQuestions::payload(&question), snapshot: None,
+                            }));
+                        } else {
+                            agent_available = false;
+                            controls.state.store(runtime_phase_state(generation, RuntimePhase::Failed), Ordering::Release);
+                            continue;
+                        }
+                        pending_requests.remove(&id);
+                        let _ = runtime_event_tx.send(CodingRuntimeEvent::RequestResolved { id, kind: REQUEST_USER_INPUT_KIND.into() });
+                        let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(format!(
+                            "问询等待已结束，尚未收到回答；目标可继续独立工作。用 /goal questions 查看待答问题，/goal answer {late_id} <回答> 回复；未回答不代表同意。"
+                        )));
+                    }
+                    if agent_available && pending_requests.keys().all(|id| goal_questions.continued.contains_key(id)) {
+                        controls.state.store(runtime_phase_state(generation, RuntimePhase::InTurn), Ordering::Release);
+                    }
+                }
                 team_event = team_event_rx.recv() => {
                     // Team runs persist across turns, so gate their events by the TEAM
                     // manager's own generation (advanced only at `begin_generation` — an
@@ -4291,6 +4404,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             fail_close_pending_requests(
                                 &agent,
                                 &mut pending_requests,
+                                &goal_questions,
                                 active_turn.is_some(),
                             );
                         }
@@ -4364,6 +4478,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             fail_close_pending_requests(
                                 &agent,
                                 &mut pending_requests,
+                                &goal_questions,
                                 active_turn.is_some(),
                             );
                         }
@@ -4439,6 +4554,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             fail_close_pending_requests(
                                 &agent,
                                 &mut pending_requests,
+                                &goal_questions,
                                 active_turn.is_some(),
                             );
                         }
@@ -4844,6 +4960,28 @@ fn spawn_runtime_owner_with_optional_agent(
                     if let Some(done) = pending.done.take() { let _ = done.send(outcome); }
                 }
                 control = controls.recv(), if controls_open => match control {
+                    Some(CodingRuntimeControl::PendingQuestions { done }) => {
+                        let _ = done.send(goal_questions.list());
+                    }
+                    Some(CodingRuntimeControl::QuestionReplyFinished { generation: requested, id, result, done }) => {
+                        if requested != generation {
+                            let _ = done.send(Err(RuntimeError::StaleRequest { id }));
+                        } else if !pending_requests.contains_key(&id) {
+                            // A fast turn may admit the contextual reply and
+                            // commit its snapshot before this callback is read.
+                            let accepted = result.is_ok() && goal_questions.admitted_replies.contains(&id);
+                            let _ = done.send(if accepted { Ok(()) } else { Err(RuntimeError::StaleRequest {id}) });
+                        } else if result.is_ok() {
+                            // Keep queued correlation until the native log admits it.
+                            // A cancel before that admission must still close the question.
+                            pending_requests.remove(&id);
+                            let _ = runtime_event_tx.send(CodingRuntimeEvent::RequestResolved { id, kind: REQUEST_USER_INPUT_KIND.into() });
+                            let _ = done.send(Ok(()));
+                        } else {
+                            if let Some((_, queued)) = goal_questions.continued.get_mut(&id) { *queued = false; }
+                            let _ = done.send(result);
+                        }
+                    }
                     Some(control)
                         if persistence_failure.is_some()
                             && !matches!(&control, CodingRuntimeControl::Shutdown { .. }) =>
@@ -4899,6 +5037,7 @@ fn spawn_runtime_owner_with_optional_agent(
                     Some(CodingRuntimeControl::Submit {
                         generation: request_generation,
                         mut input,
+                        extra_context,
                         receipt: driver_receipt,
                         from,
                         expected_session,
@@ -5226,6 +5365,11 @@ fn spawn_runtime_owner_with_optional_agent(
                                 None => recovery_context = Some(reference_context),
                             }
                         }
+                        if let Some(extra) = extra_context {
+                            let mut context=serde_json::from_str::<serde_json::Value>(&extra).ok().filter(|value| value.is_object()).unwrap_or_else(|| serde_json::json!({"runtime_context":extra}));
+                            if let Some(previous)=recovery_context.take() { context["recovery_context"]=serde_json::Value::String(previous); }
+                            recovery_context=Some(context.to_string());
+                        }
                         let command = match (from, recovery_context) {
                             (Some(from), _) => AgentCommand::PeerNote {
                                 from,
@@ -5298,12 +5442,46 @@ fn spawn_runtime_owner_with_optional_agent(
                     }
                     Some(CodingRuntimeControl::Respond {
                         generation: request_generation,
-                        id,
+                        mut id,
                         value,
                         done,
                     }) => {
+                        id = goal_questions.aliases.get(&id).copied().unwrap_or(id);
                         if !native_protocol || request_generation != generation || !agent_available {
                             let _ = done.send(Err(RuntimeError::Unavailable));
+                        } else if let Some((question, queued)) = goal_questions.continued.get_mut(&id) {
+                            if *queued || cancel_pending || pending_policy_intervention.is_some() {
+                                let _ = done.send(Err(RuntimeError::Busy));
+                                continue;
+                            }
+                            // A late reply is an admitted user input, never a second
+                            // response to the already completed question tool.
+                            let value = preprocess_request_response(REQUEST_USER_INPUT_KIND, value, resources.as_ref(), &runtime_event_tx).await;
+                            let mut input = goal_questions::GoalQuestions::reply(question, value.clone());
+                            // Images already follow the same normalization path as an
+                            // on-time answer. The textual envelope is only correlation.
+                            if let Ok(answer) = serde_json::from_value::<UserInputResponse>(value.clone()) {
+                                input.images = answer.images;
+                            } else if let Some(responses) = value.get("responses").and_then(|v| v.as_array()) {
+                                input.images = responses.iter().filter_map(|v| serde_json::from_value::<UserInputResponse>(v.clone()).ok()).flat_map(|r| r.images).collect();
+                            } else {
+                                let _ = done.send(Err(RuntimeError::StaleRequest { id }));
+                                continue;
+                            }
+                            let Some(tx) = controls.submit_tx.upgrade() else { let _ = done.send(Err(RuntimeError::Unavailable)); continue; };
+                            let (submitted, accepted) = oneshot::channel();
+                            let expected_session = resources.as_ref().and_then(|r| r.parts.session.as_ref()).map(|s| s.id.clone());
+                            if tx.send(CodingRuntimeControl::Submit { generation, input, extra_context: Some(goal_questions::GoalQuestions::reply_context(question)), receipt: None, from: None, expected_session, done: submitted }).is_err() {
+                                let _ = done.send(Err(RuntimeError::Unavailable));
+                                continue;
+                            }
+                            *queued = true;
+                            tokio::spawn(async move {
+                                let result = accepted.await.unwrap_or(Err(RuntimeError::Unavailable)).and_then(|receipt| {
+                                    if matches!(receipt, SubmitReceipt::NotSent {..}) { Err(RuntimeError::DeliveryFailed) } else { Ok(()) }
+                                });
+                                let _ = tx.send(CodingRuntimeControl::QuestionReplyFinished { generation: request_generation, id, result, done });
+                            });
                         } else if !pending_requests.contains_key(&id) {
                             let _ = done.send(Err(RuntimeError::StaleRequest { id }));
                         } else {
@@ -5329,7 +5507,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                     id,
                                     kind,
                                 });
-                                if pending_requests.is_empty() {
+                                if pending_requests.keys().all(|id| goal_questions.continued.contains_key(id)) {
                                     controls.state.store(
                                         runtime_phase_state(generation, RuntimePhase::InTurn),
                                         Ordering::Release,
@@ -5806,6 +5984,9 @@ fn spawn_runtime_owner_with_optional_agent(
                         generation: request_generation,
                         done,
                     }) => {
+                        if request_generation == generation {
+                            goal_questions.close(resources.as_ref(), &mut pending_requests, &runtime_event_tx);
+                        }
                         // Whatever the stop reached (or did not), it is answered
                         // from here on; a fresh one waits for the next.
                         if request_generation == generation {
@@ -6529,7 +6710,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 // mid-turn, then esc → "unavailable").
                                 let resumed = if active_turn.is_none() {
                                     RuntimePhase::Ready
-                                } else if pending_requests.is_empty() {
+                                } else if pending_requests.keys().all(|id| goal_questions.continued.contains_key(id)) {
                                     RuntimePhase::InTurn
                                 } else {
                                     RuntimePhase::WaitingApproval
@@ -6652,6 +6833,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         fail_close_pending_requests(
                             &agent,
                             &mut pending_requests,
+                            &goal_questions,
                             active_turn.is_some(),
                         );
                         let had_active_turn = active_turn.is_some();
@@ -6915,6 +7097,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         fail_close_pending_requests(
                             &agent,
                             &mut pending_requests,
+                            &goal_questions,
                             active_turn.is_some(),
                         );
                         // On the harness, a logout takes the CREDENTIALS out of
@@ -7450,6 +7633,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         fail_close_pending_requests(
                             &agent,
                             &mut pending_requests,
+                            &goal_questions,
                             active_turn.is_some(),
                         );
                         let mut stop_report = stop_current_agent(
@@ -7945,6 +8129,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         fail_close_pending_requests(
                             &agent,
                             &mut pending_requests,
+                            &goal_questions,
                             active_turn.is_some(),
                         );
                         let stop_report = stop_current_agent(
@@ -8133,7 +8318,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         let _ = done.send(result);
                     }
                     Some(CodingRuntimeControl::RecheckGoal { generation: requested, receipt, done }) => {
-                        if !native_protocol || requested != generation || receipt.revision != conversation_revision || active_turn.is_some() || compactions.is_active() || compaction_suspended || pending_policy_intervention.is_some() || !pending_requests.is_empty() || !agent_available || persistence_failure.is_some() {
+                        if !native_protocol || requested != generation || receipt.revision != conversation_revision || active_turn.is_some() || compactions.is_active() || compaction_suspended || pending_policy_intervention.is_some() || pending_requests.keys().any(|id| !goal_questions.continued.contains_key(id)) || !agent_available || persistence_failure.is_some() {
                             let _ = done.send(Err(RuntimeError::Busy)); continue;
                         }
                         if let Err(error) = goal_checkpoints.available() { let _ = done.send(Err(error)); continue; }
@@ -8251,6 +8436,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 generation: request_generation,
                                 input: UserInput { text: condition, images },
                                 receipt: None,
+                                extra_context: None,
                                 from: None,
                                 expected_session: None,
                                 done: started,
@@ -8291,6 +8477,9 @@ fn spawn_runtime_owner_with_optional_agent(
                         }
                     }
                     Some(CodingRuntimeControl::StopGoal { generation: request_generation, done }) => {
+                        if request_generation == generation {
+                            goal_questions.close(resources.as_ref(), &mut pending_requests, &runtime_event_tx);
+                        }
                         if !native_protocol || request_generation != generation {
                             let _ = done.send(Err(RuntimeError::Unavailable));
                             continue;
@@ -8385,6 +8574,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 generation: request_generation,
                                 input: UserInput::from(prompt),
                                 receipt: None,
+                                extra_context: None,
                                 from: None,
                                 expected_session: None,
                                 done: started,
@@ -8450,6 +8640,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             fail_close_pending_requests(
                                 &agent,
                                 &mut pending_requests,
+                                &goal_questions,
                                 active_turn.is_some(),
                             );
                         }
@@ -8654,6 +8845,23 @@ fn spawn_runtime_owner_with_optional_agent(
                                 ));
                             }
                             AgentEvent::Request { id, kind, payload } => {
+                                if kind == REQUEST_USER_INPUT_KIND && goal.as_ref().is_some_and(|state| state.active) {
+                                    // Only ordinary questions have a foreground deadline.
+                                    // Permission requests retain their original semantics.
+                                    if payload.get("authorization_required").and_then(serde_json::Value::as_bool) != Some(true) {
+                                        if payload.get("asking_member").is_some() {
+                                            let _ = send_agent_command(&agent, AgentCommand::Respond { id, value: serde_json::json!({"question_error":"This delegated goal worker cannot wait for a human answer. Report the question and blocker to your parent agent; continue only independent work. No answer or authorization was provided."}) });
+                                            continue;
+                                        }
+                                        if payload.to_string().len() > 16 * 1024 {
+                                            let _ = send_agent_command(&agent, AgentCommand::Respond { id, value: serde_json::json!({"question_error":"Question exceeds the bounded foreground wait payload. Ask a concise question under 16 KiB, or continue independent work. No user answer or authorization was provided."}) });
+                                            continue;
+                                        }
+                                        if payload.get("question_call_id").and_then(serde_json::Value::as_str).is_some() && atomcode_capabilities::tools::request_user_input::parse_batch(&payload.to_string()).is_ok() {
+                                            goal_questions.waiting(id, payload.clone());
+                                        }
+                                    }
+                                }
                                 // Auto is a runtime-owned execution mode, so approval bypass
                                 // belongs at this common request boundary rather than in each
                                 // driver. Do not publish an approval that has already been
@@ -8855,6 +9063,16 @@ fn spawn_runtime_owner_with_optional_agent(
                             }
                             AgentEvent::Snapshot { snapshot } => {
                                 snapshot_in_flight = false;
+                                let before:Vec<_>=goal_questions.continued.iter().map(|(id,(_,queued))|(*id,*queued)).collect();
+                                if before.iter().any(|(_, queued)| *queued) {
+                                    if let Some(runtime)=resources.as_ref() { goal_questions.restore_runtime(runtime); }
+                                    for (id,queued) in before {
+                                        if !goal_questions.continued.contains_key(&id) {
+                                            pending_requests.remove(&id);
+                                            if !queued { let _=runtime_event_tx.send(CodingRuntimeEvent::RequestResolved{id,kind:REQUEST_USER_INPUT_KIND.into()}); }
+                                        }
+                                    }
+                                }
                                 if terminal_reason.is_some() || cancel_pending {
                                     conversation_revision = conversation_revision.wrapping_add(1);
                                 }
@@ -8881,7 +9099,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                     .or_else(|| cancel_pending.then_some(StopReason::Cancelled))
                                 {
                                     cancel_pending = false;
-                                    pending_requests.clear();
+                                    pending_requests.retain(|id, _| goal_questions.continued.contains_key(id));
                                     let stats = std::mem::take(&mut turn_stats);
                                     let turn_id = active_turn.unwrap_or_default();
                                     let mut completion_reason = reason;
@@ -8907,7 +9125,11 @@ fn spawn_runtime_owner_with_optional_agent(
                                             _ => false,
                                         };
                                         let mut keep_goal_registered = false;
-                                        if let Some(why) = stop_reason {
+                                        if goal_questions.continued.values().any(|(_, queued)| !queued) && !goal_questions::GoalQuestions::has_independent_work(&snapshot.messages) && evaluate {
+                                            state.pause_for_recovery("等待用户回答待答问题；本轮没有独立工具工作，自动续跑已暂停。用 /goal questions 查看并回复。");
+                                            keep_goal_registered = true;
+                                            let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                                        } else if let Some(why) = stop_reason {
                                             // A cap fired (round budget, or the optional time cap).
                                             // This is "ran out of budget", NOT "the evaluator judged
                                             // the work unfinished" — the note names the budget and
@@ -9085,6 +9307,23 @@ fn spawn_runtime_owner_with_optional_agent(
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::Agent(
                                     AgentEvent::TurnStarted { turn: None },
                                 ));
+                            }
+                            AgentEvent::ToolResult { result } => {
+                                // A driver's own shorter timeout, or a withdrawn
+                                // dialog, may finish the tool before our deadline.
+                                // Never resurrect that closed wait as pending.
+                                let settled: Vec<_> = goal_questions.waiting.iter().filter(|(_, (_, payload))| payload.get("question_call_id").and_then(serde_json::Value::as_str) == Some(result.call_id.as_str())).map(|(id, _)| *id).collect();
+                                for id in settled {
+                                    goal_questions.waiting.remove(&id);
+                                    pending_requests.remove(&id);
+                                    let _ = runtime_event_tx.send(CodingRuntimeEvent::RequestResolved {id,kind:REQUEST_USER_INPUT_KIND.into()});
+                                }
+                                let overtaken = goal_questions.settle_receipt(&result.call_id, &result.content);
+                                for id in overtaken {
+                                    pending_requests.remove(&id);
+                                    let _ = runtime_event_tx.send(CodingRuntimeEvent::RequestResolved {id,kind:REQUEST_USER_INPUT_KIND.into()});
+                                }
+                                let _ = runtime_event_tx.send(CodingRuntimeEvent::Agent(AgentEvent::ToolResult {result}));
                             }
                             event @ AgentEvent::ToolStarted { .. } => {
                                 turn_stats.tool_call_count =
@@ -9338,6 +9577,7 @@ fn reject_runtime_control_with_error(
             let _ = done.send(Err(error));
         }
         CodingRuntimeControl::Respond { done, .. }
+        | CodingRuntimeControl::QuestionReplyFinished { done, .. }
         | CodingRuntimeControl::ResolvePolicyIntervention { done, .. }
         | CodingRuntimeControl::Cancel { done, .. }
         | CodingRuntimeControl::PauseGoal { done, .. }
@@ -9356,6 +9596,9 @@ fn reject_runtime_control_with_error(
         // belong to a tree that is being torn down.
         CodingRuntimeControl::Mode { done, .. } => {
             let _ = done.send(Err(error));
+        }
+        CodingRuntimeControl::PendingQuestions { done } => {
+            drop(done);
         }
         CodingRuntimeControl::McpStatus { done, .. } => {
             let _ = done.send(Err(error));
@@ -9522,10 +9765,15 @@ async fn preprocess_one_user_input_response(
 fn fail_close_pending_requests(
     agent: &Option<AgentHandle>,
     pending_requests: &mut BTreeMap<RequestId, String>,
+    questions: &goal_questions::GoalQuestions,
     cancel_turn: bool,
 ) {
     if let Some(agent) = agent.as_ref() {
-        for id in pending_requests.keys().copied() {
+        for id in pending_requests
+            .keys()
+            .copied()
+            .filter(|id| !questions.continued.contains_key(id))
+        {
             let _ = agent.commands.send(AgentCommand::Respond {
                 id,
                 value: serde_json::Value::Null,
@@ -10721,6 +10969,35 @@ fn reload_skills_live(runtime: &RuntimeResources) -> Result<usize, ()> {
 
 #[async_trait::async_trait]
 impl RuntimeCommands for CodingRuntimeHandle {
+    async fn goal_questions(&self) -> Result<Vec<RuntimeRequest>, String> {
+        CodingRuntimeHandle::goal_questions(self)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    async fn answer_goal_question(&self, id: RequestId, text: String) -> Result<(), String> {
+        let generation = self.status().generation;
+        if !CodingRuntimeHandle::goal_questions(self)
+            .await
+            .map_err(|error| error.to_string())?
+            .iter()
+            .any(|question| question.id == id)
+        {
+            return Err("这不是当前会话的待答问题。".into());
+        }
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::Respond {
+                generation,
+                id,
+                value: serde_json::json!({"declined":false,"text":text}),
+                done,
+            })
+            .map_err(|_| "runtime unavailable".to_string())?;
+        result
+            .await
+            .map_err(|_| "runtime unavailable".to_string())?
+            .map_err(|error| error.to_string())
+    }
     async fn recheck_goal(&self) -> Result<(), String> {
         CodingRuntimeHandle::recheck_goal(self)
             .await

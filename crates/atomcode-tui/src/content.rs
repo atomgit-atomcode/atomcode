@@ -1160,6 +1160,17 @@ impl ToolCallBlock {
     /// while it is still open, when it failed, or when the text is not one those
     /// writers produced; the call is then drawn like any other.
     fn exchange(&self) -> Option<Vec<(String, ReadAnswer)>> {
+        if self.name == "ask_user" {
+            if let Outcome::Ok(content) = &self.outcome {
+                let answers = read_result(content, 1)?;
+                if matches!(answers.first(), Some(ReadAnswer::Pending { .. })) {
+                    return Some(vec![(
+                        asked_question(&self.args_without_reason())?,
+                        answers[0].clone(),
+                    )]);
+                }
+            }
+        }
         if self.name != REQUEST_USER_INPUT_KIND {
             return None;
         }
@@ -1195,9 +1206,14 @@ impl ToolCallBlock {
         let gutter = format!("{}{} ", " ".repeat(GUTTER), caps.g(Glyph::Gutter));
         let under = " ".repeat(width::str_width(&gutter));
         for (i, (question, answer)) in exchange.iter().enumerate() {
-            let (said, said_style) = match answer_words(answer) {
-                Some(words) => (words, Style::new()),
-                None => (t(Msg::AskUnanswered).into_owned(), muted()),
+            let (said, said_style) = match answer {
+                ReadAnswer::Pending { id } => {
+                    (t(Msg::AskPending { id: *id }).into_owned(), muted())
+                }
+                _ => match answer_words(answer) {
+                    Some(words) => (words, Style::new()),
+                    None => (t(Msg::AskUnanswered).into_owned(), muted()),
+                },
             };
             let spans = [
                 Span::styled(flatten(question), muted()),
@@ -5561,6 +5577,24 @@ mod tests {
             .iter()
             .map(|l| l.plain().trim_end().to_string())
             .collect()
+    }
+
+    #[test]
+    fn pending_questions_show_how_to_reply_without_dumping_the_wire_payload() {
+        let question = atomcode_capabilities::tools::request_user_input::PendingUserQuestion::new(
+            900,
+            serde_json::json!({"header":"Account","question":"Which account?","mode":"text"}),
+        );
+        let rows = answered(
+            r#"{"header":"Account","question":"Which account?","mode":"text"}"#,
+            Outcome::Ok(question.result().content),
+        );
+        let text = rows.join("\n");
+        assert!(text.contains("Which account?"));
+        assert!(text.contains("/goal questions"));
+        assert!(text.contains("900"));
+        assert!(!text.contains("pending_question"));
+        assert!(!text.contains("guidance"));
     }
 
     /// An answered question reads as the question beside its answer — the

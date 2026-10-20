@@ -9698,6 +9698,13 @@ fn starts_goal_turn(line: &str) -> bool {
     if name != "goal" || args.is_empty() {
         return false;
     }
+    if args == "questions"
+        || args == "report"
+        || args == "recheck"
+        || args.split_whitespace().next() == Some("answer")
+    {
+        return false;
+    }
     !matches!(
         args,
         "stop"
@@ -11111,6 +11118,7 @@ mod autonomy_tests {
         atomcode_host_api::Running {
             usage: None,
             recovering: false,
+            retry_in_secs: None,
             kind: "goal".into(),
             what: "测试全绿".into(),
             round,
@@ -13651,6 +13659,11 @@ mod midturn_command_tests {
             "/goal pause",
             "/goal stop",
             "/goal help",
+            "/goal questions",
+            "/goal answer 900 B",
+            "/goal answer\t900 B",
+            "/goal report",
+            "/goal recheck",
             "/loop ship it",
         ] {
             assert!(!starts_goal_turn(command), "misclassified {command:?}");

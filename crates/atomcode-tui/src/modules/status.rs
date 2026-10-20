@@ -1288,6 +1288,7 @@ mod tests {
         m.autonomy = Some(atomcode_host_api::Running {
             usage: None,
             recovering: false,
+            retry_in_secs: None,
             kind: "goal".into(),
             what: "把量化器搬到 NPU".into(),
             round: 4,
@@ -1307,6 +1308,7 @@ mod tests {
         m.autonomy = Some(atomcode_host_api::Running {
             usage: None,
             recovering: false,
+            retry_in_secs: None,
             kind: "loop".into(),
             what: "跑测试".into(),
             round: 2,

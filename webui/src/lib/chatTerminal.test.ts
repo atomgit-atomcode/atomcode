@@ -13,6 +13,7 @@ import {
   reduceLiveLifecycle,
   resolveUserInputRequest,
   completeUserInputRequest,
+  retainContinuedUserInput,
   restoreLiveSnapshot,
   sessionHeldElsewhere,
   syncAttachDisposition,
@@ -240,4 +241,13 @@ test('late HTTP completion preserves replacement prompts even when native ids re
   assert.equal(completeUserInputRequest(replacement, submitted), replacement);
   assert.equal(completeUserInputRequest(next, submitted), next);
   assert.equal(completeUserInputRequest(null, submitted), null);
+});
+
+test('only a continued live question survives normal idle', () => {
+  const pending = { request_id: 900, goal_question_pending: true, response_transport: 'live' };
+  assert.equal(retainContinuedUserInput(pending, true), pending);
+  assert.equal(retainContinuedUserInput(pending, false), null);
+  assert.equal(retainContinuedUserInput({ ...pending, goal_question_pending: false }, true), null);
+  assert.equal(retainContinuedUserInput({ ...pending, response_transport: 'chat' }, true), null);
+  assert.equal(retainContinuedUserInput(null, true), null);
 });

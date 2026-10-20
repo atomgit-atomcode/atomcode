@@ -1341,6 +1341,8 @@ export interface UserInputResponseBody {
 export interface UserInputRequestEvent {
   type: 'user_input_request';
   request_id: number;
+  /** The tool continued; this question may still be answered in the live runtime. */
+  goal_question_pending?: boolean;
   /** Session correlation. Session-scoped `/live` events may also carry this field. */
   session_id?: string;
   header: string;
