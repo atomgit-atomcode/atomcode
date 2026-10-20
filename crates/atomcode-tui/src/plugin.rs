@@ -839,7 +839,7 @@ fn paths_under(
             // `Entry::rel_path` already ends in `/` for a directory, which is
             // exactly what the next keystroke needs to continue into it.
             let value = format!("@{}", entry.rel_path);
-            let item = crate::menu::Item::new(value.clone(), value);
+            let item = crate::menu::Item::new(value, entry.rel_path.clone()).sigil("");
             if entry.is_dir {
                 item.about(t(Msg::MenuFolder).into_owned())
             } else {
@@ -3159,7 +3159,13 @@ impl UserInterface for Tui {
                 // level and a half-typed `/comp` reaching the dispatcher that
                 // suggests `/compact`.
                 Wake::Input(Input::Key(press))
-                    if self.host.menu_open() && crate::menu::Slash::owns(press) =>
+                    if self.host.menu_open()
+                        && (crate::menu::Slash::owns(press)
+                            || (matches!(
+                                press.key,
+                                crate::surface::Key::Left | crate::surface::Key::Right
+                            ) && press.mods == crate::surface::Mods::NONE
+                                && self.host.menu_adjacent_tab(1).is_some())) =>
                 {
                     quit = self.slash_menu_key(press, &client);
                     stale = true;
@@ -8874,7 +8880,7 @@ impl Tui {
                 self.host.project_dir_name(),
             ));
         }
-        if kind != 1 {
+        if kind == 2 {
             let mut cache = self
                 .session_references
                 .lock()
@@ -8918,45 +8924,23 @@ impl Tui {
                     std::cmp::Reverse(e.updated_at_ms),
                 )
             });
-            for e in candidates.into_iter().take(12) {
+            for e in candidates {
                 let reference = atomcode_capabilities::session::reference::SessionReference {
                     bucket: e.project_bucket.clone(),
                     id: e.id.clone(),
                 };
                 rows.push(
-                    crate::menu::Item::new(
-                        reference.spelling(&e.name),
-                        format!("{}: {}", t(Msg::MentionSessions), e.name),
-                    )
-                    .about(format!(
-                        "{} · {} · {}",
-                        e.working_dir.display(),
-                        chrono::DateTime::from_timestamp_millis(e.updated_at_ms)
-                            .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
-                            .unwrap_or_default(),
-                        e.id
-                    ))
-                    .sigil("@"),
+                    crate::menu::Item::new(reference.spelling(&e.name), e.name.clone())
+                        .about(format!(
+                            "{} · {}",
+                            chrono::DateTime::from_timestamp_millis(e.updated_at_ms)
+                                .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+                                .unwrap_or_default(),
+                            e.working_dir.display()
+                        ))
+                        .sigil("@"),
                 );
             }
-        }
-        for (i, (key, label)) in [
-            ("all", t(Msg::MentionAll)),
-            ("files", t(Msg::MentionFiles)),
-            ("sessions", t(Msg::MentionSessions)),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            rows.push(
-                crate::menu::Item::new(format!("@\0mention-filter:{key}"), label)
-                    .about(if kind as usize == i {
-                        t(Msg::MentionSelected)
-                    } else {
-                        t(Msg::MentionFilter)
-                    })
-                    .sigil("@"),
-            );
         }
         rows
     }
@@ -8981,6 +8965,7 @@ impl Tui {
                 .clone();
             skill_prefix(&input).map(str::to_string)
         };
+        let mention_context = prefix.is_none() && skill.is_none();
         let menu = match prefix {
             Some(rest) => {
                 let (matches, option_filter) = match rest.split_once(char::is_whitespace) {
@@ -9100,7 +9085,26 @@ impl Tui {
                 }
             }
         };
-        self.host.set_menu(menu);
+        let is_mention = {
+            let m = self.host.moment.read().expect("moment poisoned");
+            !browsing
+                && mention_context
+                && atomcode_capabilities::file_index::detect_at_mention(&m.input, m.caret).is_some()
+        };
+        if is_mention {
+            let kind = *self.mention_kind.lock().expect("mention kind poisoned");
+            let tabs = [
+                ("files", t(Msg::MentionFiles)),
+                ("sessions", t(Msg::MentionSessions)),
+            ]
+            .into_iter()
+            .map(|(key, label)| crate::menu::Item::new(format!("@\0mention-filter:{key}"), label))
+            .collect();
+            self.host
+                .set_mention_menu(menu, tabs, usize::from(kind == 2));
+        } else {
+            self.host.set_menu(menu);
+        }
     }
 
     /// Route one key to the slash menu. Returns `true` to quit.
@@ -9118,6 +9122,12 @@ impl Tui {
     fn slash_menu_key(&self, press: crate::surface::KeyPress, client: &AgentClient) -> bool {
         use crate::surface::Key;
         match press.key {
+            Key::Left | Key::Right => {
+                let delta = if press.key == Key::Left { -1 } else { 1 };
+                if let Some(tab) = self.host.menu_adjacent_tab(delta) {
+                    self.complete_path(&tab);
+                }
+            }
             Key::Up => {
                 let _ = self.host.menu_move_by(-1);
             }
@@ -11869,7 +11879,7 @@ mod at_menu_tests {
         let found = eventually(&index, &cwd, "applystock", |items| !items.is_empty());
         assert_eq!(
             labels(&found),
-            vec!["@src/http/handler/ApplyStockController.java".to_string()],
+            vec!["src/http/handler/ApplyStockController.java".to_string()],
             "a file several directories down is found by its name alone"
         );
 
@@ -11899,10 +11909,10 @@ mod at_menu_tests {
         let there = second.path().to_string_lossy().into_owned();
 
         let found = eventually(&index, &here, "only", |items| !items.is_empty());
-        assert_eq!(labels(&found), vec!["@only-here.rs".to_string()]);
+        assert_eq!(labels(&found), vec!["only-here.rs".to_string()]);
 
         let moved = eventually(&index, &there, "over", |items| !items.is_empty());
-        assert_eq!(labels(&moved), vec!["@over-there.rs".to_string()]);
+        assert_eq!(labels(&moved), vec!["over-there.rs".to_string()]);
         assert!(
             labels(&paths_under(&index, &there, "only", ".ours")).is_empty(),
             "the directory that was left behind is no longer offered"

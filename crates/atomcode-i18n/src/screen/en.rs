@@ -68,7 +68,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
 
         // ── completion menu and policy interventions ──
         Msg::MentionAll => "All".into(),
-        Msg::MentionFiles => "Files".into(),
+        Msg::MentionFiles => "Files & directories".into(),
+        Msg::MentionEmpty => "  No matching items".into(),
+        Msg::MentionLegend => "  enter/tab insert · esc close · up/down select · left/right category".into(),
         Msg::MentionSessions => "Sessions".into(),
         Msg::MentionSelected => "Selected".into(),
         Msg::MentionFilter => "Filter · Enter / Tab".into(),

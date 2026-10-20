@@ -83,6 +83,8 @@ pub enum Msg<'a> {
     MenuFolder,
     MentionAll,
     MentionFiles,
+    MentionEmpty,
+    MentionLegend,
     MentionSessions,
     MentionSelected,
     MentionFilter,

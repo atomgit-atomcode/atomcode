@@ -54,7 +54,9 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
 
         // ── 补全菜单与策略介入 ──
         Msg::MentionAll => "全部".into(),
-        Msg::MentionFiles => "文件".into(),
+        Msg::MentionFiles => "文件与目录".into(),
+        Msg::MentionEmpty => "  暂无匹配条目".into(),
+        Msg::MentionLegend => "  Enter/Tab 插入 · Esc 关闭 · ↑/↓ 选择 · ←/→ 切换分类".into(),
         Msg::MentionSessions => "会话".into(),
         Msg::MentionSelected => "已选中".into(),
         Msg::MentionFilter => "切换类别 · Enter / Tab".into(),

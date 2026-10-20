@@ -434,6 +434,8 @@ fn beside(hold: Rect, w: u16, h: u16, screen_w: u16, screen_h: u16) -> Option<Re
 pub struct Slash {
     items: Vec<Item>,
     cursor: usize,
+    tabs: Vec<Item>,
+    active_tab: usize,
 }
 
 impl Slash {
@@ -443,11 +445,54 @@ impl Slash {
     /// menu that opens with nothing pointed at it makes the person press a key
     /// before it will say what it is about to do.
     pub fn new(items: Vec<Item>) -> Self {
-        Self { items, cursor: 0 }
+        Self {
+            items,
+            cursor: 0,
+            tabs: Vec::new(),
+            active_tab: 0,
+        }
+    }
+
+    /// Categories are chrome, never entries in the selectable result list.
+    pub fn with_tabs(mut self, tabs: Vec<Item>, active: usize) -> Self {
+        self.active_tab = active.min(tabs.len().saturating_sub(1));
+        self.tabs = tabs;
+        self
+    }
+
+    pub fn header_rows(&self) -> usize {
+        if self.tabs.is_empty() {
+            0
+        } else {
+            3
+        }
+    }
+
+    pub fn adjacent_tab(&self, delta: i32) -> Option<String> {
+        if self.tabs.is_empty() {
+            return None;
+        }
+        let at = (self.active_tab as i32 + delta).rem_euclid(self.tabs.len() as i32) as usize;
+        Some(self.tabs[at].value.clone())
+    }
+
+    fn tab_at(&self, x: u16, y: u16, rect: Rect, rows: usize) -> Option<String> {
+        if rows < 2 || !rect.contains(x, y) || y != rect.y.saturating_add(1) {
+            return None;
+        }
+        let mut start = 2;
+        for tab in &self.tabs {
+            let end = start + width::str_width(&tab.label) + 4;
+            if (start..end).contains(&((x - rect.x) as usize)) {
+                return Some(tab.value.clone());
+            }
+            start = end + 2;
+        }
+        None
     }
 
     pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
+        self.items.is_empty() && self.tabs.is_empty()
     }
 
     /// Whether a key is one the list answers for itself.
@@ -542,7 +587,9 @@ impl Slash {
         if !rect.contains(x, y) {
             return None;
         }
-        let row = (y - rect.y) as usize;
+        let header = self.header_rows().min(rows);
+        let row = ((y - rect.y) as usize).checked_sub(header)?;
+        let rows = rows.saturating_sub(header);
         if row >= rows {
             return None;
         }
@@ -577,6 +624,9 @@ impl Slash {
     /// The value is the item's own, the same as [`Step::Picked`] carries: what
     /// a name means is not this module's business.
     pub fn click(&mut self, x: u16, y: u16, rect: Rect, rows: usize) -> Option<String> {
+        if let Some(value) = self.tab_at(x, y, rect, rows) {
+            return Some(value);
+        }
         let row = self.row_at(x, y, rect, rows)?;
         self.cursor = row;
         Some(self.items[row].value.clone())
@@ -593,14 +643,45 @@ impl Slash {
     /// [`name_column`] — which is what makes this read as a table of commands
     /// rather than as a ragged list that happens to have two parts per line.
     pub fn render(&self, rect: Rect, rows: usize) -> Vec<Line> {
+        self.render_with_caps(rect, rows, crate::caps::Caps::default())
+    }
+
+    pub fn render_with_caps(&self, rect: Rect, rows: usize, caps: crate::caps::Caps) -> Vec<Line> {
         let w = rect.w as usize;
         if w == 0 || rows == 0 {
             return Vec::new();
         }
-        let panel = theme::bg(Role::PanelBg).under(theme::fg(Role::PanelFg));
+        let panel = if self.tabs.is_empty() {
+            theme::bg(Role::PanelBg).under(theme::fg(Role::PanelFg))
+        } else {
+            theme::fg(Role::PanelFg)
+        };
+        let header = self.header_rows().min(rows);
+        let rows = rows.saturating_sub(header);
         let start = self.window(rows);
         let column = name_column(&self.items, name_stop(w));
-        let mut out: Vec<Line> = Vec::with_capacity(rows);
+        let mut out: Vec<Line> = Vec::with_capacity(rows + header);
+        if header > 0 {
+            let mut tabs = vec![Span::raw("  ")];
+            for (i, tab) in self.tabs.iter().enumerate() {
+                let style = if i == self.active_tab {
+                    theme::bg(Role::PanelSelBg).under(theme::fg(Role::Accent))
+                } else {
+                    theme::fg(Role::Muted)
+                };
+                tabs.push(Span::styled(format!("  {}  ", tab.label), style));
+                tabs.push(Span::raw("  "));
+            }
+            out.extend(
+                [
+                    crate::modules::chrome::panel_edge(w, caps),
+                    pad(Line::from_spans(tabs), w, panel),
+                    pad(Line::empty(), w, panel),
+                ]
+                .into_iter()
+                .take(header),
+            );
+        }
         for i in 0..rows {
             let index = start + i;
             let (line, base) = match self.items.get(index) {
@@ -611,8 +692,15 @@ impl Slash {
                     } else {
                         panel
                     };
+                    let marker = if self.tabs.is_empty() {
+                        format!("  {}", item.sigil)
+                    } else if here {
+                        format!("{} ", caps.g(crate::caps::Glyph::Pointer))
+                    } else {
+                        "  ".into()
+                    };
                     let mut spans = vec![
-                        Span::styled(format!("  {}", item.sigil), base),
+                        Span::styled(marker, base),
                         Span::styled(
                             widen(&item.label, column),
                             if here {
@@ -628,6 +716,13 @@ impl Slash {
                 // Never reached in practice: the rect is sized to the window,
                 // and this is what keeps a short list from showing the screen
                 // through its own panel.
+                None if !self.tabs.is_empty() && i == 0 => (
+                    Line::styled(
+                        crate::i18n::t(crate::i18n::Msg::MentionEmpty),
+                        theme::fg(Role::Muted),
+                    ),
+                    panel,
+                ),
                 None => (Line::empty(), panel),
             };
             out.push(pad(line, w, base));
@@ -722,6 +817,56 @@ fn widen(label: &str, column: usize) -> String {
 mod tests {
     use super::*;
     use crate::moment::Moment;
+
+    fn categorized(items: Vec<Item>) -> Slash {
+        Slash::new(items).with_tabs(
+            vec![
+                Item::new("files", "Files"),
+                Item::new("sessions", "Sessions"),
+            ],
+            0,
+        )
+    }
+
+    #[test]
+    fn category_chrome_does_not_shift_pointer_selection_or_scroll() {
+        let mut menu = categorized(
+            (0..20)
+                .map(|i| Item::new(format!("@{i}"), format!("file{i}")))
+                .collect(),
+        );
+        let rect = Rect::new(0, 0, 80, 7);
+        assert_eq!(menu.click(2, 1, rect, 7).as_deref(), Some("files"));
+        assert_eq!(menu.click(14, 1, rect, 7).as_deref(), Some("sessions"));
+        assert_eq!(menu.click(2, 2, rect, 7), None);
+        assert_eq!(menu.click(2, 3, rect, 7).as_deref(), Some("@0"));
+        menu.move_by(19);
+        let shown = menu.render(rect, 7);
+        assert!(shown.last().unwrap().plain().contains("file19"));
+        assert_eq!(menu.click(2, 6, rect, 7).as_deref(), Some("@19"));
+        assert_eq!(menu.adjacent_tab(-1).as_deref(), Some("sessions"));
+        assert_eq!(menu.adjacent_tab(1).as_deref(), Some("sessions"));
+    }
+
+    #[test]
+    fn an_empty_category_stays_open_and_has_no_insertable_placeholder() {
+        let mut menu = categorized(vec![]);
+        assert!(!menu.is_empty());
+        assert!(menu.selected().is_none());
+        assert!(menu.click(2, 3, Rect::new(0, 0, 80, 4), 4).is_none());
+        // With only a rule above the footer, the tabs are not drawn. A click
+        // on that footer must not activate an invisible category.
+        assert!(menu.click(2, 1, Rect::new(0, 0, 80, 2), 1).is_none());
+        let shown = menu.render(Rect::new(0, 0, 80, 4), 4);
+        assert!(!shown[3].plain().trim().is_empty());
+        for width in [0, 1, 8, 20] {
+            for height in 0..5 {
+                let lines = menu.render(Rect::new(0, 0, width, height), height as usize);
+                assert!(lines.len() <= height as usize);
+                assert!(lines.iter().all(|line| line.width() <= width as usize));
+            }
+        }
+    }
 
     fn items() -> Vec<Item> {
         vec![

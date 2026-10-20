@@ -5508,6 +5508,20 @@ impl Host {
         *self.menu.write().expect("menu poisoned") = crate::menu::Slash::new(items);
     }
 
+    pub fn set_mention_menu(
+        &self,
+        items: Vec<crate::menu::Item>,
+        tabs: Vec<crate::menu::Item>,
+        active: usize,
+    ) {
+        *self.menu.write().expect("menu poisoned") =
+            crate::menu::Slash::new(items).with_tabs(tabs, active);
+    }
+
+    pub fn menu_adjacent_tab(&self, delta: i32) -> Option<String> {
+        self.menu.read().expect("menu poisoned").adjacent_tab(delta)
+    }
+
     pub fn menu_select_value(&self, value: &str) {
         self.menu
             .write()
@@ -5825,7 +5839,7 @@ impl Host {
     /// now rather than a truncation: the list scrolls with its cursor, so a cap
     /// costs no reachability — see [`crate::menu::Slash::window`].
     fn menu_rows(&self, menu: &crate::menu::Slash) -> u16 {
-        (menu.len() as u16).clamp(1, MENU_ROWS)
+        menu.len().clamp(1, MENU_ROWS as usize) as u16 + menu.header_rows() as u16
     }
 
     /// Where the menu rises to, over the layout.
@@ -5860,17 +5874,36 @@ impl Host {
     /// also what decides which row is lit and which row a cell is on — one
     /// layout, so the highlight and the pointer cannot disagree. What is left
     /// here is the margin, which is this panel's and not the list's.
-    fn menu_lines(&self, rect: Rect, menu: &crate::menu::Slash) -> Vec<Line> {
+    fn menu_lines(
+        &self,
+        rect: Rect,
+        menu: &crate::menu::Slash,
+        caps: crate::caps::Caps,
+    ) -> Vec<Line> {
         let w = rect.w as usize;
         let room = (rect.h as usize).saturating_sub(1);
         let list = Rect::new(rect.x, rect.y, rect.w, room as u16);
-        let mut out = menu.render(list, room);
+        let mut out = menu.render_with_caps(list, room, caps);
         out.truncate(room);
         // The margin: one blank row of the panel's colour, so the list reads as
         // a surface lifted off the prompt rather than as text floating on it.
         let style = crate::theme::bg(crate::theme::Role::PanelBg)
             .under(crate::theme::fg(crate::theme::Role::PanelFg));
-        out.push(Line::styled(" ".repeat(w), style).truncate(w));
+        if menu.header_rows() > 0 {
+            out.push(
+                Line::styled(
+                    format!(
+                        "{}{}",
+                        crate::i18n::t(crate::i18n::Msg::MentionLegend),
+                        " ".repeat(w)
+                    ),
+                    crate::theme::fg(crate::theme::Role::Muted),
+                )
+                .truncate(w),
+            );
+        } else {
+            out.push(Line::styled(" ".repeat(w), style).truncate(w));
+        }
         out
     }
 
@@ -6660,7 +6693,7 @@ impl Host {
         let menu = self.menu.read().expect("menu poisoned").clone();
         if !menu.is_empty() {
             if let Some(rect) = self.menu_rect(&frame, Rect::sized(w, h), self.menu_rows(&menu)) {
-                frame.place("menu", rect, self.menu_lines(rect, &menu));
+                frame.place("menu", rect, self.menu_lines(rect, &menu, moment.caps));
                 self.hits.lock().expect("hits poisoned").menu = Some(rect);
             }
         } else {
