@@ -60,10 +60,20 @@ Verdict: yes All requested tests pass and the file was written.
 Verdict: no Two tests still fail and the migration is unrun.
 Verdict: unknown The bounded log does not contain the required build result."#;
 
+/// Provider-reported usage accumulated over a goal, including its evaluator.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GoalTokenUsage {
+    pub input: u64,
+    pub output: u64,
+    pub cached: u64,
+}
+
 /// Observed work, not estimates of unobserved activity while the process was down.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct GoalRunReport {
+    /// None for older checkpoints whose historical breakdown is unknown.
+    pub usage: Option<GoalTokenUsage>,
     pub provider_recoveries: u32,
     pub evaluator_attempts: u32,
     pub tool_calls: u64,
@@ -180,11 +190,24 @@ impl Drop for GoalState {
 }
 
 impl GoalState {
+    pub fn record_usage(&mut self, prompt: u32, completion: u32, cached: u32) {
+        self.tokens_used = self
+            .tokens_used
+            .saturating_add(u64::from(prompt))
+            .saturating_add(u64::from(completion));
+        if let Some(usage) = &mut self.report.usage {
+            usage.input = usage.input.saturating_add(u64::from(prompt));
+            usage.output = usage.output.saturating_add(u64::from(completion));
+            usage.cached = usage.cached.saturating_add(u64::from(cached));
+        }
+    }
+
     pub fn new(id: u64, condition: String, max_rounds: u32, max_duration_secs: u64) -> Self {
         let started_at = Instant::now();
         let cancel = CancellationToken::new();
         Self {
             report: GoalRunReport {
+                usage: Some(GoalTokenUsage::default()),
                 time_limit_secs: max_duration_secs,
                 ..Default::default()
             },
@@ -1699,6 +1722,47 @@ impl Tool for ScheduleWakeupTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn goal_usage_accumulates_receipts_and_survives_checkpoint_restore() {
+        let mut goal = GoalState::new(1, "finish".into(), 0, 0);
+        goal.record_usage(100, 20, 80);
+        goal.record_usage(200, 30, 100);
+        let progress = goal.progress();
+        let encoded = serde_json::to_value(&progress).unwrap();
+        let decoded: GoalProgress = serde_json::from_value(encoded.clone()).unwrap();
+        let mut restored = GoalState::restore_paused(2, &decoded);
+        restored.record_usage(50, 10, 40);
+        let report = restored.progress().report;
+        assert_eq!(report.tokens, 410);
+        assert_eq!(
+            report.usage,
+            Some(GoalTokenUsage {
+                input: 350,
+                output: 60,
+                cached: 220
+            })
+        );
+
+        // Old checkpoints retain their budget total but cannot reconstruct its split.
+        let mut old = encoded;
+        old["report"].as_object_mut().unwrap().remove("usage");
+        let decoded: GoalProgress = serde_json::from_value(old).unwrap();
+        let mut restored = GoalState::restore_paused(3, &decoded);
+        restored.record_usage(50, 10, 40);
+        assert_eq!(restored.progress().report.tokens, 410);
+        assert_eq!(restored.progress().report.usage, None);
+    }
+
+    #[test]
+    fn goal_usage_does_not_overflow_at_u32_boundaries() {
+        let mut goal = GoalState::new(1, "finish".into(), 0, 0);
+        goal.record_usage(u32::MAX, u32::MAX, u32::MAX);
+        goal.record_usage(1, 1, 1);
+        let report = goal.progress().report;
+        assert_eq!(report.tokens, 2 * (u64::from(u32::MAX) + 1));
+        assert_eq!(report.usage.unwrap().input, u64::from(u32::MAX) + 1);
+    }
 
     struct OptionsRecordingProvider {
         options: Arc<std::sync::Mutex<Vec<ChatOptions>>>,

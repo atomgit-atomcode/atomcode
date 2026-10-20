@@ -96,7 +96,7 @@ pub use config::{
 };
 pub use controllers::{
     GoalPhase, GoalProgress, GoalRecoveryKind, GoalRecoveryProgress, GoalRunReport, GoalTerminal,
-    LoopProgress,
+    GoalTokenUsage, LoopProgress,
 };
 pub use init_prompt::{build_init_prompt, INIT_PROMPT, INIT_PROMPT_ZH_CN};
 pub use parts::{

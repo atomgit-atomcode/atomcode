@@ -203,6 +203,7 @@ mod tests {
     fn goal_status_and_tips_share_one_row_even_on_narrow_terminals() {
         let mut m = Moment::default();
         m.autonomy = Some(atomcode_host_api::Running {
+            usage: None,
             recovering: false,
             kind: "goal".into(),
             what: "a long objective".into(),

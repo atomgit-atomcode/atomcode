@@ -150,18 +150,27 @@ plexus_service!(SetupSvc => dyn crate::setup::Setup, "tui-setup", Seam, "Install
 
 /// The session's clock, and the only place this crate reads one.
 ///
-/// A duration on screen is the difference of two readings the log does not
-/// carry, so the readings travel in `Moment` and every `render` stays a pure
-/// function of them (`docs/adr/0008`). Read here because the host loop is the
+/// Current time is injected into `Moment`, so render can compare it with a
+/// committed start or a runtime progress sample without reading a clock
+/// (`docs/adr/0008`). Read here because the host loop is the
 /// only thing that knows when *now* is: it wakes for a fact, for a key and for a
 /// tick, and each of those is a moment the screen is painted from.
-struct Clock(std::time::Instant);
+struct Clock {
+    started: std::time::Instant,
+    unix_ms: Option<u64>,
+}
 
 impl Clock {
     /// Start counting. Called before anything can commit a fact, so a turn that
     /// opens during start-up is measured on the same clock as every later one.
     fn start() -> Self {
-        Self(std::time::Instant::now())
+        Self {
+            started: std::time::Instant::now(),
+            unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)),
+        }
     }
 
     /// How long this session has been on screen.
@@ -169,8 +178,15 @@ impl Clock {
         // Milliseconds since the loop started, saturated rather than wrapped: a
         // u64 of milliseconds is 584 million years, and a number that suddenly
         // went backwards would read as a turn that started in the future.
-        let ms = u64::try_from(self.0.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
         Timestamp::millis(ms)
+    }
+
+    fn stamp(&self, moment: &mut crate::moment::Moment) {
+        moment.now = self.reading();
+        moment.unix_ms = self
+            .unix_ms
+            .map(|at| at.saturating_add(moment.now.as_millis()));
     }
 }
 
@@ -1499,7 +1515,7 @@ impl UserInterface for Tui {
             // dark, fully capable terminal — whatever the real one is, which is
             // how a light terminal ended up painted in a dark palette.
             m.caps = self.surface.caps();
-            m.now = clock.reading();
+            clock.stamp(&mut m);
         }
         *self.ctx.lock().expect("ctx poisoned") = Some(ctx.clone());
         *self.wake.lock().expect("wake poisoned") = Some(wake_tx.clone());
@@ -1942,7 +1958,7 @@ impl UserInterface for Tui {
                 // The reading the frame about to be painted is drawn from. Facts
                 // absorb against whatever the last one was — a frame at most out
                 // of date, and the only reading available between commits.
-                self.host.moment.write().expect("moment poisoned").now = clock.reading();
+                clock.stamp(&mut self.host.moment.write().expect("moment poisoned"));
                 self.refresh_members();
                 // A question that arrived while the loop was asleep is brought
                 // onto the moment here, before the frame it appears in is
@@ -2184,8 +2200,9 @@ impl UserInterface for Tui {
                     session,
                     condition,
                     met,
+                    summary,
                 }) => {
-                    stale |= took_goal_end(&self.host, &session, condition, met);
+                    stale |= took_goal_end(&self.host, &session, condition, met, summary);
                 }
                 // The turn finished; the log did not get it. Said loudly and
                 // at once: the log is the session's only authority
@@ -9746,19 +9763,38 @@ fn deliver(
 /// from a criterion, and "did the screen keep what the host pushed" is exactly
 /// the thing worth asserting. Returns whether anything moved.
 ///
-/// News about a session nobody is looking at is dropped: a member running a
-/// goal must not overwrite the lead's status line.
+/// Background samples are retained for view restoration, but a member's news
+/// must not overwrite the lead's visible status line.
 pub fn took_autonomy(
     moment: &std::sync::RwLock<crate::moment::Moment>,
     session: &str,
     running: Option<atomcode_host_api::Running>,
 ) -> bool {
     let mut m = moment.write().expect("moment poisoned");
+    // Preserve background samples too: a paused/ended member must not keep
+    // advancing its old clock when the reader returns to it. Identical samples
+    // leave their receipt unchanged so duplicate announcements cannot reset time.
+    let clock_changed = match running.as_ref() {
+        Some(progress)
+            if m.autonomy_samples
+                .get(session)
+                .is_some_and(|(old, _)| old == progress) =>
+        {
+            false
+        }
+        Some(progress) => {
+            let now = m.now;
+            m.autonomy_samples
+                .insert(session.to_owned(), (progress.clone(), now));
+            true
+        }
+        None => m.autonomy_samples.remove(session).is_some(),
+    };
     if m.viewing != session && m.lead != session {
         return false;
     }
     if m.autonomy == running {
-        return false;
+        return clock_changed && m.viewing == session;
     }
     m.autonomy = running;
     true
@@ -9776,17 +9812,39 @@ pub fn took_goal_end(
     session: &str,
     condition: String,
     met: bool,
+    summary: Option<atomcode_host_api::Running>,
 ) -> bool {
-    {
+    let usage = match &summary {
+        Some(summary) => summary.usage.clone(),
+        None => host
+            .moment
+            .read()
+            .expect("moment poisoned")
+            .autonomy_samples
+            .get(session)
+            .and_then(|(running, _)| running.usage.clone()),
+    };
+    let elapsed_ms = {
         let mut m = host.moment.write().expect("moment poisoned");
+        let elapsed_ms = summary
+            .as_ref()
+            .map(|s| s.elapsed_secs.saturating_mul(1000))
+            .or_else(|| m.goal_elapsed_ms(session));
         if m.viewing != session {
             if m.lead == session {
-                m.held_goal_end = Some((session.to_string(), condition, met));
+                m.held_goal_end = Some(crate::moment::HeldGoalEnd {
+                    session: session.to_string(),
+                    condition,
+                    met,
+                    elapsed_ms,
+                    usage,
+                });
             }
             return false;
         }
-    }
-    say_goal_end(host, condition, met);
+        elapsed_ms
+    };
+    say_goal_end(host, condition, met, elapsed_ms, usage);
     true
 }
 
@@ -9796,24 +9854,35 @@ pub fn flush_held_goal_end(host: &crate::host::Host) -> bool {
     let held = {
         let mut m = host.moment.write().expect("moment poisoned");
         match &m.held_goal_end {
-            Some((session, ..)) if *session == m.viewing => m.held_goal_end.take(),
+            Some(end) if end.session == m.viewing => m.held_goal_end.take(),
             _ => None,
         }
     };
     match held {
-        Some((_, condition, met)) => {
-            say_goal_end(host, condition, met);
+        Some(end) => {
+            say_goal_end(host, end.condition, end.met, end.elapsed_ms, end.usage);
             true
         }
         None => false,
     }
 }
 
-fn say_goal_end(host: &crate::host::Host, condition: String, met: bool) {
+fn say_goal_end(
+    host: &crate::host::Host,
+    condition: String,
+    met: bool,
+    elapsed_ms: Option<u64>,
+    usage: Option<atomcode_host_api::TokenTotals>,
+) {
     let mut stream = host.stream.write().expect("stream poisoned");
     stream.writer("commands").emit(
         crate::block::Coord::default(),
-        Arc::new(crate::content::GoalEndedBlock { condition, met }),
+        Arc::new(crate::content::GoalEndedBlock {
+            condition,
+            met,
+            elapsed_ms,
+            usage,
+        }),
     );
 }
 
@@ -11040,6 +11109,7 @@ mod autonomy_tests {
 
     fn running(round: u32) -> atomcode_host_api::Running {
         atomcode_host_api::Running {
+            usage: None,
             recovering: false,
             kind: "goal".into(),
             what: "测试全绿".into(),
@@ -11091,9 +11161,15 @@ mod autonomy_tests {
             m.lead = "lead".into();
             m.viewing = "lead".into();
         }
-        assert!(!took_goal_end(&host, "lead~scout", "测试全绿".into(), true));
+        assert!(!took_goal_end(
+            &host,
+            "lead~scout",
+            "测试全绿".into(),
+            true,
+            None
+        ));
         assert_eq!(host.stream.read().unwrap().len(), 0);
-        assert!(took_goal_end(&host, "lead", "测试全绿".into(), true));
+        assert!(took_goal_end(&host, "lead", "测试全绿".into(), true, None));
         {
             let stream = host.stream.read().unwrap();
             assert_eq!(stream.len(), 1);
@@ -11111,7 +11187,21 @@ mod autonomy_tests {
             m.lead = "lead".into();
             m.viewing = "lead~scout".into();
         }
-        assert!(!took_goal_end(&host, "lead", "测试全绿".into(), true));
+        took_autonomy(&host.moment, "lead", Some(running(3)));
+        host.moment.write().unwrap().now = crate::moment::Timestamp::millis(10_000);
+        assert!(!took_goal_end(&host, "lead", "测试全绿".into(), true, None));
+        assert_eq!(
+            host.moment
+                .read()
+                .unwrap()
+                .held_goal_end
+                .as_ref()
+                .unwrap()
+                .elapsed_ms,
+            Some(100_000)
+        );
+        took_autonomy(&host.moment, "lead", None);
+        host.moment.write().unwrap().now = crate::moment::Timestamp::millis(60_000);
         assert_eq!(
             host.stream.read().unwrap().len(),
             0,
@@ -11121,7 +11211,59 @@ mod autonomy_tests {
         host.moment.write().unwrap().viewing = "lead".into();
         assert!(flush_held_goal_end(&host), "said once the lead is back");
         assert_eq!(host.stream.read().unwrap().len(), 1);
+        let stream = host.stream.read().unwrap();
+        let text = stream.slots()[0]
+            .block()
+            .content
+            .lines(&crate::block::RenderCtx::bare(160))
+            .iter()
+            .map(|line| line.plain())
+            .collect::<String>();
+        assert!(
+            text.contains("耗时 1m40s"),
+            "goal end is frozen before returning to its view: {text}"
+        );
+        drop(stream);
         assert!(!flush_held_goal_end(&host), "and only once");
+    }
+
+    #[test]
+    fn goal_end_uses_the_final_runtime_usage_instead_of_a_stale_sample() {
+        let host = crate::host::Host::new(
+            std::sync::Arc::new(crate::module::Modules::new()),
+            crate::host::default_layout(),
+        );
+        {
+            let mut m = host.moment.write().unwrap();
+            m.lead = "lead".into();
+            m.viewing = "lead".into();
+        }
+        took_autonomy(&host.moment, "lead", Some(running(1)));
+        let mut final_state = running(2);
+        final_state.elapsed_secs = 120;
+        final_state.usage = Some(atomcode_host_api::TokenTotals {
+            input: 10_000,
+            output: 500,
+            cached: 7_000,
+        });
+        assert!(took_goal_end(
+            &host,
+            "lead",
+            "finish".into(),
+            true,
+            Some(final_state)
+        ));
+        let stream = host.stream.read().unwrap();
+        let text = stream.slots()[0]
+            .block()
+            .content
+            .lines(&crate::block::RenderCtx::bare(200))
+            .iter()
+            .map(|l| l.plain())
+            .collect::<String>();
+        for part in ["耗时 2m0s", "↑ 10.0K", "↓ 500", "缓存 70.00%"] {
+            assert!(text.contains(part), "{part}: {text}");
+        }
     }
 
     /// A member running a goal must not write on the lead's line.

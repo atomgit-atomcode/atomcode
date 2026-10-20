@@ -4538,7 +4538,7 @@ fn spawn_runtime_owner_with_optional_agent(
                     }
                     if let Some(usage) = outcome.usage {
                         if let Some(state) = goal.as_mut() {
-                            state.tokens_used = state.tokens_used.saturating_add((usage.prompt + usage.completion) as u64);
+                            state.record_usage(usage.prompt, usage.completion, usage.cached);
                         }
                     }
                     let mut finish_reason = None;
@@ -8646,10 +8646,8 @@ fn spawn_runtime_owner_with_optional_agent(
                                 // makes the goal inactive. Its final usage may arrive while
                                 // the explicitly paused turn is draining cancellation.
                                 if let Some(state) = goal.as_mut().filter(|state| state.active || (cancel_pending && state.phase == GoalPhase::Paused)) {
-                                    state.tokens_used = state.tokens_used.saturating_add(u64::from(meta.tokens.prompt).saturating_add(u64::from(meta.tokens.completion)));
-                                    if !state.active {
-                                        let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
-                                    }
+                                    state.record_usage(meta.tokens.prompt, meta.tokens.completion, meta.tokens.cached);
+                                    let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                                 }
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::Agent(
                                     AgentEvent::Usage(meta),

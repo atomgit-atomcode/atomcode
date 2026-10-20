@@ -1920,6 +1920,7 @@ impl Host {
         m.stream_selection = None;
         m.edge_scroll = None;
         m.turn_started = None;
+        m.turn_started_unix_ms = None;
         m.generation = Default::default();
         m.quiet_since = None;
         m.provider_retry_started = None;
@@ -2255,21 +2256,21 @@ impl Host {
             let now = m.now;
             m.generation.absorb(fact, now);
         }
-        // When a turn opened or closed, on the clock the host was handed. Here
-        // rather than in a module because this is the one place that sees both
-        // the fact and the reading — and a duration on screen is the difference
-        // of two readings the log does not carry (docs/adr/0008).
+        // Keep the committed start across replay, with a local fallback for
+        // older records. Rendering subtracts only clocks injected by the host.
         match fact {
             SessionEvent::TurnStart { .. } => {
                 let mut m = self.moment.write().expect("moment poisoned");
                 let now = m.now;
                 m.provider_retry_started = None;
                 m.turn_started = Some(now);
+                m.turn_started_unix_ms = (logged.at > 0).then_some(logged.at);
                 m.quiet_since = Some(now);
             }
             SessionEvent::TurnEnd { .. } => {
                 let mut m = self.moment.write().expect("moment poisoned");
                 m.turn_started = None;
+                m.turn_started_unix_ms = None;
                 m.quiet_since = None;
                 m.provider_retry_started = None;
             }
@@ -7672,6 +7673,36 @@ fn waiting(queued: &[crate::moment::Queued]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn switching_views_replays_the_original_committed_turn_start() {
+        let h = host();
+        let start = LoggedEvent {
+            seq: 1,
+            at: 9_000_000,
+            event: SessionEvent::TurnStart { turn: 1 },
+        };
+        h.moment.write().unwrap().unix_ms = Some(10_000_000);
+        h.absorb_logged(&start);
+        assert_eq!(
+            h.moment.read().unwrap().turn_started_unix_ms,
+            Some(9_000_000)
+        );
+        h.switch_view();
+        assert_eq!(h.moment.read().unwrap().turn_started_unix_ms, None);
+        h.moment.write().unwrap().now = crate::moment::Timestamp::millis(60_000);
+        h.absorb_logged(&start);
+        assert_eq!(
+            h.moment.read().unwrap().turn_started_unix_ms,
+            Some(9_000_000)
+        );
+        h.absorb(&SessionEvent::TurnEnd {
+            turn: 1,
+            stop: atomcode_kernel::event::StopReason::Stopped,
+            error: None,
+        });
+        assert_eq!(h.moment.read().unwrap().turn_started_unix_ms, None);
+    }
+
     #[test]
     fn live_chunks_measure_generation_and_turn_end_clears_it() {
         let h = host();

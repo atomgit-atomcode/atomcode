@@ -441,6 +441,21 @@ mod tests {
         assert_eq!(counts.evaluations.load(Ordering::SeqCst), 1);
         runtime.handle.shutdown().await.unwrap();
         runtime.task.await.unwrap();
+        let manager = atomcode_capabilities::session::SessionManager::for_project(
+            &root.path().join("project"),
+            &atomcode_capabilities::ProductDirs::new(root.path().join("user"), ".project"),
+        );
+        let lease = manager.acquire_lease(&id).unwrap();
+        let checkpoint: Checkpoint = manager.read_controller_checkpoint(&lease).unwrap().unwrap();
+        assert_eq!(
+            checkpoint.progress.report.usage,
+            Some(crate::GoalTokenUsage {
+                input: 22,
+                output: 6,
+                cached: 0
+            })
+        );
+        drop(lease);
         let runtime =
             CodingRuntime::start(input(root.path(), &counts, crate::SessionMode::Resume(id)))
                 .await

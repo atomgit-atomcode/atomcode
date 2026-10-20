@@ -447,6 +447,15 @@ pub enum ScrollbarMode {
 }
 
 /// The non-derivable half of what a module renders from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeldGoalEnd {
+    pub session: String,
+    pub condition: String,
+    pub met: bool,
+    pub elapsed_ms: Option<u64>,
+    pub usage: Option<atomcode_host_api::TokenTotals>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Moment {
     pub activity: Activity,
@@ -542,18 +551,12 @@ pub struct Moment {
     /// Injected wall time, for anything that needs a real interval (a
     /// countdown). Still injected: tests set it, `render` never reads a clock.
     pub now: Timestamp,
-    /// When the turn in flight began, on the same clock as [`Moment::now`].
-    /// `None` between turns.
-    ///
-    /// Read off a fact rather than derived from one: the log records no clock,
-    /// so a turn's start time exists only here — stamped where facts land
-    /// (`Host::absorb`), which is the one place that sees both the fact and the
-    /// reading. A duration on screen is therefore the difference of two
-    /// injected readings, and `render` still never reads a clock
-    /// (docs/adr/0008). Folded rather than stored per module for the same
-    /// reason [`Moment::history`] is: it is not derivable, and two modules
-    /// folding it separately would eventually give two answers.
+    /// Unix milliseconds anchored by the host clock; absent in synthetic hosts.
+    pub unix_ms: Option<u64>,
+    /// Local fallback for records without a committed wall-clock timestamp.
     pub turn_started: Option<Timestamp>,
+    /// The current turn's committed start, retained by log replay across views.
+    pub turn_started_unix_ms: Option<u64>,
     /// Current streamed generation estimate, stamped only by the live host.
     pub generation: crate::generation::Generation,
     /// When something last arrived for the turn in flight, on the same clock as
@@ -795,6 +798,10 @@ pub struct Moment {
     /// a fact about the conversation, it is the state of something running
     /// beside it. `None` is "not driving itself".
     pub autonomy: Option<atomcode_host_api::Running>,
+    /// Latest runtime samples and local receipt times, retained per session so
+    /// changing views cannot overwrite another session's cumulative clock.
+    pub autonomy_samples:
+        std::collections::HashMap<String, (atomcode_host_api::Running, Timestamp)>,
     /// The allowance window nearest its limit, as of the last check.
     ///
     /// Polled rather than pushed, and that is forced: an allowance moves on the
@@ -970,12 +977,9 @@ pub struct Moment {
     /// 标记:这时滚轮会被终端转成方向键,滚动要用 pgup/pgdn —— 滚轮出怪事时,
     /// 原因得就在眼前,而不是在很久以前滚上去的那一句提示里。
     pub mouse_handed_back: bool,
-    /// The lead's goal ended while a member was on screen: `(session,
-    /// condition, met)`, said when the lead is back on screen
-    /// ([`crate::plugin::flush_held_goal_end`]). Written into the member's view
-    /// it would be in the wrong conversation, and gone when the view switched
-    /// back — the stream is rebuilt from the log, and this is not in it.
-    pub held_goal_end: Option<(String, String, bool)>,
+    /// A frozen goal end held until its lead's view is back on screen.
+    /// It must not be written into a member's conversation.
+    pub held_goal_end: Option<HeldGoalEnd>,
     /// 开屏时问到的「现在发不出回合」的原因(没有可用 provider、登录过期……),
     /// `None` 是能发。画在状态行里、常挂着,而不是写进对话流顶上:和 tuix 一样,
     /// 页面照常打开(欢迎块照画),原因在底下。agent 起来(`Described`)时清掉。
@@ -1228,6 +1232,21 @@ impl Moment {
             return None;
         }
         crate::text::ghost(&self.input, &self.history, self.history_at.is_some())
+    }
+
+    /// Read a session's cumulative goal clock from its last runtime sample.
+    /// Used both by the live row and to freeze the goal's ending caption.
+    pub fn goal_elapsed_ms(&self, session: &str) -> Option<u64> {
+        let (running, since) = self.autonomy_samples.get(session)?;
+        if running.kind != "goal" || (running.paused.is_some() && !running.recovering) {
+            return None;
+        }
+        Some(
+            running
+                .elapsed_secs
+                .saturating_mul(1_000)
+                .saturating_add(self.now.as_millis().saturating_sub(since.as_millis())),
+        )
     }
 
     pub fn goal_recovering(&self) -> bool {
@@ -1495,6 +1514,7 @@ mod tests {
     fn goal_evaluation_and_cooldown_remain_stoppable_only_from_the_lead() {
         let mut m = Moment::default();
         m.autonomy = Some(atomcode_host_api::Running {
+            usage: None,
             kind: "goal".into(),
             recovering: true,
             what: "finish".into(),

@@ -2285,8 +2285,11 @@ impl Content for ToolCallBlock {
 /// failure. Undecided is a caution, not an error: `⚠` and the warning colour.
 #[derive(Debug)]
 pub struct GoalEndedBlock {
+    pub usage: Option<atomcode_host_api::TokenTotals>,
     pub condition: String,
     pub met: bool,
+    /// Frozen from the same cumulative clock as the live goal row.
+    pub elapsed_ms: Option<u64>,
 }
 
 impl Content for GoalEndedBlock {
@@ -2298,6 +2301,7 @@ impl Content for GoalEndedBlock {
             "goal_end",
             &self.condition,
             if self.met { "met" } else { "undecided" },
+            &format!("{:?}:{:?}", self.elapsed_ms, self.usage),
         ])
     }
     fn always_open(&self) -> bool {
@@ -2311,6 +2315,16 @@ impl Content for GoalEndedBlock {
             let warn = Style::new().fg(Color::role(Role::Warning));
             (t(Msg::GoalGaveUp { condition }), "⚠ ", warn, warn)
         };
+        let mut text = match self.elapsed_ms {
+            Some(ms) => format!("{text} · {}", t(Msg::LiveElapsed { took: &fmt_dur(ms) })),
+            None => text.into_owned(),
+        };
+        if let Some(usage) = &self.usage {
+            for part in usage_parts(usage.input, usage.output, usage.cached) {
+                text.push_str(" · ");
+                text.push_str(&part);
+            }
+        }
         let mut out = wrapped(&text, ctx.width, body, mark);
         if let Some(lead) = out.first_mut().and_then(|line| line.spans.first_mut()) {
             lead.style = mark_style;
@@ -3203,6 +3217,31 @@ pub fn cache_hit_rate(cached: u64, prompt: u64) -> Option<String> {
     (cached > 0 && prompt > 0).then(|| format!("{:.2}%", cached as f64 * 100.0 / prompt as f64))
 }
 
+/// Shared wording for usage accumulated over the selected task scope.
+pub fn usage_parts(input: u64, output: u64, cached: u64) -> Vec<String> {
+    let mut parts = Vec::new();
+    if input > 0 {
+        parts.push(
+            t(Msg::LiveIn {
+                tokens: &token_count_total(input),
+            })
+            .into_owned(),
+        );
+    }
+    if output > 0 {
+        parts.push(
+            t(Msg::LiveOut {
+                tokens: &token_count_total(output),
+            })
+            .into_owned(),
+        );
+    }
+    if let Some(hit) = cache_hit_rate(cached, input) {
+        parts.push(t(Msg::LiveCached { hit: &hit }).into_owned());
+    }
+    parts
+}
+
 /// A token count as a person says it: exact while it is small enough to read,
 /// rounded in thousands once it is not.
 ///
@@ -3210,9 +3249,11 @@ pub fn cache_hit_rate(cached: u64, prompt: u64) -> Option<String> {
 /// quantity on the same screen, and two renderings of one number is a
 /// disagreement a person has to stop and resolve.
 pub fn token_count(n: u32) -> String {
-    // `K` from a thousand, with one decimal kept (`8.0K`, not `8K`): the live line
-    // shows `入` and `出` side by side, and a bare `8003` next to `78.2K` reads as
-    // two different units. One decimal, always, keeps the column consistent.
+    token_count_total(u64::from(n))
+}
+
+/// The same formatting for accumulated request usage beyond a u32 counter.
+pub fn token_count_total(n: u64) -> String {
     if n < 1_000 {
         return n.to_string();
     }
@@ -3578,11 +3619,29 @@ mod tests {
     /// colour — and one that stopped undecided is a caution in the warning
     /// colour. Neither is the error red it used to come out in.
     #[test]
+    fn goal_end_reports_the_frozen_total_without_inventing_missing_time() {
+        let mut block = GoalEndedBlock {
+            usage: None,
+            condition: "finish".into(),
+            met: true,
+            elapsed_ms: None,
+        };
+        let ctx = RenderCtx::bare(160);
+        assert!(!block.lines(&ctx)[0].plain().contains("耗时"));
+        let before = block.content_hash();
+        block.elapsed_ms = Some(1_172_000);
+        assert!(block.lines(&ctx)[0].plain().contains("耗时 19m32s"));
+        assert_ne!(before, block.content_hash());
+    }
+
+    #[test]
     fn a_goal_end_is_drawn_as_news_not_as_an_error() {
         let ctx = RenderCtx::bare(80);
         let met = GoalEndedBlock {
+            usage: None,
             condition: "测试全绿".into(),
             met: true,
+            elapsed_ms: None,
         }
         .lines(&ctx);
         assert!(met[0].plain().starts_with("✓ "), "{:?}", met[0].plain());
@@ -3591,8 +3650,10 @@ mod tests {
         assert_eq!(met[0].spans[1].style, Style::new());
 
         let undecided = GoalEndedBlock {
+            usage: None,
             condition: "测试全绿".into(),
             met: false,
+            elapsed_ms: None,
         }
         .lines(&ctx);
         let warn = Style::new().fg(Color::role(Role::Warning));

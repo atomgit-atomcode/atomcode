@@ -738,6 +738,7 @@ mod tests {
             title: Some("修解析器".into()),
             title_user_set: true,
             autonomy: Some(atomcode_host_api::Running {
+                usage: None,
                 recovering: false,
                 kind: "goal".into(),
                 what: "分析当前项目死代码".into(),
@@ -783,6 +784,7 @@ mod tests {
     fn a_paused_goal_never_claims_to_be_active() {
         let m = Moment {
             autonomy: Some(atomcode_host_api::Running {
+                usage: None,
                 recovering: false,
                 kind: "goal".into(),
                 what: "ship it".into(),

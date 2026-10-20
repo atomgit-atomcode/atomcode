@@ -313,6 +313,7 @@ pub(crate) fn attach(
                     // road, and a goal met came out red, read as a failure.
                     if let Some(met) = goal_ending(&progress) {
                         watched.announce(HostEvent::GoalEnded {
+                            summary: Some(running_of_goal(progress.clone())),
                             session: session.clone(),
                             condition: progress.condition.clone(),
                             met,
@@ -985,6 +986,14 @@ fn without_a_log(apps_fed: u64) -> Result<(), HostError> {
 /// A goal, as the contract says a self-driving session.
 fn running_of_goal(goal: atomcode_coding::GoalProgress) -> atomcode_host_api::Running {
     atomcode_host_api::Running {
+        usage: goal
+            .report
+            .usage
+            .map(|usage| atomcode_host_api::TokenTotals {
+                input: usage.input,
+                output: usage.output,
+                cached: usage.cached,
+            }),
         recovering: goal.recovery.is_some(),
         kind: "goal".into(),
         what: goal.condition,
@@ -1021,6 +1030,7 @@ fn running_of_goal(goal: atomcode_coding::GoalProgress) -> atomcode_host_api::Ru
 /// A loop, the same way. No `of`: a loop repeats until it is stopped.
 fn running_of_loop(looping: atomcode_coding::LoopProgress) -> atomcode_host_api::Running {
     atomcode_host_api::Running {
+        usage: None,
         recovering: false,
         kind: "loop".into(),
         what: looping.label,
@@ -3391,6 +3401,42 @@ mod tests {
     /// 目标完成了。另外两种终态(停死、评估失败)运行时自己会发
     /// `ControllerWarning` 带着原因,在这儿再说一遍就是说两遍;人自己停的
     /// (`Cancelled`)命令已经答过一句了。
+    #[test]
+    fn goal_projection_keeps_cumulative_usage_and_unknown_checkpoint_history() {
+        let mut progress = atomcode_coding::GoalProgress {
+            active: true,
+            terminal: None,
+            phase: atomcode_coding::GoalPhase::Pursuing,
+            round: 2,
+            max_rounds: None,
+            elapsed_secs: 120,
+            condition: "finish".into(),
+            last_reason: None,
+            recovery: None,
+            evaluation_ready: false,
+            report: atomcode_coding::GoalRunReport {
+                usage: Some(atomcode_coding::GoalTokenUsage {
+                    input: 10_000,
+                    output: 500,
+                    cached: 7_000,
+                }),
+                ..Default::default()
+            },
+        };
+        let running = running_of_goal(progress.clone());
+        assert_eq!(running.elapsed_secs, 120);
+        assert_eq!(
+            running.usage,
+            Some(atomcode_host_api::TokenTotals {
+                input: 10_000,
+                output: 500,
+                cached: 7_000
+            })
+        );
+        progress.report.usage = None;
+        assert_eq!(running_of_goal(progress).usage, None);
+    }
+
     #[test]
     fn a_goal_that_ended_says_which_of_the_two_silent_endings_it_was() {
         use atomcode_coding::{GoalPhase, GoalProgress, GoalTerminal};

@@ -671,6 +671,8 @@ pub enum HostReply {
 /// when there is a cap.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Running {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<TokenTotals>,
     /// `goal` or `loop`. A word rather than an enum: a host with a third kind
     /// of autonomy should not need this contract changed to say so.
     pub kind: String,
@@ -689,6 +691,15 @@ pub struct Running {
     /// Why it is not running right now, when it is registered but paused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paused: Option<String>,
+}
+
+/// Cumulative provider usage for the whole autonomous goal. Unknown history is
+/// represented by an absent value on Running, never by fabricated zero totals.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenTotals {
+    pub input: u64,
+    pub output: u64,
+    pub cached: u64,
 }
 
 /// One rolling window of an account's allowance.
@@ -1298,6 +1309,9 @@ pub enum HostEvent {
     /// was drawn as an error — red, read as a failure. What it says and in which
     /// colour is the front end's to decide.
     GoalEnded {
+        /// Final runtime snapshot; optional for older hosts.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<Running>,
         session: String,
         condition: String,
         met: bool,
@@ -1848,6 +1862,7 @@ mod tests {
             },
             HostReply::Autonomy {
                 running: Some(Running {
+                    usage: None,
                     recovering: false,
                     kind: "goal".into(),
                     what: "the tests pass".into(),
@@ -2026,6 +2041,31 @@ mod tests {
         all
     }
 
+    #[test]
+    fn old_autonomy_payloads_keep_unknown_usage_and_final_summary_optional() {
+        let old = serde_json::json!({"kind":"goal", "recovering":false, "what":"finish", "round":1, "elapsed_secs":30});
+        let mut running: Running = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(running.usage, None);
+        assert_eq!(serde_json::to_value(&running).unwrap(), old);
+        running.usage = Some(TokenTotals {
+            input: 100,
+            output: 20,
+            cached: 80,
+        });
+        let json = serde_json::to_value(&running).unwrap();
+        assert_eq!(serde_json::from_value::<Running>(json).unwrap(), running);
+        // Old goal-end events still decode without the final runtime snapshot.
+        let event = HostEvent::GoalEnded {
+            session: "lead".into(),
+            condition: "finish".into(),
+            met: true,
+            summary: None,
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert!(json.get("summary").is_none());
+        assert_eq!(serde_json::from_value::<HostEvent>(json).unwrap(), event);
+    }
+
     fn events() -> Vec<HostEvent> {
         let all = vec![
             HostEvent::SessionChanged {
@@ -2039,6 +2079,7 @@ mod tests {
             HostEvent::Autonomy {
                 session: "b".into(),
                 running: Some(Running {
+                    usage: None,
                     recovering: false,
                     kind: "goal".into(),
                     what: "测试全绿".into(),
@@ -2060,6 +2101,7 @@ mod tests {
                 sessions: vec![background_session()],
             },
             HostEvent::GoalEnded {
+                summary: None,
                 session: "b".into(),
                 condition: "测试全绿".into(),
                 met: true,
