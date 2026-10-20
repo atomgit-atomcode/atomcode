@@ -1224,7 +1224,17 @@ impl Terminal {
                 "this console cannot draw escape sequences; use `--classic`",
             ));
         }
+        crate::terminal_modes::take_input()?;
+        let mut setup = TerminalSetup {
+            armed: true,
+            screen: false,
+        };
         crossterm::terminal::enable_raw_mode()?;
+        // Arm before the first fallible screen write, not after palette probing.
+        arm_panic_restore(None);
+        setup.screen = true;
+        #[cfg(unix)]
+        arm_signal_restore();
         let mut out = std::io::stdout();
         out.write_all(ansi::enter().as_bytes())?;
         if crate::caps::wants_keyboard_protocol() {
@@ -1247,10 +1257,8 @@ impl Terminal {
             mouse,
             link_terminal != link_pointer::TerminalKind::Unsupported,
         );
-        out.write_all(pointer.escape().as_bytes())?;
-        out.flush()?;
+        configure_pointer(&mut out, pointer)?;
         console_wrap(false);
-        console_mouse(pointer != ansi::Pointer::Terminal);
         let mut caps = crate::caps::Caps::detect_with(overrides);
         // A classic console with a CJK font draws ambiguous characters wide;
         // widths everywhere have to count them that way (`crate::width`).
@@ -1281,11 +1289,8 @@ impl Terminal {
         arm_panic_restore(stderr.as_ref().map(|held| held.original));
         #[cfg(not(unix))]
         arm_panic_restore(None);
-        // The other way out: killed rather than unwound, where no hook and no
-        // `Drop` runs at all.
-        #[cfg(unix)]
-        arm_signal_restore();
         link_pointer::POINTER.configure(link_terminal);
+        setup.armed = false;
         Ok(Self {
             raw: true,
             state: std::sync::atomic::AtomicU8::new(pointer_state(pointer)),
@@ -1321,19 +1326,19 @@ impl Terminal {
             self.hover.load(Ordering::SeqCst) || link_pointer::POINTER.enabled(),
         );
         let had = self.pointer_mode();
-        let Some(escape) = want.escape_from(had) else {
+        let Some(_) = want.escape_from(had) else {
             return;
         };
-        self.state.store(pointer_state(want), Ordering::SeqCst);
         // Recorded but not said while the transcript is up: coming back says
         // the whole state at once.
         if self.away.load(Ordering::SeqCst) {
+            self.state.store(pointer_state(want), Ordering::SeqCst);
             return;
         }
         let mut out = std::io::stdout();
-        let _ = out.write_all(escape.as_bytes());
-        let _ = out.flush();
-        console_mouse(want != ansi::Pointer::Terminal);
+        if configure_pointer(&mut out, want).is_ok() {
+            self.state.store(pointer_state(want), Ordering::SeqCst);
+        }
     }
 }
 
@@ -1402,9 +1407,9 @@ fn classic_console() -> bool {
 /// and an escape on the output side changes no input mode. So on Win10's
 /// conhost the screen never saw a click or a wheel: tool rows did not open,
 /// the wheel did not scroll, and a drag was QuickEdit's selection, which copies
-/// nothing until Enter. crossterm's mouse capture is exactly that mode switch on
-/// Windows (and nothing else — it writes no escape there); off puts back the
-/// mode it found.
+/// nothing until Enter. The native mode switch lives in `terminal_modes`:
+/// capture flags are restored from the input snapshot without restoring line
+/// input/echo while the TUI still owns raw input.
 ///
 /// Every Windows console, not only the classic one: behind Windows Terminal or
 /// a ConPTY Git Bash (mintty) the program's console is a pseudo-console, which
@@ -1451,18 +1456,28 @@ fn console_wrap(on: bool) {
     let _ = on;
 }
 
-fn console_mouse(on: bool) {
-    #[cfg(windows)]
-    {
-        let mut out = std::io::stdout();
-        let _ = if on {
-            crossterm::execute!(out, crossterm::event::EnableMouseCapture)
-        } else {
-            crossterm::execute!(out, crossterm::event::DisableMouseCapture)
-        };
+fn console_mouse(on: bool) -> std::io::Result<()> {
+    crate::terminal_modes::capture_mouse(on)
+}
+
+fn configure_pointer(out: &mut impl Write, pointer: ansi::Pointer) -> std::io::Result<()> {
+    crate::terminal_modes::pointer(out, pointer, console_mouse)
+}
+
+/// Roll back every fallible initialization step, including writes before Self exists.
+struct TerminalSetup {
+    armed: bool,
+    screen: bool,
+}
+impl Drop for TerminalSetup {
+    fn drop(&mut self) {
+        if self.armed {
+            if self.screen {
+                emergency_restore();
+            }
+            let _ = crate::terminal_modes::restore_input();
+        }
     }
-    #[cfg(not(windows))]
-    let _ = on;
 }
 
 /// Both the panic hook and [`Terminal::restore`] call it; whichever gets there
@@ -1477,8 +1492,7 @@ pub fn emergency_restore() {
     }
     let mut out = std::io::stdout();
     let _ = link_pointer::POINTER.restore(&mut out);
-    let _ = out.write_all(ansi::MOUSE_OFF.as_bytes());
-    console_mouse(false);
+    let _ = configure_pointer(&mut out, ansi::Pointer::Terminal);
     let _ = out.write_all(ansi::RESTORE_TITLE.as_bytes());
     // In `/raw` the conversation is on the terminal's own screen and stays
     // there; otherwise the way out the launch's screen needs.
@@ -1494,6 +1508,7 @@ pub fn emergency_restore() {
     let _ = out.flush();
     console_wrap(true);
     let _ = crossterm::terminal::disable_raw_mode();
+    let _ = crate::terminal_modes::restore_input();
     #[cfg(unix)]
     {
         // Keys pressed after the screen stopped reading — during the wait for a
@@ -2507,9 +2522,7 @@ impl Surface for Terminal {
             return;
         }
         let mut out = std::io::stdout();
-        let _ = out.write_all(self.pointer_mode().escape().as_bytes());
-        let _ = out.flush();
-        console_mouse(self.pointer_mode() != ansi::Pointer::Terminal);
+        let _ = configure_pointer(&mut out, self.pointer_mode());
         if link_pointer::POINTER.enabled() {
             let hover = self.link_hover.lock().expect("link hover poisoned");
             let _ = link_pointer::POINTER.update_after_terminal_write(&mut out, hover.over_link());
@@ -2533,8 +2546,7 @@ impl Surface for Terminal {
         self.link_hover.lock().expect("link hover poisoned").clear();
         let mut out = std::io::stdout();
         let _ = link_pointer::POINTER.restore(&mut out);
-        let _ = out.write_all(ansi::MOUSE_OFF.as_bytes());
-        console_mouse(false);
+        let _ = configure_pointer(&mut out, ansi::Pointer::Terminal);
         let _ = out.write_all(ansi::transcript_out().as_bytes());
         let _ = out.flush();
         console_wrap(true);
@@ -2565,12 +2577,7 @@ impl Surface for Terminal {
         // the buttons and their SGR coordinates off, and the hover escape on
         // its own (`?1003h`) would bring motion back without them.
         let pointer = self.pointer_mode();
-        if pointer != ansi::Pointer::Terminal {
-            let _ = out.write_all(ansi::MOUSE_ON.as_bytes());
-        }
-        let _ = out.write_all(pointer.escape().as_bytes());
-        let _ = out.flush();
-        console_mouse(pointer != ansi::Pointer::Terminal);
+        let _ = configure_pointer(&mut out, pointer);
         self.painted.forget();
     }
     /// The screen given back the way `restore` gives it — pointer, keys,
@@ -2619,12 +2626,7 @@ impl Surface for Terminal {
             let _ = out.write_all(ansi::KEYS_ON.as_bytes());
         }
         let pointer = self.pointer_mode();
-        if pointer != ansi::Pointer::Terminal {
-            let _ = out.write_all(ansi::MOUSE_ON.as_bytes());
-        }
-        let _ = out.write_all(pointer.escape().as_bytes());
-        let _ = out.flush();
-        console_mouse(pointer != ansi::Pointer::Terminal);
+        let _ = configure_pointer(&mut out, pointer);
         self.painted.forget();
         true
     }

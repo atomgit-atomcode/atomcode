@@ -166,8 +166,8 @@ fn nothing_is_printed_after_the_screen_is_given_back() {
         .copied();
     assert_eq!(
         next,
-        Some("Ok(())"),
-        "the exit stops at the screen: no transcript is printed into the shell's buffer"
+        Some("result"),
+        "after restoring the screen, only return the already computed success/error result"
     );
 }
 

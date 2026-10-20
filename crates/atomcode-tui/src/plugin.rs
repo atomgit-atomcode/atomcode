@@ -1073,6 +1073,7 @@ enum Wake {
     /// the mouse mode, and neither should run faster because a drag is held.
     EdgeScroll,
     Closed,
+    TerminalInputFailed(String),
 }
 
 /// The scrollbar is screen policy. The old knob — `mascot = true` — is now
@@ -1822,6 +1823,7 @@ impl UserInterface for Tui {
         // A picture already on the clipboard when the screen comes up is as
         // much news as one that arrives later.
         self.look_at_clipboard(true);
+        let mut terminal_input_error = None;
         let mut quit = false;
         // Whether what is on screen is out of date. `compose` walks the stream
         // and encodes a whole screen, so a frame is composed when the loop is
@@ -2113,9 +2115,13 @@ impl UserInterface for Tui {
                 Wake::Input(Input::Key(_)) => self.look_at_clipboard(false),
                 _ => {}
             }
-            let closed = matches!(woke, Wake::Closed);
+            let closed = matches!(woke, Wake::Closed | Wake::TerminalInputFailed(_));
             match woke {
                 Wake::Closed => quit = true,
+                Wake::TerminalInputFailed(error) => {
+                    terminal_input_error = Some(error);
+                    quit = true;
+                }
                 // The fact was folded into the stream by the listener that sent
                 // this, so what is drawn is a frame behind it now.
                 //
@@ -3272,8 +3278,12 @@ impl UserInterface for Tui {
         client.shutdown();
         events_pump.abort();
         self.host.overlays.close_all();
+        let result = match terminal_input_error {
+            Some(error) => Err(format!("terminal input failed: {error}")),
+            None => Ok(()),
+        };
         self.surface.restore();
-        Ok(())
+        result
     }
 }
 
@@ -10398,10 +10408,54 @@ async fn read_input(
     wake: mpsc::UnboundedSender<Wake>,
     handed_back: impl Fn() -> bool + Send + 'static,
 ) {
+    let events = crate::terminal_modes::input_records(
+        crossterm::event::EventStream::new(),
+        crate::terminal_modes::ensure_input,
+    );
+    pump_terminal_input(events, wake, handed_back).await;
+}
+
+/// Keep read/mode failures visible and stop accepting input after the first one.
+async fn pump_terminal_input<S>(
+    events: S,
+    wake: mpsc::UnboundedSender<Wake>,
+    handed_back: impl Fn() -> bool,
+) where
+    S: futures::Stream<Item = std::io::Result<crossterm::event::Event>>,
+{
     use futures::StreamExt;
-    let events = crossterm::event::EventStream::new().filter_map(|read| async { read.ok() });
+    let errors = wake.clone();
+    let events = events
+        .take_while(move |result| {
+            if let Err(error) = result {
+                let _ = errors.send(Wake::TerminalInputFailed(error.to_string()));
+            }
+            futures::future::ready(result.is_ok())
+        })
+        .filter_map(|result| futures::future::ready(result.ok()));
     futures::pin_mut!(events);
-    pump_input(events, wake, handed_back).await;
+    pump_input(events, wake.clone(), handed_back).await;
+    let _ = wake.send(Wake::Closed);
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn terminal_input_failure_is_reported_and_never_followed_by_more_text() {
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    let (wake, mut received) = mpsc::unbounded_channel();
+    let events = futures::stream::iter(vec![
+        Err(std::io::Error::other("console mode refused")),
+        Ok(Event::Key(KeyEvent::new(
+            KeyCode::Char('#'),
+            KeyModifiers::NONE,
+        ))),
+    ]);
+    pump_terminal_input(events, wake, || false).await;
+    assert!(
+        matches!(received.recv().await, Some(Wake::TerminalInputFailed(message)) if message.contains("console mode refused"))
+    );
+    assert!(matches!(received.recv().await, Some(Wake::Closed)));
+    assert!(received.try_recv().is_err());
 }
 
 /// [`read_input`] over any stream of terminal events.
