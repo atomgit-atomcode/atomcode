@@ -212,6 +212,22 @@ impl Default for LiveViewHub {
     }
 }
 
+// A normal turn boundary retires transient waits, but not unanswered
+// questions whose tool already continued. Runtime replacement still clears all.
+fn retain_goal_questions(state: &mut HubState) {
+    state.pending_requests.retain(|_, request| {
+        atomcode_capabilities::tools::request_user_input::is_continued_question(
+            &request.kind,
+            &request.payload,
+        )
+    });
+    state.replay.retain(|observation| {
+        matches!(&observation.event,
+        LiveViewEvent::Runtime(CodingRuntimeEvent::Request(request))
+            if state.pending_requests.contains_key(&request.id))
+    });
+}
+
 impl LiveViewHub {
     pub fn new() -> Self {
         let (events, _) = broadcast::channel(BROADCAST_CAPACITY);
@@ -448,8 +464,7 @@ impl LiveViewHub {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         Self::dispatch_locked(&state, DriverCommand::Submit(input.clone()))?;
         if !state.turn_active {
-            state.replay.clear();
-            state.pending_requests.clear();
+            retain_goal_questions(&mut state);
             state.pending_web_steers.clear();
         }
         state.turn_active = true;
@@ -540,8 +555,7 @@ impl LiveViewHub {
             });
         }
         if matches!(receipt, SubmitReceipt::Started { .. }) {
-            state.replay.clear();
-            state.pending_requests.clear();
+            retain_goal_questions(&mut state);
             if correlation_registered {
                 remove_pending_web_steer_locked(&mut state, client_input_id.as_deref());
             }
@@ -581,11 +595,10 @@ impl LiveViewHub {
             });
         }
         if !state.turn_active {
-            state.replay.clear();
             state.pending_web_steers.clear();
         }
         state.turn_active = true;
-        state.pending_requests.clear();
+        retain_goal_questions(&mut state);
         self.publish_view_locked(
             &mut state,
             LiveViewEvent::InputAccepted {
@@ -1001,7 +1014,12 @@ impl LiveViewHub {
                 replay = true;
             }
             CodingRuntimeEvent::Request(request) => {
-                state.turn_active = true;
+                if !atomcode_capabilities::tools::request_user_input::is_continued_question(
+                    &request.kind,
+                    &request.payload,
+                ) {
+                    state.turn_active = true;
+                }
                 state.pending_requests.insert(
                     request.id,
                     PendingRequest {
@@ -1037,9 +1055,8 @@ impl LiveViewHub {
                 };
                 state.snapshot = Some(snapshot.clone());
                 state.snapshot_error = None;
-                state.replay.clear();
+                retain_goal_questions(&mut state);
                 state.replay.extend(terminal_intervention);
-                state.pending_requests.clear();
                 state.pending_web_steers.clear();
                 state.turn_active = false;
                 replay = false;
@@ -1801,6 +1818,76 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(duplicate, HubError::StaleEvent);
+    }
+
+    #[test]
+    fn a_continued_goal_question_survives_normal_turns_until_its_reply_resolves() {
+        let hub = LiveViewHub::new();
+        let (control, _) = control();
+        let binding = hub
+            .bind("session-1", PathBuf::from("/one"), snapshot("old"), control)
+            .unwrap();
+        let payload = serde_json::json!({"goal_question_pending":true,"question":"Which account?"});
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 1,
+                event: CodingRuntimeEvent::Request(atomcode_coding::RuntimeRequest {
+                    id: 42,
+                    kind: "request_user_input".into(),
+                    payload: payload.clone(),
+                    snapshot: None,
+                }),
+            },
+        )
+        .unwrap();
+        assert!(
+            !hub.state.lock().unwrap().turn_active,
+            "an answerable card alone is not running work"
+        );
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 2,
+                event: CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
+                    turn_id: 1,
+                    reason: atomcode_kernel::event::StopReason::Stopped,
+                    snapshot: Arc::new(snapshot("done")),
+                    stats: Default::default(),
+                }),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            hub.pending_of_kind("request_user_input"),
+            Some((42, payload))
+        );
+        assert_eq!(hub.join().unwrap().replay.len(), 1);
+        hub.accept_local_input(UserInput::from("do independent work"))
+            .unwrap();
+        assert!(
+            hub.pending_of_kind("request_user_input").is_some(),
+            "ordinary input lost the question"
+        );
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 3,
+                event: CodingRuntimeEvent::RequestResolved {
+                    id: 42,
+                    kind: "request_user_input".into(),
+                },
+            },
+        )
+        .unwrap();
+        assert!(hub.pending_of_kind("request_user_input").is_none());
+        assert!(!hub.join().unwrap().replay.iter().any(|event| matches!(
+            &event.event,
+            LiveViewEvent::Runtime(CodingRuntimeEvent::Request(_))
+        )));
     }
 
     #[test]

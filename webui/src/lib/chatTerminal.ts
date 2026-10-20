@@ -244,6 +244,16 @@ export function completeUserInputRequest<T>(current: T | null, submitted: T): T 
   return current === submitted ? null : current;
 }
 
+/** Only a continued live question outlives normal idle. Approvals and ordinary
+ * waits still close, and cancellation/failure never revives a question card. */
+export function retainContinuedUserInput<T extends { goal_question_pending?: boolean; response_transport: string }>(
+  current: T | null,
+  normalTerminal: boolean,
+): T | null {
+  return normalTerminal && current?.response_transport === 'live' && current.goal_question_pending === true
+    ? current : null;
+}
+
 /**
  * Whether a runtime failure is a session another atomcode holds (a terminal
  * window, VS Code). The session store's own wording is all the wire carries,

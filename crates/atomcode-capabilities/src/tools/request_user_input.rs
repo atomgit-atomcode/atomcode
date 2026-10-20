@@ -10,6 +10,52 @@ use atomcode_kernel::tool::{Tool, ToolContext, ToolResult};
 /// The `kind` string for the generic driver round-trip carrying a user-input request.
 pub const REQUEST_USER_INPUT_KIND: &str = "request_user_input";
 
+/// Driver projection of an ordinary question whose tool already continued.
+/// A payload flag can never turn an approval into an ordinary question.
+pub fn is_continued_question(kind: &str, payload: &serde_json::Value) -> bool {
+    kind == REQUEST_USER_INPUT_KIND
+        && payload
+            .get("goal_question_pending")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+}
+
+/// A question whose foreground wait ended without an answer. It remains
+/// answerable; this is neither a selected option nor permission to act.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingUserQuestion {
+    pub pending_question: String,
+    pub id: u64,
+    pub question: serde_json::Value,
+}
+
+impl PendingUserQuestion {
+    pub fn new(id: u64, question: serde_json::Value) -> Self {
+        Self {
+            pending_question: "goal-question-v1".into(),
+            id,
+            question,
+        }
+    }
+
+    pub fn read(value: &serde_json::Value) -> Option<Self> {
+        let pending: Self = serde_json::from_value(value.clone()).ok()?;
+        (pending.pending_question == "goal-question-v1"
+            && pending.id > 0
+            && pending.id < (1 << 53)
+            && parse_batch(&pending.question.to_string()).is_ok())
+        .then_some(pending)
+    }
+
+    pub fn result(&self) -> ToolResult {
+        ok_result(serde_json::json!({
+            "pending": self,
+            "guidance": "The user has NOT answered. This is not consent or authorization. Continue only work independent of this answer, state any reversible assumptions, and do not repeat the question. If nothing can proceed independently, report what is blocked and end this turn; the goal will be retained. A later answer arrives as a new user message."
+        }).to_string())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum UserInputMode {
@@ -314,6 +360,8 @@ pub const NO_ANSWER: &str = "No answer was provided. Proceed with your own best 
 /// One question's answer, as a result read back says it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReadAnswer {
+    /// Foreground waiting ended; this question remains answerable.
+    Pending { id: u64 },
     /// Closed without an answer: declined, or nobody there.
     Declined,
     /// What was picked and what was typed. `text` is `None` when nothing was typed.
@@ -340,6 +388,12 @@ pub enum ReadAnswer {
 pub fn read_result(content: &str, questions: usize) -> Option<Vec<ReadAnswer>> {
     if questions == 0 {
         return None;
+    }
+    if let Some(pending) = serde_json::from_str::<serde_json::Value>(content)
+        .ok()
+        .and_then(|value| value.get("pending").and_then(PendingUserQuestion::read))
+    {
+        return Some(vec![ReadAnswer::Pending { id: pending.id }; questions]);
     }
     if content == NO_ANSWER {
         return Some(vec![ReadAnswer::Declined; questions]);
@@ -497,7 +551,10 @@ impl Tool for RequestUserInputTool {
          interaction, pass a `questions` array of those same objects instead. A free-text \
          \"type your own answer\" row is always added automatically for single/multiple, so do \
          NOT add your own \"Other\"/catch-all option. Keep each \
-         `header` short (a few words)."
+         `header` short (a few words). The host may return pending after a bounded wait. \
+         Pending is not an answer or authorization: continue only independent authorized work, \
+         do not repeat the question, and report the blocker if nothing can proceed. \
+         Late replies arrive as new user input."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -546,13 +603,25 @@ impl Tool for RequestUserInputTool {
         };
         if !is_batch {
             // Legacy single-question path — wire + result unchanged.
-            let payload = match serde_json::to_value(&reqs[0]) {
+            let mut payload = match serde_json::to_value(&reqs[0]) {
                 Ok(v) => v,
                 Err(e) => return err_result(format!("request_user_input: serialize failed: {e}")),
             };
+            if let Some(call_id) = ctx.progress.source_id() {
+                payload["question_call_id"] = serde_json::Value::String(call_id.into());
+            }
             let resp_val = ctx.request(REQUEST_USER_INPUT_KIND, payload).await;
             if resp_val.is_null() {
                 return null_result();
+            }
+            if let Some(error) = resp_val
+                .get("question_error")
+                .and_then(serde_json::Value::as_str)
+            {
+                return err_result(error);
+            }
+            if let Some(pending) = PendingUserQuestion::read(&resp_val) {
+                return pending.result();
             }
             return match serde_json::from_value::<UserInputResponse>(resp_val) {
                 Ok(resp) => format_result(&resp),
@@ -560,10 +629,22 @@ impl Tool for RequestUserInputTool {
             };
         }
         // Batch path.
-        let payload = serde_json::json!({ "questions": reqs });
+        let mut payload = serde_json::json!({ "questions": reqs });
+        if let Some(call_id) = ctx.progress.source_id() {
+            payload["question_call_id"] = serde_json::Value::String(call_id.into());
+        }
         let resp_val = ctx.request(REQUEST_USER_INPUT_KIND, payload).await;
         if resp_val.is_null() {
             return null_result();
+        }
+        if let Some(error) = resp_val
+            .get("question_error")
+            .and_then(serde_json::Value::as_str)
+        {
+            return err_result(error);
+        }
+        if let Some(pending) = PendingUserQuestion::read(&resp_val) {
+            return pending.result();
         }
         let resps: Vec<UserInputResponse> = resp_val
             .get("responses")
@@ -1094,5 +1175,28 @@ mod tests {
         }
         // A batch that does not have one line per question.
         assert_eq!(read_result(r#"Q1 (A): User selected: "x""#, 2), None);
+    }
+}
+
+#[cfg(test)]
+mod pending_tests {
+    use super::*;
+    #[test]
+    fn a_pending_receipt_projects_as_pending_not_as_an_answer_or_approval() {
+        let question = PendingUserQuestion::new(
+            900,
+            serde_json::json!({"header":"Account","question":"Which?","mode":"text"}),
+        );
+        assert_eq!(
+            read_result(&question.result().content, 1),
+            Some(vec![ReadAnswer::Pending { id: 900 }])
+        );
+        let payload = serde_json::json!({"goal_question_pending":true});
+        assert!(is_continued_question(REQUEST_USER_INPUT_KIND, &payload));
+        assert!(!is_continued_question("approval", &payload));
+        assert!(!is_continued_question(
+            REQUEST_USER_INPUT_KIND,
+            &serde_json::json!({})
+        ));
     }
 }

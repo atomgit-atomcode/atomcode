@@ -799,6 +799,9 @@ pub(crate) enum LiveWireEvent {
     #[serde(rename = "user_input_request")]
     UserInputRequest {
         request_id: u64,
+        /// The tool continued without an answer; keep the card past normal idle.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        goal_question_pending: bool,
         header: String,
         question: String,
         mode: String,
@@ -1033,6 +1036,11 @@ impl NativeLiveWireProjector {
                 } else if request.kind == REQUEST_USER_INPUT_KIND {
                     LiveWireEvent::UserInputRequest {
                         request_id: request.id,
+                        goal_question_pending:
+                            atomcode_capabilities::tools::request_user_input::is_continued_question(
+                                &request.kind,
+                                &request.payload,
+                            ),
                         header: request
                             .payload
                             .get("header")
@@ -3527,6 +3535,7 @@ mod tests {
             id: 42,
             kind: REQUEST_USER_INPUT_KIND.into(),
             payload: serde_json::json!({
+                "goal_question_pending": true,
                 "header": "Pick one",
                 "question": "Red or blue?",
                 "mode": "single",
@@ -3542,6 +3551,7 @@ mod tests {
         let json = serde_json::to_value(wire).unwrap();
         assert_eq!(json["type"], "user_input_request");
         assert_eq!(json["request_id"], 42);
+        assert_eq!(json["goal_question_pending"], true);
         assert_eq!(json["mode"], "single");
         assert_eq!(json["options"][0]["label"], "Red");
 

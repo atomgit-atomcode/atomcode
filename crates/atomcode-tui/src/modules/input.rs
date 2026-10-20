@@ -740,6 +740,7 @@ mod tests {
             autonomy: Some(atomcode_host_api::Running {
                 usage: None,
                 recovering: false,
+                retry_in_secs: None,
                 kind: "goal".into(),
                 what: "分析当前项目死代码".into(),
                 round: 0,
@@ -760,7 +761,7 @@ mod tests {
         );
         let top = &tip[0];
         let plain = top.plain();
-        assert!(plain.contains("/goal active"), "{plain:?}");
+        assert!(plain.contains("Goal active"), "{plain:?}");
         assert!(!plain.contains("分析当前项目死代码"), "{plain:?}");
         assert!(!plain.contains("0/240"), "{plain:?}");
         assert!(
@@ -770,7 +771,7 @@ mod tests {
         let badge = top
             .spans
             .iter()
-            .find(|span| span.text.contains("/goal active"))
+            .find(|span| span.text.contains("Goal active"))
             .expect("goal badge");
         assert_eq!(badge.style.fg, theme::fg(Role::Accent).fg, "{top:?}");
 
@@ -786,6 +787,7 @@ mod tests {
             autonomy: Some(atomcode_host_api::Running {
                 usage: None,
                 recovering: false,
+                retry_in_secs: None,
                 kind: "goal".into(),
                 what: "ship it".into(),
                 round: 2,
@@ -800,12 +802,12 @@ mod tests {
             &Viewport::new(Rect::sized(40, 1), &m),
         );
         let top = &rendered[0];
-        assert!(top.plain().contains("/goal paused"), "{top:?}");
+        assert!(top.plain().contains("Goal paused"), "{top:?}");
         assert!(!top.plain().contains("active"), "{top:?}");
         let badge = top
             .spans
             .iter()
-            .find(|span| span.text.contains("/goal paused"))
+            .find(|span| span.text.contains("Goal paused"))
             .expect("paused badge");
         assert_eq!(badge.style.fg, theme::fg(Role::Warning).fg, "{top:?}");
     }

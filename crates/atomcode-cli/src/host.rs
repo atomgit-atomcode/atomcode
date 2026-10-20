@@ -994,36 +994,21 @@ fn running_of_goal(goal: atomcode_coding::GoalProgress) -> atomcode_host_api::Ru
                 output: usage.output,
                 cached: usage.cached,
             }),
-        recovering: goal.recovery.is_some(),
+        recovering: goal.active && goal.recovery.is_some(),
+        retry_in_secs: goal
+            .recovery
+            .as_ref()
+            .filter(|_| goal.active)
+            .map(|r| r.retry_in_secs),
         kind: "goal".into(),
         what: goal.condition,
         round: goal.round,
         of: goal.max_rounds,
         elapsed_secs: goal.elapsed_secs,
-        paused: goal
-            .recovery
-            .as_ref()
-            .map(|recovery| {
-                let message = match recovery.kind {
-                    atomcode_coding::GoalRecoveryKind::Provider => SMsg::GoalProviderRecovery {
-                        attempt: recovery.attempt,
-                        max: recovery.max_attempts,
-                        secs: recovery.retry_in_secs,
-                    },
-                    atomcode_coding::GoalRecoveryKind::Evaluator => SMsg::GoalEvaluatorRecovery {
-                        attempt: recovery.attempt,
-                        max: recovery.max_attempts,
-                        secs: recovery.retry_in_secs,
-                    },
-                };
-                tr(message).into_owned()
-            })
-            .or_else(|| {
-                (!goal.active).then(|| {
-                    goal.last_reason
-                        .unwrap_or_else(|| format!("{:?}", goal.phase))
-                })
-            }),
+        paused: (!goal.active).then(|| {
+            goal.last_reason
+                .unwrap_or_else(|| format!("{:?}", goal.phase))
+        }),
     }
 }
 
@@ -1032,6 +1017,7 @@ fn running_of_loop(looping: atomcode_coding::LoopProgress) -> atomcode_host_api:
     atomcode_host_api::Running {
         usage: None,
         recovering: false,
+        retry_in_secs: None,
         kind: "loop".into(),
         what: looping.label,
         round: looping.round,
@@ -1203,6 +1189,16 @@ fn to_mcp_detail(facts: atomcode_coding::McpRowFacts) -> atomcode_host_api::McpS
 fn translate(event: CodingRuntimeEvent) -> Option<AgentEvent> {
     match event {
         CodingRuntimeEvent::Agent(event) => Some(event),
+        // Deferred questions are available through /goal questions and answer.
+        // Opening another blocking composer card would hide ongoing work.
+        CodingRuntimeEvent::Request(request)
+            if atomcode_capabilities::tools::request_user_input::is_continued_question(
+                &request.kind,
+                &request.payload,
+            ) =>
+        {
+            None
+        }
         CodingRuntimeEvent::Request(request) => Some(AgentEvent::Request {
             id: request.id,
             kind: request.kind,
@@ -3222,6 +3218,28 @@ mod source_tests {
 mod completion_tests {
     use super::{persistence_failure, without_a_log};
 
+    #[test]
+    fn deferred_goal_questions_do_not_reopen_a_blocking_tui_card() {
+        use atomcode_coding::{CodingRuntimeEvent, RuntimeRequest};
+        let request = RuntimeRequest {
+            id: 900,
+            kind: "request_user_input".into(),
+            payload: serde_json::json!({"question":"Which?","goal_question_pending":true}),
+            snapshot: None,
+        };
+        assert!(super::translate(CodingRuntimeEvent::Request(request.clone())).is_none());
+        let mut ordinary = request;
+        ordinary
+            .payload
+            .as_object_mut()
+            .unwrap()
+            .remove("goal_question_pending");
+        assert!(matches!(
+            super::translate(CodingRuntimeEvent::Request(ordinary)),
+            Some(atomcode_kernel::event::AgentEvent::Request { id: 900, .. })
+        ));
+    }
+
     /// "No log right now" and "no log, ever" are different answers.
     ///
     /// The guard compares a caller's position against the front end's own log.
@@ -3393,6 +3411,45 @@ mod tests {
                 "`{hook}` 只有定义没有调用点 —— {at} 那一臂没接上通知"
             );
         }
+    }
+
+    #[test]
+    fn goal_recovery_is_not_a_pause_in_the_host_projection() {
+        use atomcode_coding::{GoalPhase, GoalProgress, GoalRecoveryKind, GoalRecoveryProgress};
+        let mut goal = GoalProgress {
+            active: true,
+            terminal: None,
+            phase: GoalPhase::Pursuing,
+            round: 1,
+            max_rounds: None,
+            elapsed_secs: 1,
+            condition: "objective".into(),
+            last_reason: Some("retrying provider".into()),
+            recovery: Some(GoalRecoveryProgress {
+                kind: GoalRecoveryKind::Provider,
+                attempt: 1,
+                max_attempts: 3,
+                retry_in_secs: 30,
+            }),
+            report: Default::default(),
+            evaluation_ready: false,
+        };
+        let running = running_of_goal(goal.clone());
+        assert!(running.recovering);
+        assert_eq!(running.retry_in_secs, Some(30));
+        assert_eq!(running.paused, None);
+        goal.recovery.as_mut().unwrap().retry_in_secs = 0;
+        assert_eq!(running_of_goal(goal.clone()).retry_in_secs, Some(0));
+        goal.active = false;
+        goal.recovery = None;
+        goal.last_reason = Some("provider recovery budget exhausted".into());
+        let paused = running_of_goal(goal);
+        assert!(!paused.recovering);
+        assert_eq!(paused.retry_in_secs, None);
+        assert_eq!(
+            paused.paused.as_deref(),
+            Some("provider recovery budget exhausted")
+        );
     }
 
     /// 目标结束时,「达成」和「判不了算不算达成」不能长得一样。

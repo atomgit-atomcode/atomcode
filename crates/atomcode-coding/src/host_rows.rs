@@ -3149,7 +3149,7 @@ async fn run_goal(
             // 问「怎么用」的绝不能把东西跑起来,见 `means_help`。
             word if means_help(word) => Ok("/goal <要达成的条件> —— 自己干到它成立为止。\n\
                  /goal stop(或 off/clear/cancel/reset/none)—— 收工。\n\
-                 /goal pause —— 先搁着,接着说话就继续。\n/goal recheck —— 只重新评估已完成的工作。\n/goal report —— 查看运行报告。\n\
+                 /goal pause —— 先搁着,接着说话就继续。\n/goal recheck —— 只重新评估已完成的工作。\n/goal report —— 查看运行报告。\n/goal questions —— 查看待答问题。\n/goal answer <ID> <回答> —— 回复待答问题。\n\
                  干到哪一轮了,状态行一直在说。"
                 .into()),
             // 收工的几种说法都认。一个人想停下自主循环的时候,不该还要先想起
@@ -3164,6 +3164,28 @@ async fn run_goal(
             }
             "recheck" => { runtime.recheck_goal().await?; Ok("正在仅重新评估，不会重跑主任务。".into()) }
             "report" => runtime.goal_report().await,
+            "questions" => {
+                let questions = runtime.goal_questions().await?;
+                if questions.is_empty() { return Ok("没有待答问题。".into()); }
+                Ok(questions.iter().map(|q| {
+                    let body = atomcode_capabilities::tools::request_user_input::parse_batch(&q.payload.to_string())
+                        .map(|(questions, _)| questions.into_iter().map(|question| {
+                            let choices=question.options.iter().map(|option| option.label.as_str()).collect::<Vec<_>>().join(" / ");
+                            if choices.is_empty() { question.question } else { format!("{}\n  {}", question.question, choices) }
+                        }).collect::<Vec<_>>().join("\n"))
+                        .unwrap_or_else(|_| "问题内容不可用，请查看会话记录。".into());
+                    format!("{}: {}\n/goal answer {} <回答>", q.id, body, q.id)
+                }).collect::<Vec<_>>().join("\n\n"))
+            }
+            answer if answer.split_whitespace().next() == Some("answer") => {
+                let Some((id, text)) = answer[6..].trim().split_once(char::is_whitespace) else {
+                    return Err("用法：/goal answer <问题 ID> <回答>".into());
+                };
+                let id = id.parse().map_err(|_| "问题 ID 无效")?;
+                if text.trim().is_empty() { return Err("回答不能为空".into()); }
+                runtime.answer_goal_question(id, text.trim().into()).await?;
+                Ok("回答已交给原会话继续处理。".into())
+            }
             "pause" => {
                 runtime.pause_goal().await?;
                 Ok("目标先搁着,还可以接着干。".into())

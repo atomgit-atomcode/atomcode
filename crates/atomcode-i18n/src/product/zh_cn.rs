@@ -1388,7 +1388,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdCatalogWorklogUsage => "[今天|昨天|8/27]".into(),
         Msg::CmdCatalogGoal =>
             "自己干到条件成立为止;`stop` 收工,`pause` 先搁着。".into(),
-        Msg::CmdCatalogGoalUsage => "<要达成的条件> | stop | pause | recheck | report".into(),
+        Msg::CmdCatalogGoalUsage => "<要达成的条件> | stop | pause | recheck | report | questions | answer <id> <text>".into(),
         Msg::CmdCatalogLoop =>
             "一遍遍地做同一件事,直到 `stop`。".into(),
         Msg::CmdCatalogLoopUsage => "<每轮要做的事> | stop".into(),

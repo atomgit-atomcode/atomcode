@@ -207,6 +207,41 @@ pub async fn ask_person(ctx: &Context, question: crate::seams::Question) -> Opti
     answer
 }
 
+/// Tool-facing ordinary question exchange. A pending result records that no
+/// answer arrived during the wait, not an answer selected on the user's behalf.
+/// The tool result carries the durable pending identity and late replies are
+/// admitted user messages rather than changes to that historical result.
+pub async fn ask_person_reply(
+    ctx: &Context,
+    question: crate::seams::Question,
+    call_id: Option<&str>,
+) -> crate::seams::QuestionReply {
+    use crate::seams::QuestionReply;
+    let Some(questions) = ctx.service::<crate::seams::UserQuestionsSvc>() else {
+        return QuestionReply::Unanswered;
+    };
+    record_asked(ctx, &question);
+    let reply = questions.ask_reply(&question, call_id).await;
+    match &reply {
+        QuestionReply::Answered(answer) => record_answered(ctx, Some(answer.clone())),
+        QuestionReply::Unanswered | QuestionReply::Failed(_) => record_answered(ctx, None),
+        QuestionReply::Pending(_) => {
+            if let Some(log) = person_session(ctx) {
+                crate::session::commit(
+                    &scoped(ctx),
+                    &log,
+                    SessionEvent::Answered {
+                        turn: log.current_turn(),
+                        answer: None,
+                        by: "pending foreground wait".into(),
+                    },
+                );
+            }
+        }
+    }
+    reply
+}
+
 /// Run `f` as this agent's turn: everything it awaits resolves in the agent's
 /// realm through [`scoped`].
 pub async fn as_agent<F: std::future::Future>(ctx: Context, f: F) -> F::Output {

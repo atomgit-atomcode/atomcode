@@ -1,7 +1,7 @@
 # Goal status placement
 
-Keep the user-set rename pill on the input box's upper rule. Move `/goal active` /
-`/goal paused` to the already-reserved tip row above the input box, right-aligned.
+Keep the user-set rename pill on the input box's upper rule. Move `Goal active` /
+`Goal paused` to the already-reserved tip row above the input box, right-aligned.
 Concurrent notices/clipboard hints use the remaining left-hand space, clipped to
 one row. Hide goal status for secret prompts and degrade gracefully on narrow
 terminals. This adds no layout rows and changes no goal lifecycle state.

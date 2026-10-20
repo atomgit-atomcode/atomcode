@@ -702,12 +702,19 @@ impl Asker {
 
     /// One round-trip. `None` means no answer arrived, which every caller must
     /// read as a refusal — never as consent.
-    async fn request(&self, kind: &str, payload: Value) -> Option<Value> {
+    async fn request(&self, kind: &str, mut payload: Value) -> Option<Value> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         // Whose turn is asking: a question is refused when that agent is
         // stopped, not when some other one is.
         let asking = crate::agent::current();
+        if kind == REQUEST_USER_INPUT_KIND {
+            if let Some(member) = asking.as_ref().and_then(crate::agent::current_member_name) {
+                if let Some(object) = payload.as_object_mut() {
+                    object.insert("asking_member".into(), Value::String(member));
+                }
+            }
+        }
         let asker = asking
             .as_ref()
             .and_then(|ctx| ctx.service::<SessionSvc>())
@@ -956,6 +963,18 @@ impl UserQuestions for Asker {
     }
 
     async fn ask(&self, question: &crate::seams::Question) -> Option<String> {
+        match self.ask_reply(question, None).await {
+            crate::seams::QuestionReply::Answered(answer) => Some(answer),
+            _ => None,
+        }
+    }
+
+    async fn ask_reply(
+        &self,
+        question: &crate::seams::Question,
+        call_id: Option<&str>,
+    ) -> crate::seams::QuestionReply {
+        use crate::seams::QuestionReply;
         let request = UserInputRequest {
             // Who is asking belongs in the header, where a driver draws it
             // without having to parse the sentence for a name.
@@ -982,19 +1001,42 @@ impl UserQuestions for Asker {
                 .collect(),
             custom: true,
         };
-        let answer = self
-            .request(
-                REQUEST_USER_INPUT_KIND,
-                serde_json::to_value(&request).unwrap_or(Value::Null),
-            )
-            .await?;
-        let response: UserInputResponse = serde_json::from_value(answer).ok()?;
-        if response.declined {
-            return None;
+        let mut payload = serde_json::to_value(&request).unwrap_or(Value::Null);
+        if let Some(call_id) = call_id {
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("question_call_id".into(), Value::String(call_id.into()));
+            }
         }
-        response
+        if question.about.is_some() {
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("authorization_required".into(), Value::Bool(true));
+            }
+        }
+        let answer = self.request(REQUEST_USER_INPUT_KIND, payload).await;
+        let Some(answer) = answer else {
+            return QuestionReply::Unanswered;
+        };
+        if let Some(error) = answer.get("question_error").and_then(Value::as_str) {
+            return QuestionReply::Failed(error.into());
+        }
+        if let Some(pending) =
+            atomcode_capabilities::tools::request_user_input::PendingUserQuestion::read(&answer)
+        {
+            return QuestionReply::Pending(pending);
+        }
+        let Ok(response) = serde_json::from_value::<UserInputResponse>(answer) else {
+            return QuestionReply::Unanswered;
+        };
+        if response.declined {
+            return QuestionReply::Unanswered;
+        }
+        match response
             .text
             .or_else(|| response.selected.into_iter().next())
+        {
+            Some(answer) => QuestionReply::Answered(answer),
+            None => QuestionReply::Unanswered,
+        }
     }
 }
 
