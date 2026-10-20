@@ -40,9 +40,9 @@ use atomcode_kernel::provider::LlmProvider;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::controllers::{
-    evaluate_goal, goal_cap_stop_note, goal_continuation_message, summarize_for_goal,
-    transient_provider_failure, EvalOutcome, GoalPhase, GoalProgress, GoalRecoveryKind, GoalResult,
-    GoalState, GoalTerminal, LoopProgress, LoopState, ScheduleWakeupTool, WakeupRequest,
+    goal_cap_stop_note, goal_continuation_message, summarize_for_goal, transient_provider_failure,
+    EvalOutcome, GoalPhase, GoalProgress, GoalRecoveryKind, GoalResult, GoalState, GoalTerminal,
+    LoopProgress, LoopState, ScheduleWakeupTool, WakeupRequest,
 };
 use crate::parts::{prepare_with_plugin_hook_source_reusing_lease, SessionLeaseSource};
 #[cfg(test)]
@@ -4532,6 +4532,10 @@ fn spawn_runtime_owner_with_optional_agent(
                     {
                         continue;
                     }
+                    if let Some(state) = goal.as_mut() {
+                        state.evidence_expanded = outcome.evidence_expanded;
+                        state.report.evaluator_attempts = state.report.evaluator_attempts.saturating_add(outcome.requests.saturating_sub(1));
+                    }
                     if let Some(usage) = outcome.usage {
                         if let Some(state) = goal.as_mut() {
                             state.tokens_used = state.tokens_used.saturating_add((usage.prompt + usage.completion) as u64);
@@ -4599,6 +4603,13 @@ fn spawn_runtime_owner_with_optional_agent(
                                     let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                                 }
                             }
+                        }
+                        GoalResult::Inconclusive(detail) if outcome.evidence_exhausted => {
+                            if let Some(state) = goal.as_mut() {
+                                state.pause_for_recovery(format!("bounded logged evidence remains insufficient; goal retained: {detail}"));
+                                let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                            }
+                            finish_reason = Some(StopReason::Stopped);
                         }
                         result @ (GoalResult::Inconclusive(_) | GoalResult::RetryableError { .. }) => {
                             let (detail, retry_after) = match &result {
@@ -9864,18 +9875,33 @@ fn launch_goal_evaluation(
             async_epoch,
             result: GoalResult::Error("could not build evaluator provider".into()),
             usage: None,
+            evidence_expanded: false,
+            evidence_exhausted: false,
+            requests: 0,
         });
         return;
     };
     let condition = state.condition.clone();
     let summary = summarize_for_goal(&snapshot.messages, state.last_reason.as_deref());
-    let user_directions = crate::controllers::goal_user_directions(&snapshot.messages);
+    // The mounted prompt registry owns the project's instructions. Native
+    // snapshots contain conversation facts, not the assembled system prompt.
+    let loaded_context = resources
+        .and_then(|runtime| runtime.harness_app.as_ref())
+        .and_then(|app| {
+            app.context()
+                .service::<atomcode_harness::seams::SystemPromptSvc>()
+        })
+        .and_then(|prompts| prompts.fragment("project-instructions"));
+    let user_directions =
+        crate::controllers::goal_user_directions(&snapshot.messages, loaded_context.as_deref());
+    let supplement = crate::controllers::goal_evidence_supplement(&snapshot.messages);
+    let already_expanded = state.evidence_expanded;
     let cancel = state.work_cancel.clone();
     let timeout =
         std::time::Duration::from_secs(state.recovery_policy.evaluator_timeout_secs.clamp(1, 3600));
     let tx = tx.clone();
     tokio::spawn(async move {
-        let inner = tokio::spawn(evaluate_goal(
+        let inner = tokio::spawn(crate::controllers::evaluate_goal_with_evidence(
             generation,
             controller_id,
             async_epoch,
@@ -9885,6 +9911,8 @@ fn launch_goal_evaluation(
             user_directions,
             cancel,
             timeout,
+            Some(supplement),
+            already_expanded,
         ));
         let outcome = inner.await.unwrap_or_else(|_| EvalOutcome {
             generation,
@@ -9892,6 +9920,9 @@ fn launch_goal_evaluation(
             async_epoch,
             result: GoalResult::Error("evaluator task failed".into()),
             usage: None,
+            evidence_expanded: false,
+            evidence_exhausted: false,
+            requests: 0,
         });
         let _ = tx.send(outcome);
     });

@@ -566,3 +566,86 @@ async fn explicitly_unknown_evidence_pauses_without_dispatching_more_main_work()
     );
     handle.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn an_unknown_after_evidence_expansion_stops_without_recovery_or_main_replay() {
+    struct UnknownFactory(Arc<AtomicU64>);
+    impl CodingProviderFactory for UnknownFactory {
+        fn build(
+            &self,
+            _: &CodingAgentConfig,
+            _: Option<&str>,
+        ) -> Result<Arc<dyn LlmProvider>, crate::ProviderBuildError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::new(atomcode_kernel::testkit::MockProvider::new(vec![
+                vec![
+                    StreamEvent::TextDelta(
+                        "Verdict: unknown insufficient observed validation".into()
+                    ),
+                    StreamEvent::Done { truncated: false },
+                ];
+                2
+            ])))
+        }
+    }
+    let builds = Arc::new(AtomicU64::new(0));
+    let (handle, mut commands, events, mut output, _, _, _adapter) =
+        controller_test_runtime(Arc::new(UnknownFactory(builds.clone()))).await;
+    handle.start_goal("tests pass").await.unwrap();
+    assert!(matches!(
+        commands.recv().await,
+        Some(AgentCommand::SendMessage { .. })
+    ));
+    events
+        .send(AgentEvent::TurnComplete {
+            turn: None,
+            reason: StopReason::Stopped,
+            provider_failure: None,
+        })
+        .unwrap();
+    assert!(matches!(
+        commands.recv().await,
+        Some(AgentCommand::Snapshot)
+    ));
+    events
+        .send(AgentEvent::Snapshot {
+            snapshot: SessionSnapshot::new(vec![
+                Message::assistant(
+                    "",
+                    vec![atomcode_kernel::tool::ToolCall {
+                        id: "tests".into(),
+                        name: "bash".into(),
+                        arguments: serde_json::json!({"command":"python3 -m unittest"}).to_string(),
+                    }],
+                ),
+                Message::tool_result("tests", "Ran 28 tests; OK", false),
+            ]),
+        })
+        .unwrap();
+    let mut paused = false;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match output.recv().await {
+                Some(CodingRuntimeEvent::GoalChanged(progress)) if !progress.active => {
+                    assert_eq!(progress.phase, GoalPhase::PausedAtCap);
+                    assert_eq!(progress.report.evaluator_attempts, 2);
+                    assert!(progress
+                        .last_reason
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("bounded logged evidence"));
+                    paused = true;
+                }
+                Some(CodingRuntimeEvent::TurnFinished(_)) => break,
+                Some(_) => {}
+                None => panic!("missing terminal"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(paused);
+    assert_eq!(builds.load(Ordering::SeqCst), 1);
+    assert!(commands.try_recv().is_err());
+    handle.shutdown().await.unwrap();
+}

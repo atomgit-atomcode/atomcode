@@ -1,0 +1,35 @@
+{
+  "source": "20261019 phase 3 observed native-log receipts; project path anonymized",
+  "receipts": [
+    {
+      "seq": 1726,
+      "call": {
+        "id": "call_90563e96f8c44a63964f86be0cd3cead",
+        "name": "bash",
+        "arguments": "{\"command\":\"python3 tools/test_receipt.py --phase 03\",\"timeout\":60}"
+      },
+      "result": "test_killed_process_reclaimed_at_boundary (test_concurrency.ProcessTests) ... ok\ntest_live_stale_process_cannot_write_new_lease (test_concurrency.ProcessTests) ... ok\ntest_lock_wait_bounded_and_recovers (test_concurrency.ProcessTests) ... ok\ntest_process_competition_one_live_lease (test_concurrency.ProcessTests) ... ok\ntest_sigterm_graceful_shutdown_leaves_unfinished_lease (test_concurrency.ProcessTests) ... ok\ntest_cancel_pending_running_and_terminal (test_core.QueueTests) ... ok\ntest_cli_real_subprocess_roundtrip (test_core.QueueTests) ... ok\ntest_concurrent_claim_has_one_winner (test_core.QueueTests) ... ok\ntest_concurrent_dedupe_has_one_record (test_core.QueueTests) ... ok\ntest_duplicate_submission_survives_terminal_state_and_reopen (test_core.QueueTests) ... ok\ntest_expired_final_attempt_becomes_failed (test_core.QueueTests) ... ok\ntest_exponential_backoff_and_exhaustion (test_core.QueueTests) ... ok\ntest_json_payloads_and_unique_ids (test_core.QueueTests) ... ok\ntest_lease_boundary_and_stale_fencing (test_core.QueueTests) ... ok\ntest_local_worker_failure (test_core.QueueTests) ... ok\ntest_normal_workflow (test_core.QueueTests) ... ok\ntest_reopen_preserves_running_pending_result_error (test_core.QueueTests) ... ok\ntest_schema_version_and_unknown_schema_rejected (test_core.QueueTests) ... ok\ntest_validation_and_wrong_token_do_not_mutate (test_core.QueueTests) ... ok\ntest_delayed_boundary_rollback_and_reopen (test_scheduler.SchedulerTests) ... ok\ntest_heartbeat_boundary_and_terminal_fencing (test_scheduler.SchedulerTests) ... ok\ntest_heartbeat_races_cancel_and_expiry (test_scheduler.SchedulerTests) ... ok\ntest_one_shot_and_concurrent_tick_deduplicate (test_scheduler.SchedulerTests) ... ok\ntest_periodic_coalesce_reopen_rollback_and_cancel (test_scheduler.SchedulerTests) ... ok\ntest_scheduler_cli_and_validation (test_scheduler.SchedulerTests) ... ok\ntest_v1_migration_preserves_jobs (test_scheduler.SchedulerTests) ... ok\ntest_worker_heartbeat_then_real_kill (test_scheduler.SchedulerTests) ... ok\ntest_worker_shutdown_blocks_heartbeat (test_scheduler.SchedulerTests) ... ok\n\n----------------------------------------------------------------------\nRan 28 tests in 2.477s\n\nOK\nexit_code=0; elapsed_seconds=2.628\n",
+      "is_error": false
+    },
+    {
+      "seq": 1820,
+      "call": {
+        "id": "call_03bd47d2a1264ad39190d1514852ba85",
+        "name": "read_file",
+        "arguments": "{\"file_path\":\"artifacts/phase-03-renew-kill.json\",\"ranges\":[],\"limit\":120,\"offset\":1}"
+      },
+      "result": "1\t{\n2\t  \"renewed\": {\n3\t    \"id\": \"772fef92880a4105b2be1cea4781d608\",\n4\t    \"payload\": \"crash with heartbeat\",\n5\t    \"dedupe_key\": null,\n6\t    \"status\": \"running\",\n7\t    \"attempts\": 1,\n8\t    \"max_attempts\": 3,\n9\t    \"backoff\": 1.0,\n10\t    \"available_at\": 1000.0,\n11\t    \"lease_until\": 1015.0,\n12\t    \"lease_token\": \"e0a13ec378144336a4e59580bd671200\",\n13\t    \"result\": null,\n14\t    \"error\": null,\n15\t    \"created_at\": 1000.0,\n16\t    \"updated_at\": 1005.0\n17\t  },\n18\t  \"exitcode\": -9,\n19\t  \"new\": {\n20\t    \"id\": \"772fef92880a4105b2be1cea4781d608\",\n21\t    \"payload\": \"crash with heartbeat\",\n22\t    \"dedupe_key\": null,\n23\t    \"status\": \"running\",\n24\t    \"attempts\": 2,\n25\t    \"max_attempts\": 3,\n26\t    \"backoff\": 1.0,\n27\t    \"available_at\": 1000.0,\n28\t    \"lease_until\": 1025.0,\n29\t    \"lease_token\": \"8e568e00b978419f992883ae799f8323\",\n30\t    \"result\": null,\n31\t    \"error\": null,\n32\t    \"created_at\": 1000.0,\n33\t    \"updated_at\": 1015.0\n34\t  }\n35\t}\n",
+      "is_error": false
+    },
+    {
+      "seq": 1863,
+      "call": {
+        "id": "call_7c936d66909e463685753cd077352dd5",
+        "name": "write_file",
+        "arguments": "{\"content\":\"# Phase 03 — scheduler\\n\\n本轮仅阶段三。实现延迟任务、持久化一次性/固定间隔计划、触发去重、取消与重启恢复，以及 worker 协作式心跳续租。\\n\\n## 实际回归\\n\\n运行 `python3 tools/test_receipt.py --phase 03`，内部执行规定的 `python3 -m unittest discover -s tests -v`。\\n\\n**Ran 28 tests in 2.477s — OK，退出码 0**。完整输出：[phase-03-tests.txt](phase-03-tests.txt)；真实运行元数据：[phase-03-run.json](phase-03-run.json)。保留原有 19 项测试，仅将两处 schema 版本断言由 1 更新为 2；新增 9 项测试。\\n\\n| 验证 | 实际断言与结果 |\\n| --- | --- |\\n| 延迟边界、回拨、重开 | 1010 截止，1009.999 不可领，重开后 1010 可领；取消状态重开保留 |\\n| 周期、错过触发、回拨 | 起点 1010、周期 10；1010 生成一次，回拨 1000 不重复，重开到 1045 仅生成 1040 实例，1050 正常继续 |\\n| 取消、恢复、一次性 | 取消计划后重开至 2000 无新任务；一次性计划完成后不重复 |\\n| 并发触发去重 | 4 独立连接并发 tick，总共仅生成一个实例 |\\n| schema 迁移 | 独立构造 v1 fixture，迁移 v2 后原任务载荷 42、原 ID 可领取，并可创建新计划 |\\n| 续租边界与 fencing | 1005 心跳将 1010 延至 1015；attempt 不变，回拨不缩短；1015 旧心跳拒绝，重领和完成后均不可旧写入 |\\n| 续租后真实终止 | spawn worker 经心跳回调续租到 1015 后被 SIGKILL，exitcode=-9；1010 不可重领，1015 重领 attempt=2 且 token 改变 |\\n| 竞态与关闭 | 续租与取消并发最终 cancelled/token=null；到期续租与领取并发旧续租 LeaseLost、新领取 attempt=2；停止请求阻止 worker 心跳和成功提交 |\\n| CLI | 真实子进程创建周期计划、tick、查询、取消成功；非法时间与周期拒绝 |\\n\\n## 原始事实文件\\n\\n- [phase-03-scheduler.json](phase-03-scheduler.json)：首次、合并补触发及下一周期任务快照。\\n- [phase-03-renew-kill.json](phase-03-renew-kill.json)：任务 772fef92880a4105b2be1cea4781d608，旧 token e0a13ec378144336a4e59580bd671200，心跳截止 1015；终止退出码 -9；新 token 8e568e00b978419f992883ae799f8323，attempt=2，截止 1025。\\n- [phase-03-races.json](phase-03-races.json)：真实独立连接并发续租/取消和过期/重领的结果快照。\\n\\n## 明确语义与限制\\n\\n- 时间统一 UTC epoch 秒；不解析本地时区字符串。时钟回拨不倒退调度游标、不缩短心跳截止，但墙钟回拨会延长实际等待；不保证单调真实经过时间。\\n- 错过触发采用 coalesce-latest：每次 tick 每个计划最多生成最近一个到期实例，之前错过的永久跳过。固定秒数周期，不是 cron/日历周期。\\n- 显式调用 tick；没有后台调度循环。触发插入、去重记录和游标推进在同一 SQLite 事务中。取消计划仅停止未来实例，不撤销已生成任务。\\n- schema v2 自动事务迁移 v1；无降级支持。当前 tick 扫描全部 active 计划，未进行大规模性能验证；时间和周期受 SQLite 整数及浮点可表示范围限制。\\n- 心跳为协作回调，不是自动线程；长阻塞 handler 必须拆分并主动心跳。旧租约不能续租复活；续租不改变 attempt/token。进程终止与事务遵循 SQLite 提交原子性，本轮真实终止发生在续租提交后，未注入提交中断电故障。\\n- 保持至少一次执行；token 无法阻止外部副作用。关闭与完成提交的临界顺序不提供强原子取消保证。\\n- 时间边界使用注入时钟，无人工 sleep；真实进程、信号、SQLite 竞争均实际运行。所有测试子进程已 join，无后台服务。阶段二五份事实 JSON 因完整回归重新生成，阶段二历史文本/运行回执未覆盖。\\n\\n使用说明见 README.md，工作记录见 WORKLOG.md。未启动下一阶段，无外部 API、子 agent、提交推送或依赖安装。\\n\",\"file_path\":\"artifacts/phase-03.md\"}"
+      },
+      "result": "Created /project/artifacts/phase-03.md (3990 bytes, 39 lines)",
+      "is_error": false
+    }
+  ]
+}

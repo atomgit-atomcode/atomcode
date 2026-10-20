@@ -562,6 +562,18 @@ impl PromptRegistry {
             .join("\n\n")
     }
 
+    /// Read one currently mounted contribution without parsing the assembled
+    /// prompt or reloading its source. Removal/replacement has the same owner
+    /// and visibility as `render()`.
+    pub fn fragment(&self, id: &str) -> Option<String> {
+        self.fragments
+            .read()
+            .expect("prompt registry poisoned")
+            .iter()
+            .find(|fragment| fragment.id == id)
+            .map(|fragment| fragment.text.clone())
+    }
+
     pub fn ids(&self) -> Vec<String> {
         self.fragments
             .read()
@@ -1276,5 +1288,29 @@ mod tool_policy_tests {
         assert!(only.admits("tool-fs", "read_file"));
         assert!(!only.admits("tool-search", "glob"), "not on the list");
         assert!(!only.admits("tool-search", "grep"), "exclude beats include");
+    }
+}
+
+#[cfg(test)]
+mod prompt_fragment_tests {
+    #[test]
+    fn reading_a_fragment_tracks_its_owner_replacing_and_withdrawing_it() {
+        let prompts = super::PromptRegistry::new();
+        prompts.contribute("persona", 0, "unrelated persona");
+        prompts.contribute("project-instructions", 1, "original rules");
+        let original = prompts.fragment("project-instructions").unwrap();
+        assert_eq!(original, "original rules");
+        prompts.contribute("project-instructions", 1, "replacement rules");
+        assert_eq!(
+            prompts.fragment("project-instructions").as_deref(),
+            Some("replacement rules")
+        );
+        assert_eq!(
+            original, "original rules",
+            "a captured evaluation input remains immutable"
+        );
+        prompts.remove("project-instructions");
+        assert!(prompts.fragment("project-instructions").is_none());
+        assert_eq!(prompts.render(), "unrelated persona");
     }
 }

@@ -1876,6 +1876,101 @@ async fn a_goal_works_towards_the_condition_without_being_pushed() {
     runtime.handle.shutdown().await.unwrap();
 }
 
+/// Project rules live in the mounted prompt registry, not the event snapshot.
+/// Editing the file after mount must not secretly give the evaluator different
+/// rules from the main agent's already assembled prompt.
+async fn a_goal_evaluator_uses_the_mounted_project_instructions() {
+    struct Provider(Arc<Mutex<Vec<String>>>);
+    #[async_trait::async_trait]
+    impl LlmProvider for Provider {
+        fn model_name(&self) -> &str {
+            "goal-context"
+        }
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            tools: &[ToolDef],
+            options: &ChatOptions,
+        ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+            let evaluation = messages
+                .first()
+                .is_some_and(|m| m.text.starts_with("You are a strict goal evaluator"));
+            if evaluation {
+                assert!(tools.is_empty());
+                assert_eq!(options.tool_choice, ToolChoice::None);
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(messages.last().unwrap().text.clone());
+            }
+            Ok(Box::pin(futures::stream::iter(vec![
+                StreamEvent::TextDelta(
+                    if evaluation {
+                        "Verdict: yes observed work complete"
+                    } else {
+                        "completed"
+                    }
+                    .into(),
+                ),
+                StreamEvent::Done { truncated: false },
+            ])))
+        }
+    }
+    struct Factory(Arc<Mutex<Vec<String>>>);
+    impl CodingProviderFactory for Factory {
+        fn build(
+            &self,
+            _: &CodingAgentConfig,
+            _: Option<&str>,
+        ) -> Result<Arc<dyn LlmProvider>, ProviderBuildError> {
+            Ok(Arc::new(Provider(self.0.clone())))
+        }
+    }
+    let env = env();
+    let input = Arc::new(Mutex::new(Vec::new()));
+    std::fs::write(
+        env.project.path().join("AGENTS.md"),
+        "RULES_FROM_MOUNTED_OWNER: work only in the project.",
+    )
+    .unwrap();
+    let recorder = Arc::new(Recorder::default());
+    let mut config = start(env.project.path(), &recorder, SessionMode::Fresh);
+    config.provider_factory = Arc::new(Factory(input.clone()));
+    let mut runtime = CodingRuntime::start(config).await.unwrap();
+    std::fs::write(env.project.path().join("AGENTS.md"), "CHANGED_AFTER_MOUNT").unwrap();
+    runtime
+        .handle
+        .start_goal("finish work while following AGENTS.md")
+        .await
+        .unwrap();
+    let mut met = false;
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while let Some(envelope) = runtime.events.recv().await {
+            let event = envelope.event;
+            if let CodingRuntimeEvent::GoalChanged(progress) = &event {
+                met |= progress.terminal == Some(atomcode_coding::GoalTerminal::Met);
+            }
+            if matches!(event, CodingRuntimeEvent::TurnFinished(_)) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(met);
+    let requests = input.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0].contains("RULES_FROM_MOUNTED_OWNER"),
+        "mounted rules omitted from evaluator request"
+    );
+    assert!(
+        !requests[0].contains("CHANGED_AFTER_MOUNT"),
+        "evaluator reread the file instead of using mounted rules"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
 /// Inside a `/loop`, the model can schedule its next pass — the loop stays
 /// alive instead of finishing after the first turn.
 ///
@@ -5232,7 +5327,24 @@ async fn past_most_of_the_window_older_turns_are_summarized_and_the_summary_kept
         "the second summary did not start from the first"
     );
     let seen = recorder.last_turn_request();
-    let asked = user_texts(&seen);
+    let retained = seen
+        .iter()
+        .find(|m| m.role == Role::User && m.display_text().starts_with("prompt 0 "))
+        .expect("the first request is retained as historical context");
+    assert_eq!(
+        retained.internal_origin.as_deref(),
+        Some(atomcode_kernel::message::COMPACTION_RETAINED_MODEL_ORIGIN)
+    );
+    assert_ne!(
+        retained.text,
+        retained.display_text(),
+        "the model must not see a fresh instruction"
+    );
+    let asked: Vec<_> = seen
+        .iter()
+        .filter(|m| m.role == Role::User)
+        .map(|m| m.display_text())
+        .collect();
     assert!(
         asked[0].starts_with("prompt 0 "),
         "the first request is gone"
@@ -5243,7 +5355,13 @@ async fn past_most_of_the_window_older_turns_are_summarized_and_the_summary_kept
             .any(|t| t.starts_with("prompt 1 ") || t.starts_with("prompt 2 ")),
         "the older turns are still there"
     );
-    assert!(asked.last().unwrap().starts_with("prompt 5 "));
+    assert!(
+        seen.iter()
+            .rev()
+            .find(|m| m.role == Role::User && !m.synthetic && m.internal_origin.is_none())
+            .is_some_and(|m| m.display_text().starts_with("prompt 5 ")),
+        "the newest real user request is gone"
+    );
     assert_eq!(
         seen.iter()
             .filter(|m| m
@@ -6163,6 +6281,12 @@ macro_rules! criteria {
 }
 
 mod criteria {
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[serial_test::serial(engine)]
+    async fn a_goal_evaluator_uses_the_mounted_project_instructions() {
+        super::a_goal_evaluator_uses_the_mounted_project_instructions().await;
+    }
+
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     #[serial_test::serial(engine)]
     async fn a_silent_stream_times_the_turn_out() {

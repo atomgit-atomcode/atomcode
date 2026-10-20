@@ -1,0 +1,125 @@
+{
+  "source": "20261019 long-run phase 2; canonical seq 887 onward; project path anonymized",
+  "receipts": [
+    {
+      "seq": 887,
+      "call": {
+        "id": "call_977d2956ec3b42769d55bc96502965d0",
+        "name": "bash",
+        "arguments": "{\"command\":\"python3 tools/test_receipt.py --phase 02\",\"timeout\":60}"
+      },
+      "result": "test_killed_process_reclaimed_at_boundary (test_concurrency.ProcessTests) ... ok\ntest_live_stale_process_cannot_write_new_lease (test_concurrency.ProcessTests) ... ok\ntest_lock_wait_bounded_and_recovers (test_concurrency.ProcessTests) ... ok\ntest_process_competition_one_live_lease (test_concurrency.ProcessTests) ... ok\ntest_sigterm_graceful_shutdown_leaves_unfinished_lease (test_concurrency.ProcessTests) ... ok\ntest_cancel_pending_running_and_terminal (test_core.QueueTests) ... ok\ntest_cli_real_subprocess_roundtrip (test_core.QueueTests) ... ok\ntest_concurrent_claim_has_one_winner (test_core.QueueTests) ... ok\ntest_concurrent_dedupe_has_one_record (test_core.QueueTests) ... ok\ntest_duplicate_submission_survives_terminal_state_and_reopen (test_core.QueueTests) ... ok\ntest_expired_final_attempt_becomes_failed (test_core.QueueTests) ... ok\ntest_exponential_backoff_and_exhaustion (test_core.QueueTests) ... ok\ntest_json_payloads_and_unique_ids (test_core.QueueTests) ... ok\ntest_lease_boundary_and_stale_fencing (test_core.QueueTests) ... ok\ntest_local_worker_failure (test_core.QueueTests) ... ok\ntest_normal_workflow (test_core.QueueTests) ... ok\ntest_reopen_preserves_running_pending_result_error (test_core.QueueTests) ... ok\ntest_schema_version_and_unknown_schema_rejected (test_core.QueueTests) ... ok\ntest_validation_and_wrong_token_do_not_mutate (test_core.QueueTests) ... ok\n\n----------------------------------------------------------------------\nRan 19 tests in 1.700s\n\nOK\nexit_code=0; elapsed_seconds=1.810\n",
+      "is_error": false
+    },
+    {
+      "seq": 897,
+      "call": {
+        "id": "call_fe3b6607e0744e9d8b6db9a5391f710f",
+        "name": "read_file",
+        "arguments": "{\"file_path\":\"artifacts/phase-02-crash.json\",\"ranges\":[],\"limit\":150,\"offset\":1}"
+      },
+      "result": "1\t{\n2\t  \"pid\": 21419,\n3\t  \"exitcode\": -9,\n4\t  \"old\": {\n5\t    \"id\": \"fe710056582c44b8a9ab9fe8436788e4\",\n6\t    \"payload\": \"crash\",\n7\t    \"dedupe_key\": null,\n8\t    \"status\": \"running\",\n9\t    \"attempts\": 1,\n10\t    \"max_attempts\": 3,\n11\t    \"backoff\": 1.0,\n12\t    \"available_at\": 1000.0,\n13\t    \"lease_until\": 1010.0,\n14\t    \"lease_token\": \"76f074fe2d7f43c596d50081b34e99b1\",\n15\t    \"result\": null,\n16\t    \"error\": null,\n17\t    \"created_at\": 1000.0,\n18\t    \"updated_at\": 1000.0\n19\t  },\n20\t  \"new\": {\n21\t    \"id\": \"fe710056582c44b8a9ab9fe8436788e4\",\n22\t    \"payload\": \"crash\",\n23\t    \"dedupe_key\": null,\n24\t    \"status\": \"running\",\n25\t    \"attempts\": 2,\n26\t    \"max_attempts\": 3,\n27\t    \"backoff\": 1.0,\n28\t    \"available_at\": 1000.0,\n29\t    \"lease_until\": 1020.0,\n30\t    \"lease_token\": \"ef78c1e6abbb47b998251dd148d66d54\",\n31\t    \"result\": null,\n32\t    \"error\": null,\n33\t    \"created_at\": 1000.0,\n34\t    \"updated_at\": 1010.0\n35\t  },\n36\t  \"final\": {\n37\t    \"id\": \"fe710056582c44b8a9ab9fe8436788e4\",\n38\t    \"payload\": \"crash\",\n39\t    \"dedupe_key\": null,\n40\t    \"status\": \"succeeded\",\n41\t    \"attempts\": 2,\n42\t    \"max_attempts\": 3,\n43\t    \"backoff\": 1.0,\n44\t    \"available_at\": 1000.0,\n45\t    \"lease_until\": null,\n46\t    \"lease_token\": null,\n47\t    \"result\": \"recovered\",\n48\t    \"error\": null,\n49\t    \"created_at\": 1000.0,\n50\t    \"updated_at\": 1010.0\n51\t  }\n52\t}\n",
+      "is_error": false
+    },
+    {
+      "seq": 898,
+      "call": {
+        "id": "call_b8b0d3ba859a48acb97df965284fe6e6",
+        "name": "read_file",
+        "arguments": "{\"file_path\":\"artifacts/phase-02-lock.json\",\"ranges\":[],\"limit\":100,\"offset\":1}"
+      },
+      "result": "1\t{\n2\t  \"elapsed_seconds\": 0.1753655,\n3\t  \"budget_seconds\": 0.15,\n4\t  \"error\": \"SQLite lock wait exceeded 0.15s: database is locked\",\n5\t  \"cli_exit\": 2,\n6\t  \"cli_stderr\": \"{\\\"error\\\": \\\"SQLite lock wait exceeded 0.15s: database is locked\\\"}\\n\",\n7\t  \"recovery\": \"submit succeeded\"\n8\t}\n",
+      "is_error": false
+    },
+    {
+      "seq": 899,
+      "call": {
+        "id": "call_c283e27b75ef45be866897cb13970534",
+        "name": "read_file",
+        "arguments": "{\"file_path\":\"README.md\",\"ranges\":[],\"limit\":200,\"offset\":1}"
+      },
+      "result": "1\t# durable_joblab — 阶段 1 / core\n2\t\n3\t仅依赖 Python 3 标准库的 SQLite 持久化任务队列。导入包名为 `joblab`，在项目根目录运行，无需安装依赖。没有 HTTP、UI 或网络调用。\n4\t\n5\t## 快速开始\n6\t\n7\t```sh\n8\tpython3 -m joblab --db demo.sqlite3 init\n9\tpython3 -m joblab --db demo.sqlite3 submit '{\"op\":\"sum\",\"numbers\":[2,3,7]}' --dedupe-key sum-demo\n10\tpython3 -m joblab --db demo.sqlite3 worker --limit 10\n11\tpython3 -m joblab --db demo.sqlite3 list --status succeeded\n12\t```\n13\t\n14\t`submit` 输出包含唯一 `id` 的 JSON 对象。用该 ID 执行 `status ID` 或 `cancel ID`。所有子命令均输出 JSON；参数或执行错误以非零退出码返回。`worker` 默认最多执行一个任务；无当前可执行任务时立即退出，不轮询、不等待退避。它只支持本地 `echo`（默认）、`sum` 和 `fail` 示例操作。\n15\t\n16\t## Python API\n17\t\n18\t```python\n19\tfrom joblab import Queue\n20\tfrom joblab.worker import run_once\n21\t\n22\twith Queue('demo.sqlite3') as queue:\n23\t    job = queue.submit({'op': 'sum', 'numbers': [1, 2]},\n24\t                       dedupe_key='example', max_attempts=3, backoff=1)\n25\t    run_once(queue)\n26\t    print(queue.get(job['id']))\n27\t```\n28\t\n29\t| API | 行为 |\n30\t| --- | --- |\n31\t| `submit(payload, *, dedupe_key=None, max_attempts=3, backoff=1)` | 接受 JSON 可序列化载荷，生成 UUID，返回任务快照 |\n32\t| `claim(lease_seconds=30)` | 事务领取一个就绪或租约过期任务，无任务返回 `None` |\n33\t| `succeed(id, token, result=None)` | 用当前有效租约完成任务，结果必须可 JSON 序列化 |\n34\t| `fail(id, token, error)` | 记录错误；安排重试或进入失败终态 |\n35\t| `cancel(id)` | 取消待执行或运行任务，发生转换返回 `True` |\n36\t| `get(id)` / `list(status=None)` | 查询持久化状态；不存在的 ID 返回 `None` |\n37\t\n38\t领取返回的 `lease_token` 必须传入 `succeed` / `fail`。错误令牌、已取消任务、过期或已被重领的租约抛出 `LeaseLost`，不会修改任务。`Queue(path, clock=callable)` 可注入返回有限 epoch 秒数的时钟，默认 `time.time`。每个线程使用独立 Queue 连接；通过上下文管理器关闭连接。\n39\t\n40\t## 状态与事务语义\n41\t\n42\t- 状态：`pending` 待执行、`running` 运行、`succeeded` 成功、`failed` 失败、`cancelled` 取消。\n43\t- 每次领取递增 `attempts`，不是提交时计数。最大次数包含初次领取。\n44\t- 显式失败后，等待 `backoff * 2 ** (attempts - 1)` 秒；在 `available_at` 精确边界可领取。最后一次失败直接成为 `failed`。\n45\t- 租约区间为半开区间：`now < lease_until` 才有效。到期可立即重领；最后一次尝试到期由下一次 `claim` 标记为失败。查询不触发回收，因此尚未被领取操作处理的过期任务仍显示 `running`。\n46\t- 去重 key 在该数据库内永久保留，包括终态；重复提交返回原任务，不覆盖原载荷或重试配置。不带 key 的提交彼此独立。\n47\t- `BEGIN IMMEDIATE` 串行化写入、领取和终结；SQLite WAL 和 `synchronous=FULL` 用于持久化。数据库锁等待超时为 10 秒。\n48\t- schema 版本使用 `PRAGMA user_version=1`。仅初始化空数据库；未知版本或非空无版本数据库拒绝打开。当前没有升级迁移，未来阶段需显式添加。\n49\t\n50\t## 限制\n51\t\n52\t这是至少一次执行队列，不是恰好一次执行。租约令牌阻止陈旧结果写回，但不能撤销 worker 已产生的外部副作用；业务 handler 应幂等。取消运行任务同样不能强制中止 handler。当前不提供续租、后台清理、任务删除、无限轮询或时钟回拨补偿；运行时间应小于租约。退避参数应保持在浮点可表示范围内，极端指数溢出会抛错并回滚失败转换，不会悄悄写入无限时间。仅验证本机 SQLite 场景，不承诺网络文件系统或断电故障表现。\n53\t\n54\t## 验证与证据\n55\t\n56\t```sh\n57\tpython3 -m unittest discover -s tests -v\n58\tpython3 tools/test_receipt.py\n59\t```\n60\t\n61\t第二条命令调用同一 unittest suite，保存原始输出与执行元数据至 `artifacts/phase-01-tests.txt`、`artifacts/phase-01-run.json`。临时数据库创建在本项目内并自动清理；并发测试使用真实独立数据库连接，CLI 测试使用真实子进程，无人工 sleep。阶段总结见 `artifacts/phase-01.md`。\n",
+      "is_error": false
+    },
+    {
+      "seq": 900,
+      "call": {
+        "id": "call_2693ea602e984b81bbee5942ca923c35",
+        "name": "read_file",
+        "arguments": "{\"file_path\":\"WORKLOG.md\",\"ranges\":[],\"limit\":100,\"offset\":1}"
+      },
+      "result": "1\t# WORKLOG\n2\t\n3\t## 阶段 1 / core（仅本阶段）\n4\t\n5\t- 检查：初始目录仅有 AGENTS.md；无已有业务代码。遵守纯标准库、项目目录内操作、无网络、无子 agent、无提交推送约束。\n6\t- 实现：新增 joblab 包、SQLite schema v1、事务领取、租约 fencing、指数退避、最大尝试次数、永久去重 key、取消和查询，以及 JSON CLI、本地有限执行 worker。\n7\t- 设计：租约到期立即可重领；显式失败才退避；过期末次尝试由 claim 转为 failed；查询只读。使用可注入时钟验证精确边界，无人工等待。\n8\t- 验证命令：`python3 tools/test_receipt.py`，内部执行 `python3 -m unittest discover -s tests -v`（使用当前 Python 解释器绝对路径）。\n9\t- 实际结果：14 tests，unittest 报告 0.816s，OK；包装器测得 0.925s（四舍五入），退出码 0。包括真实 CLI 子进程、8 连接领取竞争、8 连接去重竞争。\n10\t- 回执：artifacts/phase-01-tests.txt 是捕获的原始输出；artifacts/phase-01-run.json 含真实时间、解释器、命令和退出码。\n11\t- 缺陷记录：本次首次回归无失败；未发现必须修复的测试缺陷。过期 worker 无权写回、取消后不再领取均有断言。\n12\t- 限制：至少一次执行、不续租、不强杀 handler、无后台回收；极端指数超出浮点范围会回滚并报错；未验证断电或网络文件系统。后续阶段未启动。\n",
+      "is_error": false
+    },
+    {
+      "seq": 1006,
+      "call": {
+        "id": "call_f0405d4015764fb894b28dcc7ef52d57",
+        "name": "todowrite",
+        "arguments": "{\"action\":\"update\",\"content\":\"\",\"id\":3,\"todos\":[{\"content\":\"检查现有领取、锁等待及 worker 退出路径\",\"status\":\"completed\"},{\"content\":\"实现有界锁错误与安全的优雅关闭\",\"status\":\"completed\"},{\"content\":\"运行真实多进程竞争、终止和租约 fencing 测试并记录事实\",\"status\":\"completed\"},{\"content\":\"更新阶段二证据、README 和 WORKLOG\",\"status\":\"in_progress\"}],\"status\":\"completed\"}"
+      },
+      "result": "[x] 1. 检查现有领取、锁等待及 worker 退出路径\n[x] 2. 实现有界锁错误与安全的优雅关闭\n[x] 3. 运行真实多进程竞争、终止和租约 fencing 测试并记录事实\n[~] 4. 更新阶段二证据、README 和 WORKLOG",
+      "is_error": false
+    },
+    {
+      "seq": 1015,
+      "call": {
+        "id": "call_f5fa0ac4c9ad4e358123a0f52f7d7424",
+        "name": "edit_file",
+        "arguments": "{\"file_path\":\"README.md\",\"replace_all\":false,\"new_string\":\"# durable_joblab — core + concurrency（阶段 1–2）\",\"old_string\":\"# durable_joblab — 阶段 1 / core\"}"
+      },
+      "result": "Edited /workspace/joblab/README.md (1 replacement)\n@@ -1,4 +1,4 @@\n-# durable_joblab — 阶段 1 / core\n+# durable_joblab — core + concurrency（阶段 1–2）\n \n 仅依赖 Python 3 标准库的 SQLite 持久化任务队列。导入包名为 `joblab`，在项目根目录运行，无需安装依赖。没有 HTTP、UI 或网络调用。",
+      "is_error": false
+    },
+    {
+      "seq": 1016,
+      "call": {
+        "id": "call_21c8eb3cb9474d76ae6068348f825f69",
+        "name": "edit_file",
+        "arguments": "{\"file_path\":\"WORKLOG.md\",\"replace_all\":false,\"new_string\":\"- 限制：至少一次执行、不续租、不强杀 handler、无后台回收；极端指数超出浮点范围会回滚并报错；未验证断电或网络文件系统。后续阶段未启动。\\n\\n## 阶段 2 / concurrency\\n\\n- 检查发现：原锁等待固定 10 秒、错误未归类；worker 无关闭协议。原事务领取与 token fencing 在多进程验证中保持正确。\\n- 修改：Queue 支持正数 `lock_timeout`（默认 1 秒），写事务及初始化遇 SQLite 锁竞争抛出 QueueBusy；失败事务回滚。CLI 增加 --lock-timeout。worker 增加 StopToken、WorkerStopped、信号上下文和 handler 注入；收到停止请求后不将未完成工作标记成功。\\n- 新增真实 spawn 进程测试：6 进程争抢单任务、SIGKILL 退出与边界重领、存活旧持有者双路径拒写、SIGTERM 优雅停止、独立进程持写锁超时与恢复。通过 Pipe 握手协调，无人工 sleep。\\n- 命令：`python3 tools/test_receipt.py --phase 02`，内部执行 `python3 -m unittest discover -s tests -v`。结果：19 tests / 1.700s / OK，退出码 0；原 14 项测试保留且通过。\\n- 事实：被杀进程 PID 21419，退出码 -9；重领 attempt 1→2，token 改变；锁预算 0.15s，实测 0.1753655s，CLI 返回码 2，释放锁后提交成功。\\n- 回执：artifacts/phase-02-tests.txt、phase-02-run.json 和 competition/crash/fencing/shutdown/lock 五份 JSON。阶段一回执保留未覆盖。\\n- 限制：边界用注入时钟推进，不宣称真实等待 10 秒；只保证同一时刻一个有效租约，不保证过期旧 handler 不再执行外部副作用。优雅关闭为协作式，阻塞 handler 需自行退出；完成提交与信号存在顺序竞争，已提交成功不撤销。未测断电或网络文件系统。仅本阶段，无残留子进程、无提交推送。\\n\",\"old_string\":\"- 限制：至少一次执行、不续租、不强杀 handler、无后台回收；极端指数超出浮点范围会回滚并报错；未验证断电或网络文件系统。后续阶段未启动。\"}"
+      },
+      "result": "Edited /workspace/joblab/WORKLOG.md (1 replacement)\n@@ -10,3 +10,14 @@\n - 回执：artifacts/phase-01-tests.txt 是捕获的原始输出；artifacts/phase-01-run.json 含真实时间、解释器、命令和退出码。\n - 缺陷记录：本次首次回归无失败；未发现必须修复的测试缺陷。过期 worker 无权写回、取消后不再领取均有断言。\n - 限制：至少一次执行、不续租、不强杀 handler、无后台回收；极端指数超出浮点范围会回滚并报错；未验证断电或网络文件系统。后续阶段未启动。\n+\n+## 阶段 2 / concurrency\n+\n+- 检查发现：原锁等待固定 10 秒、错误未归类；worker 无关闭协议。原事务领取与 token fencing 在多进程验证中保持正确。\n+- 修改：Queue 支持正数 `lock_timeout`（默认 1 秒），写事务及初始化遇 SQLite 锁竞争抛出 QueueBusy；失败事务回滚。CLI 增加 --lock-timeout。worker 增加 StopToken、WorkerStopped、信号上下文和 handler 注入；收到停止请求后不将未完成工作标记成功。\n+- 新增真实 spawn 进程测试：6 进程争抢单任务、SIGKILL 退出与边界重领、存活旧持有者双路径拒写、SIGTERM 优雅停止、独立进程持写锁超时与恢复。通过 Pipe 握手协调，无人工 sleep。\n+- 命令：`python3 tools/test_receipt.py --phase 02`，内部执行 `python3 -m unittest discover -s tests -v`。结果：19 tests / 1.700s / OK，退出码 0；原 14 项测试保留且通过。\n+- 事实：被杀进程 PID 21419，退出码 -9；重领 attempt 1→2，token 改变；锁预算 0.15s，实测 0.1753655s，CLI 返回码 2，释放锁后提交成功。\n+- 回执：artifacts/phase-02-tests.txt、phase-02-run.json 和 competition/crash/fencing/shutdown/lock 五份 JSON。阶段一回执保留未覆盖。\n+- 限制：边界用注入时钟推进，不宣称真实等待 10 秒；只保证同一时刻一个有效租约，不保证过期旧 handler 不再执行外部副作用。优雅关闭为协作式，阻塞 handler 需自行退出；完成提交与信号存在顺序竞争，已提交成功不撤销。未测断电或网络文件系统。仅本阶段，无残留子进程、无提交推送。\n+",
+      "is_error": false
+    },
+    {
+      "seq": 1017,
+      "call": {
+        "id": "call_426819b07fa743dc8ffc532c71463ada",
+        "name": "write_file",
+        "arguments": "{\"content\":\"# Phase 02 — concurrency\\n\\n本阶段完成。未启动阶段三，无网络、子 agent、依赖安装或提交推送。\\n\\n## 实际验证\\n\\n命令：`python3 tools/test_receipt.py --phase 02`。包装器真实执行 `python3 -m unittest discover -s tests -v`。\\n\\n**19 tests in 1.700s，OK，exit_code=0**。原有 14 项 core 测试未删除或修改，新增 5 项真实多进程测试。原始输出见 [phase-02-tests.txt](phase-02-tests.txt)，执行时间、解释器及命令见 [phase-02-run.json](phase-02-run.json)。\\n\\n| 不变量 | 实际观察 / 证据 |\\n| --- | --- |\\n| 同一任务只能有一个有效领取者 | 6 个 spawn 子进程，各自打开独立连接，经 IPC 同时放行。仅一个返回任务，其他均为空；attempt=1，数据库 token 等于赢家 token。所有进程正常退出。见 [competition](phase-02-competition.json) |\\n| 真正终止后可重领 | 持有者 PID 21419 被 SIGKILL，join 确认 exitcode=-9。旧租约截止 1010；1009.999 不可领取，1010 可领取。相同 ID，attempt 1→2，token 从 76f074fe2d7f43c596d50081b34e99b1 变为 ef78c1e6abbb47b998251dd148d66d54；新持有者完成 recovered。见 [crash](phase-02-crash.json) |\\n| 旧持有者不得覆盖新领取结果 | 旧进程保持存活且其时钟仍为 1000；父进程在 1010 重领。旧进程 succeed 和 fail 均得到 LeaseLost；新租约完整快照不变，新持有者成功写入 new owner。见 [fencing](phase-02-fencing.json) |\\n| 优雅关闭不误报成功 | handler 已进入后发送真实 SIGTERM，等待信号确认，再让 handler 返回；worker 抛 WorkerStopped 并正常退出，任务仍 running、result=null，之后 attempt=2 可重领。见 [shutdown](phase-02-shutdown.json) |\\n| 锁等待有界且可恢复 | 独立进程持 BEGIN IMMEDIATE 写锁；0.15s 预算实测 0.1753655s，得到 QueueBusy。事务未打开、未插入任务；初始化也明确失败，CLI 退出码 2。释放锁后提交成功。见 [lock](phase-02-lock.json) |\\n\\n## 实现变更\\n\\n- `Queue(..., lock_timeout=1.0)`，正有限秒数；默认从固定 10 秒降为 1 秒。初始化及写事务的锁错误翻译为 `QueueBusy`，不无限重试；回滚仅在事务实际打开时执行。\\n- CLI `--lock-timeout` 传入连接，错误 JSON 和退出码 2。\\n- `run_once(..., handler=execute, stop=StopToken())` 支持协作式关闭；实际默认参数为 None 时创建 token。`shutdown_signals` 安装并恢复 SIGTERM/SIGINT 处理器，CLI 停止返回 130。关闭不转换为失败或成功，而是保留未完成租约。\\n- SQLite schema 仍为 v1；未改表，不需要迁移。\\n\\n## 证据边界与剩余限制\\n\\n1. 真实多进程、真实信号终止、真实 SQLite 锁等待；租约时间使用注入时钟推进，无人工 sleep，不宣称已经进行现实时间 10 秒等待。\\n2. 唯一有效租约不等于只有一个 handler 在执行。过期后旧进程可能仍产生外部副作用，token 只能阻止写回队列；仍是至少一次执行，handler 应幂等。\\n3. 优雅关闭是协作式：信号仅设置停止标志，不打断任意阻塞 handler。任务完成检查之前观察到停止才保留租约；已完成提交不撤销，信号与提交的临界顺序不提供强原子关闭保证。\\n4. SQLite timeout 是每次锁获取的等待预算，不是整个 CLI 的硬实时截止；调度存在额外耗时。测试上界 2 秒，未宣称精准 150ms。\\n5. 信号测试验证 POSIX 环境。没有续租、断电注入或网络文件系统保证。spawn 子进程均 join；异常清理也仅终止测试自身创建的子进程，无后台服务。\\n\",\"file_path\":\"artifacts/phase-02.md\"}"
+      },
+      "result": "Created /workspace/joblab/artifacts/phase-02.md (3634 bytes, 32 lines)",
+      "is_error": false
+    },
+    {
+      "seq": 1024,
+      "call": {
+        "id": "call_c601459c2c7140f18311efe190c6d203",
+        "name": "edit_file",
+        "arguments": "{\"file_path\":\"README.md\",\"replace_all\":false,\"new_string\":\"- `BEGIN IMMEDIATE` 串行化写入、领取和终结；SQLite WAL 和 `synchronous=FULL` 用于持久化。`Queue(path, lock_timeout=1.0)` 配置正有限秒数的锁等待预算，默认 1 秒；初始化或写事务锁等待失败抛 `QueueBusy`，CLI 输出错误 JSON、退出码 2。预算为每次 SQLite 锁获取的等待时间，不是整个操作的硬实时上限。\",\"old_string\":\"- `BEGIN IMMEDIATE` 串行化写入、领取和终结；SQLite WAL 和 `synchronous=FULL` 用于持久化。数据库锁等待超时为 10 秒。\"}"
+      },
+      "result": "Edited /workspace/joblab/README.md (1 replacement)\n@@ -44,7 +44,7 @@\n - 显式失败后，等待 `backoff * 2 ** (attempts - 1)` 秒；在 `available_at` 精确边界可领取。最后一次失败直接成为 `failed`。\n - 租约区间为半开区间：`now < lease_until` 才有效。到期可立即重领；最后一次尝试到期由下一次 `claim` 标记为失败。查询不触发回收，因此尚未被领取操作处理的过期任务仍显示 `running`。\n - 去重 key 在该数据库内永久保留，包括终态；重复提交返回原任务，不覆盖原载荷或重试配置。不带 key 的提交彼此独立。\n-- `BEGIN IMMEDIATE` 串行化写入、领取和终结；SQLite WAL 和 `synchronous=FULL` 用于持久化。数据库锁等待超时为 10 秒。\n+- `BEGIN IMMEDIATE` 串行化写入、领取和终结；SQLite WAL 和 `synchronous=FULL` 用于持久化。`Queue(path, lock_timeout=1.0)` 配置正有限秒数的锁等待预算，默认 1 秒；初始化或写事务锁等待失败抛 `QueueBusy`，CLI 输出错误 JSON、退出码 2。预算为每次 SQLite 锁获取的等待时间，不是整个操作的硬实时上限。\n - schema 版本使用 `PRAGMA user_version=1`。仅初始化空数据库；未知版本或非空无版本数据库拒绝打开。当前没有升级迁移，未来阶段需显式添加。\n \n ## 限制",
+      "is_error": false
+    },
+    {
+      "seq": 1031,
+      "call": {
+        "id": "call_b3b8f9bb92dc46a79f4f87721dc7087e",
+        "name": "edit_file",
+        "arguments": "{\"file_path\":\"README.md\",\"replace_all\":false,\"new_string\":\"第二条命令调用同一 unittest suite，默认保存回执到阶段一文件。阶段二请使用下述命令，避免覆盖历史回执：\\n\\n```sh\\npython3 tools/test_receipt.py --phase 02\\npython3 -m joblab --db demo.sqlite3 --lock-timeout 0.5 worker --limit 10\\n```\\n\\n## 多进程与优雅关闭\\n\\n每个进程必须自行创建 Queue，不能跨进程共享连接。多个 worker 可竞争同一数据库，每个任务同时最多存在一个有效租约。测试通过 spawn 创建独立进程并记录 PID、attempt、lease token 和最终状态。\\n\\nCLI worker 在运行循环内捕获 SIGTERM/SIGINT，仅设置停止请求；不在信号处理器中修改数据库。`run_once(queue, handler=execute, stop=None)` 在领取前、执行前、提交结果前检查停止标志。观察到停止后抛 `WorkerStopped`，保留未完成租约，不误标成功，CLI 返回 130。库调用者可使用 `StopToken` 与 `shutdown_signals(stop)`（主线程），或直接调用 `stop.request()`；长时间 handler 可自行调用 `stop.check()` 协作退出。\\n\\n关闭不会强制打断阻塞 handler；完成提交与信号存在先后竞争，已经提交的成功不会撤销。SIGKILL 后无清理逻辑运行，依赖租约到期重领。旧 handler 仍可能执行副作用，但旧 token 不能覆盖新持有者的结果。\\n\\n临时数据库均创建在本项目内并清理；测试无人工 sleep。阶段二原始输出与元数据在 `artifacts/phase-02-tests.txt`、`artifacts/phase-02-run.json`，五份事实 JSON 与限制说明见 `artifacts/phase-02.md`；阶段一历史证据见 `artifacts/phase-01.md`。\",\"old_string\":\"第二条命令调用同一 unittest suite，保存原始输出与执行元数据至 `artifacts/phase-01-tests.txt`、`artifacts/phase-01-run.json`。临时数据库创建在本项目内并自动清理；并发测试使用真实独立数据库连接，CLI 测试使用真实子进程，无人工 sleep。阶段总结见 `artifacts/phase-01.md`。\"}"
+      },
+      "result": "Edited /workspace/joblab/README.md (1 replacement)\n@@ -58,4 +58,19 @@\n python3 tools/test_receipt.py\n ```\n \n-第二条命令调用同一 unittest suite，保存原始输出与执行元数据至 `artifacts/phase-01-tests.txt`、`artifacts/phase-01-run.json`。临时数据库创建在本项目内并自动清理；并发测试使用真实独立数据库连接，CLI 测试使用真实子进程，无人工 sleep。阶段总结见 `artifacts/phase-01.md`。\n+第二条命令调用同一 unittest suite，默认保存回执到阶段一文件。阶段二请使用下述命令，避免覆盖历史回执：\n+\n+```sh\n+python3 tools/test_receipt.py --phase 02\n+python3 -m joblab --db demo.sqlite3 --lock-timeout 0.5 worker --limit 10\n+```\n+\n+## 多进程与优雅关闭\n+\n+每个进程必须自行创建 Queue，不能跨进程共享连接。多个 worker 可竞争同一数据库，每个任务同时最多存在一个有效租约。测试通过 spawn 创建独立进程并记录 PID、attempt、lease token 和最终状态。\n+\n+CLI worker 在运行循环内捕获 SIGTERM/SIGINT，仅设置停止请求；不在信号处理器中修改数据库。`run_once(queue, handler=execute, stop=None)` 在领取前、执行前、提交结果前检查停止标志。观察到停止后抛 `WorkerStopped`，保留未完成租约，不误标成功，CLI 返回 130。库调用者可使用 `StopToken` 与 `shutdown_signals(stop)`（主线程），或直接调用 `stop.request()`；长时间 handler 可自行调用 `stop.check()` 协作退出。\n+\n+关闭不会强制打断阻塞 handler；完成提交与信号存在先后竞争，已经提交的成功不会撤销。SIGKILL 后无清理逻辑运行，依赖租约到期重领。旧 handler 仍可能执行副作用，但旧 token 不能覆盖新持有者的结果。\n+\n+临时数据库均创建在本项目内并清理；测试无人工 sleep。阶段二原始输出与元数据在 `artifacts/phase-02-tests.txt`、`artifacts/phase-02-run.json`，五份事实 JSON 与限制说明见 `artifacts/phase-02.md`；阶段一历史证据见 `artifacts/phase-01.md`。",
+      "is_error": false
+    },
+    {
+      "seq": 1038,
+      "call": {
+        "id": "call_35d4e187ec774c5184c3e621256008c1",
+        "name": "todowrite",
+        "arguments": "{\"action\":\"update\",\"content\":\"\",\"id\":4,\"todos\":[{\"content\":\"检查现有领取、锁等待及 worker 退出路径\",\"status\":\"completed\"},{\"content\":\"实现有界锁错误与安全的优雅关闭\",\"status\":\"completed\"},{\"content\":\"运行真实多进程竞争、终止和租约 fencing 测试并记录事实\",\"status\":\"completed\"},{\"content\":\"更新阶段二证据、README 和 WORKLOG\",\"status\":\"completed\"}],\"status\":\"completed\"}"
+      },
+      "result": "[x] 1. 检查现有领取、锁等待及 worker 退出路径\n[x] 2. 实现有界锁错误与安全的优雅关闭\n[x] 3. 运行真实多进程竞争、终止和租约 fencing 测试并记录事实\n[x] 4. 更新阶段二证据、README 和 WORKLOG",
+      "is_error": false
+    }
+  ]
+}

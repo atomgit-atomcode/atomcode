@@ -380,7 +380,24 @@ fn a_compaction_keeps_the_head_it_names_and_never_unfolds_an_earlier_one() {
     });
     log.append(said(4, "q4"));
 
-    let texts: Vec<String> = log.derive_messages().into_iter().map(|m| m.text).collect();
+    let messages = log.derive_messages();
+    assert_eq!(
+        messages[1].internal_origin.as_deref(),
+        Some(atomcode_kernel::message::COMPACTION_RETAINED_MODEL_ORIGIN)
+    );
+    assert_ne!(
+        messages[1].text,
+        messages[1].display_text(),
+        "the model must see historical framing"
+    );
+    assert!(
+        messages[2].internal_origin.is_none(),
+        "the newest request stays fresh"
+    );
+    let texts: Vec<String> = messages
+        .iter()
+        .map(|m| m.display_text().to_owned())
+        .collect();
     assert_eq!(
         texts,
         vec!["S2", "q2", "q4"],
@@ -461,7 +478,16 @@ fn a_seeded_summary_gives_way_to_a_later_compaction() {
         from: q1,
     });
 
-    let texts: Vec<String> = log.derive_messages().into_iter().map(|m| m.text).collect();
+    let messages = log.derive_messages();
+    assert_eq!(
+        messages[1].internal_origin.as_deref(),
+        Some(atomcode_kernel::message::COMPACTION_RETAINED_MODEL_ORIGIN)
+    );
+    assert_ne!(messages[1].text, messages[1].display_text());
+    let texts: Vec<String> = messages
+        .iter()
+        .map(|m| m.display_text().to_owned())
+        .collect();
     assert_eq!(texts, vec!["LATER", "q1", "q2"]);
 }
 
@@ -507,17 +533,19 @@ fn renumbering_moves_a_compactions_references_with_its_events() {
             at: 0,
         },
     ];
-    let before: Vec<String> = derive_messages(&events)
-        .into_iter()
-        .map(|m| m.text)
-        .collect();
+    let before = derive_messages(&events);
     let moved = atomcode_harness::session::renumber(events, 101);
-    let after: Vec<String> = derive_messages(&moved)
-        .into_iter()
-        .map(|m| m.text)
-        .collect();
-    assert_eq!(before, vec!["S", "q1", "q2, cut"]);
-    assert_eq!(after, before, "the same conversation under new numbers");
+    let after = derive_messages(&moved);
+    let texts: Vec<_> = before.iter().map(|m| m.display_text()).collect();
+    assert_eq!(texts, vec!["S", "q1", "q2, cut"]);
+    assert_eq!(
+        before[1].internal_origin.as_deref(),
+        Some(atomcode_kernel::message::COMPACTION_RETAINED_MODEL_ORIGIN)
+    );
+    assert_eq!(
+        after, before,
+        "the same conversation and historical provenance under new numbers"
+    );
 }
 
 #[test]
