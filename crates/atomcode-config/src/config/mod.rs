@@ -4741,6 +4741,9 @@ api_key = "sk-legacy"
 model = "deepseek-chat"
 context_window = 128000
 capable_model = 3
+
+[providers.MyDeepSeek.headers]
+X-Custom-Auth = "legacy-header-secret"
 "#;
 
     #[test]
@@ -4751,6 +4754,15 @@ capable_model = 3
         assert_eq!(a.provider, "openai");
         assert_eq!(a.base_url.as_deref(), Some("https://api.deepseek.com/v1"));
         assert_eq!(a.api_key.as_deref(), Some("sk-legacy"));
+        // A legacy flat entry carries custom headers like any account: the
+        // connection editor writes them in place, and the projection must not
+        // drop them on the way to the runtime.
+        let got = a.headers.iter().collect::<Vec<_>>();
+        assert_eq!(
+            got,
+            vec![("x-custom-auth", "legacy-header-secret")],
+            "legacy headers survive the projection: {got:?}"
+        );
 
         let models = cfg.logical_models();
         let m = models.get("MyDeepSeek").expect("synthetic model");
@@ -4762,6 +4774,15 @@ capable_model = 3
         assert_eq!(
             cfg.effective_model_selection().as_deref(),
             Some("MyDeepSeek")
+        );
+
+        // And the resolution the provider factory consumes carries them too.
+        let resolved = cfg.resolve_model(None).expect("legacy resolves");
+        let got = resolved.headers.iter().collect::<Vec<_>>();
+        assert_eq!(
+            got,
+            vec![("x-custom-auth", "legacy-header-secret")],
+            "resolved model keeps the legacy headers: {got:?}"
         );
     }
 
