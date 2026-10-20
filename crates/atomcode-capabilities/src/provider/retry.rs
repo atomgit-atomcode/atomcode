@@ -4,9 +4,10 @@
 //! transparently reopen the request, but only until replay-sensitive output (text,
 //! reasoning, or tool data) reaches the consumer. Metadata alone is replay-safe.
 //!
-//! HTTP 429 ownership is selected per call: direct consumers retain the bounded
-//! provider OPEN retry, while kernel turns surface the first 429 so their
-//! lifecycle can provide cancellable waits, countdowns, and a fuse.
+//! Direct consumers retain bounded adapter retries. Budgeted native calls
+//! delegate transient OPEN and no-output stream retries to their request owner,
+//! so every retry/continuation uses one allowance and cancellable wait policy.
+//! HTTP 429 ownership is also selectable independently for older direct callers.
 
 use std::time::Duration;
 
@@ -91,6 +92,30 @@ pub struct RetryPolicy {
     pub max_attempts: u32,
     pub base_delay: Duration,
     pub max_delay: Duration,
+}
+
+/// Budgeted native calls have one retry owner. Standalone providers retain
+/// their own policy; a caller's explicit zero still means one OPEN attempt.
+pub(crate) fn policy_for_call(
+    policy: &RetryPolicy,
+    options: &atomcode_kernel::provider::ChatOptions,
+) -> RetryPolicy {
+    if options.request_recovery.is_some() {
+        RetryPolicy::none()
+    } else {
+        policy.clone()
+    }
+}
+
+pub(crate) fn recovery_exhausted(
+    limit: atomcode_kernel::provider::RecoveryExhausted,
+) -> atomcode_kernel::stream::ProviderError {
+    atomcode_kernel::stream::ProviderError {
+        retryable: true,
+        code: Some(atomcode_kernel::provider::REQUEST_RECOVERY_EXHAUSTED_CODE.into()),
+        message: limit.to_string(),
+        ..Default::default()
+    }
 }
 
 impl RetryPolicy {

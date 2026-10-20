@@ -200,17 +200,14 @@ pub struct CodingAgentConfig {
     /// Disable TLS certificate verification (self-signed / internal gateways).
     /// Sourced from `ProviderConfig::skip_tls_verify`; default false.
     pub skip_tls_verify: bool,
-    /// Max attempts (including the first request) for provider OPEN retries;
-    /// when set, also caps kernel-owned HTTP 429 recovery. `None` preserves
-    /// each layer's default.
+    /// Total attempts for a native logical model request, shared by OPEN,
+    /// transient retry, 429 and stream continuation. `None` uses six.
+    /// An explicit upstream retry count takes precedence.
     /// Sourced from `ProviderConfig::retry_max_attempts`.
     pub retry_max_attempts: Option<u32>,
-    /// Global cap on the VISIBLE kernel provider-retry tier (the `重试(N/M)`
-    /// re-opens, now with patient exponential backoff that honors `Retry-After`).
-    /// Sourced from `[network] upstream_retry_max_attempts`. `None` keeps the
-    /// kernel default. When set it takes precedence over the `retry_max_attempts`
-    /// → disable-kernel coupling, so a user on a flaky gateway can keep the fast
-    /// adapter budget small AND make the patient tier more persistent.
+    /// Retry count after the initial attempt, sourced from `[network]
+    /// upstream_retry_max_attempts`. When set, the native shared total is this
+    /// count plus one, taking precedence over the provider's total-attempt cap.
     pub upstream_retry_max_attempts: Option<u32>,
     /// Full provider registry used to resolve task-tool fast/capable tiers.
     pub subagent_config: Option<Arc<atomcode_config::config::Config>>,
@@ -304,13 +301,12 @@ pub struct CodingRuntimeConfig {
     pub user_agent: Option<String>,
     pub headers: atomcode_config::provider_headers::ProviderHeaders,
     pub skip_tls_verify: bool,
-    /// Max attempts (including the first request) for provider OPEN retries;
-    /// when set, also caps kernel-owned HTTP 429 recovery. `None` preserves
-    /// each layer's default.
+    /// Total attempts for a native logical model request, shared by OPEN,
+    /// transient retry, 429 and stream continuation. `None` uses six.
+    /// An explicit upstream retry count takes precedence.
     pub retry_max_attempts: Option<u32>,
-    /// Global cap on the visible kernel provider-retry tier (`[network]
-    /// upstream_retry_max_attempts`). `None` keeps the kernel default; takes
-    /// precedence over the `retry_max_attempts`→disable-kernel coupling.
+    /// Retry count after the first attempt (`[network] upstream_retry_max_attempts`).
+    /// Takes precedence over the provider's shared total-attempt cap.
     pub upstream_retry_max_attempts: Option<u32>,
     pub loop_max_rounds: u32,
     pub turn_max_rounds: u32,

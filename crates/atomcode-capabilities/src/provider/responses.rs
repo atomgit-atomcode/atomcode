@@ -747,7 +747,9 @@ impl LlmProvider for ResponsesProvider {
             }
         };
 
-        let policy = self.cfg.retry.clone();
+        let policy = retry::policy_for_call(&self.cfg.retry, options);
+        let caller_recovers = options.request_recovery.is_some();
+        let request_recovery = options.request_recovery.clone();
         let client = self.client.clone();
         let url = self.url.clone();
         let signer = self.cfg.request_signer.clone();
@@ -766,6 +768,7 @@ impl LlmProvider for ResponsesProvider {
             &session_id,
             &policy,
             rate_limit_retry_owner,
+            request_recovery.as_ref(),
             open_timeout,
         )
         .await
@@ -782,7 +785,7 @@ impl LlmProvider for ResponsesProvider {
         };
 
         let s = async_stream::stream! {
-            const MAX_STREAM_ATTEMPTS: u32 = 3;
+            let max_stream_attempts: u32 = if caller_recovers { 1 } else { 3 };
             let mut stream_attempt = 1u32;
             let mut reconnect_attempts = 0u32;
             let mut resp = resp;
@@ -804,7 +807,9 @@ impl LlmProvider for ResponsesProvider {
                     .await
                     {
                         Err(_elapsed) => {
-                            yield StreamEvent::Error(retry::stream_idle_error());
+                            let mut error = retry::stream_idle_error();
+                            error.retryable = caller_recovers && !emitted_replay_sensitive;
+                            yield StreamEvent::Error(error);
                             return;
                         }
                         Ok(None) => {
@@ -825,7 +830,7 @@ impl LlmProvider for ResponsesProvider {
                             return;
                         }
                         Ok(Some(Err(e))) => {
-                            if !emitted_replay_sensitive && stream_attempt < MAX_STREAM_ATTEMPTS {
+                            if !emitted_replay_sensitive && stream_attempt < max_stream_attempts {
                                 reconnect_attempts += 1;
                                 tokio::time::sleep(retry::compute_backoff(stream_attempt, &policy)).await;
                                 if retry::is_stale_connection_error(&e)
@@ -839,15 +844,24 @@ impl LlmProvider for ResponsesProvider {
                                     }
                                 }
                                 if let Ok(fresh) =
-                                    open_stream(&client, &url, &body_bytes, &signer, &api_key, &session_id, &policy, rate_limit_retry_owner, open_timeout).await
+                                    open_stream(&client, &url, &body_bytes, &signer, &api_key, &session_id, &policy, rate_limit_retry_owner, request_recovery.as_ref(), open_timeout).await
                                 {
                                     stream_attempt += 1;
                                     resp = fresh;
                                     continue 'reopen;
                                 }
                             }
+                            // Repair the pool for the caller's next attempt without
+                            // opening a hidden request or replaying content here.
+                            if caller_recovers && (retry::is_stale_connection_error(&e) || retry::chain_has_tls_corruption(&e)) {
+                                let capped = client.is_tls12() || atomcode_config::tls::should_cap_url(&url);
+                                if let Err(error) = client.rebuild(capped) {
+                                    yield StreamEvent::Error(error);
+                                    return;
+                                }
+                            }
                             yield StreamEvent::Error(ProviderError {
-                                retryable: false,
+                                retryable: caller_recovers && !emitted_replay_sensitive,
                                 code: retry::stream_read_error_code(&e),
                                 message: retry::stream_read_error_message(
                                     &e,

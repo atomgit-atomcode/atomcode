@@ -37,6 +37,44 @@ fn parse<T: for<'de> Deserialize<'de> + Default>(config: &Value) -> Result<T, St
     serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))
 }
 
+/// Charge one existing recovery handler's whole wait to the logical request.
+/// A missing retry row retains the standalone handler's historical behavior.
+/// No mutex is held across sleep; cancellation drops the request and its budget.
+pub fn reserve_recovery_wait(
+    req: &ModelRequest,
+    wait: Duration,
+    reason: &str,
+) -> Result<(), String> {
+    let Some(budget) = &req.options.request_recovery else {
+        return Ok(());
+    };
+    match budget.reserve_wait(wait) {
+        Ok(state) => {
+            tracing::info!(
+                turn = req.turn,
+                round = req.round,
+                reason,
+                attempts = state.attempts,
+                max_attempts = state.max_attempts,
+                wait_ms = wait.as_millis() as u64,
+                reserved_wait_ms = state.reserved_wait.as_millis() as u64,
+                max_wait_ms = state.max_wait.as_millis() as u64,
+                "shared request recovery scheduled"
+            );
+            Ok(())
+        }
+        Err(limit) => {
+            tracing::warn!(turn = req.turn, round = req.round, reason,
+                attempts = limit.snapshot.attempts, max_attempts = limit.snapshot.max_attempts,
+                reserved_wait_ms = limit.snapshot.reserved_wait.as_millis() as u64,
+                max_wait_ms = limit.snapshot.max_wait.as_millis() as u64,
+                requested_wait_ms = wait.as_millis() as u64,
+                limit = ?limit.limit, "shared request recovery exhausted");
+            Err(limit.to_string())
+        }
+    }
+}
+
 // ---- rate limiting ------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
@@ -139,6 +177,12 @@ impl Waterfall<AgentRequest> for RateLimit {
                                 error.message,
                                 wait.as_secs()
                             ),
+                            ..error
+                        });
+                    }
+                    if let Err(why) = reserve_recovery_wait(req, wait, "rate_limit") {
+                        return Err(RequestError {
+                            message: format!("{} ({why})", error.message),
                             ..error
                         });
                     }
@@ -317,6 +361,13 @@ impl Waterfall<AgentRequest> for OverflowLadder {
             match next.run(req).await {
                 Ok(response) => return Ok(response),
                 Err(error) if error.context_overflow && attempt < self.max_attempts => {
+                    if let Err(why) = reserve_recovery_wait(req, Duration::ZERO, "context_overflow")
+                    {
+                        return Err(RequestError {
+                            message: format!("{} ({why})", error.message),
+                            ..error
+                        });
+                    }
                     if let Err(why) = self.shrink(req, &mut attempt, "context overflow").await {
                         return Err(RequestError {
                             message: format!("{} ({why})", error.message),
@@ -635,6 +686,12 @@ impl Waterfall<AgentRequest> for StreamRecovery {
                 return Err(error);
             };
             let delay_secs = (1u64 << (attempt - 1).min(3)).min(8);
+            if let Err(why) =
+                reserve_recovery_wait(req, Duration::from_secs(delay_secs), "stream_continuation")
+            {
+                error.message = format!("{} ({why})", error.message);
+                return Err(error);
+            }
             notice(
                 &self.ctx,
                 NoticeKind::ProviderRetry,

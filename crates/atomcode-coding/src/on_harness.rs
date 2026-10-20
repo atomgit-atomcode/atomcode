@@ -652,7 +652,7 @@ fn persona_patch(app: &App, model: &str) -> serde_json::Value {
 /// every model switch, because each one is a fact about the model.
 /// What `llm-retry` carries in `bundle::INFRA`, restated here because a swap to
 /// a provider with no opinion has to actively put it back.
-const DEFAULT_RETRY_ATTEMPTS: u32 = 3;
+const DEFAULT_RETRY_ATTEMPTS: u32 = 6;
 
 #[derive(serde::Serialize)]
 struct CodeReviewModelPatch<'a> {
@@ -694,14 +694,16 @@ struct RetryPatch {
     attempts: u32,
     backoff_ms: u64,
     cap_ms: u64,
+    recovery_wait_secs: u64,
 }
 
 /// Rows whose config follows the running model — patched at mount and again on
 /// every model switch, because each one is a fact about the model.
 fn model_rows(cfg: &crate::CodingAgentConfig) -> Result<Layer, String> {
     // Retries. An explicit upstream budget is the visible tier and wins; an
-    // explicit per-model adapter budget otherwise switches the outer tier off,
-    // the coupling the chain applies. Attempts count the first request.
+    // explicit provider budget becomes the shared total. Budgeted native calls
+    // delegate adapter retries to this row, so the tiers cannot multiply.
+    // Attempts count the first request.
     //
     // Always emitted, never conditional: a swap TO a provider that says nothing
     // has to put the default back, and a patch that is simply absent leaves the
@@ -709,7 +711,7 @@ fn model_rows(cfg: &crate::CodingAgentConfig) -> Result<Layer, String> {
     // `the_retry_budget_follows_a_model_switch`.
     let attempts = match (cfg.upstream_retry_max_attempts, cfg.retry_max_attempts) {
         (Some(n), _) => n.saturating_add(1),
-        (None, Some(_)) => 1,
+        (None, Some(n)) => n.max(1),
         (None, None) => DEFAULT_RETRY_ATTEMPTS,
     };
     Layer::new()
@@ -731,7 +733,7 @@ fn model_rows(cfg: &crate::CodingAgentConfig) -> Result<Layer, String> {
                 max_waits: 5,
                 max_wait_secs: 120,
                 fallback_secs: 5,
-                max_attempts: cfg.retry_max_attempts,
+                max_attempts: Some(attempts),
             },
         )
         .map_err(|e| e.to_string())?
@@ -760,6 +762,7 @@ fn model_rows(cfg: &crate::CodingAgentConfig) -> Result<Layer, String> {
                 attempts,
                 backoff_ms: 3000,
                 cap_ms: 30000,
+                recovery_wait_secs: 300,
             },
         )
         .map_err(|e| e.to_string())

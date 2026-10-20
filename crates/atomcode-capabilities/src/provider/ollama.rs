@@ -196,7 +196,8 @@ impl LlmProvider for OllamaProvider {
 
         // Open the stream. A hard failure here returns `Err` so the kernel's
         // agent-layer open retry still applies.
-        let policy = self.cfg.retry.clone();
+        let policy = retry::policy_for_call(&self.cfg.retry, options);
+        let caller_recovers = options.request_recovery.is_some();
         let client = self.client.clone();
         let url = self.url.clone();
         let api_key = self.cfg.api_key.clone();
@@ -224,7 +225,7 @@ impl LlmProvider for OllamaProvider {
             // 1 initial open + up to 2 transparent reopens — a gateway resetting
             // connections under load can drop more than one attempt before a
             // healthy backend answers.
-            const MAX_STREAM_ATTEMPTS: u32 = 3;
+            let max_stream_attempts: u32 = if caller_recovers { 1 } else { 3 };
             let mut stream_attempt = 1u32;
             let mut reconnect_attempts = 0u32;
             let mut resp = resp;
@@ -246,7 +247,9 @@ impl LlmProvider for OllamaProvider {
                     .await
                     {
                         Err(_elapsed) => {
-                            yield StreamEvent::Error(retry::stream_idle_error());
+                            let mut error = retry::stream_idle_error();
+                            error.retryable = caller_recovers && !emitted_replay_sensitive;
+                            yield StreamEvent::Error(error);
                             return;
                         }
                         Ok(None) => {
@@ -267,7 +270,7 @@ impl LlmProvider for OllamaProvider {
                             return;
                         }
                         Ok(Some(Err(e))) => {
-                            if !emitted_replay_sensitive && stream_attempt < MAX_STREAM_ATTEMPTS {
+                            if !emitted_replay_sensitive && stream_attempt < max_stream_attempts {
                                 reconnect_attempts += 1;
                                 // Brief, esc-interruptible backoff before reopening so an
                                 // immediate retry does not slam a gateway resetting under load.
@@ -279,7 +282,7 @@ impl LlmProvider for OllamaProvider {
                                 }
                             }
                             yield StreamEvent::Error(ProviderError {
-                                retryable: false,
+                                retryable: caller_recovers && !emitted_replay_sensitive,
                                 code: retry::stream_read_error_code(&e),
                                 message: retry::stream_read_error_message(
                                     &e,

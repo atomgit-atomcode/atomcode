@@ -237,6 +237,9 @@ struct RetryRow {
     /// minutes-long wait.
     #[serde(default = "default_cap")]
     cap_ms: u64,
+    /// Cumulative recovery waiting, not a deadline on inference or output.
+    #[serde(default = "default_recovery_wait_secs")]
+    recovery_wait_secs: u64,
 }
 
 impl Default for RetryRow {
@@ -245,12 +248,17 @@ impl Default for RetryRow {
             attempts: default_attempts(),
             backoff_ms: default_backoff(),
             cap_ms: default_cap(),
+            recovery_wait_secs: default_recovery_wait_secs(),
         }
     }
 }
 
+fn default_recovery_wait_secs() -> u64 {
+    300
+}
+
 fn default_attempts() -> u32 {
-    3
+    6
 }
 
 fn default_backoff() -> u64 {
@@ -262,15 +270,15 @@ fn default_cap() -> u64 {
 }
 
 /// The longest a server `Retry-After` may hold a retry. A hostile or
-/// misconfigured hint must not park the turn for minutes; our own schedule
-/// would not have.
+/// misconfigured hint must not park the turn for minutes. Longer hints stop
+/// automatic recovery; they must never be shortened into an early retry.
 const RETRY_AFTER_CAP: Duration = Duration::from_secs(60);
 
 /// How long to wait before retry number `attempt` (1-based).
 ///
 /// A server `Retry-After` is authoritative — the gateway is saying exactly when
-/// to come back — clamped to `[1s, RETRY_AFTER_CAP]`: zero would busy-spin, and
-/// the ceiling keeps a bad hint from stalling the turn. Without a hint the wait
+/// to come back. The caller refuses hints over `RETRY_AFTER_CAP`; zero is
+/// floored to one second to avoid busy-spinning. Without a hint the wait
 /// doubles from `base` and stops at `cap`, so a sustained-but-transient gateway
 /// failure (a relay's momentary "no upstream available") gets a real window to
 /// clear instead of three quick pokes.
@@ -281,7 +289,7 @@ pub(crate) fn retry_backoff(
     retry_after: Option<Duration>,
 ) -> Duration {
     if let Some(hint) = retry_after {
-        return hint.clamp(Duration::from_secs(1), RETRY_AFTER_CAP);
+        return hint.max(Duration::from_secs(1));
     }
     // Bounded shift: a large configured `attempts` must not overflow `1 << n`.
     let shift = attempt.saturating_sub(1).min(20);
@@ -293,6 +301,7 @@ struct Retry {
     attempts: u32,
     base: Duration,
     cap: Duration,
+    recovery_wait: Duration,
 }
 
 #[async_trait]
@@ -302,6 +311,11 @@ impl Waterfall<AgentRequest> for Retry {
         req: &mut ModelRequest,
         next: Next<'_, AgentRequest>,
     ) -> Result<ModelResponse, RequestError> {
+        // A 429, overflow or continuation re-enters this row with the SAME
+        // allowance. Never refill it just because a different handler retries.
+        req.options.request_recovery.get_or_insert_with(|| {
+            atomcode_kernel::provider::RequestRecoveryBudget::new(self.attempts, self.recovery_wait)
+        });
         let mut attempt = 1;
         loop {
             // `Next` is `Copy`, so delegating again genuinely re-runs the
@@ -318,6 +332,7 @@ impl Waterfall<AgentRequest> for Retry {
                     // spends the budget on a round that was already finished.
                     let nothing_to_add = error.empty_response && req.answering_a_nudge;
                     let worth_retrying = !error.is_fatal()
+                        && error.code.as_deref() != Some(atomcode_kernel::provider::REQUEST_RECOVERY_EXHAUSTED_CODE)
                         && !nothing_to_add
                         && error.partial.is_none()
                         && !error.unexecuted_tool_output
@@ -328,9 +343,43 @@ impl Waterfall<AgentRequest> for Retry {
                         && !error.is_rate_limited()
                         && !error.context_overflow;
                     if attempt >= self.attempts || !worth_retrying {
+                        let mut error = error;
+                        if worth_retrying {
+                            if let Err(why) = super::recovery::reserve_recovery_wait(
+                                req,
+                                Duration::ZERO,
+                                "provider_retry",
+                            ) {
+                                error.message = format!("{} ({why})", error.message);
+                            }
+                        }
+                        tracing::debug!(
+                            local_attempt = attempt,
+                            max_local_attempts = self.attempts,
+                            retryable = worth_retrying,
+                            http_status = error.http_status,
+                            code = error.code.as_deref(),
+                            "provider retry finished without another attempt"
+                        );
+                        return Err(error);
+                    }
+                    if error.retry_after.is_some_and(|hint| hint > RETRY_AFTER_CAP) {
+                        tracing::info!(
+                            attempt,
+                            retry_after_secs = error.retry_after.unwrap().as_secs(),
+                            "provider retry stopped: server wait exceeds automatic recovery allowance"
+                        );
                         return Err(error);
                     }
                     let wait = retry_backoff(attempt, self.base, self.cap, error.retry_after);
+                    if let Err(why) =
+                        super::recovery::reserve_recovery_wait(req, wait, "provider_retry")
+                    {
+                        return Err(RequestError {
+                            message: format!("{} ({why})", error.message),
+                            ..error
+                        });
+                    }
                     // A silent re-issue reads as "nothing happened" to a person
                     // watching a stalled turn. Logged, so every front end can
                     // show it and a replay can explain the gap.
@@ -341,18 +390,28 @@ impl Waterfall<AgentRequest> for Retry {
                     // sentence. The error itself is the one thing that tells a
                     // dead proxy from a silent gateway, so it is never reduced
                     // to a category here.
+                    let shared = req.options.request_recovery.as_ref().map(|b| b.snapshot());
+                    let (retry_number, max_retries) = match shared {
+                        Some(state) if state.attempts > 0 => {
+                            (state.attempts, state.max_attempts.saturating_sub(1))
+                        }
+                        _ => (attempt, self.attempts.saturating_sub(1)),
+                    };
                     super::recovery::notice_with(
                         &self.ctx,
                         crate::session::NoticeKind::ProviderRetry,
                         error.message.clone(),
                         Some(crate::session::RetryAttempt {
-                            attempt,
-                            max_attempts: self.attempts.saturating_sub(1),
+                            attempt: retry_number,
+                            max_attempts: max_retries,
                             backoff_secs: wait.as_secs(),
                         }),
                     );
                     tokio::time::sleep(wait).await;
                     attempt += 1;
+                    // The native provider boundary emits the actual shared
+                    // attempt ordinal. A local retry sequence is not a new
+                    // attempt until that boundary is reached.
                 }
             }
         }
@@ -377,6 +436,7 @@ impl Plugin for RetryPlugin {
                 attempts: row.attempts,
                 base: Duration::from_millis(row.backoff_ms),
                 cap: Duration::from_millis(row.cap_ms),
+                recovery_wait: Duration::from_secs(row.recovery_wait_secs),
             }),
             true,
         );
@@ -1278,7 +1338,7 @@ mod focused_policy_tests {
     }
 
     #[test]
-    fn a_retry_after_hint_wins_and_is_clamped() {
+    fn a_retry_after_hint_is_never_shortened() {
         // The server's word beats the schedule…
         assert_eq!(
             retry_backoff(1, BASE, CAP, Some(Duration::from_secs(20))),
@@ -1289,10 +1349,11 @@ mod focused_policy_tests {
             retry_backoff(3, BASE, CAP, Some(Duration::ZERO)),
             Duration::from_secs(1)
         );
-        // …and a hostile hint cannot park the turn for minutes.
+        // …and the delay calculation must never shorten a server hint.
+        // The handler refuses this wait before scheduling it.
         assert_eq!(
             retry_backoff(1, BASE, CAP, Some(Duration::from_secs(6000))),
-            Duration::from_secs(60)
+            Duration::from_secs(6000)
         );
     }
 

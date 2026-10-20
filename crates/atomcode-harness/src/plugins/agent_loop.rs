@@ -295,7 +295,7 @@ impl PluginAgentLoop {
 #[tracing::instrument(
     name = "llm_call",
     skip_all,
-    fields(purpose = "main_reply", turn, round)
+    fields(purpose = "main_reply", turn, round, session_id = %session.id())
 )]
 async fn stream_once(
     provider: &dyn LlmProvider,
@@ -309,6 +309,23 @@ async fn stream_once(
     idle: Option<std::time::Duration>,
     first_content: Option<std::time::Duration>,
 ) -> Result<ModelResponse, RequestError> {
+    if let Some(budget) = &options.request_recovery {
+        let state = budget.try_attempt().map_err(|limit| RequestError {
+            retryable: true,
+            code: Some(atomcode_kernel::provider::REQUEST_RECOVERY_EXHAUSTED_CODE.into()),
+            ..RequestError::message(limit.to_string())
+        })?;
+        tracing::info!(
+            turn,
+            round,
+            attempt = state.attempts,
+            max_attempts = state.max_attempts,
+            reserved_wait_ms = state.reserved_wait.as_millis() as u64,
+            "shared provider attempt started"
+        );
+    }
+    let mut options = options;
+    options.rate_limit_retry_owner = atomcode_kernel::provider::RateLimitRetryOwner::Kernel;
     let mut stream = provider
         .chat_stream(&messages, &tools, &options)
         .await
@@ -1443,5 +1460,45 @@ mod content_deadline_tests {
         .unwrap();
         assert_eq!(out.tool_calls.len(), 1);
         assert_eq!(seen.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_progressing_response_outlives_its_spent_recovery_wait_allowance() {
+        let app = atomcode_plexus::App::new(
+            atomcode_plexus::PluginRegistry::new(),
+            atomcode_plexus::ConfigTree::from_layers(Vec::new()).unwrap(),
+        );
+        let budget =
+            atomcode_kernel::provider::RequestRecoveryBudget::new(2, Duration::from_secs(1));
+        budget.try_attempt().unwrap(); // a failed original OPEN
+        budget.reserve_wait(Duration::from_secs(1)).unwrap();
+        let options = ChatOptions {
+            request_recovery: Some(budget.clone()),
+            ..Default::default()
+        };
+        let provider = TimedProvider(vec![
+            (60, StreamEvent::TextDelta("a".into())),
+            (240, StreamEvent::TextDelta("b".into())),
+            (240, StreamEvent::TextDelta("c".into())),
+            (240, StreamEvent::TextDelta("d".into())),
+            (0, StreamEvent::Done { truncated: false }),
+        ]);
+        let began = tokio::time::Instant::now();
+        let response = stream_once(
+            &provider,
+            &app.context(),
+            &SessionLog::new("progressing-recovery"),
+            1,
+            1,
+            vec![],
+            vec![],
+            options,
+            Some(Duration::from_secs(300)),
+            Some(Duration::from_secs(600)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.text, "abcd");
+        assert_eq!(began.elapsed(), Duration::from_secs(780));
+        assert_eq!(budget.snapshot().attempts, 2);
     }
 }

@@ -124,7 +124,7 @@ config = { max_rounds = 24, max_seconds = 0 }
 
 [[insert]]
 name = "llm-retry"
-config = { attempts = 3, backoff_ms = 3000, cap_ms = 30000 }
+config = { attempts = 6, backoff_ms = 3000, cap_ms = 30000, recovery_wait_secs = 300 }
 
 # Recovery, outermost first: an explicitly configured total budget covers all
 # retries. By default content-idle watchdogs bound stalls, while a response that

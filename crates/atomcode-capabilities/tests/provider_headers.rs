@@ -38,44 +38,60 @@ fn provider(wire: &str, key: &str, url: &str) -> Box<dyn LlmProvider> {
 }
 
 // Real HTTP is intentional: assert the bytes the server receives, including
-// overriding built-in authentication. The 401 response never enters backoff.
+// overriding built-in authentication. Fatal 401s and caller-owned 503s never
+// enter adapter backoff, so this real-I/O test does not wait through retries.
 #[tokio::test]
 async fn every_chat_wire_sends_account_headers_and_redacts_echoed_credentials() {
     for wire in ["openai", "responses", "anthropic", "ollama"] {
         for key in ["", "ordinary-key"] {
-            let server = MockServer::start().await;
-            Mock::given(wiremock::matchers::method("POST"))
-                .respond_with(ResponseTemplate::new(401).set_body_json(
-                    serde_json::json!({"error":{"message":"rejected private-token"}}),
-                ))
-                .mount(&server)
-                .await;
-            let provider = provider(wire, key, &server.uri());
-            let error = match provider
-                .chat_stream(&[Message::user("hi")], &[], &ChatOptions::default())
-                .await
-            {
-                Err(e) => e,
-                Ok(_) => panic!("401 must fail"),
-            };
-            assert!(
-                !error.message.contains("private-token"),
-                "{wire} leaked a credential"
-            );
-            let requests = server.received_requests().await.unwrap();
-            assert_eq!(requests.len(), 1);
-            let r = &requests[0];
-            assert_eq!(r.headers.get("x-custom-auth").unwrap(), "private-token");
-            assert_eq!(
-                r.headers.get("authorization").unwrap(),
-                "Custom private-token"
-            );
-            assert_eq!(
-                r.headers.get("anthropic-version").unwrap(),
-                "custom-version"
-            );
-            if wire == "anthropic" && key.is_empty() {
-                assert!(r.headers.get("x-api-key").is_none());
+            for status in [401, 503] {
+                let server = MockServer::start().await;
+                Mock::given(wiremock::matchers::method("POST"))
+                    .respond_with(ResponseTemplate::new(status).set_body_json(
+                        serde_json::json!({"error":{"message":"rejected private-token"}}),
+                    ))
+                    .mount(&server)
+                    .await;
+                let provider = provider(wire, key, &server.uri());
+                let mut options = ChatOptions::default();
+                if status == 503 {
+                    let budget = atomcode_kernel::provider::RequestRecoveryBudget::new(
+                        6,
+                        std::time::Duration::from_secs(300),
+                    );
+                    budget.try_attempt().unwrap();
+                    options.request_recovery = Some(budget);
+                }
+                let error = match provider
+                    .chat_stream(&[Message::user("hi")], &[], &options)
+                    .await
+                {
+                    Err(e) => e,
+                    Ok(_) => panic!("error status {status} must fail"),
+                };
+                assert!(
+                    !error.message.contains("private-token"),
+                    "{wire} leaked a credential"
+                );
+                assert_eq!(error.http_status, Some(status));
+                assert_eq!(error.retryable, status == 503);
+                // Budgeted calls must not hide a second inference inside ANY of
+                // the four wire adapters. Standalone 401 coverage remains intact.
+                let requests = server.received_requests().await.unwrap();
+                assert_eq!(requests.len(), 1, "{wire} {status} retried below its owner");
+                let r = &requests[0];
+                assert_eq!(r.headers.get("x-custom-auth").unwrap(), "private-token");
+                assert_eq!(
+                    r.headers.get("authorization").unwrap(),
+                    "Custom private-token"
+                );
+                assert_eq!(
+                    r.headers.get("anthropic-version").unwrap(),
+                    "custom-version"
+                );
+                if wire == "anthropic" && key.is_empty() {
+                    assert!(r.headers.get("x-api-key").is_none());
+                }
             }
         }
     }

@@ -201,6 +201,92 @@ async fn a_recovery_a_person_should_know_about_is_logged_not_printed() {
     );
 }
 
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn ordinary_requests_survive_a_short_gateway_outage() {
+    let dir = scratch("ordinary-recovery");
+    let app = start(tree(&dir, &[])).await;
+    let run = run_with(
+        &app,
+        4,
+        RequestError {
+            retryable: true,
+            http_status: Some(503),
+            ..RequestError::message("gateway unavailable")
+        },
+    )
+    .await;
+    assert_eq!(run.text, "recovered");
+    assert_eq!(run.attempts, 5);
+    assert_eq!(run.elapsed, Duration::from_secs(45));
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn ordinary_request_recovery_is_finite() {
+    let dir = scratch("ordinary-exhausted");
+    let app = start(tree(&dir, &[])).await;
+    let run = run_with(
+        &app,
+        u32::MAX,
+        RequestError {
+            retryable: true,
+            http_status: Some(503),
+            ..RequestError::message("gateway unavailable")
+        },
+    )
+    .await;
+    assert_eq!(run.attempts, 6);
+    assert_eq!(run.elapsed, Duration::from_secs(75));
+    assert!(run
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("gateway unavailable"));
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn an_excessive_retry_after_never_causes_an_early_retry() {
+    let dir = scratch("ordinary-long-hint");
+    let app = start(tree(&dir, &[])).await;
+    let run = run_with(
+        &app,
+        1,
+        RequestError {
+            retryable: true,
+            http_status: Some(503),
+            retry_after: Some(Duration::from_secs(600)),
+            ..RequestError::message("gateway unavailable")
+        },
+    )
+    .await;
+    assert_eq!(run.attempts, 1);
+    assert_eq!(run.elapsed, Duration::ZERO);
+    assert!(run
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("gateway unavailable"));
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_retry_after_at_the_allowance_is_honoured_in_full() {
+    let dir = scratch("ordinary-hint-boundary");
+    let app = start(tree(&dir, &[])).await;
+    let run = run_with(
+        &app,
+        1,
+        RequestError {
+            retryable: true,
+            http_status: Some(503),
+            retry_after: Some(Duration::from_secs(60)),
+            ..RequestError::message("gateway unavailable")
+        },
+    )
+    .await;
+    assert_eq!(run.attempts, 2);
+    assert_eq!(run.text, "recovered");
+    assert_eq!(run.elapsed, Duration::from_secs(60));
+}
+
 /// A retry is logged with the provider's error as it came and the numbers apart
 /// from it.
 ///
@@ -509,7 +595,12 @@ impl Waterfall<AgentRequest> for Hangs {
 async fn a_request_that_never_returns_is_bounded() {
     let dir = scratch("hang");
     let row = "[[patch]]\nid = \"llm-request-timeout\"\nconfig = { request_secs = 1 }";
-    let app = start(tree(&dir, &[row])).await;
+    // Isolate the request deadline from the independently configured retry
+    // schedule. The next test explicitly covers their composition.
+    let retries = r#"[[patch]]
+id = "llm-retry"
+config = { attempts = 1 }"#;
+    let app = start(tree(&dir, &[row, retries])).await;
     let _guard = app
         .context()
         .on_waterfall::<AgentRequest>(Arc::new(Hangs), false);
@@ -1706,6 +1797,52 @@ async fn shipping_default_recovers_three_times_with_backoff_and_preserves_each_p
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn cancelling_an_ordinary_retry_backoff_never_opens_another_request() {
+    use atomcode_kernel::stream::StreamEvent;
+    let (app, provider, _) = streamed_app(
+        vec![
+            vec![StreamEvent::Error(atomcode_kernel::stream::ProviderError {
+                message: "gateway unavailable".into(),
+                retryable: true,
+                http_status: Some(503),
+                ..Default::default()
+            })],
+            finished(),
+        ],
+        &[],
+    )
+    .await;
+    let agent = atomcode_harness::create_agent(&app).await.unwrap();
+    agent.send("go");
+    let (outcome, ()) = tokio::join!(atomcode_harness::drive(&app, &agent), async {
+        loop {
+            let noticed = app
+                .context()
+                .only_session()
+                .unwrap()
+                .events()
+                .iter()
+                .any(|e| {
+                    matches!(
+                        &e.event,
+                        SessionEvent::Notice {
+                            notice: atomcode_harness::session::NoticeKind::ProviderRetry,
+                            ..
+                        }
+                    )
+                });
+            if noticed {
+                agent.interrupt();
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    });
+    assert_eq!(outcome.unwrap().stop, StopReason::Cancelled);
+    assert_eq!(provider.recorded().len(), 1);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn cancelling_stream_recovery_backoff_never_opens_another_request() {
     use atomcode_kernel::stream::StreamEvent;
     let (app, provider, _) = streamed_app(
@@ -1816,5 +1953,149 @@ async fn stream_recovery_terminal_reports_why_it_cannot_continue() {
         assert_eq!(provider.recorded().len(), 1);
         let events = app.context().only_session().unwrap().events();
         assert!(format!("{events:?}").contains(t(reason).as_ref()));
+    }
+}
+
+// Shared counters span changes of failure category, rather than refilling each
+// time one recovery handler delegates to another.
+fn recoverable_status(
+    status: u16,
+    retry_after_secs: Option<u64>,
+) -> atomcode_kernel::stream::StreamEvent {
+    atomcode_kernel::stream::StreamEvent::Error(atomcode_kernel::stream::ProviderError {
+        message: format!("upstream status {status}"),
+        http_status: Some(status),
+        retryable: true,
+        retry_after_secs,
+        ..Default::default()
+    })
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn mixed_failures_share_six_attempts_and_keep_partial_progress() {
+    use atomcode_kernel::stream::StreamEvent;
+    let rate_row = "";
+    let (app, provider, _) = streamed_app(
+        vec![
+            vec![recoverable_status(503, None)],
+            vec![recoverable_status(429, Some(1))],
+            vec![StreamEvent::TextDelta("saved first".into()), transport()],
+            vec![recoverable_status(503, None)],
+            vec![recoverable_status(503, None)],
+            vec![StreamEvent::TextDelta("saved last".into()), transport()],
+            finished(),
+        ],
+        &[rate_row],
+    )
+    .await;
+    let began = Instant::now();
+    let outcome = run_turn(&app, "go").await.unwrap();
+    assert_eq!(
+        provider.recorded().len(),
+        6,
+        "a different recovery handler refilled the allowance"
+    );
+    let options = provider.recorded_options();
+    let shared = options[0].request_recovery.as_ref().unwrap();
+    assert!(options
+        .iter()
+        .all(|o| o.request_recovery.as_ref() == Some(shared)));
+    assert_eq!(shared.snapshot().attempts, 6);
+    assert_eq!(shared.snapshot().reserved_wait, Duration::from_secs(23));
+    assert_eq!(began.elapsed(), Duration::from_secs(23));
+    assert!(outcome
+        .error
+        .unwrap()
+        .contains("request recovery budget exhausted"));
+    let session = app.context().only_session().unwrap();
+    let messages = session.derive_messages();
+    for text in ["saved first", "saved last"] {
+        assert_eq!(messages.iter().filter(|m| m.text == text).count(), 1);
+    }
+    let numbers: Vec<_> = session
+        .events()
+        .into_iter()
+        .filter_map(|e| match e.event {
+            SessionEvent::Notice {
+                retry: Some(retry), ..
+            } => Some((retry.attempt, retry.max_attempts)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        numbers,
+        [(1, 5), (4, 5), (5, 5)],
+        "visible retries must use the shared ordinal"
+    );
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn mixed_failures_share_the_wait_allowance_without_shortening_retry_after() {
+    let rate_row = "";
+    let retry = "[[patch]]\nid = \"llm-retry\"\nconfig = { attempts = 8, recovery_wait_secs = 4 }";
+    let (app, provider, _) = streamed_app(
+        vec![
+            vec![recoverable_status(503, None)],
+            vec![recoverable_status(429, Some(2))],
+            finished(),
+        ],
+        &[rate_row, retry],
+    )
+    .await;
+    let began = Instant::now();
+    let outcome = run_turn(&app, "go").await.unwrap();
+    assert_eq!(provider.recorded().len(), 2);
+    assert_eq!(began.elapsed(), Duration::from_secs(3));
+    let error = outcome.error.unwrap();
+    assert!(
+        error.contains("upstream status 429"),
+        "original failure was lost: {error}"
+    );
+    assert!(
+        error.contains("Waiting"),
+        "the exhausted allowance must be explained: {error}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_new_model_round_gets_its_own_recovery_allowance() {
+    let retry = "[[patch]]\nid = \"llm-retry\"\nconfig = { attempts = 2, recovery_wait_secs = 3 }";
+    let (app, provider, count) = streamed_app(
+        vec![
+            vec![recoverable_status(503, None)],
+            completed_call("first", "count"),
+            vec![recoverable_status(503, None)],
+            finished(),
+        ],
+        &[retry],
+    )
+    .await;
+    let outcome = run_turn(&app, "go").await.unwrap();
+    assert_eq!(outcome.stop, StopReason::Stopped);
+    assert_eq!(provider.recorded().len(), 4);
+    let options = provider.recorded_options();
+    assert_eq!(options[0].request_recovery, options[1].request_recovery);
+    assert_eq!(options[2].request_recovery, options[3].request_recovery);
+    assert_ne!(options[0].request_recovery, options[2].request_recovery);
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn one_attempt_forbids_every_kind_of_automatic_replay() {
+    use atomcode_kernel::stream::StreamEvent;
+    let retry = "[[patch]]\nid = \"llm-retry\"\nconfig = { attempts = 1 }";
+    for broken in [
+        vec![recoverable_status(503, None)],
+        vec![recoverable_status(429, Some(1))],
+        vec![StreamEvent::TextDelta("preserved".into()), transport()],
+    ] {
+        let (app, provider, _) = streamed_app(vec![broken, finished()], &[retry]).await;
+        let outcome = run_turn(&app, "go").await.unwrap();
+        assert_ne!(outcome.stop, StopReason::Stopped);
+        assert_eq!(provider.recorded().len(), 1);
+        assert!(outcome
+            .error
+            .unwrap()
+            .contains("request recovery budget exhausted"));
     }
 }

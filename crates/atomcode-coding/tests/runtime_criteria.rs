@@ -2994,23 +2994,42 @@ async fn shutdown_interrupts_a_slow_mcp_reconnect() {
 /// The retry budget follows the model, because it is the model's provider that
 /// declared it.
 ///
-/// `retry_max_attempts` is per-provider (`ProviderConfig`), and the coupling the
-/// chain applies is that an explicit per-model budget switches the outer tier
-/// OFF — one attempt, no kernel retries. `/model` moves the conversation to a
-/// provider that may have said something else, or nothing at all, and both
-/// tiers have to move with it. Only one of them did: `llm-rate-limit` is
-/// re-patched on a swap, `llm-retry` was not, so a session that started on a
-/// provider with `retry_max_attempts = 0` kept "one attempt" on every model it
-/// switched to afterwards — while the same model, started fresh, retried three
-/// times. Same state, different behaviour, depending on how you got there.
+/// `retry_max_attempts` is per-provider (`ProviderConfig`); native recovery now
+/// shares it across all retries. `/model` must replace that allowance rather
+/// than carrying the old provider's single-attempt policy forward.
 ///
 /// Negative control: drop the `llm-retry` patch from `model_rows` and the second
-/// provider gets one attempt instead of the default three.
+/// provider gets one attempt instead of the default six.
 ///
-/// Costs ~8s of real time: the second turn burns the default budget and the
-/// backoff between attempts is not mocked. Worth it — the thing being measured
-/// is how many times a failing provider is actually called.
+/// Runs with a virtual clock: the observable is the number of real provider
+/// invocations, including restored defaults after a model switch.
 async fn the_retry_budget_follows_a_model_switch() {
+    // Default retry backoff can now exceed the shared helper's 10-second
+    // event gap. Bound the complete six-attempt schedule (75 seconds), using
+    // virtual time, instead of timing out a valid wait between notices.
+    async fn failed_turn(runtime: &mut CodingRuntime) {
+        runtime
+            .handle
+            .submit(UserInput::from("fail every time"))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            loop {
+                let event = runtime
+                    .events
+                    .recv()
+                    .await
+                    .expect("runtime event stream closed");
+                match event.event {
+                    CodingRuntimeEvent::TurnFinished(_) => return,
+                    CodingRuntimeEvent::Request(_) => panic!("unexpected question"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("retry schedule did not terminate");
+    }
     let env = env();
     let recorder = Arc::new(Recorder::default());
     let mut start = start(env.project.path(), &recorder, SessionMode::Fresh);
@@ -3023,18 +3042,42 @@ async fn the_retry_budget_follows_a_model_switch() {
     next.retry_max_attempts = None;
     let mut runtime = CodingRuntime::start(start).await.unwrap();
 
-    turn(&mut runtime, "fail every time").await;
+    failed_turn(&mut runtime).await;
     let on_first = recorder.requests.lock().unwrap().len();
     assert_eq!(on_first, 1, "a provider that forbade retries was retried");
 
     recorder.requests.lock().unwrap().clear();
-    runtime.handle.reassemble_provider(next).await.unwrap();
-    turn(&mut runtime, "fail every time").await;
+    runtime
+        .handle
+        .reassemble_provider(next.clone())
+        .await
+        .unwrap();
+    failed_turn(&mut runtime).await;
     let on_second = recorder.requests.lock().unwrap().len();
     assert_eq!(
-        on_second, 3,
+        on_second, 6,
         "after /model the new provider still carries the old one's retry budget"
     );
+    // Provider totals are no longer implemented as "outer retries off";
+    // they must become the actual shared count, with upstream overrides first.
+    for (model, provider_total, upstream_retries, expected) in [
+        ("recorder-three", Some(2), None, 2),
+        ("recorder-four", Some(1), Some(2), 3),
+        ("recorder-five", None, Some(0), 1),
+    ] {
+        recorder.requests.lock().unwrap().clear();
+        let mut selected = next.clone();
+        selected.model = model.into();
+        selected.retry_max_attempts = provider_total;
+        selected.upstream_retry_max_attempts = upstream_retries;
+        runtime.handle.reassemble_provider(selected).await.unwrap();
+        failed_turn(&mut runtime).await;
+        assert_eq!(
+            recorder.requests.lock().unwrap().len(),
+            expected,
+            "{model} did not apply the shared retry policy"
+        );
+    }
     runtime.handle.shutdown().await.unwrap();
 }
 
@@ -6283,6 +6326,12 @@ macro_rules! criteria {
 mod criteria {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     #[serial_test::serial(engine)]
+    async fn the_retry_budget_follows_a_model_switch() {
+        super::the_retry_budget_follows_a_model_switch().await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[serial_test::serial(engine)]
     async fn a_goal_evaluator_uses_the_mounted_project_instructions() {
         super::a_goal_evaluator_uses_the_mounted_project_instructions().await;
     }
@@ -6352,7 +6401,6 @@ mod criteria {
         an_update_after_a_compaction_is_what_the_next_round_sees,
         a_compacted_plan_still_asks_to_close_out_what_is_open,
         a_compacted_plan_is_not_planned_again,
-        the_retry_budget_follows_a_model_switch,
         a_meaningless_temperature_is_ignored_rather_than_breaking_a_model_switch,
         a_cancelled_turn_is_undone_by_default,
         a_cancelled_turn_is_kept_when_asked,

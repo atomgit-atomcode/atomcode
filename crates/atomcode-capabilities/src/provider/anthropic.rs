@@ -246,7 +246,8 @@ impl LlmProvider for AnthropicProvider {
 
         // Open the stream. A hard failure here returns `Err` so the kernel's
         // agent-layer open retry still applies.
-        let policy = self.cfg.retry.clone();
+        let policy = retry::policy_for_call(&self.cfg.retry, options);
+        let caller_recovers = options.request_recovery.is_some();
         let client = self.client.clone();
         let url = self.url.clone();
         let api_key = self.cfg.api_key.clone();
@@ -266,6 +267,7 @@ impl LlmProvider for AnthropicProvider {
             &session_id,
             &policy,
             rate_limit_retry_owner,
+            caller_recovers,
             open_timeout,
         )
         .await?;
@@ -281,7 +283,7 @@ impl LlmProvider for AnthropicProvider {
             // 1 initial open + up to 2 transparent reopens — a gateway resetting
             // connections under load can drop more than one attempt before a
             // healthy backend answers.
-            const MAX_STREAM_ATTEMPTS: u32 = 3;
+            let max_stream_attempts: u32 = if caller_recovers { 1 } else { 3 };
             let mut stream_attempt = 1u32;
             let mut reconnect_attempts = 0u32;
             let mut resp = resp;
@@ -304,7 +306,9 @@ impl LlmProvider for AnthropicProvider {
                     .await
                     {
                         Err(_elapsed) => {
-                            yield StreamEvent::Error(retry::stream_idle_error());
+                            let mut error = retry::stream_idle_error();
+                            error.retryable = caller_recovers && !emitted_replay_sensitive;
+                            yield StreamEvent::Error(error);
                             return;
                         }
                         Ok(None) => {
@@ -348,21 +352,30 @@ impl LlmProvider for AnthropicProvider {
                                 }
                                 return;
                             }
-                            if !emitted_replay_sensitive && stream_attempt < MAX_STREAM_ATTEMPTS {
+                            if !emitted_replay_sensitive && stream_attempt < max_stream_attempts {
                                 reconnect_attempts += 1;
                                 // Brief, esc-interruptible backoff before reopening so an
                                 // immediate retry does not slam a gateway resetting under load.
                                 tokio::time::sleep(retry::compute_backoff(stream_attempt, &policy)).await;
                                 if let Ok(fresh) =
-                                    open_stream(&client, &url, &body, &api_key, &anthropic_version, &session_id, &policy, rate_limit_retry_owner, open_timeout).await
+                                    open_stream(&client, &url, &body, &api_key, &anthropic_version, &session_id, &policy, rate_limit_retry_owner, caller_recovers, open_timeout).await
                                 {
                                     stream_attempt += 1;
                                     resp = fresh;
                                     continue 'reopen;
                                 }
                             }
+                            // Repair the pool for the caller's next attempt without
+                            // opening a hidden request or replaying content here.
+                            if caller_recovers && (retry::is_stale_connection_error(&e) || retry::chain_has_tls_corruption(&e)) {
+                                let capped = client.is_tls12() || atomcode_config::tls::should_cap_url(&url);
+                                if let Err(error) = client.rebuild(capped) {
+                                    yield StreamEvent::Error(error);
+                                    return;
+                                }
+                            }
                             yield StreamEvent::Error(ProviderError {
-                                retryable: false,
+                                retryable: caller_recovers && !emitted_replay_sensitive,
                                 code: retry::stream_read_error_code(&e),
                                 message: retry::stream_read_error_message(
                                     &e,
@@ -442,6 +455,7 @@ async fn open_stream(
     session_id: &str,
     policy: &RetryPolicy,
     rate_limit_retry_owner: atomcode_kernel::provider::RateLimitRetryOwner,
+    caller_recovers: bool,
     open_timeout: Duration,
 ) -> Result<reqwest::Response, ProviderError> {
     retry::bounded_open(
@@ -455,6 +469,7 @@ async fn open_stream(
             session_id,
             policy,
             rate_limit_retry_owner,
+            caller_recovers,
             open_timeout,
         ),
     )
@@ -470,6 +485,7 @@ async fn open_stream_attempts(
     session_id: &str,
     policy: &RetryPolicy,
     rate_limit_retry_owner: atomcode_kernel::provider::RateLimitRetryOwner,
+    caller_recovers: bool,
     open_timeout: Duration,
 ) -> Result<reqwest::Response, ProviderError> {
     let mut attempt = 1u32;
@@ -497,6 +513,9 @@ async fn open_stream_attempts(
                     pool_refreshed = timeout_pool_refreshed,
                     "provider response headers timed out"
                 );
+                if caller_recovers {
+                    client.rebuild(client.is_tls12())?;
+                }
                 if attempt < policy.max_attempts {
                     if !timeout_pool_refreshed {
                         client.rebuild(false)?;
@@ -567,6 +586,11 @@ async fn open_stream_attempts(
                 return Ok(resp);
             }
             Err(e) => {
+                if caller_recovers
+                    && (retry::is_stale_connection_error(&e) || retry::chain_has_tls_corruption(&e))
+                {
+                    client.rebuild(client.is_tls12())?;
+                }
                 if retry::is_retryable_reqwest_error(&e) && attempt < policy.max_attempts {
                     let wait = retry::compute_backoff(attempt, policy);
                     tokio::time::sleep(wait).await;
@@ -2124,6 +2148,7 @@ mod tests {
             temperature: Some(0.5),
             tool_choice: ToolChoice::Required,
             rate_limit_retry_owner: Default::default(),
+            request_recovery: None,
         };
         let tools = vec![ToolDef {
             name: "read".into(),

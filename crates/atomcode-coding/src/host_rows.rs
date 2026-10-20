@@ -2032,9 +2032,21 @@ impl Waterfall<AgentRequest> for RateLimitCoding {
                     let wait = if quiet_first && waits == 1 {
                         QUIET_FIRST_RETRY
                     } else {
-                        self.notice(format!("rate limited; retrying in {secs}s"));
                         std::time::Duration::from_secs(secs)
                     };
+                    if let Err(why) = atomcode_harness::plugins::recovery::reserve_recovery_wait(
+                        req,
+                        wait,
+                        "rate_limit_coding",
+                    ) {
+                        return Err(RequestError {
+                            message: format!("{} ({why})", error.message),
+                            ..error
+                        });
+                    }
+                    if !(quiet_first && waits == 1) {
+                        self.notice(format!("rate limited; retrying in {secs}s"));
+                    }
                     // The loop races this request against the stop button, so a
                     // cancel drops the sleep with it.
                     tokio::time::sleep(wait).await;
@@ -4498,6 +4510,89 @@ mod goal_rate_limit_classification_tests {
             assert!(error.rate_limit_pause.is_some());
             assert_eq!(error.retry_after, Some(std::time::Duration::from_secs(901)));
             assert_eq!(error.retryable, !partial);
+        }
+    }
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn coding_rate_limits_share_the_attempt_and_wait_allowance() {
+        use std::time::Duration;
+        for (attempts, max_wait, statuses, expected_wait) in
+            [(8, 4, [503, 429], 3), (2, 300, [429, 429], 1)]
+        {
+            let mut recovery_plugins = atomcode_plexus::PluginRegistry::new();
+            recovery_plugins.register(Arc::new(
+                atomcode_harness::plugins::loop_policy::RetryPlugin,
+            ));
+            recovery_plugins.register(Arc::new(RateLimitCodingPlugin(None)));
+            let layer = atomcode_plexus::Layer::from_toml(&format!(
+                r#"
+                [[insert]]
+                name = "llm-retry"
+                config = {{ attempts = {attempts}, recovery_wait_secs = {max_wait} }}
+                [[insert]]
+                name = "rate-limit-coding"
+                config = {{ base_url = "https://example.test/v1" }}
+            "#
+            ))
+            .unwrap();
+            let mut app = atomcode_plexus::App::new(
+                recovery_plugins,
+                atomcode_plexus::ConfigTree::from_layers([layer]).unwrap(),
+            );
+            app.start().await.unwrap();
+            let mut req = ModelRequest {
+                messages: vec![],
+                tools: vec![],
+                options: Default::default(),
+                turn: 1,
+                round: 1,
+                answering_a_nudge: false,
+            };
+            let seen = std::sync::atomic::AtomicU32::new(0);
+            let began = tokio::time::Instant::now();
+            let error = app
+                .context()
+                .waterfall::<AgentRequest, _>(&mut req, |req| {
+                    // This terminal stands for the native provider boundary: one
+                    // reservation per invocation, before any network operation.
+                    req.options
+                        .request_recovery
+                        .as_ref()
+                        .unwrap()
+                        .try_attempt()
+                        .unwrap();
+                    let n = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    assert!(
+                        n < 2,
+                        "the coding rate-limit row bypassed the shared allowance"
+                    );
+                    let status = statuses[n as usize];
+                    Box::pin(async move {
+                        Err(RequestError {
+                            retryable: true,
+                            http_status: Some(status),
+                            retry_after: (status == 429)
+                                .then_some(Duration::from_secs(if attempts == 2 { 1 } else { 2 })),
+                            ..RequestError::message("upstream failed")
+                        })
+                    })
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 2);
+            assert_eq!(error.http_status, Some(429));
+            assert!(
+                error.message.contains("request recovery budget exhausted"),
+                "{error}"
+            );
+            assert_eq!(began.elapsed(), Duration::from_secs(expected_wait));
+            assert_eq!(
+                req.options
+                    .request_recovery
+                    .unwrap()
+                    .snapshot()
+                    .reserved_wait,
+                began.elapsed()
+            );
         }
     }
 }

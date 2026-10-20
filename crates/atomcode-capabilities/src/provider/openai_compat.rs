@@ -587,7 +587,7 @@ pub(crate) fn add_trusted_roots(mut builder: reqwest::ClientBuilder) -> reqwest:
 /// because every reuse of the old pool re-hands-out the dead socket.
 pub(crate) struct SwappableClient {
     pub(crate) headers: atomcode_config::provider_headers::ProviderHeaders,
-    current: std::sync::RwLock<reqwest::Client>,
+    current: std::sync::RwLock<(reqwest::Client, bool)>,
     #[allow(clippy::type_complexity)]
     build: Box<dyn Fn(bool) -> Result<reqwest::Client, ProviderError> + Send + Sync>,
 }
@@ -608,7 +608,7 @@ impl SwappableClient {
         let initial = build(force_tls12)?;
         Ok(Self {
             headers: Default::default(),
-            current: std::sync::RwLock::new(initial),
+            current: std::sync::RwLock::new((initial, force_tls12)),
             build: Box::new(build),
         })
     }
@@ -621,14 +621,19 @@ impl SwappableClient {
         self.current
             .read()
             .unwrap_or_else(|p| p.into_inner())
+            .0
             .clone()
+    }
+
+    pub(crate) fn is_tls12(&self) -> bool {
+        self.current.read().unwrap_or_else(|p| p.into_inner()).1
     }
 
     /// Rebuild with a fresh (empty) pool and swap it in. On failure the old
     /// client remains valid, but the caller receives the build error explicitly.
     pub(crate) fn rebuild(&self, force_tls12: bool) -> Result<reqwest::Client, ProviderError> {
         let fresh = (self.build)(force_tls12)?;
-        *self.current.write().unwrap_or_else(|p| p.into_inner()) = fresh.clone();
+        *self.current.write().unwrap_or_else(|p| p.into_inner()) = (fresh.clone(), force_tls12);
         Ok(fresh)
     }
 }
@@ -715,7 +720,9 @@ impl LlmProvider for OpenAiCompatProvider {
         // Open the stream. A hard failure here returns `Err` (not a stream of one
         // Error event) so the kernel's agent-layer open retry — which keys off the
         // returned `ProviderError` — still applies.
-        let policy = self.cfg.retry.clone();
+        let policy = retry::policy_for_call(&self.cfg.retry, options);
+        let caller_recovers = options.request_recovery.is_some();
+        let request_recovery = options.request_recovery.clone();
         let client = self.client.clone();
         let url = self.url.clone();
         let signer = self.cfg.request_signer.clone();
@@ -737,6 +744,7 @@ impl LlmProvider for OpenAiCompatProvider {
             &session_id,
             &policy,
             rate_limit_retry_owner,
+            request_recovery.as_ref(),
             open_timeout,
         )
         .instrument(timing.span())
@@ -774,10 +782,10 @@ impl LlmProvider for OpenAiCompatProvider {
             // connection under load (surfaces as "error decoding response body" /
             // "unexpected EOF during chunk size line"). Once replay-sensitive output
             // has been emitted, retry would duplicate it, so the error is surfaced.
-            // 1 initial open + up to 2 transparent reopens. A gateway resetting
+            // Standalone callers get 1 initial open + up to 2 transparent reopens. A gateway resetting
             // connections under load can drop more than one attempt before a
             // healthy backend answers, so a single reopen is not enough.
-            const MAX_STREAM_ATTEMPTS: u32 = 3;
+            let max_stream_attempts: u32 = if caller_recovers { 1 } else { 3 };
             let mut stream_attempt = 1u32;
             let mut reconnect_attempts = 0u32;
             let mut resp = resp;
@@ -813,7 +821,9 @@ impl LlmProvider for OpenAiCompatProvider {
                             // Do not replay here: partial deltas may already be visible.
                             // The owner can continue from preserved safe progress.
                             request_span.in_scope(|| tracing::warn!(error_origin = "stream_watchdog", stream_attempt, had_replay_sensitive_output = emitted_replay_sensitive, "provider stream diagnostic"));
-                            yield StreamEvent::Error(retry::stream_idle_error());
+                            let mut error = retry::stream_idle_error();
+                            error.retryable = caller_recovers && !emitted_replay_sensitive;
+                            yield StreamEvent::Error(error);
                             return;
                         }
                         Ok(None) => {
@@ -867,8 +877,8 @@ impl LlmProvider for OpenAiCompatProvider {
                                 return;
                             }
                             // No replay-sensitive output reached the consumer yet → re-open
-                            // the whole request transparently (bounded by MAX_STREAM_ATTEMPTS).
-                            if !emitted_replay_sensitive && stream_attempt < MAX_STREAM_ATTEMPTS {
+                            // the whole request transparently (bounded by this call's stream attempt limit).
+                            if !emitted_replay_sensitive && stream_attempt < max_stream_attempts {
                                 reconnect_attempts += 1;
                                 // Brief backoff so an immediate reopen does not slam a
                                 // gateway that is resetting under load. Bounded and
@@ -895,7 +905,7 @@ impl LlmProvider for OpenAiCompatProvider {
                                     }
                                 }
                                 if let Ok(fresh) =
-                                    open_stream(&client, &url, &body_bytes, &signer, &api_key, &session_id, &policy, rate_limit_retry_owner, open_timeout).instrument(request_span.clone()).await
+                                    open_stream(&client, &url, &body_bytes, &signer, &api_key, &session_id, &policy, rate_limit_retry_owner, request_recovery.as_ref(), open_timeout).instrument(request_span.clone()).await
                                 {
                                     stream_attempt += 1;
                                     resp = fresh;
@@ -904,8 +914,17 @@ impl LlmProvider for OpenAiCompatProvider {
                                 // Re-open failed: fall through and surface the
                                 // original mid-stream error below.
                             }
+                            // Repair the pool for the caller's next attempt without
+                            // opening a hidden request or replaying content here.
+                            if caller_recovers && (retry::is_stale_connection_error(&e) || retry::chain_has_tls_corruption(&e)) {
+                                let capped = client.is_tls12() || atomcode_config::tls::should_cap_url(&url);
+                                if let Err(error) = client.rebuild(capped) {
+                                    yield StreamEvent::Error(error);
+                                    return;
+                                }
+                            }
                             yield StreamEvent::Error(ProviderError {
-                                retryable: false,
+                                retryable: caller_recovers && !emitted_replay_sensitive,
                                 code: retry::stream_read_error_code(&e),
                                 message: retry::stream_read_error_message(
                                     &e,
@@ -1093,6 +1112,7 @@ pub(crate) async fn open_stream(
     session_id: &str,
     policy: &RetryPolicy,
     rate_limit_retry_owner: atomcode_kernel::provider::RateLimitRetryOwner,
+    request_recovery: Option<&atomcode_kernel::provider::RequestRecoveryBudget>,
     open_timeout: Duration,
 ) -> Result<reqwest::Response, ProviderError> {
     retry::bounded_open(
@@ -1106,6 +1126,7 @@ pub(crate) async fn open_stream(
             session_id,
             policy,
             rate_limit_retry_owner,
+            request_recovery,
             open_timeout,
         ),
     )
@@ -1121,13 +1142,29 @@ async fn open_stream_attempts(
     session_id: &str,
     policy: &RetryPolicy,
     rate_limit_retry_owner: atomcode_kernel::provider::RateLimitRetryOwner,
+    request_recovery: Option<&atomcode_kernel::provider::RequestRecoveryBudget>,
     open_timeout: Duration,
 ) -> Result<reqwest::Response, ProviderError> {
     let mut attempt = 1u32;
     let mut timeout_pool_refreshed = false;
     let mut tls12_probe = false;
     let mut auth_recovery_attempted = false;
+    let mut first_wire_attempt = true;
     loop {
+        // The caller reserved the first OPEN at its provider boundary. The
+        // bounded authentication replay below is an additional wire attempt.
+        if !first_wire_attempt {
+            if let Some(budget) = request_recovery {
+                let state = budget.try_attempt().map_err(retry::recovery_exhausted)?;
+                tracing::info!(
+                    attempt = state.attempts,
+                    max_attempts = state.max_attempts,
+                    reason = "authentication_replay",
+                    "shared provider attempt started"
+                );
+            }
+        }
+        first_wire_attempt = false;
         // Take the CURRENT client each attempt: a transport-error retry below
         // rebuilds it, so the retried attempt gets a fresh (empty) pool.
         let http = client.get();
@@ -1167,7 +1204,8 @@ async fn open_stream_attempts(
         if signer.is_none() {
             req = super::apply_account_headers(req, &client.headers)?;
         }
-        let was_capped = tls12_probe || atomcode_config::tls::should_cap_url(url);
+        let was_capped =
+            tls12_probe || client.is_tls12() || atomcode_config::tls::should_cap_url(url);
         // TTFB watchdog for THIS attempt. `send()` resolves as soon as the response
         // HEAD arrives, so wrapping it never truncates a slow streaming body — it only
         // bounds the wait for a gateway that accepted the connection then went silent.
@@ -1183,6 +1221,9 @@ async fn open_stream_attempts(
                     pool_refreshed = timeout_pool_refreshed,
                     "provider response headers timed out"
                 );
+                if request_recovery.is_some() {
+                    client.rebuild(was_capped)?;
+                }
                 if attempt < policy.max_attempts {
                     if !timeout_pool_refreshed {
                         client.rebuild(was_capped)?;
@@ -1309,6 +1350,17 @@ async fn open_stream_attempts(
                 return Ok(resp);
             }
             Err(e) => {
+                if request_recovery.is_some() {
+                    let corruption = retry::chain_has_tls_corruption(&e);
+                    let fallback = atomcode_config::tls::should_try_fallback(
+                        url,
+                        was_capped,
+                        e.is_connect() || corruption,
+                    );
+                    if fallback || retry::is_stale_connection_error(&e) || corruption {
+                        client.rebuild(was_capped || fallback)?;
+                    }
+                }
                 if retry::is_retryable_reqwest_error(&e) && attempt < policy.max_attempts {
                     let tls_corruption = retry::chain_has_tls_corruption(&e);
                     // A managed-endpoint TLS-1.2 probe is warranted by either a
@@ -2898,54 +2950,78 @@ mod tests {
 
     #[tokio::test]
     async fn refreshable_signer_recovers_one_401_and_resigns_retry() {
-        let server = MockServer::start().await;
-        let responses = std::sync::Arc::new(AtomicUsize::new(0));
-        let sequence = responses.clone();
-        Mock::given(method("POST"))
-            .and(path("/v1/chat/completions"))
-            .respond_with(move |_request: &wiremock::Request| {
-                if sequence.fetch_add(1, Ordering::SeqCst) == 0 {
-                    ResponseTemplate::new(401).set_body_string("expired")
-                } else {
-                    ResponseTemplate::new(200)
-                        .insert_header("content-type", "text/event-stream")
-                        .set_body_string("data: [DONE]\n\n")
-                }
-            })
-            .expect(2)
-            .mount(&server)
-            .await;
+        // Authentication replay is bounded too; standalone callers preserve
+        // their historical one-refresh behavior. This test uses real sockets.
+        for total in [None, Some(1), Some(2)] {
+            let server = MockServer::start().await;
+            let responses = std::sync::Arc::new(AtomicUsize::new(0));
+            let sequence = responses.clone();
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(move |_request: &wiremock::Request| {
+                    if sequence.fetch_add(1, Ordering::SeqCst) == 0 {
+                        ResponseTemplate::new(401).set_body_string("expired")
+                    } else {
+                        ResponseTemplate::new(200)
+                            .insert_header("content-type", "text/event-stream")
+                            .set_body_string("data: [DONE]\n\n")
+                    }
+                })
+                .expect(if total == Some(1) { 1 } else { 2 })
+                .mount(&server)
+                .await;
 
-        let signer = std::sync::Arc::new(RecoveringSigner {
-            generation: AtomicUsize::new(0),
-            recoveries: AtomicUsize::new(0),
-        });
-        let mut cfg =
-            OpenAiCompatConfig::new("unused", format!("{}/v1", server.uri()), "test-model");
-        cfg.request_signer = Some(signer.clone());
-        let provider = OpenAiCompatProvider::new(cfg).unwrap();
+            let signer = std::sync::Arc::new(RecoveringSigner {
+                generation: AtomicUsize::new(0),
+                recoveries: AtomicUsize::new(0),
+            });
+            let mut cfg =
+                OpenAiCompatConfig::new("unused", format!("{}/v1", server.uri()), "test-model");
+            cfg.request_signer = Some(signer.clone());
+            let provider = OpenAiCompatProvider::new(cfg).unwrap();
 
-        let stream = provider
-            .chat_stream(&[Message::user("hi")], &[], &ChatOptions::default())
-            .await
-            .expect("401 recovery should reopen the request");
-        let events: Vec<_> = stream.collect().await;
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, StreamEvent::Done { .. })));
-        assert_eq!(signer.recoveries.load(Ordering::SeqCst), 1);
+            let mut options = ChatOptions::default();
+            let budget = total.map(|n| {
+                atomcode_kernel::provider::RequestRecoveryBudget::new(n, Duration::from_secs(300))
+            });
+            if let Some(budget) = &budget {
+                budget.try_attempt().unwrap();
+            }
+            options.request_recovery = budget.clone();
+            let result = provider
+                .chat_stream(&[Message::user("hi")], &[], &options)
+                .await;
+            if total == Some(1) {
+                let error = result
+                    .err()
+                    .expect("auth recovery must not bypass the shared cap");
+                assert_eq!(error.code.as_deref(), Some("request_recovery_exhausted"));
+                assert_eq!(server.received_requests().await.unwrap().len(), 1);
+                assert_eq!(budget.as_ref().unwrap().snapshot().attempts, 1);
+                continue;
+            }
+            let stream = result.expect("401 recovery should reopen the request");
+            let events: Vec<_> = stream.collect().await;
+            assert!(events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::Done { .. })));
+            assert_eq!(signer.recoveries.load(Ordering::SeqCst), 1);
 
-        let requests = server.received_requests().await.unwrap();
-        let authorization: Vec<_> = requests
-            .iter()
-            .map(|request| {
-                request.headers["authorization"]
-                    .to_str()
-                    .unwrap()
-                    .to_string()
-            })
-            .collect();
-        assert_eq!(authorization, ["Bearer token-0", "Bearer token-1"]);
+            let requests = server.received_requests().await.unwrap();
+            let authorization: Vec<_> = requests
+                .iter()
+                .map(|request| {
+                    request.headers["authorization"]
+                        .to_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect();
+            assert_eq!(authorization, ["Bearer token-0", "Bearer token-1"]);
+            if let Some(budget) = budget {
+                assert_eq!(budget.snapshot().attempts, 2);
+            }
+        }
     }
 
     #[tokio::test]
@@ -3018,13 +3094,15 @@ mod tests {
         assert!(local.message.contains("auth store unavailable"));
     }
 
-    async fn open_429_request_count(
+    async fn open_failure_request_count(
         owner: atomcode_kernel::provider::RateLimitRetryOwner,
+        budgeted: bool,
+        status: u16,
     ) -> usize {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(429))
+            .respond_with(ResponseTemplate::new(status))
             .mount(&server)
             .await;
         let mut cfg = OpenAiCompatConfig::new("test", format!("{}/v1", server.uri()), "test-model");
@@ -3036,8 +3114,14 @@ mod tests {
         let provider = OpenAiCompatProvider::new(cfg).unwrap();
         let mut options = ChatOptions::default();
         options.rate_limit_retry_owner = owner;
+        if budgeted {
+            let budget =
+                atomcode_kernel::provider::RequestRecoveryBudget::new(6, Duration::from_secs(300));
+            budget.try_attempt().unwrap(); // caller reserves its provider invocation
+            options.request_recovery = Some(budget);
+        }
         let result = provider.chat_stream(&[], &[], &options).await;
-        assert!(matches!(result, Err(e) if e.http_status == Some(429)));
+        assert!(matches!(result, Err(e) if e.http_status == Some(status)));
         server.received_requests().await.unwrap().len()
     }
 
@@ -3045,8 +3129,13 @@ mod tests {
     async fn per_call_owner_controls_real_429_open_retries() {
         use atomcode_kernel::provider::RateLimitRetryOwner::{Kernel, Provider};
 
-        assert_eq!(open_429_request_count(Provider).await, 2);
-        assert_eq!(open_429_request_count(Kernel).await, 1);
+        assert_eq!(open_failure_request_count(Provider, false, 429).await, 2);
+        assert_eq!(open_failure_request_count(Kernel, false, 429).await, 1);
+        // Existing real-I/O test: all adapter backoffs are ZERO. Budgeted
+        // native calls surface the first 5xx as well as the first 429.
+        assert_eq!(open_failure_request_count(Provider, false, 503).await, 2);
+        assert_eq!(open_failure_request_count(Kernel, true, 503).await, 1);
+        assert_eq!(open_failure_request_count(Kernel, true, 429).await, 1);
     }
 
     // Classification lock for every supported vision naming rule plus a
@@ -3162,6 +3251,7 @@ mod tests {
             "",
             &policy,
             atomcode_kernel::provider::RateLimitRetryOwner::Provider,
+            None,
             Duration::from_millis(200),
         )
         .await
@@ -3899,6 +3989,7 @@ mod tests {
             temperature: Some(0.5),
             tool_choice: ToolChoice::Required,
             rate_limit_retry_owner: Default::default(),
+            request_recovery: None,
         };
         let tools = vec![ToolDef {
             name: "read".into(),

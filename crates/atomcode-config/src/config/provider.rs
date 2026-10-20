@@ -95,9 +95,9 @@ pub struct ProviderConfig {
     /// tier; fewer than 2 (or a non-participating host) ⇒ the subagent uses the current model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capable_model: Option<i64>,
-    /// Max attempts (including the first request) for provider OPEN retries;
-    /// when set, also caps kernel-owned HTTP 429 recovery. `None` preserves
-    /// each layer's default. Set `1` to disable adapter-level and 429 retries.
+    /// Total attempts including the first request. Native coding shares this
+    /// across request recovery unless the upstream retry setting overrides it;
+    /// standalone adapters apply it to OPEN retries. `1` disables retries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_max_attempts: Option<u32>,
 }
@@ -185,9 +185,9 @@ pub struct ModelProfileConfig {
     pub thinking_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_budget: Option<u32>,
-    /// Max attempts (including the first request) for provider OPEN retries;
-    /// when set, also caps kernel-owned HTTP 429 recovery. `None` preserves
-    /// each layer's default.
+    /// Total attempts including the first request. Native coding shares this
+    /// across request recovery unless overridden by the upstream retry setting;
+    /// standalone adapters apply it to OPEN retries. `None` uses host defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_max_attempts: Option<u32>,
     /// Who put this entry here, when it was not the person: a command that
@@ -267,9 +267,9 @@ pub struct ResolvedModelConfig {
     pub thinking_enabled: Option<bool>,
     pub thinking_budget: Option<u32>,
     pub capable_model: Option<i64>,
-    /// Max attempts (including the first request) for provider OPEN retries;
-    /// when set, also caps kernel-owned HTTP 429 recovery. `None` preserves
-    /// each layer's default.
+    /// Total attempts including the first request. Native coding shares this
+    /// across request recovery unless overridden by the upstream retry setting;
+    /// standalone adapters apply it to OPEN retries. `None` uses host defaults.
     pub retry_max_attempts: Option<u32>,
 }
 
