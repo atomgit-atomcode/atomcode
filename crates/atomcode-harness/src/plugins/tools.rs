@@ -233,20 +233,28 @@ impl Plugin for SearchToolsPlugin {
     fn description(&self) -> &'static str {
         "grep and glob over the working directory"
     }
-    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+    async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
+        let options: atomcode_capabilities::world::WalkOptions = if config.is_null() {
+            Default::default()
+        } else {
+            serde_json::from_value(config.clone())
+                .map_err(|e| format!("bad tool-search config: {e}"))?
+        };
         mount(ctx, {
             let dirs = (*crate::product_dirs(ctx)?).clone();
             vec![
-                Arc::new(GrepTool::new(dirs.clone())),
-                Arc::new(GlobTool::new(dirs)),
+                Arc::new(GrepTool::new(dirs.clone()).with_options(options.clone())),
+                Arc::new(GlobTool::new(dirs).with_options(options)),
             ]
         })?;
         contribute_prompt(
             ctx,
             "tool-search",
             52,
-            "Prefer `grep`/`glob` over listing directories by hand when you are looking for \
-             something by name or content.",
+            "For a known file path, call `read_file` directly: ignored files can still be read. \
+             Use `grep`/`glob` to discover unknown paths. An empty filtered search does not prove absence. \
+             If needed, explicitly scope the provided directory and choose respect_gitignore=false, \
+             include_hidden=true, or follow_symlinks=true independently; do not expand to the whole disk.",
         );
         Ok(())
     }

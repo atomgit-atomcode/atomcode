@@ -400,3 +400,13 @@ theme = "auto"
 # max_attempts = 32
 # max_elapsed_secs = 28800
 # interval_secs = 900
+
+# Glob/Grep discovery defaults. Per-call switches override these; project overrides
+# may be placed in the product directory's search.toml (same keys, no table header).
+# Ignored files remain readable by exact path. Permissions are never bypassed.
+# [tools.search]
+# respect_gitignore = true
+# include_hidden = false
+# follow_symlinks = false
+# timeout_secs = 30     # 1..300 seconds
+# max_entries = 100000 # 1..1000000 visited entries

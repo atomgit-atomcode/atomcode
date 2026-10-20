@@ -6423,6 +6423,10 @@ impl Tui {
                 self.ask_about_policy(intervention);
                 true
             }
+            AgentEvent::ToolProgress { message, .. } => {
+                self.host.say_for(message, false, 1_500);
+                true
+            }
             AgentEvent::StreamRecovery {
                 attempt,
                 max_attempts,
@@ -6482,6 +6486,23 @@ impl Tui {
                         return false;
                     }
                     self.host.echo_command(&line);
+                }
+                // Starting a goal already submits its condition as the user
+                // message. Keep the short acknowledgement in the reserved tip
+                // row instead of inserting a command block ahead of that input.
+                if failed == Some(false)
+                    && [crate::i18n::Locale::En, crate::i18n::Locale::ZhCn]
+                        .into_iter()
+                        .any(|locale| {
+                            output
+                                == crate::i18n::product::t_with(
+                                    locale,
+                                    crate::i18n::product::Msg::GoalStarted,
+                                )
+                        })
+                {
+                    self.host.say_for(output, false, 3_000);
+                    return true;
                 }
                 if !output.is_empty() {
                     if failed == Some(true) {
@@ -13255,6 +13276,48 @@ mod midturn_command_tests {
         }));
         assert_eq!(kinds(&host), before);
         assert!(host.moment.read().unwrap().sheet.is_none());
+    }
+
+    #[test]
+    fn goal_start_acknowledgement_does_not_precede_the_user_message_in_transcript() {
+        for locale in [crate::i18n::Locale::En, crate::i18n::Locale::ZhCn] {
+            let (host, tui, _) = screen();
+            let before = kinds(&host);
+            let output =
+                crate::i18n::product::t_with(locale, crate::i18n::product::Msg::GoalStarted)
+                    .into_owned();
+            assert!(tui.on_event(AgentEvent::Invoked {
+                id: "goal-start".into(),
+                output: output.clone(),
+                queued: false,
+                failed: Some(false)
+            }));
+            assert_eq!(kinds(&host), before);
+            assert_eq!(
+                host.moment.read().unwrap().notice.as_ref().unwrap().text,
+                output
+            );
+        }
+    }
+
+    #[test]
+    fn tool_scan_progress_is_visible_without_adding_transcript_rows() {
+        let (host, tui, _) = screen();
+        let before = kinds(&host);
+        assert!(tui.on_event(AgentEvent::ToolProgress {
+            call_id: "search-1".into(),
+            message: "Searching: 1000 entries visited".into()
+        }));
+        assert_eq!(kinds(&host), before);
+        assert!(host
+            .moment
+            .read()
+            .unwrap()
+            .notice
+            .as_ref()
+            .unwrap()
+            .text
+            .contains("1000"));
     }
 
     #[test]

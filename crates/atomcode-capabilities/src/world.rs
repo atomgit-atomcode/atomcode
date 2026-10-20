@@ -156,6 +156,70 @@ pub struct FileInfo {
     pub len: u64,
 }
 
+/// Read-only discovery policy. Defaults preserve existing ignore and link behavior.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WalkOptions {
+    pub respect_gitignore: bool,
+    pub include_hidden: bool,
+    pub follow_symlinks: bool,
+    pub timeout_secs: u64,
+    pub max_entries: usize,
+    #[serde(skip)]
+    pub progress: atomcode_kernel::tool::ProgressSink,
+}
+impl Default for WalkOptions {
+    fn default() -> Self {
+        Self {
+            respect_gitignore: true,
+            include_hidden: false,
+            follow_symlinks: false,
+            timeout_secs: 30,
+            max_entries: 100_000,
+            progress: Default::default(),
+        }
+    }
+}
+impl WalkOptions {
+    pub fn bounded(mut self) -> Self {
+        self.timeout_secs = self.timeout_secs.clamp(1, 300);
+        self.max_entries = self.max_entries.clamp(1, 1_000_000);
+        self
+    }
+    pub fn filter_hint(&self) -> String {
+        format!("respect_gitignore={}, include_hidden={}, follow_symlinks={}. For a known filename, use read_file directly. Broaden only the specified directory; use respect_gitignore=false/include_hidden=true/follow_symlinks=true when needed. These options do not bypass permissions.", self.respect_gitignore, self.include_hidden, self.follow_symlinks)
+    }
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScanReport {
+    pub entries_scanned: usize,
+    pub skipped_entries: usize,
+    pub entry_limit_reached: bool,
+    pub result_limit_reached: bool,
+    pub timed_out: bool,
+}
+impl ScanReport {
+    pub fn incomplete(&self) -> bool {
+        self.entry_limit_reached
+            || self.result_limit_reached
+            || self.timed_out
+            || self.skipped_entries > 0
+    }
+    pub fn summary(&self) -> String {
+        format!("Scan {}: {} entries visited; {} unreadable, restricted or invalid entries skipped{}{}{}. Narrow the search path if needed.",
+            if self.incomplete() { "incomplete" } else { "completed" },
+            self.entries_scanned, self.skipped_entries,
+            if self.entry_limit_reached { "; entry limit reached" } else { "" },
+            if self.timed_out { "; time limit reached" } else { "" },
+            if self.result_limit_reached { "; match limit reached" } else { "" })
+    }
+}
+#[derive(Default)]
+pub struct WalkResult {
+    pub files: Vec<PathBuf>,
+    pub scan: ScanReport,
+}
+
 /// A content search, as the caller wants it run. Everything here is the
 /// caller's decision — the world only executes it.
 #[cfg(feature = "tools")]
@@ -174,6 +238,7 @@ pub struct SearchQuery {
     /// The caller's stop, as for [`Fs::walk`]: a search over a big tree is the
     /// other thing here that a person can be left waiting on.
     pub cancel: CancellationToken,
+    pub walk: WalkOptions,
 }
 
 /// One line of a search result, **undecoded** — the world's bytes, for the
@@ -201,6 +266,7 @@ pub struct SearchResult {
     pub lines: Vec<SearchLine>,
     pub matches: usize,
     pub files_searched: usize,
+    pub scan: ScanReport,
 }
 
 // ---- the filesystem seam -------------------------------------------------
@@ -313,6 +379,30 @@ pub trait FileSystem: Send + Sync {
         Ok(files)
     }
 
+    /// Options-aware discovery. Worlds with different filter semantics must override
+    /// this method rather than silently accepting an option they cannot implement.
+    async fn walk_with_options(
+        &self,
+        root: &Path,
+        skip_dir: &SkipDir,
+        cancel: &CancellationToken,
+        options: &WalkOptions,
+    ) -> Result<WalkResult, FsError> {
+        if !options.respect_gitignore || options.include_hidden || options.follow_symlinks {
+            return Err(FsError::io(
+                "this filesystem does not support alternate discovery filters",
+            ));
+        }
+        let mut files = self.walk(root, skip_dir, cancel).await?;
+        let scan = ScanReport {
+            entries_scanned: files.len(),
+            entry_limit_reached: files.len() > options.max_entries,
+            ..Default::default()
+        };
+        files.truncate(options.max_entries);
+        Ok(WalkResult { files, scan })
+    }
+
     /// Search file contents under `root`.
     ///
     /// Derived from [`walk`](Self::walk) + [`read_bytes`](Self::read_bytes):
@@ -327,7 +417,11 @@ pub trait FileSystem: Send + Sync {
         let matcher = build_matcher(query)?;
         let mut searcher = build_searcher(query.context);
         let mut result = SearchResult::default();
-        for path in self.walk(root, &query.skip_dir, &query.cancel).await? {
+        let walked = self
+            .walk_with_options(root, &query.skip_dir, &query.cancel, &query.walk)
+            .await?;
+        result.scan = walked.scan;
+        for path in walked.files {
             if result.matches >= query.max_matches || query.cancel.is_cancelled() {
                 break;
             }
@@ -345,6 +439,7 @@ pub trait FileSystem: Send + Sync {
             };
             let _ = searcher.search_slice(&matcher, &bytes, sink);
         }
+        result.scan.result_limit_reached = result.matches >= query.max_matches;
         Ok(result)
     }
 
@@ -673,6 +768,7 @@ pub use crate::tools::bash::LocalShell;
 ///
 /// Containment lives here rather than in each tool: a consumer cannot forget to
 /// call it, and a different world enforces its own boundary its own way.
+#[derive(Clone)]
 pub struct LocalFs {
     /// `None` means **no containment**: the path is used exactly as given.
     ///
@@ -973,7 +1069,38 @@ impl FileSystem for LocalFs {
                 is_dir: meta.is_dir(),
                 len: meta.len(),
             },
-            Err(_) => FileInfo::default(),
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Err(FsError::denied(format!(
+                    "cannot access {}: {error}",
+                    path.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                for ancestor in path.ancestors() {
+                    if let Ok(meta) = tokio::fs::symlink_metadata(ancestor).await {
+                        if meta.file_type().is_symlink()
+                            && tokio::fs::metadata(ancestor)
+                                .await
+                                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+                        {
+                            return Err(FsError::io(format!(
+                                "broken symbolic link: {} (target is unavailable)",
+                                ancestor.display()
+                            )));
+                        }
+                        if meta.is_dir() {
+                            break;
+                        }
+                    }
+                }
+                FileInfo::default()
+            }
+            Err(error) => {
+                return Err(FsError::io(format!(
+                    "cannot inspect {}: {error}",
+                    path.display()
+                )))
+            }
         })
     }
 
@@ -1010,6 +1137,41 @@ impl FileSystem for LocalFs {
         .map_err(FsError::io)?
     }
 
+    #[cfg(feature = "tools")]
+    async fn walk_with_options(
+        &self,
+        root: &Path,
+        skip_dir: &SkipDir,
+        cancel: &CancellationToken,
+        options: &WalkOptions,
+    ) -> Result<WalkResult, FsError> {
+        let root = self.resolve(root)?;
+        let world = self.clone();
+        let skip = skip_dir.clone();
+        let cancel = cancel.clone();
+        let options = options.clone().bounded();
+        tokio::task::spawn_blocking(move || {
+            let mut result = WalkResult::default();
+            let mut budget = ScanBudget::new(options.clone());
+            let skipped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            for entry in option_walker(&root, skip, world, &options, skipped.clone()) {
+                if !budget.next(&cancel) {
+                    break;
+                }
+                match entry {
+                    Ok(entry) if entry.path().is_file() => result.files.push(entry.into_path()),
+                    Ok(_) => {}
+                    Err(_) => budget.scan.skipped_entries += 1,
+                }
+            }
+            budget.scan.skipped_entries += skipped.load(std::sync::atomic::Ordering::Relaxed);
+            result.scan = budget.scan;
+            Ok(result)
+        })
+        .await
+        .map_err(FsError::io)?
+    }
+
     /// The streaming search `grep` always ran, verbatim: the same walker, one
     /// [`grep::searcher::Searcher`] per call with a per-file heap cap so a
     /// multi-MB single line cannot grow the buffer without bound, matches
@@ -1019,15 +1181,41 @@ impl FileSystem for LocalFs {
         let root = self.resolve(root)?;
         let matcher = build_matcher(query)?;
         let query = query.clone();
+        let world = self.clone();
         tokio::task::spawn_blocking(move || {
             let mut result = SearchResult::default();
             let mut searcher = build_searcher(query.context);
-            for entry in local_walker(&root, Arc::clone(&query.skip_dir)).flatten() {
-                if result.matches >= query.max_matches || query.cancel.is_cancelled() {
+            let mut budget = ScanBudget::new(query.walk.clone().bounded());
+            let skipped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            for entry in option_walker(
+                &root,
+                Arc::clone(&query.skip_dir),
+                world.clone(),
+                &query.walk,
+                skipped.clone(),
+            ) {
+                if result.matches >= query.max_matches || !budget.next(&query.cancel) {
                     break;
                 }
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(_) => {
+                        budget.scan.skipped_entries += 1;
+                        continue;
+                    }
+                };
                 let path = entry.path();
-                if !path.is_file() || (query.skip_file)(path) {
+                // Recheck file containment even when an iterator reports a link as a file.
+                if world.resolve(path).is_err() {
+                    budget.scan.skipped_entries += 1;
+                    continue;
+                }
+                if !path.is_file()
+                    || (query.skip_file)(path)
+                    || Self::real_path(path)
+                        .ok()
+                        .is_some_and(|real| (query.skip_file)(&real))
+                {
                     continue;
                 }
                 result.files_searched += 1;
@@ -1037,13 +1225,87 @@ impl FileSystem for LocalFs {
                     max: query.max_matches,
                 };
                 // io / binary / decode errors ⇒ skip the file, as before.
-                let _ = searcher.search_path(&matcher, path, sink);
+                if searcher.search_path(&matcher, path, sink).is_err() {
+                    budget.scan.skipped_entries += 1;
+                }
             }
+            budget.scan.skipped_entries += skipped.load(std::sync::atomic::Ordering::Relaxed);
+            budget.scan.result_limit_reached = result.matches >= query.max_matches;
+            result.scan = budget.scan;
             Ok(result)
         })
         .await
         .map_err(FsError::io)?
     }
+}
+
+#[cfg(feature = "tools")]
+struct ScanBudget {
+    options: WalkOptions,
+    started: std::time::Instant,
+    last_notice: std::time::Instant,
+    scan: ScanReport,
+}
+#[cfg(feature = "tools")]
+impl ScanBudget {
+    fn new(options: WalkOptions) -> Self {
+        Self {
+            options,
+            started: std::time::Instant::now(),
+            last_notice: std::time::Instant::now(),
+            scan: Default::default(),
+        }
+    }
+    fn next(&mut self, cancel: &CancellationToken) -> bool {
+        if cancel.is_cancelled() {
+            return false;
+        }
+        if self.started.elapsed() >= std::time::Duration::from_secs(self.options.timeout_secs) {
+            self.scan.timed_out = true;
+            return false;
+        }
+        if self.scan.entries_scanned >= self.options.max_entries {
+            self.scan.entry_limit_reached = true;
+            return false;
+        }
+        self.scan.entries_scanned += 1;
+        if self.last_notice.elapsed() >= std::time::Duration::from_millis(500) {
+            self.options.progress.emit(format!(
+                "Searching: {} entries visited",
+                self.scan.entries_scanned
+            ));
+            self.last_notice = std::time::Instant::now();
+        }
+        true
+    }
+}
+#[cfg(feature = "tools")]
+fn option_walker(
+    root: &Path,
+    skip: SkipDir,
+    world: LocalFs,
+    options: &WalkOptions,
+    skipped: Arc<std::sync::atomic::AtomicUsize>,
+) -> ignore::Walk {
+    ignore::WalkBuilder::new(root)
+        .hidden(!options.include_hidden)
+        .git_ignore(options.respect_gitignore)
+        .git_global(options.respect_gitignore)
+        .git_exclude(options.respect_gitignore)
+        .ignore(options.respect_gitignore)
+        .parents(options.respect_gitignore)
+        .follow_links(options.follow_symlinks)
+        .filter_entry(move |entry| {
+            // Do not descend through an alias escaping a read-fenced world.
+            // File reads are rechecked too. Never infer access from link location.
+            if world.resolve(entry.path()).is_err() {
+                skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return false;
+            }
+            !entry.file_type().is_some_and(|t| t.is_dir())
+                || !entry.file_name().to_str().is_some_and(|name| skip(name))
+        })
+        .build()
 }
 
 /// The walker `glob` and `grep` always used: gitignore-aware (tree, global and

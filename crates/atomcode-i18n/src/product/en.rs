@@ -1646,6 +1646,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
                  authenticate against. Use the official binary, or point the provider at a \
                  plain OpenAI-compatible endpoint with an api_key."
             ).into(),
+        Msg::GoalStarted => "Goal enabled; work will continue until it is complete.".into(),
         Msg::StreamStalled => "esc to cancel".into(),
         Msg::StreamRecoveryRunning { attempt, max_attempts } => format!(
             "stream interrupted; safely continuing from saved progress ({attempt}/{max_attempts})…"

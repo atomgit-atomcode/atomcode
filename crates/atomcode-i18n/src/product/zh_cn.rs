@@ -1600,6 +1600,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
                 "provider base_url「{base_url}」是 AtomGit 网关，当前构建无法对其鉴权。请使用官方版本，\
                  或将该 provider 指向带 api_key 的标准 OpenAI 兼容端点。"
             ).into(),
+        Msg::GoalStarted => "目标已启用，将持续执行直到完成。".into(),
         Msg::StreamStalled => "按 esc 可取消".into(),
         Msg::StreamRecoveryRunning { attempt, max_attempts } => format!(
             "流响应中断，正在从已保存进度安全续接（{attempt}/{max_attempts}）…"

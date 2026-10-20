@@ -178,6 +178,75 @@ pub struct ToolsConfig {
     pub output: OutputToolConfig,
     #[serde(skip_serializing_if = "McpToolConfig::is_default")]
     pub mcp: McpToolConfig,
+    #[serde(skip_serializing_if = "SearchToolConfig::is_default")]
+    pub search: SearchToolConfig,
+}
+
+/// `[tools.search]` defaults for read-only Glob/Grep discovery. Per-call boolean
+/// switches override these values; access permissions remain independent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SearchToolConfig {
+    pub respect_gitignore: bool,
+    pub include_hidden: bool,
+    pub follow_symlinks: bool,
+    /// Clamped to 1..=300 seconds at mounting.
+    pub timeout_secs: u64,
+    /// Clamped to 1..=1,000,000 visited entries at mounting.
+    pub max_entries: usize,
+}
+impl Default for SearchToolConfig {
+    fn default() -> Self {
+        Self {
+            respect_gitignore: true,
+            include_hidden: false,
+            follow_symlinks: false,
+            timeout_secs: 30,
+            max_entries: 100_000,
+        }
+    }
+}
+impl SearchToolConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+    /// Merge a dedicated project search.toml; absence preserves global defaults.
+    pub fn with_project_file(&self, path: &Path) -> Result<Self> {
+        use std::io::Read;
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(self.clone()),
+            Err(e) => anyhow::bail!("cannot read project search config {}: {e}", path.display()),
+        };
+        let mut text = String::new();
+        file.take(64 * 1024 + 1)
+            .read_to_string(&mut text)
+            .map_err(|_| anyhow::anyhow!("cannot read project search config {}", path.display()))?;
+        if text.len() > 64 * 1024 {
+            anyhow::bail!("project search config is too large: {}", path.display());
+        }
+        let overrides: toml::Value = toml::from_str(&text).map_err(|e: toml::de::Error| {
+            anyhow::anyhow!(
+                "invalid project search config {}: {}",
+                path.display(),
+                e.message()
+            )
+        })?;
+        let mut merged = serde_json::to_value(self)?;
+        let fields = merged.as_object_mut().expect("search options are a table");
+        for (key, value) in overrides
+            .as_table()
+            .ok_or_else(|| anyhow::anyhow!("project search config must be a table"))?
+        {
+            if !fields.contains_key(key) {
+                anyhow::bail!("unknown project search setting: {key}");
+            }
+            fields.insert(key.clone(), serde_json::to_value(value)?);
+        }
+        serde_json::from_value(merged).map_err(|_| {
+            anyhow::anyhow!("invalid project search setting type in {}", path.display())
+        })
+    }
 }
 
 /// How model-facing MCP schemas are offered; transport and approval are unchanged.
@@ -3781,6 +3850,7 @@ model = "missing-type"
                     threshold_bytes: Some(204_800),
                 },
                 mcp: Default::default(),
+                search: Default::default(),
             },
             vision_preprocessor_provider: None,
             language: None,

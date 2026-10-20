@@ -570,3 +570,40 @@ async fn a_configured_output_threshold_reaches_the_row_that_cuts() {
     assert_eq!(row["dir"], dir.to_string_lossy().as_ref(), "{row}");
     mounted.stop();
 }
+
+#[tokio::test]
+async fn search_defaults_reach_the_shipping_tools_and_project_overrides_are_scoped() {
+    let project = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let dirs = atomcode_coding::config::product_dirs_from_env();
+    std::fs::create_dir_all(dirs.project(project.path())).unwrap();
+    std::fs::write(
+        dirs.project(project.path()).join("search.toml"),
+        "respect_gitignore=false\nfollow_symlinks=true\n",
+    )
+    .unwrap();
+    let mut file = atomcode_config::Config::default();
+    file.tools.search.include_hidden = true;
+    let mut cfg = atomcode_coding::CodingRuntimeConfig::from_config(
+        &file,
+        project.path(),
+        dirs.clone(),
+        None,
+        None,
+        false,
+        true,
+    )
+    .agent_config();
+    assert!(cfg.tool_search.include_hidden);
+    let dumped = support::mount(&cfg, quiet_options(), Arc::new(CannedProvider))
+        .await
+        .dump();
+    assert!(dumped.contains("\"respect_gitignore\": false"), "{dumped}");
+    assert!(dumped.contains("\"follow_symlinks\": true"), "{dumped}");
+    cfg.working_dir = elsewhere.path().into();
+    let dumped = support::mount(&cfg, quiet_options(), Arc::new(CannedProvider))
+        .await
+        .dump();
+    assert!(dumped.contains("\"respect_gitignore\": true"), "{dumped}");
+    assert!(dumped.contains("\"follow_symlinks\": false"), "{dumped}");
+}

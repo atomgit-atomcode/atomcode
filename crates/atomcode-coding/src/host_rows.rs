@@ -3170,7 +3170,7 @@ async fn run_goal(
             }
             condition => {
                 runtime.start_goal(condition.to_string()).await?;
-                Ok(format!("开始干,直到:{condition}"))
+                Ok(t(Msg::GoalStarted).into_owned())
             }
         }
     }

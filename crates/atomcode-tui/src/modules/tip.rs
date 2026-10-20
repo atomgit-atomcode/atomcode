@@ -117,6 +117,31 @@ impl View for Tip {
                 ),
             },
         };
+        // Goal status uses the already-reserved row above the box, never the
+        // rename pill's position on the input rule. Preserve a tip on the left.
+        if vp.moment.secret.is_none() {
+            if let Some(goal) = vp.moment.autonomy.as_ref().filter(|a| a.kind == "goal") {
+                let (label, badge_role) = if goal.paused.is_some() {
+                    ("/goal paused", Role::Warning)
+                } else {
+                    ("/goal active", Role::Accent)
+                };
+                let badge_width = crate::width::str_width(label);
+                let available = w.saturating_sub(1) as usize;
+                if available >= badge_width {
+                    let room = available.saturating_sub(badge_width + 1);
+                    let mut line = Line::from_spans(vec![crate::frame::Span::styled(
+                        text.clone(),
+                        theme::fg(role),
+                    )])
+                    .truncate(room);
+                    let gap = available.saturating_sub(line.width() + badge_width);
+                    line.push(crate::frame::Span::raw(" ".repeat(gap)));
+                    line.push(crate::frame::Span::styled(label, theme::fg(badge_role)));
+                    return vec![line];
+                }
+            }
+        }
         // One cell short of the edge. A row written into its last column is one
         // miscounted width away from the console wrapping its last character onto
         // the next row — the composer's rule, which is not redrawn, so the stray
@@ -128,6 +153,9 @@ impl View for Tip {
             El::styled(" ", crate::frame::Style::new()),
         ])
         .lay(w)
+        .into_iter()
+        .take(1)
+        .collect()
     }
 
     /// Always one row — the point of the module.
@@ -169,6 +197,29 @@ mod tests {
             .iter()
             .map(|l| l.plain())
             .collect()
+    }
+
+    #[test]
+    fn goal_status_and_tips_share_one_row_even_on_narrow_terminals() {
+        let mut m = Moment::default();
+        m.autonomy = Some(atomcode_host_api::Running {
+            recovering: false,
+            kind: "goal".into(),
+            what: "a long objective".into(),
+            round: 1,
+            of: None,
+            elapsed_secs: 1,
+            paused: None,
+        });
+        m.clipboard_hint = true;
+        for w in [1, 8, 14, 30, 80] {
+            let rows = draw_at(&m, w, 1);
+            assert_eq!(rows.len(), 1);
+            assert!(rows[0].width() <= w as usize);
+            if w >= 14 {
+                assert!(rows[0].plain().contains("/goal active"));
+            }
+        }
     }
 
     #[test]

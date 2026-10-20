@@ -839,7 +839,13 @@ pub fn names_sessions_with_a_model(cfg: &crate::CodingAgentConfig) -> bool {
 pub fn config_rows(cfg: &crate::CodingAgentConfig) -> Result<Layer, String> {
     use atomcode_capabilities::tools::CredentialShellPolicy;
 
+    let search = cfg
+        .tool_search
+        .with_project_file(&cfg.dirs.project(&cfg.working_dir).join("search.toml"))
+        .map_err(|e| e.to_string())?;
     let mut out = model_rows(cfg)?
+        .patch("tool-search", search)
+        .map_err(|e| e.to_string())?
         .patch(
             "mcp",
             serde_json::json!({"tool_search": cfg.mcp_tool_search}),

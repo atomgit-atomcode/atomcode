@@ -2155,6 +2155,8 @@ pub enum Msg<'a> {
         base_url: &'a str,
     },
 
+    /// Short acknowledgement; the goal condition is already in the user message.
+    GoalStarted,
     // ── streaming liveness (atomcode-tuix spinner) ──
     /// Spinner hint shown when a streaming response has gone silent past the stall
     /// threshold. A silent stretch is OFTEN legitimate (slow first-byte prefill or

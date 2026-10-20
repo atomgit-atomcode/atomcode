@@ -210,8 +210,8 @@ impl View for Status {
             reserved += width::str_width(text) + sep_w;
         }
         // A repeating `/loop` still reports here. `/goal` deliberately does
-        // not: its compact `/goal active` badge lives on the composer's upper
-        // right shoulder, where autonomous goal state is visible without
+        // not: its compact `/goal active` badge lives on the tip row above the composer, aligned
+        // to the right, where autonomous goal state is visible without
         // squeezing model, cwd, context and cache out of this row.
         //
         // Reserved beside the activity indicator and for the same reason: it

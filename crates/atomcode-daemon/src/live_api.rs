@@ -313,6 +313,7 @@ pub(crate) fn chat_runtime_config(
         ),
         tool_output_threshold_bytes: config.tools.output.threshold_bytes,
         mcp_tool_search: config.tools.mcp.tool_search,
+        tool_search: config.tools.search.clone(),
         provider_name: provider_name.to_string(),
         working_dir: working_dir.to_path_buf(),
         context_window: p.map(|p| p.context_window as u32).unwrap_or(128_000),

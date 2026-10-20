@@ -31,6 +31,7 @@ pub struct GrepTool {
     /// Where the product keeps its data: our own per-project dir is skipped
     /// in walks (plugin clones, artifacts, team worktrees).
     dirs: crate::ProductDirs,
+    options: crate::world::WalkOptions,
 }
 
 #[cfg(test)]
@@ -48,12 +49,22 @@ impl GrepTool {
 
     /// Search `world` instead of this machine's disk.
     pub fn with_world(world: Arc<dyn FileSystem>, dirs: crate::ProductDirs) -> Self {
-        Self { world, dirs }
+        Self {
+            world,
+            dirs,
+            options: Default::default(),
+        }
+    }
+    pub fn with_options(mut self, options: crate::world::WalkOptions) -> Self {
+        self.options = options.bounded();
+        self
     }
 }
 
 #[derive(Deserialize)]
 struct Args {
+    #[serde(flatten)]
+    discovery: super::SearchOverrides,
     pattern: String,
     #[serde(default)]
     path: Option<String>,
@@ -70,7 +81,7 @@ impl Tool for GrepTool {
     }
     fn description(&self) -> &str {
         "Search file contents by regular expression under a directory (gitignore-aware; \
-         build/cache dirs and .log files are skipped). Prefer this over `bash grep`/`rg`. \
+         build/cache dirs and .log files are skipped by default). For known paths prefer read_file directly; discovery filters do not prove absence. respect_gitignore=false includes ignored/build content; include_hidden and follow_symlinks are independent. Prefer this over `bash grep`/`rg`. \
          Use it to LOCATE code, then read the exact window with `read_file` (offset/limit/\
          ranges) rather than dumping whole files or slicing them with a shell/`python` \
          script. Smart-case: case-insensitive unless the pattern contains an uppercase \
@@ -81,6 +92,9 @@ impl Tool for GrepTool {
         json!({
             "type": "object",
             "properties": {
+                "respect_gitignore": { "type": "boolean", "description": "Honor ignore files and skip build directories; false includes ignored/build content, excluding VCS metadata and product internals" },
+                "include_hidden": { "type": "boolean", "description": "Include hidden files and directories" },
+                "follow_symlinks": { "type": "boolean", "description": "Follow directory links within filesystem permissions; loops are not traversed" },
                 "pattern": { "type": "string", "description": "Regex to search for" },
                 "path": { "type": "string", "description": "Directory or file to search (default: the working directory)" },
                 "max_results": { "type": "integer", "description": "Max matching lines to return (default 50)" },
@@ -104,12 +118,18 @@ impl Tool for GrepTool {
                 ))
             }
         };
+        if ctx.cancel.is_cancelled() {
+            return err("grep: cancelled before completion.");
+        }
+        let options = a.discovery.resolve(&self.options, ctx);
+        let scan_cancel = ctx.cancel.child_token();
+        let _stop_scan = scan_cancel.clone().drop_guard();
         let raw = a.path.clone().unwrap_or_else(|| ".".to_string());
         let root = resolve_path(&raw, &ctx.working_dir);
         let walks_a_dir = match self.world.info(&root).await {
             Ok(m) if m.exists => m.is_dir,
             // Denied is not missing — see the same note in `read`.
-            Err(e) if e.is_denied() => return err(format!("grep: {e}")),
+            Err(e) => return err(format!("grep: {e}")),
             _ => {
                 return err(format!(
                     "grep: path not found: {}{}",
@@ -152,19 +172,39 @@ impl Tool for GrepTool {
         // the home must not read it: `grep api_key ~/.atomcode` would otherwise
         // hand over what `read_file ~/.atomcode/config.toml` asks about. Resolved
         // on the first file the walk meets, on the walker's own thread.
+        let sensitive = super::sensitive_path::SensitivePaths::of(&self.dirs);
+        let explicitly_sensitive = sensitive
+            .references_in(
+                &json!({ "path": root }).to_string(),
+                &ctx.working_dir,
+                &*self.world,
+            )
+            .await;
+        let mut named_roots = vec![root.clone()];
+        if let Ok(real) = self.world.canonicalize(&root).await {
+            named_roots.push(real);
+        }
         let credential_homes = std::sync::OnceLock::new();
         let user_dir = self.dirs.user().to_path_buf();
+        let respect_ignored_logs = options.respect_gitignore && walks_a_dir;
         let query = SearchQuery {
             pattern,
             case_insensitive,
             context,
             max_matches: max,
-            cancel: ctx.cancel.clone(),
-            skip_dir: crate::pathutil::skip_dir_for(&self.dirs),
+            cancel: scan_cancel.clone(),
+            walk: options.clone(),
+            skip_dir: crate::pathutil::search_skip_dir_for(&self.dirs, options.respect_gitignore),
             skip_file: Arc::new(move |path: &std::path::Path| {
-                path.extension()
-                    .map(|x| x.eq_ignore_ascii_case("log"))
-                    .unwrap_or(false)
+                (respect_ignored_logs
+                    && path
+                        .extension()
+                        .map(|x| x.eq_ignore_ascii_case("log"))
+                        .unwrap_or(false))
+                    || (walks_a_dir
+                        && sensitive.references(&json!({"path": path}).to_string())
+                        && !(explicitly_sensitive
+                            && named_roots.iter().any(|root| path.starts_with(root))))
                     || (walks_a_dir
                         && credential_homes
                             .get_or_init(|| home_spellings(&user_dir))
@@ -175,7 +215,27 @@ impl Tool for GrepTool {
         let base = ctx.working_dir.clone();
         let display_path = raw.clone();
         let shown_pattern = a.pattern.clone();
-        let searched = self.world.search(&root, &query).await;
+        ctx.progress.emit(format!(
+            "Searching {} (up to {}s / {} entries)",
+            display_path, options.timeout_secs, options.max_entries
+        ));
+        let waited = tokio::select! {
+            biased;
+            _ = ctx.cancel.cancelled() => return err("grep: cancelled before completion."),
+            result = tokio::time::timeout(std::time::Duration::from_secs(options.timeout_secs),
+                self.world.search(&root, &query)) => result,
+        };
+        let searched = match waited {
+            Ok(result) => result,
+            Err(_) => {
+                return err(format!(
+                    "grep: search timed out after {}s in {}; scan incomplete. Narrow the path. {}",
+                    options.timeout_secs,
+                    display_path,
+                    options.filter_hint()
+                ))
+            }
+        };
         // The walk gives back what it had when it saw the stop, which is not an
         // answer to what was asked: a "no matches" from a search that was cut
         // short reads to the model as a fact about the tree. Said the way `bash`
@@ -185,8 +245,15 @@ impl Tool for GrepTool {
         }
         match searched {
             Ok(result) if result.lines.is_empty() => ok(format!(
-                "No matches found for '{shown_pattern}' in {display_path} ({} files searched)",
-                result.files_searched
+                "{} for '{shown_pattern}' in {display_path} ({} files searched)\n{}\n{}",
+                if result.scan.incomplete() {
+                    "No matches collected in the scanned portion"
+                } else {
+                    "No matches found under the active filters"
+                },
+                result.files_searched,
+                result.scan.summary(),
+                options.filter_hint()
             )),
             Ok(result) => {
                 let lines: Vec<String> = result
@@ -201,6 +268,7 @@ impl Tool for GrepTool {
                 if capped {
                     out.push_str(&format!("\n\n[Results capped at {max} matches]"));
                 }
+                out.push_str(&format!("\n{}", result.scan.summary()));
                 ok(out)
             }
             Err(e) => err(format!("grep: {e}")),

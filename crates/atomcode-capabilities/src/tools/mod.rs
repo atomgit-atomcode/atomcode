@@ -1016,3 +1016,31 @@ mod tests {
         );
     }
 }
+
+/// Per-call discovery switches override the mounted project/user defaults.
+#[derive(Default, serde::Deserialize)]
+pub(crate) struct SearchOverrides {
+    respect_gitignore: Option<bool>,
+    include_hidden: Option<bool>,
+    follow_symlinks: Option<bool>,
+}
+impl SearchOverrides {
+    pub(crate) fn resolve(
+        &self,
+        defaults: &crate::world::WalkOptions,
+        ctx: &atomcode_kernel::tool::ToolContext,
+    ) -> crate::world::WalkOptions {
+        let mut out = defaults.clone().bounded();
+        if let Some(value) = self.respect_gitignore {
+            out.respect_gitignore = value;
+        }
+        if let Some(value) = self.include_hidden {
+            out.include_hidden = value;
+        }
+        if let Some(value) = self.follow_symlinks {
+            out.follow_symlinks = value;
+        }
+        out.progress = ctx.progress.clone();
+        out
+    }
+}

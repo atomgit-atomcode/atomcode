@@ -470,22 +470,6 @@ impl View for Input {
             El::text(crate::el::captioned_rule(&keys, w as usize, muted, muted))
         } else {
             let history = history_caption(vp.moment);
-            // An active goal owns the right shoulder while it runs. Keep the
-            // label fixed and short: the condition is already the turn's input
-            // line, while this badge answers only whether `/goal` is still in
-            // control. When it goes away, the person's session name returns.
-            let goal = vp
-                .moment
-                .autonomy
-                .as_ref()
-                .filter(|running| running.kind == "goal")
-                .map(|running| {
-                    if running.paused.is_some() {
-                        ("/goal paused", theme::fg(Role::Warning))
-                    } else {
-                        ("/goal active", theme::fg(Role::Accent))
-                    }
-                });
             // Only a name the PERSON chose (`/rename`) earns the pill; an auto
             // first-prompt guess would otherwise pin a chip to the composer for a
             // name nobody asked for. The window title still carries any name.
@@ -494,10 +478,8 @@ impl View for Input {
                 .title
                 .as_deref()
                 .filter(|s| !s.is_empty() && vp.moment.title_user_set);
-            let right = goal.map(|(text, _)| text).or(name);
-            let right_style = goal
-                .map(|(_, style)| style)
-                .unwrap_or_else(|| theme::fg(Role::Border).reverse());
+            let right = name;
+            let right_style = theme::fg(Role::Border).reverse();
             // The clipboard's offer used to take this shoulder for the few
             // seconds it was up. It is the tip row's line now, one row above the
             // box (`modules::tip`): beside the field it read as chrome about the
@@ -748,10 +730,10 @@ mod tests {
 
     /// A running goal needs one stable glanceable fact, not its condition and
     /// internal round counter repeated in the footer. It temporarily owns the
-    /// upper-right shoulder, in the accent colour the slash commands use; when
-    /// the goal ends, the person's session name comes back.
+    /// tip row above the composer in accent colour; the rename pill remains
+    /// visible on the input rule throughout.
     #[test]
-    fn an_active_goal_is_a_cyan_badge_on_the_composers_right_shoulder() {
+    fn an_active_goal_is_above_the_composer_without_hiding_rename() {
         let mut m = Moment {
             title: Some("修解析器".into()),
             title_user_set: true,
@@ -767,14 +749,22 @@ mod tests {
             ..Moment::default()
         };
         let rendered = Input::render(&State::default(), &Viewport::new(Rect::sized(60, 3), &m));
-        let top = &rendered[0];
+        assert!(
+            rendered[0].plain().contains("修解析器"),
+            "rename remains on the input rule"
+        );
+        let tip = crate::modules::tip::Tip::render(
+            &crate::modules::tip::State,
+            &Viewport::new(Rect::sized(60, 1), &m),
+        );
+        let top = &tip[0];
         let plain = top.plain();
         assert!(plain.contains("/goal active"), "{plain:?}");
         assert!(!plain.contains("分析当前项目死代码"), "{plain:?}");
         assert!(!plain.contains("0/240"), "{plain:?}");
         assert!(
             !plain.contains("修解析器"),
-            "goal owns the shoulder: {plain:?}"
+            "the goal has its own row: {plain:?}"
         );
         let badge = top
             .spans
@@ -803,7 +793,10 @@ mod tests {
             }),
             ..Moment::default()
         };
-        let rendered = Input::render(&State::default(), &Viewport::new(Rect::sized(40, 3), &m));
+        let rendered = crate::modules::tip::Tip::render(
+            &crate::modules::tip::State,
+            &Viewport::new(Rect::sized(40, 1), &m),
+        );
         let top = &rendered[0];
         assert!(top.plain().contains("/goal paused"), "{top:?}");
         assert!(!top.plain().contains("active"), "{top:?}");
