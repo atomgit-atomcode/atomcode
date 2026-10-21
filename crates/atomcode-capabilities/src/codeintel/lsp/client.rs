@@ -1167,4 +1167,44 @@ mod tests {
         assert_eq!(all.len(), 1, "malformed diagnostic must be dropped");
         assert_eq!(all[0].message, "ok");
     }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn oversized_unterminated_header_fails_pending_requests_without_server_exit() {
+        let (client_end, server_end) = tokio::io::duplex(16 * 1024);
+        let (cr, cw) = tokio::io::split(client_end);
+        let (sr, mut sw) = tokio::io::split(server_end);
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(sr);
+            let initialize = jsonrpc::read_message(&mut reader).await.unwrap();
+            let initialize: Value = serde_json::from_slice(&initialize).unwrap();
+            let response =
+                json!({"jsonrpc":"2.0","id":initialize["id"],"result":{"capabilities":{}}});
+            sw.write_all(&jsonrpc::encode(&serde_json::to_vec(&response).unwrap()))
+                .await
+                .unwrap();
+            let _initialized = jsonrpc::read_message(&mut reader).await.unwrap();
+            let _hover = jsonrpc::read_message(&mut reader).await.unwrap();
+            sw.write_all(&vec![b'x'; 8192]).await.unwrap();
+            // Keep the peer open: a framing violation, not EOF, must close the reader.
+            let _keepalive = (reader, sw);
+            std::future::pending::<()>().await;
+        });
+        let client = LspClient::connect(Box::new(cr), Box::new(cw), "file:///proj".into())
+            .await
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let path = PathBuf::from(if cfg!(windows) {
+            "C:\\proj\\a.rs"
+        } else {
+            "/proj/a.rs"
+        });
+        let error =
+            tokio::time::timeout(Duration::from_secs(1), client.hover(&path, 0, 0, &cancel))
+                .await
+                .expect("framing failure must wake pending requests")
+                .unwrap_err();
+        assert!(error.contains("stream closed"), "{error}");
+        let error = client.hover(&path, 0, 0, &cancel).await.unwrap_err();
+        assert!(error.contains("stream closed"), "{error}");
+    }
 }
