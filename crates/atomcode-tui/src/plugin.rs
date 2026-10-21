@@ -3668,6 +3668,8 @@ impl Tui {
         let Some(port) = ctx.service::<crate::plugin::SettingsSvc>() else {
             return false;
         };
+        self.host
+            .set_history_layout_rows(port.history_replay_rows());
         let view = port.rows();
         let value = view
             .rows()
@@ -8485,7 +8487,7 @@ impl Tui {
             // anywhere else it is the screen selection it always was.
             Action::SelectFrom(x, y) => {
                 let size = self.surface.size();
-                m.stream_selection = self.host.block_view(size, &m).and_then(|view| {
+                m.stream_selection = self.host.selection_view(size, &m).and_then(|view| {
                     view.row_at(y)
                         .map(|row| crate::moment::StreamSelection::at(view.col_at(x), row))
                 });

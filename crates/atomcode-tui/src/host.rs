@@ -1581,6 +1581,7 @@ pub struct Host {
     /// instead of one somebody has to remember — and the two revisions are
     /// bumped by every writer, not by the call sites that happen to exist today.
     row_index: Mutex<RowIndex>,
+    history_layout_rows: std::sync::atomic::AtomicUsize,
     /// The in-flow user bar shown while a picture is being recognised for a
     /// text-only model, before the message that carries it is logged.
     ///
@@ -1629,6 +1630,8 @@ impl crate::block::Content for Gone {
 /// earlier members, which draw nothing), and whether a blank row separates it
 /// from the slot above.
 struct RowIndex {
+    /// Earliest measured slot, including hidden slots with no rows.
+    loaded_start: usize,
     /// What the measurements below were taken under. A different width, a
     /// different terminal, or a different idea of which blocks are folded,
     /// changes the answer for *every* slot — so those invalidate the lot.
@@ -1822,7 +1825,9 @@ impl Host {
             hits: Mutex::new(Hits::default()),
             last_room: Mutex::new(Rect::default()),
             pin_gate: Mutex::new(()),
+            history_layout_rows: std::sync::atomic::AtomicUsize::new(usize::MAX),
             row_index: Mutex::new(RowIndex {
+                loaded_start: usize::MAX,
                 width: 0,
                 caps: crate::block::ShapeCaps::of(&crate::caps::Caps::default()),
                 presentation: 0,
@@ -1901,6 +1906,7 @@ impl Host {
         *self.stream.write().expect("stream poisoned") = Stream::new();
         *self.presentation.write().expect("presentation poisoned") = Presentation::default_folds();
         *self.row_index.lock().expect("row index poisoned") = RowIndex {
+            loaded_start: usize::MAX,
             width: 0,
             caps: crate::block::ShapeCaps::of(&crate::caps::Caps::default()),
             presentation: 0,
@@ -6084,7 +6090,30 @@ impl Host {
             width: rect.w,
             caps: crate::block::ShapeCaps::of(&moment.caps),
         };
-        let index = self.row_index(&ctx, stream.slots(), &pres, moment.activity);
+        let index = self.row_index_window(
+            &ctx,
+            stream.slots(),
+            &pres,
+            moment.activity,
+            if moment.stream_selection.is_some() {
+                usize::MAX
+            } else {
+                self.history_layout_budget(pane.block_scroll, rect.h as usize)
+            },
+            moment.scroll.0 > 0 || moment.stream_selection.is_some(),
+        );
+        let history_notice = || {
+            (index.loaded_start > 0 && index.loaded_start < stream.slots().len()).then(|| {
+                Line::from_spans(vec![crate::frame::Span::styled(
+                    crate::i18n::t(crate::i18n::Msg::HistoryLoadsOnScroll).into_owned(),
+                    crate::theme::fg(crate::theme::Role::Muted),
+                )])
+                .truncate(rect.w as usize)
+            })
+        };
+        if pane.block_scroll == 0 && index.loaded_start > 0 {
+            return history_notice();
+        }
         let distance = pane
             .block_scroll
             .saturating_add(rect.h as usize)
@@ -6095,7 +6124,7 @@ impl Host {
         let first =
             (first..index.rows.len()).find(|i| index.rows[*i].is_some_and(|row| row.rows > 0))?;
         if stream.slots()[first].block().kind() == "user" {
-            return None;
+            return history_notice();
         }
         // A reserved row must not push the reading position into the next
         // prompt while still labeling it with the preceding turn.
@@ -6105,14 +6134,17 @@ impl Host {
             .find(|i| index.rows[*i].is_some_and(|row| row.rows > 0))
             .is_some_and(|i| stream.slots()[i].block().kind() == "user")
         {
-            return None;
+            return history_notice();
         }
-        (0..first).rev().find_map(|i| {
-            let block = stream.slots()[i].block();
-            (block.kind() == "user" && index.rows[i].is_some_and(|row| row.rows > 0))
-                .then(|| block.content.prompt_header(rect.w))
-                .flatten()
-        })
+        (0..first)
+            .rev()
+            .find_map(|i| {
+                let block = stream.slots()[i].block();
+                (block.kind() == "user" && index.rows[i].is_some_and(|row| row.rows > 0))
+                    .then(|| block.content.prompt_header(rect.w))
+                    .flatten()
+            })
+            .or_else(history_notice)
     }
 
     fn reserve_prompt_header(&self, pane: &mut Pane, moment: &Moment) -> Option<Line> {
@@ -6197,7 +6229,7 @@ impl Host {
         // about how tall anything is. It carries the run table too, so the walk
         // below never builds `lids` of its own — that fold is O(slots) and the
         // index already paid for it.
-        let index = self.row_index(
+        let index = self.row_index_window(
             &crate::block::RenderCtx {
                 width: rect.w,
                 caps,
@@ -6205,6 +6237,8 @@ impl Host {
             stream.slots(),
             &pres,
             activity,
+            self.history_layout_budget(scroll, want),
+            scroll > 0,
         );
 
         // **Start where the window starts.** Everything newer than this is
@@ -6945,11 +6979,8 @@ impl Host {
 
     /// Throw the index away, so the next ask rebuilds it from the stream.
     ///
-    /// Test-only, and the whole point of the ratchet beside it: the property
-    /// that needs proving is that the incrementally-kept index says exactly what
-    /// a from-scratch one would. Without a way to force the rebuild there is
-    /// nothing to compare the reuse against.
-    #[cfg(test)]
+    /// Used when the history layout setting changes and by the ratchet proving
+    /// that incremental measurements agree with a fresh rebuild.
     fn forget_row_index(&self) {
         self.row_index.lock().expect("row index poisoned").width = 0;
     }
@@ -6992,6 +7023,44 @@ impl Host {
             .collect()
     }
 
+    /// Limit expensive block measurement, not the authoritative history.
+    pub(crate) fn set_history_layout_rows(&self, rows: Option<usize>) {
+        let rows = rows.filter(|rows| *rows > 0).unwrap_or(usize::MAX);
+        if self
+            .history_layout_rows
+            .swap(rows, std::sync::atomic::Ordering::Relaxed)
+            != rows
+        {
+            self.forget_row_index();
+        }
+    }
+
+    fn history_layout_budget(&self, scroll: usize, height: usize) -> usize {
+        let page = self
+            .history_layout_rows
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if page == usize::MAX {
+            return page;
+        }
+        scroll
+            .saturating_add(height)
+            .checked_div(page)
+            .unwrap_or(0)
+            .saturating_add(1)
+            .saturating_mul(page)
+    }
+
+    #[cfg(test)]
+    fn row_index<'a>(
+        &'a self,
+        ctx: &crate::block::RenderCtx,
+        slots: &[crate::block::Slot],
+        pres: &Presentation,
+        activity: crate::moment::Activity,
+    ) -> std::sync::MutexGuard<'a, RowIndex> {
+        self.row_index_window(ctx, slots, pres, activity, usize::MAX, true)
+    }
+
     /// Build or extend the row index, and hand it back.
     ///
     /// **One row sum for the whole host.** `stream_height_in` bounds the scroll
@@ -7013,12 +7082,14 @@ impl Host {
     /// A different width or a different idea of what is folded changes the
     /// answer for every slot, so those start over. Both are revisions rather
     /// than arguments somebody passes correctly: see `Presentation::revision`.
-    fn row_index<'a>(
+    fn row_index_window<'a>(
         &'a self,
         ctx: &crate::block::RenderCtx,
         slots: &[crate::block::Slot],
         pres: &Presentation,
         activity: crate::moment::Activity,
+        budget: usize,
+        retain_loaded: bool,
     ) -> std::sync::MutexGuard<'a, RowIndex> {
         let mut idx = self.row_index.lock().expect("row index poisoned");
         if idx.width != ctx.width
@@ -7028,13 +7099,39 @@ impl Host {
         {
             idx.measured.clear();
             idx.rows.clear();
+            idx.loaded_start = usize::MAX;
             idx.width = ctx.width;
             idx.caps = ctx.caps;
             idx.presentation = pres.revision();
             idx.activity = activity;
         }
         let lids = lids(slots, pres, activity);
-        for i in 0..slots.len() {
+        // Facts arrive in batches during resume. A growing stream must not
+        // pin its first batch forever: keep a moving suffix at the requested
+        // budget. A stable stream keeps already visited history cached.
+        let loaded_start = if retain_loaded || idx.measured.len() == slots.len() {
+            idx.loaded_start.min(slots.len())
+        } else {
+            idx.loaded_start = usize::MAX;
+            slots.len()
+        };
+        idx.measured.truncate(slots.len());
+        idx.rows.truncate(slots.len());
+        while idx.measured.len() < slots.len() {
+            let i = idx.measured.len();
+            idx.measured.push(Measured {
+                id: slots[i].block().id,
+                settled: false,
+            });
+            idx.rows.push(None);
+        }
+        let mut measured_rows = 0usize;
+        let mut measured_below: Option<&'static str> = None;
+        for i in (0..slots.len()).rev() {
+            if measured_rows >= budget && i < loaded_start {
+                break;
+            }
+            idx.loaded_start = idx.loaded_start.min(i);
             let slot = &slots[i];
             let b = slot.block();
             let settled = slot.is_settled();
@@ -7058,6 +7155,14 @@ impl Host {
                     .get(i)
                     .is_some_and(|m| m.settled && m.id == b.id);
             if reusable {
+                if let Some(entry) = idx.rows[i].filter(|entry| entry.rows > 0) {
+                    let seam = measured_below
+                        .is_some_and(|below| blank_between(entry.kind, below, pres.calls_apart()));
+                    measured_rows = measured_rows
+                        .saturating_add(entry.rows)
+                        .saturating_add(usize::from(seam));
+                    measured_below = Some(entry.kind);
+                }
                 continue;
             }
             // The same width the painter will use: a row count is only the
@@ -7080,14 +7185,21 @@ impl Host {
                 b,
                 pres,
             );
-            let m = Measured { id: b.id, settled };
-            if idx.measured.len() <= i {
-                idx.measured.push(m);
-                idx.rows.push(entry);
-            } else {
-                idx.measured[i] = m;
-                idx.rows[i] = entry;
+            if let Some(entry) = entry.filter(|entry| entry.rows > 0) {
+                let seam = measured_below
+                    .is_some_and(|below| blank_between(entry.kind, below, pres.calls_apart()));
+                measured_rows = measured_rows
+                    .saturating_add(entry.rows)
+                    .saturating_add(usize::from(seam));
+                measured_below = Some(entry.kind);
             }
+            let m = Measured { id: b.id, settled };
+            idx.measured[i] = m;
+            idx.rows[i] = entry;
+        }
+        for i in 0..idx.loaded_start.min(slots.len()) {
+            idx.rows[i] = None;
+            idx.measured[i].settled = false;
         }
         // The suffix sum, in the walk's terms — see `skip_from`. Backwards, so
         // the slot seen last is the one *below* the current one, which is the
@@ -7149,18 +7261,52 @@ impl Host {
     }
 
     /// How many rows the conversation's blocks render to at `width` — the
-    /// painter's own count ([`Host::row_index`]), tail not included.
+    /// painter's own count ([`Host::row_index_window`]), tail not included.
     fn block_total(&self, width: u16, moment: &Moment) -> usize {
         let caps = crate::block::ShapeCaps::of(&moment.caps);
         let stream = self.stream.read().expect("stream poisoned");
         let pres = self.presentation.read().expect("presentation poisoned");
-        self.row_index(
+        self.row_index_window(
             &crate::block::RenderCtx { width, caps },
             stream.slots(),
             &pres,
             moment.activity,
+            if moment.stream_selection.is_some() {
+                usize::MAX
+            } else {
+                self.history_layout_budget(moment.scroll.0, 0)
+            },
+            moment.scroll.0 > 0 || moment.stream_selection.is_some(),
         )
         .total
+    }
+
+    fn full_block_total(&self, width: u16, moment: &Moment) -> usize {
+        let stream = self.stream.read().expect("stream poisoned");
+        let pres = self.presentation.read().expect("presentation poisoned");
+        let total = self
+            .row_index_window(
+                &crate::block::RenderCtx {
+                    width,
+                    caps: crate::block::ShapeCaps::of(&moment.caps),
+                },
+                stream.slots(),
+                &pres,
+                moment.activity,
+                usize::MAX,
+                true,
+            )
+            .total;
+        total
+    }
+
+    /// Selections use stable absolute row numbers. Measure the remaining
+    /// prefix once on an explicit selection gesture, before assigning those
+    /// numbers, while preserving the geometry of the frame that was clicked.
+    pub(crate) fn selection_view(&self, size: (u16, u16), moment: &Moment) -> Option<BlockView> {
+        let mut view = self.block_view(size, moment)?;
+        view.total = self.full_block_total(view.rect.w, moment);
+        Some(view)
     }
 
     /// A stable reading copy: expand tools without changing the live screen's folds.
@@ -7191,7 +7337,7 @@ impl Host {
     /// the screen does; drawn in slices because a rect is at most `u16` rows
     /// tall and a long session is not.
     pub fn transcript_lines(&self, width: u16, moment: &Moment) -> Vec<Line> {
-        let total = self.block_total(width, moment);
+        let total = self.full_block_total(width, moment);
         let caps = crate::block::ShapeCaps::of(&moment.caps);
         // A question in flight with no panel to ride is drawn under the
         // blocks in every window (`stream_lines`), taking rows the count above
@@ -7332,16 +7478,22 @@ impl Host {
         let stream = self.stream.read().expect("stream poisoned");
         let pres = self.presentation.read().expect("presentation poisoned");
         // The sum, from the one place both this and the painter read it — see
-        // [`Host::row_index`]. This used to walk every slot itself: a second
+        // [`Host::row_index_window`]. This used to walk every slot itself: a second
         // answer to a question the frame had already asked. On a 1458-slot
         // session the two walks cost 4.1ms here and 13.7ms in `stream_lines`,
         // per wheel notch (measured, debug, 2026-09-15).
         let total = self
-            .row_index(
+            .row_index_window(
                 &crate::block::RenderCtx { width, caps },
                 stream.slots(),
                 &pres,
                 moment.activity,
+                if moment.stream_selection.is_some() {
+                    usize::MAX
+                } else {
+                    self.history_layout_budget(moment.scroll.0, room.h as usize)
+                },
+                moment.scroll.0 > 0 || moment.stream_selection.is_some(),
             )
             .total;
         // The tail is content too, so it counts towards what there is to read:
@@ -11007,6 +11159,146 @@ mod tests {
             short, long,
             "a four-times-longer session made one scrolled frame cost more: what \
              is above the fold is still being rendered"
+        );
+    }
+
+    #[test]
+    fn history_layout_measures_a_tail_and_scrolls_back_to_the_oldest_block() {
+        let (h, asked) = counted(2_000);
+        h.set_history_layout_rows(Some(80));
+        let size = (80, 20);
+        let _ = h.compose(size);
+        assert!(
+            asked.load(std::sync::atomic::Ordering::SeqCst) < 100,
+            "initial layout formatted the whole history"
+        );
+        assert_eq!(h.stream.read().unwrap().slots().len(), 2_000);
+        assert!(
+            h.compose(size).part("stream.prompt").is_some(),
+            "bounded history must be visible to the reader"
+        );
+        let first = h.row_index.lock().unwrap().loaded_start;
+        assert!(first > 0);
+        // Scroll against the currently known upper boundary. Each step must
+        // bring in more history, even when blank seams alter the row count.
+        for _ in 0..200 {
+            let mut m = h.moment.read().unwrap().clone();
+            m.scroll = crate::moment::ScrollPos(h.scroll_limit(size, &m));
+            *h.moment.write().unwrap() = m;
+            let _ = h.compose(size);
+            if h.row_index.lock().unwrap().loaded_start == 0 {
+                break;
+            }
+        }
+        assert_eq!(
+            h.row_index.lock().unwrap().loaded_start,
+            0,
+            "progressive history got stuck at the loaded boundary"
+        );
+        let mut m = h.moment.read().unwrap().clone();
+        m.scroll = crate::moment::ScrollPos(h.scroll_limit(size, &m));
+        *h.moment.write().unwrap() = m;
+        let frame = h.compose(size);
+        assert!(
+            frame
+                .part("stream")
+                .unwrap()
+                .lines
+                .iter()
+                .any(|line| line.plain().contains("paragraph 0")),
+            "the oldest retained block must remain reachable"
+        );
+        // Resize at the bottom starts from a bounded tail again.
+        h.moment.write().unwrap().scroll = crate::moment::ScrollPos::BOTTOM;
+        let _ = h.compose((60, 20));
+        assert!(h.row_index.lock().unwrap().loaded_start > 0);
+        h.set_history_layout_rows(None);
+        let _ = h.compose((60, 20));
+        assert_eq!(h.row_index.lock().unwrap().loaded_start, 0);
+        h.switch_session();
+        assert!(h.stream.read().unwrap().slots().is_empty());
+        let _ = h.compose(size);
+        assert_eq!(h.row_index.lock().unwrap().total, 0);
+    }
+
+    #[test]
+    fn bounded_history_keeps_exports_and_selection_coordinates_complete() {
+        let (h, _) = counted(200);
+        h.set_history_layout_rows(Some(40));
+        let _ = h.compose((80, 20));
+        let m = h.moment.read().unwrap().clone();
+        let before = h.block_view((80, 20), &m).unwrap();
+        let selected = h.selection_view((80, 20), &m).unwrap();
+        assert_eq!(before.rect, selected.rect);
+        assert!(selected.total > before.total);
+        assert_eq!(h.row_index.lock().unwrap().loaded_start, 0);
+        h.forget_row_index();
+        let exported = h
+            .transcript_lines(80, &m)
+            .iter()
+            .map(Line::plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(exported.contains("paragraph 0\n"));
+        assert!(exported.contains("paragraph 199\n"));
+    }
+
+    #[test]
+    fn history_layout_stays_bounded_when_resume_arrives_in_batches() {
+        let (h, _) = counted(10);
+        h.set_history_layout_rows(Some(40));
+        let _ = h.compose((80, 20));
+        assert_eq!(h.row_index.lock().unwrap().loaded_start, 0);
+        for batch in 0..10 {
+            {
+                let mut stream = h.stream.write().unwrap();
+                let mut writer = stream.writer("bench");
+                for item in 0..100 {
+                    writer.emit(
+                        crate::block::Coord::default(),
+                        Arc::new(Kinded {
+                            kind: "assistant",
+                            lines: vec![format!("batch {batch} item {item}")],
+                        }),
+                    );
+                }
+            }
+            let _ = h.compose((80, 20));
+            let idx = h.row_index.lock().unwrap();
+            assert!(idx.total < 50, "a replay batch retained the full prefix");
+            assert!(idx.loaded_start > 0);
+        }
+    }
+
+    #[test]
+    fn incoming_blocks_keep_the_loaded_prefix_while_reading_older_history() {
+        let (h, _) = counted(200);
+        h.set_history_layout_rows(Some(40));
+        h.moment.write().unwrap().scroll = crate::moment::ScrollPos(30);
+        let _ = h.compose((80, 20));
+        let (start, total) = {
+            let idx = h.row_index.lock().unwrap();
+            (idx.loaded_start, idx.total)
+        };
+        {
+            let mut stream = h.stream.write().unwrap();
+            stream.writer("bench").emit(
+                crate::block::Coord::default(),
+                Arc::new(Kinded {
+                    kind: "assistant",
+                    lines: vec!["new incoming block".into()],
+                }),
+            );
+        }
+        let _ = h.compose((80, 20));
+        let idx = h.row_index.lock().unwrap();
+        assert!(
+            idx.loaded_start <= start,
+            "incoming content retired the reader's prefix"
+        );
+        assert!(
+            idx.total > total,
+            "incoming rows must grow the existing coordinate space"
         );
     }
 

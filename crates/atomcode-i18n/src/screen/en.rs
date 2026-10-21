@@ -1110,6 +1110,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::LiveOut { tokens } => format!("↓ {tokens}").into(),
         Msg::LiveCached { hit } => format!("cached {hit}").into(),
         Msg::LiveSpeed { rate } => format!("{rate} tok/s").into(),
+        Msg::HistoryLoadsOnScroll => "Earlier history loads as you scroll up".into(),
         Msg::FoldedLines { hidden } => format!("⋯ {hidden} lines folded — click to open").into(),
         Msg::MoreBelow { arrow, lines } => format!(" {arrow} {lines} more lines · click to go back to the bottom ").into(),
 

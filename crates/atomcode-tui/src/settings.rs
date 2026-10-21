@@ -1124,6 +1124,12 @@ pub fn key(view: &SettingsView, panel: &mut Panel, press: crate::surface::KeyPre
 /// the same reason: what the screen knows about the product came over a seam,
 /// not out of a service of the product's own (`docs/adr/0022` §3).
 pub trait Settings: Send + Sync {
+    /// Initial history layout budget; older rows are measured as the reader
+    /// scrolls upwards. None retains eager full-history layout.
+    fn history_replay_rows(&self) -> Option<usize> {
+        Some(1_000)
+    }
+
     /// The settings as they are now.
     ///
     /// Asked again when the panel opens and after every change, so a file edited

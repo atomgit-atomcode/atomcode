@@ -179,6 +179,14 @@ fn write_retry(path: &PathBuf, value: Option<&str>) -> Result<(), String> {
 }
 
 impl Settings for ConfigSettings {
+    fn history_replay_rows(&self) -> Option<usize> {
+        let config = atomcode_config::config::Config::load(&self.path).unwrap_or_default();
+        history_replay_rows(
+            &config.ui,
+            std::env::var("TERM_PROGRAM").as_deref().unwrap_or(""),
+        )
+    }
+
     fn rows(&self) -> SettingsView {
         self.read()
     }
@@ -621,5 +629,43 @@ mod tests {
                 "{kind:?} maps to a kind with no gesture: {mapped:?}"
             );
         }
+    }
+}
+
+/// Presentation only: never changes the native session or model context.
+fn history_replay_rows(ui: &atomcode_config::config::UiConfig, terminal: &str) -> Option<usize> {
+    if !ui.truncate_resumed_history || ui.history_replay_max_rows == Some(0) {
+        return None;
+    }
+    ui.history_replay_max_rows.or_else(|| {
+        let terminal = terminal.to_ascii_lowercase();
+        Some(
+            if cfg!(windows) || terminal.contains("vscode") || terminal.contains("jediterm") {
+                1_000
+            } else if terminal.contains("wezterm") {
+                3_000
+            } else {
+                2_500
+            },
+        )
+    })
+}
+
+#[cfg(test)]
+mod history_layout_tests {
+    use super::*;
+
+    #[test]
+    fn history_layout_preserves_disable_and_custom_budget_settings() {
+        let mut ui = atomcode_config::config::UiConfig::default();
+        assert_eq!(history_replay_rows(&ui, "vscode"), Some(1_000));
+        ui.history_replay_max_rows = Some(777);
+        assert_eq!(history_replay_rows(&ui, "wezterm"), Some(777));
+        ui.truncate_resumed_history = false;
+        assert_eq!(history_replay_rows(&ui, "vscode"), None);
+        assert_eq!(ui.history_replay_max_rows, Some(777));
+        ui.truncate_resumed_history = true;
+        ui.history_replay_max_rows = Some(0);
+        assert_eq!(history_replay_rows(&ui, "vscode"), None);
     }
 }

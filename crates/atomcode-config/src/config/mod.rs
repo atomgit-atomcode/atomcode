@@ -820,10 +820,10 @@ pub struct UiConfig {
     /// Default on; off saves the side call it costs.
     #[serde(default = "default_true")]
     pub recap: bool,
-    /// Maximum number of already-wrapped transcript rows written to the host
-    /// terminal when a session is resumed. `None` selects a terminal-aware
-    /// default; `Some(0)` disables the cap and restores the legacy full replay.
-    /// This only limits presentation: runtime restores the full native session.
+    /// Initial transcript layout budget in rows. Older history is measured
+    /// progressively as the reader scrolls up. `None` selects a terminal-aware
+    /// default; `Some(0)` disables the budget and lays out the full history.
+    /// Whole blocks may exceed the budget. Runtime restores the full native session.
     #[serde(default)]
     pub history_replay_max_rows: Option<usize>,
     /// Whether resumed history replay is bounded. Disabling this keeps the

@@ -1742,6 +1742,8 @@ pub enum Msg<'a> {
     LiveSpeed {
         rate: u64,
     },
+    /// Older transcript layout is loaded progressively by scrolling upwards.
+    HistoryLoadsOnScroll,
     FoldedLines {
         hidden: usize,
     },
