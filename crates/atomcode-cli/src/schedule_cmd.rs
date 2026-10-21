@@ -897,6 +897,10 @@ mod tests {
     /// normal unwind), preventing subsequent store tests from silently seeing a
     /// dangling path.
     fn with_temp_home<T, F: FnOnce() -> T>(f: F) -> T {
+        // The helper mutates the process-global ATOMCODE_HOME, so it must hold
+        // the same global serial lock the other env-mutating tests (acp replay,
+        // tui_login) take — `store_lock` alone only serializes this module.
+        let _serial = serial_test::serial_lock();
         struct EnvGuard {
             prev: Option<std::ffi::OsString>,
         }

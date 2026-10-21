@@ -783,6 +783,7 @@ mod credential_tests {
     /// no, and codingplan's setup ran its own login — the stdout-driven one —
     /// printing an English URL banner onto the frame, past the border.
     #[test]
+    #[serial_test::serial]
     fn a_finished_login_reaches_the_disk() {
         let home = tempfile::tempdir().expect("tempdir");
         std::env::set_var("ATOMCODE_HOME", home.path());
