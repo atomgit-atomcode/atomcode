@@ -11546,6 +11546,10 @@ mod tests {
     #[test]
     fn the_jump_draws_what_the_walk_draws() {
         use std::sync::atomic::Ordering as O;
+        // Both legs render localized chrome (the jump badge among it), so the
+        // race is not the jump's arithmetic but the global locale being
+        // flipped underneath by a parallel test — hold the lock for the run.
+        let _locale = crate::i18n::test_lock();
         // A stream with everything the jump has to reason about: prose (seams
         // between blocks), reasoning (hidden by default → draws nothing and is
         // not a neighbour), tool calls (merged behind lids), and a kind folded to

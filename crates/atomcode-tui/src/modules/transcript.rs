@@ -1138,6 +1138,10 @@ mod tests {
     #[test]
     fn what_the_model_was_handed_instead_is_said_on_screen() {
         use atomcode_harness::session::RewrittenText;
+        // Asserts the Chinese wording, so it must not race a parallel test
+        // flipping the process-global locale — same class as the conformance
+        // criteria; hold the lock for the draw.
+        let _locale = crate::i18n::test_lock();
         let s = fold(&[
             SessionEvent::TurnStart { turn: 1 },
             SessionEvent::Compacted {
