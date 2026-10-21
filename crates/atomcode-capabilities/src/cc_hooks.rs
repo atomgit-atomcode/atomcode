@@ -102,6 +102,8 @@ pub struct HookConfig {
     /// `"foo_*"` = prefix; otherwise exact.
     pub matcher: Option<String>,
     pub command: String,
+    /// Literal arguments. Never concatenate these into the shell command.
+    pub args: Vec<String>,
     pub timeout_ms: u64,
     /// Set for plugin-contributed hooks; exported as `CLAUDE_PLUGIN_ROOT` /
     /// `ATOMCODE_PLUGIN_ROOT` so a plugin script can locate resources alongside
@@ -112,6 +114,12 @@ pub struct HookConfig {
 }
 
 impl HookConfig {
+    /// Attach manifest argv without reinterpreting it as command text.
+    pub fn with_args(mut self, args: Vec<String>) -> Self {
+        self.args = args;
+        self
+    }
+
     /// Build a config from a Claude-Code plugin's INLINE manifest hook (a `plugin.json`
     /// `hooks` entry). The driver resolves these from installed plugins — which L1 cannot
     /// reach — and feeds them in via [`CCExternalHooks::load_with_extra`]. `event_name` is
@@ -135,6 +143,7 @@ impl HookConfig {
                 crate::plugin::hook_trust::plugin_content_hash(&plugin_root)
                     .unwrap_or_else(|_| "unverifiable".into()),
             ),
+            args: Vec::new(),
             plugin_root: Some(plugin_root),
         })
     }
@@ -228,6 +237,7 @@ fn read_hooks_file(path: &Path) -> (Vec<HookConfig>, HooksFileStatus) {
             matcher: entry.matcher,
             command: entry.command,
             timeout_ms: entry.timeout_ms,
+            args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
         });
@@ -416,7 +426,13 @@ fn import_wrapper_path(command: &str) -> Option<String> {
 /// Keep argument boundaries and execute the exact canonical path we checked.
 fn plugin_hook_command(hook: &HookConfig) -> Result<tokio::process::Command, String> {
     let Some(root) = &hook.plugin_root else {
-        return Ok(shell_command(&hook.command));
+        return Ok(if hook.args.is_empty() {
+            shell_command(&hook.command)
+        } else {
+            let mut command = tokio::process::Command::new(&hook.command);
+            command.args(&hook.args);
+            command
+        });
     };
     // CC plugins sometimes wrap a script entry point in this Node expression
     // solely to normalize Windows separators. Recognize the exact wrapper,
@@ -490,6 +506,10 @@ fn plugin_hook_command(hook: &HookConfig) -> Result<tokio::process::Command, Str
     if words.is_empty() {
         return Err("empty plugin hook command".into());
     }
+    if hook.args.iter().any(|arg| arg.contains('\0')) {
+        return Err("plugin hook arguments cannot contain NUL".into());
+    }
+    words.extend(hook.args.iter().cloned());
     let mut interpreter = match words[0].as_str() {
         "python" | "python3" | "node" | "sh" | "bash" => Some(words.remove(0)),
         _ => None,
@@ -602,6 +622,7 @@ pub(crate) fn validate_plugin_hook(
         matcher: hook.matcher.clone(),
         command: hook.command.clone(),
         timeout_ms: default_timeout_ms(),
+        args: hook.args.clone(),
         plugin_root: Some(hook.plugin_root.clone()),
         plugin_content_hash: None,
     };
@@ -1594,6 +1615,7 @@ mod tests {
                 "cd '{cwd}' && grep -q '\"hook_event_name\":\"{name}\"' && touch '{marker}'"
             ),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
         };
@@ -1679,6 +1701,7 @@ mod tests {
                  && grep -q '\"stop_hook_active\":false' payload.json && touch '{m1_s}'"
             ),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
         };
@@ -1701,6 +1724,7 @@ mod tests {
                 "cd '{cwd}' && grep -q '\"stop_hook_active\":true' && touch '{marker_s}'"
             ),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
         };
@@ -1948,6 +1972,52 @@ mod tests {
     }
 
     #[test]
+    fn plugin_argv_preserves_literals_and_still_checks_the_entry_point() {
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("entry with spaces.py");
+        std::fs::write(
+            &script,
+            "import json, sys; print(json.dumps(sys.argv[1:]))\n",
+        )
+        .unwrap();
+        let interpreter = if cfg!(windows) { "python" } else { "python3" };
+        let literals = vec![
+            "session-start".to_string(),
+            "a b".into(),
+            "quote'\"".into(),
+            "$(echo SHOULD_NOT_RUN); & | >".into(),
+            "".into(),
+        ];
+        let mut argv = vec!["${CLAUDE_PLUGIN_ROOT}/entry with spaces.py".into()];
+        argv.extend(literals.clone());
+        let hook = plugin_config(root.path(), interpreter).with_args(argv);
+        let output = plugin_hook_command(&hook)
+            .unwrap()
+            .as_std_mut()
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            serde_json::from_slice::<Vec<String>>(&output.stdout).unwrap(),
+            literals
+        );
+        for arguments in [
+            vec!["../outside.py".into()],
+            vec!["-c".into(), "print('bad')".into()],
+            vec!["entry with spaces.py".into(), "nul\0arg".into()],
+        ] {
+            assert!(plugin_hook_command(
+                &plugin_config(root.path(), interpreter).with_args(arguments)
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
     fn channel_multi_segment_import_uses_a_checked_script_path() {
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("atomcode/src with spaces");
@@ -2102,6 +2172,7 @@ mod tests {
             matcher: None,
             command: r#"echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"x"}}'"#.into(),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
         };
@@ -2127,6 +2198,7 @@ mod tests {
             matcher: None,
             command: "echo hooktest-ok".into(),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
         };
@@ -2156,6 +2228,7 @@ mod tests {
             matcher: None,
             command: r#"echo '{"hookSpecificOutput":{"permissionDecision":"ask"}}'"#.into(),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
         };
@@ -2188,6 +2261,7 @@ mod tests {
             matcher: None,
             command: r#"echo '{"decision":"block","reason":"banned"}'"#.into(),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
         };
@@ -2204,6 +2278,7 @@ mod tests {
             matcher: None,
             command: r#"echo '{"hookSpecificOutput":{"additionalContext":"CTX"}}'"#.into(),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
         };
@@ -2232,6 +2307,7 @@ mod tests {
             matcher: None,
             command: r#"printf '{"hookSpecificOutput":{"additionalContext":"cwd=%s|a=%s|c=%s"}}' "$(pwd -P)" "$ATOMCODE_PROJECT_DIR" "$CLAUDE_PROJECT_DIR""#.into(),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
         };
@@ -2270,6 +2346,7 @@ mod tests {
             matcher: None,
             command: command.into(),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
         };
@@ -2299,6 +2376,7 @@ mod tests {
             matcher: None,
             command: r#"echo '{"hookSpecificOutput":{"additionalContext":"STILL-RAN"}}'"#.into(),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
         };
@@ -2316,6 +2394,7 @@ mod tests {
             command: r#"echo '{"hookSpecificOutput":{"additionalContext":"WSL setup hint"}}'"#
                 .into(),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
         };
@@ -2355,6 +2434,7 @@ mod tests {
             matcher: None,
             command: "exit 1".into(),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
         };
@@ -2380,6 +2460,7 @@ mod tests {
             matcher: None,
             command: cmd.into(),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
         };
@@ -2414,6 +2495,7 @@ mod tests {
             matcher: None,
             command,
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
         };
@@ -2582,6 +2664,7 @@ mod tests {
             matcher: Some("bash".into()),
             command: r#"echo '{"hookSpecificOutput":{"updatedToolOutput":"REWRITTEN"}}'"#.into(),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
         };
@@ -2640,6 +2723,7 @@ mod tests {
             matcher: None,
             command: r#"echo '{"hookSpecificOutput":{"updatedToolOutput":"OK-REWRITE"}}'"#.into(),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
         };
@@ -2648,6 +2732,7 @@ mod tests {
             matcher: None,
             command: r#"echo '{"hookSpecificOutput":{"updatedToolOutput":"FAIL-REWRITE"}}'"#.into(),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
         };
@@ -2704,6 +2789,7 @@ mod tests {
             matcher: None,
             command: r#"grep -q '"session_id":"sess-xyz"' && echo MATCHED"#.into(),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
         };
@@ -2728,6 +2814,7 @@ mod tests {
             command: r#"grep -q '"call_id":"tc-42"' && echo '{"decision":"block","reason":"saw call_id"}'"#
                 .into(),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
         };
@@ -2750,6 +2837,7 @@ mod tests {
             matcher: None,
             command: cmd.into(),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
         }

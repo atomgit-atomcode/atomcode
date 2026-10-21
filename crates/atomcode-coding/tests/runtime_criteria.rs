@@ -1677,6 +1677,7 @@ async fn a_persons_hooks_and_a_plugins_hooks_both_run() {
             matcher: None,
             command: format!("touch {}", from_plugin.display()),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
             plugin_content_hash: None,
         },

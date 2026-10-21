@@ -23,22 +23,34 @@ pub fn plugin_id(plugin: &str, marketplace: &str) -> String {
 /// so no field content (including control bytes) can shift a boundary and collide
 /// two different hook sets.
 pub fn plugin_hook_set_hash(hooks: &[PluginCcHook]) -> String {
-    let mut triples: Vec<(&str, &str, &str)> = hooks
+    let mut triples: Vec<(&str, &str, &str, &[String])> = hooks
         .iter()
         .map(|h| {
             (
                 h.event.as_str(),
                 h.matcher.as_deref().unwrap_or(""),
                 h.command.as_str(),
+                h.args.as_slice(),
             )
         })
         .collect();
     triples.sort_unstable();
     let mut hasher = Sha256::new();
-    for (event, matcher, command) in &triples {
+    let has_args = hooks.iter().any(|hook| !hook.args.is_empty());
+    if has_args {
+        hasher.update(b"plugin-hook-argv-v1\0");
+    }
+    for (event, matcher, command, args) in &triples {
         for field in [event, matcher, command] {
             hasher.update((field.len() as u64).to_le_bytes());
             hasher.update(field.as_bytes());
+        }
+        if has_args {
+            hasher.update((args.len() as u64).to_le_bytes());
+            for arg in *args {
+                hasher.update((arg.len() as u64).to_le_bytes());
+                hasher.update(arg.as_bytes());
+            }
         }
     }
     let metadata = format!("{:x}", hasher.clone().finalize());
@@ -206,6 +218,7 @@ mod tests {
             matcher: matcher.map(|s| s.into()),
             command: command.into(),
             timeout_secs: None,
+            args: Vec::new(),
             plugin_root: PathBuf::from("/x"),
         }
     }
@@ -242,6 +255,29 @@ mod tests {
                 &hash
             ));
         }
+    }
+
+    #[test]
+    fn changing_argv_invalidates_authorization_and_preserves_argument_boundaries() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("entry.py"), "pass\n").unwrap();
+        let mut hook = mk(
+            "SessionStart",
+            None,
+            if cfg!(windows) { "python" } else { "python3" },
+        );
+        hook.plugin_root = root.path().into();
+        hook.args = vec!["entry.py".into(), "ab".into(), "c".into()];
+        let original = plugin_hook_set_hash(&[hook.clone()]);
+        assert!(!original.starts_with("invalid:"));
+        let grants = BTreeMap::from([("p@m".into(), original.clone())]);
+        assert!(is_trusted(&grants, "p@m", &original));
+        hook.args = vec!["entry.py".into(), "a".into(), "bc".into()];
+        let changed = plugin_hook_set_hash(&[hook.clone()]);
+        assert_ne!(original, changed);
+        assert!(!is_trusted(&grants, "p@m", &changed));
+        hook.args.swap(1, 2);
+        assert_ne!(changed, plugin_hook_set_hash(&[hook]));
     }
 
     #[test]
