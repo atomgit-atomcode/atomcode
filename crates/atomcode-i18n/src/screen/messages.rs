@@ -7,6 +7,9 @@
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Msg<'a> {
+    InjectedFromSession {
+        from: &'a str,
+    },
     MemoryEmpty,
 
     // ── the command dispatcher (`command.rs`) ──
@@ -39,6 +42,7 @@ pub enum Msg<'a> {
     // ── the moment (`moment.rs`) ──
     /// After the first Ctrl+C: press it again and the screen closes.
     MomentQuitAgain,
+    MomentEofAgain,
 
     // ── overlays (`overlay.rs`) ──
     OverlayEmptyFile,
@@ -77,6 +81,13 @@ pub enum Msg<'a> {
     // ── completion menu and policy interventions (`plugin.rs`) ──
     /// The one-word note beside a directory in the `@`-completion menu.
     MenuFolder,
+    MentionAll,
+    MentionFiles,
+    MentionEmpty,
+    MentionLegend,
+    MentionSessions,
+    MentionSelected,
+    MentionFilter,
 
     // ── the providers panel (`providers.rs`) ──
 
@@ -188,6 +199,9 @@ pub enum Msg<'a> {
     AskReviewCancel,
     /// A batch question with no answer yet, on the review page.
     AskUnanswered,
+    AskPending {
+        id: u64,
+    },
     AskLegendToggle,
     AskLegendSwitch,
     /// Left and right, on a typing row with words in it.
@@ -227,6 +241,24 @@ pub enum Msg<'a> {
     },
     StatusStopping,
     StatusGoal,
+    GoalStageEvaluating,
+    GoalStageContinuing {
+        detail: &'a str,
+    },
+    GoalStageRecovering,
+    GoalStagePaused {
+        detail: &'a str,
+    },
+    GoalProviderRecovery {
+        attempt: u32,
+        max: u32,
+        secs: u64,
+    },
+    GoalEvaluatorRecovery {
+        attempt: u32,
+        max: u32,
+        secs: u64,
+    },
     StatusLoop,
     /// `kind` is already localised — [`Msg::StatusGoal`] or [`Msg::StatusLoop`].
     StatusRoundsHeld {
@@ -383,8 +415,8 @@ pub enum Msg<'a> {
     TranscriptShortened {
         count: usize,
     },
-    /// A provider request failed and is being sent again. `reason` is the
-    /// provider's own error, verbatim.
+    /// A provider request failed and is being sent again. The caller supplies
+    /// a short localized reason; original diagnostics belong in expandable details.
     TranscriptProviderRetry {
         reason: &'a str,
         seconds: u64,
@@ -423,6 +455,7 @@ pub enum Msg<'a> {
     CmdAboutQuit,
     CmdAboutReasoning,
     CmdAboutTools,
+    CmdAboutErrors,
     CmdAboutShowInject,
     CmdAboutMouse,
     /// `/provider`'s model picker: the listing had nothing the account lacks.
@@ -458,6 +491,9 @@ pub enum Msg<'a> {
     /// suspending switched off.
     SuspendUnsupported,
     CmdAboutRaw,
+    CmdAboutRead,
+    ReadLegend,
+    ReadUnavailable,
     CmdAboutKeys,
     CmdAboutTodo,
     CmdAboutTeam,
@@ -575,6 +611,19 @@ pub enum Msg<'a> {
         error: &'a str,
     },
     KeysHelp,
+    KeysHelpWithNewline {
+        keys: &'a str,
+    },
+    KeybindingsMenu,
+    KeybindingsCapture,
+    KeybindingsConfirm {
+        key: &'a str,
+    },
+    KeybindingsManual,
+    KeybindingsEmpty,
+    KeybindingsError {
+        error: &'a str,
+    },
     ToolOutputUnknown {
         what: &'a str,
     },
@@ -1073,10 +1122,12 @@ pub enum Msg<'a> {
     McpActionUntrust,
     McpActionLogin,
     McpActionLogout,
+    McpActionReconnect,
     McpActionEnable,
     McpActionDisable,
     /// The key legend: on the list, on the detail page, and while a round trip
     /// is out.
+    McpRefreshTimeout,
     McpLegendList,
     McpLegendDetail,
     McpLegendBusy,
@@ -1489,6 +1540,8 @@ pub enum Msg<'a> {
     MenuCopyAllAbout,
     MenuPaste,
     MenuPasteAbout,
+    MenuNewline,
+    MenuNewlineAbout,
     MenuClear,
     MenuClearAbout,
     MenuSend,
@@ -1515,6 +1568,10 @@ pub enum Msg<'a> {
     PluginTabMarkets,
     PluginHookTrustedShort,
     PluginHookUntrustedShort,
+    PluginHookIncompatibleShort,
+    PluginHooksIncompatible {
+        id: &'a str,
+    },
     PluginActionTrust,
     PluginActionUntrust,
     PluginActionTrustAbout,
@@ -1592,6 +1649,29 @@ pub enum Msg<'a> {
     SessionCached {
         pct: u64,
     },
+    StopProviderError,
+    ProviderBusy,
+    ProviderUnavailable,
+    ProviderAccessDenied,
+    ProviderAuthenticationFailed,
+    ProviderRateLimitError,
+    ProviderConnectionError,
+    ProviderUnknownError,
+    ProviderErrorStatus {
+        reason: &'a str,
+        status: u16,
+    },
+    ProviderTryAgain,
+    ProviderCheckAccess,
+    ProviderCheckCredentials,
+    ProviderCheckConnection,
+    ProviderCheckRequest,
+    ProviderNoFallback,
+    ProviderErrorDetails,
+    ProviderRetryDetailsHint,
+    TeamPanelEmpty,
+    TeamPanelExpanded,
+    TeamPanelCollapsed,
     StopCancelled,
     StopMaxRounds,
     StopByPolicy,
@@ -1659,8 +1739,9 @@ pub enum Msg<'a> {
     LiveCached {
         hit: &'a str,
     },
-    LiveStep {
-        step: u32,
+    LiveSpeedPending,
+    LiveSpeed {
+        rate: u64,
     },
     FoldedLines {
         hidden: usize,
@@ -1765,6 +1846,21 @@ pub enum Msg<'a> {
     HostHeld,
     SourceConfigFile,
     SourceSettings,
+    SourceLoaded,
+    SourceShadowed,
+    SourceEmpty,
+    SourceUnreadable,
+    SourceNotLoaded,
+    SourceDiskChanged,
+    SourceSkillDirs,
+    SourceSkills,
+    SourceSkillDiagnostics,
+    SourceSkillSummary {
+        loaded: usize,
+        directories: usize,
+        overridden: usize,
+        failed: usize,
+    },
     SourceInstructionFiles,
     SourceMemoryFiles,
     HostNoEditableConfig,
@@ -1965,19 +2061,6 @@ pub enum Msg<'a> {
     },
     CmdAboutOnboarding,
     CmdAboutOnboardingFinished,
-    /// A command the classic screen has and this one does not have yet — typed
-    /// here, it says where it still lives rather than "no such command".
-    ClassicOnlyForNow {
-        command: &'a str,
-    },
-    CmdAboutClassicOnly,
-    /// A command this screen does not have because it belongs to the command
-    /// line — `/upgrade` replaces the binary, which a screen inside it cannot.
-    LivesInTheCli {
-        command: &'a str,
-        run: &'a str,
-    },
-    CmdAboutInTheCli,
     /// The confirmation before a rollback (titled by the product's
     /// `UpgradeOptRollback`).
     RollbackConfirmSwitch,

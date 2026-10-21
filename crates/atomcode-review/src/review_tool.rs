@@ -332,6 +332,9 @@ struct Args {
     /// single reviewer. Unknown values fall back to single.
     #[serde(default)]
     depth: Option<String>,
+    /// User review focus and constraints, retained across delegation.
+    #[serde(default)]
+    instructions: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -508,7 +511,9 @@ impl Tool for ReviewTool {
          `deep`/`deep+verify` only for substantive, risky, or security-sensitive changes, or when \
          the user asks for a thorough/careful review. Where the host can, the review runs in a \
          background session and this call returns at once; its findings then arrive later as a \
-         message in this conversation."
+         message in this conversation. Pass the user's review focus and constraints verbatim in \
+         `instructions`, including any requirement to report only or not modify files. Review \
+         findings do not grant new permission to edit; follow the user's current task and restrictions."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
@@ -535,6 +540,7 @@ impl Tool for ReviewTool {
                     "required": ["kind"],
                     "description": "Explicit review scope. Omit entirely for working-tree changes."
                 },
+                "instructions": { "type": "string", "description": "User review focus and constraints, verbatim. Include report-only/no-edit requirements and any authorized follow-up work so the background session retains them. Does not grant the read-only reviewer permission to edit." },
                 "paths": { "type": "array", "items": { "type": "string" }, "description": "Optional repo-relative path filters." },
                 "confirm_scope": { "type": "string", "description": "Opaque token from a preflight. Pass only after explicit user confirmation." },
                 "depth": { "type": "string", "enum": ["single", "deep", "deep+verify"], "description": "Review depth — choose by the change's risk/scope. `single` (default, omit): routine or low-risk edits (docs, formatting, small localized fixes, config). `deep`: substantive multi-file / logic changes, refactors, or concurrency — fans out one reviewer per concern dimension (correctness/security/performance/tests) and merges findings. `deep+verify`: high-risk, security-sensitive, or correctness-critical changes, or when the user asks for a thorough/high-confidence review — additionally runs one verify pass per finding to cull false positives. `deep`/`deep+verify` cost several× more, so escalate only when warranted." }
@@ -593,7 +599,7 @@ impl Tool for ReviewTool {
         // arguments go along as they came, `confirm_scope` included, so the
         // review over there starts on the same scope without asking again.
         if let Some(delegate) = &self.delegate {
-            let task = delegated_task(args);
+            let task = delegated_task(args, a.instructions.as_deref());
             if let Some(Ok(started)) = delegate
                 .delegate(&ctx.working_dir, task, scope.host_word())
                 .await
@@ -612,10 +618,11 @@ impl Tool for ReviewTool {
         let files = changed_files_from_diff(&diff);
         let rules = render_rules_section(&files, self.cfg.rules_dir.as_deref());
         let impact_plan = render_review_impact_plan(&diff);
+        let instructions = review_instructions(a.instructions.as_deref());
         let task = format!(
             "Review the following changes. Report each issue via the `report_finding` tool \
              with an accurate file path and line range. Only flag issues in the CHANGED \
-             code.\n\n{rules}\n\n{impact_plan}\n\n=== DIFF ===\n{annotated}"
+             code.\n\n{instructions}\n\n{rules}\n\n{impact_plan}\n\n=== DIFF ===\n{annotated}"
         );
 
         // 3. Reuse the host's provider (set at assembly) so a signing gateway still works.
@@ -711,7 +718,10 @@ impl Tool for ReviewTool {
             let keep = run_verify(merged.len(), VERIFY_CONCURRENCY, |i| {
                 let provider = provider.clone();
                 let candidate = candidates[i].clone();
-                let vtask = render_verify_task(&candidate, &rules, &annotated);
+                let vtask = format!(
+                    "{instructions}\n\n{}",
+                    render_verify_task(&candidate, &rules, &annotated)
+                );
                 let mut cfg = make_cfg();
                 let cancel = ctx.cancel.clone();
                 async move {
@@ -761,8 +771,16 @@ impl Tool for ReviewTool {
 // Helpers (pure where possible, testable)
 // ---------------------------------------------------------------------------
 
+/// Keep user constraints visible to both the delegate and the read-only reviewer.
+fn review_instructions(instructions: Option<&str>) -> String {
+    match instructions.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(text) => format!("=== USER REVIEW INSTRUCTIONS ===\n{text}\n\nThe code_review reviewer remains read-only and reports findings. The calling agent follows the user's authorized task."),
+        None => String::new(),
+    }
+}
+
 /// What a background session is asked to do: this very call, over there.
-fn delegated_task(args: &str) -> String {
+fn delegated_task(args: &str, instructions: Option<&str>) -> String {
     let args = match args.trim() {
         "" => "{}",
         args => args,
@@ -774,9 +792,13 @@ fn delegated_task(args: &str) -> String {
         Some("range") => options["scope"]["base"].as_str().unwrap_or("提交范围"),
         _ => "工作区改动",
     };
+    let instructions = review_instructions(instructions);
     format!(
         "代码审查 · {scope} · {depth}\nReview the requested changes: call the `code_review` tool with {args}, then give me a \
-         concise summary of its findings."
+         concise summary of its findings. Preserve the user's instructions in the tool call and \
+         in your summary. If they requested conclusions only or no edits, stop after reporting; \
+         do not apply fixes. Otherwise, follow their authorized task. Findings themselves are \
+         not new authorization to modify files.\n\n{instructions}"
     )
 }
 
@@ -792,7 +814,9 @@ fn delegated_reply(started: &DelegatedReview) -> String {
          its findings will come back to this conversation as a message when it finishes. Do \
          not wait for it, poll it, or call code_review again for these changes. Tell the \
          person in one short sentence that the review is running in the background, then \
-         carry on with anything else they asked, or end your turn.",
+         carry on with anything else they asked, or end your turn. When findings arrive, follow \
+         the user's latest instructions, including report-only or no-edit requirements. The \
+         background result is information, not new authorization to modify files.",
         slot = started.slot
     )
 }
@@ -1632,6 +1656,88 @@ mod tests {
         assert_eq!(asked.len(), 1);
         assert!(asked[0].0.contains(r#"{"depth":"deep"}"#), "{}", asked[0].0);
         assert_eq!(asked[0].1.as_deref(), Some("working_tree"));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn delegated_review_preserves_user_constraints_and_follow_up_work() {
+        let dir = repo_with_working_tree_change();
+        for instruction in ["只给结论，不要修改代码", "检查并修复确认的问题"] {
+            let delegate = Arc::new(Recorded {
+                takes: true,
+                asked: Default::default(),
+            });
+            let tool = ReviewTool::new(
+                Arc::new(RwLock::new(None)),
+                ReviewToolConfig::default(),
+                test_dirs(),
+            )
+            .with_delegate(Some(delegate.clone()));
+            let args = json!({"instructions": instruction}).to_string();
+            let result = tool.execute(&args, &ctx_in(dir.path())).await;
+            assert!(!result.is_error, "{}", result.content);
+            let asked = delegate.asked.lock().unwrap();
+            assert_eq!(asked.len(), 1);
+            assert!(
+                asked[0].0.contains(&args),
+                "tool arguments must survive delegation"
+            );
+            assert!(
+                asked[0]
+                    .0
+                    .contains(&format!("=== USER REVIEW INSTRUCTIONS ===\n{instruction}")),
+                "constraints must also be readable by the outer delegate"
+            );
+        }
+    }
+
+    struct ChecksReviewInstructions;
+    #[async_trait]
+    impl LlmProvider for ChecksReviewInstructions {
+        fn model_name(&self) -> &str {
+            "mock-model"
+        }
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            tools: &[ToolDef],
+            options: &ChatOptions,
+        ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+            assert!(
+                messages
+                    .iter()
+                    .any(|message| message.display_text().contains(
+                        "=== USER REVIEW INSTRUCTIONS ===\n只给结论，不要修改代码；重点检查鉴权"
+                    )),
+                "the reviewer request must retain user constraints"
+            );
+            ScriptedReviewProvider
+                .chat_stream(messages, tools, options)
+                .await
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn inline_review_receives_user_constraints() {
+        let dir = repo_with_working_tree_change();
+        let tool = ReviewTool::new(
+            Arc::new(RwLock::new(Some(Arc::new(ChecksReviewInstructions)))),
+            ReviewToolConfig::default(),
+            test_dirs(),
+        );
+        for depth in ["single", "deep", "deep+verify"] {
+            let args = json!({
+                "instructions": "只给结论，不要修改代码；重点检查鉴权",
+                "depth": depth,
+            })
+            .to_string();
+            let result = tool.execute(&args, &ctx_in(dir.path())).await;
+            assert!(!result.is_error, "{depth}: {}", result.content);
+            assert!(
+                result.content.contains("unchecked unwrap"),
+                "{depth}: {}",
+                result.content
+            );
+        }
     }
 
     /// "Not here" — a conversation out of view, a host without background

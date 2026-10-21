@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'preact/hooks';
-import { getModels, ModelInfo, postLiveReasoningEffort } from '../api';
+import { getModels, ModelInfo, postLiveReasoningEffort, ReasoningEffortError } from '../api';
 import { useT } from '../settings';
 import { MsgKey } from '../i18n';
 
@@ -36,11 +36,15 @@ function areModelsEqual(a: ModelInfo[], b: ModelInfo[]): boolean {
 export function ModelSelector({
   value,
   liveEffort,
+  busy = false,
+  onError,
   onChange,
   onDefaultChange,
 }: {
   value: string | null;
   liveEffort?: string | null;
+  busy?: boolean;
+  onError?: (message: string) => void;
   onChange: (p: string) => void;
   onDefaultChange?: (p: string) => void;
 }) {
@@ -48,6 +52,8 @@ export function ModelSelector({
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [open, setOpen] = useState(false);
   const [effortOpen, setEffortOpen] = useState(false);
+  const [effortSaving, setEffortSaving] = useState(false);
+  const [effortError, setEffortError] = useState<string | null>(null);
   // undefined = "show the provider's persisted value"; a string/null is a
   // local override after the user picks one (config isn't re-fetched).
   const [effortOverride, setEffortOverride] = useState<string | null | undefined>(undefined);
@@ -98,8 +104,11 @@ export function ModelSelector({
     return () => document.removeEventListener('mousedown', h);
   }, [open, effortOpen]);
   const current = models.find((m) => m.provider === value) ?? models.find((m) => m.is_default) ?? models[0];
+  const currentProvider = useRef(current?.provider);
+  currentProvider.current = current?.provider;
+  useEffect(() => { if (busy) setEffortOpen(false); }, [busy]);
   // Switching models resets the effort display back to the new model's
-  // persisted value (and hides the selector entirely for non-V4 models).
+  // persisted value; capability declarations decide whether the selector appears.
   useEffect(() => { setEffortOverride(undefined); }, [current?.provider]);
   useEffect(() => {
     if (liveEffort !== undefined) setEffortOverride(liveEffort);
@@ -110,15 +119,22 @@ export function ModelSelector({
     return t(o.key);
   };
   const selectEffort = (v: string | null) => {
+    if (busy || effortSaving || !current) return;
+    const target = current.provider;
     const previous = effort;
+    setEffortError(null);
+    setEffortSaving(true);
     setEffortOverride(v);
     setEffortOpen(false);
-    if (current) {
-      void postLiveReasoningEffort(v, current.provider).catch((error) => {
-        setEffortOverride(previous);
-        console.error('Failed to update reasoning effort', error);
-      });
-    }
+    void postLiveReasoningEffort(v, target).then(() => {
+      // The write succeeded. A later list refresh failure must not undo that fact.
+      void getModels().then(setModels).catch(() => {});
+    }).catch((error) => {
+      if (currentProvider.current === target) setEffortOverride(previous);
+      const message = t(error instanceof ReasoningEffortError && error.activeTurn ? 'effort.busy' : 'effort.failed');
+      if (onError) onError(message);
+      else setEffortError(message);
+    }).finally(() => setEffortSaving(false));
   };
   // 同名模型可能来自多个 Provider（如两个 deepseek-v4-flash）。仅在模型名重复时
   // 附上 Provider 标识以区分，唯一的模型名保持简洁。
@@ -136,19 +152,21 @@ export function ModelSelector({
   };
   return (
     <div class="model-controls">
+      {effortError && <span role="alert">{effortError}</span>}
       {current?.effort_applicable && (
         <div class="model-selector effort-selector model-selector-up" ref={effortRef}>
           <button
             class="model-selector-trigger"
             onClick={() => { setEffortOpen((o) => !o); setOpen(false); }}
             type="button"
-            title={t('effort.label')}
+            disabled={busy || effortSaving}
+            title={t(busy ? 'effort.busy' : 'effort.label')}
           >
             <span class="effort-prefix">{t('effort.label')}</span>
             <span class="model-selector-label">{effortLabel(effort)}</span>
             <span class="model-selector-chevron">▾</span>
           </button>
-          {effortOpen && (
+          {effortOpen && !busy && !effortSaving && (
             <div class="model-dropdown">
               {EFFORT_OPTIONS.filter(
                 (o) =>

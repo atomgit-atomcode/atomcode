@@ -56,6 +56,7 @@ pub mod front_end;
 pub mod host;
 pub mod on_harness;
 pub mod parts;
+pub mod permission_settings;
 pub mod persona;
 pub mod plan_mode;
 pub mod plugin_hooks;
@@ -75,6 +76,7 @@ mod execution_policy;
 pub mod host_rows;
 mod init_prompt;
 mod mcp_instructions;
+mod mcp_tool_search;
 pub mod native_log;
 mod next_prompt_suggestion;
 mod rate_limit;
@@ -92,7 +94,10 @@ pub use config::{
     CodingRuntimeConfig, SubagentModelProviders, SubagentModelResolver, SubagentProvider,
     TierProvider,
 };
-pub use controllers::{GoalPhase, GoalProgress, GoalTerminal, LoopProgress};
+pub use controllers::{
+    GoalPhase, GoalProgress, GoalRecoveryKind, GoalRecoveryProgress, GoalRunReport, GoalTerminal,
+    GoalTokenUsage, LoopProgress,
+};
 pub use init_prompt::{build_init_prompt, INIT_PROMPT, INIT_PROMPT_ZH_CN};
 pub use parts::{
     prepare, prepare_from_config, prepare_with_plugin_hook_source, prepare_with_plugin_hooks,

@@ -94,7 +94,7 @@ mod tests {
     use serial_test::serial;
 
     #[test]
-    #[serial]
+    #[serial(atomcode_home)]
     fn atomcode_dir_follows_home() {
         // `atomcode_dir()` is exactly the resolved config root = ATOMCODE_HOME.
         // (The unset→`~/.atomcode` fallback lives in core and is covered by
@@ -106,7 +106,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(atomcode_home)]
     fn atomcode_home_env_wins() {
         // Under unified semantics, ATOMCODE_HOME IS the data root.
         // The legacy ATOMCODE_HOME_OVERRIDE variable is gone.

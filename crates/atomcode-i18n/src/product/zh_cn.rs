@@ -258,6 +258,45 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StatusMemoryScopeGlobal => "用户全局".into(),
         Msg::StatusMemoryScopeProject => "项目记忆".into(),
         Msg::StatusMemoryScopeLocal => "本机记忆".into(),
+        Msg::StatusMemoryInjection => "注入状态".into(),
+        Msg::MemoryEntryCatalog => "条目元数据".into(),
+        Msg::MemoryOriginalSource => "原始源文本".into(),
+        Msg::MemoryReviewTitle => "# 记忆注入状态\n\n".into(),
+        Msg::MemoryDiskPreview { budget, chars } => format!("## 磁盘最新预览\n\n三层记忆和知识索引共用 {budget} 字符预算，本次预览为 {chars} 字符。这是磁盘内容的预算选择结果，不代表当前会话已加载。\n").into(),
+        Msg::MemoryScopeSelection { scope, path, loaded, selected, omitted, shortened } => format!("\n### {scope} — {path}\n\n读入 {loaded} 条，选中 {selected} 条，省略 {omitted} 条，缩短 {shortened} 条。\n").into(),
+        Msg::MemoryPartialRead => "\n普通条目保留最近 64 KiB，置顶候选另行扫描并最多保留 64 KiB；其余条目未纳入本次计数。\n".into(),
+        Msg::MemoryReadFailed { error } => format!("\n读取失败：{error}\n").into(),
+        Msg::MemoryKnowledgeReview { path, state } => format!("\n### 知识索引\n\n{path}\n\n{state}；链接文件的正文不会自动注入。\n").into(),
+        Msg::MemoryIndexIncluded => "已纳入路由索引".into(),
+        Msg::MemoryIndexNotIncluded => "未纳入索引（文件不存在、为空、读取失败或超出预算）".into(),
+        Msg::MemoryIndexLimited => "\n索引已缩短或省略，需要时请读取完整索引。\n".into(),
+        Msg::MemorySessionLogged { present, matches } => format!("## 会话日志中的记忆\n\n仍在投影上下文中：{present}。与磁盘最新预览一致：{matches}。\n\n").into(),
+        Msg::MemoryInjectionDisabled => "当前运行时已关闭记忆注入。\n\n".into(),
+        Msg::MemoryNotLoggedYet => "尚未记录记忆注入。以下是运行时装配时准备的首回合内容：\n\n".into(),
+        Msg::MemoryNotLogged => "本会话没有记忆注入记录。磁盘修改不会自动注入已有会话。\n\n".into(),
+        Msg::MemoryEntrySelected => "选中".into(),
+        Msg::MemoryEntryOmitted => "省略".into(),
+        Msg::MemoryEntryExpired => "已过期（保留内容，新会话不注入）".into(),
+        Msg::MemoryInvalidDays => "期限必须是 1 至 36500 的整数天数".into(),
+        Msg::MemoryExpiryConflict => "到期选项冲突，或不适用于此操作".into(),
+        Msg::MemoryEntryInactive => "未启用".into(),
+        Msg::MemoryArgUnclosedQuote => "记忆参数的引号未闭合".into(),
+        Msg::MemoryArgQuoteSpacing => "引号后的参数需要空格".into(),
+        Msg::MemoryArgNeedsValue { arg } => format!("{arg} 需要一个值").into(),
+        Msg::MemoryArgUnknown { arg } => format!("不认识记忆参数：{arg}").into(),
+        Msg::MemoryCommandSyntax => "用法：/memory [筛选参数]，或 /memory update|pin|unpin|deprecate <ID>".into(),
+        Msg::MemoryIdKeywordConflict => "不能同时指定 ID 和删除关键词".into(),
+        Msg::MemoryUnexpectedContent => "此记忆操作不接受正文参数".into(),
+        Msg::MemoryInvalidStatus => "记忆状态只能是 active、outdated 或 deprecated".into(),
+        Msg::MemoryJsonListOnly => "--json 仅用于记忆列表".into(),
+        Msg::MemoryListFilters => "记忆列表支持 --topic、--status 和范围筛选".into(),
+        Msg::MemoryIdRequired => "此记忆操作需要条目 ID".into(),
+        Msg::MemoryRememberRequired => "/remember 需要记忆正文".into(),
+        Msg::MemoryForgetRequired => "/forget 需要关键词，或用 --id 精确废弃".into(),
+        Msg::MemoryFilteredDetails => "条目明细按请求筛选；预算总计和会话实际注入内容仍完整展示。\n\n".into(),
+        Msg::MemoryEntryShortened => "缩短".into(),
+        Msg::MemoryInjectionIncomplete => "记忆未完整加载，请用 /memory 查看".into(),
+        Msg::MemorySelectionWarning { omitted, shortened, failures, partial } => format!("省略 {omitted} 条，缩短 {shortened} 条，读取失败 {failures} 处，文件或索引未完整加载：{partial}。请用 /memory 查看。").into(),
         Msg::StatusMemoryPresent { path, scope } =>
             format!("    ✓ {scope}：{path}\n").into(),
         Msg::StatusMemoryMissing { path, scope } =>
@@ -549,8 +588,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "未选中会话".into(),
         Msg::SessionPickerHint =>
             "↑↓ 移动 · Enter 打开 · Ctrl+D×2 删除 · 输入内容搜索 · Esc 取消".into(),
-        Msg::ClassicScreenFallback =>
-            "当前控制台不支持新界面所需的终端控制序列，已改用经典界面。在 Windows Terminal 中运行可使用新界面。".into(),
+        Msg::AnsiTerminalRequired =>
+            "当前终端不支持 TUI 所需的 ANSI 功能。请使用 Windows Terminal 等支持 ANSI 的终端，或通过 -p 使用无界面模式。".into(),
+        Msg::ClassicScreenRetired =>
+            "经典界面已退役，现使用当前 TUI；请将 [ui] screen 改为 rows。".into(),
         Msg::PasswordPromptHint =>
             "🔒 命令在请求密码 · 输入不显示、不留存 · Enter 提交 · Esc 取消".into(),
         Msg::SessionPickerTitle { n, total, project } =>
@@ -1031,8 +1072,11 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("插件市场同步已跳过（不影响对话）：{detail}").into(),
         Msg::OfflineModeActive =>
             "离线模式：已停用联网工具、遥测与自动更新。".into(),
-        Msg::PluginHooksUntrusted { count, names } => format!(
-            "{count} 个插件的 hook 尚未获信任（{names}），这些 hook 不会运行。输入 /plugin trust <插件名> 授权。"
+        Msg::PluginHooksUntrusted { count, names: _ } => format!(
+            "{count} 个插件的 hook 待重新授权，暂不运行。输入 /plugin 查看并授权。"
+        ).into(),
+        Msg::PluginHooksIncompatible { count } => format!(
+            "{count} 个插件的 hook 配置不兼容，暂不运行。运行 atomcode hooks list 查看原因；重新授权不能解决。"
         ).into(),
         Msg::PluginInstalling { plugin, marketplace } =>
             format!("正在安装 `{plugin}@{marketplace}`…").into(),
@@ -1370,7 +1414,10 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
 
         // ── 能力行自己挂的命令，菜单怎么画 ──
         Msg::CmdCatalogWorktree =>
-            "开一个自己的分支与 checkout 并进去干活;`list` 看有哪些,`done` 回主检出,`cleanup` 清掉".into(),
+            "开一个自己的分支与 checkout 并进去干活;`list` 看有哪些,`done` 仅回主检出（不提交或合并）,`cleanup` 清理前请确认成果已合并".into(),
+        Msg::WorktreeReturned { path } => format!("已切回主检出：{path}。本操作仅切换目录，不提交或合并；原 worktree 的改动和提交仍保留在原处。请确认成果已提交并合并后再清理 worktree。").into(),
+        Msg::WorktreeDirty { name } => format!("`{name}` 里仍有未提交改动，清理已拒绝。请先处理并确认成果已合并；`/worktree cleanup {name} --force` 会丢弃未提交内容。").into(),
+        Msg::WorktreeHelp => "用法：`/worktree [create] <名字> [基准]` 创建并进入；`/worktree list` 查看；`/worktree done` 仅切回主检出，不提交或合并；`/worktree cleanup <名字> [--force]` 清理前请确认成果已合并，--force 会丢弃未提交内容。".into(),
         Msg::CmdCatalogWorktreeUsage =>
             "[create] <名字> [基准] | list | done | cleanup <名字> [--force]".into(),
         Msg::CmdCatalogInit =>
@@ -1380,7 +1427,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdCatalogWorklogUsage => "[今天|昨天|8/27]".into(),
         Msg::CmdCatalogGoal =>
             "自己干到条件成立为止;`stop` 收工,`pause` 先搁着。".into(),
-        Msg::CmdCatalogGoalUsage => "<要达成的条件> | stop | pause".into(),
+        Msg::CmdCatalogGoalUsage => "<要达成的条件> | stop | pause | recheck | report | questions | answer <id> <text>".into(),
         Msg::CmdCatalogLoop =>
             "一遍遍地做同一件事,直到 `stop`。".into(),
         Msg::CmdCatalogLoopUsage => "<每轮要做的事> | stop".into(),
@@ -1393,15 +1440,19 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             "让评审员看一遍现在的改动;只读,不改".into(),
         Msg::CmdCatalogSkills =>
             "装了哪些 skill;给名字就把它们一起用上".into(),
+        Msg::CmdCatalogSkillsEmpty => "一个 skill 都没装".into(),
+        Msg::CmdCatalogSkillDirs => "Skill 扫描目录".into(),
+        Msg::CmdCatalogSkillDiagnostics => "Skill 加载诊断".into(),
         Msg::CmdCatalogSkillsUsage => "[名字… [给它们的话]]".into(),
         Msg::CmdCatalogSkillUsage => "[给它的话]".into(),
         Msg::CmdCatalogPromptCommandUsage => "[命令参数]".into(),
-        Msg::CmdCatalogMemory => "存下来的那些话".into(),
+        Msg::CmdCatalogMemory => "查看、筛选和管理记忆条目".into(),
+        Msg::CmdCatalogMemoryUsage => "[--topic <主题>] [--status <状态>] [--expired|--expiring-within N] | update|pin|unpin|deprecate <ID>".into(),
         Msg::CmdCatalogRemember =>
             "记住一句话,以后每个会话都带着".into(),
-        Msg::CmdCatalogRememberUsage => "<要记住的话>".into(),
+        Msg::CmdCatalogRememberUsage => "[--topic <主题>] [--source <来源>] [--pin] [--ttl-days N] <要记住的话>".into(),
         Msg::CmdCatalogForget => "把记住的某句话删掉".into(),
-        Msg::CmdCatalogForgetUsage => "<要忘掉的话>".into(),
+        Msg::CmdCatalogForgetUsage => "<关键词> | --id <ID>".into(),
         Msg::ModelNoImageSupport { model } => format!(
             "当前模型 \"{}\" 不支持图片输入，且未配置 vision_preprocessor_provider。\
              请用 /model 切换到支持视觉的模型，或在配置中设置 vision_preprocessor_provider。",
@@ -1592,11 +1643,18 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
                 "provider base_url「{base_url}」是 AtomGit 网关，当前构建无法对其鉴权。请使用官方版本，\
                  或将该 provider 指向带 api_key 的标准 OpenAI 兼容端点。"
             ).into(),
+        Msg::GoalStarted => "目标已启用，将持续执行直到完成。".into(),
         Msg::StreamStalled => "按 esc 可取消".into(),
         Msg::StreamRecoveryRunning { attempt, max_attempts } => format!(
             "流响应中断，正在从已保存进度安全续接（{attempt}/{max_attempts}）…"
         )
         .into(),
+        Msg::StreamRecoveryPreserved { max_recoveries } => format!("模型响应中断，已保留收到的内容，正在尝试继续（本轮最多自动恢复 {max_recoveries} 次）。").into(),
+        Msg::StreamRecoveryRetry { attempt, max_recoveries, delay_secs } => format!("连接中断，已保留进度，{delay_secs} 秒后尝试继续（{attempt}/{max_recoveries}）；可按 Esc 取消。").into(),
+        Msg::StreamRecoveryExhausted { max_recoveries: 0 } => "自动恢复已禁用。已保留可安全保存的内容，请检查连接或模型服务后回复「继续」。".into(),
+        Msg::StreamRecoveryExhausted { max_recoveries } => format!("自动恢复已达到本轮上限（{max_recoveries} 次）。已保留可安全保存的内容，请检查连接或模型服务后回复「继续」。").into(),
+        Msg::StreamRecoveryUnsafeTools => "响应中断，工具调用未完成或执行状态无法确认，为避免重复执行已停止自动恢复。已保留可安全保存的内容，请核对工具结果后再继续。".into(),
+        Msg::StreamRecoveryNoProgress => "响应中断，没有足够的安全进度可用于续接；本次未自动续接。请检查连接或模型服务后重试。".into(),
         Msg::StreamRecoverySucceeded => "✓ 已从流中断处恢复".into(),
         Msg::ContextFromPeer => "对 agent 说".into(),
         Msg::ContextFromMemory => "来自记忆".into(),

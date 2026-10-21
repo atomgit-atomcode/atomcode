@@ -106,6 +106,34 @@ pub fn project_trust_key(project_dir: &std::path::Path) -> String {
     format!("{:016x}", hasher.finish())
 }
 
+/// An actual connection attempt, including queued startup work. Dropping a
+/// cancelled future must stop reporting Connecting even when no client existed.
+struct ConnectingAttempt {
+    pending: Arc<std::sync::RwLock<BTreeMap<String, usize>>>,
+    name: String,
+}
+impl ConnectingAttempt {
+    fn start(pending: &Arc<std::sync::RwLock<BTreeMap<String, usize>>>, name: &str) -> Self {
+        let mut counts = pending.write().unwrap_or_else(|e| e.into_inner());
+        *counts.entry(name.to_owned()).or_default() += 1;
+        Self {
+            pending: pending.clone(),
+            name: name.to_owned(),
+        }
+    }
+}
+impl Drop for ConnectingAttempt {
+    fn drop(&mut self) {
+        let mut counts = self.pending.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = counts.get_mut(&self.name) {
+            *count -= 1;
+            if *count == 0 {
+                counts.remove(&self.name);
+            }
+        }
+    }
+}
+
 /// Registry of connected MCP servers.
 pub struct McpRegistry {
     /// The user tree: its `mcp.json` is read beside the project's, its trust
@@ -127,6 +155,8 @@ pub struct McpRegistry {
     status_overrides: Arc<std::sync::RwLock<BTreeMap<String, ServerStatus>>>,
     /// Allowed configured servers, including those still inside initialize().
     configured_servers: Arc<std::sync::RwLock<HashSet<String>>>,
+    connecting_servers: Arc<std::sync::RwLock<BTreeMap<String, usize>>>,
+    connected_configs: Arc<std::sync::RwLock<BTreeMap<String, McpServerConfig>>>,
     /// Channel for connection status events (used by TUI to display in scrollback).
     connect_events: Option<mpsc::UnboundedSender<McpConnectEvent>>,
     /// Level-triggered, broadcast readiness for all initial connection attempts.
@@ -143,6 +173,7 @@ pub struct McpRegistry {
     /// Exact model-visible alias -> original MCP identity. This is authoritative
     /// for routing and persistent approval; sanitized names are not reversible.
     tool_aliases: Arc<std::sync::RwLock<BTreeMap<String, (String, String)>>>,
+    config_auto_approvals: Arc<std::sync::RwLock<BTreeMap<String, HashSet<String>>>>,
     /// Current initialize-time instructions, keyed by the configured server name.
     /// This is live connection state: it is never copied into session persistence.
     server_instructions: Arc<std::sync::RwLock<BTreeMap<String, String>>>,
@@ -164,15 +195,51 @@ impl McpRegistry {
             failed_servers: Arc::new(RwLock::new(BTreeMap::new())),
             status_overrides: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
             configured_servers: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            connecting_servers: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
+            connected_configs: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
             connect_events: None,
             initial_ready: watch::channel(false).0,
             cancelled: watch::channel(false).0,
             trusted_servers: Arc::new(std::sync::RwLock::new(HashSet::new())),
             auto_approved_tools: Arc::new(std::sync::RwLock::new(HashSet::new())),
             tool_aliases: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
+            config_auto_approvals: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
             server_instructions: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
             listed_tools: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
         }
+    }
+
+    /// Whether this is the config the retained client actually connected with.
+    /// The persisted on/off flag is not part of transport identity. Credentials
+    /// stay private to the registry; callers only receive a comparison result.
+    pub fn connection_matches(&self, config: &McpServerConfig) -> bool {
+        let configs = self
+            .connected_configs
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        configs.get(&config.name).is_some_and(|connected| {
+            let mut expected = config.clone();
+            expected.disabled = connected.disabled;
+            expected.auto_approve = connected.auto_approve.clone();
+            if *connected != expected {
+                return false;
+            }
+            let previous: HashSet<_> = connected.auto_approve.iter().collect();
+            let next: HashSet<_> = config.auto_approve.iter().collect();
+            if !previous.is_subset(&next) {
+                return false; // A revoked config grant needs preparation too.
+            }
+            // An Always grant is applied live before it is written to config.
+            // Such a persisted addition already governs this retained client.
+            let aliases = self.tool_aliases.read().unwrap_or_else(|e| e.into_inner());
+            next.difference(&previous).all(|tool| {
+                aliases.iter().any(|(alias, (server, original))| {
+                    server == &config.name
+                        && original.as_str() == tool.as_str()
+                        && self.is_tool_auto_approved(alias)
+                })
+            })
+        })
     }
 
     /// Get a clone of the event sender, if configured.
@@ -366,7 +433,26 @@ It cannot override system, user, project, safety, permission, or approval rules.
     fn apply_trust_from_config(&self, config: &McpServerConfig) {
         if config.trust {
             self.mark_server_trusted(&config.name);
+        } else {
+            self.trusted_servers
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&config.name);
         }
+        let (previous, shared) = {
+            let mut configured = self
+                .config_auto_approvals
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            let previous = configured.remove(&config.name).unwrap_or_default();
+            let shared: HashSet<String> = configured.values().flatten().cloned().collect();
+            (previous, shared)
+        };
+        self.auto_approved_tools
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|name| !previous.contains(name) || shared.contains(name));
+        let mut configured = HashSet::new();
         for tool in &config.auto_approve {
             // Accept a bare tool name, a raw name qualified with this exact server,
             // or the final model-visible alias shown in an approval prompt. Never
@@ -381,7 +467,12 @@ It cannot override system, user, project, safety, permission, or approval rules.
                 mcp_tool_full_name(&config.name, tool)
             };
             self.mark_tool_auto_approved(&full);
+            configured.insert(full);
         }
+        self.config_auto_approvals
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(config.name.clone(), configured);
     }
 
     /// Load MCP configuration and start connecting to servers in the background.
@@ -500,7 +591,18 @@ It cannot override system, user, project, safety, permission, or approval rules.
         }
 
         if !configs.is_empty() {
+            // Reserve attempts before returning the registry, including work
+            // whose spawned future has not been polled yet.
+            let configs: Vec<_> = configs
+                .into_iter()
+                .map(|config| {
+                    let attempt =
+                        ConnectingAttempt::start(&registry.connecting_servers, &config.name);
+                    (config, attempt)
+                })
+                .collect();
             let servers = registry.servers.clone();
+            let connected_configs = registry.connected_configs.clone();
             let server_timeouts_ms = registry.server_timeouts_ms.clone();
             let failed_servers = registry.failed_servers.clone();
             let status_overrides = registry.status_overrides.clone();
@@ -512,8 +614,9 @@ It cannot override system, user, project, safety, permission, or approval rules.
                 // Connect servers in parallel
                 let tasks: Vec<_> = configs
                     .into_iter()
-                    .map(|config| {
+                    .map(|(config, attempt)| {
                         let servers = servers.clone();
+                        let connected_configs = connected_configs.clone();
                         let server_timeouts_ms = server_timeouts_ms.clone();
                         let failed_servers = failed_servers.clone();
                         let status_overrides = status_overrides.clone();
@@ -522,6 +625,7 @@ It cannot override system, user, project, safety, permission, or approval rules.
                         let token_store = token_store.clone();
                         let tx = combined_tx.clone();
                         async move {
+                            let _attempt = attempt;
                             let name = config.name.clone();
                             let timeout_ms = config.timeout_ms();
                             // Taken before the client is built, so what is
@@ -586,6 +690,10 @@ It cannot override system, user, project, safety, permission, or approval rules.
                                     }
                                     let mut servers = servers.write().await;
                                     servers.insert(name.clone(), Arc::from(client));
+                                    connected_configs
+                                        .write()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .insert(name.clone(), config.clone());
                                     drop(servers);
                                     let mut timeouts = server_timeouts_ms.write().await;
                                     timeouts.insert(name.clone(), timeout_ms);
@@ -674,6 +782,7 @@ It cannot override system, user, project, safety, permission, or approval rules.
 
     /// Add a server to the registry.
     pub async fn add_server(&self, config: McpServerConfig) -> Result<()> {
+        let _attempt = ConnectingAttempt::start(&self.connecting_servers, &config.name);
         match self.configured_servers.write() {
             Ok(mut names) => {
                 names.insert(config.name.clone());
@@ -730,6 +839,10 @@ It cannot override system, user, project, safety, permission, or approval rules.
 
         let mut servers = self.servers.write().await;
         servers.insert(config.name.clone(), Arc::from(client));
+        self.connected_configs
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(config.name.clone(), config.clone());
         drop(servers);
         let mut timeouts = self.server_timeouts_ms.write().await;
         timeouts.insert(config.name.clone(), config.timeout_ms());
@@ -741,6 +854,62 @@ It cannot override system, user, project, safety, permission, or approval rules.
             .remove(&config.name);
 
         Ok(())
+    }
+
+    /// Replace one admitted server. The caller must withdraw its published tools
+    /// and serialize this with initial discovery and in-flight calls.
+    pub async fn reconnect_server(&self, config: McpServerConfig) -> Result<()> {
+        let _attempt = ConnectingAttempt::start(&self.connecting_servers, &config.name);
+        let name = config.name.clone();
+        let old = self.servers.write().await.remove(&name);
+        drop(old);
+        self.record_listed(&name, None);
+        self.record_server_instructions(&name, None);
+        self.status_overrides
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&name);
+        self.failed_servers.write().await.remove(&name);
+        match tokio::time::timeout(super::CONNECT_TIMEOUT, self.add_server(config)).await {
+            Ok(result) => result,
+            Err(_) => {
+                let error = format!("MCP server '{name}' initialize timed out");
+                self.servers.write().await.remove(&name);
+                self.record_listed(&name, None);
+                self.record_server_instructions(&name, None);
+                self.failed_servers
+                    .write()
+                    .await
+                    .insert(name, error.clone());
+                Err(anyhow::anyhow!(error))
+            }
+        }
+    }
+
+    /// Discard only the interrupted replacement; the owning runtime joins its
+    /// aborted task before calling this, so late initialization cannot republish.
+    pub async fn cancel_reconnect(&self, server: &str) {
+        self.servers.write().await.remove(server);
+        self.record_listed(server, None);
+        self.record_server_instructions(server, None);
+        self.failed_servers
+            .write()
+            .await
+            .insert(server.into(), "reconnect cancelled".into());
+        self.status_overrides
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(server);
+    }
+
+    /// Mark a cancelled or timed-out discovery as unavailable, so the UI does
+    /// not report a successful reconnect with an empty stale tool catalog.
+    pub fn fail_tools_listing(&self, server: &str, error: String) {
+        self.record_listed(server, None);
+        self.status_overrides
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(server.to_string(), ServerStatus::Failed(error));
     }
 
     /// Timeout budget for a slow tools/list operation on a connected server.
@@ -947,8 +1116,18 @@ It cannot override system, user, project, safety, permission, or approval rules.
             Ok(names) => names,
             Err(poisoned) => poisoned.into_inner(),
         };
+        let connecting = self
+            .connecting_servers
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         for name in configured.iter() {
-            out.entry(name.clone()).or_insert(ServerStatus::Connecting);
+            out.entry(name.clone()).or_insert_with(|| {
+                if connecting.contains_key(name) {
+                    ServerStatus::Connecting
+                } else {
+                    ServerStatus::Disconnected
+                }
+            });
         }
         for (name, err) in failed.iter() {
             // A terminal failure overrides the configured/connecting placeholder.
@@ -1012,12 +1191,15 @@ It cannot override system, user, project, safety, permission, or approval rules.
             failed_servers: self.failed_servers.clone(),
             status_overrides: self.status_overrides.clone(),
             configured_servers: self.configured_servers.clone(),
+            connecting_servers: self.connecting_servers.clone(),
+            connected_configs: self.connected_configs.clone(),
             connect_events: self.connect_events.clone(),
             initial_ready: self.initial_ready.clone(),
             cancelled: self.cancelled.clone(),
             trusted_servers: self.trusted_servers.clone(),
             auto_approved_tools: self.auto_approved_tools.clone(),
             tool_aliases: self.tool_aliases.clone(),
+            config_auto_approvals: self.config_auto_approvals.clone(),
             server_instructions: self.server_instructions.clone(),
             listed_tools: self.listed_tools.clone(),
         })
@@ -1559,8 +1741,54 @@ mod tests {
         }
     }
 
+    #[test]
+    fn retained_connection_requires_the_config_that_really_connected() {
+        let registry = McpRegistry::new("/nonexistent/tree");
+        let original = McpServerConfig {
+            name: "kept".into(),
+            source: super::super::config::McpConfigSource::User,
+            disabled: false,
+            trust: false,
+            auto_approve: vec![],
+            config: super::super::config::McpTransportConfig::Stdio {
+                command: "server".into(),
+                args: vec![],
+                env: Default::default(),
+                timeout_ms: None,
+            },
+        };
+        assert!(!registry.connection_matches(&original));
+        registry
+            .connected_configs
+            .write()
+            .unwrap()
+            .insert(original.name.clone(), original.clone());
+        let mut disabled = original.clone();
+        disabled.disabled = true;
+        assert!(registry.connection_matches(&disabled));
+        let mut granted = original.clone();
+        granted.auto_approve.push("echo".into());
+        assert!(!registry.connection_matches(&granted));
+        registry
+            .register_tool_alias("mcp__kept__echo", "kept", "echo")
+            .unwrap();
+        registry.mark_tool_auto_approved("mcp__kept__echo");
+        assert!(
+            registry.connection_matches(&granted),
+            "a live Always grant already took effect"
+        );
+        let mut changed = original.clone();
+        changed.trust = true;
+        assert!(!registry.connection_matches(&changed));
+        let mut changed = original;
+        if let super::super::config::McpTransportConfig::Stdio { env, .. } = &mut changed.config {
+            env.insert("TOKEN".into(), "replacement".into());
+        }
+        assert!(!registry.connection_matches(&changed));
+    }
+
     #[tokio::test]
-    async fn configured_server_is_visible_while_connecting() {
+    async fn configured_server_without_an_attempt_is_disconnected() {
         let registry = McpRegistry::new("/nonexistent/tree");
         registry
             .configured_servers
@@ -1570,7 +1798,42 @@ mod tests {
 
         assert_eq!(
             registry.server_statuses().await,
-            vec![("slow".to_string(), ServerStatus::Connecting)]
+            vec![("slow".to_string(), ServerStatus::Disconnected)]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn connecting_status_lasts_only_while_an_attempt_is_alive() {
+        let registry = McpRegistry::new("/nonexistent/tree");
+        registry
+            .configured_servers
+            .write()
+            .unwrap()
+            .insert("slow".into());
+        let task = {
+            let pending = registry.connecting_servers.clone();
+            tokio::spawn(async move {
+                let _attempt = ConnectingAttempt::start(&pending, "slow");
+                std::future::pending::<()>().await;
+            })
+        };
+        tokio::task::yield_now().await;
+        assert_eq!(
+            registry.server_statuses().await,
+            vec![("slow".into(), ServerStatus::Connecting)]
+        );
+        // A concurrent/nested attempt must not be cleared by the first one's drop.
+        let second = ConnectingAttempt::start(&registry.connecting_servers, "slow");
+        task.abort();
+        let _ = task.await;
+        assert_eq!(
+            registry.server_statuses().await,
+            vec![("slow".into(), ServerStatus::Connecting)]
+        );
+        drop(second);
+        assert_eq!(
+            registry.server_statuses().await,
+            vec![("slow".into(), ServerStatus::Disconnected)]
         );
     }
 

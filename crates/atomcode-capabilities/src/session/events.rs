@@ -214,7 +214,17 @@ impl SessionManager {
     /// Messages only: the system prompt is assembled per request and was never
     /// a fact.
     pub fn project_snapshot(&self, id: &str) -> SessionResult<SessionSnapshot> {
-        Ok(snapshot_of(&self.load_events(id)?))
+        self.project_snapshot_bounded(id, MAX_JSONL_BYTES)
+    }
+
+    pub(super) fn project_snapshot_bounded(
+        &self,
+        id: &str,
+        limit: usize,
+    ) -> SessionResult<SessionSnapshot> {
+        Ok(snapshot_of(
+            &self.read_event_log_bounded(id, false, limit)?.1,
+        ))
     }
 
     fn read_event_log(
@@ -222,8 +232,17 @@ impl SessionManager {
         id: &str,
         header_only: bool,
     ) -> SessionResult<(Option<SessionHeader>, Vec<LoggedEvent>)> {
+        self.read_event_log_bounded(id, header_only, MAX_JSONL_BYTES)
+    }
+
+    fn read_event_log_bounded(
+        &self,
+        id: &str,
+        header_only: bool,
+        limit: usize,
+    ) -> SessionResult<(Option<SessionHeader>, Vec<LoggedEvent>)> {
         let path = self.events_path(id)?;
-        let bytes = read_regular_file_bounded(&path, "session events", MAX_JSONL_BYTES)?;
+        let bytes = read_regular_file_bounded(&path, "session events", limit.min(MAX_JSONL_BYTES))?;
         let mut header = None;
         let mut events = Vec::new();
         for (index, raw) in bytes.split(|b| *b == b'\n').enumerate() {

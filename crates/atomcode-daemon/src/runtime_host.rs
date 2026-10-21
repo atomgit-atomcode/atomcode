@@ -28,6 +28,7 @@ impl PluginHookSource for InstalledPluginHookSource {
                     hook.timeout_secs,
                     hook.plugin_root,
                 )
+                .map(|config| config.with_args(hook.args))
             })
             .collect(),
         )

@@ -41,8 +41,8 @@ mod login_state_tests;
 pub mod native_live;
 mod runtime_host;
 /// File-sink diagnostic trace (`ctrace!` macro), enabled via `ATOMCODE_TUIX_LOG`.
-/// Moved here from the retired `atomcode-core` (daemon is its only consumer;
-/// `atomcode_tuix::trace` keeps its own copy targeting the same append file).
+/// Daemon owns this sink; the historical environment name is retained for
+/// existing diagnostic scripts.
 #[macro_use]
 pub mod trace;
 pub use kernel_runtime::{
@@ -200,6 +200,8 @@ pub(crate) struct ProviderAccountInfo {
     pub provider_type: String,
     pub base_url: Option<String>,
     pub has_api_key: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub header_names: Vec<String>,
     pub model_ids: Vec<String>,
     pub legacy: bool,
     pub managed: bool,
@@ -947,7 +949,7 @@ impl MessageInfo {
         let mut content = if user_interruption {
             String::new()
         } else {
-            msg.text.clone()
+            msg.display_text().to_string()
         };
         let mut images = (!msg.images.is_empty()).then(|| {
             msg.images
@@ -972,7 +974,11 @@ impl MessageInfo {
             role: role.into(),
             content,
             synthetic: msg.synthetic,
-            internal_origin: if user_interruption {
+            internal_origin: if msg.internal_origin.as_deref()
+                == Some(atomcode_kernel::message::COMPACTION_RETAINED_MODEL_ORIGIN)
+            {
+                Some(atomcode_kernel::message::COMPACTION_RETAINED_ORIGIN.into())
+            } else if user_interruption {
                 Some(atomcode_kernel::message::USER_INTERRUPTION_ORIGIN.to_string())
             } else {
                 msg.internal_origin.clone()
@@ -2333,7 +2339,7 @@ async fn get_session_detail(Path((hash, id)): Path<(String, String)>) -> impl In
 }
 
 /// The full, never-compacted per-turn trajectory of a session — the same ground
-/// truth the `recall` tool reads (`<id>.jsonl`), turn-granular and UNAFFECTED by
+/// truth the `recall` tool reads (the native event log), turn-granular and UNAFFECTED by
 /// compaction, so a UI can surface history the runtime snapshot dropped.
 #[derive(serde::Serialize)]
 struct SessionTranscript {
@@ -2903,6 +2909,58 @@ fn search_sessions_by_name_in_root(
         })
         .map(catalog_entry_with_project)
         .collect())
+}
+
+#[derive(Deserialize)]
+struct SessionReferenceQuery {
+    #[serde(default)]
+    q: String,
+    #[serde(default)]
+    cwd: String,
+}
+
+/// Metadata only: neither migrate a legacy session nor read its transcript.
+async fn session_reference_candidates(
+    Query(query): Query<SessionReferenceQuery>,
+) -> impl IntoResponse {
+    let root = NativeSessionManager::sessions_root(
+        atomcode_coding::config::product_dirs_from_env().user(),
+    );
+    let result = tokio::task::spawn_blocking(move || {
+        let keyword = query.q.to_lowercase();
+        let mut entries: Vec<_> = catalog_scan_in_root(&root)?
+            .entries
+            .into_iter()
+            .filter(atomcode_capabilities::session::reference::available)
+            .filter(|e| {
+                format!("{} {} {}", e.name, e.working_dir.display(), e.id)
+                    .to_lowercase()
+                    .contains(&keyword)
+            })
+            .collect();
+        entries.sort_by_key(|e| {
+            (
+                e.working_dir != std::path::Path::new(&query.cwd),
+                std::cmp::Reverse(e.updated_at_ms),
+            )
+        });
+        Ok::<_, std::io::Error>(
+            entries
+                .iter()
+                .take(100)
+                .map(catalog_entry_with_project)
+                .collect::<Vec<_>>(),
+        )
+    })
+    .await;
+    match result {
+        Ok(Ok(entries)) => (StatusCode::OK, Json(entries)).into_response(),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json("Could not read session references"),
+        )
+            .into_response(),
+    }
 }
 
 /// GET /sessions/search?q=keyword - Search sessions by name
@@ -3665,6 +3723,9 @@ pub enum ChatEvent {
         #[serde(flatten)]
         payload: serde_json::Value,
     },
+    /// The request was answered or declined through the runtime boundary.
+    #[serde(rename = "user_input_resolved")]
+    UserInputResolved { request_id: u64 },
     /// A security policy stopped the turn and offers only driver-owned, safe
     /// recovery actions. Rejected commands and credentials are never included.
     #[serde(rename = "policy_intervention")]
@@ -3826,6 +3887,7 @@ mod chat_event_type_tests {
             http_status: None,
             code: None,
             retryable: None,
+            retry_after_secs: None,
             ends_turn: false,
         });
         assert!(projector.unterminated_reason().contains("already in use"));
@@ -3926,6 +3988,36 @@ mod chat_event_type_tests {
     }
 
     #[test]
+    fn native_user_input_resolution_reaches_chat_before_turn_completion() {
+        let mut projector = ChatRuntimeProjector::default();
+        let events = projector.project_runtime(
+            atomcode_coding::CodingRuntimeEvent::RequestResolved {
+                id: 77,
+                kind: atomcode_capabilities::tools::request_user_input::REQUEST_USER_INPUT_KIND
+                    .into(),
+            },
+            "session-1",
+        );
+        assert_eq!(
+            serde_json::to_value(&events[0]).unwrap(),
+            serde_json::json!({"type": "user_input_resolved", "request_id": 77})
+        );
+        assert!(
+            !projector.terminal_seen,
+            "answering the question must not finish the turn"
+        );
+        assert!(projector
+            .project_runtime(
+                atomcode_coding::CodingRuntimeEvent::RequestResolved {
+                    id: 78,
+                    kind: "unknown-kind".into()
+                },
+                "session-1"
+            )
+            .is_empty());
+    }
+
+    #[test]
     fn native_user_input_request_keeps_session_request_and_batch_payload() {
         let mut projector = ChatRuntimeProjector::default();
         let request = atomcode_coding::RuntimeRequest {
@@ -4003,6 +4095,7 @@ mod chat_event_type_tests {
                 http_status: Some(500),
                 code: None,
                 retryable: Some(true),
+                retry_after_secs: None,
                 ends_turn: false,
             }),
             "session-1",
@@ -4370,6 +4463,14 @@ impl ChatRuntimeProjector {
 
         match event {
             CodingRuntimeEvent::Agent(event) => self.project_agent(event),
+            CodingRuntimeEvent::RequestResolved { id, kind } => {
+                if kind == atomcode_capabilities::tools::request_user_input::REQUEST_USER_INPUT_KIND
+                {
+                    vec![ChatEvent::UserInputResolved { request_id: id }]
+                } else {
+                    Vec::new()
+                }
+            }
             CodingRuntimeEvent::Request(request) => {
                 use atomcode_capabilities::tools::{
                     request_user_input::REQUEST_USER_INPUT_KIND, ApprovalRequest, APPROVAL_KIND,
@@ -5692,6 +5793,8 @@ struct WebuiHandle {
     host: String,
     /// server task 的 abort handle；用于 `/webui stop` 停止。
     abort: tokio::task::AbortHandle,
+    relay_url: Option<String>,
+    relay_error: Option<String>,
 }
 
 static WEBUI: std::sync::Mutex<Option<WebuiHandle>> = std::sync::Mutex::new(None);
@@ -5707,6 +5810,31 @@ pub fn webui_port() -> Option<u16> {
         .as_ref()
         .filter(|handle| !handle.abort.is_finished())
         .map(|handle| handle.port)
+}
+
+/// Host-owned tunnel presentation; never used as an authentication bypass.
+pub fn set_webui_relay_access(
+    target: &WebuiRelayTarget,
+    url: Option<String>,
+    error: Option<String>,
+) {
+    let mut guard = WEBUI.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(handle) = guard
+        .as_mut()
+        .filter(|h| h.port == target.port && h.tokens.is_valid(&target.token))
+    {
+        handle.relay_url = url;
+        handle.relay_error = error;
+    }
+}
+
+/// Clear presentation when the host has retired its tunnel.
+pub fn clear_webui_relay_access() {
+    let mut guard = WEBUI.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(handle) = guard.as_mut() {
+        handle.relay_url = None;
+        handle.relay_error = None;
+    }
 }
 
 /// What to try when a port cannot be bound for a reason other than being in
@@ -5806,12 +5934,28 @@ fn primary_lan_ipv4() -> Option<String> {
 /// （webui 的访问 URL 是生成的，端口号对用户无感；被占时仍会向上扫描）。
 pub const WEBUI_DEFAULT_PORT: u16 = atomcode_config::distribution::WEBUI_PORT;
 
+/// Launch feedback for a frontend. URLs contain credentials; do not log them.
+pub struct WebuiLaunch {
+    pub message: String,
+    /// Usable phone URL. The local launcher requires a non-loopback address;
+    /// the host may replace it with an authenticated relay URL.
+    pub qr_url: Option<String>,
+    /// Authenticated local endpoint for a host-owned relay. Never log credentials.
+    pub relay_target: Option<WebuiRelayTarget>,
+}
+
+pub struct WebuiRelayTarget {
+    pub port: u16,
+    pub endpoint: String,
+    pub token: String,
+}
+
 /// 确保进程内 webui server 已起（已停止则重启），mint 一次性 token；`open_browser`
 /// 为 `true` 时自动打开浏览器，`false` 时跳过（脚本/桌面客户端集成场景），URL 仍随状态串返回。
 ///
 /// 返回给用户展示的状态串。在 `atomcode` 主程序（已有 tokio runtime）内调用。
 /// `host` 为绑定地址（默认 `127.0.0.1`；`0.0.0.0` 暴露到局域网/外网）。
-/// `port` 为首选端口（CLI 子命令可自定义；TUI 传 13456）；被占用时自动向上扫描。
+/// `port` 为首选端口（CLI 子命令可自定义；TUI 默认 13457）；被占用时自动向上扫描。
 ///
 /// 不再轮询等待绑定：先在本函数内同步绑定端口（亚毫秒级，且借此拿到真实端口、
 /// 支持动态端口），再把已绑定的 listener 交给后台 `run_server`。浏览器随即打开，
@@ -5822,6 +5966,12 @@ pub async fn ensure_server_and_open(
     sync: bool,
     open_browser: bool,
 ) -> String {
+    launch_webui(host, port, sync, open_browser).await.message
+}
+
+/// Start/reuse the embedded server and return its actual access URL separately
+/// from presentation text, so frontends never need to parse a translated report.
+pub async fn launch_webui(host: &str, port: u16, sync: bool, open_browser: bool) -> WebuiLaunch {
     // 1) 短临界区判定能否复用仍在运行的 server（std Mutex guard 不可跨 .await）。
     //    复用时连同其绑定地址一起取出：换绑需先 /webui stop。
     let reuse = {
@@ -5845,10 +5995,14 @@ pub async fn ensure_server_and_open(
                 // script prints the answer where nobody reads it, and a failed
                 // start used to leave nothing in `atomcode.log` at all.
                 tracing::error!(target: "atomcode::webui", %host, port, error = %format!("{e:#}"), "webui failed to bind");
-                return format!(
-                    "webui 启动失败：{host}:{port} 起的端口绑定失败（{e:#}）{}",
-                    bind_failure_hint(&e)
-                );
+                return WebuiLaunch {
+                    message: format!(
+                        "webui 启动失败：{host}:{port} 起的端口绑定失败（{e:#}）{}",
+                        bind_failure_hint(&e)
+                    ),
+                    qr_url: None,
+                    relay_target: None,
+                };
             }
         };
         if actual_port != port {
@@ -5897,6 +6051,8 @@ pub async fn ensure_server_and_open(
                 port: actual_port,
                 host: host.to_string(),
                 abort: task.abort_handle(),
+                relay_url: None,
+                relay_error: None,
             });
         }
         (tokens, actual_port, host.to_string())
@@ -5965,7 +6121,36 @@ pub async fn ensure_server_and_open(
         }
     }
 
-    msg
+    WebuiLaunch {
+        message: msg,
+        qr_url: webui_qr_url(&open_host, local_url),
+        relay_target: Some(WebuiRelayTarget {
+            port: actual_port,
+            endpoint: format!("http://{open_host}:{actual_port}"),
+            token,
+        }),
+    }
+}
+
+fn webui_qr_url(host: &str, url: String) -> Option<String> {
+    (!is_loopback_authority(host) && host != "0.0.0.0" && host != "::").then_some(url)
+}
+
+#[cfg(test)]
+mod webui_qr_tests {
+    use super::*;
+
+    #[test]
+    fn mobile_qr_requires_an_actual_non_loopback_access_address() {
+        for host in ["127.0.0.1", "localhost", "::1", "0.0.0.0", "::"] {
+            assert!(webui_qr_url(host, "unused".into()).is_none(), "{host}");
+        }
+        let url = "http://192.168.1.9:20001/?token=test-token&sync=1";
+        assert_eq!(
+            webui_qr_url("192.168.1.9", url.into()).as_deref(),
+            Some(url)
+        );
+    }
 }
 
 /// 停止进程内 webui server（若在运行）。返回状态串。
@@ -6086,13 +6271,15 @@ struct PgyInfo {
 
 #[derive(serde::Serialize)]
 struct TunnelStatus {
+    mode: &'static str,
+    relay_error: Option<String>,
     /// server 绑定地址（127.0.0.1=仅本机；0.0.0.0/具体 IP=可被其它设备访问）。
     bind_host: String,
     port: u16,
-    /// 是否绑定到非回环地址（手机/其它设备可达的前提）。
+    /// 是否可通过中继或非回环监听地址远程访问。
     reachable: bool,
     pgy: PgyInfo,
-    /// 推荐的远程访问 URL（蒲公英 IP + 当前 token）；不可用时 None。
+    /// 推荐的已鉴权远程 URL（中继优先）；不可用时 None。
     remote_url: Option<String>,
     /// remote_url 的二维码（SVG 字符串）；不可用时 None。
     qr_svg: Option<String>,
@@ -6218,6 +6405,37 @@ async fn get_tunnel_status(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
+    let relay = {
+        let guard = WEBUI.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .as_ref()
+            .filter(|h| h.port == state.bind_port)
+            .map(|h| (h.relay_url.clone(), h.relay_error.clone()))
+    };
+    if let Some((url, error)) = relay.filter(|(url, error)| url.is_some() || error.is_some()) {
+        let qr_svg = url
+            .as_ref()
+            .and_then(|url| qrcode::QrCode::new(url.as_bytes()).ok())
+            .map(|code| {
+                code.render::<qrcode::render::svg::Color>()
+                    .min_dimensions(200, 200)
+                    .quiet_zone(true)
+                    .build()
+            });
+        return Json(TunnelStatus {
+            mode: "relay",
+            relay_error: error,
+            bind_host: state.bind_host.clone(),
+            port: state.bind_port,
+            reachable: url.is_some(),
+            pgy: PgyInfo {
+                installed: false,
+                ipv4: None,
+            },
+            remote_url: url,
+            qr_svg,
+        });
+    }
     let pgy = tokio::task::spawn_blocking(pgy_probe)
         .await
         .unwrap_or(PgyInfo {
@@ -6265,6 +6483,8 @@ async fn get_tunnel_status(
     };
 
     Json(TunnelStatus {
+        mode: "lan",
+        relay_error: None,
         bind_host: state.bind_host.clone(),
         port: state.bind_port,
         reachable,
@@ -6817,6 +7037,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/sessions", get(get_all_sessions).post(create_session))
         .route("/sessions/by-working-dir", get(get_sessions_by_working_dir))
         .route("/sessions/search", get(search_sessions))
+        .route("/sessions/references", get(session_reference_candidates))
         .route("/sessions/resolve/:id", get(resolve_session))
         // Current project state (working directory)
         .route("/project", get(get_project_state))
@@ -8399,6 +8620,7 @@ mod tests {
         base_url: String,
     ) -> atomcode_config::config::provider::ProviderConfig {
         atomcode_config::config::provider::ProviderConfig {
+            headers: Default::default(),
             provider_type: "openai".into(),
             api_key: Some("test-key".into()),
             model: model.into(),
@@ -9325,6 +9547,34 @@ done
             info.images.as_deref(),
             Some([ImageData { missing: true, .. }])
         ));
+    }
+
+    #[test]
+    fn retained_history_has_the_same_original_text_on_live_and_disk_display_paths() {
+        use atomcode_kernel::message::{
+            Message, COMPACTION_RETAINED_FRAMING, COMPACTION_RETAINED_MODEL_ORIGIN,
+            COMPACTION_RETAINED_ORIGIN,
+        };
+        let mut original = Message::user("old task");
+        original.internal_origin = Some(COMPACTION_RETAINED_ORIGIN.into());
+        let mut model = original.clone();
+        model.text.insert_str(0, COMPACTION_RETAINED_FRAMING);
+        model.internal_origin = Some(COMPACTION_RETAINED_MODEL_ORIGIN.into());
+        for message in [&original, &model] {
+            let shown = MessageInfo::from_kernel(message);
+            assert_eq!(shown.content, "old task");
+            assert_eq!(
+                shown.internal_origin.as_deref(),
+                Some(COMPACTION_RETAINED_ORIGIN)
+            );
+            assert!(!shown.synthetic);
+        }
+        // A human may literally quote the framing; raw display must preserve it.
+        original.text = COMPACTION_RETAINED_FRAMING.into();
+        assert_eq!(
+            MessageInfo::from_kernel(&original).content,
+            COMPACTION_RETAINED_FRAMING
+        );
     }
 
     #[test]

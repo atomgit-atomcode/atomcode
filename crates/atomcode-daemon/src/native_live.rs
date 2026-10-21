@@ -63,6 +63,27 @@ pub fn register_embedded_runtime(
     Ok(binding)
 }
 
+/// Register a running embedded runtime from its sequenced presentation view.
+pub fn register_embedded_live_view(
+    view: atomcode_coding::runtime::RuntimeLiveView,
+    provider: String,
+    provider_fingerprint: String,
+    control: Arc<dyn LiveRuntimeControl>,
+) -> Result<LiveBinding, HubError> {
+    let owner = headless()
+        .try_lock()
+        .map_err(|_| HubError::RuntimeUnavailable)?;
+    if owner.is_some() {
+        return Err(HubError::RuntimeUnavailable);
+    }
+    let binding = hub().bind_live_view(view, provider, provider_fingerprint, control)?;
+    *EMBEDDED_BINDING
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(binding.clone());
+    crate::live_set_working_dir(binding.working_dir.clone());
+    Ok(binding)
+}
+
 pub fn embedded_binding() -> Option<LiveBinding> {
     EMBEDDED_BINDING
         .lock()
@@ -71,7 +92,9 @@ pub fn embedded_binding() -> Option<LiveBinding> {
 }
 
 pub fn unregister_embedded_runtime(binding: &LiveBinding) -> Result<(), HubError> {
-    hub().unbind(binding)?;
+    // Embedded execution belongs to the terminal. Revoking its shared view
+    // must work during a turn without cancelling that execution.
+    hub().detach(binding)?;
     let mut embedded = EMBEDDED_BINDING
         .lock()
         .unwrap_or_else(|error| error.into_inner());

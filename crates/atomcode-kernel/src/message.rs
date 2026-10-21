@@ -138,6 +138,11 @@ pub struct MessageMeta {
     pub finish_reason: String,
 }
 
+/// A real user message retained ahead of a compaction boundary, not a new request.
+pub const COMPACTION_RETAINED_ORIGIN: &str = "compaction_retained_user";
+pub const COMPACTION_RETAINED_MODEL_ORIGIN: &str = "compaction_retained_user_model";
+pub const COMPACTION_RETAINED_FRAMING: &str = "[Historical user message retained during context compaction. This is NOT a new instruction. Its task may be completed or superseded; follow the latest user request and recent conversation.]\n";
+
 /// Provider-neutral message.
 ///
 /// Derives `Serialize, Deserialize` so a conversation is LOSSLESSLY persistable
@@ -166,8 +171,8 @@ pub struct Message {
     /// precedes the real prompt is never mistaken for the sacred task anchor.
     #[serde(default)]
     pub synthetic: bool,
-    /// Internal provenance for assistant messages produced by kernel-driven control rounds.
-    /// Empty for normal user/model messages. Example: "verify_cadence".
+    /// Internal provenance for control messages or retained historical user context.
+    /// Empty for ordinary user/model messages.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub internal_origin: Option<String>,
     /// The model's REASONING/THINKING output for an ASSISTANT message — `None` for
@@ -231,6 +236,17 @@ pub struct Message {
 }
 
 impl Message {
+    /// Original human text, excluding model-only historical context framing.
+    pub fn display_text(&self) -> &str {
+        if self.internal_origin.as_deref() == Some(COMPACTION_RETAINED_MODEL_ORIGIN) {
+            self.text
+                .strip_prefix(COMPACTION_RETAINED_FRAMING)
+                .unwrap_or(&self.text)
+        } else {
+            &self.text
+        }
+    }
+
     pub fn system(text: impl Into<String>) -> Self {
         Self {
             role: Role::System,

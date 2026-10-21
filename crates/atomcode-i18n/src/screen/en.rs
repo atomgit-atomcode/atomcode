@@ -21,6 +21,7 @@ use std::borrow::Cow;
 
 pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
     match msg {
+        Msg::InjectedFromSession { from } => format!("from another session {from}").into(),
         Msg::MemoryEmpty => Cow::Borrowed("No memory in this scope yet."),
 
         // ── the command dispatcher ──
@@ -43,6 +44,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
 
         // ── the moment ──
         Msg::MomentQuitAgain => "press Ctrl+C again to quit".into(),
+        Msg::MomentEofAgain => "press Ctrl+D again to quit".into(),
 
         // ── overlays ──
         Msg::OverlayEmptyFile => "  (empty file)".into(),
@@ -65,6 +67,13 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ViewPickerEmpty => "no files here to read yet".into(),
 
         // ── completion menu and policy interventions ──
+        Msg::MentionAll => "All".into(),
+        Msg::MentionFiles => "Files & directories".into(),
+        Msg::MentionEmpty => "  No matching items".into(),
+        Msg::MentionLegend => "  enter/tab insert · esc close · up/down select · left/right category".into(),
+        Msg::MentionSessions => "Sessions".into(),
+        Msg::MentionSelected => "Selected".into(),
+        Msg::MentionFilter => "Filter · Enter / Tab".into(),
         Msg::MenuFolder => "folder".into(),
 
         // ── the providers panel ──
@@ -139,6 +148,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::AskReviewSend => "Submit answers".into(),
         Msg::AskReviewCancel => "Cancel".into(),
         Msg::AskUnanswered => "(not answered)".into(),
+        Msg::AskPending { id } => format!("Wait ended (#{id}) · /goal questions").into(),
         Msg::AskLegendToggle => "toggle".into(),
         Msg::AskLegendSwitch => "switch question".into(),
         Msg::AskLegendCaret => "move cursor".into(),
@@ -161,6 +171,15 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         // ── the status bar ──
         Msg::StatusMember { name } => format!("member {name}").into(),
         Msg::StatusStopping => "stopping".into(),
+        Msg::GoalStageEvaluating => "This reply has ended. Checking whether the goal is met; completion is not confirmed yet.".into(),
+        Msg::GoalStageContinuing { detail } => format!("Goal completion is not confirmed; continuing work. Continuation explanation: {detail}").into(),
+        Msg::GoalStageRecovering => "A goal model request failed. Automatic recovery is in progress; earlier replies remain available.".into(),
+        Msg::GoalStagePaused { detail } => format!("Goal paused: {detail}. Use /goal report for details.").into(),
+        Msg::GoalEvaluatorRecovery { attempt: 0, .. } => "evaluating goal".into(),
+        Msg::GoalProviderRecovery { secs: 0, .. } => "retrying model request".into(),
+        Msg::GoalEvaluatorRecovery { secs: 0, .. } => "retrying goal evaluation".into(),
+        Msg::GoalProviderRecovery { attempt, max, secs } => format!("provider recovery {attempt}/{max} · {secs}s").into(),
+        Msg::GoalEvaluatorRecovery { attempt, max, secs } => format!("evaluation recovery {attempt}/{max} · {secs}s").into(),
         Msg::StatusGoal => "goal".into(),
         Msg::StatusLoop => "loop".into(),
         Msg::StatusRoundsHeld { kind, rounds, why } => {
@@ -252,7 +271,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
 
         // ── notes in the transcript ──
         Msg::TranscriptCompacted { through } => {
-            format!("the conversation before this is folded into one summary (through #{through})")
+            format!("earlier model context was compacted (through #{through}); retained opening messages are historical, not new instructions. The original history is still available above.")
                 .into()
         }
         Msg::TranscriptShortened { count } => {
@@ -288,6 +307,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         // ── what each command is for (`commands.rs`) ──
         Msg::CmdAboutQuit => "quit".into(),
         Msg::CmdAboutReasoning => "reasoning: show or hide received content".into(),
+        Msg::CmdAboutErrors => "Show or fold original model error details".into(),
         Msg::CmdAboutTools => "tool output: all of it, one summary each, summarised in groups; cycles with no argument".into(),
         Msg::CmdAboutShowInject => "injected context: folded, label only, in full — cycles; all of them with no name".into(),
         Msg::CmdAboutMouse => "hand the mouse back to the terminal, or take it back".into(),
@@ -316,6 +336,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SuspendUnsupported => {
             "Suspending (Ctrl+Z) is not available here — not on Windows, or whatever started this switched it off. Run one command with !cmd, or open another terminal.".into()
         }
+        Msg::CmdAboutRead => "read the conversation and expanded tool output in the terminal".into(),
+        Msg::ReadLegend => "Esc back · ↑↓/jk · PgUp/Dn/^B/F page · ^U/D half · Home/End".into(),
+        Msg::ReadUnavailable => "The reading panel is not available in this interface.".into(),
         Msg::CmdAboutRaw => "print the whole conversation into the terminal, for its own selection, scrolling and search; any key comes back".into(),
         Msg::CmdAboutKeys => "list the key bindings".into(),
         Msg::CmdAboutTodo => "print the plan; `add <task>`, `clear`; `show`/`hide` the panel".into(),
@@ -404,6 +427,13 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ClipboardHasNothing => "there is nothing on the clipboard to paste; `/paste <path>` takes a file instead — a picture attaches, anything else goes in as text".into(),
         Msg::FileIsEmpty { path } => format!("{path} is empty").into(),
         Msg::FileUnreadable { path, error } => format!("cannot read {path}: {error}").into(),
+        Msg::KeybindingsMenu => "Newline shortcuts · ↑/↓ select · Enter/A add · M type names\nDelete remove · Ctrl+D restore defaults · Esc back".into(),
+        Msg::KeybindingsCapture => "Press a shortcut… Esc cancels; Tab types its name.\nF1–F24, Alt+J, etc. supported; conflicts are reported.\nIf the IDE intercepts it, release the IDE shortcut or use manual entry.".into(),
+        Msg::KeybindingsConfirm { key } => format!("Detected: {key} · Enter saves · Esc cancels").into(),
+        Msg::KeybindingsManual => "Type names separated by commas (f3, alt+j)\nF1–F24, Alt+J, etc. supported; conflicts are reported.\nEnter saves · Esc cancels · Ctrl+U clears".into(),
+        Msg::KeybindingsEmpty => "No newline chords; backslash + Enter still inserts a newline".into(),
+        Msg::KeybindingsError { error } => format!("Shortcut unchanged: {error}").into(),
+        Msg::KeysHelpWithNewline { keys } => en(Msg::KeysHelp).replace("Shift+Enter / Ctrl+J", keys).into(),
         Msg::KeysHelp => r#"
   Keyboard shortcuts
 
@@ -411,7 +441,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
     Enter                           send the message
     Shift+Enter / Ctrl+J            insert a new line
     Ctrl+W                          delete the previous word
-    Ctrl+D                          quit
+    Ctrl+D                          delete forward; when idle and empty, press twice to quit
+    Ctrl+B / Ctrl+F                 move one character left / right
+    Ctrl+A / Ctrl+E                 start / end of the current line
+    Ctrl+U / Ctrl+K                 delete to line start / end
     Ctrl+Z                          suspend to the shell, fg to return (not on Windows)
     Up / Down                       move the caret, and page through history once at the end
     Ctrl+P / Ctrl+N                 page through history (with the mouse handed back, ↑↓ scroll instead)
@@ -427,7 +460,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
     Ctrl+C                          clear the composer, again to quit
 
   ── Reading & display ──
-    PgUp / PgDn / wheel             scroll the conversation
+    PgUp / PgDn                     page through the conversation
+    /read                           read conversation and tool output; Esc returns
+    Mouse wheel                     scroll the conversation
     drag                            select and copy
     Esc                             drop the selection
     click a fold                    open or fold that thought / tool call
@@ -702,7 +737,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "Signed out of MCP server '{server}': its stored OAuth token was removed (if there was one); reloading MCP."
         )
         .into(),
-        Msg::Reloaded => "the skills, the MCP servers and the config were read again".into(),
+        Msg::Reloaded => "Reload complete. See /status for loaded instruction sources; a lightweight skill reload keeps instruction text unchanged.".into(),
         Msg::SignedOut => "signed out; /login signs in again".into(),
         Msg::SignedIn => "signed in".into(),
 
@@ -735,10 +770,12 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::McpActionUntrust => "Untrust".into(),
         Msg::McpActionLogin => "Authenticate".into(),
         Msg::McpActionLogout => "Sign out".into(),
+        Msg::McpActionReconnect => "Reconnect".into(),
         Msg::McpActionEnable => "Enable".into(),
         Msg::McpActionDisable => "Disable".into(),
-        Msg::McpLegendList => "↑/↓ move · Enter details · Esc close".into(),
-        Msg::McpLegendDetail => "↑/↓ move · Enter run · Esc back".into(),
+        Msg::McpRefreshTimeout => "MCP status refresh timed out; press Ctrl+R to retry".into(),
+        Msg::McpLegendList => "↑/↓ move · Enter details · Esc close · Ctrl+R refresh".into(),
+        Msg::McpLegendDetail => "↑/↓ move · Enter run · Esc back · Ctrl+R refresh".into(),
         Msg::McpLegendBusy => "Esc cancel".into(),
         Msg::McpLegendBusyHide => "Esc hide".into(),
         Msg::McpLegendCancelling => "cancelling… · Esc hide".into(),
@@ -940,6 +977,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::MenuCopyAllAbout => "put the composer on the clipboard".into(),
         Msg::MenuPaste => "paste".into(),
         Msg::MenuPasteAbout => "insert from the clipboard".into(),
+        Msg::MenuNewline => "new line".into(),
+        Msg::MenuNewlineAbout => "insert a line break at the caret (Ctrl+J)".into(),
         Msg::MenuClear => "clear".into(),
         Msg::MenuClearAbout => "throw away the draft and what is attached".into(),
         Msg::MenuSend => "send".into(),
@@ -964,6 +1003,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PluginTabMarkets => "marketplaces".into(),
         Msg::PluginHookTrustedShort => "hooks trusted".into(),
         Msg::PluginHookUntrustedShort => "hooks not trusted".into(),
+        Msg::PluginHookIncompatibleShort => "hooks incompatible".into(),
+        Msg::PluginHooksIncompatible { id } => format!("Hooks from `{id}` are incompatible. Update or repair the plugin; run atomcode hooks list for details. Reauthorization cannot fix this.").into(),
         Msg::PluginActionTrust => "trust hooks".into(),
         Msg::PluginActionUntrust => "untrust hooks".into(),
         Msg::PluginActionTrustAbout => "allow this plugin's current hook commands to run".into(),
@@ -1006,10 +1047,30 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::TurnTools { tools } => format!("{tools} tools").into(),
         Msg::TurnCached { pct } => format!("{pct}% cached").into(),
         Msg::SessionCached { pct } => format!("cache {pct}%").into(),
+        Msg::StopProviderError => "Model service error · this model request failed".into(),
+        Msg::ProviderBusy => "Model service is busy".into(),
+        Msg::ProviderUnavailable => "Model service is unavailable".into(),
+        Msg::ProviderAccessDenied => "Model service denied the request".into(),
+        Msg::ProviderAuthenticationFailed => "Model service authentication failed".into(),
+        Msg::ProviderRateLimitError => "Model service rate limit reached".into(),
+        Msg::ProviderConnectionError => "Cannot connect to the model service".into(),
+        Msg::ProviderUnknownError => "Model request failed".into(),
+        Msg::ProviderTryAgain => "Try again later with “continue”, or switch models before continuing.".into(),
+        Msg::ProviderCheckAccess => "Check access to this model or contact the service provider.".into(),
+        Msg::ProviderCheckCredentials => "Check the model service API key and authentication settings.".into(),
+        Msg::ProviderCheckRequest => "Check the error details and model configuration, or contact the service provider.".into(),
+        Msg::ProviderCheckConnection => "Check the network connection and model service URL, then try again.".into(),
+        Msg::ProviderNoFallback => "No available fallback route was found for this model; automatic switching failed.".into(),
+        Msg::ProviderRetryDetailsHint => "details: /errors".into(),
+        Msg::ProviderErrorDetails => "Original error details · click to expand/collapse, or /errors show".into(),
+        Msg::ProviderErrorStatus { reason, status } => format!("{reason} ({status})").into(),
+        Msg::TeamPanelEmpty => "No team members or background tasks; there is no team panel to show.".into(),
+        Msg::TeamPanelExpanded => "Team panel expanded.".into(),
+        Msg::TeamPanelCollapsed => "Team panel collapsed.".into(),
         Msg::StopCancelled => "stopped".into(),
         Msg::StopMaxRounds => "stopped · the rounds ran out".into(),
         Msg::StopByPolicy => "stopped · a stopping policy ended it (a deadline or a budget)".into(),
-        Msg::StopRunawayFuse => "stopped · the backstop fuse blew; this tree has no stopping policy at all".into(),
+        Msg::StopRunawayFuse => "stopped · execution loop safety limit reached".into(),
         Msg::StopToolLoop => {
             "stopped · the model kept repeating the same step with no progress — send a new \
              message (rephrase or add a hint) to continue"
@@ -1045,10 +1106,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::LiveSilentFor { secs } => format!("nothing new for {secs}s").into(),
         Msg::LiveRunningTools { n } => format!("running {n} tools").into(),
         Msg::LiveElapsed { took } => format!("{took} elapsed").into(),
-        Msg::LiveIn { tokens } => format!("in {tokens}").into(),
-        Msg::LiveOut { tokens } => format!("out {tokens}").into(),
+        Msg::LiveIn { tokens } => format!("↑ {tokens}").into(),
+        Msg::LiveOut { tokens } => format!("↓ {tokens}").into(),
         Msg::LiveCached { hit } => format!("cached {hit}").into(),
-        Msg::LiveStep { step } => format!("step {step}").into(),
+        Msg::LiveSpeedPending => "— tok/s".into(),
+        Msg::LiveSpeed { rate } => format!("{rate} tok/s").into(),
         Msg::FoldedLines { hidden } => format!("⋯ {hidden} lines folded — click to open").into(),
         Msg::MoreBelow { arrow, lines } => format!(" {arrow} {lines} more lines · click to go back to the bottom ").into(),
 
@@ -1126,6 +1188,21 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::HostHeld => "held".into(),
         Msg::SourceConfigFile => "config file".into(),
         Msg::SourceSettings => "settings".into(),
+        Msg::SourceLoaded => "loaded".into(),
+        Msg::SourceShadowed => "shadowed, not loaded".into(),
+        Msg::SourceEmpty => "empty, not loaded".into(),
+        Msg::SourceUnreadable => "unreadable, not loaded".into(),
+        Msg::SourceNotLoaded => "not loaded".into(),
+        Msg::SourceDiskChanged => "disk changed; resume to refresh instructions".into(),
+        Msg::SourceSkillDirs => crate::product::t_with(crate::Locale::En, crate::product::Msg::CmdCatalogSkillDirs),
+        Msg::SourceSkills => "Loaded skills".into(),
+        Msg::SourceSkillDiagnostics => crate::product::t_with(crate::Locale::En, crate::product::Msg::CmdCatalogSkillDiagnostics),
+        Msg::SourceSkillSummary { loaded, directories, overridden, failed } => {
+            let mut text = format!("{loaded} loaded · {directories} scan directories");
+            if overridden > 0 { text.push_str(&format!(" · {overridden} overridden")); }
+            if failed > 0 { text.push_str(&format!(" · {failed} loading failures")); }
+            text.push_str("\nUse /skills for details."); text.into()
+        },
         Msg::SourceInstructionFiles => "instruction files".into(),
         Msg::SourceMemoryFiles => "memory files".into(),
         Msg::HostNoEditableConfig => "this host has no configuration that can be changed".into(),
@@ -1235,16 +1312,6 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::OnboardSignedInConfigNotWritten { error } => format!("signed in, but the config was not written: {error}").into(),
         Msg::CmdAboutOnboarding => "set this machine up to work: language, sign in, and a look at the result".into(),
         Msg::CmdAboutOnboardingFinished => "the walkthrough is done".into(),
-        Msg::ClassicOnlyForNow { command } => format!(
-            "/{command} is only on the classic screen for now: quit and run `atomcode --classic` \
-             (same sessions). It is coming to this screen."
-        )
-        .into(),
-        Msg::CmdAboutClassicOnly => "only on the classic screen for now".into(),
-        Msg::LivesInTheCli { command, run } => {
-            format!("/{command} belongs to the command line: quit and run `{run}`.").into()
-        }
-        Msg::CmdAboutInTheCli => "belongs to the command line".into(),
         Msg::RollbackConfirmSwitch => "AtomCode switches to the previous version and starts again in this directory.".into(),
         Msg::RollbackConfirmNoUpdates => {
             "Automatic updates stay off afterwards; to go back to the newer version, run /upgrade (or `atomcode upgrade` on the command line).".into()
@@ -1255,8 +1322,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         )
         .into(),
         Msg::ShareNoModel => "no model is configured yet — run /login or /model first".into(),
-        Msg::CmdAboutWebui => "share this session with a browser (lan to expose it; stop to end)".into(),
-        Msg::WebuiTakes => "[lan | --host <addr>] [--port <port>] [--no-open] | stop".into(),
+        Msg::CmdAboutWebui => "share in a browser; scan for phone relay access (--local for local only; stop to end)".into(),
+        Msg::WebuiTakes => "[--local | lan | --host <addr>] [--port <port>] [--no-open] | stop".into(),
         Msg::WebuiInvalidArguments { argument } => format!("Invalid /webui argument near `{argument}`. Usage: /webui [lan | --host <addr>] [--port <0-65535>] [--no-open], or /webui stop.").into(),
         Msg::CmdAboutSync => "share this session without opening anything (off to stop)".into(),
         Msg::SyncTakes => "[off]".into(),

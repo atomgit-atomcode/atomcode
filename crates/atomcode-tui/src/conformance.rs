@@ -520,6 +520,10 @@ macro_rules! tui_conformance {
     (view $ty:ty as $name:ident) => {
         #[test]
         fn $name() {
+            // The suite renders localized text, so it must not run while
+            // another test is flipping the process-global locale — hold the
+            // lock for the whole check, like the flip-holding tests do.
+            let _locale = $crate::i18n::test_lock();
             let bad = $crate::conformance::check_view::<$ty>();
             assert!(
                 bad.is_empty(),
@@ -531,6 +535,8 @@ macro_rules! tui_conformance {
     (producer $make:expr, as $name:ident) => {
         #[test]
         fn $name() {
+            // Same reason as the `view` arm: rendering races the global locale.
+            let _locale = $crate::i18n::test_lock();
             let bad = $crate::conformance::check_producer(&$make);
             assert!(bad.is_empty(), "producer failed conformance: {bad:#?}");
         }

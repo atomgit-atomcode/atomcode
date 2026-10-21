@@ -495,7 +495,9 @@ fn with_logged_meta(messages: &[Message], logged: &[Message]) -> Vec<Message> {
         return out;
     };
     let lines_up = span.iter().zip(logged).all(|(sent, kept)| {
-        sent.role == kept.role && sent.text == kept.text && sent.tool_calls == kept.tool_calls
+        sent.role == kept.role
+            && sent.display_text() == kept.display_text()
+            && sent.tool_calls == kept.tool_calls
     });
     if lines_up {
         for (sent, kept) in span.iter_mut().zip(logged) {
@@ -616,7 +618,10 @@ impl Waterfall<AgentRequest> for Bridge {
                 }
 
                 if response.tool_calls.is_empty() && !response.truncated {
-                    let mut messages = req.messages.clone();
+                    // Stop checks need the same execution positions as
+                    // pre_request: a mid-turn user message is steering, not a
+                    // new turn. Keep this metadata local to the hook view.
+                    let mut messages = with_logged_meta(&req.messages, &logged);
                     messages.push(message);
                     let convo = Conversation {
                         messages,
@@ -720,6 +725,7 @@ impl Plugin for GrantsHostPlugin {
 /// rebuilt catalog starts where the old one left off.
 pub(crate) struct ToolsHostPlugin {
     pub(crate) switches: Arc<atomcode_harness::seams::ToolSwitches>,
+    pub(crate) permissions: Option<crate::permission_settings::PermissionSettings>,
     /// Where to publish the catalog once built, for a runtime that has to
     /// answer a front end about it. `None` for a host that only wants the
     /// switches to survive.
@@ -741,11 +747,23 @@ impl Plugin for ToolsHostPlugin {
         "the live tool catalog, over the runtime's own on/off switches"
     }
     async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
-        atomcode_harness::plugins::registries::mount_catalog(
+        atomcode_harness::plugins::registries::mount_catalog_with_permissions(
             ctx,
             config,
             Some(self.switches.clone()),
+            self.permissions
+                .as_ref()
+                .map(|settings| settings.rules.clone())
+                .unwrap_or_default(),
         )?;
+        if let Some(settings) = &self.permissions {
+            atomcode_harness::plugins::self_knowledge::describes(
+                ctx,
+                "permission-settings",
+                21,
+                settings.describe(),
+            );
+        }
         if let Some(slot) = self.slot.clone() {
             let catalog = ctx
                 .require::<atomcode_harness::seams::ToolsSvc>()
@@ -930,11 +948,8 @@ pub struct LoadedSkills {
     pub registry: Arc<atomcode_capabilities::skills::SkillRegistry>,
     /// The catalog as rendered for the prompt.
     pub catalog: Option<String>,
-    /// Scanned in this order; a skill in a later directory replaces an earlier
-    /// one of the same name.
-    pub dirs: Vec<std::path::PathBuf>,
-    /// Where a new skill goes — `(every project, this project)` — when `dirs`
-    /// is the standard list. `None` when the driver named its own directories.
+    /// Where a new skill goes — `(every project, this project)` — when the roots
+    /// are the standard list. `None` when the driver named its own directories.
     pub install: Option<(std::path::PathBuf, std::path::PathBuf)>,
     /// Installed plugins whose skills were loaded, under each plugin's name.
     pub plugins: Vec<String>,
@@ -944,19 +959,31 @@ impl SkillsHostPlugin {
     /// The directories this runtime actually scanned — a driver may name its
     /// own — rather than the standard list the harness row describes.
     fn describe(&self, ctx: &Context) {
+        let plugin = Self(self.0.clone());
+        atomcode_harness::plugins::self_knowledge::describes_live(
+            ctx,
+            atomcode_harness::seams::Aspect::Operations,
+            "skills",
+            13,
+            move |_| Some(plugin.description_text()),
+        );
+    }
+
+    fn description_text(&self) -> String {
         let loaded = &self.0;
+        let dirs = loaded.registry.directories();
         let mut text = format!("SKILLS — {} loaded.", loaded.registry.len());
-        if loaded.dirs.is_empty() && loaded.plugins.is_empty() {
+        if dirs.is_empty() && loaded.plugins.is_empty() {
             text.push_str(" This runtime was started without skill directories.");
         } else {
-            if !loaded.dirs.is_empty() {
+            if !dirs.is_empty() {
                 text.push_str(
                     " A skill is `<name>/SKILL.md` (with any files it uses beside it), or \
                      a single `<name>.md`, inside one of these directories, scanned in \
                      this order — a later one's skill replaces an earlier one's of the \
                      same name:",
                 );
-                for dir in &loaded.dirs {
+                for dir in &dirs {
                     text.push_str(&format!("\n  {}", dir.display()));
                 }
                 text.push_str(
@@ -965,10 +992,11 @@ impl SkillsHostPlugin {
                      name: <name>   (letters, digits, `-`, `_`; defaults to the directory \
                      or file name)\n\
                      description: <when to use it — this is what gets it chosen>\n\
+                     allowed-tools: [Bash, read_file]  (optional tool preauthorization)\n\
                      ---\n\
                      then the instructions. `$ARGUMENTS` in them is replaced by what the \
                      skill was invoked with. A file whose name is invalid is skipped \
-                     without a warning.\n",
+                     with its path and reason reported as a loading warning.\n",
                 );
             }
             if let Some((every_project, this_project)) = &loaded.install {
@@ -992,7 +1020,7 @@ impl SkillsHostPlugin {
             }
             text.push_str("`list_skills` shows what is loaded; `use_skill` loads one.");
         }
-        atomcode_harness::plugins::self_knowledge::describes(ctx, "skills", 13, text);
+        text
     }
 }
 
@@ -1375,6 +1403,8 @@ impl Plugin for CcHooksHostPlugin {
 
 // ---- the session context block --------------------------------------------
 
+atomcode_plexus::plexus_service!(LoadedContextSvc => atomcode_capabilities::session::SessionContextHook, "loaded-context", Core, "The instruction snapshot this runtime mounted");
+
 /// `session-context`: environment, project instructions and a git snapshot,
 /// contributed to the system prompt once per tree.
 ///
@@ -1399,11 +1429,17 @@ impl Plugin for SessionContextPlugin {
     fn inject(&self) -> &'static [&'static str] {
         &["system-prompt"]
     }
+    fn provides(&self) -> &'static [&'static str] {
+        &["loaded-context"]
+    }
     fn description(&self) -> &'static str {
         "environment, project instructions and a session-start git snapshot, in the system prompt"
     }
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
         let block = self.hook.block(self.stored.as_deref());
+        let _ = ctx
+            .provide::<LoadedContextSvc>(self.hook.clone())
+            .map_err(|e| e.to_string())?;
         // Withdrawn with the row, like every other fragment.
         atomcode_harness::plugins::tools::contribute_prompt(ctx, "project-instructions", 1, &block);
         Ok(())
@@ -1420,6 +1456,7 @@ pub(crate) struct McpPublication {
     pub(crate) tool_names: Arc<RwLock<Vec<String>>>,
     pub(crate) publish_lock: Arc<tokio::sync::Mutex<()>>,
     pub(crate) publication_enabled: Arc<AtomicBool>,
+    pub(crate) discovery_jobs: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) catalog_ready: tokio::sync::watch::Sender<bool>,
     /// Where this row hands the mounted catalog back, so `withdraw_mcp_tools`
     /// can take the published tools off it. Nothing else writes it.
@@ -1427,6 +1464,57 @@ pub(crate) struct McpPublication {
     /// Where this row hands the system prompt back, so `withdraw_mcp_tools` can
     /// take the servers' instructions out with their tools.
     pub(crate) prompts_slot: Arc<RwLock<Option<Arc<atomcode_harness::seams::PromptRegistry>>>>,
+}
+
+impl McpPublication {
+    pub(crate) fn reconnect_state(&self) -> Self {
+        Self {
+            registry: self.registry.clone(),
+            connect_rx: None,
+            tool_names: self.tool_names.clone(),
+            publish_lock: self.publish_lock.clone(),
+            publication_enabled: self.publication_enabled.clone(),
+            discovery_jobs: self.discovery_jobs.clone(),
+            catalog_ready: self.catalog_ready.clone(),
+            toolbox_slot: self.toolbox_slot.clone(),
+            prompts_slot: self.prompts_slot.clone(),
+        }
+    }
+}
+
+pub(crate) async fn cancel_mcp_reconnect(publication: &McpPublication, server: &str) {
+    let _guard = publication.publish_lock.lock().await;
+    let toolbox = publication
+        .toolbox_slot
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    {
+        let aliases = publication.registry.tool_aliases_for_server(server);
+        let mut names = publication
+            .tool_names
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        names.retain(|name| {
+            if aliases.contains(name) {
+                if let Some(toolbox) = &toolbox {
+                    toolbox.unregister(name);
+                }
+                false
+            } else {
+                true
+            }
+        });
+        if let Some(prompts) = publication
+            .prompts_slot
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            crate::mcp_instructions::project(prompts, &publication.registry, &names);
+        }
+    }
+    publication.registry.cancel_reconnect(server).await;
 }
 
 /// What `mcp-telemetry` needs: the second stream of connection events, and the
@@ -1561,6 +1649,92 @@ async fn publish_mcp(
     }
 }
 
+/// An idle runtime replaces exactly one server through the same publication
+/// seam as startup. Initial discovery must be complete and runtime admission
+/// idle, so no startup publisher or tool caller can race this replacement.
+pub(crate) async fn reconnect_mcp_server(
+    publication: McpPublication,
+    config: atomcode_capabilities::mcp::McpServerConfig,
+) -> Result<(), String> {
+    let registry = publication.registry;
+    let toolbox = publication
+        .toolbox_slot
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .ok_or("MCP tool catalog is not mounted")?;
+    let shared = McpShared {
+        tool_names: publication.tool_names,
+        publish_lock: publication.publish_lock,
+        publication_enabled: publication.publication_enabled,
+        prompts: publication
+            .prompts_slot
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone(),
+    };
+    let server = config.name.clone();
+    {
+        let _guard = shared.publish_lock.lock().await;
+        if !shared.publication_enabled.load(Ordering::Acquire) {
+            return Err("MCP tools have been withdrawn; reload capabilities first".into());
+        }
+        let aliases = registry.tool_aliases_for_server(&server);
+        let mut names = shared.tool_names.write().unwrap_or_else(|e| e.into_inner());
+        names.retain(|name| {
+            if aliases.contains(name) {
+                toolbox.unregister(name);
+                false
+            } else {
+                true
+            }
+        });
+        if let Some(prompts) = &shared.prompts {
+            crate::mcp_instructions::project(prompts, &registry, &names);
+        }
+    }
+    // Initial publication is already complete and runtime admission is idle;
+    // there is no active caller or startup publisher to race this replacement.
+    registry
+        .reconnect_server(config)
+        .await
+        .map_err(|e| format!("MCP server '{server}' reconnect failed: {e:#}"))?;
+    let budget = registry.list_tools_timeout(&server).await;
+    let tools = match tokio::time::timeout(budget, registry.list_tools_for_server(&server)).await {
+        Ok(tools) => tools,
+        Err(_) => {
+            let error = format!("MCP server '{server}' tools/list timed out");
+            registry.fail_tools_listing(&server, error.clone());
+            return Err(error);
+        }
+    };
+    if let Some((_, atomcode_capabilities::mcp::ServerStatus::Failed(error))) = registry
+        .server_statuses()
+        .await
+        .into_iter()
+        .find(|(name, _)| name == &server)
+    {
+        return Err(format!("MCP server '{server}' reconnect failed: {error}"));
+    }
+    publish_mcp(&toolbox, &registry, tools, &shared, false).await;
+    Ok(())
+}
+
+/// Tracks a mounted row's discovery pass, including cancellation before its
+/// task first polls. Reconnect cannot race a remount's cached catalog refresh.
+struct McpDiscoveryJob(Arc<std::sync::atomic::AtomicUsize>);
+impl McpDiscoveryJob {
+    fn new(jobs: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        jobs.fetch_add(1, Ordering::AcqRel);
+        Self(jobs)
+    }
+}
+impl Drop for McpDiscoveryJob {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// The publication state a publishing task shares with the runtime.
 #[derive(Clone)]
 struct McpShared {
@@ -1588,10 +1762,16 @@ impl Plugin for McpHostPlugin {
     fn description(&self) -> &'static str {
         "the MCP servers the coding runtime connected, their tools published as they come up"
     }
-    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+    async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
+        let row: atomcode_config::config::McpToolConfig = if config.is_null() {
+            Default::default()
+        } else {
+            serde_json::from_value(config.clone()).map_err(|e| format!("bad MCP config: {e}"))?
+        };
         let Some(publication) = self.0.lock().unwrap_or_else(|e| e.into_inner()).take() else {
             return Err("mcp-host mounted twice from one publication".into());
         };
+        crate::mcp_tool_search::mount(ctx, row.tool_search)?;
         // The harness `mcp` row this displaces told the agent servers are entries
         // on its row config — which nothing in this runtime reads. This is where
         // the runtime's servers actually come from.
@@ -1620,7 +1800,9 @@ impl Plugin for McpHostPlugin {
                  `--global` the user file). Two things only the person can do, and both \
                  are on the MCP screen that `/mcp` opens, one server to a row: trusting \
                  the project, without which its own `.mcp.json` servers never connect, \
-                 and signing in to an OAuth server. After a file changes, `/reload` reads \
+                 and signing in to an OAuth server. The server's detail page also offers \
+                 Reconnect, which replaces only that server while the session is idle. \
+                 After a file changes, `/reload` reads \
                  the servers again and reconnects. Each server's tools join the catalog \
                  as `mcp__<server>__<tool>` and go through the same approval as \
                  everything else.",
@@ -1636,6 +1818,7 @@ impl Plugin for McpHostPlugin {
             tool_names,
             publish_lock,
             publication_enabled,
+            discovery_jobs,
             catalog_ready,
             toolbox_slot,
             prompts_slot,
@@ -1666,10 +1849,12 @@ impl Plugin for McpHostPlugin {
         publish_mcp(&toolbox, &registry, registry.listed_tools(), &shared, true).await;
 
         let task = {
+            let discovery_job = McpDiscoveryJob::new(discovery_jobs);
             let toolbox = toolbox.clone();
             let registry = Arc::clone(&registry);
             let shared = shared.clone();
             tokio::spawn(async move {
+                let _discovery_job = discovery_job;
                 // A tree mounted after the servers came up (a rebuild) starts from
                 // what is already connected.
                 let now = registry.list_all_tools().await;
@@ -1836,9 +2021,14 @@ impl Waterfall<AgentRequest> for RateLimitCoding {
             };
             let quiet_first =
                 verdict.is_none() && hint.retry_after_secs.is_none() && !hint.terminal;
+            let host_decided = verdict.is_some();
             let decision = verdict.unwrap_or_else(|| RateLimitDecision::from_hint(&hint));
             let pause = |reset_at_display: String, reset_label: String, secs: Option<u64>| {
                 Err(RequestError {
+                    retryable: error.retryable
+                        && !hint.terminal
+                        && !host_decided
+                        && error.partial.is_none(),
                     rate_limit_pause: Some(atomcode_harness::events::RateLimitPause {
                         reset_at_display,
                         reset_label,
@@ -1862,9 +2052,21 @@ impl Waterfall<AgentRequest> for RateLimitCoding {
                     let wait = if quiet_first && waits == 1 {
                         QUIET_FIRST_RETRY
                     } else {
-                        self.notice(format!("rate limited; retrying in {secs}s"));
                         std::time::Duration::from_secs(secs)
                     };
+                    if let Err(why) = atomcode_harness::plugins::recovery::reserve_recovery_wait(
+                        req,
+                        wait,
+                        "rate_limit_coding",
+                    ) {
+                        return Err(RequestError {
+                            message: format!("{} ({why})", error.message),
+                            ..error
+                        });
+                    }
+                    if !(quiet_first && waits == 1) {
+                        self.notice(format!("rate limited; retrying in {secs}s"));
+                    }
                     // The loop races this request against the stop button, so a
                     // cancel drops the sleep with it.
                     tokio::time::sleep(wait).await;
@@ -2254,12 +2456,15 @@ async fn run_worktree(
     // is therefore unreachable — tuix read it the same way, and the alternative
     // is a command whose subcommands depend on the repository.
     match parts.first().copied() {
-        None => Err(WORKTREE_USAGE.into()),
+        None => Err(t(Msg::WorktreeHelp).into_owned()),
         Some("list") => list_worktrees(root),
         Some("done") => {
             let at = main_checkout(root)?;
             runtime.change_directory(at.clone()).await?;
-            Ok(format!("回到 {} 干活", at.display()))
+            Ok(t(Msg::WorktreeReturned {
+                path: &at.display().to_string(),
+            })
+            .into_owned())
         }
         Some("cleanup") => {
             let name = parts
@@ -2296,11 +2501,6 @@ fn worktree_target<'a>(parts: &[&'a str]) -> Option<(&'a str, Option<&'a str>)> 
     };
     Some((*rest.first()?, rest.get(1).copied()))
 }
-
-const WORKTREE_USAGE: &str =
-    "用法:`/worktree [create] <名字> [基准]` 开一个自己的 checkout 并进去 · \
-     `/worktree list` 看有哪些 · `/worktree done` 回主检出 · \
-     `/worktree cleanup <名字> [--force]` 清掉";
 
 /// What `list` answers: every worktree git has, the person's own place marked.
 ///
@@ -2385,7 +2585,7 @@ fn remove_worktree(root: &std::path::Path, name: &str, force: bool) -> Result<()
                 .iter()
                 .any(|word| error.contains(word));
         return Err(if dirty {
-            format!("`{name}` 里还有没提交的改动;要清掉就 `/worktree cleanup {name} --force`")
+            t(Msg::WorktreeDirty { name }).into_owned()
         } else {
             format!("清不掉 `{name}`:{error}")
         });
@@ -2981,7 +3181,7 @@ async fn run_goal(
             // 问「怎么用」的绝不能把东西跑起来,见 `means_help`。
             word if means_help(word) => Ok("/goal <要达成的条件> —— 自己干到它成立为止。\n\
                  /goal stop(或 off/clear/cancel/reset/none)—— 收工。\n\
-                 /goal pause —— 先搁着,接着说话就继续。\n\
+                 /goal pause —— 先搁着,接着说话就继续。\n/goal recheck —— 只重新评估已完成的工作。\n/goal report —— 查看运行报告。\n/goal questions —— 查看待答问题。\n/goal answer <ID> <回答> —— 回复待答问题。\n\
                  干到哪一轮了,状态行一直在说。"
                 .into()),
             // 收工的几种说法都认。一个人想停下自主循环的时候,不该还要先想起
@@ -2994,13 +3194,37 @@ async fn run_goal(
                 runtime.stop_goal().await?;
                 Ok("目标停了。".into())
             }
+            "recheck" => { runtime.recheck_goal().await?; Ok("正在仅重新评估，不会重跑主任务。".into()) }
+            "report" => runtime.goal_report().await,
+            "questions" => {
+                let questions = runtime.goal_questions().await?;
+                if questions.is_empty() { return Ok("没有待答问题。".into()); }
+                Ok(questions.iter().map(|q| {
+                    let body = atomcode_capabilities::tools::request_user_input::parse_batch(&q.payload.to_string())
+                        .map(|(questions, _)| questions.into_iter().map(|question| {
+                            let choices=question.options.iter().map(|option| option.label.as_str()).collect::<Vec<_>>().join(" / ");
+                            if choices.is_empty() { question.question } else { format!("{}\n  {}", question.question, choices) }
+                        }).collect::<Vec<_>>().join("\n"))
+                        .unwrap_or_else(|_| "问题内容不可用，请查看会话记录。".into());
+                    format!("{}: {}\n/goal answer {} <回答>", q.id, body, q.id)
+                }).collect::<Vec<_>>().join("\n\n"))
+            }
+            answer if answer.split_whitespace().next() == Some("answer") => {
+                let Some((id, text)) = answer[6..].trim().split_once(char::is_whitespace) else {
+                    return Err("用法：/goal answer <问题 ID> <回答>".into());
+                };
+                let id = id.parse().map_err(|_| "问题 ID 无效")?;
+                if text.trim().is_empty() { return Err("回答不能为空".into()); }
+                runtime.answer_goal_question(id, text.trim().into()).await?;
+                Ok("回答已交给原会话继续处理。".into())
+            }
             "pause" => {
                 runtime.pause_goal().await?;
                 Ok("目标先搁着,还可以接着干。".into())
             }
             condition => {
                 runtime.start_goal(condition.to_string()).await?;
-                Ok(format!("开始干,直到:{condition}"))
+                Ok(t(Msg::GoalStarted).into_owned())
             }
         }
     }
@@ -3220,6 +3444,48 @@ impl atomcode_harness::commands::CatalogCommand for PolicyCommand {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn historical_framing_keeps_logged_stats_aligned_without_accepting_changed_text() {
+        use atomcode_kernel::message::{
+            Message, MessageMeta, COMPACTION_RETAINED_FRAMING, COMPACTION_RETAINED_MODEL_ORIGIN,
+            COMPACTION_RETAINED_ORIGIN,
+        };
+        let mut original = Message::user("original task");
+        original.internal_origin = Some(COMPACTION_RETAINED_ORIGIN.into());
+        let mut assistant = Message::assistant("reply", vec![]);
+        assistant.meta = Some(MessageMeta {
+            elapsed_ms: 42,
+            ..Default::default()
+        });
+        let logged = vec![original.clone(), assistant];
+        let mut framed = original;
+        framed.text.insert_str(0, COMPACTION_RETAINED_FRAMING);
+        framed.internal_origin = Some(COMPACTION_RETAINED_MODEL_ORIGIN.into());
+        let mut sent = vec![framed, Message::assistant("reply", vec![])];
+        let enriched = super::with_logged_meta(&sent, &logged);
+        assert_eq!(enriched[1].meta.as_ref().unwrap().elapsed_ms, 42);
+        assert_eq!(
+            enriched[0].text, sent[0].text,
+            "the request framing stays intact"
+        );
+        sent[0].text.push_str("different task");
+        assert!(super::with_logged_meta(&sent, &logged)[1].meta.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_cancelled_mcp_discovery_releases_the_reconnect_guard() {
+        let jobs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let guard = super::McpDiscoveryJob::new(jobs.clone());
+        assert_eq!(jobs.load(std::sync::atomic::Ordering::Acquire), 1);
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(jobs.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+
     use async_trait::async_trait;
     use std::sync::Arc;
 
@@ -3295,10 +3561,13 @@ mod tests {
     ///
     /// The root is canonicalized because git's answers are: on macOS a `/var`
     /// tempdir and git's `/private/var` are one place spelled two ways, and
-    /// every path compared below is one of git's.
+    /// every path compared below is one of git's. On Windows raw `canonicalize`
+    /// answers with the `\\?\` verbatim prefix git never prints, so the
+    /// capabilities `pathnorm` form strips it before anything is compared.
     fn a_repository() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path().canonicalize().expect("canonical root");
+        let root =
+            atomcode_capabilities::pathnorm::canonicalize(dir.path()).expect("canonical root");
         git(&root, &["init", "-q"]);
         git(&root, &["config", "user.email", "t@example.com"]);
         git(&root, &["config", "user.name", "t"]);
@@ -3674,6 +3943,23 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn goal_report_and_recheck_route_without_starting_main_work() {
+        let runtime: Arc<dyn crate::runtime::RuntimeCommands> = pointed();
+        for word in ["report", "recheck"] {
+            let error = super::run_goal(&runtime, word)
+                .await
+                .expect_err("fake explicitly does not support this control");
+            assert!(!error.is_empty());
+            let condition = format!("{word} 输出符合要求");
+            let call = std::panic::AssertUnwindSafe(super::run_goal(&runtime, &condition));
+            assert!(
+                futures::FutureExt::catch_unwind(call).await.is_err(),
+                "a real condition must still start a goal"
+            );
+        }
+    }
+
     /// `/loop 5m <每轮要做的事>` 的解析,包括它**不**该认的那些。
     ///
     /// 反面才是理由:名单要是宽到吃掉第一个词,`/loop 5m 之内把测试跑绿` 里的
@@ -3938,10 +4224,16 @@ mod tests {
     async fn done_goes_back_to_the_main_checkout() {
         let (_dir, root) = a_repository();
         let at = worktree(&root, "somewhere-else", None).expect("a worktree");
+        let main_head = git(&root, &["rev-parse", "HEAD"]);
+        std::fs::write(at.join("committed-result.txt"), "committed work").unwrap();
+        git(&at, &["add", "committed-result.txt"]);
+        git(&at, &["commit", "-qm", "child work"]);
+        let child_head = git(&at, &["rev-parse", "HEAD"]);
+        std::fs::write(at.join("pending-result.txt"), "pending work").unwrap();
         let runtime = pointed();
         let runtime_dyn: Arc<dyn crate::runtime::RuntimeCommands> = runtime.clone();
 
-        super::run_worktree(&at, "done", &runtime_dyn)
+        let said = super::run_worktree(&at, "done", &runtime_dyn)
             .await
             .expect("going back");
 
@@ -3949,6 +4241,22 @@ mod tests {
             where_it_went(&runtime),
             vec![root.clone()],
             "asked from inside a worktree, `done` still points at the main checkout"
+        );
+        assert_eq!(git(&root, &["rev-parse", "HEAD"]), main_head);
+        assert_eq!(git(&at, &["rev-parse", "HEAD"]), child_head);
+        assert!(!root.join("committed-result.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(at.join("pending-result.txt")).unwrap(),
+            "pending work"
+        );
+        assert_eq!(
+            said,
+            atomcode_config::i18n::t(atomcode_config::i18n::Msg::WorktreeReturned {
+                // The message is a UI boundary: the production side renders the
+                // path in the display form (forward slashes on Windows), so the
+                // expectation is built the same way instead of `root.display()`.
+                path: &atomcode_capabilities::pathnorm::to_display(&root),
+            })
         );
     }
 
@@ -4166,5 +4474,151 @@ mod tests {
             panic!("usage");
         };
         assert!(zh.contains("用法") && en.contains("Usage"), "{zh} / {en}");
+    }
+}
+
+#[cfg(test)]
+mod goal_rate_limit_classification_tests {
+    use super::*;
+    struct Limited(bool);
+    #[async_trait]
+    impl Waterfall<AgentRequest> for Limited {
+        async fn handle(
+            &self,
+            _: &mut ModelRequest,
+            _: Next<'_, AgentRequest>,
+        ) -> Result<ModelResponse, RequestError> {
+            Err(RequestError {
+                retryable: true,
+                http_status: Some(429),
+                code: Some("rate_limit_exceeded".into()),
+                retry_after: Some(std::time::Duration::from_secs(901)),
+                partial: self.0.then(|| {
+                    Box::new(ModelResponse {
+                        text: "already shown".into(),
+                        ..Default::default()
+                    })
+                }),
+                ..RequestError::message("limited")
+            })
+        }
+    }
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn default_long_reset_keeps_timing_but_partial_output_forbids_replay() {
+        for partial in [false, true] {
+            let app = atomcode_plexus::App::new(
+                atomcode_plexus::PluginRegistry::new(),
+                atomcode_plexus::ConfigTree::empty(),
+            );
+            let ctx = app.context();
+            let _failure = ctx.on_waterfall::<AgentRequest>(Arc::new(Limited(partial)), false);
+            let _rate = ctx.on_waterfall::<AgentRequest>(
+                Arc::new(RateLimitCoding {
+                    ctx: ctx.clone(),
+                    hook: crate::rate_limit::RateLimitHook::new("https://example.test/v1".into()),
+                }),
+                true,
+            );
+            let mut request = ModelRequest {
+                messages: vec![],
+                tools: vec![],
+                options: Default::default(),
+                turn: 1,
+                round: 1,
+                answering_a_nudge: false,
+            };
+            let error = ctx
+                .waterfall::<AgentRequest, _>(&mut request, |_| {
+                    Box::pin(async { panic!("the injected failure must handle this request") })
+                })
+                .await
+                .unwrap_err();
+            assert!(error.rate_limit_pause.is_some());
+            assert_eq!(error.retry_after, Some(std::time::Duration::from_secs(901)));
+            assert_eq!(error.retryable, !partial);
+        }
+    }
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn coding_rate_limits_share_the_attempt_and_wait_allowance() {
+        use std::time::Duration;
+        for (attempts, max_wait, statuses, expected_wait) in
+            [(8, 4, [503, 429], 3), (2, 300, [429, 429], 1)]
+        {
+            let mut recovery_plugins = atomcode_plexus::PluginRegistry::new();
+            recovery_plugins.register(Arc::new(
+                atomcode_harness::plugins::loop_policy::RetryPlugin,
+            ));
+            recovery_plugins.register(Arc::new(RateLimitCodingPlugin(None)));
+            let layer = atomcode_plexus::Layer::from_toml(&format!(
+                r#"
+                [[insert]]
+                name = "llm-retry"
+                config = {{ attempts = {attempts}, recovery_wait_secs = {max_wait} }}
+                [[insert]]
+                name = "rate-limit-coding"
+                config = {{ base_url = "https://example.test/v1" }}
+            "#
+            ))
+            .unwrap();
+            let mut app = atomcode_plexus::App::new(
+                recovery_plugins,
+                atomcode_plexus::ConfigTree::from_layers([layer]).unwrap(),
+            );
+            app.start().await.unwrap();
+            let mut req = ModelRequest {
+                messages: vec![],
+                tools: vec![],
+                options: Default::default(),
+                turn: 1,
+                round: 1,
+                answering_a_nudge: false,
+            };
+            let seen = std::sync::atomic::AtomicU32::new(0);
+            let began = tokio::time::Instant::now();
+            let error = app
+                .context()
+                .waterfall::<AgentRequest, _>(&mut req, |req| {
+                    // This terminal stands for the native provider boundary: one
+                    // reservation per invocation, before any network operation.
+                    req.options
+                        .request_recovery
+                        .as_ref()
+                        .unwrap()
+                        .try_attempt()
+                        .unwrap();
+                    let n = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    assert!(
+                        n < 2,
+                        "the coding rate-limit row bypassed the shared allowance"
+                    );
+                    let status = statuses[n as usize];
+                    Box::pin(async move {
+                        Err(RequestError {
+                            retryable: true,
+                            http_status: Some(status),
+                            retry_after: (status == 429)
+                                .then_some(Duration::from_secs(if attempts == 2 { 1 } else { 2 })),
+                            ..RequestError::message("upstream failed")
+                        })
+                    })
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 2);
+            assert_eq!(error.http_status, Some(429));
+            assert!(
+                error.message.contains("request recovery budget exhausted"),
+                "{error}"
+            );
+            assert_eq!(began.elapsed(), Duration::from_secs(expected_wait));
+            assert_eq!(
+                req.options
+                    .request_recovery
+                    .unwrap()
+                    .snapshot()
+                    .reserved_wait,
+                began.elapsed()
+            );
+        }
     }
 }

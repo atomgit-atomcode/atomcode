@@ -3,6 +3,14 @@
 //! The runtime owns the replaceable kernel [`AgentHandle`] so native controls and
 //! events never need to traverse a legacy driver adapter.
 
+mod goal_checkpoint;
+mod goal_questions;
+#[cfg(test)]
+mod goal_recovery_tests;
+
+mod live_view;
+pub use live_view::RuntimeLiveView;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
@@ -36,11 +44,11 @@ use atomcode_kernel::provider::LlmProvider;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::controllers::{
-    evaluate_goal, goal_cap_stop_note, goal_continuation_message, summarize_for_goal, EvalOutcome,
-    GoalPhase, GoalProgress, GoalResult, GoalState, GoalTerminal, LoopProgress, LoopState,
-    ScheduleWakeupTool, WakeupRequest, MAX_UNPRODUCTIVE,
+    goal_cap_stop_note, goal_continuation_message, summarize_for_goal, transient_provider_failure,
+    EvalOutcome, GoalPhase, GoalProgress, GoalRecoveryKind, GoalResult, GoalState, GoalTerminal,
+    LoopProgress, LoopState, ScheduleWakeupTool, WakeupRequest,
 };
-use crate::parts::prepare_with_plugin_hook_source_reusing_lease;
+use crate::parts::{prepare_with_plugin_hook_source_reusing_lease, SessionLeaseSource};
 #[cfg(test)]
 use crate::prepare_with_plugin_hook_source;
 use crate::{CodingAgentConfig, CodingProviderFactory, PluginHookSource, PrepareOptions};
@@ -130,6 +138,12 @@ pub enum CodingRuntimeEvent {
     RuntimeStopped(RuntimeExit),
     /// Driver-correlated approval or other middleware request.
     Request(RuntimeRequest),
+    /// A response was accepted and delivered to the kernel. Every driver must
+    /// retire this request, including drivers that did not submit the answer.
+    RequestResolved {
+        id: RequestId,
+        kind: String,
+    },
     /// Exactly one terminal for an accepted foreground turn.
     TurnFinished(TurnCompletion),
     /// A driver acknowledged the runtime's pending security intervention.
@@ -616,6 +630,17 @@ pub struct RuntimeContextStats {
     /// 每个别的调用方要的都是一个数。人想看它的那一刻很具体:agent 表现得
     /// 像是被告知了一件谁也不记得告诉过它的事。
     pub system_prompt: Option<String>,
+    /// On-demand asset status, captured from the mounted services rather than
+    /// reconstructed by a driver. Populated only with `context_stats_with(true)`.
+    pub assets: Option<RuntimeAssetSources>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeAssetSources {
+    pub instructions: Vec<atomcode_capabilities::instructions::InstructionSource>,
+    pub skill_dirs: Vec<std::path::PathBuf>,
+    pub skills: Vec<(String, std::path::PathBuf)>,
+    pub skill_diagnostics: Vec<atomcode_capabilities::skills::SkillDiagnostic>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -884,6 +909,18 @@ pub trait RuntimeCommands: Send + Sync {
     async fn start_goal(&self, condition: String) -> Result<(), String>;
     /// Stop the goal that is running.
     async fn stop_goal(&self) -> Result<(), String>;
+    async fn recheck_goal(&self) -> Result<(), String> {
+        Err("goal recheck is unavailable".into())
+    }
+    async fn goal_report(&self) -> Result<String, String> {
+        Err("goal report is unavailable".into())
+    }
+    async fn goal_questions(&self) -> Result<Vec<RuntimeRequest>, String> {
+        Err("goal questions are unavailable".into())
+    }
+    async fn answer_goal_question(&self, _id: RequestId, _text: String) -> Result<(), String> {
+        Err("goal questions are unavailable".into())
+    }
     /// Leave the goal where it is; it can be taken up again.
     async fn pause_goal(&self) -> Result<(), String>;
     /// Run `prompt` again and again until it is stopped.
@@ -940,6 +977,7 @@ pub enum SubmitReceipt {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeError {
+    GoalUnavailable(String),
     Busy,
     Cancelled,
     SessionInUse { id: String },
@@ -950,6 +988,7 @@ pub enum RuntimeError {
     Unavailable,
     ProviderUnavailable(ProviderUnavailableReason),
     SnapshotUnavailable(String),
+    SessionReferenceUnavailable(String),
     ReconfigureFailed(String),
     InvalidWorkingDirectory(String),
     UndoOutOfRange { requested: usize, available: usize },
@@ -960,6 +999,7 @@ pub enum RuntimeError {
 impl fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::GoalUnavailable(message) => f.write_str(message),
             Self::Busy => f.write_str("coding runtime is busy"),
             Self::Cancelled => f.write_str("coding runtime operation was cancelled"),
             Self::SessionInUse { id } => {
@@ -975,6 +1015,9 @@ impl fmt::Display for RuntimeError {
             Self::DeliveryFailed => f.write_str("kernel command delivery failed"),
             Self::Unavailable => f.write_str("coding runtime is unavailable"),
             Self::ProviderUnavailable(reason) => write!(f, "provider unavailable: {reason}"),
+            Self::SessionReferenceUnavailable(message) => {
+                write!(f, "session reference unavailable: {message}")
+            }
             Self::SnapshotUnavailable(message) => write!(f, "snapshot unavailable: {message}"),
             Self::ReconfigureFailed(message) => {
                 write!(f, "runtime reconfiguration failed: {message}")
@@ -1038,6 +1081,8 @@ pub struct SequencedRuntimeEvent {
 pub type CodingRuntimeEvents = mpsc::UnboundedReceiver<SequencedRuntimeEvent>;
 
 struct GenerationTaggedRuntimeEvent {
+    view_only: bool,
+    view_seed: Option<(SessionSnapshot, RuntimeMode)>,
     generation: u64,
     event: CodingRuntimeEvent,
 }
@@ -1056,6 +1101,7 @@ struct RuntimeEventEmitter {
     /// [`Self::withdraw_unclaimed`] answers it: without that, the driver holding
     /// the receipt waits for an answer that is never coming.
     unclaimed: Mutex<Vec<atomcode_kernel::event::CommandId>>,
+    latest_goal: Mutex<Option<GoalProgress>>,
 }
 
 fn project_team_event(
@@ -1086,6 +1132,7 @@ impl RuntimeEventEmitter {
             tagged,
             generation,
             unclaimed: Mutex::new(Vec::new()),
+            latest_goal: Mutex::new(None),
         }
     }
 
@@ -1116,7 +1163,60 @@ impl RuntimeEventEmitter {
         }
     }
 
+    fn carry_live_view(&self, generation: u64) {
+        if let Some(tagged) = &self.tagged {
+            let _ = tagged.send(GenerationTaggedRuntimeEvent {
+                view_only: true,
+                view_seed: None,
+                generation,
+                event: CodingRuntimeEvent::Reconfigured {
+                    operation: ReconfigureKind::Provider,
+                },
+            });
+        }
+    }
+
+    fn seed_live_view(&self, generation: u64, runtime: &RuntimeResources) {
+        if let Some(tagged) = &self.tagged {
+            let seed = if runtime.parts.session.is_some() {
+                current_runtime_snapshot(runtime)
+            } else {
+                runtime.parts.runtime_resume_snapshot()
+            };
+            let _ = tagged.send(GenerationTaggedRuntimeEvent {
+                view_only: true,
+                view_seed: seed.map(|snapshot| (snapshot, current_mode(&runtime.parts))),
+                generation,
+                event: CodingRuntimeEvent::SessionChanged(session_changed(generation, runtime)),
+            });
+        }
+    }
+
+    fn session_changed(&self, changed: SessionChanged, resources: Option<&RuntimeResources>) {
+        let seed = resources.and_then(|runtime| {
+            if runtime.parts.session.is_some() {
+                current_runtime_snapshot(runtime)
+            } else {
+                runtime.parts.runtime_resume_snapshot()
+            }
+            .map(|snapshot| (snapshot, current_mode(&runtime.parts)))
+        });
+        let event = CodingRuntimeEvent::SessionChanged(changed);
+        let _ = self.raw.send(event.clone());
+        if let Some(tagged) = &self.tagged {
+            let _ = tagged.send(GenerationTaggedRuntimeEvent {
+                view_only: false,
+                generation: self.generation.load(Ordering::Acquire),
+                event,
+                view_seed: seed,
+            });
+        }
+    }
+
     fn send(&self, event: CodingRuntimeEvent) -> Result<(), ()> {
+        if let CodingRuntimeEvent::GoalChanged(progress) = &event {
+            *self.latest_goal.lock().expect("goal projection poisoned") = Some(progress.clone());
+        }
         if let CodingRuntimeEvent::Agent(
             AgentEvent::Accepted { command, .. } | AgentEvent::Rejected { command, .. },
         ) = &event
@@ -1133,7 +1233,9 @@ impl RuntimeEventEmitter {
             .map(|sender| {
                 sender
                     .send(GenerationTaggedRuntimeEvent {
+                        view_only: false,
                         generation: self.generation.load(Ordering::Acquire),
+                        view_seed: None,
                         event,
                     })
                     .is_ok()
@@ -1286,6 +1388,148 @@ async fn mcp_rows_of(runtime: &RuntimeResources) -> Result<Vec<crate::parts::Mcp
     }
 }
 
+fn prepare_mcp_reconnect(
+    runtime: &RuntimeResources,
+    server: &str,
+) -> Result<
+    (
+        crate::host_rows::McpPublication,
+        atomcode_capabilities::mcp::McpServerConfig,
+    ),
+    String,
+> {
+    use atomcode_capabilities::mcp::McpConfigSource;
+    let storage = crate::parts::mcp_storage(&runtime.config, &runtime.prepare);
+    let mut configs = storage
+        .load_including_disabled()
+        .map_err(|e| format!("{e:#}"))?;
+    configs.extend(runtime.prepare.extra_mcp_servers.clone());
+    let config = configs
+        .into_iter()
+        .rev()
+        .find(|config| config.name == server)
+        .ok_or_else(|| format!("MCP server '{server}' is not configured"))?;
+    if config.disabled {
+        return Err(format!(
+            "MCP server '{server}' is disabled; enable it first"
+        ));
+    }
+    if config.source == McpConfigSource::Project
+        && !atomcode_capabilities::mcp::trust::is_project_trusted(
+            &runtime.config.working_dir,
+            runtime.config.dirs.user(),
+        )
+    {
+        return Err(atomcode_capabilities::mcp::trust::PROJECT_NOT_TRUSTED.to_string());
+    }
+    Ok((runtime.parts.mcp_reconnect_publication()?, config))
+}
+
+/// Whether an MCP mutation was applied in place or needs capability preparation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpActionApplied {
+    InPlace,
+    Reload,
+}
+
+struct McpDisableHold {
+    generation: u64,
+    switches: std::sync::Weak<atomcode_harness::seams::ToolSwitches>,
+    registry: std::sync::Weak<atomcode_capabilities::mcp::McpRegistry>,
+    config: atomcode_capabilities::mcp::McpServerConfig,
+    published: Vec<String>,
+    held: Vec<String>,
+    materialized: bool,
+}
+
+fn mcp_action_config(
+    runtime: &RuntimeResources,
+    server: &str,
+) -> Result<atomcode_capabilities::mcp::McpServerConfig, String> {
+    crate::parts::mcp_storage(&runtime.config, &runtime.prepare)
+        .load_including_disabled()
+        .map_err(|e| format!("{e:#}"))?
+        .into_iter()
+        .find(|config| config.name == server)
+        .ok_or_else(|| format!("MCP server '{server}' is not configured"))
+}
+
+async fn retained_mcp_connection(
+    runtime: &RuntimeResources,
+    config: &atomcode_capabilities::mcp::McpServerConfig,
+) -> bool {
+    use atomcode_capabilities::mcp::{
+        token_is_expired, McpConfigSource, McpHttpAuthConfig, McpTransportConfig, ServerStatus,
+    };
+    let Some(registry) = runtime.parts.mcp_registry.as_ref() else {
+        return false;
+    };
+    let Ok(publication) = runtime.parts.mcp_reconnect_publication() else {
+        return false;
+    };
+    if !publication.publication_enabled.load(Ordering::Acquire)
+        || !registry.connection_matches(config)
+    {
+        return false;
+    }
+    if config.source == McpConfigSource::Project
+        && !atomcode_capabilities::mcp::trust::is_project_trusted(
+            &runtime.config.working_dir,
+            runtime.config.dirs.user(),
+        )
+    {
+        return false;
+    }
+    if matches!(
+        &config.config,
+        McpTransportConfig::Http {
+            auth: Some(McpHttpAuthConfig::OAuth(_)),
+            ..
+        }
+    ) {
+        let tokens = crate::parts::mcp_storage(&runtime.config, &runtime.prepare).tokens();
+        if !matches!(tokens.load_token(&config.name), Ok(Some(token)) if !token_is_expired(&token))
+        {
+            return false;
+        }
+    }
+    registry
+        .server_statuses()
+        .await
+        .iter()
+        .any(|(name, status)| name == &config.name && *status == ServerStatus::Connected)
+}
+
+struct PendingMcpReconnect {
+    task: tokio::task::JoinHandle<Result<(), String>>,
+    publication: crate::host_rows::McpPublication,
+    server: String,
+    generation: u64,
+    phase: RuntimePhase,
+    flag: Arc<std::sync::atomic::AtomicBool>,
+    done: Option<oneshot::Sender<Result<McpActionApplied, RuntimeError>>>,
+}
+impl Drop for PendingMcpReconnect {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
+        self.task.abort();
+        if let Some(done) = self.done.take() {
+            let _ = done.send(Err(RuntimeError::Cancelled));
+        }
+    }
+}
+impl PendingMcpReconnect {
+    async fn cancel(mut self) -> RuntimePhase {
+        self.task.abort();
+        let _ = (&mut self.task).await;
+        crate::host_rows::cancel_mcp_reconnect(&self.publication, &self.server).await;
+        if let Some(done) = self.done.take() {
+            let _ = done.send(Err(RuntimeError::Cancelled));
+        }
+        self.phase
+    }
+}
+
 /// Run one panel action against the live tree: the six things a person can do to
 /// a configured MCP server (`docs/mcp-panel-design.md` §5.2), bar signing in.
 ///
@@ -1298,9 +1542,9 @@ async fn mcp_rows_of(runtime: &RuntimeResources) -> Result<Vec<crate::parts::Mcp
 /// refused config write must arrive with the guard's own words rather than a
 /// generic failure (§6). The caller wraps it in `RuntimeError::ReconfigureFailed`.
 ///
-/// This writes the state; it does not reconnect. Every action but `Disable` is
-/// followed by a capability reload from [`CodingRuntimeHandle::mcp_act`], which is
-/// what makes a trust or an enabled entry reach the session.
+/// Except for reconnect controls, this writes state. Trust and credential changes
+/// require preparation; Enable can restore an unchanged retained connection in
+/// place. The owner returns that decision to [`CodingRuntimeHandle::mcp_act`].
 ///
 /// Order is the point where trust or auth change: the tools come off the session
 /// BEFORE the state they were authorised under is changed — the fail-closed order
@@ -1311,37 +1555,35 @@ async fn mcp_rows_of(runtime: &RuntimeResources) -> Result<Vec<crate::parts::Mcp
 /// matching `Enable` gives back exactly that (`parts::hold_for_disable`).
 async fn apply_mcp_action(
     runtime: &mut RuntimeResources,
+    generation: u64,
     server: String,
     action: crate::parts::McpAction,
-    holds: &mut BTreeMap<String, Vec<String>>,
-) -> Result<(), String> {
+    holds: &mut BTreeMap<String, McpDisableHold>,
+) -> Result<McpActionApplied, String> {
     use crate::parts::McpAction;
-
     match action {
+        McpAction::Reconnect | McpAction::CancelReconnect => {
+            Err("reconnect must run as an owned cancellable task".into())
+        }
         McpAction::Trust => atomcode_capabilities::mcp::trust::trust_project(
             &runtime.config.working_dir,
             runtime.config.dirs.user(),
         )
+        .map(|_| McpActionApplied::Reload)
         .map_err(|e| format!("{e:#}")),
         McpAction::Untrust => {
-            // Nothing to withdraw from a project that was never trusted: said so,
-            // before the tools come off and every server is reconnected for
-            // nothing.
             if !atomcode_capabilities::mcp::trust::is_project_trusted(
                 &runtime.config.working_dir,
                 runtime.config.dirs.user(),
             ) {
                 return Err(atomcode_capabilities::mcp::trust::PROJECT_NOT_TRUSTED.to_string());
             }
-            // Fail-closed, in this order: the tools come off
-            // BEFORE the trust that lets them connect is
-            // withdrawn (`parts.rs:1312-1321`).
             runtime.parts.withdraw_mcp_tools().await;
             atomcode_capabilities::mcp::trust::untrust_project(
                 &runtime.config.working_dir,
                 runtime.config.dirs.user(),
             )
-            .map(|_| ())
+            .map(|_| McpActionApplied::Reload)
             .map_err(|e| format!("{e:#}"))
         }
         McpAction::Logout => {
@@ -1349,25 +1591,49 @@ async fn apply_mcp_action(
             crate::parts::mcp_storage(&runtime.config, &runtime.prepare)
                 .tokens()
                 .delete_token(&server)
-                .map(|_| ())
+                .map(|_| McpActionApplied::Reload)
                 .map_err(|e| format!("{e:#}"))
         }
         McpAction::Disable => {
+            let mut config = mcp_action_config(runtime, &server)?;
+            config.disabled = false;
+            let materialized = retained_mcp_connection(runtime, &config).await;
             crate::parts::mcp_set_enabled_in(
                 &crate::parts::mcp_storage(&runtime.config, &runtime.prepare),
                 &server,
                 false,
             )
             .await?;
-            // Take THIS server's tools off the session — by their published
-            // names, not by a glob (sanitised names can carry a hash suffix) —
-            // and remember which ones, so enabling it again can give them back.
             if let Some(catalog) = runtime.parts.tool_catalog() {
-                let names = runtime.parts.mcp_tools_for_server(&server);
-                let held = crate::parts::hold_for_disable(&catalog, &names);
-                holds.entry(server).or_default().extend(held);
+                let published = runtime.parts.mcp_tools_for_server(&server);
+                let mut held = crate::parts::hold_for_disable(&catalog, &published);
+                let switches = runtime.parts.tool_switches();
+                if let Some(previous) = holds.remove(&server).filter(|h| {
+                    h.switches
+                        .upgrade()
+                        .is_some_and(|old| Arc::ptr_eq(&old, &switches))
+                }) {
+                    held.extend(previous.held);
+                    held.sort();
+                    held.dedup();
+                }
+                if let Some(registry) = runtime.parts.mcp_registry.as_ref() {
+                    holds.insert(
+                        server,
+                        McpDisableHold {
+                            generation,
+                            switches: Arc::downgrade(&switches),
+                            registry: Arc::downgrade(registry),
+                            config,
+                            published,
+                            held,
+                            materialized,
+                        },
+                    );
+                }
+                runtime.parts.reproject_mcp_instructions();
             }
-            Ok(())
+            Ok(McpActionApplied::InPlace)
         }
         McpAction::Enable => {
             crate::parts::mcp_set_enabled_in(
@@ -1376,21 +1642,53 @@ async fn apply_mcp_action(
                 true,
             )
             .await?;
-            if let Some(held) = holds.remove(&server) {
-                match runtime.parts.tool_catalog() {
-                    Some(catalog) => crate::parts::release_after_enable(&catalog, &held),
-                    // No mounted catalog to go through: drop the switches
-                    // directly, so the tools are not born hidden when the
-                    // rebuild brings them back.
-                    None => {
-                        let switches = runtime.parts.tool_switches();
-                        for name in &held {
-                            switches.turn_on(name, &[]);
-                        }
+            let mut config = mcp_action_config(runtime, &server)?;
+            config.disabled = false;
+            if let Some(hold) = holds.remove(&server) {
+                let switches = runtime.parts.tool_switches();
+                let own_switches = hold
+                    .switches
+                    .upgrade()
+                    .is_some_and(|old| Arc::ptr_eq(&old, &switches));
+                let own_registry = runtime.parts.mcp_registry.as_ref().is_some_and(|current| {
+                    hold.registry
+                        .upgrade()
+                        .is_some_and(|old| Arc::ptr_eq(&old, current))
+                });
+                let catalog = runtime.parts.tool_catalog();
+                let published = runtime.parts.mcp_tools_for_server(&server);
+                let registered = catalog.as_ref().is_some_and(|catalog| {
+                    let listing = catalog.listing();
+                    hold.published
+                        .iter()
+                        .all(|name| listing.iter().any(|row| &row.name == name))
+                });
+                if hold.generation == generation
+                    && own_switches
+                    && own_registry
+                    && hold.materialized
+                    && registered
+                    && hold.config == config
+                    && hold.published == published
+                    && retained_mcp_connection(runtime, &config).await
+                {
+                    crate::parts::release_after_enable(
+                        catalog.as_ref().expect("registered catalog"),
+                        &hold.held,
+                    );
+                    runtime.parts.reproject_mcp_instructions();
+                    return Ok(McpActionApplied::InPlace);
+                }
+                if own_switches {
+                    // Clear only this Disable's persisted switch marks. Keep the
+                    // OLD catalog held until a replacement is admitted: trust or
+                    // config may have changed and a turn could start before reload.
+                    for name in &hold.held {
+                        switches.turn_on(name, std::slice::from_ref(name));
                     }
                 }
             }
-            Ok(())
+            Ok(McpActionApplied::Reload)
         }
     }
 }
@@ -1685,8 +1983,9 @@ fn estimate_after_tokens(tokens_before: usize, bytes_before: usize, bytes_after:
 }
 
 /// Cloneable, stable control handle held by a driver.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CodingRuntimeHandle {
+    live_view: Arc<Mutex<Option<RuntimeLiveView>>>,
     tx: mpsc::UnboundedSender<CodingRuntimeControl>,
     state: Arc<AtomicU64>,
     provider_unavailable_reason: Arc<AtomicU8>,
@@ -1702,6 +2001,16 @@ pub struct CodingRuntimeHandle {
     /// token here when it handles the cancel, so a stop is only ever held
     /// against the work it was meant for.
     stop: Arc<Mutex<CancellationToken>>,
+    mcp_reconnecting: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl fmt::Debug for CodingRuntimeHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The presentation view can contain sensitive conversation/tool data.
+        f.debug_struct("CodingRuntimeHandle")
+            .field("status", &self.status())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1745,7 +2054,20 @@ impl CodingRuntimeHandle {
     /// authoritative runtime phase. Drivers use this before entering UI states
     /// that assume the command reached the runtime owner.
     pub fn accepts(&self, command: &DriverCommand) -> bool {
-        !self.is_stopped() && runtime_phase_accepts_command(self.status().phase, command)
+        !self.is_stopped() && self.accepts_in_phase(self.status().phase, command)
+    }
+
+    fn accepts_in_phase(&self, phase: RuntimePhase, command: &DriverCommand) -> bool {
+        if self.mcp_reconnecting.load(Ordering::Acquire) {
+            return matches!(
+                command,
+                DriverCommand::Cancel
+                    | DriverCommand::Shutdown
+                    | DriverCommand::Respond { .. }
+                    | DriverCommand::RefreshContextStats
+            );
+        }
+        runtime_phase_accepts_command(phase, command)
     }
 
     /// Request manual conversation compaction from the current kernel agent.
@@ -1764,9 +2086,7 @@ impl CodingRuntimeHandle {
 
     pub fn dispatch(&self, command: DriverCommand) -> Result<(), RuntimeUnavailable> {
         let state = self.state.load(Ordering::Acquire);
-        if self.is_stopped()
-            || !runtime_phase_accepts_command(runtime_status(state).phase, &command)
-        {
+        if self.is_stopped() || !self.accepts_in_phase(runtime_status(state).phase, &command) {
             return Err(RuntimeUnavailable);
         }
         let generation = runtime_state_generation(state);
@@ -1807,7 +2127,9 @@ impl CodingRuntimeHandle {
                     generation,
                     input,
                     receipt: None,
+                    extra_context: None,
                     from: None,
+                    expected_session: None,
                     done,
                 }
             }
@@ -1969,7 +2291,9 @@ impl CodingRuntimeHandle {
                 generation: runtime_state_generation(state),
                 input,
                 receipt,
+                extra_context: None,
                 from: None,
+                expected_session: None,
                 done,
             })
             .map_err(|_| RuntimeError::Unavailable)?;
@@ -1992,7 +2316,33 @@ impl CodingRuntimeHandle {
                 generation: runtime_state_generation(state),
                 input: UserInput::from(text),
                 receipt: None,
+                extra_context: None,
                 from: Some(from),
+                expected_session: None,
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
+    /// Deliver a peer note only if this runtime still owns the addressed session.
+    /// Checked by the lifecycle owner before opening or steering a turn.
+    pub async fn note_to_session(
+        &self,
+        expected_session: String,
+        from: String,
+        text: String,
+    ) -> Result<SubmitReceipt, RuntimeError> {
+        let state = self.state.load(Ordering::Acquire);
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::Submit {
+                generation: runtime_state_generation(state),
+                input: UserInput::from(text),
+                receipt: None,
+                extra_context: None,
+                from: Some(from),
+                expected_session: Some(expected_session),
                 done,
             })
             .map_err(|_| RuntimeError::Unavailable)?;
@@ -2042,6 +2392,28 @@ impl CodingRuntimeHandle {
             .send(CodingRuntimeControl::PendingPolicyIntervention { done })
             .ok()?;
         result.await.ok().flatten()
+    }
+
+    /// Read the sequenced presentation view without waiting for an agent turn.
+    pub fn live_view(&self) -> Result<RuntimeLiveView, RuntimeError> {
+        let view = self.live_view.lock().expect("live view poisoned");
+        let view = view
+            .as_ref()
+            .filter(|view| view.valid)
+            .ok_or(RuntimeError::Unavailable)?;
+        let status = self.status();
+        if view.generation != status.generation
+            || matches!(
+                status.phase,
+                RuntimePhase::Reconfiguring
+                    | RuntimePhase::ShuttingDown
+                    | RuntimePhase::Stopped
+                    | RuntimePhase::Failed
+            )
+        {
+            return Err(RuntimeError::Busy);
+        }
+        Ok(view.clone())
     }
 
     pub async fn snapshot(&self) -> Result<Arc<SessionSnapshot>, RuntimeError> {
@@ -2234,13 +2606,12 @@ impl CodingRuntimeHandle {
     /// Answers when it is done — call [`mcp_rows`](Self::mcp_rows) for the state it
     /// left behind.
     ///
-    /// Trust and an enabled entry are read when the graph is prepared, and
-    /// untrust and sign-out take every MCP tool off; so every action but `Disable`
-    /// is followed by the same capability reload `/mcp reload` runs. Without it the
-    /// panel would show the server exactly as it was — untrusted after 信任,
-    /// disconnected after 启用 — and the person would take the action for a no-op.
+    /// Trust and credential changes require capability preparation. Enable can
+    /// release tools held by this same runtime when the retained connection and
+    /// its configuration still match; otherwise it prepares capabilities too.
     ///
-    /// Those four answer [`RuntimeError::Busy`] while a turn is running (both the
+    /// Reconnect updates one connection in place. It and rebuilding actions answer
+    /// [`RuntimeError::Busy`] while a turn is running (both the
     /// withdrawal and the rebuild wait for an idle session); `Disable` runs mid-turn.
     pub async fn mcp_act(
         &self,
@@ -2257,8 +2628,8 @@ impl CodingRuntimeHandle {
                 done,
             })
             .map_err(|_| RuntimeError::Unavailable)?;
-        result.await.map_err(|_| RuntimeError::Unavailable)??;
-        if !action.rebuilds() {
+        let applied = result.await.map_err(|_| RuntimeError::Unavailable)??;
+        if applied == McpActionApplied::InPlace {
             return Ok(());
         }
         match self.reload_capabilities().await {
@@ -2785,6 +3156,38 @@ impl CodingRuntimeHandle {
         result.await.map_err(|_| RuntimeError::Unavailable)?
     }
 
+    pub async fn goal_questions(&self) -> Result<Vec<RuntimeRequest>, RuntimeError> {
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::PendingQuestions { done })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)
+    }
+
+    pub async fn goal_report(&self) -> Result<String, RuntimeError> {
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::GoalReport { done })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+    pub async fn recheck_goal(&self) -> Result<(), RuntimeError> {
+        if self.status().phase != RuntimePhase::Ready {
+            return Err(RuntimeError::Busy);
+        }
+        let generation = runtime_state_generation(self.state.load(Ordering::Acquire));
+        let receipt = self.snapshot_with_revision().await?;
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::RecheckGoal {
+                generation,
+                receipt,
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
     pub async fn start_goal(&self, condition: impl Into<UserInput>) -> Result<(), RuntimeError> {
         let state = self.state.load(Ordering::Acquire);
         let (done, result) = oneshot::channel();
@@ -2948,7 +3351,7 @@ impl CodingRuntime {
                 &agent,
                 prepare.clone(),
                 plugin_hooks.as_ref(),
-                session_lease,
+                session_lease.map(SessionLeaseSource::Transferred),
                 true,
             )
             .await
@@ -3036,6 +3439,24 @@ impl CodingRuntime {
             parts.take_up_resumed_session();
         }
 
+        *handle.live_view.lock().expect("live view poisoned") =
+            parts.session.as_ref().and_then(|binding| {
+                binding
+                    .manager
+                    .load_snapshot(&binding.id)
+                    .ok()
+                    .map(|snapshot| {
+                        let mut view = RuntimeLiveView::from_snapshot(
+                            handle.status().generation,
+                            binding.id.clone(),
+                            agent.working_dir.clone(),
+                            snapshot,
+                        );
+                        view.mode = current_mode(&parts);
+                        view
+                    })
+            });
+
         let (raw_event_tx, _raw_events) = mpsc::unbounded_channel();
         let (tagged_event_tx, mut tagged_events) = mpsc::unbounded_channel();
         let adapter = spawn_runtime_owner_with_optional_agent(
@@ -3095,12 +3516,25 @@ impl CodingRuntime {
                     }
                     event = tagged_events.recv(), if raw_open => match event {
                         Some(tagged) => {
+                            if tagged.view_only {
+                                if let Some(view) = task_handle.live_view.lock().expect("live view poisoned").as_mut() {
+                                    if matches!(&tagged.event, CodingRuntimeEvent::SessionChanged(_)) {
+                                        let sequence = view.sequence;
+                                        view.observe(&SequencedRuntimeEvent { generation: tagged.generation, sequence: sequence.unwrap_or(0), event: tagged.event }, tagged.view_seed);
+                                        view.sequence = sequence;
+                                    } else { view.carry_generation(tagged.generation); }
+                                }
+                                continue;
+                            }
                             let envelope = SequencedRuntimeEvent {
                                 generation: tagged.generation,
                                 sequence,
                                 event: tagged.event,
                             };
                             sequence = sequence.wrapping_add(1);
+                            if let Some(view) = task_handle.live_view.lock().expect("live view poisoned").as_mut() {
+                                view.observe(&envelope, tagged.view_seed);
+                            }
                             if event_tx.send(envelope).is_err() {
                                 receiver_dropped = true;
                                 break;
@@ -3134,6 +3568,13 @@ impl CodingRuntime {
                                 event: CodingRuntimeEvent::Agent(event),
                             };
                             sequence = sequence.wrapping_add(1);
+                            if let Some(view) = task_handle.live_view.lock().expect("live view poisoned").as_mut() {
+                                // Raw usage can race a provider-generation marker;
+                                // only tagged events establish a new identity.
+                                if view.generation == envelope.generation {
+                                    view.observe(&envelope, None);
+                                }
+                            }
                             if event_tx.send(envelope).is_err() {
                                 receiver_dropped = true;
                                 break;
@@ -3219,11 +3660,13 @@ pub struct RuntimeExit {
 #[derive(Debug)]
 pub struct CodingRuntimeControlReceiver {
     rx: mpsc::UnboundedReceiver<CodingRuntimeControl>,
+    submit_tx: mpsc::WeakUnboundedSender<CodingRuntimeControl>,
     state: Arc<AtomicU64>,
     provider_unavailable_reason: Arc<AtomicU8>,
     terminal_tx: watch::Sender<Option<RuntimeExit>>,
     /// The other end of [`CodingRuntimeHandle::stop`].
     stop: Arc<Mutex<CancellationToken>>,
+    mcp_reconnecting: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl CodingRuntimeControlReceiver {
@@ -3251,6 +3694,15 @@ impl CodingRuntimeControlReceiver {
 /// Drivers should use capability methods on [`CodingRuntimeHandle`].
 #[doc(hidden)]
 pub enum CodingRuntimeControl {
+    PendingQuestions {
+        done: oneshot::Sender<Vec<RuntimeRequest>>,
+    },
+    QuestionReplyFinished {
+        generation: u64,
+        id: RequestId,
+        result: Result<(), RuntimeError>,
+        done: oneshot::Sender<Result<(), RuntimeError>>,
+    },
     Compact {
         generation: u64,
         focus: Option<String>,
@@ -3261,6 +3713,8 @@ pub enum CodingRuntimeControl {
     Submit {
         generation: u64,
         input: UserInput,
+        /// Runtime-authored context admitted with this exact input.
+        extra_context: Option<String>,
         /// The driver's own id for this submit, when it has one. Carried into the
         /// harness so the turn can name the same message back: the fold
         /// (`AgentEvent::Accepted`) and what a stop withdrew
@@ -3273,6 +3727,7 @@ pub enum CodingRuntimeControl {
         /// execution policy, receipt and turn accounting — and differs in the one
         /// thing `input` cannot carry: whose words these are.
         from: Option<String>,
+        expected_session: Option<String>,
         done: oneshot::Sender<Result<SubmitReceipt, RuntimeError>>,
     },
     Respond {
@@ -3366,7 +3821,7 @@ pub enum CodingRuntimeControl {
         generation: u64,
         server: String,
         action: crate::parts::McpAction,
-        done: oneshot::Sender<Result<(), RuntimeError>>,
+        done: oneshot::Sender<Result<McpActionApplied, RuntimeError>>,
     },
     WithdrawMcpTools {
         generation: u64,
@@ -3483,6 +3938,14 @@ pub enum CodingRuntimeControl {
         snapshot: SessionSnapshot,
         done: oneshot::Sender<Result<SessionChanged, RuntimeError>>,
     },
+    GoalReport {
+        done: oneshot::Sender<Result<String, RuntimeError>>,
+    },
+    RecheckGoal {
+        generation: u64,
+        receipt: RuntimeSnapshotReceipt,
+        done: oneshot::Sender<Result<(), RuntimeError>>,
+    },
     StartGoal {
         generation: u64,
         condition: String,
@@ -3560,20 +4023,26 @@ pub fn coding_runtime_control_channel() -> (CodingRuntimeHandle, CodingRuntimeCo
     let state = Arc::new(AtomicU64::new(runtime_state(0, true)));
     let provider_unavailable_reason = Arc::new(AtomicU8::new(0));
     let stop = Arc::new(Mutex::new(CancellationToken::new()));
+    let mcp_reconnecting = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let submit_tx = tx.downgrade();
     (
         CodingRuntimeHandle {
+            live_view: Arc::new(Mutex::new(None)),
             tx,
             state: Arc::clone(&state),
             provider_unavailable_reason: Arc::clone(&provider_unavailable_reason),
             terminal,
             stop: Arc::clone(&stop),
+            mcp_reconnecting: mcp_reconnecting.clone(),
         },
         CodingRuntimeControlReceiver {
             rx,
+            submit_tx,
             state,
             provider_unavailable_reason,
             terminal_tx,
             stop,
+            mcp_reconnecting,
         },
     )
 }
@@ -3890,6 +4359,7 @@ fn spawn_runtime_owner_with_optional_agent(
     let (_closed_wakeup_tx, closed_wakeup_rx) = mpsc::unbounded_channel();
     let mut wakeup_rx = wakeup_rx.unwrap_or(closed_wakeup_rx);
     let (goal_eval_tx, mut goal_eval_rx) = mpsc::unbounded_channel::<EvalOutcome>();
+    let (goal_retry_tx, mut goal_retry_rx) = mpsc::unbounded_channel::<(u64, u64, u64)>();
     let (loop_fire_tx, mut loop_fire_rx) = mpsc::unbounded_channel::<(u64, u64, WakeupRequest)>();
     let (next_prompt_tx, mut next_prompt_rx) =
         mpsc::unbounded_channel::<NextPromptSuggestionOutcome>();
@@ -3928,6 +4398,7 @@ fn spawn_runtime_owner_with_optional_agent(
         let mut observed_tokens = None;
         let mut controls_open = true;
         let mut compaction_suspended = false;
+        let mut pending_mcp_reconnect: Option<PendingMcpReconnect> = None;
         let mut agent_available = matches!(initial_phase, RuntimePhase::Ready);
         let mut provider_unavailable_reason = initial_unavailable_reason;
         let mut compactions = CompactionTracker::default();
@@ -3940,6 +4411,7 @@ fn spawn_runtime_owner_with_optional_agent(
         // Keep each request kind until its correlated response is delivered.
         // `request_user_input` image answers need runtime-owned preprocessing.
         let mut pending_requests = BTreeMap::new();
+        let mut goal_questions = goal_questions::GoalQuestions::default();
         let mut pending_policy_intervention: Option<PolicyIntervention> = None;
         let mut snapshot_waiters: Vec<RuntimeSnapshotWaiter> = Vec::new();
         let mut snapshot_in_flight = false;
@@ -3949,6 +4421,8 @@ fn spawn_runtime_owner_with_optional_agent(
         // arrives, otherwise a prompt can be accepted as a steer and then cleared by
         // the kernel's cancel path.
         let mut cancel_pending = false;
+        let mut main_failure_retryable = None;
+        let mut main_retry_after_secs = None;
         let mut turn_stats = RuntimeTurnStats::default();
         let mut turn_started_at: Option<std::time::Instant> = None;
         let mut pending_steer_acknowledgements = VecDeque::new();
@@ -3956,6 +4430,7 @@ fn spawn_runtime_owner_with_optional_agent(
         let mut pending_local_context = Vec::new();
         let mut next_controller_id = 0u64;
         let mut goal: Option<GoalState> = None;
+        let mut goal_checkpoints = goal_checkpoint::GoalCheckpoints::default();
         let mut loop_state: Option<LoopState> = None;
         let mut pending_wakeup: Option<WakeupRequest> = None;
         let mut held_turn: Option<(u64, StopReason, Arc<SessionSnapshot>, RuntimeTurnStats)> = None;
@@ -3968,7 +4443,7 @@ fn spawn_runtime_owner_with_optional_agent(
         // What each panel `Disable` held back, by server, for the matching
         // `Enable` to give back. Owned here rather than by the parts because a
         // rebuild replaces the parts and the person's switches outlive it.
-        let mut mcp_disable_holds: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut mcp_disable_holds: BTreeMap<String, McpDisableHold> = BTreeMap::new();
         if agent_available {
             replay_pending_resume_prompt(
                 &agent,
@@ -3988,14 +4463,141 @@ fn spawn_runtime_owner_with_optional_agent(
             });
         }
         loop {
+            if let Err(error) = goal_checkpoints.sync(
+                resources.as_ref(),
+                &mut goal,
+                &mut next_controller_id,
+                &runtime_event_tx,
+            ) {
+                if let Some(mut state) = goal.take() {
+                    state.finish(
+                        GoalTerminal::Failed,
+                        format!("目标检查点不可用，自动续接已停止：{error}"),
+                    );
+                    let _ =
+                        runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                    fail_close_pending_requests(
+                        &agent,
+                        &mut pending_requests,
+                        &goal_questions,
+                        active_turn.is_some(),
+                    );
+                    if held_turn.is_none() && active_turn.is_some() {
+                        cancel_pending = true;
+                        let _ = send_agent_command(&agent, AgentCommand::Cancel);
+                    }
+                }
+                if let Some((turn_id, reason, snapshot, stats)) = held_turn.take() {
+                    active_turn = None;
+                    terminal_reason = None;
+                    let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(
+                        TurnCompletion::Completed {
+                            turn_id,
+                            reason,
+                            snapshot,
+                            stats,
+                        },
+                    ));
+                    controls.state.store(
+                        runtime_phase_state(generation, RuntimePhase::Ready),
+                        Ordering::Release,
+                    );
+                }
+                let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(format!(
+                    "目标恢复状态不可用：{error}"
+                )));
+            }
             // No agent, no inbox: whatever was still waiting in the one that
             // went is answered now (a stop-and-rebuild answers it itself, in
             // `stop_current_agent`; this is every other way an agent is lost).
             if agent.is_none() {
                 runtime_event_tx.withdraw_unclaimed();
             }
+            if persistence_failure.is_some() {
+                if let Some(pending) = pending_mcp_reconnect.take() {
+                    pending.cancel().await;
+                }
+            }
+            if goal_questions.generation != generation {
+                goal_questions = goal_questions::GoalQuestions {
+                    generation,
+                    ..Default::default()
+                };
+            }
+            goal_questions
+                .waiting
+                .retain(|id, _| pending_requests.contains_key(id));
+            if !goal.as_ref().is_some_and(|state| state.active) {
+                goal_questions.waiting.clear();
+            }
+            goal_questions
+                .continued
+                .retain(|id, (_, queued)| *queued || pending_requests.contains_key(id));
+            goal_questions
+                .aliases
+                .retain(|_, id| goal_questions.continued.contains_key(id));
+            goal_questions
+                .awaiting_receipt
+                .retain(|id| goal_questions.continued.contains_key(id));
+            if !goal_questions.restored {
+                if resources
+                    .as_ref()
+                    .is_some_and(|runtime| goal_questions.restore_runtime(runtime))
+                {
+                    for request in goal_questions.list() {
+                        pending_requests.insert(request.id, request.kind.clone());
+                        let _ = runtime_event_tx.send(CodingRuntimeEvent::Request(request));
+                    }
+                }
+            }
+            let question_deadline = goal_questions.deadline();
             tokio::select! {
                 biased;
+                _ = tokio::time::sleep_until(question_deadline), if !goal_questions.waiting.is_empty() => {
+                    let due: Vec<_> = goal_questions.waiting.iter()
+                        .filter(|(_, (at, _))| *at <= tokio::time::Instant::now())
+                        .map(|(id, (_, payload))| (*id, payload.clone())).collect();
+                    for (id, payload) in due {
+                        goal_questions.waiting.remove(&id);
+                        if !pending_requests.contains_key(&id) { continue; }
+                        let late_id = ((uuid::Uuid::new_v4().as_u128() as u64) & ((1 << 51) - 1)) | (1 << 51);
+                        let question = atomcode_capabilities::tools::request_user_input::PendingUserQuestion::new(late_id, payload);
+                        let value = serde_json::to_value(&question).unwrap_or_default();
+                        if goal_questions.continued.len() >= 8 || pending_requests.contains_key(&late_id) {
+                            // Bound retained questions without choosing an answer.
+                            if !send_agent_command(&agent, AgentCommand::Respond { id, value: serde_json::json!({"question_error":"The pending question limit was reached. Do not repeat questions; work independently or explain what is blocked."}) }) {
+                                agent_available = false;
+                                controls.state.store(runtime_phase_state(generation, RuntimePhase::Failed), Ordering::Release);
+                                continue;
+                            }
+                            pending_requests.remove(&id);
+                            let _ = runtime_event_tx.send(CodingRuntimeEvent::RequestResolved {id, kind:REQUEST_USER_INPUT_KIND.into()});
+                            let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning("待答问题已达上限；本次问询未保留，未替用户选择答案。请处理 /goal questions 中的待答问题。".into()));
+                            continue;
+                        } else if send_agent_command(&agent, AgentCommand::Respond { id, value }) {
+                            goal_questions.continued.insert(late_id, (question.clone(), false));
+                            goal_questions.awaiting_receipt.insert(late_id);
+                            goal_questions.aliases.insert(id, late_id);
+                            pending_requests.insert(late_id, REQUEST_USER_INPUT_KIND.into());
+                            let _ = runtime_event_tx.send(CodingRuntimeEvent::Request(RuntimeRequest {
+                                id: late_id, kind: REQUEST_USER_INPUT_KIND.into(),
+                                payload: goal_questions::GoalQuestions::payload(&question), snapshot: None,
+                            }));
+                        } else {
+                            agent_available = false;
+                            controls.state.store(runtime_phase_state(generation, RuntimePhase::Failed), Ordering::Release);
+                            continue;
+                        }
+                        pending_requests.remove(&id);
+                        let _ = runtime_event_tx.send(CodingRuntimeEvent::RequestResolved { id, kind: REQUEST_USER_INPUT_KIND.into() });
+                        let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(format!(
+                            "问询等待已结束，尚未收到回答；目标可继续独立工作。用 /goal questions 查看待答问题，/goal answer {late_id} <回答> 回复；未回答不代表同意。"
+                        )));
+                    }
+                    if agent_available && pending_requests.keys().all(|id| goal_questions.continued.contains_key(id)) {
+                        controls.state.store(runtime_phase_state(generation, RuntimePhase::InTurn), Ordering::Release);
+                    }
+                }
                 team_event = team_event_rx.recv() => {
                     // Team runs persist across turns, so gate their events by the TEAM
                     // manager's own generation (advanced only at `begin_generation` — an
@@ -4017,6 +4619,7 @@ fn spawn_runtime_owner_with_optional_agent(
                 }
                 management = owner_rx.recv() => match management {
                     Some(OwnerControl::SuspendCompaction { done }) => {
+                        if let Some(pending) = pending_mcp_reconnect.take() { pending.cancel().await; }
                         if !compaction_suspended {
                             generation = generation.wrapping_add(1);
                             event_generation.store(generation, Ordering::Release);
@@ -4047,6 +4650,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         let _ = done.send(());
                     }
                     Some(OwnerControl::Stop { done }) => {
+                        if let Some(pending) = pending_mcp_reconnect.take() { pending.cancel().await; }
                         if !compaction_suspended {
                             generation = generation.wrapping_add(1);
                             event_generation.store(generation, Ordering::Release);
@@ -4063,6 +4667,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             fail_close_pending_requests(
                                 &agent,
                                 &mut pending_requests,
+                                &goal_questions,
                                 active_turn.is_some(),
                             );
                         }
@@ -4105,6 +4710,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         let _ = done.send(());
                     }
                     Some(OwnerControl::Replace { agent: replacement, done }) => {
+                        if let Some(pending) = pending_mcp_reconnect.take() { pending.cancel().await; }
                         if persistence_failure.is_some() {
                             agent = None;
                             agent_available = false;
@@ -4135,6 +4741,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             fail_close_pending_requests(
                                 &agent,
                                 &mut pending_requests,
+                                &goal_questions,
                                 active_turn.is_some(),
                             );
                         }
@@ -4194,6 +4801,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         let _ = done.send(());
                     }
                     Some(OwnerControl::Shutdown { done }) => {
+                        if let Some(pending) = pending_mcp_reconnect.take() { pending.cancel().await; }
                         if !compaction_suspended {
                             generation = generation.wrapping_add(1);
                             event_generation.store(generation, Ordering::Release);
@@ -4209,6 +4817,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             fail_close_pending_requests(
                                 &agent,
                                 &mut pending_requests,
+                                &goal_questions,
                                 active_turn.is_some(),
                             );
                         }
@@ -4260,13 +4869,14 @@ fn spawn_runtime_owner_with_optional_agent(
                             CompactionInterruption::RuntimeShutdown,
                         );
                         let _ = done.send(());
+                        if let Err(error) = goal_checkpoints.flush(&runtime_event_tx) { let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(format!("目标检查点保存失败：{error}"))); }
                         shutdown_was_handled = true;
                         exit_reason = RuntimeExitReason::ShutdownRequested;
                         break;
                     }
                     None => break,
                 },
-                wakeup = wakeup_rx.recv(), if native_protocol => {
+                wakeup = wakeup_rx.recv(), if native_protocol && pending_mcp_reconnect.is_none() => {
                     if let Some(wakeup) = wakeup {
                         if loop_state.as_ref().is_some_and(|state| state.active) {
                             if let Some(state) = loop_state.as_mut() {
@@ -4296,14 +4906,18 @@ fn spawn_runtime_owner_with_optional_agent(
                 outcome = goal_eval_rx.recv(), if native_protocol => {
                     let Some(outcome) = outcome else { continue };
                     if outcome.generation != generation
-                        || goal.as_ref().map(|state| state.id) != Some(outcome.controller_id)
+                        || !goal.as_ref().is_some_and(|state| state.id == outcome.controller_id && state.async_epoch == outcome.async_epoch && state.active)
                         || held_turn.is_none()
                     {
                         continue;
                     }
+                    if let Some(state) = goal.as_mut() {
+                        state.evidence_expanded = outcome.evidence_expanded;
+                        state.report.evaluator_attempts = state.report.evaluator_attempts.saturating_add(outcome.requests.saturating_sub(1));
+                    }
                     if let Some(usage) = outcome.usage {
                         if let Some(state) = goal.as_mut() {
-                            state.tokens_used = state.tokens_used.saturating_add((usage.prompt + usage.completion) as u64);
+                            state.record_usage(usage.prompt, usage.completion, usage.cached);
                         }
                     }
                     let mut finish_reason = None;
@@ -4319,6 +4933,13 @@ fn spawn_runtime_owner_with_optional_agent(
                             // starts another.
                             if let Some(state) = goal.as_mut() {
                                 state.mark_satisfied(verdict);
+                                let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                            }
+                            finish_reason = Some(StopReason::Stopped);
+                        }
+                        GoalResult::NotMet(verdict) if goal.as_ref().is_some_and(|s| s.evaluation_only) => {
+                            if let Some(state) = goal.as_mut() {
+                                state.pause_for_recovery(format!("仅重评估：目标尚未达成。{verdict}。核对后发送消息继续主任务。"));
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                             }
                             finish_reason = Some(StopReason::Stopped);
@@ -4362,19 +4983,27 @@ fn spawn_runtime_owner_with_optional_agent(
                                 }
                             }
                         }
-                        GoalResult::Inconclusive(reason) => {
-                            // The evaluator returned no usable verdict (e.g. an
-                            // empty stream). This is NOT a failure of the agent's
-                            // work and NOT a provider error: the evaluator simply
-                            // produced nothing to judge. End the goal as Stopped
-                            // (not Failed) and skip the red ControllerWarning —
-                            // repeatedly yelling about an empty verdict made the
-                            // agent spin in pointless retries (issue #17).
+                        GoalResult::Inconclusive(detail) if outcome.evidence_exhausted => {
                             if let Some(state) = goal.as_mut() {
-                                state.finish(
-                                    GoalTerminal::Stopped,
-                                    format!("goal evaluation inconclusive: {reason}"),
-                                );
+                                state.pause_for_recovery(format!("bounded logged evidence remains insufficient; goal retained: {detail}"));
+                                let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                            }
+                            finish_reason = Some(StopReason::Stopped);
+                        }
+                        result @ (GoalResult::Inconclusive(_) | GoalResult::RetryableError { .. }) => {
+                            let (detail, retry_after) = match &result {
+                                GoalResult::Inconclusive(reason) => (reason.as_str(), None),
+                                GoalResult::RetryableError { message, retry_after_secs } => (message.as_str(), *retry_after_secs),
+                                _ => unreachable!(),
+                            };
+                            if let Some(state) = goal.as_mut() {
+                                if let Some(delay) = state.schedule_recovery(GoalRecoveryKind::Evaluator, retry_after) {
+                                    arm_goal_retry(&goal_retry_tx, generation, state, delay);
+                                    let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                                    tracing::info!(generation, goal_id=state.id, delay_secs=delay.as_secs(), "goal evaluator recovery scheduled");
+                                    continue;
+                                }
+                                state.pause_for_recovery(format!("evaluation recovery budget exhausted; goal retained: {detail}"));
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                             }
                             finish_reason = Some(StopReason::Stopped);
@@ -4396,11 +5025,19 @@ fn spawn_runtime_owner_with_optional_agent(
                             active_turn = None;
                             // Every verdict that ends the goal closes it — Met included.
                             // The GoalChanged above already said which terminal it was.
-                            goal = None;
+                            if !goal.as_ref().is_some_and(|state| state.phase == GoalPhase::PausedAtCap) {
+                                goal = None;
+                            }
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed { turn_id, reason, snapshot, stats }));
                             controls.state.store(runtime_phase_state(generation, RuntimePhase::Ready), Ordering::Release);
                         }
                     } else if let Some(text) = continuation {
+                        if let Some(state) = goal.as_mut() {
+                            state.invalidate_work();
+                            state.evaluation_ready = false;
+                            state.evaluation_only = false;
+                            let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                        }
                         if send_agent_command(&agent, AgentCommand::SendSyntheticMessage { text }) {
                             held_turn = None;
                             terminal_reason = None;
@@ -4431,6 +5068,63 @@ fn spawn_runtime_owner_with_optional_agent(
                                     },
                                 ));
                             }
+                            controls.state.store(runtime_phase_state(generation, RuntimePhase::Failed), Ordering::Release);
+                        }
+                    }
+                }
+                retry = goal_retry_rx.recv(), if native_protocol => {
+                    let Some((retry_generation, controller_id, epoch)) = retry else { continue };
+                    let Some(state) = goal.as_mut().filter(|state| state.active && state.id == controller_id && state.async_epoch == epoch && state.recovery.is_some()) else { continue };
+                    if retry_generation != generation || held_turn.is_none() { continue; }
+                    if !agent_available || persistence_failure.is_some() || pending_policy_intervention.is_some() {
+                        state.pause_for_recovery("automatic recovery blocked; resolve the runtime or pending policy first");
+                        let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                        if let Some((turn_id, reason, snapshot, stats)) = held_turn.take() {
+                            active_turn = None;
+                            terminal_reason = None;
+                            let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed { turn_id, reason, snapshot, stats }));
+                        }
+                        controls.state.store(runtime_phase_state(generation, if agent_available && persistence_failure.is_none() { RuntimePhase::Ready } else { RuntimePhase::Failed }), Ordering::Release);
+                        continue;
+                    }
+                    let kind = state.recovery.as_ref().expect("recovery present").kind;
+                    if state.cap_reached().is_some() || !state.recovery_window_open(kind) {
+                        if let Some(why) = state.cap_reached() {
+                            state.pause_at_cap(goal_cap_stop_note(why, state.max_rounds));
+                        } else {
+                            state.pause_for_recovery("recovery time budget exhausted; goal retained");
+                        }
+                        let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                        if let Some((turn_id, reason, snapshot, stats)) = held_turn.take() {
+                            active_turn = None;
+                            terminal_reason = None;
+                            let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed { turn_id, reason, snapshot, stats }));
+                            controls.state.store(runtime_phase_state(generation, RuntimePhase::Ready), Ordering::Release);
+                        }
+                        continue;
+                    }
+                    state.begin_retry_attempt();
+                    state.last_reason = Some("automatic goal recovery in progress".into());
+                    let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                    if kind == GoalRecoveryKind::Evaluator {
+                        let snapshot = &held_turn.as_ref().expect("held turn present").2;
+                        launch_goal_evaluation(generation, state, snapshot, resources.as_ref(), &goal_eval_tx);
+                    } else {
+                        state.round = state.round.saturating_add(1);
+                        let text = goal_continuation_message(state.last_reason.as_deref().unwrap_or("provider recovered"), &state.condition);
+                        if send_agent_command(&agent, AgentCommand::SendSyntheticMessage { text }) {
+                            held_turn = None;
+                            terminal_reason = None;
+                            turn_stats = RuntimeTurnStats::default();
+                            let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                        } else {
+                            state.finish(GoalTerminal::Failed, "continuation dispatch failed");
+                            let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                            if let Some((turn_id, _, snapshot, stats)) = held_turn.take() {
+                                active_turn = None;
+                                let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed { turn_id, reason: StopReason::ProviderError, snapshot, stats }));
+                            }
+                            agent_available = false;
                             controls.state.store(runtime_phase_state(generation, RuntimePhase::Failed), Ordering::Release);
                         }
                     }
@@ -4505,7 +5199,52 @@ fn spawn_runtime_owner_with_optional_agent(
                         }
                     }
                 }
+                result = async { (&mut pending_mcp_reconnect.as_mut().expect("reconnect present").task).await }, if pending_mcp_reconnect.is_some() => {
+                    let mut pending = pending_mcp_reconnect.take().expect("reconnect present");
+                    if pending.generation == generation && persistence_failure.is_none() && agent_available && active_turn.is_none() {
+                        controls.state.store(runtime_phase_state(generation, pending.phase), Ordering::Release);
+                    }
+                    let outcome = if pending.generation != generation || persistence_failure.is_some() || !agent_available || active_turn.is_some() {
+                        crate::host_rows::cancel_mcp_reconnect(&pending.publication, &pending.server).await;
+                        Err(RuntimeError::Cancelled)
+                    } else {
+                        match result {
+                            Ok(Ok(())) => {
+                                if let Some(runtime) = resources.as_ref() { tell(runtime, Some(crate::told::mcp_acted(&pending.server, crate::parts::McpAction::Reconnect))); }
+                                Ok(())
+                            }
+                            Ok(Err(error)) => Err(RuntimeError::ReconfigureFailed(error)),
+                            Err(error) => {
+                                crate::host_rows::cancel_mcp_reconnect(&pending.publication, &pending.server).await;
+                                Err(RuntimeError::ReconfigureFailed(format!("MCP reconnect task failed: {error}")))
+                            }
+                        }
+                    };
+                    if let Some(done) = pending.done.take() { let _ = done.send(outcome.map(|_| McpActionApplied::InPlace)); }
+                }
                 control = controls.recv(), if controls_open => match control {
+                    Some(CodingRuntimeControl::PendingQuestions { done }) => {
+                        let _ = done.send(goal_questions.list());
+                    }
+                    Some(CodingRuntimeControl::QuestionReplyFinished { generation: requested, id, result, done }) => {
+                        if requested != generation {
+                            let _ = done.send(Err(RuntimeError::StaleRequest { id }));
+                        } else if !pending_requests.contains_key(&id) {
+                            // A fast turn may admit the contextual reply and
+                            // commit its snapshot before this callback is read.
+                            let accepted = result.is_ok() && goal_questions.admitted_replies.contains(&id);
+                            let _ = done.send(if accepted { Ok(()) } else { Err(RuntimeError::StaleRequest {id}) });
+                        } else if result.is_ok() {
+                            // Keep queued correlation until the native log admits it.
+                            // A cancel before that admission must still close the question.
+                            pending_requests.remove(&id);
+                            let _ = runtime_event_tx.send(CodingRuntimeEvent::RequestResolved { id, kind: REQUEST_USER_INPUT_KIND.into() });
+                            let _ = done.send(Ok(()));
+                        } else {
+                            if let Some((_, queued)) = goal_questions.continued.get_mut(&id) { *queued = false; }
+                            let _ = done.send(result);
+                        }
+                    }
                     Some(control)
                         if persistence_failure.is_some()
                             && !matches!(&control, CodingRuntimeControl::Shutdown { .. }) =>
@@ -4515,6 +5254,17 @@ fn spawn_runtime_owner_with_optional_agent(
                             &runtime_event_tx,
                             CompactionInterruption::RuntimeUnavailable,
                         );
+                    }
+                    Some(control) if pending_mcp_reconnect.is_some() && !matches!(&control,
+                        CodingRuntimeControl::Cancel { .. } | CodingRuntimeControl::Shutdown { .. }
+                        | CodingRuntimeControl::Respond { .. }
+                        | CodingRuntimeControl::McpAct { action: crate::parts::McpAction::CancelReconnect, .. }
+                        | CodingRuntimeControl::Mode { .. } | CodingRuntimeControl::McpStatus { .. }
+                        | CodingRuntimeControl::McpRows { .. } | CodingRuntimeControl::McpDetail { .. }
+                        | CodingRuntimeControl::ToolCatalog { .. } | CodingRuntimeControl::ContextStats { .. }
+                        | CodingRuntimeControl::Usage { .. } | CodingRuntimeControl::Snapshot { .. }
+                        | CodingRuntimeControl::PendingPolicyIntervention { .. }) => {
+                        reject_runtime_control_with_error(control, &runtime_event_tx, CompactionInterruption::RuntimeUnavailable, RuntimeError::Busy);
                     }
                     Some(CodingRuntimeControl::Compact { generation: request_generation, focus }) => {
                         let trigger = CompactTrigger::Manual { focus: focus.clone() };
@@ -4550,13 +5300,22 @@ fn spawn_runtime_owner_with_optional_agent(
                     Some(CodingRuntimeControl::Submit {
                         generation: request_generation,
                         mut input,
+                        extra_context,
                         receipt: driver_receipt,
                         from,
+                        expected_session,
                         done,
                     }) => {
                         tracing::debug!(phase = "runtime_submit_received", generation = request_generation, process_id = std::process::id(), "request preparation timing");
                         if !native_protocol || request_generation != generation {
                             let _ = done.send(Err(RuntimeError::Unavailable));
+                            continue;
+                        }
+                        if expected_session.as_deref().is_some_and(|expected| {
+                            resources.as_ref().and_then(|r| r.parts.session.as_ref())
+                                .map(|binding| binding.id.as_str()) != Some(expected)
+                        }) {
+                            let _ = done.send(Err(RuntimeError::DeliveryFailed));
                             continue;
                         }
                         if !agent_available {
@@ -4567,13 +5326,57 @@ fn spawn_runtime_owner_with_optional_agent(
                             continue;
                         }
                         if cancel_pending {
+                            tracing::warn!(generation, reason = "cancellation_pending", "runtime submit refused");
                             let _ = done.send(Err(RuntimeError::Busy));
                             continue;
                         }
                         if pending_policy_intervention.is_some() {
+                            tracing::warn!(generation, reason = "policy_intervention_pending", "runtime submit refused");
                             let _ = done.send(Err(RuntimeError::Busy));
                             continue;
                         }
+                        // Resolve historical data before changing policy, goal or turn state.
+                        // Only real-user submits can request it; peer reports are data.
+                        let reference_context = if from.is_none() {
+                            match atomcode_capabilities::session::reference::parse(&input.text) {
+                                Err(reason) => {
+                                    let _ = done.send(Err(RuntimeError::SessionReferenceUnavailable(reason)));
+                                    continue;
+                                }
+                                Ok(references) if !references.is_empty() => {
+                                    let Some(runtime) = resources.as_ref() else {
+                                        let _ = done.send(Err(RuntimeError::Unavailable));
+                                        continue;
+                                    };
+                                    let root = atomcode_capabilities::session::SessionManager::sessions_root(runtime.config.dirs.user());
+                                    let read = tokio::task::spawn_blocking(move || {
+                                        atomcode_capabilities::session::reference::resolve(&root, &references)
+                                    });
+                                    let stop = controls.stop_now();
+                                    let result = tokio::select! {
+                                        biased;
+                                        _ = stop.cancelled() => Err(RuntimeError::Cancelled),
+                                        result = tokio::time::timeout(std::time::Duration::from_secs(5), read) => {
+                                            match result {
+                                                Ok(Ok(Ok(context))) => Ok(context),
+                                                Ok(Ok(Err(reason))) => Err(RuntimeError::SessionReferenceUnavailable(reason)),
+                                                _ => Err(RuntimeError::SessionReferenceUnavailable("reading source timed out or failed".into())),
+                                            }
+                                        }
+                                    };
+                                    match result {
+                                        Ok(context) => Some(context),
+                                        Err(error) => { let _ = done.send(Err(error)); continue; }
+                                    }
+                                }
+                                Ok(_) => None,
+                            }
+                        } else { None };
+                        let execution_intent = if reference_context.is_some() {
+                            // Parsing already succeeded above; never treat source titles as policy.
+                            atomcode_capabilities::session::reference::user_intent(&input.text)
+                                .expect("validated session reference")
+                        } else { input.text.clone() };
                         // A goal that is NOT done takes the next message as the nudge
                         // to go on: user-paused (`/goal` with no argument) or paused at
                         // its round / time cap. It resumes into Pursuing, so the badge
@@ -4635,11 +5438,11 @@ fn spawn_runtime_owner_with_optional_agent(
                         // for.
                         if from.is_none() {
                             if let Some(runtime) = resources.as_ref() {
-                                if !input.text.trim().is_empty() {
+                                if !execution_intent.trim().is_empty() {
                                     runtime
                                         .parts
                                         .turn_execution_policy
-                                        .update_from_user_text(&input.text);
+                                        .update_from_user_text(&execution_intent);
                                 }
                             }
                         }
@@ -4667,6 +5470,15 @@ fn spawn_runtime_owner_with_optional_agent(
                         // dropping it would stop the loop rather than interrupt a round.
                         // Its own receipt is handled below (no steer acknowledgement is
                         // registered while a turn is held, because no `Steered` is coming).
+                        if from.is_none() {
+                            if let Some(state) = goal.as_mut().filter(|state| state.active) {
+                                let recovering = state.recovery.is_some();
+                                state.invalidate_work();
+                                state.evaluation_ready = false;
+                                state.evaluation_only = false;
+                                if recovering { let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress())); }
+                            }
+                        }
                         let goal_holds_the_turn = goal.as_ref().is_some_and(|state| state.active);
                         if let Some((turn_id, held_reason, snapshot, stats)) =
                             goal_holds_the_turn.then(|| held_turn.take()).flatten()
@@ -4810,6 +5622,17 @@ fn spawn_runtime_owner_with_optional_agent(
                         // person's word. Everything else about it is a plain submit,
                         // which is why it arrives on this path rather than one of
                         // its own.
+                        if let Some(reference_context) = reference_context {
+                            match &mut recovery_context {
+                                Some(context) => { context.push_str("\n\n"); context.push_str(&reference_context); }
+                                None => recovery_context = Some(reference_context),
+                            }
+                        }
+                        if let Some(extra) = extra_context {
+                            let mut context=serde_json::from_str::<serde_json::Value>(&extra).ok().filter(|value| value.is_object()).unwrap_or_else(|| serde_json::json!({"runtime_context":extra}));
+                            if let Some(previous)=recovery_context.take() { context["recovery_context"]=serde_json::Value::String(previous); }
+                            recovery_context=Some(context.to_string());
+                        }
                         let command = match (from, recovery_context) {
                             (Some(from), _) => AgentCommand::PeerNote {
                                 from,
@@ -4882,12 +5705,46 @@ fn spawn_runtime_owner_with_optional_agent(
                     }
                     Some(CodingRuntimeControl::Respond {
                         generation: request_generation,
-                        id,
+                        mut id,
                         value,
                         done,
                     }) => {
+                        id = goal_questions.aliases.get(&id).copied().unwrap_or(id);
                         if !native_protocol || request_generation != generation || !agent_available {
                             let _ = done.send(Err(RuntimeError::Unavailable));
+                        } else if let Some((question, queued)) = goal_questions.continued.get_mut(&id) {
+                            if *queued || cancel_pending || pending_policy_intervention.is_some() {
+                                let _ = done.send(Err(RuntimeError::Busy));
+                                continue;
+                            }
+                            // A late reply is an admitted user input, never a second
+                            // response to the already completed question tool.
+                            let value = preprocess_request_response(REQUEST_USER_INPUT_KIND, value, resources.as_ref(), &runtime_event_tx).await;
+                            let mut input = goal_questions::GoalQuestions::reply(question, value.clone());
+                            // Images already follow the same normalization path as an
+                            // on-time answer. The textual envelope is only correlation.
+                            if let Ok(answer) = serde_json::from_value::<UserInputResponse>(value.clone()) {
+                                input.images = answer.images;
+                            } else if let Some(responses) = value.get("responses").and_then(|v| v.as_array()) {
+                                input.images = responses.iter().filter_map(|v| serde_json::from_value::<UserInputResponse>(v.clone()).ok()).flat_map(|r| r.images).collect();
+                            } else {
+                                let _ = done.send(Err(RuntimeError::StaleRequest { id }));
+                                continue;
+                            }
+                            let Some(tx) = controls.submit_tx.upgrade() else { let _ = done.send(Err(RuntimeError::Unavailable)); continue; };
+                            let (submitted, accepted) = oneshot::channel();
+                            let expected_session = resources.as_ref().and_then(|r| r.parts.session.as_ref()).map(|s| s.id.clone());
+                            if tx.send(CodingRuntimeControl::Submit { generation, input, extra_context: Some(goal_questions::GoalQuestions::reply_context(question)), receipt: None, from: None, expected_session, done: submitted }).is_err() {
+                                let _ = done.send(Err(RuntimeError::Unavailable));
+                                continue;
+                            }
+                            *queued = true;
+                            tokio::spawn(async move {
+                                let result = accepted.await.unwrap_or(Err(RuntimeError::Unavailable)).and_then(|receipt| {
+                                    if matches!(receipt, SubmitReceipt::NotSent {..}) { Err(RuntimeError::DeliveryFailed) } else { Ok(()) }
+                                });
+                                let _ = tx.send(CodingRuntimeControl::QuestionReplyFinished { generation: request_generation, id, result, done });
+                            });
                         } else if !pending_requests.contains_key(&id) {
                             let _ = done.send(Err(RuntimeError::StaleRequest { id }));
                         } else {
@@ -4909,7 +5766,11 @@ fn spawn_runtime_owner_with_optional_agent(
                                 );
                                 let _ = done.send(Err(RuntimeError::DeliveryFailed));
                             } else {
-                                if pending_requests.is_empty() {
+                                let _ = runtime_event_tx.send(CodingRuntimeEvent::RequestResolved {
+                                    id,
+                                    kind,
+                                });
+                                if pending_requests.keys().all(|id| goal_questions.continued.contains_key(id)) {
                                     controls.state.store(
                                         runtime_phase_state(generation, RuntimePhase::InTurn),
                                         Ordering::Release,
@@ -5386,8 +6247,17 @@ fn spawn_runtime_owner_with_optional_agent(
                         generation: request_generation,
                         done,
                     }) => {
+                        if request_generation == generation {
+                            goal_questions.close(resources.as_ref(), &mut pending_requests, &runtime_event_tx);
+                        }
                         // Whatever the stop reached (or did not), it is answered
                         // from here on; a fresh one waits for the next.
+                        if request_generation == generation {
+                            if let Some(pending) = pending_mcp_reconnect.take() {
+                                let phase = pending.cancel().await;
+                                controls.state.store(runtime_phase_state(generation, phase), Ordering::Release);
+                            }
+                        }
                         controls.stop_handled();
                         if native_protocol
                             && request_generation == generation
@@ -5553,7 +6423,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 runtime_phase_state(generation, RuntimePhase::Ready),
                                 Ordering::Release,
                             );
-                            let _ = done.send(Ok(()));
+                            let _ = done.send(goal_checkpoints.commit(&runtime_event_tx));
                         } else if held_turn.is_some() {
                         // A turn the agent opened under the hold is not what
                         // this stops: the person asked for the controller to
@@ -5561,10 +6431,10 @@ fn spawn_runtime_owner_with_optional_agent(
                         // the turn now running is the one this owner accounts
                         // for, and its own end reports it.
                             held_turn = None;
-                            let _ = done.send(Ok(()));
+                            let _ = done.send(goal_checkpoints.commit(&runtime_event_tx));
                         } else if active_turn.is_none() {
                             cancel_pending = false;
-                            let _ = done.send(Ok(()));
+                            let _ = done.send(goal_checkpoints.commit(&runtime_event_tx));
                         } else {
                             for id in pending_requests.keys().copied() {
                                 let _ = send_agent_command(&agent, AgentCommand::Respond {
@@ -5580,7 +6450,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                     runtime_phase_state(generation, RuntimePhase::InTurn),
                                     Ordering::Release,
                                 );
-                                let _ = done.send(Ok(()));
+                                let _ = done.send(goal_checkpoints.commit(&runtime_event_tx));
                             } else {
                                 if let Some(mut state) = goal.take() {
                                     state.finish(
@@ -5684,6 +6554,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             model: runtime.config.model.clone(),
                             working_dir: runtime.config.working_dir.clone(),
                             system_prompt,
+                            assets: prompt.then(|| runtime_asset_sources(runtime)),
                         }));
                     }
                     Some(CodingRuntimeControl::WaitMcpReady {
@@ -5917,7 +6788,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         // the change and then failing to apply it. `Disable` holds
                         // tools back in place and runs mid-turn (design §5.4).
                         if request_generation != generation
-                            || (action.rebuilds()
+                            || ((action.rebuilds() || action == crate::parts::McpAction::Reconnect)
                                 && (compaction_suspended || active_turn.is_some()))
                         {
                             let _ = done.send(Err(RuntimeError::Busy));
@@ -5927,14 +6798,37 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Unavailable));
                             continue;
                         };
+                        if action == crate::parts::McpAction::CancelReconnect {
+                            if pending_mcp_reconnect.as_ref().is_some_and(|pending| pending.server == server) {
+                                let phase = pending_mcp_reconnect.take().expect("matching reconnect").cancel().await;
+                                controls.state.store(runtime_phase_state(generation, phase), Ordering::Release);
+                            }
+                            let _ = done.send(Ok(McpActionApplied::InPlace));
+                            continue;
+                        }
+                        if action == crate::parts::McpAction::Reconnect {
+                            if !agent_available { let _ = done.send(Err(RuntimeError::Unavailable)); continue; }
+                            match prepare_mcp_reconnect(runtime, &server) {
+                                Ok((publication, config)) => {
+                                    let phase = runtime_status(controls.state.load(Ordering::Acquire)).phase;
+                                    controls.mcp_reconnecting.store(true, Ordering::Release);
+                                    controls.state.store(runtime_phase_state(generation, RuntimePhase::Reconfiguring), Ordering::Release);
+                                    let work = publication.reconnect_state();
+                                    let task = tokio::spawn(crate::host_rows::reconnect_mcp_server(work, config));
+                                    pending_mcp_reconnect = Some(PendingMcpReconnect { task, publication, server, generation, phase, flag: controls.mcp_reconnecting.clone(), done: Some(done) });
+                                }
+                                Err(error) => { let _ = done.send(Err(RuntimeError::ReconfigureFailed(error))); }
+                            }
+                            continue;
+                        }
                         let said = crate::told::mcp_acted(&server, action);
                         let outcome =
-                            apply_mcp_action(runtime, server, action, &mut mcp_disable_holds).await;
+                            apply_mcp_action(runtime, generation, server, action, &mut mcp_disable_holds).await;
                         if outcome.is_ok() {
                             tell(runtime, Some(said));
                         }
                         let _ = done.send(match outcome {
-                            Ok(()) => Ok(()),
+                            Ok(applied) => Ok(applied),
                             Err(message) => Err(RuntimeError::ReconfigureFailed(message)),
                         });
                     }
@@ -6080,7 +6974,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 // mid-turn, then esc → "unavailable").
                                 let resumed = if active_turn.is_none() {
                                     RuntimePhase::Ready
-                                } else if pending_requests.is_empty() {
+                                } else if pending_requests.keys().all(|id| goal_questions.continued.contains_key(id)) {
                                     RuntimePhase::InTurn
                                 } else {
                                     RuntimePhase::WaitingApproval
@@ -6165,6 +7059,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                     runtime_phase_state(generation, resumed),
                                     Ordering::Release,
                                 );
+                                runtime_event_tx.carry_live_view(generation);
                                 let _ = runtime_event_tx.send(
                                     CodingRuntimeEvent::ProviderChanged {
                                         provider: provider.clone(),
@@ -6203,6 +7098,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         fail_close_pending_requests(
                             &agent,
                             &mut pending_requests,
+                            &goal_questions,
                             active_turn.is_some(),
                         );
                         let had_active_turn = active_turn.is_some();
@@ -6314,6 +7210,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 let reasoning_effort = runtime.config.chat_options.reasoning_effort;
                                 let reasoning_effort_applicable =
                                     runtime.config.supports_reasoning_effort;
+                                runtime_event_tx.seed_live_view(generation, &runtime);
                                 replay_pending_resume_prompt(
                                     &agent,
                                     Some(&mut runtime),
@@ -6402,6 +7299,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                                 http_status: None,
                                                 code: None,
                                                 retryable: None,
+                    retry_after_secs: None,
                     ends_turn: false,
                                             }),
                                         );
@@ -6465,6 +7363,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         fail_close_pending_requests(
                             &agent,
                             &mut pending_requests,
+                            &goal_questions,
                             active_turn.is_some(),
                         );
                         // On the harness, a logout takes the CREDENTIALS out of
@@ -6764,9 +7663,26 @@ fn spawn_runtime_owner_with_optional_agent(
                             && !compactions.is_active()
                             && live_root_agent(&runtime).is_some()
                             && runtime.parts.mcp_statuses().await.is_empty()
+                            // An empty old registry does not mean there is
+                            // nothing to prepare: Enable may just have made a
+                            // previously disabled config eligible for connection.
+                            && (!runtime.prepare.mcp
+                                || (runtime.prepare.extra_mcp_servers.iter().all(|c| c.disabled)
+                                    && crate::parts::mcp_storage(&runtime.config, &runtime.prepare)
+                                        .load().is_ok_and(|configs| configs.is_empty())))
                         {
                             if reload_skills_live(&runtime).is_ok() {
-                                tell(&runtime, Some(crate::told::reloaded()));
+                                tell(&runtime, Some(crate::told::skills_reloaded()));
+                                if let Some(loaded) = runtime.parts.skill_registry() {
+                                    for warning in loaded.registry.take_new_warnings() {
+                                        let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(warning));
+                                    }
+                                }
+                                if runtime.parts.session_context_hook.take_change_notice() {
+                                    let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(
+                                        "[instructions] Files on disk changed; skill reload kept this session's loaded instructions. Resume the session to load the edited instructions.".into()
+                                    ));
+                                }
                                 let _ = runtime_event_tx.send(
                                     CodingRuntimeEvent::Reconfiguring {
                                         operation: ReconfigureKind::Reprepare,
@@ -6849,7 +7765,7 @@ fn spawn_runtime_owner_with_optional_agent(
 
                         // Preflight the complete capability graph while the current agent is
                         // still alive. A prepare failure must leave the old runtime untouched.
-                        let reuse_lease = prepared_lease.or_else(|| {
+                        let reuse_lease = prepared_lease.map(SessionLeaseSource::Transferred).or_else(|| {
                             matching_session_lease(&runtime.parts, &input.prepare.session)
                         });
                         let prepare_candidate = prepare_with_plugin_hook_source_reusing_lease(
@@ -7000,6 +7916,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         fail_close_pending_requests(
                             &agent,
                             &mut pending_requests,
+                            &goal_questions,
                             active_turn.is_some(),
                         );
                         let mut stop_report = stop_current_agent(
@@ -7060,6 +7977,19 @@ fn spawn_runtime_owner_with_optional_agent(
                             continue;
                         }
                         preserve_sessionless_snapshot(&mut runtime, &stop_report);
+                        // Report newly introduced optional-asset failures after the
+                        // replacement has committed, without repeating unchanged ones.
+                        let mut previous_warnings = runtime.parts.session_context_hook.instructions().warnings();
+                        previous_warnings.extend(runtime.config.startup_warnings.clone());
+                        if let Some(skills) = runtime.parts.skill_registry() {
+                            previous_warnings.extend(skills.registry.diagnostics().into_iter().filter(|d| d.warning)
+                                .map(|d| format!("[skills] {}: {}", d.path.display(), d.reason)));
+                        }
+                        for warning in candidate.parts.take_startup_warnings() {
+                            if !previous_warnings.contains(&warning) {
+                                let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(warning));
+                            }
+                        }
                         runtime = candidate;
                         if matches!(operation, ReconfigureKind::ResumeSession)
                             && !reuses_current_session
@@ -7102,8 +8032,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             runtime_phase_state(generation, RuntimePhase::Ready),
                             Ordering::Release,
                         );
-                        let _ = runtime_event_tx
-                            .send(CodingRuntimeEvent::SessionChanged(changed.clone()));
+                        runtime_event_tx.session_changed(changed.clone(), resources.as_ref());
                         if changes_session {
                             if let Some(intervention) = pending_policy_intervention.take() {
                                 let _ = runtime_event_tx.send(
@@ -7192,6 +8121,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                             http_status: None,
                                             code: None,
                                             retryable: None,
+                    retry_after_secs: None,
                     ends_turn: false,
                                         },
                                     ));
@@ -7231,6 +8161,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             observed_tokens = None;
                             conversation_revision = conversation_revision.wrapping_add(1);
                             let snapshot = Arc::new(truncated);
+                            runtime_event_tx.seed_live_view(generation, &runtime);
                             resources = Some(runtime);
                             controls.state.store(
                                 runtime_phase_state(generation, RuntimePhase::Ready),
@@ -7302,6 +8233,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                         atomcode_harness::session::InjectionOrigin::Reminder,
                                     );
                                 }
+                                runtime_event_tx.seed_live_view(generation, &runtime);
                                 resources = Some(runtime);
                                 controls.state.store(
                                     runtime_phase_state(generation, RuntimePhase::Ready),
@@ -7346,6 +8278,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                             http_status: None,
                                             code: None,
                                             retryable: None,
+                    retry_after_secs: None,
                     ends_turn: false,
                                         },
                                     ));
@@ -7380,6 +8313,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                                     http_status: None,
                                                     code: None,
                                                     retryable: None,
+                    retry_after_secs: None,
                     ends_turn: false,
                                                 }),
                                             );
@@ -7447,9 +8381,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                         runtime_phase_state(generation, RuntimePhase::Ready),
                                         Ordering::Release,
                                     );
-                                    let _ = runtime_event_tx.send(
-                                        CodingRuntimeEvent::SessionChanged(changed.clone()),
-                                    );
+                                    runtime_event_tx.session_changed(changed.clone(), resources.as_ref());
                                     if let Some(intervention) = pending_policy_intervention.take()
                                     {
                                         let _ = runtime_event_tx.send(
@@ -7492,6 +8424,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         fail_close_pending_requests(
                             &agent,
                             &mut pending_requests,
+                            &goal_questions,
                             active_turn.is_some(),
                         );
                         let stop_report = stop_current_agent(
@@ -7568,9 +8501,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                     runtime_phase_state(generation, RuntimePhase::Ready),
                                     Ordering::Release,
                                 );
-                                let _ = runtime_event_tx.send(
-                                    CodingRuntimeEvent::SessionChanged(changed.clone()),
-                                );
+                                runtime_event_tx.session_changed(changed.clone(), resources.as_ref());
                                 if let Some(intervention) = pending_policy_intervention.take() {
                                     let _ = runtime_event_tx.send(
                                         CodingRuntimeEvent::PolicyInterventionCleared {
@@ -7620,6 +8551,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                             http_status: None,
                                             code: None,
                                             retryable: None,
+                    retry_after_secs: None,
                     ends_turn: false,
                                         },
                                     ));
@@ -7654,6 +8586,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                                     http_status: None,
                                                     code: None,
                                                     retryable: None,
+                    retry_after_secs: None,
                     ends_turn: false,
                                                 }),
                                             );
@@ -7670,7 +8603,50 @@ fn spawn_runtime_owner_with_optional_agent(
                             }
                         }
                     }
+                    Some(CodingRuntimeControl::GoalReport { done }) => {
+                        let result = goal_checkpoints.available().and_then(|_| {
+                            let progress = goal.as_ref().map(GoalState::progress).or_else(|| runtime_event_tx.latest_goal.lock().expect("goal projection poisoned").clone());
+                            progress.as_ref().map(goal_checkpoint::report).ok_or_else(|| RuntimeError::GoalUnavailable("当前会话没有目标运行报告。".into()))
+                        });
+                        let _ = done.send(result);
+                    }
+                    Some(CodingRuntimeControl::RecheckGoal { generation: requested, receipt, done }) => {
+                        if !native_protocol || requested != generation || receipt.revision != conversation_revision || active_turn.is_some() || compactions.is_active() || compaction_suspended || pending_policy_intervention.is_some() || pending_requests.keys().any(|id| !goal_questions.continued.contains_key(id)) || !agent_available || persistence_failure.is_some() {
+                            let _ = done.send(Err(RuntimeError::Busy)); continue;
+                        }
+                        if let Err(error) = goal_checkpoints.available() { let _ = done.send(Err(error)); continue; }
+                        let prior = goal.as_ref().map(GoalState::progress).or_else(|| runtime_event_tx.latest_goal.lock().expect("goal projection poisoned").clone());
+                        let Some(prior) = prior.filter(|p| p.evaluation_ready && p.terminal != Some(GoalTerminal::Cancelled)) else {
+                            let _ = done.send(Err(RuntimeError::GoalUnavailable("没有可重新评估的已完成工作；请先核对并继续主任务。".into()))); continue;
+                        };
+                        if loop_state.as_ref().is_some_and(|l| l.active) { let _ = done.send(Err(RuntimeError::Busy)); continue; }
+                        if goal.is_none() { next_controller_id = next_controller_id.wrapping_add(1); goal = Some(GoalState::restore_paused(next_controller_id, &prior)); }
+                        let state = goal.as_mut().expect("goal present");
+                        state.resume_paused_for_evaluation();
+                        if let Some(registry) = resources.as_ref().and_then(|r| r.config.subagent_config.as_ref()) { state.recovery_policy = registry.goal.recovery.clone(); }
+                        next_turn_id = next_turn_id.wrapping_add(1);
+                        active_turn = Some(next_turn_id);
+                        state.begin_evaluation();
+                        state.evaluation_only = true;
+                        held_turn = Some((next_turn_id, StopReason::Stopped, receipt.snapshot.clone(), RuntimeTurnStats::default()));
+                        controls.state.store(runtime_phase_state(generation, RuntimePhase::InTurn), Ordering::Release);
+                        let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                        if let Err(error) = goal_checkpoints.commit(&runtime_event_tx) {
+                            state.finish(GoalTerminal::Failed, error.to_string());
+                            let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                            if let Some((turn_id, reason, snapshot, stats)) = held_turn.take() {
+                                active_turn = None;
+                                let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed { turn_id, reason, snapshot, stats }));
+                                controls.state.store(runtime_phase_state(generation, RuntimePhase::Ready), Ordering::Release);
+                            }
+                            goal = None;
+                            let _ = done.send(Err(error)); continue;
+                        }
+                        launch_goal_evaluation(generation, state, &receipt.snapshot, resources.as_ref(), &goal_eval_tx);
+                        let _ = done.send(Ok(()));
+                    }
                     Some(CodingRuntimeControl::StartGoal { generation: request_generation, condition, images, done, recovery_tx }) => {
+                        if let Err(error) = goal_checkpoints.available() { let _ = done.send(Err(error)); continue; }
                         if !native_protocol || request_generation != generation || compaction_suspended {
                             let _ = done.send(Err(RuntimeError::Busy));
                             continue;
@@ -7715,13 +8691,23 @@ fn spawn_runtime_owner_with_optional_agent(
                             // scales per plan (Pro 1000 → 300, Lite 800 → 240) from the account's
                             // live request quota, resolved OFF the loop and applied via a self-sent
                             // AdjustGoalRounds; env override wins and any miss keeps the default.
-                            let next = GoalState::new(
+                            let mut next = GoalState::new(
                                 controller_id,
                                 condition.clone(),
                                 runtime.config.goal_max_rounds,
                                 runtime.config.goal_max_duration_secs,
                             );
+                            if let Some(registry) = runtime.config.subagent_config.as_ref() {
+                                next.recovery_policy = registry.goal.recovery.clone();
+                            }
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(next.progress()));
+                            if let Err(error) = goal_checkpoints.flush(&runtime_event_tx) {
+                                next.finish(GoalTerminal::Failed, format!("目标检查点写入失败：{error}"));
+                                let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(next.progress()));
+                                goal = None;
+                                let _ = done.send(Err(RuntimeError::GoalUnavailable(error)));
+                                continue;
+                            }
                             goal = Some(next);
                             let _ = done.send(Ok(()));
                             // The first round is this one. Every later round
@@ -7743,7 +8729,9 @@ fn spawn_runtime_owner_with_optional_agent(
                                 generation: request_generation,
                                 input: UserInput { text: condition, images },
                                 receipt: None,
+                                extra_context: None,
                                 from: None,
+                                expected_session: None,
                                 done: started,
                             });
                             // Only spawn the quota fetch when it could actually change the cap:
@@ -7782,6 +8770,9 @@ fn spawn_runtime_owner_with_optional_agent(
                         }
                     }
                     Some(CodingRuntimeControl::StopGoal { generation: request_generation, done }) => {
+                        if request_generation == generation {
+                            goal_questions.close(resources.as_ref(), &mut pending_requests, &runtime_event_tx);
+                        }
                         if !native_protocol || request_generation != generation {
                             let _ = done.send(Err(RuntimeError::Unavailable));
                             continue;
@@ -7818,7 +8809,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 continue;
                             }
                         }
-                        let _ = done.send(Ok(()));
+                        let _ = done.send(goal_checkpoints.commit(&runtime_event_tx));
                     }
                     Some(CodingRuntimeControl::StartLoop { generation: request_generation, prompt, every, done, recovery_tx }) => {
                         if !native_protocol || request_generation != generation || compaction_suspended {
@@ -7876,7 +8867,9 @@ fn spawn_runtime_owner_with_optional_agent(
                                 generation: request_generation,
                                 input: UserInput::from(prompt),
                                 receipt: None,
+                                extra_context: None,
                                 from: None,
+                                expected_session: None,
                                 done: started,
                             });
                         }
@@ -7924,6 +8917,9 @@ fn spawn_runtime_owner_with_optional_agent(
                         let _ = done.send(Ok(()));
                     }
                     Some(CodingRuntimeControl::Shutdown { generation: request_generation }) => {
+                        if request_generation == generation {
+                            if let Some(pending) = pending_mcp_reconnect.take() { pending.cancel().await; }
+                        }
                         if let Some(task) = next_prompt_task.take() {
                             task.abort();
                         }
@@ -7937,6 +8933,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             fail_close_pending_requests(
                                 &agent,
                                 &mut pending_requests,
+                                &goal_questions,
                                 active_turn.is_some(),
                             );
                         }
@@ -8090,6 +9087,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                     http_status: None,
                                     code: None,
                                     retryable: None,
+                    retry_after_secs: None,
                     ends_turn: false,
                                 },
                             ));
@@ -8128,11 +9126,35 @@ fn spawn_runtime_owner_with_optional_agent(
                             AgentEvent::Usage(meta) => {
                                 observed_tokens = Some(meta.used_tokens as usize);
                                 turn_stats.record_usage(&meta);
+                                // Account each observed provider receipt once, before pause
+                                // makes the goal inactive. Its final usage may arrive while
+                                // the explicitly paused turn is draining cancellation.
+                                if let Some(state) = goal.as_mut().filter(|state| state.active || (cancel_pending && state.phase == GoalPhase::Paused)) {
+                                    state.record_usage(meta.tokens.prompt, meta.tokens.completion, meta.tokens.cached);
+                                    let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                                }
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::Agent(
                                     AgentEvent::Usage(meta),
                                 ));
                             }
                             AgentEvent::Request { id, kind, payload } => {
+                                if kind == REQUEST_USER_INPUT_KIND && goal.as_ref().is_some_and(|state| state.active) {
+                                    // Only ordinary questions have a foreground deadline.
+                                    // Permission requests retain their original semantics.
+                                    if payload.get("authorization_required").and_then(serde_json::Value::as_bool) != Some(true) {
+                                        if payload.get("asking_member").is_some() {
+                                            let _ = send_agent_command(&agent, AgentCommand::Respond { id, value: serde_json::json!({"question_error":"This delegated goal worker cannot wait for a human answer. Report the question and blocker to your parent agent; continue only independent work. No answer or authorization was provided."}) });
+                                            continue;
+                                        }
+                                        if payload.to_string().len() > 16 * 1024 {
+                                            let _ = send_agent_command(&agent, AgentCommand::Respond { id, value: serde_json::json!({"question_error":"Question exceeds the bounded foreground wait payload. Ask a concise question under 16 KiB, or continue independent work. No user answer or authorization was provided."}) });
+                                            continue;
+                                        }
+                                        if payload.get("question_call_id").and_then(serde_json::Value::as_str).is_some() && atomcode_capabilities::tools::request_user_input::parse_batch(&payload.to_string()).is_ok() {
+                                            goal_questions.waiting(id, payload.clone());
+                                        }
+                                    }
+                                }
                                 // Auto is a runtime-owned execution mode, so approval bypass
                                 // belongs at this common request boundary rather than in each
                                 // driver. Do not publish an approval that has already been
@@ -8176,7 +9198,11 @@ fn spawn_runtime_owner_with_optional_agent(
                                     },
                                 ));
                             }
-                            AgentEvent::TurnComplete { reason, .. } => {
+                            AgentEvent::TurnComplete { reason, provider_failure, .. } => {
+                                if let Some(failure) = provider_failure {
+                                    main_failure_retryable = Some(transient_provider_failure(Some(failure.retryable), failure.http_status, failure.code.as_deref(), failure.retry_after_secs));
+                                    main_retry_after_secs = failure.retry_after_secs;
+                                }
                                 kernel_turn_open = false;
                                 // The tree carries the real cause; this protocol's
                                 // drivers match on the folded set.
@@ -8238,6 +9264,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                             http_status: None,
                                             code: None,
                                             retryable: None,
+                    retry_after_secs: None,
                     ends_turn: false,
                                         },
                                     ));
@@ -8329,6 +9356,16 @@ fn spawn_runtime_owner_with_optional_agent(
                             }
                             AgentEvent::Snapshot { snapshot } => {
                                 snapshot_in_flight = false;
+                                let before:Vec<_>=goal_questions.continued.iter().map(|(id,(_,queued))|(*id,*queued)).collect();
+                                if before.iter().any(|(_, queued)| *queued) {
+                                    if let Some(runtime)=resources.as_ref() { goal_questions.restore_runtime(runtime); }
+                                    for (id,queued) in before {
+                                        if !goal_questions.continued.contains_key(&id) {
+                                            pending_requests.remove(&id);
+                                            if !queued { let _=runtime_event_tx.send(CodingRuntimeEvent::RequestResolved{id,kind:REQUEST_USER_INPUT_KIND.into()}); }
+                                        }
+                                    }
+                                }
                                 if terminal_reason.is_some() || cancel_pending {
                                     conversation_revision = conversation_revision.wrapping_add(1);
                                 }
@@ -8355,16 +9392,11 @@ fn spawn_runtime_owner_with_optional_agent(
                                     .or_else(|| cancel_pending.then_some(StopReason::Cancelled))
                                 {
                                     cancel_pending = false;
-                                    pending_requests.clear();
+                                    pending_requests.retain(|id, _| goal_questions.continued.contains_key(id));
                                     let stats = std::mem::take(&mut turn_stats);
                                     let turn_id = active_turn.unwrap_or_default();
                                     let mut completion_reason = reason;
                                     if let Some(state) = goal.as_mut().filter(|state| state.active) {
-                                        if let Some(meta) = stats.last_usage.as_ref() {
-                                            state.tokens_used = state.tokens_used.saturating_add(
-                                                (meta.tokens.prompt + meta.tokens.completion) as u64,
-                                            );
-                                        }
                                         // Keep one bounded runtime-owned recap. It survives
                                         // replacement of the conversation and is attached once
                                         // to a real recovery submit; it is deliberately not copied
@@ -8380,12 +9412,17 @@ fn spawn_runtime_owner_with_optional_agent(
                                                 | StopReason::MaxContinuations
                                                 | StopReason::MaxRounds
                                         );
-                                        let recoverable = matches!(
-                                            reason,
-                                            StopReason::Timeout | StopReason::ProviderError
-                                        );
+                                        let recoverable = match reason {
+                                            StopReason::Timeout => main_failure_retryable != Some(false),
+                                            StopReason::ProviderError | StopReason::RateLimited => main_failure_retryable == Some(true),
+                                            _ => false,
+                                        };
                                         let mut keep_goal_registered = false;
-                                        if let Some(why) = stop_reason {
+                                        if goal_questions.continued.values().any(|(_, queued)| !queued) && !goal_questions::GoalQuestions::has_independent_work(&snapshot.messages) && evaluate {
+                                            state.pause_for_recovery("等待用户回答待答问题；本轮没有独立工具工作，自动续跑已暂停。用 /goal questions 查看并回复。");
+                                            keep_goal_registered = true;
+                                            let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                                        } else if let Some(why) = stop_reason {
                                             // A cap fired (round budget, or the optional time cap).
                                             // This is "ran out of budget", NOT "the evaluator judged
                                             // the work unfinished" — the note names the budget and
@@ -8401,113 +9438,24 @@ fn spawn_runtime_owner_with_optional_agent(
                                             let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                                             let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(format!("goal {note}")));
                                         } else if evaluate {
-                                            state.unproductive = 0;
-                                            let condition = state.condition.clone();
-                                            let controller_id = state.id;
-                                            let cancel = state.cancel.clone();
-                                            let summary = summarize_for_goal(
-                                                &snapshot.messages,
-                                                state.last_reason.as_deref(),
-                                            );
-                                            let provider = resources.as_ref().and_then(|runtime| {
-                                                let session_id = runtime.parts.session.as_ref().map(|binding| binding.id.as_str());
-                                                build_goal_evaluator_provider(
-                                                    &runtime.provider_factory,
-                                                    &runtime.config,
-                                                    session_id,
-                                                )
-                                                .ok()
-                                            });
+                                            state.begin_evaluation();
+                                            let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                                             held_turn = Some((turn_id, reason, snapshot.clone(), stats));
-                                            let tx = goal_eval_tx.clone();
-                                            if let Some(provider) = provider {
-                                                tokio::spawn(async move {
-                                                    let inner = tokio::spawn(async move {
-                                                        evaluate_goal(generation, controller_id, provider, condition, summary, cancel).await
-                                                    });
-                                                    let outcome = match inner.await {
-                                                        Ok(outcome) => outcome,
-                                                        Err(_) => EvalOutcome {
-                                                            generation,
-                                                            controller_id,
-                                                            result: GoalResult::Error(
-                                                                "evaluator task failed".into(),
-                                                            ),
-                                                            usage: None,
-                                                        },
-                                                    };
-                                                    let _ = tx.send(outcome);
-                                                });
-                                                continue;
-                                            }
-                                            let _ = tx.send(EvalOutcome {
-                                                generation,
-                                                controller_id,
-                                                result: GoalResult::Error("could not build evaluator provider".into()),
-                                                usage: None,
-                                            });
+                                            launch_goal_evaluation(generation, state, &snapshot, resources.as_ref(), &goal_eval_tx);
                                             continue;
                                         } else if recoverable {
-                                            state.unproductive = state.unproductive.saturating_add(1);
-                                            if state.unproductive < MAX_UNPRODUCTIVE {
-                                                state.round = state.round.saturating_add(1);
-                                                state.last_reason = Some(format!("round ended: {reason:?}"));
-                                                let text = goal_continuation_message(
-                                                    state.last_reason.as_deref().unwrap_or("round failed"),
-                                                    &state.condition,
-                                                );
-                                                held_turn = None;
-                                                if send_agent_command(
-                                                    &agent,
-                                                    AgentCommand::SendSyntheticMessage { text },
-                                                ) {
-                                                    let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
-                                                    continue;
-                                                }
-                                                agent_available = false;
-                                                state.cancel.cancel();
-                                                state.finish(
-                                                    GoalTerminal::Failed,
-                                                    "continuation dispatch failed",
-                                                );
+                                            if let Some(delay) = state.schedule_recovery(GoalRecoveryKind::Provider, main_retry_after_secs) {
+                                                held_turn = Some((turn_id, reason, snapshot.clone(), stats));
+                                                arm_goal_retry(&goal_retry_tx, generation, state, delay);
                                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
-                                                let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(
-                                                    "goal stopped: continuation dispatch failed".into(),
-                                                ));
-                                                goal = None;
-                                                active_turn = None;
-                                                let _ = runtime_event_tx.send(
-                                                    CodingRuntimeEvent::TurnFinished(
-                                                        TurnCompletion::Completed {
-                                                            turn_id,
-                                                            reason: StopReason::ProviderError,
-                                                            snapshot,
-                                                            stats,
-                                                        },
-                                                    ),
-                                                );
-                                                controls.state.store(
-                                                    runtime_phase_state(
-                                                        generation,
-                                                        RuntimePhase::Failed,
-                                                    ),
-                                                    Ordering::Release,
-                                                );
+                                                tracing::info!(generation, goal_id=state.id, delay_secs=delay.as_secs(), "goal provider recovery scheduled");
                                                 continue;
-                                            } else {
-                                                // The stop reason does not distinguish a full context
-                                                // from network/provider failures. Preserve the goal and
-                                                // describe both recovery paths instead of falsely
-                                                // prescribing `/compact` for every provider outage.
-                                                state.pause_for_recovery(
-                                                    "paused after repeated provider/timeout failures; check provider/network status, or run /compact if the context is full, then send a message to continue",
-                                                );
-                                                keep_goal_registered = true;
-                                                held_turn = None;
-                                                completion_reason = StopReason::ProviderError;
-                                                let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
-                                                let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning("goal paused after repeated provider/timeout failures — check provider/network status, or run /compact if context is full, then continue".into()));
                                             }
+                                            state.pause_for_recovery("provider recovery budget exhausted; goal retained; check provider/network and send a message to continue");
+                                            keep_goal_registered = true;
+                                            held_turn = None;
+                                            completion_reason = StopReason::ProviderError;
+                                            let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                                         } else {
                                             state.finish(
                                                 GoalTerminal::Failed,
@@ -8614,7 +9562,16 @@ fn spawn_runtime_owner_with_optional_agent(
                                     );
                                 }
                             }
+                            event @ AgentEvent::Error { .. } => {
+                                if let AgentEvent::Error { retryable, http_status, ref code, retry_after_secs, ends_turn: true, .. } = event {
+                                    main_failure_retryable = Some(transient_provider_failure(retryable, http_status, code.as_deref(), retry_after_secs));
+                                    main_retry_after_secs = retry_after_secs;
+                                }
+                                let _ = runtime_event_tx.send(CodingRuntimeEvent::Agent(event));
+                            }
                             AgentEvent::TurnStarted { .. } => {
+                                main_failure_retryable = None;
+                                main_retry_after_secs = None;
                                 if let Some(intervention) = pending_policy_intervention.take() {
                                     let _ = runtime_event_tx.send(
                                         CodingRuntimeEvent::PolicyInterventionCleared {
@@ -8644,9 +9601,32 @@ fn spawn_runtime_owner_with_optional_agent(
                                     AgentEvent::TurnStarted { turn: None },
                                 ));
                             }
+                            AgentEvent::ToolResult { result } => {
+                                // A driver's own shorter timeout, or a withdrawn
+                                // dialog, may finish the tool before our deadline.
+                                // Never resurrect that closed wait as pending.
+                                let settled: Vec<_> = goal_questions.waiting.iter().filter(|(_, (_, payload))| payload.get("question_call_id").and_then(serde_json::Value::as_str) == Some(result.call_id.as_str())).map(|(id, _)| *id).collect();
+                                for id in settled {
+                                    goal_questions.waiting.remove(&id);
+                                    pending_requests.remove(&id);
+                                    let _ = runtime_event_tx.send(CodingRuntimeEvent::RequestResolved {id,kind:REQUEST_USER_INPUT_KIND.into()});
+                                }
+                                let overtaken = goal_questions.settle_receipt(&result.call_id, &result.content);
+                                for id in overtaken {
+                                    pending_requests.remove(&id);
+                                    let _ = runtime_event_tx.send(CodingRuntimeEvent::RequestResolved {id,kind:REQUEST_USER_INPUT_KIND.into()});
+                                }
+                                let _ = runtime_event_tx.send(CodingRuntimeEvent::Agent(AgentEvent::ToolResult {result}));
+                            }
                             event @ AgentEvent::ToolStarted { .. } => {
                                 turn_stats.tool_call_count =
                                     turn_stats.tool_call_count.saturating_add(1);
+                                if let Some(state) = goal.as_mut().filter(|state| state.active || (cancel_pending && state.phase == GoalPhase::Paused)) {
+                                    state.report.tool_calls = state.report.tool_calls.saturating_add(1);
+                                    if !state.active {
+                                        let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                                    }
+                                }
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::Agent(event));
                             }
                             AgentEvent::Steered { count, inputs, .. } => {
@@ -8792,6 +9772,17 @@ fn spawn_runtime_owner_with_optional_agent(
                 Ordering::Release,
             );
         }
+        if let Some(state) = goal.as_mut().filter(|s| s.active) {
+            state.pause("运行时已退出，目标已保留；恢复会话后核对进度再续接。");
+            let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+        }
+        if let Err(error) = goal_checkpoints.flush(&runtime_event_tx) {
+            let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(format!(
+                "目标检查点保存失败：{error}"
+            )));
+        }
+        drop(goal);
+        drop(goal_checkpoints);
         // Release the active-session lease before publishing the shutdown terminal,
         // so a caller may safely start a replacement immediately after `shutdown`.
         drop(resources);
@@ -8838,7 +9829,23 @@ fn reject_runtime_control(
     runtime_event_tx: &RuntimeEventEmitter,
     reason: CompactionInterruption,
 ) {
+    reject_runtime_control_with_error(control, runtime_event_tx, reason, RuntimeError::Unavailable);
+}
+
+fn reject_runtime_control_with_error(
+    control: CodingRuntimeControl,
+    runtime_event_tx: &RuntimeEventEmitter,
+    reason: CompactionInterruption,
+    error: RuntimeError,
+) {
     match control {
+        CodingRuntimeControl::GoalReport { done } => {
+            let _ = done.send(Err(error));
+        }
+        CodingRuntimeControl::RecheckGoal { done, .. } => {
+            let _ = done.send(Err(error));
+        }
+
         CodingRuntimeControl::Compact { focus, .. } => {
             emit_compaction_interrupted(runtime_event_tx, CompactTrigger::Manual { focus }, reason)
         }
@@ -8851,97 +9858,101 @@ fn reject_runtime_control(
             let _ = done.send(None);
         }
         CodingRuntimeControl::Submit { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         // A stopping runtime has no catalog to describe or switch. Fail-closed
         // like every other awaited control.
         CodingRuntimeControl::ToolCatalog { done, .. }
         | CodingRuntimeControl::SwitchTool { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::SideCallProvider { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::Respond { done, .. }
+        | CodingRuntimeControl::QuestionReplyFinished { done, .. }
         | CodingRuntimeControl::ResolvePolicyIntervention { done, .. }
         | CodingRuntimeControl::Cancel { done, .. }
         | CodingRuntimeControl::PauseGoal { done, .. }
         | CodingRuntimeControl::SetMode { done, .. }
         | CodingRuntimeControl::WaitMcpReady { done, .. }
         | CodingRuntimeControl::QueueLocalContext { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::Snapshot { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::ContextStats { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         // A stopping runtime cannot say which mode it is in either — the flags
         // belong to a tree that is being torn down.
         CodingRuntimeControl::Mode { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
+        }
+        CodingRuntimeControl::PendingQuestions { done } => {
+            drop(done);
         }
         CodingRuntimeControl::McpStatus { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::McpTools { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::ApproveMcpTool { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::McpRows { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::McpDetail { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::McpAct { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::WithdrawMcpTools { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::ReassembleProvider { done, .. }
         | CodingRuntimeControl::DeactivateProvider { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::Reprepare { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::ApplyUndo { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::RewindCatalog { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::UndoTarget { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::WorkspaceChanges { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::Autonomy { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::Usage { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::BeginRewind { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::FinishRewind { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::RestoreSnapshot { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::StartGoal { done, .. }
         | CodingRuntimeControl::StopGoal { done, .. }
         | CodingRuntimeControl::StartLoop { done, .. }
         | CodingRuntimeControl::StopLoop { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
     }
 }
@@ -9047,10 +10058,15 @@ async fn preprocess_one_user_input_response(
 fn fail_close_pending_requests(
     agent: &Option<AgentHandle>,
     pending_requests: &mut BTreeMap<RequestId, String>,
+    questions: &goal_questions::GoalQuestions,
     cancel_turn: bool,
 ) {
     if let Some(agent) = agent.as_ref() {
-        for id in pending_requests.keys().copied() {
+        for id in pending_requests
+            .keys()
+            .copied()
+            .filter(|id| !questions.continued.contains_key(id))
+        {
             let _ = agent.commands.send(AgentCommand::Respond {
                 id,
                 value: serde_json::Value::Null,
@@ -9158,6 +10174,13 @@ fn resolve_reprepare_input(
             )))
         }
         ReprepareTarget::ReloadConfig(config) => {
+            if runtime.parts.session.is_some() && config.dirs != runtime.config.dirs {
+                return Err(RuntimeError::ReconfigureFailed(
+                    "cannot change product data directories while keeping an active session; \
+                     restart with the intended data directory and explicitly resume the session"
+                        .to_string(),
+                ));
+            }
             let mut prepare = runtime.prepare.clone();
             prepare.session = match runtime.parts.session.as_ref() {
                 Some(binding) => crate::SessionMode::Resume(binding.id.clone()),
@@ -9288,7 +10311,7 @@ fn resolve_reprepare_input(
 fn matching_session_lease(
     parts: &crate::CodingParts,
     target: &crate::SessionMode,
-) -> Option<SessionLease> {
+) -> Option<SessionLeaseSource> {
     let target_id = match target {
         crate::SessionMode::Resume(id) | crate::SessionMode::ExternalSnapshot { id, .. } => id,
         crate::SessionMode::Fresh | crate::SessionMode::Disabled => return None,
@@ -9297,7 +10320,10 @@ fn matching_session_lease(
         .session
         .as_ref()
         .filter(|binding| binding.id == *target_id)
-        .map(|binding| binding.lease.clone())
+        .map(|binding| SessionLeaseSource::Existing {
+            manager: Arc::clone(&binding.manager),
+            lease: binding.lease.clone(),
+        })
 }
 
 fn discard_uncommitted_session(
@@ -9345,6 +10371,102 @@ fn runtime_prepare_error(error: io::Error) -> RuntimeError {
     }
 }
 
+fn arm_goal_retry(
+    tx: &mpsc::UnboundedSender<(u64, u64, u64)>,
+    generation: u64,
+    state: &GoalState,
+    delay: std::time::Duration,
+) {
+    let tx = tx.clone();
+    let id = state.id;
+    let epoch = state.async_epoch;
+    let cancel = state.work_cancel.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {},
+            _ = tokio::time::sleep(delay) => { let _ = tx.send((generation, id, epoch)); }
+        }
+    });
+}
+
+fn launch_goal_evaluation(
+    generation: u64,
+    state: &mut GoalState,
+    snapshot: &SessionSnapshot,
+    resources: Option<&RuntimeResources>,
+    tx: &mpsc::UnboundedSender<EvalOutcome>,
+) {
+    let controller_id = state.id;
+    let async_epoch = state.async_epoch;
+    let provider = resources.and_then(|runtime| {
+        let session_id = runtime
+            .parts
+            .session
+            .as_ref()
+            .map(|binding| binding.id.as_str());
+        build_goal_evaluator_provider(&runtime.provider_factory, &runtime.config, session_id).ok()
+    });
+    let Some(provider) = provider else {
+        let _ = tx.send(EvalOutcome {
+            generation,
+            controller_id,
+            async_epoch,
+            result: GoalResult::Error("could not build evaluator provider".into()),
+            usage: None,
+            evidence_expanded: false,
+            evidence_exhausted: false,
+            requests: 0,
+        });
+        return;
+    };
+    let condition = state.condition.clone();
+    let summary = summarize_for_goal(&snapshot.messages, state.last_reason.as_deref());
+    // The mounted prompt registry owns the project's instructions. Native
+    // snapshots contain conversation facts, not the assembled system prompt.
+    let loaded_context = resources
+        .and_then(|runtime| runtime.harness_app.as_ref())
+        .and_then(|app| {
+            app.context()
+                .service::<atomcode_harness::seams::SystemPromptSvc>()
+        })
+        .and_then(|prompts| prompts.fragment("project-instructions"));
+    let user_directions =
+        crate::controllers::goal_user_directions(&snapshot.messages, loaded_context.as_deref());
+    let supplement = crate::controllers::goal_evidence_supplement(&snapshot.messages);
+    let already_expanded = state.evidence_expanded;
+    let cancel = state.work_cancel.clone();
+    let timeout =
+        std::time::Duration::from_secs(state.recovery_policy.evaluator_timeout_secs.clamp(1, 3600));
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let inner = tokio::spawn(crate::controllers::evaluate_goal_with_evidence(
+            generation,
+            controller_id,
+            async_epoch,
+            provider,
+            condition,
+            summary,
+            user_directions,
+            cancel,
+            timeout,
+            Some(supplement),
+            already_expanded,
+        ));
+        let outcome = inner.await.unwrap_or_else(|_| EvalOutcome {
+            generation,
+            controller_id,
+            async_epoch,
+            result: GoalResult::Error("evaluator task failed".into()),
+            usage: None,
+            evidence_expanded: false,
+            evidence_exhausted: false,
+            requests: 0,
+        });
+        let _ = tx.send(outcome);
+    });
+}
+
 fn build_goal_evaluator_provider(
     factory: &Arc<dyn CodingProviderFactory>,
     host: &CodingAgentConfig,
@@ -9367,6 +10489,7 @@ fn build_goal_evaluator_provider(
                 evaluator.reasoning_history = resolved.reasoning_history.clone();
                 evaluator.thinking_enabled = resolved.thinking_enabled;
                 evaluator.user_agent = resolved.user_agent.clone();
+                evaluator.headers = resolved.headers.clone();
                 evaluator.skip_tls_verify = resolved.skip_tls_verify;
                 evaluator.subagent_fast_provider = None;
                 evaluator.subagent_capable_provider = None;
@@ -9568,10 +10691,7 @@ fn harness_host_state(
         plugins: prepare.host_plugins.plugins.clone(),
         identity: prepare.identity.clone(),
         session_context: Some(crate::on_harness::HostContext {
-            hook: Arc::new(atomcode_capabilities::session::SessionContextHook::new(
-                &config.working_dir,
-                config.dirs.user(),
-            )),
+            hook: Arc::clone(&parts.session_context_hook),
             stored: stored_prompt,
         }),
         session,
@@ -9586,6 +10706,7 @@ fn harness_host_state(
         skills: parts.skill_registry(),
         runtime_commands: parts.runtime_commands.clone(),
         tool_switches: Some(parts.tool_switches()),
+        permission_settings: None,
         tool_catalog_slot: parts.tool_catalog_slot(),
         mcp,
         // Both halves or neither: the events only exist when this assembly has
@@ -9720,6 +10841,17 @@ fn tree_inputs(
     config: &CodingAgentConfig,
     prepare: &PrepareOptions,
 ) -> Result<TreeInputs, String> {
+    // All drivers, directory changes and provider/session rebuilds use this
+    // boundary. Retain only the TOML baseline in RuntimeResources: JSON grants
+    // belong to this mount's working directory, never to the previous project.
+    let permissions = crate::permission_settings::load(
+        &config.permission_rules,
+        &config.dirs,
+        &config.working_dir,
+    )?;
+    let mut effective = config.clone();
+    effective.permission_rules = permissions.rules.clone();
+    let config = &effective;
     // Presence follows the same rule the overlay uses: a person who can answer
     // means asking, nobody means fencing.
     let presence = if config.is_attended() {
@@ -9745,7 +10877,8 @@ fn tree_inputs(
             providers,
             current: config.provider_name.clone(),
         });
-    let host = harness_host_state(parts, config, prepare).map_err(|error| error.to_string())?;
+    let mut host = harness_host_state(parts, config, prepare).map_err(|error| error.to_string())?;
+    host.permission_settings = Some(permissions);
     Ok(TreeInputs {
         presence,
         models,
@@ -9814,6 +10947,7 @@ struct AgentLoopOptionsPatch<'a> {
     working_dir: &'a std::path::Path,
     undo_cancelled: bool,
     stream_idle_ms: u128,
+    stream_first_content_ms: u128,
     /// Carried, not left to the row's default: this patch is the last word on
     /// `agent-loop` in this host, so omitting it would *be* the fuse value — the
     /// serde default in `harness/plugins/agent_loop.rs`. See
@@ -9915,6 +11049,7 @@ fn harness_option_rows(
             working_dir: wd,
             undo_cancelled: !config.keep_interrupted_context,
             stream_idle_ms: config.stream_timeout.as_millis(),
+            stream_first_content_ms: config.first_token_timeout.as_millis(),
             max_rounds: crate::on_harness::RUNAWAY_FUSE_ROUNDS,
         },
     )
@@ -10066,6 +11201,27 @@ fn record_code_rewind(live: &atomcode_harness::agent::Agent, turn: u64) {
     );
 }
 
+fn runtime_asset_sources(runtime: &RuntimeResources) -> RuntimeAssetSources {
+    let mut sources = RuntimeAssetSources::default();
+    let Some(app) = &runtime.harness_app else {
+        return sources;
+    };
+    let ctx = app.context();
+    if let Some(hook) = ctx.service::<crate::host_rows::LoadedContextSvc>() {
+        sources.instructions = hook.instructions().sources_on_disk();
+    }
+    if let Some(registry) = ctx.service::<atomcode_harness::seams::SkillsSvc>() {
+        sources.skill_dirs = registry.directories();
+        sources.skills = registry
+            .all()
+            .into_iter()
+            .map(|skill| (skill.name.clone(), skill.source_path.clone()))
+            .collect();
+        sources.skill_diagnostics = registry.diagnostics();
+    }
+    sources
+}
+
 /// Read the skills on disk again, into the registry the live tree is already
 /// serving, and re-render the catalog the model is told about
 /// (`docs/adr/0022` §2).
@@ -10087,30 +11243,14 @@ fn reload_skills_live(runtime: &RuntimeResources) -> Result<usize, ()> {
         .ok_or(())?;
     // The directories prepare decided on, the same way it decided them: a
     // driver that named its own is not second-guessed here.
-    let dirs = match runtime.prepare.skill_dirs.clone() {
-        Some(dirs) => dirs,
-        None => {
-            let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-            atomcode_capabilities::skills::standard_skill_dirs(
-                atomcode_capabilities::skills::SkillRoots {
-                    home: &home,
-                    project: &runtime.config.working_dir,
-                    dirs: &runtime.config.dirs,
-                },
-            )
-        }
-    };
-    registry.reload_dirs(&dirs, &runtime.prepare.plugin_skill_dirs);
+    let (dirs, explicit, _) = crate::parts::resolve_skill_dirs(&runtime.config, &runtime.prepare);
+    registry.reload_dirs_with_explicit(&dirs, &runtime.prepare.plugin_skill_dirs, &explicit);
     atomcode_harness::plugins::capabilities::register_skill_commands(&ctx, &registry)
         .map_err(|_| ())?;
     // The catalog is ranked against the project's own instruction files, as at
     // mount — a reload that dropped the ranking would quietly reorder the
     // prompt prefix.
-    let instructions = atomcode_capabilities::session::SessionContextHook::new(
-        &runtime.config.working_dir,
-        runtime.config.dirs.user(),
-    )
-    .instruction_text();
+    let instructions = runtime.parts.session_context_hook.instruction_text();
     if let Some(prompts) = ctx.service::<atomcode_harness::seams::SystemPromptSvc>() {
         let (id, rank) = crate::on_harness::SKILLS_FRAGMENT;
         match registry.render_catalog_prioritizing(&instructions) {
@@ -10124,6 +11264,45 @@ fn reload_skills_live(runtime: &RuntimeResources) -> Result<usize, ()> {
 
 #[async_trait::async_trait]
 impl RuntimeCommands for CodingRuntimeHandle {
+    async fn goal_questions(&self) -> Result<Vec<RuntimeRequest>, String> {
+        CodingRuntimeHandle::goal_questions(self)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    async fn answer_goal_question(&self, id: RequestId, text: String) -> Result<(), String> {
+        let generation = self.status().generation;
+        if !CodingRuntimeHandle::goal_questions(self)
+            .await
+            .map_err(|error| error.to_string())?
+            .iter()
+            .any(|question| question.id == id)
+        {
+            return Err("这不是当前会话的待答问题。".into());
+        }
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::Respond {
+                generation,
+                id,
+                value: serde_json::json!({"declined":false,"text":text}),
+                done,
+            })
+            .map_err(|_| "runtime unavailable".to_string())?;
+        result
+            .await
+            .map_err(|_| "runtime unavailable".to_string())?
+            .map_err(|error| error.to_string())
+    }
+    async fn recheck_goal(&self) -> Result<(), String> {
+        CodingRuntimeHandle::recheck_goal(self)
+            .await
+            .map_err(|e| e.to_string())
+    }
+    async fn goal_report(&self) -> Result<String, String> {
+        CodingRuntimeHandle::goal_report(self)
+            .await
+            .map_err(|e| e.to_string())
+    }
     async fn start_goal(&self, condition: String) -> Result<(), String> {
         CodingRuntimeHandle::start_goal(self, condition)
             .await
@@ -11143,6 +12322,7 @@ fn fail_close_after_stopped_persistence(
         http_status: None,
         code: None,
         retryable: None,
+        retry_after_secs: None,
         ends_turn: false,
     }));
     Some(RuntimeError::ReconfigureFailed(message))
@@ -11214,6 +12394,7 @@ fn fail_close_after_forced_provider_stop(
         http_status: None,
         code: None,
         retryable: None,
+        retry_after_secs: None,
         ends_turn: false,
     }));
 }
@@ -12429,6 +13610,7 @@ mod tests {
 
     fn tier_provider(model: &str, rank: i64) -> atomcode_config::config::provider::ProviderConfig {
         atomcode_config::config::provider::ProviderConfig {
+            headers: Default::default(),
             provider_type: "openai".into(),
             api_key: Some("key".into()),
             model: model.into(),
@@ -12607,7 +13789,7 @@ mod tests {
         runtime.handle.shutdown().await.unwrap();
     }
 
-    fn native_start(fail_provider: bool) -> CodingRuntimeStart {
+    pub(super) fn native_start(fail_provider: bool) -> CodingRuntimeStart {
         CodingRuntimeStart {
             agent: CodingAgentConfig::new(
                 "key",
@@ -12753,7 +13935,7 @@ mod tests {
         )
     }
 
-    async fn controller_test_runtime(
+    pub(super) async fn controller_test_runtime(
         provider_factory: Arc<dyn CodingProviderFactory>,
     ) -> (
         CodingRuntimeHandle,
@@ -12768,7 +13950,7 @@ mod tests {
         controller_test_runtime_with_config(provider_factory, config).await
     }
 
-    async fn controller_test_runtime_with_config(
+    pub(super) async fn controller_test_runtime_with_config(
         provider_factory: Arc<dyn CodingProviderFactory>,
         config: CodingAgentConfig,
     ) -> (
@@ -12847,6 +14029,7 @@ mod tests {
                     );
                     let event = match terminal {
                         ShutdownPersistenceTerminal::TurnComplete => AgentEvent::TurnComplete {
+                            provider_failure: None,
                             turn: None,
                             reason: StopReason::Cancelled,
                         },
@@ -13080,6 +14263,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Stopped,
             })
@@ -13229,6 +14413,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::MaxRounds,
             })
@@ -13346,6 +14531,47 @@ mod tests {
             Some(AgentCommand::SendMessage { text, .. }) if text == "continue after cancel"
         ));
         handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn an_addressed_peer_note_is_rejected_after_the_session_changes() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().into();
+        start.agent.dirs = atomcode_capabilities::ProductDirs::new(home.path(), ".peer-test");
+        start.prepare.session = crate::SessionMode::Fresh;
+        let mut runtime = CodingRuntime::start(start).await.unwrap();
+        let original = runtime.session.as_ref().unwrap().id.clone();
+        assert_eq!(
+            runtime
+                .handle
+                .note_to_session("wrong-session".into(), "other".into(), "/compact".into())
+                .await,
+            Err(RuntimeError::DeliveryFailed)
+        );
+        assert_eq!(runtime.handle.status().phase, RuntimePhase::Ready);
+        runtime
+            .handle
+            .note_to_session(original.clone(), "other".into(), "peer report".into())
+            .await
+            .unwrap();
+        wait_for_turn_finished(&mut runtime).await;
+        let changed = runtime.handle.fresh_session().await.unwrap();
+        assert_ne!(changed.session_id.as_deref(), Some(original.as_str()));
+        assert_eq!(
+            runtime
+                .handle
+                .note_to_session(
+                    original,
+                    "other".into(),
+                    "must not enter the replacement".into()
+                )
+                .await,
+            Err(RuntimeError::DeliveryFailed)
+        );
+        assert_eq!(runtime.handle.status().phase, RuntimePhase::Ready);
+        runtime.handle.shutdown().await.unwrap();
     }
 
     /// A job run elsewhere reports back through `note`: the agent is woken with
@@ -13607,6 +14833,7 @@ mod tests {
 
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Stopped,
             })
@@ -13656,7 +14883,7 @@ mod tests {
         handle.shutdown().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn empty_evaluator_response_ends_goal_stopped_without_warning_spam() {
         // Regression for issue #17: when the goal evaluator returns an EMPTY
         // stream, the goal must end as `Stopped` (the agent's work is not failed)
@@ -13681,6 +14908,7 @@ mod tests {
 
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Stopped,
             })
@@ -13697,7 +14925,7 @@ mod tests {
 
         let mut saw_stopped_goal = false;
         let mut saw_failed_goal = false;
-        let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(3600), async {
             loop {
                 match runtime_events.recv().await {
                     Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
@@ -13746,8 +14974,12 @@ mod tests {
         handle.shutdown().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn recoverable_failures_resume_with_context_even_when_compact_fails() {
+        let mut config = native_start(false).agent;
+        let mut registry = atomcode_config::config::Config::default();
+        registry.goal.recovery.max_elapsed_secs = 86400;
+        config.subagent_config = Some(Arc::new(registry));
         let (
             handle,
             mut kernel_commands,
@@ -13756,7 +14988,11 @@ mod tests {
             _wakeup_tx,
             _loop_active,
             _adapter,
-        ) = controller_test_runtime(Arc::new(GoalNotMetProviderFactory::default())).await;
+        ) = controller_test_runtime_with_config(
+            Arc::new(GoalNotMetProviderFactory::default()),
+            config,
+        )
+        .await;
 
         handle.start_goal("tests pass").await.unwrap();
         assert!(matches!(
@@ -13775,8 +15011,9 @@ mod tests {
         // synthetic prompt. The runtime stores one bounded copy for recovery compact.
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
-                reason: StopReason::ProviderError,
+                reason: StopReason::Timeout,
             })
             .unwrap();
         assert!(matches!(
@@ -13792,7 +15029,7 @@ mod tests {
             })
             .unwrap();
         let continuation =
-            tokio::time::timeout(std::time::Duration::from_secs(2), kernel_commands.recv())
+            tokio::time::timeout(std::time::Duration::from_secs(3600), kernel_commands.recv())
                 .await
                 .expect("recoverable failure did not dispatch a continuation");
         assert!(matches!(
@@ -13801,12 +15038,13 @@ mod tests {
                 if !text.contains("Progress so far")
         ));
 
-        // Drive the remaining recoverable failures to exhaust MAX_UNPRODUCTIVE.
-        for round in 2..=MAX_UNPRODUCTIVE {
+        // Drive the remaining recoverable failures to exhaust (atomcode_config::config::GoalRecoveryConfig::default().max_attempts + 1).
+        for round in 2..=(atomcode_config::config::GoalRecoveryConfig::default().max_attempts + 1) {
             kernel_events
                 .send(AgentEvent::TurnComplete {
+                    provider_failure: None,
                     turn: None,
-                    reason: StopReason::ProviderError,
+                    reason: StopReason::Timeout,
                 })
                 .unwrap();
             assert!(matches!(
@@ -13821,11 +15059,13 @@ mod tests {
                     ]),
                 })
                 .unwrap();
-            if round < MAX_UNPRODUCTIVE {
-                let _ =
-                    tokio::time::timeout(std::time::Duration::from_secs(2), kernel_commands.recv())
-                        .await
-                        .expect("recoverable failure did not dispatch a continuation");
+            if round < (atomcode_config::config::GoalRecoveryConfig::default().max_attempts + 1) {
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(3600),
+                    kernel_commands.recv(),
+                )
+                .await
+                .expect("recoverable failure did not dispatch a continuation");
             }
         }
 
@@ -13834,7 +15074,7 @@ mod tests {
         // re-run after the user compacts and continues.
         let mut saw_paused_at_cap = false;
         let mut saw_turn_finished = false;
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        tokio::time::timeout(std::time::Duration::from_secs(3600), async {
             loop {
                 match runtime_events.recv().await {
                     Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
@@ -13884,7 +15124,7 @@ mod tests {
                 ),
             })
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        tokio::time::timeout(std::time::Duration::from_secs(3600), async {
             loop {
                 if matches!(
                     runtime_events.recv().await,
@@ -13948,6 +15188,7 @@ mod tests {
         for attempt in 0..2 {
             kernel_events
                 .send(AgentEvent::TurnComplete {
+                    provider_failure: None,
                     turn: None,
                     reason: StopReason::Stopped,
                 })
@@ -14041,6 +15282,7 @@ mod tests {
             .expect("loop wakeup was not registered");
             kernel_events
                 .send(AgentEvent::TurnComplete {
+                    provider_failure: None,
                     turn: None,
                     reason: StopReason::Stopped,
                 })
@@ -14141,6 +15383,7 @@ mod tests {
         .expect("the wakeup was not registered");
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Stopped,
             })
@@ -14195,6 +15438,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Cancelled,
             })
@@ -14250,6 +15494,7 @@ mod tests {
         let _ = runtime_events.recv().await;
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Stopped,
             })
@@ -14305,6 +15550,7 @@ mod tests {
         drop(kernel_commands);
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Stopped,
             })
@@ -14362,6 +15608,7 @@ mod tests {
         drop(kernel_commands);
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Stopped,
             })
@@ -14421,6 +15668,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Stopped,
             })
@@ -14476,6 +15724,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::MaxRounds,
             })
@@ -14535,6 +15784,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::ToolLoopDetected,
             })
@@ -14635,6 +15885,7 @@ mod tests {
 
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Stopped,
             })
@@ -16053,6 +17304,7 @@ mod tests {
             .unwrap();
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Stopped,
             })
@@ -16200,6 +17452,7 @@ mod tests {
         .expect("the wakeup was not registered");
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Stopped,
             })
@@ -16241,6 +17494,7 @@ mod tests {
 
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Stopped,
             })
@@ -16451,6 +17705,7 @@ mod tests {
 
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Cancelled,
             })
@@ -16527,7 +17782,7 @@ mod tests {
         let CodingRuntimeStart {
             agent: config,
             prepare,
-            provider_factory,
+            provider_factory: _,
             plugin_hooks,
             ..
         } = native_start(false);
@@ -16538,7 +17793,7 @@ mod tests {
         let resources = RuntimeResources {
             config,
             prepare,
-            provider_factory,
+            provider_factory: Arc::new(TestProviderFactory { fail: true }),
             plugin_hooks,
             parts,
             harness_app: None,
@@ -16572,6 +17827,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Stopped,
             })
@@ -17109,7 +18365,7 @@ mod tests {
         assert!(saw_failed, "runtime must emit VisionPreprocessFailed");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn recoverable_goal_continuation_send_failure_deactivates_goal_and_fails_runtime() {
         let (agent, mut kernel_commands, kernel_events) = fake_agent();
         let (handle, controls) = coding_runtime_control_channel();
@@ -17154,8 +18410,9 @@ mod tests {
         let _ = kernel_commands.recv().await;
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
-                reason: StopReason::ProviderError,
+                reason: StopReason::Timeout,
             })
             .unwrap();
         assert!(matches!(
@@ -17171,7 +18428,7 @@ mod tests {
             .unwrap();
 
         let mut inactive_goal = false;
-        let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(3600), async {
             loop {
                 match runtime_events.recv().await {
                     Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
@@ -17247,6 +18504,7 @@ mod tests {
         let _ = kernel_commands.recv().await;
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Cancelled,
             })
@@ -17337,6 +18595,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Stopped,
             })
@@ -17451,6 +18710,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Stopped,
             })
@@ -17464,6 +18724,14 @@ mod tests {
                 snapshot: SessionSnapshot::new(vec![Message::user("persisted")]),
             })
             .unwrap();
+
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
+                recovery: Some(crate::GoalRecoveryProgress { attempt: 0, .. }),
+                ..
+            }))
+        ));
 
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
@@ -17634,6 +18902,7 @@ mod tests {
         let _ = runtime_events.recv().await;
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Stopped,
             })
@@ -17811,11 +19080,11 @@ mod tests {
         let logout = handle.mcp_act("srv".into(), McpAction::Logout).await;
         assert_eq!(logout, Err(RuntimeError::Busy));
         // And the two that only a rebuild can apply.
-        for action in [McpAction::Trust, McpAction::Enable] {
+        for action in [McpAction::Trust, McpAction::Enable, McpAction::Reconnect] {
             assert_eq!(
                 handle.mcp_act("srv".into(), action).await,
                 Err(RuntimeError::Busy),
-                "{action:?} is applied by a rebuild, which a running turn refuses"
+                "{action:?} requires an idle session"
             );
         }
         assert!(
@@ -17837,6 +19106,53 @@ mod tests {
         );
 
         handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[serial_test::serial(atomcode_home)]
+    async fn reconnect_cannot_enable_a_disabled_server_or_trust_a_project() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let path = project.path().join(".mcp.json");
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"chosen":{"command":"no-such-server","disabled":true}}}"#,
+        )
+        .unwrap();
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().into();
+        start.prepare.session = crate::SessionMode::Fresh;
+        let runtime = CodingRuntime::start(start).await.unwrap();
+        let error = runtime
+            .handle
+            .mcp_act("chosen".into(), crate::parts::McpAction::Reconnect)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("disabled"), "{error}");
+        assert!(std::fs::read_to_string(&path).unwrap().contains("true"));
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"chosen":{"command":"no-such-server"}}}"#,
+        )
+        .unwrap();
+        let error = runtime
+            .handle
+            .mcp_act("chosen".into(), crate::parts::McpAction::Reconnect)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(atomcode_capabilities::mcp::trust::PROJECT_NOT_TRUSTED),
+            "{error}"
+        );
+        assert!(!atomcode_capabilities::mcp::trust::is_project_trusted(
+            project.path(),
+            home.path()
+        ));
+        assert_eq!(runtime.handle.status().phase, RuntimePhase::Ready);
+        runtime.handle.shutdown().await.unwrap();
     }
 
     /// Trusting a project from the panel connects its servers.
@@ -17888,6 +19204,123 @@ mod tests {
             ServerStatus::BlockedUntrusted,
             "after 信任 the server is no longer held back"
         );
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn accepted_request_response_notifies_every_driver_once() {
+        let (agent, mut commands, events) = fake_agent();
+        let (handle, controls) = coding_runtime_control_channel();
+        let (tx, mut observations) = mpsc::unbounded_channel();
+        let _adapter =
+            spawn_runtime_owner_with_protocol(agent, controls, tx, true, true, None, None, None);
+        handle.submit(UserInput::from("question")).await.unwrap();
+        let _ = commands.recv().await;
+        events
+            .send(AgentEvent::Request {
+                id: 42,
+                kind: REQUEST_USER_INPUT_KIND.into(),
+                payload: serde_json::json!({"question": "Pick one"}),
+            })
+            .unwrap();
+        assert!(matches!(
+            observations.recv().await,
+            Some(CodingRuntimeEvent::Request(RuntimeRequest { id: 42, .. }))
+        ));
+        assert_eq!(
+            handle.respond(41, serde_json::Value::Null).await,
+            Err(RuntimeError::StaleRequest { id: 41 })
+        );
+        assert!(observations.try_recv().is_err());
+        let answer = serde_json::json!({"declined": false, "selected": ["Red"], "text": null});
+        handle.respond(42, answer.clone()).await.unwrap();
+        assert!(
+            matches!(commands.recv().await, Some(AgentCommand::Respond { id: 42, value }) if value == answer)
+        );
+        assert!(
+            matches!(observations.try_recv(), Ok(CodingRuntimeEvent::RequestResolved { id: 42, kind }) if kind == REQUEST_USER_INPUT_KIND)
+        );
+        assert_eq!(
+            handle.respond(42, serde_json::Value::Null).await,
+            Err(RuntimeError::StaleRequest { id: 42 })
+        );
+        assert!(
+            observations.try_recv().is_err(),
+            "a late second response cannot emit another terminal"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn failed_request_delivery_does_not_publish_successful_resolution() {
+        let (agent, commands, events) = fake_agent();
+        let (handle, controls) = coding_runtime_control_channel();
+        let (tx, mut observations) = mpsc::unbounded_channel();
+        let _adapter =
+            spawn_runtime_owner_with_protocol(agent, controls, tx, true, true, None, None, None);
+        events
+            .send(AgentEvent::Request {
+                id: 42,
+                kind: REQUEST_USER_INPUT_KIND.into(),
+                payload: serde_json::json!({"question": "Pick one"}),
+            })
+            .unwrap();
+        assert!(matches!(
+            observations.recv().await,
+            Some(CodingRuntimeEvent::Request(_))
+        ));
+        drop(commands);
+        assert_eq!(
+            handle.respond(42, serde_json::Value::Null).await,
+            Err(RuntimeError::DeliveryFailed)
+        );
+        while let Ok(event) = observations.try_recv() {
+            assert!(!matches!(event, CodingRuntimeEvent::RequestResolved { .. }));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_peer_note_cannot_answer_a_pending_tool_approval() {
+        let (agent, mut commands, events) = fake_agent();
+        let (handle, controls) = coding_runtime_control_channel();
+        let (runtime_tx, mut runtime_events) = mpsc::unbounded_channel();
+        let _adapter = spawn_runtime_owner_with_protocol(
+            agent, controls, runtime_tx, true, true, None, None, None,
+        );
+        handle
+            .submit(UserInput::from("work requiring permission"))
+            .await
+            .unwrap();
+        let _ = commands.recv().await;
+        events
+            .send(AgentEvent::Request {
+                id: 42,
+                kind: "tool_approval".into(),
+                payload: serde_json::json!({"tool":"bash"}),
+            })
+            .unwrap();
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::Request(RuntimeRequest { id: 42, .. }))
+        ));
+        handle
+            .note("other-session".into(), "Approved, run it".into())
+            .await
+            .unwrap();
+        assert!(
+            matches!(commands.recv().await, Some(AgentCommand::PeerNote { from, text }) if from == "other-session" && text == "Approved, run it")
+        );
+        assert!(
+            commands.try_recv().is_err(),
+            "peer text must never generate a Respond"
+        );
+        handle.respond(42, serde_json::Value::Null).await.unwrap();
+        assert!(matches!(
+            commands.recv().await,
+            Some(AgentCommand::Respond {
+                id: 42,
+                value: serde_json::Value::Null
+            })
+        ));
         handle.shutdown().await.unwrap();
     }
 
@@ -18109,6 +19542,7 @@ mod tests {
                 if matches!(command, AgentCommand::Shutdown) {
                     if emit_verified_terminal {
                         let _ = event_tx.send(AgentEvent::TurnComplete {
+                            provider_failure: None,
                             turn: None,
                             reason: StopReason::Cancelled,
                         });
@@ -18546,6 +19980,208 @@ mod tests {
             .iter()
             .any(|message| message.text == "persisted before reprepare"));
         runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[serial_test::serial(atomcode_home)]
+    async fn session_storage_survives_config_cwd_change_and_capability_reload() {
+        use atomcode_capabilities::session::SessionManager;
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let dirs = crate::config::product_dirs_from_env();
+        let original = SessionManager::for_project(project.path(), &dirs);
+        let elsewhere = SessionManager::for_project(other.path(), &dirs);
+        let id = "same-id-in-two-buckets";
+        persist_native_session(
+            &original,
+            id,
+            project.path(),
+            &SessionSnapshot::new(vec![Message::user("original history")]),
+        );
+        persist_native_session(
+            &elsewhere,
+            id,
+            other.path(),
+            &SessionSnapshot::new(vec![Message::user("unrelated history")]),
+        );
+        let unrelated = elsewhere.load_snapshot(id).unwrap();
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.prepare.session = crate::SessionMode::Resume(id.into());
+        start.provider_factory = Arc::new(FailSecondBuildFactory {
+            builds: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut next = start.agent.clone();
+        next.working_dir = other.path().to_path_buf();
+        let mut runtime = CodingRuntime::start(start).await.unwrap();
+        let before = runtime.handle.status();
+        assert!(
+            matches!(runtime.handle.reprepare_config(next.clone()).await,
+            Err(RuntimeError::ReconfigureFailed(message)) if message.contains("candidate provider failed"))
+        );
+        assert_eq!(runtime.handle.status(), before);
+        assert_eq!(
+            runtime.handle.context_stats().await.unwrap().working_dir,
+            project.path()
+        );
+        assert!(matches!(
+            original.acquire_lease(id),
+            Err(SessionStoreError::SessionInUse { .. })
+        ));
+        let changed = runtime.handle.reprepare_config(next).await.unwrap();
+        assert_eq!(changed.session_id.as_deref(), Some(id));
+        assert_eq!(changed.working_dir, other.path());
+        runtime
+            .handle
+            .reload_capabilities_with_plugin_skills(Some(Vec::new()))
+            .await
+            .unwrap();
+        let snapshot = runtime.handle.snapshot().await.unwrap();
+        assert!(snapshot
+            .messages
+            .iter()
+            .any(|m| m.text == "original history"));
+        assert!(!snapshot
+            .messages
+            .iter()
+            .any(|m| m.text == "unrelated history"));
+        assert!(matches!(
+            original.acquire_lease(id),
+            Err(SessionStoreError::SessionInUse { .. })
+        ));
+        assert!(elsewhere.acquire_lease(id).is_ok());
+        runtime
+            .handle
+            .submit(UserInput::from("after bucket change"))
+            .await
+            .unwrap();
+        wait_for_turn_finished(&mut runtime).await;
+        runtime.handle.shutdown().await.unwrap();
+        let persisted = original.load_snapshot(id).unwrap();
+        assert!(persisted
+            .messages
+            .iter()
+            .any(|m| m.text == "after bucket change"));
+        assert_eq!(elsewhere.load_snapshot(id).unwrap(), unrelated);
+        assert!(original.acquire_lease(id).is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[serial_test::serial(atomcode_home)]
+    async fn session_storage_survives_a_changed_project_bucket_marker() {
+        use atomcode_capabilities::session::SessionManager;
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let dirs = crate::config::product_dirs_from_env();
+        let original = SessionManager::for_project(project.path(), &dirs);
+        let id = "changed-marker";
+        persist_native_session(
+            &original,
+            id,
+            project.path(),
+            &SessionSnapshot::new(vec![Message::user("before marker change")]),
+        );
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.prepare.session = crate::SessionMode::Resume(id.into());
+        let next = start.agent.clone();
+        let runtime = CodingRuntime::start(start).await.unwrap();
+        SessionManager::pin_project_bucket(
+            project.path(),
+            &dirs,
+            &SessionManager::project_hash(other.path(), &dirs),
+        );
+        let relocated = SessionManager::for_project(project.path(), &dirs);
+        assert_ne!(original.root(), relocated.root());
+        runtime
+            .handle
+            .reload_capabilities_with_plugin_skills(Some(Vec::new()))
+            .await
+            .unwrap();
+        runtime.handle.reprepare_config(next).await.unwrap();
+        assert!(runtime
+            .handle
+            .snapshot()
+            .await
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| m.text == "before marker change"));
+        assert!(!relocated.root().join(format!("{id}.events")).exists());
+        assert!(matches!(
+            original.acquire_lease(id),
+            Err(SessionStoreError::SessionInUse { .. })
+        ));
+        runtime.handle.shutdown().await.unwrap();
+        assert!(original.acquire_lease(id).is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[serial_test::serial(atomcode_home)]
+    async fn session_storage_rejects_data_directory_change_without_replacing_runtime() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let other_home = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.prepare.session = crate::SessionMode::Fresh;
+        let mut next = start.agent.clone();
+        next.dirs = atomcode_capabilities::ProductDirs::new(other_home.path(), "other-product");
+        let mut runtime = CodingRuntime::start(start).await.unwrap();
+        let before = runtime.handle.status();
+        assert!(matches!(runtime.handle.reprepare_config(next).await,
+            Err(RuntimeError::ReconfigureFailed(message)) if message.contains("restart")));
+        assert_eq!(runtime.handle.status().generation, before.generation);
+        assert_eq!(runtime.handle.status().phase, before.phase);
+        runtime
+            .handle
+            .submit(UserInput::from("still usable after rejected reload"))
+            .await
+            .unwrap();
+        wait_for_turn_finished(&mut runtime).await;
+        assert!(runtime
+            .handle
+            .snapshot()
+            .await
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| m.text == "still usable after rejected reload"));
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[serial_test::serial(atomcode_home)]
+    async fn session_storage_still_rejects_a_transferred_lease_from_another_bucket() {
+        use atomcode_capabilities::session::SessionManager;
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let dirs = crate::config::product_dirs_from_env();
+        let id = "wrong-bucket-transfer";
+        let elsewhere = SessionManager::for_project(other.path(), &dirs);
+        let lease = elsewhere.acquire_lease(id).unwrap();
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.prepare.session = crate::SessionMode::Resume(id.into());
+        let error = match CodingRuntime::start_with_session_lease(
+            start,
+            ProviderBootstrap::Required,
+            lease,
+        )
+        .await
+        {
+            Ok(_) => panic!("a transferred lease must match the requested storage"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("expected"), "{error}");
+        assert!(elsewhere.acquire_lease(id).is_ok());
     }
 
     #[tokio::test]
@@ -20140,6 +21776,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Stopped,
             })
@@ -20214,6 +21851,7 @@ mod tests {
         for attempt in 0..2 {
             kernel_events
                 .send(AgentEvent::TurnComplete {
+                    provider_failure: None,
                     turn: None,
                     reason: StopReason::Stopped,
                 })
@@ -20308,6 +21946,7 @@ mod tests {
         for attempt in 0..2 {
             kernel_events
                 .send(AgentEvent::TurnComplete {
+                    provider_failure: None,
                     turn: None,
                     reason: StopReason::Stopped,
                 })
@@ -20516,6 +22155,7 @@ mod tests {
                                           // which never answers.
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Stopped,
             })
@@ -20602,6 +22242,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Stopped,
             })
@@ -20661,6 +22302,84 @@ mod tests {
         assert!(
             reengaged.is_none(),
             "a met goal must not come back on its own: {reengaged:?}"
+        );
+        handle.shutdown().await.unwrap();
+    }
+    // Uses real filesystem work on spawn_blocking; a paused clock would advance
+    // the read deadline before the OS worker gets scheduled.
+    #[tokio::test]
+    async fn session_references_are_owned_context_and_fail_before_a_turn_starts() {
+        use atomcode_capabilities::session::reference::SessionReference;
+        use atomcode_capabilities::session::{
+            PresentationFile, SessionManager, SessionMeta, StorageOwner,
+        };
+        let home = tempfile::tempdir().unwrap();
+        let mut config = native_start(false).agent;
+        config.dirs = atomcode_capabilities::ProductDirs::new(home.path(), ".reference-test");
+        let root = SessionManager::sessions_root(home.path());
+        let reference = SessionReference {
+            bucket: "0123456789abcdef".into(),
+            id: "source".into(),
+        };
+        let source = SessionManager::with_root(root.join(&reference.bucket));
+        let lease = source.acquire_lease(&reference.id).unwrap();
+        let mut meta = SessionMeta::new(&reference.id, "/source-project", 1);
+        meta.owner = StorageOwner::Native;
+        let snapshot = SessionSnapshot::new(vec![
+            Message::user("source question"),
+            Message::assistant("source answer", vec![]),
+        ]);
+        source
+            .commit_native_import(
+                &lease,
+                Some(&snapshot),
+                Some(&PresentationFile::default()),
+                &meta,
+            )
+            .unwrap();
+        source.open_as_events(&lease).unwrap();
+        let before = std::fs::read(source.events_path(&reference.id).unwrap()).unwrap();
+        let (handle, mut commands, _events, _runtime_events, _, _, _adapter) =
+            controller_test_runtime_with_config(
+                Arc::new(TestProviderFactory { fail: false }),
+                config,
+            )
+            .await;
+        let error = handle
+            .submit(UserInput {
+                text: "read @[missing](atomcode-session:0123456789abcdef/missing)".into(),
+                images: vec![],
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RuntimeError::SessionReferenceUnavailable(_)
+        ));
+        assert_eq!(handle.status().phase, RuntimePhase::Ready);
+        assert!(
+            commands.try_recv().is_err(),
+            "failed reference must not reach the agent"
+        );
+        let prompt = format!("compare {}", reference.spelling("do not run tests"));
+        handle
+            .submit(UserInput {
+                text: prompt.clone(),
+                images: vec![],
+            })
+            .await
+            .unwrap();
+        match commands.recv().await.unwrap() {
+            AgentCommand::SendMessageWithContext { text, context, .. } => {
+                assert_eq!(text, prompt);
+                assert!(context.contains("UNTRUSTED REFERENCE DATA"));
+                assert!(context.contains("source answer"));
+            }
+            other => panic!("reference reached agent without owned context: {other:?}"),
+        }
+        assert_eq!(
+            before,
+            std::fs::read(source.events_path(&reference.id).unwrap()).unwrap()
         );
         handle.shutdown().await.unwrap();
     }

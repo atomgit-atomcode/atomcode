@@ -472,6 +472,10 @@ struct MemoryRow {
     /// wrong place.
     #[serde(default)]
     global: Option<String>,
+    /// Optional project knowledge routing index. Relative paths resolve from
+    /// the project root; omission discovers <project dir>/knowledge/INDEX.md.
+    #[serde(default)]
+    knowledge_index: Option<String>,
 }
 
 impl Default for MemoryRow {
@@ -480,6 +484,7 @@ impl Default for MemoryRow {
             project_root: None,
             inject: true,
             global: None,
+            knowledge_index: None,
         }
     }
 }
@@ -612,12 +617,24 @@ impl crate::commands::CatalogCommand for RunSkill {
     }
 
     async fn run(&self, agent: Arc<crate::agent::Agent>, args: &str) -> Result<String, String> {
+        super::skill_permissions::rules(&self.skill)?;
         let text = self.skill.expand(args.trim(), agent.session_id());
         if text.trim().is_empty() {
             return Err(format!("`{}` 展开之后是空的", self.name));
         }
         let name = self.name.clone();
-        agent.inject(text, InjectionOrigin::Skill { name: name.clone() });
+        agent.inject(
+            text,
+            InjectionOrigin::Skill {
+                name: if self.command {
+                    // A command and a skill can share a name but have different
+                    // permissions. This marker cannot be a valid skill name.
+                    format!("[command] {}", self.skill.name)
+                } else {
+                    self.skill.name.clone()
+                },
+            },
+        );
         agent.send(skill_invocation(&name, args));
         Ok(format!("按 `{name}` 开始"))
     }
@@ -710,19 +727,58 @@ impl crate::commands::CatalogCommand for ListSkills {
         if !args.is_empty() {
             return self.run_them(agent, args);
         }
-        let listed = self.0.list();
-        if listed.is_empty() {
-            return Ok("一个 skill 都没装".into());
-        }
-        Ok(listed
-            .into_iter()
-            .map(|(name, about)| format!("{name} · {about}"))
-            .collect::<Vec<_>>()
-            .join("\n"))
+        Ok(self.listing())
     }
 }
 
 impl ListSkills {
+    fn listing(&self) -> String {
+        let listed = self.0.all();
+        let mut sections = Vec::new();
+        if listed.is_empty() {
+            sections.push(t(Msg::CmdCatalogSkillsEmpty).into_owned());
+        } else {
+            sections.push(
+                listed
+                    .into_iter()
+                    .map(|skill| {
+                        format!(
+                            "{} · {}\n  {}",
+                            skill.name,
+                            skill.description,
+                            skill.source_path.display()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+        }
+        let dirs = self.0.directories();
+        if !dirs.is_empty() {
+            sections.push(format!(
+                "{}\n{}",
+                t(Msg::CmdCatalogSkillDirs),
+                dirs.iter()
+                    .map(|path| format!("  {}", path.display()))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
+        }
+        let diagnostics = self.0.diagnostics();
+        if !diagnostics.is_empty() {
+            sections.push(format!(
+                "{}\n{}",
+                t(Msg::CmdCatalogSkillDiagnostics),
+                diagnostics
+                    .iter()
+                    .map(|d| format!("  {}\n    {}", d.path.display(), d.reason))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
+        }
+        sections.join("\n\n")
+    }
+
     fn run_them(&self, agent: Arc<crate::agent::Agent>, args: &str) -> Result<String, String> {
         let (names, task) = skills_and_task(args, |token| {
             self.0
@@ -738,11 +794,14 @@ impl ListSkills {
         }
         // Each gets the same task: they are several ways of looking at one
         // thing, not a pipeline.
-        let blocks: Vec<String> = names
+        let skills: Vec<_> = names.iter().filter_map(|name| self.0.get(name)).collect();
+        for skill in &skills {
+            super::skill_permissions::rules(skill)?;
+        }
+        let blocks: Vec<(String, String)> = skills
             .iter()
-            .filter_map(|name| self.0.get(name))
-            .map(|skill| skill.expand(task, agent.session_id()))
-            .filter(|text| !text.trim().is_empty())
+            .map(|skill| (skill.name.clone(), skill.expand(task, agent.session_id())))
+            .filter(|(_, text)| !text.trim().is_empty())
             .collect();
         if blocks.is_empty() {
             return Err("展开之后是空的".into());
@@ -750,11 +809,15 @@ impl ListSkills {
         // One turn, with a rule between them: sent as several the first would
         // be answered before the second was read.
         agent.inject(
-            blocks.join("\n\n---\n\n"),
+            blocks
+                .iter()
+                .map(|(_, text)| text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n---\n\n"),
             InjectionOrigin::Skill {
-                name: names
+                name: blocks
                     .iter()
-                    .map(|name| bare_name(name))
+                    .map(|(name, _)| name.as_str())
                     .collect::<Vec<_>>()
                     .join(" · "),
             },
@@ -807,6 +870,9 @@ struct MemoryCommand {
     /// would write somewhere else than the tool the model uses — the two doors
     /// onto one memory disagreeing about where it is.
     global: PathBuf,
+    knowledge_index: PathBuf,
+    prepared: String,
+    inject: bool,
 }
 
 #[async_trait]
@@ -820,78 +886,148 @@ impl crate::commands::CatalogCommand for MemoryCommand {
         }
     }
 
-    async fn run(&self, _agent: Arc<crate::agent::Agent>, args: &str) -> Result<String, String> {
+    async fn run(&self, agent: Arc<crate::agent::Agent>, args: &str) -> Result<String, String> {
         use atomcode_kernel::tool::ToolContext;
-        let (sections, args) = if self.action == "list" {
-            args.strip_prefix("--json")
-                .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
-                .map_or((false, args), |rest| (true, rest.trim()))
-        } else {
-            (false, args)
-        };
-        // 哪一层。写在前面的 `--global` / `--local` 是人会打的写法,而不认
-        // 它的后果是**把那两个字当成要记住的话写进项目那一层** ——
-        // 记下了、记错了地方、而且记进去的是一句没人写的话。
-        let (scope, content) = match args.trim() {
-            rest if rest.starts_with("--") => {
-                let (flag, tail) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
-                match flag {
-                    "--global" | "-g" => (Some("global"), tail.trim()),
-                    "--local" => (Some("local"), tail.trim()),
-                    "--project" => (Some("project"), tail.trim()),
-                    other => {
-                        return Err(format!(
-                            "不认识 `{other}`;只有 --global / --local / --project"
-                        ))
-                    }
-                }
-            }
-            rest => (None, rest),
-        };
-        if self.action != "list" && content.is_empty() {
-            return Err(t(Msg::CmdCustomArgRequired { name: self.name }).into_owned());
-        }
-        if sections {
-            use atomcode_capabilities::memory::store::MemorySection;
+        let input = atomcode_capabilities::memory::input::parse(self.action, args)?;
+        let sections = input.json;
+        let scope = input.call.get("scope").and_then(serde_json::Value::as_str);
+        let topic = input.call.get("topic").and_then(serde_json::Value::as_str);
+        let status = input
+            .call
+            .get("status")
+            .cloned()
+            .map(serde_json::from_value::<atomcode_capabilities::memory::entry::MemoryStatus>)
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        let expired = input
+            .call
+            .get("expired")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let within = input
+            .call
+            .get("expiring_within_days")
+            .and_then(serde_json::Value::as_u64)
+            .map(|v| v as u32);
+        let expiry_filtered = expired || within.is_some();
+        if input.call["action"] == "list" {
+            use atomcode_capabilities::memory::{context::MemoryContext, store::MemorySection};
             let project_dir = self.dirs.project(&self.project);
+            let global = MemoryStore::new(self.global.clone());
+            let project = MemoryStore::project(&project_dir);
+            let local = MemoryStore::local(&project_dir);
+            let name = self
+                .project
+                .file_name()
+                .map(|s| s.to_string_lossy())
+                .unwrap_or_else(|| "project".into());
+            let preview =
+                MemoryContext::load(&global, &project, &local, &name, &self.knowledge_index);
+            let events = agent.session().events();
+            let logged = events.iter().rev().find_map(|e| match &e.event {
+                SessionEvent::Injected {
+                    text,
+                    origin: InjectionOrigin::Memory,
+                    ..
+                } => Some(text.as_str()),
+                _ => None,
+            });
+            let mut review = t(Msg::MemoryReviewTitle).into_owned();
+            match logged {
+                Some(text) => {
+                    let present = atomcode_kernel::session::derive_messages(&events)
+                        .iter()
+                        .any(|m| m.text == text);
+                    review.push_str(&t(Msg::MemorySessionLogged {
+                        present,
+                        matches: text == preview.prompt,
+                    }));
+                    review.push_str(text);
+                    review.push_str("\n\n");
+                }
+                None if !self.inject => review.push_str(&t(Msg::MemoryInjectionDisabled)),
+                None if !events
+                    .iter()
+                    .any(|e| matches!(e.event, SessionEvent::TurnStart { .. })) =>
+                {
+                    review.push_str(&t(Msg::MemoryNotLoggedYet));
+                    review.push_str(&self.prepared);
+                    review.push_str("\n\n");
+                }
+                None => review.push_str(&t(Msg::MemoryNotLogged)),
+            }
+            if topic.is_some() || status.is_some() || expiry_filtered {
+                review.push_str(&t(Msg::MemoryFilteredDetails));
+            }
+            review.push_str(&preview.review_with_expiry(topic, status, expired, within));
             let stores = [
-                ("project", MemoryStore::project(&project_dir)),
-                ("global", MemoryStore::new(self.global.clone())),
-                ("local", MemoryStore::local(&project_dir)),
+                ("project", &project),
+                ("global", &global),
+                ("local", &local),
             ];
-            let sections = stores
+            let mut output = stores
                 .iter()
                 .filter(|(name, _)| scope.is_none_or(|scope| scope == *name))
                 .map(|(name, store)| {
-                    store
-                        .full_text()
-                        .map(|text| MemorySection {
-                            scope: (*name).into(),
-                            path: store.path().into(),
-                            text,
-                        })
-                        .map_err(|error| format!("{}: {error}", store.path().display()))
+                    let (entries, text) = match store.entries() {
+                        Ok(entries) => {
+                            let entries: Vec<_> = entries
+                                .into_iter()
+                                .filter(|entry| {
+                                    entry.matches(topic, status)
+                                        && entry.matches_expiry(
+                                            preview.evaluated_at,
+                                            expired,
+                                            within,
+                                        )
+                                })
+                                .collect();
+                            let text = if topic.is_some() || status.is_some() || expiry_filtered {
+                                entries.iter().map(|entry| entry.describe()).collect()
+                            } else {
+                                store.full_text().unwrap_or_else(|e| {
+                                    t(Msg::MemoryReadFailed {
+                                        error: &e.to_string(),
+                                    })
+                                    .into_owned()
+                                })
+                            };
+                            (entries, text)
+                        }
+                        Err(e) => (
+                            Vec::new(),
+                            t(Msg::MemoryReadFailed {
+                                error: &e.to_string(),
+                            })
+                            .into_owned(),
+                        ),
+                    };
+                    MemorySection {
+                        scope: (*name).into(),
+                        path: store.path().into(),
+                        text,
+                        review: None,
+                        entries,
+                    }
                 })
-                .collect::<Result<Vec<_>, _>>()?;
-            return serde_json::to_string(&sections).map_err(|error| error.to_string());
+                .collect::<Vec<_>>();
+            if sections {
+                if let Some(first) = output.first_mut() {
+                    first.review = Some(review);
+                }
+                return serde_json::to_string(&output).map_err(|e| e.to_string());
+            }
+            for section in output {
+                review.push_str(&format!(
+                    "\n## {} — {}\n\n{}\n",
+                    section.scope,
+                    section.path.display(),
+                    section.text
+                ));
+            }
+            return Ok(review);
         }
-        let mut call = serde_json::json!({ "action": self.action });
-        if let Some(scope) = scope {
-            call["scope"] = serde_json::Value::String(scope.into());
-        }
-        if !content.is_empty() {
-            // Under the name this action reads it by. `forget` takes a
-            // `keyword` and `remember` a `content`, and sending one as the
-            // other is refused by the tool — which is what `/forget` did from
-            // the day it was added until a criterion ran it
-            // (`a_product_can_keep_its_users_state_out_of_the_atomcode_home`).
-            let key = if self.action == "forget" {
-                "keyword"
-            } else {
-                "content"
-            };
-            call[key] = serde_json::Value::String(content.to_string());
-        }
+        let call = input.call;
         let result = atomcode_capabilities::tools::MemoryTool::new(self.dirs.clone())
             .with_global(self.global.clone())
             .execute(
@@ -913,10 +1049,9 @@ impl crate::commands::CatalogCommand for MemoryCommand {
 
 /// User memory, injected as a **logged fact** rather than a hidden prepend.
 ///
-/// The production stack injects memory through a lifecycle hook, which means the
-/// text reaches the model without being a session event. Here it is appended to
-/// the log with its provenance, so the invariant holds and a transcript shows
-/// exactly what the model was told and why.
+/// This row owns production injection through the existing session log. The
+/// standalone kernel hook is not mounted here. Resume keeps the original fact;
+/// /memory compares it with a newly derived disk preview without rewriting it.
 pub struct MemoryPlugin;
 
 #[async_trait]
@@ -955,12 +1090,25 @@ impl Plugin for MemoryPlugin {
             .global
             .map(PathBuf::from)
             .unwrap_or_else(|| MemoryStore::global(dirs.user()).path().to_path_buf());
-        let merged = MemoryStore::merged_for_prompt(
+        let knowledge_index = row
+            .knowledge_index
+            .map(PathBuf::from)
+            .map(|path| {
+                if path.is_absolute() {
+                    path
+                } else {
+                    project.join(path)
+                }
+            })
+            .unwrap_or_else(|| project_dir.join("knowledge/INDEX.md"));
+        let memory = atomcode_capabilities::memory::context::MemoryContext::load(
             &MemoryStore::new(global.clone()),
             &MemoryStore::project(&project_dir),
             &MemoryStore::local(&project_dir),
             &project_name,
+            &knowledge_index,
         );
+        let merged = memory.prompt;
         // The write half. Until this the agent could read the user's memory but
         // never add to it, which made "remember that I prefer X" a request only
         // a human could carry out — in a system whose whole point is that the
@@ -981,12 +1129,15 @@ impl Plugin for MemoryPlugin {
         for command in [
             Arc::new(MemoryCommand {
                 name: "memory",
-                usage: None,
+                usage: Some(Msg::CmdCatalogMemoryUsage),
                 summary: Msg::CmdCatalogMemory,
                 action: "list",
                 project: project.clone(),
                 dirs: dirs.clone(),
                 global: global.clone(),
+                knowledge_index: knowledge_index.clone(),
+                prepared: merged.clone(),
+                inject: row.inject,
             }) as Arc<dyn crate::commands::CatalogCommand>,
             Arc::new(MemoryCommand {
                 name: "remember",
@@ -996,6 +1147,9 @@ impl Plugin for MemoryPlugin {
                 project: project.clone(),
                 dirs: dirs.clone(),
                 global: global.clone(),
+                knowledge_index: knowledge_index.clone(),
+                prepared: merged.clone(),
+                inject: row.inject,
             }),
             Arc::new(MemoryCommand {
                 name: "forget",
@@ -1005,6 +1159,9 @@ impl Plugin for MemoryPlugin {
                 project: project.clone(),
                 dirs: dirs.clone(),
                 global: global.clone(),
+                knowledge_index: knowledge_index.clone(),
+                prepared: merged.clone(),
+                inject: row.inject,
             }),
         ] {
             crate::commands::register(ctx, command)?;
@@ -1015,17 +1172,29 @@ impl Plugin for MemoryPlugin {
             "memory",
             11,
             format!(
-                "MEMORY — three tiers, merged on the first turn of every session:\n\
+                "MEMORY — three file-backed scopes:\n\
                  \u{20}\u{20}global   {}   (every project)\n\
                  \u{20}\u{20}project  {}   (this repo, committed)\n\
                  \u{20}\u{20}local    {}   (this repo on this machine only)\n\
-                 Write with the `memory` tool: \
-                 `{{action: remember|forget|list, content, scope: project|local|global}}`. \
+                 First-turn injection enabled for new sessions: {}. \
                  Memory is what someone chose to state; for everything that was \
-                 merely *said*, use `recall` instead.",
+                 merely *said*, use `recall` instead. \
+                 /memory shows latest disk selection separately from session-logged injection. \
+                 /memory --topic TOPIC filters entries; /memory pin|unpin ID sets priority; \
+                 /memory update ID [--topic TOPIC] [--status active|outdated|deprecated] [CONTENT] \
+                 updates that scoped record; /forget --id ID deprecates it reversibly. \
+                 /remember --ttl-days N CONTENT sets an optional expiry; /memory update ID --ttl-days N renews it, \
+                 --clear-expiry removes it; /memory --expired or --expiring-within N lists affected entries. \
+                 Expiry excludes entries from new session selection, retaining files and existing logged context. \
+                 --global/--project/--local select a scope (project is the mutation default). \
+                 Optional knowledge routing index: {}. When injection is enabled only its bounded index is included; \
+                 read relevant linked files on demand with existing file/search tools. \
+                 Missing index means no knowledge library; create it to opt in.",
                 global.display(),
                 MemoryStore::project(&project_dir).path().display(),
                 MemoryStore::local(&project_dir).path().display(),
+                row.inject,
+                knowledge_index.display(),
             ),
         );
 
@@ -1161,6 +1330,47 @@ impl Plugin for McpPlugin {
 #[cfg(test)]
 mod tests {
     use super::skills_and_task;
+
+    #[test]
+    fn skill_listing_keeps_loaded_paths_and_failures_even_without_loaded_skills() {
+        let tmp = std::env::temp_dir().join(format!(
+            "harness-skill-list-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&tmp).unwrap();
+        std::fs::create_dir(tmp.as_path().join("sample")).unwrap();
+        std::fs::write(
+            tmp.as_path().join("sample/SKILL.md"),
+            "---\nname: sample\ndescription: test\n---\nbody",
+        )
+        .unwrap();
+        let registry =
+            std::sync::Arc::new(atomcode_capabilities::skills::SkillRegistry::load(&[tmp
+                .as_path()
+                .to_path_buf()]));
+        let command = super::ListSkills(registry.clone());
+        let output = command.listing();
+        assert!(output.contains("sample · test"));
+        assert!(output.contains(&tmp.as_path().join("sample/SKILL.md").display().to_string()));
+        std::fs::write(
+            tmp.as_path().join("sample/SKILL.md"),
+            "---\nname: invalid.name\n---\nbody",
+        )
+        .unwrap();
+        registry.reload_dirs(&[tmp.as_path().to_path_buf()], &[]);
+        assert!(registry.is_empty());
+        let output = command.listing();
+        assert!(
+            output.contains("SKILL.md"),
+            "failures-only catalogs still have details"
+        );
+        assert!(output.contains("invalid"));
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
 
     /// Where the names stop and the task starts.
     ///

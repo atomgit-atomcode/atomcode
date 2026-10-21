@@ -20,8 +20,8 @@ use futures::future::{BoxFuture, Shared};
 use futures::FutureExt;
 
 use super::rewind::{
-    FileChangeSummary, RewindLedger, RewindPoint, RewindTransactionJournal, WorkspaceRestorePlan,
-    LEDGER_VERSION, TRANSACTION_VERSION,
+    FileChangeSummary, MissingRewindPoint, RewindLedger, RewindPoint, RewindTransactionJournal,
+    WorkspaceRestorePlan, LEDGER_VERSION, TRANSACTION_VERSION,
 };
 use super::{
     now_ms, ModelUsageStat, PresentationFile, SessionLease, SessionManager, SessionMeta,
@@ -122,7 +122,65 @@ struct RewindState {
     /// Retain the same job through finalization so parallel terminal listeners
     /// can still publish the baseline after the pending point is consumed.
     capture_job: Option<PendingCapture>,
+    // Kept through finalization, including cancellation of a checkpoint waiter.
+    capture_pin: Option<Arc<super::rewind::WorkspaceCapturePin>>,
     points: Vec<RewindPoint>,
+    missing_workspaces: std::collections::BTreeMap<u64, Vec<String>>,
+    reported_missing: std::collections::BTreeSet<(u64, String)>,
+}
+
+impl RewindState {
+    fn project_point(&self, point: &RewindPoint) -> RewindPoint {
+        let mut point = point.clone();
+        if self.missing_workspaces.contains_key(&point.turn_id) {
+            point.before_tree = None;
+            point.after_tree = None;
+        }
+        point
+    }
+
+    fn note_missing(
+        &mut self,
+        missing: Vec<MissingRewindPoint>,
+        status: &SnapshotPersistenceStatus,
+    ) {
+        let mut newly_missing = Vec::new();
+        self.missing_workspaces.clear();
+        for point in missing {
+            let mut first_notice = false;
+            for object in &point.objects {
+                if self
+                    .reported_missing
+                    .insert((point.turn_id, object.clone()))
+                {
+                    first_notice = true;
+                    tracing::warn!(turn_id = point.turn_id, object = %object, "rewind snapshot root is missing");
+                }
+            }
+            if first_notice {
+                newly_missing.push(point.turn_id.to_string());
+            }
+            self.missing_workspaces.insert(point.turn_id, point.objects);
+        }
+        if !newly_missing.is_empty() {
+            let turns = newly_missing
+                .iter()
+                .take(10)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            let extra = newly_missing.len().saturating_sub(10);
+            let suffix = if extra > 0 {
+                format!(" (+{extra} more)")
+            } else {
+                String::new()
+            };
+            status.report_auxiliary_warning(format!(
+                "code rewind is unavailable for turn(s) {turns}{suffix}: workspace snapshot objects are missing. \
+                 Conversation history is preserved; other valid rewind points and new checkpoints remain enabled."
+            ));
+        }
+    }
 }
 
 struct PendingRewindPoint {
@@ -204,6 +262,17 @@ impl SnapshotHook {
         working_dir: impl Into<String>,
         dirs: &crate::ProductDirs,
     ) -> Self {
+        Self::new_with_context(mgr, session_id, working_dir, dirs, None)
+    }
+
+    /// Reuse the preparation's Git probe without retaining another state owner.
+    pub fn new_with_context(
+        mgr: Arc<SessionManager>,
+        session_id: impl Into<String>,
+        working_dir: impl Into<String>,
+        dirs: &crate::ProductDirs,
+        context: Option<&super::SessionContextHook>,
+    ) -> Self {
         let session_id = session_id.into();
         let working_dir = working_dir.into();
         // Code Rewind is on unless ATOMCODE_CODE_REWIND turns it off: we
@@ -211,11 +280,20 @@ impl SnapshotHook {
         // whose store lives under <user tree>/rewind/<bucket>/<session_id> —
         // NOT inside the worktree or on a hard-coded C: path.
         let (checkpoint, unavailable) = if crate::session::rewind::code_rewind_enabled() {
-            match WorkspaceCheckpoint::for_session(
-                std::path::Path::new(&working_dir),
-                &session_id,
-                dirs,
-            ) {
+            let checkpoint = match context {
+                Some(context) => context
+                    .worktree_root_for(std::path::Path::new(&working_dir))
+                    .map_err(|message| WorkspaceCheckpointError::Unsupported(message.into()))
+                    .and_then(|root| {
+                        WorkspaceCheckpoint::for_session_root(root, &session_id, dirs)
+                    }),
+                None => WorkspaceCheckpoint::for_session(
+                    std::path::Path::new(&working_dir),
+                    &session_id,
+                    dirs,
+                ),
+            };
+            match checkpoint {
                 Ok(cp) => (Some(Arc::new(cp)), None),
                 Err(e) => (
                     None,
@@ -229,6 +307,21 @@ impl SnapshotHook {
             .load_rewind_ledger(&session_id)
             .map(|ledger| ledger.points)
             .unwrap_or_default();
+        let persistence_status = SnapshotPersistenceStatus::default();
+        let mut rewind = RewindState {
+            checkpoint,
+            unavailable,
+            points,
+            ..RewindState::default()
+        };
+        if let Some(checkpoint) = rewind.checkpoint.as_ref() {
+            match checkpoint.missing_points(&rewind.points) {
+                Ok(missing) => rewind.note_missing(missing, &persistence_status),
+                Err(error) => {
+                    tracing::warn!(%error, "could not inspect rewind snapshot roots on open")
+                }
+            }
+        }
         Self {
             mgr,
             dirs: dirs.clone(),
@@ -236,14 +329,9 @@ impl SnapshotHook {
             working_dir,
             lease: None,
             accum: Mutex::new(TurnAccum::default()),
-            persistence_status: SnapshotPersistenceStatus::default(),
+            persistence_status,
             attribution: Mutex::new(None),
-            rewind: Mutex::new(RewindState {
-                checkpoint,
-                unavailable,
-                points,
-                ..RewindState::default()
-            }),
+            rewind: Mutex::new(rewind),
         }
     }
 
@@ -291,11 +379,15 @@ impl SnapshotHook {
     }
 
     pub fn rewind_points(&self) -> Vec<RewindPoint> {
-        self.rewind
+        let rewind = self
+            .rewind
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
+            .unwrap_or_else(|error| error.into_inner());
+        rewind
             .points
-            .clone()
+            .iter()
+            .map(|point| rewind.project_point(point))
+            .collect()
     }
 
     /// What this session has changed in the workspace, so far.
@@ -310,7 +402,8 @@ impl SnapshotHook {
     /// different thing and must read differently on screen.
     pub fn changes(&self) -> Result<Vec<FileChangeSummary>, String> {
         let (checkpoint, first) = self.diff_ends()?;
-        let now = checkpoint
+        let pin = checkpoint.capture_pin();
+        let now = pin
             .capture()
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "工作区快照现在取不到".to_string())?;
@@ -320,7 +413,8 @@ impl SnapshotHook {
     /// The unified diff of one changed file, over the same two ends.
     pub fn file_diff(&self, path: &str) -> Result<String, String> {
         let (checkpoint, first) = self.diff_ends()?;
-        let now = checkpoint
+        let pin = checkpoint.capture_pin();
+        let now = pin
             .capture()
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "工作区快照现在取不到".to_string())?;
@@ -397,6 +491,18 @@ impl SnapshotHook {
         // The oldest point that has one: the earliest state this session ever
         // saw. A point with no tree is a conversation-only one and says nothing
         // about files.
+        if let Some(first) = state
+            .points
+            .iter()
+            .find(|point| point.before_tree.is_some())
+        {
+            if state.missing_workspaces.contains_key(&first.turn_id) {
+                return Err(format!(
+                    "workspace baseline for turn {} is missing",
+                    first.turn_id
+                ));
+            }
+        }
         let first = state
             .points
             .iter()
@@ -433,6 +539,12 @@ impl SnapshotHook {
             .rewind
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        if rewind.missing_workspaces.contains_key(&point.turn_id) {
+            return Err(WorkspaceCheckpointError::Unsupported(format!(
+                "code rewind for turn {} is unavailable: workspace snapshot objects are missing",
+                point.turn_id
+            )));
+        }
         let checkpoint = rewind.checkpoint.as_ref().ok_or_else(|| {
             WorkspaceCheckpointError::Unsupported(
                 rewind
@@ -486,13 +598,22 @@ impl SnapshotHook {
             return Err(WorkspaceCheckpointError::Persistence(reason.clone()));
         }
         let previous = rewind.points.clone();
-        if !previous.iter().any(|candidate| candidate == point) {
+        if !previous
+            .iter()
+            .any(|candidate| candidate == point || rewind.project_point(candidate) == *point)
+        {
             return Err(WorkspaceCheckpointError::Persistence(format!(
                 "rewind point {} is no longer available",
                 point.turn_id
             )));
         }
         let workspace_plan = if restore_code {
+            if rewind.missing_workspaces.contains_key(&point.turn_id) {
+                return Err(WorkspaceCheckpointError::Unsupported(format!(
+                "code rewind for turn {} is unavailable: workspace snapshot objects are missing", point.turn_id
+            )));
+            }
+
             let checkpoint = rewind.checkpoint.as_ref().ok_or_else(|| {
                 WorkspaceCheckpointError::Unsupported(
                     rewind
@@ -630,13 +751,14 @@ impl SnapshotHook {
         // Drop the temporary recovery ref that prepare_restore pinned: the
         // transaction is committed so gc can reclaim the object if needed.
         {
-            let rewind = self
+            let mut rewind = self
                 .rewind
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             if let Some(checkpoint) = rewind.checkpoint.as_ref() {
                 let _ = checkpoint.unpin_recovery_ref();
             }
+            self.collect_rewind_references(&mut rewind);
         }
         self.clear_rewind_transaction()
     }
@@ -699,6 +821,31 @@ impl SnapshotHook {
         }
     }
 
+    /// Preserve both sides until the ledger is durable. Deleting old refs can
+    /// trigger eager GC, which must never destroy the rollback ledger's objects.
+    fn transition_points(previous: &[RewindPoint], next: &[RewindPoint]) -> Vec<RewindPoint> {
+        previous
+            .iter()
+            .chain(next)
+            .map(|point| (point.turn_id, point.clone()))
+            .collect::<std::collections::BTreeMap<_, _>>()
+            .into_values()
+            .collect()
+    }
+
+    fn collect_rewind_references(&self, rewind: &mut RewindState) {
+        if let Some(checkpoint) = rewind.checkpoint.as_ref() {
+            match checkpoint.retain_points_report(&rewind.points) {
+                Ok(missing) => rewind.note_missing(missing, &self.persistence_status),
+                // The ledger already committed. Keeping extra references is safe;
+                // do not report a failed rewind or roll back a successful commit.
+                Err(error) => {
+                    tracing::warn!(%error, "rewind ledger committed but reference cleanup failed")
+                }
+            }
+        }
+    }
+
     fn replace_rewind_points_locked(
         &self,
         rewind: &mut RewindState,
@@ -706,7 +853,9 @@ impl SnapshotHook {
     ) -> Result<(), WorkspaceCheckpointError> {
         let previous = rewind.points.clone();
         if let Some(checkpoint) = rewind.checkpoint.as_ref() {
-            checkpoint.retain_points(&points)?;
+            let protected = Self::transition_points(&previous, &points);
+            let missing = checkpoint.retain_points_report(&protected)?;
+            rewind.note_missing(missing, &self.persistence_status);
         }
         let ledger = RewindLedger {
             version: LEDGER_VERSION,
@@ -718,16 +867,21 @@ impl SnapshotHook {
         };
         if let Err(error) = saved {
             if let Some(checkpoint) = rewind.checkpoint.as_ref() {
-                if let Err(compensation) = checkpoint.retain_points(&previous) {
-                    return Err(WorkspaceCheckpointError::Compensation {
-                        operation: error.to_string(),
-                        compensation: compensation.to_string(),
-                    });
+                match checkpoint.retain_points_report(&previous) {
+                    Ok(missing) => rewind.note_missing(missing, &self.persistence_status),
+                    Err(compensation) => {
+                        return Err(WorkspaceCheckpointError::Compensation {
+                            operation: error.to_string(),
+                            compensation: compensation.to_string(),
+                        })
+                    }
                 }
             }
             return Err(WorkspaceCheckpointError::Persistence(error.to_string()));
         }
         rewind.points = points;
+        // A rewind may still be awaiting conversation commit/rebuild. Keep its
+        // preimage pinned until commit_rewind or the next completed turn.
         Ok(())
     }
 
@@ -1000,13 +1154,14 @@ impl LifecycleHooks for SnapshotHook {
             .unwrap_or_else(|error| error.into_inner())
             .checkpoint
             .clone();
-        let capture = checkpoint.map(|checkpoint| {
+        let capture_pin = checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.capture_pin());
+        let capture = capture_pin.clone().map(|pin| {
             let span = tracing::Span::current();
             let job = tokio::task::spawn_blocking(move || {
                 let started = std::time::Instant::now();
-                let result = checkpoint
-                    .capture()
-                    .map_err(|_| "capture_failed".to_string());
+                let result = pin.capture().map_err(|_| "capture_failed".to_string());
                 let elapsed_ms = started.elapsed().as_millis() as u64;
                 span.in_scope(|| {
                     if result.is_err() {
@@ -1043,6 +1198,7 @@ impl LifecycleHooks for SnapshotHook {
                 .rewind
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
+            rewind.capture_pin = capture_pin;
             rewind.capture_job = capture.clone();
             rewind.pending = Some(PendingRewindPoint {
                 prompt_number,
@@ -1124,12 +1280,18 @@ impl LifecycleHooks for SnapshotHook {
             (rewind.pending.take(), rewind.checkpoint.clone())
         };
         let turn_id = ctx.turn_id;
+        // The after-tree must stay pinned until retention and ledger persistence
+        // finish, including error paths. The baseline pin lives in RewindState.
+        let after_pin = checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.capture_pin());
         let completed_rewind = match pending {
             Some(pending) => {
                 let workspace = match (pending.before_tree, checkpoint) {
                     (Some(before_tree), Some(checkpoint)) => {
+                        let pin = after_pin.clone().expect("checkpoint has a capture pin");
                         tokio::task::spawn_blocking(move || {
-                            let after_tree = checkpoint.capture().ok()??;
+                            let after_tree = pin.capture().ok()??;
                             let files = checkpoint.diff(&before_tree, &after_tree).ok()?;
                             Some((before_tree, after_tree, files))
                         })
@@ -1274,13 +1436,17 @@ impl LifecycleHooks for SnapshotHook {
                 points: rewind.points.clone(),
             };
             if let Some(checkpoint) = rewind.checkpoint.as_ref() {
-                if let Err(error) = checkpoint.retain_points(&ledger.points) {
-                    self.persistence_status.report_auxiliary_warning(format!(
-                        "this turn's rewind point could not be kept ({error}); \
-                         `/rewind` will not offer it"
-                    ));
-                    rewind.points = previous_points;
-                    return;
+                let protected = Self::transition_points(&previous_points, &ledger.points);
+                match checkpoint.retain_points_report(&protected) {
+                    Ok(missing) => rewind.note_missing(missing, &self.persistence_status),
+                    Err(error) => {
+                        self.persistence_status.report_auxiliary_warning(format!(
+                            "this turn's rewind point could not be kept ({error}); \
+                             `/rewind` will not offer it"
+                        ));
+                        rewind.points = previous_points;
+                        return;
+                    }
                 }
             }
             let saved = match &self.lease {
@@ -1288,14 +1454,19 @@ impl LifecycleHooks for SnapshotHook {
                 None => self.mgr.save_rewind_ledger(&self.session_id, &ledger),
             };
             if let Err(error) = saved {
+                if let Some(checkpoint) = rewind.checkpoint.as_ref() {
+                    if let Ok(missing) = checkpoint.retain_points_report(&previous_points) {
+                        rewind.note_missing(missing, &self.persistence_status);
+                    }
+                }
+                rewind.points = previous_points;
+                // A degraded old point must not mask a failed new-ledger write.
                 self.persistence_status.report_auxiliary_warning(format!(
                     "this turn's rewind point could not be saved ({error}); \
                      `/rewind` will not offer it"
                 ));
-                if let Some(checkpoint) = rewind.checkpoint.as_ref() {
-                    let _ = checkpoint.retain_points(&previous_points);
-                }
-                rewind.points = previous_points;
+            } else {
+                self.collect_rewind_references(&mut rewind);
             }
         }
         self.mgr.clear_inflight_snapshot(&self.session_id);
@@ -1318,6 +1489,312 @@ mod tests {
             mgr,
             dir,
         )
+    }
+
+    fn workspace_hook(
+        id: &str,
+    ) -> (
+        SnapshotHook,
+        Arc<SessionManager>,
+        tempfile::TempDir,
+        std::path::PathBuf,
+        crate::ProductDirs,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = root.path().join("work");
+        std::fs::create_dir(&worktree).unwrap();
+        let worktree = std::fs::canonicalize(worktree).unwrap();
+        git(&worktree, &["init", "--quiet"]);
+        std::fs::write(worktree.join("tracked.txt"), "committed\n").unwrap();
+        git(&worktree, &["add", "tracked.txt"]);
+        git(
+            &worktree,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-qm",
+                "initial",
+            ],
+        );
+        std::fs::write(worktree.join("tracked.txt"), "first baseline\n").unwrap();
+        let dirs = crate::ProductDirs::new(root.path().join("product"), ".test-product");
+        let manager = Arc::new(SessionManager::with_root(root.path().join("sessions")));
+        let hook = SnapshotHook::new(manager.clone(), id, worktree.to_str().unwrap(), &dirs);
+        // Own fixture capabilities, independent of other tests toggling the product switch.
+        {
+            let mut state = hook.rewind.lock().unwrap();
+            state.checkpoint = Some(Arc::new(
+                WorkspaceCheckpoint::for_session(&worktree, id, &dirs).unwrap(),
+            ));
+            state.unavailable = None;
+        }
+        (hook, manager, root, worktree, dirs)
+    }
+
+    async fn finish_workspace_turn(hook: &SnapshotHook, worktree: &std::path::Path, n: usize) {
+        let mut conversation = convo_with(n);
+        let event_bytes = hook
+            .lease
+            .as_ref()
+            .filter(|_| hook.mgr.is_event_session(&hook.session_id))
+            .map(|lease| {
+                hook.mgr
+                    .append_conversation_change(lease, &conversation.messages, n as u64 * 1_000)
+                    .unwrap();
+                std::fs::read(hook.mgr.events_path(&hook.session_id).unwrap()).unwrap()
+            });
+        hook.turn_start(&mut conversation).await;
+        assert!(hook.wait_for_checkpoint().await.is_some());
+        std::fs::write(worktree.join("tracked.txt"), format!("after {n}\n")).unwrap();
+        hook.turn_complete(
+            &conversation,
+            &StopReason::Stopped,
+            &TurnCtx {
+                turn_id: n as u64,
+                ..TurnCtx::default()
+            },
+        )
+        .await;
+        if let Some(before) = event_bytes {
+            assert_eq!(
+                std::fs::read(hook.mgr.events_path(&hook.session_id).unwrap()).unwrap(),
+                before,
+                "checkpoint retention must not rewrite or append conversation facts"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[serial_test::serial(atomcode_code_rewind_env)]
+    async fn an_inflight_baseline_survives_gc_and_its_pin_is_released_with_the_hook() {
+        let (hook, _manager, _root, worktree, _dirs) = workspace_hook("active-baseline");
+        let mut conversation = convo_with(1);
+        hook.turn_start(&mut conversation).await;
+        let before = hook.wait_for_checkpoint().await.unwrap();
+        let checkpoint = hook.rewind.lock().unwrap().checkpoint.clone().unwrap();
+        let shadow_git = checkpoint.git_dir_path().to_path_buf();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("--git-dir")
+                .arg(&shadow_git)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output.stdout
+        };
+        assert!(!git(&[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/atomcode/capture/"
+        ])
+        .is_empty());
+        git(&["gc", "--prune=now", "--quiet"]);
+        git(&["cat-file", "-e", &before]);
+        std::fs::write(worktree.join("tracked.txt"), "completed").unwrap();
+        hook.turn_complete(
+            &conversation,
+            &StopReason::Stopped,
+            &TurnCtx {
+                turn_id: 1,
+                ..TurnCtx::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            hook.rewind_points()[0].before_tree.as_deref(),
+            Some(before.as_str())
+        );
+        drop(hook);
+        assert!(git(&[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/atomcode/capture/"
+        ])
+        .is_empty());
+        git(&["gc", "--prune=now", "--quiet"]);
+        git(&["cat-file", "-e", &before]);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[serial_test::serial(atomcode_code_rewind_env)]
+    async fn missing_old_checkpoint_is_quarantined_without_blocking_later_turns() {
+        let id = "missing-old-root";
+        let (hook, manager, _root, worktree, dirs) = workspace_hook(id);
+        let lease = manager.acquire_lease(id).unwrap();
+        let mut meta = SessionMeta::new(id, worktree.to_str().unwrap(), now_ms());
+        meta.owner = StorageOwner::Native;
+        manager
+            .create_event_session(
+                &lease,
+                &atomcode_kernel::session::SessionHeader::new(id),
+                &meta,
+            )
+            .unwrap();
+        let hook = hook.with_lease(lease);
+        finish_workspace_turn(&hook, &worktree, 1).await;
+        let old = manager.load_rewind_ledger(id).unwrap().points[0].clone();
+        let tree = old.before_tree.as_ref().unwrap();
+        let store = dirs
+            .user()
+            .join("rewind")
+            .join(SessionManager::project_hash(&worktree, &dirs))
+            .join(id);
+        std::fs::remove_file(store.join("objects").join(&tree[..2]).join(&tree[2..])).unwrap();
+        finish_workspace_turn(&hook, &worktree, 2).await;
+        let warning = hook.persistence_status.take_auxiliary_warning().unwrap();
+        assert!(
+            warning.contains("turn(s) 1") && warning.contains("Conversation history is preserved")
+        );
+        let points = hook.rewind_points();
+        assert_eq!(points.len(), 2);
+        assert!(points[0].before_tree.is_none() && points[0].after_tree.is_none());
+        assert!(points[1].before_tree.is_some() && points[1].after_tree.is_some());
+        assert_eq!(
+            manager.load_rewind_ledger(id).unwrap().points[0],
+            old,
+            "persist original IDs for diagnostics"
+        );
+        assert!(hook
+            .restore_workspace(&old)
+            .unwrap_err()
+            .to_string()
+            .contains("missing"));
+        assert!(hook
+            .begin_rewind(&old, true, None)
+            .unwrap_err()
+            .to_string()
+            .contains("missing"));
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("tracked.txt")).unwrap(),
+            "after 2\n"
+        );
+        finish_workspace_turn(&hook, &worktree, 3).await;
+        assert!(
+            hook.persistence_status.take_auxiliary_warning().is_none(),
+            "same bad root is not announced every turn"
+        );
+        assert_eq!(manager.load_rewind_ledger(id).unwrap().points.len(), 3);
+        drop(hook);
+        let reopened = SnapshotHook::new(manager.clone(), id, worktree.to_str().unwrap(), &dirs)
+            .with_lease(manager.acquire_lease(id).unwrap());
+        assert!(
+            reopened.rewind_points()[0].before_tree.is_none(),
+            "resume rechecks roots without rewriting history"
+        );
+        assert!(reopened
+            .persistence_status
+            .take_auxiliary_warning()
+            .is_some());
+        finish_workspace_turn(&reopened, &worktree, 4).await;
+        assert!(reopened
+            .persistence_status
+            .take_auxiliary_warning()
+            .is_none());
+        assert_eq!(manager.load_rewind_ledger(id).unwrap().points.len(), 4);
+        // The UI's conversation-only projection remains a valid transaction target.
+        let projected = reopened.rewind_points()[0].clone();
+        let receipt = reopened.begin_rewind(&projected, false, None).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("tracked.txt")).unwrap(),
+            "after 4\n"
+        );
+        reopened.commit_rewind(receipt).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[serial_test::serial(atomcode_code_rewind_env)]
+    async fn an_uncommitted_rewind_keeps_previous_objects_for_compensation() {
+        let id = "pending-rewind-roots";
+        let (hook, manager, _root, worktree, _dirs) = workspace_hook(id);
+        finish_workspace_turn(&hook, &worktree, 1).await;
+        finish_workspace_turn(&hook, &worktree, 2).await;
+        let hook = hook.with_lease(manager.acquire_lease(id).unwrap());
+        let original = hook.rewind_points();
+        let checkpoint = hook.rewind.lock().unwrap().checkpoint.clone().unwrap();
+        let receipt = hook.begin_rewind(&original[0], true, None).unwrap();
+        git(checkpoint.git_dir_path(), &["gc", "--prune=now", "--quiet"]);
+        checkpoint
+            .diff(
+                original[0].before_tree.as_deref().unwrap(),
+                original[0].after_tree.as_deref().unwrap(),
+            )
+            .expect("pending rewind must preserve its previous checkpoint objects");
+        hook.compensate_rewind(receipt).unwrap();
+        assert_eq!(hook.rewind_points(), original);
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("tracked.txt")).unwrap(),
+            "after 2\n"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn failed_full_ledger_save_keeps_evicted_points_and_does_not_publish_a_new_point() {
+        let id = "failed-ledger-save";
+        let (hook, manager, _root, worktree, _dirs) = workspace_hook(id);
+        finish_workspace_turn(&hook, &worktree, 1).await;
+        finish_workspace_turn(&hook, &worktree, 2).await;
+        // Reach the 100-point retention boundary without running 100 turns.
+        // Only turn 1 refers to its unique initial baseline; losing that root
+        // proves that failed ledger persistence destroyed the rollback state.
+        let mut original = manager.load_rewind_ledger(id).unwrap();
+        for turn in 3..=100 {
+            let mut point = original.points[1].clone();
+            point.turn_id = turn;
+            point.prompt_number = turn as usize;
+            original.points.push(point);
+        }
+        manager.save_rewind_ledger(id, &original).unwrap();
+        let checkpoint = {
+            let mut state = hook.rewind.lock().unwrap();
+            state.points = original.points.clone();
+            state.checkpoint.clone().unwrap()
+        };
+        checkpoint.retain_points(&original.points).unwrap();
+        let path = std::fs::read_dir(manager.root())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name().unwrap().to_str().unwrap().starts_with(id)
+                    && path
+                        .file_name()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .contains(".rewind")
+            })
+            .unwrap();
+        let backup = path.with_extension("saved-ledger");
+        std::fs::rename(&path, &backup).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        finish_workspace_turn(&hook, &worktree, 101).await;
+        assert_eq!(hook.rewind_points(), original.points);
+        let first = &original.points[0];
+        checkpoint
+            .diff(
+                first.before_tree.as_deref().unwrap(),
+                first.after_tree.as_deref().unwrap(),
+            )
+            .expect("failed ledger save must leave the evicted point's objects readable");
+        assert!(hook
+            .persistence_status
+            .take_auxiliary_warning()
+            .unwrap()
+            .contains("could not be saved"));
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&backup, &path).unwrap();
+        assert_eq!(manager.load_rewind_ledger(id).unwrap(), original);
+        assert!(
+            manager.load_snapshot(id).is_ok(),
+            "conversation persistence still succeeds"
+        );
     }
 
     fn pending_capture(hook: &SnapshotHook, capture: PendingCapture) {

@@ -140,6 +140,47 @@ const PROMPT_DOORS: &[(&str, &str)] = &[
     ("atomcode-coding/src/runtime.rs", "reload_skills_live"),
 ];
 
+/// `child_tools` is not a use of the shared `tools` binding. Keep lexical
+/// receiver boundaries so independent child/test catalogs are not false hits.
+fn bound_receiver_calls(line: &str, name: &str, method: &str) -> bool {
+    let needle = format!("{name}.{method}(");
+    line.match_indices(&needle).any(|(at, _)| {
+        line[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|previous| !(previous.is_alphanumeric() || previous == '_'))
+    })
+}
+
+#[test]
+fn bound_receivers_are_whole_identifiers() {
+    assert!(bound_receiver_calls(
+        "tools.register(tool)",
+        "tools",
+        "register"
+    ));
+    assert!(bound_receiver_calls(
+        "let result = tools.register(tool);",
+        "tools",
+        "register"
+    ));
+    assert!(!bound_receiver_calls(
+        "child_tools.register(tool)",
+        "tools",
+        "register"
+    ));
+    assert!(!bound_receiver_calls(
+        "other_prompts.contribute(id, 0, text)",
+        "prompts",
+        "contribute"
+    ));
+    assert!(bound_receiver_calls(
+        "prompts.contribute(id, 0, text)",
+        "prompts",
+        "contribute"
+    ));
+}
+
 #[test]
 fn every_tool_mount_goes_through_the_door() {
     let root = crates_dir();
@@ -161,7 +202,7 @@ fn every_tool_mount_goes_through_the_door() {
         for (no, line) in lines.iter().enumerate() {
             if !names
                 .iter()
-                .any(|n| line.contains(&format!("{n}.register(")))
+                .any(|n| bound_receiver_calls(line, n, "register"))
             {
                 continue;
             }
@@ -227,7 +268,7 @@ fn every_prompt_fragment_goes_through_the_door() {
         for (no, line) in lines.iter().enumerate() {
             if !names
                 .iter()
-                .any(|n| line.contains(&format!("{n}.contribute(")))
+                .any(|n| bound_receiver_calls(line, n, "contribute"))
             {
                 continue;
             }

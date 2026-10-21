@@ -24,6 +24,30 @@ For whoever edits this file; this block is never shown.
 - Compiled into the binary; rebuild to see a change.
 -->
 
+## v5.2.4 (2026-10-21)
+
+### Overview
+
+This release strengthens long-running tasks and recovery, lets running terminal sessions continue in the background when switching history, and loads large MCP tool schemas on demand. It adds a read-only IDE language-service bridge, phone access to the WebUI and custom provider headers, alongside improvements to terminal editing, reading, configuration synchronization and plugin permissions.
+
+### Changes
+
+- **Long-task recovery and goal verification**: improve `/goal` recovery and persisted paused checkpoints, retaining observed work, verification evidence and pending questions. Distinguish execution, recovery, verification and completion, with duration and token usage accumulated across turns rather than presenting verification replies as completed tasks.
+- **Switch sessions while work runs**: leave a running terminal session working in the background when switching history. Keep live state and queued input consistent through switches.
+- **On-demand MCP tools**: search with `mcp_search` to load large MCP tool schemas as needed instead of sending them all on every request. Reconnect individual servers from their detail panels, with cancellable reconnects that keep the runtime responsive; fix request correlation for MCP replies.
+- **IDE language-service bridge**: add a read-only bridge to editor-provided types, definitions, references and diagnostics. Discover IDE windows and inspect bridge connection status; existing file and code search remains available without an IDE connection.
+- **Phone access to the WebUI**: connect through the relay, or scan a terminal QR code for LAN access. Update remote-access guidance accordingly.
+- **More provider options**: configure custom HTTP headers per account and opt into the DeepSeek Messages protocol. Saved WebUI model settings reconcile live sessions, and reasoning effort accepts levels declared by the model, including `xhigh`.
+- **More reliable streaming**: remove the default total deadline for responses that keep making progress, avoiding the 600-second cutoff. Align first-content timeouts, improve bounded continuations and diagnostics, and retain explicit failure when recovery is exhausted.
+- **Round budgets follow configuration**: honor unlimited rounds for main and delegated tasks. Explicit budgets produce a progress summary when exhausted rather than letting implicit limits stop complex tasks early.
+- **Terminal editing and reading**: configure newline shortcuts, restore backslash followed by Enter, and add a menu entry for newlines. Improve Shift+Backspace, repeated keys and Emacs editing while protecting drafts from Ctrl+D. Add a terminal reader and viewport paging; manual navigation stops edge autoscroll.
+- **Clearer code and task display**: wrap long code lines instead of truncating commands. Background surfaces group code blocks without copying decorative gutters, and language labels stand out. Todo plans start folded with expandable scrolling; team panels acknowledge expanded, collapsed and empty states. Restore generation-speed display and improve cache-reuse statistics.
+- **Consistent sessions and context**: retain the actual session storage binding across configuration reloads, avoiding lease mismatches after directory changes. Identify history and summaries retained by compaction rather than presenting them as new requests. Unify cross-platform file and history references and add local cross-session messaging.
+- **WebUI interaction fixes**: refresh skills when reopening menus, keep directory creation controls reachable alongside recent projects, and resolve shared questions on the web when answered in the terminal.
+- **Skill preauthorization and static permissions**: support user and project JSON allow/deny policies and turn-scoped skill `allowed-tools` preauthorization. Unlisted tools still follow normal approval rules; explicit denies and sensitive-operation boundaries remain in force.
+- **Plugin and platform compatibility**: validate plugin hook script entry points, bind trust to bundle content and support checked script wrappers. Improve serialized Windows clipboard access, MobaXterm rendering and unsupported pipe-input errors. Ignore stale sudo identity for non-root home resolution and resolve installer fallback versions from the release manifest.
+- **Command boundaries and startup**: standardize on the current terminal UI, removing `--classic` and the `ui.screen` selector. Clarify that `/worktree done` returns to the main checkout without merging. Reduce repeated Git probes, prepare automatic upgrades without blocking terminal startup, and clarify repository lookup and Git credential failures.
+
 ## v5.2.3 (2026-10-13)
 
 ### Overview

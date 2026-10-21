@@ -339,6 +339,15 @@ pub enum ContextSource {
     TeamNote { member: String },
 }
 
+/// Final provider classification, including rate-limit pauses without an Error fact.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProviderFailure {
+    pub retryable: bool,
+    pub http_status: Option<u16>,
+    pub code: Option<String>,
+    pub retry_after_secs: Option<u64>,
+}
+
 /// Agent → driver. Serializable for the same reason. The id-correlated
 /// Request/Respond pair replaces any in-process oneshot, so the round-trip
 /// works identically in-process and over the wire.
@@ -517,6 +526,8 @@ pub enum AgentEvent {
     /// failed and shut-down turns included.
     TurnComplete {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_failure: Option<ProviderFailure>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         turn: Option<u64>,
         reason: StopReason,
     },
@@ -534,6 +545,9 @@ pub enum AgentEvent {
         /// classification.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retryable: Option<bool>,
+        /// Authoritative provider Retry-After, retained after retry exhaustion.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_after_secs: Option<u64>,
         /// 这条错误**同时就是这次收尾的错误**(会话日志里 `TurnEnd::error` 的那一句)。
         ///
         /// 这是给读者的一道选择题,不是给生产者省事:同一段文字会从两条通道到达
@@ -683,6 +697,7 @@ mod tests {
         assert!(matches!(
             old,
             AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::Stopped
             }
@@ -960,6 +975,7 @@ mod tests {
             old,
             AgentEvent::Error {
                 retryable: None,
+                retry_after_secs: None,
                 ..
             }
         ));
@@ -969,6 +985,7 @@ mod tests {
             http_status: None,
             code: None,
             retryable: Some(true),
+            retry_after_secs: Some(901),
             ends_turn: false,
         };
         let json = serde_json::to_string(&event).unwrap();
@@ -977,6 +994,7 @@ mod tests {
             decoded,
             AgentEvent::Error {
                 retryable: Some(true),
+                retry_after_secs: Some(901),
                 ..
             }
         ));
@@ -993,6 +1011,47 @@ mod tests {
         assert!(matches!(
             decoded,
             AgentEvent::CompactionFailed { error, .. } if error.message() == "disk full"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod terminal_provider_metadata_tests {
+    use super::*;
+    #[test]
+    fn old_terminals_decode_and_new_provider_metadata_roundtrips() {
+        let old: AgentEvent =
+            serde_json::from_str(r#"{"TurnComplete":{"reason":"RateLimited"}}"#).unwrap();
+        assert!(matches!(
+            old,
+            AgentEvent::TurnComplete {
+                provider_failure: None,
+                ..
+            }
+        ));
+        let event = AgentEvent::TurnComplete {
+            turn: Some(7),
+            reason: StopReason::RateLimited,
+            provider_failure: Some(ProviderFailure {
+                retryable: true,
+                http_status: Some(429),
+                code: Some("rate_limit_exceeded".into()),
+                retry_after_secs: Some(901),
+            }),
+        };
+        let restored: AgentEvent =
+            serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+        assert!(matches!(
+            restored,
+            AgentEvent::TurnComplete {
+                turn: Some(7),
+                provider_failure: Some(ProviderFailure {
+                    retryable: true,
+                    retry_after_secs: Some(901),
+                    ..
+                }),
+                ..
+            }
         ));
     }
 }

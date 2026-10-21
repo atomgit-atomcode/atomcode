@@ -9,6 +9,7 @@ use std::borrow::Cow;
 
 pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
     match msg {
+        Msg::InjectedFromSession { from } => format!("来自其他会话 {from}").into(),
         Msg::MemoryEmpty => Cow::Borrowed("这一范围暂无记忆。"),
 
         // ── 命令分发 ──
@@ -29,6 +30,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
 
         // ── 当下 ──
         Msg::MomentQuitAgain => "再按 Ctrl+C 退出".into(),
+        Msg::MomentEofAgain => "再按 Ctrl+D 退出".into(),
 
         // ── 浮层 ──
         Msg::OverlayEmptyFile => "  (空文件)".into(),
@@ -51,6 +53,13 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ViewPickerEmpty => "这里还没有能看的文件".into(),
 
         // ── 补全菜单与策略介入 ──
+        Msg::MentionAll => "全部".into(),
+        Msg::MentionFiles => "文件与目录".into(),
+        Msg::MentionEmpty => "  暂无匹配条目".into(),
+        Msg::MentionLegend => "  Enter/Tab 插入 · Esc 关闭 · ↑/↓ 选择 · ←/→ 切换分类".into(),
+        Msg::MentionSessions => "会话".into(),
+        Msg::MentionSelected => "已选中".into(),
+        Msg::MentionFilter => "切换类别 · Enter / Tab".into(),
         Msg::MenuFolder => "目录".into(),
 
         // ── 模型提供方面板 ──
@@ -120,6 +129,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::AskReviewSend => "提交回答".into(),
         Msg::AskReviewCancel => "取消".into(),
         Msg::AskUnanswered => "（未回答）".into(),
+        Msg::AskPending { id } => format!("等待窗口已结束（#{id}）· /goal questions 查看当前待答").into(),
         Msg::AskLegendToggle => "勾选".into(),
         Msg::AskLegendSwitch => "切换题目".into(),
         Msg::AskLegendCaret => "移动光标".into(),
@@ -138,6 +148,15 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         // ── 状态栏 ──
         Msg::StatusMember { name } => format!("成员 {name}").into(),
         Msg::StatusStopping => "停止中".into(),
+        Msg::GoalStageEvaluating => "本轮回复已结束，正在验收目标；尚未确认目标完成。".into(),
+        Msg::GoalStageContinuing { detail } => format!("目标尚未确认达成，正在继续执行。续跑说明：{detail}").into(),
+        Msg::GoalStageRecovering => "目标模型请求失败，正在自动恢复；此前回复仍然保留。".into(),
+        Msg::GoalStagePaused { detail } => format!("目标已暂停：{detail}。用 /goal report 查看详情。").into(),
+        Msg::GoalEvaluatorRecovery { attempt: 0, .. } => "正在评估目标".into(),
+        Msg::GoalProviderRecovery { secs: 0, .. } => "正在重试模型请求".into(),
+        Msg::GoalEvaluatorRecovery { secs: 0, .. } => "正在重试目标评估".into(),
+        Msg::GoalProviderRecovery { attempt, max, secs } => format!("模型恢复 {attempt}/{max} · {secs}s").into(),
+        Msg::GoalEvaluatorRecovery { attempt, max, secs } => format!("评估恢复 {attempt}/{max} · {secs}s").into(),
         Msg::StatusGoal => "目标".into(),
         Msg::StatusLoop => "循环".into(),
         Msg::StatusRoundsHeld { kind, rounds, why } => {
@@ -224,7 +243,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
 
         // ── 对话里的旁注 ──
         Msg::TranscriptCompacted { through } => {
-            format!("已把这里之前的对话压成一段摘要(到 #{through})").into()
+            format!("已压缩模型的早前上下文(到 #{through})；保留的开场消息是历史参考，不是新指令。原始历史仍可向上查看。").into()
         }
         Msg::TranscriptShortened { count } => {
             format!("模型看到的 {count} 处工具输出被就地换短了;这里显示的仍是原文").into()
@@ -257,6 +276,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         // ── what each command is for (`commands.rs`) ──
         Msg::CmdAboutQuit => "退出".into(),
         Msg::CmdAboutReasoning => "思考:展开或隐藏已收到的内容".into(),
+        Msg::CmdAboutErrors => "展开或折叠模型错误的原始详情".into(),
         Msg::CmdAboutTools => "工具输出:全部、单个摘要、成组摘要;不带参数则循环".into(),
         Msg::CmdAboutShowInject => "环境注入:收起、只留标签、全文,循环;不带名字则全部".into(),
         Msg::CmdAboutMouse => "把鼠标交还终端,或收回来".into(),
@@ -281,6 +301,9 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SuspendUnsupported => {
             "这里没法挂起(Ctrl+Z):Windows 没有,或启动方设成了不许挂起。单条命令可以用 !命令,或另开一个终端。".into()
         }
+        Msg::CmdAboutRead => "在终端内阅读对话和展开的工具输出".into(),
+        Msg::ReadLegend => "Esc 返回 · ↑↓/jk · PgUp/Dn/^B/F 翻页 · ^U/D 半页 · Home/End 首尾".into(),
+        Msg::ReadUnavailable => "当前界面未挂载阅读面板。".into(),
         Msg::CmdAboutRaw => "把整段对话原样打到终端里,用终端自己的拖选、滚动、搜索;按任意键回来".into(),
         Msg::CmdAboutKeys => "列出快捷键".into(),
         Msg::CmdAboutTodo => "列出计划清单;`add <任务>` 加一项、`clear` 清空;`show`/`hide` 开关面板".into(),
@@ -367,6 +390,13 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ClipboardHasNothing => "剪贴板里没有能贴的东西;`/paste 路径` 可以贴一个文件 —— 是图就当附件,别的当文字".into(),
         Msg::FileIsEmpty { path } => format!("{path} 是空的").into(),
         Msg::FileUnreadable { path, error } => format!("读不了 {path}:{error}").into(),
+        Msg::KeybindingsMenu => "换行快捷键 · ↑/↓选择 · Enter/A添加 · M手动填写\nDelete移除 · Ctrl+D恢复默认 · Esc返回".into(),
+        Msg::KeybindingsCapture => "请按下组合键… Esc取消，Tab手动填写。\n支持 F1–F24、Alt+J 等；冲突时提示。\n若按键被IDE拦截，请在IDE中放行，或手动填写名称。".into(),
+        Msg::KeybindingsConfirm { key } => format!("已识别：{key} · Enter保存 · Esc取消").into(),
+        Msg::KeybindingsManual => "输入按键名称，用逗号分隔（f3, alt+j）\n支持 F1–F24、Alt+J 等；冲突时提示。\nEnter保存 · Esc取消 · Ctrl+U清空".into(),
+        Msg::KeybindingsEmpty => "未绑定换行组合键；仍可使用反斜杠 + Enter换行".into(),
+        Msg::KeybindingsError { error } => format!("快捷键未更新：{error}").into(),
+        Msg::KeysHelpWithNewline { keys } => zh_cn(Msg::KeysHelp).replace("Shift+Enter / Ctrl+J", keys).into(),
         Msg::KeysHelp => r#"
   键盘快捷键
 
@@ -374,7 +404,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
     Enter                           发送消息
     Shift+Enter / Ctrl+J            插入换行
     Ctrl+W                          删除前一个单词
-    Ctrl+D                          退出
+    Ctrl+D                          删除当前字符；空闲且输入为空时连按两次退出
+    Ctrl+B / Ctrl+F                 前移 / 后移一个字符
+    Ctrl+A / Ctrl+E                 到当前行首 / 行尾
+    Ctrl+U / Ctrl+K                 删除到当前行首 / 行尾
     Ctrl+Z                          挂起回到 shell，fg 回来（Windows 不支持）
     Up / Down                       在输入里移动游标，到头则翻历史
     Ctrl+P / Ctrl+N                 翻历史（鼠标交还终端时 ↑↓ 用来滚动对话）
@@ -390,7 +423,9 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
     Ctrl+C                          清空输入；再按一次退出
 
   ── 翻看与显示 ──
-    PgUp / PgDn / 滚轮              滚动对话
+    PgUp / PgDn                     按屏翻页（保留一行重叠）
+    /read                           终端内阅读对话及完整工具输出；Esc 返回草稿
+    滚轮                            逐行滚动对话
     拖动选中                        选中并复制
     Esc                             取消选中
     点击折叠行                      展开或收起思考 / 工具调用那一条
@@ -645,7 +680,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "已注销 MCP 服务 '{server}':保存的 OAuth Token 已移除(如有),正在重载 MCP。"
         )
         .into(),
-        Msg::Reloaded => "已重新读取 skills、MCP 与配置".into(),
+        Msg::Reloaded => "重新加载完成；已加载的指令来源可在 /status 查看。轻量 skill 重载不刷新指令正文".into(),
         Msg::SignedOut => "已登出;/login 重新登录".into(),
         Msg::SignedIn => "已登录".into(),
 
@@ -677,10 +712,12 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::McpActionUntrust => "取消信任".into(),
         Msg::McpActionLogin => "认证".into(),
         Msg::McpActionLogout => "登出".into(),
+        Msg::McpActionReconnect => "重连".into(),
         Msg::McpActionEnable => "启用".into(),
         Msg::McpActionDisable => "停用".into(),
-        Msg::McpLegendList => "↑/↓ 移动 · Enter 详情 · Esc 关闭".into(),
-        Msg::McpLegendDetail => "↑/↓ 移动 · Enter 执行 · Esc 返回".into(),
+        Msg::McpRefreshTimeout => "MCP 状态刷新超时，按 Ctrl+R 重试".into(),
+        Msg::McpLegendList => "↑/↓ 移动 · Enter 详情 · Esc 关闭 · Ctrl+R 刷新".into(),
+        Msg::McpLegendDetail => "↑/↓ 移动 · Enter 执行 · Esc 返回 · Ctrl+R 刷新".into(),
         Msg::McpLegendBusy => "Esc 取消".into(),
         Msg::McpLegendBusyHide => "Esc 收起".into(),
         Msg::McpLegendCancelling => "正在取消… · Esc 收起".into(),
@@ -879,6 +916,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::MenuCopyAllAbout => "把输入框写到剪贴板".into(),
         Msg::MenuPaste => "粘贴".into(),
         Msg::MenuPasteAbout => "从剪贴板插入".into(),
+        Msg::MenuNewline => "换行".into(),
+        Msg::MenuNewlineAbout => "在光标处换行（Ctrl+J）".into(),
         Msg::MenuClear => "清空".into(),
         Msg::MenuClearAbout => "丢掉草稿和附件".into(),
         Msg::MenuSend => "发送".into(),
@@ -903,6 +942,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PluginTabMarkets => "市场".into(),
         Msg::PluginHookTrustedShort => "hook 已信任".into(),
         Msg::PluginHookUntrustedShort => "hook 未信任".into(),
+        Msg::PluginHookIncompatibleShort => "hook 配置不兼容".into(),
+        Msg::PluginHooksIncompatible { id } => format!("`{id}` 的 hook 配置不兼容。请更新或修复插件；运行 atomcode hooks list 查看详情，重新授权不能解决。").into(),
         Msg::PluginActionTrust => "信任 hook".into(),
         Msg::PluginActionUntrust => "取消信任 hook".into(),
         Msg::PluginActionTrustAbout => "允许这个插件当前的 hook 命令运行".into(),
@@ -942,10 +983,30 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::TurnTools { tools } => format!("{tools} 工具").into(),
         Msg::TurnCached { pct } => format!("本轮缓存 {pct}%").into(),
         Msg::SessionCached { pct } => format!("缓存 {pct}%").into(),
+        Msg::StopProviderError => "模型服务错误 · 本次模型请求失败".into(),
+        Msg::ProviderBusy => "模型服务繁忙".into(),
+        Msg::ProviderUnavailable => "模型服务暂不可用".into(),
+        Msg::ProviderAccessDenied => "模型服务拒绝了请求".into(),
+        Msg::ProviderAuthenticationFailed => "模型服务身份验证失败".into(),
+        Msg::ProviderRateLimitError => "模型服务限流".into(),
+        Msg::ProviderConnectionError => "无法连接模型服务".into(),
+        Msg::ProviderUnknownError => "模型请求失败".into(),
+        Msg::ProviderTryAgain => "可稍后输入“继续”，或切换模型后继续。".into(),
+        Msg::ProviderCheckAccess => "请检查当前模型的访问权限，或联系服务提供方。".into(),
+        Msg::ProviderCheckCredentials => "请检查模型服务的 API Key 和认证配置。".into(),
+        Msg::ProviderCheckRequest => "请查看错误详情，检查模型配置或联系服务提供方。".into(),
+        Msg::ProviderCheckConnection => "请检查网络连接和模型服务地址，然后重试。".into(),
+        Msg::ProviderNoFallback => "当前模型未找到可用的备用路由，无法自动切换。".into(),
+        Msg::ProviderRetryDetailsHint => "详情：/errors".into(),
+        Msg::ProviderErrorDetails => "原始错误详情 · 点击展开/收起，或 /errors show".into(),
+        Msg::ProviderErrorStatus { reason, status } => format!("{reason} ({status})").into(),
+        Msg::TeamPanelEmpty => "当前没有团队成员或后台任务，暂无可展示的团队面板。".into(),
+        Msg::TeamPanelExpanded => "团队面板已展开。".into(),
+        Msg::TeamPanelCollapsed => "团队面板已收起。".into(),
         Msg::StopCancelled => "已中断".into(),
         Msg::StopMaxRounds => "已中断 · 轮数用完了".into(),
         Msg::StopByPolicy => "已中断 · 一条停止策略叫停(时限或预算)".into(),
-        Msg::StopRunawayFuse => "已中断 · 兜底熔断,这棵树没挂停止策略".into(),
+        Msg::StopRunawayFuse => "已中断 · 已达到执行循环安全上限".into(),
         Msg::StopToolLoop => {
             "已中断 · 模型反复同一步、没有进展 —— 换个说法或给点提示,再发一条消息继续".into()
         }
@@ -975,10 +1036,11 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::LiveSilentFor { secs } => format!("已 {secs} 秒没有新内容").into(),
         Msg::LiveRunningTools { n } => format!("正在运行 {n} 个工具").into(),
         Msg::LiveElapsed { took } => format!("耗时 {took}").into(),
-        Msg::LiveIn { tokens } => format!("入 {tokens}").into(),
-        Msg::LiveOut { tokens } => format!("出 {tokens}").into(),
+        Msg::LiveIn { tokens } => format!("↑ {tokens}").into(),
+        Msg::LiveOut { tokens } => format!("↓ {tokens}").into(),
         Msg::LiveCached { hit } => format!("缓存 {hit}").into(),
-        Msg::LiveStep { step } => format!("第 {step} 步").into(),
+        Msg::LiveSpeedPending => "— tok/s".into(),
+        Msg::LiveSpeed { rate } => format!("{rate} tok/s").into(),
         Msg::FoldedLines { hidden } => format!("⋯ 已折叠 {hidden} 行，点击展开").into(),
         Msg::MoreBelow { arrow, lines } => format!(" {arrow} 还有 {lines} 行 · 点击回到底部 ").into(),
 
@@ -1056,6 +1118,21 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::HostHeld => "停着".into(),
         Msg::SourceConfigFile => "配置文件".into(),
         Msg::SourceSettings => "设置".into(),
+        Msg::SourceLoaded => "已加载".into(),
+        Msg::SourceShadowed => "被遮蔽，未加载".into(),
+        Msg::SourceEmpty => "空文件，未加载".into(),
+        Msg::SourceUnreadable => "无法读取，未加载".into(),
+        Msg::SourceNotLoaded => "未加载".into(),
+        Msg::SourceDiskChanged => "磁盘已变更；恢复会话时刷新指令".into(),
+        Msg::SourceSkillDirs => crate::product::t_with(crate::Locale::ZhCn, crate::product::Msg::CmdCatalogSkillDirs),
+        Msg::SourceSkills => "已加载的 skill".into(),
+        Msg::SourceSkillDiagnostics => crate::product::t_with(crate::Locale::ZhCn, crate::product::Msg::CmdCatalogSkillDiagnostics),
+        Msg::SourceSkillSummary { loaded, directories, overridden, failed } => {
+            let mut text = format!("已加载 {loaded} 个 · 扫描目录 {directories} 个");
+            if overridden > 0 { text.push_str(&format!(" · 同名覆盖 {overridden} 个")); }
+            if failed > 0 { text.push_str(&format!(" · 加载失败 {failed} 个")); }
+            text.push_str("\n输入 /skills 查看详情"); text.into()
+        },
         Msg::SourceInstructionFiles => "指令文件".into(),
         Msg::SourceMemoryFiles => "记忆文件".into(),
         Msg::HostNoEditableConfig => "这个宿主没有可改的配置".into(),
@@ -1165,16 +1242,6 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::OnboardSignedInConfigNotWritten { error } => format!("登录成了，但配置没写成：{error}").into(),
         Msg::CmdAboutOnboarding => "把这台机器配到能干活：语言、登录、看一眼结果".into(),
         Msg::CmdAboutOnboardingFinished => "引导走完了".into(),
-        Msg::ClassicOnlyForNow { command } => format!(
-            "/{command} 暂时只在经典界面里有：退出后用 `atomcode --classic` 打开（会话是同一份）。\
-             新界面的版本在做。"
-        )
-        .into(),
-        Msg::CmdAboutClassicOnly => "暂时只在经典界面里有".into(),
-        Msg::LivesInTheCli { command, run } => {
-            format!("/{command} 归命令行：退出后运行 `{run}`。").into()
-        }
-        Msg::CmdAboutInTheCli => "归命令行".into(),
         Msg::RollbackConfirmSwitch => "会切换到上一版本,并在这个目录里重新启动 AtomCode。".into(),
         Msg::RollbackConfirmNoUpdates => {
             "之后不再自动升级;想回到新版本时运行 /upgrade(或命令行 `atomcode upgrade`)。".into()
@@ -1185,8 +1252,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         )
         .into(),
         Msg::ShareNoModel => "还没有配好模型——先 /login 或 /model".into(),
-        Msg::CmdAboutWebui => "把这个会话共享给浏览器(lan 暴露到局域网;stop 结束)".into(),
-        Msg::WebuiTakes => "[lan | --host <地址>] [--port <端口>] [--no-open] | stop".into(),
+        Msg::CmdAboutWebui => "浏览器共享，手机可扫码走中继(--local 仅本机;stop 结束)".into(),
+        Msg::WebuiTakes => "[--local | lan | --host <地址>] [--port <端口>] [--no-open] | stop".into(),
         Msg::WebuiInvalidArguments { argument } => format!("/webui 参数 `{argument}` 无效或缺少参数值。用法：/webui [lan | --host <地址>] [--port <0-65535>] [--no-open]，或 /webui stop。").into(),
         Msg::CmdAboutSync => "共享这个会话,但什么也不打开(off 停止)".into(),
         Msg::SyncTakes => "[off]".into(),

@@ -37,9 +37,15 @@ fn screen_catalogue() -> Vec<Command> {
             "[full|head|each|group]".into(),
             t(Msg::CmdAboutTools),
         ),
+        Command::said_taking(
+            "errors",
+            "[show|hide|toggle]".into(),
+            t(Msg::CmdAboutErrors),
+        ),
         Command::said("showinject", t(Msg::CmdAboutShowInject)),
         Command::said("mouse", t(Msg::CmdAboutMouse)),
         Command::said("raw", t(Msg::CmdAboutRaw)),
+        Command::said("read", t(Msg::CmdAboutRead)),
         Command::said("keys", t(Msg::CmdAboutKeys)),
         // Taking its row stops on the line (`/todo `) for `add <task>` and the
         // rest to be typed; enter on the bare name still prints the plan. Run
@@ -69,6 +75,24 @@ impl CommandSet for ScreenCommands {
         match name {
             "quit" | "exit" => Outcome::Do(Action::Quit),
             "reasoning" => Outcome::Do(Action::ToggleFold("reasoning")),
+            "errors" => match args.trim().to_ascii_lowercase().as_str() {
+                "" | "toggle" => Outcome::Do(Action::ToggleFold("provider_diagnostic")),
+                "show" | "open" => Outcome::Do(Action::SetFold(
+                    "provider_diagnostic",
+                    crate::host::Showing::Open,
+                )),
+                "hide" | "fold" | "close" => Outcome::Do(Action::SetFold(
+                    "provider_diagnostic",
+                    crate::host::Showing::Folded,
+                )),
+                other => Outcome::Refused(
+                    t(Msg::FoldUsage {
+                        name: "errors",
+                        other,
+                    })
+                    .into_owned(),
+                ),
+            },
             "tools" => match tool_output(&args.to_ascii_lowercase()) {
                 Ok(action) => Outcome::Do(action),
                 Err(why) => Outcome::Refused(why),
@@ -79,6 +103,7 @@ impl CommandSet for ScreenCommands {
             },
             "mouse" => Outcome::Do(Action::ToggleMouse),
             "raw" => Outcome::Do(Action::ShowTranscript),
+            "read" => Outcome::Do(Action::ReadTranscript),
             // The two panels a person toggles by name. Same gesture the fold
             // keys are, so a command and a key share one implementation — and
             // with a state named, the flat setter, because a toggle means the
@@ -152,7 +177,18 @@ impl CommandSet for ScreenCommands {
             },
             "config" => Outcome::Do(Action::ToggleSettings),
             "provider" => Outcome::Do(Action::ToggleProviders),
-            "keys" => Outcome::Said(t(Msg::KeysHelp).into_owned()),
+            "keys" => {
+                let names = ctx
+                    .service::<crate::plugin::KeysSvc>()
+                    .map(|keys| keys.newline_names())
+                    .unwrap_or_else(crate::keymap::default_newline_names);
+                let names = if names.is_empty() {
+                    "∅".into()
+                } else {
+                    names.join(" / ")
+                };
+                Outcome::Said(t(Msg::KeysHelpWithNewline { keys: &names }).into_owned())
+            }
             _ => Outcome::Quiet,
         }
     }
@@ -869,11 +905,22 @@ fn review_prompt(arg: &str) -> String {
         Some(depth) => format!(r#"{{"scope":{scope_json},"depth":"{depth}"}}"#),
         None => format!(r#"{{"scope":{scope_json}}}"#),
     };
+    let args = if focus.is_empty() {
+        args
+    } else {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&args).expect("valid review arguments");
+        value["instructions"] = serde_json::Value::String(focus.to_owned());
+        value.to_string()
+    };
     let ask = format!(
         "/review {arg}\nReview the requested changes: call the `code_review` tool with {args}, then give me a \
-         concise summary of its findings."
+         concise summary of its findings. Preserve the user's instructions in the tool call and \
+         summary. If they requested conclusions only or no edits, stop after reporting without \
+         applying fixes. Otherwise, follow their authorized task; findings are not new authorization \
+         to modify files."
     );
-    // 关注点是人的原话,不是参数:交给评审自己去读,而不是塞进工具的 schema。
+    // 保留原话给外层汇总,同时通过 instructions 传到后台和内层 reviewer。
     match focus {
         "" => ask,
         focus => format!("{ask} The person also said: {focus}"),
@@ -1112,9 +1159,9 @@ impl CommandSet for SessionCommands {
             control.ok_or_else(|| Outcome::Refused(t(Msg::NoHost).into_owned()))
         };
         // A command that replaces the conversation (a new session, another
-        // session, another directory, a reload) or rewinds it, typed while the
-        // lead's turn runs. The runtime refuses it until the turn is over, and
-        // its own word for that is "busy" — which says neither why nor what to
+        // directory, a reload) or rewinds it, typed while the lead's turn runs.
+        // The runtime refuses it until the turn is over, and its own word for
+        // that is "busy" — which says neither why nor what to
         // do. Said here instead, before anything is asked: wait for the turn, or
         // stop it with Esc.
         let waits_for_the_turn = |command: &str| {
@@ -1395,11 +1442,8 @@ impl CommandSet for SessionCommands {
                         Err(error) => Outcome::Refused(refusal(error)),
                     };
                 }
-                // The list above is only a look and is fine mid-turn; going to
-                // another session is not.
-                if let Some(refused) = waits_for_the_turn(name) {
-                    return refused;
-                }
+                // The terminal host can keep the running session in a background
+                // slot. It owns admission, preparation and any refusal.
                 match control
                     .call(HostCommand::Resume {
                         session: root.clone(),
@@ -2261,94 +2305,7 @@ impl CommandSet for SessionCommands {
                     Err(error) => Outcome::Refused(refusal(error)),
                 }
             }
-            // What a person asks when they come back to a window and cannot
-            // remember which one it is. Everything here is already on screen
-            // somewhere — this is the one place that says it all at once.
-            "status" => {
-                let described = client.described();
-                // Everything the Status page says — who is signed in, the plan
-                // and when it runs out, what is left of the allowance, where the
-                // configuration came from — gathered and laid out by the same
-                // code the page uses. This command said only the session, the
-                // model and the directory, and the account and the plan's expiry
-                // the other front end's `/status` showed went missing.
-                if let Some(control) = control.clone() {
-                    let page = crate::settings::gather_status(
-                        control.clone(),
-                        root.clone(),
-                        described.clone(),
-                        None,
-                    )
-                    .await;
-                    let mut said = crate::modules::settings::status_text(&page);
-                    if let Ok(HostReply::Autonomy {
-                        running: Some(running),
-                    }) = control
-                        .call(HostCommand::Autonomy {
-                            session: root.clone(),
-                        })
-                        .await
-                    {
-                        said.push_str("\n\n");
-                        said.push_str(&t(Msg::StatusAutonomyLine {
-                            what: &running.what,
-                            round: running.round,
-                            took: &crate::text::spoken_duration(running.elapsed_secs),
-                        }));
-                    }
-                    return Outcome::Said(said);
-                }
-                let model = described
-                    .as_ref()
-                    .and_then(|d| d.model.clone())
-                    .unwrap_or_else(|| t(Msg::StatusNoModel).into_owned());
-                let effort = described
-                    .as_ref()
-                    .and_then(|d| d.reasoning_effort)
-                    .map(|level| level.as_str().to_string())
-                    .unwrap_or_else(|| t(Msg::StatusEffortDefault).into_owned());
-                let mut lines = vec![
-                    t(Msg::StatusSessionLine {
-                        session: &client.session(),
-                    })
-                    .into_owned(),
-                    t(Msg::StatusModelLine {
-                        model: &model,
-                        effort: &effort,
-                    })
-                    .into_owned(),
-                ];
-                // Where the session works is the host's to say; with no answer
-                // the line is left out rather than filled with the session id.
-                if let Ok(here) = working_dir(control.clone(), root.clone()).await {
-                    lines.push(
-                        t(Msg::StatusWhereLine {
-                            where_: &crate::text::collapse_home(&here),
-                        })
-                        .into_owned(),
-                    );
-                }
-                if let Some(control) = control {
-                    if let Ok(HostReply::Autonomy {
-                        running: Some(running),
-                    }) = control
-                        .call(HostCommand::Autonomy {
-                            session: root.clone(),
-                        })
-                        .await
-                    {
-                        lines.push(
-                            t(Msg::StatusAutonomyLine {
-                                what: &running.what,
-                                round: running.round,
-                                took: &crate::text::spoken_duration(running.elapsed_secs),
-                            })
-                            .into_owned(),
-                        );
-                    }
-                }
-                Outcome::Said(lines.join("\n"))
-            }
+            "status" => Outcome::Do(Action::OpenStatus),
             "whoami" => {
                 let control = match host(control) {
                     Ok(control) => control,
@@ -3147,6 +3104,9 @@ impl CommandSet for AgentCatalogCommands {
             .filter(|c| !described_command_is_skill(c))
             .map(|c| {
                 let is_skills = c.name == "skills";
+                // Picking /goal prepares its condition for editing. Its bare
+                // status/help behavior remains available on explicit submit.
+                let edit_goal = c.name == "goal";
                 Command {
                     name: c.name.into(),
                     about: c.summary.into(),
@@ -3162,7 +3122,7 @@ impl CommandSet for AgentCatalogCommands {
                     },
                     // Picking `/skills` enters that second level. With no skills
                     // installed it remains a bare command and can say so itself.
-                    require_arg: is_skills && !skill_options.is_empty(),
+                    require_arg: edit_goal || (is_skills && !skill_options.is_empty()),
                     // The agent's commands are described, not typed with keys.
                     secret_args: false,
                 }
@@ -3712,6 +3672,37 @@ mod tests {
     }
 
     #[test]
+    fn picking_goal_leaves_room_for_its_condition() {
+        let client = Arc::new(crate::plugin::AgentClient::default());
+        client.follow("lead");
+        client.describe(&atomcode_kernel::agent::AgentDescription {
+            session: "lead".into(),
+            commands: vec![atomcode_kernel::agent::CommandDescription {
+                name: "goal".into(),
+                usage: Some("[condition]".into()),
+                summary: "Work toward a goal".into(),
+                target: atomcode_kernel::agent::CommandTarget::Session,
+            }],
+            ..Default::default()
+        });
+        let set = AgentCatalogCommands { client };
+        let goal = set
+            .commands()
+            .into_iter()
+            .find(|c| c.name == "goal")
+            .unwrap();
+        assert!(
+            goal.require_arg,
+            "a menu pick must complete instead of dispatching"
+        );
+        assert!(
+            goal.takes.is_some(),
+            "completion leaves a space for the condition"
+        );
+        assert!(goal.options.is_empty(), "the condition is free text");
+    }
+
+    #[test]
     fn skills_are_a_second_level_menu_and_stay_dispatchable() {
         let _locale = crate::i18n::test_lock();
         crate::i18n::set_locale(crate::i18n::Locale::ZhCn);
@@ -3827,7 +3818,6 @@ mod tests {
         for line in [
             "/clear",
             "/session",
-            "/resume other",
             "/cd /tmp",
             "/undo",
             "/rewind",
@@ -3942,8 +3932,10 @@ mod tests {
                 },
                 HostCommand::Sources { .. } => HostReply::Sources {
                     groups: vec![atomcode_host_api::SourceGroup {
+                        summary: None,
                         label: "指令文件".into(),
                         files: vec![atomcode_host_api::SourceFile {
+                            detail: None,
                             label: "项目".into(),
                             path: "/work/AGENTS.md".into(),
                             present: false,
@@ -3958,11 +3950,9 @@ mod tests {
         }
     }
 
-    /// `/status` says what the Status page says: who is signed in, the plan and
-    /// when it runs out — which is what the other front end's `/status` showed
-    /// and this one had dropped — and where the configuration came from.
+    /// The Status panel retains account, plan and configuration details.
     #[tokio::test]
-    async fn status_says_who_is_signed_in_and_when_the_plan_runs_out() {
+    async fn status_panel_includes_identity_and_plan_expiry() {
         let app = bare();
         let client = Arc::new(crate::plugin::AgentClient::default());
         let (commands, _agent) = tokio::sync::mpsc::unbounded_channel();
@@ -3973,10 +3963,18 @@ mod tests {
             .provide::<crate::plugin::AgentClientSvc>(client.clone());
         let all = Arc::new(Commands::new());
         let _ = all.add(Arc::new(SessionCommands));
-        let said = match all.dispatch("/status", &app.context()).await {
-            Outcome::Said(said) => said,
-            other => panic!("{other:?}"),
-        };
+        assert!(matches!(
+            all.dispatch("/status", &app.context()).await,
+            Outcome::Do(Action::OpenStatus)
+        ));
+        let page = crate::settings::gather_status(
+            Arc::new(Answering),
+            "lead".into(),
+            client.described(),
+            None,
+        )
+        .await;
+        let said = crate::modules::settings::status_text(&page);
         for expected in [
             "lead",
             "lichao",
@@ -4998,8 +4996,13 @@ mod tests {
             "`unpinned-dir` 同理"
         );
         // 而真的子命令仍然是子命令。
+        // A path spelled the way this host spells it: `/srv/x` is not absolute on
+        // Windows, so the pin would ask the host to resolve it instead of reaching the
+        // missing places port — a different refusal than the one asserted here.
+        let target = if cfg!(windows) { r"C:\srv\x" } else { "/srv/x" };
         assert_eq!(
-            all.dispatch("/cd pin /srv/x", &app.context()).await,
+            all.dispatch(&format!("/cd pin {target}"), &app.context())
+                .await,
             Outcome::Refused(t(Msg::NoPlaces).into_owned()),
             "后面跟空格的才是子命令"
         );
@@ -5141,6 +5144,11 @@ mod tests {
         host.replies.lock().unwrap().extend([
             Ok(HostReply::Autonomy {
                 running: Some(atomcode_host_api::Running {
+                    usage: None,
+                    recovering: false,
+                    retry_in_secs: None,
+                    goal_stage: None,
+                    goal_detail: None,
                     kind: "goal".into(),
                     what: "测试全过".into(),
                     round: 3,
@@ -5151,6 +5159,11 @@ mod tests {
             }),
             Ok(HostReply::Autonomy {
                 running: Some(atomcode_host_api::Running {
+                    usage: None,
+                    recovering: false,
+                    retry_in_secs: None,
+                    goal_stage: None,
+                    goal_detail: None,
                     kind: "loop".into(),
                     what: "再看一遍".into(),
                     round: 9,
@@ -5607,6 +5620,14 @@ mod tests {
         (app, all, surface)
     }
 
+    #[tokio::test]
+    async fn copy_code_keeps_yaml_source_without_its_surface_or_header() {
+        let source = "services:\n  api:\n    image: server:latest\n\n    environment:\n      - WORKER_CONCURRENCY=2";
+        let (app, all, surface) = answered(&format!("```yaml\n{source}\n```"));
+        let _ = all.dispatch("/copy code", &app.context()).await;
+        assert_eq!(surface.clipboard_text().as_deref(), Some(source));
+    }
+
     /// `/copy code` takes the code out of the last answer and nothing else —
     /// not the prose around it, not the fences. Bare, it is the last block;
     /// the old spellings (`/copy N`, `/copy all`) still work, in any case.
@@ -5885,18 +5906,16 @@ mod tests {
         }
     }
 
-    /// `/status` says where the session works, not which session it is twice.
+    /// Opening Status does not wait for host requests or print a transcript answer.
     #[tokio::test]
-    async fn status_says_the_working_directory() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (app, _client, all) = following(&working_in(dir.path()));
-        match all.dispatch("/status", &app.context()).await {
-            Outcome::Said(text) => assert!(
-                text.contains(&dir.path().display().to_string()),
-                "the where-line names the working directory:\n{text}"
-            ),
-            other => panic!("{other:?}"),
-        }
+    async fn status_opens_the_status_page_without_waiting_for_the_host() {
+        let host = Arc::new(Recording::default());
+        let (app, _client, all) = following(&host);
+        assert!(matches!(
+            all.dispatch("/status", &app.context()).await,
+            Outcome::Do(Action::OpenStatus)
+        ));
+        assert!(host.asked.lock().unwrap().is_empty());
     }
 
     /// `/cd pin` with no directory marks the one the session is working in.
@@ -6289,6 +6308,35 @@ mod tests {
     /// the opposite of itself every other time, which is unusable from a script
     /// or from a session just resumed onto another screen.
     #[tokio::test]
+    async fn error_details_are_accessible_without_a_pointer() {
+        let app = bare();
+        let all = Arc::new(Commands::new());
+        let _ = all.add(Arc::new(ScreenCommands));
+        assert!(matches!(
+            all.dispatch("/errors", &app.context()).await,
+            Outcome::Do(Action::ToggleFold("provider_diagnostic"))
+        ));
+        assert!(matches!(
+            all.dispatch("/errors show", &app.context()).await,
+            Outcome::Do(Action::SetFold(
+                "provider_diagnostic",
+                crate::host::Showing::Open
+            ))
+        ));
+        assert!(matches!(
+            all.dispatch("/errors hide", &app.context()).await,
+            Outcome::Do(Action::SetFold(
+                "provider_diagnostic",
+                crate::host::Showing::Folded
+            ))
+        ));
+        assert!(matches!(
+            all.dispatch("/errors typo", &app.context()).await,
+            Outcome::Refused(_)
+        ));
+    }
+
+    #[tokio::test]
     async fn team_and_todo_take_a_named_state_and_refuse_anything_else() {
         use crate::host::Showing;
         let app = bare();
@@ -6500,7 +6548,7 @@ mod tests {
         // range stays the default, and the words reach the reviewer.
         let said = review_prompt("下代码改动");
         assert!(
-            said.contains(r#"{"scope":{"kind":"working_tree"}}"#),
+            said.contains(r#""scope":{"kind":"working_tree"}"#),
             "{said}"
         );
         assert!(said.contains("下代码改动"), "{said}");
@@ -6519,6 +6567,28 @@ mod tests {
         // An option is never a ref: it would reach git as a flag.
         let flag = review_prompt("--output=x");
         assert!(!flag.contains(r#""base""#), "{flag}");
+    }
+
+    #[test]
+    fn review_constraints_are_in_tool_arguments() {
+        for instruction in [
+            "只给结论，不要修改代码",
+            "审计并修复确认的问题",
+            "重点检查 \"鉴权\"\n只给结论",
+        ] {
+            let prompt = review_prompt(&format!("deep staged {instruction}"));
+            let args = prompt
+                .split("tool with ")
+                .nth(1)
+                .unwrap()
+                .split(", then give me")
+                .next()
+                .unwrap();
+            let args: serde_json::Value = serde_json::from_str(args).unwrap();
+            assert_eq!(args["instructions"], instruction);
+            assert_eq!(args["scope"]["kind"], "staged");
+            assert_eq!(args["depth"], "deep");
+        }
     }
 
     /// A set that carries `/review` the way the agent's catalog does — and, like
@@ -7547,7 +7617,7 @@ mod plugin_tests {
             marketplace: market.into(),
             description: String::new(),
             installed: None,
-            hook_trusted: None,
+            hook_trust: None,
         }
     }
 

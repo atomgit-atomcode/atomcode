@@ -1435,6 +1435,7 @@ fn sanitize_model_for_name(model: &str) -> String {
 /// login token is still never written into the user's `config.toml`.
 fn build_codingplan_provider(entry: &ModelEntry) -> ProviderConfig {
     ProviderConfig {
+        headers: Default::default(),
         provider_type: entry
             .provider_type
             .clone()

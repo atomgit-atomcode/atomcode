@@ -21,6 +21,8 @@ pub struct CodingAgentConfig {
     /// (`CodingRuntimeEvent::ControllerWarning`), which every front end renders;
     /// not stderr, which a full-screen front end is holding.
     pub startup_warnings: Vec<String>,
+    /// Explicit trusted skill roots from `[skills].extra_dirs`.
+    pub extra_skill_dirs: Vec<String>,
     /// Where the product keeps its data — the one place this runtime learns it.
     /// Every capability that persists or guards something (skills, memory, MCP,
     /// sessions, plugins, the credential gates) is built from this, and nothing
@@ -57,6 +59,10 @@ pub struct CodingAgentConfig {
     /// `[tools.output] threshold_bytes`: spill a tool result above this many
     /// bytes instead of the default. `None` leaves the row as the tree mounts it.
     pub tool_output_threshold_bytes: Option<usize>,
+    /// `[tools.mcp] tool_search`: model-facing schema projection, not permissions.
+    pub mcp_tool_search: atomcode_config::config::McpToolSearchMode,
+    /// `[tools.search]` discovery filters and scan budgets.
+    pub tool_search: atomcode_config::config::SearchToolConfig,
     /// Stable config/provider registry key exposed to drivers. This is distinct
     /// from `provider_type`, which selects the adapter implementation.
     pub provider_name: String,
@@ -65,8 +71,8 @@ pub struct CodingAgentConfig {
     pub working_dir: PathBuf,
     /// Model context window in tokens (forwarded to the provider). Default 128k.
     pub context_window: u32,
-    /// Liveness: max byte-idle wait BETWEEN stream events, once the first content byte
-    /// has arrived (inter-token). Default 120s, override via `ATOMCODE_STREAM_TIMEOUT_SECS`.
+    /// Liveness: max wait without content progress, once the first content byte
+    /// has arrived (inter-token). Default 300s, override via `ATOMCODE_STREAM_TIMEOUT_SECS`.
     /// The prefill / first-token wait is governed separately by `first_token_timeout`.
     pub stream_timeout: Duration,
     /// Liveness: max wait for the FIRST content byte (prefill / time-to-first-token).
@@ -74,7 +80,7 @@ pub struct CodingAgentConfig {
     /// than between subsequent tokens, so this budget is separate from — and usually
     /// larger than — `stream_timeout`. Env `ATOMCODE_FIRST_TOKEN_TIMEOUT_SECS` (explicit
     /// value wins), else `max(600s, stream_timeout)` so it never drops below the
-    /// inter-token budget. Once the first byte arrives, `stream_timeout` takes over.
+    /// inter-token budget. Once the first content arrives, `stream_timeout` takes over.
     /// Reconnecting on a slow-but-progressing prefill just restarts it, so we wait longer.
     pub first_token_timeout: Duration,
     /// Liveness: max wait for a driver approval response before it degrades to deny.
@@ -192,20 +198,18 @@ pub struct CodingAgentConfig {
     /// can attribute/slice traffic by version. Restores parity with v1's
     /// `build_http_client`, which the v2 adapters had dropped.
     pub user_agent: Option<String>,
+    pub headers: atomcode_config::provider_headers::ProviderHeaders,
     /// Disable TLS certificate verification (self-signed / internal gateways).
     /// Sourced from `ProviderConfig::skip_tls_verify`; default false.
     pub skip_tls_verify: bool,
-    /// Max attempts (including the first request) for provider OPEN retries;
-    /// when set, also caps kernel-owned HTTP 429 recovery. `None` preserves
-    /// each layer's default.
+    /// Total attempts for a native logical model request, shared by OPEN,
+    /// transient retry, 429 and stream continuation. `None` uses six.
+    /// An explicit upstream retry count takes precedence.
     /// Sourced from `ProviderConfig::retry_max_attempts`.
     pub retry_max_attempts: Option<u32>,
-    /// Global cap on the VISIBLE kernel provider-retry tier (the `重试(N/M)`
-    /// re-opens, now with patient exponential backoff that honors `Retry-After`).
-    /// Sourced from `[network] upstream_retry_max_attempts`. `None` keeps the
-    /// kernel default. When set it takes precedence over the `retry_max_attempts`
-    /// → disable-kernel coupling, so a user on a flaky gateway can keep the fast
-    /// adapter budget small AND make the patient tier more persistent.
+    /// Retry count after the initial attempt, sourced from `[network]
+    /// upstream_retry_max_attempts`. When set, the native shared total is this
+    /// count plus one, taking precedence over the provider's total-attempt cap.
     pub upstream_retry_max_attempts: Option<u32>,
     /// Full provider registry used to resolve task-tool fast/capable tiers.
     pub subagent_config: Option<Arc<atomcode_config::config::Config>>,
@@ -258,6 +262,8 @@ pub fn settle_dir_names(dirs: &atomcode_capabilities::ProductDirs) {
 pub struct CodingRuntimeConfig {
     /// See [`CodingAgentConfig::startup_warnings`].
     pub startup_warnings: Vec<String>,
+    /// Explicit trusted skill roots from `[skills].extra_dirs`.
+    pub extra_skill_dirs: Vec<String>,
     /// See [`CodingAgentConfig::dirs`].
     pub dirs: atomcode_capabilities::ProductDirs,
     pub api_key: String,
@@ -269,6 +275,10 @@ pub struct CodingRuntimeConfig {
     pub atomgit_enabled: bool,
     /// See `CodingAgentConfig::tool_output_threshold_bytes`.
     pub tool_output_threshold_bytes: Option<usize>,
+    /// `[tools.mcp] tool_search`: model-facing schema projection, not permissions.
+    pub mcp_tool_search: atomcode_config::config::McpToolSearchMode,
+    /// `[tools.search]` discovery filters and scan budgets.
+    pub tool_search: atomcode_config::config::SearchToolConfig,
     pub provider_name: String,
     pub working_dir: PathBuf,
     pub context_window: u32,
@@ -293,14 +303,14 @@ pub struct CodingRuntimeConfig {
     /// Parsed `[permissions]` allow/deny rules (see `CodingAgentConfig::permission_rules`).
     pub permission_rules: std::sync::Arc<atomcode_capabilities::tools::PermissionRules>,
     pub user_agent: Option<String>,
+    pub headers: atomcode_config::provider_headers::ProviderHeaders,
     pub skip_tls_verify: bool,
-    /// Max attempts (including the first request) for provider OPEN retries;
-    /// when set, also caps kernel-owned HTTP 429 recovery. `None` preserves
-    /// each layer's default.
+    /// Total attempts for a native logical model request, shared by OPEN,
+    /// transient retry, 429 and stream continuation. `None` uses six.
+    /// An explicit upstream retry count takes precedence.
     pub retry_max_attempts: Option<u32>,
-    /// Global cap on the visible kernel provider-retry tier (`[network]
-    /// upstream_retry_max_attempts`). `None` keeps the kernel default; takes
-    /// precedence over the `retry_max_attempts`→disable-kernel coupling.
+    /// Retry count after the first attempt (`[network] upstream_retry_max_attempts`).
+    /// Takes precedence over the provider's shared total-attempt cap.
     pub upstream_retry_max_attempts: Option<u32>,
     pub loop_max_rounds: u32,
     pub turn_max_rounds: u32,
@@ -326,6 +336,8 @@ pub fn lsp_settings_from_config(
     config: &atomcode_config::config::LspConfig,
 ) -> atomcode_capabilities::codeintel::LspSettings {
     atomcode_capabilities::codeintel::LspSettings {
+        ide_connection_file: config.ide_connection_file.clone(),
+        ide_discovery_dir: config.ide_discovery_dir.clone(),
         enabled: config.enabled,
         auto_detect: config.auto_detect,
         settle_delay_ms: config.diagnostics_settle_delay_ms,
@@ -396,12 +408,29 @@ pub fn describe_config_file_for(
          - Model: `default_model` names a `[models.<id>]` entry (`account`, `model`, and \
          optional `context_window`, `max_tokens`, `supports_vision`, `reasoning_effort`, \
          `capable_model`, `note`) whose `account` is a `[provider_accounts.<id>]` entry \
-         (`provider`, `api_key`, `base_url`). The legacy form is `default_provider` naming \
+         (`provider`, `api_key`, `base_url`, optional `headers` map). Headers can authenticate \
+         with an empty API key; custom names override defaults. Header values are secrets. The legacy form is `default_provider` naming \
          a `[providers.<name>]` entry (`type`, `model`, `api_key`, `base_url`, …); \
          `default_model` wins. An `api_key` may be written `${{VAR}}`. `capable_model` \
          ranks models for `task` and `team`: the lowest rank is the fast tier, the \
          highest the capable one.\n\
+         - `[skills]` `extra_dirs`: additional trusted skill roots, e.g. [`~/shared-skills`]. \
+         Relative paths use the session working directory; `~` uses the user home. Standard \
+         roots take precedence over extra roots; later extra roots win among themselves. \
+         Skill files can contain executable workflows. Existing permission checks still apply. \
+         Directory configuration is read when this runtime is configured; skill reload re-reads \
+         those directories, not config.toml.\n\
          - `evaluator_provider`: the model that judges whether a `/goal` is met.\n\
+         - `[goal.recovery]`: transient goal outage recovery, using the selected model. \
+         `max_attempts` (default 12) and `max_elapsed_secs` (1800) bound new retries; \
+         `base_delay_secs` (30) / `max_delay_secs` (300) set backoff. \
+         `evaluator_max_attempts` (3) retries only the verdict, with \
+         `evaluator_timeout_secs` (600) per attempt. Zero attempts disables that tier. \
+         Optional `[goal.recovery.long_wait]` adds low-frequency main retries after that: \
+         `max_attempts` (32), `max_elapsed_secs` (28800), `interval_secs` (900). \
+         Omit the table to disable long waits; zero short attempts disables both stages. \
+         Existing goal caps and permissions still apply. Automatic retries stop on process exit; \
+         native persistent sessions restore unfinished goals paused for review.\n\
          - `[permissions]` `allow` / `deny`: rules such as `Bash(git *)`, `Read(<path>)` or \
          `mcp__<server>__<tool>`. `deny` wins, and `allow` never opens a sensitive path.\n\
          - `[coding]` `max_rounds` (per turn; 0 = no cap; `ATOMCODE_TURN_MAX_ROUNDS` wins), \
@@ -412,18 +441,21 @@ pub fn describe_config_file_for(
          the ordinary approval rules (`off`).\n\
          - `[loop_config]` `max_rounds`: how many passes a `/loop` may run (default 100; \
          0 = no cap).\n\
-         - `[subagent]` `max_concurrent` (default 3) and `max_rounds` (default 200) for \
+         - `[subagent]` `max_concurrent` (default 3) and `max_rounds` (default 0 = unbounded) for \
          delegated execution; `[team]` `max_members` (default 6) limits the persistent \
          roster, including idle members; `codex` / `claude` = `off` | `read-only` | `accept-edits` | \
          `auto`, and `[[subagent.external]]` entries (`name`, `kind` = `codex` | \
          `claude-code`, `model`, `permission`, `timeout_secs`, `enabled`), add the Codex \
          or Claude Code CLI as a delegate where the front end allows it.\n\
          - `[tools.todo]` `enabled`, and `eager` = `auto` | `preferred` | `always`.\n\
+         - `[tools.mcp]` `tool_search`: `auto` (default), `on`, or `off`; \
+         lazily expose large MCP schemas through `mcp_search`, without changing approvals.\n\
+         - `[tools.search]` `respect_gitignore`, `include_hidden`, `follow_symlinks`, `timeout_secs`, `max_entries`: Glob/Grep discovery defaults; per-project search.toml under the product settings directory overrides individual keys; permissions still apply.\n\
          - `[tools.output]` `threshold_bytes`: a tool result larger than this (default \
          51200, clamped to 46080..=4194304) is saved whole and shown as a head + tail \
          preview that `fetch_output` reads past; `ATOMCODE_TOOL_OUTPUT_THRESHOLD_BYTES` \
          wins.\n\
-         - `[lsp]` `enabled`, `auto_detect`, and `[lsp.servers.<extension>]` = \
+         - `[lsp]` `enabled`, `auto_detect`, `ide_discovery_dir` (opt-in private window discovery), `ide_connection_file` (private IDE window binding path), and `[lsp.servers.<extension>]` = \
          `{{ command, args, root_markers }}`.\n\
          - `[web_search]` `provider` = `exa` | `duckduckgo`, and `api_key` for Exa; the \
          `ATOMCODE_WEB_SEARCH_PROVIDER` and `EXA_API_KEY` environment variables win.\n\
@@ -512,6 +544,7 @@ impl CodingRuntimeConfig {
             .extend(crate::parts::resolve_external_subagents(&config.subagent, interactive).1);
         Self {
             startup_warnings,
+            extra_skill_dirs: config.skills.extra_dirs.clone(),
             dirs,
             api_key: r.and_then(|r| r.api_key.clone()).unwrap_or_default(),
             base_url: r.and_then(|r| r.base_url.clone()).unwrap_or_default(),
@@ -527,6 +560,8 @@ impl CodingRuntimeConfig {
                 config.tools.atomgit.enabled,
             ),
             tool_output_threshold_bytes: config.tools.output.threshold_bytes,
+            mcp_tool_search: config.tools.mcp.tool_search,
+            tool_search: config.tools.search.clone(),
             provider_name: r.map(|r| r.selection_id.clone()).unwrap_or_default(),
             working_dir: working_dir.to_path_buf(),
             context_window: r.map(|r| r.context_window as u32).unwrap_or(128_000),
@@ -551,6 +586,7 @@ impl CodingRuntimeConfig {
             ),
             permission_rules: std::sync::Arc::new(permission_rules),
             user_agent: r.and_then(|r| r.user_agent.clone()),
+            headers: r.map(|r| r.headers.clone()).unwrap_or_default(),
             skip_tls_verify: r.map(|r| r.skip_tls_verify).unwrap_or(false),
             retry_max_attempts: r.and_then(|r| r.retry_max_attempts),
             upstream_retry_max_attempts: config.network.upstream_retry_max_attempts,
@@ -583,6 +619,7 @@ impl CodingRuntimeConfig {
             self.dirs.clone(),
         );
         config.startup_warnings = self.startup_warnings.clone();
+        config.extra_skill_dirs = self.extra_skill_dirs.clone();
         config.context_window = self.context_window;
         config.supports_vision = self.supports_vision;
         config.supports_reasoning_effort =
@@ -598,6 +635,8 @@ impl CodingRuntimeConfig {
         config.todo = self.todo.clone();
         config.atomgit_enabled = self.atomgit_enabled;
         config.tool_output_threshold_bytes = self.tool_output_threshold_bytes;
+        config.mcp_tool_search = self.mcp_tool_search;
+        config.tool_search = self.tool_search.clone();
         config.provider_name = self.provider_name.clone();
         config.chat_options.max_tokens = self.max_tokens;
         config.telemetry = self.telemetry.clone();
@@ -612,6 +651,7 @@ impl CodingRuntimeConfig {
         config.thinking_type = self.thinking_type.clone();
         config.thinking_keep = self.thinking_keep.clone();
         config.user_agent = self.user_agent.clone();
+        config.headers = self.headers.clone();
         config.skip_tls_verify = self.skip_tls_verify;
         config.retry_max_attempts = self.retry_max_attempts;
         config.upstream_retry_max_attempts = self.upstream_retry_max_attempts;
@@ -679,6 +719,7 @@ pub fn apply_provider_config(
     config.thinking_type = provider.thinking_type.clone();
     config.thinking_keep = provider.thinking_keep.clone();
     config.user_agent = provider.user_agent.clone();
+    config.headers = provider.headers.clone();
     config.skip_tls_verify = provider.skip_tls_verify;
     config.retry_max_attempts = provider.retry_max_attempts;
 }
@@ -903,16 +944,11 @@ fn env_duration_secs(var: &str) -> Option<Duration> {
         .filter(|n| *n > 0)
         .map(Duration::from_secs)
 }
-/// The default byte-idle stream timeout: `ATOMCODE_STREAM_TIMEOUT_SECS` if set to a valid
-/// positive integer, else 300s. Ported from core's env-configurable liveness knob.
+/// The default content-idle stream timeout: `ATOMCODE_STREAM_TIMEOUT_SECS` if set
+/// to a valid positive integer, else 300s. Reasoning and tool argument progress
+/// reset this budget; a slow stream must not be mistaken for a dead connection.
 fn default_stream_timeout() -> Duration {
-    // Two minutes, not five. A gateway that opens a stream and then goes quiet
-    // is recovered from without loss — the partial output is preserved and the
-    // turn continues — so the budget buys nothing but the wait itself, and the
-    // wait is what a person sits through with no way to tell a slow model from
-    // a dead one. Measured against a real stall (2026-09-23): one token, then
-    // five minutes of silence before the recovery that always worked.
-    env_duration_secs("ATOMCODE_STREAM_TIMEOUT_SECS").unwrap_or_else(|| Duration::from_secs(120))
+    env_duration_secs("ATOMCODE_STREAM_TIMEOUT_SECS").unwrap_or_else(|| Duration::from_secs(300))
 }
 /// The default first-token (prefill / TTFB) timeout. An explicit
 /// `ATOMCODE_FIRST_TOKEN_TIMEOUT_SECS` (valid positive integer) wins as-is — a
@@ -1070,6 +1106,7 @@ impl CodingAgentConfig {
         let model = model.into();
         Self {
             startup_warnings: Vec::new(),
+            extra_skill_dirs: Vec::new(),
             dirs,
             api_key: api_key.into(),
             base_url: base_url.into(),
@@ -1082,6 +1119,8 @@ impl CodingAgentConfig {
             todo: Default::default(),
             atomgit_enabled: true,
             tool_output_threshold_bytes: None,
+            mcp_tool_search: Default::default(),
+            tool_search: Default::default(),
             working_dir: working_dir.into(),
             context_window: 128_000,
             stream_timeout: default_stream_timeout(),
@@ -1113,6 +1152,7 @@ impl CodingAgentConfig {
             credential_shell_policy: Default::default(),
             permission_rules: Default::default(),
             user_agent: None,
+            headers: Default::default(),
             skip_tls_verify: false,
             retry_max_attempts: None,
             upstream_retry_max_attempts: None,
@@ -1127,6 +1167,25 @@ impl CodingAgentConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_skill_roots_reach_the_agent_config() {
+        let mut source = atomcode_config::config::Config::default();
+        source.skills.extra_dirs = vec!["~/external/skills".into()];
+        let runtime = CodingRuntimeConfig::from_config(
+            &source,
+            std::path::Path::new("/project"),
+            atomcode_capabilities::ProductDirs::new("/home/test", ".test"),
+            None,
+            None,
+            false,
+            true,
+        );
+        assert_eq!(
+            runtime.agent_config().extra_skill_dirs,
+            source.skills.extra_dirs
+        );
+    }
 
     /// The home the config file is in is the product's: AtomCode's by default,
     /// in the words it always used, and the configured product's otherwise.
@@ -1237,6 +1296,8 @@ mod tests {
         let mut config = atomcode_config::config::Config::default();
         assert!(!config.lsp.enabled);
         config.lsp.enabled = true;
+        config.lsp.ide_connection_file = Some(std::path::PathBuf::from("/private/ide-window.json"));
+        config.lsp.ide_discovery_dir = Some(std::path::PathBuf::from("/private/windows"));
         config.lsp.auto_detect = false;
         config.lsp.diagnostics_settle_delay_ms = 725;
         config.lsp.servers.insert(
@@ -1256,6 +1317,11 @@ mod tests {
             false,
             false,
         );
+        assert_eq!(
+            runtime.lsp.ide_connection_file,
+            config.lsp.ide_connection_file
+        );
+        assert_eq!(runtime.lsp.ide_discovery_dir, config.lsp.ide_discovery_dir);
         assert!(runtime.lsp.enabled);
         assert!(!runtime.lsp.auto_detect);
         assert_eq!(runtime.lsp.settle_delay_ms, 725);

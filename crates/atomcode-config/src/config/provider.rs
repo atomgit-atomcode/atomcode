@@ -18,6 +18,11 @@ pub struct ProviderConfig {
     /// Defaults to `atomcode/<version>` if not set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_agent: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::provider_headers::ProviderHeaders::is_empty"
+    )]
+    pub headers: crate::provider_headers::ProviderHeaders,
     /// Maximum tokens to use for context (system prompt + messages).
     /// The windowing algorithm fits messages within this budget,
     /// condensing old tool results to save space.
@@ -90,9 +95,9 @@ pub struct ProviderConfig {
     /// tier; fewer than 2 (or a non-participating host) ⇒ the subagent uses the current model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capable_model: Option<i64>,
-    /// Max attempts (including the first request) for provider OPEN retries;
-    /// when set, also caps kernel-owned HTTP 429 recovery. `None` preserves
-    /// each layer's default. Set `1` to disable adapter-level and 429 retries.
+    /// Total attempts including the first request. Native coding shares this
+    /// across request recovery unless the upstream retry setting overrides it;
+    /// standalone adapters apply it to OPEN retries. `1` disables retries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_max_attempts: Option<u32>,
 }
@@ -117,6 +122,11 @@ pub struct ProviderAccountConfig {
     pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_agent: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::provider_headers::ProviderHeaders::is_empty"
+    )]
+    pub headers: crate::provider_headers::ProviderHeaders,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub skip_tls_verify: bool,
     /// Enterprise/self-hosted control-plane URL for OAuth-style providers
@@ -175,9 +185,9 @@ pub struct ModelProfileConfig {
     pub thinking_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_budget: Option<u32>,
-    /// Max attempts (including the first request) for provider OPEN retries;
-    /// when set, also caps kernel-owned HTTP 429 recovery. `None` preserves
-    /// each layer's default.
+    /// Total attempts including the first request. Native coding shares this
+    /// across request recovery unless overridden by the upstream retry setting;
+    /// standalone adapters apply it to OPEN retries. `None` uses host defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_max_attempts: Option<u32>,
     /// Who put this entry here, when it was not the person: a command that
@@ -247,6 +257,7 @@ pub struct ResolvedModelConfig {
     pub max_tokens: Option<usize>,
     pub system_prompt: Option<String>,
     pub user_agent: Option<String>,
+    pub headers: crate::provider_headers::ProviderHeaders,
     pub skip_tls_verify: bool,
     pub thinking_type: Option<String>,
     pub thinking_keep: Option<String>,
@@ -256,9 +267,9 @@ pub struct ResolvedModelConfig {
     pub thinking_enabled: Option<bool>,
     pub thinking_budget: Option<u32>,
     pub capable_model: Option<i64>,
-    /// Max attempts (including the first request) for provider OPEN retries;
-    /// when set, also caps kernel-owned HTTP 429 recovery. `None` preserves
-    /// each layer's default.
+    /// Total attempts including the first request. Native coding shares this
+    /// across request recovery unless overridden by the upstream retry setting;
+    /// standalone adapters apply it to OPEN retries. `None` uses host defaults.
     pub retry_max_attempts: Option<u32>,
 }
 
@@ -293,6 +304,7 @@ impl ResolvedModelConfig {
             system_prompt: self.system_prompt.clone(),
             supports_vision: Some(self.supports_vision),
             user_agent: self.user_agent.clone(),
+            headers: self.headers.clone(),
             context_window: self.context_window,
             max_tokens: self.max_tokens,
             thinking_type: self.thinking_type.clone(),
@@ -351,6 +363,7 @@ impl ProviderConfig {
         let env_var = match self.provider_type.as_str() {
             "openai" | "openai-compat" | "openai_compat" | "responses" => "OPENAI_API_KEY",
             "claude" | "anthropic" => "ANTHROPIC_API_KEY",
+            "deepseek-messages" => "DEEPSEEK_API_KEY",
             "ollama" => "OLLAMA_API_KEY",
             "opencode" => "OPENCODE_API_KEY",
             _ => "",
@@ -603,6 +616,7 @@ mod tests {
             system_prompt: None,
             supports_vision: None,
             user_agent: None,
+            headers: Default::default(),
             context_window: 128000,
             max_tokens: None,
             thinking_type: None,
@@ -634,6 +648,7 @@ mod tests {
             system_prompt: None,
             supports_vision: None,
             user_agent: None,
+            headers: Default::default(),
             context_window: 128000,
             max_tokens: None,
             thinking_type: None,
@@ -713,6 +728,7 @@ mod tests {
             system_prompt: None,
             supports_vision: None,
             user_agent: None,
+            headers: Default::default(),
             context_window: 128000,
             max_tokens: None,
             thinking_type: None,
@@ -743,6 +759,7 @@ mod tests {
             system_prompt: None,
             supports_vision: None,
             user_agent: None,
+            headers: Default::default(),
             context_window: 128000,
             max_tokens: None,
             thinking_type: None,
@@ -773,6 +790,7 @@ mod tests {
             system_prompt: None,
             supports_vision: None,
             user_agent: None,
+            headers: Default::default(),
             context_window: 128000,
             max_tokens: None,
             thinking_type: None,

@@ -31,6 +31,8 @@ fn action_of(args: &str) -> Option<String> {
 struct RepoArgs {
     action: String,
     #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
     owner: Option<String>,
     #[serde(default)]
     repo: Option<String>,
@@ -57,6 +59,57 @@ struct RepoArgs {
 }
 fn default_limit() -> usize {
     30
+}
+
+/// Resolve only ordinary code-repository web URLs. Never request the supplied host.
+fn repo_target(a: &RepoArgs) -> Result<(String, String), String> {
+    let target = if let Some(raw) = &a.url {
+        if a.owner.is_some() || a.repo.is_some() {
+            return Err("Use either url or owner+repo, not both.".into());
+        }
+        let url = reqwest::Url::parse(raw).map_err(|_| "Invalid repository URL.".to_string())?;
+        if !matches!(url.scheme(), "https" | "http")
+            || !matches!(
+                url.host_str(),
+                Some("gitcode.com" | "www.gitcode.com" | "atomgit.com" | "www.atomgit.com")
+            )
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.port().is_some()
+        {
+            return Err("Use a code repository URL on gitcode.com or atomgit.com. Model/dataset sites and other hosts are not supported by this repository API; check the target's own feedback entry point.".into());
+        }
+        let parts: Vec<_> = url.path().trim_matches('/').split('/').collect();
+        if parts.len() < 2
+            || (parts.len() > 2
+                && !matches!(parts[2], "issues" | "pulls" | "tree" | "blob" | "commits"))
+        {
+            return Err("Expected a code repository URL /owner/repo (optionally an issues, pulls, tree, blob or commits page). Nested model/dataset paths are not ordinary owner/repo targets.".into());
+        }
+        (
+            parts[0].to_string(),
+            parts[1]
+                .strip_suffix(".git")
+                .unwrap_or(parts[1])
+                .to_string(),
+        )
+    } else {
+        match (&a.owner, &a.repo) {
+            (Some(o), Some(r)) => (o.clone(), r.clone()),
+            _ => return Err("atomgit_repo view: provide owner+repo or a repository url".into()),
+        }
+    };
+    if [&target.0, &target.1].iter().any(|s| {
+        s.is_empty()
+            || *s == "."
+            || *s == ".."
+            || !s
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    }) {
+        return Err("Expected ordinary code repository owner/repo identifiers, without slashes or URL escapes. Model/dataset paths may require a different API; do not infer issue support from a failed lookup.".into());
+    }
+    Ok(target)
 }
 
 /// `atomgit_repo` tool. Holds the shared client.
@@ -108,8 +161,8 @@ impl Tool for AtomgitRepoTool {
         "atomgit_repo"
     }
     fn description(&self) -> &str {
-        "Operate on AtomGit repositories. action: \"list\" (your repos), \"view\" \
-         (owner+repo), \"create\" (name; optional owner=org, description, private), \
+        "Operate on AtomGit repositories. action: \"list\" (current account repos only, NOT public search), \"view\" \
+         (owner+repo or url; use directly for known public repos, without list), \"create\" (name; optional owner=org, description, private), \
          \"delete\" (owner+repo), \"fork\" (owner+repo; optional name, private), \
          \"clone\" (owner+repo; optional branch, dir — runs local `git clone`), \
          \"create_tag\" (owner+repo+tag_name; optional refs=start point (default main), \
@@ -120,6 +173,7 @@ impl Tool for AtomgitRepoTool {
         json!({
             "type": "object",
             "properties": {
+                "url": { "type": "string", "description": "view only: ordinary gitcode.com/atomgit.com code repository URL, including an issues page. Alternative to owner+repo; not model/dataset URLs." },
                 "action": { "type": "string", "enum": ["list","view","create","delete","fork","clone","create_tag","labels","ensure_label"] },
                 "owner": { "type": "string", "description": "Repo owner (org for create). Omit on create for a personal repo." },
                 "repo": { "type": "string", "description": "Repo name for view/delete/fork/clone." },
@@ -148,9 +202,17 @@ impl Tool for AtomgitRepoTool {
             Ok(a) => a,
             Err(e) => return err(format!("atomgit_repo: invalid arguments: {e}")),
         };
+        if a.url.is_some() && a.action != "view" {
+            return err(
+                "url is supported only for view; use the resolved owner+repo for other actions.",
+            );
+        }
+        if a.action == "list" && a.limit == 0 {
+            return err("atomgit_repo list: limit must be greater than zero");
+        }
         match a.action.as_str() {
             "list" => match self.client.repo_list(a.limit).await {
-                Ok(repos) if repos.is_empty() => ok("No repositories.".to_string()),
+                Ok(repos) if repos.is_empty() => ok("No repositories returned for the current account by /user/repos. This is not a public repository search and does not mean a known public repository is missing. Use atomgit_repo action=view with owner+repo or url directly, e.g. {\"action\":\"view\",\"owner\":\"atomgit_atomcode\",\"repo\":\"atomcode\"}.".to_string()),
                 Ok(repos) => ok(repos
                     .iter()
                     .map(render_repo)
@@ -158,12 +220,12 @@ impl Tool for AtomgitRepoTool {
                     .join("\n\n")),
                 Err(e) => err(e),
             },
-            "view" => match (a.owner, a.repo) {
-                (Some(o), Some(r)) => match self.client.repo_view(&o, &r).await {
+            "view" => match repo_target(&a) {
+                Ok((o, r)) => match self.client.repo_view(&o, &r).await {
                     Ok(repo) => ok(render_repo(&repo)),
                     Err(e) => err(e),
                 },
-                _ => err("atomgit_repo view: owner and repo are required".to_string()),
+                Err(e) => err(e),
             },
             "create" => match a.name {
                 Some(n) => match self
@@ -989,6 +1051,98 @@ mod tests {
         AtomgitRepoTool::new(Arc::new(client))
     }
 
+    #[tokio::test]
+    async fn empty_personal_list_does_not_prevent_public_view() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v5/user/repos"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v5/repos/atomgit_atomcode/atomcode"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"full_name":"atomgit_atomcode/atomcode"})),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        let t = tool(&server);
+        let empty = t.execute(r#"{"action":"list"}"#, &ctx()).await;
+        assert!(!empty.is_error);
+        assert!(empty.content.contains("current account"));
+        assert!(empty.content.contains("not a public repository search"));
+        for args in [
+            r#"{"action":"view","owner":"atomgit_atomcode","repo":"atomcode"}"#,
+            r#"{"action":"view","url":"https://gitcode.com/atomgit_atomcode/atomcode/issues"}"#,
+        ] {
+            let result = t.execute(args, &ctx()).await;
+            assert!(!result.is_error, "{}", result.content);
+            assert!(result.content.contains("atomgit_atomcode/atomcode"));
+        }
+    }
+
+    #[tokio::test]
+    async fn repository_errors_distinguish_missing_and_access_denied() {
+        let server = MockServer::start().await;
+        for (repo, status) in [("missing", 404), ("denied", 403)] {
+            Mock::given(method("GET"))
+                .and(path(format!("/api/v5/repos/o/{repo}")))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+            let result = tool(&server)
+                .execute(
+                    &json!({"action":"view","owner":"o","repo":repo}).to_string(),
+                    &ctx(),
+                )
+                .await;
+            assert!(result.is_error);
+            assert!(result.content.contains(&status.to_string()));
+            assert!(!result.content.contains("No repositories"));
+            if status == 404 {
+                assert!(result.content.contains("may not exist"));
+                assert!(result.content.contains("inaccessible"));
+            } else {
+                assert!(result.content.contains("permissions"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_list_limit_and_url_writes_do_not_send_requests() {
+        let server = MockServer::start().await;
+        for args in [
+            r#"{"action":"list","limit":0}"#,
+            r#"{"action":"delete","url":"https://gitcode.com/o/r"}"#,
+        ] {
+            let result = tool(&server).execute(args, &ctx()).await;
+            assert!(result.is_error);
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn repository_targets_reject_ambiguous_and_special_paths() {
+        for args in [
+            json!({"url":"https://ai.atomgit.com/hf_mirrors/deepseek/model"}),
+            json!({"url":"https://atomgit.com/hf_mirrors/deepseek/model"}),
+            json!({"url":"https://example.com/o/r"}),
+            json!({"url":"https://gitcode.com/o/r", "owner":"o", "repo":"r"}),
+            json!({"owner":"hf_mirrors", "repo":"deepseek/model"}),
+            json!({"url":"https://gitcode.com/o/r%2Fextra"}),
+        ] {
+            let mut args = args;
+            args["action"] = json!("view");
+            assert!(repo_target(&serde_json::from_value(args).unwrap()).is_err());
+        }
+        let a: RepoArgs =
+            serde_json::from_value(json!({"action":"view","url":"https://atomgit.com/o/r.git"}))
+                .unwrap();
+        assert_eq!(repo_target(&a).unwrap(), ("o".into(), "r".into()));
+    }
+
     #[test]
     fn risk_reads_are_safe_writes_risky() {
         let t = AtomgitRepoTool::new(Arc::new(
@@ -1177,14 +1331,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_view_requires_owner_repo() {
+    async fn execute_view_requires_owner_repo_or_url() {
         let server = MockServer::start().await;
         let r = tool(&server)
             .execute(r#"{"action":"view","owner":"o"}"#, &ctx())
             .await;
         assert!(r.is_error);
         assert!(
-            r.content.contains("owner and repo are required"),
+            r.content.contains("provide owner+repo or a repository url"),
             "{}",
             r.content
         );

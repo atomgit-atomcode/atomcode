@@ -111,7 +111,10 @@ fn classify_llm_error(reason: &str) -> LlmErrorKind {
         LlmErrorKind::RateLimited
     } else if r.contains("500") || r.contains("502") || r.contains("503") {
         LlmErrorKind::ServerError
-    } else if r.contains("stream timeout") || r.contains("no event for") {
+    } else if r.contains("stream timeout")
+        || r.contains("stream idle timeout")
+        || r.contains("no event for")
+    {
         LlmErrorKind::StreamTimeout
     } else if r.contains("decode") || r.contains("mid-flight") || r.contains("terminated") {
         LlmErrorKind::StreamInterrupted
@@ -859,6 +862,19 @@ fn transport_str(transport: atomcode_telemetry::McpTransport) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn phased_stream_deadlines_remain_stream_timeouts_in_telemetry() {
+        for reason in [
+            "stream idle timeout (first_content): no content for 600000ms",
+            "stream idle timeout (stream_idle): no content for 120000ms",
+        ] {
+            assert!(matches!(
+                super::classify_llm_error(reason),
+                atomcode_telemetry::LlmErrorKind::StreamTimeout
+            ));
+        }
+    }
+
     use super::*;
     use atomcode_kernel::message::MessageMeta;
 

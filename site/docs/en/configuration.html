@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.2.3</span>
+    <span class="dhdr-ver">v5.2.4</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -270,7 +270,7 @@ base_url = "http://localhost:11434"</code></pre>
       <h2 id="turn-round-limit">Turn round limit</h2>
       <pre><code>[coding]
 max_rounds = 200</code></pre>
-      <p>When the limit is reached, the TUI asks whether to continue or stop instead of dropping the task. Set it to <code>0</code> for no limit.</p>
+      <p>The default <code>0</code> means unlimited, with no additional fixed 300-round cap. A positive value limits work rounds. If work remains at the cap, at most one additional text-only model request summarizes progress, remaining work and next steps; it is billed and counted as a round. Interactive checkpoints, when enabled, can extend the budget first. Cancellation, timeout or provider errors can interrupt closing. Repetition guards remain independent.</p>
 
       <h2 id="todo-eagerness">Todo eagerness</h2>
       <pre><code>[tools.todo]
@@ -309,6 +309,9 @@ base_url = "https://api.siliconflow.cn/v1"</code></pre>
         <li><strong><code>/config</code> in the TUI</strong> — search and edit safe settings in place. The dynamic <em>Retry attempts (current model)</em> row writes <code>retry_max_attempts</code> to the active model; press Delete twice to restore the default.</li>
         <li><strong><code>/provider</code> in the TUI</strong> — interactively manage provider accounts and their models; changes are written back to disk.</li>
       </ul>
+
+      <h2 id="ui-keybindings">TUI shortcuts</h2>
+      <p>Set <code>newline = ["alt+j", "ctrl+j"]</code> under <code>[ui.keybindings]</code> to customize newline chords. You can also search for “newline” in <code>/config</code> and record a chord or type its name. Changes apply immediately. See <a href="./keybindings.html#custom-newline">Custom newline shortcuts</a>.</p>
 
       <h2 id="next-steps">Next steps</h2>
       <ul>

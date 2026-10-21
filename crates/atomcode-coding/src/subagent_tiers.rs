@@ -49,6 +49,7 @@ mod tests {
 
     fn pc(model: &str, capable: Option<i64>) -> ProviderConfig {
         ProviderConfig {
+            headers: Default::default(),
             provider_type: "openai".into(),
             api_key: Some("sk-x".into()),
             model: model.into(),

@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.2.3</span>
+    <span class="dhdr-ver">v5.2.4</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -97,7 +97,9 @@
           <tr><td><code>Ctrl+R</code></td><td>反向搜索输入历史(输入关键字实时过滤;再次按 <code>Ctrl+R</code> 跳到下一个更旧的匹配;<code>Enter</code> 选中填入,<code>Esc</code> 取消)</td></tr>
           <tr><td><code>Tab</code></td><td>接受斜杠命令、Skill 或文件补全</td></tr>
           <tr><td><code>Shift+Tab</code></td><td>无补全菜单时切换到下一个执行模式（流式输出期间也可切换）</td></tr>
-          <tr><td><code>Ctrl+U</code></td><td>清空整行</td></tr>
+          <tr><td><code>Ctrl+D</code></td><td>删除当前字符；空闲且输入为空时，两秒内连按两次退出</td></tr>
+          <tr><td><code>Ctrl+B / Ctrl+F</code></td><td>前移 / 后移一个字符</td></tr>
+          <tr><td><code>Ctrl+U</code></td><td>删除从当前行首到光标的内容</td></tr>
           <tr><td><code>Ctrl+W</code></td><td>删除一个单词</td></tr>
           <tr><td><code>Ctrl+K</code></td><td>删除从光标到行尾的内容</td></tr>
           <tr><td><code>Ctrl+A</code></td><td>光标移到行首</td></tr>
@@ -105,18 +107,27 @@
         </tbody>
       </table>
 
+      <h2 id="custom-newline">自定义换行快捷键</h2>
+      <p>在 <code>/config</code> 中搜索“换行”，选择“快捷键 / 换行”。按 <code>Enter</code> 或 <code>A</code> 添加，按下想绑定的组合键后再按 <code>Enter</code> 确认。按 <code>M</code> 可手动填写逗号分隔的按键名（例如 <code>alt+j, ctrl+j</code>）；录入时也可按 <code>Tab</code> 切到手动填写。<code>Delete</code> 移除选中绑定，<code>Ctrl+D</code> 恢复默认，<code>Esc</code> 返回。</p>
+      <pre><code>[ui.keybindings]
+newline = ["alt+j", "ctrl+j"]</code></pre>
+      <p>此列表替换默认的换行组合键。保存后立即生效，<code>/keys</code> 展示实际绑定；<code>\</code> + <code>Enter</code> 始终保留。设置空列表 <code>newline = []</code> 可禁用换行组合键，删除 <code>newline</code> 配置项则恢复默认。与现有动作或保留按键冲突、重复或格式错误时拒绝保存并保留原绑定。</p>
+      <p>普通字符不能单独用作快捷键。支持 <code>ctrl</code>、<code>alt</code>、<code>shift</code>、<code>cmd</code> 修饰符，字母、数字、<code>enter</code>、<code>space</code>、方向键和 <code>f1</code>–<code>f24</code> 等按键名。终端或 IDE 拦截的组合键无法由 AtomCode 检测或释放；手动填写后仍须验证宿主能把它传入。</p>
+
       <h2 id="浏览与滚动">浏览与滚动</h2>
       <table>
         <thead>
           <tr><th>按键</th><th>动作</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>Shift+↑ / Shift+↓</code></td><td>翻一行</td></tr>
-          <tr><td><code>PageUp / PageDown</code></td><td>翻一页(10 行)</td></tr>
-          <tr><td><code>Alt+↑ / Alt+↓</code></td><td>跳到上 / 下一条消息(macOS Apple Terminal 需先在 Settings → Profiles → Keyboard 启用 "Use Option as Meta key")</td></tr>
-          <tr><td><code>Ctrl+↑ / Ctrl+↓</code></td><td>跳到上 / 下一条<strong>自己发的</strong>消息</td></tr>
-          <tr><td><code>Home / End</code></td><td>跳到对话最顶端 / 最底端</td></tr>
-          <tr><td>鼠标滚轮</td><td>在聊天区上下滚(atomcode 接管)</td></tr>
+          <tr><td><code>PageUp / PageDown</code></td><td>主界面按可见高度翻页，保留一行重叠</td></tr>
+          <tr><td><code>鼠标滚轮</code></td><td>逐行滚动对话</td></tr>
+          <tr><td><code>/read</code></td><td>打开终端内只读对话副本，展开工具输出，不依赖 GUI 或剪贴板</td></tr>
+          <tr><td><code>↑ / ↓ / j / k</code></td><td>阅读模式：逐行滚动</td></tr>
+          <tr><td><code>PgUp / PgDn / Ctrl+B / Ctrl+F</code></td><td>阅读模式：翻页</td></tr>
+          <tr><td><code>Ctrl+U / Ctrl+D</code></td><td>阅读模式：翻半页</td></tr>
+          <tr><td><code>Home / End</code></td><td>阅读模式：跳到首尾</td></tr>
+          <tr><td><code>Esc</code></td><td>退出阅读模式，保留原输入草稿和主界面阅读位置；重新运行 /read 更新副本</td></tr>
         </tbody>
       </table>
 

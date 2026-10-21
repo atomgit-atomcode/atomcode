@@ -20,7 +20,7 @@
 //!    codingplan 配置——「/login 是唯一的规范入口，/codingplan 已并入它」）;
 //! 3. setup 报 `auth_expired`（本地 token 还没过期但服务端拒了）→ 再走**一次**
 //!    OAuth，重跑 setup；
-//! 4. 配置要落盘才写盘（半途而废的 setup 不写），并给活着的东西发 reload。
+//! 4. 配置要落盘才写盘（半途而废的 setup 不写），并通过 SignIn 把刚保存的配置应用到当前会话。
 
 use atomcode_i18n::screen::{t as tr, Msg as SMsg};
 use std::path::PathBuf;
@@ -278,7 +278,7 @@ impl World {
             let screen = ui.clone();
             runtime_handle.spawn(async move {
                 if let Err(error) = control
-                    .call(atomcode_host_api::HostCommand::Reload { session: root })
+                    .call(atomcode_host_api::HostCommand::SignIn { session: root })
                     .await
                 {
                     screen.say(&tr(SMsg::ConfigWrittenReloadFailedCli {
@@ -368,9 +368,9 @@ fn run_login_flow_with(world: &World, ui: &Arc<dyn UserInterface>, painted: &dyn
         }
     }
 
-    // The configuration is on disk, but the running graph was assembled before
-    // it existed — the same "wrote the file is not making it so" gap
-    // `tui_onboarding` closes with a reload. The session stays.
+    // The configuration is on disk, but the live graph still needs it.
+    // SignIn applies the persisted default even with an unchanged file or a
+    // launch-time model override. The session stays.
     (world.reload)(&sink);
 
     // **The report, in the conversation** — the same lines tuix rendered, said
@@ -783,6 +783,7 @@ mod credential_tests {
     /// no, and codingplan's setup ran its own login — the stdout-driven one —
     /// printing an English URL banner onto the frame, past the border.
     #[test]
+    #[serial_test::serial(atomcode_home)]
     fn a_finished_login_reaches_the_disk() {
         let home = tempfile::tempdir().expect("tempdir");
         std::env::set_var("ATOMCODE_HOME", home.path());

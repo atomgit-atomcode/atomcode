@@ -1,3 +1,5 @@
+import { apiFetch } from '../lib/transport';
+
 // Account / login state for the settings menu (the gear's "Account" entry).
 // Self-contained: reads the webui token from the URL, calls /auth/* directly,
 // and picks zh/en labels from settings — to stay decoupled from api.ts/i18n.ts.
@@ -88,7 +90,7 @@ export function useAuth() {
 
   async function refresh(shouldApply: () => boolean = () => true) {
     try {
-      const r = await fetch('/auth/status', { headers: authHeaders() });
+      const r = await apiFetch('/auth/status', { headers: authHeaders() });
       if (r.status === 401) {
         window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
         return;
@@ -130,7 +132,7 @@ export function useAuth() {
     setBusy(true);
     setProblem(null);
     try {
-      const r = await fetch('/auth/login/start', {
+      const r = await apiFetch('/auth/login/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({ open_browser: false }),
@@ -163,7 +165,7 @@ export function useAuth() {
       const poll = async () => {
         if (loginGeneration.current !== generation) return;
         if (Date.now() >= deadline) {
-          await fetch(`/auth/login/${encodeURIComponent(id)}`, {
+          await apiFetch(`/auth/login/${encodeURIComponent(id)}`, {
             method: 'DELETE',
             headers: authHeaders(),
           }).catch(() => undefined);
@@ -171,7 +173,7 @@ export function useAuth() {
           return;
         }
         try {
-          const response = await fetch(`/auth/login/${encodeURIComponent(id)}/poll`, {
+          const response = await apiFetch(`/auth/login/${encodeURIComponent(id)}/poll`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', ...authHeaders() },
           });
@@ -243,7 +245,7 @@ export function useAuth() {
   async function doLogout() {
     stopPolling();
     try {
-      await fetch('/auth/logout', { method: 'POST', headers: authHeaders() });
+      await apiFetch('/auth/logout', { method: 'POST', headers: authHeaders() });
     } catch {
       /* ignore */
     }

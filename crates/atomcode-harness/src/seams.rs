@@ -88,21 +88,41 @@ plexus_service!(GrantsSvc => dyn atomcode_capabilities::tools::PermissionStore, 
 pub struct ToolPolicy {
     include: Vec<String>,
     exclude: Vec<String>,
+    permission_rules: Arc<atomcode_capabilities::tools::PermissionRules>,
 }
 
 impl ToolPolicy {
     pub fn new(include: Vec<String>, exclude: Vec<String>) -> Self {
-        Self { include, exclude }
+        Self {
+            include,
+            exclude,
+            ..Self::default()
+        }
+    }
+
+    /// Apply unconditional permission denies to every contributor, including
+    /// tools an MCP server publishes after the catalog is mounted.
+    pub fn with_permissions(
+        mut self,
+        rules: Arc<atomcode_capabilities::tools::PermissionRules>,
+    ) -> Self {
+        self.permission_rules = rules;
+        self
     }
 
     /// Nothing named, nothing to enforce — the ordinary case, and worth asking
     /// about before a caller pays for a match.
     pub fn is_open(&self) -> bool {
-        self.include.is_empty() && self.exclude.is_empty()
+        self.include.is_empty()
+            && self.exclude.is_empty()
+            && !self.permission_rules.has_tool_denies()
     }
 
     /// `owner` is the row offering the tool, as the config tree names it.
     pub fn admits(&self, owner: &str, name: &str) -> bool {
+        if self.permission_rules.denies_tool(name) {
+            return false;
+        }
         if self.exclude.iter().any(|p| names(p, owner, name)) {
             return false;
         }
@@ -540,6 +560,18 @@ impl PromptRegistry {
             .map(|f| f.text.as_str())
             .collect::<Vec<_>>()
             .join("\n\n")
+    }
+
+    /// Read one currently mounted contribution without parsing the assembled
+    /// prompt or reloading its source. Removal/replacement has the same owner
+    /// and visibility as `render()`.
+    pub fn fragment(&self, id: &str) -> Option<String> {
+        self.fragments
+            .read()
+            .expect("prompt registry poisoned")
+            .iter()
+            .find(|fragment| fragment.id == id)
+            .map(|fragment| fragment.text.clone())
     }
 
     pub fn ids(&self) -> Vec<String> {
@@ -990,6 +1022,22 @@ pub trait UserQuestions: Send + Sync {
     fn describe(&self) -> String;
     /// Put the question and wait. The returned string is an [`Answer::value`].
     async fn ask(&self, question: &Question) -> Option<String>;
+
+    /// Ordinary questions may finish their foreground wait while remaining
+    /// answerable. Approval callers continue to use their own decision path.
+    async fn ask_reply(&self, question: &Question, _call_id: Option<&str>) -> QuestionReply {
+        match self.ask(question).await {
+            Some(answer) => QuestionReply::Answered(answer),
+            None => QuestionReply::Unanswered,
+        }
+    }
+}
+
+pub enum QuestionReply {
+    Answered(String),
+    Unanswered,
+    Failed(String),
+    Pending(atomcode_capabilities::tools::request_user_input::PendingUserQuestion),
 }
 
 /// What a delegated task produced.
@@ -1119,6 +1167,10 @@ pub enum Decision {
 
 #[derive(Clone, Debug, Default)]
 pub struct TurnOutcome {
+    /// Identity for listeners above more than one agent realm.
+    pub session_id: String,
+    /// Final provider failure, live metadata rather than another stored fact.
+    pub provider_error: Option<crate::events::RequestError>,
     pub text: String,
     /// Which turn this was, 1-based within the session.
     pub turn: u64,
@@ -1166,6 +1218,41 @@ pub struct DelegationLane {
 #[cfg(test)]
 mod tool_policy_tests {
     use super::ToolPolicy;
+
+    #[test]
+    fn allow_and_argument_deny_rules_leave_the_tool_catalog_open() {
+        let rules = atomcode_capabilities::tools::PermissionRules::parse(
+            &["Bash(python3 *)".into()],
+            &["Bash(rm *)".into()],
+        )
+        .0;
+        let policy = ToolPolicy::default().with_permissions(std::sync::Arc::new(rules));
+        assert!(policy.is_open());
+        assert!(policy.admits("tool-bash", "bash"));
+    }
+
+    #[test]
+    fn static_permissions_cannot_be_reopened_by_an_include_or_session_switch() {
+        use super::{ToolBox, ToolState, ToolSwitches};
+        use atomcode_capabilities::tools::{PermissionRules, WebFetchTool};
+        use std::sync::Arc;
+        let rules = PermissionRules::parse(
+            &["WebFetch".into()],
+            &["WebFetch".into(), "Bash(rm *)".into()],
+        )
+        .0;
+        let policy = ToolPolicy::new(vec!["web_fetch".into(), "bash".into()], vec![])
+            .with_permissions(Arc::new(rules));
+        assert!(!policy.admits("late-mcp", "WebFetch"));
+        assert!(policy.admits("tool-bash", "bash"));
+        let tools = ToolBox::with_policy_and_switches(policy, ToolSwitches::new());
+        tools
+            .register_from("late-web", Arc::new(WebFetchTool))
+            .unwrap();
+        assert!(tools.get("web_fetch").is_none());
+        assert!(tools.turn_on("web_fetch").is_empty());
+        assert_eq!(tools.listing()[0].state, ToolState::ExcludedByConfig);
+    }
 
     fn policy(exclude: &[&str]) -> ToolPolicy {
         ToolPolicy::new(vec![], exclude.iter().map(|s| s.to_string()).collect())
@@ -1217,5 +1304,29 @@ mod tool_policy_tests {
         assert!(only.admits("tool-fs", "read_file"));
         assert!(!only.admits("tool-search", "glob"), "not on the list");
         assert!(!only.admits("tool-search", "grep"), "exclude beats include");
+    }
+}
+
+#[cfg(test)]
+mod prompt_fragment_tests {
+    #[test]
+    fn reading_a_fragment_tracks_its_owner_replacing_and_withdrawing_it() {
+        let prompts = super::PromptRegistry::new();
+        prompts.contribute("persona", 0, "unrelated persona");
+        prompts.contribute("project-instructions", 1, "original rules");
+        let original = prompts.fragment("project-instructions").unwrap();
+        assert_eq!(original, "original rules");
+        prompts.contribute("project-instructions", 1, "replacement rules");
+        assert_eq!(
+            prompts.fragment("project-instructions").as_deref(),
+            Some("replacement rules")
+        );
+        assert_eq!(
+            original, "original rules",
+            "a captured evaluation input remains immutable"
+        );
+        prompts.remove("project-instructions");
+        assert!(prompts.fragment("project-instructions").is_none());
+        assert_eq!(prompts.render(), "unrelated persona");
     }
 }

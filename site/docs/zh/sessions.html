@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.2.3</span>
+    <span class="dhdr-ver">v5.2.4</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -98,6 +98,9 @@
       <pre><code>/resume</code></pre>
       <p>弹出会话选择器,按时间倒序显示当前项目的历史会话,可以快速跳到任一会话。每一条都带有最近的用户提问作为标题,便于识别。</p>
 
+      <p>回合运行中也可在 <code>/resume</code> 列表选择其他会话，或执行 <code>/resume &lt;id&gt;</code>：当前会话自动放到后台继续运行，目标会话准备成功后才切换画面；打开失败时保持原会话。切回本进程的后台会话会复用原 runtime，不重复启动任务。后台列表可用 <code>/bg list</code> 查看，最多 16 个后台槽位。</p>
+      <p>等待审批或交互回答、重配置期间以及开启 WebUI 共享同步时暂不允许切换。后台槽位已满时，先用 <code>/bg drop &lt;N&gt;</code> 停止不再需要的会话。该能力属于 TUI，不代表 WebUI 已支持运行中切换。</p>
+
       <h3 id="新开一个干净会话">新开一个干净会话</h3>
       <pre><code>/session</code></pre>
       <p>在不切换工作目录的前提下开启全新的上下文。适合"刚刚那个任务已经收尾,我要开始完全不相关的另一件事"。</p>
@@ -137,6 +140,11 @@
         <strong>典型场景</strong>
         <p>主前台正在调试 A 模块,模型一边改一边跑 <code>cargo check</code>(耗时)。这时想到要顺便重构 B 模块——直接 <code>/bg</code> 切到新前台开始 B;A 那边的 build 在后台跑完状态切到"已完成",<code>/bg 1</code> 切回去拿结果。</p>
       </div>
+
+      <h3 id="后台生命周期与多进程">后台生命周期与多进程</h3>
+      <p>后台会话依赖当前 AtomCode 进程；退出时会停止其 runtime，不是脱离进程的常驻任务。会话记录保留后可恢复，但不保证原工具进程继续执行。</p>
+      <p>无需安装两份 AtomCode：可在多个终端启动同一个可执行文件，分别使用不同会话。同一 home、同一项目的不同会话可以并行；同一存储 bucket 中的同一会话由排他租约保护，不能被两个 runtime 同时写入。交互恢复遇到其他进程占用时可能创建分支副本，请留意提示。配置文件写入使用跨进程锁和原子替换，但配置仍然共享。</p>
+      <p>不同 <code>ATOMCODE_HOME</code> 可隔离配置与会话存储。会话锁和 home 隔离均不保护项目工作区；多个 agent 并行修改代码时建议使用独立 Git worktree，避免文件或 Git 操作互相覆盖。</p>
 
       <h2 id="清空-vs-压缩-vs-新建">清空 vs 压缩 vs 新建</h2>
       <table>

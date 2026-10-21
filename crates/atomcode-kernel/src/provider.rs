@@ -1,3 +1,9 @@
+mod recovery_budget;
+pub use recovery_budget::{
+    RecoveryExhausted, RecoveryLimit, RecoverySnapshot, RequestRecoveryBudget,
+    REQUEST_RECOVERY_EXHAUSTED_CODE,
+};
+
 use crate::message::Message;
 use crate::stream::{ProviderError, StreamEvent};
 use crate::tool::ToolDef;
@@ -15,8 +21,8 @@ use serde::{Deserialize, Serialize};
 /// knob onto whatever its backend speaks (e.g. `reasoning_effort` → OpenAI's
 /// `reasoning_effort` string vs Anthropic's thinking `budget_tokens`), and a given
 /// adapter MAY IGNORE any option it does not support. The kernel never interprets
-/// these model knobs — it only forwards them. The runtime-only retry owner below
-/// is a lifecycle sideband and is deliberately excluded from serialization.
+/// these model knobs — it only forwards them. Retry ownership and the neutral
+/// recovery allowance are runtime sidebands, excluded from serialization.
 ///
 /// `ChatOptions::default()` is a NEUTRAL request: every tunable is `None` and
 /// `tool_choice` is `ToolChoice::Auto` — i.e. "no opinion", the model decides. An
@@ -45,6 +51,12 @@ pub struct ChatOptions {
     /// so waits remain cancellable and visible.
     #[serde(skip)]
     pub rate_limit_retry_owner: RateLimitRetryOwner,
+    /// Shared caller-owned recovery allowance. Its presence delegates adapter
+    /// transient retries to the caller; never serialized or sent on the wire.
+    /// The caller reserves an attempt before each `chat_stream` invocation;
+    /// adapters charge any additional authentication replay themselves.
+    #[serde(skip)]
+    pub request_recovery: Option<RequestRecoveryBudget>,
 }
 
 /// Per-call ownership of HTTP 429 retry policy.
@@ -247,6 +259,7 @@ mod tests {
             temperature: Some(0.2),
             tool_choice: ToolChoice::Required,
             rate_limit_retry_owner: RateLimitRetryOwner::Provider,
+            request_recovery: None,
         };
         let back: ChatOptions =
             serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();
@@ -254,9 +267,15 @@ mod tests {
 
         let mut runtime = full;
         runtime.rate_limit_retry_owner = RateLimitRetryOwner::Kernel;
+        runtime.request_recovery = Some(RequestRecoveryBudget::new(
+            6,
+            std::time::Duration::from_secs(300),
+        ));
         let json = serde_json::to_string(&runtime).unwrap();
         assert!(!json.contains("rate_limit_retry_owner"));
+        assert!(!json.contains("request_recovery"));
         let back: ChatOptions = serde_json::from_str(&json).unwrap();
+        assert!(back.request_recovery.is_none());
         assert_eq!(
             back.rate_limit_retry_owner,
             RateLimitRetryOwner::Provider,

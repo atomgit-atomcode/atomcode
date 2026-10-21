@@ -19,6 +19,8 @@ tar = "0.4"
 [dependencies]
 # L0 only. NEVER add atomcode-core or any L2/L3 crate here (layering is compile-enforced).
 atomcode-kernel = { path = "../atomcode-kernel" }
+# Shared leaf translations for memory diagnostics; no driver/config dependency.
+atomcode-i18n = { path = "../atomcode-i18n", optional = true }
 atomcode-auth = { path = "../atomcode-auth", optional = true }
 # Leaf config crate (sits below core). The `notify` capability reads NotificationConfig;
 # the config crate is explicitly designed so every stack layer can read config without an
@@ -173,9 +175,9 @@ codeintel = [
     # the cross-file graph layer (build_graph) walks the repo gitignore-aware
     "dep:ignore",
 ]
-# Read-only LSP code intelligence (spawns local language servers, JSON-RPC over stdio).
+# Read-only LSP and explicitly bound IDE queries (tool infrastructure + private HTTP).
 # Runtime exposure stays opt-in and missing binaries degrade gracefully.
-lsp = ["codeintel", "dep:which", "dep:url", "tokio/process", "tokio/io-util", "tokio/fs"]
+lsp = ["tools", "dep:reqwest", "codeintel", "dep:which", "dep:url", "tokio/process", "tokio/io-util", "tokio/fs"]
 # Real-server LSP e2e (needs rust-analyzer etc. installed) — default-off, on demand.
 lsp-e2e = ["lsp"]
 # Desktop / terminal notifications (turn-finished + approval-needed). Reads NotificationConfig
@@ -194,7 +196,7 @@ skills = []
 # `cc_hooks` uses `crate::tools::{request_approval_decision, PermissionDecision, …}`,
 # so it needs `tools` — without this it only compiled when a consumer happened to enable
 # `tools` transitively (e.g. via `atomgit`).
-cc-hooks = ["tools", "dep:dirs", "tokio/process", "tokio/io-util"]
+cc-hooks = ["tools", "plugin", "dep:dirs", "tokio/process", "tokio/io-util"]
 # E2E tests that hit a REAL provider (network + API key). Separate from the default
 # suite; run on demand: `cargo test -p atomcode-capabilities --features e2e --test e2e`.
 e2e = ["provider"]
@@ -225,10 +227,10 @@ search = []
 session = ["dep:dirs", "dep:chrono", "dep:fs2", "dep:atomcode-config", "instructions", "search", "dep:sha2"]
 # User-driven persistent memory: the production memory.md store (global
 # $ATOMCODE_HOME/memory.md + per-project <root>/.atomcode/memory.md + machine-local
-# <root>/.atomcode/local/memory.md, same files so old/new coexist) + a MemoryHook
-# that injects the merged entries at session_start. v1 is USER-driven only (driver
-# slash-commands write the store); no model-facing remember/forget tools. Opt-in (NOT default).
-memory = ["dep:dirs", "dep:ignore"]
+# <root>/.atomcode/local/memory.md) and derived selection diagnostics.
+# The harness row owns logged injection; MemoryHook adapts standalone kernels.
+# The memory tool can read/write these stores. Opt-in (NOT default).
+memory = ["dep:dirs", "dep:ignore", "dep:atomcode-i18n", "dep:sha2", "dep:uuid", "dep:chrono", "dep:fs2", "dep:tempfile"]
 # Lazy offline auto-detection: web_search transport failures flip the process
 # offline verdict (for offline_mode="auto"). Pulls the config leaf (where the verdict
 # lives). Opt-in — a network embedder that doesn't use offline_mode skips it.

@@ -274,6 +274,45 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StatusMemoryScopeGlobal => "User global".into(),
         Msg::StatusMemoryScopeProject => "Project memory".into(),
         Msg::StatusMemoryScopeLocal => "Local memory".into(),
+        Msg::StatusMemoryInjection => "Injection status".into(),
+        Msg::MemoryEntryCatalog => "Entry metadata".into(),
+        Msg::MemoryOriginalSource => "Original source".into(),
+        Msg::MemoryReviewTitle => "# Memory injection status\n\n".into(),
+        Msg::MemoryDiskPreview { budget, chars } => format!("## Latest disk preview\n\nCombined budget: {budget} characters across all scopes and the knowledge index. Preview: {chars} characters. This is not the current session's injected state.\n").into(),
+        Msg::MemoryScopeSelection { scope, path, loaded, selected, omitted, shortened } => format!("\n### {scope} — {path}\n\n{loaded} loaded entries; {selected} selected; {omitted} omitted; {shortened} shortened.\n").into(),
+        Msg::MemoryPartialRead => "\nPartial read: recent ordinary entries and separately retained pinned candidates are each bounded to 64 KiB; unretained earlier entries are not counted here.\n".into(),
+        Msg::MemoryReadFailed { error } => format!("\nRead failed: {error}\n").into(),
+        Msg::MemoryKnowledgeReview { path, state } => format!("\n### Knowledge index\n\n{path}\n\n{state}; linked file contents are not injected.\n").into(),
+        Msg::MemoryIndexIncluded => "Routing index included".into(),
+        Msg::MemoryIndexNotIncluded => "Not injected (missing, empty, unreadable, or over budget)".into(),
+        Msg::MemoryIndexLimited => "\nIndex shortened or omitted; read the complete index on demand.\n".into(),
+        Msg::MemorySessionLogged { present, matches } => format!("## Session-logged memory\n\nPresent in projected context: {present}. Matches latest disk preview: {matches}.\n\n").into(),
+        Msg::MemoryInjectionDisabled => "Memory injection is disabled for this runtime.\n\n".into(),
+        Msg::MemoryNotLoggedYet => "No memory injection has been logged yet. Prepared first-turn payload (frozen at runtime mount):\n\n".into(),
+        Msg::MemoryNotLogged => "No memory injection is recorded in this session. Disk edits are not automatically injected into existing sessions.\n\n".into(),
+        Msg::MemoryEntrySelected => "selected".into(),
+        Msg::MemoryEntryOmitted => "omitted".into(),
+        Msg::MemoryEntryExpired => "expired (retained, excluded from new session injection)".into(),
+        Msg::MemoryInvalidDays => "Duration must be an integer from 1 to 36500 days".into(),
+        Msg::MemoryExpiryConflict => "Expiry options conflict or are unsupported for this action".into(),
+        Msg::MemoryEntryInactive => "inactive".into(),
+        Msg::MemoryArgUnclosedQuote => "Unclosed quote in memory arguments".into(),
+        Msg::MemoryArgQuoteSpacing => "A quoted argument must be followed by whitespace".into(),
+        Msg::MemoryArgNeedsValue { arg } => format!("{arg} requires a value").into(),
+        Msg::MemoryArgUnknown { arg } => format!("Unknown memory option: {arg}").into(),
+        Msg::MemoryCommandSyntax => "Usage: /memory [filters], or /memory update|pin|unpin|deprecate <ID>".into(),
+        Msg::MemoryIdKeywordConflict => "Do not combine an exact ID with a deletion keyword".into(),
+        Msg::MemoryUnexpectedContent => "This memory action does not accept content".into(),
+        Msg::MemoryInvalidStatus => "Memory status must be active, outdated or deprecated".into(),
+        Msg::MemoryJsonListOnly => "--json is only supported for memory listing".into(),
+        Msg::MemoryListFilters => "Memory listing supports --topic, --status and scope filters".into(),
+        Msg::MemoryIdRequired => "This memory action requires an entry ID".into(),
+        Msg::MemoryRememberRequired => "/remember requires memory content".into(),
+        Msg::MemoryForgetRequired => "/forget requires a keyword, or --id for exact deprecation".into(),
+        Msg::MemoryFilteredDetails => "Entry detail rows follow the requested filters; budget totals and session-logged context remain unfiltered.\n\n".into(),
+        Msg::MemoryEntryShortened => "shortened".into(),
+        Msg::MemoryInjectionIncomplete => "Memory incompletely loaded; run /memory to review".into(),
+        Msg::MemorySelectionWarning { omitted, shortened, failures, partial } => format!("{omitted} entries omitted; {shortened} entries shortened; {failures} read errors; partial source/index: {partial}. Run /memory to review.").into(),
         Msg::StatusMemoryPresent { path, scope } =>
             format!("    ✓ {scope}: {path}\n").into(),
         Msg::StatusMemoryMissing { path, scope } =>
@@ -577,8 +616,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "No session selected".into(),
         Msg::SessionPickerHint =>
             "↑↓ move · Enter open · Ctrl+D×2 delete · Type to search · Esc cancel".into(),
-        Msg::ClassicScreenFallback =>
-            "This console cannot draw the new screen (no escape-sequence support); opening the classic screen. Windows Terminal runs the new one.".into(),
+        Msg::AnsiTerminalRequired =>
+            "This terminal cannot display the TUI. Use an ANSI-capable terminal such as Windows Terminal, or run with -p for headless mode.".into(),
+        Msg::ClassicScreenRetired =>
+            "The classic screen has been retired. Using the current TUI; change [ui] screen to rows.".into(),
         Msg::PasswordPromptHint =>
             "🔒 A command is asking for a password · not shown, not kept · Enter send · Esc cancel".into(),
         Msg::SessionPickerTitle { n, total, project } =>
@@ -1060,8 +1101,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("Marketplace sync skipped (chat unaffected): {detail}").into(),
         Msg::OfflineModeActive =>
             "Offline mode: web tools, telemetry, and auto-update are disabled.".into(),
-        Msg::PluginHooksUntrusted { count, names } => format!(
-            "Hooks from {count} plugin(s) are not trusted ({names}) and will not run. Enter /plugin trust <name> to authorize them."
+        Msg::PluginHooksUntrusted { count, names: _ } => format!(
+            "Hooks from {count} plugin(s) need authorization and will not run. Enter /plugin to review and trust."
+        ).into(),
+        Msg::PluginHooksIncompatible { count } => format!(
+            "Hooks from {count} plugin(s) are incompatible and will not run. Run atomcode hooks list for details; trusting again will not fix them."
         ).into(),
         Msg::PluginInstalling { plugin, marketplace } =>
             format!("installing `{plugin}@{marketplace}`…").into(),
@@ -1410,7 +1454,10 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
 
         // ── the agent catalog's own commands, as a front end draws them ──
         Msg::CmdCatalogWorktree =>
-            "Work on a branch and checkout of your own; `list` shows them, `done` returns to the main checkout, `cleanup` removes one".into(),
+            "Work on a branch and checkout of your own; `list` shows them, `done` only returns to the main checkout (no commit or merge); confirm work is merged before `cleanup`".into(),
+        Msg::WorktreeReturned { path } => format!("Returned to the main checkout: {path}. This only changes directories; it does not commit or merge. Changes and commits remain in the original worktree. Confirm your work is committed and merged before cleanup.").into(),
+        Msg::WorktreeDirty { name } => format!("`{name}` has uncommitted changes; cleanup refused. Preserve your work and confirm it is merged first. `/worktree cleanup {name} --force` discards uncommitted content.").into(),
+        Msg::WorktreeHelp => "Usage: `/worktree [create] <name> [base]` creates and enters a checkout; `/worktree list` lists them; `/worktree done` only returns to the main checkout, without committing or merging; `/worktree cleanup <name> [--force]` removes one. Confirm work is merged first; --force discards uncommitted content.".into(),
         Msg::CmdCatalogWorktreeUsage =>
             "[create] <name> [base] | list | done | cleanup <name> [--force]".into(),
         Msg::CmdCatalogInit =>
@@ -1420,7 +1467,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdCatalogWorklogUsage => "[today|yesterday|M/D]".into(),
         Msg::CmdCatalogGoal =>
             "Keep working until the condition holds; `stop` finishes, `pause` sets it aside.".into(),
-        Msg::CmdCatalogGoalUsage => "<condition to meet> | stop | pause".into(),
+        Msg::CmdCatalogGoalUsage => "<condition to meet> | stop | pause | recheck | report | questions | answer <id> <text>".into(),
         Msg::CmdCatalogLoop =>
             "Do the same thing over and over, until `stop`.".into(),
         Msg::CmdCatalogLoopUsage => "<what to do each round> | stop".into(),
@@ -1434,15 +1481,19 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
                 .into(),
         Msg::CmdCatalogSkills =>
             "Which skills are installed; give names and they are used together".into(),
+        Msg::CmdCatalogSkillsEmpty => "No skills installed".into(),
+        Msg::CmdCatalogSkillDirs => "Skill scan directories".into(),
+        Msg::CmdCatalogSkillDiagnostics => "Skill loading diagnostics".into(),
         Msg::CmdCatalogSkillsUsage => "[name… [what to tell them]]".into(),
         Msg::CmdCatalogSkillUsage => "[what to tell it]".into(),
         Msg::CmdCatalogPromptCommandUsage => "[command arguments]".into(),
-        Msg::CmdCatalogMemory => "The things you remembered".into(),
+        Msg::CmdCatalogMemory => "View, filter and manage memory entries".into(),
+        Msg::CmdCatalogMemoryUsage => "[--topic <topic>] [--status <state>] [--expired|--expiring-within N] | update|pin|unpin|deprecate <ID>".into(),
         Msg::CmdCatalogRemember =>
             "Remember one line, carried into every session from now on".into(),
-        Msg::CmdCatalogRememberUsage => "<what to remember>".into(),
+        Msg::CmdCatalogRememberUsage => "[--topic <topic>] [--source <source>] [--pin] [--ttl-days N] <what to remember>".into(),
         Msg::CmdCatalogForget => "Delete one of the lines you remembered".into(),
-        Msg::CmdCatalogForgetUsage => "<what to forget>".into(),
+        Msg::CmdCatalogForgetUsage => "<keyword> | --id <ID>".into(),
         Msg::ModelNoImageSupport { model } => format!(
             "Current model \"{}\" does not support image input and no \
              vision_preprocessor_provider is configured. Use /model to \
@@ -1638,11 +1689,18 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
                  authenticate against. Use the official binary, or point the provider at a \
                  plain OpenAI-compatible endpoint with an api_key."
             ).into(),
+        Msg::GoalStarted => "Goal enabled; work will continue until it is complete.".into(),
         Msg::StreamStalled => "esc to cancel".into(),
         Msg::StreamRecoveryRunning { attempt, max_attempts } => format!(
             "stream interrupted; safely continuing from saved progress ({attempt}/{max_attempts})…"
         )
         .into(),
+        Msg::StreamRecoveryPreserved { max_recoveries } => format!("Model response interrupted. Received content was preserved; attempting to continue (up to {max_recoveries} automatic recoveries per turn).").into(),
+        Msg::StreamRecoveryRetry { attempt, max_recoveries, delay_secs } => format!("Connection interrupted; progress preserved. Continuing in {delay_secs}s ({attempt}/{max_recoveries}); press Esc to cancel.").into(),
+        Msg::StreamRecoveryExhausted { max_recoveries: 0 } => "Automatic recovery is disabled. Safely preservable content was kept. Check the connection or model service, then send 'continue'.".into(),
+        Msg::StreamRecoveryExhausted { max_recoveries } => format!("Automatic recovery reached this turn's limit ({max_recoveries}). Safely preservable content was kept. Check the connection or model service, then send 'continue'.").into(),
+        Msg::StreamRecoveryUnsafeTools => "Response interrupted with incomplete or unconfirmed tool output; automatic recovery stopped to avoid duplicate execution. Safely preservable content was kept. Check tool results before continuing.".into(),
+        Msg::StreamRecoveryNoProgress => "Response interrupted without enough safe progress to continue; no automatic continuation was attempted. Check the connection or model service and retry.".into(),
         Msg::StreamRecoverySucceeded => "✓ recovered from the interrupted stream".into(),
         Msg::ContextFromPeer => "said to the agent by".into(),
         Msg::ContextFromMemory => "from memory".into(),

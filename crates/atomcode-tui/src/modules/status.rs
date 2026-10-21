@@ -210,8 +210,8 @@ impl View for Status {
             reserved += width::str_width(text) + sep_w;
         }
         // A repeating `/loop` still reports here. `/goal` deliberately does
-        // not: its compact `/goal active` badge lives on the composer's upper
-        // right shoulder, where autonomous goal state is visible without
+        // not: its compact `Goal active` badge lives on the tip row above the composer, aligned
+        // to the right, where autonomous goal state is visible without
         // squeezing model, cwd, context and cache out of this row.
         //
         // Reserved beside the activity indicator and for the same reason: it
@@ -1286,6 +1286,11 @@ mod tests {
         assert!(!idle.contains("轮"), "nothing is running: {idle:?}");
 
         m.autonomy = Some(atomcode_host_api::Running {
+            usage: None,
+            recovering: false,
+            retry_in_secs: None,
+            goal_stage: None,
+            goal_detail: None,
             kind: "goal".into(),
             what: "把量化器搬到 NPU".into(),
             round: 4,
@@ -1303,6 +1308,11 @@ mod tests {
         // Registered but not running is the state somebody would otherwise sit
         // and wait through, so it is said.
         m.autonomy = Some(atomcode_host_api::Running {
+            usage: None,
+            recovering: false,
+            retry_in_secs: None,
+            goal_stage: None,
+            goal_detail: None,
             kind: "loop".into(),
             what: "跑测试".into(),
             round: 2,
@@ -1868,7 +1878,12 @@ mod tests {
         };
         let line =
             Status::render(&State::default(), &Viewport::new(Rect::sized(120, 1), &m))[0].plain();
-        assert!(line.contains("~/proj"), "{line:?}");
+        // `~/proj` spelled the way this host spells it: Windows prints `~\proj`, and the
+        // point of the claim is the fold, not the separator.
+        let mut folded = String::from("~");
+        folded.push(std::path::MAIN_SEPARATOR);
+        folded.push_str("proj");
+        assert!(line.contains(&folded), "{line:?}");
         assert!(
             !line.contains(&cwd),
             "the absolute path must not appear: {line:?}"

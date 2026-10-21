@@ -8,7 +8,7 @@
       {
         "id": "atomcode-使用指南",
         "heading": "AtomCode 使用指南",
-        "body": "住在终端里的 AI 编码助手。给它一个自然语言任务，它会自主读取、编辑、运行并自我验证。本文档带你从零开始，逐步掌握 AtomCode 的每一项能力。 v5.2.3 许可证 MIT 语言 Rust 1.88+ 平台 macOS · Linux · HarmonyOS PC · Windows 100% AI 生成"
+        "body": "住在终端里的 AI 编码助手。给它一个自然语言任务，它会自主读取、编辑、运行并自我验证。本文档带你从零开始，逐步掌握 AtomCode 的每一项能力。 v5.2.4 许可证 MIT 语言 Rust 1.88+ 平台 macOS · Linux · HarmonyOS PC · Windows 100% AI 生成"
       },
       {
         "id": "三步开始",
@@ -151,7 +151,7 @@
       {
         "id": "第-13-步-欢迎",
         "heading": "第 1/3 步 · 欢迎",
-        "body": "███ █████ ███ █ █ ████ ███ ████ █████ █ █ █ █ █ ██ ██ █ █ █ █ █ █ █████ █ █ █ █ █ █ █ █ █ █ █ █ ████ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ ███ █ █ ████ ███ ████ █████ AtomCode 版本 5.2.3 · 在终端里运行的 AI 编程代理 • 多步骤 agent loop · 内置代码图工具 • 兼容所有 OpenAI 风格 API • 通过 CodingPlan 获取免费额度 按 Enter 继续。 Ctrl+C 可随时退出。"
+        "body": "███ █████ ███ █ █ ████ ███ ████ █████ █ █ █ █ █ ██ ██ █ █ █ █ █ █ █████ █ █ █ █ █ █ █ █ █ █ █ █ ████ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ ███ █ █ ████ ███ ████ █████ AtomCode 版本 5.2.4 · 在终端里运行的 AI 编程代理 • 多步骤 agent loop · 内置代码图工具 • 兼容所有 OpenAI 风格 API • 通过 CodingPlan 获取免费额度 按 Enter 继续。 Ctrl+C 可随时退出。"
       },
       {
         "id": "第-23-步-语言-choose-your-language-选择语言",
@@ -357,7 +357,7 @@
       {
         "id": "回合轮数",
         "heading": "回合轮数",
-        "body": "[coding] max_rounds = 200 达到上限时，TUI 会询问继续还是停止，不会直接丢失当前任务。设置为 0 表示不限制。"
+        "body": "[coding] max_rounds = 200 默认 0 表示不限制，不再额外受固定 300 轮上限约束。正数限制工作轮数；预算耗尽且任务仍需继续时，最多增加一次禁用工具的模型请求，总结进展、未完成项和下一步（这次请求仍计费并计入轮数）。启用交互检查点时可先选择延长预算；取消、超时或模型错误可中断收尾。重复调用保护仍独立生效。"
       },
       {
         "id": "todo-触发积极度",
@@ -373,6 +373,11 @@
         "id": "编辑配置的三种方式",
         "heading": "编辑配置的三种方式",
         "body": "手动编辑 —— 直接用你喜欢的编辑器打开 ~/.atomcode/config.toml 。 TUI 内 /config —— 可直接搜索和修改安全配置。其中动态的“最大重试次数（当前模型）”会把 retry_max_attempts 写入当前模型；连续按两次 Delete 可恢复默认值。 TUI 内 /provider —— 交互式管理供应商账号及其模型，改动会自动落盘。"
+      },
+      {
+        "id": "ui-keybindings",
+        "heading": "TUI 快捷键",
+        "body": "在 [ui.keybindings] 下设置 newline = [\"alt+j\", \"ctrl+j\"] 自定义换行组合键。也可在 /config 搜索“换行”，通过按键录入或手动填写配置，保存后立即生效。详见 自定义换行快捷键 。"
       },
       {
         "id": "下一步",
@@ -493,12 +498,17 @@
       {
         "id": "工具与实用操作",
         "heading": "工具与实用操作",
-        "body": "命令 作用 /view · /view <文件路径> 打开只读文件查看器。 不带参数 时打开一个模糊「仅文件」选择器(输入即筛选;像 ~/… 或 ./… 这类路径式查询还能打开项目 之外 的文件)。带路径则直接打开该文件。方向键 / PageUp-Down / Home-End(或 g / G 跳到首/末行)滚动; Esc 退回, Ctrl+C 退出 /undo · /undo N 把对话记忆回退到上一轮(或第 N 轮)之前,并把那一轮的 prompt 还原回输入框;只回退记忆,不恢复磁盘文件 /diff 显示当前工作目录未提交改动的 git diff(文件列表一次最多显示 5 行,并带「更多文件」滚动提示) /review 对当前改动做代码审查: /review 审查未提交改动, /review staged 审查暂存区, /review <base> 对比某个基准 ref /paste 从剪贴板粘贴图片(Windows 下 Ctrl+V 被终端拦截时的备用入口) /cost 按模型显示当前会话累计的提示、补全和缓存 Token。与 /usage 不同,后者查询的是 CodingPlan 网关的套餐额度 /context 显示本轮上下文预算分解:系统提示、工具定义、冷区压缩、总消息数、context window 占用 /compact 压缩历史消息,把早期对话压缩成摘要以腾出上下文预算 /rewind 选择历史提示，并回退对话、代码或两者；详见 会话与撤销 /clear 清空当前会话的消息(保留工作目录和模型) /init 扫描当前工作目录，按优先级创建或完善当前生效的项目指令文件（ .atomcode.md 、 AGENTS.md 或 CLAUDE.md ）。生成内容跟随当前语言，并可在 /config 中配置自定义提示词文件。 /background <任务> 把任务派发给一个隔离的后台 agent(只读为主的工具子集),不污染当前主对话上下文。用于\"顺手让它去查一下 X\"这类轻探索。详见 后台会话 /worktree <子命令> Git worktree 隔离: create 在新分支上拉一份独立 worktree、 list 查看现有 worktree、 done 把 worktree 改动 squash 回主分支、 cleanup 清理已完成的 worktree /todo · /todo add <任务> · /todo clear 重新打印当前待办清单 —— 从会话记录里派生(定位最近一次 todowrite 工具调用并重渲染),带「进行中 / 已完成」状态标记。 /todo add <任务> 确定性地追加一条任务(不走模型); /todo clear 清空清单。清单是无状态派生的,不额外落盘;模型执行长任务时会自己维护它,你也可以随时用此命令查看进度 /copy 把上一条回复复制到剪贴板: /copy 复制整条回复的 markdown 原文(整个回合,不含工具输出); /copy code 复制最后一个代码块、 /copy code N 复制第 N 个、 /copy code all 复制全部代码块(旧写法 /copy N 、 /copy all 、 /copy msg 仍可用)。经典界面( --classic )里直接 /copy 仍是复制最后一个代码块 /save 把当前会话导出成 markdown 文件: /save 用自动生成的文件名, /save <文件名> 指定文件名 AtomGit Issue 现在由内置工具处理 /issue 已移除。执行 /login 后，直接用自然语言提出需求即可，例如“为这个 Bug 创建一个 AtomGit Issue”。AtomCode 会选择内置的 atomgit_issue 工具，写操作仍需权限确认。详见 内置工具 。 只读报告可在回合中运行 不必等回合结束就能查看状态: /status 、 /diff 、 /cost 、 /usage 、 /rename 在 agent 流式输出时也能运行。它们以输入框下方的临时面板呈现(按 Esc 关闭),不打断进行中的回合。 /usage 在回合中还能在 Current / Overview / Models 视图间按 Tab 切换。"
+        "body": "命令 作用 /view · /view <文件路径> 打开只读文件查看器。 不带参数 时打开一个模糊「仅文件」选择器(输入即筛选;像 ~/… 或 ./… 这类路径式查询还能打开项目 之外 的文件)。带路径则直接打开该文件。方向键 / PageUp-Down / Home-End(或 g / G 跳到首/末行)滚动; Esc 退回, Ctrl+C 退出 /undo · /undo N 把对话记忆回退到上一轮(或第 N 轮)之前,并把那一轮的 prompt 还原回输入框;只回退记忆,不恢复磁盘文件 /diff 显示当前工作目录未提交改动的 git diff(文件列表一次最多显示 5 行,并带「更多文件」滚动提示) /review 对当前改动做代码审查: /review 审查未提交改动, /review staged 审查暂存区, /review <base> 对比某个基准 ref /paste 从剪贴板粘贴图片(Windows 下 Ctrl+V 被终端拦截时的备用入口) /cost 按模型显示当前会话累计的提示、补全和缓存 Token。与 /usage 不同,后者查询的是 CodingPlan 网关的套餐额度 /context 显示本轮上下文预算分解:系统提示、工具定义、冷区压缩、总消息数、context window 占用 /compact 压缩历史消息,把早期对话压缩成摘要以腾出上下文预算 /rewind 选择历史提示，并回退对话、代码或两者；详见 会话与撤销 /clear 清空当前会话的消息(保留工作目录和模型) /init 扫描当前工作目录，按优先级创建或完善当前生效的项目指令文件（ .atomcode.md 、 AGENTS.md 或 CLAUDE.md ）。生成内容跟随当前语言，并可在 /config 中配置自定义提示词文件。 /background <任务> 把任务派发给一个隔离的后台 agent(只读为主的工具子集),不污染当前主对话上下文。用于\"顺手让它去查一下 X\"这类轻探索。详见 后台会话 /worktree <子命令> Git worktree 隔离: create 在新分支上拉一份独立 worktree、 list 查看现有 worktree、 done 仅切回主检出（不提交、不 squash、不合并）、 cleanup 删除 worktree（不验证是否已合并；请先提交并合并需保留的成果， --force 会丢弃未提交内容） /todo · /todo add <任务> · /todo clear 重新打印当前待办清单 —— 从会话记录里派生(定位最近一次 todowrite 工具调用并重渲染),带「进行中 / 已完成」状态标记。 /todo add <任务> 确定性地追加一条任务(不走模型); /todo clear 清空清单。清单是无状态派生的,不额外落盘;模型执行长任务时会自己维护它,你也可以随时用此命令查看进度 /copy 把上一条回复复制到剪贴板: /copy 复制整条回复的 markdown 原文(整个回合,不含工具输出); /copy code 复制最后一个代码块、 /copy code N 复制第 N 个、 /copy code all 复制全部代码块(旧写法 /copy N 、 /copy all 、 /copy msg 仍可用) /save 把当前会话导出成 markdown 文件: /save 用自动生成的文件名, /save <文件名> 指定文件名 AtomGit Issue 现在由内置工具处理 /issue 已移除。执行 /login 后，直接用自然语言提出需求即可，例如“为这个 Bug 创建一个 AtomGit Issue”。AtomCode 会选择内置的 atomgit_issue 工具，写操作仍需权限确认。详见 内置工具 。 只读报告可在回合中运行 不必等回合结束就能查看状态: /status 、 /diff 、 /cost 、 /usage 、 /rename 在 agent 流式输出时也能运行。它们以输入框下方的临时面板呈现(按 Esc 关闭),不打断进行中的回合。 /usage 在回合中还能在 Current / Overview / Models 视图间按 Tab 切换。"
       },
       {
         "id": "对话模式与思考",
         "heading": "对话模式与思考",
         "body": "命令 作用 /plan 切到 Plan 模式 :只读探索,模型可以调用 read_file / grep / list_directory 等不写盘的工具,但 edit_file / bash 等会被屏蔽。适合在动手之前让模型先理清方案 /build 切回 Build 模式 (默认):全部工具可用,可以读、写、执行。 /plan 和 /build 之间可随时来回切 /goal <目标> 设定一个完成目标,让 agent 自动循环 ——一轮接一轮——直到目标达成。 /goal (无参数)查看当前目标与轮数, /goal clear 停止 /loop <间隔> <prompt 或 /命令> 按固定 间隔 重复执行一个 prompt 或斜杠命令。例 /loop 5m /diff 每 5 分钟跑一次 /diff ; /loop 30s 检查一下构建 每 30 秒发一次该 prompt。间隔单位 s / m / h ,范围 10s–24h /loop <prompt> 不带间隔时进入 自定节奏 模式:任务交给模型,由它自己决定何时进行下一轮,适合「盯着某件事直到收敛」这类不好用固定周期表达的任务 /loop · /loop stop /loop (无参数)查看当前循环状态; /loop stop (或 off / clear / cancel )停止循环。 /loop 与 /goal 互斥,设定其中一个会自动取消另一个 /think on / off 开关 extended thinking(对支持的模型 — Claude / DeepSeek-R1 / GLM-4.5 等)。开启后模型会输出推理过程,代价是更慢更费 token /think budget <N> 给 thinking 设个 token 预算上限(对 Claude 系列生效),控制推理长度 /effort <high|max|off> DeepSeek 推理努力控制——在 DeepSeek 模型上用更多延迟/token 换取更深的推理"
+      },
+      {
+        "id": "团队面板",
+        "heading": "团队面板",
+        "body": "命令 作用 /team · /team toggle 展开 / 收起团队面板(切换)。收起后只留一行表头,成员行不再绘制,键盘焦点也不再落到它们上面 /team show · /team open 展开团队面板。没有成员也没有后台任务时回执「当前没有团队成员或后台任务,暂无可展示的团队面板。」 /team hide · /team fold · /team close 收起团队面板(成员照常在后台继续,不取消任何成员),回执「团队面板已收起。」 其它参数 拒绝并回显用法 —— /team 只认这三态( status 、 clear 等不在其中) 三个子命令都只改显示:回执以提示行出现、约 5 秒后消失,不写进会话记录,也不调用模型;它们不会启动、取消或等待成员。面板表头给出成员数与后台任务数,成员行标注它被要求做什么、已运行多久与上下文占用;成员由 agent 通过 team 工具委派产生(多成员并行、各带角色与 scope)。另见 子代理 ( task 工具的短生命周期子任务)。"
       },
       {
         "id": "永久记忆",
@@ -518,7 +528,7 @@
       {
         "id": "webui-与同步",
         "heading": "WebUI 与同步",
-        "body": "命令 作用 /webui 启动浏览器界面并自动打开浏览器(默认绑定 127.0.0.1:13457 ,仅本机)。当前 TUI 会话会自动接入实时同步 /webui --host <addr> 把服务绑定到指定地址; /webui lan 等价于 --host 0.0.0.0 (暴露到局域网)。配合蒲公英虚拟 IP 可远程访问,见 远程访问指南 /webui stop 关闭 webui 服务 /sync 把当前 TUI 接入正在运行的 webui 会话(需先 /webui )。两端实时双向同步,多个浏览器 / 终端可同时围观同一会话 /sync off 退出同步,回到独立会话 /app 把当前会话通过官方中继暴露给 手机 App :终端里直接吐出一个二维码,用 App 扫码即可配对,在手机上实时查看并接管这段对话(与 /webui 同源共用同一段会话,双向实时同步;区别是不开浏览器、走中继而非局域网)。需先 /login 登录 /app stop 停止 App 远程访问,断开中继并回到本地会话 详细见 WebUI 界面 与 远程访问指南 。"
+        "body": "命令 作用 /webui 启动本机浏览器并生成手机中继二维码，无需组网； --local 仅本机。当前 TUI 会话自动实时同步 /webui --host <addr> 把服务绑定到指定地址; /webui lan 等价于 --host 0.0.0.0 (暴露到局域网)。可用的局域网访问地址会同时显示文字链接和二维码，手机扫码即可打开。跨网络访问使用默认 /webui 的中继二维码,见 远程访问指南 /webui stop 关闭 webui 服务 /sync 把当前 TUI 接入正在运行的 webui 会话(需先 /webui )。两端实时双向同步,多个浏览器 / 终端可同时围观同一会话 /sync off 退出同步,回到独立会话 /app 把当前会话通过官方中继暴露给 手机 App :终端里直接吐出一个二维码,用 App 扫码即可配对,在手机上实时查看并接管这段对话(与 /webui 同源共用同一段会话,双向实时同步;区别是 App 扫码配对，不打开浏览器)。需先 /login 登录 /app stop 停止 App 远程访问,断开中继并回到本地会话 详细见 WebUI 界面 与 远程访问指南 。"
       },
       {
         "id": "配置与帮助",
@@ -576,12 +586,17 @@
       {
         "id": "输入编辑",
         "heading": "输入编辑",
-        "body": "按键 动作 Enter 发送消息 \\ 后接 Enter 换行(所有终端通用 — 行尾反斜杠会被识别为续行) Alt+Enter 换行(多数终端可用;macOS Apple Terminal 需在 Settings → Profiles → Keyboard 启用 \"Use Option as Meta key\";Windows Terminal 默认占用,可在设置里释放) Shift+Enter 换行(仅以下终端区分 Shift+Enter 与 Enter :Kitty / WezTerm / iTerm2(需启用 Report Modifiers)/ Windows Terminal / Ghostty / Warp。Apple Terminal、xterm、GNOME Terminal、VS Code 集成终端不支持,请用 \\ + Enter ) Ctrl+Enter 换行(需启用 Kitty 键盘协议的终端,如 Kitty、WezTerm 等) Ctrl+J 换行(终端能区分该组合键时) Esc 清空当前输入 / 打断正在流式输出的回复 Esc Esc 输入框空闲且为空时撤销上一轮 ↑ / ↓ 浏览输入历史 → 将暗色的下一步提示填入空输入框(仍需单独按 Enter 发送) Ctrl+R 反向搜索输入历史(输入关键字实时过滤;再次按 Ctrl+R 跳到下一个更旧的匹配; Enter 选中填入, Esc 取消) Tab 接受斜杠命令、Skill 或文件补全 Shift+Tab 无补全菜单时切换到下一个执行模式（流式输出期间也可切换） Ctrl+U 清空整行 Ctrl+W 删除一个单词 Ctrl+K 删除从光标到行尾的内容 Ctrl+A 光标移到行首 Ctrl+E 光标移到行尾"
+        "body": "按键 动作 Enter 发送消息 \\ 后接 Enter 换行(所有终端通用 — 行尾反斜杠会被识别为续行) Alt+Enter 换行(多数终端可用;macOS Apple Terminal 需在 Settings → Profiles → Keyboard 启用 \"Use Option as Meta key\";Windows Terminal 默认占用,可在设置里释放) Shift+Enter 换行(仅以下终端区分 Shift+Enter 与 Enter :Kitty / WezTerm / iTerm2(需启用 Report Modifiers)/ Windows Terminal / Ghostty / Warp。Apple Terminal、xterm、GNOME Terminal、VS Code 集成终端不支持,请用 \\ + Enter ) Ctrl+Enter 换行(需启用 Kitty 键盘协议的终端,如 Kitty、WezTerm 等) Ctrl+J 换行(终端能区分该组合键时) Esc 清空当前输入 / 打断正在流式输出的回复 Esc Esc 输入框空闲且为空时撤销上一轮 ↑ / ↓ 浏览输入历史 → 将暗色的下一步提示填入空输入框(仍需单独按 Enter 发送) Ctrl+R 反向搜索输入历史(输入关键字实时过滤;再次按 Ctrl+R 跳到下一个更旧的匹配; Enter 选中填入, Esc 取消) Tab 接受斜杠命令、Skill 或文件补全 Shift+Tab 无补全菜单时切换到下一个执行模式（流式输出期间也可切换） Ctrl+D 删除当前字符；空闲且输入为空时，两秒内连按两次退出 Ctrl+B / Ctrl+F 前移 / 后移一个字符 Ctrl+U 删除从当前行首到光标的内容 Ctrl+W 删除一个单词 Ctrl+K 删除从光标到行尾的内容 Ctrl+A 光标移到行首 Ctrl+E 光标移到行尾"
+      },
+      {
+        "id": "custom-newline",
+        "heading": "自定义换行快捷键",
+        "body": "在 /config 中搜索“换行”，选择“快捷键 / 换行”。按 Enter 或 A 添加，按下想绑定的组合键后再按 Enter 确认。按 M 可手动填写逗号分隔的按键名（例如 alt+j, ctrl+j ）；录入时也可按 Tab 切到手动填写。 Delete 移除选中绑定， Ctrl+D 恢复默认， Esc 返回。 [ui.keybindings] newline = [\"alt+j\", \"ctrl+j\"] 此列表替换默认的换行组合键。保存后立即生效， /keys 展示实际绑定； \\ + Enter 始终保留。设置空列表 newline = [] 可禁用换行组合键，删除 newline 配置项则恢复默认。与现有动作或保留按键冲突、重复或格式错误时拒绝保存并保留原绑定。 普通字符不能单独用作快捷键。支持 ctrl 、 alt 、 shift 、 cmd 修饰符，字母、数字、 enter 、 space 、方向键和 f1 – f24 等按键名。终端或 IDE 拦截的组合键无法由 AtomCode 检测或释放；手动填写后仍须验证宿主能把它传入。"
       },
       {
         "id": "浏览与滚动",
         "heading": "浏览与滚动",
-        "body": "按键 动作 Shift+↑ / Shift+↓ 翻一行 PageUp / PageDown 翻一页(10 行) Alt+↑ / Alt+↓ 跳到上 / 下一条消息(macOS Apple Terminal 需先在 Settings → Profiles → Keyboard 启用 \"Use Option as Meta key\") Ctrl+↑ / Ctrl+↓ 跳到上 / 下一条 自己发的 消息 Home / End 跳到对话最顶端 / 最底端 鼠标滚轮 在聊天区上下滚(atomcode 接管)"
+        "body": "按键 动作 PageUp / PageDown 主界面按可见高度翻页，保留一行重叠 鼠标滚轮 逐行滚动对话 /read 打开终端内只读对话副本，展开工具输出，不依赖 GUI 或剪贴板 ↑ / ↓ / j / k 阅读模式：逐行滚动 PgUp / PgDn / Ctrl+B / Ctrl+F 阅读模式：翻页 Ctrl+U / Ctrl+D 阅读模式：翻半页 Home / End 阅读模式：跳到首尾 Esc 退出阅读模式，保留原输入草稿和主界面阅读位置；重新运行 /read 更新副本"
       },
       {
         "id": "选区与复制",
@@ -639,7 +654,7 @@
       {
         "id": "tui-内切换会话",
         "heading": "TUI 内切换会话",
-        "body": "/resume 弹出会话选择器,按时间倒序显示当前项目的历史会话,可以快速跳到任一会话。每一条都带有最近的用户提问作为标题,便于识别。"
+        "body": "/resume 弹出会话选择器,按时间倒序显示当前项目的历史会话,可以快速跳到任一会话。每一条都带有最近的用户提问作为标题,便于识别。 回合运行中也可在 /resume 列表选择其他会话，或执行 /resume <id> ：当前会话自动放到后台继续运行，目标会话准备成功后才切换画面；打开失败时保持原会话。切回本进程的后台会话会复用原 runtime，不重复启动任务。后台列表可用 /bg list 查看，最多 16 个后台槽位。 等待审批或交互回答、重配置期间以及开启 WebUI 共享同步时暂不允许切换。后台槽位已满时，先用 /bg drop <N> 停止不再需要的会话。该能力属于 TUI，不代表 WebUI 已支持运行中切换。"
       },
       {
         "id": "新开一个干净会话",
@@ -660,6 +675,11 @@
         "id": "background-任务-一次性后台派发",
         "heading": "/background <任务> —— 一次性后台派发",
         "body": "如果你不想专门切换前后台、只是\"顺手让它跑一下查个东西\",直接带任务即可(两个名字等价)—— /background <任务> 或 /bg <任务> : /background 列出 src 下未使用的依赖 会在一个 /bg 槽位里启动一次性任务(默认配置为只读工具子集,不污染主对话上下文)。跑完后用 /bg list 看状态, /bg <N> 切过去读结果, /bg drop <N> 丢弃。 典型场景 主前台正在调试 A 模块,模型一边改一边跑 cargo check (耗时)。这时想到要顺便重构 B 模块——直接 /bg 切到新前台开始 B;A 那边的 build 在后台跑完状态切到\"已完成\", /bg 1 切回去拿结果。"
+      },
+      {
+        "id": "后台生命周期与多进程",
+        "heading": "后台生命周期与多进程",
+        "body": "后台会话依赖当前 AtomCode 进程；退出时会停止其 runtime，不是脱离进程的常驻任务。会话记录保留后可恢复，但不保证原工具进程继续执行。 无需安装两份 AtomCode：可在多个终端启动同一个可执行文件，分别使用不同会话。同一 home、同一项目的不同会话可以并行；同一存储 bucket 中的同一会话由排他租约保护，不能被两个 runtime 同时写入。交互恢复遇到其他进程占用时可能创建分支副本，请留意提示。配置文件写入使用跨进程锁和原子替换，但配置仍然共享。 不同 ATOMCODE_HOME 可隔离配置与会话存储。会话锁和 home 隔离均不保护项目工作区；多个 agent 并行修改代码时建议使用独立 Git worktree，避免文件或 Git 操作互相覆盖。"
       },
       {
         "id": "清空-vs-压缩-vs-新建",
@@ -780,7 +800,7 @@
       {
         "id": "atomgit",
         "heading": "AtomGit 集成（3 个）",
-        "body": "执行 /login 后，模型可以通过以下内置工具直接操作 AtomGit。你只需用自然语言描述目标，不再使用 /issue 斜杠命令。 工具 作用 需要确认 atomgit_repo 列出、查看、创建、删除、Fork 或 Clone 仓库，创建 Tag 并管理项目标签 写操作：是 atomgit_pr 列出、查看、创建或关闭 PR，管理 PR 评论，并关联或取消关联 Issue 写操作：是 atomgit_issue 列出或查看 Issue，创建 Issue，以及查看、新增、编辑或删除评论 写操作：是 示例：为这个 Bug 创建一个 AtomGit Issue，并附上复现步骤和环境信息。"
+        "body": "执行 /login 后，模型可以通过以下内置工具直接操作 AtomGit。你只需用自然语言描述目标，不再使用 /issue 斜杠命令。 工具 作用 需要确认 atomgit_repo 列出当前账号仓库（非公开搜索）；按 owner/repo 或仓库 URL 查看代码仓库；创建、删除、Fork、Clone、创建 Tag 并管理项目标签。个人列表为空不代表公开仓库不存在，模型/数据集站点不属于此 URL 查询范围 写操作：是 atomgit_pr 列出、查看、创建或关闭 PR，管理 PR 评论，并关联或取消关联 Issue 写操作：是 atomgit_issue 列出或查看 Issue，创建 Issue，以及查看、新增、编辑或删除评论 写操作：是 示例：为这个 Bug 创建一个 AtomGit Issue，并附上复现步骤和环境信息。"
       },
       {
         "id": "大型工具输出",
@@ -828,7 +848,7 @@
       {
         "id": "配置",
         "heading": "配置",
-        "body": "在 ~/.atomcode/config.toml 中调整子代理池： [subagent] max_concurrent = 3 # 同时并行的子代理数（最小 1） timeout_secs = 900 # 每个子任务的墙钟超时，秒（最小 30） max_rounds = 200 # 每个子任务的模型轮次上限（0 = 不限） 键 默认 含义 max_concurrent 3 并行运行的子代理数 timeout_secs 900 每个子任务的墙钟超时（下限 30 秒） max_rounds 200 每个子任务的模型轮次上限； 0 = 不限 环境变量覆盖： ATOMCODE_SUBAGENT_TIMEOUT 和 ATOMCODE_SUBAGENT_MAX_ROUNDS 优先于配置值。"
+        "body": "在 ~/.atomcode/config.toml 中调整子代理池： [subagent] max_concurrent = 3 # 同时并行的子代理数（最小 1） max_rounds = 0 # 每个子任务的模型轮次上限（0 = 不限） 默认不限制子任务轮数；已有配置中的正数预算会保留。要取消旧的 200 轮限制，请设置 [subagent] max_rounds = 0 ，或使用环境变量 ATOMCODE_SUBAGENT_MAX_ROUNDS=0 。正数预算耗尽时最多增加一次纯文本收尾；并发数、取消和重复调用保护独立生效。外部 Codex/Claude 子代理使用各自的运行策略。 键 默认 含义 max_concurrent 3 并行运行的子代理数 max_rounds 0 每个子任务的模型轮次上限； 0 = 不限 环境变量覆盖： ATOMCODE_SUBAGENT_MAX_ROUNDS 优先于配置值。"
       },
       {
         "id": "自定义团队角色",
@@ -925,6 +945,11 @@
         "id": "skill-文件结构",
         "heading": "Skill 文件结构",
         "body": "一个 skill 通常是一个目录,里面至少包含一个 SKILL.md : my-skills/ ├── release/ │ └── SKILL.md ├── write-changelog/ │ └── SKILL.md └── debug-flaky-test/ ├── SKILL.md └── references/ └── pattern-library.md SKILL.md 的典型格式: --- name: release description: 发布一个新的 release tag,更新 changelog,并打包 --- ## 何时使用 当用户说\"发布新版本\"、\"出一个 release\"、\"打 tag\" 时使用。 ## 步骤 1. 通过 `git log` 确认上次发布以来的改动 2. 让用户确认 semver 版本号(patch / minor / major) 3. 更新 `CHANGELOG.md` 中新增条目 4. 运行 `pnpm build` 并确保构建通过 5. 创建 git tag `v<version>` 并写上发布说明 6. 运行 `pnpm publish`(或者对应的发布命令) ## 规则 - 版本号必须符合 semver - 不允许绕过测试,任何失败都必须先修复 - 发布失败时,回滚所有本地 tag 和 changelog 改动"
+      },
+      {
+        "id": "allowed-tools",
+        "heading": "工具预授权：allowed-tools",
+        "body": "allowed-tools 声明调用此 skill 的当前回合可以免去常规审批的工具。它不是排他白名单：未列出的工具仍可调用，继续按现有权限与审批规则处理。 推荐使用 allowed-tools ；兼容下划线别名 allowed_tools ，校验规则相同。重复声明该字段（包括两种写法混用）会拒绝加载。 --- name: setup description: 安装 vibekeys-plugin 的 hidapi 依赖 allowed-tools: - Bash(pip3 *) - Bash(pip *) - Bash(python3 -c *) --- 支持 YAML 缩进列表、行内列表（ allowed-tools: [Bash, read_file] ），也支持空格或逗号分隔的单行字符串（ allowed-tools: Bash(pip3 *) read_file ）。括号内的空格保留。工具名和模式复用静态 permissions 规则的匹配语法， Bash 与 bash 、 Read 与 read_file 对应。语法不完整的声明拒绝加载，不会退化成宽泛授权。 通过斜杠命令、 $ 菜单、 /skills 或模型的 use_skill 成功调用后，授权仅作用于调用它的 agent；下一条用户消息（包括运行中的追加消息）、回合结束或取消、会话切换和运行时重建都不会继承旧授权。恢复历史会话也不会重新授予权限。 全局或项目级 deny 仍优先；敏感路径、凭据、plan mode 等安全边界不被绕过。AtomCode 还保留对破坏性 shell 命令的常规审批：skill 的声明不让这类命令免审批。这是在 Claude Code 预授权语义上保留的产品安全限制；用户自己配置的静态 allow 规则仍按原有语义处理。 Bash 预授权不是沙箱。 Shell 命令本身仍可能读写文件或联网；不要把 allowed-tools: Bash 解读为“只能安装依赖”。插件 hook 和 skill 模板中的预执行 shell 片段属于独立执行入口，不受此模型工具调用预授权控制。"
       },
       {
         "id": "skill-目录",
@@ -1130,12 +1155,12 @@
       {
         "id": "userpromptsubmit-io-协议",
         "heading": "UserPromptSubmit IO 协议",
-        "body": "Hook 通过 stdin 拿到 JSON,通过 stdout 决定如何处理: { \"session_id\": \"...\", \"hook_event_name\": \"UserPromptSubmit\", \"prompt\": \"用户输入的文本\", \"cwd\": \"/工作目录\" } Hook 可以用以下方式响应(优先级由高到低): 退出码非零 —— 阻断 prompt,reason 取自 stderr。 stdout 输出 JSON {\"decision\": \"block\", \"reason\": \"...\"} —— 阻断,显式给原因。 stdout 输出 JSON {\"hookSpecificOutput\": {\"additionalContext\": \"...\"}} —— 把 additionalContext 追加到用户消息后,作为 LLM 的额外上下文。 stdout 输出纯文本 —— 整段作为 additionalContext 注入。 空 stdout / 不可解析 JSON —— 放行,prompt 原样进入 LLM。 AtomCode 解析 stdout 时,优先用 最后一个非空行 试 JSON;失败再回退到整段文本注入 —— 让 hook 脚本可以前置打印 debug 输出而不影响最终决策。"
+        "body": "Hook 通过 stdin 拿到 JSON,通过 stdout 决定如何处理: { \"session_id\": \"...\", \"hook_event_name\": \"UserPromptSubmit\", \"prompt\": \"用户输入的文本\", \"cwd\": \"/工作目录\" } Hook 可以用以下方式响应(优先级由高到低): 退出码 2 且有明确拒绝原因 —— 阻断 prompt；其他非零退出和启动失败不作为业务拒绝。 stdout 输出 JSON {\"decision\": \"block\", \"reason\": \"...\"} —— 阻断,显式给原因。 stdout 输出 JSON {\"hookSpecificOutput\": {\"additionalContext\": \"...\"}} —— 把 additionalContext 追加到用户消息后,作为 LLM 的额外上下文。 stdout 输出纯文本 —— 整段作为 additionalContext 注入。 空 stdout / 不可解析 JSON —— 放行,prompt 原样进入 LLM。 AtomCode 解析 stdout 时,优先用 最后一个非空行 试 JSON;失败再回退到整段文本注入 —— 让 hook 脚本可以前置打印 debug 输出而不影响最终决策。"
       },
       {
         "id": "路径变量",
         "heading": "路径变量",
-        "body": "Hook 命令字符串中可以引用以下环境变量(由 executor 注入): ${CLAUDE_PLUGIN_ROOT} —— plugin 安装目录绝对路径(CC 兼容)。 ${ATOMCODE_PLUGIN_ROOT} —— 同上,atomcode 别名。 这些是 真实环境变量 由 shell 自身展开,不是字符串替换 —— 安装路径含空格、引号、 $ 、 ; 都不会破命令。"
+        "body": "Hook 命令字符串中可以引用以下环境变量(由 executor 注入): ${CLAUDE_PLUGIN_ROOT} —— plugin 安装目录绝对路径(CC 兼容)。 ${ATOMCODE_PLUGIN_ROOT} —— 同上,atomcode 别名。 插件 hook 只接受插件目录内受检的脚本入口和字面量参数，可选 python、python3、node、sh、bash 解释器。插件根占位符作为路径解析，不经过 shell；管道、重定向和内联代码应迁移到脚本中，已知的 Node 路径包装会转换为直接脚本入口，batch/bash 双格式 .cmd 包装使用 bash 执行；普通 .cmd/.bat 文件不受支持。用户自定义 hook 才保留 shell 展开语义。"
       },
       {
         "id": "marketplace-管理",
@@ -1279,12 +1304,12 @@
       {
         "id": "webui-界面",
         "heading": "WebUI 界面",
-        "body": "除了终端 TUI，AtomCode 还内置一个 浏览器界面 ：在 TUI 里输入 /webui 即可一键启动，在浏览器里聊天、翻看历史会话、增删改模型配置、上传图片，并通过 /sync 让终端与浏览器 实时同步 同一个会话。它复用本机的登录态、模型与会话历史，不需要另外配置。"
+        "body": "除了终端 TUI，AtomCode 还内置一个 浏览器界面 ：在 TUI 里输入 /webui 即可一键启动，在浏览器里聊天、翻看历史会话、增删改模型配置、上传图片，并通过 /sync 让终端与浏览器 实时同步 同一个会话。它复用本机的登录态、模型与会话历史，不需要另外配置。 上下文压缩后，保留的历史用户消息会标注“非新指令”。点击会话顶部的“查看完整历史”可阅读原始回合、推理与工具记录，不会改变当前任务或输入草稿。刷新页面只是重新读取会话； /reload 用于重新加载配置，不等于上下文压缩。"
       },
       {
         "id": "启动与关闭",
         "heading": "启动与关闭",
-        "body": "在 AtomCode 的 TUI 输入框里运行： # 启动 webui 并自动打开浏览器（默认绑定 127.0.0.1:13457，仅本机可访问） /webui # 关闭 webui 服务 /webui stop 启动后 AtomCode 会在本机起一个 HTTP 服务，并自动打开浏览器到形如 http://127.0.0.1:13457/?token=<一次性令牌> 的地址。URL 里带的 token 用于鉴权， 等同于密码 ，请勿外传。同时，当前 TUI 会话会自动接入实时同步（见下文 多端实时同步 ）。 默认只监听本机 webui 默认绑定 127.0.0.1 ，只有本机能访问。要让手机等设备访问， 不要 直接用 --host 0.0.0.0 暴露到公网，请走蒲公英虚拟局域网方案 —— 见 远程访问指南 。"
+        "body": "在 AtomCode 的 TUI 输入框里运行： # 启动 webui 并自动打开浏览器（本机服务绑定 127.0.0.1:13457，手机通过中继访问） /webui # 关闭 webui 服务 /webui stop 启动后 AtomCode 会在本机起一个 HTTP 服务，并自动打开浏览器到形如 http://127.0.0.1:13457/?token=<一次性令牌> 的地址。URL 里带的 token 用于鉴权， 等同于密码 ，请勿外传。同时，当前 TUI 会话会自动接入实时同步（见下文 多端实时同步 ）。 手机通过中继访问 webui 本地服务默认绑定 127.0.0.1 ，同时连接 https://relay-atomcode.atomgit.com 中继。手机扫描终端或「远程访问」面板的二维码即可访问，无需组网。仅本机使用可加 --local 。详见 远程访问指南 。"
       },
       {
         "id": "两种启动方式与生命周期",
@@ -1309,12 +1334,12 @@
       {
         "id": "远程访问",
         "heading": "远程访问",
-        "body": "想从手机等设备打开 webui，又不暴露公网？借助蒲公英（Oray PGY）组建的虚拟局域网，用 /webui --host <虚拟 IP> 把服务绑定到虚拟 IP，再在「远程访问」面板扫码即可。完整流程见 远程访问指南 。"
+        "body": "在终端运行 /webui （独立启动用 atomcode webui ），手机浏览器扫描中继二维码即可打开同一会话，手机和电脑可使用不同网络。完整流程见 远程访问指南 。"
       },
       {
         "id": "下一步",
         "heading": "下一步",
-        "body": "远程访问指南 —— 用蒲公英从手机安全打开 webui Headless 与 Daemon —— webui 背后的 daemon 与 HTTP/SSE 接口 斜杠命令 —— /webui 、 /sync 等命令速查 © 2026 AtomCode · MIT 报告问题"
+        "body": "远程访问指南 —— 通过 HTTPS 中继从手机打开 webui Headless 与 Daemon —— webui 背后的 daemon 与 HTTP/SSE 接口 斜杠命令 —— /webui 、 /sync 等命令速查 © 2026 AtomCode · MIT 报告问题"
       }
     ]
   },
@@ -1322,52 +1347,37 @@
     "slug": "webui-remote-access",
     "title": "远程访问指南",
     "group": "进阶",
-    "lede": "AtomCode 的 webui 默认只监听本机回环地址（ 127.0.0.1 ），手机等其他设备访问不到。借助 蒲公英（Oray PGY） 组建的虚拟局域网，你可以在不暴露公网、无需公网 IP 的前提下，从手机/平板安全地打开本机 webui。本页讲解完整的连接流程与安全须知。",
+    "lede": "在 AtomCode 运行 /webui ，手机浏览器扫描中继二维码即可访问，无需蒲公英组网，也无需让电脑监听公网端口。",
     "sections": [
       {
         "id": "远程访问指南",
         "heading": "远程访问指南",
-        "body": "AtomCode 的 webui 默认只监听本机回环地址（ 127.0.0.1 ），手机等其他设备访问不到。借助 蒲公英（Oray PGY） 组建的虚拟局域网，你可以在不暴露公网、无需公网 IP 的前提下，从手机/平板安全地打开本机 webui。本页讲解完整的连接流程与安全须知。"
+        "body": "在 AtomCode 运行 /webui ，手机浏览器扫描中继二维码即可访问，无需蒲公英组网，也无需让电脑监听公网端口。"
       },
       {
-        "id": "工作原理",
-        "heading": "工作原理",
-        "body": "蒲公英是一个异地组网工具：在本机和手机上安装并登录 同一账号 、加入 同一网络 后，两台设备就处在同一个虚拟局域网里，彼此可以用一个 蒲公英虚拟 IP 直接通信。webui 只要绑定到这个虚拟 IP，手机就能通过它访问。整个链路是点对点的私有网络， 不会把你的本机暴露到公网 。 为什么不直接开放公网 webui / daemon 没有内置鉴权，访问者相当于拿到本机所有工具的执行权（包括 bash 、 write 、 edit ）。所以请 不要 用 --host 0.0.0.0 把它直接暴露到公网或开放局域网。蒲公英虚拟局域网 + 一次性访问令牌（token），是为普通用户准备的安全远程方案。"
+        "id": "使用方式",
+        "heading": "使用方式",
+        "body": "电脑保持 AtomCode 运行，执行 /webui 。本机浏览器会打开，终端同时显示手机链接和二维码。 用手机浏览器扫码，或在电脑 WebUI 的“远程访问”面板复制中继链接。手机和电脑可使用不同网络。 TUI 与手机同步查看和回答同一会话。执行 /webui stop 、退出 AtomCode 或在终端登出会停止中继共享。 独立启动可用 atomcode webui ；仅本机访问用 /webui --local 或 atomcode webui --local 。显式指定 /webui lan 或 --host <地址> 时使用局域网地址，不自动连接中继。"
       },
       {
-        "id": "前置条件",
-        "heading": "前置条件",
-        "body": "本机已经能正常启动 AtomCode 的 webui。 本机与手机都安装了 蒲公英 客户端： https://pgy.oray.com 。 两台设备登录 同一蒲公英账号 ，并加入 同一网络 。"
+        "id": "连接失败",
+        "heading": "连接失败",
+        "body": "中继连接失败时本机 WebUI 仍可使用，终端和远程访问面板会说明原因。若提示中继未启用 WebUI，需升级中继服务端并部署当前版本的 WebUI 资源，再执行 /webui 重试。可通过 ATOMCODE_APP_RELAY 指定自建中继， ATOMCODE_ENABLE_RELAY=0 禁用中继。"
       },
       {
-        "id": "操作步骤",
-        "heading": "操作步骤",
-        "body": ""
+        "id": "中继地址",
+        "heading": "中继地址",
+        "body": "默认使用线上 HTTPS 中继 https://relay-atomcode.atomgit.com ，无需额外配置。手机请打开 AtomCode 生成的配对链接或扫描二维码。"
       },
       {
-        "id": "1-连接蒲公英拿到虚拟-ip",
-        "heading": "1. 连接蒲公英，拿到虚拟 IP",
-        "body": "在本机的蒲公英客户端里完成登录与组网，记下分配给本机的 虚拟 IP （形如 10.x.x.x ）。手机端同样登录同一账号、加入同一网络即可，无需记 IP。"
+        "id": "安全与生命周期",
+        "heading": "安全与生命周期",
+        "body": "链接等同于访问密码，请勿外传。请求经 HTTPS 中继到本机，继续校验 WebUI 令牌；中继可以处理传输内容，不提供端到端加密。浏览器把配对凭据保存在当前标签页的 sessionStorage，用于刷新重连，关闭标签页后清除。网络中断时客户端自动重连；电脑休眠、离线或 AtomCode 退出后不可访问。"
       },
       {
-        "id": "2-让-webui-绑定到虚拟-ip",
-        "heading": "2. 让 webui 绑定到虚拟 IP",
-        "body": "默认 webui 只绑回环地址，手机访问不到。在 AtomCode 的 TUI 里用 --host 指定蒲公英虚拟 IP 重新启动 webui： /webui --host 10.x.x.x 把 10.x.x.x 换成上一步记下的本机虚拟 IP。绑定成功后，webui 就会在这个地址上对同一虚拟局域网内的设备开放。"
-      },
-      {
-        "id": "3-在远程访问面板扫码连接",
-        "heading": "3. 在「远程访问」面板扫码连接",
-        "body": "打开 webui 右上角的 远程访问 （手机图标）面板，AtomCode 会自动检测蒲公英状态并生成： 一个可直接打开的 远程地址 （已带上访问令牌）； 对应的 二维码 。 用手机扫码，或把地址复制到手机浏览器打开即可。手机需登录同一蒲公英账号、处于同一网络。 访问令牌 = 密码 远程地址中带有一次性访问令牌（ ?token=… ）， 等同于密码 ：任何拿到这条完整链接的人都能操作你的本机。请勿把它发到群里、截图外传或贴到公开页面。"
-      },
-      {
-        "id": "排错",
-        "heading": "排错",
-        "body": "「远程访问」面板会根据检测结果给出不同提示，对应处理如下： 面板提示 含义 怎么办 未检测到蒲公英 本机没装蒲公英，或客户端未运行。 在本机与手机都安装并登录蒲公英，加入同一网络后回到面板「重新检测」。 本机还没分配虚拟 IP 装了蒲公英但还没组网成功。 在蒲公英客户端里连接 / 加入网络，拿到虚拟 IP 后再「重新检测」。 webui 仅绑定了本机 检测到蒲公英，但 webui 还监听在回环地址。 按步骤 2 用 /webui --host <虚拟 IP> 重启 webui，再刷新本页。 手机打不开 / 一直转圈 两端不在同一网络，或防火墙拦截。 确认手机与本机登录同一蒲公英账号、加入同一网络；检查本机防火墙是否放行 webui 端口。"
-      },
-      {
-        "id": "下一步",
-        "heading": "下一步",
-        "body": "Headless 与 Daemon —— 了解 webui 背后的 daemon 与 HTTP/SSE 接口 常见问题 —— 远程 / 登录相关的常见坑 © 2026 AtomCode · MIT 报告问题"
+        "id": "局域网备选",
+        "heading": "局域网备选",
+        "body": "仍可使用 /webui lan 在同一 Wi-Fi 内访问，或 /webui --host <虚拟 IP> 配合已有 VPN。此时需自行确保网络可信，本地 HTTP 不提供传输加密。 © 2026 AtomCode · MIT 报告问题"
       }
     ]
   },

@@ -39,8 +39,14 @@ pub trait HostConfig: Send + Sync {
     /// The agent configuration for `model`, as the host's configuration
     /// resolves that id now.
     fn for_model(&self, model: &str) -> Result<CodingAgentConfig, String>;
-    /// The agent configuration as configured now — what signing in again reads.
+    /// The agent configuration as configured now, including launch overrides.
     fn current(&self) -> Result<CodingAgentConfig, String>;
+
+    /// Interactive login adopts the persisted selection, rather than a model
+    /// override supplied when the process started.
+    fn after_sign_in(&self) -> Result<CodingAgentConfig, String> {
+        self.current()
+    }
 
     /// What the configuration *is* right now, as a value that changes when it
     /// changes — a hash of the file, a modification time, a revision.
@@ -307,12 +313,14 @@ pub(crate) fn attach(
                     // road, and a goal met came out red, read as a failure.
                     if let Some(met) = goal_ending(&progress) {
                         watched.announce(HostEvent::GoalEnded {
+                            summary: Some(running_of_goal(progress.clone())),
                             session: session.clone(),
                             condition: progress.condition.clone(),
                             met,
                         });
                     }
-                    let ended = progress.terminal.is_some();
+                    let ended = progress.terminal.is_some()
+                        && progress.phase != atomcode_coding::GoalPhase::PausedAtCap;
                     watched.announce(HostEvent::Autonomy {
                         session,
                         running: (!ended).then(|| running_of_goal(progress)),
@@ -375,6 +383,7 @@ pub(crate) fn attach(
                     }
                 }
                 CodingRuntimeEvent::ProviderChanged { .. }
+                | CodingRuntimeEvent::Reconfigured { .. }
                 | CodingRuntimeEvent::ReasoningEffortChanged { .. } => watched.redescribe(),
                 // How much the session may do without asking is session state,
                 // not a fact in the log — so a screen draws it from here or not
@@ -573,6 +582,7 @@ fn reply(out: &mpsc::UnboundedSender<AgentEvent>, receipt: Option<CommandId>, an
                 code: None,
                 retryable: None,
                 // 一条被拒的命令:没有回合收尾会再说一遍它。
+                retry_after_secs: None,
                 ends_turn: false,
             });
         }
@@ -828,6 +838,7 @@ async fn run(
 ) -> Answered {
     let refused = |error: RuntimeError| {
         let message = match error {
+            RuntimeError::Busy => tr(SMsg::RuntimeBusy).into_owned(),
             // The same sentence the screen was told when the provider went,
             // in the person's language — not the runtime's English `Display`.
             RuntimeError::ProviderUnavailable(reason) => match readiness_for(Some(reason)) {
@@ -974,19 +985,69 @@ fn without_a_log(apps_fed: u64) -> Result<(), HostError> {
 
 /// A goal, as the contract says a self-driving session.
 fn running_of_goal(goal: atomcode_coding::GoalProgress) -> atomcode_host_api::Running {
+    use atomcode_host_api::GoalStage;
+    let stage = if matches!(
+        goal.phase,
+        atomcode_coding::GoalPhase::Satisfied | atomcode_coding::GoalPhase::Ended
+    ) {
+        None
+    } else {
+        Some(if !goal.active {
+            GoalStage::Paused
+        } else if let Some(recovery) = &goal.recovery {
+            match recovery.kind {
+                atomcode_coding::GoalRecoveryKind::Evaluator => GoalStage::Evaluating,
+                atomcode_coding::GoalRecoveryKind::Provider => GoalStage::Recovering,
+            }
+        } else if goal.round > 0 {
+            GoalStage::Continuing
+        } else {
+            GoalStage::Working
+        })
+    };
+    let paused = matches!(
+        goal.phase,
+        atomcode_coding::GoalPhase::Paused | atomcode_coding::GoalPhase::PausedAtCap
+    );
     atomcode_host_api::Running {
+        goal_stage: stage,
+        goal_detail: (stage == Some(GoalStage::Continuing))
+            .then(|| goal.last_reason.clone())
+            .flatten(),
+        usage: goal
+            .report
+            .usage
+            .map(|usage| atomcode_host_api::TokenTotals {
+                input: usage.input,
+                output: usage.output,
+                cached: usage.cached,
+            }),
+        recovering: goal.active && goal.recovery.is_some(),
+        retry_in_secs: goal
+            .recovery
+            .as_ref()
+            .filter(|_| goal.active)
+            .map(|r| r.retry_in_secs),
         kind: "goal".into(),
         what: goal.condition,
         round: goal.round,
         of: goal.max_rounds,
         elapsed_secs: goal.elapsed_secs,
-        paused: (!goal.active).then(|| format!("{:?}", goal.phase)),
+        paused: paused.then(|| {
+            goal.last_reason
+                .unwrap_or_else(|| format!("{:?}", goal.phase))
+        }),
     }
 }
 
 /// A loop, the same way. No `of`: a loop repeats until it is stopped.
 fn running_of_loop(looping: atomcode_coding::LoopProgress) -> atomcode_host_api::Running {
     atomcode_host_api::Running {
+        usage: None,
+        recovering: false,
+        retry_in_secs: None,
+        goal_stage: None,
+        goal_detail: None,
         kind: "loop".into(),
         what: looping.label,
         round: looping.round,
@@ -1102,6 +1163,8 @@ fn to_mcp_action(
     use atomcode_coding::parts::McpAction as Runtime;
     use atomcode_host_api::McpAction;
     match action {
+        McpAction::Reconnect => Some(Runtime::Reconnect),
+        McpAction::CancelReconnect => Some(Runtime::CancelReconnect),
         McpAction::Trust => Some(Runtime::Trust),
         McpAction::Untrust => Some(Runtime::Untrust),
         McpAction::Logout => Some(Runtime::Logout),
@@ -1156,6 +1219,16 @@ fn to_mcp_detail(facts: atomcode_coding::McpRowFacts) -> atomcode_host_api::McpS
 fn translate(event: CodingRuntimeEvent) -> Option<AgentEvent> {
     match event {
         CodingRuntimeEvent::Agent(event) => Some(event),
+        // Deferred questions are available through /goal questions and answer.
+        // Opening another blocking composer card would hide ongoing work.
+        CodingRuntimeEvent::Request(request)
+            if atomcode_capabilities::tools::request_user_input::is_continued_question(
+                &request.kind,
+                &request.payload,
+            ) =>
+        {
+            None
+        }
         CodingRuntimeEvent::Request(request) => Some(AgentEvent::Request {
             id: request.id,
             kind: request.kind,
@@ -1166,7 +1239,11 @@ fn translate(event: CodingRuntimeEvent) -> Option<AgentEvent> {
                 TurnCompletion::Completed { reason, .. }
                 | TurnCompletion::SnapshotUnavailable { reason, .. } => reason,
             };
-            Some(AgentEvent::TurnComplete { turn: None, reason })
+            Some(AgentEvent::TurnComplete {
+                turn: None,
+                reason,
+                provider_failure: None,
+            })
         }
         CodingRuntimeEvent::CompactionStarted { trigger } => {
             Some(AgentEvent::CompactionStarted { trigger })
@@ -1195,6 +1272,7 @@ fn translate(event: CodingRuntimeEvent) -> Option<AgentEvent> {
             code: None,
             retryable: None,
             // 警告:回合照跑,收尾块不会再说它一遍。
+            retry_after_secs: None,
             ends_turn: false,
         }),
         // 识图失败。此前屏上只剩一个 `[图片识别失败]` 标记,原因和怎么
@@ -1346,6 +1424,7 @@ fn said(message: std::borrow::Cow<'_, str>) -> AgentEvent {
         code: None,
         retryable: None,
         // 一句"给人看的话"(识图失败、压缩被打断…):它不是回合的收尾错误。
+        retry_after_secs: None,
         ends_turn: false,
     }
 }
@@ -1892,31 +1971,26 @@ fn preview_of(session: &str) -> Result<Vec<String>, HostError> {
     Ok(lines)
 }
 
-/// The files a coding session is configured from, grouped the way a person
-/// looks for them.
-///
-/// **A file that is not there is reported as not there.** That is the answer
-/// this question is usually asked for: "my instructions are being ignored" is
-/// almost always "that file is not where you thought it was", and a list that
-/// showed only what it found would answer a different question — one whose
-/// answer is always "everything is fine".
-///
-/// A named function rather than inline in the handler so it can be judged
-/// without a runtime: what this carries is a list of paths, and a list of paths
-/// is exactly the kind of thing that goes quietly wrong.
-fn source_groups(working_dir: &std::path::Path) -> Vec<atomcode_host_api::SourceGroup> {
+/// The runtime's loaded asset sources, alongside local configuration/memory paths.
+/// Instruction and skill status comes from mounted services. Disk inspection may
+/// mark changes but never replaces the loaded source with a new candidate.
+fn source_groups(
+    working_dir: &std::path::Path,
+    assets: &atomcode_coding::runtime::RuntimeAssetSources,
+) -> Vec<atomcode_host_api::SourceGroup> {
+    use atomcode_capabilities::instructions::InstructionState;
     use atomcode_capabilities::memory::MemoryStore;
-    use atomcode_config::config::instructions::{InstructionLevel, LayeredInstructions};
     use atomcode_host_api::{SourceFile, SourceGroup};
 
     let file = |label: &str, path: std::path::PathBuf| SourceFile {
         label: label.to_string(),
         present: path.is_file(),
+        detail: None,
         path: path.display().to_string(),
     };
-    let instructions = LayeredInstructions::load(working_dir);
-    vec![
+    let mut groups = vec![
         SourceGroup {
+            summary: None,
             label: tr(SMsg::SourceConfigFile).into_owned(),
             files: vec![file(
                 &tr(SMsg::SourceSettings),
@@ -1924,35 +1998,56 @@ fn source_groups(working_dir: &std::path::Path) -> Vec<atomcode_host_api::Source
             )],
         },
         SourceGroup {
+            summary: None,
             label: tr(SMsg::SourceInstructionFiles).into_owned(),
-            files: instructions
-                .status_lines(working_dir)
-                .into_iter()
-                .map(|line| SourceFile {
-                    label: match line.level {
-                        InstructionLevel::Global => atomcode_config::i18n::t(
+            files: assets
+                .instructions
+                .iter()
+                .filter(|source| {
+                    source.state != InstructionState::Missing
+                        || source.disk_changed
+                        || source.scope != "PROJECT"
+                        || source.path.file_name().is_some_and(|n| n == ".atomcode.md")
+                            && !assets.instructions.iter().any(|s| {
+                                s.scope == "PROJECT" && s.state != InstructionState::Missing
+                            })
+                })
+                .map(|source| {
+                    let scope = match source.scope {
+                        "GLOBAL" => atomcode_config::i18n::t(
                             atomcode_config::i18n::Msg::StatusInstructionScopeGlobal,
-                        )
-                        .into_owned(),
-                        InstructionLevel::Project => atomcode_config::i18n::t(
-                            atomcode_config::i18n::Msg::StatusInstructionScopeProject,
-                        )
-                        .into_owned(),
-                        InstructionLevel::User => atomcode_config::i18n::t(
+                        ),
+                        "USER" => atomcode_config::i18n::t(
                             atomcode_config::i18n::Msg::StatusInstructionScopeUser,
-                        )
-                        .into_owned(),
-                    },
-                    // The loader's own answer, not a second `is_file` here: it
-                    // is the one that decided whether this file is in play, and
-                    // a page that disagreed with it would be reporting on a
-                    // different run than the one that is happening.
-                    present: line.found,
-                    path: line.path.display().to_string(),
+                        ),
+                        _ => atomcode_config::i18n::t(
+                            atomcode_config::i18n::Msg::StatusInstructionScopeProject,
+                        ),
+                    };
+                    let state = match source.state {
+                        InstructionState::Loaded => tr(SMsg::SourceLoaded),
+                        InstructionState::Shadowed => tr(SMsg::SourceShadowed),
+                        InstructionState::Empty => tr(SMsg::SourceEmpty),
+                        InstructionState::Unreadable => tr(SMsg::SourceUnreadable),
+                        InstructionState::Missing => tr(SMsg::SourceNotLoaded),
+                    };
+                    let changed = if source.disk_changed {
+                        format!(" · {}", tr(SMsg::SourceDiskChanged))
+                    } else {
+                        String::new()
+                    };
+                    SourceFile {
+                        label: scope.into_owned(),
+                        path: source.path.display().to_string(),
+                        // Loaded bytes remain available even after the file is removed.
+                        present: source.state != InstructionState::Missing || source.disk_changed,
+                        detail: Some(format!("{state}{changed}")),
+                    }
                 })
                 .collect(),
         },
         SourceGroup {
+            summary: None,
             label: tr(SMsg::SourceMemoryFiles).into_owned(),
             files: vec![
                 file(
@@ -1979,7 +2074,53 @@ fn source_groups(working_dir: &std::path::Path) -> Vec<atomcode_host_api::Source
                 ),
             ],
         },
-    ]
+    ];
+    if !assets.skill_dirs.is_empty()
+        || !assets.skills.is_empty()
+        || !assets.skill_diagnostics.is_empty()
+    {
+        let mut files: Vec<_> = assets
+            .skill_dirs
+            .iter()
+            .map(|path| SourceFile {
+                label: tr(SMsg::SourceSkillDirs).into_owned(),
+                path: path.display().to_string(),
+                present: path.is_dir(),
+                detail: None,
+            })
+            .collect();
+        files.extend(assets.skills.iter().map(|(name, path)| SourceFile {
+            label: name.clone(),
+            path: path.display().to_string(),
+            present: true,
+            detail: Some(tr(SMsg::SourceLoaded).into_owned()),
+        }));
+        files.extend(assets.skill_diagnostics.iter().map(|d| SourceFile {
+            label: tr(SMsg::SourceSkillDiagnostics).into_owned(),
+            path: d.path.display().to_string(),
+            present: true,
+            detail: Some(d.reason.clone()),
+        }));
+        let failed = assets
+            .skill_diagnostics
+            .iter()
+            .filter(|d| d.warning)
+            .count();
+        groups.push(SourceGroup {
+            label: "Skills".into(),
+            summary: Some(
+                tr(SMsg::SourceSkillSummary {
+                    loaded: assets.skills.len(),
+                    directories: assets.skill_dirs.len(),
+                    overridden: assets.skill_diagnostics.len() - failed,
+                    failed,
+                })
+                .into_owned(),
+            ),
+            files,
+        });
+    }
+    groups
 }
 
 fn reasoning_persistence_reply(saved: Result<(), String>) -> HostReply {
@@ -2115,9 +2256,13 @@ impl HostControl for RuntimeControl {
                 // The runtime's own working directory, not the process's: a
                 // session that has been `cd`-ed reads a different project's
                 // files, and the page is about the session.
-                let now = self.handle.context_stats().await.map_err(refused)?;
+                let now = self
+                    .handle
+                    .context_stats_with(true)
+                    .await
+                    .map_err(refused)?;
                 Ok(HostReply::Sources {
-                    groups: source_groups(&now.working_dir),
+                    groups: source_groups(&now.working_dir, &now.assets.unwrap_or_default()),
                 })
             }
             HostCommand::ListSessions { working_dir } => Ok(HostReply::Sessions {
@@ -2676,11 +2821,28 @@ impl HostControl for RuntimeControl {
                 self.addressed(&session)?;
                 let next = match self.host_config.clone() {
                     Some(source) => source
-                        .current()
+                        .after_sign_in()
                         .map_err(|message| HostError::Failed { message })?,
                     None => self.config.lock().expect("config poisoned").clone(),
                 };
-                self.reconfigure(next).await
+                // Login also refreshes account settings, permissions and tools.
+                // Always apply them, even if the file's bytes did not change.
+                let changed = self
+                    .handle
+                    .reprepare_config(next.clone())
+                    .await
+                    .map_err(refused)?;
+                *self.config.lock().expect("config poisoned") = next;
+                *self.fingerprint.lock().expect("fingerprint poisoned") = self
+                    .host_config
+                    .as_ref()
+                    .and_then(|source| source.fingerprint());
+                match self.changed(changed.session_id)? {
+                    HostReply::SessionChanged { session: now } if now == session => {
+                        Ok(HostReply::Done)
+                    }
+                    other => Ok(other),
+                }
             }
             HostCommand::Autonomy { session } => {
                 self.addressed(&session)?;
@@ -3060,6 +3222,8 @@ pub fn refused(error: RuntimeError) -> HostError {
             RuntimeError::RewindPointUnavailable { turn_id } => {
                 HostError::RewindPointNotFound { turn: turn_id }
             }
+            RuntimeError::GoalUnavailable(message)
+            | RuntimeError::SessionReferenceUnavailable(message) => HostError::Failed { message },
             RuntimeError::CodeRewindUnavailable(message) => {
                 HostError::CodeRewindUnavailable { message }
             }
@@ -3080,6 +3244,46 @@ mod source_tests {
     use super::source_groups;
     use atomcode_i18n::screen::{t as tr, Msg as SMsg};
 
+    #[test]
+    fn skill_sources_keep_details_but_provide_a_bounded_status_summary() {
+        let project = tempfile::tempdir().unwrap();
+        let assets = atomcode_coding::runtime::RuntimeAssetSources {
+            skill_dirs: vec![project.path().join("skills")],
+            skills: vec![(
+                "sample".into(),
+                project.path().join("skills/sample/SKILL.md"),
+            )],
+            skill_diagnostics: vec![
+                atomcode_capabilities::skills::SkillDiagnostic {
+                    path: project.path().join("old/SKILL.md"),
+                    reason: "overridden by new".into(),
+                    warning: false,
+                },
+                atomcode_capabilities::skills::SkillDiagnostic {
+                    path: project.path().join("invalid/SKILL.md"),
+                    reason: "invalid name".into(),
+                    warning: true,
+                },
+            ],
+            ..Default::default()
+        };
+        let groups = source_groups(project.path(), &assets);
+        let skills = groups.iter().find(|group| group.label == "Skills").unwrap();
+        assert_eq!(skills.files.len(), 4, "detailed sources remain available");
+        let summary = skills.summary.as_ref().unwrap();
+        assert_eq!(
+            summary,
+            &tr(SMsg::SourceSkillSummary {
+                loaded: 1,
+                directories: 1,
+                overridden: 1,
+                failed: 1
+            })
+        );
+        assert!(!summary.contains("SKILL.md"));
+        assert!(summary.contains("/skills"));
+    }
+
     /// Every file the session is configured from is reported, and the ones that
     /// are not there are reported as not there.
     ///
@@ -3088,12 +3292,66 @@ mod source_tests {
     /// the file is somewhere else — a list that showed only what it found
     /// would be a list that can never say that.
     #[test]
+    fn source_panel_reports_the_loaded_file_after_it_was_renamed() {
+        let project = tempfile::tempdir().unwrap();
+        let old = project.path().join(".atomcode.md");
+        let new = project.path().join("AGENTS.md");
+        std::fs::write(&old, "original instructions").unwrap();
+        let loaded = atomcode_capabilities::instructions::load_instructions(
+            &project.path().join("home"),
+            project.path(),
+        );
+        std::fs::rename(&old, &new).unwrap();
+        let assets = atomcode_coding::runtime::RuntimeAssetSources {
+            instructions: loaded.sources_on_disk(),
+            ..Default::default()
+        };
+        let groups = source_groups(project.path(), &assets);
+        let files: Vec<_> = groups.iter().flat_map(|g| &g.files).collect();
+        let original = files
+            .iter()
+            .find(|f| f.path == old.display().to_string())
+            .unwrap();
+        assert!(original.present, "the bytes are still loaded");
+        assert_eq!(
+            original.detail,
+            Some(format!(
+                "{} · {}",
+                tr(SMsg::SourceLoaded),
+                tr(SMsg::SourceDiskChanged)
+            ))
+        );
+        let renamed = files
+            .iter()
+            .find(|f| f.path == new.display().to_string())
+            .unwrap();
+        assert_eq!(
+            renamed.detail,
+            Some(format!(
+                "{} · {}",
+                tr(SMsg::SourceNotLoaded),
+                tr(SMsg::SourceDiskChanged)
+            ))
+        );
+    }
+
+    #[test]
     fn a_configuration_file_that_is_not_there_is_still_reported() {
         let project = tempfile::tempdir().expect("a temp dir");
         // One instruction file present, the rest of the layers absent.
         std::fs::write(project.path().join("AGENTS.md"), "# 项目").expect("write");
 
-        let groups = source_groups(project.path());
+        let instructions = atomcode_capabilities::instructions::load_instructions(
+            &project.path().join("nohome"),
+            project.path(),
+        );
+        let groups = source_groups(
+            project.path(),
+            &atomcode_coding::runtime::RuntimeAssetSources {
+                instructions: instructions.sources_on_disk(),
+                ..Default::default()
+            },
+        );
         // Read from the table rather than spelled out, so this asserts *which
         // three groups* there are and not one language's words for them.
         let labels: Vec<&str> = groups.iter().map(|group| group.label.as_str()).collect();
@@ -3116,9 +3374,12 @@ mod source_tests {
         // the instruction layers come from the loader's own answer and
         // everything else from asking the filesystem. A criterion satisfied by
         // one of them would leave the other free to say whatever it liked.
+        // Compared by path components, not by string suffix: the tail is written with
+        // `/` and Windows reports the same file with `\`, and a string test called that
+        // a missing file.
         let by_path = |ends: &str| -> &atomcode_host_api::SourceFile {
             all.iter()
-                .find(|file| file.path.ends_with(ends))
+                .find(|file| std::path::Path::new(&file.path).ends_with(ends))
                 .unwrap_or_else(|| panic!("{ends}: {all:#?}"))
         };
         assert!(
@@ -3149,6 +3410,28 @@ mod source_tests {
 #[cfg(test)]
 mod completion_tests {
     use super::{persistence_failure, without_a_log};
+
+    #[test]
+    fn deferred_goal_questions_do_not_reopen_a_blocking_tui_card() {
+        use atomcode_coding::{CodingRuntimeEvent, RuntimeRequest};
+        let request = RuntimeRequest {
+            id: 900,
+            kind: "request_user_input".into(),
+            payload: serde_json::json!({"question":"Which?","goal_question_pending":true}),
+            snapshot: None,
+        };
+        assert!(super::translate(CodingRuntimeEvent::Request(request.clone())).is_none());
+        let mut ordinary = request;
+        ordinary
+            .payload
+            .as_object_mut()
+            .unwrap()
+            .remove("goal_question_pending");
+        assert!(matches!(
+            super::translate(CodingRuntimeEvent::Request(ordinary)),
+            Some(atomcode_kernel::event::AgentEvent::Request { id: 900, .. })
+        ));
+    }
 
     /// "No log right now" and "no log, ever" are different answers.
     ///
@@ -3323,6 +3606,79 @@ mod tests {
         }
     }
 
+    #[test]
+    fn goal_recovery_is_not_a_pause_in_the_host_projection() {
+        use atomcode_coding::{GoalPhase, GoalProgress, GoalRecoveryKind, GoalRecoveryProgress};
+        let mut goal = GoalProgress {
+            active: true,
+            terminal: None,
+            phase: GoalPhase::Pursuing,
+            round: 1,
+            max_rounds: None,
+            elapsed_secs: 1,
+            condition: "objective".into(),
+            last_reason: Some("retrying provider".into()),
+            recovery: Some(GoalRecoveryProgress {
+                kind: GoalRecoveryKind::Provider,
+                attempt: 1,
+                max_attempts: 3,
+                retry_in_secs: 30,
+            }),
+            report: Default::default(),
+            evaluation_ready: false,
+        };
+        let running = running_of_goal(goal.clone());
+        assert!(running.recovering);
+        assert_eq!(running.retry_in_secs, Some(30));
+        assert_eq!(running.paused, None);
+        assert_eq!(
+            running.goal_stage,
+            Some(atomcode_host_api::GoalStage::Recovering)
+        );
+        goal.recovery.as_mut().unwrap().kind = GoalRecoveryKind::Evaluator;
+        assert_eq!(
+            running_of_goal(goal.clone()).goal_stage,
+            Some(atomcode_host_api::GoalStage::Evaluating)
+        );
+        goal.recovery.as_mut().unwrap().retry_in_secs = 0;
+        assert_eq!(running_of_goal(goal.clone()).retry_in_secs, Some(0));
+        goal.recovery = None;
+        goal.last_reason = Some("coverage needs verification".into());
+        let continued = running_of_goal(goal.clone());
+        assert_eq!(
+            continued.goal_stage,
+            Some(atomcode_host_api::GoalStage::Continuing)
+        );
+        assert_eq!(
+            continued.goal_detail.as_deref(),
+            Some("coverage needs verification")
+        );
+        goal.round = 0;
+        assert_eq!(
+            running_of_goal(goal.clone()).goal_stage,
+            Some(atomcode_host_api::GoalStage::Working)
+        );
+        goal.active = false;
+        goal.phase = GoalPhase::PausedAtCap;
+        goal.last_reason = Some("provider recovery budget exhausted".into());
+        let paused = running_of_goal(goal.clone());
+        assert!(!paused.recovering);
+        assert_eq!(paused.retry_in_secs, None);
+        assert_eq!(
+            paused.paused.as_deref(),
+            Some("provider recovery budget exhausted")
+        );
+        for phase in [GoalPhase::Satisfied, GoalPhase::Ended] {
+            goal.phase = phase;
+            let ended = running_of_goal(goal.clone());
+            assert_eq!(
+                ended.goal_stage, None,
+                "a finished goal cannot still be paused"
+            );
+            assert_eq!(ended.paused, None);
+        }
+    }
+
     /// 目标结束时,「达成」和「判不了算不算达成」不能长得一样。
     ///
     /// 徽标消失是两者共有的,所以只看屏幕的话第二种会被当成第一种 —— 人以为
@@ -3330,10 +3686,49 @@ mod tests {
     /// `ControllerWarning` 带着原因,在这儿再说一遍就是说两遍;人自己停的
     /// (`Cancelled`)命令已经答过一句了。
     #[test]
+    fn goal_projection_keeps_cumulative_usage_and_unknown_checkpoint_history() {
+        let mut progress = atomcode_coding::GoalProgress {
+            active: true,
+            terminal: None,
+            phase: atomcode_coding::GoalPhase::Pursuing,
+            round: 2,
+            max_rounds: None,
+            elapsed_secs: 120,
+            condition: "finish".into(),
+            last_reason: None,
+            recovery: None,
+            evaluation_ready: false,
+            report: atomcode_coding::GoalRunReport {
+                usage: Some(atomcode_coding::GoalTokenUsage {
+                    input: 10_000,
+                    output: 500,
+                    cached: 7_000,
+                }),
+                ..Default::default()
+            },
+        };
+        let running = running_of_goal(progress.clone());
+        assert_eq!(running.elapsed_secs, 120);
+        assert_eq!(
+            running.usage,
+            Some(atomcode_host_api::TokenTotals {
+                input: 10_000,
+                output: 500,
+                cached: 7_000
+            })
+        );
+        progress.report.usage = None;
+        assert_eq!(running_of_goal(progress).usage, None);
+    }
+
+    #[test]
     fn a_goal_that_ended_says_which_of_the_two_silent_endings_it_was() {
         use atomcode_coding::{GoalPhase, GoalProgress, GoalTerminal};
         let ended = |terminal, last_reason| {
             goal_ending(&GoalProgress {
+                report: Default::default(),
+                evaluation_ready: false,
+                recovery: None,
                 active: false,
                 terminal: Some(terminal),
                 phase: GoalPhase::Pursuing,

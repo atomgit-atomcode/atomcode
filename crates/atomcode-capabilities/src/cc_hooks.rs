@@ -1,11 +1,6 @@
 //! Claude-Code-compatible EXTERNAL hooks for the new (kernel) stack.
 //!
-//! The legacy `atomcode-core` engine shipped a full CC-parity hook engine
-//! (spawn an external command per lifecycle event, speak CC's stdin/stdout JSON
-//! contract). The new default v2/kernel engine never ran it — it lives in core,
-//! which L1 may not depend on. This module PORTS that executor onto the kernel's
-//! seams ([`LifecycleHooks`] + [`ToolMiddleware`]) so user/plugin CC hooks run on
-//! the default engine again.
+//! User and plugin hook commands run on the kernel lifecycle/tool seams.
 //!
 //! ONE [`CCExternalHooks`] instance implements BOTH traits — register it as a
 //! lifecycle hook AND as a tool middleware (it carries the same loaded config):
@@ -13,10 +8,9 @@
 //!   plus `turn_complete` (mapped to the CC `Stop` / `StopFailure` terminal events)
 //! - [`ToolMiddleware`]: `before` (PreToolUse) / `after` (PostToolUse)
 //!
-//! SCOPE (M2a): user (`$ATOMCODE_HOME/hooks.json`) + project (`<root>/.hooks.json`).
-//! Plugin-contributed inline CC hooks need the plugin loader (still in core) and
-//! land in a later slice; the [`HookConfig::plugin_root`] field is already wired so
-//! that port is additive.
+//! User/project hooks retain shell semantics. Plugin hooks require explicitly
+//! authorized bundle content and a checked entry point; invalid configurations
+//! are withheld by the loader. Runtime content-verification failures fail closed.
 //!
 //! GRACEFUL BY DESIGN: a hook that times out, fails to spawn, or emits garbage is a
 //! silent continue — a broken hook never wedges the turn. Only an explicit `deny` /
@@ -108,14 +102,24 @@ pub struct HookConfig {
     /// `"foo_*"` = prefix; otherwise exact.
     pub matcher: Option<String>,
     pub command: String,
+    /// Literal arguments. Never concatenate these into the shell command.
+    pub args: Vec<String>,
     pub timeout_ms: u64,
     /// Set for plugin-contributed hooks; exported as `CLAUDE_PLUGIN_ROOT` /
     /// `ATOMCODE_PLUGIN_ROOT` so a plugin script can locate resources alongside
     /// its manifest. We never substitute it into the command (injection-safe).
     pub plugin_root: Option<PathBuf>,
+    /// Content authorized when this runtime loaded the plugin.
+    pub plugin_content_hash: Option<String>,
 }
 
 impl HookConfig {
+    /// Attach manifest argv without reinterpreting it as command text.
+    pub fn with_args(mut self, args: Vec<String>) -> Self {
+        self.args = args;
+        self
+    }
+
     /// Build a config from a Claude-Code plugin's INLINE manifest hook (a `plugin.json`
     /// `hooks` entry). The driver resolves these from installed plugins — which L1 cannot
     /// reach — and feeds them in via [`CCExternalHooks::load_with_extra`]. `event_name` is
@@ -135,6 +139,11 @@ impl HookConfig {
             timeout_ms: timeout_secs
                 .map(|s| s.saturating_mul(1000))
                 .unwrap_or_else(default_timeout_ms),
+            plugin_content_hash: Some(
+                crate::plugin::hook_trust::plugin_content_hash(&plugin_root)
+                    .unwrap_or_else(|_| "unverifiable".into()),
+            ),
+            args: Vec::new(),
             plugin_root: Some(plugin_root),
         })
     }
@@ -228,7 +237,9 @@ fn read_hooks_file(path: &Path) -> (Vec<HookConfig>, HooksFileStatus) {
             matcher: entry.matcher,
             command: entry.command,
             timeout_ms: entry.timeout_ms,
+            args: Vec::new(),
             plugin_root: None,
+            plugin_content_hash: None,
         });
     }
     let status = HooksFileStatus::Loaded {
@@ -377,6 +388,247 @@ fn shell_command(command: &str) -> tokio::process::Command {
 /// names its script `./hooks/x.sh` or `"$ATOMCODE_PROJECT_DIR"/hooks/x.sh`.
 /// Variables are the shell's to expand, never substituted into the command
 /// here: a value spliced into a shell line would be parsed as shell.
+/// Avoid Windows' implicit current-directory executable search for interpreters.
+#[cfg(windows)]
+fn plugin_interpreter(name: &str) -> Result<PathBuf, String> {
+    let path = std::env::var_os("PATH").ok_or("interpreter PATH is unavailable")?;
+    for directory in std::env::split_paths(&path).filter(|directory| directory.is_absolute()) {
+        for suffix in [".exe", ".com"] {
+            let candidate = directory.join(format!("{name}{suffix}"));
+            if candidate.is_file() {
+                return std::fs::canonicalize(candidate)
+                    .map_err(|_| "plugin interpreter is unavailable".into());
+            }
+        }
+    }
+    Err("plugin interpreter was not found in an absolute PATH directory".into())
+}
+
+// Recognize only a fixed import wrapper with literal path arguments. Never
+// evaluate its JavaScript; the result still passes normal containment checks.
+fn import_wrapper_path(command: &str) -> Option<String> {
+    let arguments = command.strip_prefix(
+        "node -e \"import(require('node:url').pathToFileURL(require('node:path').join(process.env.CLAUDE_PLUGIN_ROOT,"
+    )?.strip_suffix(")).href)\"")?;
+    let parts: Option<Vec<_>> = arguments
+        .split(',')
+        .map(|part| {
+            let literal = part.trim().strip_prefix('\'')?.strip_suffix('\'')?;
+            // No JS escapes, interpolation, or quote injection into the normalized
+            // command. More complex expressions need a regular script entry point.
+            (!literal.is_empty() && !literal.contains(['\'', '"', '\\'])).then_some(literal)
+        })
+        .collect();
+    Some(parts?.join("/"))
+}
+
+/// Plugin hooks are executable entry points, not arbitrary shell programs.
+/// Keep argument boundaries and execute the exact canonical path we checked.
+fn plugin_hook_command(hook: &HookConfig) -> Result<tokio::process::Command, String> {
+    let Some(root) = &hook.plugin_root else {
+        return Ok(if hook.args.is_empty() {
+            shell_command(&hook.command)
+        } else {
+            let mut command = tokio::process::Command::new(&hook.command);
+            command.args(&hook.args);
+            command
+        });
+    };
+    // CC plugins sometimes wrap a script entry point in this Node expression
+    // solely to normalize Windows separators. Recognize the exact wrapper,
+    // never evaluate JavaScript, and send the extracted path through the same
+    // canonicalization and containment checks as an ordinary script command.
+    let original = hook.command.trim();
+    let normalized = original
+        .strip_prefix("node -e \"require(require('path').join(process.env.CLAUDE_PLUGIN_ROOT.split(String.fromCharCode(92)).join('/'), '")
+        .and_then(|rest| rest.strip_suffix("'))\""))
+        .map(str::to_owned)
+        .or_else(|| import_wrapper_path(original))
+        .map(|path| format!("node \"${{CLAUDE_PLUGIN_ROOT}}/{path}\""));
+    if let Some(expected) = &hook.plugin_content_hash {
+        let current = crate::plugin::hook_trust::plugin_content_hash(root)
+            .map_err(|error| format!("plugin content cannot be verified: {error:#}"))?;
+        if &current != expected {
+            return Err(
+                "plugin content changed since authorization; reload and re-trust the plugin".into(),
+            );
+        }
+    }
+    let text = normalized.as_deref().unwrap_or(original);
+    let stripped = text
+        .replace("${CLAUDE_PLUGIN_ROOT}", "")
+        .replace("$CLAUDE_PLUGIN_ROOT", "")
+        .replace("${ATOMCODE_PLUGIN_ROOT}", "")
+        .replace("$ATOMCODE_PLUGIN_ROOT", "")
+        .replace("%CLAUDE_PLUGIN_ROOT%", "")
+        .replace("%ATOMCODE_PLUGIN_ROOT%", "");
+    if stripped.chars().any(|ch| {
+        ch.is_control()
+            || matches!(
+                ch,
+                ';' | '|' | '&' | '`' | '$' | '(' | ')' | '>' | '<' | '\n' | '\r' | '%' | '^'
+            )
+    }) {
+        return Err(
+            "plugin hooks require a script entry point; shell expressions are not allowed".into(),
+        );
+    }
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut present = false;
+    for ch in text.chars() {
+        if matches!(ch, '\'' | '"') {
+            if quote == Some(ch) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(ch);
+            } else {
+                word.push(ch);
+            }
+            present = true;
+        } else if ch.is_whitespace() && quote.is_none() {
+            if present {
+                words.push(std::mem::take(&mut word));
+                present = false;
+            }
+        } else {
+            word.push(ch);
+            present = true;
+        }
+    }
+    if quote.is_some() {
+        return Err("unclosed quote in plugin hook".into());
+    }
+    if present {
+        words.push(word);
+    }
+    if words.is_empty() {
+        return Err("empty plugin hook command".into());
+    }
+    if hook.args.iter().any(|arg| arg.contains('\0')) {
+        return Err("plugin hook arguments cannot contain NUL".into());
+    }
+    words.extend(hook.args.iter().cloned());
+    let mut interpreter = match words[0].as_str() {
+        "python" | "python3" | "node" | "sh" | "bash" => Some(words.remove(0)),
+        _ => None,
+    };
+    if words.is_empty() {
+        return Err("plugin hook interpreter requires a script".into());
+    }
+    let mut script = words.remove(0);
+    for prefix in [
+        "${CLAUDE_PLUGIN_ROOT}/",
+        "$CLAUDE_PLUGIN_ROOT/",
+        "${ATOMCODE_PLUGIN_ROOT}/",
+        "$ATOMCODE_PLUGIN_ROOT/",
+        "%CLAUDE_PLUGIN_ROOT%/",
+        "%ATOMCODE_PLUGIN_ROOT%/",
+        "${CLAUDE_PLUGIN_ROOT}\\",
+        "$CLAUDE_PLUGIN_ROOT\\",
+        "${ATOMCODE_PLUGIN_ROOT}\\",
+        "$ATOMCODE_PLUGIN_ROOT\\",
+        "%CLAUDE_PLUGIN_ROOT%\\",
+        "%ATOMCODE_PLUGIN_ROOT%\\",
+    ] {
+        if let Some(relative) = script.strip_prefix(prefix) {
+            script = relative.to_string();
+            break;
+        }
+    }
+    // Normalize separators even when checking Windows manifests on Unix.
+    let relative = script.replace('\\', "/");
+    if relative.is_empty()
+        || relative.starts_with('-')
+        || relative.contains(':')
+        || Path::new(&relative).is_absolute()
+        || Path::new(&relative).components().any(|part| {
+            !matches!(
+                part,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err("plugin hook script must be relative to its plugin directory".into());
+    }
+    let root = std::fs::canonicalize(root).map_err(|_| "plugin directory is unavailable")?;
+    let script = std::fs::canonicalize(root.join(relative))
+        .map_err(|_| "plugin hook script is unavailable")?;
+    if !script.starts_with(&root) || !script.is_file() {
+        return Err("plugin hook script escapes its plugin directory or is not a file".into());
+    }
+    if script
+        .strip_prefix(&root)
+        .expect("contained script")
+        .components()
+        .any(|part| part.as_os_str() == ".git")
+    {
+        return Err(
+            "plugin hook entry points cannot reside in Git metadata outside the trusted bundle"
+                .into(),
+        );
+    }
+    // A batch/bash polyglot is a checked bash script, not a cmd /C command.
+    if interpreter.is_none()
+        && script
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd"))
+    {
+        use std::io::Read;
+        let marker = b": << 'CMDBLOCK'";
+        let mut prefix = vec![0; marker.len()];
+        if std::fs::File::open(&script)
+            .and_then(|mut file| file.read_exact(&mut prefix))
+            .is_ok()
+            && prefix == marker
+        {
+            interpreter = Some("bash".into());
+        }
+    }
+    let mut command = if let Some(interpreter) = interpreter {
+        #[cfg(windows)]
+        let interpreter = plugin_interpreter(&interpreter)?;
+        let mut command = tokio::process::Command::new(interpreter);
+        command.arg(&script);
+        command
+    } else {
+        // Batch files are shell programs and cannot use direct argv semantics.
+        if script
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
+        {
+            return Err("plugin batch hooks require a supported script interpreter".into());
+        }
+        tokio::process::Command::new(&script)
+    };
+    command.args(words);
+    // Python imports must not mutate the authorized bundle by creating pyc
+    // files during the first invocation.
+    command.env("PYTHONDONTWRITEBYTECODE", "1");
+    Ok(command)
+}
+
+pub(crate) fn validate_plugin_hook(
+    hook: &crate::plugin::loader::PluginCcHook,
+) -> Result<(), String> {
+    let Some(event) = HookEvent::parse(&hook.event) else {
+        return Ok(());
+    };
+    // The caller already hashes the bundle once. Preflight checks the entry
+    // point without repeatedly reading every bundle file for each hook.
+    let config = HookConfig {
+        event,
+        matcher: hook.matcher.clone(),
+        command: hook.command.clone(),
+        timeout_ms: default_timeout_ms(),
+        args: hook.args.clone(),
+        plugin_root: Some(hook.plugin_root.clone()),
+        plugin_content_hash: None,
+    };
+    plugin_hook_command(&config).map(|_| ())
+}
+
 async fn run_command_hook(
     hook: &HookConfig,
     project_dir: &str,
@@ -385,7 +637,38 @@ async fn run_command_hook(
     use std::process::Stdio;
     use tokio::io::AsyncWriteExt;
 
-    let mut cmd = shell_command(&hook.command);
+    // Bundle verification can read many files; keep it off the async runtime.
+    // Dropping the waiter cannot launch a child: spawning happens below, only
+    // after verification has returned successfully.
+    let prepared = if hook.plugin_root.is_some() {
+        let owned = hook.clone();
+        match tokio::time::timeout(
+            Duration::from_millis(hook.timeout_ms),
+            tokio::task::spawn_blocking(move || plugin_hook_command(&owned)),
+        )
+        .await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => Err(format!("plugin verification failed: {error}")),
+            Err(_) => Err("plugin verification timed out; hook was not executed".into()),
+        }
+    } else {
+        plugin_hook_command(hook)
+    };
+    let mut cmd = match prepared {
+        Ok(command) => command,
+        Err(reason) => {
+            let reason = format!("plugin hook rejected: {}", reason.escape_debug());
+            tracing::warn!("{reason}");
+            // A deliberate rejection, not a missing/failed hook: gate callers
+            // must see the block instead of silently proceeding.
+            return Some((
+                Some(2),
+                serde_json::json!({"decision": "block", "reason": reason}).to_string(),
+                reason,
+            ));
+        }
+    };
     if !project_dir.is_empty() {
         cmd.env("ATOMCODE_PROJECT_DIR", project_dir);
         cmd.env("CLAUDE_PROJECT_DIR", project_dir);
@@ -520,6 +803,53 @@ fn deliberate_block_reason(stdout: &str, stderr: &str) -> Option<String> {
 fn last_json_line(stdout: &str) -> Option<Value> {
     let line = stdout.lines().rev().find(|l| !l.trim().is_empty())?;
     serde_json::from_str(line.trim()).ok()
+}
+
+/// What a hook left on stdout — the three cases a decision site must tell apart.
+///
+/// The third is the one nobody can see: a hook that was meant to answer (`deny`, `ask`,
+/// `block`) printed text instead of a decision, so the call proceeded exactly as if no
+/// hook had run. On Windows that is the ordinary outcome of a POSIX-style
+/// `echo '{"…"}'`, whose quotes `cmd /C` leaves in place — the hook looks installed and
+/// silently does nothing.
+#[derive(Debug, PartialEq, Eq)]
+enum StdoutShape {
+    /// Nothing on stdout: the exit-code contract alone decides.
+    Silent,
+    /// JSON on the last non-empty line — a decision, usable or not.
+    Json,
+    /// Text that is not JSON: only actionable as "the hook did not speak".
+    NotJson,
+}
+
+fn stdout_shape(stdout: &str) -> StdoutShape {
+    if last_json_line(stdout).is_some() {
+        return StdoutShape::Json;
+    }
+    if stdout.trim().is_empty() {
+        StdoutShape::Silent
+    } else {
+        StdoutShape::NotJson
+    }
+}
+
+/// The decision this hook's stdout carries, naming the silent case in the log.
+///
+/// Sites where plain stdout is a *feature* — SessionStart context, UserPromptSubmit
+/// injection — keep calling [`last_json_line`] directly: there the same bytes reach the
+/// model, so nothing is lost and a warning would be noise. Here they reach nobody, and
+/// a hook that expected to decide quietly did not.
+fn decision_from_stdout(stdout: &str, event: HookEvent) -> Option<Decision> {
+    if let Some(value) = last_json_line(stdout) {
+        return serde_json::from_value::<Decision>(value).ok();
+    }
+    if stdout_shape(stdout) == StdoutShape::NotJson {
+        tracing::warn!(
+            event = ?event,
+            "hook stdout is not a JSON decision; the hook was ignored"
+        );
+    }
+    None
 }
 
 // ───────────────────────────── decision parsing ─────────────────────────────
@@ -952,8 +1282,7 @@ impl CCExternalHooks {
             else {
                 continue;
             };
-            let decided =
-                last_json_line(&stdout).and_then(|v| serde_json::from_value::<Decision>(v).ok());
+            let decided = decision_from_stdout(&stdout, HookEvent::PreToolUse);
 
             // Apply an arg rewrite (CC updatedInput / atomcode modify).
             if let Some(d) = &decided {
@@ -1078,9 +1407,7 @@ impl CCExternalHooks {
             else {
                 continue;
             };
-            if let Some(d) =
-                last_json_line(&stdout).and_then(|v| serde_json::from_value::<Decision>(v).ok())
-            {
+            if let Some(d) = decision_from_stdout(&stdout, event) {
                 if let Some(new_out) = d
                     .hook_specific
                     .as_ref()
@@ -1121,6 +1448,37 @@ fn stronger(a: BeforeOutcome, b: BeforeOutcome) -> BeforeOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A hook that printed text instead of a decision used to be indistinguishable from
+    /// one that printed nothing: both proceeded. They are different facts — only the
+    /// first means the hook is silently not working — so the shape is its own answer,
+    /// and the warning rides on it.
+    #[test]
+    fn a_hook_that_printed_text_instead_of_a_decision_is_told_apart() {
+        assert_eq!(stdout_shape(""), StdoutShape::Silent);
+        assert_eq!(stdout_shape("   \n\n"), StdoutShape::Silent);
+        // Diagnostics ahead of the decision are still a decision.
+        assert_eq!(stdout_shape("checking…\n{}\n"), StdoutShape::Json);
+        assert_eq!(
+            stdout_shape("'{\"hookSpecificOutput\":{\"permissionDecision\":\"deny\"}}'"),
+            StdoutShape::NotJson
+        );
+    }
+
+    /// The Windows case this exists for: `echo '{"…"}'` under `cmd /C` keeps its quotes,
+    /// so the decision parses as ordinary text. The call then proceeds as if no hook had
+    /// run — which is why the shape is named in the log instead of shrugged at.
+    #[test]
+    fn quoting_a_decision_away_yields_no_decision() {
+        let quoted = "'{\"hookSpecificOutput\":{\"permissionDecision\":\"deny\"}}'";
+        assert!(decision_from_stdout(quoted, HookEvent::PreToolUse).is_none());
+        assert!(decision_from_stdout("", HookEvent::PreToolUse).is_none());
+        assert!(decision_from_stdout(
+            r#"{"hookSpecificOutput":{"permissionDecision":"deny"}}"#,
+            HookEvent::PreToolUse
+        )
+        .is_some());
+    }
 
     #[test]
     fn parse_event_both_spellings() {
@@ -1257,7 +1615,9 @@ mod tests {
                 "cd '{cwd}' && grep -q '\"hook_event_name\":\"{name}\"' && touch '{marker}'"
             ),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
+            plugin_content_hash: None,
         };
         let cc = CCExternalHooks::new(
             vec![
@@ -1341,7 +1701,9 @@ mod tests {
                  && grep -q '\"stop_hook_active\":false' payload.json && touch '{m1_s}'"
             ),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
+            plugin_content_hash: None,
         };
         CCExternalHooks::new(vec![single], "/tmp")
             .with_transcript_path(transcript_s.clone())
@@ -1362,7 +1724,9 @@ mod tests {
                 "cd '{cwd}' && grep -q '\"stop_hook_active\":true' && touch '{marker_s}'"
             ),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
+            plugin_content_hash: None,
         };
         CCExternalHooks::new(vec![hook(&m_a_s), hook(&m_b_s)], "/tmp")
             .turn_complete(&convo, &StopReason::Stopped, &ctx)
@@ -1542,6 +1906,264 @@ mod tests {
         );
     }
 
+    fn plugin_config(root: &Path, command: &str) -> HookConfig {
+        HookConfig::from_plugin_spec("PreToolUse", None, command.into(), None, root.into()).unwrap()
+    }
+
+    /// A plugin entry point whose interpreter actually resolves on this host.
+    ///
+    /// The pre-check resolves a bare interpreter name against PATH and accepts only a real
+    /// program found there — `python3` on unix, and on Windows `.exe`/`.com` only, where
+    /// that name does not exist. The files below are the point (an entry script and its
+    /// imported helper); which interpreter runs them is not.
+    fn host_plugin_entry() -> &'static str {
+        if cfg!(windows) {
+            "python entry.py"
+        } else {
+            "python3 entry.py"
+        }
+    }
+
+    #[test]
+    fn a_loaded_plugin_cannot_execute_changed_content() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("entry.py"), "import helper").unwrap();
+        std::fs::write(root.path().join("helper.py"), "safe = True").unwrap();
+        let config = plugin_config(root.path(), host_plugin_entry());
+        assert!(plugin_hook_command(&config).is_ok());
+        std::fs::write(root.path().join("helper.py"), "safe = False").unwrap();
+        assert!(plugin_hook_command(&config)
+            .unwrap_err()
+            .contains("content changed"));
+    }
+
+    #[test]
+    fn channel_import_wrappers_and_polyglot_batch_files_use_checked_interpreters() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("start.js"), "export {};").unwrap();
+        std::fs::write(
+            root.path().join("run-hook.cmd"),
+            ": << 'CMDBLOCK'\n@echo off\nCMDBLOCK\nexit 0\n",
+        )
+        .unwrap();
+        let hook = plugin_config(root.path(), "node -e \"import(require('node:url').pathToFileURL(require('node:path').join(process.env.CLAUDE_PLUGIN_ROOT,'start.js')).href)\"");
+        let command = plugin_hook_command(&hook).unwrap();
+        assert_eq!(
+            command.as_std().get_args().collect::<Vec<_>>(),
+            [std::fs::canonicalize(root.path().join("start.js"))
+                .unwrap()
+                .as_os_str()]
+        );
+        let hook = plugin_config(
+            root.path(),
+            "\"${CLAUDE_PLUGIN_ROOT}/run-hook.cmd\" session-start",
+        );
+        let command = plugin_hook_command(&hook).unwrap();
+        assert!(command
+            .as_std()
+            .get_program()
+            .to_string_lossy()
+            .contains("bash"));
+        assert_eq!(command.as_std().get_args().last().unwrap(), "session-start");
+        std::fs::write(root.path().join("ordinary.cmd"), "@echo off\necho no").unwrap();
+        assert!(plugin_hook_command(&plugin_config(root.path(), "ordinary.cmd")).is_err());
+        let escape = hook.command.replace("run-hook.cmd", "../run-hook.cmd");
+        assert!(plugin_hook_command(&plugin_config(root.path(), &escape)).is_err());
+    }
+
+    #[test]
+    fn plugin_argv_preserves_literals_and_still_checks_the_entry_point() {
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("entry with spaces.py");
+        std::fs::write(
+            &script,
+            "import json, sys; print(json.dumps(sys.argv[1:]))\n",
+        )
+        .unwrap();
+        let interpreter = if cfg!(windows) { "python" } else { "python3" };
+        let literals = vec![
+            "session-start".to_string(),
+            "a b".into(),
+            "quote'\"".into(),
+            "$(echo SHOULD_NOT_RUN); & | >".into(),
+            "".into(),
+        ];
+        let mut argv = vec!["${CLAUDE_PLUGIN_ROOT}/entry with spaces.py".into()];
+        argv.extend(literals.clone());
+        let hook = plugin_config(root.path(), interpreter).with_args(argv);
+        let output = plugin_hook_command(&hook)
+            .unwrap()
+            .as_std_mut()
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            serde_json::from_slice::<Vec<String>>(&output.stdout).unwrap(),
+            literals
+        );
+        for arguments in [
+            vec!["../outside.py".into()],
+            vec!["-c".into(), "print('bad')".into()],
+            vec!["entry with spaces.py".into(), "nul\0arg".into()],
+        ] {
+            assert!(plugin_hook_command(
+                &plugin_config(root.path(), interpreter).with_args(arguments)
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn channel_multi_segment_import_uses_a_checked_script_path() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("atomcode/src with spaces");
+        std::fs::create_dir_all(&directory).unwrap();
+        let script = directory.join("start-detached.js");
+        std::fs::write(&script, "export {};\n").unwrap();
+        let wrapper = |arguments: &str| {
+            format!("node -e \"import(require('node:url').pathToFileURL(require('node:path').join(process.env.CLAUDE_PLUGIN_ROOT,{arguments})).href)\"")
+        };
+        let hook = plugin_config(
+            root.path(),
+            &wrapper("'atomcode', 'src with spaces', 'start-detached.js'"),
+        );
+        let command = plugin_hook_command(&hook).unwrap();
+        assert_eq!(
+            command.as_std().get_args().collect::<Vec<_>>(),
+            [std::fs::canonicalize(script).unwrap().as_os_str()]
+        );
+        for arguments in [
+            "'..','outside.js'",
+            "'atomcode',process.env.ENTRY",
+            "'atomcode','missing.js'",
+            "'atomcode',require('evil')",
+            "'atomcode','src with spaces','start-detached.js');evil('//')",
+        ] {
+            assert!(
+                plugin_hook_command(&plugin_config(root.path(), &wrapper(arguments))).is_err(),
+                "{arguments}"
+            );
+        }
+    }
+
+    #[test]
+    fn node_path_wrapper_is_a_checked_script_entry_point() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("check.js"), "").unwrap();
+        let wrapper = |path: &str| {
+            format!("node -e \"require(require('path').join(process.env.CLAUDE_PLUGIN_ROOT.split(String.fromCharCode(92)).join('/'), '{path}'))\"")
+        };
+        let command =
+            plugin_hook_command(&plugin_config(root.path(), &wrapper("check.js"))).unwrap();
+        let args: Vec<_> = command.as_std().get_args().collect();
+        assert_eq!(
+            args,
+            [std::fs::canonicalize(root.path().join("check.js"))
+                .unwrap()
+                .as_os_str()]
+        );
+        for path in ["../check.js", "check.js');evil('//", "missing.js"] {
+            assert!(plugin_hook_command(&plugin_config(root.path(), &wrapper(path))).is_err());
+        }
+        assert!(plugin_hook_command(&plugin_config(
+            root.path(),
+            "node -e \"console.log('anything')\""
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn plugin_entry_points_reject_shell_and_escape_paths() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("check.sh"), "exit 0").unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        std::fs::write(root.path().join(".git/check.sh"), "exit 0").unwrap();
+        for command in [
+            "sh .git/check.sh",
+            "",
+            "echo hello",
+            "sh -c 'echo hello'",
+            "check.sh; echo x",
+            "check.sh | sh",
+            "check.sh\necho x",
+            "$(echo x)",
+            "../check.sh",
+            "/tmp/check.sh",
+            "C:\\tmp\\check.sh",
+            "missing.sh",
+            "check.sh > out",
+            "check.sh\0",
+        ] {
+            assert!(
+                plugin_hook_command(&plugin_config(root.path(), command)).is_err(),
+                "{command}"
+            );
+        }
+        // The bare script name needs no interpreter; the rest name one, and the pre-check
+        // accepts only a program this host resolves (`sh`/`bash`/`python3` are unix names,
+        // and Windows takes `.exe`/`.com` only). The rejection rules above are what this
+        // test is for, and they run everywhere.
+        assert!(
+            plugin_hook_command(&plugin_config(root.path(), "check.sh")).is_ok(),
+            "check.sh"
+        );
+        #[cfg(unix)]
+        for command in [
+            "sh check.sh",
+            "bash \"${CLAUDE_PLUGIN_ROOT}/check.sh\" --verbose",
+            "python3 check.sh 'literal argument'",
+        ] {
+            assert!(
+                plugin_hook_command(&plugin_config(root.path(), command)).is_ok(),
+                "{command}"
+            );
+        }
+        let mut user = plugin_config(root.path(), "echo hello | cat");
+        user.plugin_root = None;
+        assert!(plugin_hook_command(&user).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn plugin_runs_the_checked_script_not_a_project_namesake() {
+        let plugin = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(plugin.path().join("check.sh"), "printf plugin").unwrap();
+        std::fs::write(project.path().join("check.sh"), "printf project").unwrap();
+        let hook = plugin_config(plugin.path(), "sh check.sh");
+        let (code, stdout, _) = run_command_hook(&hook, project.path().to_str().unwrap(), "{}")
+            .await
+            .unwrap();
+        assert_eq!(code, Some(0));
+        assert_eq!(stdout, "plugin");
+        std::os::unix::fs::symlink(
+            project.path().join("check.sh"),
+            plugin.path().join("escape.sh"),
+        )
+        .unwrap();
+        assert!(plugin_hook_command(&plugin_config(plugin.path(), "sh escape.sh")).is_err());
+    }
+
+    #[tokio::test]
+    async fn rejected_plugin_hook_blocks_pretooluse() {
+        let plugin = tempfile::tempdir().unwrap();
+        let cc = CCExternalHooks::new(vec![plugin_config(plugin.path(), "echo unsafe | sh")], "");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let rt = RequestCtx::new(tx, Some(Duration::from_millis(50)));
+        let tool: Arc<dyn Tool> = Arc::new(atomcode_kernel::testkit::EchoTool);
+        let mut call = ToolCall {
+            id: "1".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        };
+        assert!(cc.before(&mut call, &tool, &rt).await.is_deny());
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn before_denies_on_cc_deny() {
         // A hook that prints a CC deny decision blocks the call.
@@ -1550,7 +2172,9 @@ mod tests {
             matcher: None,
             command: r#"echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"x"}}'"#.into(),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
+            plugin_content_hash: None,
         };
         let cc = CCExternalHooks::new(vec![hook], "/tmp");
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1574,7 +2198,9 @@ mod tests {
             matcher: None,
             command: "echo hooktest-ok".into(),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
+            plugin_content_hash: None,
         };
         let out = run_hook_for_test(
             &hook,
@@ -1587,6 +2213,7 @@ mod tests {
         assert!(out.stdout.contains("hooktest-ok"), "stdout: {}", out.stdout);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn before_ask_forces_approval_round_trip_and_fails_closed() {
         // REGRESSION: a hook `permissionDecision:"ask"` must FORCE a real approval prompt,
@@ -1601,7 +2228,9 @@ mod tests {
             matcher: None,
             command: r#"echo '{"hookSpecificOutput":{"permissionDecision":"ask"}}'"#.into(),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
+            plugin_content_hash: None,
         };
         let cc = CCExternalHooks::new(vec![hook], "/tmp");
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1624,6 +2253,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn user_prompt_block_returns_err() {
         let hook = HookConfig {
@@ -1631,7 +2261,9 @@ mod tests {
             matcher: None,
             command: r#"echo '{"decision":"block","reason":"banned"}'"#.into(),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
+            plugin_content_hash: None,
         };
         let cc = CCExternalHooks::new(vec![hook], "/tmp");
         let mut text = "hello".to_string();
@@ -1646,7 +2278,9 @@ mod tests {
             matcher: None,
             command: r#"echo '{"hookSpecificOutput":{"additionalContext":"CTX"}}'"#.into(),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
+            plugin_content_hash: None,
         };
         let cc = CCExternalHooks::new(vec![hook], "/tmp");
         let mut text = "hi".to_string();
@@ -1673,7 +2307,9 @@ mod tests {
             matcher: None,
             command: r#"printf '{"hookSpecificOutput":{"additionalContext":"cwd=%s|a=%s|c=%s"}}' "$(pwd -P)" "$ATOMCODE_PROJECT_DIR" "$CLAUDE_PROJECT_DIR""#.into(),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
+            plugin_content_hash: None,
         };
         let cc = CCExternalHooks::new(vec![hook], dir.clone());
         let mut text = "hi".to_string();
@@ -1710,7 +2346,9 @@ mod tests {
             matcher: None,
             command: command.into(),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
+            plugin_content_hash: None,
         };
         let cc = CCExternalHooks::new(
             vec![
@@ -1738,7 +2376,9 @@ mod tests {
             matcher: None,
             command: r#"echo '{"hookSpecificOutput":{"additionalContext":"STILL-RAN"}}'"#.into(),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
+            plugin_content_hash: None,
         };
         let cc = CCExternalHooks::new(vec![hook], "/nonexistent/atomcode-project-dir");
         let mut text = "hi".to_string();
@@ -1754,7 +2394,9 @@ mod tests {
             command: r#"echo '{"hookSpecificOutput":{"additionalContext":"WSL setup hint"}}'"#
                 .into(),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
+            plugin_content_hash: None,
         };
         let cc = CCExternalHooks::new(vec![hook], "/tmp");
         let mut convo = Conversation::new();
@@ -1792,7 +2434,9 @@ mod tests {
             matcher: None,
             command: "exit 1".into(),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
+            plugin_content_hash: None,
         };
         let cc = CCExternalHooks::new(vec![hook], "/tmp");
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1816,7 +2460,9 @@ mod tests {
             matcher: None,
             command: cmd.into(),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
+            plugin_content_hash: None,
         };
         let cc = CCExternalHooks::new(vec![hook], "/tmp");
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1849,7 +2495,9 @@ mod tests {
             matcher: None,
             command,
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
+            plugin_content_hash: None,
         };
         let _guard = crate::process_utils::EnvVarGuard::new(&["LC_ALL", "LANG", "LC_CTYPE"]);
         std::env::set_var("LC_ALL", "C");
@@ -1867,6 +2515,7 @@ mod tests {
 
     /// Exit 2 WITH a deliberate reason DOES block (CC's bare exit-2 contract), and the
     /// reason is surfaced (stdout, then stderr) rather than an opaque "(exit 2)".
+    #[cfg(unix)]
     #[tokio::test]
     async fn before_deliberate_exit_2_blocks() {
         let out = run_before("echo BLOCKED; exit 2").await;
@@ -1917,6 +2566,7 @@ mod tests {
 
     /// UserPromptSubmit mirrors `before`: a DELIBERATE exit 2 (with a reason) blocks the
     /// prompt (Err), other non-zero does not (the prompt proceeds).
+    #[cfg(unix)]
     #[tokio::test]
     async fn user_prompt_exit_code_contract() {
         let cc = CCExternalHooks::new(vec![prompt_hook("echo BLOCKED; exit 2")], "/tmp");
@@ -2006,6 +2656,7 @@ mod tests {
 
     /// F3: a PostToolUse hook with a tool-name matcher now fires for the matching tool
     /// (the name `before` recorded for the call_id) and is skipped for a non-match.
+    #[cfg(unix)]
     #[tokio::test]
     async fn post_tool_use_honors_matcher() {
         let hook = HookConfig {
@@ -2013,7 +2664,9 @@ mod tests {
             matcher: Some("bash".into()),
             command: r#"echo '{"hookSpecificOutput":{"updatedToolOutput":"REWRITTEN"}}'"#.into(),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
+            plugin_content_hash: None,
         };
         let cc = CCExternalHooks::new(vec![hook], "/tmp");
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2062,6 +2715,7 @@ mod tests {
     /// PostToolUseFailure: a FAILED tool call (`is_error`) fires the failure event
     /// instead of PostToolUse, so a plugin can tell success from failure. Both
     /// events share the same payload/rewrite semantics.
+    #[cfg(unix)]
     #[tokio::test]
     async fn failed_tool_fires_post_tool_use_failure() {
         let ok_hook = HookConfig {
@@ -2069,14 +2723,18 @@ mod tests {
             matcher: None,
             command: r#"echo '{"hookSpecificOutput":{"updatedToolOutput":"OK-REWRITE"}}'"#.into(),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
+            plugin_content_hash: None,
         };
         let fail_hook = HookConfig {
             event: HookEvent::PostToolUseFailure,
             matcher: None,
             command: r#"echo '{"hookSpecificOutput":{"updatedToolOutput":"FAIL-REWRITE"}}'"#.into(),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
+            plugin_content_hash: None,
         };
         let cc = CCExternalHooks::new(vec![ok_hook, fail_hook], "/tmp");
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2131,7 +2789,9 @@ mod tests {
             matcher: None,
             command: r#"grep -q '"session_id":"sess-xyz"' && echo MATCHED"#.into(),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
+            plugin_content_hash: None,
         };
         let cc = CCExternalHooks::new(vec![hook], "/tmp").with_session_id("sess-xyz");
         let mut text = "hi".to_string();
@@ -2145,6 +2805,7 @@ mod tests {
     /// E4: the call id is threaded into the tool payload, so a hook can correlate
     /// a PreToolUse with the matching Post frame (and tell concurrent same-name
     /// calls apart). The hook greps its own stdin for the id and blocks on a hit.
+    #[cfg(unix)]
     #[tokio::test]
     async fn call_id_is_threaded_into_the_tool_payload() {
         let hook = HookConfig {
@@ -2153,7 +2814,9 @@ mod tests {
             command: r#"grep -q '"call_id":"tc-42"' && echo '{"decision":"block","reason":"saw call_id"}'"#
                 .into(),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
+            plugin_content_hash: None,
         };
         let cc = CCExternalHooks::new(vec![hook], "/tmp");
         let mut call = ToolCall {
@@ -2174,7 +2837,9 @@ mod tests {
             matcher: None,
             command: cmd.into(),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
+            plugin_content_hash: None,
         }
     }
 

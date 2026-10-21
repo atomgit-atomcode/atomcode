@@ -58,6 +58,7 @@ pub enum BookError {
 /// A new account.
 #[derive(Clone, Debug, Default)]
 pub struct AccountInput<'a> {
+    pub headers: Option<&'a crate::provider_headers::HeaderChanges>,
     /// What the id is made from; sanitised, and suffixed when taken.
     pub name: &'a str,
     /// A preset (`deepseek`) or protocol (`openai-compatible`) id.
@@ -76,6 +77,7 @@ pub struct AccountInput<'a> {
 /// An edit to an account's connection.
 #[derive(Clone, Debug, Default)]
 pub struct AccountEdit<'a> {
+    pub headers: Option<&'a crate::provider_headers::HeaderChanges>,
     pub protocol: &'a str,
     pub endpoint: &'a str,
     /// Empty keeps the stored key.
@@ -228,6 +230,7 @@ impl ProviderBook {
                     provider: preset.id,
                     base_url: endpoint,
                     api_key: key,
+                    headers: input.headers,
                     display_name: match display_name {
                         Some(name) => Edit::Set(name),
                         None => Edit::Keep,
@@ -289,7 +292,8 @@ impl ProviderBook {
             let id = id.to_string();
             return self
                 .write(move |document| {
-                    provider_edit::patch_legacy_provider(document, &id, wire, endpoint, key)
+                    provider_edit::patch_legacy_provider(document, &id, wire, endpoint, key)?;
+                    provider_edit::put_headers(document, "providers", &id, edit.headers)
                 })
                 .map(|_| ());
         }
@@ -318,6 +322,7 @@ impl ProviderBook {
                     provider: &provider,
                     base_url: endpoint.as_deref(),
                     api_key: if clears { KeyWrite::Clear } else { key },
+                    headers: edit.headers,
                     display_name,
                 },
             )
@@ -405,6 +410,7 @@ impl ProviderBook {
                         provider: preset.id,
                         base_url: preset.default_base_url,
                         api_key: key,
+                        headers: None,
                         display_name: Edit::Keep,
                     },
                 )
@@ -420,6 +426,7 @@ impl ProviderBook {
                             provider: &provider,
                             base_url: base_url.as_deref(),
                             api_key: key,
+                            headers: None,
                             display_name: Edit::Keep,
                         },
                     )
@@ -811,6 +818,45 @@ fn base_url_of(document: &toml_edit::DocumentMut, id: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn headers_survive_resolution_and_atomic_keep_replace_clear_edits() {
+        let (book, path) = book("headers", HAND);
+        let initial: crate::provider_headers::HeaderChanges =
+            serde_json::from_str(r#"{"X-Token":"secret","Version":"v1"}"#).unwrap();
+        let edit = |headers| AccountEdit {
+            protocol: "openai-compatible",
+            endpoint: "https://one.example.com/v1",
+            headers,
+            ..Default::default()
+        };
+        book.edit_account("mine", &edit(Some(&initial))).unwrap();
+        let resolved = book.load().resolve_model(Some("mine/a")).unwrap();
+        assert_eq!(resolved.headers.names(), vec!["version", "x-token"]);
+        assert_eq!(resolved.to_provider_config().headers, resolved.headers);
+        book.edit_account("mine", &edit(None)).unwrap();
+        assert!(text(&path).contains("secret"));
+        let keep: crate::provider_headers::HeaderChanges =
+            serde_json::from_str(r#"{"x-token":null}"#).unwrap();
+        book.edit_account("mine", &edit(Some(&keep))).unwrap();
+        let saved = book.load();
+        let h = &saved.provider_accounts["mine"].headers;
+        assert_eq!(h.names(), vec!["x-token"]);
+        assert_eq!(h.iter().next(), Some(("x-token", "secret")));
+        let missing: crate::provider_headers::HeaderChanges =
+            serde_json::from_str(r#"{"unknown":null}"#).unwrap();
+        let before = text(&path);
+        assert!(book.edit_account("mine", &edit(Some(&missing))).is_err());
+        assert_eq!(
+            text(&path),
+            before,
+            "a rejected edit must not touch the file"
+        );
+        book.edit_account("mine", &edit(Some(&Default::default())))
+            .unwrap();
+        assert!(book.load().provider_accounts["mine"].headers.is_empty());
+        assert!(!text(&path).contains("headers"));
+    }
+
     const HAND: &str = r#"# my providers, by hand
 default_model = "mine/a"
 
@@ -863,6 +909,7 @@ reasoning_effort_levels = ["low", "high"]
         let (id, models) = book
             .create_account(
                 &AccountInput {
+                    headers: None,
                     name: "deepseek",
                     protocol: "deepseek",
                     display_name: Some("我的 DeepSeek"),

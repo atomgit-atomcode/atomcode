@@ -749,7 +749,14 @@ mod tests {
                             {
                                 std::os::unix::process::ExitStatusExt::from_raw(1)
                             }
-                            #[cfg(not(unix))]
+                            // `Default::default()` here was exit code 0 — the fake
+                            // "failure" read as success on Windows, so a runner that was
+                            // meant to refuse reported that it worked.
+                            #[cfg(windows)]
+                            {
+                                std::os::windows::process::ExitStatusExt::from_raw(1)
+                            }
+                            #[cfg(not(any(unix, windows)))]
                             {
                                 Default::default()
                             }
@@ -892,7 +899,11 @@ mod tests {
     }
 
     /// #3: install must propagate non-zero exit from systemctl enable as an error.
+    ///
+    /// systemd is the Linux half of this file; on a host without it the install refuses
+    /// before the runner is consulted, so the claim only holds where the impl does.
     #[test]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     fn systemd_install_fails_when_enable_returns_nonzero() {
         let tmp = tempfile::tempdir().unwrap();
         // Fail when systemctl is called with "enable" as an argument
@@ -918,6 +929,7 @@ mod tests {
     // ---- Launchd fake-runner tests ----
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn launchd_install_writes_plist_and_bootstraps() {
         let tmp = tempfile::tempdir().unwrap();
         let runner = FakeRunner::new();
@@ -987,6 +999,7 @@ mod tests {
 
     /// A: install twice on same task must be Ok (idempotent via bootout before bootstrap).
     #[test]
+    #[cfg(target_os = "macos")]
     fn launchd_install_is_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
         let runner = FakeRunner::new();
@@ -1017,6 +1030,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn launchd_interval_uses_start_interval() {
         let tmp = tempfile::tempdir().unwrap();
         let runner = FakeRunner::new();

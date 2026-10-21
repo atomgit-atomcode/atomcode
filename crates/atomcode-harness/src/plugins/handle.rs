@@ -76,6 +76,7 @@ struct OpenBatch {
 /// closes when the step that ran them ends. Everything else is a straight
 /// rename.
 struct Projector {
+    terminal_error: Option<(u64, crate::events::RequestError)>,
     /// Resolved live, so a tool mounted mid-session is classified correctly.
     tools: Option<Arc<ToolBox>>,
     ctx_window: u32,
@@ -107,6 +108,23 @@ struct Projector {
     /// changed. The facts alone cannot say: a cut names a boundary, not a size.
     /// `None` for a replay, which reports no sizes.
     log: Option<Arc<crate::session::SessionLog>>,
+}
+
+struct TerminalMetadata {
+    session: String,
+    projector: Arc<Mutex<Projector>>,
+}
+#[async_trait]
+impl atomcode_plexus::Listener<crate::events::TurnFinishing> for TerminalMetadata {
+    async fn call(&self, outcome: &crate::seams::TurnOutcome) -> Option<()> {
+        if outcome.session_id == self.session {
+            self.projector
+                .lock()
+                .expect("projector poisoned")
+                .terminal_error = outcome.provider_error.clone().map(|e| (outcome.turn, e));
+        }
+        None
+    }
 }
 
 impl Projector {
@@ -182,6 +200,7 @@ impl Projector {
     ) -> Vec<AgentEvent> {
         match event {
             SessionEvent::TurnStart { turn } => {
+                self.terminal_error = None;
                 self.stepped_this_turn = false;
                 vec![AgentEvent::TurnStarted { turn: Some(*turn) }]
             }
@@ -443,14 +462,18 @@ impl Projector {
 
             SessionEvent::TurnEnd { turn, stop, error } => {
                 let mut out = Vec::new();
+                let metadata = self.terminal_error.take()
+                    .filter(|(id, failure)| id == turn && (error.as_deref() == Some(failure.message.as_str()) || (*stop == crate::seams::StopReason::RateLimited && error.is_none())))
+                    .map(|(_, failure)| failure);
                 if let Some(message) = error {
                     out.push(AgentEvent::Error {
                         message: message.clone(),
-                        http_status: None,
-                        code: None,
-                        retryable: None,
+                        http_status: metadata.as_ref().and_then(|e| e.http_status),
+                        code: metadata.as_ref().and_then(|e| e.code.clone()),
+                        retryable: metadata.as_ref().map(|e| e.retryable),
                         // 这就是那次收尾的错误(`TurnEnd::error` 的同一句话):画了回合
                         // 结尾的前端不必再画这一条,否则同一段文字会出现两次。
+                        retry_after_secs: metadata.as_ref().and_then(|e| e.retry_after.map(|d| d.as_secs())),
                         ends_turn: true,
                     });
                 }
@@ -458,6 +481,10 @@ impl Projector {
                     out.push(AgentEvent::Cancelled);
                 }
                 out.push(AgentEvent::TurnComplete {
+                    provider_failure: metadata.map(|e| atomcode_kernel::event::ProviderFailure {
+                        retryable: e.retryable, http_status: e.http_status, code: e.code,
+                        retry_after_secs: e.retry_after.map(|d| d.as_secs()),
+                    }),
                     turn: Some(*turn),
                     reason: *stop,
                 });
@@ -675,12 +702,19 @@ impl Asker {
 
     /// One round-trip. `None` means no answer arrived, which every caller must
     /// read as a refusal — never as consent.
-    async fn request(&self, kind: &str, payload: Value) -> Option<Value> {
+    async fn request(&self, kind: &str, mut payload: Value) -> Option<Value> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         // Whose turn is asking: a question is refused when that agent is
         // stopped, not when some other one is.
         let asking = crate::agent::current();
+        if kind == REQUEST_USER_INPUT_KIND {
+            if let Some(member) = asking.as_ref().and_then(crate::agent::current_member_name) {
+                if let Some(object) = payload.as_object_mut() {
+                    object.insert("asking_member".into(), Value::String(member));
+                }
+            }
+        }
         let asker = asking
             .as_ref()
             .and_then(|ctx| ctx.service::<SessionSvc>())
@@ -929,6 +963,18 @@ impl UserQuestions for Asker {
     }
 
     async fn ask(&self, question: &crate::seams::Question) -> Option<String> {
+        match self.ask_reply(question, None).await {
+            crate::seams::QuestionReply::Answered(answer) => Some(answer),
+            _ => None,
+        }
+    }
+
+    async fn ask_reply(
+        &self,
+        question: &crate::seams::Question,
+        call_id: Option<&str>,
+    ) -> crate::seams::QuestionReply {
+        use crate::seams::QuestionReply;
         let request = UserInputRequest {
             // Who is asking belongs in the header, where a driver draws it
             // without having to parse the sentence for a name.
@@ -955,19 +1001,42 @@ impl UserQuestions for Asker {
                 .collect(),
             custom: true,
         };
-        let answer = self
-            .request(
-                REQUEST_USER_INPUT_KIND,
-                serde_json::to_value(&request).unwrap_or(Value::Null),
-            )
-            .await?;
-        let response: UserInputResponse = serde_json::from_value(answer).ok()?;
-        if response.declined {
-            return None;
+        let mut payload = serde_json::to_value(&request).unwrap_or(Value::Null);
+        if let Some(call_id) = call_id {
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("question_call_id".into(), Value::String(call_id.into()));
+            }
         }
-        response
+        if question.about.is_some() {
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("authorization_required".into(), Value::Bool(true));
+            }
+        }
+        let answer = self.request(REQUEST_USER_INPUT_KIND, payload).await;
+        let Some(answer) = answer else {
+            return QuestionReply::Unanswered;
+        };
+        if let Some(error) = answer.get("question_error").and_then(Value::as_str) {
+            return QuestionReply::Failed(error.into());
+        }
+        if let Some(pending) =
+            atomcode_capabilities::tools::request_user_input::PendingUserQuestion::read(&answer)
+        {
+            return QuestionReply::Pending(pending);
+        }
+        let Ok(response) = serde_json::from_value::<UserInputResponse>(answer) else {
+            return QuestionReply::Unanswered;
+        };
+        if response.declined {
+            return QuestionReply::Unanswered;
+        }
+        match response
             .text
             .or_else(|| response.selected.into_iter().next())
+        {
+            Some(answer) => QuestionReply::Answered(answer),
+            None => QuestionReply::Unanswered,
+        }
     }
 }
 
@@ -1230,7 +1299,7 @@ fn send_snapshot(ctx: &Context, events: &mpsc::UnboundedSender<AgentEvent>) {
             messages.push(atomcode_kernel::message::Message::system(system));
         }
     }
-    messages.extend(log.derive_messages());
+    messages.extend(crate::session::derive_messages_with_meta(&log.events()));
     let _ = events.send(AgentEvent::Snapshot {
         snapshot: SessionSnapshot::new(messages),
     });
@@ -1308,6 +1377,7 @@ async fn pump(
             code: None,
             retryable: Some(false),
             // 连回合都跑不起来:不会有哪次收尾再说它一遍。
+            retry_after_secs: None,
             ends_turn: false,
         });
         return;
@@ -1518,8 +1588,13 @@ async fn pump(
                 images,
                 context,
             } => {
-                agent.inject(context, crate::session::InjectionOrigin::Continuation);
-                agent.send_receipted(text, MessageOrigin::User, images, receipt.clone());
+                agent.send_contextual(
+                    text,
+                    MessageOrigin::User,
+                    images,
+                    receipt.clone(),
+                    (context, crate::session::InjectionOrigin::Continuation),
+                );
             }
             AgentCommand::SendSyntheticMessage { text } => {
                 agent.send_receipted(text, MessageOrigin::Harness, Vec::new(), receipt.clone());
@@ -1855,7 +1930,7 @@ async fn compact(
                     messages.push(atomcode_kernel::message::Message::system(system));
                 }
             }
-            messages.extend(after);
+            messages.extend(crate::session::derive_messages_with_meta(&log.events()));
             SessionSnapshot::new(messages)
         }),
     });
@@ -2042,6 +2117,7 @@ fn attach(
     let session_id = agent.session_id().to_string();
     let manual_compaction = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let projector = Arc::new(Mutex::new(Projector {
+        terminal_error: None,
         tools: ctx.service::<ToolsSvc>(),
         ctx_window: ctx
             .service::<LlmSvc>()
@@ -2057,6 +2133,11 @@ fn attach(
         log: Some(agent.session()),
     }));
 
+    let terminal_metadata =
+        ctx.on_parallel::<crate::events::TurnFinishing>(Arc::new(TerminalMetadata {
+            session: session_id.clone(),
+            projector: projector.clone(),
+        }));
     let out = events.clone();
     let fold = projector.clone();
     // Sessions a driver subscribed to, pushed as they happen. Attached before
@@ -2079,6 +2160,20 @@ fn attach(
         }
     });
 
+    let tool_session = agent.session_id().to_string();
+    let tool_out = events.clone();
+    let tool_stream =
+        ctx.on_emit::<crate::events::ToolCallChunk>(move |chunk: &crate::events::ToolChunk| {
+            if chunk.session == tool_session {
+                let _ = tool_out.send(AgentEvent::ToolCallStreaming {
+                    index: chunk.index,
+                    id: chunk.id.clone(),
+                    name: chunk.name.clone(),
+                    arguments: chunk.arguments.clone(),
+                });
+            }
+        });
+
     let (done_tx, done_rx) = oneshot::channel();
     let pump_ctx = ctx.clone();
     let pump_agent = agent.clone();
@@ -2099,6 +2194,8 @@ fn attach(
         // lets the event channel close, so a driver reading to the end sees
         // the end. Dropping only the local handles would hang it forever.
         stream.dispose();
+        tool_stream.dispose();
+        terminal_metadata.dispose();
         for listener in feeding {
             listener.dispose();
         }
@@ -2301,6 +2398,7 @@ async fn mount_handle(ctx: &Context, config: &Value, approvals: bool) -> Result<
 /// produces, because it is the same fold.
 pub fn replay(events: &[SessionEvent], ctx_window: u32) -> Vec<AgentEvent> {
     let mut projector = Projector {
+        terminal_error: None,
         tools: None,
         ctx_window,
         batch: None,

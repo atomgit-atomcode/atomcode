@@ -461,6 +461,24 @@ pub struct SessionBinding {
     staged_fresh: Option<(SessionMeta, SessionHeader)>,
 }
 
+/// A live binding carries its storage owner across rebuilds. An importer only
+/// transfers a lease, which must still match the requested project's manager.
+pub(crate) enum SessionLeaseSource {
+    Existing {
+        manager: Arc<SessionManager>,
+        lease: SessionLease,
+    },
+    Transferred(SessionLease),
+}
+
+impl SessionLeaseSource {
+    fn lease(&self) -> &SessionLease {
+        match self {
+            Self::Existing { lease, .. } | Self::Transferred(lease) => lease,
+        }
+    }
+}
+
 struct McpWorkGuard {
     registry: Option<Arc<McpRegistry>>,
     publication_enabled: Arc<std::sync::atomic::AtomicBool>,
@@ -498,6 +516,78 @@ fn register_atomgit_capabilities(
     Ok(())
 }
 
+/// One resolver shared by prepare and live reload. Standard roots outrank extras;
+/// exact driver overrides continue to suppress all default/configured discovery.
+pub(crate) fn resolve_skill_dirs(
+    cfg: &CodingAgentConfig,
+    opts: &PrepareOptions,
+) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<String>) {
+    let home = dirs::home_dir();
+    resolve_skill_dirs_at(cfg, opts, home.as_deref())
+}
+
+fn resolve_skill_dirs_at(
+    cfg: &CodingAgentConfig,
+    opts: &PrepareOptions,
+    home: Option<&std::path::Path>,
+) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<String>) {
+    if !opts.tools {
+        return (Vec::new(), Vec::new(), Vec::new());
+    }
+    if let Some(dirs) = &opts.skill_dirs {
+        return (dirs.clone(), dirs.clone(), Vec::new());
+    }
+    let mut warnings = Vec::new();
+    let mut extra = Vec::new();
+    for value in &cfg.extra_skill_dirs {
+        let path = if value == "~" || value.starts_with("~/") || value.starts_with("~\\") {
+            let Some(home) = home else {
+                warnings.push(
+                    "[skills] cannot expand ~ in extra_dirs: user home is unavailable".into(),
+                );
+                continue;
+            };
+            home.join(value.get(2..).unwrap_or(""))
+        } else if value.is_empty() || value.starts_with('~') {
+            warnings.push(
+                "[skills] extra_dirs entries must be nonempty paths; ~user is not supported".into(),
+            );
+            continue;
+        } else {
+            let path = PathBuf::from(value);
+            if path.is_absolute() {
+                path
+            } else {
+                cfg.working_dir.join(path)
+            }
+        };
+        extra.push(path.canonicalize().unwrap_or(path));
+    }
+    let mut dirs = extra.clone();
+    dirs.extend(standard_skill_dirs(SkillRoots {
+        home: home.unwrap_or(std::path::Path::new(".")),
+        project: &cfg.working_dir,
+        dirs: &cfg.dirs,
+    }));
+    let mut seen = std::collections::BTreeSet::new();
+    dirs.reverse();
+    dirs.retain(|p| {
+        // A single physical directory can intentionally supply both flat
+        // commands and skills. Deduplicate aliases only within the same role.
+        let command_root = p.file_name().is_some_and(|name| name == "commands");
+        seen.insert((p.canonicalize().unwrap_or_else(|_| p.clone()), command_root))
+    });
+    dirs.reverse();
+    // A configured alias of a standard directory stays explicit, but keeps the
+    // standard directory's place in the precedence list.
+    let explicit = dirs
+        .iter()
+        .filter(|p| extra.contains(&p.canonicalize().unwrap_or_else(|_| (*p).clone())))
+        .cloned()
+        .collect();
+    (dirs, explicit, warnings)
+}
+
 /// Everything `assemble` composes — and everything a respawn must REUSE so state
 /// survives (approval grants, hook state, session identity).
 pub struct CodingParts {
@@ -507,6 +597,7 @@ pub struct CodingParts {
     /// could not read). The runtime sends each as a `ControllerWarning` when
     /// it starts; nothing here writes to stderr.
     startup_warnings: Vec<String>,
+    pub(crate) session_context_hook: Arc<SessionContextHook>,
     registry: ToolRegistry,
     tool_names: Vec<String>,
     /// Capability-graph decision made at prepare time. Like request-user-input,
@@ -523,6 +614,7 @@ pub struct CodingParts {
         std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<McpConnectEvent>>>,
     mcp_publish_lock: Arc<tokio::sync::Mutex<()>>,
     mcp_publication_enabled: Arc<std::sync::atomic::AtomicBool>,
+    mcp_discovery_jobs: Arc<std::sync::atomic::AtomicUsize>,
     /// The mounted catalog the `mcp-host` row publishes into, once it is up.
     ///
     /// Withdrawal has to reach the SAME catalog the model is offered, not just
@@ -661,7 +753,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     cfg: &CodingAgentConfig,
     opts: PrepareOptions,
     plugin_cc_hooks: Vec<HookConfig>,
-    reuse_lease: Option<SessionLease>,
+    reuse_lease: Option<SessionLeaseSource>,
     stage_fresh: bool,
 ) -> io::Result<CodingParts> {
     let tools_started = std::time::Instant::now();
@@ -847,29 +939,22 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // injection observe the exact same instruction-file precedence and bytes.
     crate::runtime::record_startup_phase("tools", tools_started.elapsed(), None);
     let context_started = std::time::Instant::now();
-    let session_context_hook = Arc::new(SessionContextHook::new(&cfg.working_dir, cfg.dirs.user()));
+    let session_context_hook = Arc::new(
+        SessionContextHook::new(&cfg.working_dir, cfg.dirs.user()).with_frozen_instructions(),
+    );
     let instruction_text = session_context_hook.instruction_text();
     crate::runtime::record_startup_phase("instructions", context_started.elapsed(), None);
     let skills_started = std::time::Instant::now();
 
     // Skills: standard home+project precedence unless the caller supplied dirs.
-    let skill_dirs = if opts.tools {
-        opts.skill_dirs.clone().unwrap_or_else(|| {
-            let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-            standard_skill_dirs(SkillRoots {
-                home: &home,
-                project: &cfg.working_dir,
-                dirs: &cfg.dirs,
-            })
-        })
-    } else {
-        Vec::new()
-    };
+    let (skill_dirs, explicit_skill_dirs, directory_warnings) = resolve_skill_dirs(cfg, &opts);
+    startup_warnings.extend(directory_warnings);
+    startup_warnings.extend(session_context_hook.instructions().warnings());
     // Plugin-contributed skills: each (dir, namespace) pair registered as
     // `<namespace>:<skill-name>`, matching the slash-menu's core registry
     // convention. Empty when the driver saw no installed plugins (the L1
     // capabilities crate cannot reach the core plugin loader by design).
-    let skills = SkillRegistry::load(&skill_dirs);
+    let skills = SkillRegistry::load_with_explicit(&skill_dirs, &explicit_skill_dirs);
     // Our own trees rank first in the catalog, whatever they are named — the
     // host handed them in, so this is the one place that knows. Set whether or
     // not the driver named its own dirs: a skill under our tree is ours either
@@ -887,11 +972,11 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // Render the catalog BEFORE the registry is moved into the tools; injected as a
     // leading system message by SkillCatalogHook below (without it the model never
     // learns which skills exist — only the use_skill/list_skills tools were mounted).
+    startup_warnings.extend(skills.take_new_warnings());
     let skill_catalog = skills.render_catalog_prioritizing(&instruction_text);
     let skill_registry = opts.tools.then(|| crate::host_rows::LoadedSkills {
         registry: Arc::clone(&skills),
         catalog: skill_catalog.clone(),
-        dirs: skill_dirs.clone(),
         // Only for the standard list: a driver that named its own directories
         // decided where skills come from, and this runtime cannot say where a
         // new one belongs in that.
@@ -979,8 +1064,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             // adoption for a project that already has one, a no-op change for a
             // brand-new one — see `SessionManager::ensure_project_marker`.
             SessionManager::ensure_project_marker(&cfg.working_dir, &cfg.dirs);
-            let manager = Arc::new(SessionManager::for_project(&cfg.working_dir, &cfg.dirs));
-            let lease = session_lease(&manager, &id, reuse_lease.as_ref())?;
+            let (manager, lease) = session_storage(cfg, &id, reuse_lease.as_ref())?;
             let now = atomcode_capabilities::session::now_ms();
             let working_dir = cfg.working_dir.to_string_lossy().into_owned();
             let mut meta = SessionMeta::new(&id, working_dir.as_str(), now);
@@ -992,8 +1076,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             let mut header = SessionHeader::new(&id);
             header.created_at = u64::try_from(now).unwrap_or(0);
             header.cwd = Some(working_dir);
-            header.context =
-                Some(SessionContextHook::new(&cfg.working_dir, cfg.dirs.user()).block(None));
+            header.context = Some(session_context_hook.block(None));
             if !stage_fresh {
                 manager
                     .create_event_session(&lease, &header, &meta)
@@ -1009,8 +1092,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             })
         }
         SessionMode::Resume(id) => {
-            let manager = Arc::new(SessionManager::for_project(&cfg.working_dir, &cfg.dirs));
-            let lease = session_lease(&manager, id, reuse_lease.as_ref())?;
+            let (manager, lease) = session_storage(cfg, id, reuse_lease.as_ref())?;
             // Resume is a native-only boundary. Legacy/unconfirmed data must first
             // converge through a driver importer; accepting a lone snapshot here
             // would bypass ownership and manufacture an incomplete native session.
@@ -1034,8 +1116,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         }
         SessionMode::ExternalSnapshot { id, snapshot } => {
             check_snapshot_version(snapshot)?;
-            let manager = Arc::new(SessionManager::for_project(&cfg.working_dir, &cfg.dirs));
-            let lease = session_lease(&manager, id, reuse_lease.as_ref())?;
+            let (manager, lease) = session_storage(cfg, id, reuse_lease.as_ref())?;
             manager.open_as_events(&lease).map_err(io::Error::from)?;
             let loaded = manager.load_native_session(id).map_err(io::Error::from)?;
             check_snapshot_version(&loaded.snapshot)?;
@@ -1084,9 +1165,15 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     if let Some(b) = &session {
         let wd = cfg.working_dir.to_string_lossy().into_owned();
         let snapshot_hook = Arc::new(
-            SnapshotHook::new(b.manager.clone(), &b.id, &wd, &cfg.dirs)
-                .with_lease(b.lease.clone())
-                .with_model_attribution(&cfg.provider_name, &cfg.model),
+            SnapshotHook::new_with_context(
+                b.manager.clone(),
+                &b.id,
+                &wd,
+                &cfg.dirs,
+                Some(&session_context_hook),
+            )
+            .with_lease(b.lease.clone())
+            .with_model_attribution(&cfg.provider_name, &cfg.model),
         );
         snapshot_persistence_status = Some(snapshot_hook.persistence_status());
         snapshot_hook_handle = Some(snapshot_hook);
@@ -1147,6 +1234,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
 
     Ok(CodingParts {
         startup_warnings,
+        session_context_hook,
         runtime_commands: None,
         tool_switches: atomcode_harness::seams::ToolSwitches::new(),
         tool_catalog: Arc::new(std::sync::RwLock::new(None)),
@@ -1178,6 +1266,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         mcp_telemetry_rx: std::sync::Mutex::new(mcp_telemetry_rx),
         mcp_publish_lock: Arc::new(tokio::sync::Mutex::new(())),
         mcp_publication_enabled,
+        mcp_discovery_jobs: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         mcp_toolbox: Arc::new(std::sync::RwLock::new(None)),
         mcp_prompts: Arc::new(std::sync::RwLock::new(None)),
         mcp_catalog_ready: tokio::sync::watch::channel(mcp_registry.is_none()).0,
@@ -1266,7 +1355,7 @@ pub(crate) async fn prepare_with_plugin_hook_source_reusing_lease(
     cfg: &CodingAgentConfig,
     opts: PrepareOptions,
     source: &dyn PluginHookSource,
-    reuse_lease: Option<SessionLease>,
+    reuse_lease: Option<SessionLeaseSource>,
     stage_fresh: bool,
 ) -> io::Result<CodingParts> {
     let started = std::time::Instant::now();
@@ -1276,20 +1365,27 @@ pub(crate) async fn prepare_with_plugin_hook_source_reusing_lease(
     prepare_with_plugin_hooks_reusing_lease(cfg, opts, hooks, reuse_lease, stage_fresh).await
 }
 
-fn session_lease(
-    manager: &SessionManager,
+fn session_storage(
+    cfg: &CodingAgentConfig,
     id: &str,
-    reuse_lease: Option<&SessionLease>,
-) -> io::Result<SessionLease> {
-    match reuse_lease.filter(|lease| lease.id() == id) {
-        Some(lease) => {
+    reuse: Option<&SessionLeaseSource>,
+) -> io::Result<(Arc<SessionManager>, SessionLease)> {
+    let reuse = reuse.filter(|source| source.lease().id() == id);
+    let manager = match reuse {
+        Some(SessionLeaseSource::Existing { manager, .. }) => Arc::clone(manager),
+        _ => Arc::new(SessionManager::for_project(&cfg.working_dir, &cfg.dirs)),
+    };
+    let lease = match reuse {
+        Some(source) => {
+            let lease = source.lease();
             manager
                 .validate_active_lease(lease)
                 .map_err(io::Error::from)?;
-            Ok(lease.clone())
+            lease.clone()
         }
-        None => manager.acquire_lease(id).map_err(Into::into),
-    }
+        None => manager.acquire_lease(id).map_err(io::Error::from)?,
+    };
+    Ok((manager, lease))
 }
 
 impl SessionBinding {
@@ -1368,6 +1464,7 @@ impl CodingParts {
             tool_names: Arc::clone(&self.mcp_tool_names),
             publish_lock: Arc::clone(&self.mcp_publish_lock),
             publication_enabled: Arc::clone(&self.mcp_publication_enabled),
+            discovery_jobs: self.mcp_discovery_jobs.clone(),
             catalog_ready: self.mcp_catalog_ready.clone(),
             toolbox_slot: Arc::clone(&self.mcp_toolbox),
             prompts_slot: Arc::clone(&self.mcp_prompts),
@@ -1560,12 +1657,53 @@ impl CodingParts {
         }
     }
 
+    pub(crate) fn mcp_reconnect_publication(
+        &self,
+    ) -> Result<crate::host_rows::McpPublication, String> {
+        if !*self.mcp_catalog_ready.borrow()
+            || self
+                .mcp_discovery_jobs
+                .load(std::sync::atomic::Ordering::Acquire)
+                != 0
+        {
+            return Err(
+                "MCP tool discovery is still running; try reconnect after it finishes".into(),
+            );
+        }
+        let registry = self.mcp_registry.clone().ok_or("MCP is not enabled")?;
+        Ok(crate::host_rows::McpPublication {
+            registry,
+            connect_rx: None,
+            tool_names: self.mcp_tool_names.clone(),
+            publish_lock: self.mcp_publish_lock.clone(),
+            publication_enabled: self.mcp_publication_enabled.clone(),
+            discovery_jobs: self.mcp_discovery_jobs.clone(),
+            catalog_ready: self.mcp_catalog_ready.clone(),
+            toolbox_slot: self.mcp_toolbox.clone(),
+            prompts_slot: self.mcp_prompts.clone(),
+        })
+    }
+
     pub(crate) async fn mcp_statuses(
         &self,
     ) -> Vec<(String, atomcode_capabilities::mcp::ServerStatus)> {
         match &self.mcp_registry {
             Some(registry) => registry.server_statuses().await,
             None => Vec::new(),
+        }
+    }
+
+    /// Project guidance from exactly the tools visible after an in-place switch.
+    pub(crate) fn reproject_mcp_instructions(&self) {
+        if let (Some(registry), Some(catalog), Some(prompts)) = (
+            self.mcp_registry.as_ref(),
+            self.tool_catalog(),
+            self.mcp_prompts
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref(),
+        ) {
+            crate::mcp_instructions::project(prompts, registry, &catalog.names());
         }
     }
 
@@ -1736,6 +1874,10 @@ pub async fn mcp_row_facts_in(
 /// waits on a browser and writes only a token (`cli/tui_mcp.rs`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum McpAction {
+    /// Reconnect only this server, keeping the current session.
+    Reconnect,
+    /// Cancel the current reconnect of this server, without cancelling a turn.
+    CancelReconnect,
     Trust,
     Untrust,
     Logout,
@@ -1746,16 +1888,20 @@ pub enum McpAction {
 }
 
 impl McpAction {
-    /// Whether the change only reaches the session through a rebuild.
+    /// Whether the action may need a rebuild. Enable is resolved dynamically by
+    /// the runtime: a retained, unchanged connection can be restored in place.
     ///
     /// Trust and a config entry are both read when the graph is
     /// prepared, so writing them changes nothing until it is prepared again —
     /// and withdrawing (untrust, sign out) takes every MCP tool off, which only
     /// a rebuild puts back for the servers that are still allowed. `Disable` is
-    /// the one that acts in place: it holds this server's tools back through the
-    /// person's switches, so it needs neither an idle session nor a rebuild.
+    /// in-place switch: it holds this server's tools back through the person's
+    /// switches. Reconnect also acts in place, but requires an idle session.
     pub fn rebuilds(self) -> bool {
-        !matches!(self, Self::Disable)
+        !matches!(
+            self,
+            Self::Disable | Self::Reconnect | Self::CancelReconnect
+        )
     }
 }
 
@@ -2115,6 +2261,82 @@ mod tests {
     use crate::config::CodingAgentConfig;
     use atomcode_capabilities::session::PresentationFile;
 
+    #[cfg(unix)]
+    #[test]
+    fn aliased_standard_command_and_skill_roots_keep_both_source_roles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let project = tmp.path().join("project");
+        let skill_root = home.join(".claude/skills");
+        std::fs::create_dir_all(&skill_root).unwrap();
+        std::fs::write(skill_root.join("shared.md"), "shared workflow").unwrap();
+        std::os::unix::fs::symlink(&skill_root, home.join(".claude/commands")).unwrap();
+        let cfg = CodingAgentConfig::new(
+            "",
+            "",
+            "test",
+            &project,
+            atomcode_capabilities::ProductDirs::new(home.join("ours"), ".ours"),
+        );
+        let (dirs, _, _) =
+            super::resolve_skill_dirs_at(&cfg, &PrepareOptions::default(), Some(&home));
+        let registry = atomcode_capabilities::skills::SkillRegistry::load(&dirs);
+        assert!(
+            registry.get("shared").is_some(),
+            "the skill source stays loaded"
+        );
+        assert!(
+            registry.slash_commands().iter().any(|s| s.name == "shared"),
+            "deduplication must retain a command source even when it aliases a skill root"
+        );
+    }
+
+    #[test]
+    fn extra_skill_roots_expand_deduplicate_and_keep_native_precedence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let project = tmp.path().join("project");
+        let native = project.join(".ours/skills");
+        std::fs::create_dir_all(&native).unwrap();
+        let mut cfg = CodingAgentConfig::new(
+            "",
+            "",
+            "test",
+            &project,
+            atomcode_capabilities::ProductDirs::new(home.join("ours"), ".ours"),
+        );
+        cfg.extra_skill_dirs = vec![
+            "~/shared".into(),
+            "relative".into(),
+            native.display().to_string(),
+            "~/shared".into(),
+        ];
+        let opts = PrepareOptions::default();
+        let (dirs, explicit, warnings) = super::resolve_skill_dirs_at(&cfg, &opts, Some(&home));
+        assert!(warnings.is_empty());
+        assert_eq!(
+            dirs.iter().filter(|p| **p == home.join("shared")).count(),
+            1
+        );
+        assert!(dirs.contains(&project.join("relative")));
+        assert_eq!(dirs.last().unwrap(), &native);
+        assert!(explicit.contains(&native));
+        let exact = PrepareOptions {
+            skill_dirs: Some(vec![]),
+            ..opts
+        };
+        assert!(super::resolve_skill_dirs_at(&cfg, &exact, Some(&home))
+            .0
+            .is_empty());
+        cfg.extra_skill_dirs = vec!["~user/unsupported".into(), "".into()];
+        assert_eq!(
+            super::resolve_skill_dirs_at(&cfg, &PrepareOptions::default(), Some(&home))
+                .2
+                .len(),
+            2
+        );
+    }
+
     #[test]
     fn external_profiles_convert_and_guard_bypass() {
         use atomcode_capabilities::subagent::{PermissionMode, SubagentKind};
@@ -2356,7 +2578,7 @@ mod tests {
         };
         let (mc, rounds) = subagent_runtime_knobs(&cfg, None);
         assert_eq!(mc, 1, "max_concurrent is still floored to one");
-        assert_eq!(rounds, 200);
+        assert_eq!(rounds, 0);
     }
 
     #[test]
@@ -2365,7 +2587,7 @@ mod tests {
         use atomcode_config::config::SubAgentConfig;
         let (mc, rounds) = subagent_runtime_knobs(&SubAgentConfig::default(), None);
         assert_eq!(mc, 3, "default max_concurrent unchanged");
-        assert_eq!(rounds, 200, "default child round high-water unchanged");
+        assert_eq!(rounds, 0, "default child execution is unbounded");
     }
 
     #[test]

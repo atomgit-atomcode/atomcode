@@ -487,6 +487,22 @@ fn sgr(style: &Style, caps: crate::caps::Caps) -> String {
 /// is a row that stays wrong.
 fn write_line(out: &mut String, line: &Line, width: u16, caps: crate::caps::Caps) {
     let mut left = width as usize;
+    let surface = line
+        .background
+        .filter(|_| caps.cell_background)
+        .map(|color| Style::new().bg(color))
+        .unwrap_or_default();
+    if line.background.is_some() && width > 0 {
+        // ECH paints erased cells without writing padding into copied source.
+        // Unlike EL it is bounded by this part's width, including in overlays.
+        if caps.colors != crate::caps::Colors::None {
+            out.push_str(&sgr(&surface, caps));
+        }
+        out.push_str(&format!("\x1b[{width}X"));
+        if caps.colors != crate::caps::Colors::None {
+            out.push_str("\x1b[0m");
+        }
+    }
     for span in &line.spans {
         if left == 0 {
             break;
@@ -504,7 +520,7 @@ fn write_line(out: &mut String, line: &Line, width: u16, caps: crate::caps::Caps
         let codes = if plain {
             String::new()
         } else {
-            sgr(&span.style, caps)
+            sgr(&span.style.under(surface), caps)
         };
         // OSC 8 wraps the run this span actually drew (after clipping), so a
         // supporting terminal makes exactly the visible text clickable and one
@@ -555,7 +571,7 @@ fn write_line(out: &mut String, line: &Line, width: u16, caps: crate::caps::Caps
 /// layering enforceable — a module has no opportunity to forget, because it was
 /// never asked.
 pub fn encode_with(frame: &Frame, caps: crate::caps::Caps) -> String {
-    encode_rows(frame, caps).full()
+    Lines::of(frame, caps, None).full()
 }
 
 /// A frame encoded as one payload per screen row.
@@ -638,6 +654,8 @@ impl Rows {
 pub struct Lines {
     lines: Vec<Vec<(u16, u16, Line)>>,
     rows: Rows,
+    image: Option<crate::terminal_image::Image>,
+    graphics: crate::caps::Graphics,
 }
 
 impl Lines {
@@ -700,6 +718,10 @@ impl Lines {
             None => "\x1b[?25l".to_string(),
         };
         Lines {
+            image: crate::terminal_image::supported(caps.graphics)
+                .then(|| crate::terminal_image::visible(frame))
+                .flatten(),
+            graphics: caps.graphics,
             lines,
             rows: Rows {
                 size: (w, frame.size.h),
@@ -711,12 +733,50 @@ impl Lines {
 
     /// Every row, as one write. A first paint, or a resize.
     pub fn full(&self) -> String {
-        self.rows.full()
+        self.patch_from(None)
     }
 
-    /// Only the rows whose payload changed. Empty when nothing did.
+    /// Images are redrawn only when their placement or underlying rows change.
+    /// Erase old image rows even when their text payload happened to stay blank.
     pub fn patch_from(&self, prev: Option<&Lines>) -> String {
-        self.rows.patch_from(prev.map(|p| &p.rows))
+        let image_changed = prev.is_none_or(|p| {
+            p.image != self.image || p.graphics != self.graphics || p.rows.size != self.rows.size
+        });
+        let erase_old = image_changed && prev.is_some_and(|p| p.image.is_some());
+        let text = if erase_old {
+            self.rows.full()
+        } else {
+            self.rows.patch_from(prev.map(|p| &p.rows))
+        };
+        let image_dirty = self.image.is_some_and(|image| {
+            image_changed
+                || prev.is_none_or(|p| {
+                    (image.rect.y..image.rect.bottom()).any(|row| {
+                        self.rows.rows.get(row as usize) != p.rows.rows.get(row as usize)
+                    })
+                })
+        });
+        let cleanup = if image_changed {
+            crate::terminal_image::delete(prev.map_or(self.graphics, |p| p.graphics))
+        } else {
+            String::new()
+        };
+        if text.is_empty() && !image_dirty && cleanup.is_empty() {
+            return String::new();
+        }
+        let text = text.strip_prefix(SYNC_BEGIN).unwrap_or(&text);
+        let text = text.strip_suffix(SYNC_END).unwrap_or(text);
+        let mut out = String::from(SYNC_BEGIN);
+        out.push_str(&cleanup);
+        out.push_str(text);
+        if image_dirty {
+            out.push_str(&crate::terminal_image::draw(
+                self.image.unwrap(),
+                self.graphics,
+            ));
+        }
+        out.push_str(SYNC_END);
+        out
     }
 }
 
@@ -770,6 +830,58 @@ pub fn encode(frame: &Frame) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_row_surface_paints_without_printable_padding() {
+        let row = Line::raw("abc").with_background(Color::role(crate::theme::Role::PanelBg));
+        let mut caps = crate::caps::Caps::default();
+        let painted = transcript(&[row.clone()], 8, caps);
+        assert!(painted.contains("\x1b[8X"));
+        assert!(!painted.contains("abc "));
+        caps.colors = crate::caps::Colors::None;
+        assert_eq!(transcript(&[row.clone()], 8, caps), "\x1b[8Xabc\x1b[0m\r\n");
+        assert_eq!(row.plain(), "abc");
+        assert_eq!(transcript(&[row], 0, caps), "\x1b[0m\r\n");
+    }
+
+    #[test]
+    fn row_surfaces_inherit_onto_text_and_follow_background_capability() {
+        let row = Line::raw("abc").with_background(Color::role(crate::theme::Role::PanelBg));
+        let mut caps = crate::caps::Caps::default();
+        let painted = transcript(&[row.clone()], 8, caps);
+        assert_eq!(
+            painted.matches("48;").count(),
+            2,
+            "surface and text both carry the background"
+        );
+        caps.cell_background = false;
+        let plain_ground = transcript(&[row], 8, caps);
+        assert!(!plain_ground.contains("48;"));
+        assert!(plain_ground.contains("abc"));
+    }
+
+    #[test]
+    fn a_surface_only_change_invalidates_the_cached_row() {
+        let caps = crate::caps::Caps::default();
+        let mut frame = Frame::new(8, 1);
+        frame.place("body", Rect::sized(8, 1), vec![Line::raw("abc")]);
+        let old = Lines::of(&frame, caps, None);
+        frame.parts[0].lines[0].background = Some(Color::role(crate::theme::Role::PanelBg));
+        let raised = Lines::of(&frame, caps, Some(&old));
+        assert!(raised.patch_from(Some(&old)).contains("\x1b[8X"));
+        frame.parts[0].lines[0].background = None;
+        let flat = Lines::of(&frame, caps, Some(&raised));
+        let patch = flat.patch_from(Some(&raised));
+        assert!(!patch.is_empty(), "removing a background must also repaint");
+        assert!(!patch.contains("48;"));
+    }
+
+    #[test]
+    fn a_blank_source_row_still_has_its_surface() {
+        let row = Line::empty().with_background(Color::role(crate::theme::Role::PanelBg));
+        assert!(transcript(&[row.clone()], 12, crate::caps::Caps::default()).contains("\x1b[12X"));
+        assert_eq!(row.plain(), "");
+    }
+
     /// `ATOMCODE_TERM_SKIP` takes out exactly the modes it names, from the
     /// opening and from the way back from `/raw`, and nothing else.
     #[test]
@@ -871,6 +983,8 @@ mod tests {
             Rect::new(0, 0, 60, 1),
             vec![Line {
                 spans: vec![Span::linked("issue 1565", Style::new().underline(), url)],
+                background: None,
+                image: None,
             }],
         );
         let s = encode(&f);
@@ -909,6 +1023,8 @@ mod tests {
                     Style::new().underline(),
                     "http://a\x1b]0;pwned\x07b",
                 )],
+                background: None,
+                image: None,
             }],
         );
         let s = encode(&f);

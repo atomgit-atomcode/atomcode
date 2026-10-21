@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.2.3</span>
+    <span class="dhdr-ver">v5.2.4</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -121,6 +121,22 @@ When the user says "ship a new version", "cut a release", or "tag it".
 - Version numbers must follow semver.
 - Never skip tests — fix any failure first.
 - If publish fails, roll back the local tag and changelog edits.</code></pre>
+
+      <h2 id="allowed-tools">Tool preauthorization: allowed-tools</h2>
+      <p><code>allowed-tools</code> preauthorizes matching tools for the turn that invokes a skill. It is not an exclusive tool whitelist: other tools remain available and follow normal permission and approval rules.</p>
+      <p>Prefer <code>allowed-tools</code>. The underscore alias <code>allowed_tools</code> accepts the same syntax and validation. Repeated declarations, including mixed spellings, refuse loading.</p>
+      <pre><code>---
+name: setup
+description: Install hidapi for vibekeys-plugin
+allowed-tools:
+  - Bash(pip3 *)
+  - Bash(pip *)
+  - Bash(python3 -c *)
+---</code></pre>
+      <p>Use a YAML block list, an inline list (<code>allowed-tools: [Bash, read_file]</code>), or a space/comma-separated scalar (<code>allowed-tools: Bash(pip3 *) read_file</code>). Spaces inside patterns are preserved. Names and patterns use the static permissions matcher, including aliases such as <code>Bash</code>/<code>bash</code> and <code>Read</code>/<code>read_file</code>. Malformed declarations refuse loading rather than widening the grant.</p>
+      <p>Slash commands, the <code>$</code> menu, <code>/skills</code> and successful <code>use_skill</code> calls share this behavior. Grants belong only to the calling agent and expire on its next user input (including steering), turn completion or cancellation. Session switching, runtime rebuilding and history replay do not restore grants.</p>
+      <p>Global/project deny rules remain authoritative, and sensitive-path, credential and plan-mode boundaries still apply. AtomCode additionally keeps normal approval for destructive shell commands: a skill cannot preauthorize them. This is a product safety restriction on top of Claude Code compatible preauthorization; explicit static allow rules retain their existing behavior.</p>
+      <p><strong>Bash preauthorization is not a sandbox.</strong> Shell commands may read/write files and access the network. Plugin hooks and shell snippets executed while expanding a skill are separate execution paths, outside this model-tool preauthorization.</p>
 
       <h2 id="skill-directories">Skill directories</h2>
       <p>AtomCode loads skills from a few well-known locations:</p>

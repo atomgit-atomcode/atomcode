@@ -1,0 +1,17 @@
+# Bounded native-log evidence expansion
+
+Baseline: release/v5.2.4 c4a7e3ac4, with the preceding verification receipt fix pending. CLI relay and daemon live edits are unrelated and preserved.
+
+Owner: CodingRuntime retains goal, held turn, cancellation and generation/epoch fences. The evaluator remains tool-free. No session format or driver contract changes.
+
+On a terminal, well-formed unknown verdict, allow one expanded evaluation using the same snapshot's observed execution results and successful report read/write receipts. Select at most two verification executions and four text report receipts, capped at 24 KiB serialized. Historical writes are explicitly not current filesystem snapshots. No filesystem reads or commands are authorized by this projection.
+
+Both calls share one evaluator deadline and cancellation token. Count actual calls and aggregate cumulative per-call usage correctly. Expanded transport recovery reuses the expanded projection. A subsequent explicit unknown pauses the retained goal immediately; malformed/truncated responses retain existing bounded transport recovery. New work resets expansion eligibility.
+
+Validation: replay anonymized real phase-three receipts; bounded Unicode and failed/unobserved writes; tool-free expansion and sentinel sanitization; usage aggregation; malformed verdict separation; recovery/reset; shared timeout/cancellation; existing runtime recovery suite, coding tests, workspace compile gate and formatting.
+
+Observed validation (2026-10-19): 29 focused evidence/runtime recovery tests passed, including shared deadline/cancellation and stop-without-main-replay. Coding full run: 1083 executed, 1079 passed, four failures already present in the preceding baseline (runtime compaction and three session compaction assertions), nine skipped. The final additional ambiguous-ID regression passed in the focused run. Workspace/feature compile gate and its negative controls passed. Formatting and diff checks passed. Official build and real-model recheck are recorded separately; no commit/push performed.
+
+Real-model check 1: `20261019-234848-lumen-evidence-resume`, official binary SHA256 `b5e0c0ecf56381a2b0c9ac6990277e9dd49480cd163ea5121a2e72869898fa70`. One evaluator request, no main requests/tools; retained goal stopped after unknown. This exposed a resume boundary bug: synthetic user-role messages after completed work made the current submitted segment empty. Supplement selection now starts at the last real user task (including facts across synthetic continuation/resume markers); no earlier real task is imported. Added the resume marker to the real scheduler fixture test. All 29 focused tests and compile gate passed again. Rebuild/recheck required; the first live result is not a success claim.
+
+Real-model check 2: `20261019-235644-lumen-evidence-recheck`, official binary SHA256 `d56148942b25d53cbfaf8cbb84da3d2c1e3319566bf2b5a3d4c618a1ff896346`. Same native session, `/goal recheck`: first Lumen call unknown, second expanded call Met. Archived JSON requests confirm model `lumen-alpha`, zero tools on both evaluator requests, and historical report payload/full test evidence in request 2 (user input 24,760 bytes vs 6,433 initially). The checkpoint's tool count stayed 42, evaluator attempts rose 5→7, and reported tokens rose 2,282,177→2,292,423 (+10,246). Only after Met did the explicit outer controller start phase 4. This validates the evidence expansion path, not two-hour reliability; the continuing run has its own logs and cap.

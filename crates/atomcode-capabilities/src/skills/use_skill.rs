@@ -99,29 +99,66 @@ impl ListSkillsTool {
     }
 }
 
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct ListArgs {
+    #[serde(default)]
+    query: String,
+    #[serde(default)]
+    offset: usize,
+    limit: Option<usize>,
+}
+
 #[async_trait]
 impl Tool for ListSkillsTool {
     fn name(&self) -> &str {
         "list_skills"
     }
     fn description(&self) -> &str {
-        "List the available skills (name + description). Invoke one with use_skill."
+        "Search available skills by name or description. Results are paginated (default 20, max 50), descriptions abbreviated. Use query or offset to discover more, then invoke an exact name with use_skill."
     }
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({ "type": "object", "properties": {} })
+        json!({ "type": "object", "properties": {
+            "query": {"type":"string", "description":"Case-insensitive name or description search"},
+            "offset": {"type":"integer", "minimum":0},
+            "limit": {"type":"integer", "minimum":1, "maximum":50}
+        }, "additionalProperties":false })
     }
-    async fn execute(&self, _args: &str, _ctx: &ToolContext) -> ToolResult {
-        let skills = self.registry.list();
+    async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
+        let args: ListArgs = match serde_json::from_str(args) {
+            Ok(args) => args,
+            Err(error) => return err(format!("list_skills: invalid arguments: {error}")),
+        };
+        let limit = args.limit.unwrap_or(20);
+        if !(1..=50).contains(&limit) {
+            return err("list_skills: limit must be between 1 and 50");
+        }
+        let query = args.query.to_lowercase();
+        let mut skills = self.registry.list();
         if skills.is_empty() {
             return ok("No skills are loaded.".to_string());
         }
+        skills.retain(|(name, desc)| {
+            name.to_lowercase().contains(&query) || desc.to_lowercase().contains(&query)
+        });
+        skills.sort_by(|a, b| a.0.cmp(&b.0));
         let mut out = format!("Available skills ({}):\n", skills.len());
-        for (name, desc) in &skills {
+        for (name, description) in skills.iter().skip(args.offset).take(limit) {
+            let desc: String = description.chars().take(240).collect();
+            let suffix = if description.chars().count() > 240 {
+                "…"
+            } else {
+                ""
+            };
             if desc.is_empty() {
                 out.push_str(&format!("- {name}\n"));
             } else {
-                out.push_str(&format!("- {name}: {desc}\n"));
+                out.push_str(&format!("- {name}: {desc}{suffix}\n"));
             }
+        }
+        let next = args.offset.saturating_add(limit);
+        if next < skills.len() {
+            out.push_str(&format!("More results: use query to narrow the search or offset={next} with the same query.\n"));
         }
         ok(out)
     }
@@ -253,6 +290,40 @@ mod tests {
         let r = tool.execute("{}", &ctx()).await;
         assert!(r.content.contains("Available skills (1)"), "{}", r.content);
         assert!(r.content.contains("- greet: say hi"), "{}", r.content);
+    }
+
+    #[tokio::test]
+    async fn large_skill_catalog_is_searchable_and_paginated() {
+        let entries: Vec<_> = (0..35)
+            .map(|n| {
+                (
+                    format!("skill-{n:02}"),
+                    format!(
+                        "---\ndescription: {} marker-{n:02}\n---\nbody",
+                        "中文".repeat(200)
+                    ),
+                )
+            })
+            .collect();
+        let borrowed: Vec<_> = entries
+            .iter()
+            .map(|(n, d)| (n.as_str(), d.as_str()))
+            .collect();
+        let tool = ListSkillsTool::new(registry_with(&borrowed));
+        let first = tool.execute("{}", &ctx()).await;
+        assert!(!first.is_error);
+        assert!(first.content.contains("offset=20"));
+        assert!(!first.content.contains("- skill-20:"));
+        assert!(first.content.chars().count() < 6_000);
+        let next = tool.execute(r#"{"offset":20}"#, &ctx()).await;
+        assert!(next.content.contains("- skill-20:"));
+        assert!(!next.content.contains("- skill-00:"));
+        let found = tool.execute(r#"{"query":"MARKER-34"}"#, &ctx()).await;
+        assert!(found.content.contains("- skill-34:"));
+        assert!(!found.content.contains("- skill-00:"));
+        for invalid in [r#"{"limit":0}"#, r#"{"offset":-1}"#, r#"{"query":1}"#] {
+            assert!(tool.execute(invalid, &ctx()).await.is_error);
+        }
     }
 
     #[tokio::test]

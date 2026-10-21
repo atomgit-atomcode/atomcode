@@ -304,6 +304,29 @@ eager = "auto"
 # [permissions]
 # allow = ["Bash(git *)", "Bash(cargo test*)", "Read(src/**)"]
 # deny  = ["Bash(rm -rf *)"]
+#
+# 也支持 Claude Code 格式的 JSON 权限文件（只读取 permissions，不加载其他字段）：
+#   ~/.atomcode/settings.json、~/.atomcode/settings.local.json
+#   <工作目录>/.claude/settings.json、.claude/settings.local.json
+#   <工作目录>/.atomcode/settings.json、.atomcode/settings.local.json
+# 用户目录遵循 ATOMCODE_HOME；项目文件只查当前工作目录，不向上查找。
+# settings.json 适合提交到仓库共享，settings.local.json 适合个人本地配置。
+#
+# {
+#   "permissions": {
+#     "allow": ["Bash(python3 *)", "Bash(python *)"],
+#     "deny": ["WebSearch", "WebFetch"]
+#   }
+# }
+#
+# TOML 和所有 JSON 文件的列表合并，任意来源的 deny 都优先于 allow；空列表不会清空
+# 其他来源的规则。裸工具 deny 同时从模型工具目录移除工具，/tools on 也不能重新启用；
+# Bash(...) / Read(...) 等带参数的 deny 只拒绝匹配的调用，保留工具供其他调用使用。
+# 文件缺失正常；JSON、permissions 字段或规则格式错误，以及读取失败，会让本次启动 /
+# 重建明确失败，不静默忽略 deny。运行中的工具树不监视文件；新会话、重启或完整工具树
+# 重建（如切换工作目录）时重新读取；/model 的 provider 替换和仅技能的快速 reload
+# 保留当前策略，不重读权限文件。配置权限只管工具调用，不预批准插件 hook 子进程；
+# 插件 hook 用 atomcode plugin trust <plugin> 的信任机制。
 
 # =============================================================================
 # Subagent 设置（`task` / `team` 工具：主 agent 把子任务派发给隔离上下文的子 agent）
@@ -322,6 +345,11 @@ max_members = 6         # 每个 lead 最多保留的成员数；空闲成员也
 # LSP（语言服务器协议）
 # =============================================================================
 [lsp]
+# Optional: discover live IDE windows; copy this directory from the VS Code extension.
+# ide_discovery_dir = "/absolute/private/path/ide-bridge"
+# An explicit window binding takes precedence over discovery:
+# Does not enable local language-server processes. See docs/ide-language-bridge.md.
+# ide_connection_file = "/absolute/private/path/window-id.json"
 enabled = false
 auto_detect = false
 diagnostics_settle_delay_ms = 150
@@ -341,3 +369,44 @@ theme = "auto"
 # /resume 初次回放到终端原生 scrollback 的视觉行上限。
 # 省略时按终端自动选择；0 表示完整回放（长会话恢复会更慢）。
 # history_replay_max_rows = 5000
+
+# Custom gateway authentication (optional account-level HTTP headers):
+# [provider_accounts.company]
+# provider = "openai-compatible"
+# base_url = "https://gateway.example/v1"
+# headers = { "X-Company-Token" = "replace-me", "API-Version" = "2026-01" }
+# API key may be omitted for header-only authentication. Header values are
+# credentials; do not commit them. Custom headers override built-in defaults.
+# Transport/proxy headers cannot be overridden. Signed managed accounts do
+# not accept custom headers. The WebUI returns names only; leave a saved value
+# blank to preserve it, or delete its row to remove the header.
+
+# Autonomous goals: bounded recovery while this runtime remains alive.
+# Existing goal round/time caps still apply. 0 attempts disables that retry tier.
+# Recovery does not bypass permissions, quota limits, or uncertain persistence.
+# The time budget controls scheduling; an already running model request may finish.
+# [goal.recovery]
+# max_attempts = 12
+# max_elapsed_secs = 1800
+# base_delay_secs = 30
+# max_delay_secs = 300
+# evaluator_max_attempts = 3
+# evaluator_timeout_secs = 600
+
+# Optional low-frequency goal recovery after the short retry budget is exhausted.
+# Omit this table to keep the default 30-minute recovery window.
+# This may incur further model costs. Goal round/time caps still apply.
+# [goal.recovery.long_wait]
+# max_attempts = 32
+# max_elapsed_secs = 28800
+# interval_secs = 900
+
+# Glob/Grep discovery defaults. Per-call switches override these; project overrides
+# may be placed in the product directory's search.toml (same keys, no table header).
+# Ignored files remain readable by exact path. Permissions are never bypassed.
+# [tools.search]
+# respect_gitignore = true
+# include_hidden = false
+# follow_symlinks = false
+# timeout_secs = 30     # 1..300 seconds
+# max_entries = 100000 # 1..1000000 visited entries

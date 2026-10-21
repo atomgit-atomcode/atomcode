@@ -606,3 +606,42 @@ test('a live switch to a session held elsewhere says which copy it opened', asyn
     },
   );
 });
+
+test('config reload returns pending or invalid live application separately from persistence', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    const { postConfigReload } = await import('./api.ts');
+    for (const status of ['pending', 'invalid', 'failed', 'reloaded']) {
+      globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+        assert.equal(String(url), '/config/reload');
+        assert.equal(init?.method, 'POST');
+        return new Response(JSON.stringify({
+          providers: [],
+          live_provider_sync: { status, provider: 'test', message: 'saved configuration status' },
+        }), { status: 200 });
+      }) as typeof fetch;
+      const result = await postConfigReload();
+      assert.equal(result.live_provider_sync?.status, status);
+      assert.equal(result.live_provider_sync?.provider, 'test');
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('reasoning effort sends xhigh and exposes active-turn rejection for a visible hint', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    const { postLiveReasoningEffort, ReasoningEffortError } = await import('./api.ts');
+    globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+      assert.equal(String(url), '/live/reasoning_effort');
+      assert.deepEqual(JSON.parse(String(init?.body)), { reasoning_effort: 'xhigh', provider: 'custom/model' });
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    }) as typeof fetch;
+    await postLiveReasoningEffort('xhigh', 'custom/model');
+    globalThis.fetch = (async () => new Response(JSON.stringify({ ok: false, active_turn: true, error: 'busy' }), { status: 200 })) as typeof fetch;
+    await assert.rejects(postLiveReasoningEffort('high'), (error: unknown) => error instanceof ReasoningEffortError && error.activeTurn);
+    globalThis.fetch = (async () => new Response(JSON.stringify({ ok: false, error: 'unsupported' }), { status: 400 })) as typeof fetch;
+    await assert.rejects(postLiveReasoningEffort('xhigh'), (error: unknown) => error instanceof ReasoningEffortError && !error.activeTurn);
+  } finally { globalThis.fetch = originalFetch; }
+});

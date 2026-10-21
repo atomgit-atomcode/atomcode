@@ -1210,6 +1210,7 @@ impl Agent {
                     retryable,
                     // 这道标记与 outcome 无关(它抓的是原因本身),模式吃掉即可。
                     ends_turn: _,
+                    retry_after_secs: _,
                 } => {
                     outcome.error = Some(message);
                     outcome.http_status = http_status;
@@ -1738,9 +1739,11 @@ impl RunningAgent {
                 // its bare `TurnComplete` without `finish_turn`, so no `TurnEnd::error`
                 // will ever repeat this sentence. Claiming otherwise would make a
                 // front end that honours the flag drop the only copy.
+                retry_after_secs: None,
                 ends_turn: false,
             });
             self.rt.emit(AgentEvent::TurnComplete {
+                provider_failure: None,
                 turn: None,
                 reason: StopReason::PromptRejected,
             });
@@ -2024,8 +2027,11 @@ impl RunningAgent {
     /// a turn that ran — it keeps its bare event emit, no `turn_complete`.)
     async fn finish_turn(&self, convo: &Conversation, reason: StopReason, ctx: &TurnCtx) {
         self.hooks.turn_complete(convo, &reason, ctx).await;
-        self.rt
-            .emit(AgentEvent::TurnComplete { turn: None, reason });
+        self.rt.emit(AgentEvent::TurnComplete {
+            turn: None,
+            reason,
+            provider_failure: None,
+        });
     }
 
     /// Persist only the replay-safe, fully assembled portion of a failed stream.
@@ -2317,6 +2323,7 @@ impl RunningAgent {
                             http_status: None,
                             code: None,
                             retryable: None,
+                            retry_after_secs: None,
                             ends_turn: true,
                         });
                         self.finish_turn(convo, StopReason::MaxRounds, &turn_ctx)
@@ -2701,6 +2708,7 @@ impl RunningAgent {
                         retryable: Some(e.retryable),
                         // 紧接着就是 finish_turn(ProviderError):这句话会同时落进
                         // `TurnEnd::error`,所以画了收尾块的前端不必再画事件这一条。
+                        retry_after_secs: e.retry_after_secs,
                         ends_turn: true,
                     });
                     self.finish_turn(convo, StopReason::ProviderError, &turn_ctx)
@@ -2903,6 +2911,7 @@ impl RunningAgent {
                             http_status: None,
                             code: None,
                             retryable: None,
+                        retry_after_secs: None,
                         ends_turn: true,
                         });
                         self.finish_turn(convo, StopReason::Timeout, &turn_ctx).await;
@@ -3204,6 +3213,7 @@ impl RunningAgent {
                             code: e.code,
                             retryable: Some(e.retryable),
                             // The error terminates this turn with the classified stop reason.
+                            retry_after_secs: e.retry_after_secs,
                             ends_turn: true,
                         });
                         self.finish_turn(convo, stop, &turn_ctx).await;
@@ -3329,6 +3339,7 @@ impl RunningAgent {
                     http_status: None,
                     code: None,
                     retryable: None,
+                    retry_after_secs: None,
                     ends_turn: true,
                 });
                 self.finish_turn(convo, StopReason::ProviderError, &turn_ctx)
@@ -3524,6 +3535,7 @@ impl RunningAgent {
                                 http_status: None,
                                 code: None,
                                 retryable: None,
+                                retry_after_secs: None,
                                 ends_turn: true,
                             });
                             self.finish_turn(convo, StopReason::MaxContinuations, &turn_ctx)
@@ -4457,6 +4469,7 @@ impl RunningAgent {
                     http_status: None,
                     code: None,
                     retryable: None,
+                    retry_after_secs: None,
                     ends_turn: true,
                 });
                 self.finish_turn(convo, StopReason::RepeatLoop, &turn_ctx)

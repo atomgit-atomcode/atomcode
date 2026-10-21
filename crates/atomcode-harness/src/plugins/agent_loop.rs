@@ -16,12 +16,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use atomcode_kernel::message::Message;
-use atomcode_kernel::provider::{ChatOptions, LlmProvider};
+use atomcode_kernel::provider::{ChatOptions, LlmProvider, ToolChoice};
 use atomcode_kernel::stream::StreamEvent;
 use atomcode_kernel::tool::{ToolCall, ToolDef, ToolResult};
 use atomcode_plexus::{Context, Plugin};
 use futures::future::BoxFuture;
-use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -41,8 +40,8 @@ use crate::session::{
 
 #[derive(Debug, Deserialize)]
 struct LoopRow {
-    /// The runaway fuse, not a policy. A tree with no `agent/turn-stopping`
-    /// listener still terminates; a tree that has one should hit that first.
+    /// Optional runaway fuse (0 disables it), independent of turn policy.
+    /// A positive value bounds trees without a stopping listener.
     #[serde(default = "default_max_rounds")]
     max_rounds: u32,
     #[serde(default)]
@@ -57,12 +56,16 @@ struct LoopRow {
     /// them, with a cancelled result for any call that never ran.
     #[serde(default)]
     undo_cancelled: bool,
-    /// How long a stream may go without an event — first token included —
+    /// How long a stream may go without content progress — first content included
+    /// when stream_first_content_ms is omitted —
     /// before the request is abandoned as stalled. `0` waits as long as the
     /// provider does. A stall is retryable: what happens next is the retry
     /// policy's, and a turn that runs out of retries ends as timed out.
     #[serde(default)]
     stream_idle_ms: u64,
+    /// First content budget; omitted keeps the old single-budget behavior.
+    #[serde(default)]
+    stream_first_content_ms: Option<u64>,
 }
 
 impl Default for LoopRow {
@@ -73,6 +76,7 @@ impl Default for LoopRow {
             verify_log_invariant: true,
             undo_cancelled: false,
             stream_idle_ms: 0,
+            stream_first_content_ms: None,
         }
     }
 }
@@ -98,6 +102,7 @@ struct PluginAgentLoop {
     verify_log_invariant: bool,
     undo_cancelled: bool,
     stream_idle: Option<std::time::Duration>,
+    stream_first_content: Option<std::time::Duration>,
 }
 
 impl PluginAgentLoop {
@@ -159,6 +164,7 @@ impl PluginAgentLoop {
         mut req: ModelRequest,
     ) -> Result<ModelResponse, RequestError> {
         let ctx = agent_ctx.clone();
+        let text_only = req.options.tool_choice == ToolChoice::None;
         let request_started = std::time::Instant::now();
         let mut timing = crate::diagnostics::PhaseTiming::start("request_pipeline");
         let result = agent_ctx
@@ -175,12 +181,31 @@ impl PluginAgentLoop {
                 let ctx = ctx.clone();
                 let session = session.clone();
                 let messages = req.messages.clone();
-                let tools = req.tools.clone();
-                let options = req.options.clone();
+                let tools = if text_only {
+                    Vec::new()
+                } else {
+                    req.tools.clone()
+                };
+                let mut options = req.options.clone();
+                // A request hook may adjust normal options, but cannot turn a
+                // budget-closing request back into a tool request.
+                if text_only {
+                    options.tool_choice = ToolChoice::None;
+                }
                 let idle = self.stream_idle;
+                let first_content = self.stream_first_content;
                 Box::pin(async move {
                     stream_once(
-                        &*provider, &ctx, &session, turn, round, messages, tools, options, idle,
+                        &*provider,
+                        &ctx,
+                        &session,
+                        turn,
+                        round,
+                        messages,
+                        tools,
+                        options,
+                        idle,
+                        first_content,
                     )
                     .await
                 }) as BoxFuture<'_, Result<ModelResponse, RequestError>>
@@ -270,7 +295,7 @@ impl PluginAgentLoop {
 #[tracing::instrument(
     name = "llm_call",
     skip_all,
-    fields(purpose = "main_reply", turn, round)
+    fields(purpose = "main_reply", turn, round, session_id = %session.id())
 )]
 async fn stream_once(
     provider: &dyn LlmProvider,
@@ -282,35 +307,65 @@ async fn stream_once(
     tools: Vec<ToolDef>,
     options: ChatOptions,
     idle: Option<std::time::Duration>,
+    first_content: Option<std::time::Duration>,
 ) -> Result<ModelResponse, RequestError> {
+    if let Some(budget) = &options.request_recovery {
+        let state = budget.try_attempt().map_err(|limit| RequestError {
+            retryable: true,
+            code: Some(atomcode_kernel::provider::REQUEST_RECOVERY_EXHAUSTED_CODE.into()),
+            ..RequestError::message(limit.to_string())
+        })?;
+        tracing::info!(
+            turn,
+            round,
+            attempt = state.attempts,
+            max_attempts = state.max_attempts,
+            reserved_wait_ms = state.reserved_wait.as_millis() as u64,
+            "shared provider attempt started"
+        );
+    }
+    let mut options = options;
+    options.rate_limit_retry_owner = atomcode_kernel::provider::RateLimitRetryOwner::Kernel;
     let mut stream = provider
         .chat_stream(&messages, &tools, &options)
         .await
         .map_err(|e| RequestError::from_provider(&e))?;
     let mut out = ModelResponse::default();
     let mut saw_tool_stream = false;
+    let mut watchdog = atomcode_capabilities::provider::StreamWatchdog::new(first_content, idle);
     loop {
-        let next = match idle {
-            Some(bound) => match tokio::time::timeout(bound, stream.next()).await {
-                Ok(next) => next,
-                // Silence is not an answer. Retryable, and carrying what already
-                // streamed, so recovery can keep it.
-                Err(_) => {
-                    return Err(RequestError {
-                        retryable: !saw_tool_stream,
-                        unexecuted_tool_output: saw_tool_stream,
-                        code: Some(STREAM_IDLE_CODE.to_string()),
-                        ..RequestError::message(format!(
-                            "stream idle timeout: no event for {}ms",
-                            bound.as_millis()
-                        ))
-                    }
-                    .with_partial(out))
+        let next = match watchdog.next(&mut stream).await {
+            Ok(next) => next,
+            // Silence is not an answer. Retryable, and carrying what already
+            // streamed, so recovery can keep it.
+            Err(_) => {
+                let budget_ms = watchdog.budget().unwrap().as_millis();
+                tracing::warn!(
+                    phase = watchdog.phase(),
+                    budget_ms = budget_ms as u64,
+                    silent_ms = watchdog.silent_for().as_millis() as u64,
+                    turn,
+                    round,
+                    saw_tool_stream,
+                    text_chars = out.text.chars().count(),
+                    reasoning_chars = out.reasoning.chars().count(),
+                    "harness content deadline exceeded"
+                );
+                return Err(RequestError {
+                    retryable: !saw_tool_stream,
+                    unexecuted_tool_output: saw_tool_stream,
+                    code: Some(STREAM_IDLE_CODE.to_string()),
+                    ..RequestError::message(format!(
+                        "stream idle timeout ({}): no content for {}ms",
+                        watchdog.phase(),
+                        budget_ms
+                    ))
                 }
-            },
-            None => stream.next().await,
+                .with_partial(out));
+            }
         };
         let Some(event) = next else { break };
+        watchdog.observe(&event);
         match event {
             StreamEvent::TextDelta(text) => {
                 // Through the one write path like every other fact. A chunk
@@ -351,10 +406,26 @@ async fn stream_once(
                 out.reasoning.push_str(&text);
             }
             StreamEvent::ToolCall(call) => {
+                // Complete calls are not a first-token observation. Their
+                // fragments, if provided, have already been forwarded.
                 saw_tool_stream = true;
                 out.tool_calls.push(call);
             }
-            StreamEvent::ToolCallDelta { .. } => saw_tool_stream = true,
+            StreamEvent::ToolCallDelta {
+                index,
+                id,
+                name,
+                arguments,
+            } => {
+                saw_tool_stream = true;
+                ctx.emit::<crate::events::ToolCallChunk>(&crate::events::ToolChunk {
+                    session: session.id().into(),
+                    index,
+                    id,
+                    name,
+                    arguments,
+                });
+            }
             StreamEvent::Usage(usage) => out.usage = Some(usage),
             // Hand back what was already produced: the tokens were paid for,
             // and a retry that starts from nothing repeats work the model has
@@ -435,18 +506,24 @@ impl PluginAgentLoop {
         let turn = session.next_turn();
         self.commit(&session, SessionEvent::TurnStart { turn });
         let mut outcome = TurnOutcome {
+            session_id: session.id().to_string(),
             turn,
             ..Default::default()
         };
         let started_at = std::time::Instant::now();
         let mut used_tokens = 0u32;
         let mut step: u32 = 0;
+        let mut closing: Option<StopReason> = None;
 
         loop {
             // Claim one message plus whatever context queued alongside it. On
             // later passes this is what folds a mid-turn message into the turn
             // already running instead of making it wait for the next one.
-            let claimed = agent.inbox().claim();
+            let claimed = if closing.is_some() {
+                crate::agent::Claimed::default()
+            } else {
+                agent.inbox().claim()
+            };
             // The receipt is answered once the turn has kept the message, not
             // here: a stop can still overtake it (below).
             let answering = match (&claimed.receipt, claimed.message.is_some()) {
@@ -642,7 +719,19 @@ impl PluginAgentLoop {
             outcome.rounds = step;
             self.commit(&session, SessionEvent::StepStart { turn, step });
 
-            let (messages, tools) = self.assemble(&session, &ctx);
+            if closing.is_some() {
+                self.commit(&session, SessionEvent::Injected {
+                    turn,
+                    text: format!("The configured round budget has been reached after {} rounds. Tools are disabled for this closing request only; a later user request may resume work. Respond with text only: explain that the round limit was reached, summarize verified progress, list unfinished work and suggest next steps. Do not claim unfinished work is complete.", step - 1),
+                    origin: InjectionOrigin::InternalNudge,
+                });
+            }
+            let (messages, mut tools) = self.assemble(&session, &ctx);
+            let mut options = ChatOptions::default();
+            if closing.is_some() {
+                tools.clear();
+                options.tool_choice = ToolChoice::None;
+            }
 
             if self.verify_log_invariant {
                 if let Err(unexplained) =
@@ -688,7 +777,7 @@ impl PluginAgentLoop {
                 ModelRequest {
                     messages,
                     tools,
-                    options: ChatOptions::default(),
+                    options,
                     turn,
                     round: step,
                     answering_a_nudge,
@@ -713,6 +802,7 @@ impl PluginAgentLoop {
                 }
                 Err(error) => {
                     if let Some(pause) = error.rate_limit_pause.clone() {
+                        outcome.provider_error = Some(error.clone());
                         // Not a failure: the turn stops cleanly and says when to
                         // come back.
                         self.commit(&session, SessionEvent::RateLimitPaused { turn, pause });
@@ -725,6 +815,7 @@ impl PluginAgentLoop {
                         StopReason::ProviderError
                     };
                     outcome.error = Some(error.to_string());
+                    outcome.provider_error = Some(error);
                     break;
                 }
             };
@@ -772,7 +863,14 @@ impl PluginAgentLoop {
             outcome.tool_calls += tool_count;
             // No calls, nothing to schedule: dispatching an empty batch would
             // make every listener reason about a round that did not happen.
-            let results = if tool_count == 0 {
+            let results = if closing.is_some() {
+                response.tool_calls.into_iter().map(|call| ToolResult {
+                    call_id: call.id,
+                    content: "Tool not executed: the round budget was reached; this request is text-only.".into(),
+                    is_error: true,
+                    images: Vec::new(),
+                }).collect()
+            } else if tool_count == 0 {
                 Vec::new()
             } else {
                 self.execute_batch(&ctx, agent, response.tool_calls, turn, step)
@@ -818,6 +916,10 @@ impl PluginAgentLoop {
                 break;
             }
 
+            if let Some(stop) = closing.take() {
+                outcome.stop = stop;
+                break;
+            }
             let owes_a_request = tool_count > 0 || response.truncated;
             // Asked on the agent's own context: a delegated agent's budget is a
             // listener on its realm, which the tree cannot see — asked on the
@@ -835,6 +937,10 @@ impl PluginAgentLoop {
                 })
                 .await
             {
+                if stop == StopReason::MaxRounds && owes_a_request {
+                    closing = Some(stop);
+                    continue;
+                }
                 outcome.stop = stop;
                 break;
             }
@@ -855,7 +961,7 @@ impl PluginAgentLoop {
                 break;
             }
 
-            if step >= self.max_rounds {
+            if self.max_rounds > 0 && step >= self.max_rounds {
                 outcome.stop = StopReason::RunawayFuse;
                 break;
             }
@@ -1108,6 +1214,11 @@ impl Plugin for AgentLoopPlugin {
             max_rounds: row.max_rounds,
             verify_log_invariant: row.verify_log_invariant,
             undo_cancelled: row.undo_cancelled,
+            stream_first_content: row
+                .stream_first_content_ms
+                .or(Some(row.stream_idle_ms))
+                .filter(|ms| *ms > 0)
+                .map(std::time::Duration::from_millis),
             stream_idle: (row.stream_idle_ms > 0)
                 .then(|| std::time::Duration::from_millis(row.stream_idle_ms)),
         };
@@ -1115,5 +1226,279 @@ impl Plugin for AgentLoopPlugin {
             .provide::<AgentLoopSvc>(Arc::new(driver))
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod content_deadline_tests {
+    use super::*;
+    use std::time::Duration;
+
+    struct TimedProvider(Vec<(u64, StreamEvent)>);
+    #[async_trait]
+    impl LlmProvider for TimedProvider {
+        fn model_name(&self) -> &str {
+            "timed"
+        }
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[ToolDef],
+            _: &ChatOptions,
+        ) -> Result<
+            futures::stream::BoxStream<'static, StreamEvent>,
+            atomcode_kernel::stream::ProviderError,
+        > {
+            let events = self.0.clone().into_iter();
+            Ok(Box::pin(futures::stream::unfold(
+                events,
+                |mut events| async move {
+                    let (seconds, event) = events.next()?;
+                    tokio::time::sleep(Duration::from_secs(seconds)).await;
+                    Some((event, events))
+                },
+            )))
+        }
+    }
+    async fn run(provider: &TimedProvider) -> Result<ModelResponse, RequestError> {
+        let app = atomcode_plexus::App::new(
+            atomcode_plexus::PluginRegistry::new(),
+            atomcode_plexus::ConfigTree::from_layers(Vec::new()).unwrap(),
+        );
+        let ctx = app.context();
+        let log = SessionLog::new("deadline-test");
+        stream_once(
+            provider,
+            &ctx,
+            &log,
+            1,
+            0,
+            Vec::new(),
+            Vec::new(),
+            ChatOptions::default(),
+            Some(Duration::from_secs(120)),
+            Some(Duration::from_secs(600)),
+        )
+        .await
+    }
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn first_content_after_two_minutes_is_not_abandoned() {
+        let out = run(&TimedProvider(vec![(
+            200,
+            StreamEvent::TextDelta("late answer".into()),
+        )]))
+        .await
+        .unwrap();
+        assert_eq!(out.text, "late answer");
+    }
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn metadata_cannot_extend_first_content_forever() {
+        let started = tokio::time::Instant::now();
+        let error = run(&TimedProvider(vec![
+            (
+                100,
+                StreamEvent::Usage(Default::default())
+            );
+            10
+        ]))
+        .await
+        .unwrap_err();
+        assert_eq!(error.code.as_deref(), Some(STREAM_IDLE_CODE));
+        assert_eq!(started.elapsed(), Duration::from_secs(600));
+    }
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn idle_silence_is_bounded_and_partial_output_is_kept() {
+        let started = tokio::time::Instant::now();
+        let error = run(&TimedProvider(vec![
+            (1, StreamEvent::TextDelta("saved".into())),
+            (100, StreamEvent::Usage(Default::default())),
+            (100, StreamEvent::TextDelta("too late".into())),
+        ]))
+        .await
+        .unwrap_err();
+        assert_eq!(started.elapsed(), Duration::from_secs(121));
+        assert_eq!(error.partial.unwrap().text, "saved");
+    }
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_stalled_tool_fragment_is_not_marked_safe_to_replay() {
+        let error = run(&TimedProvider(vec![
+            (
+                1,
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call".into()),
+                    name: Some("write_file".into()),
+                    arguments: "{".into(),
+                },
+            ),
+            (200, StreamEvent::TextDelta("too late".into())),
+        ]))
+        .await
+        .unwrap_err();
+        assert!(error.unexecuted_tool_output);
+        assert!(!error.retryable);
+        assert!(
+            error.partial.is_none(),
+            "an incomplete fragment is not a completed response"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn cancelling_a_first_content_wait_does_not_wait_for_its_deadline() {
+        let provider = TimedProvider(vec![(500, StreamEvent::TextDelta("late".into()))]);
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(10)) => {},
+            _ = run(&provider) => panic!("the response must still be pending"),
+        }
+    }
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn tool_fragments_are_live_observations_not_prose_or_persisted_facts() {
+        let app = atomcode_plexus::App::new(
+            atomcode_plexus::PluginRegistry::new(),
+            atomcode_plexus::ConfigTree::from_layers(Vec::new()).unwrap(),
+        );
+        let ctx = app.context();
+        let log = SessionLog::new("tool-observation");
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = seen.clone();
+        let _listener =
+            ctx.on_emit::<crate::events::ToolCallChunk>(move |chunk: &crate::events::ToolChunk| {
+                capture.lock().unwrap().push(chunk.clone())
+            });
+        let provider = TimedProvider(vec![
+            (
+                60,
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("c".into()),
+                    name: Some("read_file".into()),
+                    arguments: "{".into(),
+                },
+            ),
+            (
+                2,
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: None,
+                    name: None,
+                    arguments: "}".into(),
+                },
+            ),
+            (
+                0,
+                StreamEvent::ToolCall(atomcode_kernel::tool::ToolCall {
+                    id: "c".into(),
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                }),
+            ),
+        ]);
+        let out = stream_once(
+            &provider,
+            &ctx,
+            &log,
+            1,
+            0,
+            vec![],
+            vec![],
+            ChatOptions::default(),
+            Some(Duration::from_secs(120)),
+            Some(Duration::from_secs(600)),
+        )
+        .await
+        .unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen.len(),
+            2,
+            "the completed call must not duplicate streamed output"
+        );
+        assert!(seen.iter().all(|c| c.session == "tool-observation"));
+        assert_eq!(seen[0].arguments, "{");
+        assert_eq!(seen[1].arguments, "}");
+        assert!(out.text.is_empty() && out.reasoning.is_empty());
+        assert_eq!(out.tool_calls.len(), 1);
+        assert!(
+            log.events().is_empty(),
+            "observational arguments must never be persisted as assistant text"
+        );
+    }
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn completed_only_calls_do_not_invent_a_first_token_observation() {
+        let app = atomcode_plexus::App::new(
+            atomcode_plexus::PluginRegistry::new(),
+            atomcode_plexus::ConfigTree::from_layers(Vec::new()).unwrap(),
+        );
+        let ctx = app.context();
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = seen.clone();
+        let _listener =
+            ctx.on_emit::<crate::events::ToolCallChunk>(move |_: &crate::events::ToolChunk| {
+                count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            });
+        let provider = TimedProvider(vec![(
+            60,
+            StreamEvent::ToolCall(atomcode_kernel::tool::ToolCall {
+                id: "c".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            }),
+        )]);
+        let out = stream_once(
+            &provider,
+            &ctx,
+            &SessionLog::new("nonstreaming"),
+            1,
+            0,
+            vec![],
+            vec![],
+            ChatOptions::default(),
+            Some(Duration::from_secs(120)),
+            Some(Duration::from_secs(600)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.tool_calls.len(), 1);
+        assert_eq!(seen.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_progressing_response_outlives_its_spent_recovery_wait_allowance() {
+        let app = atomcode_plexus::App::new(
+            atomcode_plexus::PluginRegistry::new(),
+            atomcode_plexus::ConfigTree::from_layers(Vec::new()).unwrap(),
+        );
+        let budget =
+            atomcode_kernel::provider::RequestRecoveryBudget::new(2, Duration::from_secs(1));
+        budget.try_attempt().unwrap(); // a failed original OPEN
+        budget.reserve_wait(Duration::from_secs(1)).unwrap();
+        let options = ChatOptions {
+            request_recovery: Some(budget.clone()),
+            ..Default::default()
+        };
+        let provider = TimedProvider(vec![
+            (60, StreamEvent::TextDelta("a".into())),
+            (240, StreamEvent::TextDelta("b".into())),
+            (240, StreamEvent::TextDelta("c".into())),
+            (240, StreamEvent::TextDelta("d".into())),
+            (0, StreamEvent::Done { truncated: false }),
+        ]);
+        let began = tokio::time::Instant::now();
+        let response = stream_once(
+            &provider,
+            &app.context(),
+            &SessionLog::new("progressing-recovery"),
+            1,
+            1,
+            vec![],
+            vec![],
+            options,
+            Some(Duration::from_secs(300)),
+            Some(Duration::from_secs(600)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.text, "abcd");
+        assert_eq!(began.elapsed(), Duration::from_secs(780));
+        assert_eq!(budget.snapshot().attempts, 2);
     }
 }

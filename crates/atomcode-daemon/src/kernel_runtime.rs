@@ -271,6 +271,7 @@ pub fn spawn_native_runtime_for_session_deferred_with_preprocessor(
                         http_status: None,
                         code: None,
                         retryable: None,
+                        retry_after_secs: None,
                         ends_turn: false,
                     }),
                 );
@@ -287,6 +288,7 @@ pub fn spawn_native_runtime_for_session_deferred_with_preprocessor(
                             http_status: None,
                             code: None,
                             retryable: None,
+                            retry_after_secs: None,
                             ends_turn: false,
                         }),
                     );
@@ -350,6 +352,7 @@ pub fn spawn_native_runtime_for_session_deferred_with_preprocessor(
                                         http_status: None,
                                         code: None,
                                         retryable: None,
+                    retry_after_secs: None,
                     ends_turn: false,
                                     }),
                                 );

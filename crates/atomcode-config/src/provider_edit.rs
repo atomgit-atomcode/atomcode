@@ -37,6 +37,7 @@ fn set_key(table: &mut Table, key: &str, item: Item) {
 /// alone.
 #[derive(Clone, Debug, Default)]
 pub struct AccountPatch<'a> {
+    pub headers: Option<&'a crate::provider_headers::HeaderChanges>,
     /// The preset or protocol id this account speaks.
     pub provider: &'a str,
     /// `None` takes the key out of the file, so the preset's own default stands.
@@ -165,6 +166,7 @@ pub fn put_account(document: &mut DocumentMut, id: &str, patch: &AccountPatch<'_
         }
     }
     edit_key(table, "display_name", str_item(patch.display_name));
+    put_headers(document, "provider_accounts", id, patch.headers)?;
     Ok(())
 }
 
@@ -376,6 +378,7 @@ note = "hand-written"
             &mut document,
             "mine",
             &AccountPatch {
+                headers: None,
                 provider: "openai-compatible",
                 base_url: Some("https://two.example.com/v1"),
                 api_key: KeyWrite::Keep,
@@ -404,6 +407,7 @@ note = "hand-written"
             &mut document,
             "mine",
             &AccountPatch {
+                headers: None,
                 provider: "ollama",
                 base_url: None,
                 api_key: KeyWrite::Keep,
@@ -425,6 +429,7 @@ note = "hand-written"
             &mut document,
             "fresh",
             &AccountPatch {
+                headers: None,
                 provider: "openai-compatible",
                 base_url: Some("https://fresh.example.com/v1"),
                 api_key: KeyWrite::Set("sk-fresh"),
@@ -554,6 +559,7 @@ origin = "openrouter-free"
             &mut document,
             "mine",
             &AccountPatch {
+                headers: None,
                 provider: "ollama",
                 base_url: None,
                 api_key: KeyWrite::Clear,
@@ -628,4 +634,42 @@ origin = "openrouter-free"
         set_default_model(&mut document, None);
         assert!(!document.to_string().contains("default_model"));
     }
+}
+
+/// Replace headers atomically with the rest of the account edit. Null values
+/// preserve a stored credential without returning it to a UI.
+pub fn put_headers(
+    document: &mut DocumentMut,
+    section: &str,
+    id: &str,
+    changes: Option<&crate::provider_headers::HeaderChanges>,
+) -> Result<()> {
+    let Some(changes) = changes else {
+        return Ok(());
+    };
+    changes.validate().map_err(anyhow::Error::msg)?;
+    let table = sub_table(document, section, id);
+    let mut next = toml_edit::InlineTable::new();
+    for (name, value) in &changes.0 {
+        let stored = table
+            .get("headers")
+            .and_then(|v| v.as_table_like())
+            .and_then(|t| t.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)))
+            .and_then(|(_, v)| v.as_str());
+        let value = value
+            .as_deref()
+            .or(stored)
+            .ok_or_else(|| anyhow::anyhow!("Cannot preserve a header that is not stored"))?;
+        next.insert(name, value.into());
+    }
+    if next.is_empty() {
+        table.remove("headers");
+    } else {
+        set_key(
+            table,
+            "headers",
+            Item::Value(toml_edit::Value::InlineTable(next)),
+        );
+    }
+    Ok(())
 }

@@ -116,26 +116,9 @@ pub const CODING_DEFAULTS: &str = r#"
 # patches this row back to the configured budget when that budget is not `0`.
 # So in the shipped runtime this `0` is the default, not the last word.
 #
-# ALSO worth knowing, and this one is a divergence: `agent-loop` carries a
-# second, coarser stop — `infra` sets `config = { max_rounds = 100 }`, and
-# `agent_loop.rs` ends the turn with `StopReason::RunawayFuse` at that round.
-# The engine's counterpart is `cfg.max_rounds` → the kernel fuse, whose comment
-# reads "`0` leaves the neutral kernel fuse unwired" — i.e. the engine ships it
-# **off** and relies on the repetition guards, which is what this assembly's
-# `tool-loop-guard` + `repeat-fuse` rows are.
-#
-# Matching that here would mean setting the fuse to `0`, and that is not one
-# change: `agent_loop.rs` compares `step >= self.max_rounds`, so a bare `0` stops
-# the turn before its first request (the same trap `round-cap` had). The
-# corresponding statement in that direction is [`RUNAWAY_FUSE_ROUNDS`].
-#
-# The fuse stays ON — a turn that nothing else is watching must still end — but
-# its number is this product's, not `infra`'s 100 and not a serde default:
-# [`RUNAWAY_FUSE_ROUNDS`]. Every patch this crate aims at `agent-loop` carries
-# the field, because `Op::Patch` **replaces a row's whole config**: a patch that
-# says only `working_dir` does not leave the fuse alone, it drops it back to
-# `LoopRow::default()` — which is how a `--dump-config` reading 100 came to mean
-# nothing in particular.
+# The product disables the separate agent-loop fuse (0 = unlimited).
+# `round-cap` is the configurable budget; reaching it allows one text-only
+# closing request. Repeat guards, deadlines and cancellation remain independent.
 [[patch]]
 id = "round-cap"
 config = { max_rounds = 0 }
@@ -309,7 +292,11 @@ disabled = true
 [[insert]]
 name = "delegation-bounds"
 
-# No rules by default, so the row is inert until a user writes some.
+# Temporary skill grants, inside the static deny rules and ahead of approval.
+[[insert]]
+name = "skill-permissions"
+
+# No static rules by default, so this row is inert until a user writes some.
 [[insert]]
 name = "permissions"
 
@@ -373,27 +360,10 @@ name = "telemetry"
 disabled = true
 "#;
 
-/// The coarse fuse `agent-loop` ends a turn on, in rounds.
-///
-/// Not `infra`'s 100 and not `LoopRow::default()`: the number a person reads in
-/// `--dump-config` has to be the number in force. The row's own default lives in
-/// `harness/plugins/agent_loop.rs`, and a `[[patch]]` replaces a row's whole
-/// config, so a patch carrying only `working_dir` silently reverts this to that
-/// default. Both of this crate's `agent-loop` patches therefore state it:
-/// `AgentLoopOptionsPatch` (the runtime's own option rows) and `AgentLoopPatch`
-/// (the layer `mount_hosted` scopes, which is the last word on the
-/// `mount_swappable` path, where no runtime option rows exist).
-///
-/// It is the *fuse*, not the budget: `round-cap` owns the turn's round budget,
-/// and the fuse exists so a turn terminates even when no `turn-stopping`
-/// listener does. Raising it moves the round at which a tree with no stopping
-/// policy gives up; it does not by itself make a turn run longer than the budget
-/// allows.
-///
-/// Public for the reason [`CODING_DEFAULTS`] is: a host that stacks that list and
-/// then patches `agent-loop` itself has to state the same number, or the value
-/// it reverts to is `LoopRow::default()` and nobody chose it.
-pub const RUNAWAY_FUSE_ROUNDS: u32 = 300;
+/// The product leaves the separate loop fuse disabled. The round-cap policy
+/// owns configured budgets; repetition guards and cancellation remain active.
+/// Every agent-loop patch carries this value because patches replace config.
+pub const RUNAWAY_FUSE_ROUNDS: u32 = 0;
 
 // ---- the shapes this product patches rows with ------------------------------
 //
@@ -682,7 +652,7 @@ fn persona_patch(app: &App, model: &str) -> serde_json::Value {
 /// every model switch, because each one is a fact about the model.
 /// What `llm-retry` carries in `bundle::INFRA`, restated here because a swap to
 /// a provider with no opinion has to actively put it back.
-const DEFAULT_RETRY_ATTEMPTS: u32 = 3;
+const DEFAULT_RETRY_ATTEMPTS: u32 = 6;
 
 #[derive(serde::Serialize)]
 struct CodeReviewModelPatch<'a> {
@@ -724,14 +694,16 @@ struct RetryPatch {
     attempts: u32,
     backoff_ms: u64,
     cap_ms: u64,
+    recovery_wait_secs: u64,
 }
 
 /// Rows whose config follows the running model — patched at mount and again on
 /// every model switch, because each one is a fact about the model.
 fn model_rows(cfg: &crate::CodingAgentConfig) -> Result<Layer, String> {
     // Retries. An explicit upstream budget is the visible tier and wins; an
-    // explicit per-model adapter budget otherwise switches the outer tier off,
-    // the coupling the chain applies. Attempts count the first request.
+    // explicit provider budget becomes the shared total. Budgeted native calls
+    // delegate adapter retries to this row, so the tiers cannot multiply.
+    // Attempts count the first request.
     //
     // Always emitted, never conditional: a swap TO a provider that says nothing
     // has to put the default back, and a patch that is simply absent leaves the
@@ -739,7 +711,7 @@ fn model_rows(cfg: &crate::CodingAgentConfig) -> Result<Layer, String> {
     // `the_retry_budget_follows_a_model_switch`.
     let attempts = match (cfg.upstream_retry_max_attempts, cfg.retry_max_attempts) {
         (Some(n), _) => n.saturating_add(1),
-        (None, Some(_)) => 1,
+        (None, Some(n)) => n.max(1),
         (None, None) => DEFAULT_RETRY_ATTEMPTS,
     };
     Layer::new()
@@ -761,7 +733,7 @@ fn model_rows(cfg: &crate::CodingAgentConfig) -> Result<Layer, String> {
                 max_waits: 5,
                 max_wait_secs: 120,
                 fallback_secs: 5,
-                max_attempts: cfg.retry_max_attempts,
+                max_attempts: Some(attempts),
             },
         )
         .map_err(|e| e.to_string())?
@@ -790,6 +762,7 @@ fn model_rows(cfg: &crate::CodingAgentConfig) -> Result<Layer, String> {
                 attempts,
                 backoff_ms: 3000,
                 cap_ms: 30000,
+                recovery_wait_secs: 300,
             },
         )
         .map_err(|e| e.to_string())
@@ -869,7 +842,18 @@ pub fn names_sessions_with_a_model(cfg: &crate::CodingAgentConfig) -> bool {
 pub fn config_rows(cfg: &crate::CodingAgentConfig) -> Result<Layer, String> {
     use atomcode_capabilities::tools::CredentialShellPolicy;
 
-    let mut out = model_rows(cfg)?;
+    let search = cfg
+        .tool_search
+        .with_project_file(&cfg.dirs.project(&cfg.working_dir).join("search.toml"))
+        .map_err(|e| e.to_string())?;
+    let mut out = model_rows(cfg)?
+        .patch("tool-search-world", search)
+        .map_err(|e| e.to_string())?
+        .patch(
+            "mcp",
+            serde_json::json!({"tool_search": cfg.mcp_tool_search}),
+        )
+        .map_err(|e| e.to_string())?;
     // `[ui] ai_session_naming`(或 `ATOMCODE_AI_SESSION_NAMING`)选的是**哪一个
     // 命名器**填 `session-title` 这条缝:默认那个读第一句话、不问模型;开了之后
     // 换成问工具模型的那个。两者都把答案作为一条 `Titled` 事实提交,所以会话
@@ -993,6 +977,7 @@ pub fn tools_host_row(
     crate::host_rows::ToolsHostPlugin {
         switches,
         slot: None,
+        permissions: None,
     }
 }
 
@@ -1572,6 +1557,8 @@ pub struct HostState {
     /// tree being rebuilt (`tools-host`). Absent means the catalog's switches
     /// live and die with the tree, which is right for a tree nobody rebuilds.
     pub tool_switches: Option<Arc<atomcode_harness::seams::ToolSwitches>>,
+    /// The runtime's per-mount permission projection, shared by the catalog and gate.
+    pub permission_settings: Option<crate::permission_settings::PermissionSettings>,
     /// Where `tools-host` publishes the catalog it built, for a host that has
     /// to answer a front end about what the model can call.
     pub tool_catalog_slot: Arc<std::sync::RwLock<Option<Arc<atomcode_harness::seams::ToolBox>>>>,
@@ -2088,6 +2075,7 @@ fn compose_hosted(
         registry.register(Arc::new(crate::host_rows::ToolsHostPlugin {
             switches,
             slot: Some(host.tool_catalog_slot.clone()),
+            permissions: host.permission_settings.clone(),
         }));
     }
     registry.register(Arc::new(crate::host_rows::KernelHooksPlugin(

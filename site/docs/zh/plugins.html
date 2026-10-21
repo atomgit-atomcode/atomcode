@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.2.3</span>
+    <span class="dhdr-ver">v5.2.4</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -221,7 +221,7 @@ atomcode plugin marketplace remove|update|list</code></pre>
 }</code></pre>
       <p>Hook 可以用以下方式响应(优先级由高到低):</p>
       <ul>
-        <li><strong>退出码非零</strong> —— 阻断 prompt,reason 取自 stderr。</li>
+        <li><strong>退出码 2 且有明确拒绝原因</strong> —— 阻断 prompt；其他非零退出和启动失败不作为业务拒绝。</li>
         <li><strong>stdout 输出 JSON</strong> <code>{"decision": "block", "reason": "..."}</code> —— 阻断,显式给原因。</li>
         <li><strong>stdout 输出 JSON</strong> <code>{"hookSpecificOutput": {"additionalContext": "..."}}</code> —— 把 <code>additionalContext</code> 追加到用户消息后,作为 LLM 的额外上下文。</li>
         <li><strong>stdout 输出纯文本</strong> —— 整段作为 <code>additionalContext</code> 注入。</li>
@@ -235,7 +235,7 @@ atomcode plugin marketplace remove|update|list</code></pre>
         <li><code>${CLAUDE_PLUGIN_ROOT}</code> —— plugin 安装目录绝对路径(CC 兼容)。</li>
         <li><code>${ATOMCODE_PLUGIN_ROOT}</code> —— 同上,atomcode 别名。</li>
       </ul>
-      <p>这些是<strong>真实环境变量</strong>由 shell 自身展开,不是字符串替换 —— 安装路径含空格、引号、<code>$</code>、<code>;</code> 都不会破命令。</p>
+      <p>插件 hook 只接受插件目录内受检的脚本入口和字面量参数，可选 python、python3、node、sh、bash 解释器。插件根占位符作为路径解析，不经过 shell；管道、重定向和内联代码应迁移到脚本中，已知的 Node 路径包装会转换为直接脚本入口，batch/bash 双格式 .cmd 包装使用 bash 执行；普通 .cmd/.bat 文件不受支持。用户自定义 hook 才保留 shell 展开语义。</p>
 
       <h2 id="marketplace-管理">Marketplace 管理</h2>
       <pre><code># 列出已注册的 marketplace

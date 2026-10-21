@@ -68,6 +68,32 @@ retained after loading, so you cannot address a hook by it (see the CLI section)
 
 ## How the command runs
 
+Execution depends on the source:
+
+| Source | Execution |
+|---|---|
+| User project/user hooks | Shell command, retaining pipes, quoting and variable expansion. |
+| Plugin hooks | Validated plugin-relative script entry point, directly executed with literal arguments. Optional interpreters: `python`, `python3`, `node`, `sh`, `bash`. |
+
+Plugin examples: `python3 "${CLAUDE_PLUGIN_ROOT}/hooks/check.py"` or
+`node "${CLAUDE_PLUGIN_ROOT}/hooks/check.js"`. Move pipelines and inline `-e`/`-c`
+programs into scripts. Known Node path-only wrappers are normalized to their
+script entry point. Recognized batch/bash polyglot `.cmd` wrappers run through
+bash with literal arguments; ordinary `.cmd`/`.bat` files remain unsupported.
+Plugin-root placeholders are resolved as paths; arbitrary shell expansion is not
+performed. Invalid plugin configurations are withheld at load and cannot be
+trusted; inspect `atomcode hooks list`, repair the command or disable the plugin.
+A script's explicit `decision:block`, or exit 2 with a deliberate reason, still
+blocks. Other nonzero exits and launch failures are not business block decisions.
+
+Trust now includes plugin bundle contents (excluding Git metadata), not just
+commands. Script/helper changes require explicit `atomcode plugin trust <name>`.
+It does not sandbox external dependencies, protect external environment/PATH, or
+make validation and execution atomic against concurrent filesystem mutation.
+
+The remainder of this section describes **user-authored hooks**.
+
+
 `command` is handed to the shell as one line — `sh -c` on Linux/macOS, `cmd /C`
 on Windows — so pipes, `&&` and quoting work as they would in a terminal.
 
@@ -208,9 +234,16 @@ atomcode hooks test <NAME>    # dry-run a hook with a synthetic payload
 
 ## Security notes
 
-1. Hooks **cannot bypass the permission system** — a `PreToolUse` deny does not
-   override a user's stored allow, and an allow is convenience, never consent for
-   a security boundary.
+Plugin hook scripts run as subprocesses after plugin trust; they are not Bash
+tool calls. Use `atomcode plugin trust <plugin>` to trust a plugin's hooks.
+`permissions.allow = ["Bash(python3 *)"]` preauthorizes matching **model tool
+calls**, and does not change hook-script authorization. Likewise, a tool deny
+does not prohibit a trusted hook script from launching that command. JSON
+`settings.json` / `settings.local.json` permission loading reads only
+`permissions`; it does not load hooks from those files.
+
+1. Hooks **cannot bypass hard safety boundaries** — a `PreToolUse` deny blocks
+   the tool call; an allow is convenience, never consent for a security boundary.
 2. Commands run with **your** permissions — mind the command's own safety.
 3. **Fail-open:** a timeout or crash is treated as "proceed", not "block".
 4. On Windows the command runs under `cmd /C`: use an explicit interpreter,

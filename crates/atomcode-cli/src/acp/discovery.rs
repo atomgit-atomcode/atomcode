@@ -184,9 +184,16 @@ mod tests {
 
     #[tokio::test]
     async fn list_respects_cwd_filter() {
-        let sessions = sessions_with(vec![("acp-1", "/work-a"), ("acp-2", "/work-b")]);
+        // Spelled the way this host spells paths: a `/work-b` cwd is not absolute on
+        // Windows, so the request is refused before the filter is applied at all.
+        let (first, second) = if cfg!(windows) {
+            (r"C:\work-a", r"C:\work-b")
+        } else {
+            ("/work-a", "/work-b")
+        };
+        let sessions = sessions_with(vec![("acp-1", first), ("acp-2", second)]);
 
-        let req = ListSessionsRequest::new().cwd("/work-b");
+        let req = ListSessionsRequest::new().cwd(second);
         let resp = handle_list_sessions(&sessions, &req, &empty_scan())
             .await
             .unwrap();

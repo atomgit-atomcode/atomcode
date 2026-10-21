@@ -130,6 +130,7 @@ pub fn discovery_protocol(provider_type: &str) -> Option<&'static str> {
 pub struct DiscoveryTransport {
     pub api_key: Option<String>,
     pub user_agent: Option<String>,
+    pub headers: atomcode_config::provider_headers::ProviderHeaders,
     pub skip_tls_verify: bool,
 }
 
@@ -252,6 +253,8 @@ pub async fn fetch_discovery_body(
     } else if let Some(key) = transport.api_key.as_deref() {
         request = request.bearer_auth(key.trim());
     }
+    request = super::apply_account_headers(request, &transport.headers)
+        .map_err(|_| DiscoveryRequestError::Transport)?;
     let response = request.send().await.map_err(|error| {
         if error.is_timeout() {
             DiscoveryRequestError::Timeout

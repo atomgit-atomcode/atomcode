@@ -19,8 +19,8 @@ use crate::command::Command;
 use crate::content::{WelcomeBlock, WelcomeWords};
 use crate::module::{Opening, Producer};
 
-/// How many randomly-chosen tips to show, beside the pinned one.
-const MAX_TIPS: usize = 3;
+/// Random tip slots beside login; without login its slot is also available.
+const MAX_TIPS: usize = 4;
 
 /// The one command worth pinning first, when the screen has it.
 ///
@@ -128,7 +128,8 @@ impl WelcomeWords for ShippedWords {
     }
 }
 
-/// The tips to show: the pinned one when it exists, then up to [`MAX_TIPS`] more.
+/// Up to five tips, with login pinned first when available.
+/// Rendering keeps the smaller pixel layout’s original tip count.
 ///
 /// **Filtered against the screen's own commands.** Tuix's pool pins `/provider`,
 /// `/webui` and `/plan` among others, none of which this screen need have;
@@ -190,7 +191,8 @@ pub(crate) fn choose_tips(
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed_of(seed));
     rest.shuffle(&mut rng);
 
-    for (name, command) in rest.into_iter().take(MAX_TIPS) {
+    let remaining = (MAX_TIPS + 1).saturating_sub(tips.len());
+    for (name, command) in rest.into_iter().take(remaining) {
         tips.push((format!("/{name}"), describe(name, command)));
     }
     tips
@@ -363,7 +365,7 @@ mod tests {
     #[test]
     fn tips_are_distinct_and_capped() {
         let tips = choose_tips(&all_offered(), &words(), "~/proj");
-        assert!(tips.len() <= MAX_TIPS + 1, "at most four: {tips:?}");
+        assert!(tips.len() <= MAX_TIPS + 1, "at most five: {tips:?}");
         let mut names: Vec<&str> = tips.iter().map(|(c, _)| c.as_str()).collect();
         let count = names.len();
         names.sort_unstable();

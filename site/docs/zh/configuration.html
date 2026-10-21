@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.2.3</span>
+    <span class="dhdr-ver">v5.2.4</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -270,7 +270,7 @@ base_url = "http://localhost:11434"</code></pre>
       <h2 id="回合轮数">回合轮数</h2>
       <pre><code>[coding]
 max_rounds = 200</code></pre>
-      <p>达到上限时，TUI 会询问继续还是停止，不会直接丢失当前任务。设置为 <code>0</code> 表示不限制。</p>
+      <p>默认 <code>0</code> 表示不限制，不再额外受固定 300 轮上限约束。正数限制工作轮数；预算耗尽且任务仍需继续时，最多增加一次禁用工具的模型请求，总结进展、未完成项和下一步（这次请求仍计费并计入轮数）。启用交互检查点时可先选择延长预算；取消、超时或模型错误可中断收尾。重复调用保护仍独立生效。</p>
 
       <h2 id="todo-触发积极度">Todo 触发积极度</h2>
       <pre><code>[tools.todo]
@@ -309,6 +309,9 @@ base_url = "https://api.siliconflow.cn/v1"</code></pre>
         <li><strong>TUI 内 <code>/config</code></strong> —— 可直接搜索和修改安全配置。其中动态的“最大重试次数（当前模型）”会把 <code>retry_max_attempts</code> 写入当前模型；连续按两次 Delete 可恢复默认值。</li>
         <li><strong>TUI 内 <code>/provider</code></strong> —— 交互式管理供应商账号及其模型，改动会自动落盘。</li>
       </ul>
+
+      <h2 id="ui-keybindings">TUI 快捷键</h2>
+      <p>在 <code>[ui.keybindings]</code> 下设置 <code>newline = ["alt+j", "ctrl+j"]</code> 自定义换行组合键。也可在 <code>/config</code> 搜索“换行”，通过按键录入或手动填写配置，保存后立即生效。详见<a href="./keybindings.html#custom-newline">自定义换行快捷键</a>。</p>
 
       <h2 id="下一步">下一步</h2>
       <ul>

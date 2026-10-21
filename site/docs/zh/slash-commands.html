@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.2.3</span>
+    <span class="dhdr-ver">v5.2.4</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -113,9 +113,9 @@
           <tr><td><code>/clear</code></td><td>清空当前会话的消息(保留工作目录和模型)</td></tr>
           <tr><td><code>/init</code></td><td>扫描当前工作目录，按优先级创建或完善当前生效的项目指令文件（<code>.atomcode.md</code>、<code>AGENTS.md</code> 或 <code>CLAUDE.md</code>）。生成内容跟随当前语言，并可在 <code>/config</code> 中配置自定义提示词文件。</td></tr>
           <tr><td><code>/background &lt;任务&gt;</code></td><td>把任务派发给一个隔离的后台 agent(只读为主的工具子集),不污染当前主对话上下文。用于"顺手让它去查一下 X"这类轻探索。详见 <a href="./sessions.html#bg">后台会话</a></td></tr>
-          <tr><td><code>/worktree &lt;子命令&gt;</code></td><td>Git worktree 隔离:<code>create</code> 在新分支上拉一份独立 worktree、<code>list</code> 查看现有 worktree、<code>done</code> 把 worktree 改动 squash 回主分支、<code>cleanup</code> 清理已完成的 worktree</td></tr>
+          <tr><td><code>/worktree &lt;子命令&gt;</code></td><td>Git worktree 隔离:<code>create</code> 在新分支上拉一份独立 worktree、<code>list</code> 查看现有 worktree、<code>done</code> 仅切回主检出（不提交、不 squash、不合并）、<code>cleanup</code> 删除 worktree（不验证是否已合并；请先提交并合并需保留的成果，<code>--force</code> 会丢弃未提交内容）</td></tr>
           <tr><td><code>/todo</code> · <code>/todo add &lt;任务&gt;</code> · <code>/todo clear</code></td><td>重新打印当前待办清单 —— 从会话记录里派生(定位最近一次 <code>todowrite</code> 工具调用并重渲染),带「进行中 / 已完成」状态标记。<code>/todo add &lt;任务&gt;</code> 确定性地追加一条任务(不走模型);<code>/todo clear</code> 清空清单。清单是无状态派生的,不额外落盘;模型执行长任务时会自己维护它,你也可以随时用此命令查看进度</td></tr>
-          <tr><td><code>/copy</code></td><td>把上一条回复复制到剪贴板:<code>/copy</code> 复制整条回复的 markdown 原文(整个回合,不含工具输出);<code>/copy code</code> 复制最后一个代码块、<code>/copy code N</code> 复制第 N 个、<code>/copy code all</code> 复制全部代码块(旧写法 <code>/copy N</code>、<code>/copy all</code>、<code>/copy msg</code> 仍可用)。经典界面(<code>--classic</code>)里直接 <code>/copy</code> 仍是复制最后一个代码块</td></tr>
+          <tr><td><code>/copy</code></td><td>把上一条回复复制到剪贴板:<code>/copy</code> 复制整条回复的 markdown 原文(整个回合,不含工具输出);<code>/copy code</code> 复制最后一个代码块、<code>/copy code N</code> 复制第 N 个、<code>/copy code all</code> 复制全部代码块(旧写法 <code>/copy N</code>、<code>/copy all</code>、<code>/copy msg</code> 仍可用)</td></tr>
           <tr><td><code>/save</code></td><td>把当前会话导出成 markdown 文件:<code>/save</code> 用自动生成的文件名,<code>/save &lt;文件名&gt;</code> 指定文件名</td></tr>
         </tbody>
       </table>
@@ -147,6 +147,20 @@
           <tr><td><code>/effort &lt;high|max|off&gt;</code></td><td>DeepSeek 推理努力控制——在 DeepSeek 模型上用更多延迟/token 换取更深的推理</td></tr>
         </tbody>
       </table>
+
+      <h2 id="团队面板">团队面板</h2>
+      <table>
+        <thead>
+          <tr><th>命令</th><th>作用</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/team</code> · <code>/team toggle</code></td><td>展开 / 收起团队面板(切换)。收起后只留一行表头,成员行不再绘制,键盘焦点也不再落到它们上面</td></tr>
+          <tr><td><code>/team show</code> · <code>/team open</code></td><td>展开团队面板。没有成员也没有后台任务时回执「当前没有团队成员或后台任务,暂无可展示的团队面板。」</td></tr>
+          <tr><td><code>/team hide</code> · <code>/team fold</code> · <code>/team close</code></td><td>收起团队面板(成员照常在后台继续,不取消任何成员),回执「团队面板已收起。」</td></tr>
+          <tr><td>其它参数</td><td>拒绝并回显用法 —— <code>/team</code> 只认这三态(<code>status</code>、<code>clear</code> 等不在其中)</td></tr>
+        </tbody>
+      </table>
+      <p>三个子命令都只改显示:回执以提示行出现、约 5 秒后消失,不写进会话记录,也不调用模型;它们不会启动、取消或等待成员。面板表头给出成员数与后台任务数,成员行标注它被要求做什么、已运行多久与上下文占用;成员由 agent 通过 <code>team</code> 工具委派产生(多成员并行、各带角色与 scope)。另见 <a href="./subagents.html">子代理</a>(<code>task</code> 工具的短生命周期子任务)。</p>
 
       <h2 id="永久记忆">永久记忆</h2>
       <table>
@@ -202,12 +216,12 @@
           <tr><th>命令</th><th>作用</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>/webui</code></td><td>启动浏览器界面并自动打开浏览器(默认绑定 <code>127.0.0.1:13457</code>,仅本机)。当前 TUI 会话会自动接入实时同步</td></tr>
-          <tr><td><code>/webui --host &lt;addr&gt;</code></td><td>把服务绑定到指定地址;<code>/webui lan</code> 等价于 <code>--host 0.0.0.0</code>(暴露到局域网)。配合蒲公英虚拟 IP 可远程访问,见 <a href="./webui-remote-access.html">远程访问指南</a></td></tr>
+          <tr><td><code>/webui</code></td><td>启动本机浏览器并生成手机中继二维码，无需组网；<code>--local</code> 仅本机。当前 TUI 会话自动实时同步</td></tr>
+          <tr><td><code>/webui --host &lt;addr&gt;</code></td><td>把服务绑定到指定地址;<code>/webui lan</code> 等价于 <code>--host 0.0.0.0</code>(暴露到局域网)。可用的局域网访问地址会同时显示文字链接和二维码，手机扫码即可打开。跨网络访问使用默认 <code>/webui</code> 的中继二维码,见 <a href="./webui-remote-access.html">远程访问指南</a></td></tr>
           <tr><td><code>/webui stop</code></td><td>关闭 webui 服务</td></tr>
           <tr><td><code>/sync</code></td><td>把当前 TUI 接入正在运行的 webui 会话(需先 <code>/webui</code>)。两端实时双向同步,多个浏览器 / 终端可同时围观同一会话</td></tr>
           <tr><td><code>/sync off</code></td><td>退出同步,回到独立会话</td></tr>
-          <tr><td><code>/app</code></td><td>把当前会话通过官方中继暴露给 <strong>手机 App</strong>:终端里直接吐出一个二维码,用 App 扫码即可配对,在手机上实时查看并接管这段对话(与 <code>/webui</code> 同源共用同一段会话,双向实时同步;区别是不开浏览器、走中继而非局域网)。需先 <code>/login</code> 登录</td></tr>
+          <tr><td><code>/app</code></td><td>把当前会话通过官方中继暴露给 <strong>手机 App</strong>:终端里直接吐出一个二维码,用 App 扫码即可配对,在手机上实时查看并接管这段对话(与 <code>/webui</code> 同源共用同一段会话,双向实时同步;区别是 App 扫码配对，不打开浏览器)。需先 <code>/login</code> 登录</td></tr>
           <tr><td><code>/app stop</code></td><td>停止 App 远程访问,断开中继并回到本地会话</td></tr>
         </tbody>
       </table>

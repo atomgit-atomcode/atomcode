@@ -447,6 +447,7 @@ pub fn provision_with_listed(
             }
         })
         .or_insert_with(|| ProviderAccountConfig {
+            headers: Default::default(),
             provider: OPENROUTER_ACCOUNT_ID.to_string(),
             display_name: None,
             api_key: (!from_the_environment).then(|| api_key.to_string()),

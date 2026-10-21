@@ -664,6 +664,17 @@ pub enum HostReply {
     },
 }
 
+/// Presentation of the runtime-owned goal stage; not a second lifecycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalStage {
+    Working,
+    Evaluating,
+    Continuing,
+    Recovering,
+    Paused,
+}
+
 /// A session driving itself: what it is working towards, and how far it has got.
 ///
 /// One shape for a goal and a loop, because a front end draws them the same way
@@ -671,9 +682,24 @@ pub enum HostReply {
 /// when there is a cap.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Running {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<TokenTotals>,
     /// `goal` or `loop`. A word rather than an enum: a host with a third kind
     /// of autonomy should not need this contract changed to say so.
     pub kind: String,
+    /// Work is retained while the agent itself is idle (evaluation or recovery).
+    #[serde(default)]
+    pub recovering: bool,
+    /// Remaining automatic retry delay at the time of this sample; zero means
+    /// recovery is in flight. Absent for ordinary execution and true pauses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_in_secs: Option<u64>,
+    /// Optional for hosts predating explicit goal stage presentation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_stage: Option<GoalStage>,
+    /// Runtime explanation for a continuation; not independently verified evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_detail: Option<String>,
     /// The condition being worked towards, or the prompt being repeated.
     pub what: String,
     pub round: u32,
@@ -686,6 +712,15 @@ pub struct Running {
     /// Why it is not running right now, when it is registered but paused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paused: Option<String>,
+}
+
+/// Cumulative provider usage for the whole autonomous goal. Unknown history is
+/// represented by an absent value on Running, never by fabricated zero totals.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenTotals {
+    pub input: u64,
+    pub output: u64,
+    pub cached: u64,
 }
 
 /// One rolling window of an account's allowance.
@@ -772,6 +807,9 @@ pub struct UsageStats {
 /// it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceGroup {
+    /// Compact status text; files remain available to detailed source consumers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
     pub label: String,
     pub files: Vec<SourceFile>,
 }
@@ -783,6 +821,9 @@ pub struct SourceFile {
     pub label: String,
     pub path: String,
     pub present: bool,
+    /// Loaded-state or diagnostic detail, independent of file existence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// What the account is subscribed to.
@@ -1184,6 +1225,10 @@ pub struct McpServerDetail {
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum McpAction {
+    /// Reconnect only this server, keeping the current session.
+    Reconnect,
+    /// Cancel the current reconnect of this server, without cancelling a turn.
+    CancelReconnect,
     /// Trust this project, so its `.mcp.json` servers may connect at all.
     Trust,
     /// Withdraw that trust. The project's tools come off the session first.
@@ -1291,6 +1336,9 @@ pub enum HostEvent {
     /// was drawn as an error — red, read as a failure. What it says and in which
     /// colour is the front end's to decide.
     GoalEnded {
+        /// Final runtime snapshot; optional for older hosts.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<Running>,
         session: String,
         condition: String,
         met: bool,
@@ -1482,6 +1530,14 @@ pub struct HostConnection {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn source_summaries_are_optional_on_existing_wire_replies() {
+        let old = serde_json::json!({"label":"sources", "files":[]});
+        let group: super::SourceGroup = serde_json::from_value(old.clone()).unwrap();
+        assert!(group.summary.is_none());
+        assert_eq!(serde_json::to_value(group).unwrap(), old);
+    }
+
     use super::*;
 
     /// Each command, reply, event and error exactly once. The matches are
@@ -1841,6 +1897,11 @@ mod tests {
             },
             HostReply::Autonomy {
                 running: Some(Running {
+                    usage: None,
+                    recovering: false,
+                    retry_in_secs: None,
+                    goal_stage: None,
+                    goal_detail: None,
                     kind: "goal".into(),
                     what: "the tests pass".into(),
                     round: 3,
@@ -1936,11 +1997,13 @@ mod tests {
             },
             HostReply::Sources {
                 groups: vec![SourceGroup {
+                    summary: None,
                     label: "指令文件".into(),
                     files: vec![SourceFile {
                         label: "项目共享".into(),
                         path: "/w/AGENTS.md".into(),
                         present: true,
+                        detail: None,
                     }],
                 }],
             },
@@ -2018,6 +2081,44 @@ mod tests {
         all
     }
 
+    #[test]
+    fn older_source_files_without_details_still_decode() {
+        let old = r#"{"label":"Project","path":"/work/AGENTS.md","present":true}"#;
+        let source: SourceFile = serde_json::from_str(old).unwrap();
+        assert!(source.detail.is_none());
+        let detailed = SourceFile {
+            detail: Some("loaded; disk changed".into()),
+            ..source
+        };
+        let wire = serde_json::to_string(&detailed).unwrap();
+        assert_eq!(serde_json::from_str::<SourceFile>(&wire).unwrap(), detailed);
+    }
+
+    #[test]
+    fn old_autonomy_payloads_keep_unknown_usage_and_final_summary_optional() {
+        let old = serde_json::json!({"kind":"goal", "recovering":false, "what":"finish", "round":1, "elapsed_secs":30});
+        let mut running: Running = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(running.usage, None);
+        assert_eq!(serde_json::to_value(&running).unwrap(), old);
+        running.usage = Some(TokenTotals {
+            input: 100,
+            output: 20,
+            cached: 80,
+        });
+        let json = serde_json::to_value(&running).unwrap();
+        assert_eq!(serde_json::from_value::<Running>(json).unwrap(), running);
+        // Old goal-end events still decode without the final runtime snapshot.
+        let event = HostEvent::GoalEnded {
+            session: "lead".into(),
+            condition: "finish".into(),
+            met: true,
+            summary: None,
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert!(json.get("summary").is_none());
+        assert_eq!(serde_json::from_value::<HostEvent>(json).unwrap(), event);
+    }
+
     fn events() -> Vec<HostEvent> {
         let all = vec![
             HostEvent::SessionChanged {
@@ -2031,6 +2132,11 @@ mod tests {
             HostEvent::Autonomy {
                 session: "b".into(),
                 running: Some(Running {
+                    usage: None,
+                    recovering: false,
+                    retry_in_secs: None,
+                    goal_stage: None,
+                    goal_detail: None,
                     kind: "goal".into(),
                     what: "测试全绿".into(),
                     round: 3,
@@ -2051,6 +2157,7 @@ mod tests {
                 sessions: vec![background_session()],
             },
             HostEvent::GoalEnded {
+                summary: None,
                 session: "b".into(),
                 condition: "测试全绿".into(),
                 met: true,

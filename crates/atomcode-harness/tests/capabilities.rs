@@ -1133,3 +1133,465 @@ async fn what_a_catalog_row_says_follows_the_language_in_force() {
 fn has_cjk(text: &str) -> bool {
     text.chars().any(|c| matches!(c, '\u{4e00}'..='\u{9fff}'))
 }
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn skill_grants_stay_with_the_calling_agent_and_are_not_restored_from_history() {
+    use async_trait::async_trait;
+    use atomcode_harness::seams::{AgentLoop, AgentLoopSvc, CommandsSvc};
+    use atomcode_kernel::tool::{RiskLevel, Tool, ToolContext, ToolResult};
+    use std::sync::{Arc, Weak};
+
+    struct Probe {
+        calls: Arc<AtomicU32>,
+        child: Weak<atomcode_harness::agent::Agent>,
+        driver: Weak<dyn AgentLoop>,
+    }
+    #[async_trait]
+    impl Tool for Probe {
+        fn name(&self) -> &str {
+            "risky_probe"
+        }
+        fn description(&self) -> &str {
+            "test-only risky probe"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object"})
+        }
+        fn risk(&self, _: &str) -> RiskLevel {
+            RiskLevel::Risky
+        }
+        async fn execute(&self, _: &str, _: &ToolContext) -> ToolResult {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                let child = self.child.upgrade().unwrap();
+                child.send("a different agent's task");
+                self.driver.upgrade().unwrap().drive(&child).await;
+            }
+            ToolResult {
+                call_id: String::new(),
+                content: "executed".into(),
+                is_error: false,
+                images: vec![],
+            }
+        }
+    }
+    let dir = scratch("skill-grant-scope");
+    let skills = dir.join("skills/setup");
+    std::fs::create_dir_all(&skills).unwrap();
+    std::fs::write(skills.join("SKILL.md"), "---\nname: setup\ndescription: setup probe\nallowed-tools: risky_probe\n---\nRun the probe.").unwrap();
+    let extra = format!("[[patch]]\nid = \"skills\"\nconfig = {{ dirs = [{:?}], project_root = {:?}, home = {:?} }}\n", dir.join("skills"), dir, dir.join("empty-home"));
+    let script = r#"
+[[patch]]
+id = "llm"
+name = "llm-replay"
+config = { script = [
+  { calls = [ { name = "risky_probe", args = {} } ] },
+  { calls = [ { name = "risky_probe", args = {} } ] },
+  { text = "child done" },
+  { calls = [ { name = "risky_probe", args = {} } ] },
+  { text = "lead done" },
+  { calls = [ { name = "risky_probe", args = {} } ] },
+  { text = "resumed done" },
+] }
+[[patch]]
+id = "approval"
+config = { mode = "deny-risky" }
+"#;
+    let app = start(tree(&dir, script, &[&extra])).await;
+    let ctx = app.context();
+    let lead = atomcode_harness::create_agent(&app).await.unwrap();
+    let child = atomcode_harness::create_agent(&app).await.unwrap();
+    let driver = ctx.require::<AgentLoopSvc>().unwrap();
+    let calls = Arc::new(AtomicU32::new(0));
+    ctx.require::<ToolsSvc>()
+        .unwrap()
+        .register(Arc::new(Probe {
+            calls: calls.clone(),
+            child: Arc::downgrade(&child),
+            driver: Arc::downgrade(&driver),
+        }))
+        .unwrap();
+    ctx.require::<CommandsSvc>()
+        .unwrap()
+        .find("setup", &lead)
+        .unwrap()
+        .run(lead.clone(), "")
+        .await
+        .unwrap();
+    atomcode_harness::drive(&app, &lead).await.unwrap();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "only the lead's two probes execute"
+    );
+    assert!(child.session().events().iter().any(|e| matches!(
+        e.event,
+        SessionEvent::ToolResultLogged { is_error: true, .. }
+    )));
+    // Restoring model-visible skill content is not a fresh invocation.
+    child.session().restore(lead.session().events());
+    child.send("continue history");
+    atomcode_harness::drive(&app, &child).await.unwrap();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "restored history grants no authority"
+    );
+    assert!(
+        child
+            .session()
+            .events()
+            .iter()
+            .rev()
+            .find_map(|record| {
+                if let SessionEvent::ToolResultLogged { is_error, .. } = &record.event {
+                    Some(*is_error)
+                } else {
+                    None
+                }
+            })
+            .unwrap(),
+        "the resumed probe is refused rather than reusing a success"
+    );
+    ctx.require::<ToolsSvc>().unwrap().unregister("risky_probe");
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn memory_review_distinguishes_disk_changes_from_logged_and_resumed_context() {
+    let _locale = atomcode_config::i18n::test_lock();
+    atomcode_config::i18n::set_locale(atomcode_config::i18n::Locale::En);
+    use atomcode_capabilities::memory::store::MemorySection;
+    let dir = scratch("memory-review-state");
+    let project = dir.join(".atomcode");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("memory.md"), "- OLD_MEMORY\n").unwrap();
+    let app = start(tree(&dir, STOP, &[])).await;
+    let agent = atomcode_harness::create_agent(&app).await.unwrap();
+    let catalog = app
+        .context()
+        .service::<atomcode_harness::seams::CommandsSvc>()
+        .unwrap();
+    let command = catalog.find("memory", &agent).unwrap();
+    let before = command.run(agent.clone(), "--json").await.unwrap();
+    let before: Vec<MemorySection> = serde_json::from_str(&before).unwrap();
+    assert!(before[0]
+        .review
+        .as_ref()
+        .unwrap()
+        .contains("No memory injection has been logged yet"));
+    run_turn(&app, "hello").await.unwrap();
+    let events = agent.session().events();
+    let count = agent.session().len();
+    std::fs::write(project.join("memory.md"), "- NEW_MEMORY\n").unwrap();
+    let output = command.run(agent.clone(), "--json").await.unwrap();
+    let sections: Vec<MemorySection> = serde_json::from_str(&output).unwrap();
+    let review = sections[0].review.as_ref().unwrap();
+    assert!(
+        review.contains("Present in projected context: true"),
+        "{review}"
+    );
+    assert!(review.contains("Matches latest disk preview: false"));
+    assert!(review.contains("OLD_MEMORY"));
+    assert!(sections[0].text.contains("NEW_MEMORY"));
+    assert_eq!(agent.session().len(), count, "review is read-only");
+
+    // Rebuild under a changed disk, restore the authoritative log, and continue.
+    let resumed = start(tree(&dir, STOP, &[])).await;
+    let restored = atomcode_harness::create_agent(&resumed).await.unwrap();
+    restored.session().restore(events);
+    run_turn(&resumed, "continue").await.unwrap();
+    let injections: Vec<_> = restored
+        .session()
+        .events()
+        .into_iter()
+        .filter(|e| {
+            matches!(
+                e.event,
+                SessionEvent::Injected {
+                    origin: InjectionOrigin::Memory,
+                    ..
+                }
+            )
+        })
+        .collect();
+    assert_eq!(
+        injections.len(),
+        1,
+        "resume must not replace the historical payload"
+    );
+    assert!(restored
+        .session()
+        .derive_messages()
+        .iter()
+        .any(|m| m.text.contains("OLD_MEMORY")));
+    let catalog = resumed
+        .context()
+        .service::<atomcode_harness::seams::CommandsSvc>()
+        .unwrap();
+    let review = catalog
+        .find("memory", &restored)
+        .unwrap()
+        .run(restored, "")
+        .await
+        .unwrap();
+    assert!(review.contains("Matches latest disk preview: false"));
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn knowledge_index_is_optional_logged_bounded_and_does_not_load_documents() {
+    let dir = scratch("memory-knowledge");
+    let library = dir.join(".atomcode/knowledge");
+    std::fs::create_dir_all(&library).unwrap();
+    std::fs::write(
+        library.join("INDEX.md"),
+        "Architecture | architecture.md | runtime ownership\n",
+    )
+    .unwrap();
+    std::fs::write(
+        library.join("architecture.md"),
+        "FULL_DOCUMENT_NOT_FOR_INJECTION",
+    )
+    .unwrap();
+    let app = start(tree(&dir, STOP, &[])).await;
+    run_turn(&app, "hello").await.unwrap();
+    let text = transcript(&app);
+    assert!(text.contains("runtime ownership"));
+    assert!(text.contains("Read relevant linked files"));
+    assert!(!text.contains("FULL_DOCUMENT_NOT_FOR_INJECTION"));
+    let memory = app
+        .context()
+        .only_session()
+        .unwrap()
+        .events()
+        .into_iter()
+        .find_map(|e| match e.event {
+            SessionEvent::Injected {
+                text,
+                origin: InjectionOrigin::Memory,
+                ..
+            } => Some(text),
+            _ => None,
+        })
+        .unwrap();
+    assert!(memory.chars().count() <= atomcode_capabilities::memory::context::CHAR_BUDGET);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn configured_knowledge_index_and_disabled_injection_are_reported() {
+    let _locale = atomcode_config::i18n::test_lock();
+    atomcode_config::i18n::set_locale(atomcode_config::i18n::Locale::En);
+    let dir = scratch("memory-configured-index");
+    std::fs::write(dir.join("CUSTOM.md"), "CUSTOM_ROUTING_INDEX").unwrap();
+    let overlay = format!("[[patch]]\nid = \"memory\"\nconfig = {{ project_root = {:?}, inject = false, knowledge_index = \"CUSTOM.md\" }}", dir.to_string_lossy());
+    let app = start(tree(&dir, STOP, &[&overlay])).await;
+    let agent = atomcode_harness::create_agent(&app).await.unwrap();
+    run_turn(&app, "hello").await.unwrap();
+    assert!(!transcript(&app).contains("CUSTOM_ROUTING_INDEX"));
+    let catalog = app
+        .context()
+        .service::<atomcode_harness::seams::CommandsSvc>()
+        .unwrap();
+    let output = catalog
+        .find("memory", &agent)
+        .unwrap()
+        .run(agent, "--json")
+        .await
+        .unwrap();
+    let sections: Vec<atomcode_capabilities::memory::store::MemorySection> =
+        serde_json::from_str(&output).unwrap();
+    let review = sections[0].review.as_ref().unwrap();
+    assert!(review.contains("injection is disabled"));
+    assert!(review.contains("CUSTOM.md"));
+    assert!(review.contains("Routing index included"));
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn memory_commands_expose_metadata_filter_and_exact_reversible_management() {
+    use atomcode_capabilities::memory::{entry::MemoryStatus, store::MemorySection};
+    let dir = scratch("memory-entry-commands");
+    let app = start(tree(&dir, STOP, &[])).await;
+    let agent = atomcode_harness::create_agent(&app).await.unwrap();
+    let catalog = app
+        .context()
+        .service::<atomcode_harness::seams::CommandsSvc>()
+        .unwrap();
+    let remember = catalog.find("remember", &agent).unwrap();
+    let memory = catalog.find("memory", &agent).unwrap();
+    let forget = catalog.find("forget", &agent).unwrap();
+    let count = agent.session().len();
+    remember
+        .run(
+            agent.clone(),
+            "--topic runtime --source issue-1667 --pin RUNTIME_FACT",
+        )
+        .await
+        .unwrap();
+    remember
+        .run(agent.clone(), "--topic tools OTHER_FACT")
+        .await
+        .unwrap();
+    let result = memory
+        .run(agent.clone(), "--json --project --topic runtime")
+        .await
+        .unwrap();
+    let sections: Vec<MemorySection> = serde_json::from_str(&result).unwrap();
+    assert_eq!(sections.len(), 1);
+    assert_eq!(sections[0].entries.len(), 1);
+    assert!(!sections[0].text.contains("OTHER_FACT"));
+    let entry = &sections[0].entries[0];
+    assert!(entry.metadata.pinned);
+    assert_eq!(entry.metadata.source.as_deref(), Some("issue-1667"));
+    let id = entry.metadata.id.clone();
+    let created = entry.metadata.created_at.clone();
+    assert!(memory
+        .run(agent.clone(), &format!("--global pin {id}"))
+        .await
+        .is_err());
+    memory
+        .run(
+            agent.clone(),
+            &format!("update {id} --topic architecture CORRECTED_FACT"),
+        )
+        .await
+        .unwrap();
+    forget
+        .run(agent.clone(), &format!("--id {id}"))
+        .await
+        .unwrap();
+    let result = memory
+        .run(
+            agent.clone(),
+            "--json --project --topic architecture --status deprecated",
+        )
+        .await
+        .unwrap();
+    let sections: Vec<MemorySection> = serde_json::from_str(&result).unwrap();
+    assert_eq!(sections[0].entries.len(), 1);
+    assert_eq!(sections[0].entries[0].metadata.id, id);
+    assert_eq!(sections[0].entries[0].metadata.created_at, created);
+    assert_eq!(
+        sections[0].entries[0].metadata.status,
+        MemoryStatus::Deprecated
+    );
+    assert_eq!(sections[0].entries[0].content, "CORRECTED_FACT");
+    memory
+        .run(
+            agent.clone(),
+            &format!("update {id} --status active --unpin"),
+        )
+        .await
+        .unwrap();
+    let result = memory
+        .run(agent.clone(), "--json --project --topic architecture")
+        .await
+        .unwrap();
+    let sections: Vec<MemorySection> = serde_json::from_str(&result).unwrap();
+    assert_eq!(sections[0].entries[0].metadata.status, MemoryStatus::Active);
+    assert!(!sections[0].entries[0].metadata.pinned);
+    assert_eq!(
+        agent.session().len(),
+        count,
+        "local memory management must not rewrite conversation history"
+    );
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn deprecated_memory_stays_in_old_session_history_but_is_not_injected_into_a_fresh_session() {
+    use atomcode_capabilities::memory::MemoryStore;
+    let dir = scratch("memory-deprecation-history");
+    let path = dir.join(".atomcode/memory.md");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "- INITIAL_FACT\n").unwrap();
+    let app = start(tree(&dir, STOP, &[])).await;
+    let agent = atomcode_harness::create_agent(&app).await.unwrap();
+    run_turn(&app, "first").await.unwrap();
+    let original = agent.session().events();
+    let id = MemoryStore::new(path.clone()).entries().unwrap()[0]
+        .metadata
+        .id
+        .clone();
+    let catalog = app
+        .context()
+        .service::<atomcode_harness::seams::CommandsSvc>()
+        .unwrap();
+    let command = catalog.find("memory", &agent).unwrap();
+    command
+        .run(agent.clone(), &format!("update {id} REVISED_FACT"))
+        .await
+        .unwrap();
+    command
+        .run(agent.clone(), &format!("deprecate {id}"))
+        .await
+        .unwrap();
+    assert_eq!(agent.session().events(), original);
+    assert!(transcript(&app).contains("INITIAL_FACT"));
+    assert!(!transcript(&app).contains("REVISED_FACT"));
+    let stored = MemoryStore::new(path).entries().unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].metadata.id, id);
+    assert!(stored[0].metadata.created_at.is_none());
+    let fresh = start(tree(&dir, STOP, &[])).await;
+    run_turn(&fresh, "new task").await.unwrap();
+    assert!(!transcript(&fresh).contains("INITIAL_FACT"));
+    assert!(!transcript(&fresh).contains("REVISED_FACT"));
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn memory_expiry_filters_and_renewal_use_the_store_without_rewriting_session_facts() {
+    use atomcode_capabilities::memory::{entry::MemoryPatch, store::MemorySection, MemoryStore};
+    let dir = scratch("memory-expiry");
+    let store = MemoryStore::new(dir.join(".atomcode/memory.md"));
+    let (entry, _) = store
+        .remember("EXPIRY_HISTORY_FACT", &MemoryPatch::default())
+        .unwrap();
+    let app = start(tree(&dir, STOP, &[])).await;
+    let agent = atomcode_harness::create_agent(&app).await.unwrap();
+    run_turn(&app, "first").await.unwrap();
+    let original = agent.session().events();
+    store
+        .update(
+            &entry.metadata.id,
+            &MemoryPatch {
+                expires_at: Some(Some("2000-01-01T00:00:00Z".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let catalog = app
+        .context()
+        .service::<atomcode_harness::seams::CommandsSvc>()
+        .unwrap();
+    let command = catalog.find("memory", &agent).unwrap();
+    let json = command
+        .run(agent.clone(), "--json --project --expired")
+        .await
+        .unwrap();
+    let sections: Vec<MemorySection> = serde_json::from_str(&json).unwrap();
+    assert_eq!(sections[0].entries.len(), 1);
+    assert_eq!(sections[0].entries[0].metadata.id, entry.metadata.id);
+    let fresh = start(tree(&dir, STOP, &[])).await;
+    run_turn(&fresh, "fresh").await.unwrap();
+    assert!(!transcript(&fresh).contains("EXPIRY_HISTORY_FACT"));
+    command
+        .run(
+            agent.clone(),
+            &format!("update {} --ttl-days 7", entry.metadata.id),
+        )
+        .await
+        .unwrap();
+    let json = command
+        .run(agent.clone(), "--json --project --expiring-within 7")
+        .await
+        .unwrap();
+    let sections: Vec<MemorySection> = serde_json::from_str(&json).unwrap();
+    assert_eq!(sections[0].entries.len(), 1);
+    command
+        .run(
+            agent.clone(),
+            &format!("update {} --clear-expiry", entry.metadata.id),
+        )
+        .await
+        .unwrap();
+    assert!(store.entries().unwrap()[0].metadata.expires_at.is_none());
+    assert_eq!(agent.session().events(), original);
+    assert!(transcript(&app).contains("EXPIRY_HISTORY_FACT"));
+}

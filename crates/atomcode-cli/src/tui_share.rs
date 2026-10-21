@@ -70,13 +70,6 @@ pub async fn attach(config_path: &std::path::Path) -> Result<(), String> {
         .clone()
         .ok_or_else(|| tr(SMsg::HostUnavailable).into_owned())?;
     let handle = live.handle();
-    let session_id = live.session();
-    // 运行时此刻在哪儿,不是启动时在哪儿:`/cd` 之后再开 `/webui`,拿启动目录去挂,
-    // 下一条「换了会话」就会被当成身份变了,网页端随之连不上。
-    let working_dir = match handle.context_stats().await {
-        Ok(stats) => stats.working_dir,
-        Err(_) => live.working_dir(),
-    };
     let config =
         atomcode_config::config::Config::load(config_path).map_err(|error| error.to_string())?;
     let (selection, _model) = resolved_selection(&config);
@@ -84,54 +77,60 @@ pub async fn attach(config_path: &std::path::Path) -> Result<(), String> {
         return Err(tr(SMsg::ShareNoModel).into_owned());
     }
     let fingerprint = atomcode_daemon::native_live::provider_fingerprint(&config, &selection)?;
-    // 快照是网页端的开场:它进来时对话已经进行了一半,得先看到之前说了什么。
-    let snapshot = handle.snapshot().await.map_err(|error| error.to_string())?;
-    // 句柄给的是共享的那一份;hub 要自己的一份,它此后会跟着网页端的事件往前走。
-    let snapshot = (*snapshot).clone();
-    let binding = atomcode_daemon::native_live::register_embedded_runtime(
-        session_id.to_string(),
-        working_dir.to_path_buf(),
-        selection,
-        fingerprint,
-        snapshot,
-        Arc::new(handle.clone()),
-    )
-    .map_err(|error| format!("{error:?}"))?;
-    *bound().lock().expect("binding poisoned") = Some(binding);
-    // 远端那边的「模式」徽标读的是 daemon 里的一个全局值,不是事件流。挂上时先
-    // 把当前模式告诉它,否则手机和网页顶上写的是默认值——看着像你没在 plan 里,
-    // 而你在。
-    if let Ok(mode) = handle.mode().await {
-        atomcode_daemon::live_set_mode(mode);
-    }
-    // 第四个接点:那一端从现在起可以请这块屏幕跑一条命令。注册要在挂上之后
-    // ——`unregister_embedded_runtime` 会把这个槽清掉,先注册就白注册了。
-    let mut asked = atomcode_daemon::native_live::register_remote_command_sink();
-    let relay = relayed().0.clone();
-    let pump = tokio::spawn(async move {
-        while let Some(line) = asked.recv().await {
-            if relay.send(line).is_err() {
-                break;
-            }
+    {
+        // Publication takes the same lock. Anything already represented by the
+        // captured view is rejected by the hub's sequence watermark; newer
+        // events cannot fall into the gap before this binding is installed.
+        let mut bound = bound().lock().expect("binding poisoned");
+        if bound.is_some() {
+            return Ok(());
         }
-    });
-    if let Some(old) = relay_pump().lock().expect("pump poisoned").replace(pump) {
-        old.abort();
+        let view = handle.live_view().map_err(|error| error.to_string())?;
+        let mode = view.mode;
+        let binding = atomcode_daemon::native_live::register_embedded_live_view(
+            view,
+            selection,
+            fingerprint,
+            Arc::new(handle.clone()),
+        )
+        .map_err(|error| format!("{error:?}"))?;
+        *bound = Some(binding);
+        atomcode_daemon::live_set_mode(mode);
+        // Keep sink and pump registration under the binding lock too: a detach
+        // must not complete and then have this attach resurrect its command sink.
+        // 第四个接点:那一端从现在起可以请这块屏幕跑一条命令。注册要在挂上之后
+        // ——`unregister_embedded_runtime` 会把这个槽清掉,先注册就白注册了。
+        let mut asked = atomcode_daemon::native_live::register_remote_command_sink();
+        let relay = relayed().0.clone();
+        let pump = tokio::spawn(async move {
+            while let Some(line) = asked.recv().await {
+                if relay.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        if let Some(old) = relay_pump().lock().expect("pump poisoned").replace(pump) {
+            old.abort();
+        }
     }
     Ok(())
 }
 
 /// 摘下来。没挂着返回 `false`——`/sync off` 要能说出「本来就没共享」。
 pub fn detach() -> Result<bool, String> {
-    let taken = bound().lock().expect("binding poisoned").take();
-    let Some(binding) = taken else {
+    // Publication and attach use this same lock. Keep the local binding until
+    // the hub has revoked it, so failure cannot strand a still-bound hub with
+    // no event forwarding (and a permanently active turn flag).
+    let mut guard = bound().lock().expect("binding poisoned");
+    let Some(binding) = guard.as_ref() else {
         return Ok(false);
     };
+    atomcode_daemon::native_live::unregister_embedded_runtime(binding)
+        .map_err(|error| format!("{error:?}"))?;
+    *guard = None;
     if let Some(pump) = relay_pump().lock().expect("pump poisoned").take() {
         pump.abort();
     }
-    atomcode_daemon::native_live::unregister_embedded_runtime(&binding)
-        .map_err(|error| format!("{error:?}"))?;
     Ok(true)
 }
 
@@ -192,7 +191,12 @@ pub fn publish(event: &SequencedRuntimeEvent) {
     let Some(binding) = guard.as_ref() else {
         return;
     };
-    let _ = atomcode_daemon::native_live::publish(binding, event.clone());
+    if atomcode_daemon::native_live::publish(binding, event.clone()).is_err() {
+        // Bootstrap already includes these delayed events. Their side effects
+        // must be deduplicated too: an old SessionChanged must not schedule a
+        // snapshot handover using the replacement session's live handle.
+        return;
+    }
     // 换了会话(`/clear`、`/resume`、`/cd`):hub 收到这条就把手上的快照作废,等
     // 新会话的快照交上来 —— 在那之前网页端连不上、发的话一律被拒。经典界面换完
     // 会话自己交;这块屏幕原先不交,于是 hub 一直等到下一个终端回合跑完。
@@ -386,7 +390,7 @@ async fn start_for_phone(config_path: &std::path::Path) -> Result<String, String
     let machine = std::env::var("HOSTNAME")
         .ok()
         .filter(|name| !name.is_empty());
-    let binary = crate::relay::ensure_relay_client_bin()?;
+    let binary = crate::relay::ensure_relay_client_bin().await?;
     let mut command = tokio::process::Command::new(&binary);
     command
         .arg("run")
@@ -456,8 +460,9 @@ fn stop_for_phone() -> bool {
 /// 尽力做完,返回是否真有东西被收掉。
 pub fn stop_all_sharing() -> bool {
     let phone = stop_for_phone();
+    let webui = crate::webui_relay::stop();
     let bound = detach().unwrap_or(false);
-    phone || bound
+    phone || webui || bound
 }
 
 // ---- 命令 -------------------------------------------------------------------
@@ -549,7 +554,7 @@ impl atomcode_tui::command::CommandSet for ShareCommands {
         &self,
         name: &str,
         args: &str,
-        _ctx: &atomcode_plexus::Context,
+        ctx: &atomcode_plexus::Context,
     ) -> atomcode_tui::command::Outcome {
         use atomcode_tui::command::Outcome;
         let args = args.trim();
@@ -566,7 +571,9 @@ impl atomcode_tui::command::CommandSet for ShareCommands {
             },
             "app" if args == "stop" => {
                 let stopped = stop_for_phone();
-                let _ = detach();
+                if let Err(why) = detach() {
+                    return Outcome::Refused(why);
+                }
                 Outcome::Said(
                     match stopped {
                         true => tr(SMsg::AppStopped),
@@ -580,9 +587,12 @@ impl atomcode_tui::command::CommandSet for ShareCommands {
                 Err(why) => Outcome::Refused(why),
             },
             "webui" if args == "stop" => {
+                crate::webui_relay::stop();
                 let said = atomcode_daemon::stop_server();
-                let _ = detach();
-                Outcome::Said(said)
+                match detach() {
+                    Ok(_) => Outcome::Said(said),
+                    Err(why) => Outcome::Refused(why),
+                }
             }
             "webui" => {
                 let options = match webui_options(args) {
@@ -594,21 +604,37 @@ impl atomcode_tui::command::CommandSet for ShareCommands {
                 if let Err(why) = attach(&self.config_path).await {
                     return Outcome::Refused(why);
                 }
-                Outcome::Said(
-                    atomcode_daemon::ensure_server_and_open(
-                        &options.host,
-                        options.port,
-                        true, // sync
-                        options.open_browser,
-                    )
-                    .await,
+                let launched = crate::webui_relay::launch(
+                    &options.host,
+                    options.port,
+                    true, // sync
+                    options.open_browser,
+                    options.remote,
                 )
+                .await;
+                let ui = ctx.require::<atomcode_harness::seams::UiSvc>().ok();
+                webui_feedback(launched, ui.as_deref())
             }
             // 配对屏自己关掉时交回来的那一行——不是人打的命令,所以只说一句
             // 「码给出去了」,别的什么都不做:中继还在跑,配对照旧。
             PAIRED => Outcome::Said(tr(SMsg::AppPaired).into_owned()),
             _ => Outcome::Quiet,
         }
+    }
+}
+
+/// Keep the original report before the picture, including on narrow terminals
+/// where the renderer omits a QR that cannot fit without cropping.
+fn webui_feedback(
+    launched: atomcode_daemon::WebuiLaunch,
+    ui: Option<&dyn atomcode_harness::seams::UserInterface>,
+) -> atomcode_tui::command::Outcome {
+    if let (Some(url), Some(ui)) = (launched.qr_url.as_deref(), ui) {
+        ui.say(&launched.message);
+        ui.show_qr(url);
+        atomcode_tui::command::Outcome::Quiet
+    } else {
+        atomcode_tui::command::Outcome::Said(launched.message)
     }
 }
 
@@ -619,18 +645,21 @@ struct WebuiOptions {
     host: String,
     port: u16,
     open_browser: bool,
+    remote: bool,
 }
 
 fn webui_options(args: &str) -> Result<WebuiOptions, String> {
     let mut host = None;
     let mut port = None;
     let mut open_browser = true;
+    let mut remote = true;
     let mut tokens = args.split_whitespace();
     let invalid = |argument: &str| tr(SMsg::WebuiInvalidArguments { argument }).into_owned();
     while let Some(token) = tokens.next() {
         match token {
             "lan" | "0.0.0.0" if host.is_none() => host = Some("0.0.0.0".to_string()),
             "--no-open" => open_browser = false,
+            "--local" => remote = false,
             _ if token == "--host" || token.starts_with("--host=") => {
                 let value = token
                     .strip_prefix("--host=")
@@ -654,7 +683,9 @@ fn webui_options(args: &str) -> Result<WebuiOptions, String> {
             _ => return Err(invalid(token)),
         }
     }
+    remote &= host.is_none();
     Ok(WebuiOptions {
+        remote,
         host: host.unwrap_or_else(|| "127.0.0.1".to_string()),
         port: port.unwrap_or(atomcode_daemon::WEBUI_DEFAULT_PORT),
         open_browser,
@@ -698,6 +729,67 @@ mod tests {
     use atomcode_tui::command::CommandSet;
     use atomcode_tui::overlay::{Overlay, Step};
     use atomcode_tui::surface::{Key, KeyPress};
+
+    #[derive(Default)]
+    struct QrRecording(std::sync::Mutex<Vec<(String, String)>>);
+
+    #[async_trait::async_trait]
+    impl atomcode_harness::seams::UserInterface for QrRecording {
+        fn describe(&self) -> String {
+            "recording".into()
+        }
+        async fn run(&self, _: &atomcode_plexus::Context, _: Option<String>) -> Result<(), String> {
+            Ok(())
+        }
+        fn say(&self, text: &str) {
+            self.0.lock().unwrap().push(("text".into(), text.into()));
+        }
+        fn show_qr(&self, url: &str) {
+            self.0.lock().unwrap().push(("qr".into(), url.into()));
+        }
+    }
+
+    #[test]
+    fn webui_qr_keeps_the_full_text_address_before_the_picture() {
+        let url = "http://192.168.1.9:20001/?token=test-token&sync=1";
+        let message = format!("webui: {url}\nnetwork notice");
+        let ui = QrRecording::default();
+        let outcome = webui_feedback(
+            atomcode_daemon::WebuiLaunch {
+                message: message.clone(),
+                qr_url: Some(url.into()),
+                relay_target: None,
+            },
+            Some(&ui),
+        );
+        assert!(matches!(outcome, atomcode_tui::command::Outcome::Quiet));
+        assert_eq!(
+            *ui.0.lock().unwrap(),
+            vec![("text".into(), message), ("qr".into(), url.into())]
+        );
+    }
+
+    #[test]
+    fn webui_without_a_qr_or_ui_keeps_the_original_report() {
+        for (qr_url, has_ui) in [
+            (None, true),
+            (Some("http://192.168.1.9/?token=test".into()), false),
+        ] {
+            let ui = QrRecording::default();
+            let outcome = webui_feedback(
+                atomcode_daemon::WebuiLaunch {
+                    message: "original report".into(),
+                    qr_url,
+                    relay_target: None,
+                },
+                if has_ui { Some(&ui) } else { None },
+            );
+            assert!(
+                matches!(outcome, atomcode_tui::command::Outcome::Said(text) if text == "original report")
+            );
+            assert!(ui.0.lock().unwrap().is_empty());
+        }
+    }
 
     /// 中继给的是一个地址,拨号要 ws、手机要 https ——从同一个地址推出来,而不是
     /// 让人配两遍。
@@ -787,6 +879,15 @@ mod tests {
     }
 
     #[test]
+    fn webui_uses_relay_by_default_but_explicit_local_and_lan_do_not() {
+        assert!(webui_options("").unwrap().remote);
+        assert!(webui_options("--no-open").unwrap().remote);
+        for args in ["--local", "lan", "--host 127.0.0.1", "--host 192.168.1.9"] {
+            assert!(!webui_options(args).unwrap().remote, "{args}");
+        }
+    }
+
+    #[test]
     fn webui_passes_explicit_ports_and_browser_options() {
         assert_eq!(
             webui_options("").unwrap().port,
@@ -802,6 +903,7 @@ mod tests {
                     host: "127.0.0.1".to_string(),
                     port: 20001,
                     open_browser: false,
+                    remote: false,
                 }
             );
         }

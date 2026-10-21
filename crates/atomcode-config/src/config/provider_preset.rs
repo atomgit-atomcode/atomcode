@@ -18,6 +18,7 @@
 pub enum ProviderType {
     OpenAi,
     Anthropic,
+    DeepSeekMessages,
     Ollama,
     /// OpenAI **Responses API** (`/responses`). A distinct wire from
     /// [`ProviderType::OpenAi`] (chat/completions): different endpoint, tool
@@ -31,6 +32,7 @@ impl ProviderType {
         match self {
             Self::OpenAi => "openai",
             Self::Anthropic => "anthropic",
+            Self::DeepSeekMessages => "deepseek-messages",
             Self::Ollama => "ollama",
             Self::Responses => "responses",
         }
@@ -109,6 +111,15 @@ pub const RESPONSES_COMPATIBLE: ProviderPreset = ProviderPreset {
 /// vendor falls back to [`OPENAI_COMPATIBLE`]. Default base URLs are best-effort
 /// vendor defaults and may be overridden per account.
 pub const PRESETS: &[ProviderPreset] = &[
+    ProviderPreset {
+        id: "deepseek-messages",
+        display_name: "DeepSeek (Messages API)",
+        provider_type: ProviderType::DeepSeekMessages,
+        default_base_url: Some("https://api.deepseek.com/anthropic"),
+        auth_kind: AuthKind::ApiKey,
+        api_key_env: Some("DEEPSEEK_API_KEY"),
+        model_source: ModelSource::Manual,
+    },
     ProviderPreset {
         id: "atomgit",
         display_name: "AtomGit",
@@ -319,6 +330,14 @@ mod tests {
         ] {
             assert!(preset(id).is_some(), "missing preset: {id}");
         }
+    }
+
+    #[test]
+    fn deepseek_native_is_opt_in() {
+        assert_eq!(preset("deepseek").unwrap().provider_type.wire(), "openai");
+        let native = preset("deepseek-messages").unwrap();
+        assert_eq!(native.provider_type.wire(), "deepseek-messages");
+        assert_eq!(native.api_key_env, Some("DEEPSEEK_API_KEY"));
     }
 
     #[test]

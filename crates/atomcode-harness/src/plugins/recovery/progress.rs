@@ -117,15 +117,15 @@ impl Progress {
                     if *turn == state.number && *r == round && call_id == &call.id && images.is_empty()))
         })
     }
-    pub(crate) fn recover(&self, session: &SessionLog, max: u32, protect: bool) -> bool {
+    pub(crate) fn recover(&self, session: &SessionLog, max: u32, protect: bool) -> Option<u32> {
         let mut all = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let state = all.entry(session.id().to_owned()).or_default();
         if state.number != session.current_turn() || state.used >= max {
-            return false;
+            return None;
         }
         state.used += 1;
-        state.recovering = protect;
-        true
+        state.recovering |= protect;
+        Some(state.used)
     }
     pub(crate) fn reuse(
         &self,

@@ -24,9 +24,9 @@
 //!
 //! Not a stack of transcript look-alikes. A header says what these lines ARE —
 //! typed ahead while a turn runs, folded in at the next tool-call boundary (or
-//! flushed now with Esc) — and each waiting message is one compact `↳ <text>`
-//! preview row, oldest first. So several lines typed ahead read as ONE pending
-//! batch rather than N sent-looking bars; the panel stays small even with a
+//! flushed now with Ctrl+X) — and each waiting message is one compact `↳ <text>`
+//! numbered preview row, oldest first. Several messages typed ahead read as one
+//! pending batch rather than N sent-looking bars; the panel stays small even with a
 //! handful queued, and a long line is a single truncated preview (the full text
 //! is what actually gets sent at the boundary).
 //!
@@ -102,8 +102,7 @@ impl View for Steering {
 
     /// The margin and the bars, and nothing between turns.
     ///
-    /// Counted by rendering at `width`, not by counting newlines: a bar wraps,
-    /// so how many rows it takes is a fact about the width it is given.
+    /// Counted from the same previews used for rendering at `width`.
     fn height(_state: &State, moment: &Moment, width: u16) -> Height {
         let body = if width == 0 {
             0
@@ -120,23 +119,29 @@ impl View for Steering {
 /// A header, then one compact `↳ <text>` preview row per waiting message, oldest
 /// first. Empty (no header) when nothing is queued.
 fn bars(moment: &Moment, width: u16) -> Vec<Line> {
-    let queued: Vec<&str> = moment
-        .steering
-        .lines()
-        .map(str::trim)
-        .filter(|m| !m.is_empty())
-        .collect();
-    if queued.is_empty() {
+    if moment.queued.is_empty() {
         return Vec::new();
     }
-    // A queue, not a stack of full user bars: a header that says these are waiting
-    // (folded at the next tool call, or flushed now with Ctrl+X), then one compact
-    // `↳ <text>` per message oldest-first — so several lines typed ahead read as one
-    // pending batch instead of N look-alike sent messages.
-    let mut out: Vec<Line> = Vec::new();
-    out.extend(El::styled(t(Msg::SteeringQueued), theme::fg(Role::Muted)).lay(width));
-    for message in queued {
-        out.extend(El::styled(format!("  ↳ {message}"), theme::fg(Role::Muted)).lay(width));
+    let mut out = El::styled(
+        format!("({}) {}", moment.queued.len(), t(Msg::SteeringQueued)),
+        theme::fg(Role::Muted),
+    )
+    .lay(width);
+    for (index, message) in moment.queued.iter().enumerate() {
+        let preview = message
+            .text
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let text = format!("  ↳ {}. {preview}", index + 1);
+        let text = if crate::width::str_width(&text) > width as usize {
+            let ellipsis = crate::width::take_width("…", width as usize);
+            let budget = width as usize - crate::width::str_width(&ellipsis);
+            format!("{}{ellipsis}", crate::width::take_width(&text, budget))
+        } else {
+            text
+        };
+        out.extend(El::styled(text, theme::fg(Role::Muted)).lay(width));
     }
     out
 }
@@ -174,6 +179,10 @@ mod tests {
     fn waiting(text: &str) -> Moment {
         Moment {
             steering: text.to_string(),
+            queued: vec![crate::moment::Queued {
+                text: text.to_string(),
+                ..Default::default()
+            }],
             ..Moment::default()
         }
         .working()
@@ -226,7 +235,13 @@ mod tests {
     #[test]
     fn several_lines_typed_ahead_read_as_one_pending_batch() {
         // Three follow-ups → ONE header + three ↳ rows (a batch), not three bars.
-        let m = waiting("first follow-up\nsecond follow-up\nthird");
+        let mut m = waiting("first follow-up");
+        for text in ["second follow-up", "third"] {
+            m.queued.push(crate::moment::Queued {
+                text: text.into(),
+                ..Default::default()
+            });
+        }
         let lines = draw(&m, 80, 10);
         assert_eq!(lines[0], "");
         let entries: Vec<&String> = lines.iter().filter(|l| l.contains('↳')).collect();
@@ -252,7 +267,30 @@ mod tests {
             lines[2].contains('↳'),
             "the entry stays one row: {lines:#?}"
         );
+        assert!(lines[2].ends_with('…'), "clipped previews show an ellipsis");
         assert_eq!(Steering::height(&State, &m, width), Height::Hug(3));
+    }
+
+    #[test]
+    fn a_multiline_message_does_not_hide_the_next_message() {
+        let mut m = waiting(&"第一条消息\n".repeat(30));
+        m.queued.push(crate::moment::Queued {
+            text: "第二条消息".into(),
+            ..Default::default()
+        });
+        let original = m.queued.clone();
+        let lines = draw(&m, 80, 4);
+        assert_eq!(lines.len(), 4);
+        assert!(lines[1].contains("(2)"));
+        assert!(lines[2].contains("↳ 1."));
+        assert!(lines[3].contains("↳ 2. 第二条消息"));
+        for width in [1, 2, 8, 20] {
+            let rows = draw_at(&m, width, 4);
+            assert_eq!(rows.len(), 4);
+            assert!(rows.iter().all(|line| line.width() <= width as usize));
+        }
+        assert_eq!(m.queued, original, "previews preserve the full messages");
+        assert_eq!(Steering::height(&State, &m, 80), Height::Hug(4));
     }
 
     #[test]

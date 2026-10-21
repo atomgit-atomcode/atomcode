@@ -2540,6 +2540,13 @@ body {
 .remote-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .remote-warn { color: var(--app-warning-accent); }
 
+/* Keep each picker section at its natural height. Otherwise the browser's
+   hidden overflow clips the create row when recent projects fill the modal. */
+.cwd-picker .modal-body { min-height: 0; }
+.cwd-picker .modal-body > * { flex-shrink: 0; }
+.cwd-recent-list { max-height: 180px; overflow-y: auto; }
+.cwd-picker .dir-breadcrumb { overflow-wrap: anywhere; }
+
 /* Directory browser */
 .dir-browser {
   border: 1px solid var(--app-input-border);
@@ -4000,3 +4007,26 @@ body {
   color: var(--app-secondary-foreground);
   cursor: pointer;
 }
+
+.retained-history-badge, .compaction-history { color: var(--app-secondary-foreground); font-size: .85rem; margin-block: .5rem; }
+.compaction-history button { cursor: pointer; text-decoration: underline; }
+.compaction-history-records { max-height: 60vh; overflow: auto; padding: 1rem; border: 1px solid var(--app-border-subtle); border-radius: .5rem; }
+.compaction-history-records pre { white-space: pre-wrap; overflow-wrap: anywhere; font-family: inherit; }
+.compaction-history-records article { border-bottom: 1px solid var(--app-border-subtle); padding-block: .75rem; }
+
+.goal-recovery-status {
+  padding: 8px 12px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.effort-selector .model-selector-trigger:disabled { opacity: 0.55; cursor: not-allowed; }
+
+.at-tabs { display: flex; gap: 4px; padding: 6px; border-bottom: 1px solid var(--app-input-border); }
+.at-tabs button { border: 0; border-radius: 5px; padding: 5px 12px; background: transparent; color: inherit; cursor: pointer; }
+.at-tabs button.active { background: var(--app-command-menu-active-background); font-weight: 600; }
+.at-session-meta { font-size: 11px; color: var(--app-secondary-foreground); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 55%; }
+.session-reference-chips { display: flex; flex-wrap: wrap; gap: 6px; padding: 4px 0; }
+.session-reference-chip { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--app-input-border); border-radius: 8px; padding: 3px 8px; font-size: 12px; }
+.session-reference-chip button { border: 0; background: transparent; color: inherit; cursor: pointer; }

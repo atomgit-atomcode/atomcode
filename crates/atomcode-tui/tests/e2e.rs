@@ -793,6 +793,41 @@ async fn a_ctrl_c_is_disarmed_by_other_input() {
     task.abort();
 }
 
+/// EOF edits a nonempty draft; an empty composer needs its own double press.
+#[tokio::test]
+async fn ctrl_d_preserves_a_draft_and_confirms_empty_exit() {
+    let dir = scratch("eof-edit");
+    let s = start(tree(&dir, &replay(r#"{ text = "hi" }"#), &[])).await;
+    let task = s.open().await;
+    s.term.type_text("甲乙");
+    s.term.press(KeyPress::ctrl('a'));
+    s.term.press(KeyPress::ctrl('d'));
+    s.term
+        .settle(Duration::from_millis(60), Duration::from_secs(5))
+        .await;
+    assert!(!task.is_finished());
+    assert!(s.screen().contains("乙"), "{}", s.screen());
+    s.term.press(KeyPress::ctrl('d'));
+    s.term
+        .settle(Duration::from_millis(60), Duration::from_secs(5))
+        .await;
+    assert!(
+        !task.is_finished(),
+        "deleting the final character must not quit"
+    );
+    s.term.press(KeyPress::ctrl('d'));
+    s.term
+        .settle(Duration::from_millis(60), Duration::from_secs(5))
+        .await;
+    assert!(!task.is_finished(), "empty EOF only arms exit");
+    assert!(s.screen().contains("再按 Ctrl+D 退出"), "{}", s.screen());
+    s.term.press(KeyPress::ctrl('d'));
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("confirmed exit")
+        .expect("UI task");
+}
+
 /// The same welcome when the host is slow to say where the session works: the
 /// screen asks before it follows the session, so the history cannot fill the
 /// stream ahead of the welcome while the answer is on its way.
@@ -815,8 +850,8 @@ async fn a_resumed_session_keeps_its_welcome_when_the_host_is_slow_to_say_where_
         s.term.type_line("remember the number 42");
         s.quiet().await;
         persisted(&home, id, 6).await;
-        s.term.press(KeyPress::ctrl('d'));
-        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+        task.abort();
+        let _ = task.await;
     }
 
     let here = root.display().to_string();
@@ -861,8 +896,8 @@ async fn a_resumed_session_keeps_its_welcome_when_the_host_is_slow_to_say_where_
         .collect();
     assert!(welcome.contains(name), "{top}");
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -889,8 +924,8 @@ async fn a_resumed_session_opens_with_a_welcome_above_its_history() {
         s.term.type_line("remember the number 42");
         s.quiet().await;
         persisted(&home, id, 6).await;
-        s.term.press(KeyPress::ctrl('d'));
-        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+        task.abort();
+        let _ = task.await;
     }
 
     let s = start(tree_resumable(
@@ -936,8 +971,8 @@ async fn a_resumed_session_opens_with_a_welcome_above_its_history() {
         "the welcome sits above the history it opened:\n{top}"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// A session started with `/clear` opens with the welcome too.
@@ -987,8 +1022,8 @@ async fn a_new_session_started_from_the_screen_opens_with_the_welcome_too() {
         "and the cat came with it — the welcome draws no half-block without it:\n{fresh}"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -1020,8 +1055,8 @@ async fn a_person_types_a_question_and_reads_the_answer() {
         "the status line is on screen"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 // ---- a picture the model cannot receive is never sent quietly -----------
@@ -1061,8 +1096,8 @@ async fn a_picture_pasted_for_a_text_model_attaches_for_the_runtime_to_handle() 
         "a text-only model is no longer refused at paste time:\n{screen}"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -1090,8 +1125,8 @@ async fn a_picture_pasted_for_a_model_that_can_see_it_is_attached_and_sent() {
         "the image was in the message the model received"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -1135,8 +1170,8 @@ async fn clearing_the_composer_takes_the_picture_with_it() {
         "the turn after a clear carries text, not the cleared picture"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -1163,8 +1198,8 @@ async fn every_frame_respects_every_rect() {
             );
         }
     }
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -1193,8 +1228,8 @@ async fn typing_during_a_turn_is_folded_into_it_rather_than_queued() {
     let turn_ends = screen.matches("✻ Done").count();
     assert_eq!(turn_ends, 1, "one turn, not two:\n{screen}");
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// `Ctrl+X` 真的做到了面板上写的那句话:中断,并把排队的话立刻发出去。
@@ -1257,8 +1292,8 @@ async fn ctrl_x_interrupts_and_sends_what_was_queued() {
         s.screen()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// The runtime folds ONE queued line per step, so after the first of three is
@@ -1323,8 +1358,8 @@ async fn ctrl_x_after_one_queued_line_was_folded_sends_the_rest() {
         s.screen()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// Queue two lines behind a running turn and wait until the panel shows both.
@@ -1410,8 +1445,8 @@ async fn esc_puts_what_was_queued_back_in_the_composer() {
         s.screen()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// `ctrl-c` is the same stop, and hands the queue back the same way — ahead of
@@ -1451,8 +1486,8 @@ async fn ctrl_c_puts_what_was_queued_back_ahead_of_the_draft() {
         user_messages(&s)
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// What `Ctrl+X` sent after the first line is queued again, and a stop hands
@@ -1514,8 +1549,8 @@ async fn what_ctrl_x_resent_and_was_still_waiting_comes_back_on_esc() {
     );
     assert!(!s.screen().contains("没有送达"), "{}", s.screen());
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// The turns a stop ended, by the log.
@@ -1594,8 +1629,8 @@ async fn ctrl_x_sends_again_a_queued_line_the_turn_was_still_taking_in() {
         "both went out again, in the order they were typed: {said:?}"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// The same line, stopped with `esc`: back to the composer with the rest, ahead
@@ -1641,8 +1676,8 @@ async fn esc_hands_back_a_queued_line_the_turn_was_still_taking_in() {
     );
     assert!(!s.screen().contains("没有送达"), "{}", s.screen());
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// A `ctrl-x` on a line the turn has already taken sets nothing for the next
@@ -1716,8 +1751,8 @@ async fn a_ctrl_x_that_withdrew_nothing_does_not_make_a_later_cancel_resend() {
         user_messages(&s)
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// When the lead's turn events do not arrive — its status going idle is all
@@ -1782,8 +1817,8 @@ async fn a_stop_settles_on_idle_when_no_turn_end_arrives() {
         "both are back in the composer:\n{field}"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// `Ctrl+X` sends what was queued **as it was queued**: one message each, in
@@ -1841,8 +1876,8 @@ async fn ctrl_x_sends_each_queued_message_on_its_own_with_its_picture() {
     );
     assert_eq!(with_picture, Some(1), "the queued picture went with it");
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -1905,8 +1940,8 @@ async fn a_line_typed_mid_turn_is_shown_until_the_model_is_handed_it() {
     );
 
     s.quiet().await;
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 // Multi-threaded on purpose. The driver commits the turn's last fact and
@@ -1937,17 +1972,21 @@ async fn a_turn_the_model_never_answers_says_so_and_stops_spinning() {
     s.quiet().await;
 
     let screen = s.screen();
-    assert!(screen.contains("已中断"), "the outcome:\n{screen}");
+    assert!(screen.contains("模型服务错误"), "the outcome:\n{screen}");
     assert!(
-        screen.contains("nodename nor servname"),
+        screen.contains("无法连接模型服务"),
         "the cause, wrapped rather than dropped:\n{screen}"
+    );
+    assert!(
+        !screen.contains("nodename nor servname"),
+        "raw error starts folded"
     );
     // And exactly once. 这句话有两条通道：带 `ends_turn` 标记的事件（消费端认它，抑制
     // 自己那一份）和回合收尾块（画事实，`TurnEnd::error`）。两边都画，读起来就像两件事。
     // 反过来也在这儿钉住：生产者若在一条**没有**收尾事实的路径上标了这个标记，两份都不画，
     // 计数会掉到 0。
     assert_eq!(
-        screen.matches("nodename nor servname").count(),
+        screen.matches("无法连接模型服务").count(),
         1,
         "the cause is said exactly once:\n{screen}"
     );
@@ -1974,8 +2013,8 @@ async fn a_turn_the_model_never_answers_says_so_and_stops_spinning() {
         "and no tool row is left saying it either:\n{screen}"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -2000,8 +2039,8 @@ async fn a_half_typed_line_survives_the_model_streaming_over_it() {
     );
     assert!(screen.contains("a fairly long answer"), "{screen}");
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -2031,8 +2070,8 @@ async fn folding_changes_what_is_shown_and_not_what_was_said() {
         "and must not lose content:\n{after}"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -2054,8 +2093,8 @@ async fn a_panel_is_on_screen_because_a_row_mounted_it() {
         "the row put itself on screen, through the same LayoutOp everything else uses"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// Stop a running turn with an empty composer and the prompt that was running
@@ -2089,8 +2128,8 @@ async fn esc_hands_the_running_prompt_back_to_the_empty_composer() {
         "the composer says it was stopped:\n{screen}"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// Stop a running turn while you were already typing something else and the
@@ -2128,8 +2167,8 @@ async fn esc_keeps_a_typed_draft_and_does_not_hand_the_prompt_back() {
         "and it says it was stopped:\n{screen}"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// On an idle screen a draft takes two taps of Esc to clear — the first arms,
@@ -2406,8 +2445,8 @@ async fn a_picture_on_the_clipboard_is_offered_until_it_is_taken() {
         s.screen()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// The door most people use: `Cmd+V`, which the terminal swallows and delivers
@@ -2448,8 +2487,8 @@ async fn a_picture_pasted_with_cmd_v_is_not_offered_back_afterwards() {
         s.screen()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// `/paste` is the way in for a clipboard picture on a terminal that eats
@@ -2557,8 +2596,8 @@ async fn an_idle_draft_takes_two_taps_of_esc_to_clear() {
         s.screen()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -2593,8 +2632,8 @@ async fn esc_stops_the_turn_and_the_next_one_still_runs() {
         "and the next turn really runs:\n{screen}"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// Esc on an idle screen is not a stop, and must not be allowed to say it was.
@@ -2661,8 +2700,8 @@ async fn esc_on_an_idle_screen_stops_nothing_and_says_nothing() {
 
     s.quiet().await;
     assert!(s.screen().contains("Ready."), "{}", s.screen());
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// The tree the TUI is meant to run in: it asks before a risky call, and it is
@@ -2724,7 +2763,7 @@ async fn the_live_line_says_what_the_turn_is_doing_while_it_runs() {
     // turn in flight: 100 tokens of context, 20 out of this round. Waiting for
     // the reading rather than assuming it beats the tool call — the row is drawn
     // from the log, and the log says which of the two came first.
-    until(&s, "入 100").await;
+    until(&s, "↑ 100").await;
     let live = s
         .term
         .last()
@@ -2737,7 +2776,7 @@ async fn the_live_line_says_what_the_turn_is_doing_while_it_runs() {
         "and says how long it has been running: {said}"
     );
     assert!(
-        said.contains("入 100") && said.contains("出 20"),
+        said.contains("↑ 100") && said.contains("↓ 20"),
         "and what it has cost so far: {said}"
     );
 
@@ -2749,8 +2788,8 @@ async fn the_live_line_says_what_the_turn_is_doing_while_it_runs() {
     );
     assert!(done.contains("Done."), "{done}");
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// A question that stops waiting without this screen answering it comes down.
@@ -2801,8 +2840,8 @@ async fn a_question_that_ended_elsewhere_comes_down_on_its_own() {
         "unanswered is refused, never allowed"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -2840,8 +2879,8 @@ async fn a_risky_call_is_asked_about_on_screen_and_an_allow_lets_it_run() {
         "the answer is on the record:\n{screen}"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -2873,8 +2912,8 @@ async fn esc_declines_and_the_model_is_told_rather_than_the_turn_dying() {
         "the turn carried on:\n{screen}"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// The model's own `request_user_input`, mounted the way the coding runtime
@@ -2970,8 +3009,8 @@ async fn a_multiple_choice_question_sends_back_every_answer_ticked() {
     );
     assert!(s.screen().contains("Noted."), "the turn carried on");
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// A model asks for words, and the person types them: the words reach the
@@ -3009,8 +3048,8 @@ async fn a_text_question_sends_back_what_the_person_typed() {
         "the model gets the words: {told}"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// A typo on the row of one's own words is fixed where it is: the arrows move
@@ -3044,8 +3083,8 @@ async fn a_typo_on_the_typing_row_is_fixed_where_it_is() {
         "the model gets the word as corrected: {told}"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// Two questions put together are answered on one panel — a page each and a
@@ -3082,8 +3121,8 @@ async fn a_batch_of_questions_is_answered_on_one_panel_and_sent_together() {
         "both answers, in order: {told}"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 // ---- the command surface --------------------------------------------------
@@ -3193,8 +3232,8 @@ async fn the_light_turns_green_yellow_and_red() {
         s.term.title()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -3238,8 +3277,8 @@ async fn typing_a_slash_shows_what_is_available_and_narrows_as_you_type() {
         s.screen()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// Which row of the slash menu is the lit one, read off the drawn frame.
@@ -3314,8 +3353,8 @@ async fn a_slash_menu_opens_with_its_first_row_lit_and_the_arrows_walk_it() {
         "up came back to the first"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -3348,8 +3387,8 @@ async fn enter_runs_the_lit_command_without_its_name_being_typed_out() {
         s.screen()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// The lit row of the slash menu, as it was drawn.
@@ -3423,8 +3462,8 @@ async fn enter_takes_the_lit_row_even_before_a_name_is_typed() {
         s.screen()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -3469,8 +3508,8 @@ async fn the_arrows_choose_the_row_that_enter_then_takes() {
         s.screen()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -3506,8 +3545,8 @@ async fn tab_completes_the_lit_command_onto_the_line() {
         s.screen()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -3541,8 +3580,8 @@ async fn enter_takes_the_lit_row_and_a_command_that_wants_an_argument_asks() {
         "the list shows the levels one per row:\n{screen}"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// `/todo` takes words after its name — `add <task>` above all — so taking its
@@ -3589,8 +3628,8 @@ async fn taking_todo_from_the_menu_waits_for_what_comes_after_it() {
     s.term.press(KeyPress::plain(Key::Enter));
     until(&s, "写一个回归测试").await;
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -3631,8 +3670,8 @@ async fn tab_completes_a_command_that_takes_an_argument_and_leaves_a_space() {
         s.screen()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// A command whose free-text argument is required and has no bare form — like
@@ -3668,8 +3707,8 @@ async fn enter_on_a_required_argument_command_completes_it_rather_than_running()
         s.screen()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -3748,8 +3787,8 @@ async fn the_pointer_lights_and_chooses_a_slash_menu_row() {
         s.screen()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -3781,8 +3820,8 @@ async fn esc_puts_the_slash_menu_away_without_losing_the_line() {
         s.screen()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 // ---- right-click on the composer ----------------------------------------
@@ -3794,7 +3833,7 @@ fn right_click(s: &Session, x: u16, y: u16) {
         .pointer(atomcode_tui::surface::Click::RightPress, x, y);
 }
 
-/// Right-click on the composer, where its four items live.
+/// Right-click on the composer, where its editing items live.
 ///
 /// The field's rect is read off the last frame rather than guessed at a row: the
 /// composer's position depends on what is above it, and where the press lands
@@ -3809,6 +3848,139 @@ fn right_click_composer(s: &Session) {
         .expect("the composer")
         .rect;
     right_click(s, field.x + 2, field.y);
+}
+
+#[tokio::test]
+async fn deleting_a_selection_that_includes_the_prompt_clears_the_draft() {
+    let dir = scratch("delete-composer-prompt-selection");
+    let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    let task = s.open().await;
+
+    for (index, key) in [Key::Delete, Key::Backspace].into_iter().enumerate() {
+        s.term.type_text("alpha 中文 beta");
+        s.quiet().await;
+        let field = s.term.last().unwrap().part("input").unwrap().rect;
+        let row = field.y + 1;
+        let (start, end) = if index == 0 {
+            (field.x, field.right() - 1)
+        } else {
+            (field.right() - 1, field.x)
+        };
+        s.term
+            .pointer(atomcode_tui::surface::Click::Press, start, row);
+        s.term.pointer(atomcode_tui::surface::Click::Drag, end, row);
+        s.term
+            .pointer(atomcode_tui::surface::Click::Release, end, row);
+        s.term.press(KeyPress::plain(key));
+        s.quiet().await;
+        let input = composer_text(&s);
+        assert!(!input.contains("alpha"), "selected draft remained: {input}");
+        assert!(
+            !input.contains("中文"),
+            "selected Unicode text remained: {input}"
+        );
+        assert!(!input.contains("beta"), "selected draft remained: {input}");
+    }
+
+    task.abort();
+    let _ = task.await;
+}
+
+#[tokio::test]
+async fn delete_removes_only_the_composer_selection() {
+    let dir = scratch("delete-composer-selection");
+    let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    let task = s.open().await;
+
+    s.term.type_text("alpha beta gamma");
+    s.quiet().await;
+    let field = s
+        .term
+        .last()
+        .expect("a frame")
+        .part("input")
+        .expect("the composer")
+        .rect;
+    let row = field.y + 1;
+    s.term
+        .pointer(atomcode_tui::surface::Click::Press, field.x, row);
+    s.term
+        .pointer(atomcode_tui::surface::Click::Drag, field.x + 1, row);
+    s.term
+        .pointer(atomcode_tui::surface::Click::Release, field.x + 1, row);
+    s.term.press(KeyPress::plain(Key::Delete));
+    s.quiet().await;
+    assert!(
+        composer_text(&s).contains("alpha beta gamma"),
+        "a prompt-only selection deleted draft text:\n{}",
+        composer_text(&s)
+    );
+
+    let start = field.x + 2 + "alpha ".len() as u16;
+    let end = start + "beta".len() as u16 - 1;
+    s.term
+        .pointer(atomcode_tui::surface::Click::Press, start, row);
+    s.term.pointer(atomcode_tui::surface::Click::Drag, end, row);
+    s.term
+        .pointer(atomcode_tui::surface::Click::Release, end, row);
+    s.quiet().await;
+
+    s.term.press(KeyPress::plain(Key::Delete));
+    s.quiet().await;
+    let input = composer_text(&s);
+    assert!(
+        input.contains("alpha  gamma"),
+        "selected text remained:\n{input}"
+    );
+    assert!(
+        !input.contains("beta"),
+        "Delete removed the wrong text:\n{input}"
+    );
+
+    let start = field.x + 2 + "alpha  ".len() as u16;
+    let end = start + "gamma".len() as u16 - 1;
+    s.term
+        .pointer(atomcode_tui::surface::Click::Press, start, row);
+    s.term.pointer(atomcode_tui::surface::Click::Drag, end, row);
+    s.term
+        .pointer(atomcode_tui::surface::Click::Release, end, row);
+    s.term.press(KeyPress::plain(Key::Backspace));
+    s.quiet().await;
+    let input = composer_text(&s);
+    assert!(
+        input.contains("alpha  "),
+        "unselected text was lost:\n{input}"
+    );
+    assert!(
+        !input.contains("gamma"),
+        "Backspace left selected text:\n{input}"
+    );
+
+    s.term.press(KeyPress::ctrl('a'));
+    s.term.press(KeyPress::ctrl('k'));
+    s.term.type_text("a [Image #1] b");
+    s.quiet().await;
+    let marker_start = field.x + 2 + 3;
+    s.term
+        .pointer(atomcode_tui::surface::Click::Press, marker_start, row);
+    s.term
+        .pointer(atomcode_tui::surface::Click::Drag, marker_start + 1, row);
+    s.term
+        .pointer(atomcode_tui::surface::Click::Release, marker_start + 1, row);
+    s.term.press(KeyPress::plain(Key::Delete));
+    s.quiet().await;
+    let input = composer_text(&s);
+    assert!(
+        input.contains("a  b"),
+        "the whole marker was not removed:\n{input}"
+    );
+    assert!(
+        !input.contains("Image"),
+        "a broken marker remained:\n{input}"
+    );
+
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -3861,8 +4033,8 @@ async fn right_click_on_the_composer_opens_a_menu_that_does_what_it_says() {
         s.screen()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -3891,8 +4063,8 @@ async fn the_menu_s_paste_reads_the_clipboard_into_what_is_being_typed() {
         s.screen()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// The screen row the context menu drew `words` on, read off the drawn part —
@@ -3956,8 +4128,8 @@ async fn a_pointer_chooses_the_row_the_words_were_drawn_on() {
         "and choosing closed the menu:\n{screen}"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -3972,7 +4144,7 @@ async fn the_menu_s_send_hands_the_line_to_the_model() {
     s.quiet().await;
     right_click_composer(&s);
     s.quiet().await;
-    for _ in 0..3 {
+    for _ in 0..4 {
         s.term.press(KeyPress::plain(Key::Down));
     }
     s.term.press(KeyPress::plain(Key::Enter));
@@ -3984,8 +4156,8 @@ async fn the_menu_s_send_hands_the_line_to_the_model() {
         "the model was asked:\n{screen}"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -4015,8 +4187,8 @@ async fn a_click_away_puts_the_menu_away_and_still_does_its_own_job() {
         "and the draft is untouched — dismissing is not clearing:\n{screen}"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -4045,8 +4217,8 @@ async fn esc_puts_the_menu_away_without_picking_anything() {
         "nothing was copied on the way out"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -4125,8 +4297,8 @@ async fn moving_the_pointer_over_a_row_makes_it_the_highlighted_one() {
         "enter did not take the row the pointer was over:\n{screen}"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -4173,8 +4345,8 @@ async fn a_drag_selection_confirms_the_copy_right_away() {
         s.screen()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// A reply of sixty lines, numbered, for the selections that run past a screen.
@@ -4226,8 +4398,8 @@ async fn a_drag_past_the_top_edge_selects_beyond_the_screen() {
         "in reading order"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// Held still at the edge, the view keeps scrolling: the terminal reports a
@@ -4266,8 +4438,8 @@ async fn a_drag_held_at_the_edge_keeps_scrolling() {
         "the view kept moving while the pointer was still (got to {first:?}):\n{copied}"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// The wheel moves the view and leaves a conversation selection where it was:
@@ -4321,8 +4493,8 @@ async fn a_selection_survives_the_wheel() {
     s.quiet().await;
     assert_eq!(s.term.clipboard_text().as_deref(), Some(taken.as_str()));
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -4399,8 +4571,8 @@ async fn right_click_over_a_selection_copies_the_selection_and_not_the_field() {
         "the menu copied the field over a selection"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -4483,8 +4655,8 @@ async fn copying_says_so_on_the_tip_row_and_not_in_the_conversation() {
         "and the box did not move when it did"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -4557,8 +4729,8 @@ async fn a_right_click_outside_the_composer_offers_only_what_belongs_there() {
         "and offers nothing that acts on what is being typed:\n{screen}"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -4627,8 +4799,8 @@ async fn a_menu_over_a_selection_keeps_off_the_words_it_is_about() {
     );
 
     s.term.press(KeyPress::plain(Key::Esc));
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -4695,8 +4867,8 @@ async fn the_menu_asks_the_terminal_for_the_pointer_only_while_it_is_open() {
         "and that is what went out on the wire"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -4751,8 +4923,8 @@ async fn moving_the_pointer_across_the_menu_chooses_nothing() {
         s.screen()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -4773,8 +4945,8 @@ async fn a_command_answers_on_screen_and_never_reaches_the_model() {
         "a command must not start a turn:\n{screen}"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// What was typed stays above what it answered, the way a sent message does:
@@ -4796,8 +4968,8 @@ async fn a_typed_command_is_echoed_above_its_answer() {
         "the command is on screen, above its answer:\n{screen}"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -4830,8 +5002,8 @@ async fn an_unknown_command_suggests_instead_of_vanishing() {
         s.screen()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -4884,8 +5056,8 @@ async fn a_command_and_a_key_share_one_implementation() {
         "the command ran:\n{by_command}"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 // ---- modals ---------------------------------------------------------------
@@ -4937,8 +5109,46 @@ async fn a_member_s_own_conversation_stays_off_the_lead_s_screen() {
         "what the member told the lead is on it:\n{screen}"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
+}
+
+#[tokio::test]
+async fn idle_team_commands_acknowledge_an_empty_panel_without_calling_the_model() {
+    let dir = scratch("empty-team-commands");
+    let s = start(tree(
+        &dir,
+        &replay(r#"{ text = "MODEL-MUST-NOT-RUN" }"#),
+        &[],
+    ))
+    .await;
+    let task = s.open().await;
+    for (command, expected) in [
+        ("/team show", "当前没有团队成员或后台任务"),
+        ("/team hide", "团队面板已收起"),
+        ("/team", "当前没有团队成员或后台任务"),
+    ] {
+        s.term.type_line(command);
+        s.quiet().await;
+        let screen = s.screen();
+        assert!(screen.contains(expected), "{command}: {screen}");
+        assert!(!screen.contains("MODEL-MUST-NOT-RUN"), "{screen}");
+        let frame = s.term.last().unwrap();
+        let input = frame
+            .part("input")
+            .unwrap()
+            .lines
+            .iter()
+            .map(|l| l.plain())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !input.contains("/team"),
+            "the submitted command must leave the input: {input}"
+        );
+    }
+    task.abort();
+    let _ = task.await;
 }
 
 /// The other half of the same rule: what the screen *may* show of a member.
@@ -5011,8 +5221,8 @@ async fn the_team_panel_says_who_is_on_the_team_and_what_each_last_said() {
         "a live member is shown live:\n{panel}"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 // ---- the todo panel ------------------------------------------------------
@@ -5069,12 +5279,92 @@ async fn the_todo_panel_shows_the_plan_the_model_sent() {
     assert!(panel.contains("待办"), "the header:\n{panel}");
     assert!(panel.contains("1 已完成"), "the patched count:\n{panel}");
     assert!(panel.contains("1 待办"), "{panel}");
-    assert!(panel.contains("#1") && panel.contains("读代码"), "{panel}");
+    assert!(
+        !panel.contains("读代码"),
+        "completed work is hidden: {panel}"
+    );
     assert!(panel.contains("#2") && panel.contains("写面板"), "{panel}");
+    let rect = s.term.last().unwrap().part("todo").unwrap().rect;
+    s.term
+        .pointer(atomcode_tui::surface::Click::Press, rect.x, rect.y + 1);
+    s.quiet().await;
+    let expanded = s
+        .term
+        .last()
+        .unwrap()
+        .part("todo")
+        .unwrap()
+        .lines
+        .iter()
+        .map(|line| line.plain())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        expanded.contains("#1") && expanded.contains("读代码"),
+        "{expanded}"
+    );
+    assert!(
+        expanded.contains("#2") && expanded.contains("写面板"),
+        "{expanded}"
+    );
+    let rect = s.term.last().unwrap().part("todo").unwrap().rect;
+    s.term
+        .pointer(atomcode_tui::surface::Click::Press, rect.x, rect.y + 1);
+    s.quiet().await;
+    let collapsed = s
+        .term
+        .last()
+        .unwrap()
+        .part("todo")
+        .unwrap()
+        .lines
+        .iter()
+        .map(|line| line.plain())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !collapsed.contains("读代码"),
+        "the header collapses again: {collapsed}"
+    );
     assert!(
         !panel.contains("todowrite"),
         "the call is not the plan:\n{panel}"
     );
+    s.term.type_line("/todo show");
+    s.quiet().await;
+    let keyboard_open = s
+        .term
+        .last()
+        .unwrap()
+        .part("todo")
+        .unwrap()
+        .lines
+        .iter()
+        .map(|line| line.plain())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        keyboard_open.contains("读代码"),
+        "keyboard expansion: {keyboard_open}"
+    );
+    s.term.type_line("/todo hide");
+    s.quiet().await;
+    let keyboard_closed = s
+        .term
+        .last()
+        .unwrap()
+        .part("todo")
+        .unwrap()
+        .lines
+        .iter()
+        .map(|line| line.plain())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !keyboard_closed.contains("读代码"),
+        "keyboard collapse: {keyboard_closed}"
+    );
+
     // Placed *and* painted: `part` says the host gave it a rect, and only the
     // flattened grid — the same one a screenshot and the exit dump come from —
     // says the row reached the screen.
@@ -5107,8 +5397,8 @@ async fn the_todo_panel_shows_the_plan_the_model_sent() {
         assert!(todo.y < field.y);
     }
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// And it goes away when the work does.
@@ -5149,8 +5439,8 @@ async fn the_todo_panel_leaves_once_every_task_is_done() {
     let text = screen.rows().join("\n");
     assert!(text.contains("All done."), "{text}");
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 // ---- approval ------------------------------------------------------------
@@ -5184,7 +5474,8 @@ async fn an_approval_asked_for_by_a_member_says_which_member() {
     s.term.type_line("have someone write the notes");
     // Delegating is itself a risky call, so the lead's own `team` card comes
     // first. Allow it, and the member's card is the next one up.
-    until(&s, "team").await;
+    // The running tool line already says `team`, before its approval is ready.
+    until(&s, "1) 允许一次").await;
     s.term.press(KeyPress::ch('1'));
     // Not `quiet`: the turn is deliberately stuck on a question, which is the
     // state under test. Settle on the card being up instead.
@@ -5211,8 +5502,8 @@ async fn an_approval_asked_for_by_a_member_says_which_member() {
         s.screen()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// Take the panel away and the screen still asks.
@@ -5268,8 +5559,8 @@ async fn with_no_panel_row_the_question_is_still_asked_and_still_answered() {
         s.screen()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// The question panel rides the stream's tail, between the live line and the
@@ -5335,8 +5626,8 @@ async fn the_question_panel_rides_the_tail_and_takes_the_composer_s_place() {
         "the conversation kept a row of its own: {stream:?}"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// The arrow keys pick, enter confirms, and the pointer does both.
@@ -5441,8 +5732,8 @@ async fn the_question_panel_picks_by_key_and_by_pointer_and_confirms_the_lit_row
         s.screen()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// Wait for the lit answer row to reach `row`, or for it to leave it.
@@ -5531,8 +5822,8 @@ async fn a_question_asks_the_terminal_for_the_pointer_only_while_it_is_up() {
         "the panel closed but the terminal is still reporting every cell"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// Reading back while a question waits: the reason to scroll then is to read
@@ -5593,8 +5884,8 @@ async fn a_question_holds_still_while_the_conversation_is_read_back() {
         "the allow did not reach the call"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// The prompt marker this terminal draws.
@@ -5627,8 +5918,8 @@ async fn a_burst_of_deltas_costs_frames_not_one_per_delta() {
         "{words} deltas cost {painted} frames, so what is queued is not being drained into one frame"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// A side-call model that never answers, so a member is busy until stopped.
@@ -5720,8 +6011,8 @@ async fn cancel_all_stops_every_members_turn_and_keeps_the_team() {
     // rather than that it reported.
     until(&s, "scout 被取消了").await;
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// A model that has not answered yet is said to be being waited for.
@@ -5752,8 +6043,8 @@ async fn a_model_that_has_not_answered_yet_says_it_is_being_waited_for() {
         "a turn waiting on the model must say so: {live:?}"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// A host that writes down every undo the screen asks of it, and passes the rest
@@ -5865,8 +6156,8 @@ async fn esc_before_the_model_says_anything_takes_the_turn_back() {
         s.screen()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// A refused undo leaves the turn standing — and the `已中断` note with it.
@@ -5906,8 +6197,8 @@ async fn a_refused_take_back_keeps_saying_the_turn_was_stopped() {
         s.screen()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// Once the model has said something, the turn is the person's: a stop hands
@@ -5940,8 +6231,8 @@ async fn esc_after_the_model_answered_takes_nothing_back() {
         s.screen()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// The waiting row rises even when the turn's start arrives after its first fact.
@@ -6012,8 +6303,117 @@ async fn the_waiting_row_rises_even_when_the_turns_start_arrives_late() {
         "the turn's own message is drawn and the agent says it is working, so the row is owed: {live:?}"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
+}
+
+/// The kernel cancellation acknowledgement is not the runtime terminal.
+#[tokio::test]
+async fn cancellation_keeps_its_live_line_until_runtime_completion() {
+    use atomcode_kernel::event::{AgentEvent, StopReason};
+    let dir = scratch("cancel-before-runtime-completion");
+    let stalling = "[[patch]]\nid = \"llm\"\nname = \"test-stalling-llm\"\n";
+    let (s, agent) =
+        start_with_agent_events(tree(&dir, &replay(r#"{ text = "unused" }"#), &[stalling])).await;
+    let task = s.open().await;
+    s.term.type_line("keep working");
+    until(&s, "keep working").await;
+    for _ in 0..100 {
+        if part_text(&s, "live").contains("正在等待模型") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(part_text(&s, "live").contains("正在等待模型"));
+    agent.send(AgentEvent::Cancelled).unwrap();
+    until(&s, "正在停止").await;
+    agent
+        .send(AgentEvent::StatusChanged {
+            session: s.client().root(),
+            status: atomcode_kernel::agent::AgentStatus::Idle,
+        })
+        .unwrap();
+    // A barrier through the same event channel: the idle status was handled.
+    agent
+        .send(AgentEvent::Error {
+            message: "cancellation snapshot still pending".into(),
+            http_status: None,
+            code: None,
+            retryable: None,
+            retry_after_secs: None,
+            ends_turn: false,
+        })
+        .unwrap();
+    until(&s, "cancellation snapshot still pending").await;
+    assert!(part_text(&s, "live").contains("正在停止"));
+    agent
+        .send(AgentEvent::TurnComplete {
+            provider_failure: None,
+            turn: None,
+            reason: StopReason::Cancelled,
+        })
+        .unwrap();
+    for _ in 0..100 {
+        if !part_text(&s, "live").contains("正在停止") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!part_text(&s, "live").contains("正在停止"));
+    task.abort();
+}
+
+/// A stale screen terminal must not hide messages queued to a working agent.
+#[tokio::test]
+async fn a_working_agent_keeps_follow_up_messages_visible_in_the_queue() {
+    use atomcode_kernel::event::{AgentEvent, StopReason};
+    let dir = scratch("working-agent-stale-screen");
+    let stalling = "[[patch]]\nid = \"llm\"\nname = \"test-stalling-llm\"\n";
+    let (s, agent) =
+        start_with_agent_events(tree(&dir, &replay(r#"{ text = "unused" }"#), &[stalling])).await;
+    let task = s.open().await;
+    s.term.type_line("first request");
+    until(&s, "first request").await;
+    for _ in 0..100 {
+        if part_text(&s, "live").contains("正在等待模型") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(part_text(&s, "live").contains("正在等待模型"));
+    agent
+        .send(AgentEvent::TurnComplete {
+            provider_failure: None,
+            turn: None,
+            reason: StopReason::Stopped,
+        })
+        .unwrap();
+    agent
+        .send(AgentEvent::Error {
+            message: "screen terminal delivered".into(),
+            http_status: None,
+            code: None,
+            retryable: None,
+            retry_after_secs: None,
+            ends_turn: false,
+        })
+        .unwrap();
+    until(&s, "screen terminal delivered").await;
+    s.term.type_line("follow up while still working");
+    for _ in 0..100 {
+        if part_text(&s, "steering").contains("follow up while still working") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        part_text(&s, "steering").contains("follow up while still working"),
+        "{}",
+        s.screen()
+    );
+    assert!(!s.screen().contains("coding runtime is busy"));
+    assert!(part_text(&s, "live").contains("正在等待模型"));
+    task.abort();
 }
 
 /// An error is said without taking the line off work that is still running.
@@ -6042,6 +6442,7 @@ async fn an_error_mid_turn_does_not_take_the_working_line_away() {
             code: None,
             retryable: None,
             // 回合中的告警:回合还没有收尾,所以没有第二处会画它。
+            retry_after_secs: None,
             ends_turn: false,
         })
         .unwrap();
@@ -6065,6 +6466,7 @@ async fn an_error_mid_turn_does_not_take_the_working_line_away() {
             http_status: None,
             code: None,
             retryable: None,
+            retry_after_secs: None,
             ends_turn: true,
         })
         .unwrap();
@@ -6075,8 +6477,8 @@ async fn an_error_mid_turn_does_not_take_the_working_line_away() {
         s.screen()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// A stop the agent has finished does not go on saying 正在停止.
@@ -6165,8 +6567,8 @@ async fn a_stop_the_agent_finished_does_not_keep_saying_it_is_stopping() {
         "a stale stopping claim made a fresh turn look like steering: {steering:?}"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// Back on a lead that is still working, esc stops it.
@@ -6231,8 +6633,8 @@ async fn esc_stops_a_lead_that_is_still_working_after_looking_at_a_member() {
         s.screen()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// A lead that delegates to a member that never answers — busy until stopped —
@@ -6307,8 +6709,8 @@ async fn esc_on_a_member_s_screen_puts_what_was_queued_back() {
     );
     assert!(!s.screen().contains("没有送达"), "{}", s.screen());
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// `ctrl-x` on a member's screen sends what was queued to the member again.
@@ -6349,8 +6751,8 @@ async fn ctrl_x_on_a_member_s_screen_sends_what_was_queued() {
         s.screen()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// Leaving the lead's screen while its stop is still settling does not lose
@@ -6396,8 +6798,8 @@ async fn leaving_the_lead_mid_stop_keeps_what_the_stop_took_back() {
     );
     assert!(!s.screen().contains("没有送达"), "{}", s.screen());
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// A team whose member speaks for itself, so its screen is recognisably its own.
@@ -6515,8 +6917,8 @@ async fn the_keyboard_switches_the_screen_to_a_member_and_back() {
         s.screen()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// A press on a member's row switches to it, and the row under the pointer is
@@ -6609,8 +7011,8 @@ async fn a_press_on_a_team_row_switches_to_that_agent() {
     until(&s, "MEMBER-THINKING-OUT-LOUD").await;
     assert!(s.screen().contains("正在看 scout"), "{}", s.screen());
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// Moving the mouse over the team panel does not take the keyboard
@@ -6695,8 +7097,8 @@ async fn hovering_the_team_panel_leaves_the_keyboard_where_it_was() {
         s.screen()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// A command a row of the agent's tree puts in its catalog, for a person to run.
@@ -6759,8 +7161,8 @@ async fn a_command_the_agent_offers_is_on_the_slash_menu_and_runs() {
     s.term.type_line("/echo hello there");
     until(&s, "echoed: hello there").await;
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// What each model request asked for, recorded after the chain ran so every
@@ -6911,8 +7313,8 @@ async fn the_effort_command_changes_what_requests_ask_for_while_the_screen_runs(
         "the next request carries the level the panel picked"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -6968,8 +7370,8 @@ async fn a_late_hover_reasserts_the_mode_without_claiming_the_terminal_took_the_
         s.screen()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -7019,8 +7421,8 @@ async fn a_move_that_was_asked_for_says_nothing_again() {
          is being repeated per event, and the terminal is paying per cell"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
@@ -7051,8 +7453,8 @@ async fn a_resumed_session_redraws_the_conversation_it_left_behind() {
         // The writer is behind its own queue, so the turn being over is not the
         // same moment as the file having it.
         persisted(&home, id, 6).await;
-        s.term.press(KeyPress::ctrl('d'));
-        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+        task.abort();
+        let _ = task.await;
     }
 
     let s = start(tree_resumable(
@@ -7074,8 +7476,8 @@ async fn a_resumed_session_redraws_the_conversation_it_left_behind() {
         screen.contains("It is 42."),
         "…and what was answered:\n{screen}"
     );
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// An approval survives a resume.
@@ -7144,8 +7546,8 @@ async fn a_resumed_session_shows_the_approval_it_was_given() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(landed, "the answer was never written to the log");
-        s.term.press(KeyPress::ctrl('d'));
-        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+        task.abort();
+        let _ = task.await;
     }
 
     let s = start(tree_resumable(
@@ -7167,8 +7569,8 @@ async fn a_resumed_session_shows_the_approval_it_was_given() {
         screen.contains("write_file") && screen.contains("out.txt"),
         "…about the call it was given for:\n{screen}"
     );
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 // ---- one stream per session (docs/adr/0022 §6) ----------------------------
@@ -7246,6 +7648,61 @@ async fn a_refused_submit_hands_the_words_back_and_says_why_in_words() {
 }
 
 const SHELL_ROW_LAYER: &str = "[[insert]]\nname = \"tui-shell\"\n";
+
+#[tokio::test]
+async fn deleting_forward_or_to_end_exits_history_and_restores_completion() {
+    for key in [KeyPress::plain(Key::Delete), KeyPress::ctrl('k')] {
+        let dir = scratch("history-delete-completion");
+        let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+        let task = s.open().await;
+        s.term.type_line("/context");
+        s.quiet().await;
+        s.term.press(KeyPress::plain(Key::Up));
+        s.quiet().await;
+        s.term.press(KeyPress::plain(Key::End));
+        s.term.press(KeyPress::plain(Key::Left));
+        s.term.press(key);
+        s.quiet().await;
+        assert!(composer_text(&s).contains("/contex"));
+        assert!(
+            s.term.last().unwrap().part("menu").is_some(),
+            "editing history restores completion: {}",
+            s.screen()
+        );
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn a_hook_rejected_prompt_returns_to_the_composer_without_overwriting_a_draft() {
+    let dir = scratch("hook-refused");
+    let (s, agent) = start_with_agent_events(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    let task = s.open().await;
+    s.term.type_line("被 hook 拒绝的输入 h9k");
+    s.quiet().await;
+    agent
+        .send(atomcode_kernel::event::AgentEvent::TurnComplete {
+            provider_failure: None,
+            turn: None,
+            reason: atomcode_kernel::event::StopReason::PromptRejected,
+        })
+        .unwrap();
+    s.quiet().await;
+    assert!(composer_text(&s).contains("h9k"));
+    s.term.type_text(" 我正在补充的新草稿");
+    s.quiet().await;
+    let draft = composer_text(&s);
+    agent
+        .send(atomcode_kernel::event::AgentEvent::TurnComplete {
+            provider_failure: None,
+            turn: None,
+            reason: atomcode_kernel::event::StopReason::PromptRejected,
+        })
+        .unwrap();
+    s.quiet().await;
+    assert_eq!(composer_text(&s), draft);
+    task.abort();
+}
 
 /// 把假 shell 挂上去的那一行 —— 和启动器那一行同形(`atomcode::tui_shell`)。
 struct ShellPanelRow(Arc<dyn atomcode_tui::shell::Shell>);
@@ -7479,8 +7936,8 @@ async fn a_bang_runs_here_and_what_it_printed_goes_with_the_next_message() {
         "而话本身也在同一条里:\n{wire}"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// 一阵几行、然后安静下来的命令:那一阵要在它结束之前全部上屏。
@@ -7712,8 +8169,8 @@ async fn the_far_end_runs_what_it_may_here_and_hears_back_and_is_refused_the_res
         s.screen()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// 对话区里现在写着什么 —— 不含输入框与各种面板。
@@ -7925,8 +8382,8 @@ async fn the_screen_moves_between_sessions_without_repeating_or_freezing() {
         "and nothing of the session it came from:\n{resumed}"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// A host that says a turn would not be taken, and names what to run about it.
@@ -8238,8 +8695,8 @@ async fn a_resumed_session_remembers_what_was_typed_into_it() {
         s.term.type_line("port the quantizer to the NPU");
         s.quiet().await;
         persisted(&home, id, 6).await;
-        s.term.press(KeyPress::ctrl('d'));
-        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+        task.abort();
+        let _ = task.await;
     }
 
     let s = start(tree_resumable(
@@ -8457,14 +8914,18 @@ impl Recorded {
                     marketplace: "official".into(),
                     description: "把代码排整齐".into(),
                     installed: installed.then_some(Scope::User),
-                    hook_trusted: installed.then_some(trusted),
+                    hook_trust: installed.then_some(if trusted {
+                        atomcode_tui::plugins::HookTrust::Trusted
+                    } else {
+                        atomcode_tui::plugins::HookTrust::Untrusted
+                    }),
                 },
                 PluginRow {
                     name: "lens".into(),
                     marketplace: "official".into(),
                     description: "看一眼改了什么".into(),
                     installed: None,
-                    hook_trusted: None,
+                    hook_trust: None,
                 },
             ],
             vec![MarketRow {
@@ -9846,8 +10307,8 @@ async fn a_deleted_tail_does_not_come_back_as_a_completion() {
         s.screen()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// With `ui.mode_switch_key = "tab"` plain Tab cycles — the setting, not a
@@ -9933,8 +10394,8 @@ async fn view_picks_from_a_sheet_and_esc_comes_back_to_the_same_row() {
     s.term.press(KeyPress::plain(Key::Esc));
     until_gone(&s, &list_legend).await;
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// **The status row says where the session works, as its host answers.** The
@@ -9993,8 +10454,8 @@ async fn the_status_row_shows_the_directory_the_host_says_the_session_is_in() {
         .unwrap_or_default();
     assert!(stream.contains("dir-from-the-host"), "{stream}");
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// A host that takes its time to say where the session works.
@@ -10061,7 +10522,16 @@ async fn ctrl_p_over_the_slash_menu_recalls_and_closes_it() {
     s.quiet().await;
 
     s.term.type_text("/co");
-    until(&s, "/compact").await;
+    // The welcome banner also contains /compact; wait for the menu itself.
+    for _ in 0..100 {
+        if s.term
+            .last()
+            .is_some_and(|frame| frame.part("menu").is_some())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert!(
         s.term.last().unwrap().part("menu").is_some(),
         "{}",
@@ -10081,8 +10551,48 @@ async fn ctrl_p_over_the_slash_menu_recalls_and_closes_it() {
         s.screen()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
+}
+
+#[tokio::test]
+async fn recalled_slash_history_waits_for_an_edit_before_opening_the_menu() {
+    let dir = scratch("slash-history-menu");
+    let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    let task = s.open().await;
+
+    s.term.type_line("/context");
+    s.quiet().await;
+
+    s.term.press(KeyPress::plain(Key::Up));
+    s.quiet().await;
+    assert!(
+        composer_text(&s).contains("/context"),
+        "the slash command was not recalled:\n{}",
+        s.screen()
+    );
+    assert!(
+        s.term.last().unwrap().part("menu").is_none(),
+        "browsing history opened command completion:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::plain(Key::End));
+    s.term.press(KeyPress::plain(Key::Backspace));
+    s.quiet().await;
+    assert!(
+        composer_text(&s).contains("/contex"),
+        "editing did not keep the recalled command:\n{}",
+        s.screen()
+    );
+    assert!(
+        s.term.last().unwrap().part("menu").is_some(),
+        "editing a recalled slash command did not restore completion:\n{}",
+        s.screen()
+    );
+
+    task.abort();
+    let _ = task.await;
 }
 
 /// **The wheel with the mouse handed back scrolls, it does not step the input
@@ -10176,8 +10686,8 @@ async fn the_wheel_as_arrows_scrolls_while_the_mouse_is_handed_back() {
         s.screen()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// Pick a start screens up, scroll down to where it should end, and click
@@ -10267,8 +10777,8 @@ async fn a_click_after_scrolling_away_extends_the_selection() {
         s.screen()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// Shift-click, as a native selection does it: held, every click carries the
@@ -10352,8 +10862,8 @@ async fn shift_click_extends_each_time_and_a_plain_click_after_puts_it_away() {
         s.screen()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// While the whole selection is still on screen a click means what it always
@@ -10401,8 +10911,8 @@ async fn a_click_beside_a_selection_on_screen_puts_it_away() {
         s.screen()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// A press that goes on to drag is a new selection even when the held one has
@@ -10460,8 +10970,8 @@ async fn a_drag_after_scrolling_away_starts_a_new_selection() {
         "the drag selected only what it covered"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// `/raw` puts the whole conversation — the lines scrolled off screen too — on
@@ -10507,8 +11017,8 @@ async fn raw_prints_the_whole_conversation_and_a_key_comes_back() {
         s.screen()
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// ↓ from an empty composer steps down into the team panel — no Tab needed —
@@ -10536,8 +11046,8 @@ async fn down_steps_into_the_team_panel_and_up_steps_back_out() {
     s.term.press(KeyPress::plain(Key::Enter));
     until(&s, "正在看 scout").await;
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// With the mouse handed back every arrow arrives as a burst. A lone ↓ still
@@ -10573,8 +11083,8 @@ async fn with_the_mouse_handed_back_arrows_walk_the_team_panel() {
     s.term.press(KeyPress::plain(Key::Enter));
     until(&s, "正在看 scout").await;
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// Scrolled back, the "↓ 还有 N 行" badge sits on the conversation's last row
@@ -10633,8 +11143,8 @@ async fn the_slash_menu_s_lit_row_is_not_covered_by_the_scroll_badge() {
         "the lit row is what the screen shows there: {on_screen:?}"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// Ctrl+Z stops for the shell — the key raw mode would otherwise turn into a
@@ -10661,8 +11171,8 @@ async fn ctrl_z_suspends_for_the_shell() {
         "and painted again on the way back"
     );
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
 }
 
 /// A host that answers a recap itself, and counts the asks. The e2e host has
@@ -10748,6 +11258,86 @@ async fn a_long_answer_ends_with_a_recap_and_a_short_one_does_not() {
     );
     assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
 
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    task.abort();
+    let _ = task.await;
+}
+
+/// Long output stays readable over SSH without a GUI, a clipboard or a mouse.
+#[tokio::test]
+async fn read_opens_a_terminal_reader_and_esc_returns_to_the_composer() {
+    let dir = scratch("read-conversation");
+    let reply = (0..100)
+        .map(|i| format!("READ-OUTPUT-{i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let script = format!("{{ text = {} }}", serde_json::to_string(&reply).unwrap());
+    let s = start(tree(&dir, &replay(&script), &[])).await;
+    let task = s.open().await;
+    s.term.type_line("produce a long reply");
+    until(&s, "READ-OUTPUT-99").await;
+    s.term.type_line("/read");
+    until(&s, "Esc 返回").await;
+    assert!(s.term.last().unwrap().part("sheet").is_some());
+    until(&s, "READ-OUTPUT-0").await;
+    s.term.press(KeyPress::ctrl('f'));
+    s.quiet().await;
+    let before_end = s.screen();
+    assert!(!before_end.contains("READ-OUTPUT-0"));
+    s.term.press(KeyPress::plain(Key::End));
+    until(&s, "READ-OUTPUT-99").await;
+    s.term.press(KeyPress::plain(Key::Esc));
+    s.quiet().await;
+    assert!(s.term.last().unwrap().part("sheet").is_none());
+    s.term.type_text("a draft after reading");
+    until(&s, "a draft after reading").await;
+    task.abort();
+    let _ = task.await;
+}
+
+/// The configured chord reaches the composer; the old newline chord yields,
+/// and /keys describes the map this screen actually runs.
+#[tokio::test]
+async fn custom_newline_chords_are_loaded_and_shown_in_keys() {
+    let dir = scratch("newline-chords");
+    let s = start_with_connection_and_settings(
+        tree(&dir, &replay(r#"{ text = "ok" }"#), &[]),
+        Some(Arc::new(OneSetting(
+            atomcode_tui::settings::NEWLINE_KEYS,
+            "alt+j",
+        ))),
+    )
+    .await;
+    let task = s.open().await;
+    s.quiet().await;
+    let keys = s.app.service::<atomcode_tui::plugin::KeysSvc>().unwrap();
+    assert_eq!(keys.newline_names(), vec!["alt+j"]);
+    s.term.type_text("first");
+    s.term.press(KeyPress::new(
+        Key::Char('j'),
+        atomcode_tui::surface::Mods::ALT,
+    ));
+    s.term.type_text("second");
+    s.quiet().await;
+    s.term.press(KeyPress::plain(Key::Enter));
+    s.quiet().await;
+    assert!(s
+        .client()
+        .events()
+        .iter()
+        .any(|logged| matches!(&logged.event,
+        SessionEvent::UserMessage { text, .. } if text == "first\nsecond")));
+
+    s.term.type_text("/keys");
+    s.term.press(KeyPress::plain(Key::Enter));
+    s.quiet().await;
+    use atomcode_tui::command::CommandSet;
+    let atomcode_tui::command::Outcome::Said(help) = atomcode_tui::commands::ScreenCommands
+        .run("keys", "", &s.app)
+        .await
+    else {
+        panic!("keys help")
+    };
+    assert!(help.contains("alt+j"), "{help}");
+    assert!(!help.contains("Shift+Enter / Ctrl+J"), "{help}");
+    task.abort();
 }

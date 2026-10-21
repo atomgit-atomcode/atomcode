@@ -47,6 +47,7 @@ pub(crate) struct LiveGoalSnapshot {
     terminal: Option<String>,
     phase: String,
     last_reason: Option<String>,
+    recovery: Option<atomcode_coding::GoalRecoveryProgress>,
 }
 
 /// 读取当前生效的审批模式。`pub(crate)` 以便 `/chat` 路径（非 sync webui）也据此
@@ -296,6 +297,7 @@ pub(crate) fn chat_runtime_config(
         atomcode_coding::config::permission_rules_from_config(&config.permissions);
     atomcode_coding::CodingRuntimeConfig {
         startup_warnings,
+        extra_skill_dirs: config.skills.extra_dirs.clone(),
         dirs: atomcode_coding::config::product_dirs_from_env(),
         api_key: p.and_then(|p| p.api_key.clone()).unwrap_or_default(),
         base_url: p.and_then(|p| p.base_url.clone()).unwrap_or_default(),
@@ -311,6 +313,8 @@ pub(crate) fn chat_runtime_config(
             config.tools.atomgit.enabled,
         ),
         tool_output_threshold_bytes: config.tools.output.threshold_bytes,
+        mcp_tool_search: config.tools.mcp.tool_search,
+        tool_search: config.tools.search.clone(),
         provider_name: provider_name.to_string(),
         working_dir: working_dir.to_path_buf(),
         context_window: p.map(|p| p.context_window as u32).unwrap_or(128_000),
@@ -339,6 +343,7 @@ pub(crate) fn chat_runtime_config(
         ),
         permission_rules: std::sync::Arc::new(permission_rules),
         user_agent: p.and_then(|p| p.user_agent.clone()),
+        headers: p.map(|p| p.headers.clone()).unwrap_or_default(),
         skip_tls_verify: p.map(|p| p.skip_tls_verify).unwrap_or(false),
         retry_max_attempts: p.and_then(|p| p.retry_max_attempts),
         upstream_retry_max_attempts: config.network.upstream_retry_max_attempts,
@@ -388,6 +393,7 @@ fn send_chat_runtime_error(
             http_status: None,
             code: None,
             retryable: None,
+            retry_after_secs: None,
             ends_turn: false,
         },
     ));
@@ -721,6 +727,7 @@ pub(crate) enum LiveWireEvent {
         terminal: Option<String>,
         phase: String,
         last_reason: Option<String>,
+        recovery: Option<atomcode_coding::GoalRecoveryProgress>,
     },
     /// 斜杠命令的文本输出（如 /status 报告）。`text` 首行即 `/cmd` 标头，
     /// 前端整体显示为一条系统消息即可。
@@ -793,6 +800,9 @@ pub(crate) enum LiveWireEvent {
     #[serde(rename = "user_input_request")]
     UserInputRequest {
         request_id: u64,
+        /// The tool continued without an answer; keep the card past normal idle.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        goal_question_pending: bool,
         header: String,
         question: String,
         mode: String,
@@ -1027,6 +1037,11 @@ impl NativeLiveWireProjector {
                 } else if request.kind == REQUEST_USER_INPUT_KIND {
                     LiveWireEvent::UserInputRequest {
                         request_id: request.id,
+                        goal_question_pending:
+                            atomcode_capabilities::tools::request_user_input::is_continued_question(
+                                &request.kind,
+                                &request.payload,
+                            ),
                         header: request
                             .payload
                             .get("header")
@@ -1117,6 +1132,7 @@ impl NativeLiveWireProjector {
                     }
                     .into(),
                     last_reason: progress.last_reason,
+                    recovery: progress.recovery,
                 }
             }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::ProviderChanged {
@@ -1254,6 +1270,7 @@ fn goal_snapshot(progress: &atomcode_coding::GoalProgress) -> LiveGoalSnapshot {
         }
         .into(),
         last_reason: progress.last_reason.clone(),
+        recovery: progress.recovery.clone(),
     }
 }
 
@@ -1277,6 +1294,105 @@ fn provider_reload_required(
     requested_fingerprint: &str,
 ) -> bool {
     active != requested || active_fingerprint != requested_fingerprint
+}
+
+/// Config persistence and application to an existing live runtime are separate
+/// outcomes. This additive response never claims that a busy/invalid binding
+/// has adopted the configuration just saved.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct LiveProviderSync {
+    status: &'static str,
+    provider: Option<String>,
+    message: Option<String>,
+}
+
+fn configured_live_fingerprint(config: &Config, provider: &str) -> Result<String, String> {
+    if !config.selection_exists(provider) {
+        return Err(format!(
+            "Provider {provider:?} is no longer configured. Select an available model in chat before continuing."
+        ));
+    }
+    crate::native_live::provider_fingerprint(config, provider)
+}
+
+fn configured_message_provider(
+    config: &Config,
+    active: &str,
+    requested: Option<&str>,
+) -> Result<(String, String), String> {
+    let provider = requested.unwrap_or(active);
+    Ok((
+        provider.to_string(),
+        configured_live_fingerprint(config, provider)?,
+    ))
+}
+
+pub(crate) async fn sync_live_provider_config(
+    config: &Config,
+    telemetry: Arc<Telemetry>,
+) -> LiveProviderSync {
+    let binding = match crate::native_live::binding() {
+        Ok(binding) => binding,
+        Err(crate::live_hub::HubError::Unbound) => {
+            return LiveProviderSync {
+                status: "unbound",
+                provider: None,
+                message: None,
+            }
+        }
+        Err(error) => {
+            return LiveProviderSync {
+                status: "failed",
+                provider: None,
+                message: Some(format!(
+                    "Config saved, but live provider synchronization failed: {error:?}"
+                )),
+            }
+        }
+    };
+    let mut result = LiveProviderSync {
+        status: "unchanged",
+        provider: Some(binding.provider.clone()),
+        message: None,
+    };
+    match configured_live_fingerprint(config, &binding.provider) {
+        Err(message) => {
+            result.status = "invalid";
+            result.message = Some(message);
+        }
+        Ok(fingerprint) if fingerprint == binding.provider_fingerprint => {}
+        Ok(fingerprint) => {
+            let next = crate::kernel_runtime::coding_config_from_runtime(&chat_runtime_config(
+                config,
+                &binding.provider,
+                &binding.working_dir,
+                telemetry,
+            ));
+            match crate::native_live::reload_provider(&binding, next, fingerprint).await {
+                Ok(_) => result.status = "reloaded",
+                Err(crate::live_hub::HubError::ActiveTurn) => {
+                    result.status = "pending";
+                    result.message = Some("Config saved. The active turn keeps its current provider; the updated configuration will be checked on the next message or explicit model switch.".into());
+                }
+                Err(error) => {
+                    result.status = "failed";
+                    result.message = Some(format!(
+                        "Config saved, but live provider reload failed: {error:?}"
+                    ));
+                }
+            }
+        }
+    }
+    if let Some(message) = &result.message {
+        // Existing view notices reach every connected chat without forging a
+        // ProviderChanged event for a transition that never happened.
+        if crate::native_live::binding().is_ok_and(|current| {
+            current.id == binding.id && current.generation == binding.generation
+        }) {
+            let _ = crate::native_live::publish_command_output(message.clone());
+        }
+    }
+    result
 }
 
 /// GET /live 查询参数。`session_id` 可选：提供时绑定到该 native session。
@@ -1774,7 +1890,9 @@ pub(crate) async fn live_message(
     let active_provider = join.binding.provider.clone();
     let mut provider_name = active_provider.clone();
     let mut provider_change_applied = true;
-    if let Some(requested_provider) = requested_provider {
+    {
+        // An omitted provider still has to validate the live selection against
+        // current config; reuse must not keep deleted credentials alive.
         let config = match Config::load(&Config::default_path()) {
             Ok(config) => config,
             Err(error) => {
@@ -1784,19 +1902,16 @@ pub(crate) async fn live_message(
                 }));
             }
         };
-        if !config.selection_exists(&requested_provider) {
-            return Json(serde_json::json!({
-                "accepted": false,
-                "error": format!("provider {requested_provider:?} not found"),
-            }));
-        }
-        let requested_fingerprint =
-            match crate::native_live::provider_fingerprint(&config, &requested_provider) {
-                Ok(fingerprint) => fingerprint,
-                Err(error) => {
-                    return Json(serde_json::json!({ "accepted": false, "error": error }));
-                }
-            };
+        let (requested_provider, requested_fingerprint) = match configured_message_provider(
+            &config,
+            &active_provider,
+            requested_provider.as_deref(),
+        ) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                return Json(serde_json::json!({ "accepted": false, "error": error }));
+            }
+        };
         if provider_reload_required(
             &active_provider,
             &join.binding.provider_fingerprint,
@@ -2172,6 +2287,17 @@ pub(crate) struct LiveReasoningEffortReq {
     pub reasoning_effort: Option<String>,
 }
 
+fn parse_live_reasoning_effort(raw: Option<&str>) -> Result<Option<String>, String> {
+    let Some(value) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    atomcode_config::config::REASONING_EFFORT_LEVELS
+        .iter()
+        .find(|level| level.eq_ignore_ascii_case(value))
+        .map(|level| Some((*level).to_string()))
+        .ok_or_else(|| format!("invalid reasoning_effort: {value}"))
+}
+
 /// POST /live/reasoning_effort — webui 设置当前模型实例的 reasoning_effort。
 ///
 /// 与 /live/provider 同源：持久化进目标 provider 的 `config.reasoning_effort`，
@@ -2182,19 +2308,12 @@ pub(crate) async fn live_reasoning_effort(
     State(state): State<AppState>,
     Json(req): Json<LiveReasoningEffortReq>,
 ) -> impl IntoResponse {
-    let effort = match req.reasoning_effort.as_deref().map(str::trim) {
-        None | Some("") => None,
-        Some(v) if v.eq_ignore_ascii_case("low") => Some("low".to_string()),
-        Some(v) if v.eq_ignore_ascii_case("medium") => Some("medium".to_string()),
-        Some(v) if v.eq_ignore_ascii_case("high") => Some("high".to_string()),
-        Some(v) if v.eq_ignore_ascii_case("max") => Some("max".to_string()),
-        Some(other) => {
+    let effort = match parse_live_reasoning_effort(req.reasoning_effort.as_deref()) {
+        Ok(effort) => effort,
+        Err(error) => {
             return (
                 axum::http::StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "ok": false,
-                    "error": format!("invalid reasoning_effort: {other}"),
-                })),
+                Json(serde_json::json!({ "ok": false, "error": error })),
             )
                 .into_response();
         }
@@ -2655,6 +2774,27 @@ pub(crate) async fn live_mcp_trust(State(state): State<AppState>) -> impl IntoRe
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn live_effort_parser_accepts_canonical_levels_without_loosening_endpoint_limits() {
+        for level in atomcode_config::config::REASONING_EFFORT_LEVELS {
+            let parsed =
+                super::parse_live_reasoning_effort(Some(&format!(" {} ", level.to_uppercase())))
+                    .unwrap();
+            assert_eq!(parsed.as_deref(), Some(level));
+            let declared = vec![level.to_string()];
+            for candidate in atomcode_config::config::REASONING_EFFORT_LEVELS {
+                let accepted = atomcode_config::config::clamp_effort_to_levels(
+                    Some(candidate),
+                    Some(&declared),
+                );
+                assert_eq!(accepted.is_some(), candidate == level);
+            }
+        }
+        assert_eq!(super::parse_live_reasoning_effort(None).unwrap(), None);
+        assert_eq!(super::parse_live_reasoning_effort(Some(" ")).unwrap(), None);
+        assert!(super::parse_live_reasoning_effort(Some("ultra")).is_err());
+    }
+
     use super::*;
     use atomcode_kernel::message::Message;
 
@@ -3000,6 +3140,59 @@ mod tests {
         assert_eq!(req2.provider, None);
     }
 
+    fn live_provider_config() -> Config {
+        let mut config = Config::default();
+        config.providers.insert(
+            "test".into(),
+            serde_json::from_value(serde_json::json!({
+                "type": "openai", "model": "model", "base_url": "https://example.invalid/v1"
+            }))
+            .unwrap(),
+        );
+        config
+    }
+
+    #[test]
+    fn implicit_live_selection_is_checked_against_saved_config() {
+        let mut config = live_provider_config();
+        let (_, before) = configured_message_provider(&config, "test", None).unwrap();
+        config.providers.get_mut("test").unwrap().api_key = Some("replacement-secret".into());
+        let (name, after) = configured_message_provider(&config, "test", None).unwrap();
+        assert_eq!(name, "test");
+        assert!(provider_reload_required("test", &before, &name, &after));
+        assert!(!after.contains("replacement-secret"));
+    }
+
+    #[test]
+    fn deleting_and_recreating_a_provider_requires_explicit_selection() {
+        let mut config = live_provider_config();
+        let provider = config.providers.remove("test").unwrap();
+        config.providers.insert("ofox-anthropic".into(), provider);
+        for requested in [None, Some("test")] {
+            let error = configured_message_provider(&config, "test", requested).unwrap_err();
+            assert!(error.contains("test") && error.contains("Select an available model"));
+        }
+        assert_eq!(
+            configured_message_provider(&config, "test", Some("ofox-anthropic"))
+                .unwrap()
+                .0,
+            "ofox-anthropic"
+        );
+    }
+
+    #[test]
+    fn unchanged_live_selection_does_not_require_reassembly() {
+        let config = live_provider_config();
+        let fingerprint = configured_live_fingerprint(&config, "test").unwrap();
+        let (name, current) = configured_message_provider(&config, "test", None).unwrap();
+        assert!(!provider_reload_required(
+            "test",
+            &fingerprint,
+            &name,
+            &current
+        ));
+    }
+
     #[test]
     fn live_message_reloads_only_when_the_runtime_provider_identity_changes() {
         assert!(!provider_reload_required(
@@ -3343,6 +3536,7 @@ mod tests {
             id: 42,
             kind: REQUEST_USER_INPUT_KIND.into(),
             payload: serde_json::json!({
+                "goal_question_pending": true,
                 "header": "Pick one",
                 "question": "Red or blue?",
                 "mode": "single",
@@ -3358,6 +3552,7 @@ mod tests {
         let json = serde_json::to_value(wire).unwrap();
         assert_eq!(json["type"], "user_input_request");
         assert_eq!(json["request_id"], 42);
+        assert_eq!(json["goal_question_pending"], true);
         assert_eq!(json["mode"], "single");
         assert_eq!(json["options"][0]["label"], "Red");
 

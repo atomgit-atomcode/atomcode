@@ -21,6 +21,28 @@ fn _isolate_atomcode_home() {
     atomcode_kernel::test_support::isolate_home();
 }
 
+#[tokio::test]
+async fn the_runtime_mounts_distinct_first_content_and_idle_budgets() {
+    let project = tempfile::tempdir().unwrap();
+    let mut cfg = atomcode_coding::CodingAgentConfig::new(
+        "placeholder",
+        "http://localhost",
+        "timed",
+        project.path(),
+        atomcode_coding::config::product_dirs_from_env(),
+    );
+    cfg.first_token_timeout = std::time::Duration::from_secs(600);
+    cfg.stream_timeout = std::time::Duration::from_secs(120);
+    let dump = support::mount(&cfg, quiet_options(), Arc::new(CannedProvider))
+        .await
+        .dump();
+    assert!(
+        dump.contains("\"stream_first_content_ms\": 600000"),
+        "{dump}"
+    );
+    assert!(dump.contains("\"stream_idle_ms\": 120000"), "{dump}");
+}
+
 /// Answers with a little text and a usage report — enough for a metering
 /// decorator to fold a `TokenUsage` and emit one `LlmChat`.
 struct CannedProvider;
@@ -547,4 +569,93 @@ async fn a_configured_output_threshold_reaches_the_row_that_cuts() {
     assert!(row.get("threshold_bytes").is_none(), "{row}");
     assert_eq!(row["dir"], dir.to_string_lossy().as_ref(), "{row}");
     mounted.stop();
+}
+
+#[tokio::test]
+async fn search_defaults_reach_the_shipping_tools_and_project_overrides_are_scoped() {
+    let project = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let dirs = atomcode_coding::config::product_dirs_from_env();
+    std::fs::create_dir_all(dirs.project(project.path())).unwrap();
+    std::fs::write(
+        dirs.project(project.path()).join("search.toml"),
+        "respect_gitignore=false\nfollow_symlinks=true\n",
+    )
+    .unwrap();
+    let mut file = atomcode_config::Config::default();
+    file.tools.search.include_hidden = true;
+    let mut cfg = atomcode_coding::CodingRuntimeConfig::from_config(
+        &file,
+        project.path(),
+        dirs.clone(),
+        None,
+        None,
+        false,
+        true,
+    )
+    .agent_config();
+    assert!(cfg.tool_search.include_hidden);
+    #[cfg(unix)]
+    let linked = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    std::fs::write(linked.path().join("linked.txt"), "needle").unwrap();
+    for root in [project.path(), elsewhere.path()] {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(linked.path(), root.join("linked")).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join(".hidden")).unwrap();
+        std::fs::write(root.join(".gitignore"), "ignored.txt\n").unwrap();
+        std::fs::write(root.join(".hidden/hidden.txt"), "needle").unwrap();
+        std::fs::write(root.join("ignored.txt"), "needle").unwrap();
+    }
+    for (root, includes_ignored) in [(project.path(), true), (elsewhere.path(), false)] {
+        cfg.working_dir = root.into();
+        let mounted = support::mount(&cfg, quiet_options(), Arc::new(CannedProvider)).await;
+        let tools = mounted
+            .context()
+            .service::<atomcode_harness::seams::ToolsSvc>()
+            .unwrap();
+        let ctx = atomcode_kernel::tool::ToolContext {
+            working_dir: root.into(),
+            cancel: Default::default(),
+            progress: Default::default(),
+            requester: None,
+        };
+        for (name, args) in [
+            ("glob", r#"{"pattern":"**/*.txt"}"#),
+            ("grep", r#"{"pattern":"needle","context":0}"#),
+        ] {
+            let tool = tools.get(name).unwrap();
+            let result = tool.execute(args, &ctx).await;
+            assert!(!result.is_error, "{}", result.content);
+            assert!(
+                result.content.contains("hidden.txt"),
+                "{name}: {}",
+                result.content
+            );
+            assert_eq!(
+                result.content.contains("ignored.txt"),
+                includes_ignored,
+                "{name}: {}",
+                result.content
+            );
+            #[cfg(unix)]
+            assert_eq!(
+                result.content.contains("linked.txt"),
+                includes_ignored,
+                "{name}: follow_symlinks must use the current project's setting: {}",
+                result.content
+            );
+            if !includes_ignored {
+                let args = if name == "glob" {
+                    r#"{"pattern":"**/*.txt","respect_gitignore":false}"#
+                } else {
+                    r#"{"pattern":"needle","respect_gitignore":false}"#
+                };
+                let result = tool.execute(args, &ctx).await;
+                assert!(result.content.contains("ignored.txt"), "{}", result.content);
+            }
+        }
+        mounted.shutdown().await;
+    }
 }

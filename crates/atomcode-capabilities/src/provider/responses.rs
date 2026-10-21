@@ -60,17 +60,19 @@ impl ResponsesProvider {
         let user_agent = cfg.user_agent.clone();
         let url = format!("{}/responses", cfg.base_url.trim_end_matches('/'));
         let initial_tls12 = atomcode_config::tls::should_cap_url(&url);
-        let client = std::sync::Arc::new(super::openai_compat::SwappableClient::new(
-            initial_tls12,
-            move |tls12| {
-                super::openai_compat::build_http_client(
+        let custom_headers = !cfg.headers.is_empty();
+        let client = std::sync::Arc::new(
+            super::openai_compat::SwappableClient::new(initial_tls12, move |tls12| {
+                super::openai_compat::build_account_http_client(
                     connect_timeout,
                     skip_tls_verify,
                     user_agent.clone(),
                     tls12,
+                    custom_headers,
                 )
-            },
-        )?);
+            })?
+            .with_headers(cfg.headers.clone()),
+        );
         Ok(Self {
             cfg,
             client,
@@ -745,7 +747,9 @@ impl LlmProvider for ResponsesProvider {
             }
         };
 
-        let policy = self.cfg.retry.clone();
+        let policy = retry::policy_for_call(&self.cfg.retry, options);
+        let caller_recovers = options.request_recovery.is_some();
+        let request_recovery = options.request_recovery.clone();
         let client = self.client.clone();
         let url = self.url.clone();
         let signer = self.cfg.request_signer.clone();
@@ -764,6 +768,7 @@ impl LlmProvider for ResponsesProvider {
             &session_id,
             &policy,
             rate_limit_retry_owner,
+            request_recovery.as_ref(),
             open_timeout,
         )
         .await
@@ -780,7 +785,7 @@ impl LlmProvider for ResponsesProvider {
         };
 
         let s = async_stream::stream! {
-            const MAX_STREAM_ATTEMPTS: u32 = 3;
+            let max_stream_attempts: u32 = if caller_recovers { 1 } else { 3 };
             let mut stream_attempt = 1u32;
             let mut reconnect_attempts = 0u32;
             let mut resp = resp;
@@ -790,23 +795,21 @@ impl LlmProvider for ResponsesProvider {
                 let mut pending_metadata = Vec::new();
                 let byte_stream = resp.bytes_stream();
                 futures::pin_mut!(byte_stream);
-                // PHASE-AWARE byte-idle watchdog: prefill (before the first byte of this
-                // (re)opened stream) waits up to `first_token`; after the first byte we
-                // tighten to the inter-token `idle`. See openai_compat for the rationale
-                // (keep-alives flip early but keep resetting; silent prefill gets the full
-                // first-token budget). Reset per (re)open — a reconnect restarts prefill.
-                let mut first_byte_seen = false;
+                // Heartbeats and metadata do not end prefill or extend the
+                // content deadline. Every decoded content event resets idle.
+                // A transparent reopen gets a fresh first-content budget.
+                let mut watchdog = super::StreamWatchdog::new(Some(first_token), Some(idle));
                 loop {
                     match retry::next_chunk_phased(
                         &mut byte_stream,
-                        first_token,
-                        idle,
-                        &mut first_byte_seen,
+                        &watchdog,
                     )
                     .await
                     {
                         Err(_elapsed) => {
-                            yield StreamEvent::Error(retry::stream_idle_error());
+                            let mut error = retry::stream_idle_error();
+                            error.retryable = caller_recovers && !emitted_replay_sensitive;
+                            yield StreamEvent::Error(error);
                             return;
                         }
                         Ok(None) => {
@@ -820,13 +823,14 @@ impl LlmProvider for ResponsesProvider {
                                 {
                                     for metadata in pending_metadata.drain(..) { yield metadata; }
                                 }
+                                watchdog.observe(&ev);
                                 emitted_replay_sensitive |= retry::is_replay_sensitive_event(&ev);
                                 yield ev;
                             }
                             return;
                         }
                         Ok(Some(Err(e))) => {
-                            if !emitted_replay_sensitive && stream_attempt < MAX_STREAM_ATTEMPTS {
+                            if !emitted_replay_sensitive && stream_attempt < max_stream_attempts {
                                 reconnect_attempts += 1;
                                 tokio::time::sleep(retry::compute_backoff(stream_attempt, &policy)).await;
                                 if retry::is_stale_connection_error(&e)
@@ -840,15 +844,24 @@ impl LlmProvider for ResponsesProvider {
                                     }
                                 }
                                 if let Ok(fresh) =
-                                    open_stream(&client, &url, &body_bytes, &signer, &api_key, &session_id, &policy, rate_limit_retry_owner, open_timeout).await
+                                    open_stream(&client, &url, &body_bytes, &signer, &api_key, &session_id, &policy, rate_limit_retry_owner, request_recovery.as_ref(), open_timeout).await
                                 {
                                     stream_attempt += 1;
                                     resp = fresh;
                                     continue 'reopen;
                                 }
                             }
+                            // Repair the pool for the caller's next attempt without
+                            // opening a hidden request or replaying content here.
+                            if caller_recovers && (retry::is_stale_connection_error(&e) || retry::chain_has_tls_corruption(&e)) {
+                                let capped = client.is_tls12() || atomcode_config::tls::should_cap_url(&url);
+                                if let Err(error) = client.rebuild(capped) {
+                                    yield StreamEvent::Error(error);
+                                    return;
+                                }
+                            }
                             yield StreamEvent::Error(ProviderError {
-                                retryable: false,
+                                retryable: caller_recovers && !emitted_replay_sensitive,
                                 code: retry::stream_read_error_code(&e),
                                 message: retry::stream_read_error_message(
                                     &e,
@@ -876,6 +889,7 @@ impl LlmProvider for ResponsesProvider {
                                 {
                                     for metadata in pending_metadata.drain(..) { yield metadata; }
                                 }
+                                watchdog.observe(&ev);
                                 emitted_replay_sensitive |= retry::is_replay_sensitive_event(&ev);
                                 if matches!(ev, StreamEvent::Done { .. }) {
                                     saw_done = true;
@@ -889,7 +903,11 @@ impl LlmProvider for ResponsesProvider {
             }
         };
 
-        Ok(s.boxed())
+        let headers = self.cfg.headers.clone();
+        Ok(
+            s.map(move |event| super::redact_header_error(event, &headers))
+                .boxed(),
+        )
     }
 }
 

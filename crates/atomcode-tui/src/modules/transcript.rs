@@ -153,17 +153,18 @@ impl Transcript {
 
 /// What an injected block says about where it came from.
 ///
-/// The kind, not the sender's id: a peer's message already names the sender
-/// in its own text, and a session id on screen is an identifier nobody reads.
-/// Debug-formatting the origin put `peer { from: "1789…/scout" }` in front of
-/// every report, which is a struct dump, not a label.
+/// Team notes name their role; messages from outside this tree also name the
+/// sending session so independent terminal sessions can be distinguished.
+/// Keep this readable rather than dumping the origin's debug representation.
 fn origin_label(origin: &InjectionOrigin) -> String {
     match origin {
-        // A sender this tree has never held is a job run elsewhere reporting
-        // back. Calling it `peer` would put it in the same breath as a team
-        // member, and the person reading the block has no way to tell the two
-        // apart — the log has always been able to say which it was.
-        InjectionOrigin::Peer { outside: true, .. } => t(Msg::InjectedFromBackground).into_owned(),
+        // A sender outside this tree may be a background job reporting back
+        // or another independent terminal session. Both retain their source
+        // identity rather than being labelled as the team's lead.
+        InjectionOrigin::Peer {
+            outside: true,
+            from,
+        } => t(Msg::InjectedFromSession { from }).into_owned(),
         // On a member's screen this is its lead assigning or steering the work.
         // Reports in the other direction use the result presentation below,
         // whose heading already names the member.
@@ -507,24 +508,45 @@ impl Producer for Transcript {
                 // (`host_rows::RateLimitCoding`); said here in the person's
                 // language, as the classic screen says it. A provider retry
                 // carries its numbers apart from the provider's error, so it is
-                // said the same way. Anything else — and a retry logged before
-                // the numbers were kept — is shown as it was written.
+                // said the same way. Older retries without structured counters
+                // keep their raw text in details without inventing retry numbers.
+                let raw_detail = detail.clone();
                 let detail = match (notice, retry) {
                     (atomcode_harness::session::NoticeKind::RateLimited, _) => {
                         rate_limit_wait(detail).unwrap_or_else(|| detail.clone())
                     }
                     (atomcode_harness::session::NoticeKind::ProviderRetry, Some(retry)) => {
                         t(Msg::TranscriptProviderRetry {
-                            reason: detail,
+                            reason: &crate::provider_notice::reason(detail),
                             seconds: retry.backoff_secs,
                             attempt: retry.attempt,
                             max: retry.max_attempts,
                         })
                         .into_owned()
                     }
+                    (atomcode_harness::session::NoticeKind::ProviderRetry, None) => {
+                        crate::provider_notice::reason(detail)
+                    }
                     _ => detail.clone(),
                 };
-                out.emit(at, Arc::new(NoticeBlock { detail }));
+                let detail =
+                    if matches!(notice, atomcode_harness::session::NoticeKind::ProviderRetry) {
+                        format!("{detail} · {}", t(Msg::ProviderRetryDetailsHint))
+                    } else {
+                        detail
+                    };
+                let summary = Arc::new(NoticeBlock { detail });
+                if matches!(notice, atomcode_harness::session::NoticeKind::ProviderRetry) {
+                    out.emit(
+                        at,
+                        Arc::new(crate::provider_notice::DiagnosticBlock {
+                            summary,
+                            detail: raw_detail,
+                        }),
+                    );
+                } else {
+                    out.emit(at, summary);
+                }
             }
 
             // ---- things the harness did that change what the model sees -----
@@ -616,7 +638,25 @@ impl Producer for Transcript {
                     at,
                     Arc::new(InjectedBlock {
                         kind: origin_kind(origin),
-                        origin: origin_label(origin),
+                        origin: if matches!(origin, InjectionOrigin::Memory) {
+                            text.lines()
+                                .find(|line| {
+                                    line.starts_with(
+                                        atomcode_capabilities::memory::context::WARNING_PREFIX,
+                                    ) || (line.starts_with("[... ")
+                                        && line.contains("older memory ")
+                                        && line.contains("omitted to fit the budget; run /memory"))
+                                })
+                                .map(|_| {
+                                    atomcode_i18n::product::t(
+                                        atomcode_i18n::product::Msg::MemoryInjectionIncomplete,
+                                    )
+                                    .into_owned()
+                                })
+                                .unwrap_or_else(|| origin_label(origin))
+                        } else {
+                            origin_label(origin)
+                        },
                         text,
                         result,
                     }),
@@ -759,21 +799,37 @@ impl Producer for Transcript {
                     }
                     idx
                 };
-                out.emit(
-                    at,
-                    Arc::new(TurnEndBlock {
-                        // The typed reason, not a rendering of it: how the turn
-                        // ended is what the block draws, and a `{:?}` here would
-                        // put a Rust identifier on the screen (see
-                        // `content::turn_end_note`).
-                        stop: *stop,
-                        error: error.clone(),
-                        stats,
-                        done_index,
-                        open_items,
-                        ended_at: crate::content::clock_of(logged.at),
-                    }),
-                );
+                let block = TurnEndBlock {
+                    // The typed reason, not a rendering of it: how the turn
+                    // ended is what the block draws, and a `{:?}` here would
+                    // put a Rust identifier on the screen (see
+                    // `content::turn_end_note`).
+                    stop: *stop,
+                    error: if matches!(stop, atomcode_harness::seams::StopReason::ProviderError) {
+                        error.as_deref().map(crate::provider_notice::advice)
+                    } else {
+                        error.clone()
+                    },
+                    stats,
+                    done_index,
+                    open_items,
+                    ended_at: crate::content::clock_of(logged.at),
+                };
+                if matches!(stop, atomcode_harness::seams::StopReason::ProviderError) {
+                    if let Some(detail) = error {
+                        out.emit(
+                            at,
+                            Arc::new(crate::provider_notice::DiagnosticBlock {
+                                summary: Arc::new(block),
+                                detail: detail.clone(),
+                            }),
+                        );
+                    } else {
+                        out.emit(at, Arc::new(block));
+                    }
+                } else {
+                    out.emit(at, Arc::new(block));
+                }
             }
 
             // What the turn cost, in the two facts that carry it. `step` and
@@ -917,6 +973,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_outside_peer_is_labelled_with_its_session_identity() {
+        let label = origin_label(&InjectionOrigin::Peer {
+            from: "other-instance:session".into(),
+            outside: true,
+        });
+        assert!(label.contains("other-instance:session"));
+        assert_eq!(
+            label,
+            t(Msg::InjectedFromSession {
+                from: "other-instance:session"
+            })
+        );
+    }
+
+    #[test]
     fn work_sent_to_a_member_is_labelled_as_coming_from_main() {
         let label = origin_label(&InjectionOrigin::Peer {
             from: "lead-1".into(),
@@ -1023,6 +1094,25 @@ mod tests {
         s
     }
 
+    #[test]
+    fn incomplete_memory_is_visible_even_when_the_injection_is_folded() {
+        let _locale = atomcode_i18n::test_lock();
+        atomcode_i18n::set_locale(atomcode_i18n::Locale::En);
+        for text in [
+            "=== MEMORY ===\nMemory warning: 48 entries omitted to fit the budget; run /memory to review.\n- kept",
+            "=== MEMORY ===\n- kept\n[... 48 older memory entries omitted to fit the budget; run /memory to review]",
+        ] {
+            let stream = fold(&[SessionEvent::Injected { turn: 1, text: text.into(), origin: InjectionOrigin::Memory }]);
+            let summary = stream.slots()[0].block().content.summary(&crate::block::RenderCtx::bare(100)).plain();
+            assert!(summary.contains("Memory incompletely loaded"), "{summary}");
+            assert!(summary.contains("/memory"), "{summary}");
+            let body = stream.slots()[0].block().content.lines(&crate::block::RenderCtx::bare(300))
+                .iter().map(|line| line.plain()).collect::<Vec<_>>().join("\n");
+            assert!(body.contains("omitted"), "{body}");
+            assert!(body.contains("48"), "{body}");
+        }
+    }
+
     /// Every line of every block, joined — for judging that something was said
     /// at all, rather than where.
     fn said(s: &Stream) -> String {
@@ -1048,6 +1138,10 @@ mod tests {
     #[test]
     fn what_the_model_was_handed_instead_is_said_on_screen() {
         use atomcode_harness::session::RewrittenText;
+        // Asserts the Chinese wording, so it must not race a parallel test
+        // flipping the process-global locale — same class as the conformance
+        // criteria; hold the lock for the draw.
+        let _locale = crate::i18n::test_lock();
         let s = fold(&[
             SessionEvent::TurnStart { turn: 1 },
             SessionEvent::Compacted {
@@ -1076,7 +1170,7 @@ mod tests {
         ]);
         let drawn = said(&s);
         assert!(
-            drawn.contains("压成一段摘要") && drawn.contains("#7"),
+            drawn.contains("已压缩模型") && drawn.contains("#7") && drawn.contains("不是新指令"),
             "the compaction says how far it reached:\n{drawn}"
         );
         assert!(
@@ -1116,7 +1210,7 @@ mod tests {
         ]);
         let drawn = said(&s);
         let said_once = t(Msg::TranscriptProviderRetry {
-            reason: "connection refused",
+            reason: &crate::provider_notice::reason("connection refused"),
             seconds: 3,
             attempt: 1,
             max: 2,

@@ -128,6 +128,10 @@ impl View for Settings {
                     value,
                     caret,
                 } => edit_line(&label, &value, caret, w, vp.moment.caps),
+                Row::Keybinding(text) => Line::styled(
+                    width::take_width(&format!("  {text}"), w),
+                    theme::fg(Role::Accent),
+                ),
                 Row::Nothing => Line::styled(
                     width::take_width(&t(Msg::SettingsNoMatch), w),
                     theme::fg(Role::Muted),
@@ -164,7 +168,17 @@ impl View for Settings {
         }
         // The same number [`layout`] pads to, from the same function, so the
         // report and the drawing cannot disagree about how tall the panel is.
-        Height::Hug(anchor(&moment.settings).min(u16::MAX as usize) as u16)
+        let editor_height = moment
+            .settings_panel
+            .as_ref()
+            .filter(|panel| panel.keybindings.is_some())
+            .map(|panel| rows_for(&moment.settings, panel, None, None).len())
+            .unwrap_or(0);
+        Height::Hug(
+            anchor(&moment.settings)
+                .max(editor_height)
+                .min(u16::MAX as usize) as u16,
+        )
     }
 }
 
@@ -177,6 +191,7 @@ impl View for Settings {
 /// step.
 #[derive(Clone, Debug, PartialEq)]
 enum Row {
+    Keybinding(String),
     /// The panel's name and its pages, on one row: `设置  Config  Status …`.
     ///
     /// One row, not two. The name and the pages answer the same question —
@@ -335,6 +350,11 @@ fn rows_for(
     // what the panel is, and which page of it, before anything it has to say.
     let mut rows = vec![Row::Header];
     rows.push(Row::Rule);
+    if let Some(editor) = panel.keybindings.as_ref() {
+        rows.extend(editor.lines().into_iter().map(Row::Keybinding));
+        rows.push(Row::Rule);
+        return rows;
+    }
 
     // The other pages are not the settings list, so the search box goes with
     // them: a filter with nothing to filter would be a box that collects
@@ -970,6 +990,10 @@ fn status_lines(page: Option<&crate::settings::StatusPage>) -> Vec<UsageLine> {
     for group in &page.sources {
         out.push(UsageLine::Gap);
         out.push(UsageLine::Head(group.label.clone()));
+        if let Some(summary) = &group.summary {
+            out.extend(summary.lines().map(|line| UsageLine::Note(line.to_owned())));
+            continue;
+        }
         for file in &group.files {
             let same_as = seen
                 .iter()
@@ -984,17 +1008,15 @@ fn status_lines(page: Option<&crate::settings::StatusPage>) -> Vec<UsageLine> {
                 path: file.path.clone(),
                 same_as,
             });
+            if let Some(detail) = &file.detail {
+                out.push(UsageLine::Note(format!("    {detail}")));
+            }
         }
     }
     out
 }
 
-/// The Status page as text, for `/status`: the same rows, in the same order.
-///
-/// Walked from [`status_lines`] rather than written again, so the command and
-/// the page cannot drift. A file row says it was not found in words rather
-/// than with a mark: a command's answer is text, and which glyphs this terminal
-/// can draw is not known to it.
+/// Plain text projection of Status rows for remote clients without the local panel.
 pub fn status_text(page: &crate::settings::StatusPage) -> String {
     let mut out = Vec::new();
     for line in status_lines(Some(page)) {
@@ -2179,6 +2201,74 @@ pub fn value_column(row: &crate::settings::SettingRow) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn source_details_show_loaded_state_without_hiding_the_path() {
+        use atomcode_host_api::{SourceFile, SourceGroup};
+        let page = crate::settings::StatusPage {
+            sources: vec![SourceGroup {
+                summary: None,
+                label: "Instructions".into(),
+                files: vec![SourceFile {
+                    label: "Project".into(),
+                    path: "/work/AGENTS.md".into(),
+                    present: true,
+                    detail: Some("loaded; disk changed, resume to refresh".into()),
+                }],
+            }],
+            ..Default::default()
+        };
+        let shown = status_text(&page);
+        assert!(shown.contains("/work/AGENTS.md"));
+        assert!(shown.contains("loaded; disk changed"));
+        let rows = status_lines(Some(&page));
+        assert!(rows
+            .iter()
+            .any(|row| matches!(row, UsageLine::Note(note) if note.contains("disk changed"))));
+    }
+
+    #[test]
+    fn shortcut_capture_is_visible_and_hides_catalog_click_targets() {
+        let view = SettingsView::new(vec![row(
+            crate::settings::NEWLINE_KEYS,
+            "Newline",
+            "default",
+            SettingKind::Text,
+        )]);
+        let mut panel = Panel::new();
+        crate::settings::key(
+            &view,
+            &mut panel,
+            crate::surface::KeyPress::plain(Key::Enter),
+        );
+        crate::settings::key(
+            &view,
+            &mut panel,
+            crate::surface::KeyPress::plain(Key::Enter),
+        );
+        crate::settings::key(
+            &view,
+            &mut panel,
+            crate::keymap::parse_chord("alt+j").unwrap(),
+        );
+        let m = moment(Some(panel), view);
+        let text = drawn(&m, 80, 16).join("\n");
+        assert!(text.contains("alt+j"), "{text}");
+        assert!(text.contains("Enter"), "{text}");
+        assert!(lines(&m, 80, 16)
+            .iter()
+            .all(|line| crate::width::str_width(&line.plain()) <= 80));
+        assert!(!layout(
+            &m.settings,
+            m.settings_panel.as_ref().unwrap(),
+            None,
+            None,
+            80,
+            16
+        )
+        .iter()
+        .any(|row| matches!(row, Row::Setting { .. })));
+    }
+
     use crate::frame::Rect;
     use crate::module::{Mounted, ViewObject};
     use crate::settings::{Applies, Edit, SettingRow};
@@ -3391,6 +3481,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn status_summary_replaces_verbose_source_rows_in_text_and_on_screen() {
+        let data = crate::settings::StatusPage {
+            sources: vec![atomcode_host_api::SourceGroup {
+                label: "Skills".into(),
+                summary: Some("86 loaded · 10 directories · 1 failure\n/skills for details".into()),
+                files: vec![atomcode_host_api::SourceFile {
+                    label: "diagnostic".into(),
+                    path: "/private/invalid/SKILL.md".into(),
+                    present: true,
+                    detail: Some("verbose failure reason".into()),
+                }],
+            }],
+            ..Default::default()
+        };
+        let text = status_text(&data);
+        let screen = drawn(&status_page(data), 100, 40).join("\n");
+        for output in [text, screen] {
+            assert!(output.contains("86 loaded"));
+            assert!(output.contains("/skills"));
+            assert!(!output.contains("SKILL.md"));
+            assert!(!output.contains("verbose failure reason"));
+        }
+    }
+
     /// A file the session was configured from is listed **whether or not it is
     /// there**, and says which.
     ///
@@ -3410,17 +3525,20 @@ mod tests {
             session: "abc".into(),
             cwd: "/w".into(),
             sources: vec![SourceGroup {
+                summary: None,
                 label: "指令文件".into(),
                 files: vec![
                     SourceFile {
                         label: "项目共享".into(),
                         path: "/w/AGENTS.md".into(),
                         present: true,
+                        detail: None,
                     },
                     SourceFile {
                         label: "用户全局".into(),
                         path: "/w/ATOMCODE.md".into(),
                         present: false,
+                        detail: None,
                     },
                 ],
             }],
@@ -3458,17 +3576,20 @@ mod tests {
             session: "abc".into(),
             cwd: "/home/me".into(),
             sources: vec![SourceGroup {
+                summary: None,
                 label: "记忆文件".into(),
                 files: vec![
                     SourceFile {
                         label: "全局".into(),
                         path: "/home/me/.tree/memory.md".into(),
                         present: false,
+                        detail: None,
                     },
                     SourceFile {
                         label: "项目".into(),
                         path: "/home/me/.tree/memory.md".into(),
                         present: false,
+                        detail: None,
                     },
                 ],
             }],

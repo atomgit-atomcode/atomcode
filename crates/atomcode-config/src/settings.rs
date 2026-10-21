@@ -103,8 +103,6 @@ const SHELL_GUARD_POLICIES: &[&str] = &["prompt", "strict", "off"];
 const SUBAGENT_LEVELS: &[&str] = &["off", "read-only", "accept-edits", "auto"];
 const MODE_SWITCH_KEYS: &[&str] = &["shift_tab", "tab"];
 const SCROLLBARS: &[&str] = &["auto", "always", "hidden"];
-/// `default` is this build's, which is what a person gets back by unsetting it.
-const SCREENS: &[&str] = &["default", "rows", "classic"];
 
 pub static SETTINGS: &[SettingSpec] = &[
     bool_setting(
@@ -123,6 +121,60 @@ pub static SETTINGS: &[SettingSpec] = &[
         &["cancel", "undo"],
         ApplyPolicy::AgentReassemble,
     ),
+    bool_setting(
+        "tools.search.respect_gitignore",
+        &["tools", "search", "respect_gitignore"],
+        "Respect search ignore rules",
+        "搜索遵守忽略规则",
+        &["search", "glob", "grep"],
+        ApplyPolicy::CapabilityReprepare,
+    ),
+    bool_setting(
+        "tools.search.include_hidden",
+        &["tools", "search", "include_hidden"],
+        "Search hidden files",
+        "搜索隐藏文件",
+        &["search", "glob", "grep"],
+        ApplyPolicy::CapabilityReprepare,
+    ),
+    bool_setting(
+        "tools.search.follow_symlinks",
+        &["tools", "search", "follow_symlinks"],
+        "Follow directory links in search",
+        "搜索跟随目录链接",
+        &["search", "glob", "grep"],
+        ApplyPolicy::CapabilityReprepare,
+    ),
+    SettingSpec {
+        id: "tools.search.timeout_secs",
+        path: &["tools", "search", "timeout_secs"],
+        label_en: "Search time limit (seconds)",
+        label_zh: "搜索超时（秒）",
+        aliases: &["search", "glob", "grep"],
+        kind: SettingKind::Integer { min: 1, max: 300 },
+        apply: ApplyPolicy::CapabilityReprepare,
+    },
+    SettingSpec {
+        id: "tools.search.max_entries",
+        path: &["tools", "search", "max_entries"],
+        label_en: "Search entry limit",
+        label_zh: "搜索扫描数量上限",
+        aliases: &["search", "glob", "grep"],
+        kind: SettingKind::Integer {
+            min: 1,
+            max: 1000000,
+        },
+        apply: ApplyPolicy::CapabilityReprepare,
+    },
+    SettingSpec {
+        id: "tools.mcp.tool_search",
+        path: &["tools", "mcp", "tool_search"],
+        label_en: "MCP tool schema search",
+        label_zh: "MCP 工具 schema 按需加载",
+        aliases: &["lazy", "defer", "schema"],
+        kind: SettingKind::Choice(&["auto", "on", "off"]),
+        apply: ApplyPolicy::CapabilityReprepare,
+    },
     bool_setting(
         "tools.todo.enabled",
         &["tools", "todo", "enabled"],
@@ -230,15 +282,6 @@ pub static SETTINGS: &[SettingSpec] = &[
         apply: ApplyPolicy::CapabilityReprepare,
     },
     SettingSpec {
-        id: "ui.screen",
-        path: &["ui", "screen"],
-        label_en: "Screen",
-        label_zh: "界面",
-        aliases: &["tui", "classic", "rows", "界面", "屏幕"],
-        kind: SettingKind::Choice(SCREENS),
-        apply: ApplyPolicy::NextStartup,
-    },
-    SettingSpec {
         id: "ui.scrollbar",
         path: &["ui", "scrollbar"],
         label_en: "Conversation scrollbar",
@@ -278,6 +321,15 @@ pub static SETTINGS: &[SettingSpec] = &[
         aliases: &["dark", "light"],
         kind: SettingKind::Choice(THEMES),
         apply: ApplyPolicy::NextStartup,
+    },
+    SettingSpec {
+        id: "ui.keybindings.newline",
+        path: &["ui", "keybindings", "newline"],
+        label_en: "Keyboard shortcuts / Newline",
+        label_zh: "快捷键 / 换行",
+        aliases: &["keybindings", "newline", "shortcut", "换行", "快捷键"],
+        kind: SettingKind::Text,
+        apply: ApplyPolicy::ImmediateUi,
     },
     SettingSpec {
         id: "ui.mode_switch_key",
@@ -456,6 +508,12 @@ impl SettingSpec {
         match self.id {
             "auto_update" => config.auto_update.to_string(),
             "keep_interrupted_context" => config.keep_interrupted_context.to_string(),
+            "tools.search.respect_gitignore" => config.tools.search.respect_gitignore.to_string(),
+            "tools.search.include_hidden" => config.tools.search.include_hidden.to_string(),
+            "tools.search.follow_symlinks" => config.tools.search.follow_symlinks.to_string(),
+            "tools.search.timeout_secs" => config.tools.search.timeout_secs.to_string(),
+            "tools.search.max_entries" => config.tools.search.max_entries.to_string(),
+            "tools.mcp.tool_search" => format!("{:?}", config.tools.mcp.tool_search).to_lowercase(),
             "tools.todo.enabled" => config.tools.todo.enabled.to_string(),
             "tools.atomgit.enabled" => config.tools.atomgit.enabled.to_string(),
             "tools.todo.eager" => format!("{:?}", config.tools.todo.eager).to_lowercase(),
@@ -474,10 +532,16 @@ impl SettingSpec {
             "team.max_members" => config.team.max_members.to_string(),
             "subagent.codex" => config.subagent.codex.clone(),
             "subagent.claude" => config.subagent.claude.clone(),
-            "ui.screen" => format!("{:?}", config.ui.screen).to_lowercase(),
             "ui.scrollbar" => format!("{:?}", config.ui.scrollbar).to_lowercase(),
             "ui.mouse" => config.ui.mouse.to_string(),
             "ui.theme" => format!("{:?}", config.ui.theme).to_lowercase(),
+            "ui.keybindings.newline" => config
+                .ui
+                .keybindings
+                .newline
+                .as_ref()
+                .map(|keys| keys.join(", "))
+                .unwrap_or_else(|| "default".into()),
             "ui.mode_switch_key" => match config.ui.mode_switch_key {
                 crate::config::ModeSwitchKey::ShiftTab => "shift_tab",
                 crate::config::ModeSwitchKey::Tab => "tab",
@@ -516,6 +580,21 @@ impl SettingSpec {
     }
 
     pub fn patch(&self, document: &mut DocumentMut, input: &str) -> Result<()> {
+        if self.id == "ui.keybindings.newline" {
+            if input.trim() == "default" {
+                self.reset(document);
+            } else {
+                let mut keys = toml_edit::Array::new();
+                if !input.trim().is_empty() {
+                    for key in input.split(',').map(str::trim) {
+                        anyhow::ensure!(!key.is_empty(), "empty shortcut name");
+                        keys.push(key);
+                    }
+                }
+                set_path(document, self.path, value(keys));
+            }
+            return Ok(());
+        }
         // `history_replay_max_rows = 0` was the legacy way to disable the cap.
         // When the user explicitly enables the new switch, remove only that
         // legacy sentinel; positive custom caps remain untouched.
@@ -706,6 +785,28 @@ pub fn patch_selection_retry_max_attempts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_schema_search_is_editable_and_defaults_to_auto() {
+        let setting = SETTINGS
+            .iter()
+            .find(|s| s.id == "tools.mcp.tool_search")
+            .unwrap();
+        let mut document = "# keep\n".parse::<DocumentMut>().unwrap();
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(setting.value(&config), "auto");
+        for mode in ["on", "off", "auto"] {
+            setting.patch(&mut document, mode).unwrap();
+            let config: Config = toml::from_str(&document.to_string()).unwrap();
+            assert_eq!(setting.value(&config), mode);
+        }
+        assert!(setting.patch(&mut document, "invalid").is_err());
+        assert!(toml::from_str::<Config>("[tools.mcp]\ntool_search='invalid'").is_err());
+        assert!(!toml::to_string(&config).unwrap().contains("[tools.mcp]"));
+        setting.reset(&mut document);
+        assert!(!document.to_string().contains("tool_search"));
+        assert!(document.to_string().contains("# keep"));
+    }
 
     /// Provider config, model selection and credentials have their own deliberate UIs and must
     /// never be editable through this generic catalog.

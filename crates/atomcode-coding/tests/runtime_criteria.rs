@@ -597,7 +597,296 @@ fn env() -> Env {
     }
 }
 
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
+async fn extra_skill_roots_and_loaded_instruction_status_survive_a_live_reload() {
+    use atomcode_capabilities::instructions::InstructionState;
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let extra = env.project.path().join("extra-skills");
+    std::fs::create_dir_all(extra.join("migration-probe")).unwrap();
+    std::fs::write(
+        extra.join("migration-probe/SKILL.md"),
+        "---\nname: migration-probe\ndescription: migration probe\n---\nold skill",
+    )
+    .unwrap();
+    std::fs::create_dir_all(extra.join("broken")).unwrap();
+    std::fs::write(
+        extra.join("broken/SKILL.md"),
+        "---\nname: bad.name\n---\nprivate text",
+    )
+    .unwrap();
+    let old_path = env.project.path().join(".atomcode.md");
+    let new_path = env.project.path().join("AGENTS.md");
+    std::fs::write(&old_path, "ORIGINAL_INSTRUCTION_PROBE").unwrap();
+    std::fs::write(&new_path, "SHADOWED_INSTRUCTION_PROBE").unwrap();
+    let mut input = start(env.project.path(), &recorder, SessionMode::Fresh);
+    input.prepare.skill_dirs = None;
+    input.agent.extra_skill_dirs = vec!["extra-skills".into()];
+    let mut runtime = CodingRuntime::start(input).await.unwrap();
+    let initial = runtime.handle.context_stats_with(true).await.unwrap();
+    assert!(initial
+        .system_prompt
+        .as_ref()
+        .unwrap()
+        .contains("ORIGINAL_INSTRUCTION_PROBE"));
+    assert!(!initial
+        .system_prompt
+        .as_ref()
+        .unwrap()
+        .contains("SHADOWED_INSTRUCTION_PROBE"));
+    let assets = initial.assets.unwrap();
+    assert!(assets
+        .skills
+        .iter()
+        .any(|(name, _)| name == "migration-probe"));
+    assert!(assets
+        .skill_diagnostics
+        .iter()
+        .any(|d| d.warning && d.path.ends_with("broken/SKILL.md")));
+    assert!(assets
+        .instructions
+        .iter()
+        .any(|s| s.path == new_path && s.state == InstructionState::Shadowed));
+    let mut warnings = Vec::new();
+    while let Ok(event) = runtime.events.try_recv() {
+        if let CodingRuntimeEvent::ControllerWarning(warning) = event.event {
+            warnings.push(warning);
+        }
+    }
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("broken") && w.contains("invalid characters")),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("AGENTS.md") && w.contains("shadowed")),
+        "{warnings:?}"
+    );
+    assert!(!warnings.join("\n").contains("private text"));
+    std::fs::remove_file(&old_path).unwrap();
+    std::fs::write(&new_path, "UPDATED_INSTRUCTION_PROBE").unwrap();
+    std::fs::create_dir_all(extra.join("newly-added")).unwrap();
+    std::fs::write(extra.join("newly-added/SKILL.md"), "new skill").unwrap();
+    runtime.handle.reload_capabilities().await.unwrap();
+    let reloaded = runtime.handle.context_stats_with(true).await.unwrap();
+    let prompt = reloaded.system_prompt.unwrap();
+    assert!(prompt.contains("ORIGINAL_INSTRUCTION_PROBE"));
+    assert!(!prompt.contains("UPDATED_INSTRUCTION_PROBE"));
+    let assets = reloaded.assets.unwrap();
+    assert!(assets.skills.iter().any(|(name, _)| name == "newly-added"));
+    assert!(assets
+        .instructions
+        .iter()
+        .any(|s| s.path == old_path && s.state == InstructionState::Loaded && s.disk_changed));
+    runtime.handle.reload_capabilities().await.unwrap();
+    let _ = runtime.handle.context_stats().await.unwrap();
+    let mut warnings = Vec::new();
+    while let Ok(event) = runtime.events.try_recv() {
+        if let CodingRuntimeEvent::ControllerWarning(warning) = event.event {
+            warnings.push(warning);
+        }
+    }
+    assert!(
+        !warnings.iter().any(|w| w.contains("invalid characters")),
+        "unchanged failures repeat: {warnings:?}"
+    );
+    assert_eq!(
+        warnings
+            .iter()
+            .filter(|w| w.contains("Files on disk changed"))
+            .count(),
+        1,
+        "{warnings:?}"
+    );
+    // Full reprepare (as on resume/config reload) adopts the new instruction source.
+    runtime
+        .handle
+        .reload_capabilities_with_plugin_skills(Some(Vec::new()))
+        .await
+        .unwrap();
+    let refreshed = runtime.handle.context_stats_with(true).await.unwrap();
+    let prompt = refreshed.system_prompt.unwrap();
+    assert!(prompt.contains("UPDATED_INSTRUCTION_PROBE"));
+    assert!(!prompt.contains("ORIGINAL_INSTRUCTION_PROBE"));
+    assert!(!refreshed
+        .assets
+        .unwrap()
+        .instructions
+        .iter()
+        .any(|s| s.disk_changed));
+    runtime.handle.shutdown().await.unwrap();
+}
+
 // ---- scenarios -----------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
+async fn json_permissions_follow_sessions_and_directories_and_survive_a_model_patch() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let dirs = atomcode_coding::config::product_dirs_from_env();
+    let first_settings = dirs.project(env.project.path()).join("settings.local.json");
+    std::fs::create_dir_all(first_settings.parent().unwrap()).unwrap();
+    std::fs::write(&first_settings, r#"{"permissions":{"deny":["Read"]}}"#).unwrap();
+    let mut input = start(env.project.path(), &recorder, SessionMode::Fresh);
+    input.agent.permission_rules =
+        Arc::new(atomcode_capabilities::tools::PermissionRules::parse(&[], &["Grep".into()]).0);
+    let next_provider = input.agent.clone();
+    let mut runtime = CodingRuntime::start(input).await.unwrap();
+    let original_session = runtime.session.as_ref().unwrap().id.clone();
+    for text in ["first", "fresh", "resume", "provider"] {
+        match text {
+            "fresh" => {
+                runtime.handle.fresh_session().await.unwrap();
+            }
+            "resume" => {
+                runtime
+                    .handle
+                    .resume_session(original_session.clone())
+                    .await
+                    .unwrap();
+            }
+            "provider" => {
+                runtime
+                    .handle
+                    .reassemble_provider(next_provider.clone())
+                    .await
+                    .unwrap();
+            }
+            _ => {}
+        }
+        turn(&mut runtime, text).await;
+        let offered = recorder.tools.lock().unwrap().last().cloned().unwrap();
+        assert!(
+            !offered
+                .iter()
+                .any(|name| name == "read_file" || name == "grep"),
+            "{text}: {offered:?}"
+        );
+        assert!(offered.iter().any(|name| name == "write_file"));
+    }
+
+    // A /model patch keeps the existing tool tree, even after a file edit.
+    std::fs::write(&first_settings, r#"{"permissions":{"deny":["Write"]}}"#).unwrap();
+    runtime
+        .handle
+        .reassemble_provider(next_provider.clone())
+        .await
+        .unwrap();
+    turn(&mut runtime, "policy before rebuild").await;
+    let offered = recorder.tools.lock().unwrap().last().cloned().unwrap();
+    assert!(!offered.iter().any(|name| name == "read_file"));
+    assert!(offered.iter().any(|name| name == "write_file"));
+    // An explicit full config reprepare reloads the edited policy.
+    runtime
+        .handle
+        .reprepare_config(next_provider.clone())
+        .await
+        .unwrap();
+    turn(&mut runtime, "policy after rebuild").await;
+    let offered = recorder.tools.lock().unwrap().last().cloned().unwrap();
+    assert!(offered.iter().any(|name| name == "read_file"));
+    assert!(!offered
+        .iter()
+        .any(|name| name == "write_file" || name == "grep"));
+
+    turn(&mut runtime, "describe operations").await;
+    let said = last_tool_result(&recorder);
+    assert!(said.contains("PERMISSION SETTINGS"), "{said}");
+    assert!(
+        said.contains(&first_settings.display().to_string()),
+        "{said}"
+    );
+
+    let other = tempfile::tempdir().unwrap();
+    let settings = dirs.project(other.path()).join("settings.json");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(&settings, r#"{"permissions":{"deny":["Edit"]}}"#).unwrap();
+    runtime
+        .handle
+        .change_directory(other.path().to_path_buf())
+        .await
+        .unwrap();
+    turn(&mut runtime, "other project").await;
+    let offered = recorder.tools.lock().unwrap().last().cloned().unwrap();
+    assert!(
+        offered.iter().any(|name| name == "read_file"),
+        "old project deny must be gone: {offered:?}"
+    );
+    assert!(
+        offered.iter().any(|name| name == "write_file"),
+        "old project deny must be gone: {offered:?}"
+    );
+    assert!(
+        !offered
+            .iter()
+            .any(|name| name == "edit_file" || name == "grep"),
+        "new project deny and TOML baseline: {offered:?}"
+    );
+    turn(&mut runtime, "describe operations").await;
+    let said = last_tool_result(&recorder);
+    assert!(
+        // The rendered message shows the plain native path, while raw
+        // `canonicalize` on Windows answers with the `\\?\` verbatim prefix —
+        // strip it so the containment check compares like with like.
+        said.contains(
+            &atomcode_capabilities::pathnorm::canonicalize(settings.parent().unwrap())
+                .unwrap()
+                .display()
+                .to_string()
+        ),
+        "{said}"
+    );
+    assert!(
+        !said.contains(&first_settings.display().to_string()),
+        "stale permission source: {said}"
+    );
+
+    let broken = tempfile::tempdir().unwrap();
+    let broken_settings = dirs.project(broken.path()).join("settings.local.json");
+    std::fs::create_dir_all(broken_settings.parent().unwrap()).unwrap();
+    std::fs::write(&broken_settings, r#"{"permissions":{"deny":["Bash("]}}"#).unwrap();
+    let error = runtime
+        .handle
+        .change_directory(broken.path().to_path_buf())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("settings.local.json"), "{error}");
+    turn(&mut runtime, "still in other project").await;
+    assert_eq!(recorder.tools.lock().unwrap().last().unwrap(), &offered);
+    runtime.handle.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
+async fn invalid_json_permissions_fail_start_even_without_a_provider() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let dirs = atomcode_coding::config::product_dirs_from_env();
+    let settings = dirs.project(env.project.path()).join("settings.local.json");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(&settings, r#"{"permissions":{"deny":"WebSearch"}}"#).unwrap();
+    for bootstrap in [
+        atomcode_coding::ProviderBootstrap::Required,
+        atomcode_coding::ProviderBootstrap::Unavailable(
+            atomcode_coding::ProviderUnavailableReason::AuthenticationRequired,
+        ),
+    ] {
+        let result = CodingRuntime::start_with_bootstrap(
+            start(env.project.path(), &recorder, SessionMode::Fresh),
+            bootstrap,
+        )
+        .await;
+        match result {
+            Err(error) => assert!(error.to_string().contains("settings.local.json"), "{error}"),
+            Ok(_) => panic!("invalid permissions must fail start"),
+        }
+    }
+}
 
 /// The turn is in the native store by the time the driver hears it finished.
 ///
@@ -794,8 +1083,6 @@ async fn a_session_a_released_build_stored_is_converted_when_resumed() {
 /// A write to the session's log that fails stops the session: a log with a hole
 /// in it would replay into a conversation that never happened.
 async fn a_failed_write_to_the_log_stops_the_session() {
-    use std::os::unix::fs::PermissionsExt;
-
     let env = env();
     let recorder = Arc::new(Recorder::default());
     let mut runtime =
@@ -811,7 +1098,12 @@ async fn a_failed_write_to_the_log_stops_the_session() {
     )
     .events_path(&id)
     .unwrap();
-    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o444)).unwrap();
+    // Cross-platform spelling of "drop every write bit" (0o444 on Unix, the
+    // read-only attribute on Windows): the session-store fail-close must hold
+    // on both.
+    let mut perms = std::fs::metadata(&log).unwrap().permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&log, perms).unwrap();
 
     runtime.handle.submit(UserInput::from("two")).await.unwrap();
     let mut stopped = false;
@@ -829,7 +1121,9 @@ async fn a_failed_write_to_the_log_stops_the_session() {
             _ => {}
         }
     }
-    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let mut perms = std::fs::metadata(&log).unwrap().permissions();
+    perms.set_readonly(false);
+    std::fs::set_permissions(&log, perms).unwrap();
     assert!(
         stopped,
         "the runtime went on after its log could not be written"
@@ -1383,7 +1677,9 @@ async fn a_persons_hooks_and_a_plugins_hooks_both_run() {
             matcher: None,
             command: format!("touch {}", from_plugin.display()),
             timeout_ms: 5_000,
+            args: Vec::new(),
             plugin_root: None,
+            plugin_content_hash: None,
         },
     ]));
     let mut runtime = CodingRuntime::start(start).await.unwrap();
@@ -1409,6 +1705,10 @@ async fn a_persons_hooks_and_a_plugins_hooks_both_run() {
 ///
 /// Negative control: send a refused call through `post_tool` in `CcHooks` and
 /// the failure log gains a `grep` entry.
+///
+/// The hook script is POSIX shell (`$(cat)`, `case … esac`); hook commands run
+/// under `cmd /C` on Windows, so this scenario is Unix-only by construction.
+#[cfg(unix)]
 async fn the_failure_hook_hears_what_ran_by_name_and_not_what_was_refused() {
     let env = env();
     let project = env.project.path();
@@ -1707,6 +2007,101 @@ async fn a_goal_works_towards_the_condition_without_being_pushed() {
     );
 
     let _ = runtime.handle.stop_goal().await;
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// Project rules live in the mounted prompt registry, not the event snapshot.
+/// Editing the file after mount must not secretly give the evaluator different
+/// rules from the main agent's already assembled prompt.
+async fn a_goal_evaluator_uses_the_mounted_project_instructions() {
+    struct Provider(Arc<Mutex<Vec<String>>>);
+    #[async_trait::async_trait]
+    impl LlmProvider for Provider {
+        fn model_name(&self) -> &str {
+            "goal-context"
+        }
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            tools: &[ToolDef],
+            options: &ChatOptions,
+        ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+            let evaluation = messages
+                .first()
+                .is_some_and(|m| m.text.starts_with("You are a strict goal evaluator"));
+            if evaluation {
+                assert!(tools.is_empty());
+                assert_eq!(options.tool_choice, ToolChoice::None);
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(messages.last().unwrap().text.clone());
+            }
+            Ok(Box::pin(futures::stream::iter(vec![
+                StreamEvent::TextDelta(
+                    if evaluation {
+                        "Verdict: yes observed work complete"
+                    } else {
+                        "completed"
+                    }
+                    .into(),
+                ),
+                StreamEvent::Done { truncated: false },
+            ])))
+        }
+    }
+    struct Factory(Arc<Mutex<Vec<String>>>);
+    impl CodingProviderFactory for Factory {
+        fn build(
+            &self,
+            _: &CodingAgentConfig,
+            _: Option<&str>,
+        ) -> Result<Arc<dyn LlmProvider>, ProviderBuildError> {
+            Ok(Arc::new(Provider(self.0.clone())))
+        }
+    }
+    let env = env();
+    let input = Arc::new(Mutex::new(Vec::new()));
+    std::fs::write(
+        env.project.path().join("AGENTS.md"),
+        "RULES_FROM_MOUNTED_OWNER: work only in the project.",
+    )
+    .unwrap();
+    let recorder = Arc::new(Recorder::default());
+    let mut config = start(env.project.path(), &recorder, SessionMode::Fresh);
+    config.provider_factory = Arc::new(Factory(input.clone()));
+    let mut runtime = CodingRuntime::start(config).await.unwrap();
+    std::fs::write(env.project.path().join("AGENTS.md"), "CHANGED_AFTER_MOUNT").unwrap();
+    runtime
+        .handle
+        .start_goal("finish work while following AGENTS.md")
+        .await
+        .unwrap();
+    let mut met = false;
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while let Some(envelope) = runtime.events.recv().await {
+            let event = envelope.event;
+            if let CodingRuntimeEvent::GoalChanged(progress) = &event {
+                met |= progress.terminal == Some(atomcode_coding::GoalTerminal::Met);
+            }
+            if matches!(event, CodingRuntimeEvent::TurnFinished(_)) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(met);
+    let requests = input.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0].contains("RULES_FROM_MOUNTED_OWNER"),
+        "mounted rules omitted from evaluator request"
+    );
+    assert!(
+        !requests[0].contains("CHANGED_AFTER_MOUNT"),
+        "evaluator reread the file instead of using mounted rules"
+    );
     runtime.handle.shutdown().await.unwrap();
 }
 
@@ -2168,7 +2563,7 @@ async fn a_change_to_the_tools_is_told() {
         1,
         "{seen:#?}"
     );
-    assert_eq!(told(&seen, "reloaded plugins").len(), 1, "{seen:#?}");
+    assert_eq!(told(&seen, "reloaded skills").len(), 1, "{seen:#?}");
     assert!(
         told(&seen, "withdrew every MCP tool").is_empty(),
         "a reload was told as a withdrawal: {seen:#?}"
@@ -2291,7 +2686,11 @@ async fn a_round_budget_ends_the_turn() {
         Some(atomcode_kernel::event::StopReason::MaxRounds),
         ""
     );
-    assert_eq!(recorder.requests.lock().unwrap().len(), 1, "");
+    assert_eq!(
+        recorder.requests.lock().unwrap().len(),
+        2,
+        "work plus text-only closing"
+    );
     runtime.handle.shutdown().await.unwrap();
 }
 
@@ -2490,26 +2889,281 @@ async fn an_mcp_servers_tools_are_offered_and_run() {
     );
 }
 
+/// A local reconnect updates one catalog without replacing the session or its
+/// other MCP connections. Failure removes its old tools; retry restores them.
+async fn reconnecting_one_mcp_keeps_its_neighbor_and_session() {
+    let env = env();
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let a_spawns = a.path().join("spawns");
+    let b_spawns = b.path().join("spawns");
+    let script_a = write_mcp_server(a.path(), &a_spawns);
+    let script_b = write_mcp_server(b.path(), &b_spawns);
+    let recorder = Arc::new(Recorder::default());
+    let mut start = start_with_mcp_server(env.project.path(), &recorder, &script_a, true);
+    let mut neighbor = start.prepare.extra_mcp_servers[0].clone();
+    neighbor.name = "neighbor".into();
+    if let atomcode_capabilities::mcp::McpTransportConfig::Stdio { args, .. } = &mut neighbor.config
+    {
+        *args = vec![script_b.display().to_string()];
+    }
+    start.prepare.extra_mcp_servers.push(neighbor);
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+    runtime
+        .handle
+        .wait_mcp_ready(std::time::Duration::from_secs(10))
+        .await
+        .unwrap();
+    let session = runtime.session.as_ref().unwrap().id.clone();
+    turn(&mut runtime, "hello").await;
+    assert!(last_offered(&recorder).contains(&"mcp__t__echo".into()));
+    let original = std::fs::read_to_string(&script_a).unwrap();
+    let replacement = original.replace("\"name\":\"echo\"", "\"name\":\"fresh\"");
+    assert_ne!(original, replacement);
+    std::fs::write(&script_a, &replacement).unwrap();
+    runtime
+        .handle
+        .mcp_act("t".into(), atomcode_coding::parts::McpAction::Reconnect)
+        .await
+        .unwrap();
+    turn(&mut runtime, "hello after reconnect").await;
+    let offered = last_offered(&recorder);
+    assert!(offered.contains(&"mcp__t__fresh".into()), "{offered:?}");
+    assert!(!offered.contains(&"mcp__t__echo".into()), "{offered:?}");
+    assert!(
+        offered.contains(&"mcp__neighbor__echo".into()),
+        "{offered:?}"
+    );
+    assert_eq!(runtime.session.as_ref().unwrap().id, session);
+    assert_eq!(
+        std::fs::read_to_string(&b_spawns).unwrap().lines().count(),
+        1
+    );
+    std::fs::write(&script_a, "exit 1\n").unwrap();
+    assert!(runtime
+        .handle
+        .mcp_act("t".into(), atomcode_coding::parts::McpAction::Reconnect)
+        .await
+        .is_err());
+    turn(&mut runtime, "hello after failed reconnect").await;
+    let offered = last_offered(&recorder);
+    assert!(!offered.iter().any(|tool| tool.starts_with("mcp__t__")));
+    assert!(offered.contains(&"mcp__neighbor__echo".into()));
+    std::fs::write(&script_a, replacement).unwrap();
+    runtime
+        .handle
+        .mcp_act("t".into(), atomcode_coding::parts::McpAction::Reconnect)
+        .await
+        .unwrap();
+    turn(&mut runtime, "hello after retry").await;
+    assert!(last_offered(&recorder).contains(&"mcp__t__fresh".into()));
+    assert_eq!(
+        std::fs::read_to_string(&b_spawns).unwrap().lines().count(),
+        1
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
+// These use real clocks: readiness is signalled by an actual stdio child. The
+// one-second bounds verify the owner stays responsive while transport is stuck.
+async fn slow_mcp_reconnect_is_responsive(stage_tools: bool, shutdown: bool, scoped: bool) {
+    use atomcode_coding::parts::McpAction;
+    let env = env();
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let marker = a.path().join("blocked");
+    let script = write_mcp_server(a.path(), &a.path().join("spawns"));
+    let neighbor_script = write_mcp_server(b.path(), &b.path().join("spawns"));
+    let original = std::fs::read_to_string(&script).unwrap();
+    let recorder = Arc::new(Recorder::default());
+    let mut start = start_with_mcp_server(env.project.path(), &recorder, &script, true);
+    let mut neighbor = start.prepare.extra_mcp_servers[0].clone();
+    neighbor.name = "neighbor".into();
+    if let atomcode_capabilities::mcp::McpTransportConfig::Stdio { args, .. } = &mut neighbor.config
+    {
+        *args = vec![neighbor_script.display().to_string()];
+    }
+    start.prepare.extra_mcp_servers.push(neighbor);
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+    runtime
+        .handle
+        .wait_mcp_ready(std::time::Duration::from_secs(10))
+        .await
+        .unwrap();
+    let slow = if stage_tools {
+        let old = "    *'\"method\":\"tools/list\"'*)";
+        let new = format!(
+            "{old}\necho blocked > \"{}\"\nwhile IFS= read -r rest; do :; done\n",
+            marker.display()
+        );
+        let changed = original.replace(old, &new);
+        assert_ne!(changed, original);
+        changed
+    } else {
+        format!(
+            "IFS= read -r line\necho blocked > \"{}\"\nwhile IFS= read -r rest; do :; done\n",
+            marker.display()
+        )
+    };
+    std::fs::write(&script, slow).unwrap();
+    let handle = runtime.handle.clone();
+    let pending =
+        tokio::spawn(async move { handle.mcp_act("t".into(), McpAction::Reconnect).await });
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !marker.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("server entered slow phase");
+    let limit = std::time::Duration::from_secs(1);
+    assert_eq!(
+        runtime.handle.status().phase,
+        atomcode_coding::runtime::RuntimePhase::Reconfiguring
+    );
+    assert!(!runtime
+        .handle
+        .accepts(&atomcode_coding::DriverCommand::Submit("not now".into())));
+    assert!(runtime
+        .handle
+        .dispatch(atomcode_coding::DriverCommand::Submit(
+            "must not disappear".into()
+        ))
+        .is_err());
+    assert!(runtime
+        .handle
+        .accepts(&atomcode_coding::DriverCommand::Cancel));
+    tokio::time::timeout(limit, runtime.handle.mcp_status())
+        .await
+        .expect("status must remain responsive")
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(limit, runtime.handle.submit("not now".into()))
+            .await
+            .unwrap(),
+        Err(atomcode_coding::RuntimeError::Busy)
+    );
+    assert_eq!(
+        tokio::time::timeout(limit, runtime.handle.fresh_session())
+            .await
+            .unwrap()
+            .unwrap_err(),
+        atomcode_coding::RuntimeError::Busy
+    );
+    if shutdown {
+        tokio::time::timeout(limit, runtime.handle.shutdown())
+            .await
+            .expect("shutdown must interrupt reconnect")
+            .unwrap();
+    } else {
+        if scoped {
+            // A different server's cancel must not touch the pending operation.
+            runtime
+                .handle
+                .mcp_act("neighbor".into(), McpAction::CancelReconnect)
+                .await
+                .unwrap();
+            assert!(!pending.is_finished());
+            tokio::time::timeout(
+                limit,
+                runtime
+                    .handle
+                    .mcp_act("t".into(), McpAction::CancelReconnect),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        } else {
+            tokio::time::timeout(limit, runtime.handle.cancel())
+                .await
+                .expect("cancel must interrupt reconnect")
+                .unwrap();
+        }
+        let status = runtime.handle.mcp_status().await.unwrap();
+        assert!(status.servers.iter().any(|(name, state)| name == "t" && matches!(state, atomcode_capabilities::mcp::ServerStatus::Failed(error) if error.contains("cancelled"))));
+        assert!(status.servers.iter().any(|(name, state)| name == "neighbor"
+            && matches!(state, atomcode_capabilities::mcp::ServerStatus::Connected)));
+        assert_eq!(
+            std::fs::read_to_string(b.path().join("spawns"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        turn(&mut runtime, "hello after cancelled reconnect").await;
+        let offered = last_offered(&recorder);
+        assert!(!offered.iter().any(|name| name.starts_with("mcp__t__")));
+        assert!(offered.contains(&"mcp__neighbor__echo".into()));
+        std::fs::write(&script, original).unwrap();
+        runtime
+            .handle
+            .mcp_act("t".into(), McpAction::Reconnect)
+            .await
+            .unwrap();
+        // A late scoped cancel after completion must not cancel a new user turn.
+        runtime
+            .handle
+            .mcp_act("t".into(), McpAction::CancelReconnect)
+            .await
+            .unwrap();
+        turn(&mut runtime, "hello after retry").await;
+        assert!(last_offered(&recorder).contains(&"mcp__t__echo".into()));
+        runtime.handle.shutdown().await.unwrap();
+    }
+    assert_eq!(
+        pending.await.unwrap(),
+        Err(atomcode_coding::RuntimeError::Cancelled)
+    );
+}
+async fn a_slow_mcp_initialize_can_be_cancelled_without_blocking_queries() {
+    slow_mcp_reconnect_is_responsive(false, false, false).await;
+}
+async fn a_slow_mcp_tool_discovery_can_be_cancelled_from_its_panel() {
+    slow_mcp_reconnect_is_responsive(true, false, true).await;
+}
+async fn shutdown_interrupts_a_slow_mcp_reconnect() {
+    slow_mcp_reconnect_is_responsive(false, true, false).await;
+}
+
 /// The retry budget follows the model, because it is the model's provider that
 /// declared it.
 ///
-/// `retry_max_attempts` is per-provider (`ProviderConfig`), and the coupling the
-/// chain applies is that an explicit per-model budget switches the outer tier
-/// OFF — one attempt, no kernel retries. `/model` moves the conversation to a
-/// provider that may have said something else, or nothing at all, and both
-/// tiers have to move with it. Only one of them did: `llm-rate-limit` is
-/// re-patched on a swap, `llm-retry` was not, so a session that started on a
-/// provider with `retry_max_attempts = 0` kept "one attempt" on every model it
-/// switched to afterwards — while the same model, started fresh, retried three
-/// times. Same state, different behaviour, depending on how you got there.
+/// `retry_max_attempts` is per-provider (`ProviderConfig`); native recovery now
+/// shares it across all retries. `/model` must replace that allowance rather
+/// than carrying the old provider's single-attempt policy forward.
 ///
 /// Negative control: drop the `llm-retry` patch from `model_rows` and the second
-/// provider gets one attempt instead of the default three.
+/// provider gets one attempt instead of the default six.
 ///
-/// Costs ~8s of real time: the second turn burns the default budget and the
-/// backoff between attempts is not mocked. Worth it — the thing being measured
-/// is how many times a failing provider is actually called.
+/// Runs with a virtual clock: the observable is the number of real provider
+/// invocations, including restored defaults after a model switch.
 async fn the_retry_budget_follows_a_model_switch() {
+    // Default retry backoff can now exceed the shared helper's 10-second
+    // event gap. Bound the complete six-attempt schedule (75 seconds), using
+    // virtual time, instead of timing out a valid wait between notices.
+    async fn failed_turn(runtime: &mut CodingRuntime) {
+        runtime
+            .handle
+            .submit(UserInput::from("fail every time"))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            loop {
+                let event = runtime
+                    .events
+                    .recv()
+                    .await
+                    .expect("runtime event stream closed");
+                match event.event {
+                    CodingRuntimeEvent::TurnFinished(_) => return,
+                    CodingRuntimeEvent::Request(_) => panic!("unexpected question"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("retry schedule did not terminate");
+    }
     let env = env();
     let recorder = Arc::new(Recorder::default());
     let mut start = start(env.project.path(), &recorder, SessionMode::Fresh);
@@ -2522,18 +3176,42 @@ async fn the_retry_budget_follows_a_model_switch() {
     next.retry_max_attempts = None;
     let mut runtime = CodingRuntime::start(start).await.unwrap();
 
-    turn(&mut runtime, "fail every time").await;
+    failed_turn(&mut runtime).await;
     let on_first = recorder.requests.lock().unwrap().len();
     assert_eq!(on_first, 1, "a provider that forbade retries was retried");
 
     recorder.requests.lock().unwrap().clear();
-    runtime.handle.reassemble_provider(next).await.unwrap();
-    turn(&mut runtime, "fail every time").await;
+    runtime
+        .handle
+        .reassemble_provider(next.clone())
+        .await
+        .unwrap();
+    failed_turn(&mut runtime).await;
     let on_second = recorder.requests.lock().unwrap().len();
     assert_eq!(
-        on_second, 3,
+        on_second, 6,
         "after /model the new provider still carries the old one's retry budget"
     );
+    // Provider totals are no longer implemented as "outer retries off";
+    // they must become the actual shared count, with upstream overrides first.
+    for (model, provider_total, upstream_retries, expected) in [
+        ("recorder-three", Some(2), None, 2),
+        ("recorder-four", Some(1), Some(2), 3),
+        ("recorder-five", None, Some(0), 1),
+    ] {
+        recorder.requests.lock().unwrap().clear();
+        let mut selected = next.clone();
+        selected.model = model.into();
+        selected.retry_max_attempts = provider_total;
+        selected.upstream_retry_max_attempts = upstream_retries;
+        runtime.handle.reassemble_provider(selected).await.unwrap();
+        failed_turn(&mut runtime).await;
+        assert_eq!(
+            recorder.requests.lock().unwrap().len(),
+            expected,
+            "{model} did not apply the shared retry policy"
+        );
+    }
     runtime.handle.shutdown().await.unwrap();
 }
 
@@ -3998,7 +4676,7 @@ async fn a_turn_ending_on_its_last_allowed_round_is_not_cut_off() {
 }
 
 /// With the checkpoint on, a turn at its round budget asks before it is cut off:
-/// going on buys another budget, stopping ends it at the cap.
+/// going on buys another budget, stopping allows only a text-only closing request.
 async fn the_round_budget_asks_before_it_cuts_a_turn_off() {
     let env = env();
     std::fs::write(env.project.path().join("marker.txt"), "marked\n").unwrap();
@@ -4042,8 +4720,8 @@ async fn the_round_budget_asks_before_it_cuts_a_turn_off() {
     );
     assert_eq!(
         recorder.requests.lock().unwrap().len(),
-        before + 1,
-        "a round ran past a stop"
+        before + 2,
+        "one work round and one text-only closing request"
     );
     runtime.handle.shutdown().await.unwrap();
 }
@@ -4134,6 +4812,7 @@ async fn a_silent_stream_times_the_turn_out() {
     let recorder = Arc::new(Recorder::default());
     let mut config = start(env.project.path(), &recorder, SessionMode::Fresh);
     config.agent.stream_timeout = std::time::Duration::from_millis(100);
+    config.agent.first_token_timeout = std::time::Duration::from_millis(50);
     // No provider-level retries, so what is measured is the liveness bound.
     config.agent.retry_max_attempts = Some(0);
     let mut runtime = CodingRuntime::start(config).await.unwrap();
@@ -4825,7 +5504,24 @@ async fn past_most_of_the_window_older_turns_are_summarized_and_the_summary_kept
         "the second summary did not start from the first"
     );
     let seen = recorder.last_turn_request();
-    let asked = user_texts(&seen);
+    let retained = seen
+        .iter()
+        .find(|m| m.role == Role::User && m.display_text().starts_with("prompt 0 "))
+        .expect("the first request is retained as historical context");
+    assert_eq!(
+        retained.internal_origin.as_deref(),
+        Some(atomcode_kernel::message::COMPACTION_RETAINED_MODEL_ORIGIN)
+    );
+    assert_ne!(
+        retained.text,
+        retained.display_text(),
+        "the model must not see a fresh instruction"
+    );
+    let asked: Vec<_> = seen
+        .iter()
+        .filter(|m| m.role == Role::User)
+        .map(|m| m.display_text())
+        .collect();
     assert!(
         asked[0].starts_with("prompt 0 "),
         "the first request is gone"
@@ -4836,7 +5532,13 @@ async fn past_most_of_the_window_older_turns_are_summarized_and_the_summary_kept
             .any(|t| t.starts_with("prompt 1 ") || t.starts_with("prompt 2 ")),
         "the older turns are still there"
     );
-    assert!(asked.last().unwrap().starts_with("prompt 5 "));
+    assert!(
+        seen.iter()
+            .rev()
+            .find(|m| m.role == Role::User && !m.synthetic && m.internal_origin.is_none())
+            .is_some_and(|m| m.display_text().starts_with("prompt 5 ")),
+        "the newest real user request is gone"
+    );
     assert_eq!(
         seen.iter()
             .filter(|m| m
@@ -5744,8 +6446,9 @@ async fn what_the_configuration_lost_is_said_when_the_runtime_starts() {
 /// environment (`ATOMCODE_HOME`, the offline verdict), which is also why each is
 /// its own process under `cargo nextest`.
 macro_rules! criteria {
-    ($($scenario:ident),* $(,)?) => {
+    ($($(#[$gate:meta])* $scenario:ident),* $(,)?) => {
         $(
+            $(#[$gate])*
             #[tokio::test]
             #[serial_test::serial(engine)]
             async fn $scenario() {
@@ -5756,6 +6459,23 @@ macro_rules! criteria {
 }
 
 mod criteria {
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[serial_test::serial(engine)]
+    async fn the_retry_budget_follows_a_model_switch() {
+        super::the_retry_budget_follows_a_model_switch().await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[serial_test::serial(engine)]
+    async fn a_goal_evaluator_uses_the_mounted_project_instructions() {
+        super::a_goal_evaluator_uses_the_mounted_project_instructions().await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[serial_test::serial(engine)]
+    async fn a_silent_stream_times_the_turn_out() {
+        super::a_silent_stream_times_the_turn_out().await;
+    }
     criteria!(
         the_turn_is_stored_before_it_is_reported_finished,
         a_resumed_session_continues_the_stored_conversation,
@@ -5776,6 +6496,7 @@ mod criteria {
         the_session_context_is_shown_and_its_git_snapshot_survives_a_resume,
         a_turn_is_transcribed_and_metered,
         a_persons_hooks_and_a_plugins_hooks_both_run,
+        #[cfg(unix)]
         the_failure_hook_hears_what_ran_by_name_and_not_what_was_refused,
         a_stop_hook_is_pointed_at_the_sessions_log,
         the_datalog_is_written_when_it_is_on,
@@ -5797,13 +6518,23 @@ mod criteria {
         the_ui_language_does_not_reach_the_persona,
         a_permission_rule_refuses_what_it_denies,
         a_round_budget_ends_the_turn,
+        #[cfg(unix)]
         what_the_model_is_told_about_mcp_only_names_ways_this_build_has,
         an_mcp_servers_tools_are_offered_and_run,
+        reconnecting_one_mcp_keeps_its_neighbor_and_session,
+        a_slow_mcp_initialize_can_be_cancelled_without_blocking_queries,
+        a_slow_mcp_tool_discovery_can_be_cancelled_from_its_panel,
+        shutdown_interrupts_a_slow_mcp_reconnect,
         withdrawing_mcp_takes_the_tools_off_the_model,
+        #[cfg(unix)]
         a_servers_instructions_are_in_the_system_prompt,
+        #[cfg(unix)]
         a_switched_session_keeps_the_mcp_tools,
+        #[cfg(unix)]
         always_allowing_an_mcp_tool_holds_for_the_session_and_is_written,
+        #[cfg(unix)]
         an_undo_or_a_restore_keeps_the_mcp_tools,
+        #[cfg(unix)]
         a_failed_mcp_connection_is_metered,
         a_model_round_reports_how_long_it_took,
         every_metered_event_says_which_turn_and_round_it_was,
@@ -5812,7 +6543,6 @@ mod criteria {
         an_update_after_a_compaction_is_what_the_next_round_sees,
         a_compacted_plan_still_asks_to_close_out_what_is_open,
         a_compacted_plan_is_not_planned_again,
-        the_retry_budget_follows_a_model_switch,
         a_meaningless_temperature_is_ignored_rather_than_breaking_a_model_switch,
         a_cancelled_turn_is_undone_by_default,
         a_cancelled_turn_is_kept_when_asked,
@@ -5830,7 +6560,6 @@ mod criteria {
         the_round_budget_asks_before_it_cuts_a_turn_off,
         a_turn_left_cut_off_says_so,
         a_cut_off_turn_asks_before_giving_up,
-        a_silent_stream_times_the_turn_out,
         a_requested_compaction_is_summarized_by_the_model_about_the_focus,
         under_pressure_old_tool_output_is_folded_in_place_and_the_words_kept,
         past_most_of_the_window_older_turns_are_summarized_and_the_summary_kept_up,
@@ -5840,6 +6569,7 @@ mod criteria {
         a_picture_read_reaches_a_model_that_can_see_it,
         every_model_round_is_reported_even_without_usage,
         the_agent_is_told_where_its_session_really_is,
+        #[cfg(unix)]
         a_capability_the_runtime_mounts_itself_still_describes_itself,
         a_runtime_configured_from_a_file_describes_the_file,
         a_runtime_under_another_name_keeps_to_its_own_dirs,
@@ -5850,4 +6580,97 @@ mod criteria {
         a_skipped_role_file_is_not_said_again_when_the_session_is_resumed,
         what_the_configuration_lost_is_said_when_the_runtime_starts,
     );
+}
+
+/// Sharing can initialize while the provider is still running; the strong
+/// snapshot API continues to wait for a complete turn.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_live_view_is_available_before_the_running_turn_finishes() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+            .await
+            .unwrap();
+    turn(&mut runtime, "history").await;
+    recorder.answer_delay_ms.store(60_000, Ordering::SeqCst);
+    runtime
+        .handle
+        .submit(UserInput::from("slow turn"))
+        .await
+        .unwrap();
+    loop {
+        let event = runtime.events.recv().await.unwrap();
+        if matches!(
+            event.event,
+            CodingRuntimeEvent::Agent(atomcode_kernel::event::AgentEvent::TurnStarted { .. })
+        ) {
+            break;
+        }
+    }
+    let view = runtime.handle.live_view().unwrap();
+    assert!(view
+        .snapshot
+        .messages
+        .iter()
+        .any(|message| message.text == "history"));
+    assert!(view.events.iter().any(|event| matches!(
+        event.event,
+        CodingRuntimeEvent::Agent(atomcode_kernel::event::AgentEvent::TurnStarted { .. })
+    )));
+    assert!(tokio::time::timeout(
+        std::time::Duration::from_millis(10),
+        runtime.handle.snapshot()
+    )
+    .await
+    .is_err());
+    let generation = runtime
+        .handle
+        .reassemble_provider(start(env.project.path(), &recorder, SessionMode::Fresh).agent)
+        .await
+        .unwrap();
+    loop {
+        if matches!(
+            runtime.events.recv().await.unwrap().event,
+            CodingRuntimeEvent::ProviderChanged { .. }
+        ) {
+            break;
+        }
+    }
+    let view = runtime.handle.live_view().unwrap();
+    assert_eq!(view.generation, generation.0);
+    assert!(view
+        .events
+        .iter()
+        .all(|event| event.generation == generation.0));
+    assert!(view.events.iter().any(|event| matches!(
+        event.event,
+        CodingRuntimeEvent::Agent(atomcode_kernel::event::AgentEvent::TurnStarted { .. })
+    )));
+    assert!(!format!("{:?}", runtime.handle).contains("slow turn"));
+    runtime.handle.cancel().await.unwrap();
+    loop {
+        if matches!(
+            runtime.events.recv().await.unwrap().event,
+            CodingRuntimeEvent::TurnFinished(_)
+        ) {
+            break;
+        }
+    }
+    let view = runtime.handle.live_view().unwrap();
+    assert!(!view.events.iter().any(|event| matches!(
+        event.event,
+        CodingRuntimeEvent::Agent(atomcode_kernel::event::AgentEvent::TurnStarted { .. })
+    )));
+    let changed = runtime.handle.fresh_session().await.unwrap();
+    loop {
+        let event = runtime.events.recv().await.unwrap();
+        if matches!(event.event, CodingRuntimeEvent::SessionChanged(_)) {
+            break;
+        }
+    }
+    let view = runtime.handle.live_view().unwrap();
+    assert_eq!(Some(view.session_id), changed.session_id);
+    assert!(view.snapshot.messages.is_empty());
+    runtime.handle.shutdown().await.unwrap();
 }

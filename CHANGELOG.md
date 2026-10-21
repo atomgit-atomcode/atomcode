@@ -17,10 +17,64 @@
   所以把最想让人知道的写在前面，并给它一个加粗的短标题：
   `- **网页端按服务商管理模型**：……`
 - 这份文件编译进二进制；改完要重新构建才看得到。
-- Issues 段可以直接从 AtomGit 里程碑整理：只列已关闭的 issue，按编号排序，标题照原文。
+- Issues 段可以直接从 AtomGit 里程碑整理：正式发布默认只列已关闭的 issue；待发布版本经确认可包含标记 fixed 的未关闭条目，并注明收录范围。按编号排序，标题照原文。
 - 英文版在 `CHANGELOG.en.md`，按同样的版本号逐节对应（小标题用 Overview / Changes）；
   英文界面读它，某个版本没有英文节时显示这里的中文节。Issues 只写在这份里，英文界面也显示这里的。
 -->
+
+## v5.2.4 (2026-10-21)
+
+### 概览
+
+这一版重点增强长任务的持续执行与恢复能力，支持运行中切换会话并在后台继续工作；大型 MCP 工具按需加载，减少上下文占用。新增只读 IDE 语言服务通道、手机访问 WebUI 和自定义 Provider 请求头，并改善终端输入、长内容阅读、配置同步及插件权限边界。
+
+### 更新内容
+
+- **长任务恢复与目标验证**：改进 `/goal` 的中断恢复与暂停检查点，保留已完成工作、验证证据和待回答问题；区分执行、恢复、验证与完成状态，累计展示跨回合耗时和 token 用量，避免把验证中的回复误报为任务完成。
+- **运行中切换会话**：在终端切换历史会话时，可将正在执行的会话留在后台继续工作，不必等待长任务结束；修复切换过程中的实时状态与排队输入一致性。
+- **MCP 工具按需加载**：大型 MCP 工具 schema 支持通过 `mcp_search` 搜索后按需加载，减少每轮全量发送的上下文开销；支持从详情面板重连单个 MCP 服务，重连可取消且不阻塞运行时响应，并修复 MCP 回复的请求关联。
+- **IDE 语言服务桥接**：新增只读 IDE 语言服务通道，可利用编辑器已有的类型、定义、引用和诊断能力；支持发现 IDE 窗口并查看桥接连接状态，未连接 IDE 时仍可使用原有文件与代码检索工具。
+- **手机访问 WebUI**：支持通过中继从手机访问 WebUI，局域网访问可在终端展示二维码；同步修正远程访问指引。
+- **Provider 接入扩展**：账号支持自定义 HTTP 请求头；新增可选的 DeepSeek Messages 协议。WebUI 保存模型设置后同步更新 live 会话，思考强度接受模型声明支持的档位，包括 `xhigh`。
+- **流式响应更可靠**：移除持续有进展响应的默认总时长限制，避免长推理在 600 秒处被截断；统一首内容超时处理，改进断流后的有界续接与错误诊断，恢复耗尽时明确保留失败状态。
+- **执行轮数遵循配置**：主任务与委派任务正确处理无限轮数设置；显式设置预算时，在耗尽后汇总已有进度，避免复杂任务因隐含轮数上限提前停止。
+- **终端输入与阅读**：支持自定义换行快捷键，恢复反斜杠加 Enter 换行并增加菜单入口；改善 Shift+Backspace、重复按键和 Emacs 编辑行为，避免 Ctrl+D 误伤草稿。新增终端阅读器与视口翻页，手动导航时停止边缘自动滚动。
+- **代码与任务展示**：长代码行换行显示，不再截断命令；代码块使用背景分组，复制时不再带装饰竖线，语言标签更醒目。Todo 默认折叠并支持展开滚动，团队面板展开、收起及空状态均有明确反馈；恢复生成速度显示并改进缓存复用统计。
+- **会话与上下文一致性**：配置重载保留会话的真实存储绑定，避免目录变化后的租约不匹配；压缩保留的历史消息与摘要标明来源，避免被误读为新指令；统一跨平台文件与历史引用，增加本地跨会话消息能力。
+- **WebUI 交互修复**：重新打开技能菜单时刷新列表；修复切换目录弹窗中创建按钮被最近项目遮挡的问题；在终端回答的共享问题同步从网页解除等待。
+- **技能预授权与静态权限**：支持用户和项目级 JSON 工具 allow/deny 策略，以及技能 `allowed-tools` 的当前回合预授权；未列出的工具仍按常规审批处理，显式 deny 与敏感操作安全边界继续生效。
+- **插件与平台兼容**：插件 hook 校验脚本入口，信任与插件包内容绑定，支持经校验的脚本包装器；改善 Windows 剪贴板串行访问、MobaXterm 显示和不支持的管道输入提示；修复非 root 用户残留 sudo 环境导致的主目录误判，安装回退版本从发布清单解析。
+- **命令边界与启动体验**：统一使用当前终端界面，移除旧 `--classic` 参数及 `ui.screen` 选择项；明确 `/worktree done` 只返回主检出、不自动合并。减少重复 Git 探测，自动升级准备不再阻塞终端启动，AtomGit 仓库查询与 Git 凭据失败提示更明确。
+
+### Issues
+
+本节收录 [v5.2.4 里程碑](https://atomgit.com/atomgit_atomcode/atomcode/milestones/890796?iid=47)中已关闭或标记 `fixed` 的 issue；`fixed` 不代表已关闭或已完成发布验收。
+
+- [#1264 install scripts fallback DEFAULT_VERSION still pinned to v5.0.2 (current release is v5.0.3)](https://atomgit.com/atomgit_atomcode/atomcode/issues/1264)
+- [#1274 [security] hook/skill `sh -c` execution lacks source whitelist — command injection surface](https://atomgit.com/atomgit_atomcode/atomcode/issues/1274)
+- [#1332 [permissions] 支持静态工具 allow/deny 配置（settings.local.json），让插件 hook 命令能预批准](https://atomgit.com/atomgit_atomcode/atomcode/issues/1332)
+- [#1333 [skill] frontmatter 支持 allowed-tools 字段，让 skill 能声明自己的工具白名单](https://atomgit.com/atomgit_atomcode/atomcode/issues/1333)
+- [#1365 [feature] 终端对话输入框支持 Ctrl+Z 撤销粘贴/输入（可选 Ctrl+Y 重做）](https://atomgit.com/atomgit_atomcode/atomcode/issues/1365)
+- [#1397 [共创大赛]-[Feature] 建议增加针对单个mcp server 的重连操作](https://atomgit.com/atomgit_atomcode/atomcode/issues/1397)
+- [#1632 [共创大赛][Bug] atomcode 无法正常授权](https://atomgit.com/atomgit_atomcode/atomcode/issues/1632)
+- [#1651 ghostty 终端下回复代码或命令等片段会带竖线导致，导致复制会复制上该竖线，之前版本没有该问题](https://atomgit.com/atomgit_atomcode/atomcode/issues/1651)
+- [#1652 [Bug] 模型流式响应在恰好 10 分钟（600s）处被切断（dropped_before_terminal），长任务频繁"异常中断"](https://atomgit.com/atomgit_atomcode/atomcode/issues/1652)
+- [#1653 【BUG】WebUI 设置页修改服务商 ID 后，聊天区模型标签仍显示旧 ID（live 会话未随配置重建）](https://atomgit.com/atomgit_atomcode/atomcode/issues/1653)
+- [#1656 [Feature] 支持自定义 TUI 快捷键配置（换行键可重映射，如 Alt+J）](https://atomgit.com/atomgit_atomcode/atomcode/issues/1656)
+- [#1657 复杂任务自动停止](https://atomgit.com/atomgit_atomcode/atomcode/issues/1657)
+- [#1659 TUI 长输出缺少翻页/滚动手段，长内容阅读困难](https://atomgit.com/atomgit_atomcode/atomcode/issues/1659)
+- [#1660 [Bug] WebUI 切换工作目录弹窗：最近项目区块遮挡「创建」按钮且无法滚动，需手动删除最近项目条目才能操作](https://atomgit.com/atomgit_atomcode/atomcode/issues/1660)
+- [#1661 [Bug] 配置重载失败 "session lease belongs to ..., expected ..."：runtime 重配置仅按 session ID 复用旧租约，项目 bucket 变化后必报 LeaseMismatch](https://atomgit.com/atomgit_atomcode/atomcode/issues/1661)
+- [#1663 /worktree done 未按文档把 worktree 改动 squash 回主分支（仅切回主检出）](https://atomgit.com/atomgit_atomcode/atomcode/issues/1663)
+- [#1664 【功能请求】MCP 工具 schema 延迟加载 / tool search，避免大型 MCP server 撑爆上下文](https://atomgit.com/atomgit_atomcode/atomcode/issues/1664)
+- [#1665 /team：回执、折叠、重开已修复（d925a3ea0），仅剩 status / clear 是否补待定](https://atomgit.com/atomgit_atomcode/atomcode/issues/1665)
+- [#1670 [BUG] Provider 配置缺少自定义 HTTP 请求头支持](https://atomgit.com/atomgit_atomcode/atomcode/issues/1670)
+- [#1671 [Feature] 内置 IDE 语言服务通道：悬停类型 / 转到定义 / 语义引用 / 诊断 / 代码操作（让有 IDE 的场景不再退化为 grep + 读文件）](https://atomgit.com/atomgit_atomcode/atomcode/issues/1671)
+- [#1672 Feature request: 回合运行中支持切换会话 / 多会话并行运行](https://atomgit.com/atomgit_atomcode/atomcode/issues/1672)
+- [#1673 [Bug][WebUI] 技能列表缓存不刷新，思考强度 xhigh 被后端拒绝](https://atomgit.com/atomgit_atomcode/atomcode/issues/1673)
+- [#1674 [Feature][AtomGit] 仓库工具支持查找公开仓库，或明确提示个人仓库列表为空](https://atomgit.com/atomgit_atomcode/atomcode/issues/1674)
+- [#1675 [Feature][WebUI] 压缩锚点消息与压缩摘要缺来源标注，易被模型误读为新指令、被用户误认为消息乱入](https://atomgit.com/atomgit_atomcode/atomcode/issues/1675)
+- [#1676 【Windows】大上下文请求流式输出中途停滞（stream idle timeout），自动续接未能挽救，附 9 条客户端日志证据](https://atomgit.com/atomgit_atomcode/atomcode/issues/1676)
 
 ## v5.2.3 (2026-10-13)
 

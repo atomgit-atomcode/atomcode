@@ -12,6 +12,8 @@ import {
   reduceChatRecovery,
   reduceLiveLifecycle,
   resolveUserInputRequest,
+  completeUserInputRequest,
+  retainContinuedUserInput,
   restoreLiveSnapshot,
   sessionHeldElsewhere,
   syncAttachDisposition,
@@ -229,4 +231,23 @@ test('a session another atomcode holds is told apart from other failures', () =>
   );
   assert.equal(sessionHeldElsewhere('HTTP 500'), false);
   assert.equal(sessionHeldElsewhere(undefined), false);
+});
+
+test('late HTTP completion preserves replacement prompts even when native ids repeat', () => {
+  const submitted = { request_id: 42 };
+  const replacement = { request_id: 42 };
+  const next = { request_id: 43 };
+  assert.equal(completeUserInputRequest(submitted, submitted), null);
+  assert.equal(completeUserInputRequest(replacement, submitted), replacement);
+  assert.equal(completeUserInputRequest(next, submitted), next);
+  assert.equal(completeUserInputRequest(null, submitted), null);
+});
+
+test('only a continued live question survives normal idle', () => {
+  const pending = { request_id: 900, goal_question_pending: true, response_transport: 'live' };
+  assert.equal(retainContinuedUserInput(pending, true), pending);
+  assert.equal(retainContinuedUserInput(pending, false), null);
+  assert.equal(retainContinuedUserInput({ ...pending, goal_question_pending: false }, true), null);
+  assert.equal(retainContinuedUserInput({ ...pending, response_transport: 'chat' }, true), null);
+  assert.equal(retainContinuedUserInput(null, true), null);
 });

@@ -805,6 +805,7 @@ mod tests {
     // ── Store-effect test (uses shared isolated ATOMCODE_HOME from #[ctor]) ───
 
     #[test]
+    #[serial_test::serial(atomcode_home)]
     fn add_builds_daily_task_and_persists() {
         with_temp_home(|| {
             let t = build_task(
@@ -897,6 +898,11 @@ mod tests {
     /// normal unwind), preventing subsequent store tests from silently seeing a
     /// dangling path.
     fn with_temp_home<T, F: FnOnce() -> T>(f: F) -> T {
+        // The helper mutates the process-global ATOMCODE_HOME, so the exclusion cannot
+        // live here: it belongs to every test that reaches this helper (they carry the
+        // shared `serial_test::serial(atomcode_home)` key) and to the other drivers that
+        // point ATOMCODE_HOME at their own tempdir (acp replay, tui_login, uninstall).
+        // `store_lock` alone only serializes this module.
         struct EnvGuard {
             prev: Option<std::ffi::OsString>,
         }
@@ -925,6 +931,7 @@ mod tests {
     // ── OS-integration tests ──────────────────────────────────────────────────
 
     #[test]
+    #[serial_test::serial(atomcode_home)]
     fn add_registers_via_os_scheduler() {
         with_temp_home(|| {
             let fake = FakeScheduler::default();
@@ -937,6 +944,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(atomcode_home)]
     fn remove_unregisters_via_os_scheduler() {
         with_temp_home(|| {
             let fake = FakeScheduler::default();
@@ -950,6 +958,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(atomcode_home)]
     fn disable_unregisters_via_os_scheduler() {
         with_temp_home(|| {
             let fake = FakeScheduler::default();
@@ -964,6 +973,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(atomcode_home)]
     fn enable_registers_via_os_scheduler() {
         with_temp_home(|| {
             let fake = FakeScheduler::default();
@@ -978,6 +988,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(atomcode_home)]
     fn sync_installs_enabled_and_uninstalls_disabled() {
         with_temp_home(|| {
             let fake = FakeScheduler::default();
@@ -998,6 +1009,7 @@ mod tests {
     // E: sync must return non-zero error count (and caller maps it to exit code 1)
     // when any install/uninstall fails.
     #[test]
+    #[serial_test::serial(atomcode_home)]
     fn sync_returns_nonzero_errors_on_failure() {
         with_temp_home(|| {
             // A FakeScheduler that always fails on install.

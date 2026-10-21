@@ -62,6 +62,9 @@ impl View for SheetView {
         let Some(sheet) = moment.sheet.as_ref() else {
             return Height::Hug(0);
         };
+        if sheet.page.id() == "read" {
+            return Height::Fixed(u16::MAX);
+        }
         if width == 0 {
             return Height::Hug(0);
         }
@@ -286,8 +289,8 @@ fn header(sheet: &Sheet, w: usize, room: usize) -> Line {
 /// 提示。和读的那页同一副骨架,只是正文是渲染过的,没有行号。
 fn doc_lines(sheet: &Sheet, doc: &Doc, h: usize, w: usize, caps: Caps) -> Vec<Line> {
     let muted = theme::fg(Role::Muted);
-    let room = read_room(h);
-    let body = doc.lines(doc_width(w));
+    let room = crate::sheet::room_for(sheet, h);
+    let body = doc.shared_lines(doc_width(w));
     let from = doc.top.min(body.len().saturating_sub(room));
     let to = (from + room).min(body.len());
     let (mut header, _) = doc_header(doc);
@@ -318,11 +321,15 @@ fn doc_lines(sheet: &Sheet, doc: &Doc, h: usize, w: usize, caps: Caps) -> Vec<Li
         Line::styled(
             format!(
                 "  {}",
-                t(Msg::SheetDocLegend {
-                    back: sheet.back.is_some(),
-                    tabs: doc.tabs.len() > 1,
-                    links: doc.has_links(),
-                })
+                if doc.id == "read" {
+                    t(Msg::ReadLegend)
+                } else {
+                    t(Msg::SheetDocLegend {
+                        back: sheet.back.is_some(),
+                        tabs: doc.tabs.len() > 1,
+                        links: doc.has_links(),
+                    })
+                }
             ),
             muted,
         )

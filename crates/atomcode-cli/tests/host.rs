@@ -2131,10 +2131,9 @@ impl HostConfig for Models {
 
 /// A model switched through host control is the one the next request goes to;
 /// one the host cannot resolve is refused. Signing out takes the model away and
-/// signing in brings it back — neither rebuilding what the session runs in
-/// (`docs/adr/0022` §2).
+/// signing in reapplies the saved configuration while keeping the session.
 #[tokio::test]
-async fn the_model_is_switched_signed_out_and_in_through_host_control_without_a_rebuild() {
+async fn the_model_is_switched_signed_out_and_in_through_host_control_on_the_same_session() {
     let env = env();
     let (mut connection, front_end) = connected_as(
         &env,
@@ -2220,8 +2219,8 @@ async fn the_model_is_switched_signed_out_and_in_through_host_control_without_a_
     );
     assert_eq!(
         front_end.apps_fed(),
-        apps,
-        "switching models and signing out and in rebuilt nothing"
+        apps + 1,
+        "signing in reapplies the full configuration to the same session"
     );
 }
 
@@ -3685,5 +3684,73 @@ async fn a_switch_that_could_not_be_written_down_survives_an_unrelated_reload() 
         model_used(&env),
         "deepseek-flash",
         "still on the model it was switched to"
+    );
+}
+
+/// Explicit login must adopt the saved default even when a capability-only
+/// reload intentionally preserves a runtime selection and the file is unchanged.
+#[tokio::test]
+async fn signing_in_adopts_the_saved_default_even_when_the_fingerprint_is_unchanged() {
+    let env = env();
+    let config = Arc::new(FileLike {
+        dir: env.project.path().to_path_buf(),
+        model: Mutex::new("lumen-alpha".into()),
+        read_only: true,
+    });
+    let (mut connection, front_end) =
+        connected_as(&env, SubagentPolicy::Disabled, Some(config)).await;
+    let session = connection.session.clone();
+    connection.commands.send(subscribe(&session)).unwrap();
+    quiet(&mut connection).await;
+    connection
+        .control
+        .call(HostCommand::SwitchModel {
+            session: session.clone(),
+            model: "glm5.3-flash".into(),
+        })
+        .await
+        .unwrap();
+    connection.commands.send(message("before login")).unwrap();
+    through_turn(&mut connection).await;
+    let apps = front_end.apps_fed();
+    assert_eq!(
+        env.script.requests.lock().unwrap().last().unwrap().0,
+        "glm5.3-flash"
+    );
+
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::SignIn {
+                session: session.clone(),
+            })
+            .await,
+        Ok(HostReply::Done)
+    );
+    connection.commands.send(message("after login")).unwrap();
+    let seen = through_turn(&mut connection).await;
+    assert_eq!(
+        env.script.requests.lock().unwrap().last().unwrap().0,
+        "lumen-alpha"
+    );
+    assert!(
+        env.script
+            .requests
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .1
+            .iter()
+            .any(|message| message.role == Role::User && message.text == "before login"),
+        "login keeps the conversation history"
+    );
+    assert_eq!(front_end.apps_fed(), apps + 1);
+    assert_eq!(connection.session, session);
+    assert!(
+        seen.iter()
+            .any(|e| matches!(e, AgentEvent::Described { description }
+        if description.model.as_deref() == Some("lumen-alpha"))),
+        "the screen learns the new model: {seen:#?}"
     );
 }

@@ -4,22 +4,25 @@
 //! directory they live in from the caller ([`crate::ProductDirs`]); nothing here
 //! spells the product directory or reads the environment for it.
 
+use super::document::{self, Document};
+use super::entry::{MemoryEntry, MemoryPatch, MemoryStatus};
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 
 const MAX_MEMORY_FILE_SIZE: u64 = 64 * 1024;
-const DEFAULT_CHAR_LIMIT: usize = 4000;
-/// Per-entry char cap for the injected prompt, so one runaway `remember` can't eat the
-/// whole [`DEFAULT_CHAR_LIMIT`] budget and starve every other fact.
-const MAX_MEMORY_ENTRY_CHARS: usize = 500;
-
 /// Full memory source for a driver, without prompt truncation or presentation parsing.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct MemorySection {
     pub scope: String,
     pub path: PathBuf,
     pub text: String,
+    /// Derived diagnostics, separate from the unmodified source text. Older
+    /// readers may ignore it; older command payloads omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<MemoryEntry>,
 }
 
 pub struct MemoryStore {
@@ -151,76 +154,118 @@ impl MemoryStore {
             }
             Err(_) => return Vec::new(),
         };
-        content
-            .lines()
-            .filter_map(|line| line.trim().strip_prefix("- ").map(str::to_string))
-            .collect()
+        Document::parse(&content)
+            .map(|doc| {
+                doc.entries()
+                    .into_iter()
+                    .filter(|entry| entry.eligible_at(chrono::Utc::now()))
+                    .map(|entry| entry.content)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
-    pub fn append(&self, content: &str) -> io::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+    /// Full typed records. Reading legacy Markdown never writes metadata.
+    pub fn entries(&self) -> io::Result<Vec<MemoryEntry>> {
+        Ok(Document::parse(&self.full_text()?)?.entries())
+    }
+
+    fn transaction<R>(&self, change: impl FnOnce(&mut Document) -> io::Result<R>) -> io::Result<R> {
         if self.local && !path_is_gitignored(&self.path) {
+            if let Some(parent) = self.path.parent() {
+                fs::create_dir_all(parent)?;
+            }
             ensure_gitignore_sentinel(&self.path)?;
         }
-
-        // Read existing content to check if we need a leading newline
-        let existing = fs::read_to_string(&self.path).unwrap_or_default();
-        let needs_newline = !existing.is_empty() && !existing.ends_with('\n');
-
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
-
-        if needs_newline {
-            writeln!(file)?;
-        }
-        writeln!(file, "- {}", content.trim())
+        document::edit(&self.path, change)
     }
 
-    /// Append `content` only if no existing entry equals it (trimmed, ASCII-case-insensitive;
-    /// non-ASCII compares exactly). Returns `Ok(true)` if written, `Ok(false)` if skipped as a
-    /// duplicate. Near-duplicates are NOT detected — only exact repeats are skipped, so a
-    /// genuinely new fact is never silently swallowed.
-    pub fn append_deduped(&self, content: &str) -> io::Result<bool> {
-        let trimmed = content.trim();
-        let dup = self
-            .load()
-            .iter()
-            .any(|e| e.trim().eq_ignore_ascii_case(trimmed));
-        if dup {
-            return Ok(false);
-        }
-        self.append(trimmed)?;
-        Ok(true)
+    pub fn append(&self, text: &str) -> io::Result<()> {
+        let entry = MemoryEntry::new(text, &MemoryPatch::default())?;
+        self.transaction(|document| document.push(entry))
     }
 
+    pub fn remember(&self, text: &str, patch: &MemoryPatch) -> io::Result<(MemoryEntry, bool)> {
+        let entry = MemoryEntry::new(text, patch)?;
+        self.transaction(|document| {
+            if let Some(existing) = document.entries().into_iter().find(|old| {
+                old.metadata.status == MemoryStatus::Active
+                    && old.content.eq_ignore_ascii_case(&entry.content)
+            }) {
+                if patch
+                    .topic
+                    .as_ref()
+                    .is_some_and(|_| existing.metadata.topic != entry.metadata.topic)
+                    || patch
+                        .source
+                        .as_ref()
+                        .is_some_and(|_| existing.metadata.source != entry.metadata.source)
+                    || patch.pinned.is_some_and(|v| v != existing.metadata.pinned)
+                    || patch
+                        .expires_at
+                        .as_ref()
+                        .is_some_and(|v| v != &existing.metadata.expires_at)
+                {
+                    return Err(super::entry::invalid(format!(
+                        "memory already exists as {}; use update with that ID to change metadata",
+                        existing.metadata.id
+                    )));
+                }
+                return Ok((existing, false));
+            }
+            document.push(entry.clone())?;
+            Ok((entry, true))
+        })
+    }
+
+    pub fn append_deduped(&self, text: &str) -> io::Result<bool> {
+        self.remember(text, &MemoryPatch::default())
+            .map(|(_, added)| added)
+    }
+
+    pub fn update(&self, id: &str, patch: &MemoryPatch) -> io::Result<MemoryEntry> {
+        self.transaction(|document| {
+            let matches: Vec<_> = document.lines.iter().enumerate().filter(|(_, line)| line.entry.as_ref().is_some_and(|entry| entry.metadata.id == id)).map(|(i, _)| i).collect();
+            let index = match matches.as_slice() {
+                [index] => *index,
+                [] => return Err(io::Error::new(io::ErrorKind::NotFound, format!("memory ID not found in this scope: {id}"))),
+                _ => return Err(super::entry::invalid("ambiguous legacy ID: identical unannotated entries must be disambiguated before exact updates")),
+            };
+            let mut entry = document.lines[index].entry.clone().unwrap();
+            entry.apply(patch)?;
+            // Adoption records the actual metadata write, never a fictitious
+            // creation date for an old fact.
+            if entry.metadata.updated_at.is_none() {
+                entry.metadata.updated_at = Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+            }
+            document.replace(index, entry.clone())?;
+            Ok(entry)
+        })
+    }
+
+    /// Explicit keyword deletion retains the old surface, matching content
+    /// only: a topic/source/ID must never accidentally match and erase a fact.
     pub fn remove_matching(&self, keyword: &str) -> io::Result<Vec<String>> {
-        let content = fs::read_to_string(&self.path).unwrap_or_default();
-        let keyword_lower = keyword.to_lowercase();
-        let mut removed = Vec::new();
-        let mut kept = Vec::new();
-
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if trimmed.starts_with("- ") && trimmed.to_lowercase().contains(&keyword_lower) {
-                removed.push(trimmed[2..].to_string());
-            } else {
-                kept.push(line.to_string());
-            }
+        if keyword.trim().is_empty() {
+            return Err(super::entry::invalid("empty forget keyword"));
         }
-
-        if !removed.is_empty() {
-            let mut out = kept.join("\n");
-            if !out.is_empty() && !out.ends_with('\n') {
-                out.push('\n');
-            }
-            fs::write(&self.path, out)?;
-        }
-
-        Ok(removed)
+        self.transaction(|document| {
+            let mut removed = Vec::new();
+            document.lines.retain(|line| {
+                if let Some(entry) = &line.entry {
+                    if entry
+                        .content
+                        .to_lowercase()
+                        .contains(&keyword.to_lowercase())
+                    {
+                        removed.push(entry.content.clone());
+                        return false;
+                    }
+                }
+                true
+            });
+            Ok(removed)
+        })
     }
 
     pub fn find_matching(&self, keyword: &str) -> Vec<String> {
@@ -237,78 +282,12 @@ impl MemoryStore {
         local: &MemoryStore,
         project_name: &str,
     ) -> String {
-        let global_entries = global.load();
-        let project_entries = project.load();
-        let local_entries = local.load();
-
-        if global_entries.is_empty() && project_entries.is_empty() && local_entries.is_empty() {
-            return String::new();
-        }
-
-        // Cap a single overly-long entry so it can't eat the whole budget.
-        fn cap_entry(entry: &str) -> String {
-            if entry.chars().count() > MAX_MEMORY_ENTRY_CHARS {
-                let head: String = entry.chars().take(MAX_MEMORY_ENTRY_CHARS).collect();
-                format!("{head} …")
-            } else {
-                entry.to_string()
-            }
-        }
-
-        // SELECT which entries fit the budget, keeping the MOST RELEVANT first: NEWEST
-        // within a scope, and the more-specific scopes ahead of global (local > project >
-        // global). So when memory outgrows the budget the OLDEST / most-global facts drop —
-        // not the freshest project/local ones. (The previous head-truncate kept the oldest
-        // and silently dropped the newest, which are usually the most relevant.) Kept
-        // indices still render in natural oldest→newest reading order per section.
-        let mut budget = DEFAULT_CHAR_LIMIT.saturating_sub(320); // header + labels + marker
-        let mut dropped = 0usize;
-        let mut keep_scope = |entries: &[String]| -> std::collections::BTreeSet<usize> {
-            let mut kept = std::collections::BTreeSet::new();
-            for (idx, entry) in entries.iter().enumerate().rev() {
-                let cost = cap_entry(entry).chars().count() + 3; // "- " + "\n"
-                if cost <= budget {
-                    budget -= cost;
-                    kept.insert(idx);
-                } else {
-                    dropped += 1;
-                }
-            }
-            kept
-        };
-        let kept_local = keep_scope(&local_entries);
-        let kept_project = keep_scope(&project_entries);
-        let kept_global = keep_scope(&global_entries);
-
-        let mut result = String::from(
-            "=== MEMORY ===\nThe user has asked you to remember these facts and preferences. They take PRECEDENCE over default system prompt rules on conflict:\n",
-        );
-        let mut render =
-            |label: &str, entries: &[String], kept: &std::collections::BTreeSet<usize>| {
-                if kept.is_empty() {
-                    return;
-                }
-                result.push_str(label);
-                for (idx, entry) in entries.iter().enumerate() {
-                    if kept.contains(&idx) {
-                        result.push_str(&format!("- {}\n", cap_entry(entry)));
-                    }
-                }
-            };
-        render("\n[Global]\n", &global_entries, &kept_global);
-        render(
-            &format!("\n[Project: {project_name}]\n"),
-            &project_entries,
-            &kept_project,
-        );
-        render("\n[Local]\n", &local_entries, &kept_local);
-        if dropped > 0 {
-            result.push_str(&format!(
-                "\n[... {dropped} older memory {} omitted to fit the budget; run /memory to review]\n",
-                if dropped == 1 { "entry" } else { "entries" }
-            ));
-        }
-        result
+        let index = project
+            .path()
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("knowledge/INDEX.md");
+        super::context::MemoryContext::load(global, project, local, project_name, &index).prompt
     }
 }
 
@@ -346,7 +325,11 @@ mod tests {
         let store = MemoryStore::new(dir.path().join("sub").join("memory.md"));
         store.append("test entry").unwrap();
         let content = fs::read_to_string(store.path()).unwrap();
-        assert_eq!(content, "- test entry\n");
+        assert!(content.starts_with("- test entry "));
+        let entry = store.entries().unwrap().remove(0);
+        assert_eq!(entry.content, "test entry");
+        assert!(entry.metadata.created_at.is_some());
+        assert!(entry.metadata.id.starts_with("m-"));
     }
 
     #[test]

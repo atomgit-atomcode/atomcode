@@ -37,6 +37,44 @@ fn parse<T: for<'de> Deserialize<'de> + Default>(config: &Value) -> Result<T, St
     serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))
 }
 
+/// Charge one existing recovery handler's whole wait to the logical request.
+/// A missing retry row retains the standalone handler's historical behavior.
+/// No mutex is held across sleep; cancellation drops the request and its budget.
+pub fn reserve_recovery_wait(
+    req: &ModelRequest,
+    wait: Duration,
+    reason: &str,
+) -> Result<(), String> {
+    let Some(budget) = &req.options.request_recovery else {
+        return Ok(());
+    };
+    match budget.reserve_wait(wait) {
+        Ok(state) => {
+            tracing::info!(
+                turn = req.turn,
+                round = req.round,
+                reason,
+                attempts = state.attempts,
+                max_attempts = state.max_attempts,
+                wait_ms = wait.as_millis() as u64,
+                reserved_wait_ms = state.reserved_wait.as_millis() as u64,
+                max_wait_ms = state.max_wait.as_millis() as u64,
+                "shared request recovery scheduled"
+            );
+            Ok(())
+        }
+        Err(limit) => {
+            tracing::warn!(turn = req.turn, round = req.round, reason,
+                attempts = limit.snapshot.attempts, max_attempts = limit.snapshot.max_attempts,
+                reserved_wait_ms = limit.snapshot.reserved_wait.as_millis() as u64,
+                max_wait_ms = limit.snapshot.max_wait.as_millis() as u64,
+                requested_wait_ms = wait.as_millis() as u64,
+                limit = ?limit.limit, "shared request recovery exhausted");
+            Err(limit.to_string())
+        }
+    }
+}
+
 // ---- rate limiting ------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
@@ -139,6 +177,12 @@ impl Waterfall<AgentRequest> for RateLimit {
                                 error.message,
                                 wait.as_secs()
                             ),
+                            ..error
+                        });
+                    }
+                    if let Err(why) = reserve_recovery_wait(req, wait, "rate_limit") {
+                        return Err(RequestError {
+                            message: format!("{} ({why})", error.message),
                             ..error
                         });
                     }
@@ -317,6 +361,13 @@ impl Waterfall<AgentRequest> for OverflowLadder {
             match next.run(req).await {
                 Ok(response) => return Ok(response),
                 Err(error) if error.context_overflow && attempt < self.max_attempts => {
+                    if let Err(why) = reserve_recovery_wait(req, Duration::ZERO, "context_overflow")
+                    {
+                        return Err(RequestError {
+                            message: format!("{} ({why})", error.message),
+                            ..error
+                        });
+                    }
                     if let Err(why) = self.shrink(req, &mut attempt, "context overflow").await {
                         return Err(RequestError {
                             message: format!("{} ({why})", error.message),
@@ -367,7 +418,7 @@ impl Plugin for OverflowPlugin {
 
 #[derive(Debug, Deserialize)]
 struct TimeoutRow {
-    /// A whole request that takes longer than this is treated as hung.
+    /// Optional whole-request ceiling in seconds; `0` disables it.
     #[serde(default = "default_request_secs")]
     request_secs: u64,
 }
@@ -381,15 +432,12 @@ impl Default for TimeoutRow {
 }
 
 fn default_request_secs() -> u64 {
-    600
+    0
 }
 
-/// A ceiling on one model request.
-///
-/// The provider adapter has its own byte-idle watchdog, which catches a stream
-/// that stops producing. This catches the other shape: a stream that keeps
-/// producing forever. Without it a turn can hang with no way back except
-/// killing the process.
+/// An opt-in ceiling on one model request, including retries. The default is
+/// disabled: content-idle watchdogs detect stalls without killing a long stream
+/// that keeps making progress. Cancellation remains owned by the agent loop.
 struct RequestTimeout {
     limit: Duration,
 }
@@ -422,10 +470,13 @@ impl Plugin for RequestTimeoutPlugin {
         "llm-request-timeout"
     }
     fn description(&self) -> &'static str {
-        "bound one model request so a turn cannot hang forever"
+        "optionally bound the total duration of one model request"
     }
     async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
         let row: TimeoutRow = parse(config)?;
+        if row.request_secs == 0 {
+            return Ok(());
+        }
         // Outermost, so the ceiling covers the waits and retries below it too —
         // a bound that each retry resets is not a bound.
         let _ = ctx.on_waterfall::<AgentRequest>(
@@ -522,7 +573,7 @@ impl Default for StreamRow {
 }
 
 fn default_recoveries() -> u32 {
-    1
+    3
 }
 
 const RESUME_NUDGE: &str = "\
@@ -553,110 +604,125 @@ impl Waterfall<AgentRequest> for StreamRecovery {
         req: &mut ModelRequest,
         next: Next<'_, AgentRequest>,
     ) -> Result<ModelResponse, RequestError> {
-        match next.run(req).await {
-            Ok(response) => Ok(response),
-            Err(error) => {
-                let Some(session) = crate::agent::scoped(&self.ctx).service::<SessionSvc>() else {
-                    return Err(error);
-                };
-                let confirmed = self.progress.confirmed(&session);
-                let transport = error.code.as_deref()
-                    == Some(atomcode_kernel::stream::STREAM_TRANSPORT_INTERRUPTED_CODE);
-                let idle = error.code.as_deref() == Some(super::agent_loop::STREAM_IDLE_CODE);
-                let has_text = error
-                    .partial
-                    .as_ref()
-                    .is_some_and(|p| !p.text.trim().is_empty());
-                let eligible = error.http_status.is_none()
-                    && (transport || idle)
-                    && !error.unexecuted_tool_output
-                    && (has_text || confirmed);
-                let turn = session.current_turn();
-                // Preserve safe text even when the budget is exhausted or tools
-                // were incomplete. Never commit unexecuted calls as real work.
-                if let Some(partial) = &error.partial {
-                    if !partial.text.is_empty() || !partial.reasoning.is_empty() {
-                        crate::session::commit(
+        let mut recovered = false;
+        loop {
+            let mut error = match next.run(req).await {
+                Ok(response) => {
+                    if recovered {
+                        notice(
                             &self.ctx,
-                            &session,
-                            SessionEvent::AssistantMessage {
-                                turn,
-                                round: req.round,
-                                text: partial.text.clone(),
-                                reasoning: partial.reasoning.clone(),
-                                tool_calls: Vec::new(),
-                                reasoning_blocks: Vec::new(),
-                                meta: None,
-                            },
+                            NoticeKind::StreamRecovered,
+                            atomcode_config::i18n::t(
+                                atomcode_config::i18n::Msg::StreamRecoverySucceeded,
+                            )
+                            .into_owned(),
                         );
                     }
+                    return Ok(response);
                 }
-                if !eligible
-                    || !self
-                        .progress
-                        .recover(&session, self.max_recoveries, confirmed)
-                {
-                    return Err(error);
-                }
-                crate::session::commit(
-                    &self.ctx,
-                    &session,
-                    SessionEvent::Injected {
-                        turn,
-                        text: RESUME_NUDGE.to_string(),
-                        origin: crate::session::InjectionOrigin::Continuation,
-                    },
-                );
-                notice(
-                    &self.ctx,
-                    NoticeKind::ProviderRetry,
-                    format!(
-                        "stream broke after partial output; preserved it and continuing \
-                         (bounded continuation; max {})",
-                        self.max_recoveries
-                    ),
-                );
-
-                // Re-project so the retry carries the preserved message.
-                let mut messages: Vec<Message> = req
-                    .messages
-                    .iter()
-                    .take_while(|m| {
-                        m.role == atomcode_kernel::message::Role::System && !m.synthetic
-                    })
-                    .cloned()
-                    .collect();
-                messages.extend(session.derive_messages());
-                req.messages = messages;
-                let result = next.run(req).await;
-                match &result {
-                    Ok(_) => notice(
+                Err(error) => error,
+            };
+            let Some(session) = crate::agent::scoped(&self.ctx).service::<SessionSvc>() else {
+                return Err(error);
+            };
+            let confirmed = self.progress.confirmed(&session);
+            let transport = error.code.as_deref()
+                == Some(atomcode_kernel::stream::STREAM_TRANSPORT_INTERRUPTED_CODE);
+            let idle = error.code.as_deref() == Some(super::agent_loop::STREAM_IDLE_CODE);
+            let has_text = error
+                .partial
+                .as_ref()
+                .is_some_and(|p| !p.text.trim().is_empty());
+            let eligible = error.http_status.is_none()
+                && (transport || idle)
+                && !error.unexecuted_tool_output
+                && (has_text || confirmed);
+            let turn = session.current_turn();
+            // Each failed attempt is preserved once, including the final failure.
+            if let Some(partial) = &error.partial {
+                if !partial.text.is_empty() || !partial.reasoning.is_empty() {
+                    crate::session::commit(
                         &self.ctx,
-                        NoticeKind::StreamRecovered,
-                        "continued from saved progress".into(),
-                    ),
-                    Err(failure) => {
-                        if let Some(partial) = &failure.partial {
-                            if !partial.text.is_empty() || !partial.reasoning.is_empty() {
-                                crate::session::commit(
-                                    &self.ctx,
-                                    &session,
-                                    SessionEvent::AssistantMessage {
-                                        turn,
-                                        round: req.round,
-                                        text: partial.text.clone(),
-                                        reasoning: partial.reasoning.clone(),
-                                        tool_calls: Vec::new(),
-                                        reasoning_blocks: Vec::new(),
-                                        meta: None,
-                                    },
-                                );
-                            }
-                        }
-                    }
+                        &session,
+                        SessionEvent::AssistantMessage {
+                            turn,
+                            round: req.round,
+                            text: partial.text.clone(),
+                            reasoning: partial.reasoning.clone(),
+                            tool_calls: Vec::new(),
+                            reasoning_blocks: Vec::new(),
+                            meta: None,
+                        },
+                    );
                 }
-                result
             }
+            let attempt = eligible
+                .then(|| {
+                    self.progress
+                        .recover(&session, self.max_recoveries, confirmed)
+                })
+                .flatten();
+            let Some(attempt) = attempt else {
+                if error.http_status.is_none() && (transport || idle) {
+                    use atomcode_config::i18n::{t, Msg};
+                    let why = if error.unexecuted_tool_output {
+                        Msg::StreamRecoveryUnsafeTools
+                    } else if !has_text && !confirmed {
+                        Msg::StreamRecoveryNoProgress
+                    } else {
+                        Msg::StreamRecoveryExhausted {
+                            max_recoveries: self.max_recoveries,
+                        }
+                    };
+                    tracing::warn!(
+                        turn,
+                        max_recoveries = self.max_recoveries,
+                        eligible,
+                        unexecuted_tool_output = error.unexecuted_tool_output,
+                        "stream continuation stopped"
+                    );
+                    error.message = format!("{}\n{}", t(why), error.message);
+                }
+                return Err(error);
+            };
+            let delay_secs = (1u64 << (attempt - 1).min(3)).min(8);
+            if let Err(why) =
+                reserve_recovery_wait(req, Duration::from_secs(delay_secs), "stream_continuation")
+            {
+                error.message = format!("{} ({why})", error.message);
+                return Err(error);
+            }
+            notice(
+                &self.ctx,
+                NoticeKind::ProviderRetry,
+                atomcode_config::i18n::t(atomcode_config::i18n::Msg::StreamRecoveryRetry {
+                    attempt,
+                    max_recoveries: self.max_recoveries,
+                    delay_secs,
+                })
+                .into_owned(),
+            );
+            // The agent loop owns cancellation and drops this entire waterfall,
+            // including its sleep, before another request can be started.
+            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+            crate::session::commit(
+                &self.ctx,
+                &session,
+                SessionEvent::Injected {
+                    turn,
+                    text: RESUME_NUDGE.to_string(),
+                    origin: crate::session::InjectionOrigin::Continuation,
+                },
+            );
+            let mut messages: Vec<Message> = req
+                .messages
+                .iter()
+                .take_while(|m| m.role == atomcode_kernel::message::Role::System && !m.synthetic)
+                .cloned()
+                .collect();
+            messages.extend(session.derive_messages());
+            req.messages = messages;
+            recovered = true;
         }
     }
 }

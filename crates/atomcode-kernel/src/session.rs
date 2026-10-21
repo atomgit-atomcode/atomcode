@@ -807,11 +807,9 @@ pub fn derive_traced(events: &[LoggedEvent]) -> Vec<TracedMessage> {
 
 /// [`derive_messages`], with each assistant message's logged `meta` attached.
 ///
-/// Same projection, one more field. The model's request is built from
-/// [`derive_messages`] so that nothing about it changes; this is for a consumer
-/// that persists messages and needs the stats back — the native snapshot store.
-/// One function behind both, so the two views cannot drift on which events
-/// become which messages.
+/// Same events and order as the model projection, with original human text
+/// instead of model-only historical framing, plus execution stats. Used for
+/// persistence and display so model context never becomes a new user message.
 pub fn derive_messages_with_meta(events: &[LoggedEvent]) -> Vec<Message> {
     project(events, true)
         .into_iter()
@@ -1154,11 +1152,24 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<TracedMessage> {
             }
             SessionEvent::UserMessage { text, images, .. } => {
                 let text = text_of(text);
-                let message = if images.is_empty() {
+                let mut message = if images.is_empty() {
                     Message::user(text)
                 } else {
                     Message::user_with_images(text, images.clone())
                 };
+                // Only surviving compactions count. The original human event is
+                // immutable; provenance is derived on both live and resumed paths.
+                if folded.iter().any(|(from, _)| *from > 0 && seq <= *from) {
+                    message.internal_origin =
+                        Some(crate::message::COMPACTION_RETAINED_ORIGIN.into());
+                    if !with_meta {
+                        message.internal_origin =
+                            Some(crate::message::COMPACTION_RETAINED_MODEL_ORIGIN.into());
+                        message
+                            .text
+                            .insert_str(0, crate::message::COMPACTION_RETAINED_FRAMING);
+                    }
+                }
                 projection.push(message, Provenance::Event(seq));
             }
             // A summary a resumed session was seeded with stands for what came

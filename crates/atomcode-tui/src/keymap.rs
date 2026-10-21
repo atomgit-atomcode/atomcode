@@ -9,6 +9,131 @@ use std::sync::RwLock;
 
 use crate::surface::{Key, KeyPress, Mods};
 
+/// Parse a portable terminal chord. Printable letters require Ctrl/Alt/Cmd;
+/// capturing an ordinary letter must not accidentally replace text entry.
+pub fn parse_chord(text: &str) -> Result<KeyPress, String> {
+    let parts: Vec<_> = text.trim().split('+').map(str::trim).collect();
+    let Some((last, modifiers)) = parts.split_last() else {
+        return Err("empty shortcut".into());
+    };
+    let mut mods = Mods::NONE;
+    for modifier in modifiers {
+        let flag = match modifier.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => &mut mods.ctrl,
+            "alt" | "option" => &mut mods.alt,
+            "shift" => &mut mods.shift,
+            "cmd" | "super" | "meta" => &mut mods.cmd,
+            _ => return Err(format!("unknown modifier {modifier:?}")),
+        };
+        if *flag {
+            return Err(format!("duplicate modifier {modifier:?}"));
+        }
+        *flag = true;
+    }
+    let name = last.to_ascii_lowercase();
+    let key = match name.as_str() {
+        "enter" | "return" => Key::Enter,
+        "tab" => Key::Tab,
+        "esc" | "escape" => Key::Esc,
+        "backspace" => Key::Backspace,
+        "delete" | "del" => Key::Delete,
+        "left" => Key::Left,
+        "right" => Key::Right,
+        "up" => Key::Up,
+        "down" => Key::Down,
+        "home" => Key::Home,
+        "end" => Key::End,
+        "pageup" => Key::PageUp,
+        "pagedown" => Key::PageDown,
+        "space" => Key::Char(' '),
+        _ if name.starts_with('f')
+            && name[1..].parse::<u8>().is_ok_and(|n| (1..=24).contains(&n)) =>
+        {
+            Key::F(name[1..].parse().unwrap())
+        }
+        _ if name.len() == 1 && name.is_ascii() && name.as_bytes()[0].is_ascii_graphic() => {
+            let c = name.chars().next().unwrap();
+            Key::Char(if mods.shift {
+                c.to_ascii_uppercase()
+            } else {
+                c
+            })
+        }
+        _ => return Err(format!("unsupported shortcut {text:?}")),
+    };
+    if matches!(key, Key::Char(_)) && !(mods.ctrl || mods.alt || mods.cmd) {
+        return Err("a text shortcut needs Ctrl, Alt or Cmd".into());
+    }
+    Ok(KeyPress::new(key, mods))
+}
+
+pub fn chord_name(press: KeyPress) -> String {
+    let mut parts = Vec::new();
+    if press.mods.ctrl {
+        parts.push("ctrl".into());
+    }
+    if press.mods.alt {
+        parts.push("alt".into());
+    }
+    if press.mods.shift || press.key == Key::BackTab {
+        parts.push("shift".into());
+    }
+    if press.mods.cmd {
+        parts.push("cmd".into());
+    }
+    parts.push(match press.key {
+        Key::Char(' ') => "space".into(),
+        Key::Char(c) => c.to_ascii_lowercase().to_string(),
+        Key::Enter => "enter".into(),
+        Key::Tab | Key::BackTab => "tab".into(),
+        Key::Esc => "esc".into(),
+        Key::Backspace => "backspace".into(),
+        Key::Delete => "delete".into(),
+        Key::Left => "left".into(),
+        Key::Right => "right".into(),
+        Key::Up => "up".into(),
+        Key::Down => "down".into(),
+        Key::Home => "home".into(),
+        Key::End => "end".into(),
+        Key::PageUp => "pageup".into(),
+        Key::PageDown => "pagedown".into(),
+        Key::F(n) => format!("f{n}"),
+    });
+    parts.join("+")
+}
+
+pub fn parse_newline_bindings(text: &str) -> Result<Option<Vec<KeyPress>>, String> {
+    if text.trim() == "default" {
+        return Ok(None);
+    }
+    if text.trim().is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let mut keys = Vec::new();
+    for name in text.split(',') {
+        let key = parse_chord(name)?;
+        if keys.contains(&key) {
+            return Err(format!("duplicate shortcut {}", chord_name(key)));
+        }
+        keys.push(key);
+    }
+    Ok(Some(keys))
+}
+
+pub fn validate_newline_bindings(text: &str) -> Result<(), String> {
+    let keys = Keys::new();
+    keys.add(&Default_)?;
+    keys.set_newline_bindings(parse_newline_bindings(text)?)
+}
+
+pub fn default_newline_names() -> Vec<String> {
+    Default_
+        .bindings()
+        .into_iter()
+        .filter_map(|(key, action)| matches!(action, Action::Newline).then(|| chord_name(key)))
+        .collect()
+}
+
 /// What a key or a command asks for. The one vocabulary a key and a slash
 /// command share, so there is one implementation of each effect rather than
 /// two.
@@ -25,14 +150,12 @@ pub enum Action {
     /// ahead of the caret was to step over it and press backspace.
     DeleteForward,
     DeleteWord,
-    /// Take out everything from the caret to the end.
-    ///
-    /// To the end of the **buffer**, which is where [`Action::CaretEnd`] goes —
-    /// the pair has to agree, or `ctrl-k` deletes to somewhere `ctrl-e` does not
-    /// go and neither key can be reasoned about. (A multi-line draft is one
-    /// buffer here; `Home`/`End` answer the same way, and changing that is a
-    /// change to those keys, not something to smuggle in with this one.)
+    /// Delete to the end of the current logical line, or its newline at the end.
     DeleteToEnd,
+    /// Delete to the beginning of the current logical line.
+    DeleteToStart,
+    /// Delete forward in a draft; confirm exit only when idle and empty.
+    EndOfInput,
     Clear,
     CaretLeft,
     CaretRight,
@@ -55,6 +178,7 @@ pub enum Action {
     Cancel,
     Quit,
     Scroll(i32),
+    PageScroll(i32),
     ScrollToBottom,
     /// A click landed on this cell. What it means is decided by what is drawn
     /// there — a caret in the composer, a fold on a tool call, the way back
@@ -69,6 +193,7 @@ pub enum Action {
     /// `/raw`: the whole conversation on the terminal's own screen, for its
     /// own selection, scrolling and search; any key comes back.
     ShowTranscript,
+    ReadTranscript,
     /// Forget what is believed to be on screen and paint all of it again.
     Redraw,
     /// A line break inside what is being typed, rather than sending it.
@@ -159,6 +284,8 @@ pub enum Action {
     /// second answer printed into the conversation. Opening, not toggling: a
     /// `/usage` typed while the panel is up moves it to the page.
     OpenUsage,
+    /// Open the settings panel on Status without toggling it closed.
+    OpenStatus,
     /// Pull the providers panel up over the composer, or put it away.
     ///
     /// Its own action rather than a parameter on [`Action::ToggleSettings`]:
@@ -297,6 +424,7 @@ pub trait Keymap: Send + Sync {
 #[derive(Default)]
 pub struct Keys {
     map: RwLock<HashMap<KeyPress, (&'static str, Action)>>,
+    newline: RwLock<Option<Vec<KeyPress>>>,
 }
 
 impl Keys {
@@ -310,8 +438,18 @@ impl Keys {
     pub fn add(&self, km: &dyn Keymap) -> Result<(), String> {
         let taken_over = km.overrides();
         let mut map = self.map.write().expect("keys poisoned");
+        let newline = self.newline.read().expect("keys poisoned");
+        let mut candidate = map.clone();
         for (press, action) in km.bindings() {
-            if let Some((owner, _)) = map.get(&press) {
+            if newline.as_ref().is_some_and(|keys| keys.contains(&press))
+                && action != Action::Newline
+            {
+                return Err(format!(
+                    "{} conflicts with custom newline",
+                    chord_name(press)
+                ));
+            }
+            if let Some((owner, _)) = candidate.get(&press) {
                 if !taken_over.contains(&press) {
                     return Err(format!(
                         "`{}` and `{}` both bind {press:?}; disable one",
@@ -320,9 +458,75 @@ impl Keys {
                     ));
                 }
             }
-            map.insert(press, (km.id(), action));
+            candidate.insert(press, (km.id(), action));
+        }
+        *map = candidate;
+        Ok(())
+    }
+
+    fn check_newline(
+        map: &HashMap<KeyPress, (&'static str, Action)>,
+        keys: &Option<Vec<KeyPress>>,
+    ) -> Result<(), String> {
+        for key in keys.iter().flatten() {
+            // These gestures are dispatched before the composer keymap.
+            if matches!(key.key, Key::Tab | Key::BackTab | Key::Esc)
+                || (key.mods == Mods::CTRL && matches!(key.key, Key::Char('i' | 'm' | '[')))
+            {
+                return Err(format!(
+                    "{} is reserved for navigation or cancellation",
+                    chord_name(*key)
+                ));
+            }
+            if let Some((_, action)) = map.get(key) {
+                if *action != Action::Newline {
+                    return Err(format!(
+                        "{} is already assigned to another action",
+                        chord_name(*key)
+                    ));
+                }
+            }
         }
         Ok(())
+    }
+
+    pub fn validate_newline(&self, keys: &Option<Vec<KeyPress>>) -> Result<(), String> {
+        Self::check_newline(&self.map.read().expect("keys poisoned"), keys)
+    }
+
+    /// Keep registration, validation, persistence and activation serialized.
+    /// A rejected write leaves the effective bindings untouched.
+    pub fn configure_newline(
+        &self,
+        keys: Option<Vec<KeyPress>>,
+        persist: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let map = self.map.read().expect("keys poisoned");
+        Self::check_newline(&map, &keys)?;
+        let mut active = self.newline.write().expect("keys poisoned");
+        persist()?;
+        *active = keys;
+        Ok(())
+    }
+
+    pub fn set_newline_bindings(&self, keys: Option<Vec<KeyPress>>) -> Result<(), String> {
+        self.configure_newline(keys, || Ok(()))
+    }
+
+    pub fn newline_names(&self) -> Vec<String> {
+        let map = self.map.read().expect("keys poisoned");
+        let override_keys = self.newline.read().expect("keys poisoned");
+        let mut names: Vec<_> = match override_keys.as_ref() {
+            Some(keys) => keys.iter().copied().map(chord_name).collect(),
+            None => map
+                .iter()
+                .filter_map(|(key, (_, action))| {
+                    matches!(action, Action::Newline).then(|| chord_name(*key))
+                })
+                .collect(),
+        };
+        names.sort();
+        names
     }
 
     pub fn remove(&self, id: &str) {
@@ -333,11 +537,22 @@ impl Keys {
     }
 
     pub fn resolve(&self, press: KeyPress) -> Option<Action> {
-        if let Some((_, a)) = self.map.read().expect("keys poisoned").get(&press) {
-            return Some(a.clone());
+        let map = self.map.read().expect("keys poisoned");
+        let newline = self.newline.read().expect("keys poisoned");
+        if let Some(keys) = newline.as_ref() {
+            if keys.contains(&press) {
+                return Some(Action::Newline);
+            }
+            if map
+                .get(&press)
+                .is_some_and(|(_, action)| *action == Action::Newline)
+            {
+                return None;
+            }
         }
-        // Typing is the fallthrough, not a binding: binding every printable
-        // character would make every conflict check meaningless.
+        if let Some((_, action)) = map.get(&press) {
+            return Some(action.clone());
+        }
         match (press.key, press.mods) {
             (Key::Char(c), Mods::NONE) | (Key::Char(c), Mods::SHIFT) => Some(Action::Insert(c)),
             _ => None,
@@ -352,13 +567,19 @@ impl Keys {
     }
     /// For the help panel and for the model's view of what the keys do.
     pub fn describe(&self) -> Vec<(String, String)> {
-        let mut out: Vec<_> = self
-            .map
-            .read()
-            .expect("keys poisoned")
+        let map = self.map.read().expect("keys poisoned");
+        let newline = self.newline.read().expect("keys poisoned");
+        let mut out: Vec<_> = map
             .iter()
-            .map(|(k, (_, a))| (format!("{k:?}"), format!("{a:?}")))
+            .filter(|(_, (_, action))| newline.is_none() || *action != Action::Newline)
+            .map(|(key, (_, action))| (format!("{key:?}"), format!("{action:?}")))
             .collect();
+        if let Some(keys) = newline.as_ref() {
+            out.extend(
+                keys.iter()
+                    .map(|key| (format!("{key:?}"), "Newline".into())),
+            );
+        }
         out.sort();
         out
     }
@@ -375,6 +596,12 @@ impl Keymap for Default_ {
         vec![
             (KeyPress::plain(Key::Enter), Action::Submit),
             (KeyPress::plain(Key::Backspace), Action::Backspace),
+            // Some terminal/IME paths retain Shift on the physical erase key.
+            // It still removes the character before the caret.
+            (
+                KeyPress::new(Key::Backspace, Mods::SHIFT),
+                Action::Backspace,
+            ),
             (KeyPress::plain(Key::Esc), Action::Escape),
             (KeyPress::ctrl('c'), Action::Cancel),
             // 中断并把排队的话立刻发出去。这一下曾经是 `esc` 的承诺
@@ -390,16 +617,11 @@ impl Keymap for Default_ {
             (KeyPress::new(Key::Enter, Mods::SHIFT), Action::Newline),
             (KeyPress::new(Key::Enter, Mods::ALT), Action::Newline),
             (KeyPress::ctrl('j'), Action::Newline),
-            (KeyPress::ctrl('d'), Action::Quit),
-            (KeyPress::ctrl('u'), Action::Clear),
+            (KeyPress::ctrl('d'), Action::EndOfInput),
+            (KeyPress::ctrl('u'), Action::DeleteToStart),
             (KeyPress::ctrl('w'), Action::DeleteWord),
-            // The rest of the line-editing reflexes every shell has. They were
-            // missing, so the muscle memory landed on nothing: ctrl-a and
-            // ctrl-e are documented in the keys help as "go to the start / the
-            // end" everywhere else a person types, and ctrl-k is how a line is
-            // cut short. Bound to the SAME actions `Home` and `End` already
-            // use, rather than to line-relative ones — two answers to "where
-            // does the caret go" is how they stop agreeing.
+            (KeyPress::ctrl('b'), Action::CaretLeft),
+            (KeyPress::ctrl('f'), Action::CaretRight),
             (KeyPress::ctrl('a'), Action::CaretHome),
             (KeyPress::ctrl('e'), Action::CaretEnd),
             (KeyPress::ctrl('k'), Action::DeleteToEnd),
@@ -428,8 +650,8 @@ impl Keymap for Default_ {
             (KeyPress::plain(Key::Right), Action::CaretRight),
             (KeyPress::plain(Key::Home), Action::CaretHome),
             (KeyPress::plain(Key::End), Action::CaretEnd),
-            (KeyPress::plain(Key::PageUp), Action::Scroll(-10)),
-            (KeyPress::plain(Key::PageDown), Action::Scroll(10)),
+            (KeyPress::plain(Key::PageUp), Action::PageScroll(-1)),
+            (KeyPress::plain(Key::PageDown), Action::PageScroll(1)),
             // The arrows belong to the field, the way they do in every other
             // text input. Scrolling the conversation is pgup/pgdn and the
             // wheel — which now moves a line a notch, so nothing was lost.
@@ -546,6 +768,120 @@ mod tests {
     use super::*;
 
     #[test]
+    fn function_keys_can_be_bound_except_when_an_existing_action_owns_them() {
+        let keys = Keys::new();
+        keys.add(&Default_).unwrap();
+        for n in 1..=24 {
+            let configured = parse_newline_bindings(&format!("f{n}")).unwrap();
+            let result = keys.set_newline_bindings(configured);
+            if n == 2 {
+                assert!(result.is_err(), "F2 switches models");
+                assert_eq!(
+                    keys.resolve(KeyPress::plain(Key::F(2))),
+                    Some(Action::CycleModel { forward: true })
+                );
+            } else {
+                result.unwrap();
+                assert_eq!(
+                    keys.resolve(KeyPress::plain(Key::F(n))),
+                    Some(Action::Newline)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn custom_newline_is_transactional_and_can_be_reset() {
+        let keys = Keys::new();
+        keys.add(&Default_).unwrap();
+        let custom = parse_newline_bindings("Alt+J, ctrl+j").unwrap();
+        keys.set_newline_bindings(custom).unwrap();
+        assert_eq!(
+            keys.resolve(parse_chord("alt+j").unwrap()),
+            Some(Action::Newline)
+        );
+        assert_eq!(keys.resolve(parse_chord("alt+enter").unwrap()), None);
+        assert_eq!(
+            keys.resolve(KeyPress::plain(Key::Enter)),
+            Some(Action::Submit)
+        );
+        let before = keys.describe();
+        for name in [
+            "enter",
+            "ctrl+c",
+            "ctrl+u",
+            "tab",
+            "shift+tab",
+            "esc",
+            "ctrl+m",
+            "ctrl+i",
+            "ctrl+[",
+        ] {
+            assert!(
+                keys.set_newline_bindings(parse_newline_bindings(name).unwrap())
+                    .is_err(),
+                "{name}"
+            );
+            assert_eq!(keys.describe(), before);
+        }
+        assert!(keys
+            .configure_newline(Some(vec![]), || Err("disk full".into()))
+            .is_err());
+        assert_eq!(keys.describe(), before);
+        keys.set_newline_bindings(Some(vec![])).unwrap();
+        assert!(keys.newline_names().is_empty());
+        keys.set_newline_bindings(None).unwrap();
+        assert_eq!(
+            keys.resolve(parse_chord("alt+enter").unwrap()),
+            Some(Action::Newline)
+        );
+    }
+
+    #[test]
+    fn chord_parser_rejects_ambiguous_names_and_duplicates() {
+        for name in ["alt+j", "CTRL+SHIFT+j", "alt+enter", "ctrl+space", "f12"] {
+            let key = parse_chord(name).unwrap();
+            assert_eq!(parse_chord(&chord_name(key)).unwrap(), key);
+        }
+        for name in [
+            "j",
+            "shift+j",
+            "alt+",
+            "ctrl+ctrl+j",
+            "hyper+j",
+            "f25",
+            "中文",
+        ] {
+            assert!(parse_chord(name).is_err(), "{name}");
+        }
+        assert!(parse_newline_bindings("alt+j, option+J").is_err());
+        assert!(parse_newline_bindings("alt+j,").is_err());
+    }
+
+    #[test]
+    fn a_later_row_cannot_silently_take_a_custom_shortcut() {
+        struct Late;
+        impl Keymap for Late {
+            fn id(&self) -> &'static str {
+                "late"
+            }
+            fn bindings(&self) -> Vec<(KeyPress, Action)> {
+                vec![
+                    (parse_chord("alt+k").unwrap(), Action::Submit),
+                    (parse_chord("alt+j").unwrap(), Action::Submit),
+                ]
+            }
+        }
+        let keys = Keys::new();
+        keys.add(&Default_).unwrap();
+        keys.set_newline_bindings(parse_newline_bindings("alt+j").unwrap())
+            .unwrap();
+        let before = keys.describe();
+        assert!(keys.add(&Late).is_err());
+        assert_eq!(keys.describe(), before);
+    }
+
+    #[test]
     fn the_default_bindings_mount_without_conflicting_with_themselves() {
         let keys = Keys::new();
         keys.add(&Default_).unwrap();
@@ -562,6 +898,13 @@ mod tests {
         let keys = Keys::new();
         keys.add(&Default_).unwrap();
 
+        assert_eq!(keys.resolve(KeyPress::ctrl('d')), Some(Action::EndOfInput));
+        assert_eq!(keys.resolve(KeyPress::ctrl('b')), Some(Action::CaretLeft));
+        assert_eq!(keys.resolve(KeyPress::ctrl('f')), Some(Action::CaretRight));
+        assert_eq!(
+            keys.resolve(KeyPress::ctrl('u')),
+            Some(Action::DeleteToStart)
+        );
         let home = keys.resolve(KeyPress::plain(Key::Home));
         let end = keys.resolve(KeyPress::plain(Key::End));
         assert_eq!(keys.resolve(KeyPress::ctrl('a')), home, "ctrl-a is Home");
@@ -643,6 +986,16 @@ mod tests {
             Some(Action::Escape)
         );
         assert_eq!(keys.resolve(KeyPress::ctrl('c')), Some(Action::Cancel));
+    }
+
+    #[test]
+    fn shift_backspace_erases_instead_of_becoming_an_unbound_chord() {
+        let keys = Keys::new();
+        keys.add(&Default_).unwrap();
+        assert_eq!(
+            keys.resolve(KeyPress::new(Key::Backspace, Mods::SHIFT)),
+            Some(Action::Backspace)
+        );
     }
 
     /// What SSH and PuTTY send instead. Unbound, backspace stops working over
@@ -739,7 +1092,7 @@ mod tests {
         assert_eq!(keys.resolve(KeyPress::ch('x')), Some(Action::Insert('x')));
         assert_eq!(keys.resolve(KeyPress::ch('中')), Some(Action::Insert('中')));
         // A bound char still wins.
-        assert_eq!(keys.resolve(KeyPress::ctrl('d')), Some(Action::Quit));
+        assert_eq!(keys.resolve(KeyPress::ctrl('d')), Some(Action::EndOfInput));
     }
 
     /// A downstream build can rebind one press without re-declaring the other

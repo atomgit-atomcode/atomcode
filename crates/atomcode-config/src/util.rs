@@ -1,6 +1,5 @@
-//! Small self-contained helpers config needs, vendored from `atomcode-core` so this
-//! crate stays a leaf (no core dependency). Behavior-identical copies:
-//!   - [`real_home_dir`] mirrors `atomcode_core::tool::real_home_dir` (sudo-aware).
+//! Self-contained configuration helpers. Home resolution honors a sudo caller
+//! only for a root process; ordinary users retain their own home directory.
 
 use std::path::{Path, PathBuf};
 
@@ -23,19 +22,45 @@ pub fn stable_project_hash(path: &Path) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-/// Resolve the invoking user's real home dir, sudo-aware: under `sudo`, `$HOME`
-/// points at root, so consult `SUDO_USER` via `getpwnam` first (avoids creating a
-/// root-owned `~/.atomcode`). Falls back to `dirs::home_dir()`.
+/// Use the invoking user's home only for a root process launched through sudo.
+/// Non-root processes must not inherit a stale SUDO_USER override in containers.
 pub fn real_home_dir() -> Option<PathBuf> {
-    if let Ok(sudo_user) = std::env::var("SUDO_USER") {
-        if let Some(home) = get_user_home(&sudo_user) {
-            return Some(home);
-        }
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid has no arguments, pointers or failure mode.
+        let effective_uid = unsafe { libc::geteuid() };
+        let sudo_user = std::env::var("SUDO_USER").ok();
+        invoking_home(
+            effective_uid,
+            sudo_user.as_deref(),
+            get_user_home,
+            dirs::home_dir,
+        )
     }
-    dirs::home_dir()
+    #[cfg(not(unix))]
+    {
+        dirs::home_dir()
+    }
 }
 
-/// Look up a user's home dir via `getpwnam_r` (Unix). Returns `None` on non-Unix.
+#[cfg(any(unix, test))]
+fn invoking_home(
+    effective_uid: u32,
+    sudo_user: Option<&str>,
+    lookup: impl FnOnce(&str) -> Option<PathBuf>,
+    fallback: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    if effective_uid == 0 {
+        if let Some(user) = sudo_user.filter(|user| !user.is_empty() && *user != "root") {
+            if let Some(home) = lookup(user) {
+                return Some(home);
+            }
+        }
+    }
+    fallback()
+}
+
+/// Look up a non-root user's home directory via `getpwnam_r`.
 #[cfg(unix)]
 fn get_user_home(username: &str) -> Option<PathBuf> {
     use std::ffi::CString;
@@ -57,18 +82,13 @@ fn get_user_home(username: &str) -> Option<PathBuf> {
             &mut result,
         );
 
-        if ret == 0 && !result.is_null() {
+        if ret == 0 && !result.is_null() && pwd.pw_uid != 0 {
             let home = std::ffi::CStr::from_ptr(pwd.pw_dir)
                 .to_string_lossy()
                 .into_owned();
             return Some(PathBuf::from(home));
         }
     }
-    None
-}
-
-#[cfg(not(unix))]
-fn get_user_home(_username: &str) -> Option<PathBuf> {
     None
 }
 
@@ -112,6 +132,62 @@ pub fn model_name_suggests_vision(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ordinary_users_ignore_inherited_sudo_identity() {
+        let home = invoking_home(
+            1000,
+            Some("root"),
+            |_| panic!("must not query sudo identity"),
+            || Some(PathBuf::from("/home/user")),
+        );
+        assert_eq!(home, Some(PathBuf::from("/home/user")));
+        let home = invoking_home(
+            1000,
+            Some("other"),
+            |_| panic!("must not query sudo identity"),
+            || Some(PathBuf::from("/home/user")),
+        );
+        assert_eq!(home, Some(PathBuf::from("/home/user")));
+    }
+
+    #[test]
+    fn root_uses_a_nonroot_sudo_callers_home() {
+        let home = invoking_home(
+            0,
+            Some("user"),
+            |name| {
+                assert_eq!(name, "user");
+                Some(PathBuf::from("/home/user"))
+            },
+            || panic!("caller home resolved"),
+        );
+        assert_eq!(home, Some(PathBuf::from("/home/user")));
+    }
+
+    #[test]
+    fn root_without_a_valid_sudo_caller_falls_back() {
+        for user in [None, Some(""), Some("root")] {
+            assert_eq!(
+                invoking_home(
+                    0,
+                    user,
+                    |_| panic!("must not resolve root as sudo caller"),
+                    || Some(PathBuf::from("/root"))
+                ),
+                Some(PathBuf::from("/root"))
+            );
+        }
+        assert_eq!(
+            invoking_home(
+                0,
+                Some("missing"),
+                |_| None,
+                || Some(PathBuf::from("/root"))
+            ),
+            Some(PathBuf::from("/root"))
+        );
+    }
+
     use super::*;
 
     #[cfg(unix)]

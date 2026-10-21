@@ -19,7 +19,7 @@
 //!
 //! And when a request comes back too large anyway — the budget was set above
 //! what the gateway takes, or the text alone is large — it is sent once more
-//! with half the budget before the failure is let through.
+//! with half the image bytes it actually carried before the failure is let through.
 
 use std::sync::Arc;
 
@@ -133,8 +133,16 @@ impl Waterfall<AgentRequest> for ImageBudget {
             Err(error)
                 if too_large(&error) && req.messages.iter().any(|m| !m.images.is_empty()) =>
             {
+                // Halve what was actually sent, not just the configured ceiling:
+                // a gateway may reject a request below that ceiling already.
+                let carried: usize = req
+                    .messages
+                    .iter()
+                    .flat_map(|m| &m.images)
+                    .map(|image| image.data.len())
+                    .sum();
                 req.messages = whole;
-                keep_within(&mut req.messages, self.max_bytes / 2);
+                keep_within(&mut req.messages, carried / 2);
                 next.run(req).await
             }
             other => other,
@@ -241,6 +249,54 @@ mod tests {
         let before = messages.clone();
         assert_eq!(keep_within(&mut messages, 100), 0);
         assert_eq!(messages, before);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_413_below_the_configured_budget_retries_with_fewer_images() {
+        use atomcode_plexus::{App, ConfigTree, PluginRegistry};
+        let app = App::new(PluginRegistry::new(), ConfigTree::from_layers([]).unwrap());
+        let guard = app.context().on_waterfall::<AgentRequest>(
+            Arc::new(ImageBudget {
+                max_bytes: 8 * 1024 * 1024,
+            }),
+            false,
+        );
+        let original = vec![carrying("frames", vec![picture(100); 6])];
+        let mut request = ModelRequest {
+            messages: original.clone(),
+            tools: vec![],
+            options: Default::default(),
+            turn: 1,
+            round: 1,
+            answering_a_nudge: false,
+        };
+        let seen = std::sync::Mutex::new(Vec::new());
+        let result = app
+            .context()
+            .waterfall::<AgentRequest, _>(&mut request, |req| {
+                let bytes: usize = req
+                    .messages
+                    .iter()
+                    .flat_map(|m| &m.images)
+                    .map(|i| i.data.len())
+                    .sum();
+                seen.lock().unwrap().push(bytes);
+                Box::pin(async {
+                    let mut error = RequestError::message("payload too large");
+                    error.http_status = Some(413);
+                    Err(error)
+                })
+            })
+            .await;
+        assert!(result.is_err(), "a second refusal must propagate");
+        assert_eq!(*seen.lock().unwrap(), [600, 200]);
+        assert_eq!(
+            original[0].images.len(),
+            6,
+            "the canonical messages are untouched"
+        );
+        assert_eq!(request.messages[0].text.matches(IMAGE_LEFT_OUT).count(), 1);
+        drop(guard);
     }
 
     #[test]

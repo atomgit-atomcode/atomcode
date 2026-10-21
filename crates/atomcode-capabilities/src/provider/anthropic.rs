@@ -42,6 +42,8 @@ use std::time::Duration;
 #[derive(Clone)]
 pub struct AnthropicConfig {
     pub api_key: String,
+    /// Explicit DeepSeek Messages dialect; never inferred from the URL.
+    pub deepseek_messages: bool,
     /// API host root (no path), e.g. `https://api.anthropic.com`. The adapter appends
     /// `/v1/messages`.
     pub base_url: String,
@@ -66,10 +68,10 @@ pub struct AnthropicConfig {
     /// with `thinking`.
     pub send_sampling_params: bool,
     /// Per-chunk stream-idle watchdog: no bytes for this long ⇒ terminal error.
-    /// Governs the INTER-token phase (after the first byte of a stream).
+    /// Governs the INTER-token phase (after the first content of a stream).
     pub idle_timeout: Duration,
-    /// FIRST-byte (prefill / TTFB) idle watchdog: no bytes for this long BEFORE the
-    /// first byte of a (re)opened stream ⇒ terminal error. Separate from (and ≥)
+    /// FIRST-content (prefill) watchdog: no content for this long BEFORE the
+    /// first content of a (re)opened stream ⇒ terminal error. Separate from (and ≥)
     /// `idle_timeout`; wired from the coding-layer `first_token_timeout`.
     pub first_token_timeout: Duration,
     pub connect_timeout: Duration,
@@ -83,6 +85,7 @@ pub struct AnthropicConfig {
     /// driver injects `atomcode/<version>` for gateway attribution. See the
     /// `OpenAiCompatConfig::user_agent` doc for why a local const won't do.
     pub user_agent: Option<String>,
+    pub headers: atomcode_config::provider_headers::ProviderHeaders,
     /// Disable TLS certificate verification (self-signed / internal gateways).
     /// Mirrors core's `ProviderConfig::skip_tls_verify`. Default false.
     pub skip_tls_verify: bool,
@@ -104,6 +107,7 @@ impl AnthropicConfig {
         let model = model.into();
         Self {
             api_key: api_key.into(),
+            deepseek_messages: false,
             base_url: base_url.into(),
             supports_vision: super::model_suggests_vision(&model),
             model,
@@ -118,6 +122,7 @@ impl AnthropicConfig {
             connect_timeout: Duration::from_secs(30),
             retry: RetryPolicy::default(),
             user_agent: None,
+            headers: Default::default(),
             skip_tls_verify: false,
             effort_levels: Vec::new(),
             wire_dump_dir: None,
@@ -137,14 +142,19 @@ pub struct AnthropicProvider {
 
 impl AnthropicProvider {
     pub fn new(cfg: AnthropicConfig) -> Result<Self, ProviderError> {
+        let custom_headers = !cfg.headers.is_empty();
         let connect_timeout = cfg.connect_timeout;
         let user_agent = cfg.user_agent.clone();
         let skip_tls_verify = cfg.skip_tls_verify;
-        let client = std::sync::Arc::new(super::openai_compat::SwappableClient::new(
-            false,
-            move |_| {
+        let client = std::sync::Arc::new(
+            super::openai_compat::SwappableClient::new(false, move |_| {
                 let mut builder =
                     crate::proxy::apply_async_proxy_policy(reqwest::Client::builder())
+                        .redirect(if custom_headers {
+                            reqwest::redirect::Policy::none()
+                        } else {
+                            reqwest::redirect::Policy::default()
+                        })
                         .connect_timeout(connect_timeout)
                         // Reap idle keep-alives before the server does (see POOL_IDLE_TIMEOUT).
                         .pool_idle_timeout(retry::POOL_IDLE_TIMEOUT)
@@ -158,9 +168,15 @@ impl AnthropicProvider {
                     message: format!("http client build failed: {e}"),
                     ..Default::default()
                 })
-            },
-        )?);
-        let url = format!("{}/v1/messages", cfg.base_url.trim_end_matches('/'));
+            })?
+            .with_headers(cfg.headers.clone()),
+        );
+        let base = cfg.base_url.trim_end_matches('/');
+        let url = if cfg.deepseek_messages && base.ends_with("/v1") {
+            format!("{base}/messages")
+        } else {
+            format!("{base}/v1/messages")
+        };
         Ok(Self {
             cfg,
             client,
@@ -199,12 +215,39 @@ impl LlmProvider for AnthropicProvider {
         tools: &[ToolDef],
         options: &ChatOptions,
     ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+        if self.cfg.deepseek_messages
+            && self.cfg.thinking
+            && matches!(
+                options.reasoning_effort,
+                Some(ReasoningEffort::Medium | ReasoningEffort::XHigh)
+            )
+        {
+            return Err(ProviderError {
+                message: "DeepSeek Messages supports reasoning effort low, high or max".into(),
+                retryable: false,
+                ..Default::default()
+            });
+        }
+        if self.cfg.deepseek_messages
+            && matches!(
+                options.tool_choice,
+                ToolChoice::Required | ToolChoice::Specific(_)
+            )
+        {
+            return Err(ProviderError {
+                message: "DeepSeek Messages forced tool choice is not supported by this adapter"
+                    .into(),
+                retryable: false,
+                ..Default::default()
+            });
+        }
         let body = build_request_body(&self.cfg.model, messages, tools, options, &self.cfg);
         super::wire_dump_request(self.cfg.wire_dump_dir.as_deref(), &self.cfg.model, &body); // byte-level dump (ATOMCODE_WIRE_DUMP=1)
 
         // Open the stream. A hard failure here returns `Err` so the kernel's
         // agent-layer open retry still applies.
-        let policy = self.cfg.retry.clone();
+        let policy = retry::policy_for_call(&self.cfg.retry, options);
+        let caller_recovers = options.request_recovery.is_some();
         let client = self.client.clone();
         let url = self.url.clone();
         let api_key = self.cfg.api_key.clone();
@@ -224,42 +267,48 @@ impl LlmProvider for AnthropicProvider {
             &session_id,
             &policy,
             rate_limit_retry_owner,
+            caller_recovers,
             open_timeout,
         )
         .await?;
 
+        let reasoning_provider = if self.cfg.deepseek_messages {
+            format!("deepseek-messages:{}", self.cfg.model)
+        } else {
+            "anthropic".to_owned()
+        };
         let s = async_stream::stream! {
             // A body that dies before replay-sensitive output reaches the consumer is
             // safe to redo wholesale. Metadata may repeat; content and tool data may not.
             // 1 initial open + up to 2 transparent reopens — a gateway resetting
             // connections under load can drop more than one attempt before a
             // healthy backend answers.
-            const MAX_STREAM_ATTEMPTS: u32 = 3;
+            let max_stream_attempts: u32 = if caller_recovers { 1 } else { 3 };
             let mut stream_attempt = 1u32;
             let mut reconnect_attempts = 0u32;
             let mut resp = resp;
             'reopen: loop {
                 let mut dec = AnthropicSseDecoder::new();
+                dec.reasoning_provider = reasoning_provider.clone();
                 let mut emitted_replay_sensitive = false;
                 let mut pending_metadata = Vec::new();
                 let byte_stream = resp.bytes_stream();
                 futures::pin_mut!(byte_stream);
-                // PHASE-AWARE byte-idle watchdog: prefill (before the first byte of this
-                // (re)opened stream) waits up to `first_token`; after the first byte we
-                // tighten to the inter-token `idle`. See openai_compat for the rationale.
-                // Reset per (re)open — a transparent reconnect restarts prefill.
-                let mut first_byte_seen = false;
+                // Heartbeats and metadata do not end prefill or extend the
+                // content deadline. Every decoded content event resets idle.
+                // A transparent reopen gets a fresh first-content budget.
+                let mut watchdog = super::StreamWatchdog::new(Some(first_token), Some(idle));
                 loop {
                     match retry::next_chunk_phased(
                         &mut byte_stream,
-                        first_token,
-                        idle,
-                        &mut first_byte_seen,
+                        &watchdog,
                     )
                     .await
                     {
                         Err(_elapsed) => {
-                            yield StreamEvent::Error(retry::stream_idle_error());
+                            let mut error = retry::stream_idle_error();
+                            error.retryable = caller_recovers && !emitted_replay_sensitive;
+                            yield StreamEvent::Error(error);
                             return;
                         }
                         Ok(None) => {
@@ -273,6 +322,7 @@ impl LlmProvider for AnthropicProvider {
                                 {
                                     for metadata in pending_metadata.drain(..) { yield metadata; }
                                 }
+                                watchdog.observe(&ev);
                                 emitted_replay_sensitive |= retry::is_replay_sensitive_event(&ev);
                                 yield ev;
                             }
@@ -296,26 +346,36 @@ impl LlmProvider for AnthropicProvider {
                                     {
                                         for metadata in pending_metadata.drain(..) { yield metadata; }
                                     }
-                                    emitted_replay_sensitive |= retry::is_replay_sensitive_event(&ev);
+                                    watchdog.observe(&ev);
+                                emitted_replay_sensitive |= retry::is_replay_sensitive_event(&ev);
                                     yield ev;
                                 }
                                 return;
                             }
-                            if !emitted_replay_sensitive && stream_attempt < MAX_STREAM_ATTEMPTS {
+                            if !emitted_replay_sensitive && stream_attempt < max_stream_attempts {
                                 reconnect_attempts += 1;
                                 // Brief, esc-interruptible backoff before reopening so an
                                 // immediate retry does not slam a gateway resetting under load.
                                 tokio::time::sleep(retry::compute_backoff(stream_attempt, &policy)).await;
                                 if let Ok(fresh) =
-                                    open_stream(&client, &url, &body, &api_key, &anthropic_version, &session_id, &policy, rate_limit_retry_owner, open_timeout).await
+                                    open_stream(&client, &url, &body, &api_key, &anthropic_version, &session_id, &policy, rate_limit_retry_owner, caller_recovers, open_timeout).await
                                 {
                                     stream_attempt += 1;
                                     resp = fresh;
                                     continue 'reopen;
                                 }
                             }
+                            // Repair the pool for the caller's next attempt without
+                            // opening a hidden request or replaying content here.
+                            if caller_recovers && (retry::is_stale_connection_error(&e) || retry::chain_has_tls_corruption(&e)) {
+                                let capped = client.is_tls12() || atomcode_config::tls::should_cap_url(&url);
+                                if let Err(error) = client.rebuild(capped) {
+                                    yield StreamEvent::Error(error);
+                                    return;
+                                }
+                            }
                             yield StreamEvent::Error(ProviderError {
-                                retryable: false,
+                                retryable: caller_recovers && !emitted_replay_sensitive,
                                 code: retry::stream_read_error_code(&e),
                                 message: retry::stream_read_error_message(
                                     &e,
@@ -343,6 +403,7 @@ impl LlmProvider for AnthropicProvider {
                                 {
                                     for metadata in pending_metadata.drain(..) { yield metadata; }
                                 }
+                                watchdog.observe(&ev);
                                 emitted_replay_sensitive |= retry::is_replay_sensitive_event(&ev);
                                 if matches!(ev, StreamEvent::Done { .. }) {
                                     saw_done = true;
@@ -356,7 +417,11 @@ impl LlmProvider for AnthropicProvider {
             }
         };
 
-        Ok(s.boxed())
+        let headers = self.cfg.headers.clone();
+        Ok(
+            s.map(move |event| super::redact_header_error(event, &headers))
+                .boxed(),
+        )
     }
 }
 
@@ -390,6 +455,7 @@ async fn open_stream(
     session_id: &str,
     policy: &RetryPolicy,
     rate_limit_retry_owner: atomcode_kernel::provider::RateLimitRetryOwner,
+    caller_recovers: bool,
     open_timeout: Duration,
 ) -> Result<reqwest::Response, ProviderError> {
     retry::bounded_open(
@@ -403,6 +469,7 @@ async fn open_stream(
             session_id,
             policy,
             rate_limit_retry_owner,
+            caller_recovers,
             open_timeout,
         ),
     )
@@ -418,6 +485,7 @@ async fn open_stream_attempts(
     session_id: &str,
     policy: &RetryPolicy,
     rate_limit_retry_owner: atomcode_kernel::provider::RateLimitRetryOwner,
+    caller_recovers: bool,
     open_timeout: Duration,
 ) -> Result<reqwest::Response, ProviderError> {
     let mut attempt = 1u32;
@@ -426,10 +494,13 @@ async fn open_stream_attempts(
         let http = client.get();
         let mut req = http
             .post(url)
-            .header("x-api-key", api_key)
             .header("anthropic-version", anthropic_version)
             .json(body);
+        if !api_key.is_empty() {
+            req = req.header("x-api-key", api_key);
+        }
         req = with_session_headers(req, url, session_id);
+        req = super::apply_account_headers(req, &client.headers)?;
         // TTFB watchdog for THIS attempt (mirrors openai_compat): bounds only the
         // silent-gateway wait, never a slow streaming body.
         let send = match tokio::time::timeout(open_timeout, req.send()).await {
@@ -442,6 +513,9 @@ async fn open_stream_attempts(
                     pool_refreshed = timeout_pool_refreshed,
                     "provider response headers timed out"
                 );
+                if caller_recovers {
+                    client.rebuild(client.is_tls12())?;
+                }
                 if attempt < policy.max_attempts {
                     if !timeout_pool_refreshed {
                         client.rebuild(false)?;
@@ -492,7 +566,9 @@ async fn open_stream_attempts(
                     // authoritative rate-limit countdown for the self-heal (vs scraping text).
                     let retry_after_secs =
                         retry::parse_retry_after(resp.headers()).map(|d| d.as_secs());
-                    let text = resp.text().await.unwrap_or_default();
+                    let text = client
+                        .headers
+                        .redact(&resp.text().await.unwrap_or_default());
                     let envelope = serde_json::from_str::<serde_json::Value>(&text).ok();
                     let err_obj = envelope.as_ref().and_then(|v| v.get("error"));
                     let detail = err_obj
@@ -510,6 +586,11 @@ async fn open_stream_attempts(
                 return Ok(resp);
             }
             Err(e) => {
+                if caller_recovers
+                    && (retry::is_stale_connection_error(&e) || retry::chain_has_tls_corruption(&e))
+                {
+                    client.rebuild(client.is_tls12())?;
+                }
                 if retry::is_retryable_reqwest_error(&e) && attempt < policy.max_attempts {
                     let wait = retry::compute_backoff(attempt, policy);
                     tokio::time::sleep(wait).await;
@@ -544,7 +625,20 @@ fn build_request_body(
     );
     body.insert("stream".into(), json!(true));
 
-    let (system, msgs) = format_messages_with_vision(messages, cfg.thinking, cfg.supports_vision);
+    // Signatures are protocol/model-bound. Filter at serialization time without
+    // cloning or rewriting the durable conversation.
+    let source = if cfg.deepseek_messages {
+        format!("deepseek-messages:{model}")
+    } else {
+        "anthropic".to_owned()
+    };
+    let (system, msgs) = format_messages_for_provider(
+        messages,
+        cfg.thinking,
+        cfg.supports_vision,
+        &source,
+        cfg.deepseek_messages,
+    );
     if let Some(s) = system {
         body.insert("system".into(), json!(s));
     }
@@ -579,10 +673,19 @@ fn build_request_body(
     // Anthropic rejects extended/adaptive thinking combined with forced tool use.
     // Suppress thinking for this one request; the session config remains unchanged,
     // so the following round resumes thinking automatically.
-    if cfg.thinking && !forces_tool_use {
+    if cfg.deepseek_messages {
+        body.insert(
+            "thinking".into(),
+            json!({"type": if cfg.thinking { "enabled" } else { "disabled" }}),
+        );
+    }
+    if !cfg.deepseek_messages && cfg.thinking && !forces_tool_use {
         body.insert("thinking".into(), json!({ "type": "adaptive" }));
     }
-    if let Some(effort) = options.reasoning_effort {
+    if let Some(effort) = options
+        .reasoning_effort
+        .filter(|_| !cfg.deepseek_messages || cfg.thinking)
+    {
         body.insert(
             "output_config".into(),
             json!({ "effort": effort_str(effort) }),
@@ -602,7 +705,20 @@ fn build_request_body(
         body.insert("tools".into(), json!(t));
     }
     let mut body = Value::Object(body);
-    apply_prompt_cache(&mut body);
+    if !cfg.deepseek_messages {
+        apply_prompt_cache(&mut body);
+    } else {
+        body.as_object_mut().unwrap().remove("tool_choice");
+        if matches!(options.tool_choice, ToolChoice::None) {
+            body.as_object_mut().unwrap().remove("tools");
+        }
+        if cfg.thinking && options.reasoning_effort.is_none() {
+            body["output_config"] = json!({"effort": "high"});
+        }
+        if let Some(messages) = body["messages"].as_array_mut() {
+            messages.retain(|m| !(m["role"] == "assistant" && m["content"] == ""));
+        }
+    }
     body
 }
 
@@ -667,10 +783,21 @@ fn format_messages(messages: &[Message], echo_thinking: bool) -> (Option<String>
     format_messages_with_vision(messages, echo_thinking, true)
 }
 
+#[cfg(test)]
 fn format_messages_with_vision(
     messages: &[Message],
     echo_thinking: bool,
     supports_vision: bool,
+) -> (Option<String>, Vec<Value>) {
+    format_messages_for_provider(messages, echo_thinking, supports_vision, "anthropic", false)
+}
+
+fn format_messages_for_provider(
+    messages: &[Message],
+    echo_thinking: bool,
+    supports_vision: bool,
+    reasoning_source: &str,
+    deepseek: bool,
 ) -> (Option<String>, Vec<Value>) {
     // Leading System messages lift to the top-level `system` (joined). Anthropic has no
     // system message ROLE on the wire.
@@ -698,7 +825,12 @@ fn format_messages_with_vision(
                 continue;
             }
             Role::Assistant => {
-                out.push(format_assistant_message(m, echo_thinking));
+                out.push(format_assistant_message(
+                    m,
+                    echo_thinking,
+                    reasoning_source,
+                    deepseek,
+                ));
                 i += 1;
                 continue;
             }
@@ -820,14 +952,19 @@ fn format_user_message(m: &Message, supports_vision: bool) -> Value {
 /// An `assistant` message. Plain text (no tool calls, no echoed thinking) → `content`
 /// STRING. Otherwise an ARRAY in Anthropic's required order: signed thinking blocks
 /// (only when `echo_thinking`), then the text block, then `tool_use` blocks.
-fn format_assistant_message(m: &Message, echo_thinking: bool) -> Value {
+fn format_assistant_message(
+    m: &Message,
+    echo_thinking: bool,
+    reasoning_source: &str,
+    deepseek: bool,
+) -> Value {
     // Echo a signed thinking block back ONLY if THIS provider produced it. An opaque
     // token is PROVIDER-BOUND — replaying another vendor's `signature`/`data` to
     // Anthropic fails hard (400) — so we filter on `provider`, honoring the
     // [`ReasoningBlock`](atomcode_kernel::message::ReasoningBlock) INVARIANT. A `None`
     // provider is treated as foreign (never echoed).
     let echoable = |b: &atomcode_kernel::message::ReasoningBlock| {
-        echo_thinking && b.provider.as_deref() == Some("anthropic")
+        echo_thinking && b.provider.as_deref() == Some(reasoning_source)
     };
     let has_echo = m.reasoning_blocks.iter().any(|b| echoable(b));
     if m.tool_calls.is_empty() && !has_echo {
@@ -839,7 +976,15 @@ fn format_assistant_message(m: &Message, echo_thinking: bool) -> Value {
         let opaque = b.opaque.as_deref().unwrap_or_default();
         // Empty text ⇒ a REDACTED block (carries `data`, not a `signature`); a normal
         // thinking block carries readable text + its `signature`.
-        if b.text.is_empty() {
+        if deepseek {
+            // DeepSeek has thinking blocks with optional signatures; an empty
+            // thinking text is not Anthropic's redacted_thinking/data variant.
+            let mut block = json!({"type": "thinking", "thinking": b.text});
+            if !opaque.is_empty() {
+                block["signature"] = json!(opaque);
+            }
+            parts.push(block);
+        } else if b.text.is_empty() {
             parts.push(json!({ "type": "redacted_thinking", "data": opaque }));
         } else {
             parts.push(json!({ "type": "thinking", "thinking": b.text, "signature": opaque }));
@@ -938,6 +1083,8 @@ struct BlockState {
     id: String,
     name: String,
     input_json: String,
+    // DeepSeek may supply a complete initial input; streamed JSON supersedes it.
+    initial_input: String,
     // thinking / redacted_thinking:
     signature: String,
     redacted_data: String,
@@ -947,6 +1094,7 @@ struct BlockState {
 /// `StreamEvent`s. Splitting the event→event mapping out here (vs inline in the network
 /// loop) makes it deterministic and testable from recorded bytes.
 struct AnthropicSseDecoder {
+    reasoning_provider: String,
     buf: Vec<u8>,
     blocks: Vec<BlockState>,
     input_tokens: u32,
@@ -965,6 +1113,7 @@ struct AnthropicSseDecoder {
 impl AnthropicSseDecoder {
     fn new() -> Self {
         Self {
+            reasoning_provider: "anthropic".into(),
             buf: Vec::new(),
             blocks: Vec::new(),
             input_tokens: 0,
@@ -1102,7 +1251,40 @@ impl AnthropicSseDecoder {
                     .and_then(|s| s.as_str())
                     .unwrap_or("")
                     .to_string();
+                let deepseek = self.reasoning_provider.starts_with("deepseek-messages:");
+                if deepseek {
+                    let initial = cb
+                        .and_then(|c| {
+                            c.get(if kind == "thinking" {
+                                "thinking"
+                            } else {
+                                "text"
+                            })
+                        })
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if !initial.is_empty() {
+                        match kind.as_str() {
+                            "thinking" => out.push(StreamEvent::Reasoning(initial.to_owned())),
+                            "text" => out.push(StreamEvent::TextDelta(initial.to_owned())),
+                            _ => {}
+                        }
+                    }
+                }
                 if let Some(b) = self.block_mut(index) {
+                    if deepseek {
+                        b.signature = cb
+                            .and_then(|c| c.get("signature"))
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned();
+                        if let Some(input) = cb
+                            .and_then(|c| c.get("input"))
+                            .filter(|input| input.as_object().is_some_and(|obj| !obj.is_empty()))
+                        {
+                            b.initial_input = input.to_string();
+                        }
+                    }
                     b.kind = kind;
                     b.id = id;
                     b.name = name;
@@ -1175,7 +1357,11 @@ impl AnthropicSseDecoder {
                 match b.kind.as_str() {
                     "tool_use" => {
                         let args = if b.input_json.trim().is_empty() {
-                            "{}".to_string()
+                            if b.initial_input.is_empty() {
+                                "{}".to_string()
+                            } else {
+                                b.initial_input
+                            }
                         } else {
                             b.input_json
                         };
@@ -1188,13 +1374,13 @@ impl AnthropicSseDecoder {
                     "thinking" => {
                         out.push(StreamEvent::ReasoningSignature {
                             opaque: b.signature,
-                            provider: "anthropic".into(),
+                            provider: self.reasoning_provider.clone(),
                         });
                     }
                     "redacted_thinking" => {
                         out.push(StreamEvent::ReasoningSignature {
                             opaque: b.redacted_data,
-                            provider: "anthropic".into(),
+                            provider: self.reasoning_provider.clone(),
                         });
                     }
                     _ => {}
@@ -1270,6 +1456,255 @@ fn usize_at(v: &Value, key: &str) -> usize {
 mod tests {
     use super::*;
     use atomcode_kernel::message::{ImageContent, ReasoningBlock};
+
+    #[test]
+    fn deepseek_messages_is_an_isolated_wire_dialect() {
+        let mut c = cfg();
+        c.deepseek_messages = true;
+        c.thinking = true;
+        let mut assistant = Message::assistant(
+            "answer",
+            vec![ToolCall {
+                id: "call".into(),
+                name: "read".into(),
+                arguments: "[]".into(),
+            }],
+        );
+        assistant.reasoning_blocks = vec![
+            ReasoningBlock {
+                text: "mine".into(),
+                opaque: Some("sig".into()),
+                provider: Some("deepseek-messages:deepseek-flash".into()),
+            },
+            ReasoningBlock {
+                text: "foreign".into(),
+                opaque: Some("secret".into()),
+                provider: Some("deepseek-messages:another-model".into()),
+            },
+            ReasoningBlock {
+                text: "claude".into(),
+                opaque: Some("claude-sig".into()),
+                provider: Some("anthropic".into()),
+            },
+        ];
+        let history = vec![
+            Message::system("system"),
+            Message::user("go"),
+            assistant.clone(),
+            Message::tool_result("call", "ok", false),
+        ];
+        let body = build_request_body("deepseek-flash", &history, &[], &ChatOptions::default(), &c);
+        assert_eq!(body["thinking"], json!({"type": "enabled"}));
+        assert_eq!(body["output_config"]["effort"], "high");
+        assert_eq!(body["system"], "system");
+        assert_eq!(
+            body["messages"][1]["content"][0],
+            json!({"type":"thinking", "thinking":"mine", "signature":"sig"})
+        );
+        assert_eq!(body["messages"][1]["content"][2]["input"], json!({}));
+        let wire = body.to_string();
+        assert!(!wire.contains("cache_control"));
+        assert!(!wire.contains("foreign"));
+        assert!(!wire.contains("claude-sig"));
+        assert_eq!(
+            assistant.reasoning_blocks[0].provider.as_deref(),
+            Some("deepseek-messages:deepseek-flash")
+        );
+        c.thinking = false;
+        let body = build_request_body("deepseek-flash", &history, &[], &ChatOptions::default(), &c);
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert!(body.get("output_config").is_none());
+        assert!(!body.to_string().contains("sig"));
+    }
+
+    #[test]
+    fn deepseek_empty_and_unsigned_thinking_are_not_redacted_blocks() {
+        let mut c = cfg();
+        c.deepseek_messages = true;
+        c.thinking = true;
+        let mut assistant = Message::assistant("answer", vec![]);
+        assistant.reasoning_blocks = vec![
+            ReasoningBlock {
+                text: String::new(),
+                opaque: Some("sig".into()),
+                provider: Some("deepseek-messages:deepseek-flash".into()),
+            },
+            ReasoningBlock {
+                text: "unsigned".into(),
+                opaque: None,
+                provider: Some("deepseek-messages:deepseek-flash".into()),
+            },
+        ];
+        let body = build_request_body(
+            "deepseek-flash",
+            &[Message::user("go"), assistant],
+            &[],
+            &ChatOptions::default(),
+            &c,
+        );
+        assert_eq!(
+            body["messages"][1]["content"][0],
+            json!({"type":"thinking", "thinking":"", "signature":"sig"})
+        );
+        assert_eq!(
+            body["messages"][1]["content"][1],
+            json!({"type":"thinking", "thinking":"unsigned"})
+        );
+        assert!(!body.to_string().contains("redacted_thinking"));
+    }
+
+    #[tokio::test]
+    async fn deepseek_rejects_unsupported_effort_before_opening_a_connection() {
+        let mut c =
+            AnthropicConfig::new("key", "http://127.0.0.1:1/anthropic/v1/", "deepseek-flash");
+        c.deepseek_messages = true;
+        c.thinking = true;
+        let provider = AnthropicProvider::new(c).unwrap();
+        assert_eq!(provider.url, "http://127.0.0.1:1/anthropic/v1/messages");
+        let options = ChatOptions {
+            reasoning_effort: Some(ReasoningEffort::Medium),
+            ..Default::default()
+        };
+        let Err(error) = provider
+            .chat_stream(&[Message::user("hi")], &[], &options)
+            .await
+        else {
+            panic!("unsupported effort accepted")
+        };
+        assert!(!error.retryable);
+        assert!(error.message.contains("low, high or max"));
+        let forced = ChatOptions {
+            tool_choice: ToolChoice::Specific("read".into()),
+            ..Default::default()
+        };
+        let Err(error) = provider
+            .chat_stream(&[Message::user("hi")], &[], &forced)
+            .await
+        else {
+            panic!("forced choice accepted")
+        };
+        assert!(error.message.contains("forced tool choice"));
+    }
+
+    #[tokio::test]
+    async fn deepseek_messages_http_roundtrip_uses_native_auth_and_tools() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0; 4096];
+            loop {
+                let count = socket.read(&mut chunk).unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&chunk[..count]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]).to_lowercase();
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .unwrap()
+                        .trim()
+                        .parse()
+                        .unwrap();
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let mut response = line(
+                "content_block_start",
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call","name":"read","input":{}}}),
+            );
+            response += &line(
+                "content_block_delta",
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"a\"}"}}),
+            );
+            response += &line(
+                "content_block_stop",
+                json!({"type":"content_block_stop","index":0}),
+            );
+            response += &line("message_stop", json!({"type":"message_stop"}));
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{response}").unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let mut c = AnthropicConfig::new(
+            "test-key",
+            format!("http://127.0.0.1:{port}/anthropic"),
+            "deepseek-flash",
+        );
+        c.deepseek_messages = true;
+        c.thinking = true;
+        let provider = AnthropicProvider::new(c).unwrap();
+        let tools = vec![ToolDef {
+            name: "read".into(),
+            description: "read a file".into(),
+            parameters: json!({"type":"object"}),
+        }];
+        let events: Vec<_> = provider
+            .chat_stream(&[Message::user("go")], &tools, &ChatOptions::default())
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert!(events.iter().any(|event| matches!(event, StreamEvent::ToolCall(call) if call.name == "read" && call.arguments == r#"{"path":"a"}"#)));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::Error(_))));
+        let request = server.join().unwrap();
+        assert!(request.starts_with("POST /anthropic/v1/messages "));
+        assert!(request.to_lowercase().contains("x-api-key: test-key"));
+        let body: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(body["tools"][0]["input_schema"], json!({"type":"object"}));
+        assert_eq!(body["thinking"]["type"], "enabled");
+    }
+
+    #[test]
+    fn deepseek_streamed_tool_input_supersedes_initial_input() {
+        for streamed in [false, true] {
+            let mut decoder = AnthropicSseDecoder::new();
+            decoder.reasoning_provider = "deepseek-messages:deepseek-flash".into();
+            let mut wire = line(
+                "content_block_start",
+                json!({"type":"content_block_start", "index":0, "content_block":{"type":"tool_use", "id":"call", "name":"read", "input":{"path":"initial"}}}),
+            );
+            if streamed {
+                wire += &line(
+                    "content_block_delta",
+                    json!({"type":"content_block_delta", "index":0, "delta":{"type":"input_json_delta", "partial_json":"{\"path\":\"streamed\"}"}}),
+                );
+            }
+            wire += &line(
+                "content_block_stop",
+                json!({"type":"content_block_stop", "index":0}),
+            );
+            let events = decoder.feed(wire.as_bytes());
+            let call = events
+                .iter()
+                .find_map(|event| match event {
+                    StreamEvent::ToolCall(call) => Some(call),
+                    _ => None,
+                })
+                .unwrap();
+            let input: Value = serde_json::from_str(&call.arguments).unwrap();
+            assert_eq!(input["path"], if streamed { "streamed" } else { "initial" });
+        }
+    }
+
+    #[test]
+    fn deepseek_stream_signatures_carry_model_provenance() {
+        let mut decoder = AnthropicSseDecoder::new();
+        decoder.reasoning_provider = "deepseek-messages:deepseek-flash".into();
+        let events = decoder.feed(b"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"x\",\"signature\":\"sig\"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n");
+        assert!(events.iter().any(|e| matches!(e, StreamEvent::ReasoningSignature { provider, opaque } if provider == "deepseek-messages:deepseek-flash" && opaque == "sig")));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Reasoning(text) if text == "x")));
+    }
 
     #[test]
     fn cache_markers_preserve_thinking_and_cover_four_boundaries() {
@@ -1713,6 +2148,7 @@ mod tests {
             temperature: Some(0.5),
             tool_choice: ToolChoice::Required,
             rate_limit_retry_owner: Default::default(),
+            request_recovery: None,
         };
         let tools = vec![ToolDef {
             name: "read".into(),

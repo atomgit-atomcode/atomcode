@@ -22,8 +22,8 @@ use atomcode_config::config::TodoEagerness;
 /// Injected when the model tries to STOP while the task list still has open items — the
 /// residual weak-model gap after incremental `todo` updates land: it does the last item's work
 /// (e.g. the closing summary) then ends WITHOUT marking it completed. Mirrors
-/// `VerifyCadenceHook`'s `offer_continuation` cadence; nudges at most ONCE per real-user turn
-/// (and the kernel `max_continuations` fuse bounds it), so it can never spin.
+/// `VerifyCadenceHook`'s `offer_continuation` cadence; nudges are bounded per execution
+/// and require tool work between attempts, so steering cannot make them spin.
 ///
 /// The nudge asks for a TRUE LIST, not for more work: the list exists to show where the work
 /// actually stands, so an item that is finished gets closed, one the plan outgrew gets replaced
@@ -32,13 +32,19 @@ use atomcode_config::config::TodoEagerness;
 /// items the task no longer needed instead of reconciling the list, which is the opposite of
 /// what the list is for. Stopping is legitimate; stopping with a list that lies is not.
 const TODO_COMPLETION_NUDGE: &str = "Before you finish: the task list still has open items. \
-Take a moment to make it match where the work actually stands — the list is there to reflect \
-reality, not to keep you working. \
+An additional question during execution does not cancel the original task: after answering, \
+continue the remaining authorized work. Respect an explicit pause, cancellation or replacement \
+of the task; do not continue blocked work or work awaiting user input or approval. \
 If an item is done, mark it completed with `todowrite` \
 (`{\"action\":\"update\",\"id\":<id>,\"status\":\"completed\"}`). If the plan changed and an item \
-is no longer part of the task, replace or drop it rather than leaving it open. If it is genuinely \
-still ahead of you, keep going — and if you are stopping, say briefly which items are open and why \
-(blocked, needs approval, ambiguous, or simply no longer wanted).";
+is no longer part of the task, replace or drop it. The list reflects real work, not an obligation \
+to execute obsolete items. Do not mention this reminder, recite task-list status, announce \
+resumption, or ask the user to say continue. Report only a real blocker or a needed decision.";
+
+const TODO_STEERING_GUIDANCE: &str = "Questions and clarifications received during this execution \
+do not cancel the original task. Answer them and continue the remaining authorized work without \
+announcing resumption or asking the user to say continue. An explicit pause, cancellation or \
+replacement takes priority; wait when user input or approval is needed.";
 
 pub struct TodoHook {
     /// Project root for locating the session todo sidecar
@@ -322,7 +328,7 @@ impl LifecycleHooks for TodoEagerHook {
         options: &mut ChatOptions,
         ctx: &TurnCtx,
     ) {
-        if self.should_hard_force(messages, ctx) {
+        if options.tool_choice != ToolChoice::None && self.should_hard_force(messages, ctx) {
             options.tool_choice = ToolChoice::Specific("todowrite".to_string());
         }
     }
@@ -337,7 +343,32 @@ fn current_real_user_start(convo: &Conversation) -> usize {
         .unwrap_or(0)
 }
 
-/// How many times one real-user turn is asked to close out its list before a stop is let be.
+/// Steering adds a user message inside an execution, not a new execution.
+/// Native requests carry the actual turn on assistant metadata. Conversations
+/// without that metadata retain the older user-message boundary.
+fn current_execution_start(convo: &Conversation) -> usize {
+    let turn = convo
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::Assistant)
+        .and_then(|m| m.meta.as_ref())
+        .map(|meta| meta.turn_id)
+        .filter(|turn| *turn != 0);
+    match turn {
+        Some(turn) => convo
+            .messages
+            .iter()
+            .position(|m| {
+                m.role == Role::Assistant
+                    && m.meta.as_ref().is_some_and(|meta| meta.turn_id == turn)
+            })
+            .unwrap_or(0),
+        None => current_real_user_start(convo),
+    }
+}
+
+/// How many times one execution is asked to close out its list before a stop is let be.
 const MAX_COMPLETION_NUDGES: usize = 3;
 
 /// Whether this turn may be nudged again: under [`MAX_COMPLETION_NUDGES`], and — when it
@@ -349,7 +380,7 @@ const MAX_COMPLETION_NUDGES: usize = 3;
 /// closed as a clean finish with the list still open (a 45-minute, 50-round turn, reported
 /// against 5.1.0).
 fn completion_nudge_allowed(convo: &Conversation) -> bool {
-    let turn = &convo.messages[current_real_user_start(convo)..];
+    let turn = &convo.messages[current_execution_start(convo)..];
     let nudges: Vec<usize> = turn
         .iter()
         .enumerate()
@@ -380,12 +411,10 @@ fn stops_on_a_question(convo: &Conversation) -> bool {
         .is_some_and(|m| ends_on_a_question(&m.text))
 }
 
-/// True iff the model actively MANAGED the task list this turn (a `todo`/`todowrite` call after
-/// the last real-user message). We only nudge when it did — so a stop where the model is asking
-/// the user something unrelated to a STALE list from an earlier turn isn't hijacked into a
-/// continuation. Mirrors `VerifyCadenceHook`'s narrow "only right after an edit" scoping.
+/// Only a list managed in this execution can drive continuation. A steering
+/// question does not abandon it; an old list from a finished turn cannot wake it.
 fn managed_todos_this_turn(convo: &Conversation) -> bool {
-    let start = current_real_user_start(convo);
+    let start = current_execution_start(convo);
     convo.messages[start..].iter().any(|m| {
         m.tool_calls
             .iter()
@@ -547,7 +576,11 @@ impl LifecycleHooks for TodoHook {
                 .map(|c| c.items.clone())
                 .unwrap_or_default(),
         );
-        let Some(CurrentTodos { items: todos, .. }) = current else {
+        let Some(CurrentTodos {
+            items: todos,
+            through,
+        }) = current
+        else {
             return;
         };
         if todos.is_empty() {
@@ -569,8 +602,16 @@ impl LifecycleHooks for TodoHook {
         let note = todo_quiet_note(&todos, quiet_steps(messages))
             .map(|n| format!(" {n}"))
             .unwrap_or_default();
+        // Only an actively managed plan gets this guidance. A persisted list
+        // from an earlier execution cannot turn a new question into old work.
+        let continuity =
+            if through.is_some_and(|position| position.turn != 0 && position.turn == ctx.turn_id) {
+                format!("\n{TODO_STEERING_GUIDANCE}")
+            } else {
+                String::new()
+            };
         let body = format!(
-            "{TODO_LIST_HEADER}{rules}\n{status}{note}\n{}",
+            "{TODO_LIST_HEADER}{rules}{continuity}\n{status}{note}\n{}",
             render_todos_numbered(&todos, false)
         );
         messages.push(synthetic_system_reminder(&body));
@@ -580,7 +621,7 @@ impl LifecycleHooks for TodoHook {
     /// inject a nudge to close them out (or keep working) and continue the turn — the gap where
     /// a weak model finishes the last item's work but forgets the final `todo update`, or ends
     /// a reply on the step it was about to take. At most [`MAX_COMPLETION_NUDGES`] per
-    /// real-user turn, a further one only after the model did work since the last, and never
+    /// execution, a further one only after the model did work since the last, and never
     /// on a reply that asks the person something; `None` otherwise lets it stop.
     ///
     /// The list is the one this round's request showed (see `shown`); a driver
@@ -1277,6 +1318,18 @@ mod tests {
             ToolChoice::Specific("todowrite".into())
         );
 
+        let mut closing_options = ChatOptions {
+            tool_choice: ToolChoice::None,
+            ..Default::default()
+        };
+        hook.pre_request_options(&messages, &mut closing_options, &ctx)
+            .await;
+        assert_eq!(
+            closing_options.tool_choice,
+            ToolChoice::None,
+            "explicit text-only closing must take precedence over eager planning"
+        );
+
         let with_list = vec![
             Message::user("continue"),
             todowrite_msg(r#"{"todos":[{"content":"a","status":"pending"}]}"#),
@@ -1387,6 +1440,102 @@ mod tests {
                 .await
                 .is_none(),
             "a stale open list not touched this turn must not force a continuation"
+        );
+    }
+
+    fn reply_in_turn(turn: u64, text: &str) -> Message {
+        let mut message = Message::assistant(text, vec![]);
+        message.meta = Some(atomcode_kernel::message::MessageMeta {
+            turn_id: turn,
+            ..Default::default()
+        });
+        message
+    }
+
+    #[tokio::test]
+    async fn a_steering_question_keeps_the_active_task() {
+        let convo = convo_of(vec![
+            Message::user("implement and verify"),
+            todo_call(
+                "plan",
+                7,
+                1,
+                r#"{"todos":[{"content":"verify","status":"in_progress"}]}"#,
+            ),
+            Message::user("what does this function do?"),
+            reply_in_turn(7, "It parses the input."),
+        ]);
+        assert!(TodoHook::default()
+            .offer_continuation(&convo)
+            .await
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn a_new_execution_does_not_revive_an_old_task() {
+        let convo = convo_of(vec![
+            Message::user("implement and verify"),
+            todo_call(
+                "plan",
+                7,
+                1,
+                r#"{"todos":[{"content":"verify","status":"in_progress"}]}"#,
+            ),
+            reply_in_turn(7, "Waiting for approval."),
+            Message::user("what does this function do?"),
+            reply_in_turn(8, "It parses the input."),
+        ]);
+        assert!(TodoHook::default()
+            .offer_continuation(&convo)
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn steering_does_not_reset_the_completion_budget_or_progress_guard() {
+        let mut convo = convo_of(vec![
+            Message::user("implement and verify"),
+            todo_call(
+                "plan",
+                7,
+                1,
+                r#"{"todos":[{"content":"verify","status":"in_progress"}]}"#,
+            ),
+        ]);
+        for attempt in 0..MAX_COMPLETION_NUDGES {
+            convo.messages.push(reply_in_turn(7, "A short answer."));
+            assert!(TodoHook::default()
+                .offer_continuation(&convo)
+                .await
+                .is_some());
+            convo
+                .messages
+                .push(Message::synthetic_user(TODO_COMPLETION_NUDGE));
+            convo.messages.push(Message::user("another question"));
+            convo
+                .messages
+                .push(reply_in_turn(7, "Another short answer."));
+            assert!(
+                TodoHook::default()
+                    .offer_continuation(&convo)
+                    .await
+                    .is_none(),
+                "steering cannot erase the no-progress guard at attempt {attempt}"
+            );
+            let mut work = worked();
+            work.meta = Some(atomcode_kernel::message::MessageMeta {
+                turn_id: 7,
+                ..Default::default()
+            });
+            convo.messages.push(work);
+        }
+        convo.messages.push(reply_in_turn(7, "One more answer."));
+        assert!(
+            TodoHook::default()
+                .offer_continuation(&convo)
+                .await
+                .is_none(),
+            "tools and steering cannot erase the per-execution limit"
         );
     }
 

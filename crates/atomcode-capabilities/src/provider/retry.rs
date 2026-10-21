@@ -4,9 +4,10 @@
 //! transparently reopen the request, but only until replay-sensitive output (text,
 //! reasoning, or tool data) reaches the consumer. Metadata alone is replay-safe.
 //!
-//! HTTP 429 ownership is selected per call: direct consumers retain the bounded
-//! provider OPEN retry, while kernel turns surface the first 429 so their
-//! lifecycle can provide cancellable waits, countdowns, and a fuse.
+//! Direct consumers retain bounded adapter retries. Budgeted native calls
+//! delegate transient OPEN and no-output stream retries to their request owner,
+//! so every retry/continuation uses one allowance and cancellable wait policy.
+//! HTTP 429 ownership is also selectable independently for older direct callers.
 
 use std::time::Duration;
 
@@ -19,31 +20,25 @@ pub(crate) enum StreamReadRecovery {
     PartialResponse,
 }
 
-/// Await the next chunk from a provider byte stream with a PHASE-AWARE idle watchdog:
-/// `first_token` before the first DATA byte of this (re)opened stream (prefill / TTFB —
-/// a slow local model can be silent for minutes), then the tighter inter-token `idle`.
-/// Flips `*first_byte_seen` on the first `Ok` chunk ONLY — a transport `Err` does not
-/// count (it triggers a reopen, which resets the flag). Returns the `timeout` result for
-/// the caller to match: `Err(_)` = idle timeout, `Ok(None)` = stream end, `Ok(Some(_))`
-/// = a data chunk or a transport error.
-///
-/// Shared by all four provider byte loops (openai_compat / responses / anthropic /
-/// ollama) so the phase-aware liveness policy lives in exactly one place.
+/// Wait for bytes within the remaining semantic progress budget. Heartbeats
+/// neither switch phases nor restart the deadline; decoded events update it.
 pub(crate) async fn next_chunk_phased<S, T, E>(
     byte_stream: &mut S,
-    first_token: Duration,
-    idle: Duration,
-    first_byte_seen: &mut bool,
+    watchdog: &super::StreamWatchdog,
 ) -> Result<Option<Result<T, E>>, tokio::time::error::Elapsed>
 where
     S: futures::Stream<Item = Result<T, E>> + Unpin,
 {
-    let watchdog = if *first_byte_seen { idle } else { first_token };
-    let next = tokio::time::timeout(watchdog, futures::StreamExt::next(byte_stream)).await;
-    if matches!(&next, Ok(Some(Ok(_)))) {
-        *first_byte_seen = true;
+    let result = watchdog.next(byte_stream).await;
+    if result.is_err() {
+        tracing::warn!(
+            phase = watchdog.phase(),
+            budget_ms = watchdog.budget().map(|d| d.as_millis() as u64),
+            silent_ms = watchdog.silent_for().as_millis() as u64,
+            "provider content deadline exceeded"
+        );
     }
-    next
+    result
 }
 
 /// Preserve a typed idle failure for the owner's progress-aware recovery.
@@ -97,6 +92,30 @@ pub struct RetryPolicy {
     pub max_attempts: u32,
     pub base_delay: Duration,
     pub max_delay: Duration,
+}
+
+/// Budgeted native calls have one retry owner. Standalone providers retain
+/// their own policy; a caller's explicit zero still means one OPEN attempt.
+pub(crate) fn policy_for_call(
+    policy: &RetryPolicy,
+    options: &atomcode_kernel::provider::ChatOptions,
+) -> RetryPolicy {
+    if options.request_recovery.is_some() {
+        RetryPolicy::none()
+    } else {
+        policy.clone()
+    }
+}
+
+pub(crate) fn recovery_exhausted(
+    limit: atomcode_kernel::provider::RecoveryExhausted,
+) -> atomcode_kernel::stream::ProviderError {
+    atomcode_kernel::stream::ProviderError {
+        retryable: true,
+        code: Some(atomcode_kernel::provider::REQUEST_RECOVERY_EXHAUSTED_CODE.into()),
+        message: limit.to_string(),
+        ..Default::default()
+    }
 }
 
 impl RetryPolicy {
@@ -1310,5 +1329,31 @@ mod open_budget_tests {
             error.code.as_deref(),
             Some(atomcode_kernel::stream::OPEN_TIMEOUT_CODE)
         );
+    }
+}
+
+#[cfg(test)]
+mod content_deadline_tests {
+    use super::*;
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn heartbeat_bytes_do_not_shorten_or_extend_prefill() {
+        let watchdog = super::super::StreamWatchdog::new(
+            Some(Duration::from_secs(600)),
+            Some(Duration::from_secs(120)),
+        );
+        let bytes = futures::stream::unfold((), |_| async {
+            tokio::time::sleep(Duration::from_secs(70)).await;
+            Some((Ok::<_, ()>(b": ping\n\n"), ()))
+        });
+        futures::pin_mut!(bytes);
+        let started = tokio::time::Instant::now();
+        for _ in 0..8 {
+            assert!(next_chunk_phased(&mut bytes, &watchdog)
+                .await
+                .unwrap()
+                .is_some());
+        }
+        assert!(next_chunk_phased(&mut bytes, &watchdog).await.is_err());
+        assert_eq!(started.elapsed(), Duration::from_secs(600));
     }
 }

@@ -156,6 +156,74 @@ pub struct FileInfo {
     pub len: u64,
 }
 
+/// Read-only discovery policy. Defaults preserve existing ignore and link behavior.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WalkOptions {
+    pub respect_gitignore: bool,
+    pub include_hidden: bool,
+    pub follow_symlinks: bool,
+    pub timeout_secs: u64,
+    pub max_entries: usize,
+    #[serde(skip)]
+    pub progress: atomcode_kernel::tool::ProgressSink,
+}
+impl Default for WalkOptions {
+    fn default() -> Self {
+        Self {
+            respect_gitignore: true,
+            include_hidden: false,
+            follow_symlinks: false,
+            timeout_secs: 30,
+            max_entries: 100_000,
+            progress: Default::default(),
+        }
+    }
+}
+impl WalkOptions {
+    pub fn bounded(mut self) -> Self {
+        self.timeout_secs = self.timeout_secs.clamp(1, 300);
+        self.max_entries = self.max_entries.clamp(1, 1_000_000);
+        self
+    }
+    pub fn filter_hint(&self) -> String {
+        format!("respect_gitignore={}, include_hidden={}, follow_symlinks={}. For a known filename, use read_file directly. Broaden only the specified directory; use respect_gitignore=false/include_hidden=true/follow_symlinks=true when needed. These options do not bypass permissions.", self.respect_gitignore, self.include_hidden, self.follow_symlinks)
+    }
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScanReport {
+    pub entries_scanned: usize,
+    pub skipped_entries: usize,
+    pub entry_limit_reached: bool,
+    pub result_limit_reached: bool,
+    /// Retained search results exhausted their byte budget.
+    pub byte_limit_reached: bool,
+    pub timed_out: bool,
+}
+impl ScanReport {
+    pub fn incomplete(&self) -> bool {
+        self.entry_limit_reached
+            || self.result_limit_reached
+            || self.byte_limit_reached
+            || self.timed_out
+            || self.skipped_entries > 0
+    }
+    pub fn summary(&self) -> String {
+        format!("Scan {}: {} entries visited; {} unreadable, restricted or invalid entries skipped{}{}{}{}. Narrow the search path if needed.",
+            if self.incomplete() { "incomplete" } else { "completed" },
+            self.entries_scanned, self.skipped_entries,
+            if self.entry_limit_reached { "; entry limit reached" } else { "" },
+            if self.timed_out { "; time limit reached" } else { "" },
+            if self.result_limit_reached { "; match limit reached" } else { "" },
+            if self.byte_limit_reached { "; result byte limit reached" } else { "" })
+    }
+}
+#[derive(Default)]
+pub struct WalkResult {
+    pub files: Vec<PathBuf>,
+    pub scan: ScanReport,
+}
+
 /// A content search, as the caller wants it run. Everything here is the
 /// caller's decision — the world only executes it.
 #[cfg(feature = "tools")]
@@ -174,10 +242,12 @@ pub struct SearchQuery {
     /// The caller's stop, as for [`Fs::walk`]: a search over a big tree is the
     /// other thing here that a person can be left waiting on.
     pub cancel: CancellationToken,
+    pub walk: WalkOptions,
 }
 
-/// One line of a search result, **undecoded** — the world's bytes, for the
-/// same reason [`Chunk`] carries bytes.
+/// One bounded line preview, **undecoded** — the world's bytes, for the same
+/// reason [`Chunk`] carries bytes. Line endings are omitted; a shortened
+/// preview ends with a UTF-8 ellipsis.
 #[cfg(feature = "tools")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SearchLine {
@@ -199,8 +269,12 @@ pub enum SearchLine {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SearchResult {
     pub lines: Vec<SearchLine>,
+    /// Accounted retained bytes: text, paths and inline result records. This
+    /// bounds retained data, not allocator overhead or the searcher's buffer.
+    pub retained_bytes: usize,
     pub matches: usize,
     pub files_searched: usize,
+    pub scan: ScanReport,
 }
 
 // ---- the filesystem seam -------------------------------------------------
@@ -313,6 +387,30 @@ pub trait FileSystem: Send + Sync {
         Ok(files)
     }
 
+    /// Options-aware discovery. Worlds with different filter semantics must override
+    /// this method rather than silently accepting an option they cannot implement.
+    async fn walk_with_options(
+        &self,
+        root: &Path,
+        skip_dir: &SkipDir,
+        cancel: &CancellationToken,
+        options: &WalkOptions,
+    ) -> Result<WalkResult, FsError> {
+        if !options.respect_gitignore || options.include_hidden || options.follow_symlinks {
+            return Err(FsError::io(
+                "this filesystem does not support alternate discovery filters",
+            ));
+        }
+        let mut files = self.walk(root, skip_dir, cancel).await?;
+        let scan = ScanReport {
+            entries_scanned: files.len(),
+            entry_limit_reached: files.len() > options.max_entries,
+            ..Default::default()
+        };
+        files.truncate(options.max_entries);
+        Ok(WalkResult { files, scan })
+    }
+
     /// Search file contents under `root`.
     ///
     /// Derived from [`walk`](Self::walk) + [`read_bytes`](Self::read_bytes):
@@ -327,8 +425,15 @@ pub trait FileSystem: Send + Sync {
         let matcher = build_matcher(query)?;
         let mut searcher = build_searcher(query.context);
         let mut result = SearchResult::default();
-        for path in self.walk(root, &query.skip_dir, &query.cancel).await? {
-            if result.matches >= query.max_matches || query.cancel.is_cancelled() {
+        let walked = self
+            .walk_with_options(root, &query.skip_dir, &query.cancel, &query.walk)
+            .await?;
+        result.scan = walked.scan;
+        for path in walked.files {
+            if result.matches >= query.max_matches
+                || result.scan.byte_limit_reached
+                || query.cancel.is_cancelled()
+            {
                 break;
             }
             if (query.skip_file)(&path) {
@@ -345,6 +450,7 @@ pub trait FileSystem: Send + Sync {
             };
             let _ = searcher.search_slice(&matcher, &bytes, sink);
         }
+        result.scan.result_limit_reached = result.matches >= query.max_matches;
         Ok(result)
     }
 
@@ -673,6 +779,7 @@ pub use crate::tools::bash::LocalShell;
 ///
 /// Containment lives here rather than in each tool: a consumer cannot forget to
 /// call it, and a different world enforces its own boundary its own way.
+#[derive(Clone)]
 pub struct LocalFs {
     /// `None` means **no containment**: the path is used exactly as given.
     ///
@@ -973,7 +1080,38 @@ impl FileSystem for LocalFs {
                 is_dir: meta.is_dir(),
                 len: meta.len(),
             },
-            Err(_) => FileInfo::default(),
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Err(FsError::denied(format!(
+                    "cannot access {}: {error}",
+                    path.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                for ancestor in path.ancestors() {
+                    if let Ok(meta) = tokio::fs::symlink_metadata(ancestor).await {
+                        if meta.file_type().is_symlink()
+                            && tokio::fs::metadata(ancestor)
+                                .await
+                                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+                        {
+                            return Err(FsError::io(format!(
+                                "broken symbolic link: {} (target is unavailable)",
+                                ancestor.display()
+                            )));
+                        }
+                        if meta.is_dir() {
+                            break;
+                        }
+                    }
+                }
+                FileInfo::default()
+            }
+            Err(error) => {
+                return Err(FsError::io(format!(
+                    "cannot inspect {}: {error}",
+                    path.display()
+                )))
+            }
         })
     }
 
@@ -1010,6 +1148,41 @@ impl FileSystem for LocalFs {
         .map_err(FsError::io)?
     }
 
+    #[cfg(feature = "tools")]
+    async fn walk_with_options(
+        &self,
+        root: &Path,
+        skip_dir: &SkipDir,
+        cancel: &CancellationToken,
+        options: &WalkOptions,
+    ) -> Result<WalkResult, FsError> {
+        let root = self.resolve(root)?;
+        let world = self.clone();
+        let skip = skip_dir.clone();
+        let cancel = cancel.clone();
+        let options = options.clone().bounded();
+        tokio::task::spawn_blocking(move || {
+            let mut result = WalkResult::default();
+            let mut budget = ScanBudget::new(options.clone());
+            let skipped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            for entry in option_walker(&root, skip, world, &options, skipped.clone()) {
+                if !budget.next(&cancel) {
+                    break;
+                }
+                match entry {
+                    Ok(entry) if entry.path().is_file() => result.files.push(entry.into_path()),
+                    Ok(_) => {}
+                    Err(_) => budget.scan.skipped_entries += 1,
+                }
+            }
+            budget.scan.skipped_entries += skipped.load(std::sync::atomic::Ordering::Relaxed);
+            result.scan = budget.scan;
+            Ok(result)
+        })
+        .await
+        .map_err(FsError::io)?
+    }
+
     /// The streaming search `grep` always ran, verbatim: the same walker, one
     /// [`grep::searcher::Searcher`] per call with a per-file heap cap so a
     /// multi-MB single line cannot grow the buffer without bound, matches
@@ -1019,15 +1192,44 @@ impl FileSystem for LocalFs {
         let root = self.resolve(root)?;
         let matcher = build_matcher(query)?;
         let query = query.clone();
+        let world = self.clone();
         tokio::task::spawn_blocking(move || {
             let mut result = SearchResult::default();
             let mut searcher = build_searcher(query.context);
-            for entry in local_walker(&root, Arc::clone(&query.skip_dir)).flatten() {
-                if result.matches >= query.max_matches || query.cancel.is_cancelled() {
+            let mut budget = ScanBudget::new(query.walk.clone().bounded());
+            let skipped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            for entry in option_walker(
+                &root,
+                Arc::clone(&query.skip_dir),
+                world.clone(),
+                &query.walk,
+                skipped.clone(),
+            ) {
+                if result.matches >= query.max_matches
+                    || result.scan.byte_limit_reached
+                    || !budget.next(&query.cancel)
+                {
                     break;
                 }
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(_) => {
+                        budget.scan.skipped_entries += 1;
+                        continue;
+                    }
+                };
                 let path = entry.path();
-                if !path.is_file() || (query.skip_file)(path) {
+                // Recheck file containment even when an iterator reports a link as a file.
+                if world.resolve(path).is_err() {
+                    budget.scan.skipped_entries += 1;
+                    continue;
+                }
+                if !path.is_file()
+                    || (query.skip_file)(path)
+                    || Self::real_path(path)
+                        .ok()
+                        .is_some_and(|real| (query.skip_file)(&real))
+                {
                     continue;
                 }
                 result.files_searched += 1;
@@ -1037,13 +1239,88 @@ impl FileSystem for LocalFs {
                     max: query.max_matches,
                 };
                 // io / binary / decode errors ⇒ skip the file, as before.
-                let _ = searcher.search_path(&matcher, path, sink);
+                if searcher.search_path(&matcher, path, sink).is_err() {
+                    budget.scan.skipped_entries += 1;
+                }
             }
+            budget.scan.skipped_entries += skipped.load(std::sync::atomic::Ordering::Relaxed);
+            budget.scan.result_limit_reached = result.matches >= query.max_matches;
+            budget.scan.byte_limit_reached = result.scan.byte_limit_reached;
+            result.scan = budget.scan;
             Ok(result)
         })
         .await
         .map_err(FsError::io)?
     }
+}
+
+#[cfg(feature = "tools")]
+struct ScanBudget {
+    options: WalkOptions,
+    started: std::time::Instant,
+    last_notice: std::time::Instant,
+    scan: ScanReport,
+}
+#[cfg(feature = "tools")]
+impl ScanBudget {
+    fn new(options: WalkOptions) -> Self {
+        Self {
+            options,
+            started: std::time::Instant::now(),
+            last_notice: std::time::Instant::now(),
+            scan: Default::default(),
+        }
+    }
+    fn next(&mut self, cancel: &CancellationToken) -> bool {
+        if cancel.is_cancelled() {
+            return false;
+        }
+        if self.started.elapsed() >= std::time::Duration::from_secs(self.options.timeout_secs) {
+            self.scan.timed_out = true;
+            return false;
+        }
+        if self.scan.entries_scanned >= self.options.max_entries {
+            self.scan.entry_limit_reached = true;
+            return false;
+        }
+        self.scan.entries_scanned += 1;
+        if self.last_notice.elapsed() >= std::time::Duration::from_millis(500) {
+            self.options.progress.emit(format!(
+                "Searching: {} entries visited",
+                self.scan.entries_scanned
+            ));
+            self.last_notice = std::time::Instant::now();
+        }
+        true
+    }
+}
+#[cfg(feature = "tools")]
+fn option_walker(
+    root: &Path,
+    skip: SkipDir,
+    world: LocalFs,
+    options: &WalkOptions,
+    skipped: Arc<std::sync::atomic::AtomicUsize>,
+) -> ignore::Walk {
+    ignore::WalkBuilder::new(root)
+        .hidden(!options.include_hidden)
+        .git_ignore(options.respect_gitignore)
+        .git_global(options.respect_gitignore)
+        .git_exclude(options.respect_gitignore)
+        .ignore(options.respect_gitignore)
+        .parents(options.respect_gitignore)
+        .follow_links(options.follow_symlinks)
+        .filter_entry(move |entry| {
+            // Do not descend through an alias escaping a read-fenced world.
+            // File reads are rechecked too. Never infer access from link location.
+            if world.resolve(entry.path()).is_err() {
+                skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return false;
+            }
+            !entry.file_type().is_some_and(|t| t.is_dir())
+                || !entry.file_name().to_str().is_some_and(|name| skip(name))
+        })
+        .build()
 }
 
 /// The walker `glob` and `grep` always used: gitignore-aware (tree, global and
@@ -1083,6 +1360,33 @@ fn build_matcher(query: &SearchQuery) -> Result<grep::regex::RegexMatcher, FsErr
 #[cfg(feature = "tools")]
 pub const MAX_LINE_BUF_BYTES: usize = 10 * 1024 * 1024;
 
+/// Keep enough bytes for grep's 1000-character display, including four-byte
+/// UTF-8 characters. Truncated previews append an ellipsis (three bytes).
+#[cfg(feature = "tools")]
+pub const MAX_SEARCH_LINE_BYTES: usize = 4_000;
+
+/// One search's retained previews, paths and records, shared across files.
+#[cfg(feature = "tools")]
+pub const MAX_SEARCH_RESULT_BYTES: usize = 1024 * 1024;
+
+#[cfg(feature = "tools")]
+fn search_line_preview(bytes: &[u8]) -> (&[u8], bool) {
+    let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
+    if bytes.len() <= MAX_SEARCH_LINE_BYTES {
+        return (bytes, false);
+    }
+    let mut end = MAX_SEARCH_LINE_BYTES;
+    // Do not split a UTF-8 character. Invalid source text remains bytes and is
+    // still decoded lossily by the tool, as before.
+    if let Err(error) = std::str::from_utf8(&bytes[..end]) {
+        if error.error_len().is_none() {
+            end = error.valid_up_to();
+        }
+    }
+    (&bytes[..end], true)
+}
+
 #[cfg(feature = "tools")]
 fn build_searcher(context: usize) -> grep::searcher::Searcher {
     grep::searcher::SearcherBuilder::new()
@@ -1097,12 +1401,52 @@ fn build_searcher(context: usize) -> grep::searcher::Searcher {
         .build()
 }
 
-/// Collects raw lines; stops a file once the global cap is hit.
+/// Collects bounded byte previews; stops a file when either global cap is hit.
 #[cfg(feature = "tools")]
 struct CollectingSink<'a> {
     path: &'a Path,
     result: &'a mut SearchResult,
     max: usize,
+}
+
+#[cfg(feature = "tools")]
+impl CollectingSink<'_> {
+    /// Charge before allocating the path or preview. Empty lines and group
+    /// separators still cost a record, so they cannot bypass the byte budget.
+    fn reserve(&mut self, bytes: usize) -> bool {
+        if self.result.scan.byte_limit_reached
+            || bytes > MAX_SEARCH_RESULT_BYTES.saturating_sub(self.result.retained_bytes)
+        {
+            self.result.scan.byte_limit_reached = true;
+            return false;
+        }
+        self.result.retained_bytes += bytes;
+        self.result.scan.byte_limit_reached = self.result.retained_bytes == MAX_SEARCH_RESULT_BYTES;
+        true
+    }
+
+    fn collect(&mut self, bytes: &[u8], line: u64, matched: bool) -> bool {
+        let (preview, truncated) = search_line_preview(bytes);
+        let text_len = preview.len() + if truncated { "…".len() } else { 0 };
+        let retained = std::mem::size_of::<SearchLine>()
+            .saturating_add(self.path.as_os_str().as_encoded_bytes().len())
+            .saturating_add(text_len);
+        if !self.reserve(retained) {
+            return false;
+        }
+        let mut text = Vec::with_capacity(text_len);
+        text.extend_from_slice(preview);
+        if truncated {
+            text.extend_from_slice("…".as_bytes());
+        }
+        let path = self.path.to_path_buf();
+        self.result.lines.push(if matched {
+            SearchLine::Match { path, line, text }
+        } else {
+            SearchLine::Context { path, line, text }
+        });
+        true
+    }
 }
 
 #[cfg(feature = "tools")]
@@ -1114,13 +1458,11 @@ impl grep::searcher::Sink for CollectingSink<'_> {
         _: &grep::searcher::Searcher,
         mat: &grep::searcher::SinkMatch<'_>,
     ) -> Result<bool, std::io::Error> {
-        self.result.lines.push(SearchLine::Match {
-            path: self.path.to_path_buf(),
-            line: mat.line_number().unwrap_or(0),
-            text: mat.bytes().to_vec(),
-        });
+        if !self.collect(mat.bytes(), mat.line_number().unwrap_or(0), true) {
+            return Ok(false);
+        }
         self.result.matches += 1;
-        Ok(self.result.matches < self.max) // stop this file at the cap
+        Ok(self.result.matches < self.max && !self.result.scan.byte_limit_reached)
     }
 
     fn context(
@@ -1128,17 +1470,219 @@ impl grep::searcher::Sink for CollectingSink<'_> {
         _: &grep::searcher::Searcher,
         ctx: &grep::searcher::SinkContext<'_>,
     ) -> Result<bool, std::io::Error> {
-        self.result.lines.push(SearchLine::Context {
-            path: self.path.to_path_buf(),
-            line: ctx.line_number().unwrap_or(0),
-            text: ctx.bytes().to_vec(),
-        });
-        Ok(true)
+        let retained = self.collect(ctx.bytes(), ctx.line_number().unwrap_or(0), false);
+        Ok(retained && !self.result.scan.byte_limit_reached)
     }
 
     fn context_break(&mut self, _: &grep::searcher::Searcher) -> Result<bool, std::io::Error> {
+        if !self.reserve(std::mem::size_of::<SearchLine>()) {
+            return Ok(false);
+        }
         self.result.lines.push(SearchLine::Break);
-        Ok(true)
+        Ok(!self.result.scan.byte_limit_reached)
+    }
+}
+
+#[cfg(all(test, feature = "tools"))]
+mod search_memory_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn query(context: usize) -> SearchQuery {
+        SearchQuery {
+            pattern: "NEEDLE".into(),
+            case_insensitive: false,
+            context,
+            max_matches: 10_000,
+            skip_dir: Arc::new(|_| false),
+            skip_file: Arc::new(|_| false),
+            cancel: CancellationToken::new(),
+            walk: WalkOptions::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn long_matches_and_context_are_bounded_before_retention() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = std::fs::File::create(dir.path().join("long.txt")).unwrap();
+        // The preview boundary falls inside a four-byte character.
+        let context = format!("{}🦀{}", "x".repeat(3_999), "y".repeat(64 * 1024));
+        writeln!(file, "{context}").unwrap();
+        writeln!(file, "NEEDLE {}", "m".repeat(128 * 1024)).unwrap();
+        writeln!(file, "{context}").unwrap();
+        let result = LocalFs::unfenced()
+            .search(dir.path(), &query(1))
+            .await
+            .unwrap();
+        assert_eq!(result.matches, 1);
+        assert_eq!(result.lines.len(), 3);
+        assert!(!result.scan.byte_limit_reached);
+        for line in &result.lines {
+            let (SearchLine::Match { text, .. } | SearchLine::Context { text, .. }) = line else {
+                panic!("expected a preview");
+            };
+            assert!(text.len() <= MAX_SEARCH_LINE_BYTES + "…".len());
+            assert!(std::str::from_utf8(text).unwrap().ends_with('…'));
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_keeps_a_bounded_raw_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut bytes = b"NEEDLE ".to_vec();
+        bytes.extend(std::iter::repeat_n(0x80, 8_000));
+        std::fs::write(dir.path().join("invalid.txt"), bytes).unwrap();
+        let result = LocalFs::unfenced()
+            .search(dir.path(), &query(0))
+            .await
+            .unwrap();
+        assert_eq!(result.matches, 1);
+        let SearchLine::Match { text, .. } = &result.lines[0] else {
+            panic!("expected a matching preview");
+        };
+        assert_eq!(text.len(), MAX_SEARCH_LINE_BYTES + "…".len());
+        assert_eq!(&text[..7], b"NEEDLE ");
+        assert_eq!(
+            &text[7..MAX_SEARCH_LINE_BYTES],
+            vec![0x80; MAX_SEARCH_LINE_BYTES - 7]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_full_result_budget_stops_the_file_and_the_directory_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let row = format!("NEEDLE {}\n", "x".repeat(16 * 1024));
+        // Either file exhausts the result budget on its own, independent of
+        // directory ordering. The second file must never be searched.
+        for name in ["one.txt", "two.txt"] {
+            let mut file =
+                std::io::BufWriter::new(std::fs::File::create(dir.path().join(name)).unwrap());
+            for _ in 0..400 {
+                file.write_all(row.as_bytes()).unwrap();
+            }
+            file.flush().unwrap();
+        }
+        let result = LocalFs::unfenced()
+            .search(dir.path(), &query(0))
+            .await
+            .unwrap();
+        assert!(result.matches > 0 && result.matches < 400);
+        assert_eq!(result.files_searched, 1);
+        assert!(result.scan.byte_limit_reached);
+        assert!(!result.scan.result_limit_reached);
+        assert!(result.scan.incomplete());
+        assert!(result.scan.summary().contains("result byte limit reached"));
+        assert!(result.retained_bytes <= MAX_SEARCH_RESULT_BYTES);
+        let accounted: usize = result
+            .lines
+            .iter()
+            .map(|line| {
+                std::mem::size_of::<SearchLine>()
+                    + match line {
+                        SearchLine::Match { path, text, .. }
+                        | SearchLine::Context { path, text, .. } => {
+                            path.as_os_str().as_encoded_bytes().len() + text.len()
+                        }
+                        SearchLine::Break => 0,
+                    }
+            })
+            .sum();
+        assert_eq!(result.retained_bytes, accounted);
+    }
+
+    #[tokio::test]
+    async fn the_result_byte_budget_is_shared_across_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = format!("NEEDLE {}\n", "x".repeat(5_000)).repeat(100);
+        for name in ["one.txt", "two.txt", "three.txt", "four.txt"] {
+            std::fs::write(dir.path().join(name), &content).unwrap();
+        }
+        let result = LocalFs::unfenced()
+            .search(dir.path(), &query(0))
+            .await
+            .unwrap();
+        assert!(result.matches > 200 && result.matches < 300);
+        assert_eq!(result.files_searched, 3);
+        assert!(result.scan.byte_limit_reached);
+        assert!(result.retained_bytes <= MAX_SEARCH_RESULT_BYTES);
+    }
+
+    #[tokio::test]
+    async fn exactly_filling_the_result_budget_stops_without_another_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("exact.txt");
+        let overhead =
+            std::mem::size_of::<SearchLine>() + path.as_os_str().as_encoded_bytes().len();
+        let row_len = 100;
+        let rows = (MAX_SEARCH_RESULT_BYTES - overhead - 7) / (overhead + row_len);
+        let last_len = MAX_SEARCH_RESULT_BYTES - rows * (overhead + row_len) - overhead;
+        assert!(last_len <= MAX_SEARCH_LINE_BYTES);
+        let mut file = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+        let row = format!("NEEDLE {}\n", "x".repeat(row_len - 7));
+        for _ in 0..rows {
+            file.write_all(row.as_bytes()).unwrap();
+        }
+        writeln!(file, "NEEDLE {}", "x".repeat(last_len - 7)).unwrap();
+        writeln!(file, "no more matching lines").unwrap();
+        file.flush().unwrap();
+        let result = LocalFs::unfenced().search(&path, &query(0)).await.unwrap();
+        assert_eq!(result.retained_bytes, MAX_SEARCH_RESULT_BYTES);
+        assert_eq!(
+            result.matches,
+            rows + 1,
+            "keep the match that fills the budget"
+        );
+        assert!(result.scan.byte_limit_reached);
+        assert!(result.scan.incomplete());
+    }
+
+    #[tokio::test]
+    async fn a_small_result_can_still_search_past_the_file_buffer_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.txt");
+        let mut file = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+        let block = b"filler\n".repeat(10_000);
+        for _ in 0..200 {
+            file.write_all(&block).unwrap();
+        }
+        writeln!(file, "NEEDLE at the end").unwrap();
+        file.flush().unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() > MAX_LINE_BUF_BYTES as u64);
+        let result = LocalFs::unfenced().search(&path, &query(0)).await.unwrap();
+        assert_eq!(result.matches, 1);
+        assert!(!result.scan.incomplete());
+        assert!(matches!(&result.lines[0], SearchLine::Match { text, .. }
+            if text == b"NEEDLE at the end"));
+    }
+
+    #[test]
+    fn paths_and_context_separators_cannot_bypass_the_budget() {
+        let path = PathBuf::from("p".repeat(MAX_SEARCH_RESULT_BYTES));
+        let mut result = SearchResult::default();
+        let mut sink = CollectingSink {
+            path: &path,
+            result: &mut result,
+            max: 1,
+        };
+        assert!(!sink.collect(b"tiny", 1, false));
+        assert!(result.lines.is_empty());
+        assert_eq!(result.retained_bytes, 0);
+        assert!(result.scan.byte_limit_reached);
+
+        let mut result = SearchResult::default();
+        let mut sink = CollectingSink {
+            path: Path::new("a"),
+            result: &mut result,
+            max: 1,
+        };
+        let searcher = build_searcher(0);
+        while grep::searcher::Sink::context_break(&mut sink, &searcher).unwrap() {}
+        assert!(result.scan.byte_limit_reached);
+        assert!(result.retained_bytes <= MAX_SEARCH_RESULT_BYTES);
+        assert_eq!(
+            result.retained_bytes,
+            result.lines.len() * std::mem::size_of::<SearchLine>()
+        );
     }
 }
 

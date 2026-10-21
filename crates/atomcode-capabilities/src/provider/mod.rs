@@ -352,3 +352,45 @@ mod wire_dump_tests {
         );
     }
 }
+
+mod watchdog;
+pub use watchdog::StreamWatchdog;
+
+/// Apply last, replacing built-in headers. Mark every value sensitive so HTTP
+/// diagnostics cannot print credentials, even for an unfamiliar header name.
+pub(crate) fn apply_account_headers(
+    mut request: reqwest::RequestBuilder,
+    headers: &atomcode_config::provider_headers::ProviderHeaders,
+) -> Result<reqwest::RequestBuilder, atomcode_kernel::stream::ProviderError> {
+    let mut map = reqwest::header::HeaderMap::new();
+    for (name, value) in headers.iter() {
+        let name = reqwest::header::HeaderName::from_bytes(name.as_bytes());
+        let value = reqwest::header::HeaderValue::from_str(value);
+        let (Ok(name), Ok(mut value)) = (name, value) else {
+            return Err(atomcode_kernel::stream::ProviderError {
+                message: "Invalid custom HTTP header".into(),
+                retryable: false,
+                ..Default::default()
+            });
+        };
+        value.set_sensitive(true);
+        map.insert(name, value);
+    }
+    request = request.headers(map);
+    Ok(request)
+}
+
+fn redact_header_error(
+    event: atomcode_kernel::stream::StreamEvent,
+    headers: &atomcode_config::provider_headers::ProviderHeaders,
+) -> atomcode_kernel::stream::StreamEvent {
+    use atomcode_kernel::stream::StreamEvent;
+    match event {
+        StreamEvent::Error(mut error) => {
+            error.message = headers.redact(&error.message);
+            error.code = error.code.map(|c| headers.redact(&c));
+            StreamEvent::Error(error)
+        }
+        other => other,
+    }
+}

@@ -127,6 +127,10 @@ pub(crate) fn mcp_acted(server: &str, action: McpAction) -> String {
         McpAction::Untrust => "The person revoked trust in this project's MCP servers; their \
              tools are no longer available."
             .to_string(),
+        McpAction::CancelReconnect => format!("The person cancelled reconnection of MCP server `{server}`."),
+        McpAction::Reconnect => format!(
+            "The person reconnected MCP server `{server}`; its connection and tool catalog have been refreshed."
+        ),
         McpAction::Logout => format!(
             "The person signed out of the MCP server `{server}`; its tools are no longer \
              available."
@@ -154,6 +158,14 @@ pub(crate) fn tool_switched(pattern: &str, on: bool) -> String {
 
 pub(crate) fn mcp_withdrawn() -> String {
     reminder("The person withdrew every MCP tool from this session.")
+}
+
+pub(crate) fn skills_reloaded() -> String {
+    reminder(
+        "The person reloaded skills. Skill availability may have changed; the loaded \
+         project instructions and MCP connections were kept. Skill reload does not \
+         reload config.toml or project instruction files.",
+    )
 }
 
 pub(crate) fn reloaded() -> String {
@@ -247,7 +259,9 @@ mod tests {
             C::DeactivateProvider { .. } => Heard::Nothing,
             // Opens a transaction `FinishRewind` commits; told there.
             C::BeginRewind { .. } => Heard::Nothing,
-            C::Shutdown { .. }
+            C::GoalReport { .. }
+            | C::RecheckGoal { .. }
+            | C::Shutdown { .. }
             | C::Snapshot { .. }
             | C::ContextStats { .. }
             | C::Mode { .. }
@@ -266,7 +280,9 @@ mod tests {
             | C::UndoTarget { .. }
             | C::Autonomy { .. }
             | C::Usage { .. }
-            | C::WorkspaceChanges { .. } => Heard::Nothing,
+            | C::WorkspaceChanges { .. }
+            | C::PendingQuestions { .. }
+            | C::QuestionReplyFinished { .. } => Heard::Nothing,
         }
     }
 

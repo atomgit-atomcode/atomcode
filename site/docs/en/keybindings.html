@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.2.3</span>
+    <span class="dhdr-ver">v5.2.4</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -97,7 +97,9 @@
           <tr><td><code>Ctrl+R</code></td><td>Reverse-search input history (type to filter live; <code>Ctrl+R</code> again jumps to the next older match; <code>Enter</code> accepts into the input, <code>Esc</code> cancels)</td></tr>
           <tr><td><code>Tab</code></td><td>Accept slash-command, skill, or file completion</td></tr>
           <tr><td><code>Shift+Tab</code></td><td>Cycle to the next execution mode when no completion menu is open (also works while streaming)</td></tr>
-          <tr><td><code>Ctrl+U</code></td><td>Clear entire line</td></tr>
+          <tr><td><code>Ctrl+D</code></td><td>Delete forward; when idle and empty, press twice within two seconds to quit</td></tr>
+          <tr><td><code>Ctrl+B / Ctrl+F</code></td><td>Move one character left / right</td></tr>
+          <tr><td><code>Ctrl+U</code></td><td>Delete to the start of the current line</td></tr>
           <tr><td><code>Ctrl+W</code></td><td>Delete a word</td></tr>
           <tr><td><code>Ctrl+K</code></td><td>Delete from cursor to end of line</td></tr>
           <tr><td><code>Ctrl+A</code></td><td>Move cursor to line start</td></tr>
@@ -105,18 +107,27 @@
         </tbody>
       </table>
 
+      <h2 id="custom-newline">Custom newline shortcuts</h2>
+      <p>Open <code>/config</code>, search for “newline”, and select “Keyboard shortcuts / Newline”. Press <code>Enter</code> or <code>A</code> to add a chord, press that chord, then press <code>Enter</code> to confirm. Press <code>M</code> to type comma-separated names such as <code>alt+j, ctrl+j</code>; <code>Tab</code> also switches capture to manual entry. <code>Delete</code> removes the selected binding, <code>Ctrl+D</code> restores defaults, and <code>Esc</code> goes back.</p>
+      <pre><code>[ui.keybindings]
+newline = ["alt+j", "ctrl+j"]</code></pre>
+      <p>The list replaces the default newline chords. Changes apply immediately and <code>/keys</code> shows the effective bindings. <code>\</code> + <code>Enter</code> remains available. Use <code>newline = []</code> to disable the chords, or remove the <code>newline</code> entry to restore defaults. Conflicts with existing actions or reserved keys, duplicate chords, and invalid names are rejected without changing the active bindings.</p>
+      <p>Plain printable characters cannot be shortcuts. Names accept <code>ctrl</code>, <code>alt</code>, <code>shift</code>, and <code>cmd</code> modifiers, letters, digits, <code>enter</code>, <code>space</code>, arrows, and <code>f1</code>–<code>f24</code>. AtomCode cannot detect or release shortcuts intercepted by the terminal or IDE; verify that manually entered chords reach the app.</p>
+
       <h2 id="browse-scroll">Browse &amp; scroll</h2>
       <table>
         <thead>
           <tr><th>Key</th><th>Action</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>Shift+↑ / Shift+↓</code></td><td>Scroll one line</td></tr>
-          <tr><td><code>PageUp / PageDown</code></td><td>Scroll one page (10 lines)</td></tr>
-          <tr><td><code>Alt+↑ / Alt+↓</code></td><td>Jump to previous / next message (macOS Apple Terminal: enable Settings → Profiles → Keyboard → "Use Option as Meta key" first)</td></tr>
-          <tr><td><code>Ctrl+↑ / Ctrl+↓</code></td><td>Jump to previous / next <strong>user</strong> message</td></tr>
-          <tr><td><code>Home / End</code></td><td>Jump to top / bottom of the conversation</td></tr>
-          <tr><td>Mouse wheel</td><td>Scroll inside the chat area (atomcode captures the wheel)</td></tr>
+          <tr><td><code>PageUp / PageDown</code></td><td>Page by the visible conversation height, keeping one overlap row</td></tr>
+          <tr><td><code>Mouse wheel</code></td><td>Scroll the conversation</td></tr>
+          <tr><td><code>/read</code></td><td>Open a read-only conversation snapshot with expanded tool output; no GUI or clipboard required</td></tr>
+          <tr><td><code>↑ / ↓ / j / k</code></td><td>Reader: scroll one line</td></tr>
+          <tr><td><code>PgUp / PgDn / Ctrl+B / Ctrl+F</code></td><td>Reader: page up / down</td></tr>
+          <tr><td><code>Ctrl+U / Ctrl+D</code></td><td>Reader: half-page up / down</td></tr>
+          <tr><td><code>Home / End</code></td><td>Reader: jump to beginning / end</td></tr>
+          <tr><td><code>Esc</code></td><td>Leave the reader, preserving the draft and main scroll position; reopen /read to refresh the snapshot</td></tr>
         </tbody>
       </table>
 

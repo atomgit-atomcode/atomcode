@@ -1242,6 +1242,45 @@ impl SessionManager {
     pub fn meta_path(&self, id: &str) -> SessionResult<PathBuf> {
         self.format_path(id, "index", "meta")
     }
+    /// Non-conversation controller data. Only the lease owner may write it;
+    /// the event log remains the authority for conversation and tool results.
+    pub fn write_controller_checkpoint<T: Serialize>(
+        &self,
+        lease: &SessionLease,
+        value: &T,
+    ) -> SessionResult<()> {
+        self.validate_active_lease(lease)?;
+        if !self.is_event_session(lease.id()) {
+            return Err(SessionStoreError::Corrupt {
+                kind: "controller checkpoint",
+                message: "controller checkpoints require a native event session".into(),
+            });
+        }
+        let bytes = serialize_bounded(value, "controller checkpoint", 128 * 1024)?;
+        atomic_write(&self.path_for(lease.id(), "controller")?, &bytes)
+    }
+
+    pub fn read_controller_checkpoint<T: serde::de::DeserializeOwned>(
+        &self,
+        lease: &SessionLease,
+    ) -> SessionResult<Option<T>> {
+        self.validate_active_lease(lease)?;
+        if !self.is_event_session(lease.id()) {
+            return Err(SessionStoreError::Corrupt {
+                kind: "controller checkpoint",
+                message: "controller checkpoints require a native event session".into(),
+            });
+        }
+        let path = self.path_for(lease.id(), "controller")?;
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(io_at(&path, error)),
+        }
+        let bytes = read_regular_file_bounded(&path, "controller checkpoint", 128 * 1024)?;
+        deserialize(&bytes, "controller checkpoint").map(Some)
+    }
+
     /// Todo-list sidecar path: `<root>/<id>.todos.json` (sibling of meta/snapshot),
     /// `<id>.todos` for an event session.
     pub fn todo_sidecar_path(&self, id: &str) -> SessionResult<PathBuf> {
@@ -1656,11 +1695,18 @@ impl SessionManager {
     }
 
     pub fn load_snapshot(&self, id: &str) -> SessionResult<SessionSnapshot> {
+        self.load_snapshot_bounded(id, usize::MAX)
+    }
+
+    fn load_snapshot_bounded(&self, id: &str, limit: usize) -> SessionResult<SessionSnapshot> {
         if self.is_event_session(id) {
-            return self.project_snapshot(id);
+            return self.project_snapshot_bounded(id, limit);
         }
-        let bytes =
-            read_regular_file_bounded(&self.snapshot_path(id)?, "snapshot", MAX_SNAPSHOT_BYTES)?;
+        let bytes = read_regular_file_bounded(
+            &self.snapshot_path(id)?,
+            "snapshot",
+            limit.min(MAX_SNAPSHOT_BYTES),
+        )?;
         let snapshot: SessionSnapshot = deserialize(&bytes, "snapshot")?;
         validate_snapshot(&snapshot)?;
         Ok(snapshot)
@@ -2077,10 +2123,14 @@ impl SessionManager {
     }
 
     pub fn read_presentation(&self, id: &str) -> SessionResult<PresentationFile> {
+        self.read_presentation_bounded(id, usize::MAX)
+    }
+
+    fn read_presentation_bounded(&self, id: &str, limit: usize) -> SessionResult<PresentationFile> {
         let bytes = read_regular_file_bounded(
             &self.presentation_path(id)?,
             "presentation",
-            MAX_PRESENTATION_BYTES,
+            limit.min(MAX_PRESENTATION_BYTES),
         )?;
         let presentation: PresentationFile = deserialize(&bytes, "presentation")?;
         presentation.validate()?;
@@ -2094,8 +2144,34 @@ impl SessionManager {
         self.with_meta_lock(id, || self.load_native_session_unlocked(id))
     }
 
+    /// The same strict native aggregate, with a caller-specific per-content-file
+    /// ceiling enforced on the open reader (including growth during a read).
+    /// Metadata retains its existing independent MAX_META_BYTES bound.
+    pub fn load_native_session_bounded(
+        &self,
+        id: &str,
+        limit: usize,
+    ) -> SessionResult<LoadedSession> {
+        self.with_meta_lock(id, || self.load_native_session_unlocked_bounded(id, limit))
+    }
+
     fn load_native_session_unlocked(&self, id: &str) -> SessionResult<LoadedSession> {
+        self.load_native_session_unlocked_bounded(id, usize::MAX)
+    }
+
+    fn load_native_session_unlocked_bounded(
+        &self,
+        id: &str,
+        limit: usize,
+    ) -> SessionResult<LoadedSession> {
         let meta = self.read_meta(id)?;
+        if meta.needs_newer_version() {
+            return Err(SessionStoreError::FutureSchema {
+                kind: "session events",
+                found: meta.format_version,
+                supported: atomcode_kernel::session::SESSION_FORMAT_VERSION,
+            });
+        }
         if meta.owner != StorageOwner::Native {
             return Err(SessionStoreError::OwnershipConflict {
                 id: id.to_string(),
@@ -2103,8 +2179,8 @@ impl SessionManager {
                 operation: "load native session",
             });
         }
-        let snapshot = self.load_snapshot(id)?;
-        let presentation = match self.read_presentation(id) {
+        let snapshot = self.load_snapshot_bounded(id, limit)?;
+        let presentation = match self.read_presentation_bounded(id, limit) {
             // An event session has display-only entries only if something added
             // them.
             Err(error) if self.is_event_session(id) && error.kind() == io::ErrorKind::NotFound => {
@@ -3273,6 +3349,7 @@ impl SessionManager {
             self.path_for(id, "rewind")?,
             self.path_for(id, "rewind.txn")?,
             self.path_for(id, "todos")?,
+            self.path_for(id, "controller")?,
             self.path_for(id, "index")?,
         ];
         for path in &targets {
@@ -4911,8 +4988,17 @@ mod tests {
         use std::hash::{Hash, Hasher};
 
         let p = Path::new("/Users/theo/Documents/workspace/atomcode");
+        // The production normalization, spelled out here rather than called: the claim is
+        // that the *scheme* does not drift, so it must not borrow the code under test.
+        // Windows folds case, and both hosts fold separators to `/`.
+        let mut normalized = p.to_string_lossy().replace('\\', "/");
+        if normalized.len() > 1 && normalized.ends_with('/') {
+            normalized.pop();
+        }
+        #[cfg(windows)]
+        let normalized = normalized.to_lowercase();
         let mut expected = DefaultHasher::new();
-        PathBuf::from(p.to_string_lossy().to_string()).hash(&mut expected);
+        PathBuf::from(normalized).hash(&mut expected);
         assert_eq!(
             SessionManager::project_hash(p, &test_dirs()),
             format!("{:016x}", expected.finish())

@@ -328,6 +328,126 @@ pub fn offset_at_cell(
     Some(offset_at(&moment.input, row, col, rect.w))
 }
 
+/// A selection starting on a composer text row stays inside the composer,
+/// even when the pointer moves onto neighbouring UI. Exclude its prompt too.
+pub fn selection_without_prompt(
+    moment: &crate::moment::Moment,
+    rect: crate::frame::Rect,
+    mut selection: crate::moment::Selection,
+) -> crate::moment::Selection {
+    if moment.secret.is_some() || rect.w <= PROMPT as u16 {
+        return selection;
+    }
+    let (rows, (caret_row, _), _) = lay(&moment.input, moment.caret, body_width(rect.w));
+    let room = typed_room(rect.h);
+    let first = caret_row.saturating_sub(room.saturating_sub(1));
+    let shown = room.min(rows.len().saturating_sub(first)).max(1);
+    let top = rect.y + RULE as u16;
+    let bottom = top + shown as u16;
+    if selection.anchor.0 < rect.x
+        || selection.anchor.0 >= rect.right()
+        || selection.anchor.1 < top
+        || selection.anchor.1 >= bottom
+    {
+        return selection;
+    }
+    selection.head = if selection.head.1 < top {
+        (rect.x, top)
+    } else if selection.head.1 >= bottom {
+        (rect.right() - 1, bottom - 1)
+    } else {
+        (
+            selection.head.0.clamp(rect.x, rect.right() - 1),
+            selection.head.1,
+        )
+    };
+    if selection_range(moment, rect, selection).is_some() {
+        let left = rect.x + PROMPT as u16;
+        let original = selection;
+        selection.anchor.0 = selection.anchor.0.max(left);
+        selection.head.0 = selection.head.0.max(left);
+        // Equal endpoints mean a click rather than a selection. Use adjacent
+        // padding for a one-cell draft, only if it covers the same text.
+        if selection.is_empty() {
+            selection.head.0 = selection.head.0.saturating_add(1);
+            if selection_range(moment, rect, selection) != selection_range(moment, rect, original) {
+                return original;
+            }
+        }
+    }
+    selection
+}
+
+/// The selected bytes on composer text rows, excluding the prompt and row padding.
+pub fn selection_range(
+    moment: &crate::moment::Moment,
+    rect: crate::frame::Rect,
+    selection: crate::moment::Selection,
+) -> Option<std::ops::Range<usize>> {
+    use unicode_segmentation::UnicodeSegmentation;
+
+    if selection.is_empty() || moment.secret.is_some() {
+        return None;
+    }
+    let body = body_width(rect.w);
+    if moment
+        .input
+        .split('\n')
+        .flat_map(|line| line.graphemes(true))
+        .any(|g| width::str_width(g) > body)
+    {
+        return None;
+    }
+    let (rows, (caret_row, _), starts) = lay(&moment.input, moment.caret, body);
+    let room = typed_room(rect.h);
+    let first = caret_row.saturating_sub(room.saturating_sub(1));
+    let shown = room.min(rows.len().saturating_sub(first)).max(1);
+    let text_top = rect.y + RULE as u16;
+    let text_bottom = text_top + shown as u16;
+    let text_left = rect.x + PROMPT as u16;
+    let valid =
+        |(x, y): (u16, u16)| x >= rect.x && x < rect.right() && y >= text_top && y < text_bottom;
+    if !valid(selection.anchor) || !valid(selection.head) {
+        return None;
+    }
+
+    let (start, end) =
+        if (selection.anchor.1, selection.anchor.0) <= (selection.head.1, selection.head.0) {
+            (selection.anchor, selection.head)
+        } else {
+            (selection.head, selection.anchor)
+        };
+    let offset = |(x, y): (u16, u16), after: bool| {
+        let row = first + usize::from(y - text_top);
+        // A selection may include the decorative prompt. Its cells map to
+        // the row start, without selecting the first grapheme themselves.
+        if x < text_left {
+            return starts[row];
+        }
+        let col = usize::from(x - text_left);
+        let line = &rows[row];
+        let at = starts[row] + width::take_width(line, col).len();
+        if !after || col >= width::str_width(line) {
+            return at;
+        }
+        line[at - starts[row]..]
+            .graphemes(true)
+            .next()
+            .map_or(at, |g| at + g.len())
+    };
+    let mut range = offset(start, false)..offset(end, true);
+    if range.is_empty() {
+        return None;
+    }
+    for marker in crate::attach::marker_spans(&moment.input) {
+        if marker.start < range.end && range.start < marker.end {
+            range.start = range.start.min(marker.start);
+            range.end = range.end.max(marker.end);
+        }
+    }
+    Some(range)
+}
+
 /// The cells inside the prompt. One definition, because `render`, `caret` and
 /// every caller that moves by rows must measure the same field.
 pub fn body_width(width: u16) -> usize {
@@ -405,22 +525,6 @@ impl View for Input {
             El::text(crate::el::captioned_rule(&keys, w as usize, muted, muted))
         } else {
             let history = history_caption(vp.moment);
-            // An active goal owns the right shoulder while it runs. Keep the
-            // label fixed and short: the condition is already the turn's input
-            // line, while this badge answers only whether `/goal` is still in
-            // control. When it goes away, the person's session name returns.
-            let goal = vp
-                .moment
-                .autonomy
-                .as_ref()
-                .filter(|running| running.kind == "goal")
-                .map(|running| {
-                    if running.paused.is_some() {
-                        ("/goal paused", theme::fg(Role::Warning))
-                    } else {
-                        ("/goal active", theme::fg(Role::Accent))
-                    }
-                });
             // Only a name the PERSON chose (`/rename`) earns the pill; an auto
             // first-prompt guess would otherwise pin a chip to the composer for a
             // name nobody asked for. The window title still carries any name.
@@ -429,10 +533,8 @@ impl View for Input {
                 .title
                 .as_deref()
                 .filter(|s| !s.is_empty() && vp.moment.title_user_set);
-            let right = goal.map(|(text, _)| text).or(name);
-            let right_style = goal
-                .map(|(_, style)| style)
-                .unwrap_or_else(|| theme::fg(Role::Border).reverse());
+            let right = name;
+            let right_style = theme::fg(Role::Border).reverse();
             // The clipboard's offer used to take this shoulder for the few
             // seconds it was up. It is the tip row's line now, one row above the
             // box (`modules::tip`): beside the field it read as chrome about the
@@ -683,14 +785,19 @@ mod tests {
 
     /// A running goal needs one stable glanceable fact, not its condition and
     /// internal round counter repeated in the footer. It temporarily owns the
-    /// upper-right shoulder, in the accent colour the slash commands use; when
-    /// the goal ends, the person's session name comes back.
+    /// tip row above the composer in accent colour; the rename pill remains
+    /// visible on the input rule throughout.
     #[test]
-    fn an_active_goal_is_a_cyan_badge_on_the_composers_right_shoulder() {
+    fn an_active_goal_is_above_the_composer_without_hiding_rename() {
         let mut m = Moment {
             title: Some("修解析器".into()),
             title_user_set: true,
             autonomy: Some(atomcode_host_api::Running {
+                usage: None,
+                recovering: false,
+                retry_in_secs: None,
+                goal_stage: None,
+                goal_detail: None,
                 kind: "goal".into(),
                 what: "分析当前项目死代码".into(),
                 round: 0,
@@ -701,19 +808,27 @@ mod tests {
             ..Moment::default()
         };
         let rendered = Input::render(&State::default(), &Viewport::new(Rect::sized(60, 3), &m));
-        let top = &rendered[0];
+        assert!(
+            rendered[0].plain().contains("修解析器"),
+            "rename remains on the input rule"
+        );
+        let tip = crate::modules::tip::Tip::render(
+            &crate::modules::tip::State,
+            &Viewport::new(Rect::sized(60, 1), &m),
+        );
+        let top = &tip[0];
         let plain = top.plain();
-        assert!(plain.contains("/goal active"), "{plain:?}");
+        assert!(plain.contains("Goal active"), "{plain:?}");
         assert!(!plain.contains("分析当前项目死代码"), "{plain:?}");
         assert!(!plain.contains("0/240"), "{plain:?}");
         assert!(
             !plain.contains("修解析器"),
-            "goal owns the shoulder: {plain:?}"
+            "the goal has its own row: {plain:?}"
         );
         let badge = top
             .spans
             .iter()
-            .find(|span| span.text.contains("/goal active"))
+            .find(|span| span.text.contains("Goal active"))
             .expect("goal badge");
         assert_eq!(badge.style.fg, theme::fg(Role::Accent).fg, "{top:?}");
 
@@ -727,6 +842,11 @@ mod tests {
     fn a_paused_goal_never_claims_to_be_active() {
         let m = Moment {
             autonomy: Some(atomcode_host_api::Running {
+                usage: None,
+                recovering: false,
+                retry_in_secs: None,
+                goal_stage: None,
+                goal_detail: None,
                 kind: "goal".into(),
                 what: "ship it".into(),
                 round: 2,
@@ -736,14 +856,17 @@ mod tests {
             }),
             ..Moment::default()
         };
-        let rendered = Input::render(&State::default(), &Viewport::new(Rect::sized(40, 3), &m));
+        let rendered = crate::modules::tip::Tip::render(
+            &crate::modules::tip::State,
+            &Viewport::new(Rect::sized(40, 1), &m),
+        );
         let top = &rendered[0];
-        assert!(top.plain().contains("/goal paused"), "{top:?}");
+        assert!(top.plain().contains("Goal paused"), "{top:?}");
         assert!(!top.plain().contains("active"), "{top:?}");
         let badge = top
             .spans
             .iter()
-            .find(|span| span.text.contains("/goal paused"))
+            .find(|span| span.text.contains("Goal paused"))
             .expect("paused badge");
         assert_eq!(badge.style.fg, theme::fg(Role::Warning).fg, "{top:?}");
     }
@@ -1076,6 +1199,124 @@ mod tests {
             "clicked the top visible row and got {:?}",
             &text[hit..hit + 8.min(text.len() - hit)]
         );
+    }
+
+    #[test]
+    fn a_composer_selection_is_a_half_open_text_range() {
+        let rect = Rect::new(0, 5, 30, 3);
+        let m = Moment::default().typing("ab中cd");
+        let forward = crate::moment::Selection {
+            anchor: (3, 6), // `b`
+            head: (4, 6),   // first cell of `中`
+        };
+        let backward = crate::moment::Selection {
+            anchor: forward.head,
+            head: forward.anchor,
+        };
+        for selection in [forward, backward] {
+            let range = selection_range(&m, rect, selection).expect("inside the composer");
+            assert_eq!(&m.input[range], "b中");
+        }
+        for (anchor, head) in [((0, 6), (29, 6)), ((29, 6), (0, 6))] {
+            let selection = crate::moment::Selection { anchor, head };
+            let range = selection_range(&m, rect, selection).expect("prompt and text");
+            assert_eq!(&m.input[range], "ab中cd");
+            let clipped = selection_without_prompt(&m, rect, selection);
+            assert!(clipped.anchor.0 >= PROMPT as u16);
+            assert!(clipped.head.0 >= PROMPT as u16);
+        }
+        for head in [(100, 6), (100, 10), (0, 10)] {
+            let clipped = selection_without_prompt(
+                &m,
+                rect,
+                crate::moment::Selection {
+                    anchor: (4, 6),
+                    head,
+                },
+            );
+            assert_eq!(clipped.head, (29, 6));
+            let range = selection_range(&m, rect, clipped).expect("clamped to composer");
+            assert_eq!(&m.input[range], "中cd");
+        }
+        let above = selection_without_prompt(
+            &m,
+            rect,
+            crate::moment::Selection {
+                anchor: (4, 6),
+                head: (0, 0),
+            },
+        );
+        assert_eq!(above.head, (2, 6));
+        assert_eq!(&m.input[selection_range(&m, rect, above).unwrap()], "ab中");
+        for selection in [
+            crate::moment::Selection {
+                anchor: (0, 9),
+                head: (20, 9),
+            },
+            crate::moment::Selection {
+                anchor: (0, 4),
+                head: (20, 6),
+            },
+        ] {
+            assert_eq!(
+                selection_without_prompt(&m, rect, selection),
+                selection,
+                "selections starting outside the composer stay unrestricted"
+            );
+        }
+        let second_cell = crate::moment::Selection {
+            anchor: (4, 6),
+            head: (5, 6),
+        };
+        let range = selection_range(&m, rect, second_cell).expect("wide character");
+        assert_eq!(&m.input[range], "中");
+
+        let multiline = Moment::default().typing("one\ntwo");
+        let multiline_rect = Rect::new(0, 5, 30, 4);
+        let line_padding = crate::moment::Selection {
+            anchor: (2, 6),
+            head: (20, 6),
+        };
+        let range = selection_range(&multiline, multiline_rect, line_padding).expect("first line");
+        assert_eq!(
+            &multiline.input[range], "one",
+            "padding does not select newline"
+        );
+
+        let crossing = crate::moment::Selection {
+            anchor: forward.anchor,
+            head: (4, 4),
+        };
+        assert_eq!(selection_range(&m, rect, crossing), None);
+
+        for decoration in [
+            crate::moment::Selection {
+                anchor: (0, 6),
+                head: (1, 6),
+            },
+            crate::moment::Selection {
+                anchor: (2, 5),
+                head: (3, 5),
+            },
+        ] {
+            assert_eq!(selection_range(&m, rect, decoration), None);
+        }
+
+        let narrow = Rect::new(0, 5, (PROMPT + 1) as u16, 4);
+        let hidden = Moment::default().typing("中");
+        let overwide = crate::moment::Selection {
+            anchor: (PROMPT as u16, 6),
+            head: (PROMPT as u16, 7),
+        };
+        assert_eq!(selection_range(&hidden, narrow, overwide), None);
+
+        let marker = Moment::default().typing("a [Image #1] b");
+        let inside_marker = crate::moment::Selection {
+            anchor: (5, 6),
+            head: (6, 6),
+        };
+        let range = selection_range(&marker, rect, inside_marker).expect("marker selection");
+        assert_eq!(&marker.input[range], "[Image #1]");
     }
 
     #[test]

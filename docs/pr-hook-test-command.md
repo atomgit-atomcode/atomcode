@@ -2,7 +2,7 @@
 
 ## 改动概述
 
-实现了 `atomcode hook test <name>` 命令，目前该命令只是一个打印 TODO 的空壳，现改为实际执行指定 hook 并展示详细结果。
+实现了 `atomcode hooks test <name>` 命令，目前该命令只是一个打印 TODO 的空壳，现改为实际执行指定 hook 并展示详细结果。
 
 ## 涉及文件
 
@@ -15,9 +15,9 @@
 
 ## 改动的价值
 
-### 1. `atomcode hook test <name>` 命令
+### 1. `atomcode hooks test <name>` 命令
 
-**之前**：执行 `atomcode hook test my-hook` 只会打印：
+**之前**：执行 `atomcode hooks test my-hook` 只会打印：
 ```
 Testing hook: my-hook
 (TODO: Implement hook testing)
@@ -46,7 +46,7 @@ Testing hook: my-hook
 
 ```bash
 # 测试一个名为 "check-bash" 的 hook
-$ atomcode hook test check-bash
+$ atomcode hooks test check-bash
 
 🔧 Testing Hook: check-bash
   Event:     pre_tool_use
@@ -65,7 +65,7 @@ $ atomcode hook test check-bash
 
 ```bash
 # 查找不存在的 hook 时
-$ atomcode hook test nonexistent
+$ atomcode hooks test nonexistent
 
 ❌ Hook 'nonexistent' not found.
 
@@ -76,7 +76,7 @@ Available hooks:
 
 ```bash
 # 超时场景
-$ atomcode hook test slow-hook
+$ atomcode hooks test slow-hook
 
 🔧 Testing Hook: slow-hook
   Event:     pre_tool_use

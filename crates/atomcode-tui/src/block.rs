@@ -106,6 +106,8 @@ pub struct ShapeCaps {
     /// a two-pixel-per-cell glyph is exactly the part that would be missing. See
     /// [`crate::caps::Caps::cell_background`].
     pub cell_background: bool,
+    /// Image support changes the welcome block's reserved dimensions.
+    pub graphics: crate::caps::Graphics,
 }
 
 impl ShapeCaps {
@@ -116,6 +118,7 @@ impl ShapeCaps {
             basic_glyphs: caps.basic_glyphs,
             colors: caps.colors,
             cell_background: caps.cell_background,
+            graphics: caps.graphics,
         }
     }
 
@@ -179,6 +182,16 @@ pub trait Content: Send + Sync + std::fmt::Debug {
     /// the way out, one column in and one column out, so alignment survives.
     /// See `docs/adr/0025`.
     fn lines(&self, ctx: &RenderCtx) -> Vec<Line>;
+
+    /// Readable source for the terminal reader. Blocks with original prose or
+    /// tool output override this to avoid copying width-clipped screen rows.
+    fn reading_text(&self, ctx: &RenderCtx) -> String {
+        self.lines(ctx)
+            .into_iter()
+            .map(|line| line.plain().trim_end().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
     /// Presentation-only context for a user prompt that has scrolled above the view.
     fn prompt_header(&self, _width: u16) -> Option<Line> {
@@ -706,6 +719,7 @@ mod tests {
             basic_glyphs: false,
             colors: crate::caps::Colors::Ansi256,
             cell_background: true,
+            graphics: crate::caps::Graphics::None,
         }
     }
 

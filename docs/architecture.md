@@ -31,7 +31,7 @@ CLI / TUI / daemon / background / ACP code
 
 ```text
 L3  drivers / services
-    atomcode-cli  atomcode-tuix  atomcode-daemon  ACP
+    atomcode-cli  atomcode-tui  atomcode-daemon  ACP
                               │
                               ▼
 L2                     atomcode-coding
@@ -67,7 +67,7 @@ L0                     atomcode-kernel
 | `atomcode-config` | leaf | 配置模型、加载与产品配置策略 |
 | `atomcode-auth` | leaf | 登录、OAuth 与凭据生命周期 |
 | `atomcode-cli` | L3 | 可执行程序入口、参数解析、headless/TUI/ACP 等入口协调 |
-| `atomcode-tuix` | L3 | retained-mode 终端 UI、事件循环、modal、命令与 runtime 事件投影 |
+| `atomcode-tui` | L3 | 由插件行装配的终端 UI、输入展示与 host 连接 |
 | `atomcode-daemon` | L3 | HTTP/WebUI/live hub、headless runtime 接入及历史 session 单向导入 |
 
 | `atomcode-review` | L2/L3 | 基于 kernel + capabilities 的独立代码审查 agent |
@@ -121,7 +121,7 @@ runtime 重建或切换时必须保持 session、cwd、provider、审批、gatew
 
 ### CLI / TUI
 
-`atomcode-cli` 负责进程入口和模式选择；`atomcode-tuix` 负责终端交互与展示。TUI
+`atomcode-cli` 负责进程入口和模式选择；`atomcode-tui` 负责终端交互与展示。TUI
 消费 runtime event 并产生 driver command，不拥有第二套 agent、provider 或 session
 状态机。
 

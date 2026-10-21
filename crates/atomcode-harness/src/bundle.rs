@@ -124,13 +124,14 @@ config = { max_rounds = 24, max_seconds = 0 }
 
 [[insert]]
 name = "llm-retry"
-config = { attempts = 3, backoff_ms = 3000, cap_ms = 30000 }
+config = { attempts = 6, backoff_ms = 3000, cap_ms = 30000, recovery_wait_secs = 300 }
 
-# Recovery, outermost first: a bound that each retry resets is not a bound,
-# and waiting out a limit has to happen outside everything that would burn it.
+# Recovery, outermost first: an explicitly configured total budget covers all
+# retries. By default content-idle watchdogs bound stalls, while a response that
+# keeps making progress has no whole-request deadline. request_secs = 0 disables it.
 [[insert]]
 name = "llm-request-timeout"
-config = { request_secs = 600 }
+config = { request_secs = 0 }
 
 [[insert]]
 name = "llm-rate-limit"
@@ -146,7 +147,7 @@ config = { max_continuations = 4 }
 
 [[insert]]
 name = "llm-stream-recovery"
-config = { max_recoveries = 1 }
+config = { max_recoveries = 3 }
 
 # Images a tool returned stay in the log and ride every later request: the
 # oldest are left out of a request past this many bytes, and a request the
@@ -325,7 +326,11 @@ name = "persona-coding"
 [[insert]]
 name = "delegation-bounds"
 
-# No rules by default, so the row is inert until a user writes some.
+# Temporary skill grants, inside the static deny rules and ahead of approval.
+[[insert]]
+name = "skill-permissions"
+
+# No static rules by default, so this row is inert until a user writes some.
 [[insert]]
 name = "permissions"
 

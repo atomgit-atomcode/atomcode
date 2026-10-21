@@ -1,10 +1,10 @@
 // Input "+" attach menu: opens a popover above the button with three actions —
 // upload image (disabled / coming soon), upload file (opens FilePicker via
 // parent), and choose a user-invocable skill (inserts `/<name> ` into the
-// input). Skills are fetched lazily on first open.
+// input). Skills refresh whenever the menu opens.
 
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { getSkills, SkillInfo } from '../api';
+import { useSkills, refreshSkills } from '../skills';
 import { useT } from '../settings';
 
 interface AttachMenuProps {
@@ -57,8 +57,7 @@ function SkillIcon() {
 export function AttachMenu({ onInsert, onPickFile, onAddImages }: AttachMenuProps) {
   const t = useT();
   const [open, setOpen] = useState(false);
-  const [skills, setSkills] = useState<SkillInfo[] | null>(null);
-  const [loading, setLoading] = useState(false);
+  const { items: skills, loading, failed } = useSkills(open);
   const rootRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -73,16 +72,6 @@ export function AttachMenu({ onInsert, onPickFile, onAddImages }: AttachMenuProp
     document.addEventListener('mousedown', h);
     return () => document.removeEventListener('mousedown', h);
   }, [open]);
-
-  // Lazily fetch skills the first time the menu opens.
-  useEffect(() => {
-    if (!open || skills !== null || loading) return;
-    setLoading(true);
-    getSkills()
-      .then(setSkills)
-      .catch(() => setSkills([]))
-      .finally(() => setLoading(false));
-  }, [open, skills, loading]);
 
   function pickSkill(name: string) {
     onInsert(`/${name} `, true);
@@ -145,8 +134,9 @@ export function AttachMenu({ onInsert, onPickFile, onAddImages }: AttachMenuProp
             <span>{t('attach.skill')}</span>
           </div>
           <div class="attach-skill-list">
+            {failed && <button class="attach-row" onClick={() => void refreshSkills()}>{t('skills.loadFailedRetry')}</button>}
             {loading && <div class="attach-note">{t('attach.skillsLoading')}</div>}
-            {!loading && skills !== null && skills.length === 0 && (
+            {!loading && !failed && skills !== null && skills.length === 0 && (
               <div class="attach-note">{t('attach.skillsEmpty')}</div>
             )}
             {!loading &&

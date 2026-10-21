@@ -212,6 +212,22 @@ impl Default for LiveViewHub {
     }
 }
 
+// A normal turn boundary retires transient waits, but not unanswered
+// questions whose tool already continued. Runtime replacement still clears all.
+fn retain_goal_questions(state: &mut HubState) {
+    state.pending_requests.retain(|_, request| {
+        atomcode_capabilities::tools::request_user_input::is_continued_question(
+            &request.kind,
+            &request.payload,
+        )
+    });
+    state.replay.retain(|observation| {
+        matches!(&observation.event,
+        LiveViewEvent::Runtime(CodingRuntimeEvent::Request(request))
+            if state.pending_requests.contains_key(&request.id))
+    });
+}
+
 impl LiveViewHub {
     pub fn new() -> Self {
         let (events, _) = broadcast::channel(BROADCAST_CAPACITY);
@@ -248,11 +264,115 @@ impl LiveViewHub {
         snapshot: SessionSnapshot,
         control: Arc<dyn LiveRuntimeControl>,
     ) -> Result<LiveBinding, HubError> {
+        self.bind_initial(
+            session_id,
+            working_dir,
+            provider,
+            provider_fingerprint,
+            snapshot,
+            control,
+            false,
+        )
+    }
+
+    /// Bind a complete presentation view without waiting for turn completion.
+    /// Build replay privately, then install it atomically so joiners never see
+    /// a baseline without its in-flight turn and pending requests.
+    pub fn bind_live_view(
+        &self,
+        view: atomcode_coding::runtime::RuntimeLiveView,
+        provider: String,
+        provider_fingerprint: String,
+        control: Arc<dyn LiveRuntimeControl>,
+    ) -> Result<LiveBinding, HubError> {
+        let status = control.status();
+        if status.generation != view.generation {
+            return Err(HubError::StaleBinding);
+        }
+        let staged = Self::new();
+        let binding = staged.bind_initial(
+            view.session_id,
+            view.working_dir,
+            provider,
+            provider_fingerprint,
+            (*view.snapshot).clone(),
+            control.clone(),
+            true,
+        )?;
+        for event in view.events {
+            staged.publish(&binding, event)?;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.turn_active
+            || state.binding.as_ref().is_some_and(|bound| {
+                matches!(
+                    bound.control.status().phase,
+                    RuntimePhase::InTurn
+                        | RuntimePhase::WaitingApproval
+                        | RuntimePhase::Reconfiguring
+                )
+            })
+        {
+            return Err(HubError::ActiveTurn);
+        }
+        let current = control.status();
+        if current.generation != view.generation
+            || matches!(
+                current.phase,
+                RuntimePhase::Reconfiguring
+                    | RuntimePhase::ShuttingDown
+                    | RuntimePhase::Stopped
+                    | RuntimePhase::Failed
+            )
+        {
+            return Err(HubError::StaleBinding);
+        }
+        let mut next = staged
+            .state
+            .into_inner()
+            .unwrap_or_else(|error| error.into_inner());
+        next.next_binding_id = state.next_binding_id + 1;
+        if let Some(bound) = next.binding.as_mut() {
+            bound.identity.id = next.next_binding_id;
+        }
+        for event in &mut next.replay {
+            event.cursor += state.next_cursor;
+            event.binding_id = next.next_binding_id;
+        }
+        next.next_cursor += state.next_cursor;
+        next.turn_active |= matches!(
+            current.phase,
+            RuntimePhase::InTurn | RuntimePhase::WaitingApproval
+        );
+        next.last_runtime_sequence = view.sequence;
+        let binding = next
+            .binding
+            .as_ref()
+            .expect("staged binding")
+            .identity
+            .clone();
+        *state = next;
+        Ok(binding)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bind_initial(
+        &self,
+        session_id: impl Into<String>,
+        working_dir: PathBuf,
+        provider: impl Into<String>,
+        provider_fingerprint: impl Into<String>,
+        snapshot: SessionSnapshot,
+        control: Arc<dyn LiveRuntimeControl>,
+        allow_active: bool,
+    ) -> Result<LiveBinding, HubError> {
         let status = control.status();
         match status.phase {
-            RuntimePhase::InTurn | RuntimePhase::WaitingApproval | RuntimePhase::Reconfiguring => {
+            RuntimePhase::Reconfiguring => return Err(HubError::ActiveTurn),
+            RuntimePhase::InTurn | RuntimePhase::WaitingApproval if !allow_active => {
                 return Err(HubError::ActiveTurn)
             }
+            RuntimePhase::InTurn | RuntimePhase::WaitingApproval => {}
             RuntimePhase::ShuttingDown | RuntimePhase::Stopped | RuntimePhase::Failed => {
                 return Err(HubError::RuntimeUnavailable);
             }
@@ -362,6 +482,13 @@ impl LiveViewHub {
     /// `binding`, never an unconditional reset: a successor that is already
     /// bound is left alone (`StaleBinding`).
     pub fn unbind_retired(&self, binding: &LiveBinding) -> Result<(), HubError> {
+        self.detach(binding)
+    }
+
+    /// Revoke this binding's shared view while its runtime may keep running.
+    /// This clears publication and remote control state, never cancels the
+    /// runtime, and cannot revoke a successor binding.
+    pub fn detach(&self, binding: &LiveBinding) -> Result<(), HubError> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         let current_binding_id = state
             .binding
@@ -448,8 +575,7 @@ impl LiveViewHub {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         Self::dispatch_locked(&state, DriverCommand::Submit(input.clone()))?;
         if !state.turn_active {
-            state.replay.clear();
-            state.pending_requests.clear();
+            retain_goal_questions(&mut state);
             state.pending_web_steers.clear();
         }
         state.turn_active = true;
@@ -540,8 +666,7 @@ impl LiveViewHub {
             });
         }
         if matches!(receipt, SubmitReceipt::Started { .. }) {
-            state.replay.clear();
-            state.pending_requests.clear();
+            retain_goal_questions(&mut state);
             if correlation_registered {
                 remove_pending_web_steer_locked(&mut state, client_input_id.as_deref());
             }
@@ -581,11 +706,10 @@ impl LiveViewHub {
             });
         }
         if !state.turn_active {
-            state.replay.clear();
             state.pending_web_steers.clear();
         }
         state.turn_active = true;
-        state.pending_requests.clear();
+        retain_goal_questions(&mut state);
         self.publish_view_locked(
             &mut state,
             LiveViewEvent::InputAccepted {
@@ -934,6 +1058,18 @@ impl LiveViewHub {
         state.last_runtime_sequence = Some(envelope.sequence);
 
         let event = envelope.event;
+        if let CodingRuntimeEvent::RequestResolved { id, kind } = &event {
+            // A terminal/TUI response bypasses the HTTP response route. Retire
+            // its replay entry here too; the route may already have done so.
+            if state
+                .pending_requests
+                .get(id)
+                .is_some_and(|pending| pending.kind == *kind)
+            {
+                self.resolve_request_locked(&mut state, *id)?;
+            }
+            return Ok(());
+        }
         // ProviderChanged may be observed both from the runtime event stream and
         // from the TUI's successful reload acknowledgement.  Treat an identical
         // projection as idempotent so the explicit acknowledgement path can make
@@ -989,7 +1125,12 @@ impl LiveViewHub {
                 replay = true;
             }
             CodingRuntimeEvent::Request(request) => {
-                state.turn_active = true;
+                if !atomcode_capabilities::tools::request_user_input::is_continued_question(
+                    &request.kind,
+                    &request.payload,
+                ) {
+                    state.turn_active = true;
+                }
                 state.pending_requests.insert(
                     request.id,
                     PendingRequest {
@@ -1025,9 +1166,8 @@ impl LiveViewHub {
                 };
                 state.snapshot = Some(snapshot.clone());
                 state.snapshot_error = None;
-                state.replay.clear();
+                retain_goal_questions(&mut state);
                 state.replay.extend(terminal_intervention);
-                state.pending_requests.clear();
                 state.pending_web_steers.clear();
                 state.turn_active = false;
                 replay = false;
@@ -1389,6 +1529,90 @@ mod tests {
     };
 
     #[test]
+    fn a_live_view_binds_during_a_turn_and_keeps_requests_and_sequence_watermark() {
+        let hub = LiveViewHub::new();
+        let (previous, _) = control();
+        hub.bind("previous", "/old".into(), snapshot("previous"), previous)
+            .unwrap();
+        let (control, _) = control();
+        control.status.lock().unwrap().phase = RuntimePhase::WaitingApproval;
+        assert!(matches!(
+            hub.bind("s", "/one".into(), snapshot("history"), control.clone()),
+            Err(HubError::ActiveTurn)
+        ));
+        let mut view = atomcode_coding::runtime::RuntimeLiveView::from_snapshot(
+            1,
+            "s".into(),
+            "/one".into(),
+            snapshot("history"),
+        );
+        view.events = vec![
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 4,
+                event: CodingRuntimeEvent::Agent(AgentEvent::TurnStarted { turn: None }),
+            },
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 5,
+                event: CodingRuntimeEvent::Agent(AgentEvent::TextDelta("partial".into())),
+            },
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 6,
+                event: CodingRuntimeEvent::Request(atomcode_coding::RuntimeRequest {
+                    id: 42,
+                    kind: "approval".into(),
+                    payload: serde_json::json!({"tool":"bash"}),
+                    snapshot: None,
+                }),
+            },
+        ];
+        view.sequence = Some(6);
+        let binding = hub
+            .bind_live_view(
+                view.clone(),
+                "provider".into(),
+                "fingerprint".into(),
+                control.clone(),
+            )
+            .unwrap();
+        assert_eq!(binding.id, 2);
+        let joined = hub.join().unwrap();
+        assert_eq!(joined.snapshot.messages[0].text, "history");
+        assert_eq!(joined.replay.len(), 3);
+        assert!(joined
+            .replay
+            .iter()
+            .all(|event| event.binding_id == binding.id));
+        assert!(hub.state.lock().unwrap().pending_requests.contains_key(&42));
+        assert!(hub.state.lock().unwrap().turn_active);
+        assert_eq!(
+            hub.publish(&binding, view.events[2].clone()),
+            Err(HubError::StaleEvent)
+        );
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 7,
+                event: CodingRuntimeEvent::Agent(AgentEvent::TextDelta("new".into())),
+            },
+        )
+        .unwrap();
+        assert_eq!(hub.join().unwrap().replay.len(), 4);
+        assert!(matches!(
+            hub.bind_live_view(view.clone(), "p".into(), "f".into(), control.clone()),
+            Err(HubError::ActiveTurn)
+        ));
+        control.status.lock().unwrap().generation = 2;
+        assert!(matches!(
+            LiveViewHub::new().bind_live_view(view, "p".into(), "f".into(), control),
+            Err(HubError::StaleBinding)
+        ));
+    }
+
+    #[test]
     fn web_steer_correlation_uses_runtime_payload_and_returns_client_identity() {
         let runtime_input = UserInput {
             text: "look\n\n[图片内容（由 vl 识别）]\na cat".into(),
@@ -1470,6 +1694,8 @@ mod tests {
                 generation: 1,
                 sequence: 1,
                 event: CodingRuntimeEvent::GoalChanged(GoalProgress {
+                    report: Default::default(),
+                    evaluation_ready: false,
                     active: true,
                     terminal: None,
                     phase: GoalPhase::Pursuing,
@@ -1478,6 +1704,7 @@ mod tests {
                     elapsed_secs: 12,
                     condition: "finish the task".into(),
                     last_reason: None,
+                    recovery: None,
                 }),
             },
         )
@@ -1498,6 +1725,8 @@ mod tests {
         hub.seed_goal_progress(
             &binding,
             GoalProgress {
+                report: Default::default(),
+                evaluation_ready: false,
                 active: true,
                 terminal: None,
                 phase: GoalPhase::Pursuing,
@@ -1506,6 +1735,7 @@ mod tests {
                 elapsed_secs: 0,
                 condition: "finish".into(),
                 last_reason: None,
+                recovery: None,
             },
         )
         .unwrap();
@@ -1516,6 +1746,8 @@ mod tests {
                 generation: 1,
                 sequence: 0,
                 event: CodingRuntimeEvent::GoalChanged(GoalProgress {
+                    report: Default::default(),
+                    evaluation_ready: false,
                     active: true,
                     terminal: None,
                     phase: GoalPhase::Pursuing,
@@ -1524,6 +1756,7 @@ mod tests {
                     elapsed_secs: 1,
                     condition: "finish".into(),
                     last_reason: None,
+                    recovery: None,
                 }),
             },
         )
@@ -1783,6 +2016,76 @@ mod tests {
     }
 
     #[test]
+    fn a_continued_goal_question_survives_normal_turns_until_its_reply_resolves() {
+        let hub = LiveViewHub::new();
+        let (control, _) = control();
+        let binding = hub
+            .bind("session-1", PathBuf::from("/one"), snapshot("old"), control)
+            .unwrap();
+        let payload = serde_json::json!({"goal_question_pending":true,"question":"Which account?"});
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 1,
+                event: CodingRuntimeEvent::Request(atomcode_coding::RuntimeRequest {
+                    id: 42,
+                    kind: "request_user_input".into(),
+                    payload: payload.clone(),
+                    snapshot: None,
+                }),
+            },
+        )
+        .unwrap();
+        assert!(
+            !hub.state.lock().unwrap().turn_active,
+            "an answerable card alone is not running work"
+        );
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 2,
+                event: CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
+                    turn_id: 1,
+                    reason: atomcode_kernel::event::StopReason::Stopped,
+                    snapshot: Arc::new(snapshot("done")),
+                    stats: Default::default(),
+                }),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            hub.pending_of_kind("request_user_input"),
+            Some((42, payload))
+        );
+        assert_eq!(hub.join().unwrap().replay.len(), 1);
+        hub.accept_local_input(UserInput::from("do independent work"))
+            .unwrap();
+        assert!(
+            hub.pending_of_kind("request_user_input").is_some(),
+            "ordinary input lost the question"
+        );
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 3,
+                event: CodingRuntimeEvent::RequestResolved {
+                    id: 42,
+                    kind: "request_user_input".into(),
+                },
+            },
+        )
+        .unwrap();
+        assert!(hub.pending_of_kind("request_user_input").is_none());
+        assert!(!hub.join().unwrap().replay.iter().any(|event| matches!(
+            &event.event,
+            LiveViewEvent::Runtime(CodingRuntimeEvent::Request(_))
+        )));
+    }
+
+    #[test]
     fn a_pending_request_is_read_back_as_the_runtime_raised_it() {
         let hub = LiveViewHub::new();
         let (control, _commands) = control();
@@ -1816,6 +2119,94 @@ mod tests {
             None,
             "an answered request is no longer something an answer can act on"
         );
+    }
+
+    #[test]
+    fn terminal_answer_retires_only_its_request_and_reconnect_replay() {
+        let hub = LiveViewHub::new();
+        let (control, _) = control();
+        let binding = hub
+            .bind("session-1", PathBuf::from("/one"), snapshot("one"), control)
+            .unwrap();
+        let kind = atomcode_capabilities::tools::request_user_input::REQUEST_USER_INPUT_KIND;
+        for (sequence, id) in [(1, 42), (2, 43)] {
+            hub.publish(
+                &binding,
+                SequencedRuntimeEvent {
+                    generation: 1,
+                    sequence,
+                    event: CodingRuntimeEvent::Request(atomcode_coding::RuntimeRequest {
+                        id,
+                        kind: kind.into(),
+                        payload: serde_json::json!({"question": "Pick one"}),
+                        snapshot: None,
+                    }),
+                },
+            )
+            .unwrap();
+        }
+        let mut browser = hub.join().unwrap();
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 3,
+                event: CodingRuntimeEvent::RequestResolved {
+                    id: 42,
+                    kind: kind.into(),
+                },
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            browser.receiver.try_recv().unwrap().event,
+            LiveViewEvent::RequestResolved { request_id: 42, .. }
+        ));
+        assert_eq!(hub.pending_of_kind(kind).unwrap().0, 43);
+        let replay = hub.join().unwrap().replay;
+        assert!(!replay.iter().any(|observation| matches!(&observation.event, LiveViewEvent::Runtime(CodingRuntimeEvent::Request(request)) if request.id == 42)));
+        assert!(replay.iter().any(|observation| matches!(&observation.event, LiveViewEvent::Runtime(CodingRuntimeEvent::Request(request)) if request.id == 43)));
+        // A duplicate or stale terminal must not dismiss the next question.
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 4,
+                event: CodingRuntimeEvent::RequestResolved {
+                    id: 42,
+                    kind: kind.into(),
+                },
+            },
+        )
+        .unwrap();
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 5,
+                event: CodingRuntimeEvent::RequestResolved {
+                    id: 43,
+                    kind: "another-kind".into(),
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            hub.publish(
+                &binding,
+                SequencedRuntimeEvent {
+                    generation: 0,
+                    sequence: 6,
+                    event: CodingRuntimeEvent::RequestResolved {
+                        id: 43,
+                        kind: kind.into()
+                    }
+                }
+            ),
+            Err(HubError::StaleEvent)
+        );
+        assert!(browser.receiver.try_recv().is_err());
+        assert_eq!(hub.pending_of_kind(kind).unwrap().0, 43);
     }
 
     #[test]
@@ -2208,6 +2599,74 @@ mod tests {
             .unwrap_err(),
             HubError::StaleEvent
         );
+    }
+
+    #[test]
+    fn active_shared_views_can_be_revoked_and_reattached_without_cancelling() {
+        for phase in [RuntimePhase::InTurn, RuntimePhase::WaitingApproval] {
+            let hub = LiveViewHub::new();
+            let (control, commands) = control();
+            control.status.lock().unwrap().phase = phase;
+            let mut view = atomcode_coding::runtime::RuntimeLiveView::from_snapshot(
+                1,
+                "terminal".into(),
+                "/one".into(),
+                snapshot("history"),
+            );
+            view.events = vec![
+                SequencedRuntimeEvent {
+                    generation: 1,
+                    sequence: 1,
+                    event: CodingRuntimeEvent::Agent(AgentEvent::TurnStarted { turn: None }),
+                },
+                SequencedRuntimeEvent {
+                    generation: 1,
+                    sequence: 2,
+                    event: CodingRuntimeEvent::Request(atomcode_coding::RuntimeRequest {
+                        id: 42,
+                        kind: "approval".into(),
+                        payload: serde_json::json!({"tool":"bash"}),
+                        snapshot: None,
+                    }),
+                },
+            ];
+            view.sequence = Some(2);
+            let mut binding = hub
+                .bind_live_view(view.clone(), "p".into(), "f".into(), control.clone())
+                .unwrap();
+            // logout, then stop, then restart while the same runtime is active.
+            for _ in 0..3 {
+                assert_eq!(hub.unbind(&binding).unwrap_err(), HubError::ActiveTurn);
+                hub.detach(&binding).unwrap();
+                assert!(matches!(hub.join(), Err(HubError::Unbound)));
+                assert!(hub.respond(42, serde_json::Value::Null).is_err());
+                let next = hub
+                    .bind_live_view(view.clone(), "p".into(), "f".into(), control.clone())
+                    .unwrap();
+                assert_ne!(next.id, binding.id);
+                assert_eq!(hub.detach(&binding).unwrap_err(), HubError::StaleBinding);
+                assert_eq!(
+                    hub.publish(
+                        &binding,
+                        SequencedRuntimeEvent {
+                            generation: 1,
+                            sequence: 3,
+                            event: CodingRuntimeEvent::Agent(AgentEvent::TextDelta("late".into())),
+                        }
+                    )
+                    .unwrap_err(),
+                    HubError::StaleBinding
+                );
+                assert_eq!(hub.join().unwrap().binding, next);
+                binding = next;
+            }
+            assert!(
+                commands.lock().unwrap().is_empty(),
+                "detach must not dispatch cancel or shutdown"
+            );
+            assert_eq!(control.status().phase, phase);
+            hub.detach(&binding).unwrap();
+        }
     }
 
     /// A runtime that has been shut down is unbound even when the hub still

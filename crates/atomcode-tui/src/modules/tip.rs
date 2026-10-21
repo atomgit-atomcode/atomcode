@@ -117,6 +117,73 @@ impl View for Tip {
                 ),
             },
         };
+        // Goal status uses the already-reserved row above the box, never the
+        // rename pill's position on the input rule. Preserve a tip on the left.
+        if vp.moment.secret.is_none() {
+            if let Some(goal) = vp.moment.autonomy.as_ref().filter(|a| a.kind == "goal") {
+                let (mut label, badge_role) = if goal.paused.is_some() && !goal.recovering {
+                    ("Goal paused · /goal report".to_owned(), Role::Warning)
+                } else if goal.recovering {
+                    let elapsed = vp
+                        .moment
+                        .autonomy_samples
+                        .get(&vp.moment.viewing)
+                        .filter(|(sample, _)| sample == goal)
+                        .or_else(|| {
+                            vp.moment
+                                .autonomy_samples
+                                .get(&vp.moment.lead)
+                                .filter(|(sample, _)| sample == goal)
+                        })
+                        .map(|(_, at)| {
+                            vp.moment.now.as_millis().saturating_sub(at.as_millis()) / 1000
+                        })
+                        .unwrap_or(0);
+                    match goal.retry_in_secs.map(|secs| secs.saturating_sub(elapsed)) {
+                        Some(secs) if secs > 0 => {
+                            (format!("Goal retrying · {secs}s"), Role::Warning)
+                        }
+                        _ if goal.goal_stage == Some(atomcode_host_api::GoalStage::Evaluating) => {
+                            ("Goal evaluating".to_owned(), Role::Accent)
+                        }
+                        _ => ("Goal recovering".to_owned(), Role::Accent),
+                    }
+                } else if goal.goal_stage == Some(atomcode_host_api::GoalStage::Continuing) {
+                    ("Goal continuing".to_owned(), Role::Accent)
+                } else {
+                    ("Goal active".to_owned(), Role::Accent)
+                };
+                let text = if text.is_empty() && !goal.recovering {
+                    goal.paused.as_deref().unwrap_or(&text)
+                } else {
+                    &text
+                };
+                let available = w.saturating_sub(1) as usize;
+                if crate::width::str_width(&label) > available {
+                    label = if goal.recovering {
+                        "Goal recovering"
+                    } else if goal.paused.is_some() {
+                        "Goal paused"
+                    } else {
+                        "Goal active"
+                    }
+                    .to_owned();
+                }
+                let badge_width = crate::width::str_width(&label);
+                if available >= badge_width {
+                    let room = available.saturating_sub(badge_width + 1);
+                    let mut line = Line::from_spans(vec![crate::frame::Span::styled(
+                        text.to_owned(),
+                        theme::fg(role),
+                    )])
+                    .truncate(room);
+                    let gap = available.saturating_sub(line.width() + badge_width);
+                    line.push(crate::frame::Span::raw(" ".repeat(gap)));
+                    line.push(crate::frame::Span::styled(label, theme::fg(badge_role)));
+                    return vec![line];
+                }
+            }
+        }
         // One cell short of the edge. A row written into its last column is one
         // miscounted width away from the console wrapping its last character onto
         // the next row — the composer's rule, which is not redrawn, so the stray
@@ -128,6 +195,9 @@ impl View for Tip {
             El::styled(" ", crate::frame::Style::new()),
         ])
         .lay(w)
+        .into_iter()
+        .take(1)
+        .collect()
     }
 
     /// Always one row — the point of the module.
@@ -169,6 +239,79 @@ mod tests {
             .iter()
             .map(|l| l.plain())
             .collect()
+    }
+
+    #[test]
+    fn goal_status_and_tips_share_one_row_even_on_narrow_terminals() {
+        let mut m = Moment::default();
+        m.autonomy = Some(atomcode_host_api::Running {
+            usage: None,
+            recovering: false,
+            retry_in_secs: None,
+            goal_stage: None,
+            goal_detail: None,
+            kind: "goal".into(),
+            what: "a long objective".into(),
+            round: 1,
+            of: None,
+            elapsed_secs: 1,
+            paused: None,
+        });
+        m.clipboard_hint = true;
+        for w in [1, 8, 14, 30, 80] {
+            let rows = draw_at(&m, w, 1);
+            assert_eq!(rows.len(), 1);
+            assert!(rows[0].width() <= w as usize);
+            if w >= 14 {
+                assert!(rows[0].plain().contains("Goal active"));
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_counts_down_without_claiming_the_goal_is_paused() {
+        let mut m = Moment::default();
+        m.now = Timestamp::millis(1000);
+        m.autonomy = Some(atomcode_host_api::Running {
+            usage: None,
+            recovering: true,
+            retry_in_secs: Some(30),
+            goal_stage: None,
+            goal_detail: None,
+            kind: "goal".into(),
+            what: "objective".into(),
+            round: 1,
+            of: None,
+            elapsed_secs: 1,
+            // Older hosts used this field for recovery details too.
+            paused: Some("retrying provider".into()),
+        });
+        m.autonomy_samples
+            .insert(m.viewing.clone(), (m.autonomy.clone().unwrap(), m.now));
+        assert!(draw_at(&m, 100, 1)[0]
+            .plain()
+            .contains("Goal retrying · 30s"));
+        m.now = Timestamp::millis(11000);
+        assert!(draw_at(&m, 100, 1)[0]
+            .plain()
+            .contains("Goal retrying · 20s"));
+        m.now = Timestamp::millis(31000);
+        let line = draw_at(&m, 100, 1)[0].plain();
+        assert!(line.contains("Goal recovering"));
+        assert!(!line.contains("paused"));
+        m.autonomy.as_mut().unwrap().goal_stage = Some(atomcode_host_api::GoalStage::Evaluating);
+        m.autonomy.as_mut().unwrap().retry_in_secs = Some(0);
+        assert!(draw_at(&m, 100, 1)[0].plain().contains("Goal evaluating"));
+        let goal = m.autonomy.as_mut().unwrap();
+        goal.recovering = false;
+        goal.retry_in_secs = None;
+        goal.paused = Some("provider recovery budget exhausted".into());
+        let line = draw_at(&m, 140, 1)[0].plain();
+        assert!(line.contains("Goal paused"));
+        assert!(line.contains("provider recovery budget exhausted"));
+        assert!(line.contains("/goal report"));
+        m.autonomy.as_mut().unwrap().paused = None;
+        assert!(draw_at(&m, 100, 1)[0].plain().contains("Goal active"));
     }
 
     #[test]

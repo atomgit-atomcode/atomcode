@@ -307,7 +307,13 @@ async fn past_the_mark_older_turns_are_summarized_under_the_first_request() {
     w.apply(decision);
     let seen: Vec<String> = w.seen().into_iter().map(|m| m.text).collect();
     assert!(seen[0].contains("SUMMARY 1"), "{seen:?}");
-    assert_eq!(seen[1], "the first request");
+    assert_eq!(
+        seen[1],
+        format!(
+            "{}the first request",
+            atomcode_kernel::message::COMPACTION_RETAINED_FRAMING
+        )
+    );
     assert!(!seen.iter().any(|t| t == "the second request"));
     assert!(seen.iter().any(|t| t == "the third request"));
 
@@ -332,7 +338,10 @@ async fn past_the_mark_older_turns_are_summarized_under_the_first_request() {
         1,
         "one summary"
     );
-    assert_eq!(seen[1].text, "the first request");
+    assert_eq!(seen[1].display_text(), "the first request");
+    assert!(seen[1]
+        .text
+        .starts_with(atomcode_kernel::message::COMPACTION_RETAINED_FRAMING));
 }
 
 /// Without a model to write it, a summary is the model-free list — never a
@@ -445,7 +454,10 @@ async fn an_overflow_climbs_stub_truncate_and_a_summary_that_splits_the_turn() {
     assert!(split.through > go, "part of the turn is folded");
     w.apply(split);
     let seen = w.seen();
-    assert_eq!(seen[1].text, "go");
+    assert_eq!(seen[1].display_text(), "go");
+    assert!(seen[1]
+        .text
+        .starts_with(atomcode_kernel::message::COMPACTION_RETAINED_FRAMING));
     no_orphan_results(&seen).unwrap();
 }
 

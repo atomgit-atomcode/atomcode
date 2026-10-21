@@ -388,7 +388,7 @@ impl Tool for ReadFileTool {
             // when the world actually denied it sends it looking for a path
             // that is right there — and hides the one fact it needs, which is
             // that this world will not serve it.
-            Err(e) if e.is_denied() => return err(format!("read_file: {e}")),
+            Err(e) => return err(format!("read_file: {e}")),
             _ => {
                 return err(format!(
                     "Error: no such file: {} (resolved to {}){}",

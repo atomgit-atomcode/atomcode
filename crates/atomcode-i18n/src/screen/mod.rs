@@ -140,3 +140,61 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod provider_message_tests {
+    use super::*;
+    #[test]
+    fn provider_stop_and_retry_are_localized_without_a_global_locale_change() {
+        for (locale, stopped, denied, retry_word) in [
+            (Locale::ZhCn, "模型服务错误", "模型服务拒绝了请求", "重试"),
+            (
+                Locale::En,
+                "Model service error",
+                "Model service denied the request",
+                "retry",
+            ),
+        ] {
+            assert!(t_with(locale, Msg::StopProviderError).contains(stopped));
+            let reason = t_with(locale, Msg::ProviderAccessDenied);
+            assert_eq!(reason, denied);
+            let reason = t_with(
+                locale,
+                Msg::ProviderErrorStatus {
+                    reason: &reason,
+                    status: 403,
+                },
+            );
+            let text = t_with(
+                locale,
+                Msg::TranscriptProviderRetry {
+                    reason: &reason,
+                    seconds: 6,
+                    attempt: 2,
+                    max: 2,
+                },
+            );
+            assert!(text.contains(retry_word));
+            assert!(text.contains("403") && text.contains("2/2"));
+            assert!(!text.contains("litellm"));
+            assert!(!t_with(locale, Msg::ProviderCheckAccess).is_empty());
+            assert!(!t_with(locale, Msg::ProviderErrorDetails).is_empty());
+        }
+    }
+}
+
+#[cfg(test)]
+mod team_panel_message_tests {
+    use super::*;
+    #[test]
+    fn team_panel_feedback_is_available_in_both_languages() {
+        for (locale, empty, expanded, collapsed) in [
+            (Locale::ZhCn, "当前没有团队成员", "已展开", "已收起"),
+            (Locale::En, "No team members", "expanded", "collapsed"),
+        ] {
+            assert!(t_with(locale, Msg::TeamPanelEmpty).contains(empty));
+            assert!(t_with(locale, Msg::TeamPanelExpanded).contains(expanded));
+            assert!(t_with(locale, Msg::TeamPanelCollapsed).contains(collapsed));
+        }
+    }
+}

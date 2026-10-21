@@ -49,7 +49,7 @@ fn ok() -> Style {
 }
 /// A call that has receded behind a fold.
 ///
-/// The muted grey, so a folded line reads as scaffolding over the answer rather
+/// A light grey (#A8A8A8), so a folded line reads as scaffolding over the answer rather
 /// than as one more thing being said: an expanded call is a fact the reader is
 /// looking at, a folded one is a fact they have chosen not to, so it recedes
 /// like the rest of the chrome. The whole summary takes it — name, subject and
@@ -62,7 +62,7 @@ fn ok() -> Style {
 /// has already told the reader it exists, and the live line below is where "in
 /// flight" is stated.
 fn fold() -> Style {
-    muted()
+    Style::new().fg(Color::rgb((0xa8, 0xa8, 0xa8)))
 }
 
 /// The ink a click is announced in — the tail a lid ends with (`点击展开` on a
@@ -292,7 +292,7 @@ impl Mascot {
     }
 }
 
-/// The shipped cat, **verbatim** from `atomcode-tuix` (`render/mascot.rs`).
+/// The fallback pixel cat, **verbatim** from `atomcode-tuix` (`render/mascot.rs`).
 ///
 /// **It is coarse, and that is the art.** 18 x 8 pixels is enough for two ears,
 /// two eyes and a chin — and no whiskers, no nose, no tail. Rendered large it
@@ -406,19 +406,29 @@ impl Content for WelcomeBlock {
         }
 
         // ---- The right column: a heading and the tips ----
+        let image_mascot = uses_image_mascot(ctx, content_w, self.brand.mascot.as_ref());
+        // Preserve the pixel layout's three random tips plus optional login.
+        let limit = if image_mascot {
+            5
+        } else {
+            3 + usize::from(self.tips.first().is_some_and(|(name, _)| name == "/login"))
+        };
+        let tips = &self.tips[..self.tips.len().min(limit)];
         let mut right: Vec<Line> = Vec::new();
-        if !self.tips.is_empty() {
+        if !tips.is_empty() {
             right.push(Line::styled(
                 width::take_width(&self.heading, content_w),
                 muted(),
             ));
-            let command_w = self
-                .tips
+            if image_mascot {
+                right.push(Line::empty());
+            }
+            let command_w = tips
                 .iter()
                 .map(|(command, _)| width::str_width(command))
                 .max()
                 .unwrap_or(0);
-            for (command, about) in &self.tips {
+            for (command, about) in tips {
                 // The columns line up on the widest command, but never at the cost
                 // of the row: command, gap and description together are clipped to
                 // `content_w`. A tip that does not fit is cut, never drawn past the
@@ -492,7 +502,11 @@ impl Content for WelcomeBlock {
         } else {
             // From the art, so a fork's taller or wider mascot lines the tips
             // up beside it without touching this calculation.
-            PAD + self.brand.mascot.as_ref().map_or(0, Mascot::cells)
+            if uses_image_mascot(ctx, content_w, self.brand.mascot.as_ref()) {
+                PAD + crate::terminal_image::MASCOT_WIDTH as usize
+            } else {
+                PAD + self.brand.mascot.as_ref().map_or(0, Mascot::cells)
+            }
         };
         let tips_col = left_w + gap;
         let right_w = right.iter().map(Line::width).max().unwrap_or(0);
@@ -541,6 +555,12 @@ impl Content for WelcomeBlock {
 /// How far the block is set in from the rect it was given.
 const PAD: usize = 2;
 
+fn uses_image_mascot(ctx: &RenderCtx, content_w: usize, art: Option<&Mascot>) -> bool {
+    crate::terminal_image::supported(ctx.caps.graphics)
+        && content_w >= crate::terminal_image::MASCOT_WIDTH as usize
+        && art.is_some_and(|art| *art == Mascot::default())
+}
+
 /// The mascot, as nine cells of two vertical pixels each.
 ///
 /// **With `cell_background`** the two pixels are the cell's foreground and
@@ -560,10 +580,28 @@ const PAD: usize = 2;
 ///
 /// Cut to `content_w`, like every other row: art wider than the rect it was given
 /// is a row running into its neighbour.
+
 fn mascot(ctx: &RenderCtx, content_w: usize, art: Option<&Mascot>) -> Vec<Line> {
     let Some(art) = art else {
         return Vec::new();
     };
+    if uses_image_mascot(ctx, content_w, Some(art)) {
+        let mut rows =
+            vec![
+                Line::raw(" ".repeat(PAD + crate::terminal_image::MASCOT_WIDTH as usize));
+                crate::terminal_image::MASCOT_HEIGHT as usize
+            ];
+        rows[0].image = Some(crate::terminal_image::Image {
+            rect: crate::frame::Rect::new(
+                PAD as u16,
+                0,
+                crate::terminal_image::MASCOT_WIDTH,
+                crate::terminal_image::MASCOT_HEIGHT,
+            ),
+            png: crate::terminal_image::MASCOT_PNG,
+        });
+        return rows;
+    }
     // `▀` and `▄` are all the art is made of, and a basic console font has
     // both ([`crate::caps::console_safe`]).
     let drawable = ctx.caps.colors != crate::caps::Colors::None
@@ -661,6 +699,10 @@ impl Content for RecapBlock {
 }
 
 impl Content for UserSaid {
+    fn reading_text(&self, _ctx: &RenderCtx) -> String {
+        self.0.clone()
+    }
+
     fn kind(&self) -> &'static str {
         "user"
     }
@@ -919,6 +961,10 @@ impl ModelSaid {
 }
 
 impl Content for ModelSaid {
+    fn reading_text(&self, _ctx: &RenderCtx) -> String {
+        self.0.clone()
+    }
+
     fn kind(&self) -> &'static str {
         "assistant"
     }
@@ -1152,6 +1198,17 @@ impl ToolCallBlock {
     /// while it is still open, when it failed, or when the text is not one those
     /// writers produced; the call is then drawn like any other.
     fn exchange(&self) -> Option<Vec<(String, ReadAnswer)>> {
+        if self.name == "ask_user" {
+            if let Outcome::Ok(content) = &self.outcome {
+                let answers = read_result(content, 1)?;
+                if matches!(answers.first(), Some(ReadAnswer::Pending { .. })) {
+                    return Some(vec![(
+                        asked_question(&self.args_without_reason())?,
+                        answers[0].clone(),
+                    )]);
+                }
+            }
+        }
         if self.name != REQUEST_USER_INPUT_KIND {
             return None;
         }
@@ -1187,9 +1244,14 @@ impl ToolCallBlock {
         let gutter = format!("{}{} ", " ".repeat(GUTTER), caps.g(Glyph::Gutter));
         let under = " ".repeat(width::str_width(&gutter));
         for (i, (question, answer)) in exchange.iter().enumerate() {
-            let (said, said_style) = match answer_words(answer) {
-                Some(words) => (words, Style::new()),
-                None => (t(Msg::AskUnanswered).into_owned(), muted()),
+            let (said, said_style) = match answer {
+                ReadAnswer::Pending { id } => {
+                    (t(Msg::AskPending { id: *id }).into_owned(), muted())
+                }
+                _ => match answer_words(answer) {
+                    Some(words) => (words, Style::new()),
+                    None => (t(Msg::AskUnanswered).into_owned(), muted()),
+                },
             };
             let spans = [
                 Span::styled(flatten(question), muted()),
@@ -1909,6 +1971,15 @@ fn clip(s: &str, cells: usize) -> String {
 }
 
 impl Content for ToolCallBlock {
+    fn reading_text(&self, _ctx: &RenderCtx) -> String {
+        let (mark, _) = self.mark();
+        let body = match &self.outcome {
+            Outcome::Ok(text) | Outcome::Failed(text) => text.as_str(),
+            _ => "",
+        };
+        format!("{mark} {}({})\n{body}", self.name, self.args)
+    }
+
     fn kind(&self) -> &'static str {
         "tool_call"
     }
@@ -2268,8 +2339,11 @@ impl Content for ToolCallBlock {
 /// failure. Undecided is a caution, not an error: `⚠` and the warning colour.
 #[derive(Debug)]
 pub struct GoalEndedBlock {
+    pub usage: Option<atomcode_host_api::TokenTotals>,
     pub condition: String,
     pub met: bool,
+    /// Frozen from the same cumulative clock as the live goal row.
+    pub elapsed_ms: Option<u64>,
 }
 
 impl Content for GoalEndedBlock {
@@ -2281,6 +2355,7 @@ impl Content for GoalEndedBlock {
             "goal_end",
             &self.condition,
             if self.met { "met" } else { "undecided" },
+            &format!("{:?}:{:?}", self.elapsed_ms, self.usage),
         ])
     }
     fn always_open(&self) -> bool {
@@ -2294,6 +2369,16 @@ impl Content for GoalEndedBlock {
             let warn = Style::new().fg(Color::role(Role::Warning));
             (t(Msg::GoalGaveUp { condition }), "⚠ ", warn, warn)
         };
+        let mut text = match self.elapsed_ms {
+            Some(ms) => format!("{text} · {}", t(Msg::LiveElapsed { took: &fmt_dur(ms) })),
+            None => text.into_owned(),
+        };
+        if let Some(usage) = &self.usage {
+            for part in usage_parts(usage.input, usage.output, usage.cached) {
+                text.push_str(" · ");
+                text.push_str(&part);
+            }
+        }
         let mut out = wrapped(&text, ctx.width, body, mark);
         if let Some(lead) = out.first_mut().and_then(|line| line.spans.first_mut()) {
             lead.style = mark_style;
@@ -3173,20 +3258,42 @@ pub const DONE_LABELS: &[&str] = &[
     "Tied off",
 ];
 
-/// The cached share of one request's context, as a percentage to two decimals.
+/// Cached tokens as a share of input tokens, to two decimals. Callers supply
+/// either one request's reading or totals over the same set of requests.
 ///
 /// `None` when the provider said nothing about caching: one that does not report
 /// it reports zero, and printing `0.00%` would state a fact we do not have — the
 /// same rule as the status line's dropped zero counter.
 ///
-/// **Two decimals, and one function.** The live line, the end of a turn and the
-/// figure a person compares them against all describe the same request, on the
-/// same screen; `98%` beside `98.15%` is a disagreement someone has to stop and
-/// resolve, and at a context of tens of thousands of tokens the whole integer
-/// part is 99 for a long stretch — the decimals are the only part of this number
-/// that moves.
-pub fn cache_hit_rate(cached: u32, prompt: u32) -> Option<String> {
+/// Keep two decimals wherever this share is rendered. With large contexts,
+/// the decimals often carry the only visible change in cache reuse.
+pub fn cache_hit_rate(cached: u64, prompt: u64) -> Option<String> {
     (cached > 0 && prompt > 0).then(|| format!("{:.2}%", cached as f64 * 100.0 / prompt as f64))
+}
+
+/// Shared wording for usage accumulated over the selected task scope.
+pub fn usage_parts(input: u64, output: u64, cached: u64) -> Vec<String> {
+    let mut parts = Vec::new();
+    if input > 0 {
+        parts.push(
+            t(Msg::LiveIn {
+                tokens: &token_count_total(input),
+            })
+            .into_owned(),
+        );
+    }
+    if output > 0 {
+        parts.push(
+            t(Msg::LiveOut {
+                tokens: &token_count_total(output),
+            })
+            .into_owned(),
+        );
+    }
+    if let Some(hit) = cache_hit_rate(cached, input) {
+        parts.push(t(Msg::LiveCached { hit: &hit }).into_owned());
+    }
+    parts
 }
 
 /// A token count as a person says it: exact while it is small enough to read,
@@ -3196,9 +3303,11 @@ pub fn cache_hit_rate(cached: u32, prompt: u32) -> Option<String> {
 /// quantity on the same screen, and two renderings of one number is a
 /// disagreement a person has to stop and resolve.
 pub fn token_count(n: u32) -> String {
-    // `K` from a thousand, with one decimal kept (`8.0K`, not `8K`): the live line
-    // shows `入` and `出` side by side, and a bare `8003` next to `78.2K` reads as
-    // two different units. One decimal, always, keeps the column consistent.
+    token_count_total(u64::from(n))
+}
+
+/// The same formatting for accumulated request usage beyond a u32 counter.
+pub fn token_count_total(n: u64) -> String {
     if n < 1_000 {
         return n.to_string();
     }
@@ -3325,7 +3434,7 @@ fn turn_end_note(stop: StopReason, done_index: usize, open_items: usize) -> (Gly
         // A failure: the stream went silent and retrying did not bring it back.
         Timeout => (Glyph::Fail, t(Msg::StopTimeout).into_owned(), bad()),
         // A failure, with the provider's own sentence folded in below.
-        ProviderError => (Glyph::Fail, t(Msg::StopCancelled).into_owned(), bad()),
+        ProviderError => (Glyph::Fail, t(Msg::StopProviderError).into_owned(), bad()),
         InternalError => (Glyph::Fail, t(Msg::StopInternalError).into_owned(), bad()),
         // Not a failed request: the log cannot explain what reached the model,
         // and from here resume, fork and compaction are unsound. A person is
@@ -3564,11 +3673,29 @@ mod tests {
     /// colour — and one that stopped undecided is a caution in the warning
     /// colour. Neither is the error red it used to come out in.
     #[test]
+    fn goal_end_reports_the_frozen_total_without_inventing_missing_time() {
+        let mut block = GoalEndedBlock {
+            usage: None,
+            condition: "finish".into(),
+            met: true,
+            elapsed_ms: None,
+        };
+        let ctx = RenderCtx::bare(160);
+        assert!(!block.lines(&ctx)[0].plain().contains("耗时"));
+        let before = block.content_hash();
+        block.elapsed_ms = Some(1_172_000);
+        assert!(block.lines(&ctx)[0].plain().contains("耗时 19m32s"));
+        assert_ne!(before, block.content_hash());
+    }
+
+    #[test]
     fn a_goal_end_is_drawn_as_news_not_as_an_error() {
         let ctx = RenderCtx::bare(80);
         let met = GoalEndedBlock {
+            usage: None,
             condition: "测试全绿".into(),
             met: true,
+            elapsed_ms: None,
         }
         .lines(&ctx);
         assert!(met[0].plain().starts_with("✓ "), "{:?}", met[0].plain());
@@ -3577,8 +3704,10 @@ mod tests {
         assert_eq!(met[0].spans[1].style, Style::new());
 
         let undecided = GoalEndedBlock {
+            usage: None,
             condition: "测试全绿".into(),
             met: false,
+            elapsed_ms: None,
         }
         .lines(&ctx);
         let warn = Style::new().fg(Color::role(Role::Warning));
@@ -3947,6 +4076,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn image_welcome_spaces_the_heading_and_shows_a_fifth_tip() {
+        let mut block = welcome();
+        block.tips = (1..=5)
+            .map(|n| (format!("/tip{n}"), "description".into()))
+            .collect();
+        let pixel_ctx = wctx(100, true);
+        let pixel = block.lines(&pixel_ctx);
+        let mut image_ctx = pixel_ctx;
+        image_ctx.caps.graphics = crate::caps::Graphics::ITerm2;
+        let image = block.lines(&image_ctx);
+        for (rows, gap, fifth) in [(&pixel, 1, false), (&image, 2, true)] {
+            let heading = rows
+                .iter()
+                .position(|row| row.plain().contains("上手提示"))
+                .unwrap();
+            let first = rows
+                .iter()
+                .position(|row| row.plain().contains("/tip1"))
+                .unwrap();
+            assert_eq!(first - heading, gap);
+            assert_eq!(rows.iter().any(|row| row.plain().contains("/tip5")), fifth);
+        }
+    }
+
     /// A render context with the two shape bits a caller cares about.
     fn wctx(width: u16, cell_background: bool) -> RenderCtx {
         RenderCtx {
@@ -3956,6 +4110,7 @@ mod tests {
                 basic_glyphs: false,
                 colors: crate::caps::Colors::Ansi256,
                 cell_background,
+                graphics: crate::caps::Graphics::None,
             },
         }
     }
@@ -4011,6 +4166,7 @@ mod tests {
                 unicode: crate::caps::unicode_for(&env),
                 basic_glyphs: caps.basic_glyphs,
                 cell_background: crate::caps::cell_background_for(&env, false, false),
+                graphics: crate::caps::Graphics::None,
             },
         };
         let text = welcome()
@@ -4028,6 +4184,34 @@ mod tests {
             .iter()
             .map(Line::plain)
             .collect()
+    }
+
+    #[test]
+    fn welcome_uses_the_picture_only_when_the_terminal_and_brand_allow_it() {
+        for protocol in [crate::caps::Graphics::ITerm2, crate::caps::Graphics::Kitty] {
+            let mut ctx = wctx(80, true);
+            ctx.caps.graphics = protocol;
+            let rows = welcome().lines(&ctx);
+            let image = rows
+                .iter()
+                .find_map(|row| row.image)
+                .expect("image placement");
+            assert_eq!((image.rect.w, image.rect.h), (18, 8));
+            assert!(!rows.iter().any(|row| row.plain().contains('▀')));
+            ctx.width = 20;
+            let narrow = welcome().lines(&ctx);
+            assert!(narrow.iter().all(|row| row.image.is_none()));
+            assert!(narrow.iter().any(|row| row.plain().contains('▀')));
+            ctx.width = 80;
+            let mut custom = welcome();
+            std::sync::Arc::make_mut(&mut custom.brand)
+                .mascot
+                .as_mut()
+                .unwrap()
+                .palette
+                .insert('o', 123);
+            assert!(custom.lines(&ctx).iter().all(|row| row.image.is_none()));
+        }
     }
 
     #[test]
@@ -4469,7 +4653,7 @@ mod tests {
             .map(|l| l.plain())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("已中断"), "{text}");
+        assert!(text.contains("模型服务错误"), "{text}");
         assert!(
             text.contains("nodename nor servname"),
             "the cause must reach the screen:\n{text}"
@@ -4495,7 +4679,7 @@ mod tests {
         };
         let lines = short.lines(&crate::block::RenderCtx::bare(100));
         assert_eq!(lines.len(), 2, "{lines:?}");
-        assert!(lines[0].plain().contains("已中断"));
+        assert!(lines[0].plain().contains("模型服务错误"));
         assert!(!lines[0].plain().contains("quota reached"));
         assert_eq!(lines[1].plain().trim_end(), "  ⎿ quota reached");
         let cause = lines[1]
@@ -4559,8 +4743,8 @@ mod tests {
             "and the other two are not, whatever the loop calls them: {said:?}"
         );
         assert!(
-            said[2].contains("没挂停止策略"),
-            "the fuse says the actionable thing: nothing was watching: {}",
+            said[2].contains("执行循环安全上限"),
+            "the fuse identifies the safety limit: {}",
             said[2]
         );
         assert_eq!(
@@ -4596,7 +4780,7 @@ mod tests {
         );
 
         let failed = drawn(StopReason::ProviderError);
-        assert!(failed.contains("已中断"), "{failed}");
+        assert!(failed.contains("模型服务错误"), "{failed}");
 
         // Every reason is one of two outcomes, and the mark says which. The clean
         // end wears the `✻` sparkle; nothing cut short does.
@@ -4712,7 +4896,7 @@ mod tests {
         let lines = block.lines(&crate::block::RenderCtx::bare(80));
         assert_eq!(lines.len(), 1, "nothing to say means no extra row");
         let text = drawn(&block, 80);
-        assert!(text.contains("已中断"), "{text:?}");
+        assert!(text.contains("模型服务错误"), "{text:?}");
         for absent in ["轮", "工具", "tokens", "缓存"] {
             assert!(!text.contains(absent), "{absent} in {text:?}");
         }
@@ -5227,7 +5411,7 @@ mod tests {
     /// rather than the summary, and a fold must not swallow that.
     #[test]
     fn a_folded_call_recedes_to_the_muted_grey_once_done_and_keeps_its_failure_note() {
-        let receded = Some(crate::frame::Color::role(Role::Muted));
+        let receded = Some(crate::frame::Color::rgb((0xa8, 0xa8, 0xa8)));
         let pending = ToolCallBlock::pending(
             "c",
             "read_file",
@@ -5488,6 +5672,24 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn pending_questions_show_how_to_reply_without_dumping_the_wire_payload() {
+        let question = atomcode_capabilities::tools::request_user_input::PendingUserQuestion::new(
+            900,
+            serde_json::json!({"header":"Account","question":"Which account?","mode":"text"}),
+        );
+        let rows = answered(
+            r#"{"header":"Account","question":"Which account?","mode":"text"}"#,
+            Outcome::Ok(question.result().content),
+        );
+        let text = rows.join("\n");
+        assert!(text.contains("Which account?"));
+        assert!(text.contains("/goal questions"));
+        assert!(text.contains("900"));
+        assert!(!text.contains("pending_question"));
+        assert!(!text.contains("guidance"));
+    }
+
     /// An answered question reads as the question beside its answer — the
     /// person's own words — and never as the sentence the model was told it in.
     #[test]
@@ -5585,14 +5787,27 @@ mod tests {
     /// and it is the half that rests on nothing when only the folder is pinned.
     #[test]
     fn a_shell_row_folds_its_home_paths_and_a_file_row_does_not() {
-        let home = std::path::Path::new("/home/me");
+        // Spelled the way this host spells paths: the fold compares whole segments, so a
+        // `/`-spelled fixture on Windows asserted a fold the screen never performs there.
+        let home = std::path::Path::new(if cfg!(windows) {
+            r"\home\me"
+        } else {
+            "/home/me"
+        });
+        let proj = home.join("proj").display().to_string();
+        let file = home.join("a.rs").display().to_string();
+        let mut folded = String::from("~");
+        folded.push(std::path::MAIN_SEPARATOR);
+        folded.push_str("proj");
+        let command = serde_json::json!({ "command": format!("ls {proj}") }).to_string();
         assert_eq!(
-            subject_of_within("bash", r#"{"command":"ls /home/me/proj"}"#, Some(home)),
-            "ls ~/proj"
+            subject_of_within("bash", &command, Some(home)),
+            format!("ls {folded}")
         );
+        let opened = serde_json::json!({ "file_path": file }).to_string();
         assert_eq!(
-            subject_of_within("read_file", r#"{"file_path":"/home/me/a.rs"}"#, Some(home)),
-            "/home/me/a.rs",
+            subject_of_within("read_file", &opened, Some(home)),
+            file,
             "a path in a file card is not a shell word"
         );
     }

@@ -238,6 +238,8 @@ struct Rig {
     /// How many `HostCommand::AnswerBackground` calls have gone through this
     /// rig's control, counted by [`CountingControl`].
     answers: Arc<AtomicUsize>,
+    spawn_gate: watch::Sender<bool>,
+    spawn_started: Arc<AtomicUsize>,
 }
 
 /// A host that does not know `HostCommand::BackgroundQuestion` — a host from
@@ -314,13 +316,23 @@ impl Rig {
         let review_home = ReviewHome::new();
         let (first, config) = start(project.path(), &script, front_end.clone(), &review_home);
         let runtime = CodingRuntime::start(first).await.expect("starts");
+        let (spawn_gate, spawn_ready) = watch::channel(true);
+        let spawn_started = Arc::new(AtomicUsize::new(0));
         let spawn: Spawn = {
+            let spawn_started = spawn_started.clone();
             let script = script.clone();
             let review_home = review_home.clone();
             Arc::new(move |working_dir: std::path::PathBuf| {
                 let script = script.clone();
                 let review_home = review_home.clone();
+                let mut spawn_ready = spawn_ready.clone();
+                let spawn_started = spawn_started.clone();
                 Box::pin(async move {
+                    spawn_started.fetch_add(1, Ordering::SeqCst);
+                    spawn_ready
+                        .wait_for(|ready| *ready)
+                        .await
+                        .map_err(|e| e.to_string())?;
                     let front_end = FrontEnd::new();
                     let (start, config) =
                         start(&working_dir, &script, front_end.clone(), &review_home);
@@ -393,6 +405,8 @@ impl Rig {
             _mounted: mounted,
             host: host.expect("a host that can start runtimes"),
             answers,
+            spawn_gate,
+            spawn_started,
         };
         // The first session is on screen before anything is typed.
         rig.until("the first session is followed", |rig| {
@@ -489,8 +503,9 @@ impl Rig {
     }
 
     async fn quit(self) {
-        self.term.press(KeyPress::ctrl('d'));
-        let _ = tokio::time::timeout(Duration::from_secs(5), self.running).await;
+        self.running.abort();
+        let _ = self.running.await;
+        self.host.shutdown_all().await;
     }
 }
 
@@ -708,6 +723,271 @@ async fn a_running_background_task_can_be_opened_and_left_again() {
     rig.quit().await;
 }
 
+// A stored conversation, then a separate foreground whose turn can be held.
+async fn a_history_and_fresh_foreground() -> (Rig, String) {
+    let rig = Rig::new().await;
+    let history = rig.client.root();
+    rig.term.type_line("saved conversation");
+    rig.until_screen("answer 1").await;
+    rig.until("the saved turn settled", |rig| rig.client.root_settled())
+        .await;
+    rig.term.type_line("/new");
+    rig.until("a new foreground opened", |rig| {
+        rig.client.root() != history
+    })
+    .await;
+    (rig, history)
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+async fn resume_while_running_keeps_the_old_turn_and_reuses_it_on_return() {
+    let (rig, history) = a_history_and_fresh_foreground().await;
+    let running = rig.client.root();
+    rig.term.type_line("slow foreground task");
+    rig.until("the turn reached the model", |rig| {
+        rig.script.started.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    rig.term.type_line(&format!("/resume {history}"));
+    rig.until("history is on screen while the old turn runs", |rig| {
+        rig.client.root() == history
+    })
+    .await;
+    assert_eq!(rig.script.finished.load(Ordering::SeqCst), 0);
+    let backgrounds = rig.background().await;
+    assert_eq!(backgrounds.len(), 1);
+    assert_eq!(backgrounds[0].session, running);
+    assert_eq!(backgrounds[0].state, BackgroundState::Running);
+    // B can work while A is still waiting on its model.
+    rig.term.type_line("work in the other conversation");
+    rig.until_screen("answer 2").await;
+    rig.until("the other turn settled", |rig| rig.client.root_settled())
+        .await;
+    rig.term.type_line(&format!("/resume {running}"));
+    rig.until("the original running session is visible again", |rig| {
+        rig.client.root() == running
+    })
+    .await;
+    assert_eq!(
+        rig.script.started.load(Ordering::SeqCst),
+        1,
+        "no restarted model call"
+    );
+    rig.release();
+    rig.until_screen("slow done").await;
+    assert_eq!(rig.script.finished.load(Ordering::SeqCst), 1);
+    assert!(
+        !rig.read_stored(&history)
+            .await
+            .unwrap()
+            .contains("slow done"),
+        "A's reply must not enter B's history"
+    );
+    rig.quit().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+async fn resume_picker_can_leave_a_running_turn() {
+    let (rig, history) = a_history_and_fresh_foreground().await;
+    let running = rig.client.root();
+    rig.term.type_line("slow picker task");
+    rig.until("the turn reached the model", |rig| {
+        rig.script.started.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    rig.term.type_line("/resume");
+    rig.until_screen("saved conversation").await;
+    rig.term.press(KeyPress::plain(Key::Enter));
+    rig.until("the selected history is visible", |rig| {
+        rig.client.root() == history
+    })
+    .await;
+    assert_eq!(rig.background().await[0].session, running);
+    // Cancel now targets B; it must not cancel the detached A.
+    rig.client.cancel();
+    rig.release();
+    rig.until_background("the detached turn completed", |sessions| {
+        sessions
+            .iter()
+            .any(|session| session.session == running && session.state == BackgroundState::Done)
+    })
+    .await;
+    assert_eq!(rig.script.finished.load(Ordering::SeqCst), 1);
+    rig.quit().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+async fn failed_running_resume_leaves_the_foreground_and_slots_unchanged() {
+    let rig = Rig::new().await;
+    let running = rig.client.root();
+    rig.term.type_line("slow retained task");
+    rig.until("the turn reached the model", |rig| {
+        rig.script.started.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    let result = rig
+        .control()
+        .call(HostCommand::Resume {
+            session: running.clone(),
+            target: "missing-session".into(),
+        })
+        .await;
+    assert!(matches!(result, Err(HostError::NotFound)), "{result:?}");
+    assert_eq!(rig.client.root(), running);
+    assert!(rig.background().await.is_empty());
+    rig.release();
+    rig.until_screen("slow done").await;
+    rig.quit().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+async fn resume_history_does_not_move_a_foreground_waiting_for_input() {
+    let (rig, history) = a_history_and_fresh_foreground().await;
+    let current = rig.client.root();
+    rig.term.type_line("ask me");
+    rig.until_screen("Which one?").await;
+    let result = rig
+        .control()
+        .call(HostCommand::Resume {
+            session: current.clone(),
+            target: history,
+        })
+        .await;
+    assert!(matches!(result, Err(HostError::Busy { .. })), "{result:?}");
+    assert_eq!(rig.client.root(), current);
+    assert!(rig.background().await.is_empty());
+    rig.until_screen("Which one?").await;
+    rig.quit().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+async fn cancelling_after_a_running_resume_targets_only_the_visible_session() {
+    let (rig, history) = a_history_and_fresh_foreground().await;
+    let first = rig.client.root();
+    rig.term.type_line("slow first task");
+    rig.until("A started", |rig| {
+        rig.script.started.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    rig.term.type_line(&format!("/resume {history}"));
+    rig.until("B is visible", |rig| rig.client.root() == history)
+        .await;
+    rig.term.type_line("slow second task");
+    rig.until("both sessions reached the model", |rig| {
+        rig.script.started.load(Ordering::SeqCst) == 2
+    })
+    .await;
+    rig.term.type_line(&format!("/resume {first}"));
+    rig.until("A is visible again", |rig| rig.client.root() == first)
+        .await;
+    // An old source id must not address the foreground after navigation.
+    let stale = rig
+        .control()
+        .call(HostCommand::Resume {
+            session: history.clone(),
+            target: first.clone(),
+        })
+        .await;
+    assert!(matches!(stale, Err(HostError::NotFound)), "{stale:?}");
+    rig.client.cancel();
+    rig.until("A was cancelled", |rig| rig.client.root_settled())
+        .await;
+    rig.release();
+    rig.until_background("B completed despite cancellation of A", |sessions| {
+        sessions
+            .iter()
+            .any(|session| session.session == history && session.state == BackgroundState::Done)
+    })
+    .await;
+    assert_eq!(rig.script.finished.load(Ordering::SeqCst), 1);
+    assert!(!rig.stored(&first).await.contains("slow done"));
+    assert!(rig.stored(&history).await.contains("slow done"));
+    rig.quit().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+async fn shutdown_during_running_resume_does_not_publish_the_candidate() {
+    let (rig, history) = a_history_and_fresh_foreground().await;
+    let current = rig.client.root();
+    rig.term.type_line("slow exiting task");
+    rig.until("A started", |rig| {
+        rig.script.started.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    rig.spawn_gate.send(false).unwrap();
+    let control = rig.control();
+    let source = current.clone();
+    let switching = tokio::spawn(async move {
+        control
+            .call(HostCommand::Resume {
+                session: source,
+                target: history,
+            })
+            .await
+    });
+    rig.until("the candidate is being prepared", |rig| {
+        rig.spawn_started.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    rig.client.shutdown();
+    rig.until("exit recorded the original foreground", |rig| {
+        rig.host.front_at_exit().as_deref() == Some(current.as_str())
+    })
+    .await;
+    rig.spawn_gate.send(true).unwrap();
+    let result = switching.await.unwrap();
+    assert!(matches!(result, Err(HostError::NotFound)), "{result:?}");
+    assert_eq!(rig.client.root(), current);
+    assert!(rig.background().await.is_empty());
+    assert_eq!(rig.script.finished.load(Ordering::SeqCst), 0);
+    rig.quit().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+async fn a_question_arriving_during_resume_preparation_keeps_its_foreground() {
+    let (rig, history) = a_history_and_fresh_foreground().await;
+    let current = rig.client.root();
+    rig.term.type_line("slow original task");
+    rig.until("A started", |rig| {
+        rig.script.started.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    rig.spawn_gate.send(false).unwrap();
+    let control = rig.control();
+    let source = current.clone();
+    let switching = tokio::spawn(async move {
+        control
+            .call(HostCommand::Resume {
+                session: source,
+                target: history,
+            })
+            .await
+    });
+    rig.until("the candidate is being prepared", |rig| {
+        rig.spawn_started.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    rig.client.cancel();
+    rig.until("A stopped its old turn", |rig| rig.client.root_settled())
+        .await;
+    rig.term.type_line("ask me");
+    rig.until_screen("Which one?").await;
+    rig.spawn_gate.send(true).unwrap();
+    let result = switching.await.unwrap();
+    assert!(matches!(result, Err(HostError::Busy { .. })), "{result:?}");
+    assert_eq!(rig.client.root(), current);
+    assert!(rig.background().await.is_empty());
+    rig.until_screen("Which one?").await;
+    rig.quit().await;
+}
+
 async fn a_restored_history() -> (Rig, String) {
     let rig = Rig::new().await;
     changed_repo(rig.project.path());
@@ -769,8 +1049,9 @@ async fn the_other_runtime_commands_work_after_a_history_session_is_resumed() {
     rig.until_screen("现在没有卡住的策略边界要你决定").await;
     rig.term.type_line("/worktree list");
     rig.until_screen("← 当前").await;
-    let project = rig.project.path().canonicalize().unwrap();
-    assert!(rig.term.text().contains(project.to_str().unwrap()));
+    let project =
+        atomcode_capabilities::pathnorm::to_display(&rig.project.path().canonicalize().unwrap());
+    assert!(rig.term.text().contains(&project));
 
     rig.term.type_line("/queue slow queued context");
     rig.until_screen("排好了").await;
@@ -814,8 +1095,9 @@ async fn the_other_runtime_commands_work_after_a_history_session_is_resumed() {
     })
     .await;
     rig.term.type_line("/worktree list");
-    let other_path = other.path().canonicalize().unwrap();
-    rig.until_screen(other_path.to_str().unwrap()).await;
+    let other_path =
+        atomcode_capabilities::pathnorm::to_display(&other.path().canonicalize().unwrap());
+    rig.until_screen(&other_path).await;
     rig.until_screen("← 当前").await;
     rig.release();
     rig.quit().await;
@@ -1059,7 +1341,7 @@ async fn quitting_after_a_review_came_home_names_the_conversation() {
     );
 
     let host = rig.host.clone();
-    rig.term.press(KeyPress::ctrl('d'));
+    rig.term.type_line("/quit");
     rig.until("the screen quit", |rig| rig.running.is_finished())
         .await;
     host.shutdown_all().await;
@@ -1132,7 +1414,7 @@ async fn quitting_before_a_task_came_home_names_it() {
     );
 
     let question = t(Msg::BgQuitQuestion { count: 1 }).into_owned();
-    rig.term.press(KeyPress::ctrl('d'));
+    rig.term.type_line("/quit");
     rig.until_screen(&question).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     rig.term.press(KeyPress::plain(Key::Enter));
@@ -1455,7 +1737,7 @@ async fn foreground_is_refused_while_the_current_session_waits_for_an_answer() {
     rig.quit().await;
 }
 
-/// **Quitting with background sessions still running asks first.** ctrl+d
+/// **Quitting with background sessions still running asks first.** /quit
 /// puts the question up instead of leaving; "stay" (Esc) leaves everything
 /// running and the screen up; saying yes quits, and the background runtime is
 /// stopped — its held turn never finishes even once the model lets go.
@@ -1480,7 +1762,7 @@ async fn quitting_with_background_sessions_running_asks_first() {
     })
     .await;
     let question = t(Msg::BgQuitQuestion { count: 1 }).into_owned();
-    rig.term.press(KeyPress::ctrl('d'));
+    rig.term.type_line("/quit");
     rig.until_screen(&question).await;
     assert!(!rig.running.is_finished(), "asked, not gone");
 
@@ -1497,7 +1779,7 @@ async fn quitting_with_background_sessions_running_asks_first() {
     assert_eq!(list[0].state, BackgroundState::Running);
 
     // Asked again, and this time yes.
-    rig.term.press(KeyPress::ctrl('d'));
+    rig.term.type_line("/quit");
     rig.until_screen(&question).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     rig.term.press(KeyPress::plain(Key::Enter));
@@ -1527,7 +1809,7 @@ async fn quitting_with_nothing_running_does_not_ask() {
     .await;
     rig.until_screen(&t(Msg::BgStarted { slot: 1 })).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
-    rig.term.press(KeyPress::ctrl('d'));
+    rig.term.type_line("/quit");
     rig.until("the screen quit", |rig| rig.running.is_finished())
         .await;
 }
@@ -1615,7 +1897,7 @@ async fn quitting_says_how_to_resume_the_background_sessions_it_stopped() {
     })
     .await;
     let question = t(Msg::BgQuitQuestion { count: 1 }).into_owned();
-    rig.term.press(KeyPress::ctrl('d'));
+    rig.term.type_line("/quit");
     rig.until_screen(&question).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     rig.term.press(KeyPress::plain(Key::Enter));
@@ -1685,7 +1967,7 @@ async fn the_resume_line_on_exit_names_the_session_in_front_then() {
     rig.until_screen("hello there").await;
     assert_eq!(rig.client.root(), fresh, "still on the new foreground");
 
-    rig.term.press(KeyPress::ctrl('d'));
+    rig.term.type_line("/quit");
     rig.until_screen(&t(Msg::BgQuitQuestion { count: 1 })).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     rig.term.press(KeyPress::plain(Key::Enter));

@@ -1,3 +1,4 @@
+import { apiFetch } from './lib/transport';
 import { render } from 'preact';
 import { App } from './app';
 import { SettingsProvider } from './settings';
@@ -48,7 +49,7 @@ if ('serviceWorker' in navigator && window.isSecureContext) {
   });
 }
 
-void signedIn(fetch, getToken()).then((ok) => {
+void signedIn(apiFetch, getToken()).then((ok) => {
   render(
     <SettingsProvider>
       <CompatNotice />

@@ -103,6 +103,7 @@ pub struct McpDetail {
 /// 一次动作。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
+    Reconnect,
     Trust,
     Untrust,
     Login,
@@ -114,6 +115,7 @@ pub enum Action {
 impl Action {
     pub fn about(self) -> String {
         match self {
+            Self::Reconnect => t(Msg::McpActionReconnect),
             Self::Trust => t(Msg::McpActionTrust),
             Self::Untrust => t(Msg::McpActionUntrust),
             Self::Login => t(Msg::McpActionLogin),
@@ -157,6 +159,16 @@ impl McpView {
 
     pub fn rows(&self) -> &[McpRow] {
         &self.rows
+    }
+
+    /// 名单里还有没落定的吗——有的话,这一份就还可能变。
+    ///
+    /// 只有 `Connecting` 算:失败与断开是终态,再问也不会自己好;正在连的会。
+    /// 面板据此决定要不要自己再读一遍(`plugin.rs::refresh_mcp_request`)。
+    pub fn unsettled(&self) -> bool {
+        self.rows
+            .iter()
+            .any(|row| row.state == McpState::Connecting)
     }
 
     pub fn detail(&self) -> Option<&McpDetail> {
@@ -223,15 +235,41 @@ impl Busy {
         Self {
             what: action.about(),
             phase: None,
-            cancellable: action == Action::Login,
+            cancellable: matches!(action, Action::Login | Action::Reconnect),
             cancelling: false,
         }
+    }
+}
+
+/// An async request belongs to one panel opening, view and revision.
+#[derive(Clone)]
+pub(crate) struct Request {
+    pub identity: std::sync::Arc<()>,
+    pub revision: u64,
+    pub lead: String,
+    pub viewing: String,
+    pub cwd: String,
+    pub detail: Option<String>,
+}
+impl Request {
+    pub fn matches(&self, moment: &crate::moment::Moment) -> bool {
+        self.lead == moment.lead
+            && self.viewing == moment.viewing
+            && self.cwd == moment.cwd
+            && moment.mcp_panel.as_ref().is_some_and(|panel| {
+                std::sync::Arc::ptr_eq(&self.identity, &panel.identity)
+                    && self.revision == panel.revision
+            })
     }
 }
 
 /// 面板开着的时候。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Panel {
+    pub(crate) identity: std::sync::Arc<()>,
+    pub(crate) revision: u64,
+    pub(crate) pending: bool,
+    pub(crate) last_refresh: Option<crate::moment::Timestamp>,
     pub level: Level,
     /// 光标停在 *listed* 的第几行。
     pub cursor: usize,
@@ -283,6 +321,7 @@ impl Panel {
                 out.push(Action::Disable);
             }
             _ => {
+                out.push(Action::Reconnect);
                 if let Auth::OAuth {
                     authenticated: true,
                 } = detail.auth
@@ -322,14 +361,20 @@ impl Panel {
 /// 一次按键要面板的主人去做的事。凡是碰得到外面世界的都在这儿,不在 [`key`] 里。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Step {
+    Refresh,
     /// 面板自己动了,外面没有。
     Stay,
     /// 收起来。
     Close,
     /// 去取这一个服务器的详情。
-    OpenDetail { server: String },
+    OpenDetail {
+        server: String,
+    },
     /// 对这一个服务器做这一件事。
-    Act { server: String, action: Action },
+    Act {
+        server: String,
+        action: Action,
+    },
     /// 叫停正在跑的那一件(只有认证会发它)。停没停下来,由那一趟自己的回答说。
     Cancel,
 }
@@ -355,6 +400,9 @@ pub fn key(view: &McpView, panel: &mut Panel, press: KeyPress) -> Step {
         };
     }
 
+    if press.key == Key::Char('r') && press.mods == Mods::CTRL {
+        return Step::Refresh;
+    }
     if panel.level == Level::Detail {
         return detail_key(view, panel, press);
     }
@@ -501,7 +549,7 @@ pub trait Mcp: Send + Sync {
     /// 发生了的事(与 `/toolbox` 的 `switch` 同一个道理)。
     async fn act(&self, server: &str, action: Action) -> Result<McpView, String>;
 
-    /// 叫停正在跑的认证。停下来的那一趟 `act` 自己回答(一个错误,说它被取消了);
+    /// 叫停正在跑的认证或单服务器重连。该趟 `act` 自己回答取消结果;
     /// 没有在跑的就什么也不做。
     fn cancel(&self) {}
 }
@@ -512,6 +560,22 @@ mod tests {
 
     fn press(key: Key) -> KeyPress {
         KeyPress::plain(key)
+    }
+
+    #[test]
+    fn refresh_is_available_at_both_levels_but_not_during_an_action() {
+        let view = view_of(&["figma"]);
+        let mut panel = Panel::default();
+        let refresh = KeyPress {
+            key: Key::Char('r'),
+            mods: Mods::CTRL,
+        };
+        assert!(matches!(key(&view, &mut panel, refresh), Step::Refresh));
+        key(&view, &mut panel, press(Key::Enter));
+        assert_eq!(panel.level, Level::Detail);
+        assert!(matches!(key(&view, &mut panel, refresh), Step::Refresh));
+        panel.busy = Some(Busy::of(Action::Disable));
+        assert!(matches!(key(&view, &mut panel, refresh), Step::Stay));
     }
 
     /// 一台服务器:连着,来源一样,只有名字是这一次要的。
@@ -573,6 +637,34 @@ mod tests {
         assert_eq!(key(&view, &mut panel, press(Key::Esc)), Step::Close);
     }
 
+    /// 名单里还有正在连的,这一份就还可能变;全是终态就不再问。
+    ///
+    /// 只有 `Connecting` 算「还没落定」:失败与断开再问也不会自己好。面板据此决定
+    /// 要不要自己再读一遍(`plugin.rs::refresh_mcp_request`)。
+    #[test]
+    fn a_view_is_unsettled_exactly_while_a_row_is_still_coming_up() {
+        let settled = view_of(&["alpha"]);
+        assert!(!settled.unsettled(), "连着的那一台是落定的");
+
+        let coming_up = McpView::new(vec![McpRow {
+            state: McpState::Connecting,
+            ..row("beta")
+        }]);
+        assert!(coming_up.unsettled(), "还有一台在连");
+
+        let failed = McpView::new(vec![McpRow {
+            state: McpState::Failed("refused".into()),
+            ..row("gamma")
+        }]);
+        assert!(!failed.unsettled(), "失败是终态");
+
+        let gone = McpView::new(vec![McpRow {
+            state: McpState::Disconnected,
+            ..row("delta")
+        }]);
+        assert!(!gone.unsettled(), "断开也是终态");
+    }
+
     #[test]
     fn the_detail_actions_are_the_ones_this_server_can_take() {
         let mut panel = Panel::new();
@@ -587,7 +679,7 @@ mod tests {
         );
         assert_eq!(
             panel.actions(&connected),
-            vec![Action::Logout, Action::Disable]
+            vec![Action::Reconnect, Action::Logout, Action::Disable]
         );
 
         // Waiting for a person: authenticate it, or switch it off.
@@ -626,7 +718,12 @@ mod tests {
         assert!(actions.contains(&Action::Untrust), "{actions:?}");
         assert_eq!(
             actions,
-            vec![Action::Logout, Action::Untrust, Action::Disable]
+            vec![
+                Action::Reconnect,
+                Action::Logout,
+                Action::Untrust,
+                Action::Disable
+            ]
         );
 
         // 项目还没被信任:这里该给的是「信任」,不是「取消信任」。
@@ -638,7 +735,10 @@ mod tests {
 
         // 用户级的那一台:项目信任与它无关,一个都不给。
         let global = detail(McpState::Connected, Auth::None);
-        assert_eq!(panel.actions(&global), vec![Action::Disable]);
+        assert_eq!(
+            panel.actions(&global),
+            vec![Action::Reconnect, Action::Disable]
+        );
     }
 
     /// 认证在跑:第一下 Esc 是叫停,面板留着;第二下才收起。叫不停的一下就收起。
@@ -659,6 +759,11 @@ mod tests {
             Step::Close,
             "a second Esc never leaves a person shut in a panel that will not answer"
         );
+
+        let mut reconnect = Panel::new();
+        reconnect.busy = Some(Busy::of(Action::Reconnect));
+        assert_eq!(key(&view, &mut reconnect, press(Key::Esc)), Step::Cancel);
+        assert!(reconnect.busy.as_ref().unwrap().cancelling);
 
         // Nothing to stop: one Esc puts it away, as it always did.
         let mut quick = Panel::new();

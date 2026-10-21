@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.2.3</span>
+    <span class="dhdr-ver">v5.2.4</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -221,7 +221,7 @@ atomcode plugin marketplace remove|update|list</code></pre>
 }</code></pre>
       <p>The hook can respond in the following ways (highest priority first):</p>
       <ul>
-        <li><strong>Non-zero exit code</strong> — blocks the prompt; reason is taken from stderr.</li>
+        <li><strong>Exit 2 with a deliberate block reason</strong> — blocks the prompt; other nonzero exits and launch failures are not business block decisions.</li>
         <li><strong>JSON on stdout</strong> <code>{"decision": "block", "reason": "..."}</code> — block with an explicit reason.</li>
         <li><strong>JSON on stdout</strong> <code>{"hookSpecificOutput": {"additionalContext": "..."}}</code> — append <code>additionalContext</code> to the user message as extra LLM context.</li>
         <li><strong>Plain text on stdout</strong> — the whole block is injected as <code>additionalContext</code>.</li>
@@ -235,8 +235,9 @@ atomcode plugin marketplace remove|update|list</code></pre>
         <li><code>${CLAUDE_PLUGIN_ROOT}</code> — absolute path of the plugin install directory (CC compatible).</li>
         <li><code>${ATOMCODE_PLUGIN_ROOT}</code> — same thing, atomcode alias.</li>
       </ul>
-      <p>These are <strong>real environment variables</strong> expanded by the shell itself, not string substitutions — install paths with spaces, quotes, <code>$</code>, or <code>;</code> won't break the command.</p>
+      <p>Plugin hooks accept checked plugin-relative scripts and literal arguments, optionally using python, python3, node, sh or bash. Plugin-root placeholders resolve as paths without a shell. Move pipelines, redirections and inline code into scripts. Known Node path wrappers normalize to scripts; recognized batch/bash polyglot .cmd wrappers run through bash. Ordinary .cmd/.bat files remain unsupported. Only user-authored hooks retain shell expansion.</p>
 
+<p>Trust includes plugin contents (excluding Git metadata). Script/helper changes require explicit <code>atomcode plugin trust name</code>. Incompatible configurations are withheld at load with a diagnostic; repair the entry point or disable the plugin. This is not a sandbox, does not cover external dependencies/environment, and does not guarantee atomic execution against concurrent file mutation.</p>
       <h2 id="marketplace-management">Marketplace management</h2>
       <pre><code># List registered marketplaces
 /plugin marketplace list

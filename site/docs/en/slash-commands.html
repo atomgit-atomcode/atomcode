@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.2.3</span>
+    <span class="dhdr-ver">v5.2.4</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -113,9 +113,9 @@
           <tr><td><code>/clear</code></td><td>Clear the current session's messages (working directory and model are kept)</td></tr>
           <tr><td><code>/init</code></td><td>Scan the working directory and create or improve the active project instruction file (<code>.atomcode.md</code>, <code>AGENTS.md</code>, or <code>CLAUDE.md</code>, in precedence order). Output follows the current language; an optional custom prompt file can be configured under <code>/config</code>.</td></tr>
           <tr><td><code>/background &lt;task&gt;</code></td><td>Dispatch a task to an isolated background agent (read-only-leaning tool subset) without polluting the main conversation. Useful for "go check X on the side" sort of light exploration. See <a href="./sessions.html#bg">Background sessions</a></td></tr>
-          <tr><td><code>/worktree &lt;subcommand&gt;</code></td><td>Git worktree isolation: <code>create</code> a new branch with its own worktree, <code>list</code> existing worktrees, <code>done</code> squash worktree changes back to the main branch, <code>cleanup</code> remove finished worktrees</td></tr>
+          <tr><td><code>/worktree &lt;subcommand&gt;</code></td><td>Git worktree isolation: <code>create</code> a new branch with its own worktree, <code>list</code> existing worktrees, <code>done</code> only return to the main checkout (no commit, squash or merge), <code>cleanup</code> remove a worktree (does not verify it is merged; commit and merge work you want to keep first; <code>--force</code> discards uncommitted content)</td></tr>
           <tr><td><code>/todo</code> · <code>/todo add &lt;task&gt;</code> · <code>/todo clear</code></td><td>Reprint the current todo list — derived from the session transcript (locates the most recent <code>todowrite</code> tool call and re-renders it), with "in-progress / done" status markers. <code>/todo add &lt;task&gt;</code> appends a task deterministically (no model round-trip); <code>/todo clear</code> empties the list. The list is stateless (nothing extra is written to disk); the model maintains it during long tasks and you can run this anytime to check progress</td></tr>
-          <tr><td><code>/copy</code></td><td>Copy the last reply to the clipboard: <code>/copy</code> copies the whole reply as raw markdown (the whole turn, without tool output); <code>/copy code</code> copies the last code block, <code>/copy code N</code> the N-th, <code>/copy code all</code> every code block (the old <code>/copy N</code>, <code>/copy all</code> and <code>/copy msg</code> still work). In the classic screen (<code>--classic</code>) a plain <code>/copy</code> still copies the last code block</td></tr>
+          <tr><td><code>/copy</code></td><td>Copy the last reply to the clipboard: <code>/copy</code> copies the whole reply as raw markdown (the whole turn, without tool output); <code>/copy code</code> copies the last code block, <code>/copy code N</code> the N-th, <code>/copy code all</code> every code block (the old <code>/copy N</code>, <code>/copy all</code> and <code>/copy msg</code> still work).</td></tr>
           <tr><td><code>/save</code></td><td>Export the current conversation to a markdown file: <code>/save</code> uses an auto-generated filename, <code>/save &lt;filename&gt;</code> a name you choose</td></tr>
         </tbody>
       </table>
@@ -147,6 +147,20 @@
           <tr><td><code>/effort &lt;high|max|off&gt;</code></td><td>DeepSeek reasoning-effort control — trade latency/tokens for deeper reasoning on DeepSeek models</td></tr>
         </tbody>
       </table>
+
+      <h2 id="team-panel">Team panel</h2>
+      <table>
+        <thead>
+          <tr><th>Command</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/team</code> · <code>/team toggle</code></td><td>Expand / collapse the team panel (toggle). Collapsed, it keeps only its header row — member rows are not drawn and the keyboard no longer lands on them</td></tr>
+          <tr><td><code>/team show</code> · <code>/team open</code></td><td>Expand the team panel. With no members and no background tasks it answers "No team members or background tasks; there is no team panel to show."</td></tr>
+          <tr><td><code>/team hide</code> · <code>/team fold</code> · <code>/team close</code></td><td>Collapse the team panel (members keep running in the background; none is cancelled), answering "Team panel collapsed."</td></tr>
+          <tr><td>Anything else</td><td>Refused with the usage line — those three states are all <code>/team</code> takes (<code>status</code>, <code>clear</code> and the like are not among them)</td></tr>
+        </tbody>
+      </table>
+      <p>All three subcommands only change what is drawn: the acknowledgement appears as a notice for about five seconds, does not enter the conversation, and does not call the model; none of them starts, cancels or waits for a member. The panel's header gives the member and background-task counts, and each member row says what it was asked to do, how long it has run and how much context it holds; members come from the agent delegating through the <code>team</code> tool (several in parallel, each with a role and scope). See also <a href="./subagents.html">Subagents</a> (short-lived subtasks via the <code>task</code> tool).</p>
 
       <h2 id="persistent-memory">Persistent memory</h2>
       <table>
@@ -202,8 +216,8 @@
           <tr><th>Command</th><th>What it does</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>/webui</code></td><td>Launch the browser interface and open it (binds <code>127.0.0.1:13457</code> by default — local only). The current TUI session is attached to live sync automatically</td></tr>
-          <tr><td><code>/webui --host &lt;addr&gt;</code></td><td>Bind the server to a given address; <code>/webui lan</code> equals <code>--host 0.0.0.0</code> (exposes it to the LAN). Pair with a 蒲公英 virtual IP for remote access — see <a href="./webui-remote-access.html">Remote Access</a></td></tr>
+          <tr><td><code>/webui</code></td><td>Open the local browser and show a phone relay QR; no VPN needed. Use <code>--local</code> for local access only. The current TUI session is attached to live sync automatically</td></tr>
+          <tr><td><code>/webui --host &lt;addr&gt;</code></td><td>Bind the server to a given address; <code>/webui lan</code> equals <code>--host 0.0.0.0</code> (exposes it to the LAN). A usable LAN address is shown as both a text link and a QR code for your phone. Use the default <code>/webui</code> relay QR for remote access — see <a href="./webui-remote-access.html">Remote Access</a></td></tr>
           <tr><td><code>/webui stop</code></td><td>Stop the webui server</td></tr>
           <tr><td><code>/sync</code></td><td>Attach the current TUI to a running webui session (run <code>/webui</code> first). Both ends sync live in both directions; multiple browsers / terminals can watch the same session</td></tr>
           <tr><td><code>/sync off</code></td><td>Leave sync and return to a standalone session</td></tr>

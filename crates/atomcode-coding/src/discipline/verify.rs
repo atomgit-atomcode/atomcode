@@ -558,19 +558,69 @@ mod tests {
 
     #[test]
     fn path_in_workspace_lexical_classifies_paths() {
-        let ws = Path::new("/home/proj");
+        // Anchor on an absolute path with a drive letter on Windows: a POSIX-style
+        // `/tmp` or `/home` there is drive-relative, which `is_absolute()` rejects,
+        // so the absolute-target branch below would never run and the test would
+        // only exercise the conservative fallback instead of the lexical prefix.
+        let ws: &Path = if cfg!(windows) {
+            Path::new(r"C:\home\proj")
+        } else {
+            Path::new("/home/proj")
+        };
         // Inside.
-        assert!(path_in_workspace_lexical("/home/proj/src/main.rs", ws));
+        assert!(path_in_workspace_lexical(
+            if cfg!(windows) {
+                r"C:\home\proj\src\main.rs"
+            } else {
+                "/home/proj/src/main.rs"
+            },
+            ws
+        ));
         assert!(path_in_workspace_lexical("src/main.rs", ws)); // relative → joined to ws
         assert!(path_in_workspace_lexical("./a/b.rs", ws));
-        assert!(path_in_workspace_lexical("/home/proj/./sub/../x.rs", ws)); // normalizes inside
-                                                                            // Outside.
-        assert!(!path_in_workspace_lexical("/tmp/test.txt", ws));
-        assert!(!path_in_workspace_lexical("/home/other/x.rs", ws));
+        assert!(path_in_workspace_lexical(
+            if cfg!(windows) {
+                r"C:\home\proj\.\sub\..\x.rs"
+            } else {
+                "/home/proj/./sub/../x.rs"
+            },
+            ws
+        )); // normalizes inside
+            // Outside.
+        assert!(!path_in_workspace_lexical(
+            if cfg!(windows) {
+                r"C:\Windows\Temp\test.txt"
+            } else {
+                "/tmp/test.txt"
+            },
+            ws
+        ));
+        assert!(!path_in_workspace_lexical(
+            if cfg!(windows) {
+                r"C:\home\other\x.rs"
+            } else {
+                "/home/other/x.rs"
+            },
+            ws
+        ));
         assert!(!path_in_workspace_lexical("../sibling/x.rs", ws)); // escapes via ..
-        assert!(!path_in_workspace_lexical("/home/proj/../evil.rs", ws)); // climbs out
-                                                                          // Sibling-prefix must not false-match (/home/proj2 is NOT under /home/proj).
-        assert!(!path_in_workspace_lexical("/home/proj2/x.rs", ws));
+        assert!(!path_in_workspace_lexical(
+            if cfg!(windows) {
+                r"C:\home\proj\..\evil.rs"
+            } else {
+                "/home/proj/../evil.rs"
+            },
+            ws
+        )); // climbs out
+            // Sibling-prefix must not false-match (/home/proj2 is NOT under /home/proj).
+        assert!(!path_in_workspace_lexical(
+            if cfg!(windows) {
+                r"C:\home\proj2\x.rs"
+            } else {
+                "/home/proj2/x.rs"
+            },
+            ws
+        ));
         // Empty / unparseable → conservative in-workspace.
         assert!(path_in_workspace_lexical("", ws));
     }

@@ -392,13 +392,63 @@ pub struct DocTab {
     /// 表头里的页签名。
     pub name: String,
     pub markdown: String,
+    plain: Option<Arc<PlainText>>,
+}
+
+/// Immutable source with one width's layout cached. Scrolling a long tool
+/// result must not rewrap the whole conversation on every key or timer tick.
+#[derive(Debug)]
+struct PlainText {
+    source: String,
+    wrapped: std::sync::Mutex<Option<(usize, Arc<Vec<crate::frame::Line>>)>>,
+}
+
+impl PartialEq for PlainText {
+    fn eq(&self, other: &Self) -> bool {
+        self.source == other.source
+    }
+}
+impl Eq for PlainText {}
+
+impl PlainText {
+    fn lines(&self, width: usize) -> Arc<Vec<crate::frame::Line>> {
+        let width = width.max(1);
+        let mut cache = self.wrapped.lock().expect("reading layout poisoned");
+        if let Some((cached_width, lines)) = cache.as_ref() {
+            if *cached_width == width {
+                return lines.clone();
+            }
+        }
+        let lines: Arc<Vec<crate::frame::Line>> = Arc::new(
+            self.source
+                .lines()
+                .flat_map(|line| crate::width::wrap(&crate::text::for_screen(line), width))
+                .map(crate::frame::Line::raw)
+                .collect(),
+        );
+        *cache = Some((width, lines.clone()));
+        lines
+    }
 }
 
 impl DocTab {
+    /// Plain conversation text, rewrapped without interpreting tool output as Markdown.
+    pub fn plain(text: String) -> Self {
+        Self {
+            name: String::new(),
+            markdown: String::new(),
+            plain: Some(Arc::new(PlainText {
+                source: text,
+                wrapped: std::sync::Mutex::new(None),
+            })),
+        }
+    }
+
     pub fn new(name: impl Into<String>, markdown: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             markdown: markdown.into(),
+            plain: None,
         }
     }
 }
@@ -417,19 +467,26 @@ impl Doc {
 
     /// 正在看的那一页,宽 `width` 时画出来的样子。
     pub fn lines(&self, width: usize) -> Vec<crate::frame::Line> {
+        self.shared_lines(width).as_ref().clone()
+    }
+
+    pub(crate) fn shared_lines(&self, width: usize) -> Arc<Vec<crate::frame::Line>> {
         match self.tabs.get(self.tab) {
-            Some(tab) => crate::markdown::render(
-                &tab.markdown,
-                width.clamp(1, u16::MAX as usize) as u16,
-                crate::frame::Style::new(),
-            ),
-            None => Vec::new(),
+            Some(tab) => match &tab.plain {
+                Some(plain) => plain.lines(width),
+                None => Arc::new(crate::markdown::render(
+                    &tab.markdown,
+                    width.clamp(1, u16::MAX as usize) as u16,
+                    crate::frame::Style::new(),
+                )),
+            },
+            None => Arc::new(Vec::new()),
         }
     }
 
     /// 视野最多往下走到哪一行开始:最后一屏满着(理由同 [`Read`])。
     fn last_top(&self, room: usize, width: usize) -> usize {
-        self.lines(width).len().saturating_sub(room.max(1))
+        self.shared_lines(width).len().saturating_sub(room.max(1))
     }
 
     fn scroll(&mut self, by: isize, room: usize, width: usize) {
@@ -481,6 +538,14 @@ pub const READ_CHROME: usize = 5;
 
 /// 高 `h` 行的一块里,正文能画几行。画的那一层(`crate::modules::sheet`)和按键
 /// 这一层用的是这同一个数 —— 两边各算各的,一矮就对不上。
+pub fn room_for(sheet: &Sheet, h: usize) -> usize {
+    if sheet.page.id() == "read" {
+        h.saturating_sub(READ_CHROME).max(1)
+    } else {
+        read_room(h)
+    }
+}
+
 pub fn read_room(h: usize) -> usize {
     h.saturating_sub(READ_CHROME).clamp(1, READ_ROWS)
 }
@@ -657,7 +722,12 @@ fn doc_key(doc: &mut Doc, press: KeyPress, room: usize, width: usize) {
         (Key::BackTab, _) | (Key::Left, _) | (Key::Char('h'), Mods::NONE) => doc.switch(-1),
         (Key::Up, _) | (Key::Char('k'), Mods::NONE) => doc.scroll(-1, room, width),
         (Key::Down, _) | (Key::Char('j'), Mods::NONE) => doc.scroll(1, room, width),
-        (Key::PageUp, _) => doc.scroll(-page, room, width),
+        (Key::PageUp, _) | (Key::Char('b'), Mods::CTRL) => doc.scroll(-page, room, width),
+        (Key::Char('f'), Mods::CTRL) => doc.scroll(page, room, width),
+        (Key::Char('u'), Mods::CTRL) => {
+            doc.scroll(-((room.max(1).div_ceil(2)) as isize), room, width)
+        }
+        (Key::Char('d'), Mods::CTRL) => doc.scroll(room.max(1).div_ceil(2) as isize, room, width),
         (Key::PageDown, _) | (Key::Char(' '), Mods::NONE) => doc.scroll(page, room, width),
         (Key::Home, _) | (Key::Char('g'), Mods::NONE) => doc.top = 0,
         (Key::End, _) | (Key::Char('G'), Mods::NONE | Mods::SHIFT) => {
@@ -993,5 +1063,43 @@ mod tests {
         let read = Read::diff("diff", "x", text);
         let title: String = read.title.iter().map(|p| p.text.as_str()).collect();
         assert_eq!(title, "x  +2 -1");
+    }
+}
+
+#[cfg(test)]
+mod reading_tests {
+    use super::*;
+
+    #[test]
+    fn plain_reading_rewraps_and_supports_ssh_paging_keys() {
+        let text = (0..100)
+            .map(|i| format!("row-{i}: 中文 long output"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut sheet = Sheet::doc(Doc::new("read", Vec::new(), vec![DocTab::plain(text)]));
+        let Page::Doc(doc) = &sheet.page else {
+            panic!("doc")
+        };
+        assert!(doc.lines(10).len() > doc.lines(80).len());
+        let cached = doc.shared_lines(80);
+        assert!(Arc::ptr_eq(&cached, &doc.shared_lines(80)));
+        assert!(!Arc::ptr_eq(&cached, &doc.shared_lines(10)));
+        for (key, expected) in [('f', 9), ('b', 0), ('d', 5), ('u', 0)] {
+            key_in(&mut sheet, KeyPress::ctrl(key), 10, 84);
+            let Page::Doc(doc) = &sheet.page else {
+                panic!("doc")
+            };
+            assert_eq!(doc.top, expected, "Ctrl+{key}");
+        }
+        key_in(&mut sheet, KeyPress::plain(Key::End), 10, 84);
+        let Page::Doc(doc) = &sheet.page else {
+            panic!("doc")
+        };
+        assert_eq!(doc.top, 90);
+        assert_eq!(room_for(&sheet, 60), 55);
+        assert_eq!(
+            key_in(&mut sheet, KeyPress::plain(Key::Esc), 10, 84),
+            Step::Close
+        );
     }
 }

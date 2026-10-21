@@ -153,24 +153,18 @@ impl Default for AtomGitToolConfig {
     }
 }
 
-/// Which screen `atomcode` opens (`[ui] screen`).
-///
-/// Two screens exist while the row-assembled one replaces the other
-/// (`docs/adr/0012`, `docs/tui-replaces-tuix-plan.md` M6): same runtime, same
-/// sessions, same configuration — only what draws them differs. The setting is
-/// what makes the switch a decision a person makes once, rather than a flag
-/// they have to remember on every launch, and it is what keeps an escape hatch
-/// after the default moves.
+/// Screen preferences from existing configuration files. Only the row-assembled
+/// TUI is shipped. `Classic` is retained as an input compatibility value; the CLI
+/// reports its retirement and uses the supported screen.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Screen {
-    /// The screen this build opens by default. Since 2026-09-22 that is the
-    /// row-assembled one; the classic one stays behind `--classic`.
+    /// The screen this build opens by default: the row-assembled UI.
     #[default]
     Default,
     /// The screen assembled from plugin rows (`atomcode --tui`).
     Rows,
-    /// The classic screen.
+    /// Retired input value, accepted for existing configuration files only.
     Classic,
 }
 
@@ -182,6 +176,99 @@ pub struct ToolsConfig {
     pub atomgit: AtomGitToolConfig,
     #[serde(skip_serializing_if = "OutputToolConfig::is_default")]
     pub output: OutputToolConfig,
+    #[serde(skip_serializing_if = "McpToolConfig::is_default")]
+    pub mcp: McpToolConfig,
+    #[serde(skip_serializing_if = "SearchToolConfig::is_default")]
+    pub search: SearchToolConfig,
+}
+
+/// `[tools.search]` defaults for read-only Glob/Grep discovery. Per-call boolean
+/// switches override these values; access permissions remain independent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SearchToolConfig {
+    pub respect_gitignore: bool,
+    pub include_hidden: bool,
+    pub follow_symlinks: bool,
+    /// Clamped to 1..=300 seconds at mounting.
+    pub timeout_secs: u64,
+    /// Clamped to 1..=1,000,000 visited entries at mounting.
+    pub max_entries: usize,
+}
+impl Default for SearchToolConfig {
+    fn default() -> Self {
+        Self {
+            respect_gitignore: true,
+            include_hidden: false,
+            follow_symlinks: false,
+            timeout_secs: 30,
+            max_entries: 100_000,
+        }
+    }
+}
+impl SearchToolConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+    /// Merge a dedicated project search.toml; absence preserves global defaults.
+    pub fn with_project_file(&self, path: &Path) -> Result<Self> {
+        use std::io::Read;
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(self.clone()),
+            Err(e) => anyhow::bail!("cannot read project search config {}: {e}", path.display()),
+        };
+        let mut text = String::new();
+        file.take(64 * 1024 + 1)
+            .read_to_string(&mut text)
+            .map_err(|_| anyhow::anyhow!("cannot read project search config {}", path.display()))?;
+        if text.len() > 64 * 1024 {
+            anyhow::bail!("project search config is too large: {}", path.display());
+        }
+        let overrides: toml::Value = toml::from_str(&text).map_err(|e: toml::de::Error| {
+            anyhow::anyhow!(
+                "invalid project search config {}: {}",
+                path.display(),
+                e.message()
+            )
+        })?;
+        let mut merged = serde_json::to_value(self)?;
+        let fields = merged.as_object_mut().expect("search options are a table");
+        for (key, value) in overrides
+            .as_table()
+            .ok_or_else(|| anyhow::anyhow!("project search config must be a table"))?
+        {
+            if !fields.contains_key(key) {
+                anyhow::bail!("unknown project search setting: {key}");
+            }
+            fields.insert(key.clone(), serde_json::to_value(value)?);
+        }
+        serde_json::from_value(merged).map_err(|_| {
+            anyhow::anyhow!("invalid project search setting type in {}", path.display())
+        })
+    }
+}
+
+/// How model-facing MCP schemas are offered; transport and approval are unchanged.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpToolSearchMode {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpToolConfig {
+    pub tool_search: McpToolSearchMode,
+}
+
+impl McpToolConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 /// `[tools.output]` — how an oversized tool result reaches the model.
@@ -281,7 +368,7 @@ impl Default for LoopConfig {
 pub struct SubAgentConfig {
     /// Max parallel subagents the `task` tool runs at once (floored to 1). Default 3.
     pub max_concurrent: usize,
-    /// Per-subtask model-round high-water mark. Default 200; `0` means unbounded.
+    /// Per-subtask model-round high-water mark. Default 0 (unbounded); positive values opt into a budget.
     /// Overridden by `ATOMCODE_SUBAGENT_MAX_ROUNDS` when set.
     pub max_rounds: u32,
     /// Convenience switch for a built-in Codex subagent, editable from `/config`:
@@ -310,7 +397,7 @@ impl Default for SubAgentConfig {
     fn default() -> Self {
         Self {
             max_concurrent: 3,
-            max_rounds: 200,
+            max_rounds: 0,
             codex: default_subagent_level(),
             claude: default_subagent_level(),
             external: Vec::new(),
@@ -358,8 +445,76 @@ pub struct ExternalSubagentConfig {
     pub enabled: bool,
 }
 
+/// Recovery policy for an in-process autonomous goal.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GoalConfig {
+    pub recovery: GoalRecoveryConfig,
+}
+impl GoalConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GoalRecoveryConfig {
+    /// Optional additional low-frequency main-provider recovery after short retries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub long_wait: Option<GoalLongWaitConfig>,
+    /// Additional main-agent attempts per transient outage; 0 disables them.
+    pub max_attempts: u32,
+    /// Outage budget includes cooldowns and subsequent requests.
+    pub max_elapsed_secs: u64,
+    pub base_delay_secs: u64,
+    pub max_delay_secs: u64,
+    /// Additional tool-free evaluator attempts, independent of main rounds.
+    pub evaluator_max_attempts: u32,
+    pub evaluator_timeout_secs: u64,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GoalLongWaitConfig {
+    pub max_attempts: u32,
+    pub max_elapsed_secs: u64,
+    pub interval_secs: u64,
+}
+impl Default for GoalLongWaitConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: 32,
+            max_elapsed_secs: 28_800,
+            interval_secs: 900,
+        }
+    }
+}
+impl Default for GoalRecoveryConfig {
+    fn default() -> Self {
+        Self {
+            long_wait: None,
+            max_attempts: 12,
+            max_elapsed_secs: 1800,
+            base_delay_secs: 30,
+            max_delay_secs: 300,
+            evaluator_max_attempts: 3,
+            evaluator_timeout_secs: 600,
+        }
+    }
+}
+
+/// Additional trusted skill roots. Relative paths use the runtime working directory;
+/// `~` uses the user's home. Existing standard roots keep higher priority.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SkillsConfig {
+    pub extra_dirs: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default)]
+    pub skills: SkillsConfig,
     /// Legacy default selection (a `[providers.*]` key). `#[serde(default)]` so a
     /// pure new-schema config selecting via `default_model` needs neither legacy
     /// field. Superseded by `default_model` (design §14.1).
@@ -369,6 +524,8 @@ pub struct Config {
     /// Falls back to `default_provider` when not set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evaluator_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "GoalConfig::is_default")]
+    pub goal: GoalConfig,
     /// The daemon's default working directory: written by a `/cd` request that
     /// asks for `set_default`, read when the daemon starts (a launch-time
     /// directory, as `atomcode webui` passes, wins over it). The terminal UI
@@ -424,7 +581,7 @@ pub struct Config {
     #[serde(default)]
     pub lsp: LspConfig,
     /// `task` subagent tool policy. Missing from older configs uses the defaults in
-    /// [`SubAgentConfig`], including a configurable 200-round high-water mark.
+    /// [`SubAgentConfig`], including an optional per-subtask round budget (default unbounded).
     #[serde(default)]
     pub subagent: SubAgentConfig,
     /// Persistent team roster policy. This is independent of task execution
@@ -606,6 +763,9 @@ pub enum ScrollbarMode {
 /// Terminal UI preferences, persisted as a top-level `[ui]` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiConfig {
+    /// User overrides for composer shortcuts; omitted actions keep defaults.
+    #[serde(default)]
+    pub keybindings: UiKeybindings,
     /// Colour palette to use for markdown / code-block / chrome
     /// rendering. `dark` keeps the legacy palette (designed for dark
     /// terminals); `light` swaps in darker saturated variants that hit
@@ -613,9 +773,8 @@ pub struct UiConfig {
     /// configs see no behaviour change.
     #[serde(default)]
     pub theme: UiTheme,
-    /// Which screen `atomcode` opens. Missing means this build's default, so
-    /// nobody's launch changes by upgrading into this field; `--tui` and
-    /// `--classic` still win over it for one launch.
+    /// Existing screen preference. All values use the row-assembled UI;
+    /// `classic` is accepted only as a retired input alias with a CLI notice.
     #[serde(default)]
     pub screen: Screen,
     /// Report the pointer for in-app mouse — click-to-fold a tool call, the copy
@@ -700,9 +859,19 @@ pub struct UiConfig {
     pub cd_bookmarks: Vec<String>,
 }
 
+/// Shortcut names are interpreted by the terminal driver, not the runtime.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UiKeybindings {
+    /// None restores shipped bindings; an empty list disables the chords.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub newline: Option<Vec<String>>,
+}
+
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
+            keybindings: UiKeybindings::default(),
             theme: UiTheme::default(),
             screen: Screen::default(),
             mouse: default_mouse(),
@@ -891,6 +1060,7 @@ impl Default for Config {
         let mut cfg = Self {
             default_provider: String::new(),
             evaluator_provider: None,
+            goal: GoalConfig::default(),
             default_workdir: None,
             providers: HashMap::new(),
             provider_accounts: HashMap::new(),
@@ -906,6 +1076,7 @@ impl Default for Config {
             team: Default::default(),
             loop_config: Default::default(),
             coding: CodingConfig::default(),
+            skills: SkillsConfig::default(),
             tools: ToolsConfig::default(),
             permissions: PermissionsConfig::default(),
             vision_preprocessor_provider: None,
@@ -1196,6 +1367,7 @@ impl Config {
                     .or_else(|| preset.default_base_url.map(str::to_string)),
                 api_key: resolve_account_api_key(account, preset),
                 user_agent: account.user_agent.clone(),
+                headers: account.headers.clone(),
                 skip_tls_verify: account.skip_tls_verify,
             });
         }
@@ -1205,6 +1377,7 @@ impl Config {
             base_url: legacy.base_url.clone(),
             api_key: legacy.resolved_api_key(),
             user_agent: legacy.user_agent.clone(),
+            headers: legacy.headers.clone(),
             skip_tls_verify: legacy.skip_tls_verify,
         })
     }
@@ -1256,6 +1429,7 @@ impl Config {
             max_tokens: model.max_tokens,
             system_prompt: model.system_prompt.clone(),
             user_agent: account.user_agent.clone(),
+            headers: account.headers.clone(),
             skip_tls_verify: account.skip_tls_verify,
             thinking_type: model.thinking_type.clone(),
             thinking_keep: model.thinking_keep.clone(),
@@ -1387,11 +1561,12 @@ pub struct ReasoningFieldsMut<'a> {
 /// See [`Config::account_endpoint`]. `Debug` redacts the key.
 #[derive(Clone)]
 pub struct AccountEndpoint {
-    /// The wire type (`openai`, `responses`, `anthropic`, `ollama`).
+    /// The wire type (`openai`, `responses`, `anthropic`, `deepseek-messages`, `ollama`).
     pub provider_type: String,
     pub base_url: Option<String>,
     pub api_key: Option<String>,
     pub user_agent: Option<String>,
+    pub headers: crate::provider_headers::ProviderHeaders,
     pub skip_tls_verify: bool,
 }
 
@@ -1432,6 +1607,7 @@ fn resolve_account_api_key(
         }
     }
     let wire_env = match preset.provider_type {
+        provider_preset::ProviderType::DeepSeekMessages => "DEEPSEEK_API_KEY",
         provider_preset::ProviderType::Anthropic => "ANTHROPIC_API_KEY",
         provider_preset::ProviderType::Ollama => "OLLAMA_API_KEY",
         provider_preset::ProviderType::OpenAi => "OPENAI_API_KEY",
@@ -1458,6 +1634,7 @@ fn resolve_account_api_key(
 fn legacy_provider_to_preset_id(provider_type: &str) -> &'static str {
     match provider_type {
         "claude" | "anthropic" => "anthropic",
+        "deepseek-messages" => "deepseek-messages",
         "ollama" => "ollama",
         // OpenAI Responses API wire — distinct protocol from chat/completions,
         // so it must resolve to the Responses preset, not the generic OpenAI one.
@@ -1744,6 +1921,7 @@ fn project_legacy_account(p: &ProviderConfig) -> ProviderAccountConfig {
         api_key: p.api_key.clone(),
         base_url: p.base_url.clone(),
         user_agent: p.user_agent.clone(),
+        headers: p.headers.clone(),
         skip_tls_verify: p.skip_tls_verify,
         enterprise_url: None,
         ephemeral: p.ephemeral,
@@ -1831,12 +2009,10 @@ pub struct NotificationConfig {
 pub struct NetworkConfig {
     #[serde(default)]
     pub proxy: ProxyConfig,
-    /// Max attempts for the VISIBLE kernel provider-retry tier (the `重试(N/M)`
-    /// re-opens that fire on a transient 5xx / dropped connection at OPEN, with
-    /// patient exponential backoff that honors a server `Retry-After`). `None`
-    /// keeps the built-in default (3). Raise it for a flaky gateway/relay whose
-    /// transient "no upstream available" 503 takes longer than the default
-    /// window to clear. `0` disables the tier. Read when the agent is assembled.
+    /// Maximum retries after the initial model request. Native coding shares
+    /// this allowance across OPEN, rate-limit and stream recovery; explicit
+    /// values override the provider total-attempt setting. `None` uses five
+    /// retries (six total attempts), `0` permits only the initial attempt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_retry_max_attempts: Option<u32>,
 }
@@ -1852,7 +2028,13 @@ pub struct NetworkConfig {
 /// in their config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LspConfig {
-    /// Master switch for read-only LSP code intelligence. Off by default — opt-in only.
+    /// Opt-in private directory of IDE window connection files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ide_discovery_dir: Option<std::path::PathBuf>,
+    /// Private connection-file path selecting an IDE window; no token in config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ide_connection_file: Option<std::path::PathBuf>,
+    /// Enable locally managed language servers. IDE window binding is independent.
     #[serde(default)]
     pub enabled: bool,
     /// Automatically detect and start language servers from the built-in
@@ -1878,6 +2060,8 @@ fn default_diagnostics_settle_delay_ms() -> u64 {
 impl Default for LspConfig {
     fn default() -> Self {
         Self {
+            ide_discovery_dir: None,
+            ide_connection_file: None,
             enabled: false,
             auto_detect: false,
             servers: Default::default(),
@@ -1911,7 +2095,9 @@ fn migrate_legacy_lsp_default(cfg: &mut Config) {
     let looks_auto_written = cfg.lsp.enabled
         && cfg.lsp.auto_detect
         && cfg.lsp.diagnostics_settle_delay_ms == 150
-        && cfg.lsp.servers.is_empty();
+        && cfg.lsp.servers.is_empty()
+        && cfg.lsp.ide_connection_file.is_none()
+        && cfg.lsp.ide_discovery_dir.is_none();
     if looks_auto_written {
         cfg.lsp = LspConfig::default();
     }
@@ -2328,6 +2514,7 @@ impl Config {
 
     pub(crate) fn parse_disk_content(content: &str, path: &Path) -> Result<Self> {
         let mut config: Config = toml::from_str(content)
+            .map_err(|e: toml::de::Error| anyhow::anyhow!("{}", e.message()))
             .with_context(|| format!("Failed to parse config: {}", path.display()))?;
         migrate_legacy_lsp_default(&mut config);
         migrate_legacy_coding_round_default(&mut config);
@@ -2340,6 +2527,7 @@ impl Config {
         path: &Path,
     ) -> Result<(Self, Vec<String>)> {
         let mut document: toml::Value = toml::from_str(content)
+            .map_err(|e: toml::de::Error| anyhow::anyhow!("{}", e.message()))
             .with_context(|| format!("Failed to parse config: {}", path.display()))?;
         let mut warnings = Vec::new();
         let mut quarantined: std::collections::BTreeMap<String, toml::Value> =
@@ -2565,6 +2753,17 @@ pub enum SeedOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extra_skill_directories_roundtrip_and_default_to_empty() {
+        let old: Config = toml::from_str("default_provider = 'test'").unwrap();
+        assert!(old.skills.extra_dirs.is_empty());
+        let mut config = old;
+        config.skills.extra_dirs = vec!["~/.other/skills".into(), r"C:\Users\person\skills".into()];
+        let rendered = toml::to_string_pretty(&config).unwrap();
+        let restored: Config = toml::from_str(&rendered).unwrap();
+        assert_eq!(restored.skills, config.skills);
+    }
 
     /// Which screen opens is a setting, and a config that does not mention it
     /// keeps this build's default — an upgrade must not move anyone's screen
@@ -3331,6 +3530,39 @@ model = "missing-type"
         assert!(super::request_user_input_enabled_from_env(Some("on")));
     }
 
+    #[test]
+    fn explicit_ide_binding_survives_config_migration_without_enabling_local_lsp() {
+        let mut config: Config =
+            toml::from_str("[lsp]\nide_connection_file = '/private/window.json'\n").unwrap();
+        migrate_legacy_lsp_default(&mut config);
+        assert!(!config.lsp.enabled);
+        assert_eq!(
+            config.lsp.ide_connection_file.as_deref(),
+            Some(std::path::Path::new("/private/window.json"))
+        );
+        config.lsp.enabled = true;
+        config.lsp.auto_detect = true;
+        migrate_legacy_lsp_default(&mut config);
+        assert!(config.lsp.ide_connection_file.is_some());
+        assert!(config.lsp.enabled);
+    }
+
+    #[test]
+    fn discovery_config_survives_legacy_migration_and_is_opt_in() {
+        assert!(LspConfig::default().ide_discovery_dir.is_none());
+        let mut config: Config = toml::from_str(
+            "[lsp]\nide_discovery_dir = '/private/windows'\nenabled = true\nauto_detect = true\n",
+        )
+        .unwrap();
+        migrate_legacy_lsp_default(&mut config);
+        assert_eq!(
+            config.lsp.ide_discovery_dir.as_deref(),
+            Some(std::path::Path::new("/private/windows"))
+        );
+        assert!(config.lsp.enabled);
+        assert!(config.lsp.ide_connection_file.is_none());
+    }
+
     /// Migration: on-disk config that looks like it was auto-written by
     /// the OLD setup wizard (enabled=true + auto_detect=true + delay=150
     /// + no custom servers) must be silently reset to disabled. Without
@@ -3339,6 +3571,8 @@ model = "missing-type"
     #[test]
     fn migrate_resets_auto_written_lsp_to_disabled() {
         let mut cfg = blank_config_with_lsp(LspConfig {
+            ide_discovery_dir: None,
+            ide_connection_file: None,
             enabled: true,
             auto_detect: true,
             servers: Default::default(),
@@ -3368,6 +3602,8 @@ model = "missing-type"
             },
         );
         let mut cfg = blank_config_with_lsp(LspConfig {
+            ide_discovery_dir: None,
+            ide_connection_file: None,
             enabled: true,
             auto_detect: true,
             servers,
@@ -3378,6 +3614,8 @@ model = "missing-type"
 
         // Case 2: tuned settle delay.
         let mut cfg2 = blank_config_with_lsp(LspConfig {
+            ide_discovery_dir: None,
+            ide_connection_file: None,
             enabled: true,
             auto_detect: true,
             servers: Default::default(),
@@ -3389,6 +3627,8 @@ model = "missing-type"
         // Case 3: auto_detect=false but enabled=true (explicit narrow
         // setup with `servers` listed) — already deviates, keep.
         let mut cfg3 = blank_config_with_lsp(LspConfig {
+            ide_discovery_dir: None,
+            ide_connection_file: None,
             enabled: true,
             auto_detect: false,
             servers: Default::default(),
@@ -3601,6 +3841,7 @@ model = "missing-type"
         let mut cfg = Config {
             default_provider: "p".to_string(),
             evaluator_provider: None,
+            goal: GoalConfig::default(),
             default_workdir: None,
             providers: HashMap::new(),
             provider_accounts: HashMap::new(),
@@ -3619,6 +3860,7 @@ model = "missing-type"
             team: Default::default(),
             loop_config: Default::default(),
             coding: CodingConfig::default(),
+            skills: SkillsConfig::default(),
             tools: ToolsConfig {
                 todo: TodoToolConfig {
                     enabled: false,
@@ -3628,6 +3870,8 @@ model = "missing-type"
                 output: OutputToolConfig {
                     threshold_bytes: Some(204_800),
                 },
+                mcp: Default::default(),
+                search: Default::default(),
             },
             vision_preprocessor_provider: None,
             language: None,
@@ -3651,6 +3895,7 @@ model = "missing-type"
                 system_prompt: None,
                 supports_vision: None,
                 user_agent: None,
+                headers: Default::default(),
                 context_window: 16000,
                 max_tokens: None,
                 thinking_type: None,
@@ -3855,7 +4100,11 @@ model = "missing-type"
 
     #[test]
     fn saved_config_roundtrips_language() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        // A path inside a temp dir, not a live `NamedTempFile`: the store writes by
+        // renaming over the target, and Windows refuses that while the target is held
+        // open — which a kept `NamedTempFile` is, for the whole test.
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("config.toml");
         let mut cfg = Config {
             language: Some(crate::locale::Locale::ZhCn),
             ..Config::with_default_provider("p")
@@ -3870,6 +4119,7 @@ model = "missing-type"
                 system_prompt: None,
                 supports_vision: None,
                 user_agent: None,
+                headers: Default::default(),
                 context_window: 16000,
                 max_tokens: None,
                 thinking_type: None,
@@ -3885,9 +4135,9 @@ model = "missing-type"
                 retry_max_attempts: None,
             },
         );
-        cfg.save(tmp.path()).unwrap();
+        cfg.save(&target).unwrap();
 
-        let loaded = Config::load(tmp.path()).unwrap();
+        let loaded = Config::load(&target).unwrap();
         assert_eq!(loaded.language, Some(crate::locale::Locale::ZhCn));
     }
 
@@ -3970,6 +4220,7 @@ model = "missing-type"
                 system_prompt: None,
                 supports_vision: None,
                 user_agent: None,
+                headers: Default::default(),
                 context_window: 8000,
                 max_tokens: None,
                 thinking_type: None,
@@ -4105,6 +4356,7 @@ model = "missing-type"
                 system_prompt: None,
                 supports_vision: None,
                 user_agent: None,
+                headers: Default::default(),
                 context_window: 8000,
                 max_tokens: None,
                 thinking_type: None,
@@ -4161,6 +4413,20 @@ reflection_cadence = 7
 [providers]
 "#;
         let _cfg: Config = toml::from_str(toml_text).expect("legacy field ignored");
+    }
+
+    #[test]
+    fn subagent_round_budget_defaults_to_unbounded_and_preserves_explicit_limits() {
+        for input in ["", "[subagent]", "[subagent]\nmax_rounds = 0"] {
+            let cfg: Config = toml::from_str(input).unwrap();
+            assert_eq!(cfg.subagent.max_rounds, 0);
+            assert_eq!(cfg.subagent.max_concurrent, 3);
+        }
+        let cfg: Config = toml::from_str("[subagent]\nmax_rounds = 200").unwrap();
+        assert_eq!(
+            cfg.subagent.max_rounds, 200,
+            "existing explicit budgets survive"
+        );
     }
 
     #[test]
@@ -4345,6 +4611,7 @@ capable_model = 5
                 api_key: Some("sk-runtime-only".into()),
                 base_url: None,
                 user_agent: None,
+                headers: Default::default(),
                 skip_tls_verify: false,
                 enterprise_url: None,
                 ephemeral: true,
@@ -4398,6 +4665,7 @@ capable_model = 5
                 api_key: None,
                 base_url: None, // …and none supplied → error
                 user_agent: None,
+                headers: Default::default(),
                 skip_tls_verify: false,
                 enterprise_url: None,
                 ephemeral: false,
@@ -4500,6 +4768,9 @@ api_key = "sk-legacy"
 model = "deepseek-chat"
 context_window = 128000
 capable_model = 3
+
+[providers.MyDeepSeek.headers]
+X-Custom-Auth = "legacy-header-secret"
 "#;
 
     #[test]
@@ -4510,6 +4781,15 @@ capable_model = 3
         assert_eq!(a.provider, "openai");
         assert_eq!(a.base_url.as_deref(), Some("https://api.deepseek.com/v1"));
         assert_eq!(a.api_key.as_deref(), Some("sk-legacy"));
+        // A legacy flat entry carries custom headers like any account: the
+        // connection editor writes them in place, and the projection must not
+        // drop them on the way to the runtime.
+        let got = a.headers.iter().collect::<Vec<_>>();
+        assert_eq!(
+            got,
+            vec![("x-custom-auth", "legacy-header-secret")],
+            "legacy headers survive the projection: {got:?}"
+        );
 
         let models = cfg.logical_models();
         let m = models.get("MyDeepSeek").expect("synthetic model");
@@ -4521,6 +4801,15 @@ capable_model = 3
         assert_eq!(
             cfg.effective_model_selection().as_deref(),
             Some("MyDeepSeek")
+        );
+
+        // And the resolution the provider factory consumes carries them too.
+        let resolved = cfg.resolve_model(None).expect("legacy resolves");
+        let got = resolved.headers.iter().collect::<Vec<_>>();
+        assert_eq!(
+            got,
+            vec![("x-custom-auth", "legacy-header-secret")],
+            "resolved model keeps the legacy headers: {got:?}"
         );
     }
 
@@ -4594,6 +4883,7 @@ context_window = 131072
                 api_key: None,
                 base_url: None,
                 user_agent: None,
+                headers: Default::default(),
                 skip_tls_verify: false,
                 enterprise_url: None,
                 ephemeral: false,
@@ -4772,6 +5062,45 @@ context_window = 131072
         assert_eq!(r.model, "deepseek-chat");
         assert_eq!(r.context_window, 128000);
         assert_eq!(r.capable_model, Some(3));
+    }
+
+    #[test]
+    fn deepseek_messages_survives_new_and_legacy_config_resolution() {
+        for input in [
+            r#"default_model = "native/flash"
+[provider_accounts.native]
+provider = "deepseek-messages"
+api_key = "test-key"
+[models."native/flash"]
+account = "native"
+model = "deepseek-flash"
+context_window = 1000000
+thinking_enabled = true
+reasoning_effort = "high"
+reasoning_effort_levels = ["low", "high", "max"]
+"#,
+            r#"default_provider = "native"
+[providers.native]
+type = "deepseek-messages"
+api_key = "test-key"
+base_url = "https://api.deepseek.com/anthropic"
+model = "deepseek-flash"
+context_window = 1000000
+thinking_enabled = true
+reasoning_effort = "high"
+reasoning_effort_levels = ["low", "high", "max"]
+"#,
+        ] {
+            let config: Config = toml::from_str(input).unwrap();
+            let resolved = config.resolve_model(None).unwrap();
+            assert_eq!(resolved.provider_type, "deepseek-messages");
+            assert_eq!(
+                resolved.base_url.as_deref(),
+                Some("https://api.deepseek.com/anthropic")
+            );
+            assert_eq!(resolved.thinking_enabled, Some(true));
+            assert_eq!(resolved.reasoning_effort.as_deref(), Some("high"));
+        }
     }
 
     #[test]
@@ -5040,5 +5369,33 @@ api_key = "sk-old"
         assert!(super::atomgit_enabled_from_env(Some(""), true));
         assert!(super::atomgit_enabled_from_env(Some("maybe"), true));
         assert!(!super::atomgit_enabled_from_env(Some("maybe"), false));
+    }
+}
+
+#[cfg(test)]
+mod goal_recovery_policy_tests {
+    use super::*;
+    #[test]
+    fn old_configs_keep_defaults_and_explicit_recovery_policy_survives_roundtrip() {
+        let original = Config::default();
+        let old = toml::to_string(&original).unwrap();
+        assert!(!old.contains("[goal"));
+        let restored: Config = toml::from_str(&old).unwrap();
+        assert_eq!(restored.goal.recovery, GoalRecoveryConfig::default());
+        let configured = format!("{old}\n[goal.recovery]\nmax_attempts = 0\nmax_elapsed_secs = 900\nevaluator_max_attempts = 2\nevaluator_timeout_secs = 800\n");
+        let restored: Config = toml::from_str(&configured).unwrap();
+        assert_eq!(restored.goal.recovery.max_attempts, 0);
+        assert_eq!(restored.goal.recovery.base_delay_secs, 30);
+        assert_eq!(restored.goal.recovery.evaluator_timeout_secs, 800);
+        let again: Config = toml::from_str(&toml::to_string(&restored).unwrap()).unwrap();
+        assert_eq!(again.goal, restored.goal);
+        let overnight: Config =
+            toml::from_str(&format!("{old}\n[goal.recovery.long_wait]\n")).unwrap();
+        assert_eq!(
+            overnight.goal.recovery.long_wait,
+            Some(GoalLongWaitConfig::default())
+        );
+        let roundtrip: Config = toml::from_str(&toml::to_string(&overnight).unwrap()).unwrap();
+        assert_eq!(roundtrip.goal, overnight.goal);
     }
 }

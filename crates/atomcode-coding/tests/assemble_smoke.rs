@@ -74,11 +74,15 @@ fn list_round(id: &str, path: &str) -> Vec<StreamEvent> {
 }
 
 #[tokio::test]
-async fn coding_assembly_enables_the_round_fuse() {
+async fn coding_assembly_closes_at_the_configured_round_budget() {
     let project = tempfile::tempdir().unwrap();
-    let provider = Arc::new(MockProvider::new(vec![
+    let provider = Arc::new(atomcode_kernel::testkit::RecordingProvider::new(vec![
         list_round("1", "."),
         list_round("2", "./"),
+        vec![
+            StreamEvent::TextDelta("Round budget reached; inspection remains unfinished.".into()),
+            StreamEvent::Done { truncated: false },
+        ],
     ]));
     let mut cfg = CodingAgentConfig::new(
         "k",
@@ -89,11 +93,19 @@ async fn coding_assembly_enables_the_round_fuse() {
     );
     cfg.max_rounds = 2;
 
-    let mut mounted = mount(&cfg, quiet_options(), provider).await;
+    let mut mounted = mount(&cfg, quiet_options(), provider.clone()).await;
     let outcome = turn(&mut mounted.handle, "inspect using varied calls", allow()).await;
 
     assert_eq!(outcome.stop, Some(StopReason::MaxRounds));
     assert_eq!(outcome.tool_results.len(), 2);
+    let calls = provider.recorded();
+    assert_eq!(calls.len(), 3);
+    assert!(!calls[1].1.is_empty(), "work still has tools");
+    assert!(calls[2].1.is_empty(), "closing advertises no tools");
+    assert_eq!(
+        calls[2].2.tool_choice,
+        atomcode_kernel::provider::ToolChoice::None
+    );
 }
 
 /// The same call, over and over, is stopped — at the threshold the policy

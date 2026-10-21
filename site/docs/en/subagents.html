@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.2.3</span>
+    <span class="dhdr-ver">v5.2.4</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -109,19 +109,18 @@
       <p>Tune the subagent pool in <code>~/.atomcode/config.toml</code>:</p>
       <pre><code>[subagent]
 max_concurrent = 3     # parallel subagents at once (min 1)
-timeout_secs   = 900   # per-subtask wall-clock limit, seconds (min 30)
-max_rounds     = 200   # per-subtask model-round cap (0 = unbounded)</code></pre>
+max_rounds     = 0     # per-subtask model-round cap (0 = unbounded)</code></pre>
+      <p>Child rounds are unlimited by default; existing explicit positive budgets are preserved. Set <code>[subagent] max_rounds = 0</code> or <code>ATOMCODE_SUBAGENT_MAX_ROUNDS=0</code> to remove an old 200-round limit. Positive budgets allow at most one extra text-only closing request. Concurrency, cancellation and repetition guards remain independent. External Codex/Claude agents retain their own execution policies.</p>
       <table>
         <thead>
           <tr><th>Key</th><th>Default</th><th>Meaning</th></tr>
         </thead>
         <tbody>
           <tr><td><code>max_concurrent</code></td><td>3</td><td>How many subagents run in parallel</td></tr>
-          <tr><td><code>timeout_secs</code></td><td>900</td><td>Wall-clock timeout per subtask (floored to 30s)</td></tr>
-          <tr><td><code>max_rounds</code></td><td>200</td><td>Model-round high-water mark per subtask; <code>0</code> = unbounded</td></tr>
+          <tr><td><code>max_rounds</code></td><td>0</td><td>Model-round high-water mark per subtask; <code>0</code> = unbounded</td></tr>
         </tbody>
       </table>
-      <p>Environment overrides: <code>ATOMCODE_SUBAGENT_TIMEOUT</code> and <code>ATOMCODE_SUBAGENT_MAX_ROUNDS</code> take precedence over the config values.</p>
+      <p>Environment overrides: <code>ATOMCODE_SUBAGENT_MAX_ROUNDS</code> take precedence over the config values.</p>
 
       <h2 id="custom-team-roles">Custom team roles</h2>
       <p>The team (<code>team</code>) picks members by <strong>role</strong>. Besides the built-in roles you can define your own as Markdown files in either of:</p>

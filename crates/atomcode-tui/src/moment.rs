@@ -447,6 +447,15 @@ pub enum ScrollbarMode {
 }
 
 /// The non-derivable half of what a module renders from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeldGoalEnd {
+    pub session: String,
+    pub condition: String,
+    pub met: bool,
+    pub elapsed_ms: Option<u64>,
+    pub usage: Option<atomcode_host_api::TokenTotals>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Moment {
     pub activity: Activity,
@@ -539,21 +548,19 @@ pub struct Moment {
     /// clock read inside `render` — that would make the whole test loop
     /// non-deterministic while leaving it green.
     pub tick: u64,
+    /// Click-triggered mascot playback; UI-only, never persisted as a fact.
+    pub mascot_started: Option<Timestamp>,
     /// Injected wall time, for anything that needs a real interval (a
     /// countdown). Still injected: tests set it, `render` never reads a clock.
     pub now: Timestamp,
-    /// When the turn in flight began, on the same clock as [`Moment::now`].
-    /// `None` between turns.
-    ///
-    /// Read off a fact rather than derived from one: the log records no clock,
-    /// so a turn's start time exists only here — stamped where facts land
-    /// (`Host::absorb`), which is the one place that sees both the fact and the
-    /// reading. A duration on screen is therefore the difference of two
-    /// injected readings, and `render` still never reads a clock
-    /// (docs/adr/0008). Folded rather than stored per module for the same
-    /// reason [`Moment::history`] is: it is not derivable, and two modules
-    /// folding it separately would eventually give two answers.
+    /// Unix milliseconds anchored by the host clock; absent in synthetic hosts.
+    pub unix_ms: Option<u64>,
+    /// Local fallback for records without a committed wall-clock timestamp.
     pub turn_started: Option<Timestamp>,
+    /// The current turn's committed start, retained by log replay across views.
+    pub turn_started_unix_ms: Option<u64>,
+    /// Current streamed generation estimate, stamped only by the live host.
+    pub generation: crate::generation::Generation,
     /// When something last arrived for the turn in flight, on the same clock as
     /// [`Moment::now`]. `None` between turns.
     ///
@@ -624,6 +631,8 @@ pub struct Moment {
     /// — a `below` [`Notice`] on [`Moment::notice`] — is still up; see
     /// [`Moment::cancel_idle`] and [`Moment::exit_hint_live`].
     pub quit_armed: bool,
+    /// Empty-composer Ctrl+D confirmation; independent of Ctrl+C.
+    pub eof_armed: bool,
     /// When the last Escape was pressed, while a second one would still mean
     /// "open the rewind panel".
     ///
@@ -712,8 +721,8 @@ pub struct Moment {
     /// message** — the receipt id it was sent under, and the text as sent
     /// (`[Image #N]` markers included).
     ///
-    /// `steering` is what the panel draws, joined by newlines, where a message
-    /// with a newline of its own cannot be told from two. The id is what ties a
+    /// The panel draws `queued` to preserve message boundaries; `steering` is
+    /// the joined text used to track display changes. The id is what ties a
     /// line to the runtime's answer about it: a stop withdraws what is still
     /// waiting and answers each withdrawn send `Rejected { NotRunning }`, and
     /// only a line named by such an answer is one the model will never get. The
@@ -753,6 +762,11 @@ pub struct Moment {
     /// turn events. While it has, its end is still coming and is where a stop
     /// settles; the agent's status going idle is not.
     pub turn_open: bool,
+    /// Last terminal outcome of the displayed conversation; cleared at its next turn.
+    pub last_turn_stop: Option<atomcode_kernel::event::StopReason>,
+    /// The kernel acknowledged cancellation; runtime persistence has not yet
+    /// reported its terminal. An idle kernel status cannot close this gap.
+    pub cancellation_pending: bool,
     /// 人自己跑过的 `!` 命令与它们的输出,等着跟下一条消息一起给模型。
     ///
     /// 攒着而不是当场发:跑一条 `!git status` 不是在对模型说话,不该因此开
@@ -788,6 +802,10 @@ pub struct Moment {
     /// a fact about the conversation, it is the state of something running
     /// beside it. `None` is "not driving itself".
     pub autonomy: Option<atomcode_host_api::Running>,
+    /// Latest runtime samples and local receipt times, retained per session so
+    /// changing views cannot overwrite another session's cumulative clock.
+    pub autonomy_samples:
+        std::collections::HashMap<String, (atomcode_host_api::Running, Timestamp)>,
     /// The allowance window nearest its limit, as of the last check.
     ///
     /// Polled rather than pushed, and that is forced: an allowance moves on the
@@ -847,6 +865,11 @@ pub struct Moment {
     /// a row and stops there; a stored fact (a question waiting, below) can take
     /// the keyboard without being asked for, but a mouse move is not that.
     pub team_keyboard: bool,
+    /// Local disclosure state; folding keeps the team header and hides member rows.
+    pub team_collapsed: bool,
+    /// Local disclosure state for the task panel; plans start compact.
+    pub todo_expanded: bool,
+    pub todo_offset: usize,
     /// The settings, **as of the frame this moment was taken for**.
     ///
     /// A snapshot rather than a handle, for the reason [`Moment::rasters`] is
@@ -958,12 +981,9 @@ pub struct Moment {
     /// 标记:这时滚轮会被终端转成方向键,滚动要用 pgup/pgdn —— 滚轮出怪事时,
     /// 原因得就在眼前,而不是在很久以前滚上去的那一句提示里。
     pub mouse_handed_back: bool,
-    /// The lead's goal ended while a member was on screen: `(session,
-    /// condition, met)`, said when the lead is back on screen
-    /// ([`crate::plugin::flush_held_goal_end`]). Written into the member's view
-    /// it would be in the wrong conversation, and gone when the view switched
-    /// back — the stream is rebuilt from the log, and this is not in it.
-    pub held_goal_end: Option<(String, String, bool)>,
+    /// A frozen goal end held until its lead's view is back on screen.
+    /// It must not be written into a member's conversation.
+    pub held_goal_end: Option<HeldGoalEnd>,
     /// 开屏时问到的「现在发不出回合」的原因(没有可用 provider、登录过期……),
     /// `None` 是能发。画在状态行里、常挂着,而不是写进对话流顶上:和 tuix 一样,
     /// 页面照常打开(欢迎块照画),原因在底下。agent 起来(`Described`)时清掉。
@@ -1100,9 +1120,25 @@ impl Moment {
         // `Stopping` is a turn still in flight — the flag it is landing. Busy,
         // so the dot does not go quiet while the thing it is stopping is still
         // running.
-        match self.activity {
-            Activity::Working | Activity::Stopping => Light::Busy,
-            Activity::Idle => Light::Idle,
+        if self.turn_in_flight() {
+            return Light::Busy;
+        }
+        let goal_paused = self.viewing == self.lead
+            && self.autonomy.as_ref().is_some_and(|running| {
+                running.kind == "goal" && running.paused.is_some() && !running.recovering
+            });
+        if goal_paused
+            || self.last_turn_stop.is_some_and(|reason| {
+                !matches!(
+                    reason,
+                    atomcode_kernel::event::StopReason::Stopped
+                        | atomcode_kernel::event::StopReason::Cancelled
+                )
+            })
+        {
+            Light::Failed
+        } else {
+            Light::Idle
         }
     }
 
@@ -1170,6 +1206,7 @@ impl Moment {
     /// A copy/paste notice (`below == false`) is left where it is.
     pub fn disarm_quit(&mut self) {
         self.quit_armed = false;
+        self.eof_armed = false;
         if self.notice.as_ref().is_some_and(|n| n.below) {
             self.notice = None;
         }
@@ -1217,8 +1254,31 @@ impl Moment {
         crate::text::ghost(&self.input, &self.history, self.history_at.is_some())
     }
 
+    /// Read a session's cumulative goal clock from its last runtime sample.
+    /// Used both by the live row and to freeze the goal's ending caption.
+    pub fn goal_elapsed_ms(&self, session: &str) -> Option<u64> {
+        let (running, since) = self.autonomy_samples.get(session)?;
+        if running.kind != "goal" || (running.paused.is_some() && !running.recovering) {
+            return None;
+        }
+        Some(
+            running
+                .elapsed_secs
+                .saturating_mul(1_000)
+                .saturating_add(self.now.as_millis().saturating_sub(since.as_millis())),
+        )
+    }
+
+    pub fn goal_recovering(&self) -> bool {
+        self.viewing == self.lead
+            && self
+                .autonomy
+                .as_ref()
+                .is_some_and(|running| running.kind == "goal" && running.recovering)
+    }
+
     pub fn turn_in_flight(&self) -> bool {
-        self.activity != Activity::Idle || self.pending_working
+        self.activity != Activity::Idle || self.pending_working || self.goal_recovering()
     }
 
     /// Put this project's older history in front of what this session has said,
@@ -1468,6 +1528,45 @@ mod tests {
         assert!(m.turn_in_flight());
         m.activity = Activity::Stopping;
         assert!(m.turn_in_flight());
+    }
+
+    #[test]
+    fn goal_evaluation_and_cooldown_remain_stoppable_only_from_the_lead() {
+        let mut m = Moment::default();
+        m.autonomy = Some(atomcode_host_api::Running {
+            usage: None,
+            kind: "goal".into(),
+            recovering: true,
+            retry_in_secs: None,
+            goal_stage: None,
+            goal_detail: None,
+            what: "finish".into(),
+            round: 1,
+            of: None,
+            elapsed_secs: 0,
+            paused: Some("evaluating".into()),
+        });
+        assert_eq!(m.activity, Activity::Idle);
+        assert!(m.turn_in_flight());
+        m.last_turn_stop = Some(atomcode_kernel::event::StopReason::ProviderError);
+        assert_eq!(
+            m.light(),
+            crate::text::Light::Busy,
+            "automatic recovery stays yellow"
+        );
+        m.autonomy.as_mut().unwrap().recovering = false;
+        assert_eq!(
+            m.light(),
+            crate::text::Light::Failed,
+            "a real pause needs attention"
+        );
+        assert!(!m.turn_in_flight(), "a paused goal is not busy");
+        m.autonomy.as_mut().unwrap().recovering = true;
+        m.viewing = "member".into();
+        assert!(
+            !m.turn_in_flight(),
+            "lead recovery must not cancel a viewed member"
+        );
     }
 
     #[test]

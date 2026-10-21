@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.2.3</span>
+    <span class="dhdr-ver">v5.2.4</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -98,6 +98,9 @@
       <pre><code>/resume</code></pre>
       <p>Opens the session picker. It lists this project's historical sessions newest-first; jump to any of them quickly. Each entry uses the most recent user prompt as its label for easy recognition.</p>
 
+      <p>While a turn runs, select another session in <code>/resume</code> or run <code>/resume &lt;id&gt;</code>. The current session keeps running in the background; the view switches only after the target is ready. A failed open leaves the current session intact. Returning to a background session in this process reuses its runtime instead of restarting the task. Use <code>/bg list</code> to inspect up to 16 background slots.</p>
+      <p>Switching remains restricted while awaiting approval or interactive input, reconfiguring, or sharing live sync with the WebUI. If all slots are full, stop an unneeded session with <code>/bg drop &lt;N&gt;</code>. This applies to the TUI; it does not add running-session switching to the WebUI.</p>
+
       <h3 id="start-a-clean-new-session">Start a clean new session</h3>
       <pre><code>/session</code></pre>
       <p>Spin up a fresh context without changing the working directory. Good for "the previous task is wrapped — onto something totally unrelated".</p>
@@ -137,6 +140,11 @@
         <strong>Typical pattern</strong>
         <p>The foreground is debugging module A; the model is editing and running <code>cargo check</code> (slow). You realise you also want to refactor module B — <code>/bg</code> straight to a new foreground for B. The build on A finishes in the background, state flips to <em>done</em>; <code>/bg 1</code> to switch back and read the result.</p>
       </div>
+
+      <h3 id="background-lifetime-and-multiple-processes">Background lifetime and multiple processes</h3>
+      <p>Background sessions depend on this AtomCode process. Exiting stops their runtimes; this is not process-independent execution. Saved conversations can be resumed, but their original tool processes are not guaranteed to keep running.</p>
+      <p>One installation is enough: run the same executable in multiple terminals with different sessions. Different sessions in the same project and home can run concurrently. An exclusive lease prevents two runtimes from writing the same session in the same storage bucket. Interactive resume may fork a session held by another process; check the notice. Config writes use a cross-process lock and atomic replacement, but settings remain shared.</p>
+      <p>Separate <code>ATOMCODE_HOME</code> values isolate configuration and session storage. Neither session leases nor separate homes protect project files. Use separate Git worktrees when agents edit concurrently to avoid conflicting file or Git operations.</p>
 
       <h2 id="clear-vs-compact-vs-new-session">Clear vs compact vs new session</h2>
       <table>

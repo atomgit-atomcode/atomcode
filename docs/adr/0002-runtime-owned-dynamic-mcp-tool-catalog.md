@@ -26,3 +26,15 @@ CLI、TUI 和 clix 不再建立第二套 model-facing registry。`/mcp status` �
 - 刚完成切换的第一个交互 turn 可能尚未看到仍在连接的 MCP 工具，用户可从下一 turn 使用；
 - capability reload 仍会替换 runtime generation，而不是在当前 generation 中原地改 trust/auth policy；旧 MCP authority 在 preflight 前先撤下，replacement 失败时保持 fail-closed；
 - 后续若需要按 server 增量复用连接，可以在 CodingRuntime 内增加 connection pool，但不得恢复 driver registry 或让 capabilities 拥有 runtime generation。
+
+## 当前 harness 路径补充（2026-10-16）
+
+上文的 kernel Turn Tool Snapshot 描述的是当时的执行路径。当前 coding 产品已经使用
+harness：`ToolsSvc` 每次模型请求读定义，执行仍从该 agent 的目录解析；kernel 的独立
+`MountedToolsSnapshot` API 保持原有语义，并不是本产品当前的运行时 owner。
+
+`mcp-host` 继续发布完整、经过策略与会话开关筛选的 MCP 目录。MCP tool search 只在
+`AgentRequest` 上投影将要发送的 schema：大目录默认只提供 `mcp_search` 与选中的定义，
+搜索结果只存短摘要和工具名，下一请求从当前目录取完整 schema。选择由调用方消息中的
+已配对成功搜索结果导出，不增加第二份 live session 状态或持久化格式。真实 MCP 调用
+仍用原名进入现有 tools/execute 门禁；模型可见 schema 的缩减不是权限授予或撤销。

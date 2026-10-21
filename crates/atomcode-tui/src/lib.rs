@@ -1,14 +1,8 @@
-//! The harness's front end: a full-screen terminal UI assembled from plugins,
-//! on its way to being **the** product UI.
+//! The product's full-screen terminal UI, assembled from plugin rows.
 //!
-//! # Where this stands
-//!
-//! `atomcode-tuix` is the UI that ships today. It is 9× the size of this crate
-//! and bound to `atomcode-coding` by concrete types, not a seam — which is why
-//! it is being replaced by this crate rather than bridged onto the harness.
-//! The decision, the gap it has to close and the order to close it in are in
-//! `docs/adr/0012`; the earlier "headless only" stance is `docs/adr/0011`,
-//! superseded. Don't read tuix for what to build; build it here as rows.
+//! This is the only shipped terminal UI. Runtime state belongs to the coding
+//! runtime; this crate draws it and delivers input through the host connection.
+//! The architecture is described in `docs/adr/0012`, `0021` and `0022`.
 //!
 //! What makes this crate the one worth growing: end-to-end tests drive the
 //! whole UI with no tty, no model and no human; `atomcode --tui --audit` checks
@@ -73,6 +67,7 @@ pub mod overlay;
 pub mod places;
 pub mod plugin;
 pub mod plugins;
+mod provider_notice;
 pub mod providers;
 pub mod qr;
 pub mod raster;
@@ -90,6 +85,8 @@ pub mod sheet;
 /// `!cmd`：人自己在这台机器上跑一条命令。
 pub mod shell;
 pub mod surface;
+pub mod terminal_image;
+mod terminal_modes;
 pub mod text;
 pub mod theme;
 pub mod tools;
@@ -124,3 +121,5 @@ pub use surface::{Headless, Input, Key, KeyPress, Mods, Surface, Terminal};
 fn _tests_assert_in_chinese() {
     crate::i18n::set_locale(crate::i18n::Locale::ZhCn);
 }
+
+mod generation;

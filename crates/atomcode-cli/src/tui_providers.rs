@@ -86,15 +86,16 @@ pub fn row_layer() -> String {
 
 /// The protocols the add/edit form cycles through, in display order.
 ///
-/// The four `tuix` offers: the two generic custom endpoints, the keyless local
-/// one, and OpenAI's newer wire. A vendor preset is *not* in here — a person
+/// The generic endpoints, local Ollama, Responses and DeepSeek Messages.
+/// Other vendor presets are offered on the account list — a person
 /// adding "deepseek" reaches it as an offer on the account list, and putting
 /// forty vendors in a left-right toggle would make the toggle useless.
-const PROTOCOLS: [&str; 4] = [
+const PROTOCOLS: [&str; 5] = [
     "openai-compatible",
     "anthropic-compatible",
     "ollama",
     "openai-responses",
+    "deepseek-messages",
 ];
 
 /// Where the providers live, and how to write them.
@@ -266,6 +267,7 @@ fn protocols() -> Vec<Protocol> {
 fn protocol_label(ty: provider_preset::ProviderType) -> String {
     match ty {
         provider_preset::ProviderType::Anthropic => "Anthropic",
+        provider_preset::ProviderType::DeepSeekMessages => "DeepSeek Messages",
         provider_preset::ProviderType::Ollama => "Ollama",
         provider_preset::ProviderType::OpenAi => "OpenAI",
         provider_preset::ProviderType::Responses => "OpenAI Responses",
@@ -278,12 +280,13 @@ fn protocol_label(ty: provider_preset::ProviderType) -> String {
 /// A bool, and only a bool: this is the whole of what the screen is told about a
 /// key, so "there is one" can be drawn without the key ever leaving the file.
 fn has_stored_key(account: &atomcode_config::config::provider::ProviderAccountConfig) -> bool {
-    !account
-        .api_key
-        .as_deref()
-        .unwrap_or_default()
-        .trim()
-        .is_empty()
+    !account.headers.is_empty()
+        || !account
+            .api_key
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
 }
 
 /// What to call an account on screen — the rule the web page uses too.
@@ -325,6 +328,7 @@ impl Providers for ConfigProviders {
     fn add_account(&self, draft: &AccountDraft) -> Result<String, String> {
         self.book()
             .add_account(&AccountInput {
+                headers: None,
                 name: &draft.name,
                 protocol: &draft.protocol,
                 display_name: None,
@@ -340,6 +344,7 @@ impl Providers for ConfigProviders {
             .edit_account(
                 id,
                 &AccountEdit {
+                    headers: None,
                     protocol: &draft.protocol,
                     endpoint: &draft.endpoint,
                     key: draft.key.as_deref(),
@@ -413,6 +418,7 @@ impl Providers for ConfigProviders {
         let wire = endpoint.provider_type.clone();
         discovery_protocol(&wire)?;
         let transport = DiscoveryTransport {
+            headers: endpoint.headers.clone(),
             api_key: endpoint.api_key.clone(),
             user_agent: endpoint.user_agent.clone(),
             skip_tls_verify: endpoint.skip_tls_verify,
@@ -453,6 +459,7 @@ impl Providers for ConfigProviders {
                 (
                     resolved.provider_type.clone(),
                     ProbeTarget {
+                        headers: resolved.headers.clone(),
                         base_url: resolved.base_url.clone()?,
                         api_key: resolved.api_key.clone(),
                         model: Some(resolved.model.clone()),
@@ -466,6 +473,7 @@ impl Providers for ConfigProviders {
                 (
                     endpoint.provider_type.clone(),
                     ProbeTarget {
+                        headers: endpoint.headers.clone(),
                         base_url: endpoint.base_url.clone()?,
                         api_key: endpoint.api_key.clone(),
                         model: None,
@@ -517,6 +525,23 @@ fn said(error: BookError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn editing_a_deepseek_messages_account_preserves_its_protocol() {
+        let config: Config = toml::from_str(
+            r#"
+[provider_accounts.native]
+provider = "deepseek-messages"
+api_key = "key"
+"#,
+        )
+        .unwrap();
+        let rows = accounts(&config);
+        let native = rows.iter().find(|row| row.id == "native").unwrap().clone();
+        let view = ProvidersView::new(rows, models(&config), protocols(), vec![]);
+        let form = atomcode_tui::providers::AccountForm::edit(&view, &native);
+        assert_eq!(form.protocol_label(&view), "DeepSeek Messages");
+    }
 
     /// A file in the shape a real one is in: one legacy flat entry, one
     /// new-schema account with two models under it, and a default.

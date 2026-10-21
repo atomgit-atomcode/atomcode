@@ -150,18 +150,27 @@ plexus_service!(SetupSvc => dyn crate::setup::Setup, "tui-setup", Seam, "Install
 
 /// The session's clock, and the only place this crate reads one.
 ///
-/// A duration on screen is the difference of two readings the log does not
-/// carry, so the readings travel in `Moment` and every `render` stays a pure
-/// function of them (`docs/adr/0008`). Read here because the host loop is the
+/// Current time is injected into `Moment`, so render can compare it with a
+/// committed start or a runtime progress sample without reading a clock
+/// (`docs/adr/0008`). Read here because the host loop is the
 /// only thing that knows when *now* is: it wakes for a fact, for a key and for a
 /// tick, and each of those is a moment the screen is painted from.
-struct Clock(std::time::Instant);
+struct Clock {
+    started: std::time::Instant,
+    unix_ms: Option<u64>,
+}
 
 impl Clock {
     /// Start counting. Called before anything can commit a fact, so a turn that
     /// opens during start-up is measured on the same clock as every later one.
     fn start() -> Self {
-        Self(std::time::Instant::now())
+        Self {
+            started: std::time::Instant::now(),
+            unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)),
+        }
     }
 
     /// How long this session has been on screen.
@@ -169,8 +178,15 @@ impl Clock {
         // Milliseconds since the loop started, saturated rather than wrapped: a
         // u64 of milliseconds is 584 million years, and a number that suddenly
         // went backwards would read as a turn that started in the future.
-        let ms = u64::try_from(self.0.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
         Timestamp::millis(ms)
+    }
+
+    fn stamp(&self, moment: &mut crate::moment::Moment) {
+        moment.now = self.reading();
+        moment.unix_ms = self
+            .unix_ms
+            .map(|at| at.saturating_add(moment.now.as_millis()));
     }
 }
 
@@ -507,7 +523,11 @@ impl AgentClient {
                     ),
                 );
         }
-        if name == "memory" {
+        let memory_listing = (name == "memory")
+            .then(|| atomcode_capabilities::memory::input::parse("list", args).ok())
+            .flatten()
+            .filter(|input| input.is_listing());
+        if memory_listing.is_some() {
             self.view
                 .lock()
                 .expect("client poisoned")
@@ -518,7 +538,7 @@ impl AgentClient {
             id,
             session,
             name: name.to_string(),
-            args: if name == "memory" && !args.trim_start().starts_with("--json") {
+            args: if memory_listing.as_ref().is_some_and(|input| !input.json) {
                 format!("--json {}", args.trim())
             } else {
                 args.to_string()
@@ -823,7 +843,7 @@ fn paths_under(
             // `Entry::rel_path` already ends in `/` for a directory, which is
             // exactly what the next keystroke needs to continue into it.
             let value = format!("@{}", entry.rel_path);
-            let item = crate::menu::Item::new(value.clone(), value);
+            let item = crate::menu::Item::new(value, entry.rel_path.clone()).sigil("");
             if entry.is_dir {
                 item.about(t(Msg::MenuFolder).into_owned())
             } else {
@@ -1024,6 +1044,7 @@ enum Wake {
         message: String,
     },
     Fact,
+    SessionReferences,
     Foreground {
         request: u64,
         session: String,
@@ -1056,6 +1077,7 @@ enum Wake {
     /// the mouse mode, and neither should run faster because a drag is held.
     EdgeScroll,
     Closed,
+    TerminalInputFailed(String),
 }
 
 /// The scrollbar is screen policy. The old knob — `mascot = true` — is now
@@ -1296,8 +1318,34 @@ impl TeamRoster for Roster {
     }
 }
 
+/// Cached metadata for asynchronous session reference discovery.
+#[derive(Default)]
+struct SessionSuggestions {
+    entries: Vec<atomcode_capabilities::session::CatalogEntry>,
+    checked: Option<std::time::Instant>,
+    loading: bool,
+}
+
+/// Own and abort superseded panel reads.
+struct McpReadJob(tokio::task::JoinHandle<()>);
+impl Drop for McpReadJob {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+struct McpReadFlight {
+    host: Arc<Host>,
+    request: crate::mcp::Request,
+}
+impl Drop for McpReadFlight {
+    fn drop(&mut self) {
+        self.host.mcp_read_done(&self.request);
+    }
+}
+
 /// The assembled UI. Public so a test can drive exactly what ships.
 pub struct Tui {
+    mcp_read: Mutex<Option<McpReadJob>>,
     client: Arc<AgentClient>,
     host: Arc<Host>,
     keys: Arc<Keys>,
@@ -1338,6 +1386,8 @@ pub struct Tui {
     /// one owner, and this is that owner. The root travels with it so a `/cd`
     /// re-points it rather than silently answering from the old tree.
     files: Mutex<Option<(std::path::PathBuf, FileIndex)>>,
+    mention_kind: Mutex<u8>,
+    session_references: Arc<Mutex<SessionSuggestions>>,
     /// Where the button went down, so a release can tell a click from a drag.
     pressed_at: Mutex<Option<(u16, u16)>>,
     scroll_drag: Mutex<Option<crate::scrollbar::Drag>>,
@@ -1488,7 +1538,7 @@ impl UserInterface for Tui {
             // dark, fully capable terminal — whatever the real one is, which is
             // how a light terminal ended up painted in a dark palette.
             m.caps = self.surface.caps();
-            m.now = clock.reading();
+            clock.stamp(&mut m);
         }
         *self.ctx.lock().expect("ctx poisoned") = Some(ctx.clone());
         *self.wake.lock().expect("wake poisoned") = Some(wake_tx.clone());
@@ -1777,6 +1827,7 @@ impl UserInterface for Tui {
         // A picture already on the clipboard when the screen comes up is as
         // much news as one that arrives later.
         self.look_at_clipboard(true);
+        let mut terminal_input_error = None;
         let mut quit = false;
         // Whether what is on screen is out of date. `compose` walks the stream
         // and encodes a whole screen, so a frame is composed when the loop is
@@ -1931,7 +1982,8 @@ impl UserInterface for Tui {
                 // The reading the frame about to be painted is drawn from. Facts
                 // absorb against whatever the last one was — a frame at most out
                 // of date, and the only reading available between commits.
-                self.host.moment.write().expect("moment poisoned").now = clock.reading();
+                clock.stamp(&mut self.host.moment.write().expect("moment poisoned"));
+                self.refresh_mcp_request(false);
                 self.refresh_members();
                 // A question that arrived while the loop was asleep is brought
                 // onto the moment here, before the frame it appears in is
@@ -1980,6 +2032,16 @@ impl UserInterface for Tui {
             {
                 let left = until.saturating_duration_since(now);
                 timer = Some(timer.map_or(left, |t| t.min(left)));
+            }
+            {
+                let m = self.host.moment.read().expect("moment poisoned");
+                if let Some(left) = crate::terminal_image::next_change(m.mascot_started, m.now) {
+                    timer = Some(timer.map_or(left, |every| every.min(left)));
+                }
+            }
+            if self.host.mcp_needs_poll() {
+                let every = std::time::Duration::from_secs(1);
+                timer = Some(timer.map_or(every, |t| t.min(every)));
             }
             let woke = match replay.pop_front() {
                 Some(again) => again,
@@ -2063,15 +2125,31 @@ impl UserInterface for Tui {
                 Wake::Input(Input::Key(_)) => self.look_at_clipboard(false),
                 _ => {}
             }
-            let closed = matches!(woke, Wake::Closed);
+            let closed = matches!(woke, Wake::Closed | Wake::TerminalInputFailed(_));
             match woke {
                 Wake::Closed => quit = true,
+                Wake::TerminalInputFailed(error) => {
+                    terminal_input_error = Some(error);
+                    quit = true;
+                }
                 // The fact was folded into the stream by the listener that sent
                 // this, so what is drawn is a frame behind it now.
                 //
                 // A command's answer arrives this way, after the command ran —
                 // so a `/model` that moved the selection id is marked here,
                 // whichever order its reply and its description came in.
+                Wake::SessionReferences => {
+                    // Escape stays closed; asynchronous arrivals do not replace
+                    // the row the person is about to choose.
+                    if self.host.menu_open() {
+                        let selected = self.host.menu_selected();
+                        self.refresh_menu();
+                        if let Some(value) = selected {
+                            self.host.menu_select_value(&value);
+                        }
+                        stale = true;
+                    }
+                }
                 Wake::Fact => {
                     stale = true;
                     if client.take_remark() {
@@ -2134,12 +2212,11 @@ impl UserInterface for Tui {
                     }
                     stale = true;
                 }
-                // What the session is doing on its own. Kept, not said: a
-                // round landing is not news to read, it is a number to watch,
-                // and saying it every round would bury the conversation under
-                // its own progress bar.
+                // Keep clock/counter updates in the badge. Meaningful goal
+                // stage transitions get one neutral explanation so a later
+                // continuation failure cannot look like a failed prior reply.
                 Wake::Host(HostEvent::Autonomy { session, running }) => {
-                    stale |= took_autonomy(&self.host.moment, &session, running);
+                    stale |= took_goal_progress(&self.host, &session, running);
                 }
                 // How much the session may do without asking. Kept, not said:
                 // the mode is drawn on the status row, and a line of prose per
@@ -2161,8 +2238,9 @@ impl UserInterface for Tui {
                     session,
                     condition,
                     met,
+                    summary,
                 }) => {
-                    stale |= took_goal_end(&self.host, &session, condition, met);
+                    stale |= took_goal_end(&self.host, &session, condition, met, summary);
                 }
                 // The turn finished; the log did not get it. Said loudly and
                 // at once: the log is the session's only authority
@@ -2261,13 +2339,15 @@ impl UserInterface for Tui {
                 }
                 Wake::PullBgQuestion => self.pour_bg_question(),
                 Wake::Tick => {
-                    let mut m = self.host.moment.write().expect("moment poisoned");
-                    if m.scrollbar_until
-                        .is_some_and(|t| t <= tokio::time::Instant::now())
                     {
-                        m.scrollbar_until = None;
+                        let mut m = self.host.moment.write().expect("moment poisoned");
+                        if m.scrollbar_until
+                            .is_some_and(|t| t <= tokio::time::Instant::now())
+                        {
+                            m.scrollbar_until = None;
+                        }
+                        m.tick = m.tick.wrapping_add(1);
                     }
-                    m.tick = m.tick.wrapping_add(1);
                     stale = true;
                 }
                 // A drag held still at the conversation's edge: one more row.
@@ -2365,6 +2445,9 @@ impl UserInterface for Tui {
                 // history — in the alternate screen that history is the shell's,
                 // so a wheel the terminal keeps would scroll the wrong thing.
                 Wake::Input(Input::Mouse(click, x, y)) => {
+                    if matches!(click, Click::Press | Click::Release) {
+                        clock.stamp(&mut self.host.moment.write().expect("moment poisoned"));
+                    }
                     // A shift-press is a press in everything but what it does
                     // to a held selection, which is decided where a press
                     // becomes a selection gesture (below).
@@ -2425,6 +2508,10 @@ impl UserInterface for Tui {
                             Click::WheelUp => -WHEEL_LINES,
                             _ => WHEEL_LINES,
                         };
+                        if self.host.todo_wheel(x, y, by) {
+                            stale = true;
+                            continue;
+                        }
                         if self.host.settings_wheel(x, y, by) {
                             stale = true;
                             continue;
@@ -2511,6 +2598,10 @@ impl UserInterface for Tui {
                             // would be a panel only the keyboard can open.
                             if self.host.team_folded_at(x, y) {
                                 self.host.focus_team();
+                                stale = true;
+                                continue;
+                            }
+                            if self.host.toggle_todo_at(x, y) {
                                 stale = true;
                                 continue;
                             }
@@ -2667,6 +2758,11 @@ impl UserInterface for Tui {
                             // as the settings one: chrome first, so a stray row
                             // cannot answer a press aimed at a tab.
                             if self.host.providers_open() {
+                                if let Some(key) = self.host.providers_action_at(x, y) {
+                                    self.run_providers_key(key);
+                                    stale = true;
+                                    continue;
+                                }
                                 if let Some(tab) = self.host.providers_tab_at(x, y) {
                                     let _ = self.host.show_providers_tab(tab);
                                     stale = true;
@@ -2707,6 +2803,26 @@ impl UserInterface for Tui {
                                     continue;
                                 }
                             }
+                            // Repeated mascot clicks are still clicks, never
+                            // word/line selection over the reserved image cells.
+                            let graphics = self
+                                .host
+                                .moment
+                                .read()
+                                .expect("moment poisoned")
+                                .caps
+                                .graphics;
+                            let clicks = if clicks >= 2
+                                && crate::terminal_image::mascot_at(
+                                    &self.host.compose(self.surface.size()),
+                                    graphics,
+                                    x,
+                                    y,
+                                ) {
+                                1
+                            } else {
+                                clicks
+                            };
                             match clicks {
                                 // Forget the press so the release does not become
                                 // a `ClickAt` — which, not being a selection
@@ -2899,6 +3015,12 @@ impl UserInterface for Tui {
                 // A paste while the providers panel is up belongs to the field
                 // it is working in: the composer is off screen, so falling
                 // through would be typing into something nobody can see.
+                Wake::Input(Input::Paste(text)) if self.host.settings_open() => {
+                    let mut moment = self.host.moment.write().expect("moment poisoned");
+                    if let Some(panel) = moment.settings_panel.as_mut() {
+                        stale |= crate::settings::paste(panel, &text);
+                    }
+                }
                 Wake::Input(Input::Paste(text)) if self.host.providers_open() => {
                     stale |= self.host.providers_paste(&text);
                 }
@@ -3034,8 +3156,11 @@ impl UserInterface for Tui {
                 {
                     // Only as a scroll: a keymap that rebinds the key to
                     // something else has not made it the question's business.
-                    if let Some(action @ (Action::Scroll(_) | Action::ScrollToBottom)) =
-                        self.keys.resolve(press)
+                    if let Some(
+                        action @ (Action::Scroll(_)
+                        | Action::PageScroll(_)
+                        | Action::ScrollToBottom),
+                    ) = self.keys.resolve(press)
                     {
                         quit = self.act(action, &client);
                     }
@@ -3072,7 +3197,13 @@ impl UserInterface for Tui {
                 // level and a half-typed `/comp` reaching the dispatcher that
                 // suggests `/compact`.
                 Wake::Input(Input::Key(press))
-                    if self.host.menu_open() && crate::menu::Slash::owns(press) =>
+                    if self.host.menu_open()
+                        && (crate::menu::Slash::owns(press)
+                            || (matches!(
+                                press.key,
+                                crate::surface::Key::Left | crate::surface::Key::Right
+                            ) && press.mods == crate::surface::Mods::NONE
+                                && self.host.menu_adjacent_tab(1).is_some())) =>
                 {
                     quit = self.slash_menu_key(press, &client);
                     stale = true;
@@ -3191,8 +3322,12 @@ impl UserInterface for Tui {
         client.shutdown();
         events_pump.abort();
         self.host.overlays.close_all();
+        let result = match terminal_input_error {
+            Some(error) => Err(format!("terminal input failed: {error}")),
+            None => Ok(()),
+        };
         self.surface.restore();
-        Ok(())
+        result
     }
 }
 
@@ -3392,9 +3527,7 @@ impl Tui {
             return false;
         }
         let m = self.host.moment.read().expect("moment poisoned");
-        m.history_at.is_none()
-            && m.scroll.is_at_bottom()
-            && !crate::modules::team::targets(&m).is_empty()
+        m.history_at.is_none() && m.scroll.is_at_bottom() && crate::modules::team::running(&m)
     }
 
     /// Whether one ↑/↓ would move the caret inside a draft of several rows
@@ -3460,8 +3593,8 @@ impl Tui {
     /// this side's business. Costs one string compare a frame and writes
     /// nothing in the ordinary case.
     ///
-    /// The title carries a status dot — `🟢` idle, `🟡` working, `🔴` waiting on
-    /// the person (a question or approval) — then the session's name, or the
+    /// The title carries a status dot — `🟢` idle/success, `🟡` working or recovering,
+    /// `🔴` failed or waiting on the person (a question or approval) — then the session's name, or the
     /// project directory for a window not yet named. The dot is the "红绿灯" the
     /// reference and Claude Code put in the tab so a glance at the strip says
     /// which session wants you.
@@ -3536,6 +3669,20 @@ impl Tui {
             return false;
         };
         let view = port.rows();
+        let value = view
+            .rows()
+            .iter()
+            .find(|row| row.id == crate::settings::NEWLINE_KEYS)
+            .map(|row| row.value.as_str())
+            .unwrap_or("default");
+        if let Err(error) = crate::keymap::parse_newline_bindings(value)
+            .and_then(|keys| self.keys.set_newline_bindings(keys))
+        {
+            self.host.say(
+                t(Msg::KeybindingsError { error: &error }).into_owned(),
+                true,
+            );
+        }
         let mut moment = self.host.moment.write().expect("moment poisoned");
         if moment.settings == view {
             return false;
@@ -3864,70 +4011,73 @@ impl Tui {
     /// the panel opens now — an empty table for the beat it takes, not a
     /// composer that will not take a key.
     fn refresh_mcp(&self) {
-        let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
-            self.host
-                .mcp_note(Some(t(Msg::ScreenNotConnectedAgent).into_owned()));
-            return;
-        };
-        let Some(port) = ctx.service::<crate::plugin::McpSvc>() else {
-            self.host.mcp_note(Some(t(Msg::NoMcpPort).into_owned()));
-            return;
-        };
-        let host = self.host.clone();
-        let keys = self.wake.lock().expect("wake poisoned").clone();
-        tokio::spawn(async move {
-            match port.list().await {
-                Ok(view) => {
-                    host.show_mcp(view);
-                }
-                // 读不到的目录说在面板上,不静默:一张空表读起来像「一台都没有」
-                // (设计 §6)。
-                Err(why) => {
-                    host.mcp_note(Some(why));
-                }
-            }
-            if let Some(keys) = keys {
-                let _ = keys.send(Wake::Fact);
-            }
-        });
+        self.refresh_mcp_request(true);
     }
 
-    /// [`refresh_mcp`](Self::refresh_mcp), then `server`'s page — in that
-    /// order, because putting the list in replaces the whole view, page and all:
-    /// fetched the other way round, the page could land first and be wiped.
-    fn refresh_mcp_on(&self, server: String) {
+    fn refresh_mcp_on(&self, _server: String) {
+        self.refresh_mcp();
+    }
+
+    /// Serialized, bounded reads. Superseding a read aborts its task; dropping
+    /// the TUI aborts it too. Replies also carry a panel/view/revision guard.
+    fn refresh_mcp_request(&self, force: bool) {
         let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
-            self.host
-                .mcp_note(Some(t(Msg::ScreenNotConnectedAgent).into_owned()));
+            if force {
+                self.host
+                    .mcp_note(Some(t(Msg::ScreenNotConnectedAgent).into_owned()));
+            }
             return;
         };
         let Some(port) = ctx.service::<crate::plugin::McpSvc>() else {
-            self.host.mcp_note(Some(t(Msg::NoMcpPort).into_owned()));
+            if force {
+                self.host.mcp_note(Some(t(Msg::NoMcpPort).into_owned()));
+            }
             return;
         };
-        let host = self.host.clone();
+        let Some(request) = self.host.begin_mcp_request(force, false) else {
+            return;
+        };
+        let mut slot = self.mcp_read.lock().expect("MCP read poisoned");
+        slot.take();
+        let flight = McpReadFlight {
+            host: self.host.clone(),
+            request,
+        };
         let keys = self.wake.lock().expect("wake poisoned").clone();
-        tokio::spawn(async move {
-            match port.list().await {
-                Ok(view) => {
-                    host.show_mcp(view);
+        *slot = Some(McpReadJob(tokio::spawn(async move {
+            let timeout = std::time::Duration::from_secs(5);
+            let (view, mut error) = match tokio::time::timeout(timeout, port.list()).await {
+                Ok(Ok(view)) => (Some(view), None),
+                Ok(Err(error)) => (None, Some(error)),
+                Err(_) => (None, Some(t(Msg::McpRefreshTimeout).into_owned())),
+            };
+            let detail = if view.is_some() {
+                if let Some(server) = &flight.request.detail {
+                    match tokio::time::timeout(timeout, port.detail(server)).await {
+                        Ok(Ok(detail)) => Some(detail),
+                        Ok(Err(why)) => {
+                            error = Some(why);
+                            None
+                        }
+                        Err(_) => {
+                            error = Some(t(Msg::McpRefreshTimeout).into_owned());
+                            None
+                        }
+                    }
+                } else {
+                    None
                 }
-                Err(why) => {
-                    host.mcp_note(Some(why));
-                }
-            }
-            match port.detail(&server).await {
-                Ok(detail) => {
-                    host.mcp_detail(detail);
-                }
-                Err(why) => {
-                    host.mcp_note(Some(why));
-                }
-            }
+            } else {
+                None
+            };
+            flight
+                .host
+                .mcp_answer(&flight.request, view, detail, error, false);
+            drop(flight);
             if let Some(keys) = keys {
                 let _ = keys.send(Wake::Fact);
             }
-        });
+        })));
     }
 
     /// Ask the host again whether a turn would be taken, and put its answer on
@@ -4903,7 +5053,29 @@ impl Tui {
     ///
     /// **True when a frame is owed.**
     fn run_mcp_key(&self, press: crate::surface::KeyPress) -> bool {
+        let was_detail = self
+            .host
+            .moment
+            .read()
+            .expect("moment poisoned")
+            .mcp_panel
+            .as_ref()
+            .is_some_and(|p| p.level == crate::mcp::Level::Detail);
         let (changed, asked) = self.host.mcp_key(press);
+        let now_list = self
+            .host
+            .moment
+            .read()
+            .expect("moment poisoned")
+            .mcp_panel
+            .as_ref()
+            .is_some_and(|p| p.level == crate::mcp::Level::List);
+        if !self.host.mcp_open() {
+            self.mcp_read.lock().expect("MCP read poisoned").take();
+        }
+        if was_detail && now_list {
+            self.refresh_mcp();
+        }
         let Some(step) = asked else {
             return changed;
         };
@@ -4923,6 +5095,10 @@ impl Tui {
     /// itself, and [`Host::mcp_key`] has already acted on them.
     fn apply_mcp_step(&self, step: crate::mcp::Step) {
         use crate::mcp::Step;
+        if matches!(step, Step::Refresh | Step::OpenDetail { .. }) {
+            self.refresh_mcp();
+            return;
+        }
         let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
             self.host.mcp_busy(None);
             self.host
@@ -4934,53 +5110,61 @@ impl Tui {
             self.host.mcp_note(Some(t(Msg::NoMcpPort).into_owned()));
             return;
         };
-        // A cancel is a word to the sign-in already out there, not a trip of its
-        // own: that trip answers for itself when it stops.
         if let Step::Cancel = step {
             port.cancel();
             return;
         }
+        let Step::Act { server, action } = step else {
+            return;
+        };
+        let Some(request) = self.host.begin_mcp_request(true, true) else {
+            return;
+        };
+        self.mcp_read.lock().expect("MCP read poisoned").take();
         let host = self.host.clone();
         let keys = self.wake.lock().expect("wake poisoned").clone();
         tokio::spawn(async move {
-            match step {
-                Step::OpenDetail { server } => match port.detail(&server).await {
-                    Ok(detail) => {
-                        host.mcp_detail(detail);
-                    }
-                    Err(why) => {
-                        host.mcp_note(Some(why));
-                    }
-                },
-                Step::Act { server, action } => {
-                    let done = port.act(&server, action).await;
-                    // The panel first: whatever happened, it is over.
-                    host.mcp_busy(None);
-                    match done {
-                        Ok(view) => {
-                            host.show_mcp(view);
-                            // 动作已经落在这一台上了,所以页面上那份详情是旧状态;
-                            // 而 `act` 答的是**目录**(不带详情),整个视图换掉之后
-                            // 这一页会变成空白的「正在取详情…」。面板要是还停在这一
-                            // 台,就再取一次,让人看见动作之后的样子。
-                            if host.mcp_awaiting_detail(&server) {
-                                match port.detail(&server).await {
-                                    Ok(detail) => {
-                                        host.mcp_detail(detail);
-                                    }
-                                    Err(why) => {
-                                        host.mcp_note(Some(why));
-                                    }
-                                }
-                            }
+            let done = port.act(&server, action).await;
+            if !request.matches(&host.moment.read().expect("moment poisoned")) {
+                return;
+            }
+            let (view, mut error) = match done {
+                Ok(view) => (Some(view), None),
+                Err(error) => {
+                    // A failed reconnect has withdrawn the old tools too.
+                    let view = if action == crate::mcp::Action::Reconnect {
+                        tokio::time::timeout(std::time::Duration::from_secs(5), port.list())
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                    } else {
+                        None
+                    };
+                    (view, Some(error))
+                }
+            };
+            let detail = if view.is_some() && request.detail.as_deref() == Some(server.as_str()) {
+                match tokio::time::timeout(std::time::Duration::from_secs(5), port.detail(&server))
+                    .await
+                {
+                    Ok(Ok(detail)) => Some(detail),
+                    Ok(Err(why)) => {
+                        if error.is_none() {
+                            error = Some(why);
                         }
-                        Err(why) => {
-                            host.mcp_note(Some(why));
+                        None
+                    }
+                    Err(_) => {
+                        if error.is_none() {
+                            error = Some(t(Msg::McpRefreshTimeout).into_owned());
                         }
+                        None
                     }
                 }
-                Step::Stay | Step::Close | Step::Cancel => {}
-            }
+            } else {
+                None
+            };
+            host.mcp_answer(&request, view, detail, error, true);
             if let Some(keys) = keys {
                 let _ = keys.send(Wake::Fact);
             }
@@ -5451,8 +5635,38 @@ impl Tui {
             match done {
                 Ok(()) => {
                     self.refresh_settings();
+                    if matches!(&step, crate::settings::Step::Set { id, .. } | crate::settings::Step::Reset { id } if id == crate::settings::NEWLINE_KEYS)
+                    {
+                        if let Some(panel) = self
+                            .host
+                            .moment
+                            .write()
+                            .expect("moment poisoned")
+                            .settings_panel
+                            .as_mut()
+                        {
+                            let value = match &step {
+                                crate::settings::Step::Set { value, .. } => value.as_str(),
+                                _ => "default",
+                            };
+                            panel.keybindings =
+                                Some(crate::settings::KeybindingEditor::opening(value));
+                        }
+                    }
                 }
-                Err(why) => self.host.say(&why, true),
+                Err(why) => {
+                    let mut moment = self.host.moment.write().expect("moment poisoned");
+                    if let Some(editor) = moment
+                        .settings_panel
+                        .as_mut()
+                        .and_then(|panel| panel.keybindings.as_mut())
+                    {
+                        editor.error = Some(why);
+                    } else {
+                        drop(moment);
+                        self.host.say(&why, true);
+                    }
+                }
             }
             return true;
         }
@@ -5480,7 +5694,13 @@ impl Tui {
         let Some(port) = ctx.service::<crate::plugin::SettingsSvc>() else {
             return Err(t(Msg::NoSettingsPort).into_owned());
         };
-        port.set(id, value)?;
+        if id == crate::settings::NEWLINE_KEYS {
+            let keys = crate::keymap::parse_newline_bindings(value)?;
+            self.keys
+                .configure_newline(keys, || port.set(id, value).map(|_| ()))?;
+        } else {
+            port.set(id, value)?;
+        }
         self.reload_if_a_change_needs_it(id)
     }
 
@@ -5496,7 +5716,12 @@ impl Tui {
         let Some(port) = ctx.service::<crate::plugin::SettingsSvc>() else {
             return Err(t(Msg::NoSettingsPort).into_owned());
         };
-        port.reset(id)?;
+        if id == crate::settings::NEWLINE_KEYS {
+            self.keys
+                .configure_newline(None, || port.reset(id).map(|_| ()))?;
+        } else {
+            port.reset(id)?;
+        }
         self.reload_if_a_change_needs_it(id)
     }
 
@@ -5721,7 +5946,6 @@ impl Tui {
             (Key::Esc, _) | (Key::Tab, _) | (Key::BackTab, _) => {
                 self.host.unfocus_team();
             }
-            (Key::Char('d'), Mods::CTRL) => return true,
             _ => {}
         }
         false
@@ -6278,6 +6502,10 @@ impl Tui {
                     }
                     return true;
                 }
+                // A rejected send is not still waiting in the model inbox.
+                // Restore the text belonging to this receipt, not the most
+                // recent send when several messages were submitted in a row.
+                let rejected_text = self.host.remove_queued(&command);
                 // A send that never became a turn produces no message fact to
                 // take the `正在识别图片` line down; do it here.
                 self.host.stop_recognizing();
@@ -6288,7 +6516,7 @@ impl Tui {
                 {
                     let mut m = self.host.moment.write().expect("moment poisoned");
                     if m.input.is_empty() {
-                        if let Some(sent) = m.last_sent.clone() {
+                        if let Some(sent) = rejected_text.or_else(|| m.last_sent.clone()) {
                             m.input = sent;
                             m.caret = m.input.len();
                             m.history_at = None;
@@ -6312,6 +6540,30 @@ impl Tui {
             // nothing, and the only way on was to know that `/policy` existed.
             AgentEvent::PolicyIntervention { intervention } => {
                 self.ask_about_policy(intervention);
+                true
+            }
+            AgentEvent::ToolCallStreaming {
+                name, arguments, ..
+            } => {
+                // Raw handle observations belong to the lead. A selected team
+                // member is projected from its own facts, never the lead's IO.
+                if self.client.session() != self.client.root() {
+                    return false;
+                }
+                let mut moment = self.host.moment.write().expect("moment poisoned");
+                let now = moment.now;
+                if moment
+                    .generation
+                    .tool_stream(name.as_deref(), &arguments, now)
+                {
+                    moment.quiet_since = Some(now);
+                    true
+                } else {
+                    false
+                }
+            }
+            AgentEvent::ToolProgress { message, .. } => {
+                self.host.say_for(message, false, 1_500);
                 true
             }
             AgentEvent::StreamRecovery {
@@ -6374,6 +6626,23 @@ impl Tui {
                     }
                     self.host.echo_command(&line);
                 }
+                // Starting a goal already submits its condition as the user
+                // message. Keep the short acknowledgement in the reserved tip
+                // row instead of inserting a command block ahead of that input.
+                if failed == Some(false)
+                    && [crate::i18n::Locale::En, crate::i18n::Locale::ZhCn]
+                        .into_iter()
+                        .any(|locale| {
+                            output
+                                == crate::i18n::product::t_with(
+                                    locale,
+                                    crate::i18n::product::Msg::GoalStarted,
+                                )
+                        })
+                {
+                    self.host.say_for(output, false, 3_000);
+                    return true;
+                }
                 if !output.is_empty() {
                     if failed == Some(true) {
                         self.say_refused(&output);
@@ -6409,7 +6678,16 @@ impl Tui {
                         self.settle_withdrawn();
                         changed = true;
                     }
-                } else if on_screen && status == AgentStatus::Idle && self.client.settled() {
+                } else if on_screen
+                    && status == AgentStatus::Idle
+                    && self.client.settled()
+                    && !self
+                        .host
+                        .moment
+                        .read()
+                        .expect("moment poisoned")
+                        .cancellation_pending
+                {
                     // The lead's own line is moved by its turn events, which say
                     // more than a status does — but only while they arrive. When
                     // one does not, the claim on screen (正在停止, most of all)
@@ -6489,6 +6767,8 @@ impl Tui {
             AgentEvent::TurnStarted { .. } => {
                 let mut m = self.host.moment.write().expect("moment poisoned");
                 m.turn_open = true;
+                m.last_turn_stop = None;
+                m.cancellation_pending = false;
                 // A row the pointer lit last turn is let go of, unless the keys
                 // are on the panel: it is what keeps a team panel open that a
                 // person opened, and once a new turn runs, a team that goes
@@ -6519,6 +6799,14 @@ impl Tui {
             // `已中断` note is not raised here: a self-cancel already marked it on
             // the key (`Action::Escape`), and an internal cancel must not.
             event @ (AgentEvent::TurnComplete { .. } | AgentEvent::Cancelled) => {
+                // Persistence can fail before a TurnEnd fact is committed. The
+                // runtime terminal still gives the displayed outcome in that case.
+                let outcome_changed = if let AgentEvent::TurnComplete { reason, .. } = &event {
+                    let mut m = self.host.moment.write().expect("moment poisoned");
+                    m.last_turn_stop.replace(*reason) != Some(*reason)
+                } else {
+                    false
+                };
                 // Lines a stop withdrew are settled once the turn is over:
                 // resubmitting now no longer meets `Busy`. The withdrawal
                 // receipts precede the turn's end on this connection, so every
@@ -6532,7 +6820,23 @@ impl Tui {
                 if matches!(event, AgentEvent::TurnComplete { .. }) {
                     {
                         let mut m = self.host.moment.write().expect("moment poisoned");
+                        if matches!(
+                            event,
+                            AgentEvent::TurnComplete {
+                                reason: atomcode_kernel::event::StopReason::PromptRejected,
+                                ..
+                            }
+                        ) && m.input.is_empty()
+                        {
+                            if let Some(sent) = m.last_sent.clone() {
+                                m.input = sent;
+                                m.caret = m.input.len();
+                                m.history_at = None;
+                                m.draft.clear();
+                            }
+                        }
                         m.turn_open = false;
+                        m.cancellation_pending = false;
                         if let Some(retract) = m.retract.as_mut() {
                             retract.ended = true;
                         }
@@ -6576,7 +6880,30 @@ impl Tui {
                 // the only fact left to take the line down. `stop_turn` covers
                 // the person's stop; this covers every other way a turn ends.
                 let _ = self.host.stop_compacting();
-                self.set_activity(Activity::Idle)
+                // Cancelled only acknowledges the kernel stop. The runtime's
+                // TurnComplete follows after its snapshot has settled; until
+                // then a new submit can still be refused as busy.
+                let closing = matches!(event, AgentEvent::Cancelled)
+                    && self.host.moment.read().expect("moment poisoned").turn_open;
+                if closing {
+                    self.host
+                        .moment
+                        .write()
+                        .expect("moment poisoned")
+                        .cancellation_pending = true;
+                }
+                self.set_activity(if closing {
+                    Activity::Stopping
+                } else {
+                    Activity::Idle
+                }) | outcome_changed
+                    | matches!(
+                        event,
+                        AgentEvent::TurnComplete {
+                            reason: atomcode_kernel::event::StopReason::PromptRejected,
+                            ..
+                        }
+                    )
             }
             // A summary is being written and the request waits on it. Only the
             // slow tier announces this (a cheap fold is instant), so this is the
@@ -6640,7 +6967,14 @@ impl Tui {
                     self.client.status_of(&self.client.session()),
                     Some(AgentStatus::Working) | Some(AgentStatus::Stopping)
                 );
-                if !working {
+                if !working
+                    && !self
+                        .host
+                        .moment
+                        .read()
+                        .expect("moment poisoned")
+                        .cancellation_pending
+                {
                     self.set_activity(Activity::Idle);
                     // An error that has taken the turn down takes the compaction
                     // line with it: nothing is waiting on that summary any more.
@@ -6709,8 +7043,10 @@ impl Tui {
         // said line rather than as an event of its own (`CompactionCompletion::
         // Interrupted`), so the stop itself is what takes 正在压缩 down.
         let _ = self.host.stop_compacting();
-        let working = self.host.moment.read().expect("moment poisoned").activity
-            == crate::moment::Activity::Working;
+        let working = {
+            let moment = self.host.moment.read().expect("moment poisoned");
+            moment.activity == crate::moment::Activity::Working || moment.goal_recovering()
+        };
         if working {
             self.host.set_activity(crate::moment::Activity::Stopping);
         }
@@ -6932,7 +7268,46 @@ impl Tui {
 
     /// Apply one action. Returns `true` to quit.
     fn act(&self, action: Action, client: &AgentClient) -> bool {
+        use crate::moment::Activity;
+        let action = if let Action::PageScroll(direction) = action {
+            let m = self.host.moment.read().expect("moment poisoned");
+            let rows = self
+                .host
+                .block_view(self.surface.size(), &m)
+                .map_or(1, |view| view.rect.h.saturating_sub(1).max(1));
+            Action::Scroll(direction.saturating_mul(i32::from(rows)))
+        } else {
+            action
+        };
         let mut m = self.host.moment.write().expect("moment poisoned");
+        // Resolve EOF before editing bookkeeping, so deletion follows exactly the
+        // same selection, history and attachment handling as the Delete key.
+        let action = if action == Action::EndOfInput {
+            if !m.input.is_empty() || !m.attachments.is_empty() {
+                Action::DeleteForward
+            } else {
+                m.disarm_escape();
+                if m.turn_in_flight() || m.stopping || !client.settled() {
+                    m.disarm_quit();
+                    return false;
+                }
+                if m.eof_armed && m.exit_hint_live() {
+                    return true;
+                }
+                m.disarm_quit();
+                m.eof_armed = true;
+                m.notice = Some(
+                    crate::moment::Notice::for_ms(t(Msg::MomentEofAgain), false, m.now, 2000)
+                        .below(),
+                );
+                return false;
+            }
+        } else {
+            action
+        };
+        if m.eof_armed {
+            m.disarm_quit();
+        }
         // Any action other than a repeat Ctrl+C disarms the "press again to quit"
         // latch, and takes the exit hint below the box down with it: an accidental
         // first press followed by real work must never leave the terminal one
@@ -6949,6 +7324,17 @@ impl Tui {
         if !matches!(action, Action::Escape) {
             m.disarm_escape();
         }
+        let deleting = matches!(action, Action::Backspace | Action::DeleteForward);
+        let had_selection = deleting && m.selection.is_some_and(|selection| !selection.is_empty());
+        let selected_input = if deleting && m.stream_selection.is_none() {
+            self.host.field_rect().and_then(|rect| {
+                m.selection.and_then(|selection| {
+                    crate::modules::input::selection_range(&m, rect, selection)
+                })
+            })
+        } else {
+            None
+        };
         // A highlight is a rectangle of screen cells. Anything that repaints
         // those cells with different text leaves it pointing at the wrong
         // words, so it is dropped by everything except the gestures that are
@@ -6959,7 +7345,10 @@ impl Tui {
         // the view does not move it off its words — and keeping it is what lets
         // a person scroll to see the rest of what they picked.
         let kept_by_scroll = m.stream_selection.is_some()
-            && matches!(action, Action::Scroll(_) | Action::ScrollToBottom);
+            && matches!(
+                action,
+                Action::Scroll(_) | Action::PageScroll(_) | Action::ScrollToBottom
+            );
         if !kept_by_scroll
             && !matches!(
                 action,
@@ -6991,6 +7380,7 @@ impl Tui {
             Action::Backspace
             | Action::DeleteForward
             | Action::DeleteWord
+            | Action::DeleteToStart
             | Action::DeleteToEnd => m.completion_held = true,
             Action::Insert(_) | Action::Paste(_) | Action::Submit | Action::Clear => {
                 m.completion_held = false
@@ -7026,6 +7416,10 @@ impl Tui {
             action,
             Action::Insert(_)
                 | Action::Backspace
+                | Action::DeleteForward
+                | Action::DeleteToStart
+                | Action::DeleteToEnd
+                | Action::Clear
                 | Action::DeleteWord
                 | Action::Paste(_)
                 | Action::AttachImage
@@ -7034,7 +7428,19 @@ impl Tui {
         }
         match action {
             Action::Quit => return true,
+            Action::EndOfInput => unreachable!("EOF resolved before editing"),
             Action::Submit => {
+                // Continuation works even when the terminal cannot distinguish
+                // modified Enter keys. Only the slash immediately before the
+                // caret is consumed; text after the caret stays in place.
+                let at = m.caret.min(m.input.len());
+                if m.input[..at].ends_with('\\') {
+                    m.input.replace_range(at - 1..at, "\n");
+                    m.caret = at;
+                    m.history_at = None;
+                    m.suggestion = None;
+                    return false;
+                }
                 // A recap of the last turn landing now would go under this new
                 // prompt.
                 self.drop_recap();
@@ -7150,6 +7556,10 @@ impl Tui {
                     // goes back by turns, and would take this one with it.
                     m.retract = None;
                     m.turn_in_flight()
+                        || matches!(
+                            client.status_of(&client.session()),
+                            Some(AgentStatus::Working | AgentStatus::Stopping)
+                        )
                 };
                 // A picture bound for a text-only model is turned into text by the
                 // VL helper before the turn opens; show `正在识别图片` until the
@@ -7185,6 +7595,20 @@ impl Tui {
                 }
                 if steering {
                     self.host.add_steering(&id, &text);
+                    if self.host.moment.read().expect("moment poisoned").activity == Activity::Idle
+                    {
+                        if let Some(status) = client.status_of(&client.session()) {
+                            match status {
+                                AgentStatus::Working => {
+                                    self.set_activity(Activity::Working);
+                                }
+                                AgentStatus::Stopping => {
+                                    self.set_activity(Activity::Stopping);
+                                }
+                                AgentStatus::Idle => {}
+                            }
+                        }
+                    }
                 }
                 return false;
             }
@@ -7194,7 +7618,10 @@ impl Tui {
                 m.caret = at + c.len_utf8();
             }
             Action::Backspace => {
-                if m.caret > 0 {
+                if let Some(range) = selected_input {
+                    m.caret = range.start;
+                    m.input.replace_range(range, "");
+                } else if !had_selection && m.caret > 0 {
                     // A whole `[Image #N]` deletes as one chip: the caret sitting
                     // just past it (`caret == end`) — or, defensively, inside it —
                     // removes the marker, and since the text no longer mentions it,
@@ -7216,23 +7643,41 @@ impl Tui {
                 }
             }
             Action::DeleteForward => {
-                // The character the caret is ON, which is the one after it in
-                // byte order. Walk to the next boundary rather than assuming
-                // one byte: a `中` is three.
-                let at = m.caret.min(m.input.len());
-                if at < m.input.len() {
-                    let mut end = at + 1;
-                    while end < m.input.len() && !m.input.is_char_boundary(end) {
-                        end += 1;
+                if let Some(range) = selected_input {
+                    m.caret = range.start;
+                    m.input.replace_range(range, "");
+                } else if !had_selection {
+                    // The character the caret is ON, which is the one after it in
+                    // byte order. Walk to the next boundary rather than assuming
+                    // one byte: a `中` is three.
+                    let at = m.caret.min(m.input.len());
+                    if at < m.input.len() {
+                        let mut end = at + 1;
+                        while end < m.input.len() && !m.input.is_char_boundary(end) {
+                            end += 1;
+                        }
+                        m.input.replace_range(at..end, "");
+                        m.caret = at;
                     }
-                    m.input.replace_range(at..end, "");
-                    m.caret = at;
                 }
             }
             Action::DeleteToEnd => {
                 let at = m.caret.min(m.input.len());
-                m.input.truncate(at);
+                let end = m.input[at..].find('\n').map_or(m.input.len(), |n| {
+                    if n == 0 {
+                        at + 1
+                    } else {
+                        at + n
+                    }
+                });
+                m.input.replace_range(at..end, "");
                 m.caret = at;
+            }
+            Action::DeleteToStart => {
+                let at = m.caret.min(m.input.len());
+                let start = m.input[..at].rfind('\n').map_or(0, |n| n + 1);
+                m.input.replace_range(start..at, "");
+                m.caret = start;
             }
             Action::CycleModel { forward } => {
                 drop(m);
@@ -7350,8 +7795,12 @@ impl Tui {
                     m.caret = at;
                 }
             }
-            Action::CaretHome => m.caret = 0,
-            Action::CaretEnd => m.caret = m.input.len(),
+            Action::CaretHome => m.caret = m.input[..m.caret].rfind('\n').map_or(0, |n| n + 1),
+            Action::CaretEnd => {
+                m.caret += m.input[m.caret..]
+                    .find('\n')
+                    .unwrap_or(m.input.len() - m.caret)
+            }
 
             // Inside the text they move the caret; at its edge they hand over
             // to the history. That is what an arrow key does in a shell, and
@@ -7395,10 +7844,15 @@ impl Tui {
                     if first {
                         drop(m);
                         self.ask_for_older_history();
+                        self.refresh_menu();
                         return false;
                     }
                 } else {
                     recall_forward(&mut m);
+                }
+                if !inside {
+                    drop(m);
+                    self.refresh_menu();
                 }
                 return false;
             }
@@ -7607,6 +8061,10 @@ impl Tui {
                 return m.cancel_idle();
             }
             Action::Scroll(by) => {
+                // Manual navigation supersedes a drag's edge timer, even when
+                // a terminal lost the release or the viewport cannot move.
+                // Keep the selection; a fresh drag can arm the timer again.
+                m.edge_scroll = None;
                 crate::scrollbar::touch(&mut m);
                 // Bounded by what is left to read, not by how much there is:
                 // scrolling past the oldest line would empty the region rather
@@ -7616,6 +8074,7 @@ impl Tui {
                 m.scroll = crate::moment::ScrollPos(next.clamp(0, max as i64) as usize);
             }
             Action::ScrollToBottom => {
+                m.edge_scroll = None;
                 crate::scrollbar::touch(&mut m);
                 m.scroll = crate::moment::ScrollPos::BOTTOM;
             }
@@ -7651,6 +8110,13 @@ impl Tui {
                     }
                 }
                 drop(m);
+                let frame = self.host.compose(self.surface.size());
+                let mut m = self.host.moment.write().expect("moment poisoned");
+                if crate::terminal_image::mascot_at(&frame, m.caps.graphics, x, y) {
+                    m.mascot_started = Some(m.now);
+                    return false;
+                }
+                drop(m);
                 // A click on a link opens it. The screen draws links as OSC 8
                 // for the terminal to open, but this screen captures the mouse,
                 // so the click comes here instead and the terminal never sees
@@ -7658,7 +8124,7 @@ impl Tui {
                 // off the frame as painted, so it is the text a person sees at
                 // that cell; asked before the fold, because a URL inside a tool
                 // result is something to open, not a reason to fold the call.
-                if let Some(url) = self.host.compose(self.surface.size()).link_at(x, y) {
+                if let Some(url) = frame.link_at(x, y) {
                     if let Some(url) = link_to_open(&url) {
                         self.open_link(url);
                         return false;
@@ -7729,6 +8195,20 @@ impl Tui {
             // get back — the terminal's own screen has no status row.
             // Those two are not cut to the width: wrapping is the terminal's
             // again out there, so a narrow window wraps them instead.
+            Action::PageScroll(_) => unreachable!("page actions are resolved before locking"),
+            Action::ReadTranscript => {
+                let text = self.host.reading_text(&m);
+                drop(m);
+                let doc = crate::sheet::Doc::new(
+                    "read",
+                    Vec::new(),
+                    vec![crate::sheet::DocTab::plain(text)],
+                );
+                if !self.host.open_sheet(crate::sheet::Sheet::doc(doc)) {
+                    self.host.say(t(Msg::ReadUnavailable).into_owned(), true);
+                }
+                return false;
+            }
             Action::ShowTranscript => {
                 let (w, _) = self.surface.size();
                 let caps = self.surface.caps();
@@ -7826,12 +8306,15 @@ impl Tui {
                 }
                 return false;
             }
-            // `/usage`: the same settings panel, on its Usage page. Refreshed
-            // like `/config` does, so the allowance is asked now rather than
-            // whatever the page last showed.
-            Action::OpenUsage => {
+            // Both commands open the same panel and refresh its current data.
+            Action::OpenStatus | Action::OpenUsage => {
+                let tab = if matches!(action, Action::OpenStatus) {
+                    crate::settings::Tab::Status
+                } else {
+                    crate::settings::Tab::Usage
+                };
                 drop(m);
-                self.host.open_settings_on(crate::settings::Tab::Usage);
+                self.host.open_settings_on(tab);
                 self.refresh_settings();
                 self.fetch_usage();
                 self.fetch_status();
@@ -8028,8 +8511,11 @@ impl Tui {
             Action::SelectTo(x, y) => {
                 if m.stream_selection.is_some() {
                     self.drag_in_conversation(&mut m, x, y, true);
-                } else if let Some(sel) = m.selection.as_mut() {
+                } else if let Some(mut sel) = m.selection {
                     sel.head = (x, y);
+                    m.selection = Some(self.host.field_rect().map_or(sel, |rect| {
+                        crate::modules::input::selection_without_prompt(&m, rect, sel)
+                    }));
                 }
                 return false;
             }
@@ -8044,6 +8530,12 @@ impl Tui {
                 drop(m);
                 let frame = self.host.compose(self.surface.size());
                 if let Some(sel) = frame.word_at(x, y) {
+                    let sel = {
+                        let m = self.host.moment.read().expect("moment poisoned");
+                        self.host.field_rect().map_or(sel, |rect| {
+                            crate::modules::input::selection_without_prompt(&m, rect, sel)
+                        })
+                    };
                     let text = frame.selected_text(&sel);
                     self.host.moment.write().expect("moment poisoned").selection = Some(sel);
                     if !text.is_empty() {
@@ -8058,6 +8550,12 @@ impl Tui {
                 drop(m);
                 let frame = self.host.compose(self.surface.size());
                 if let Some(sel) = frame.line_at(y) {
+                    let sel = {
+                        let m = self.host.moment.read().expect("moment poisoned");
+                        self.host.field_rect().map_or(sel, |rect| {
+                            crate::modules::input::selection_without_prompt(&m, rect, sel)
+                        })
+                    };
                     let text = frame.selected_text(&sel);
                     self.host.moment.write().expect("moment poisoned").selection = Some(sel);
                     if !text.is_empty() {
@@ -8230,6 +8728,36 @@ impl Tui {
                 }
                 return false;
             }
+            Action::ToggleFold("team") | Action::SetFold("team", _) => {
+                m.team_collapsed = match action {
+                    Action::SetFold(_, to) => !matches!(to, crate::host::Showing::Open),
+                    _ => !m.team_collapsed,
+                };
+                if m.team_collapsed {
+                    m.team_keyboard = false;
+                    m.team_cursor = None;
+                }
+                let message = if m.team_collapsed {
+                    Msg::TeamPanelCollapsed
+                } else if !crate::modules::team::running(&m) {
+                    Msg::TeamPanelEmpty
+                } else {
+                    Msg::TeamPanelExpanded
+                };
+                drop(m);
+                self.host.say_for(t(message).into_owned(), false, 5_000);
+                return false;
+            }
+            Action::ToggleFold("todo") => {
+                m.todo_expanded = !m.todo_expanded;
+                m.todo_offset = 0;
+                return false;
+            }
+            Action::SetFold("todo", to) => {
+                m.todo_expanded = matches!(to, crate::host::Showing::Open);
+                m.todo_offset = 0;
+                return false;
+            }
             Action::ToggleFold(kind) => {
                 drop(m);
                 self.host
@@ -8288,9 +8816,6 @@ impl Tui {
     /// one implementation rather than two that agree until one changes.
     fn answer_question(&self, press: crate::surface::KeyPress) -> bool {
         use crate::surface::{Key, Mods};
-        if (press.key, press.mods) == (Key::Char('d'), Mods::CTRL) {
-            return true;
-        }
         if self.panel_mounted() {
             if let Some((id, step)) = self.host.ask_key(press) {
                 self.deliver_answer(id, step);
@@ -8406,20 +8931,92 @@ impl Tui {
     /// menu's cursor survive: this recomputes the items, and the host resets the
     /// cursor to the first of them — the row that was lit a keystroke ago is not
     /// the same command once the list has narrowed.
+    fn mention_rows(&self, cwd: &str, query: &str) -> Vec<crate::menu::Item> {
+        use atomcode_capabilities::session::SessionManager;
+        let kind = *self.mention_kind.lock().expect("mention kind poisoned");
+        let mut rows = Vec::new();
+        if kind != 2 {
+            rows.extend(paths_under(
+                &self.files,
+                cwd,
+                query,
+                self.host.project_dir_name(),
+            ));
+        }
+        if kind == 2 {
+            let mut cache = self
+                .session_references
+                .lock()
+                .expect("session suggestions poisoned");
+            if !cache.loading && cache.checked.is_none_or(|t| t.elapsed().as_secs() >= 5) {
+                if let Some(dirs) = self.host.dirs.get() {
+                    let root = SessionManager::sessions_root(dirs.user());
+                    cache.loading = true;
+                    let shared = self.session_references.clone();
+                    let wake = self.wake.lock().expect("wake poisoned").clone();
+                    std::thread::spawn(move || {
+                        let entries = SessionManager::scan_catalog(&root).entries;
+                        {
+                            let mut held = shared.lock().expect("session suggestions poisoned");
+                            held.entries = entries;
+                            held.checked = Some(std::time::Instant::now());
+                            held.loading = false;
+                        }
+                        if let Some(wake) = wake {
+                            let _ = wake.send(Wake::SessionReferences);
+                        }
+                    });
+                }
+            }
+            let query = query.to_lowercase();
+            let current = self.client.session();
+            let mut candidates: Vec<_> = cache
+                .entries
+                .iter()
+                .filter(|e| {
+                    atomcode_capabilities::session::reference::available(e)
+                        && (e.id != current || e.working_dir != std::path::Path::new(cwd))
+                        && format!("{} {}", e.name, e.working_dir.display())
+                            .to_lowercase()
+                            .contains(&query)
+                })
+                .collect();
+            candidates.sort_by_key(|e| {
+                (
+                    e.working_dir != std::path::Path::new(cwd),
+                    std::cmp::Reverse(e.updated_at_ms),
+                )
+            });
+            for e in candidates {
+                let reference = atomcode_capabilities::session::reference::SessionReference {
+                    bucket: e.project_bucket.clone(),
+                    id: e.id.clone(),
+                };
+                rows.push(
+                    crate::menu::Item::new(reference.spelling(&e.name), e.name.clone())
+                        .about(format!(
+                            "{} · {}",
+                            chrono::DateTime::from_timestamp_millis(e.updated_at_ms)
+                                .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+                                .unwrap_or_default(),
+                            e.working_dir.display()
+                        ))
+                        .sigil("@"),
+                );
+            }
+        }
+        rows
+    }
+
     fn refresh_menu(&self) {
-        // A `Ctrl+R` search owns the composer while it is up: what the field
-        // shows is a query, not a command being typed — a history search for
-        // `/model` must list the lines that said it, not open the command menu
-        // over them. And the search's matches are drawn in the menu's place.
-        let searching = self
-            .host
-            .moment
-            .read()
-            .expect("moment poisoned")
-            .search
-            .is_some();
-        let prefix = if searching { None } else { self.slash_prefix() };
-        let skill = if searching || prefix.is_some() {
+        // Reverse search and history browsing show existing text, not a command
+        // being typed. Their rows own the arrows/Enter until the person edits.
+        let browsing = {
+            let moment = self.host.moment.read().expect("moment poisoned");
+            moment.search.is_some() || moment.history_at.is_some()
+        };
+        let prefix = if browsing { None } else { self.slash_prefix() };
+        let skill = if browsing || prefix.is_some() {
             None
         } else {
             let input = self
@@ -8431,6 +9028,7 @@ impl Tui {
                 .clone();
             skill_prefix(&input).map(str::to_string)
         };
+        let mention_context = prefix.is_none() && skill.is_none();
         let menu = match prefix {
             Some(rest) => {
                 let (matches, option_filter) = match rest.split_once(char::is_whitespace) {
@@ -8545,14 +9143,31 @@ impl Tui {
                 // the middle of a sentence is a mention too. The classic
                 // screen's rule, from the same place.
                 match atomcode_capabilities::file_index::detect_at_mention(&typed, caret) {
-                    Some(token) => {
-                        paths_under(&self.files, &cwd, &token, self.host.project_dir_name())
-                    }
+                    Some(token) => self.mention_rows(&cwd, &token),
                     None => Vec::new(),
                 }
             }
         };
-        self.host.set_menu(menu);
+        let is_mention = {
+            let m = self.host.moment.read().expect("moment poisoned");
+            !browsing
+                && mention_context
+                && atomcode_capabilities::file_index::detect_at_mention(&m.input, m.caret).is_some()
+        };
+        if is_mention {
+            let kind = *self.mention_kind.lock().expect("mention kind poisoned");
+            let tabs = [
+                ("files", t(Msg::MentionFiles)),
+                ("sessions", t(Msg::MentionSessions)),
+            ]
+            .into_iter()
+            .map(|(key, label)| crate::menu::Item::new(format!("@\0mention-filter:{key}"), label))
+            .collect();
+            self.host
+                .set_mention_menu(menu, tabs, usize::from(kind == 2));
+        } else {
+            self.host.set_menu(menu);
+        }
     }
 
     /// Route one key to the slash menu. Returns `true` to quit.
@@ -8570,6 +9185,12 @@ impl Tui {
     fn slash_menu_key(&self, press: crate::surface::KeyPress, client: &AgentClient) -> bool {
         use crate::surface::Key;
         match press.key {
+            Key::Left | Key::Right => {
+                let delta = if press.key == Key::Left { -1 } else { 1 };
+                if let Some(tab) = self.host.menu_adjacent_tab(delta) {
+                    self.complete_path(&tab);
+                }
+            }
             Key::Up => {
                 let _ = self.host.menu_move_by(-1);
             }
@@ -8719,6 +9340,15 @@ impl Tui {
     /// and the menu goes away. Nothing is sent — what is typed around the path
     /// is still the message being written.
     fn complete_path(&self, picked: &str) {
+        if let Some(kind) = picked.strip_prefix("@\0mention-filter:") {
+            *self.mention_kind.lock().expect("mention kind poisoned") = match kind {
+                "files" => 1,
+                "sessions" => 2,
+                _ => 0,
+            };
+            self.refresh_menu();
+            return;
+        }
         put_path(
             &mut self.host.moment.write().expect("moment poisoned"),
             picked,
@@ -8799,7 +9429,7 @@ impl Tui {
     /// text it landed on — offering them there would be a menu whose items
     /// belong to a box that is not under the pointer. So outside the composer
     /// the menu keeps the one thing that is still true of the press: copying
-    /// what is selected. Inside it, the four the composer has.
+    /// what is selected. Inside it, the composer also offers editing and sending.
     ///
     /// The press is answered from the last painted frame (`Host::field_rect`)
     /// rather than from a fresh compose: which rect the field had is what was on
@@ -8827,6 +9457,8 @@ impl Tui {
             vec![
                 copy,
                 crate::menu::Item::new("paste", t(Msg::MenuPaste)).about(t(Msg::MenuPasteAbout)),
+                crate::menu::Item::new("newline", t(Msg::MenuNewline))
+                    .about(t(Msg::MenuNewlineAbout)),
                 crate::menu::Item::new("clear", t(Msg::MenuClear)).about(t(Msg::MenuClearAbout)),
                 crate::menu::Item::new("send", t(Msg::MenuSend)).about(t(Msg::MenuSendAbout)),
             ]
@@ -8965,6 +9597,7 @@ impl Tui {
             }
             "paste" => self.paste_clipboard_text(client),
             "clear" => self.act(Action::Clear, client),
+            "newline" => self.act(Action::Newline, client),
             "send" => self.act(Action::Submit, client),
             _ => false,
         }
@@ -9105,6 +9738,43 @@ impl Tui {
         let host = self.host.clone();
         tokio::spawn(async move {
             let outcome = commands.dispatch(&command, &ctx).await;
+            // A remote reader cannot see the local settings panel. Return its
+            // data as text without opening a modal on the desktop keyboard.
+            let outcome = if matches!(outcome, crate::command::Outcome::Do(Action::OpenStatus)) {
+                let client = ctx.service::<AgentClientSvc>();
+                if let Some(client) = client {
+                    if let Some(control) = client.control() {
+                        let title = host.moment.read().expect("moment poisoned").title.clone();
+                        let session = client.root();
+                        let page = crate::settings::gather_status(
+                            control.clone(),
+                            session.clone(),
+                            client.described(),
+                            title,
+                        )
+                        .await;
+                        let mut text = crate::modules::settings::status_text(&page);
+                        if let Ok(HostReply::Autonomy {
+                            running: Some(running),
+                        }) = control.call(HostCommand::Autonomy { session }).await
+                        {
+                            text.push_str("\n\n");
+                            text.push_str(&t(Msg::StatusAutonomyLine {
+                                what: &running.what,
+                                round: running.round,
+                                took: &crate::text::spoken_duration(running.elapsed_secs),
+                            }));
+                        }
+                        crate::command::Outcome::Said(text)
+                    } else {
+                        crate::command::Outcome::Refused(crate::remote::refusal())
+                    }
+                } else {
+                    crate::command::Outcome::Refused(crate::remote::refusal())
+                }
+            } else {
+                outcome
+            };
             // Back to whoever asked, before `deliver` consumes it. A modal or
             // an action has nothing to send: what they do shows up in the
             // session's own facts, which the far end is already watching.
@@ -9226,6 +9896,13 @@ fn starts_goal_turn(line: &str) -> bool {
     if name != "goal" || args.is_empty() {
         return false;
     }
+    if args == "questions"
+        || args == "report"
+        || args == "recheck"
+        || args.split_whitespace().next() == Some("answer")
+    {
+        return false;
+    }
     !matches!(
         args,
         "stop"
@@ -9285,25 +9962,104 @@ fn deliver(
     }
 }
 
+fn goal_stage_notice(
+    previous: Option<&atomcode_host_api::Running>,
+    current: &atomcode_host_api::Running,
+) -> Option<String> {
+    use atomcode_host_api::GoalStage;
+    if current.kind != "goal" {
+        return None;
+    }
+    let stage = current.goal_stage?;
+    if previous.is_some_and(|old| {
+        old.goal_stage == Some(stage)
+            && (stage != GoalStage::Continuing || old.round == current.round)
+    }) {
+        return None;
+    }
+    Some(match stage {
+        GoalStage::Working => return None,
+        GoalStage::Evaluating => t(Msg::GoalStageEvaluating).into_owned(),
+        GoalStage::Continuing => t(Msg::GoalStageContinuing {
+            detail: current.goal_detail.as_deref().unwrap_or("/goal report"),
+        })
+        .into_owned(),
+        GoalStage::Recovering => t(Msg::GoalStageRecovering).into_owned(),
+        GoalStage::Paused => t(Msg::GoalStagePaused {
+            detail: current.paused.as_deref().unwrap_or("/goal report"),
+        })
+        .into_owned(),
+    })
+}
+
+/// Phase notices are local presentation, never synthetic conversation input.
+fn took_goal_progress(
+    host: &crate::host::Host,
+    session: &str,
+    running: Option<atomcode_host_api::Running>,
+) -> bool {
+    let notice = {
+        let m = host.moment.read().expect("moment poisoned");
+        running
+            .as_ref()
+            .filter(|_| m.viewing == session)
+            .and_then(|current| {
+                goal_stage_notice(m.autonomy_samples.get(session).map(|(old, _)| old), current)
+            })
+    };
+    let changed = took_autonomy(&host.moment, session, running);
+    if let Some(detail) = notice {
+        host.stream
+            .write()
+            .expect("stream poisoned")
+            .writer("commands")
+            .emit(
+                crate::block::Coord::default(),
+                Arc::new(crate::content::NoticeBlock { detail }),
+            );
+        return true;
+    }
+    changed
+}
+
 /// Take the host's word for what a session is doing on its own.
 ///
 /// A separate function because the loop it is called from cannot be reached
 /// from a criterion, and "did the screen keep what the host pushed" is exactly
 /// the thing worth asserting. Returns whether anything moved.
 ///
-/// News about a session nobody is looking at is dropped: a member running a
-/// goal must not overwrite the lead's status line.
+/// Background samples are retained for view restoration, but a member's news
+/// must not overwrite the lead's visible status line.
 pub fn took_autonomy(
     moment: &std::sync::RwLock<crate::moment::Moment>,
     session: &str,
     running: Option<atomcode_host_api::Running>,
 ) -> bool {
     let mut m = moment.write().expect("moment poisoned");
+    // Preserve background samples too: a paused/ended member must not keep
+    // advancing its old clock when the reader returns to it. Identical samples
+    // leave their receipt unchanged so duplicate announcements cannot reset time.
+    let clock_changed = match running.as_ref() {
+        Some(progress)
+            if m.autonomy_samples
+                .get(session)
+                .is_some_and(|(old, _)| old == progress) =>
+        {
+            false
+        }
+        Some(progress) => {
+            let now = m.now;
+            m.autonomy_samples
+                .insert(session.to_owned(), (progress.clone(), now));
+            true
+        }
+        None => m.autonomy_samples.remove(session).is_some(),
+    };
     if m.viewing != session && m.lead != session {
         return false;
     }
     if m.autonomy == running {
-        return false;
+        return clock_changed && m.viewing == session;
     }
     m.autonomy = running;
     true
@@ -9321,17 +10077,39 @@ pub fn took_goal_end(
     session: &str,
     condition: String,
     met: bool,
+    summary: Option<atomcode_host_api::Running>,
 ) -> bool {
-    {
+    let usage = match &summary {
+        Some(summary) => summary.usage.clone(),
+        None => host
+            .moment
+            .read()
+            .expect("moment poisoned")
+            .autonomy_samples
+            .get(session)
+            .and_then(|(running, _)| running.usage.clone()),
+    };
+    let elapsed_ms = {
         let mut m = host.moment.write().expect("moment poisoned");
+        let elapsed_ms = summary
+            .as_ref()
+            .map(|s| s.elapsed_secs.saturating_mul(1000))
+            .or_else(|| m.goal_elapsed_ms(session));
         if m.viewing != session {
             if m.lead == session {
-                m.held_goal_end = Some((session.to_string(), condition, met));
+                m.held_goal_end = Some(crate::moment::HeldGoalEnd {
+                    session: session.to_string(),
+                    condition,
+                    met,
+                    elapsed_ms,
+                    usage,
+                });
             }
             return false;
         }
-    }
-    say_goal_end(host, condition, met);
+        elapsed_ms
+    };
+    say_goal_end(host, condition, met, elapsed_ms, usage);
     true
 }
 
@@ -9341,24 +10119,35 @@ pub fn flush_held_goal_end(host: &crate::host::Host) -> bool {
     let held = {
         let mut m = host.moment.write().expect("moment poisoned");
         match &m.held_goal_end {
-            Some((session, ..)) if *session == m.viewing => m.held_goal_end.take(),
+            Some(end) if end.session == m.viewing => m.held_goal_end.take(),
             _ => None,
         }
     };
     match held {
-        Some((_, condition, met)) => {
-            say_goal_end(host, condition, met);
+        Some(end) => {
+            say_goal_end(host, end.condition, end.met, end.elapsed_ms, end.usage);
             true
         }
         None => false,
     }
 }
 
-fn say_goal_end(host: &crate::host::Host, condition: String, met: bool) {
+fn say_goal_end(
+    host: &crate::host::Host,
+    condition: String,
+    met: bool,
+    elapsed_ms: Option<u64>,
+    usage: Option<atomcode_host_api::TokenTotals>,
+) {
     let mut stream = host.stream.write().expect("stream poisoned");
     stream.writer("commands").emit(
         crate::block::Coord::default(),
-        Arc::new(crate::content::GoalEndedBlock { condition, met }),
+        Arc::new(crate::content::GoalEndedBlock {
+            condition,
+            met,
+            elapsed_ms,
+            usage,
+        }),
     );
 }
 
@@ -9512,6 +10301,7 @@ fn dismisses_suggestion(action: &Action) -> bool {
             | Action::Backspace
             | Action::DeleteForward
             | Action::DeleteWord
+            | Action::DeleteToStart
             | Action::DeleteToEnd
             | Action::Clear
             | Action::CaretLeft
@@ -9590,7 +10380,7 @@ fn recall_back(m: &mut crate::moment::Moment) {
     };
     m.history_at = Some(at);
     m.input = m.history[at].clone();
-    m.caret = m.input.len();
+    m.caret = 0;
 }
 
 /// Forward one entry, and out the far side to the draft that was set aside.
@@ -9601,11 +10391,12 @@ fn recall_forward(m: &mut crate::moment::Moment) {
     if at + 1 < m.history.len() {
         m.history_at = Some(at + 1);
         m.input = m.history[at + 1].clone();
+        m.caret = 0;
     } else {
         m.history_at = None;
         m.input = std::mem::take(&mut m.draft);
+        m.caret = m.input.len();
     }
-    m.caret = m.input.len();
 }
 
 /// 前台替一个后台会话答的那一下没送到时，屏幕上说的那句（设计 §7）。
@@ -9727,10 +10518,54 @@ async fn read_input(
     wake: mpsc::UnboundedSender<Wake>,
     handed_back: impl Fn() -> bool + Send + 'static,
 ) {
+    let events = crate::terminal_modes::input_records(
+        crossterm::event::EventStream::new(),
+        crate::terminal_modes::ensure_input,
+    );
+    pump_terminal_input(events, wake, handed_back).await;
+}
+
+/// Keep read/mode failures visible and stop accepting input after the first one.
+async fn pump_terminal_input<S>(
+    events: S,
+    wake: mpsc::UnboundedSender<Wake>,
+    handed_back: impl Fn() -> bool,
+) where
+    S: futures::Stream<Item = std::io::Result<crossterm::event::Event>>,
+{
     use futures::StreamExt;
-    let events = crossterm::event::EventStream::new().filter_map(|read| async { read.ok() });
+    let errors = wake.clone();
+    let events = events
+        .take_while(move |result| {
+            if let Err(error) = result {
+                let _ = errors.send(Wake::TerminalInputFailed(error.to_string()));
+            }
+            futures::future::ready(result.is_ok())
+        })
+        .filter_map(|result| futures::future::ready(result.ok()));
     futures::pin_mut!(events);
-    pump_input(events, wake, handed_back).await;
+    pump_input(events, wake.clone(), handed_back).await;
+    let _ = wake.send(Wake::Closed);
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn terminal_input_failure_is_reported_and_never_followed_by_more_text() {
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    let (wake, mut received) = mpsc::unbounded_channel();
+    let events = futures::stream::iter(vec![
+        Err(std::io::Error::other("console mode refused")),
+        Ok(Event::Key(KeyEvent::new(
+            KeyCode::Char('#'),
+            KeyModifiers::NONE,
+        ))),
+    ]);
+    pump_terminal_input(events, wake, || false).await;
+    assert!(
+        matches!(received.recv().await, Some(Wake::TerminalInputFailed(message)) if message.contains("console mode refused"))
+    );
+    assert!(matches!(received.recv().await, Some(Wake::Closed)));
+    assert!(received.try_recv().is_err());
 }
 
 /// [`read_input`] over any stream of terminal events.
@@ -9881,6 +10716,7 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
     (
         host.clone(),
         Tui {
+            mcp_read: Mutex::new(None),
             client: Arc::new(AgentClient::default()),
             host,
             keys,
@@ -9893,6 +10729,8 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
             asks_ledger: Mutex::new(crate::ask::Ledger::default()),
             history_asked: Mutex::new(false),
             files: Mutex::new(None),
+            mention_kind: Mutex::new(0),
+            session_references: Arc::new(Mutex::new(SessionSuggestions::default())),
             pressed_at: Mutex::new(None),
             scroll_drag: Mutex::new(None),
             copy_worker: Mutex::new(None),
@@ -10263,7 +11101,10 @@ mod history_tests {
         assert_eq!(m.input, "first");
         recall_back(&mut m);
         assert_eq!(m.input, "first", "the oldest is the end of the road");
-        assert_eq!(m.caret, m.input.len(), "the caret follows to the end");
+        assert_eq!(
+            m.caret, 0,
+            "a recalled entry starts before its first letter"
+        );
     }
 
     #[test]
@@ -10272,9 +11113,11 @@ mod history_tests {
         let mut m = said(&["old"], "half a thought");
         recall_back(&mut m);
         assert_eq!(m.input, "old");
+        assert_eq!(m.caret, 0, "history opens at its start");
         recall_forward(&mut m);
         assert_eq!(m.input, "half a thought", "the draft came back");
         assert_eq!(m.history_at, None, "and we are composing again");
+        assert_eq!(m.caret, m.input.len(), "the draft resumes at its end");
     }
 
     #[test]
@@ -10576,6 +11419,11 @@ mod autonomy_tests {
 
     fn running(round: u32) -> atomcode_host_api::Running {
         atomcode_host_api::Running {
+            usage: None,
+            recovering: false,
+            retry_in_secs: None,
+            goal_stage: None,
+            goal_detail: None,
             kind: "goal".into(),
             what: "测试全绿".into(),
             round,
@@ -10583,6 +11431,61 @@ mod autonomy_tests {
             elapsed_secs: 90,
             paused: None,
         }
+    }
+
+    #[test]
+    fn goal_stage_transitions_are_neutral_deduplicated_and_session_scoped() {
+        use atomcode_host_api::GoalStage;
+        let host = crate::host::Host::new(
+            std::sync::Arc::new(crate::module::Modules::new()),
+            crate::host::default_layout(),
+        );
+        {
+            let mut m = host.moment.write().unwrap();
+            m.lead = "lead".into();
+            m.viewing = "lead".into();
+        }
+        let mut progress = running(0);
+        progress.goal_stage = Some(GoalStage::Working);
+        super::took_goal_progress(&host, "lead", Some(progress.clone()));
+        assert_eq!(host.stream.read().unwrap().len(), 0);
+        progress.recovering = true;
+        progress.goal_stage = Some(GoalStage::Evaluating);
+        super::took_goal_progress(&host, "lead", Some(progress.clone()));
+        assert_eq!(host.stream.read().unwrap().len(), 1);
+        progress.elapsed_secs += 1;
+        super::took_goal_progress(&host, "lead", Some(progress.clone()));
+        assert_eq!(
+            host.stream.read().unwrap().len(),
+            1,
+            "a clock update repeated the stage announcement"
+        );
+        super::took_goal_progress(&host, "member", Some(progress.clone()));
+        assert_eq!(
+            host.stream.read().unwrap().len(),
+            1,
+            "background work polluted the visible transcript"
+        );
+        progress.recovering = false;
+        progress.round = 1;
+        progress.goal_stage = Some(GoalStage::Continuing);
+        progress.goal_detail = Some("coverage needs verification".into());
+        let notice = super::goal_stage_notice(None, &progress).unwrap();
+        assert!(notice.contains("coverage needs verification"));
+        super::took_goal_progress(&host, "lead", Some(progress.clone()));
+        assert_eq!(host.stream.read().unwrap().len(), 2);
+        progress.goal_stage = Some(GoalStage::Recovering);
+        progress.recovering = true;
+        super::took_goal_progress(&host, "lead", Some(progress.clone()));
+        assert_eq!(host.stream.read().unwrap().len(), 3);
+        progress.retry_in_secs = Some(30);
+        super::took_goal_progress(&host, "lead", Some(progress.clone()));
+        assert_eq!(host.stream.read().unwrap().len(), 3);
+        progress.recovering = false;
+        progress.goal_stage = Some(GoalStage::Paused);
+        progress.paused = Some("retry budget exhausted".into());
+        super::took_goal_progress(&host, "lead", Some(progress));
+        assert_eq!(host.stream.read().unwrap().len(), 4);
     }
 
     /// A status line can only move on its own if something pushes to it. The
@@ -10626,9 +11529,15 @@ mod autonomy_tests {
             m.lead = "lead".into();
             m.viewing = "lead".into();
         }
-        assert!(!took_goal_end(&host, "lead~scout", "测试全绿".into(), true));
+        assert!(!took_goal_end(
+            &host,
+            "lead~scout",
+            "测试全绿".into(),
+            true,
+            None
+        ));
         assert_eq!(host.stream.read().unwrap().len(), 0);
-        assert!(took_goal_end(&host, "lead", "测试全绿".into(), true));
+        assert!(took_goal_end(&host, "lead", "测试全绿".into(), true, None));
         {
             let stream = host.stream.read().unwrap();
             assert_eq!(stream.len(), 1);
@@ -10646,7 +11555,21 @@ mod autonomy_tests {
             m.lead = "lead".into();
             m.viewing = "lead~scout".into();
         }
-        assert!(!took_goal_end(&host, "lead", "测试全绿".into(), true));
+        took_autonomy(&host.moment, "lead", Some(running(3)));
+        host.moment.write().unwrap().now = crate::moment::Timestamp::millis(10_000);
+        assert!(!took_goal_end(&host, "lead", "测试全绿".into(), true, None));
+        assert_eq!(
+            host.moment
+                .read()
+                .unwrap()
+                .held_goal_end
+                .as_ref()
+                .unwrap()
+                .elapsed_ms,
+            Some(100_000)
+        );
+        took_autonomy(&host.moment, "lead", None);
+        host.moment.write().unwrap().now = crate::moment::Timestamp::millis(60_000);
         assert_eq!(
             host.stream.read().unwrap().len(),
             0,
@@ -10656,7 +11579,59 @@ mod autonomy_tests {
         host.moment.write().unwrap().viewing = "lead".into();
         assert!(flush_held_goal_end(&host), "said once the lead is back");
         assert_eq!(host.stream.read().unwrap().len(), 1);
+        let stream = host.stream.read().unwrap();
+        let text = stream.slots()[0]
+            .block()
+            .content
+            .lines(&crate::block::RenderCtx::bare(160))
+            .iter()
+            .map(|line| line.plain())
+            .collect::<String>();
+        assert!(
+            text.contains("耗时 1m40s"),
+            "goal end is frozen before returning to its view: {text}"
+        );
+        drop(stream);
         assert!(!flush_held_goal_end(&host), "and only once");
+    }
+
+    #[test]
+    fn goal_end_uses_the_final_runtime_usage_instead_of_a_stale_sample() {
+        let host = crate::host::Host::new(
+            std::sync::Arc::new(crate::module::Modules::new()),
+            crate::host::default_layout(),
+        );
+        {
+            let mut m = host.moment.write().unwrap();
+            m.lead = "lead".into();
+            m.viewing = "lead".into();
+        }
+        took_autonomy(&host.moment, "lead", Some(running(1)));
+        let mut final_state = running(2);
+        final_state.elapsed_secs = 120;
+        final_state.usage = Some(atomcode_host_api::TokenTotals {
+            input: 10_000,
+            output: 500,
+            cached: 7_000,
+        });
+        assert!(took_goal_end(
+            &host,
+            "lead",
+            "finish".into(),
+            true,
+            Some(final_state)
+        ));
+        let stream = host.stream.read().unwrap();
+        let text = stream.slots()[0]
+            .block()
+            .content
+            .lines(&crate::block::RenderCtx::bare(200))
+            .iter()
+            .map(|l| l.plain())
+            .collect::<String>();
+        for part in ["耗时 2m0s", "↑ 10.0K", "↓ 500", "缓存 70.00%"] {
+            assert!(text.contains(part), "{part}: {text}");
+        }
     }
 
     /// A member running a goal must not write on the lead's line.
@@ -11004,7 +11979,7 @@ mod at_menu_tests {
         let found = eventually(&index, &cwd, "applystock", |items| !items.is_empty());
         assert_eq!(
             labels(&found),
-            vec!["@src/http/handler/ApplyStockController.java".to_string()],
+            vec!["src/http/handler/ApplyStockController.java".to_string()],
             "a file several directories down is found by its name alone"
         );
 
@@ -11034,10 +12009,10 @@ mod at_menu_tests {
         let there = second.path().to_string_lossy().into_owned();
 
         let found = eventually(&index, &here, "only", |items| !items.is_empty());
-        assert_eq!(labels(&found), vec!["@only-here.rs".to_string()]);
+        assert_eq!(labels(&found), vec!["only-here.rs".to_string()]);
 
         let moved = eventually(&index, &there, "over", |items| !items.is_empty());
-        assert_eq!(labels(&moved), vec!["@over-there.rs".to_string()]);
+        assert_eq!(labels(&moved), vec!["over-there.rs".to_string()]);
         assert!(
             labels(&paths_under(&index, &there, "only", ".ours")).is_empty(),
             "the directory that was left behind is no longer offered"
@@ -11216,6 +12191,55 @@ mod mcp_panel_tests {
         m.mcp_panel.as_ref().and_then(|panel| panel.note.clone())
     }
 
+    struct FailedReconnect;
+    #[async_trait]
+    impl crate::mcp::Mcp for FailedReconnect {
+        async fn list(&self) -> Result<crate::mcp::McpView, String> {
+            Ok(crate::mcp::McpView::new(vec![named(
+                "figma",
+                crate::mcp::McpState::Failed("dial failed".into()),
+            )]))
+        }
+        async fn detail(&self, name: &str) -> Result<crate::mcp::McpDetail, String> {
+            let mut page = page_of(name);
+            page.state = crate::mcp::McpState::Failed("dial failed".into());
+            page.tool_count = 0;
+            Ok(page)
+        }
+        async fn act(
+            &self,
+            _: &str,
+            action: crate::mcp::Action,
+        ) -> Result<crate::mcp::McpView, String> {
+            assert_eq!(action, crate::mcp::Action::Reconnect);
+            Err("dial failed".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_reconnect_refreshes_the_detail_and_preserves_the_error() {
+        let (host, tui, mut woken) = screen();
+        with_port_of(&tui, Arc::new(FailedReconnect));
+        tui.act(Action::ToggleMcp, &tui.client);
+        landed(&mut woken).await;
+        tui.run_mcp_key(KeyPress::plain(Key::Enter));
+        landed(&mut woken).await;
+        // Model the previously connected page; Reconnect is its first action.
+        let mut page = page_of("figma");
+        page.state = crate::mcp::McpState::Connected;
+        host.mcp_detail(page);
+        tui.run_mcp_key(KeyPress::plain(Key::Enter));
+        landed(&mut woken).await;
+        let moment = host.moment.read().unwrap();
+        let detail = moment.mcp.detail_for(Some("figma")).unwrap();
+        assert!(matches!(detail.state, crate::mcp::McpState::Failed(_)));
+        assert_eq!(detail.tool_count, 0);
+        assert_eq!(
+            moment.mcp_panel.as_ref().unwrap().note.as_deref(),
+            Some("dial failed")
+        );
+    }
+
     /// A port whose sign-in waits until it is cancelled, and counts the cancels.
     struct SlowSignIn {
         cancels: Arc<std::sync::atomic::AtomicUsize>,
@@ -11293,6 +12317,100 @@ mod mcp_panel_tests {
         );
     }
 
+    struct HangingMcp;
+    #[async_trait]
+    impl crate::mcp::Mcp for HangingMcp {
+        async fn list(&self) -> Result<crate::mcp::McpView, String> {
+            std::future::pending().await
+        }
+        async fn detail(&self, _: &str) -> Result<crate::mcp::McpDetail, String> {
+            unreachable!()
+        }
+        async fn act(&self, _: &str, _: crate::mcp::Action) -> Result<crate::mcp::McpView, String> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn mcp_read_timeout_releases_the_pending_read_for_a_retry() {
+        let (host, tui, mut woken) = screen();
+        with_port_of(&tui, Arc::new(HangingMcp));
+        tui.act(Action::ToggleMcp, &tui.client);
+        tokio::task::yield_now().await;
+        assert!(
+            host.moment
+                .read()
+                .unwrap()
+                .mcp_panel
+                .as_ref()
+                .unwrap()
+                .pending
+        );
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        landed(&mut woken).await;
+        assert!(
+            !host
+                .moment
+                .read()
+                .unwrap()
+                .mcp_panel
+                .as_ref()
+                .unwrap()
+                .pending
+        );
+        assert!(note(&host).is_some());
+        with_port(&tui);
+        tui.refresh_mcp();
+        landed(&mut woken).await;
+        assert_eq!(host.moment.read().unwrap().mcp.rows().len(), 1);
+    }
+
+    struct SettlingMcp(std::sync::atomic::AtomicUsize);
+    #[async_trait]
+    impl crate::mcp::Mcp for SettlingMcp {
+        async fn list(&self) -> Result<crate::mcp::McpView, String> {
+            let call = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::mcp::McpView::new(vec![server(if call == 0 {
+                crate::mcp::McpState::Connecting
+            } else {
+                crate::mcp::McpState::Connected
+            })]))
+        }
+        async fn detail(&self, name: &str) -> Result<crate::mcp::McpDetail, String> {
+            Ok(page_of(name))
+        }
+        async fn act(&self, _: &str, _: crate::mcp::Action) -> Result<crate::mcp::McpView, String> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn an_open_mcp_panel_refreshes_unsettled_rows_and_stops_when_settled() {
+        let (host, tui, mut woken) = screen();
+        let port = Arc::new(SettlingMcp(std::sync::atomic::AtomicUsize::new(0)));
+        with_port_of(&tui, port.clone());
+        tui.act(Action::ToggleMcp, &tui.client);
+        landed(&mut woken).await;
+        assert!(host.mcp_needs_poll());
+        host.moment.write().unwrap().now = crate::moment::Timestamp::millis(999);
+        tui.refresh_mcp_request(false);
+        assert_eq!(port.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        host.moment.write().unwrap().now = crate::moment::Timestamp::millis(1_000);
+        tui.refresh_mcp_request(false);
+        landed(&mut woken).await;
+        assert_eq!(
+            host.moment.read().unwrap().mcp.rows()[0].state,
+            crate::mcp::McpState::Connected
+        );
+        assert!(!host.mcp_needs_poll());
+        host.moment.write().unwrap().now = crate::moment::Timestamp::millis(2_000);
+        tui.refresh_mcp_request(false);
+        assert_eq!(port.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+        host.toggle_mcp();
+        tui.refresh_mcp_request(false);
+        assert_eq!(port.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
     /// The command half is in `commands.rs` — it can only ask. This is the half
     /// that says the panel really rose, and on the directory the port answered.
     #[tokio::test]
@@ -11315,7 +12433,7 @@ mod mcp_panel_tests {
     }
 
     /// `Enter` on a server asks the port for its page, and the page is hung on
-    /// the rows the panel already has — the list is not asked for again.
+    /// the freshly read rows, keeping list and detail on the same refresh.
     #[tokio::test]
     async fn drilling_into_a_server_puts_its_detail_on_the_panel() {
         let (host, tui, mut woken) = screen();
@@ -11500,11 +12618,121 @@ mod paste_burst_tests {
         seen
     }
 
+    /// Zero-gap scripts check event ordering, not a wall-clock threshold.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn chinese_first_character_can_be_erased_after_burst_with_shift_and_repeat() {
+        use crossterm::event::KeyEventKind;
+        for (code, mods, kind) in [
+            (KeyCode::Backspace, KeyModifiers::NONE, KeyEventKind::Press),
+            (KeyCode::Backspace, KeyModifiers::SHIFT, KeyEventKind::Press),
+            (KeyCode::Backspace, KeyModifiers::NONE, KeyEventKind::Repeat),
+            (
+                KeyCode::Backspace,
+                KeyModifiers::SHIFT,
+                KeyEventKind::Repeat,
+            ),
+            (
+                KeyCode::Char('h'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Repeat,
+            ),
+        ] {
+            let mut erase = KeyEvent::new(code, mods);
+            erase.kind = kind;
+            let mut release = KeyEvent::new(KeyCode::Char('中'), KeyModifiers::NONE);
+            release.kind = KeyEventKind::Release;
+            let seen = pumped(vec![
+                (0, press('中')),
+                (0, Event::Key(release)),
+                (0, press('文')),
+                (0, Event::Key(erase)),
+                (0, Event::Key(erase)),
+                (0, Event::Key(erase)),
+                (0, press('字')),
+            ])
+            .await;
+            assert_eq!(seen.len(), 6, "{erase:?}: {seen:?}");
+            let (host, tui) = assemble(Headless::new(60, 24));
+            let keys = Keys::new();
+            keys.add(&crate::keymap::Default_).unwrap();
+            for (input, expected) in seen.into_iter().zip(["中", "中文", "中", "", "", "字"]) {
+                let Input::Key(press) = input else {
+                    panic!("typing became a paste")
+                };
+                let action = keys.resolve(press).expect("editing key must be bound");
+                assert!(!tui.act(action, &tui.client));
+                let m = host.moment.read().unwrap();
+                assert_eq!(m.input, expected, "{erase:?}");
+                assert_eq!(m.caret, expected.len());
+                assert!(!m.pending_working);
+                assert!(!m.turn_open);
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn buffered_chinese_paste_precedes_backspace_and_repeat_across_newline() {
+        use crossterm::event::KeyEventKind;
+        let text = "中文\n后文";
+        let erase = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+        let mut repeated = erase;
+        repeated.kind = KeyEventKind::Repeat;
+        let mut script: Vec<_> = text
+            .chars()
+            .map(|c| (0, if c == '\n' { enter() } else { press(c) }))
+            .collect();
+        script.push((0, Event::Key(erase)));
+        script.extend((0..4).map(|_| (0, Event::Key(repeated))));
+        let seen = pumped(script).await;
+        assert_eq!(seen.first(), Some(&Input::Paste(text.into())));
+        assert_eq!(seen.len(), 6);
+        let (host, tui) = assemble(Headless::new(60, 24));
+        let keys = Keys::new();
+        keys.add(&crate::keymap::Default_).unwrap();
+        for (input, expected) in
+            seen.into_iter()
+                .zip([text, "中文\n后", "中文\n", "中文", "中", ""])
+        {
+            let action = match input {
+                Input::Paste(text) => Action::Paste(text),
+                Input::Key(press) => keys.resolve(press).expect("erase key"),
+                other => panic!("unexpected input {other:?}"),
+            };
+            tui.act(action, &tui.client);
+            let m = host.moment.read().unwrap();
+            assert_eq!(m.input, expected);
+            assert_eq!(m.caret, expected.len());
+            assert!(!m.pending_working);
+        }
+    }
+
     fn arrow(up: bool) -> Event {
         Event::Key(KeyEvent::new(
             if up { KeyCode::Up } else { KeyCode::Down },
             KeyModifiers::NONE,
         ))
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn editing_arrow_repeats_keep_the_pointer_handoff_routing() {
+        use crossterm::event::KeyEventKind;
+        let Event::Key(mut repeated) = arrow(true) else {
+            unreachable!()
+        };
+        repeated.kind = KeyEventKind::Repeat;
+        let script = vec![
+            (0, arrow(true)),
+            (0, Event::Key(repeated)),
+            (0, Event::Key(repeated)),
+        ];
+        assert_eq!(
+            pumped_with(script.clone(), false).await,
+            vec![Input::Key(KeyPress::plain(Key::Up)); 3]
+        );
+        assert_eq!(
+            pumped_with(script, true).await,
+            vec![Input::ArrowBurst { up: true, n: 3 }]
+        );
     }
 
     /// **The wheel, turned into arrows by the terminal.** With the pointer
@@ -12591,6 +13819,28 @@ mod midturn_command_tests {
     }
 
     #[test]
+    fn failed_runtime_terminal_is_red_without_a_committed_fact() {
+        use crate::text::Light;
+        use atomcode_kernel::event::StopReason;
+        let (host, tui, _) = screen();
+        assert!(tui.on_event(AgentEvent::TurnComplete {
+            provider_failure: None,
+            turn: Some(1),
+            reason: StopReason::ProviderError,
+        }));
+        assert_eq!(host.light(), Some(Light::Failed));
+        assert!(tui.on_event(AgentEvent::TurnComplete {
+            provider_failure: None,
+            turn: Some(2),
+            reason: StopReason::Stopped,
+        }));
+        assert_eq!(host.light(), Some(Light::Idle));
+        host.moment.write().unwrap().last_turn_stop = Some(StopReason::Timeout);
+        tui.on_event(AgentEvent::TurnStarted { turn: Some(3) });
+        assert_eq!(host.light(), Some(Light::Busy));
+    }
+
+    #[test]
     fn memory_reply_opens_a_scrollable_document_with_the_complete_workflow() {
         let (host, tui, _) = screen();
         host.modules
@@ -12655,6 +13905,48 @@ mod midturn_command_tests {
     }
 
     #[test]
+    fn goal_start_acknowledgement_does_not_precede_the_user_message_in_transcript() {
+        for locale in [crate::i18n::Locale::En, crate::i18n::Locale::ZhCn] {
+            let (host, tui, _) = screen();
+            let before = kinds(&host);
+            let output =
+                crate::i18n::product::t_with(locale, crate::i18n::product::Msg::GoalStarted)
+                    .into_owned();
+            assert!(tui.on_event(AgentEvent::Invoked {
+                id: "goal-start".into(),
+                output: output.clone(),
+                queued: false,
+                failed: Some(false)
+            }));
+            assert_eq!(kinds(&host), before);
+            assert_eq!(
+                host.moment.read().unwrap().notice.as_ref().unwrap().text,
+                output
+            );
+        }
+    }
+
+    #[test]
+    fn tool_scan_progress_is_visible_without_adding_transcript_rows() {
+        let (host, tui, _) = screen();
+        let before = kinds(&host);
+        assert!(tui.on_event(AgentEvent::ToolProgress {
+            call_id: "search-1".into(),
+            message: "Searching: 1000 entries visited".into()
+        }));
+        assert_eq!(kinds(&host), before);
+        assert!(host
+            .moment
+            .read()
+            .unwrap()
+            .notice
+            .as_ref()
+            .unwrap()
+            .text
+            .contains("1000"));
+    }
+
+    #[test]
     fn stream_continuation_progress_is_visible_on_the_tip_row() {
         let (host, tui, _) = screen();
         assert!(tui.on_event(AgentEvent::StreamRecovery {
@@ -12671,6 +13963,38 @@ mod midturn_command_tests {
             .unwrap()
             .text
             .contains("1/1"));
+    }
+
+    #[test]
+    fn a_refused_queued_send_returns_its_own_text_and_keeps_other_sends() {
+        let (host, tui, _) = screen();
+        host.add_steering("first", "first message");
+        host.add_steering("second", "second message");
+        host.moment.write().unwrap().last_sent = Some("second message".into());
+        tui.on_event(AgentEvent::Rejected {
+            command: "first".into(),
+            error: atomcode_kernel::event::CommandError::Busy {
+                reason: "closing".into(),
+            },
+        });
+        let moment = host.moment.read().unwrap();
+        assert_eq!(moment.input, "first message");
+        assert_eq!(moment.steering, "second message");
+        assert_eq!(moment.queued.len(), 1);
+        assert_eq!(moment.queued[0].id, "second");
+        drop(moment);
+        // A newer draft must never be overwritten by another refusal.
+        host.moment.write().unwrap().input = "new draft".into();
+        tui.on_event(AgentEvent::Rejected {
+            command: "second".into(),
+            error: atomcode_kernel::event::CommandError::Busy {
+                reason: "closing".into(),
+            },
+        });
+        let moment = host.moment.read().unwrap();
+        assert_eq!(moment.input, "new draft");
+        assert!(moment.queued.is_empty());
+        assert!(moment.steering.is_empty());
     }
 
     #[test]
@@ -12811,6 +14135,11 @@ mod midturn_command_tests {
             "/goal pause",
             "/goal stop",
             "/goal help",
+            "/goal questions",
+            "/goal answer 900 B",
+            "/goal answer\t900 B",
+            "/goal report",
+            "/goal recheck",
             "/loop ship it",
         ] {
             assert!(!starts_goal_turn(command), "misclassified {command:?}");
@@ -12901,8 +14230,259 @@ mod paste_habit_tests {
         (host, tui)
     }
 
+    #[test]
+    fn status_and_usage_open_their_tabs_without_toggling_the_panel_closed() {
+        let (host, tui) = screen();
+        for (action, tab) in [
+            (Action::OpenStatus, crate::settings::Tab::Status),
+            (Action::OpenStatus, crate::settings::Tab::Status),
+            (Action::OpenUsage, crate::settings::Tab::Usage),
+            (Action::OpenStatus, crate::settings::Tab::Status),
+        ] {
+            tui.act(action, &tui.client);
+            let m = host.moment.read().unwrap();
+            assert_eq!(m.settings_panel.as_ref().unwrap().tab, tab);
+        }
+    }
+
     fn typed(host: &Host) -> String {
         host.moment.read().expect("moment poisoned").input.clone()
+    }
+
+    #[test]
+    fn clicking_the_mascot_starts_and_restarts_only_image_playback() {
+        let (host, tui) = screen();
+        host.modules
+            .add_producer(crate::modules::transcript::Transcript::new())
+            .unwrap();
+        host.stream.write().unwrap().writer("welcome").emit(
+            crate::block::Coord::default(),
+            Arc::new(crate::content::WelcomeBlock {
+                cwd: "project".into(),
+                model: None,
+                version: "test",
+                heading: "Tips".into(),
+                tips: Vec::new(),
+                brand: Arc::new(crate::content::Brand::default()),
+                note: None,
+            }),
+        );
+        {
+            let mut m = host.moment.write().unwrap();
+            m.caps.graphics = crate::caps::Graphics::ITerm2;
+            m.now = Timestamp::millis(1000);
+            m.input = "keep draft".into();
+            m.caret = m.input.len();
+        }
+        let scene = host.compose((60, 24));
+        let rect = crate::terminal_image::visible(&scene).unwrap().rect;
+        tui.act(Action::ClickAt(rect.x + 1, rect.y + 1), &tui.client);
+        assert_eq!(
+            host.moment.read().unwrap().mascot_started,
+            Some(Timestamp::millis(1000))
+        );
+        assert_eq!(
+            crate::terminal_image::visible(&host.compose((60, 24)))
+                .unwrap()
+                .png,
+            crate::terminal_image::MASCOT_WAIT_PNG
+        );
+        host.moment.write().unwrap().now = Timestamp::millis(1800);
+        assert_eq!(
+            crate::terminal_image::visible(&host.compose((60, 24)))
+                .unwrap()
+                .png,
+            crate::terminal_image::MASCOT_GO_PNG
+        );
+        tui.act(Action::ClickAt(rect.x + 1, rect.y + 1), &tui.client);
+        assert_eq!(
+            host.moment.read().unwrap().mascot_started,
+            Some(Timestamp::millis(1800))
+        );
+        assert_eq!(host.moment.read().unwrap().input, "keep draft");
+        {
+            let mut m = host.moment.write().unwrap();
+            m.caps.graphics = crate::caps::Graphics::None;
+            m.mascot_started = None;
+        }
+        host.compose((60, 24));
+        tui.act(Action::ClickAt(rect.x + 1, rect.y + 1), &tui.client);
+        assert!(
+            host.moment.read().unwrap().mascot_started.is_none(),
+            "pixel mascot stays static"
+        );
+        host.moment.write().unwrap().mascot_started = Some(Timestamp::millis(1800));
+        host.switch_view();
+        assert!(host.moment.read().unwrap().mascot_started.is_none());
+    }
+
+    #[test]
+    fn dragging_from_the_composer_stays_inside_it() {
+        for key in [Action::Backspace, Action::DeleteForward] {
+            let (host, tui) = screen();
+            {
+                let mut m = host.moment.write().unwrap();
+                m.input = "111英文 README：保留 AtomCode".into();
+                m.caret = m.input.len();
+            }
+            host.compose((60, 24));
+            let rect = host.field_rect().unwrap();
+            tui.act(Action::SelectFrom(rect.x + 5, rect.y + 1), &tui.client);
+            tui.act(Action::SelectTo(59, rect.bottom()), &tui.client);
+            let selection = host.moment.read().unwrap().selection.unwrap();
+            assert_eq!(selection.head.1, rect.y + 1);
+            tui.act(key, &tui.client);
+            assert_eq!(host.moment.read().unwrap().input, "111");
+        }
+    }
+
+    #[test]
+    fn composer_line_selection_excludes_the_prompt() {
+        for text in ["alpha 中文 beta", "x"] {
+            let (host, tui) = screen();
+            {
+                let mut m = host.moment.write().unwrap();
+                m.input = text.into();
+                m.caret = text.len();
+            }
+            host.compose((60, 24));
+            let rect = host.field_rect().expect("composer");
+            tui.act(Action::SelectLine(rect.x, rect.y + 1), &tui.client);
+            let selection = host.moment.read().unwrap().selection.expect("selection");
+            assert!(selection.anchor.0 >= rect.x + 2);
+            assert!(selection.head.0 >= rect.x + 2);
+            assert_eq!(host.compose((60, 24)).selected_text(&selection), text);
+            tui.act(Action::Backspace, &tui.client);
+            assert!(host.moment.read().unwrap().input.is_empty());
+        }
+    }
+
+    #[test]
+    fn backspace_erases_the_first_chinese_character_on_a_wrapped_visual_row() {
+        let (host, tui) = screen();
+        let text = "中文".repeat(45);
+        for c in text.chars() {
+            tui.act(Action::Insert(c), &tui.client);
+        }
+        host.compose((60, 24));
+        let width = host.field_rect().unwrap().w;
+        let start = text
+            .char_indices()
+            .find(|(at, _)| crate::modules::input::caret_row(&text, *at, width).0 == 1)
+            .unwrap()
+            .0;
+        assert!(start > 0);
+        let end = start + text[start..].chars().next().unwrap().len_utf8();
+        tui.act(Action::CaretHome, &tui.client);
+        for _ in text[..end].chars() {
+            tui.act(Action::CaretRight, &tui.client);
+        }
+        assert_eq!(host.moment.read().unwrap().caret, end);
+        tui.act(Action::Backspace, &tui.client);
+        let mut expected = text.clone();
+        expected.replace_range(start..end, "");
+        let m = host.moment.read().unwrap();
+        assert_eq!(m.input, expected);
+        assert_eq!(m.caret, start);
+    }
+
+    #[test]
+    fn reading_and_paging_preserve_the_draft_and_live_scroll() {
+        let (host, tui) = screen();
+        host.modules
+            .add_view(Arc::new(crate::module::Mounted::<
+                crate::modules::sheet::SheetView,
+            >::new()))
+            .unwrap();
+        host.modules
+            .add_producer(crate::modules::transcript::Transcript::new())
+            .unwrap();
+        host.absorb(&atomcode_kernel::session::SessionEvent::AssistantMessage {
+            turn: 1,
+            round: 0,
+            text: (0..200)
+                .map(|i| format!("READ-LINE-{i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            reasoning: String::new(),
+            tool_calls: Vec::new(),
+            reasoning_blocks: Vec::new(),
+            meta: None,
+        });
+        {
+            let mut m = host.moment.write().unwrap();
+            m.input = "草稿保留".into();
+            m.caret = 3;
+        }
+        host.compose((60, 24));
+        let expected = {
+            let m = host.moment.read().unwrap();
+            host.block_view((60, 24), &m)
+                .unwrap()
+                .rect
+                .h
+                .saturating_sub(1)
+                .max(1) as usize
+        };
+        tui.act(Action::PageScroll(-1), &tui.client);
+        assert_eq!(host.moment.read().unwrap().scroll.0, expected);
+        tui.act(Action::ReadTranscript, &tui.client);
+        let frame = host.compose((60, 24));
+        assert!(frame.part("sheet").is_some());
+        assert!(host.sheet_open());
+        host.sheet_key(crate::surface::KeyPress::plain(crate::surface::Key::End));
+        let end = host.compose((60, 24));
+        assert!(end.rows().join("\n").contains("READ-LINE-199"));
+        host.sheet_key(crate::surface::KeyPress::plain(crate::surface::Key::Esc));
+        let m = host.moment.read().unwrap();
+        assert!(m.sheet.is_none());
+        assert_eq!(m.input, "草稿保留");
+        assert_eq!(m.caret, 3);
+        assert_eq!(m.scroll.0, expected);
+    }
+
+    #[test]
+    fn backslash_enter_continues_at_the_caret_without_sending() {
+        for (text, caret, expected) in [
+            ("hello\\", 6, "hello\n"),
+            ("中文\\后文", 7, "中文\n后文"),
+            ("\\", 1, "\n"),
+            ("hello\\\\", 7, "hello\\\n"),
+        ] {
+            let (host, tui) = screen();
+            {
+                let mut m = host.moment.write().unwrap();
+                m.input = text.into();
+                m.caret = caret;
+            }
+            assert!(!tui.act(Action::Submit, &tui.client));
+            let m = host.moment.read().unwrap();
+            assert_eq!(m.input, expected);
+            assert_eq!(m.caret, caret);
+            assert!(!m.turn_open);
+        }
+    }
+
+    #[test]
+    fn the_composer_menu_inserts_a_newline_at_the_caret() {
+        let (host, tui) = screen();
+        {
+            let mut m = host.moment.write().unwrap();
+            m.input = "前后".into();
+            m.caret = "前".len();
+        }
+        host.compose((60, 24));
+        let field = host.field_rect().unwrap();
+        tui.open_composer_menu(field.x, field.y);
+        let frame = host.compose((60, 24));
+        let menu = frame.part("context-menu").unwrap();
+        assert!(menu
+            .lines
+            .iter()
+            .any(|line| line.plain().contains(&*t(Msg::MenuNewline))));
+        assert!(!tui.run_menu_item("newline", &tui.client));
+        assert_eq!(typed(&host), "前\n后");
+        assert_eq!(host.moment.read().unwrap().caret, "前\n".len());
     }
 
     #[test]
@@ -13091,6 +14671,105 @@ mod skills_menu_tests {
     }
 
     #[test]
+    fn eof_deletes_unicode_and_does_not_exit_at_draft_end() {
+        let (host, tui) = screen();
+        type_line(&host, "甲乙\n丙");
+        host.moment.write().unwrap().caret = 0;
+        assert!(!tui.act(Action::EndOfInput, &tui.client));
+        assert_eq!(host.moment.read().unwrap().input, "乙\n丙");
+        host.moment.write().unwrap().caret = "乙\n丙".len();
+        for _ in 0..3 {
+            assert!(!tui.act(Action::EndOfInput, &tui.client));
+        }
+        assert_eq!(host.moment.read().unwrap().input, "乙\n丙");
+    }
+
+    #[test]
+    fn eof_requires_its_own_second_press_and_editing_disarms_it() {
+        let (_host, tui) = screen();
+        assert!(!tui.act(Action::EndOfInput, &tui.client));
+        assert!(tui.act(Action::EndOfInput, &tui.client));
+        tui.act(Action::Insert('x'), &tui.client);
+        tui.act(Action::Backspace, &tui.client);
+        assert!(!tui.act(Action::EndOfInput, &tui.client));
+        assert!(!tui.act(Action::Cancel, &tui.client));
+        assert!(!tui.act(Action::EndOfInput, &tui.client));
+    }
+
+    #[test]
+    fn eof_confirmation_expires_and_attachments_protect_the_draft() {
+        let (host, tui) = screen();
+        assert!(!tui.act(Action::EndOfInput, &tui.client));
+        host.moment.write().unwrap().now = Timestamp::millis(3000);
+        assert!(!tui.act(Action::EndOfInput, &tui.client));
+        {
+            let mut m = host.moment.write().unwrap();
+            m.attachments.add(atomcode_kernel::message::ImageContent {
+                media_type: "image/png".into(),
+                data: "test".into(),
+            });
+        }
+        for _ in 0..3 {
+            assert!(!tui.act(Action::EndOfInput, &tui.client));
+        }
+        assert!(!host.moment.read().unwrap().eof_armed);
+    }
+
+    #[test]
+    fn eof_does_not_exit_while_running_or_answering() {
+        let (host, tui) = screen();
+        host.moment.write().unwrap().stopping = true;
+        for _ in 0..3 {
+            assert!(!tui.act(Action::EndOfInput, &tui.client));
+        }
+        assert!(!tui.answer_question(crate::surface::KeyPress::ctrl('d')));
+        assert!(!tui.team_key(crate::surface::KeyPress::ctrl('d')));
+    }
+
+    #[test]
+    fn emacs_line_editing_keeps_other_lines() {
+        let (host, tui) = screen();
+        type_line(&host, "first\n甲乙\nlast");
+        host.moment.write().unwrap().caret = "first\n甲".len();
+        tui.act(Action::CaretHome, &tui.client);
+        assert_eq!(host.moment.read().unwrap().caret, 6);
+        tui.act(Action::CaretEnd, &tui.client);
+        assert_eq!(host.moment.read().unwrap().caret, "first\n甲乙".len());
+        tui.act(Action::DeleteToStart, &tui.client);
+        assert_eq!(host.moment.read().unwrap().input, "first\n\nlast");
+        tui.act(Action::DeleteToEnd, &tui.client);
+        assert_eq!(host.moment.read().unwrap().input, "first\nlast");
+    }
+
+    #[test]
+    fn all_deletion_actions_leave_history_browsing() {
+        for action in [Action::DeleteForward, Action::DeleteToEnd, Action::Clear] {
+            let (host, tui) = screen();
+            type_line(&host, "/skills");
+            host.moment.write().unwrap().history_at = Some(0);
+            tui.act(action, &tui.client);
+            assert_eq!(host.moment.read().unwrap().history_at, None);
+        }
+    }
+
+    #[test]
+    fn vertical_history_recall_clears_a_previous_completion_menu() {
+        let (host, tui) = screen();
+        type_line(&host, "/skills ");
+        tui.refresh_menu();
+        assert!(host.menu_selected().is_some());
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.history = vec!["/init".into(), "/skills ".into()];
+            moment.history_at = Some(1);
+            moment.caret = 0;
+        }
+        tui.act(Action::CaretUp, &tui.client);
+        assert_eq!(host.moment.read().unwrap().input, "/init");
+        assert!(host.menu_selected().is_none());
+    }
+
+    #[test]
     fn skills_filters_in_a_second_level_menu() {
         let (host, tui) = screen();
         type_line(&host, "/skills ");
@@ -13251,6 +14930,68 @@ mod conversation_mouse_tests {
         assert!(matches!(two,Wake::Copied {message,..} if message=="second copied"));
     }
     #[test]
+    fn manual_scrolling_stops_an_unreleased_edge_drag_but_keeps_the_selection() {
+        for action in [
+            Action::Scroll(-1),
+            Action::Scroll(1),
+            Action::Scroll(0),
+            Action::PageScroll(-1),
+            Action::PageScroll(1),
+            Action::ScrollToBottom,
+        ] {
+            let (host, tui) = assemble(crate::surface::Headless::new(80, 24));
+            host.modules
+                .add_producer(crate::modules::transcript::Transcript::new())
+                .unwrap();
+            host.absorb(&atomcode_kernel::session::SessionEvent::AssistantMessage {
+                turn: 1,
+                round: 0,
+                text: (0..200)
+                    .map(|i| format!("line {i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                reasoning: String::new(),
+                tool_calls: Vec::new(),
+                reasoning_blocks: Vec::new(),
+                meta: None,
+            });
+            host.moment.write().unwrap().scroll = crate::moment::ScrollPos(20);
+            host.compose((80, 24));
+            let rect = {
+                let m = host.moment.read().unwrap();
+                host.block_view((80, 24), &m).unwrap().rect
+            };
+            tui.act(Action::SelectFrom(rect.x + 2, rect.y + 2), &tui.client);
+            tui.act(Action::SelectTo(rect.x + 2, rect.y), &tui.client);
+            let selected = {
+                let m = host.moment.read().unwrap();
+                assert!(
+                    m.edge_scroll.is_some(),
+                    "dragging at the edge arms automatic scrolling"
+                );
+                m.stream_selection
+            };
+            // No release arrives. The wheel / page key still takes precedence.
+            tui.act(action.clone(), &tui.client);
+            {
+                let m = host.moment.read().unwrap();
+                assert!(
+                    m.edge_scroll.is_none(),
+                    "{action:?} must stop the edge timer"
+                );
+                assert_eq!(
+                    m.stream_selection, selected,
+                    "{action:?} keeps the selected text"
+                );
+                assert!(m.selection.is_some());
+            }
+            // A fresh real drag can resume edge scrolling.
+            tui.act(Action::SelectTo(rect.x + 2, rect.y), &tui.client);
+            assert!(host.moment.read().unwrap().edge_scroll.is_some());
+        }
+    }
+
+    #[test]
     fn scrollbar_click_and_drag_move_history_without_starting_a_selection() {
         let (host, tui) = assemble(crate::surface::Headless::new(80, 24));
         host.modules
@@ -13308,7 +15049,11 @@ fn memory_tabs(output: &str) -> Option<Vec<crate::sheet::DocTab>> {
     use crate::i18n::product::{t, Msg};
     use atomcode_capabilities::memory::store::MemorySection;
     let sections: Vec<MemorySection> = serde_json::from_str(output).ok()?;
-    sections
+    let review = sections
+        .iter()
+        .find_map(|section| section.review.as_ref())
+        .cloned();
+    let mut tabs: Vec<_> = sections
         .into_iter()
         .map(|section| {
             let label = match section.scope.as_str() {
@@ -13317,22 +15062,61 @@ fn memory_tabs(output: &str) -> Option<Vec<crate::sheet::DocTab>> {
                 "local" => Msg::StatusMemoryScopeLocal,
                 _ => return None,
             };
-            let body = if section.text.trim().is_empty() {
+            let mut body = if section.text.trim().is_empty() {
                 crate::i18n::t(crate::i18n::Msg::MemoryEmpty).into_owned()
             } else {
                 section.text
             };
+            if !section.entries.is_empty() {
+                let catalog: String = section
+                    .entries
+                    .iter()
+                    .map(|entry| entry.describe())
+                    .collect();
+                body = format!(
+                    "### {}\n\n{catalog}\n---\n\n### {}\n\n{body}",
+                    t(Msg::MemoryEntryCatalog),
+                    t(Msg::MemoryOriginalSource)
+                );
+            }
             Some(crate::sheet::DocTab::new(
                 t(label),
                 format!("## {}\n\n{body}", section.path.display()),
             ))
         })
-        .collect()
+        .collect::<Option<Vec<_>>>()?;
+    if let Some(review) = review {
+        tabs.insert(
+            0,
+            crate::sheet::DocTab::new(t(Msg::StatusMemoryInjection), review),
+        );
+    }
+    Some(tabs)
 }
 
 #[cfg(test)]
 mod memory_tab_tests {
     use super::*;
+    #[test]
+    fn memory_review_is_separate_from_unmodified_source_tabs() {
+        let tabs = memory_tabs(r##"[{"scope":"project","path":"/project/memory.md","text":"- original","review":"# Memory status\nWARNING: omitted"}]"##).unwrap();
+        assert_eq!(tabs.len(), 2);
+        assert!(tabs[1].markdown.contains("- original"));
+        assert!(!tabs[1].markdown.contains("WARNING"));
+        assert!(tabs[0].markdown.contains("WARNING: omitted"));
+    }
+    #[test]
+    fn every_source_entry_has_a_visible_id_even_without_a_prompt_candidate() {
+        let entry = atomcode_capabilities::memory::entry::MemoryEntry::legacy("OLD_FACT");
+        let id = entry.metadata.id.clone();
+        let output = serde_json::json!([{"scope":"project","path":"/project/memory.md","text":"# notes\n- OLD_FACT\n","entries":[entry]}]).to_string();
+        let tabs = memory_tabs(&output).unwrap();
+        assert!(tabs[0].markdown.contains(&id));
+        assert!(
+            tabs[0].markdown.contains("# notes\n- OLD_FACT"),
+            "original source remains available"
+        );
+    }
     #[test]
     fn memory_sources_have_separate_tabs_even_when_empty() {
         let _locale = crate::i18n::test_lock();
@@ -13351,5 +15135,186 @@ mod memory_tab_tests {
         assert_eq!(doc.top, 20);
         assert!(doc.show(1));
         assert_eq!(doc.top, 5);
+    }
+}
+
+#[cfg(test)]
+mod newline_settings_tests {
+    use super::*;
+    use crate::settings::{Applies, SettingKind, SettingRow, Settings, SettingsView, NEWLINE_KEYS};
+    use atomcode_plexus::{App, ConfigTree, PluginRegistry};
+
+    struct Port(Mutex<String>);
+    impl Settings for Port {
+        fn rows(&self) -> SettingsView {
+            SettingsView::new(vec![SettingRow {
+                id: NEWLINE_KEYS.into(),
+                label: "Newline".into(),
+                value: self.0.lock().unwrap().clone(),
+                kind: SettingKind::Text,
+                applies: Applies::Immediately,
+            }])
+        }
+        fn set(&self, _: &str, value: &str) -> Result<SettingsView, String> {
+            *self.0.lock().unwrap() = value.into();
+            Ok(self.rows())
+        }
+        fn reset(&self, id: &str) -> Result<SettingsView, String> {
+            self.set(id, "default")
+        }
+    }
+
+    #[test]
+    fn settings_apply_newline_without_rebuilding_the_runtime() {
+        let (_, tui) = assemble(crate::surface::Headless::new(80, 24));
+        tui.keys.add(&crate::keymap::Default_).unwrap();
+        let port = Arc::new(Port(Mutex::new("default".into())));
+        let app = App::new(PluginRegistry::new(), ConfigTree::default());
+        let _ = app.context().provide::<SettingsSvc>(port.clone()).unwrap();
+        *tui.ctx.lock().unwrap() = Some(app.context());
+        tui.refresh_settings();
+        tui.apply_setting(NEWLINE_KEYS, "alt+j").unwrap();
+        assert_eq!(tui.keys.newline_names(), vec!["alt+j"]);
+        assert!(tui.apply_setting(NEWLINE_KEYS, "enter").is_err());
+        assert_eq!(*port.0.lock().unwrap(), "alt+j");
+        assert_eq!(tui.keys.newline_names(), vec!["alt+j"]);
+        // A hand edit must not replace a usable map with a conflicting one.
+        *port.0.lock().unwrap() = "ctrl+c".into();
+        tui.refresh_settings();
+        assert_eq!(tui.keys.newline_names(), vec!["alt+j"]);
+        tui.reset_setting(NEWLINE_KEYS).unwrap();
+        assert!(tui.keys.newline_names().contains(&"ctrl+j".into()));
+    }
+}
+
+#[cfg(test)]
+mod session_mention_tests {
+    #[test]
+    fn picking_a_session_keeps_surrounding_text_and_closes_completion() {
+        let mut moment = crate::moment::Moment::default();
+        moment.input = "compare @old suffix".into();
+        moment.caret = "compare @o".len();
+        let reference = atomcode_capabilities::session::reference::SessionReference {
+            bucket: "0123456789abcdef".into(),
+            id: "stable-id".into(),
+        }
+        .spelling("会话 同名");
+        assert!(super::put_path(&mut moment, &reference));
+        assert_eq!(moment.input, format!("compare {reference}  suffix"));
+        assert!(
+            atomcode_capabilities::file_index::detect_at_mention(&moment.input, moment.caret)
+                .is_none()
+        );
+        assert_eq!(
+            atomcode_capabilities::session::reference::parse(&moment.input).unwrap()[0].id,
+            "stable-id"
+        );
+    }
+    #[test]
+    fn real_file_names_cannot_activate_an_internal_category() {
+        let (host, tui) = super::assemble(crate::surface::Headless::new(80, 24));
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.input = "read @atom".into();
+            moment.caret = moment.input.len();
+        }
+        tui.complete_path("@atomcode-filter:files");
+        assert_eq!(
+            host.moment.read().unwrap().input,
+            "read @atomcode-filter:files "
+        );
+        assert_eq!(*tui.mention_kind.lock().unwrap(), 0);
+        tui.complete_path("@\0mention-filter:sessions");
+        assert_eq!(*tui.mention_kind.lock().unwrap(), 2);
+    }
+}
+
+#[cfg(test)]
+mod tool_generation_tests {
+    use super::*;
+    #[test]
+    fn tool_observations_refresh_only_the_leads_active_generation() {
+        let (host, tui) = assemble(crate::surface::Headless::new(80, 24));
+        {
+            let mut view = tui.client.view.lock().unwrap();
+            view.root = "lead".into();
+            view.on_screen = "lead".into();
+        }
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.generation.absorb(
+                &atomcode_kernel::session::SessionEvent::RequestHeader {
+                    turn: 1,
+                    round: 1,
+                    model: "m".into(),
+                    reason: atomcode_kernel::session::HeaderReason::Append,
+                },
+                crate::moment::Timestamp::millis(0),
+            );
+            moment.now = crate::moment::Timestamp::millis(60_000);
+        }
+        let fragment = || AgentEvent::ToolCallStreaming {
+            index: 0,
+            id: Some("call".into()),
+            name: Some("read_file".into()),
+            arguments: "{}".into(),
+        };
+        assert!(tui.on_event(fragment()));
+        assert_eq!(
+            host.moment.read().unwrap().quiet_since,
+            Some(crate::moment::Timestamp::millis(60_000))
+        );
+        let before = host.moment.read().unwrap().generation.clone();
+        tui.client.view.lock().unwrap().on_screen = "member".into();
+        assert!(!tui.on_event(fragment()));
+        assert_eq!(host.moment.read().unwrap().generation, before);
+    }
+}
+
+#[cfg(test)]
+mod memory_transport_tests {
+    use super::*;
+    struct NoopHost;
+    #[async_trait]
+    impl HostControl for NoopHost {
+        async fn call(&self, _: HostCommand) -> Result<HostReply, atomcode_host_api::HostError> {
+            Ok(HostReply::Done)
+        }
+        fn subscribe(&self) -> mpsc::UnboundedReceiver<HostEvent> {
+            mpsc::unbounded_channel().1
+        }
+    }
+    #[test]
+    fn only_memory_listings_request_json_and_open_the_viewer() {
+        for (args, listing, expected) in [
+            ("", true, "--json "),
+            (
+                "list --topic architecture",
+                true,
+                "--json list --topic architecture",
+            ),
+            ("list --json", true, "list --json"),
+            (
+                "update m-example replacement",
+                false,
+                "update m-example replacement",
+            ),
+            ("pin m-example", false, "pin m-example"),
+            ("deprecate m-example", false, "deprecate m-example"),
+            ("--unknown", false, "--unknown"),
+        ] {
+            let client = AgentClient::default();
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            client.connect(sender, Arc::new(NoopHost));
+            client.invoke("memory", args);
+            let AgentCommand::Invoke { args: actual, .. } = receiver.try_recv().unwrap() else {
+                panic!("expected command invocation");
+            };
+            assert_eq!(actual, expected);
+            assert_eq!(
+                !client.view.lock().unwrap().memory_invocations.is_empty(),
+                listing
+            );
+        }
     }
 }

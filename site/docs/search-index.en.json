@@ -8,7 +8,7 @@
       {
         "id": "atomcode-documentation",
         "heading": "AtomCode Documentation",
-        "body": "An AI coding agent that lives in your terminal. Hand it a natural-language task and it will autonomously read, edit, run, and self-verify. These docs walk you from a fresh install to every feature AtomCode offers. v5.2.3 许可证 MIT 语言 Rust 1.88+ 平台 macOS · Linux · HarmonyOS PC · Windows 100% AI 生成"
+        "body": "An AI coding agent that lives in your terminal. Hand it a natural-language task and it will autonomously read, edit, run, and self-verify. These docs walk you from a fresh install to every feature AtomCode offers. v5.2.4 许可证 MIT 语言 Rust 1.88+ 平台 macOS · Linux · HarmonyOS PC · Windows 100% AI 生成"
       },
       {
         "id": "three-steps-to-start",
@@ -151,7 +151,7 @@
       {
         "id": "step-13-welcome",
         "heading": "Step 1/3 · Welcome",
-        "body": "███ █████ ███ █ █ ████ ███ ████ █████ █ █ █ █ █ ██ ██ █ █ █ █ █ █ █████ █ █ █ █ █ █ █ █ █ █ █ █ ████ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ ███ █ █ ████ ███ ████ █████ AtomCode Version 5.2.3 · AI coding agent in your terminal • Multi-step agent loop · built-in code-graph tools • Compatible with any OpenAI-style API • Free tokens via CodingPlan Press Enter to continue. Ctrl+C exits at any point."
+        "body": "███ █████ ███ █ █ ████ ███ ████ █████ █ █ █ █ █ ██ ██ █ █ █ █ █ █ █████ █ █ █ █ █ █ █ █ █ █ █ █ ████ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ ███ █ █ ████ ███ ████ █████ AtomCode Version 5.2.4 · AI coding agent in your terminal • Multi-step agent loop · built-in code-graph tools • Compatible with any OpenAI-style API • Free tokens via CodingPlan Press Enter to continue. Ctrl+C exits at any point."
       },
       {
         "id": "step-23-language-choose-your-language-选择语言",
@@ -357,7 +357,7 @@
       {
         "id": "turn-round-limit",
         "heading": "Turn round limit",
-        "body": "[coding] max_rounds = 200 When the limit is reached, the TUI asks whether to continue or stop instead of dropping the task. Set it to 0 for no limit."
+        "body": "[coding] max_rounds = 200 The default 0 means unlimited, with no additional fixed 300-round cap. A positive value limits work rounds. If work remains at the cap, at most one additional text-only model request summarizes progress, remaining work and next steps; it is billed and counted as a round. Interactive checkpoints, when enabled, can extend the budget first. Cancellation, timeout or provider errors can interrupt closing. Repetition guards remain independent."
       },
       {
         "id": "todo-eagerness",
@@ -373,6 +373,11 @@
         "id": "three-ways-to-edit-the-config",
         "heading": "Three ways to edit the config",
         "body": "Hand-edit — open ~/.atomcode/config.toml in your favourite editor. /config in the TUI — search and edit safe settings in place. The dynamic Retry attempts (current model) row writes retry_max_attempts to the active model; press Delete twice to restore the default. /provider in the TUI — interactively manage provider accounts and their models; changes are written back to disk."
+      },
+      {
+        "id": "ui-keybindings",
+        "heading": "TUI shortcuts",
+        "body": "Set newline = [\"alt+j\", \"ctrl+j\"] under [ui.keybindings] to customize newline chords. You can also search for “newline” in /config and record a chord or type its name. Changes apply immediately. See Custom newline shortcuts ."
       },
       {
         "id": "next-steps",
@@ -493,12 +498,17 @@
       {
         "id": "tools-utilities",
         "heading": "Tools & utilities",
-        "body": "Command Purpose /view · /view <filepath> Open a read-only file viewer. With no argument , a fuzzy files-only picker opens (type to filter; a path-like query such as ~/… or ./… can open a file outside the project). With a path, it opens that file directly. Scroll with arrows / PageUp-Down / Home-End (or g / G to jump to top/bottom); Esc backs out, Ctrl+C exits /undo · /undo N Roll conversation memory back to before the last turn (or turn N) and restore that prompt into the input box; rewinds memory only — does not revert files on disk /diff Show the git diff of uncommitted changes in the working directory (the file list shows up to 5 rows at a time with a \"more files\" scroll indicator) /review Code review the current changes: /review reviews uncommitted changes, /review staged the staged diff, /review <base> against a base ref /paste Attach an image from the clipboard (Windows fallback for when Ctrl+V is captured by the terminal) /cost Prompt, completion, and cached tokens accumulated per model in the current session. Distinct from /usage , which queries the CodingPlan gateway for your plan quota /context Show this turn's context budget breakdown: system prompt, tool defs, cold-zone compaction, total messages, and context-window usage /compact Compact history: summarise earlier messages to free up context budget /rewind Choose an earlier prompt and roll back the conversation, code, or both; see Sessions & Undo /clear Clear the current session's messages (working directory and model are kept) /init Scan the working directory and create or improve the active project instruction file ( .atomcode.md , AGENTS.md , or CLAUDE.md , in precedence order). Output follows the current language; an optional custom prompt file can be configured under /config . /background <task> Dispatch a task to an isolated background agent (read-only-leaning tool subset) without polluting the main conversation. Useful for \"go check X on the side\" sort of light exploration. See Background sessions /worktree <subcommand> Git worktree isolation: create a new branch with its own worktree, list existing worktrees, done squash worktree changes back to the main branch, cleanup remove finished worktrees /todo · /todo add <task> · /todo clear Reprint the current todo list — derived from the session transcript (locates the most recent todowrite tool call and re-renders it), with \"in-progress / done\" status markers. /todo add <task> appends a task deterministically (no model round-trip); /todo clear empties the list. The list is stateless (nothing extra is written to disk); the model maintains it during long tasks and you can run this anytime to check progress /copy Copy the last reply to the clipboard: /copy copies the whole reply as raw markdown (the whole turn, without tool output); /copy code copies the last code block, /copy code N the N-th, /copy code all every code block (the old /copy N , /copy all and /copy msg still work). In the classic screen ( --classic ) a plain /copy still copies the last code block /save Export the current conversation to a markdown file: /save uses an auto-generated filename, /save <filename> a name you choose AtomGit Issues are tools, not slash commands /issue has been removed. After /login , ask in natural language—for example, “Create an AtomGit issue for this bug.” AtomCode will select the built-in atomgit_issue tool; write actions still require approval. See Built-in Tools . Read-only reports run mid-turn You don't have to wait for a turn to finish to check on things: /status , /diff , /cost , /usage , and /rename run even while the agent is streaming. They render as a transient panel below the input box (press Esc to dismiss) without interrupting the running turn. /usage mid-turn is also tab-switchable across its Current / Overview / Models views."
+        "body": "Command Purpose /view · /view <filepath> Open a read-only file viewer. With no argument , a fuzzy files-only picker opens (type to filter; a path-like query such as ~/… or ./… can open a file outside the project). With a path, it opens that file directly. Scroll with arrows / PageUp-Down / Home-End (or g / G to jump to top/bottom); Esc backs out, Ctrl+C exits /undo · /undo N Roll conversation memory back to before the last turn (or turn N) and restore that prompt into the input box; rewinds memory only — does not revert files on disk /diff Show the git diff of uncommitted changes in the working directory (the file list shows up to 5 rows at a time with a \"more files\" scroll indicator) /review Code review the current changes: /review reviews uncommitted changes, /review staged the staged diff, /review <base> against a base ref /paste Attach an image from the clipboard (Windows fallback for when Ctrl+V is captured by the terminal) /cost Prompt, completion, and cached tokens accumulated per model in the current session. Distinct from /usage , which queries the CodingPlan gateway for your plan quota /context Show this turn's context budget breakdown: system prompt, tool defs, cold-zone compaction, total messages, and context-window usage /compact Compact history: summarise earlier messages to free up context budget /rewind Choose an earlier prompt and roll back the conversation, code, or both; see Sessions & Undo /clear Clear the current session's messages (working directory and model are kept) /init Scan the working directory and create or improve the active project instruction file ( .atomcode.md , AGENTS.md , or CLAUDE.md , in precedence order). Output follows the current language; an optional custom prompt file can be configured under /config . /background <task> Dispatch a task to an isolated background agent (read-only-leaning tool subset) without polluting the main conversation. Useful for \"go check X on the side\" sort of light exploration. See Background sessions /worktree <subcommand> Git worktree isolation: create a new branch with its own worktree, list existing worktrees, done only return to the main checkout (no commit, squash or merge), cleanup remove a worktree (does not verify it is merged; commit and merge work you want to keep first; --force discards uncommitted content) /todo · /todo add <task> · /todo clear Reprint the current todo list — derived from the session transcript (locates the most recent todowrite tool call and re-renders it), with \"in-progress / done\" status markers. /todo add <task> appends a task deterministically (no model round-trip); /todo clear empties the list. The list is stateless (nothing extra is written to disk); the model maintains it during long tasks and you can run this anytime to check progress /copy Copy the last reply to the clipboard: /copy copies the whole reply as raw markdown (the whole turn, without tool output); /copy code copies the last code block, /copy code N the N-th, /copy code all every code block (the old /copy N , /copy all and /copy msg still work). /save Export the current conversation to a markdown file: /save uses an auto-generated filename, /save <filename> a name you choose AtomGit Issues are tools, not slash commands /issue has been removed. After /login , ask in natural language—for example, “Create an AtomGit issue for this bug.” AtomCode will select the built-in atomgit_issue tool; write actions still require approval. See Built-in Tools . Read-only reports run mid-turn You don't have to wait for a turn to finish to check on things: /status , /diff , /cost , /usage , and /rename run even while the agent is streaming. They render as a transient panel below the input box (press Esc to dismiss) without interrupting the running turn. /usage mid-turn is also tab-switchable across its Current / Overview / Models views."
       },
       {
         "id": "conversation-modes-thinking",
         "heading": "Conversation modes & thinking",
         "body": "Command Purpose /plan Switch to Plan mode : read-only exploration. The model can call read_file / grep / list_directory and other non-writing tools, but edit_file / bash are blocked. Useful for getting alignment before action /build Switch back to Build mode (the default): all tools available — read, write, execute. /plan and /build are freely interchangeable /goal <text> Set a completion goal and let the agent run an autonomous loop — turn after turn — until the goal is met. /goal (no args) shows the current goal and round count; /goal clear stops it /loop <interval> <prompt or /command> Repeat a prompt or slash command on a fixed interval . e.g. /loop 5m /diff runs /diff every 5 minutes; /loop 30s check the build re-sends that prompt every 30 seconds. Interval units are s / m / h , range 10s–24h /loop <prompt> With no interval, enters self-paced mode: the task is handed to the model, which decides when to run the next round itself — good for \"keep at this until it converges\" work that doesn't map onto a fixed period /loop · /loop stop /loop (no args) shows the current loop status; /loop stop (or off / clear / cancel ) stops it. /loop and /goal are mutually exclusive — setting one automatically cancels the other /think on / off Toggle extended thinking (for supported models — Claude / DeepSeek-R1 / GLM-4.5 / …). When on, the model surfaces its reasoning at the cost of latency and tokens /think budget <N> Cap the thinking token budget (Claude family); controls reasoning length /effort <high|max|off> DeepSeek reasoning-effort control — trade latency/tokens for deeper reasoning on DeepSeek models"
+      },
+      {
+        "id": "team-panel",
+        "heading": "Team panel",
+        "body": "Command Purpose /team · /team toggle Expand / collapse the team panel (toggle). Collapsed, it keeps only its header row — member rows are not drawn and the keyboard no longer lands on them /team show · /team open Expand the team panel. With no members and no background tasks it answers \"No team members or background tasks; there is no team panel to show.\" /team hide · /team fold · /team close Collapse the team panel (members keep running in the background; none is cancelled), answering \"Team panel collapsed.\" Anything else Refused with the usage line — those three states are all /team takes ( status , clear and the like are not among them) All three subcommands only change what is drawn: the acknowledgement appears as a notice for about five seconds, does not enter the conversation, and does not call the model; none of them starts, cancels or waits for a member. The panel's header gives the member and background-task counts, and each member row says what it was asked to do, how long it has run and how much context it holds; members come from the agent delegating through the team tool (several in parallel, each with a role and scope). See also Subagents (short-lived subtasks via the task tool)."
       },
       {
         "id": "persistent-memory",
@@ -518,7 +528,7 @@
       {
         "id": "web-ui-sync",
         "heading": "Web UI & sync",
-        "body": "Command What it does /webui Launch the browser interface and open it (binds 127.0.0.1:13457 by default — local only). The current TUI session is attached to live sync automatically /webui --host <addr> Bind the server to a given address; /webui lan equals --host 0.0.0.0 (exposes it to the LAN). Pair with a 蒲公英 virtual IP for remote access — see Remote Access /webui stop Stop the webui server /sync Attach the current TUI to a running webui session (run /webui first). Both ends sync live in both directions; multiple browsers / terminals can watch the same session /sync off Leave sync and return to a standalone session /app Expose the current session to the mobile App via the official relay: a QR code is printed right in the terminal, scan it with the App to pair, then view and drive this conversation live from your phone (same source as /webui — one shared session, two-way live sync; the difference is no browser, and it goes over the relay rather than the LAN). Requires /login first /app stop Stop App remote access, disconnect the relay, and return to a local session More in Web UI and the Remote Access guide."
+        "body": "Command What it does /webui Open the local browser and show a phone relay QR; no VPN needed. Use --local for local access only. The current TUI session is attached to live sync automatically /webui --host <addr> Bind the server to a given address; /webui lan equals --host 0.0.0.0 (exposes it to the LAN). A usable LAN address is shown as both a text link and a QR code for your phone. Use the default /webui relay QR for remote access — see Remote Access /webui stop Stop the webui server /sync Attach the current TUI to a running webui session (run /webui first). Both ends sync live in both directions; multiple browsers / terminals can watch the same session /sync off Leave sync and return to a standalone session /app Expose the current session to the mobile App via the official relay: a QR code is printed right in the terminal, scan it with the App to pair, then view and drive this conversation live from your phone (same source as /webui — one shared session, two-way live sync; the difference is no browser, and it goes over the relay rather than the LAN). Requires /login first /app stop Stop App remote access, disconnect the relay, and return to a local session More in Web UI and the Remote Access guide."
       },
       {
         "id": "config-help",
@@ -576,12 +586,17 @@
       {
         "id": "input-editing",
         "heading": "Input editing",
-        "body": "Key Action Enter Send the message \\ then Enter Insert newline (universal — a trailing backslash makes the line a continuation, works in every terminal) Alt+Enter Insert newline (most terminals; macOS Apple Terminal needs \"Use Option as Meta key\" enabled under Settings → Profiles → Keyboard; Windows Terminal reserves it by default — release in settings) Shift+Enter Insert newline (only terminals that disambiguate the modifier: Kitty / WezTerm / iTerm2 with Report Modifiers / Windows Terminal / Ghostty / Warp. Apple Terminal, xterm, GNOME Terminal, VS Code integrated terminal all collapse it to Enter — use \\ + Enter instead) Ctrl+Enter Insert newline (requires a Kitty-keyboard-protocol terminal such as Kitty or WezTerm) Ctrl+J Insert newline when the terminal distinguishes the chord Esc Clear current input / interrupt streaming output Esc Esc Undo the previous turn when the prompt is idle and empty ↑ / ↓ Browse input history → Fill a faint next-prompt suggestion into an empty input (press Enter separately to send) Ctrl+R Reverse-search input history (type to filter live; Ctrl+R again jumps to the next older match; Enter accepts into the input, Esc cancels) Tab Accept slash-command, skill, or file completion Shift+Tab Cycle to the next execution mode when no completion menu is open (also works while streaming) Ctrl+U Clear entire line Ctrl+W Delete a word Ctrl+K Delete from cursor to end of line Ctrl+A Move cursor to line start Ctrl+E Move cursor to line end"
+        "body": "Key Action Enter Send the message \\ then Enter Insert newline (universal — a trailing backslash makes the line a continuation, works in every terminal) Alt+Enter Insert newline (most terminals; macOS Apple Terminal needs \"Use Option as Meta key\" enabled under Settings → Profiles → Keyboard; Windows Terminal reserves it by default — release in settings) Shift+Enter Insert newline (only terminals that disambiguate the modifier: Kitty / WezTerm / iTerm2 with Report Modifiers / Windows Terminal / Ghostty / Warp. Apple Terminal, xterm, GNOME Terminal, VS Code integrated terminal all collapse it to Enter — use \\ + Enter instead) Ctrl+Enter Insert newline (requires a Kitty-keyboard-protocol terminal such as Kitty or WezTerm) Ctrl+J Insert newline when the terminal distinguishes the chord Esc Clear current input / interrupt streaming output Esc Esc Undo the previous turn when the prompt is idle and empty ↑ / ↓ Browse input history → Fill a faint next-prompt suggestion into an empty input (press Enter separately to send) Ctrl+R Reverse-search input history (type to filter live; Ctrl+R again jumps to the next older match; Enter accepts into the input, Esc cancels) Tab Accept slash-command, skill, or file completion Shift+Tab Cycle to the next execution mode when no completion menu is open (also works while streaming) Ctrl+D Delete forward; when idle and empty, press twice within two seconds to quit Ctrl+B / Ctrl+F Move one character left / right Ctrl+U Delete to the start of the current line Ctrl+W Delete a word Ctrl+K Delete from cursor to end of line Ctrl+A Move cursor to line start Ctrl+E Move cursor to line end"
+      },
+      {
+        "id": "custom-newline",
+        "heading": "Custom newline shortcuts",
+        "body": "Open /config , search for “newline”, and select “Keyboard shortcuts / Newline”. Press Enter or A to add a chord, press that chord, then press Enter to confirm. Press M to type comma-separated names such as alt+j, ctrl+j ; Tab also switches capture to manual entry. Delete removes the selected binding, Ctrl+D restores defaults, and Esc goes back. [ui.keybindings] newline = [\"alt+j\", \"ctrl+j\"] The list replaces the default newline chords. Changes apply immediately and /keys shows the effective bindings. \\ + Enter remains available. Use newline = [] to disable the chords, or remove the newline entry to restore defaults. Conflicts with existing actions or reserved keys, duplicate chords, and invalid names are rejected without changing the active bindings. Plain printable characters cannot be shortcuts. Names accept ctrl , alt , shift , and cmd modifiers, letters, digits, enter , space , arrows, and f1 – f24 . AtomCode cannot detect or release shortcuts intercepted by the terminal or IDE; verify that manually entered chords reach the app."
       },
       {
         "id": "browse-scroll",
         "heading": "Browse & scroll",
-        "body": "Key Action Shift+↑ / Shift+↓ Scroll one line PageUp / PageDown Scroll one page (10 lines) Alt+↑ / Alt+↓ Jump to previous / next message (macOS Apple Terminal: enable Settings → Profiles → Keyboard → \"Use Option as Meta key\" first) Ctrl+↑ / Ctrl+↓ Jump to previous / next user message Home / End Jump to top / bottom of the conversation Mouse wheel Scroll inside the chat area (atomcode captures the wheel)"
+        "body": "Key Action PageUp / PageDown Page by the visible conversation height, keeping one overlap row Mouse wheel Scroll the conversation /read Open a read-only conversation snapshot with expanded tool output; no GUI or clipboard required ↑ / ↓ / j / k Reader: scroll one line PgUp / PgDn / Ctrl+B / Ctrl+F Reader: page up / down Ctrl+U / Ctrl+D Reader: half-page up / down Home / End Reader: jump to beginning / end Esc Leave the reader, preserving the draft and main scroll position; reopen /read to refresh the snapshot"
       },
       {
         "id": "selection-copy",
@@ -639,7 +654,7 @@
       {
         "id": "switch-sessions-inside-the-tui",
         "heading": "Switch sessions inside the TUI",
-        "body": "/resume Opens the session picker. It lists this project's historical sessions newest-first; jump to any of them quickly. Each entry uses the most recent user prompt as its label for easy recognition."
+        "body": "/resume Opens the session picker. It lists this project's historical sessions newest-first; jump to any of them quickly. Each entry uses the most recent user prompt as its label for easy recognition. While a turn runs, select another session in /resume or run /resume <id> . The current session keeps running in the background; the view switches only after the target is ready. A failed open leaves the current session intact. Returning to a background session in this process reuses its runtime instead of restarting the task. Use /bg list to inspect up to 16 background slots. Switching remains restricted while awaiting approval or interactive input, reconfiguring, or sharing live sync with the WebUI. If all slots are full, stop an unneeded session with /bg drop <N> . This applies to the TUI; it does not add running-session switching to the WebUI."
       },
       {
         "id": "start-a-clean-new-session",
@@ -660,6 +675,11 @@
         "id": "background-task-one-shot-dispatch",
         "heading": "/background <task> — one-shot dispatch",
         "body": "If you don't want to swap foreground/background manually and just want to \"have it look something up real quick\", just pass a task (both names work) — /background <task> or /bg <task> : /background list every unused dependency under src It starts a one-shot task in a /bg slot (configured with a read-only tool subset by default so the main conversation context isn't polluted). When done, check /bg list , use /bg <N> to read the result, /bg drop <N> to discard. Typical pattern The foreground is debugging module A; the model is editing and running cargo check (slow). You realise you also want to refactor module B — /bg straight to a new foreground for B. The build on A finishes in the background, state flips to done ; /bg 1 to switch back and read the result."
+      },
+      {
+        "id": "background-lifetime-and-multiple-processes",
+        "heading": "Background lifetime and multiple processes",
+        "body": "Background sessions depend on this AtomCode process. Exiting stops their runtimes; this is not process-independent execution. Saved conversations can be resumed, but their original tool processes are not guaranteed to keep running. One installation is enough: run the same executable in multiple terminals with different sessions. Different sessions in the same project and home can run concurrently. An exclusive lease prevents two runtimes from writing the same session in the same storage bucket. Interactive resume may fork a session held by another process; check the notice. Config writes use a cross-process lock and atomic replacement, but settings remain shared. Separate ATOMCODE_HOME values isolate configuration and session storage. Neither session leases nor separate homes protect project files. Use separate Git worktrees when agents edit concurrently to avoid conflicting file or Git operations."
       },
       {
         "id": "clear-vs-compact-vs-new-session",
@@ -780,7 +800,7 @@
       {
         "id": "atomgit",
         "heading": "AtomGit integration (3)",
-        "body": "After /login , the model can operate AtomGit directly through these built-in tools. Describe the outcome in natural language; there is no /issue slash command. Tool Purpose Confirmation? atomgit_repo List, inspect, create, delete, fork, or clone repositories; create tags and manage project labels Writes: yes atomgit_pr List, inspect, create, close, and comment on pull requests; link or unlink related Issues Writes: yes atomgit_issue List or inspect Issues; create an Issue and view, add, edit, or delete comments Writes: yes Ask: Create an AtomGit issue for this bug, including the reproduction steps and environment."
+        "body": "After /login , the model can operate AtomGit directly through these built-in tools. Describe the outcome in natural language; there is no /issue slash command. Tool Purpose Confirmation? atomgit_repo List current-account repositories (not public search); inspect code repositories by owner/repo or repository URL; create, delete, fork, clone, create tags and manage labels. An empty personal list does not mean a public repository is missing. Model/dataset sites are outside this URL lookup scope. Writes: yes atomgit_pr List, inspect, create, close, and comment on pull requests; link or unlink related Issues Writes: yes atomgit_issue List or inspect Issues; create an Issue and view, add, edit, or delete comments Writes: yes Ask: Create an AtomGit issue for this bug, including the reproduction steps and environment."
       },
       {
         "id": "large-tool-outputs",
@@ -828,7 +848,7 @@
       {
         "id": "configuration",
         "heading": "Configuration",
-        "body": "Tune the subagent pool in ~/.atomcode/config.toml : [subagent] max_concurrent = 3 # parallel subagents at once (min 1) timeout_secs = 900 # per-subtask wall-clock limit, seconds (min 30) max_rounds = 200 # per-subtask model-round cap (0 = unbounded) Key Default Meaning max_concurrent 3 How many subagents run in parallel timeout_secs 900 Wall-clock timeout per subtask (floored to 30s) max_rounds 200 Model-round high-water mark per subtask; 0 = unbounded Environment overrides: ATOMCODE_SUBAGENT_TIMEOUT and ATOMCODE_SUBAGENT_MAX_ROUNDS take precedence over the config values."
+        "body": "Tune the subagent pool in ~/.atomcode/config.toml : [subagent] max_concurrent = 3 # parallel subagents at once (min 1) max_rounds = 0 # per-subtask model-round cap (0 = unbounded) Child rounds are unlimited by default; existing explicit positive budgets are preserved. Set [subagent] max_rounds = 0 or ATOMCODE_SUBAGENT_MAX_ROUNDS=0 to remove an old 200-round limit. Positive budgets allow at most one extra text-only closing request. Concurrency, cancellation and repetition guards remain independent. External Codex/Claude agents retain their own execution policies. Key Default Meaning max_concurrent 3 How many subagents run in parallel max_rounds 0 Model-round high-water mark per subtask; 0 = unbounded Environment overrides: ATOMCODE_SUBAGENT_MAX_ROUNDS take precedence over the config values."
       },
       {
         "id": "custom-team-roles",
@@ -925,6 +945,11 @@
         "id": "skill-file-layout",
         "heading": "Skill file layout",
         "body": "A skill is usually a directory containing at least a SKILL.md : my-skills/ ├── release/ │ └── SKILL.md ├── write-changelog/ │ └── SKILL.md └── debug-flaky-test/ ├── SKILL.md └── references/ └── pattern-library.md A typical SKILL.md : --- name: release description: Cut a new release tag, update the changelog, and publish --- ## When to use When the user says \"ship a new version\", \"cut a release\", or \"tag it\". ## Steps 1. Inspect `git log` for changes since the last release. 2. Ask the user to confirm the semver bump (patch / minor / major). 3. Add the new entry to `CHANGELOG.md`. 4. Run `pnpm build` and ensure it passes. 5. Create the git tag `v<version>` with release notes. 6. Run `pnpm publish` (or the corresponding publish command). ## Rules - Version numbers must follow semver. - Never skip tests — fix any failure first. - If publish fails, roll back the local tag and changelog edits."
+      },
+      {
+        "id": "allowed-tools",
+        "heading": "Tool preauthorization: allowed-tools",
+        "body": "allowed-tools preauthorizes matching tools for the turn that invokes a skill. It is not an exclusive tool whitelist: other tools remain available and follow normal permission and approval rules. Prefer allowed-tools . The underscore alias allowed_tools accepts the same syntax and validation. Repeated declarations, including mixed spellings, refuse loading. --- name: setup description: Install hidapi for vibekeys-plugin allowed-tools: - Bash(pip3 *) - Bash(pip *) - Bash(python3 -c *) --- Use a YAML block list, an inline list ( allowed-tools: [Bash, read_file] ), or a space/comma-separated scalar ( allowed-tools: Bash(pip3 *) read_file ). Spaces inside patterns are preserved. Names and patterns use the static permissions matcher, including aliases such as Bash / bash and Read / read_file . Malformed declarations refuse loading rather than widening the grant. Slash commands, the $ menu, /skills and successful use_skill calls share this behavior. Grants belong only to the calling agent and expire on its next user input (including steering), turn completion or cancellation. Session switching, runtime rebuilding and history replay do not restore grants. Global/project deny rules remain authoritative, and sensitive-path, credential and plan-mode boundaries still apply. AtomCode additionally keeps normal approval for destructive shell commands: a skill cannot preauthorize them. This is a product safety restriction on top of Claude Code compatible preauthorization; explicit static allow rules retain their existing behavior. Bash preauthorization is not a sandbox. Shell commands may read/write files and access the network. Plugin hooks and shell snippets executed while expanding a skill are separate execution paths, outside this model-tool preauthorization."
       },
       {
         "id": "skill-directories",
@@ -1130,12 +1155,12 @@
       {
         "id": "userpromptsubmit-io-protocol",
         "heading": "UserPromptSubmit IO protocol",
-        "body": "The hook receives JSON on stdin and decides what to do via stdout: { \"session_id\": \"...\", \"hook_event_name\": \"UserPromptSubmit\", \"prompt\": \"the user's input text\", \"cwd\": \"/working/directory\" } The hook can respond in the following ways (highest priority first): Non-zero exit code — blocks the prompt; reason is taken from stderr. JSON on stdout {\"decision\": \"block\", \"reason\": \"...\"} — block with an explicit reason. JSON on stdout {\"hookSpecificOutput\": {\"additionalContext\": \"...\"}} — append additionalContext to the user message as extra LLM context. Plain text on stdout — the whole block is injected as additionalContext . Empty stdout / unparseable JSON — passthrough; the prompt reaches the LLM unchanged. When parsing stdout, AtomCode first tries the last non-empty line as JSON; on failure it falls back to whole-text injection — so a hook script can print debug output earlier without affecting the final decision."
+        "body": "The hook receives JSON on stdin and decides what to do via stdout: { \"session_id\": \"...\", \"hook_event_name\": \"UserPromptSubmit\", \"prompt\": \"the user's input text\", \"cwd\": \"/working/directory\" } The hook can respond in the following ways (highest priority first): Exit 2 with a deliberate block reason — blocks the prompt; other nonzero exits and launch failures are not business block decisions. JSON on stdout {\"decision\": \"block\", \"reason\": \"...\"} — block with an explicit reason. JSON on stdout {\"hookSpecificOutput\": {\"additionalContext\": \"...\"}} — append additionalContext to the user message as extra LLM context. Plain text on stdout — the whole block is injected as additionalContext . Empty stdout / unparseable JSON — passthrough; the prompt reaches the LLM unchanged. When parsing stdout, AtomCode first tries the last non-empty line as JSON; on failure it falls back to whole-text injection — so a hook script can print debug output earlier without affecting the final decision."
       },
       {
         "id": "path-variables",
         "heading": "Path variables",
-        "body": "Hook command strings can reference these environment variables (injected by the executor): ${CLAUDE_PLUGIN_ROOT} — absolute path of the plugin install directory (CC compatible). ${ATOMCODE_PLUGIN_ROOT} — same thing, atomcode alias. These are real environment variables expanded by the shell itself, not string substitutions — install paths with spaces, quotes, $ , or ; won't break the command."
+        "body": "Hook command strings can reference these environment variables (injected by the executor): ${CLAUDE_PLUGIN_ROOT} — absolute path of the plugin install directory (CC compatible). ${ATOMCODE_PLUGIN_ROOT} — same thing, atomcode alias. Plugin hooks accept checked plugin-relative scripts and literal arguments, optionally using python, python3, node, sh or bash. Plugin-root placeholders resolve as paths without a shell. Move pipelines, redirections and inline code into scripts. Known Node path wrappers normalize to scripts; recognized batch/bash polyglot .cmd wrappers run through bash. Ordinary .cmd/.bat files remain unsupported. Only user-authored hooks retain shell expansion. Trust includes plugin contents (excluding Git metadata). Script/helper changes require explicit atomcode plugin trust name . Incompatible configurations are withheld at load with a diagnostic; repair the entry point or disable the plugin. This is not a sandbox, does not cover external dependencies/environment, and does not guarantee atomic execution against concurrent file mutation."
       },
       {
         "id": "marketplace-management",
@@ -1279,12 +1304,12 @@
       {
         "id": "web-ui",
         "heading": "Web UI",
-        "body": "Besides the terminal TUI, AtomCode ships a built-in browser interface : type /webui in the TUI to launch it, then chat, browse session history, add/edit/delete model providers, and upload images in the browser — and use /sync to mirror one session live between the terminal and the browser. It reuses this machine's login, models, and session history, so there's nothing extra to configure."
+        "body": "Besides the terminal TUI, AtomCode ships a built-in browser interface : type /webui in the TUI to launch it, then chat, browse session history, add/edit/delete model providers, and upload images in the browser — and use /sync to mirror one session live between the terminal and the browser. It reuses this machine's login, models, and session history, so there's nothing extra to configure. After context compaction, retained historical user messages are labeled as historical rather than new requests. Use “View full history” above the conversation to read original turns, reasoning and tool records without changing the current task or draft. Refreshing reloads the session view; /reload reloads configuration and does not compact context."
       },
       {
         "id": "start-stop",
         "heading": "Start & stop",
-        "body": "Run these in the AtomCode TUI input box: # Launch the webui and open the browser (binds 127.0.0.1:13457 by default — local only) /webui # Stop the webui server /webui stop On launch, AtomCode starts a local HTTP server and opens your browser to a URL like http://127.0.0.1:13457/?token=<one-time token> . The token in the URL is the credential — it's equivalent to a password , so don't share it. The current TUI session is also attached to live sync automatically (see Live sync across devices below). Localhost only by default The webui binds 127.0.0.1 , reachable only from this machine. To open it from a phone, do not expose it with --host 0.0.0.0 ; use the 蒲公英 virtual-LAN approach instead — see Remote Access ."
+        "body": "Run these in the AtomCode TUI input box: # Launch the webui and open the browser (local server binds 127.0.0.1:13457; phones connect through the relay) /webui # Stop the webui server /webui stop On launch, AtomCode starts a local HTTP server and opens your browser to a URL like http://127.0.0.1:13457/?token=<one-time token> . The token in the URL is the credential — it's equivalent to a password , so don't share it. The current TUI session is also attached to live sync automatically (see Live sync across devices below). Phone access through the relay The local webui binds 127.0.0.1 and connects to the HTTPS relay at https://relay-atomcode.atomgit.com . Scan the QR in the terminal or Remote access dialog with your phone; no VPN is needed. Add --local for local-only access. See Remote Access ."
       },
       {
         "id": "two-ways-to-run",
@@ -1309,12 +1334,12 @@
       {
         "id": "remote-access",
         "heading": "Remote access",
-        "body": "Want to open the webui from a phone without exposing it publicly? Use a 蒲公英 (Oray PGY) virtual LAN: bind the server to the virtual IP with /webui --host <virtual IP> , then scan the QR in the Remote Access panel. Full walkthrough in Remote Access ."
+        "body": "Run /webui (or atomcode webui standalone), then scan the relay QR with your phone browser to open the same conversation. The devices may use different networks. See Remote Access ."
       },
       {
         "id": "next",
         "heading": "Next",
-        "body": "Remote Access — open the webui from a phone over 蒲公英, safely Headless & Daemon — the daemon and HTTP/SSE API behind the webui Slash Commands — quick reference for /webui , /sync and more © 2026 AtomCode · MIT 报告问题"
+        "body": "Remote Access — open the webui from your phone through the HTTPS relay Headless & Daemon — the daemon and HTTP/SSE API behind the webui Slash Commands — quick reference for /webui , /sync and more © 2026 AtomCode · MIT 报告问题"
       }
     ]
   },
@@ -1322,52 +1347,37 @@
     "slug": "webui-remote-access",
     "title": "Remote Access",
     "group": "进阶",
-    "lede": "By default the AtomCode webui only listens on loopback ( 127.0.0.1 ), so your phone and other devices can't reach it. With a virtual LAN built by 蒲公英 (Oray PGY) you can open the webui from a phone or tablet securely — no public IP, nothing exposed to the internet. This page walks through the full connection flow and the security notes.",
+    "lede": "Run /webui and scan the relay QR code with your phone browser. No VPN or public listening port is needed.",
     "sections": [
       {
         "id": "remote-access",
-        "heading": "Remote Access",
-        "body": "By default the AtomCode webui only listens on loopback ( 127.0.0.1 ), so your phone and other devices can't reach it. With a virtual LAN built by 蒲公英 (Oray PGY) you can open the webui from a phone or tablet securely — no public IP, nothing exposed to the internet. This page walks through the full connection flow and the security notes."
+        "heading": "Remote access",
+        "body": "Run /webui and scan the relay QR code with your phone browser. No VPN or public listening port is needed."
       },
       {
-        "id": "how-it-works",
-        "heading": "How it works",
-        "body": "蒲公英 is a remote-networking tool. Once it's installed on both this machine and your phone, signed into the same account and joined to the same network , the two devices sit on one virtual LAN and can talk over a 蒲公英 virtual IP . As long as the webui is bound to that virtual IP, your phone can reach it. The whole link is a private peer-to-peer network — your machine is never exposed to the public internet . Why not just open it to the internet The webui / daemon has no built-in authentication; whoever reaches it effectively gains execution rights for every tool on your machine (including bash , write , edit ). So do not use --host 0.0.0.0 to expose it to the public internet or an open LAN. The 蒲公英 virtual LAN plus a one-time access token is the safe remote path intended for regular users."
-      },
-      {
-        "id": "prerequisites",
-        "heading": "Prerequisites",
-        "body": "You can already launch the AtomCode webui on this machine. 蒲公英 is installed on both this machine and your phone: https://pgy.oray.com . Both devices are signed into the same 蒲公英 account and joined to the same network ."
-      },
-      {
-        "id": "steps",
-        "heading": "Steps",
-        "body": ""
-      },
-      {
-        "id": "1-connect-蒲公英-and-get-the-virtual-ip",
-        "heading": "1. Connect 蒲公英 and get the virtual IP",
-        "body": "Sign in and join the network in the 蒲公英 client on this machine, then note the virtual IP assigned to it (looks like 10.x.x.x ). On the phone, just sign into the same account and join the same network — no IP to remember."
-      },
-      {
-        "id": "2-bind-the-webui-to-the-virtual-ip",
-        "heading": "2. Bind the webui to the virtual IP",
-        "body": "By default the webui binds loopback only, which your phone can't reach. In the AtomCode TUI, relaunch the webui with --host pointed at the 蒲公英 virtual IP: /webui --host 10.x.x.x Replace 10.x.x.x with the virtual IP you noted above. Once bound, the webui is reachable from any device on the same virtual LAN."
-      },
-      {
-        "id": "3-scan-to-connect-from-the-remote-access-panel",
-        "heading": "3. Scan to connect from the Remote Access panel",
-        "body": "Open the Remote Access panel (the phone icon) in the top-right of the webui. AtomCode detects the 蒲公英 status and produces: a ready-to-open remote URL (already carrying the access token); a matching QR code . Scan the QR with your phone, or copy the URL into the phone's browser. The phone must be signed into the same 蒲公英 account and on the same network. The access token is a password The remote URL carries a one-time access token ( ?token=… ) that is equivalent to a password : anyone who gets the full link can operate your machine. Don't post it in chats, screenshot it out, or paste it on a public page."
+        "id": "connect",
+        "heading": "Connect",
+        "body": "Keep AtomCode running and run /webui . It opens the local browser and prints a phone link and QR code. Scan with your phone browser, or copy the relay link from the WebUI Remote access dialog. The devices may use different networks. The phone and TUI share the same conversation. /webui stop , signing out in the terminal, or exiting AtomCode stops relay sharing. Standalone: atomcode webui . Local only: /webui --local or atomcode webui --local . Explicit /webui lan or --host <address> uses the local network instead of automatically connecting a relay."
       },
       {
         "id": "troubleshooting",
-        "heading": "Troubleshooting",
-        "body": "The Remote Access panel shows different hints depending on what it detects. Map them as follows: Panel hint Meaning What to do 蒲公英 not detected 蒲公英 isn't installed, or the client isn't running. Install and sign into 蒲公英 on both machine and phone, join the same network, then hit \"Re-check\". No virtual IP yet 蒲公英 is installed but hasn't joined a network. Connect / join the network in the 蒲公英 client, get a virtual IP, then \"Re-check\". webui bound to localhost only 蒲公英 is detected, but the webui still listens on loopback. Relaunch with /webui --host <virtual IP> as in step 2, then refresh this page. Phone can't open it / hangs The two ends aren't on the same network, or a firewall blocks it. Confirm both devices share the same 蒲公英 account and network; check that the machine's firewall allows the webui port."
+        "heading": "Connection failures",
+        "body": "Local access remains available if relay setup fails. The terminal and Remote access dialog explain the failure. If WebUI is unsupported, upgrade the relay server and install the matching WebUI assets, then retry /webui . Use ATOMCODE_APP_RELAY for a self-hosted relay and ATOMCODE_ENABLE_RELAY=0 to disable relay access."
       },
       {
-        "id": "next",
-        "heading": "Next",
-        "body": "Headless & Daemon — the daemon and HTTP/SSE API behind the webui FAQ — common remote / login gotchas © 2026 AtomCode · MIT 报告问题"
+        "id": "relay-address",
+        "heading": "Relay address",
+        "body": "The default HTTPS relay is https://relay-atomcode.atomgit.com ; no extra configuration is needed. On your phone, open the pairing link generated by AtomCode or scan its QR code."
+      },
+      {
+        "id": "security",
+        "heading": "Security and lifetime",
+        "body": "The link grants access: keep it private. HTTPS protects transport; the local WebUI still checks its access token. The relay can process traffic; this is not end-to-end encryption. Pairing credentials survive reload in tab-scoped sessionStorage and are cleared when the tab closes. Network disconnects reconnect automatically. Access stops while the computer is asleep, offline, or AtomCode has exited."
+      },
+      {
+        "id": "lan",
+        "heading": "Local network alternative",
+        "body": "/webui lan remains available on the same Wi-Fi. /webui --host <virtual IP> also works with an existing VPN. These local HTTP connections require a trusted network. © 2026 AtomCode · MIT 报告问题"
       }
     ]
   },

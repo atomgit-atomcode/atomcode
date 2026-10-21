@@ -1,3 +1,5 @@
+import { useSkills, refreshSkills, invalidateSkills } from '../skills';
+import type { LiveGoalProgress } from '../api';
 // Task 13 — Chat view with streaming rendering
 // Task 15 — sessionId + cwd lifted to App
 //
@@ -25,9 +27,11 @@
 //   • P3  !ts 守卫把 ts=0 误判无效                  → 23fb3db4  formatMsgTime 改为 ts == null || !Number.isFinite(ts)
 // 我们愿意根据再审意见继续优化。
 
+import { rankSessionReferences, sessionReferenceToken, sessionReferenceTokens } from '../lib/sessionReferences';
+import { sessionReferenceCandidates } from '../api';
 import { VNode } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir, searchFiles, changeDir, postConfigReload, postCommand, postLiveCompact, postUserInputAnswer, postLivePolicyInterventionResolution, openWorkspaceFile, type CommandResult, type RoutedUserInputRequest, type PolicyInterventionEvent, type TurnStats } from '../api';
+import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, listDir, searchFiles, changeDir, postConfigReload, postCommand, postLiveCompact, postUserInputAnswer, postLivePolicyInterventionResolution, openWorkspaceFile, type CommandResult, type RoutedUserInputRequest, type PolicyInterventionEvent, type TurnStats } from '../api';
 import {
   parseSlashCommand,
   buildCommandMap,
@@ -40,6 +44,8 @@ import { resolvePendingAfterDecision } from '../lib/pendingPermission';
 import { isDuplicateTrailingNotice } from '../lib/notices';
 import { beginModeSwitch, completeModeSwitch, failModeSwitch, initModeState, modeForQueuedPrompt } from '../lib/modeSwitch';
 import { Markdown } from './Markdown';
+import { isRetainedHistoryUserMessage } from '../lib/historyMessages';
+import { CompactionHistory } from './CompactionHistory';
 import { ModelSelector } from './ModelSelector';
 import { ModeSelector } from './ModeSelector';
 import { AttachMenu } from './AttachMenu';
@@ -84,6 +90,8 @@ import {
   reduceChatRecovery,
   reduceLiveLifecycle,
   resolveUserInputRequest,
+  completeUserInputRequest,
+  retainContinuedUserInput,
   restoreLiveSnapshot,
   sessionHeldElsewhere,
   syncAttachDisposition,
@@ -105,6 +113,7 @@ import { disposeNotifications, maybeNotifyTurnFinished } from '../lib/notificati
 import { artifactsByAssistantIndex, type TurnArtifact } from '../lib/turnArtifacts';
 
 interface Message {
+  retainedHistory?: boolean;
   role: 'user' | 'assistant' | 'system';
   parts: MsgPart[];
   images?: ImageData[];
@@ -446,6 +455,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   // IME 候选窗的按键）。输入值本身始终受控同步，见 handleInput。
   const composingRef = useRef(false);
   const [busy, setBusyState] = useState(false);
+  const [goalProgress, setGoalProgress] = useState<LiveGoalProgress | null>(null);
   // Mirror of `busy` in a ref so pushCommandNotice can read it synchronously
   // without a stale closure (refs always reflect the latest render value).
   const busyRef = useRef(false);
@@ -564,15 +574,18 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   const [showFilePicker, setShowFilePicker] = useState(false);
   const [pendingImages, setPendingImages] = useState<ImageData[]>([]);
   const [attachError, setAttachError] = useState<string | null>(null);
-  const [slashSkills, setSlashSkills] = useState<SkillInfo[] | null>(null);
-  const [slashLoading, setSlashLoading] = useState(false);
   const [slashOpen, setSlashOpen] = useState(false);
+  const { items: slashSkills, loading: slashLoading, failed: slashFailed } = useSkills(slashOpen);
   const [slashQuery, setSlashQuery] = useState('');
   const [slashIndex, setSlashIndex] = useState(0);
   // The /skills command opens a pure skills browser (no commands). Set while that
   // browser is showing; cleared as soon as the user types (normal mixed filtering).
   const [slashSkillsOnly, setSlashSkillsOnly] = useState(false);
   const [atOpen, setAtOpen] = useState(false);
+  const [atKind, setAtKind] = useState<'all' | 'files' | 'sessions'>('all');
+  const [atSessions, setAtSessions] = useState<SessionMetaWithProject[]>([]);
+  const [atSessionsFor, setAtSessionsFor] = useState<string | null>(null);
+  const [atSessionError, setAtSessionError] = useState(false);
   const [atQuery, setAtQuery] = useState('');
   const [atIndex, setAtIndex] = useState(0);
   const [atItems, setAtItems] = useState<{ name: string; is_dir: boolean }[]>([]);
@@ -591,6 +604,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   const [sync, setSync] = useState<boolean>(() => {
     try { return new URLSearchParams(location.search).get('sync') === '1'; } catch { return false; }
   });
+  useEffect(() => { if (!sync) setGoalProgress(null); }, [sync]);
   const syncRef = useRef(sync);
   syncRef.current = sync;
   // Pending live-session permission request (shown as PermissionCard, calls /live/permission).
@@ -598,7 +612,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   const [livePending, setLivePending] = useState<{ tool_name: string; reason: string; call_id: string; arguments: string; allow_all_bash?: boolean } | null>(null);
   // Pending structured input from either transport. The event's optional session_id
   // selects `/chat/user-input`; live requests answer the bound `/live` runtime.
-  const [userInputReq, setUserInputReq] = useState<RoutedUserInputRequest | null>(null);
+  const userInputVersionRef = useRef(0);
+  const [userInputReq, setUserInputReq] = useState<(RoutedUserInputRequest & { viewKey: number }) | null>(null);
   const [policyIntervention, setPolicyIntervention] = useState<PolicyInterventionEvent | null>(null);
   const [todoItems, setTodoItems] = useState<TodoItem[]>([]);
   const [todoPreview, setTodoPreview] = useState<TodoItem[] | null>(null);
@@ -1123,6 +1138,23 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     return () => document.removeEventListener('mousedown', h);
   }, [atOpen]);
 
+  const atSessionKey = JSON.stringify([atQuery, cwd, sessionId, activeSession?.project_hash]);
+  useEffect(() => {
+    if (!atOpen || atKind === 'files') { setAtSessionsFor(null); return; }
+    let cancelled = false;
+    const controller = new AbortController();
+    setAtSessionsFor(null);
+    setAtSessionError(false);
+    setAtSessions([]);
+    const timer = window.setTimeout(() => {
+      sessionReferenceCandidates(atQuery, cwd, controller.signal).then(sessions => {
+        if (!cancelled) setAtSessions(rankSessionReferences(sessions, cwd, sessionId, activeSession?.project_hash));
+      }).catch(() => { if (!cancelled) setAtSessionError(true); })
+        .finally(() => { if (!cancelled) setAtSessionsFor(atSessionKey); });
+    }, 150);
+    return () => { cancelled = true; controller.abort(); window.clearTimeout(timer); };
+  }, [atOpen, atKind, atQuery, cwd, sessionId, activeSession?.project_hash]);
+
   // @ 文件菜单：把 @ 后文本拆成「目录段 + 过滤词」，以支持进入子目录 / 返回上级。
   // 例如 "examples/fo" → 列 cwd/examples 的内容，并按前缀 "fo" 过滤。
   const { scopeDir: atDirPart, filter: atFilter } = splitAtToken(atQuery);
@@ -1185,16 +1217,21 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   //    相对/绝对路径，`full` 让 chooseAtRow 直接整体插入（不再拼 atDirPart）。
   //  · 下钻模式（无过滤词）：进入子目录后首行「..」返回上级；其余是该层内容。
   const searchMode = atFilter !== '';
-  const atRows: { name: string; is_dir: boolean; up?: boolean; full?: string }[] = [];
+  const atRows: { name: string; is_dir: boolean; up?: boolean; full?: string; session?: SessionMetaWithProject }[] = [];
   if (searchMode) {
     for (const m of atSearchItems) atRows.push({ name: m.path, is_dir: m.is_dir, full: m.path });
   } else {
     if (atDirPart) atRows.push({ name: '..', is_dir: true, up: true });
     for (const it of atItems) atRows.push(it);
   }
+  if (atKind === 'sessions') atRows.length = 0;
+  if (atKind !== 'files') for (const session of atSessions) {
+    atRows.push({ name: session.name, is_dir: false, session });
+  }
   // 搜索结果尚未对上当前 token（首次进入 / 键入中，debounce+请求在途）即视为加载中，避免
   // 闪现上一次 query 的旧结果或过早的 "No files found"。下钻模式沿用 listDir 的 atLoading。
-  const atMenuLoading = searchMode ? atSearchFor !== atQuery : atLoading;
+  const atMenuLoading = (atKind !== 'files' && atSessionsFor !== atSessionKey)
+    || (atKind !== 'sessions' && (searchMode ? atSearchFor !== atQuery : atLoading));
 
   useEffect(() => {
     if (!atOpen) return;
@@ -1357,6 +1394,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
           parts: [{ kind: 'text', text: stripVisionAnnotation(msg.content ?? '') }],
           images: msg.images && msg.images.length ? msg.images : undefined,
           ts: msg.created_at,
+          retainedHistory: isRetainedHistoryUserMessage(msg),
         });
       } else if (msg.role === 'assistant') {
         if (isInternalHistoryAssistantMessage(msg)) continue;
@@ -1468,8 +1506,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
 
   // ── Live event handler ──
   function onLiveEvent(e: LiveWireEvent) {
+    if (e.type === 'goal_changed') {
+      setGoalProgress(e);
+      return;
+    }
     // snapshot：确立实时会话 id 并把视图切到它（连上即对齐）。
     if (e.type === 'snapshot') {
+      setGoalProgress(e.goal ?? null);
       liveSessionIdRef.current = e.session_id || null;
       // Historical timestamps come from the daemon's native transcript projection.
       // Older sessions may not have transcript records; leave those timestamps absent
@@ -1676,7 +1719,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
           // 回合结束（idle）时不可能再有待批准项：清掉因对端(TUI)批准或回合收尾而
           // 残留的审批卡片，否则 webui 会一直挂着一张「等待批准…」的卡片直到刷新。
           setLivePending(null);
-          setUserInputReq(null);
+          setUserInputReq((current) => retainContinuedUserInput(current, !terminal.discardQueued));
           if (e.stop_reason !== 'policy_denied') setPolicyIntervention(null);
           // 回合结束：计算通知信息并触发浏览器提醒（若守卫通过）。
           finishTurnNotification({
@@ -1721,7 +1764,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       }
       case 'user_input_request': {
         // Show the UserInputCard for the bound live runtime.
-        setUserInputReq({ ...e, response_transport: 'live' });
+        setUserInputReq({ ...e, response_transport: 'live', viewKey: ++userInputVersionRef.current });
         break;
       }
       case 'user_input_resolved': {
@@ -1953,6 +1996,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       changeDir: async (path) => {
         const res = await changeDir(path);
         if (res.success) {
+          invalidateSkills();
           onCwdChanged?.(res.current_dir);
           pushCommandNotice(t('cmd.cd.done', { dir: res.current_dir }));
         } else {
@@ -1963,25 +2007,20 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       openSessionSidebar: () => { pushCommandNotice(t('cmd.resume.openHint')); },
       // reloadConfig: POST /config/reload。
       reloadConfig: async () => {
-        await postConfigReload();
-        pushCommandNotice(t('cmd.reload.done'));
+        const result = await postConfigReload();
+        invalidateSkills();
+        pushCommandNotice(result.live_provider_sync?.message ?? t('cmd.reload.done'));
       },
       openSlashSkillsMenu: () => {
         // Open a pure SKILLS browser (not the full '/' command list — that's what
         // made running /skills look like it "reset to /"). Input stays '/', but the
         // menu shows only skills; typing anything drops back to normal filtering.
-        // Trigger the skills fetch if it hasn't been loaded yet.
+        // Opening refreshes skills; an already open browser can refresh explicitly.
         setInput('/');
         setSlashQuery('');
         setSlashIndex(0);
         setSlashSkillsOnly(true);
-        if (slashSkills === null && !slashLoading) {
-          setSlashLoading(true);
-          getSkills()
-            .then(setSlashSkills)
-            .catch(() => setSlashSkills([]))
-            .finally(() => setSlashLoading(false));
-        }
+        if (slashOpen) void refreshSkills();
         setSlashOpen(true);
         requestAnimationFrame(() => {
           const ta = textareaRef.current;
@@ -2065,10 +2104,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
             pushCommandNotice(res.undone > 0 ? t('cmd.undo.done', { n: res.undone }) : t('cmd.undo.none'));
             return;
           }
-          if (res.kind === 'remember') { pushCommandNotice(t('cmd.remember.done', { scope: res.scope })); return; }
+          if (res.kind === 'remember') { pushCommandNotice(res.text ?? t('cmd.remember.done', { scope: res.scope })); return; }
+          if (res.kind === 'memory_action') { pushCommandNotice(res.text); return; }
           if (res.kind === 'forget') { pushCommandNotice(t('cmd.forget.done', { n: res.removed.length })); return; }
           if (res.kind === 'memory') {
-            const lines = [...res.global.map((e) => `[global] ${e}`), ...res.project.map((e) => `[project] ${e}`)];
+            if (res.text !== undefined) { pushCommandNotice(res.text); return; }
+            const lines = [...res.global.map((e) => `[global] ${e}`), ...res.project.map((e) => `[project] ${e}`), ...(res.local ?? []).map((e) => `[local] ${e}`)];
             pushCommandNotice(lines.length ? `${t('cmd.memory.header')}\n${lines.join('\n')}` : t('cmd.memory.empty'));
             return;
           }
@@ -2117,7 +2158,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       t,
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [t, modeState, sync, onCwdChanged, slashSkills, slashLoading, sessionId, cwd, activeSession, provider, messages.length],
+    [t, modeState, sync, onCwdChanged, slashSkills, slashLoading, slashOpen, sessionId, cwd, activeSession, provider, messages.length],
   );
 
   // Append a non-fatal advisory as its OWN notice part (never merged into a text run,
@@ -2288,7 +2329,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         break;
 
       case 'user_input_request':
-        setUserInputReq({ ...event, response_transport: 'chat' });
+        setUserInputReq({ ...event, response_transport: 'chat', viewKey: ++userInputVersionRef.current });
+        break;
+
+      case 'user_input_resolved':
+        setUserInputReq((current) => resolveUserInputRequest(current, event.request_id));
         break;
 
       case 'policy_intervention':
@@ -2794,9 +2839,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
 
     // @ 菜单导航
     if (atOpen) {
+      if (atMenuLoading && (e.key === 'Enter' || e.key === 'Tab')) {
+        e.preventDefault();
+        return;
+      }
       if (e.key === 'ArrowDown') {
         e.preventDefault();
-        setAtIndex((i) => Math.min(i + 1, atRows.length - 1));
+        setAtIndex((i) => Math.max(0, Math.min(i + 1, atRows.length - 1)));
         return;
       }
       if (e.key === 'ArrowUp') {
@@ -2807,7 +2856,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       // Enter/Tab：目录→进入，文件→选定。Tab 便于逐级深入。
       if ((e.key === 'Enter' || e.key === 'Tab') && atRows.length > 0) {
         e.preventDefault();
-        chooseAtRow(atRows[Math.min(atIndex, atRows.length - 1)]);
+        chooseAtRow(atRows[Math.max(0, Math.min(atIndex, atRows.length - 1))]);
         return;
       }
       if (e.key === 'Escape') {
@@ -2898,7 +2947,19 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
 
   // 选择 @ 菜单某一行：「..」返回上级；搜索结果整体插入其完整相对路径（`full`）；
   // 下钻行则拼上当前目录段。目录插入后保留 `/` 可继续下钻。
-  function chooseAtRow(row: { name: string; is_dir: boolean; up?: boolean; full?: string }) {
+  function chooseAtRow(row: { name: string; is_dir: boolean; up?: boolean; full?: string; session?: SessionMetaWithProject }) {
+    if (row.session) {
+      const ta = textareaRef.current;
+      if (!ta) return;
+      const range = detectAtMentionRange(ta.value, ta.selectionStart ?? ta.value.length);
+      if (!range) return;
+      const token = sessionReferenceToken(row.session) + ' ';
+      const next = ta.value.slice(0, range.start) + token + ta.value.slice(range.end);
+      setInput(next);
+      setAtOpen(false);
+      requestAnimationFrame(() => { ta.focus(); ta.setSelectionRange(range.start + token.length, range.start + token.length); });
+      return;
+    }
     if (row.up) {
       const trimmed = atDirPart.replace(/\/+$/, '');
       const idx = trimmed.lastIndexOf('/');
@@ -2942,13 +3003,6 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     if (slashIdx >= 0 && (slashIdx === 0 || before[slashIdx - 1] === ' ')) {
       const query = before.slice(slashIdx + 1);
       if (!query.includes(' ') && query.length <= 30) {
-        if (slashSkills === null && !slashLoading) {
-          setSlashLoading(true);
-          getSkills()
-            .then(setSlashSkills)
-            .catch(() => setSlashSkills([]))
-            .finally(() => setSlashLoading(false));
-        }
         setAtOpen(false);
         setSlashQuery(query);
         setSlashIndex(0);
@@ -3202,12 +3256,28 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
           ))}
         </div>
       )}
+      {sessionReferenceTokens(input).length > 0 && <div class="session-reference-chips">
+        {sessionReferenceTokens(input).map(ref => <span class="session-reference-chip" key={ref.start} title={`${t('mention.readOnly')} · ${ref.bucket}/${ref.id}`}>
+          💬 {ref.label}<button type="button" aria-label={t('mention.remove')} onClick={() => {
+            setInput(input.slice(0, ref.start) + input.slice(ref.end));
+            textareaRef.current?.focus();
+          }}>×</button>
+        </span>)}
+      </div>}
       {atOpen && (
         <div class="at-popover" ref={atRef}>
+          <div class="at-tabs" role="tablist" aria-label={t('mention.title')}>
+            {(['all', 'files', 'sessions'] as const).map(kind => <button type="button" role="tab"
+              aria-selected={atKind === kind} class={atKind === kind ? 'active' : ''}
+              onClick={() => { setAtKind(kind); setAtIndex(0); }}
+              onMouseDown={e => { e.preventDefault(); e.stopPropagation(); setAtKind(kind); setAtIndex(0); }}
+              >{t(`mention.${kind}`)}</button>)}
+          </div>
+          {atKind !== 'files' && atSessionError && <div class="at-empty">{t('mention.error')}</div>}
           {atMenuLoading && <div class="at-loading">Loading...</div>}
           {!atMenuLoading && atRows.map((item, i) => (
             <button
-              key={(item.up ? 'up:' : item.is_dir ? 'd:' : 'f:') + item.name}
+              key={item.session ? `s:${item.session.project_hash}/${item.session.id}` : (item.up ? 'up:' : item.is_dir ? 'd:' : 'f:') + item.name}
               class={'at-row' + (i === atIndex ? ' active' : '')}
               // stopPropagation: this mousedown is an INSIDE click. Without it the
               // event bubbles to the document click-outside handler, whose
@@ -3218,19 +3288,23 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
               onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); chooseAtRow(item); }}
               onMouseEnter={() => setAtIndex(i)}
               type="button"
-              title={item.up ? '..' : (item.full ?? atDirPart + item.name + (item.is_dir ? '/' : ''))}
+              title={item.session ? `${item.session.working_dir} · ${item.session.id}` : item.up ? '..' : (item.full ?? atDirPart + item.name + (item.is_dir ? '/' : ''))}
             >
-              <span class="at-icon">{item.up ? '⬆' : item.is_dir ? '📁' : '📄'}</span>
-              <span class="at-name">{item.up ? '..' : (item.full ?? atDirPart + item.name + (item.is_dir ? '/' : ''))}</span>
+              <span class="at-icon">{item.session ? '💬' : item.up ? '⬆' : item.is_dir ? '📁' : '📄'}</span>
+              <span class="at-name">{item.session ? item.session.name : item.up ? '..' : (item.full ?? atDirPart + item.name + (item.is_dir ? '/' : ''))}</span>
+              {item.session && <small class="at-session-meta">{item.session.working_dir} · {new Date(item.session.updated_at * 1000).toLocaleString()}</small>}
             </button>
           ))}
           {!atMenuLoading && atRows.length === 0 && (
-            <div class="at-empty">No files found</div>
+            <div class="at-empty">{t('mention.empty')}</div>
           )}
         </div>
       )}
       {slashOpen && (
         <div class="slash-popover" ref={slashRef}>
+          {slashLoading && <div class="at-empty">{t('attach.skillsLoading')}</div>}
+          {slashFailed && <button class="slash-row" onMouseDown={(e) => { e.preventDefault(); void refreshSkills(); }}>{t('skills.loadFailedRetry')}</button>}
+          {!slashLoading && !slashFailed && slashSkillsOnly && slashSkills?.length === 0 && <div class="at-empty">{t('attach.skillsEmpty')}</div>}
           {buildSlashMenuItems(FRONTEND_COMMANDS, slashSkills ?? [], slashQuery, t as (k: string) => string, slashSkillsOnly).map((item, i) => (
             <button
               key={`${item.kind}:${item.name}`}
@@ -3307,13 +3381,15 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
             onChange={(m) => switchMode(m)}
           />
           <ModelSelector
+            busy={busy}
+            onError={pushCommandNotice}
             value={provider}
             liveEffort={reasoningEffort?.provider === provider ? reasoningEffort.effort : undefined}
             onChange={(p) => switchProvider(p)}
             onDefaultChange={followDefaultProvider}
           />
           <div class="input-turn-controls">
-            {busy || recoveryPolicy.allowStop ? (
+            {busy || recoveryPolicy.allowStop || Boolean(goalProgress?.recovery) ? (
               <>
                 {/* /live folds this into the active turn; /chat queues it for the next turn. */}
                 {recoveryPolicy.allowSend && (input.trim() || pendingImages.length > 0) && (
@@ -3419,8 +3495,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   // Shared structured-input card for `/chat` and `/live`.
   const userInputCard = userInputReq && (
     <UserInputCard
+      key={userInputReq.viewKey}
       req={userInputReq}
-      onDone={() => setUserInputReq(null)}
+      onDone={() => setUserInputReq((current) => completeUserInputRequest(current, userInputReq))}
       submitAnswer={(body) => postUserInputAnswer(userInputReq, body)}
     />
   );
@@ -3535,6 +3612,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       {/* Message timeline */}
       <div class="messages-container" ref={scrollRef} onScroll={recomputeAtBottom}>
         <div class="timeline-inner">
+        {sessionId && activeSession?.id === sessionId && activeSession.project_hash && <CompactionHistory
+          key={`${activeSession.project_hash}/${sessionId}`}
+          projectHash={activeSession.project_hash} sessionId={sessionId}
+        />}
         {messages.length === 0 && !historyHint && !restoring && loading && (
           <div class="messages-empty">
             <div>
@@ -3800,6 +3881,18 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         </div>
       )}
       <div class="input-container">
+        {goalProgress?.recovery && (
+          <div class="goal-recovery-status" role="status" aria-live="polite">
+            {t(goalProgress.recovery.retry_in_secs === 0 ? 'goal.recovery.running' : goalProgress.recovery.kind === 'evaluator' ? 'goal.recovery.evaluator' : 'goal.recovery.provider', {
+              attempt: goalProgress.recovery.attempt,
+              max: goalProgress.recovery.max_attempts,
+              secs: goalProgress.recovery.retry_in_secs,
+            })}
+          </div>
+        )}
+        {goalProgress?.phase === 'paused_at_cap' && !goalProgress.recovery && (
+          <div class="goal-recovery-status" role="status">{t('goal.recovery.paused')} {goalProgress.last_reason}</div>
+        )}
         {todoPanelVisible && (todoPreview ?? todoItems).length > 0 && (
           <TodoProgressPanel items={todoPreview ?? todoItems} />
         )}
@@ -4171,6 +4264,7 @@ function UserMessageView({
     return (
       <div class={wrapperClass} ref={searchRef}>
         {images}
+        {msg.retainedHistory && <div class="retained-history-badge">{t('chat.retainedHistory')}</div>}
         <button
           class="skill-badge"
           onClick={() => setExpanded(true)}
@@ -4191,6 +4285,7 @@ function UserMessageView({
 
   return (
     <div class={wrapperClass} ref={searchRef}>
+      {msg.retainedHistory && <div class="retained-history-badge">{t('chat.retainedHistory')}</div>}
       <div class={'user-message-bubble' + (skillTitle ? ' is-markdown' : '')}>
         {images}
         {skillTitle && (

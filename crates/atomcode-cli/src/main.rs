@@ -60,11 +60,6 @@ use atomcode_telemetry::{
 /// and on Windows can panic if the console handle isn't a real TTY.
 static HEADLESS_MODE: AtomicBool = AtomicBool::new(false);
 
-/// Set once the startup synchronous upgrade check has run this launch, so the
-/// post-parse detached stager can skip a redundant second `latest.json` fetch —
-/// the sync path already checked (and applied, if newer) on this same launch.
-static SYNC_UPGRADE_CHECKED: AtomicBool = AtomicBool::new(false);
-
 /// Restore terminal state if (and only if) we ever entered TUI mode.
 /// No-op in headless mode — see [`HEADLESS_MODE`].
 ///
@@ -142,7 +137,13 @@ fn restore_terminal_if_tui() {
     if HEADLESS_MODE.load(Ordering::Relaxed) {
         return;
     }
-    atomcode_tuix::panic_restore_terminal();
+    // Startup can reject a Windows pipe transport before either screen takes
+    // over. Cleanup must not then change its unrelated hidden console's mode.
+    #[cfg(windows)]
+    if atomcode_tui::surface::validate_interactive_io().is_err() {
+        return;
+    }
+    atomcode_tui::surface::emergency_restore();
     let _ = crossterm::terminal::disable_raw_mode();
 }
 
@@ -518,193 +519,6 @@ async fn run_prepare_upgrade_worker() -> i32 {
     }
 }
 
-/// Whether the startup-time SYNCHRONOUS upgrade path should fire. Restored (with the
-/// detached stager kept alongside) after 31daa6ee removed it: the everyday startup cost
-/// this guards is only a small `latest.json` fetch, so a fresh release is applied on THIS launch
-/// instead of requiring two restarts. Returns false for `.bak`, dev, `ATOMCODE_PLAIN`,
-/// headless `-p`, subcommands, `auto_update = false`, or offline mode.
-fn should_try_sync_upgrade() -> bool {
-    if is_running_as_backup() {
-        return false;
-    }
-    if is_dev_mode() {
-        return false;
-    }
-    // Package-managed (distro-pm / HarmonyBrew) builds: upgrades belong to the package
-    // manager. Match the detached stager's gate so we don't spin up the check for a
-    // guaranteed no-op (`prepare_deferred_upgrade` early-returns on pm builds anyway).
-    if atomcode_updater::is_package_managed() {
-        return false;
-    }
-
-    // PlainRenderer 模式（ATOMCODE_PLAIN=1）：跳过同步自更新检查。
-    // 自更新用 eprintln! 直接写 stderr，和 PlainRenderer 的 stdout
-    // 流式输出交错，破坏启动体验。后台异步自更新不受影响，用户仍可
-    // 手动 /upgrade。
-    if std::env::var("ATOMCODE_PLAIN")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .is_some()
-    {
-        return false;
-    }
-
-    let args: Vec<String> = std::env::args().collect();
-    let any = |needle: &[&str]| {
-        args.iter().skip(1).any(|a| {
-            needle
-                .iter()
-                .any(|n| a == n || a.starts_with(&format!("{}=", n)))
-        })
-    };
-
-    if any(&["-p", "--prompt", "--prompt-file"]) {
-        return false;
-    }
-    if args.iter().skip(1).any(|a| {
-        matches!(
-            a.as_str(),
-            "login"
-                | "logout"
-                | "status"
-                | "upgrade"
-                | "rollback"
-                | "uninstall"
-                | "mcp"
-                | "telemetry"
-                | "completion"
-                | "--version"
-                | "-V"
-                | "--help"
-                | "-h"
-        )
-    }) {
-        return false;
-    }
-
-    // Load config once to honor both `auto_update = false` and `offline_mode`.
-    // Runs pre-seed, so offline is resolved directly rather than via the process
-    // verdict. Env wins over config; only forced On skips. Failure to load = assume
-    // defaults (auto_update true, offline Off) — fresh installs benefit.
-    let path = atomcode_config::config::Config::default_path();
-    let offline_mode = if path.exists() {
-        if let Ok(cfg) = atomcode_config::config::Config::load(&path) {
-            if !cfg.auto_update {
-                return false;
-            }
-            cfg.offline_mode
-        } else {
-            atomcode_config::config::offline::OfflineMode::Off
-        }
-    } else {
-        atomcode_config::config::offline::OfflineMode::Off
-    };
-    // Offline (env wins over config; only forced On skips) disables binary self-update,
-    // same as auto_update=false. Works even with no config file (e.g. air-gapped container).
-    if atomcode_config::config::offline::offline_resolved(
-        offline_mode,
-        std::env::var(atomcode_config::config::offline::ATOMCODE_OFFLINE_ENV)
-            .ok()
-            .as_deref(),
-    ) {
-        return false;
-    }
-
-    true
-}
-
-/// Synchronous startup upgrade: fetch the manifest, and if a newer version is out,
-/// stage + apply it NOW and re-exec, so the user gets the new binary on THIS launch.
-/// Bounded by a 120s timeout; on timeout/error it just continues (the detached stager
-/// and `/upgrade` remain as fallbacks). Restored verbatim from the pre-31daa6ee path.
-async fn sync_stage_and_apply_if_newer() {
-    use atomcode_updater::{self as self_update, UpgradeEvent};
-
-    let current = format!("v{}", env!("CARGO_PKG_VERSION"));
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UpgradeEvent>();
-
-    // Progress consumer: renders ManifestFetched / Downloading / Verifying
-    // as a single-line updating status on stderr. Percent-debounced so a
-    // 15 MB download at 64 KiB chunks doesn't flood the terminal.
-    let progress = tokio::spawn(async move {
-        use std::io::Write;
-        let mut last_pct: i32 = -1;
-        while let Some(ev) = rx.recv().await {
-            match ev {
-                UpgradeEvent::ManifestFetched { version } => {
-                    eprintln!("✨ New version available: {}", version);
-                }
-                UpgradeEvent::Downloading { bytes, total } => {
-                    let pct = if total == 0 {
-                        0
-                    } else {
-                        ((bytes * 100) / total) as i32
-                    };
-                    if pct != last_pct {
-                        eprint!(
-                            "\r   Downloading {}% ({:.1} / {:.1} MB)      ",
-                            pct,
-                            bytes as f64 / 1_048_576.0,
-                            total as f64 / 1_048_576.0
-                        );
-                        let _ = std::io::stderr().flush();
-                        last_pct = pct;
-                    }
-                }
-                UpgradeEvent::Verifying => {
-                    eprintln!("\n✓ Verifying sha256");
-                }
-                _ => {}
-            }
-        }
-    });
-
-    let outcome = tokio::time::timeout(
-        std::time::Duration::from_secs(120),
-        self_update::prepare_deferred_upgrade(&current, tx),
-    )
-    .await;
-
-    // Wait briefly for the progress consumer to drain — it closes when
-    // the sender drops at the end of prepare_deferred_upgrade.
-    let _ = progress.await;
-
-    match outcome {
-        Ok(Ok(Some(_staged))) => {
-            // Staged successfully. Apply right now so the user gets the new
-            // binary on this same invocation.
-            match self_update::apply_pending_upgrade() {
-                Ok(Some(applied)) => {
-                    eprintln!("✓ Upgrading to {}...", applied.version);
-                    // Save the CURRENT version (before upgrade) so TUI can show "Upgraded old → new"
-                    std::env::set_var(UPGRADED_FROM_ENV, &current);
-                    match self_update::re_exec_self(Some(&applied.exe)) {
-                        Ok(_infallible) => unreachable!("re_exec_self returned Ok"),
-                        Err(e) => {
-                            eprintln!(
-                                "Upgrade applied but re-exec failed ({}). The new version will be used on the next launch.",
-                                e
-                            );
-                            std::env::remove_var(UPGRADED_FROM_ENV);
-                        }
-                    }
-                }
-                _ => {
-                    // Stage succeeded but apply didn't — weird, just continue.
-                }
-            }
-        }
-        Ok(Ok(None)) => {
-            // Already latest, no-op.
-        }
-        Ok(Err(_)) | Err(_) => {
-            // Network error or 120 s timeout. Don't spam the user —
-            // `/upgrade` will surface the real error if they ask.
-            eprintln!("Note: could not check for updates at startup (will retry in background).");
-        }
-    }
-}
-
 /// Spawn a detached copy of this binary that runs the upgrade-prep worker
 /// and exits. "Detached" means:
 ///   * New session on Unix (`setsid`) — parent's Ctrl+C goes to parent's
@@ -890,12 +704,6 @@ struct Cli {
     #[arg(long, conflicts_with = "headless_input")]
     pub tui: bool,
 
-    /// Open the classic screen for this launch, whatever `[ui] screen` says —
-    /// the escape hatch. `[ui] screen = "classic"` makes it the one that opens
-    /// without the flag.
-    #[arg(long, conflicts_with = "tui")]
-    pub classic: bool,
-
     /// On the row-assembled screen: show the mascot.
     #[arg(long)]
     pub mascot: bool,
@@ -999,6 +807,9 @@ enum Commands {
         /// 不自动打开浏览器（脚本/桌面客户端集成场景）；访问 URL 仍会打印
         #[arg(long)]
         no_open: bool,
+        /// 仅本机访问，不连接中继服务
+        #[arg(long)]
+        local: bool,
     },
     /// Telemetry controls
     Telemetry {
@@ -1312,6 +1123,23 @@ const UPGRADED_FROM_ENV: &str = atomcode::tui_opening::UPGRADED_FROM_ENV;
 /// parent can be Ctrl+C'd without cancelling the download.
 const INTERNAL_PREPARE_UPGRADE_ENV: &str = "ATOMCODE_INTERNAL_PREPARE_UPGRADE";
 
+fn warn_console_encoding() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Globalization::CP_UTF8;
+        use windows_sys::Win32::System::Console::{GetConsoleCP, GetConsoleOutputCP};
+        // SAFETY: neither API takes arguments or retains pointers.
+        let (input, output) = unsafe { (GetConsoleCP(), GetConsoleOutputCP()) };
+        if input != CP_UTF8 || output != CP_UTF8 {
+            eprintln!(
+                "Console code pages: input {input}, output {output} (expected UTF-8 / 65001).\n\
+                 CJK input/output may be garbled. Use Windows Terminal, or launch with:\n\
+                 cmd.exe /c \"chcp 65001 >nul & atomcode\""
+            );
+        }
+    }
+}
+
 fn main() {
     // `NSPasteboard` is not safe on the Tokio/blocking workers where the TUI
     // asks for clipboard images. A re-exec'd helper stops here, on the actual
@@ -1326,6 +1154,10 @@ fn main() {
     if try_print_shell_completion() {
         return;
     }
+
+    // Before normal-launch I/O, logging or the Tokio runtime. Clipboard and
+    // completion helpers above must not change the containing shell's encoding.
+    atomcode_tui::surface::ensure_console_utf8();
 
     // Settle where the config tree is before anything reads it, so all eight
     // resolvers — and every child process that inherits our environment —
@@ -1407,19 +1239,43 @@ fn launch_warnings(
 
 /// 现在有哪些装着的插件带着还没被信任的钩子。
 ///
-/// 先跑一次迁移:装在这条规矩之前的插件是被顺延信任的,不先迁移就会把它们
-/// 全列出来 —— 一句关于并不存在的问题的提醒。
-fn untrusted_plugin_hooks() -> Vec<String> {
-    atomcode_capabilities::plugin::hook_trust::ensure_migrated(
-        &atomcode_coding::config::product_dirs_from_env(),
-    );
-    atomcode_capabilities::plugin::installed_plugin_hook_trust_status(
-        &atomcode_coding::config::product_dirs_from_env(),
-    )
-    .into_iter()
-    .filter(|status| !status.trusted)
-    .map(|status| status.plugin)
-    .collect()
+/// 内容授权必须明确授予；旧的仅命令授权不顺延。
+fn plugin_hook_notices() -> Vec<String> {
+    let dirs = atomcode_coding::config::product_dirs_from_env();
+    atomcode_capabilities::plugin::hook_trust::ensure_migrated(&dirs);
+    let statuses = atomcode_capabilities::plugin::installed_plugin_hook_trust_status(&dirs);
+    hook_status_notices(&statuses)
+}
+
+fn hook_status_notices(statuses: &[atomcode_capabilities::plugin::PluginHookTrust]) -> Vec<String> {
+    use atomcode_i18n::product::{t, Msg};
+    let pending = statuses
+        .iter()
+        .filter(|status| !status.trusted && !status.hash.starts_with("invalid:"))
+        .count();
+    let incompatible = statuses
+        .iter()
+        .filter(|status| status.hash.starts_with("invalid:"))
+        .count();
+    let mut out = Vec::new();
+    if pending > 0 {
+        out.push(
+            t(Msg::PluginHooksUntrusted {
+                count: pending,
+                names: "",
+            })
+            .into_owned(),
+        );
+    }
+    if incompatible > 0 {
+        out.push(
+            t(Msg::PluginHooksIncompatible {
+                count: incompatible,
+            })
+            .into_owned(),
+        );
+    }
+    out
 }
 
 /// 这一趟启动,开场要说的全部。
@@ -1459,33 +1315,7 @@ async fn async_main() {
     // Wire `tracing::` diagnostics to `<config_dir>/logs/atomcode.log` (file-only,
     // TUI-safe). Must run before anything that emits traces so nothing is lost.
     init_file_logging();
-    // Set Windows console to UTF-8 so CJK and other multi-byte characters
-    // render correctly instead of showing garbled output (mojibake).
-    #[cfg(target_os = "windows")]
-    {
-        use windows_sys::Win32::Globalization::CP_UTF8;
-        use windows_sys::Win32::System::Console::{
-            GetConsoleCP, GetConsoleOutputCP, SetConsoleCP, SetConsoleOutputCP,
-        };
-        unsafe {
-            SetConsoleOutputCP(CP_UTF8);
-            SetConsoleCP(CP_UTF8);
-
-            // Also check output code page, same best-effort as input.
-            let actual_cp = GetConsoleCP();
-            let actual_out_cp = GetConsoleOutputCP();
-            if actual_cp != CP_UTF8 || actual_out_cp != CP_UTF8 {
-                let _ = eprintln!(
-                    "\n⚠  Console code pages — input: {} (expected 65001/UTF-8), output: {}.\n\
-                       Chinese/Japanese/Korean IME input/output may show garbled text.\n\
-                       → Use Windows Terminal for native UTF-8 support.\n\
-                       → Or enable Beta: Use Unicode UTF-8 in Region settings.\n",
-                    actual_cp, actual_out_cp,
-                );
-            }
-        }
-    }
-
+    warn_console_encoding();
     // Detached upgrade-prep worker mode. The parent atomcode spawns a
     // subprocess with this env var set; that subprocess does one full
     // download + verify + `pending.json` write, then exits. Because the
@@ -1541,19 +1371,9 @@ async fn async_main() {
                 }
             }
             Ok(None) => {
-                // Nothing was staged by a prior session. Do a fresh synchronous
-                // check → stage → apply so a newly-released version is picked up on
-                // THIS launch (restores the pre-31daa6ee "one restart upgrades you"
-                // behavior). The everyday no-update case is just a small latest.json
-                // fetch; should_try_sync_upgrade's gates + a 120s timeout keep
-                // headless / opted-out / offline runs fast, and the detached stager
-                // below stays as the survives-quick-exit fallback.
-                if should_try_sync_upgrade() {
-                    // Remember we checked, so the post-parse detached stager doesn't
-                    // re-fetch the manifest a second time this launch.
-                    SYNC_UPGRADE_CHECKED.store(true, Ordering::Relaxed);
-                    sync_stage_and_apply_if_newer().await;
-                }
+                // Network checks and downloads belong to the detached stager
+                // after startup. Only an already-staged local update may hold
+                // up this launch; an unreachable mirror must not delay the UI.
             }
             Err(e) => {
                 eprintln!("Note: pending upgrade could not be applied ({}). Continuing with current version.", e);
@@ -1701,6 +1521,7 @@ fn set_env_command(env: &str) -> String {
 }
 
 async fn run() -> Result<i32> {
+    let _webui_relay = atomcode::webui_relay::ShutdownGuard;
     let run_start = std::time::Instant::now();
     // -- Pre-parse --lang to set locale BEFORE clap renders --help --
     // clap help text is generated during parse, so we must resolve
@@ -2060,6 +1881,7 @@ async fn run() -> Result<i32> {
                 port,
                 host,
                 no_open,
+                local,
             } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
                 // Fail before binding a port and opening a browser: without the
@@ -2069,8 +1891,15 @@ async fn run() -> Result<i32> {
                     eprint!("{}", atomcode_daemon::webui::NOT_BUILT_HELP);
                     return Ok(1);
                 }
-                let msg =
-                    atomcode_daemon::ensure_server_and_open(&host, port, false, !no_open).await;
+                let launched = atomcode::webui_relay::launch(
+                    &host,
+                    port,
+                    false,
+                    !no_open,
+                    !local && host == "127.0.0.1",
+                )
+                .await;
+                let msg = launched.message;
                 eprintln!("{msg}");
                 // Nothing is listening: say so and exit non-zero. Waiting on
                 // Ctrl+C anyway is what left a launcher script piling up idle
@@ -2098,10 +1927,12 @@ async fn run() -> Result<i32> {
                     };
                     tokio::select! {
                         _ = ctrl_c => {
+                            atomcode::webui_relay::stop();
                             tracing::info!(target: "atomcode::webui", "atomcode webui exiting: Ctrl+C");
                             0
                         }
                         _ = stopped => {
+                            atomcode::webui_relay::stop();
                             tracing::error!(target: "atomcode::webui", "atomcode webui exiting: the server stopped");
                             eprintln!(
                                 "{}",
@@ -2416,7 +2247,7 @@ async fn run() -> Result<i32> {
     // self-upgrade) used to fire here synchronously, blocking the
     // input box for 1–3s on a warm path (and 5–10s on first clone).
     // Both now run as a detached `spawn_blocking` from inside
-    // `atomcode_tuix::run` after the skill registry is constructed —
+    // the screen after the skill registry is constructed —
     // see lib.rs near `spawn_plugin_bootstrap`. Newly-installed skills
     // are picked up by a `skill_registry.reload()` + wake pulse the
     // background task fires on completion, so the slash menu refreshes
@@ -2436,6 +2267,9 @@ async fn run() -> Result<i32> {
     // Determine if we're running in headless mode BEFORE loading MCP.
     // Headless mode requires MCP tools immediately; TUI can load them in background.
     let is_headless = cli.prompt.is_some() || cli.prompt_file.is_some();
+    if !is_headless {
+        atomcode_tui::surface::validate_interactive_io()?;
+    }
 
     // Continue the previous session only when the user explicitly opts
     // in via `-c` / `--continue`. Bare `atomcode` starts a fresh
@@ -2537,37 +2371,29 @@ async fn run() -> Result<i32> {
         !is_headless,
     );
     runtime_cfg.next_prompt_suggestions = !is_headless;
-    let model_name = runtime_cfg.model.clone();
     let provider_bootstrap = if is_headless {
         atomcode_coding::ProviderBootstrap::Required
     } else {
         interactive_provider_bootstrap(&runtime_cfg)
     };
     let runtime_start = std::time::Instant::now();
-    // `--tui` reaches the runtime through a front end fed from inside its Apps.
-    // What was asked for now, else what the configuration says — one rule, in
-    // one place (`atomcode::tui_front::screen_for`).
-    //
-    // The new screen draws in escape sequences, and a Windows console too old
-    // to execute them would print every one as text; the classic screen draws
-    // there through the console API. So such a console gets the classic screen
-    // whatever was asked — asking also turns the sequences on where the console
-    // has them and they were merely off (a plain Windows 10 PowerShell window).
-    let asked_for_rows = atomcode::tui_front::screen_for(cli.tui, cli.classic, config.ui.screen)
-        == atomcode_config::config::Screen::Rows;
-    let console_draws_rows = is_headless || atomcode_tui::surface::console_speaks_ansi();
-    if asked_for_rows && !console_draws_rows {
-        // Said, not silent: someone who asked for the new screen (or got it as
-        // the default) and sees the old one should be told why and where the
-        // new one runs.
-        eprintln!(
-            "{}",
-            atomcode_config::i18n::t(atomcode_config::i18n::Msg::ClassicScreenFallback)
-        );
+    // One screen and one runtime owner. Older classic inputs remain readable,
+    // but never select a second frontend or a fallback runtime.
+    if !is_headless {
+        if config.ui.screen == atomcode_config::config::Screen::Classic {
+            eprintln!(
+                "{}",
+                atomcode_config::i18n::t(atomcode_config::i18n::Msg::ClassicScreenRetired)
+            );
+        }
+        if !atomcode_tui::surface::console_speaks_ansi() {
+            anyhow::bail!(
+                "{}",
+                atomcode_config::i18n::t(atomcode_config::i18n::Msg::AnsiTerminalRequired)
+            );
+        }
     }
-    let rows_screen = asked_for_rows && console_draws_rows;
-    let tui_front_end =
-        (rows_screen && !is_headless).then(atomcode_coding::front_end::FrontEnd::new);
+    let tui_front_end = (!is_headless).then(atomcode_coding::front_end::FrontEnd::new);
     // Bound to the background sessions once the screen is up (`tui_front::run`);
     // until then — and on any other screen — `code_review` runs inline.
     let review_home = atomcode::background::ReviewHome::new();
@@ -2596,24 +2422,6 @@ async fn run() -> Result<i32> {
         total_ms = run_start.elapsed().as_millis() as u64,
         "startup stage completed"
     );
-    // TUI replay remains a presentation projection during S4; runtime resume above
-    // has already converged and loaded the native snapshot under one lease.
-    let resume_project_bucket = atomcode_capabilities::session::SessionManager::project_hash(
-        &working_dir,
-        &atomcode_coding::config::product_dirs_from_env(),
-    );
-    let session_to_continue = match continued_session
-        .as_ref()
-        .map(|session| session.id.as_str())
-    {
-        Some(id) => atomcode_daemon::legacy_convert::load_catalog_session_view_in_project(
-            &resume_project_bucket,
-            id,
-        )?,
-        None => None,
-    }
-    .map(atomcode_tuix::session::Session::from_catalog_view)
-    .transpose()?;
     let session_startup_notice = continued_session
         .as_ref()
         .and_then(|session| {
@@ -2642,15 +2450,16 @@ async fn run() -> Result<i32> {
             cli.dangerously_skip_permissions,
             is_admin,
             atomcode_config::config::offline::is_offline_active(),
-            &untrusted_plugin_hooks(),
-        ),
+            &[],
+        )
+        .into_iter()
+        .chain(plugin_hook_notices())
+        .collect(),
     );
-    // The first interactive launch on a new release says, in one line, what it
-    // brought and where to read the rest; never a headless one, which would spend
-    // the notice where nobody reads it. Only on the row-assembled screen: the
-    // notice points at `/changelog`, which the classic screen does not have.
+    // Tell interactive launches about a new release; headless runs never emit
+    // screen-only release notices.
     // Last among the notices: it is news, not something wrong with this launch.
-    let whats_new = (!is_headless && rows_screen).then(|| {
+    let whats_new = (!is_headless).then(|| {
         atomcode::tui_changelog::Launch::decide(
             config.ui.whats_new,
             had_config,
@@ -2676,39 +2485,6 @@ async fn run() -> Result<i32> {
         (Some(native_runtime), None)
     } else {
         (None, Some((native_runtime, native_coding_cfg)))
-    };
-
-    // Spawner for in-TUI session switches (/session, /bg, disk /resume): each one
-    // builds a fresh native runtime from the CURRENT in-process config. A launch-time
-    // `--provider` is applied to that config above, so the override remains authoritative
-    // for live views and subsequent runtime respawns without being persisted to disk.
-    let runtime_spawn_override: atomcode_tuix::RuntimeSpawnOverride = {
-        let tel = telemetry.clone();
-        // Capture the bypass flag so in-TUI re-spawns also honor
-        // --dangerously-skip-permissions — not just the launch handle.
-        let skip_perms = cli.dangerously_skip_permissions;
-        std::sync::Arc::new(
-            move |config: &atomcode_config::config::Config,
-                  working_dir: &std::path::Path,
-                  session: &atomcode_tuix::session::Session| {
-                let mut runtime_cfg = runtime_config_from(
-                    config,
-                    working_dir,
-                    None,
-                    Some(tel.clone()),
-                    skip_perms,
-                    // In-TUI re-spawns (/session, /bg, /resume) are always interactive.
-                    true,
-                );
-                // TUI-only: a `max_rounds` hit becomes the interactive
-                // continue/stop checkpoint (the render arm lives in the TUI
-                // event loop). `spawn_deferred_tui_runtime` is only ever the
-                // in-TUI respawn factory, so this is never a headless path.
-                runtime_cfg.round_cap_checkpoint = true;
-                runtime_cfg.next_prompt_suggestions = true;
-                spawn_deferred_tui_runtime(runtime_cfg, session)
-            },
-        )
     };
 
     // Resolve effective prompt: --prompt-file reads from disk; -p is inline.
@@ -2758,8 +2534,8 @@ async fn run() -> Result<i32> {
     // own session id. Events the screen itself reports — `use_command` — are
     // scoped per dispatch by `tui_command_meter`, which reads the session off
     // the screen's own seam and so follows `/new` and `/resume` on its own.
-    if let Some(ref s) = session_to_continue {
-        if let Ok(uuid) = uuid::Uuid::parse_str(s.id.as_str()) {
+    if let Some(id) = &active_session_id {
+        if let Ok(uuid) = uuid::Uuid::parse_str(id) {
             telemetry.set_session_id(uuid);
         }
     }
@@ -2839,11 +2615,7 @@ async fn run() -> Result<i32> {
                 && !is_running_as_backup()
                 && !cli.dev
                 && !atomcode_updater::is_package_managed()
-                // Skip when the startup synchronous path already checked (and applied,
-                // if newer) this launch — otherwise both fetch `latest.json`. The
-                // detached stager stays as the fallback for launches where the sync
-                // path was skipped (e.g. ATOMCODE_PLAIN).
-                && !SYNC_UPGRADE_CHECKED.load(Ordering::Relaxed)
+                && !atomcode_config::config::offline::is_offline_active()
             {
                 spawn_detached_upgrade_prep();
             }
@@ -2859,13 +2631,13 @@ async fn run() -> Result<i32> {
             // actual errors in their shell/CI output.
             redirect_stderr_to_log_file();
 
-            // The runtime task already runs the engine behind this handle; the TUI
-            // drives it. In-TUI /session and /resume spawn via
-            // runtime_spawn_override.
+            // The existing screen/host connection owns session switching;
+            // no frontend-specific runtime wrapper is built here.
             let (runtime, coding_cfg) = native_tui_runtime
                 .take()
                 .expect("native TUI runtime built above");
-            if let Some(front_end) = tui_front_end {
+            let front_end = tui_front_end.expect("interactive startup creates the frontend");
+            {
                 let screen = atomcode_tui::launch::Screen {
                     mascot: cli.mascot,
                     theme: screen_theme(cli.theme.as_deref(), config.ui.theme),
@@ -2957,11 +2729,8 @@ async fn run() -> Result<i32> {
                     &screen,
                     config_path.clone(),
                     Some(telemetry.clone()),
-                    // Cloned rather than moved: the classic arm below still
-                    // takes it by value, and which arm runs is decided at
-                    // `screen_for`, not here.
-                    startup_notice.clone(),
-                    whats_new.clone(),
+                    startup_notice,
+                    whats_new,
                     Some(spawn),
                     Some(review_home.clone()),
                 )
@@ -3022,47 +2791,6 @@ async fn run() -> Result<i32> {
                 }
                 return result;
             }
-            let provider_selection = coding_cfg.provider_name.clone();
-            let tui_runtime = into_tui_native_runtime(runtime, coding_cfg);
-            // Same as the headless arm: don't `?` — a TUI run that ends in an
-            // error must still reach the shutdown/flush below. Ok(()) → exit 0;
-            // the error propagates only after telemetry is drained.
-            // A running session owns its resolved provider/model. Shared config
-            // changes only define the default for sessions opened afterwards;
-            // they must not retarget an already-open runtime.
-            let provider_selection_mode = atomcode_tuix::ProviderSelectionMode::Pinned;
-            tracing::info!(
-                target: "atomcode::startup",
-                stage = "tui_enter",
-                total_ms = run_start.elapsed().as_millis() as u64,
-                "handing control to TUI"
-            );
-            let tui_result = match atomcode_tuix::run(
-                config,
-                provider_selection,
-                model_name,
-                provider_selection_mode,
-                atomcode_config::ConfigStore::new(config_path.clone()),
-                tui_runtime,
-                runtime_spawn_override,
-                working_dir,
-                session_to_continue,
-                startup_notice,
-                telemetry.clone(),
-                cli.dangerously_skip_permissions,
-                is_admin,
-            )
-            .await
-            {
-                Ok(()) => Ok(0),
-                Err(e) => Err(e.into()),
-            };
-            // Codex-style resume hint to STDOUT, after the TUI restored the
-            // terminal, so `atomcode resume <id>` is discoverable on exit.
-            if let Some(id) = &active_session_id {
-                let _ = print_exit_resume_hints(&[resume_hint_line(id, false, hint_zh)]);
-            }
-            tui_result
         };
 
         // Flush telemetry on EVERY exit path — Ok and Err alike. Both session
@@ -3078,80 +2806,6 @@ async fn run() -> Result<i32> {
     .await;
 
     result
-}
-
-fn spawn_deferred_tui_runtime(
-    cfg: atomcode_coding::CodingRuntimeConfig,
-    session: &atomcode_tuix::session::Session,
-) -> atomcode_tuix::SpawnedRuntime {
-    let session_id = session.id.as_str().to_string();
-    let snapshot = session.to_conversation_snapshot();
-    // Base agent config for the VL preprocessor's one-off provider builds,
-    // derived from this runtime's config before `cfg` is moved into the spawn.
-    let vl_base = cfg.agent_config();
-    let (native_control, mut events, runtime_state) =
-        atomcode_daemon::spawn_native_runtime_for_session_deferred_with_preprocessor(
-            cfg,
-            session_id.clone(),
-            snapshot,
-            Some(std::sync::Arc::new(
-                crate::vision::VlImagePreprocessor::new(
-                    atomcode_daemon::coding_provider_factory(),
-                    vl_base,
-                ),
-            )),
-        );
-    let control = atomcode_tuix::RuntimeControl::deferred(native_control, runtime_state);
-    let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
-    tokio::spawn(async move {
-        while let Some(event) = events.recv().await {
-            if event_tx
-                .send(atomcode_tuix::RuntimeEventPayload::SequencedNative(event))
-                .is_err()
-            {
-                break;
-            }
-        }
-    });
-    atomcode_tuix::SpawnedRuntime {
-        endpoint: atomcode_tuix::RuntimeEndpoint { native: control },
-        event_rx,
-        session_id: Some(session_id),
-    }
-}
-
-fn into_tui_native_runtime(
-    runtime: atomcode_coding::CodingRuntime,
-    _coding_cfg: atomcode_coding::CodingAgentConfig,
-) -> atomcode_tuix::SpawnedRuntime {
-    let session_id = runtime.session.as_ref().map(|session| session.id.clone());
-    let atomcode_coding::CodingRuntime {
-        handle,
-        mut events,
-        task,
-        ..
-    } = runtime;
-    let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
-    let control =
-        atomcode_tuix::RuntimeControl::ready_with_event_tx(handle.clone(), event_tx.clone());
-    let control_for_events = control.clone();
-    tokio::spawn(async move {
-        while let Some(event) = events.recv().await {
-            if event_tx
-                .send(atomcode_tuix::RuntimeEventPayload::SequencedNative(event))
-                .is_err()
-            {
-                break;
-            }
-        }
-        let _ = task.await;
-        control_for_events.detach_delivery_event_tx();
-    });
-    atomcode_tuix::SpawnedRuntime {
-        endpoint: atomcode_tuix::RuntimeEndpoint { native: control },
-        event_rx,
-        session_id,
-    }
 }
 
 /// On macOS the NSPasteboard runtime prints deprecation warnings to
@@ -3799,6 +3453,7 @@ pub(crate) async fn run_native_headless(
                 retryable,
                 // 这道标记与 headless 的输出无关(它要的是原因本身),模式吃掉即可。
                 ends_turn: _,
+                retry_after_secs: _,
             }) => {
                 close_native_thinking(&mut thinking_line_open);
                 if jsonl {
@@ -3927,6 +3582,13 @@ pub(crate) async fn run_native_headless(
                 }
             }
             CodingRuntimeEvent::Request(request) => {
+                if atomcode_capabilities::tools::request_user_input::is_continued_question(
+                    &request.kind,
+                    &request.payload,
+                ) {
+                    // An unattended driver has no new human answer to deliver.
+                    continue;
+                }
                 let response = if request.kind == APPROVAL_KIND {
                     serde_json::from_value::<ApprovalRequest>(request.payload)
                         .ok()
@@ -4448,6 +4110,10 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
             if !untrusted.is_empty() {
                 println!("Untrusted plugin hooks (not loaded):");
                 for s in &untrusted {
+                    if s.hash.starts_with("invalid:") {
+                        println!("  {} — incompatible hooks: {} · repair the script entry point or disable this plugin", s.plugin_id, s.hash);
+                        continue;
+                    }
                     println!(
                         "  {} — {} hook(s) [{}] · run: atomcode plugin trust {}",
                         s.plugin,
@@ -5297,14 +4963,23 @@ mod tests {
     #[test]
     fn a_failure_is_reported_once_with_where_the_data_could_live_instead() {
         use atomcode_capabilities::session::SessionStoreError;
+        // The raw code that means "permission denied" on this host: errno 13 on unix,
+        // access-denied (5) on Windows. Read as a plain number, errno 13 is *not*
+        // `PermissionDenied` there, so the advice below would never be offered and the
+        // test would assert the opposite of what it means.
+        let denied_code = if cfg!(windows) { 5 } else { 13 };
         let denied = SessionStoreError::Io {
             path: "/root/.x/sessions/47acaa0a9d16febb".into(),
-            source: std::io::Error::from_raw_os_error(13),
+            source: std::io::Error::from_raw_os_error(denied_code),
         };
         let middle = std::io::Error::new(std::io::ErrorKind::PermissionDenied, denied);
         let error = anyhow::Error::new(middle).context("coding runtime prepare failed");
         let said = super::error_report(&error);
-        assert_eq!(said.matches("os error 13").count(), 1, "said once: {said}");
+        assert_eq!(
+            said.matches(&format!("os error {denied_code}")).count(),
+            1,
+            "said once: {said}"
+        );
         assert!(
             said.contains(&super::set_env_command(
                 atomcode_config::distribution::HOME_ENV
@@ -5314,7 +4989,7 @@ mod tests {
 
         // A refusal that has nothing to do with the data directory is not met
         // with advice to move it (评审指出).
-        let elsewhere = anyhow::Error::new(std::io::Error::from_raw_os_error(13))
+        let elsewhere = anyhow::Error::new(std::io::Error::from_raw_os_error(denied_code))
             .context("reading ./src/main.rs");
         let said = super::error_report(&elsewhere);
         assert!(
@@ -5390,7 +5065,7 @@ mod tests {
     use super::{
         apply_cli_runtime_overrides, atomcode_log_path, close_thinking_chunk,
         format_thinking_chunk, format_verbose_tool_chunk, headless_completion_exit_code,
-        headless_completion_notify_reason, headless_denial_exit_code,
+        headless_completion_notify_reason, headless_denial_exit_code, hook_status_notices,
         interactive_provider_bootstrap, is_completion_invocation, launch_warnings,
         merge_startup_notices, print_shell_completion, resolve_in_catalog, resolve_working_dir,
         resume_candidates, resume_hint_line, runtime_config_from, should_fork_busy_continue,
@@ -5731,6 +5406,33 @@ mod tests {
     /// 把这个函数写成「永远都说」照样全绿 —— 而那样每一次普通启动都会顶着
     /// 四条警告开场,人两天之后就不再看它们,于是真的那一次也漏掉。
     #[test]
+    fn hook_startup_notices_separate_authorization_from_incompatibility() {
+        use atomcode_capabilities::plugin::{InstallScope, PluginHookTrust};
+        let status = |plugin: &str, hash: &str, trusted| PluginHookTrust {
+            plugin: plugin.into(),
+            marketplace: "test".into(),
+            scope: InstallScope::User,
+            plugin_id: format!("{plugin}@test"),
+            hook_count: 1,
+            events: vec!["SessionStart".into()],
+            hash: hash.into(),
+            trusted,
+        };
+        let notices = hook_status_notices(&[
+            status("pending", "digest", false),
+            status("broken", "invalid:long-command-and-hash", false),
+            status("ready", "digest", true),
+        ]);
+        assert_eq!(notices.len(), 2);
+        assert!(notices[0].contains("/plugin"));
+        assert!(notices[1].contains("atomcode hooks list"));
+        assert!(notices.iter().all(|line| !line.contains("invalid:")
+            && !line.contains("long-command")
+            && !line.contains("broken")));
+        assert!(hook_status_notices(&[status("ready", "digest", true)]).is_empty());
+    }
+
+    #[test]
     fn a_launch_says_how_it_differs_from_the_ordinary_one_and_otherwise_says_nothing() {
         assert!(
             launch_warnings(false, false, false, &[]).is_empty(),
@@ -5739,9 +5441,12 @@ mod tests {
 
         let all = launch_warnings(true, true, true, &["a".into(), "b".into()]);
         assert_eq!(all.len(), 4, "四件事各一句:{all:?}");
-        // 插件那句要说出是哪几个 —— 「有插件没被信任」而不说哪个,人无从下手。
+        // 启动只显示数量和操作入口，插件详情留在列表里。
         let plugins = all.last().expect("four lines");
-        assert!(plugins.contains('a') && plugins.contains('b'), "{plugins}");
+        assert!(
+            plugins.contains('2') && plugins.contains("/plugin"),
+            "{plugins}"
+        );
 
         // 各说各的:只有一件成立时,另外三句不许跟着出来。
         assert_eq!(launch_warnings(true, false, false, &[]).len(), 1);
@@ -6188,5 +5893,22 @@ mod tests {
             buf,
             "[thinking] I should check the file\n[tool→ read_file]\n"
         );
+    }
+}
+
+#[cfg(test)]
+mod retired_screen_tests {
+    use super::Cli;
+    use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn the_retired_flag_is_an_unknown_argument() {
+        let error = Cli::try_parse_from(["atomcode", "--classic", "-p", "hello"])
+            .err()
+            .expect("the retired flag must be rejected");
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        let help = Cli::command().render_long_help().to_string();
+        assert!(!help.contains("--classic"));
+        assert!(help.contains("--tui"));
     }
 }

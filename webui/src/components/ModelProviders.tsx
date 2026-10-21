@@ -1,3 +1,5 @@
+import { invalidateSkills } from '../skills';
+import { headerBody, headerProblem, type HeaderRow } from "../lib/providerHeaders";
 // Model settings: providers as accounts, with the models that hang off each.
 //
 // The page is the configuration's own shape — an account holds the connection
@@ -9,6 +11,7 @@
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import {
   getConfig,
+  postConfigReload,
   ConfigInfo,
   ProviderInfo,
   ProviderAccountInfo,
@@ -141,11 +144,26 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
     { kind: 'account'; id: string; name: string; n: number } | { kind: 'model'; id: string; name: string } | null
   >(null);
 
-  const reload = () => {
+  const reload = async (applyLive = false) => {
     setLoadError(null);
-    return getConfig()
-      .then(setConfig)
-      .catch((e: unknown) => setLoadError(e instanceof Error ? e.message : String(e)));
+    if (applyLive) {
+      try {
+        const result = await postConfigReload();
+        invalidateSkills();
+        setConfig(result);
+        setActionError(result.live_provider_sync?.message ?? null);
+        return;
+      } catch (e) {
+        // Persistence already succeeded. Keep the new settings visible even
+        // if applying them to the live runtime failed.
+        setActionError(e instanceof Error ? e.message : String(e));
+      }
+    }
+    try {
+      setConfig(await getConfig());
+    } catch (e) {
+      setLoadError(e instanceof Error ? e.message : String(e));
+    }
   };
   useEffect(() => {
     void reload();
@@ -175,7 +193,7 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
     setActionError(null);
     try {
       await run();
-      await reload();
+      await reload(true);
     } catch (error) {
       setActionError(errorText(error, t));
     }
@@ -189,7 +207,7 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
     } catch (error) {
       throw new Error(errorText(error, t));
     }
-    await reload();
+    await reload(true);
   }
 
   const toggle = (next: Panel) => setPanel((cur) => (samePanel(cur, next) ? null : next));
@@ -259,7 +277,7 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
                         onClosePanel={() => setPanel(null)}
                         onSaved={async (selection) => {
                           setPanel(null);
-                          await reload();
+                          await reload(true);
                           if (account.probeable) void probe(account.id, selection);
                         }}
                         onProbe={() => void probe(account.id, modelsOf(config, account)[0]?.name)}
@@ -290,7 +308,7 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
                       onCancel={() => setPanel(null)}
                       onCreated={async (account, models, probeable) => {
                         setPanel(null);
-                        await reload();
+                        await reload(true);
                         if (probeable) void probe(account, models[0]);
                       }}
                     />
@@ -364,7 +382,7 @@ function AccountCard({
   const { t } = useSettings();
   const models = modelsOf(config, account);
   const local = account.type === 'ollama';
-  const ready = account.managed || account.has_api_key || local;
+  const ready = account.managed || account.has_api_key || (account.header_names?.length ?? 0) > 0 || local;
   // A custom endpoint may need no key at all; its missing one is not an error.
   const optionalKey = !ready && !!account.custom;
   const health = local
@@ -537,6 +555,26 @@ function KeyInput({
   );
 }
 
+function HeaderRows({ rows, onChange }: { rows: HeaderRow[]; onChange: (rows: HeaderRow[]) => void }) {
+  const { t } = useSettings();
+  return <div class="add-model-field">
+    <label class="add-model-label">{t('providers.headers')}</label>
+    <span class="field-hint">{t('providers.headersHint')}</span>
+    {rows.map((row, i) => <div key={i} style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
+      <input class="menu-input" style={{ flex: '1 1 160px', minWidth: 0 }} value={row.name} readOnly={row.stored}
+        aria-label={t('providers.headerName')} placeholder="Header-Name" spellcheck={false}
+        onInput={(e) => onChange(rows.map((r, n) => n === i ? { ...r, name: e.currentTarget.value } : r))} />
+      <input class="menu-input" style={{ flex: '1 1 160px', minWidth: 0 }} type="password" value={row.value}
+        aria-label={t('providers.headerValue')} placeholder={row.stored ? t('providers.apiKeyKeep') : t('providers.headerValue')}
+        autocomplete="new-password" spellcheck={false}
+        onInput={(e) => onChange(rows.map((r, n) => n === i ? { ...r, value: e.currentTarget.value } : r))} />
+      <button class="btn" type="button" aria-label={t('providers.removeHeader')} onClick={() => onChange(rows.filter((_, n) => n !== i))}>×</button>
+    </div>)}
+    <button class="link-btn" type="button" onClick={() => onChange([...rows, { name: '', value: '' }])}>+ {t('providers.addHeader')}</button>
+    {headerProblem(rows) && <span class="form-blocker" role="alert">{t('providers.headersInvalid')}</span>}
+  </div>;
+}
+
 function AddProviderCard({
   config,
   onCancel,
@@ -570,12 +608,12 @@ function AddProviderCard({
   const blocker = firstBlocker(draft, {
     takenIds,
     hasDefaultEndpoint: !!chosen?.default_base_url,
-    requiresKey: mode === 'preset' && !!chosen?.requires_api_key && chosen?.type !== 'ollama',
+    requiresKey: mode === 'preset' && !!chosen?.requires_api_key && chosen?.type !== 'ollama' && Object.keys(headerBody(draft.headers ?? [])).length === 0,
   });
   const endpoint = draft.baseUrl.trim() || chosen?.default_base_url || '';
 
   async function submit() {
-    if (blocker || saving) return;
+    if (blocker || saving || headerProblem(draft.headers ?? [])) return;
     setSaving(true);
     setError(null);
     try {
@@ -585,6 +623,7 @@ function AddProviderCard({
         display_name: draft.displayName.trim() || undefined,
         base_url: draft.baseUrl.trim() || undefined,
         api_key: draft.apiKey.trim() || undefined,
+        headers: headerBody(draft.headers ?? []),
         models: draft.models.map(modelBody),
         set_default: setDefault,
       });
@@ -665,10 +704,12 @@ function AddProviderCard({
           <KeyInput
             value={draft.apiKey}
             onInput={(v) => setDraft({ ...typed, apiKey: v })}
-            placeholder={mode === 'custom' ? t('providers.apiKeyOptional') : 'sk-…'}
+            placeholder={t('providers.apiKeyOptional')}
           />
         )}
       </div>
+
+      <HeaderRows rows={draft.headers ?? []} onChange={(headers) => setDraft({ ...typed, headers })} />
 
       <details class="add-provider-advanced">
         <summary>{t('providers.advanced')}</summary>
@@ -710,12 +751,13 @@ function AddProviderCard({
         levels={levelsOf(config)}
         setRows={(models) => setDraft({ ...typed, models })}
         discover={
-          chosen?.discoverable !== false && endpoint && validBaseUrl(endpoint) && !apiKeyProblem(draft.apiKey)
+          chosen?.discoverable !== false && endpoint && validBaseUrl(endpoint) && !apiKeyProblem(draft.apiKey) && !headerProblem(draft.headers ?? [])
             ? () =>
                 discoverProviderModels({
                   type: chosen?.type ?? 'openai',
                   base_url: endpoint,
                   api_key: draft.apiKey.trim() || undefined,
+        headers: headerBody(draft.headers ?? []),
                 })
             : null
         }
@@ -737,7 +779,7 @@ function AddProviderCard({
         <button class="btn" type="button" onClick={onCancel} disabled={saving}>
           {t('common.cancel')}
         </button>
-        <button class="btn btn-primary" type="button" disabled={!!blocker || saving} onClick={() => void submit()}>
+        <button class="btn btn-primary" type="button" disabled={!!blocker || saving || headerProblem(draft.headers ?? [])} onClick={() => void submit()}>
           {saving ? t('providers.saving') : t('providers.create')}
         </button>
       </div>
@@ -1108,6 +1150,7 @@ function AccountEditor({
   const [displayName, setDisplayName] = useState(account.display_name ?? '');
   const [baseUrl, setBaseUrl] = useState(account.base_url ?? '');
   const [apiKey, setApiKey] = useState('');
+  const [headers, setHeaders] = useState<HeaderRow[]>(() => (account.header_names ?? []).map((name) => ({ name, value: '', stored: true })));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const local = account.type === 'ollama';
@@ -1120,7 +1163,7 @@ function AccountEditor({
       : null;
 
   async function save() {
-    if (blocker || saving) return;
+    if (blocker || saving || headerProblem(headers)) return;
     setSaving(true);
     setError(null);
     try {
@@ -1128,6 +1171,7 @@ function AccountEditor({
         ...(account.legacy ? {} : { display_name: displayName.trim() }),
         base_url: baseUrl.trim(),
         ...(apiKey.trim() ? { api_key: apiKey.trim() } : {}),
+        headers: headerBody(headers),
       });
       await onSaved();
     } catch (e) {
@@ -1174,6 +1218,7 @@ function AccountEditor({
           />
         </div>
       )}
+      <HeaderRows rows={headers} onChange={setHeaders} />
       {error && (
         <div class="modal-error" role="alert">
           {error}
@@ -1184,7 +1229,7 @@ function AccountEditor({
         <button class="btn" type="button" onClick={onCancel} disabled={saving}>
           {t('common.cancel')}
         </button>
-        <button class="btn btn-primary" type="button" disabled={!!blocker || saving} onClick={() => void save()}>
+        <button class="btn btn-primary" type="button" disabled={!!blocker || saving || headerProblem(headers)} onClick={() => void save()}>
           {saving ? t('providers.saving') : t('providers.save')}
         </button>
       </div>

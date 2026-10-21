@@ -896,6 +896,7 @@ impl Terminal {
 ///
 /// For a caller that only needs the flag on; [`Terminal::enter`] needs the
 /// answer too and asks [`console_speaks_ansi`] directly.
+#[cfg(unix)]
 fn enable_vt_output() {
     let _ = console_speaks_ansi();
 }
@@ -944,7 +945,44 @@ fn speaks_ansi_given(crossterm_said: bool, console_vt: Option<bool>) -> bool {
     console_vt.unwrap_or(crossterm_said)
 }
 
-/// The two kernel32 calls it takes to read a console's mode. kernel32 is
+/// Keep the console's byte encoding aligned with the UTF-8 this surface writes.
+/// Code pages are shared with child processes, so startup alone cannot keep
+/// this true after a native/Cygwin tool has used the same console. Returns true
+/// when output encoding was repaired and an existing frame needs repainting.
+pub fn ensure_console_utf8() -> bool {
+    #[cfg(windows)]
+    {
+        win_console::ensure_utf8()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+#[cfg(any(windows, test))]
+fn require_console_io(supported: bool) -> std::io::Result<()> {
+    if supported {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Windows interactive mode requires console input and output; this terminal provides pipes. \
+             In MobaXterm, launch with `winpty atomcode.exe` (for a local build: \
+             `winpty ./target/release/atomcode.exe`), or use Windows Terminal.",
+        ))
+    }
+}
+
+/// Check the input/output transport before launching either Windows screen.
+/// Headless callers do not need console records and should skip this check.
+pub fn validate_interactive_io() -> std::io::Result<()> {
+    #[cfg(windows)]
+    require_console_io(win_console::has_console_io())?;
+    Ok(())
+}
+
+/// The kernel32 calls for console modes, encoding and palette. kernel32 is
 /// linked by the standard library on Windows already, so declaring them costs
 /// no new dependency.
 #[cfg(windows)]
@@ -952,6 +990,7 @@ mod win_console {
     type Handle = *mut core::ffi::c_void;
     /// `(DWORD)-11`.
     const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5;
+    const STD_INPUT_HANDLE: u32 = 0xFFFF_FFF6;
     const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
     const ENABLE_WRAP_AT_EOL_OUTPUT: u32 = 0x0002;
 
@@ -962,6 +1001,82 @@ mod win_console {
         fn SetConsoleMode(console: Handle, mode: u32) -> i32;
         fn GetConsoleScreenBufferInfoEx(console: Handle, info: *mut ScreenBufferInfoEx) -> i32;
         fn GetOEMCP() -> u32;
+        fn GetConsoleCP() -> u32;
+        fn GetConsoleOutputCP() -> u32;
+        fn SetConsoleCP(code_page: u32) -> i32;
+        fn SetConsoleOutputCP(code_page: u32) -> i32;
+        fn GetFileType(file: Handle) -> u32;
+        fn GetLastError() -> u32;
+    }
+
+    pub(super) fn ensure_utf8() -> bool {
+        const UTF8: u32 = 65001;
+        // SAFETY: these APIs read/set only this process's console code pages.
+        // Zero means no attached console, so there is no code page to change.
+        unsafe {
+            let input = GetConsoleCP();
+            if is_console(STD_INPUT_HANDLE) && input != 0 && input != UTF8 {
+                SetConsoleCP(UTF8);
+            }
+            let output = GetConsoleOutputCP();
+            is_console(STD_OUTPUT_HANDLE)
+                && output != 0
+                && output != UTF8
+                && SetConsoleOutputCP(UTF8) != 0
+        }
+    }
+
+    fn is_console(which: u32) -> bool {
+        // Inspect the actual standard handle. Opening CONIN$/CONOUT$ instead
+        // can succeed against a hidden console unrelated to the visible PTY.
+        // SAFETY: the handle is borrowed; the API only writes the local mode.
+        unsafe {
+            let handle = GetStdHandle(which);
+            let mut mode = 0;
+            !handle.is_null() && handle as isize != -1 && GetConsoleMode(handle, &mut mode) != 0
+        }
+    }
+
+    pub(super) fn has_console_io() -> bool {
+        is_console(STD_INPUT_HANDLE) && is_console(STD_OUTPUT_HANDLE)
+    }
+
+    pub(super) fn diagnostics() -> Vec<String> {
+        // Read the actual standard handles, not CONOUT$: a Cygwin pipe and an
+        // attached hidden console can coexist but have different output paths.
+        // SAFETY: the APIs only inspect borrowed handles and write to locals.
+        unsafe {
+            let mut lines = vec![format!(
+                "  Windows console code pages: input={} output={}",
+                GetConsoleCP(),
+                GetConsoleOutputCP()
+            )];
+            for (label, which) in [
+                ("stdin", 0xFFFF_FFF6),
+                ("stdout", STD_OUTPUT_HANDLE),
+                ("stderr", 0xFFFF_FFF4),
+            ] {
+                let handle = GetStdHandle(which);
+                if handle.is_null() || handle as isize == -1 {
+                    lines.push(format!("  {label}: unavailable"));
+                    continue;
+                }
+                let kind = match GetFileType(handle) {
+                    1 => "disk",
+                    2 => "character",
+                    3 => "pipe",
+                    _ => "unknown",
+                };
+                let mut mode = 0;
+                let detail = if GetConsoleMode(handle, &mut mode) != 0 {
+                    format!("0x{mode:08x}")
+                } else {
+                    format!("unavailable (win32-error={})", GetLastError())
+                };
+                lines.push(format!("  {label}: type={kind} console-mode={detail}"));
+            }
+            lines
+        }
     }
 
     /// Whether the system's console code page is Chinese, Japanese or Korean —
@@ -1097,14 +1212,29 @@ impl Terminal {
         mouse: bool,
         overrides: crate::caps::Overrides,
     ) -> std::io::Result<Self> {
+        // The Windows event reader consumes console records, not PTY bytes.
+        // Reject a split transport before enabling mouse reports or touching
+        // a hidden console's modes. Otherwise reports reach the shell unread.
+        validate_interactive_io()?;
+        ensure_console_utf8();
         // Before a single byte is written: a console that will not execute
         // the sequences gets none of them, rather than a screenful of text.
         if !console_speaks_ansi() {
             return Err(std::io::Error::other(
-                "this console cannot draw escape sequences; use `--classic`",
+                "this console cannot draw escape sequences; use an ANSI-capable terminal (such as Windows Terminal) or run `atomcode webui`",
             ));
         }
+        crate::terminal_modes::take_input()?;
+        let mut setup = TerminalSetup {
+            armed: true,
+            screen: false,
+        };
         crossterm::terminal::enable_raw_mode()?;
+        // Arm before the first fallible screen write, not after palette probing.
+        arm_panic_restore(None);
+        setup.screen = true;
+        #[cfg(unix)]
+        arm_signal_restore();
         let mut out = std::io::stdout();
         out.write_all(ansi::enter().as_bytes())?;
         if crate::caps::wants_keyboard_protocol() {
@@ -1127,10 +1257,8 @@ impl Terminal {
             mouse,
             link_terminal != link_pointer::TerminalKind::Unsupported,
         );
-        out.write_all(pointer.escape().as_bytes())?;
-        out.flush()?;
+        configure_pointer(&mut out, pointer)?;
         console_wrap(false);
-        console_mouse(pointer != ansi::Pointer::Terminal);
         let mut caps = crate::caps::Caps::detect_with(overrides);
         // A classic console with a CJK font draws ambiguous characters wide;
         // widths everywhere have to count them that way (`crate::width`).
@@ -1161,11 +1289,8 @@ impl Terminal {
         arm_panic_restore(stderr.as_ref().map(|held| held.original));
         #[cfg(not(unix))]
         arm_panic_restore(None);
-        // The other way out: killed rather than unwound, where no hook and no
-        // `Drop` runs at all.
-        #[cfg(unix)]
-        arm_signal_restore();
         link_pointer::POINTER.configure(link_terminal);
+        setup.armed = false;
         Ok(Self {
             raw: true,
             state: std::sync::atomic::AtomicU8::new(pointer_state(pointer)),
@@ -1201,19 +1326,19 @@ impl Terminal {
             self.hover.load(Ordering::SeqCst) || link_pointer::POINTER.enabled(),
         );
         let had = self.pointer_mode();
-        let Some(escape) = want.escape_from(had) else {
+        let Some(_) = want.escape_from(had) else {
             return;
         };
-        self.state.store(pointer_state(want), Ordering::SeqCst);
         // Recorded but not said while the transcript is up: coming back says
         // the whole state at once.
         if self.away.load(Ordering::SeqCst) {
+            self.state.store(pointer_state(want), Ordering::SeqCst);
             return;
         }
         let mut out = std::io::stdout();
-        let _ = out.write_all(escape.as_bytes());
-        let _ = out.flush();
-        console_mouse(want != ansi::Pointer::Terminal);
+        if configure_pointer(&mut out, want).is_ok() {
+            self.state.store(pointer_state(want), Ordering::SeqCst);
+        }
     }
 }
 
@@ -1282,9 +1407,9 @@ fn classic_console() -> bool {
 /// and an escape on the output side changes no input mode. So on Win10's
 /// conhost the screen never saw a click or a wheel: tool rows did not open,
 /// the wheel did not scroll, and a drag was QuickEdit's selection, which copies
-/// nothing until Enter. crossterm's mouse capture is exactly that mode switch on
-/// Windows (and nothing else — it writes no escape there); off puts back the
-/// mode it found.
+/// nothing until Enter. The native mode switch lives in `terminal_modes`:
+/// capture flags are restored from the input snapshot without restoring line
+/// input/echo while the TUI still owns raw input.
 ///
 /// Every Windows console, not only the classic one: behind Windows Terminal or
 /// a ConPTY Git Bash (mintty) the program's console is a pseudo-console, which
@@ -1331,18 +1456,28 @@ fn console_wrap(on: bool) {
     let _ = on;
 }
 
-fn console_mouse(on: bool) {
-    #[cfg(windows)]
-    {
-        let mut out = std::io::stdout();
-        let _ = if on {
-            crossterm::execute!(out, crossterm::event::EnableMouseCapture)
-        } else {
-            crossterm::execute!(out, crossterm::event::DisableMouseCapture)
-        };
+fn console_mouse(on: bool) -> std::io::Result<()> {
+    crate::terminal_modes::capture_mouse(on)
+}
+
+fn configure_pointer(out: &mut impl Write, pointer: ansi::Pointer) -> std::io::Result<()> {
+    crate::terminal_modes::pointer(out, pointer, console_mouse)
+}
+
+/// Roll back every fallible initialization step, including writes before Self exists.
+struct TerminalSetup {
+    armed: bool,
+    screen: bool,
+}
+impl Drop for TerminalSetup {
+    fn drop(&mut self) {
+        if self.armed {
+            if self.screen {
+                emergency_restore();
+            }
+            let _ = crate::terminal_modes::restore_input();
+        }
     }
-    #[cfg(not(windows))]
-    let _ = on;
 }
 
 /// Both the panic hook and [`Terminal::restore`] call it; whichever gets there
@@ -1350,15 +1485,14 @@ fn console_mouse(on: bool) {
 /// unconditionally — disabling reporting that was never enabled costs a few
 /// bytes, and tracking the flag from a global would be one more thing to keep
 /// in step for no gain.
-fn emergency_restore() {
+pub fn emergency_restore() {
     use std::sync::atomic::Ordering;
     if !SCREEN_HELD.swap(false, Ordering::SeqCst) {
         return;
     }
     let mut out = std::io::stdout();
     let _ = link_pointer::POINTER.restore(&mut out);
-    let _ = out.write_all(ansi::MOUSE_OFF.as_bytes());
-    console_mouse(false);
+    let _ = configure_pointer(&mut out, ansi::Pointer::Terminal);
     let _ = out.write_all(ansi::RESTORE_TITLE.as_bytes());
     // In `/raw` the conversation is on the terminal's own screen and stays
     // there; otherwise the way out the launch's screen needs.
@@ -1374,6 +1508,7 @@ fn emergency_restore() {
     let _ = out.flush();
     console_wrap(true);
     let _ = crossterm::terminal::disable_raw_mode();
+    let _ = crate::terminal_modes::restore_input();
     #[cfg(unix)]
     {
         // Keys pressed after the screen stopped reading — during the wait for a
@@ -1606,6 +1741,7 @@ fn give_back_stderr(_held: &StderrHeld) {}
 /// evenly spread 128-byte windows of it. Sampling throughout tells apart two
 /// same-sized screenshots whose top and bottom chrome match, and keeps a look
 /// at a 4K picture to a couple of KB of hashing. `atomcode-tuix`'s, kept.
+#[cfg(any(not(windows), test))]
 fn pixel_fingerprint(width: usize, height: usize, bytes: &[u8]) -> u64 {
     use std::hash::{Hash, Hasher};
     const SAMPLES: usize = 16;
@@ -1624,6 +1760,67 @@ fn pixel_fingerprint(width: usize, height: usize, bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
+// Windows opens clipboard handles with a null owner. Do not let independent
+// handles in this process overlap. The captured access violation was inside
+// get_vec/memcpy while a paste and the background image probe overlapped.
+#[cfg(any(windows, test))]
+static WINDOWS_CLIPBOARD_ACCESS: Mutex<()> = Mutex::new(());
+
+#[cfg(any(windows, test))]
+fn windows_clipboard_guard() -> std::sync::MutexGuard<'static, ()> {
+    WINDOWS_CLIPBOARD_ACCESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Availability queries never request or decode the clipboard's pixel data.
+#[cfg(windows)]
+fn windows_clipboard_image_mark() -> Option<u64> {
+    let _guard = windows_clipboard_guard();
+    let before = clipboard_win::seq_num()?;
+    let image_available = clipboard_win::is_format_avail(clipboard_win::formats::CF_DIB)
+        || clipboard_win::is_format_avail(clipboard_win::formats::CF_DIBV5)
+        || clipboard_win::register_format("PNG")
+            .is_some_and(|format| clipboard_win::is_format_avail(format.get()));
+    let after = clipboard_win::seq_num()?;
+    (image_available && before == after).then_some(u64::from(after.get()))
+}
+
+/// Opt-in, synchronous breadcrumbs survive native exceptions that bypass panic hooks.
+/// The host/tester supplies the destination; no clipboard contents are recorded.
+fn clipboard_diagnostic<T>(stage: &str, operation: impl FnOnce() -> T) -> T {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let Some(path) = std::env::var_os("ATOMCODE_CLIPBOARD_DIAGNOSTICS") else {
+        return operation();
+    };
+    let call = NEXT.fetch_add(1, Ordering::Relaxed);
+    let record = |event: &str| {
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let line = format!(
+                "at={at} pid={} thread={:?} call={call} stage={stage} event={event}\n",
+                std::process::id(),
+                std::thread::current().id()
+            );
+            let _ = file.write_all(line.as_bytes());
+            let _ = file.sync_data();
+        }
+    };
+    record("begin");
+    let result = operation();
+    record("end");
+    result
+}
+
 /// The picture on the clipboard as `(width, height, RGBA8)`, or `None`.
 ///
 /// Through `arboard` first; on Windows, when it cannot decode what is there,
@@ -1633,15 +1830,23 @@ fn pixel_fingerprint(width: usize, height: usize, bytes: &[u8]) -> u64 {
 /// masks that `arboard` rejects, so without it a screenshot read as "no image"
 /// — to the paste and to the hint that offers one alike.
 fn clipboard_rgba_direct() -> Option<(usize, usize, Vec<u8>)> {
-    let from_arboard = arboard::Clipboard::new()
+    #[cfg(windows)]
+    let _guard = windows_clipboard_guard();
+    let from_arboard = clipboard_diagnostic("arboard_open", arboard::Clipboard::new)
         .ok()
-        .and_then(|mut clipboard| clipboard.get_image().ok())
+        .and_then(|mut clipboard| {
+            let image = clipboard_diagnostic("arboard_get_image", || clipboard.get_image()).ok();
+            clipboard_diagnostic("arboard_drop", || drop(clipboard));
+            image
+        })
         .map(|img| (img.width, img.height, img.bytes.into_owned()));
     #[cfg(windows)]
     {
         from_arboard.or_else(|| {
-            let dib = read_raw_cf_dib()?;
-            let (w, h, rgba) = atomcode_capabilities::image_normalize::dib_to_rgba(&dib)?;
+            let dib = clipboard_diagnostic("read_cf_dib", read_raw_cf_dib)?;
+            let (w, h, rgba) = clipboard_diagnostic("decode_cf_dib", || {
+                atomcode_capabilities::image_normalize::dib_to_rgba(&dib)
+            })?;
             Some((w as usize, h as usize, rgba))
         })
     }
@@ -1729,6 +1934,7 @@ pub fn run_clipboard_helper_if_requested() -> bool {
 
 /// The raw `CF_DIB` bytes on the Windows clipboard, when there is any bitmap.
 #[cfg(windows)]
+// Caller holds WINDOWS_CLIPBOARD_ACCESS across both arboard and this fallback.
 fn read_raw_cf_dib() -> Option<Vec<u8>> {
     let clip = clipboard_win::Clipboard::new_attempts(10).ok()?;
     let mut dib = Vec::new();
@@ -1753,12 +1959,13 @@ fn read_clipboard_image() -> Option<atomcode_kernel::message::ImageContent> {
     use base64::Engine as _;
 
     let (width, height, rgba) = clipboard_rgba()?;
-    let png = encode_rgba_png(width, height, &rgba)?;
+    let png = clipboard_diagnostic("encode_png", || encode_rgba_png(width, height, &rgba))?;
     // Downscale/re-encode an oversized paste (longest edge > 1568px or > ~1.5 MB) so a
     // big screenshot can't blow the per-request body — the image is re-sent every turn.
     // Falls back to the original PNG on any decode failure. See image_normalize.
-    let (media_type, data) = match atomcode_capabilities::image_normalize::normalize_image_raw(&png)
-    {
+    let (media_type, data) = match clipboard_diagnostic("normalize_image", || {
+        atomcode_capabilities::image_normalize::normalize_image_raw(&png)
+    }) {
         Some((mt, out)) => (mt, base64::engine::general_purpose::STANDARD.encode(out)),
         None => (
             "image/png".to_string(),
@@ -1799,6 +2006,8 @@ fn encode_rgba_png(width: usize, height: usize, rgba: &[u8]) -> Option<Vec<u8>> 
 /// line, and collapsing them here means no caller has to decide what to say
 /// about a paste of nothing.
 fn read_clipboard_text() -> Option<String> {
+    #[cfg(windows)]
+    let _guard = windows_clipboard_guard();
     #[cfg(target_os = "macos")]
     {
         let bytes = macos_clipboard_helper("text")?;
@@ -1823,6 +2032,8 @@ fn local_clipboard(text: &str) -> bool {
     if std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some() {
         return false;
     }
+    #[cfg(windows)]
+    let _guard = windows_clipboard_guard();
     // Windows: the clipboard API itself, in UTF-16. `clip.exe` reads its input
     // in the system's ANSI code page, so Chinese piped to it as UTF-8 arrived
     // garbled; it stays as the fallback.
@@ -1927,11 +2138,16 @@ pub fn probe_report(theme: Option<Theme>) -> String {
     let palette = match theme {
         Some(theme) => Palette::assumed(theme),
         None => {
-            // Same reason as `enter`: the palette probe writes OSC queries,
-            // which a legacy Windows console would echo as text without this.
+            // Only Unix sends queries and needs raw input. Windows reads the
+            // console palette directly: raw-mode APIs can touch a hidden
+            // console even when the visible terminal is connected by pipes.
+            #[cfg(unix)]
             enable_vt_output();
-            let raw = crossterm::terminal::enable_raw_mode().is_ok();
+            #[cfg(unix)]
+            let raw = !crossterm::terminal::is_raw_mode_enabled().unwrap_or(true)
+                && crossterm::terminal::enable_raw_mode().is_ok();
             let palette = measure_palette();
+            #[cfg(unix)]
             if raw {
                 let _ = crossterm::terminal::disable_raw_mode();
             }
@@ -1958,6 +2174,25 @@ pub fn probe_report(theme: Option<Theme>) -> String {
         "  colours: {:?}   unicode: {}",
         caps.colors, caps.unicode
     );
+    #[cfg(windows)]
+    {
+        for line in win_console::diagnostics() {
+            let _ = writeln!(out, "{line}");
+        }
+        if win_console::has_console_io() {
+            let _ = writeln!(
+                out,
+                "  Windows terminal size: {:?}",
+                crossterm::terminal::size()
+            );
+        } else {
+            let _ = writeln!(out, "  Windows terminal size: unavailable (standard handles are not console input/output)");
+            let _ = writeln!(out, "  Interactive mode: unsupported pipes; use winpty atomcode.exe or Windows Terminal");
+        }
+        let legacy = std::env::var("CYGWIN")
+            .is_ok_and(|v| v.split_whitespace().any(|flag| flag == "disable_pcon"));
+        let _ = writeln!(out, "  CYGWIN disable_pcon: {legacy}");
+    }
     let bg = palette.background();
     let _ = writeln!(
         out,
@@ -2185,6 +2420,9 @@ impl Surface for Terminal {
         if self.showing_transcript() {
             return;
         }
+        if ensure_console_utf8() {
+            self.painted.forget();
+        }
         let patch = self.patch(frame);
         let mut out = std::io::stdout();
         if !patch.is_empty() {
@@ -2284,9 +2522,7 @@ impl Surface for Terminal {
             return;
         }
         let mut out = std::io::stdout();
-        let _ = out.write_all(self.pointer_mode().escape().as_bytes());
-        let _ = out.flush();
-        console_mouse(self.pointer_mode() != ansi::Pointer::Terminal);
+        let _ = configure_pointer(&mut out, self.pointer_mode());
         if link_pointer::POINTER.enabled() {
             let hover = self.link_hover.lock().expect("link hover poisoned");
             let _ = link_pointer::POINTER.update_after_terminal_write(&mut out, hover.over_link());
@@ -2302,6 +2538,7 @@ impl Surface for Terminal {
     /// lands in the terminal's own scrollback.
     fn show_transcript(&self, text: &str) -> bool {
         use std::sync::atomic::Ordering;
+        ensure_console_utf8();
         if self.away.swap(true, Ordering::SeqCst) {
             return true;
         }
@@ -2309,8 +2546,8 @@ impl Surface for Terminal {
         self.link_hover.lock().expect("link hover poisoned").clear();
         let mut out = std::io::stdout();
         let _ = link_pointer::POINTER.restore(&mut out);
-        let _ = out.write_all(ansi::MOUSE_OFF.as_bytes());
-        console_mouse(false);
+        let _ = configure_pointer(&mut out, ansi::Pointer::Terminal);
+        let _ = out.write_all(crate::terminal_image::delete(self.caps.graphics).as_bytes());
         let _ = out.write_all(ansi::transcript_out().as_bytes());
         let _ = out.flush();
         console_wrap(true);
@@ -2323,6 +2560,7 @@ impl Surface for Terminal {
     }
     fn back_from_transcript(&self) {
         use std::sync::atomic::Ordering;
+        ensure_console_utf8();
         if !self.away.swap(false, Ordering::SeqCst) {
             return;
         }
@@ -2340,12 +2578,7 @@ impl Surface for Terminal {
         // the buttons and their SGR coordinates off, and the hover escape on
         // its own (`?1003h`) would bring motion back without them.
         let pointer = self.pointer_mode();
-        if pointer != ansi::Pointer::Terminal {
-            let _ = out.write_all(ansi::MOUSE_ON.as_bytes());
-        }
-        let _ = out.write_all(pointer.escape().as_bytes());
-        let _ = out.flush();
-        console_mouse(pointer != ansi::Pointer::Terminal);
+        let _ = configure_pointer(&mut out, pointer);
         self.painted.forget();
     }
     /// The screen given back the way `restore` gives it — pointer, keys,
@@ -2368,6 +2601,7 @@ impl Surface for Terminal {
         let _ = link_pointer::POINTER.restore(&mut out);
         let _ = out.write_all(ansi::MOUSE_OFF.as_bytes());
         let _ = out.write_all(ansi::RESTORE_TITLE.as_bytes());
+        let _ = out.write_all(crate::terminal_image::delete(self.caps.graphics).as_bytes());
         let _ = out.write_all(ansi::leave().as_bytes());
         let _ = out.flush();
         let _ = crossterm::terminal::disable_raw_mode();
@@ -2394,12 +2628,7 @@ impl Surface for Terminal {
             let _ = out.write_all(ansi::KEYS_ON.as_bytes());
         }
         let pointer = self.pointer_mode();
-        if pointer != ansi::Pointer::Terminal {
-            let _ = out.write_all(ansi::MOUSE_ON.as_bytes());
-        }
-        let _ = out.write_all(pointer.escape().as_bytes());
-        let _ = out.flush();
-        console_mouse(pointer != ansi::Pointer::Terminal);
+        let _ = configure_pointer(&mut out, pointer);
         self.painted.forget();
         true
     }
@@ -2462,22 +2691,35 @@ impl Surface for Terminal {
         if self.remote_clipboard() {
             return None;
         }
-        read_clipboard_image()
+        clipboard_diagnostic("paste_image", read_clipboard_image)
     }
     fn clipboard_image_mark(&self) -> Option<u64> {
         if self.remote_clipboard() {
             return None;
         }
-        let (width, height, rgba) = clipboard_rgba()?;
-        Some(pixel_fingerprint(width, height, &rgba))
+        clipboard_diagnostic("image_mark", || {
+            #[cfg(windows)]
+            {
+                windows_clipboard_image_mark()
+            }
+            #[cfg(not(windows))]
+            {
+                let (width, height, rgba) = clipboard_rgba()?;
+                Some(pixel_fingerprint(width, height, &rgba))
+            }
+        })
     }
     fn clipboard_text(&self) -> Option<String> {
         if self.remote_clipboard() {
             return None;
         }
-        read_clipboard_text()
+        clipboard_diagnostic("paste_text", read_clipboard_text)
     }
     fn restore(&self) {
+        if SCREEN_HELD.load(std::sync::atomic::Ordering::SeqCst) && !self.showing_transcript() {
+            let _ = std::io::stdout()
+                .write_all(crate::terminal_image::delete(self.caps.graphics).as_bytes());
+        }
         self.painted.forget();
         // The same path a panic takes, so an ordinary exit and a crash cannot
         // give the screen back two different ways — and so the second caller
@@ -2584,12 +2826,14 @@ pub const BURST_ACTIVE: std::time::Duration = std::time::Duration::from_millis(4
 /// The most characters gathered into one synthesised paste.
 pub const BURST_CAP: usize = 8192;
 
-/// `Some(true)` for a bare ↑ press, `Some(false)` for a bare ↓, `None` for
+/// `Some(true)` for a bare ↑ press/repeat, `Some(false)` for a bare ↓, `None` for
 /// anything else — the keys a terminal turns the wheel into (`pump_input`).
 pub fn bare_arrow(event: &crossterm::event::Event) -> Option<bool> {
     use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
     let Event::Key(k) = event else { return None };
-    if k.kind != KeyEventKind::Press || k.modifiers != KeyModifiers::NONE {
+    if !matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+        || k.modifiers != KeyModifiers::NONE
+    {
         return None;
     }
     match k.code {
@@ -2652,6 +2896,25 @@ pub fn is_paste_burst(chars: &[char]) -> bool {
     !(lines >= 3 && printed <= lines)
 }
 
+/// Only repeat editing/navigation keys. Repeating Enter or a command chord
+/// must not submit again, quit, or toggle a panel. Keep modifiers intact so
+/// the normal keymap still decides what an accepted key means.
+fn repeats_editing(code: crossterm::event::KeyCode, mods: crossterm::event::KeyModifiers) -> bool {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    match code {
+        KeyCode::Backspace
+        | KeyCode::Delete
+        | KeyCode::Left
+        | KeyCode::Right
+        | KeyCode::Up
+        | KeyCode::Down
+        | KeyCode::Home
+        | KeyCode::End => (mods & !KeyModifiers::SHIFT).is_empty(),
+        KeyCode::Char('h' | '?') => mods == KeyModifiers::CONTROL,
+        _ => false,
+    }
+}
+
 pub fn from_crossterm(event: crossterm::event::Event) -> Option<Input> {
     use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
     use crossterm::event::{MouseButton, MouseEventKind};
@@ -2698,7 +2961,10 @@ pub fn from_crossterm(event: crossterm::event::Event) -> Option<Input> {
             };
             Some(Input::Mouse(click, m.column, m.row))
         }
-        Event::Key(k) if k.kind == KeyEventKind::Press => {
+        Event::Key(k)
+            if k.kind == KeyEventKind::Press
+                || (k.kind == KeyEventKind::Repeat && repeats_editing(k.code, k.modifiers)) =>
+        {
             let key = match k.code {
                 KeyCode::Char(c) => Key::Char(c),
                 KeyCode::Enter => Key::Enter,
@@ -2738,6 +3004,78 @@ pub fn from_crossterm(event: crossterm::event::Event) -> Option<Input> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn editing_key_repeats_preserve_modifiers_and_releases_stay_ignored() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+        for code in [
+            KeyCode::Backspace,
+            KeyCode::Delete,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Home,
+            KeyCode::End,
+        ] {
+            for mods in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+                let press = KeyEvent::new(code, mods);
+                let mut repeat = press;
+                repeat.kind = KeyEventKind::Repeat;
+                assert!(from_crossterm(Event::Key(repeat)).is_some(), "{repeat:?}");
+                assert_eq!(
+                    from_crossterm(Event::Key(repeat)),
+                    from_crossterm(Event::Key(press))
+                );
+                let mut release = press;
+                release.kind = KeyEventKind::Release;
+                assert_eq!(from_crossterm(Event::Key(release)), None);
+            }
+        }
+        for c in ['h', '?'] {
+            let mut key = KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+            let press = from_crossterm(Event::Key(key));
+            key.kind = KeyEventKind::Repeat;
+            assert_eq!(from_crossterm(Event::Key(key)), press);
+        }
+    }
+
+    #[test]
+    fn command_key_repeats_cannot_submit_quit_or_toggle_panels() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+        for (code, mods) in [
+            (KeyCode::Enter, KeyModifiers::NONE),
+            (KeyCode::Enter, KeyModifiers::SHIFT),
+            (KeyCode::Esc, KeyModifiers::NONE),
+            (KeyCode::Tab, KeyModifiers::NONE),
+            (KeyCode::F(2), KeyModifiers::NONE),
+            (KeyCode::Char('c'), KeyModifiers::CONTROL),
+            (KeyCode::Char('d'), KeyModifiers::CONTROL),
+            (KeyCode::Char('o'), KeyModifiers::CONTROL),
+            (KeyCode::Char('x'), KeyModifiers::CONTROL),
+            (KeyCode::Char('x'), KeyModifiers::NONE),
+            (
+                KeyCode::Char('h'),
+                KeyModifiers::ALT | KeyModifiers::CONTROL,
+            ),
+            (KeyCode::Backspace, KeyModifiers::SUPER),
+        ] {
+            let mut key = KeyEvent::new(code, mods);
+            assert!(
+                from_crossterm(Event::Key(key)).is_some(),
+                "press still works: {key:?}"
+            );
+            key.kind = KeyEventKind::Repeat;
+            assert_eq!(from_crossterm(Event::Key(key)), None, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn a_windows_pipe_transport_is_rejected_before_screen_takeover() {
+        let error = require_console_io(false).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("winpty"));
+        assert!(require_console_io(true).is_ok());
+    }
     /// A console's table is in its own order and ANSI swaps red and blue; the
     /// background and text colour are the attribute's two halves. PowerShell's
     /// window is the case: navy ground (index 5, remapped), near-white text
@@ -3391,6 +3729,19 @@ mod tests {
             body.contains("probes_colours("),
             "the probe writes to the terminal without asking whether this one              can be asked"
         );
+    }
+
+    #[test]
+    fn native_clipboard_access_excludes_other_threads_until_the_operation_finishes() {
+        let guard = windows_clipboard_guard();
+        let blocked = std::thread::spawn(|| WINDOWS_CLIPBOARD_ACCESS.try_lock().is_err());
+        assert!(blocked.join().unwrap());
+        drop(guard);
+        std::thread::spawn(|| {
+            let _guard = windows_clipboard_guard();
+        })
+        .join()
+        .unwrap();
     }
 
     #[cfg(target_os = "macos")]

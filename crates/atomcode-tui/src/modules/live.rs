@@ -14,20 +14,19 @@
 //!
 //! * **What it is doing** is folded from the log, like every other module's
 //!   state, so a live session, a replay and a resumed one cannot disagree.
-//! * **How long it has been doing it** cannot be folded — the log records no
-//!   clock (`docs/adr/0008`). The opening reading and the current one are both
-//!   in [`Moment`], put there by the host, and `render` subtracts them. It still
-//!   never reads a clock, which is what keeps the test loop deterministic.
+//! * **How long it has been doing it** uses the goal's runtime sample when
+//!   active, otherwise the turn's committed start time. The host injects the
+//!   current clock; legacy records without a timestamp use a local reading.
+//!   Rendering never reads a clock, keeping the test loop deterministic.
 //!
 //! Nothing is invented. A figure with no fact behind it is left out rather than
 //! printed as zero: no reading yet means no number, not `0 tok`.
 //!
-//! The figures are counted the two ways the facts demand, and the line is where
-//! both are visible at once: `入` and `缓存` are the *latest* request's own
-//! readings — the context is re-sent whole every round, so summing would count
-//! the same tokens once per round — while `出` is summed over the turn, because
-//! each round's output is new. `耗时` is neither: it is the difference of two
-//! readings the host injected.
+//! Input shows the latest request's context size. Output, cache reuse and
+//! generation throughput describe the whole turn. Cache reuse weights every
+//! request's cached tokens by its input tokens; this measures reuse across the
+//! turn, rather than pretending the repeated inputs are a larger context.
+//! `耗时` is the goal's cumulative wall time, or the current ordinary turn's.
 //!
 //! Its place on screen is written once, by `host::composer`, rather than claimed
 //! with `LayoutOp::Show` the way the mascot and the team strip claim theirs: it
@@ -85,23 +84,11 @@ pub struct State {
     running: u32,
     /// Output tokens this turn's own readings reported.
     ///
-    /// Summed, unlike the context: every round generates new output, while each
-    /// request re-sends a prefix of the same input — the trap `TurnStats` in
-    /// `content` spells out.
-    output: u32,
-    /// The context the turn's **last** reading sent, and the part of it that came
-    /// from cache.
-    ///
-    /// Last one wins rather than summed, for the reason `output` is the other way
-    /// round: request four re-sends requests one to three, so adding them up
-    /// counts the same tokens four times and reports a number about nothing.
-    /// Kept as a pair because the share is only a fact about the request they
-    /// were both read off: a ratio folded from two rounds' readings would be a
-    /// percentage of nothing anyone asked for.
-    prompt: u32,
-    cached: u32,
-    /// Which request of the turn is in flight.
-    step: u32,
+    /// Summed over provider receipts, as with the input and cache counters below.
+    output: u64,
+    /// All input and cached tokens reported in this turn, for weighted reuse.
+    cache_prompt: u64,
+    cached: u64,
     retry: Option<atomcode_harness::session::RetryAttempt>,
 }
 
@@ -127,7 +114,6 @@ impl View for Live {
             }
             SessionEvent::TurnEnd { .. } => state.turn = None,
 
-            SessionEvent::StepStart { step, .. } => state.step = *step,
             SessionEvent::RequestHeader { .. } => {
                 state.phase = Phase::Waiting;
                 state.retry = None;
@@ -165,11 +151,9 @@ impl View for Live {
             // after the next turn opened would otherwise land on its line, and
             // nobody reading that number could tell whose work it was.
             SessionEvent::Usage { turn, usage, .. } if state.turn == Some(*turn) => {
-                state.output = state.output.saturating_add(usage.completion);
-                // Overwritten, not added to: this is what the *latest* request
-                // sent. The pair moves together or the share is nonsense.
-                state.prompt = usage.prompt;
-                state.cached = usage.cached;
+                state.output = state.output.saturating_add(u64::from(usage.completion));
+                state.cache_prompt = state.cache_prompt.saturating_add(u64::from(usage.prompt));
+                state.cached = state.cached.saturating_add(u64::from(usage.cached));
             }
             _ => {}
         }
@@ -226,11 +210,11 @@ impl View for Live {
 
         // The words and the clock first, then the figures — and nothing is cut
         // in half. A part that does not fit is left out whole: a timer clipped
-        // to `1` reads as a second, and `出 8` reads as a number nobody
+        // to `1` reads as a second, and `↓ 8` reads as a number nobody
         // measured, so which figure fits is decided before drawing rather than
         // by the last cell of the row.
         // The figures ride in one parenthesised group after the words:
-        // `正在运行 1 个工具 （耗时 8m54s · 入 78.2k · 出 8.0k …）`. The open comes
+        // `正在运行 1 个工具 （耗时 8m54s · ↑ 78.2k · ↓ 8.0k …）`. The open comes
         // before the first figure that fits, the close after the last — and the
         // close's width is reserved on every step, so a figure is never taken in
         // and then left with no room to close the group behind it.
@@ -451,10 +435,25 @@ fn doing(state: &State, moment: &Moment) -> Option<String> {
     // The elapsed clock rides the parenthesised figures group like the turn's own
     // does (`parts`), so 正在识别图片 （耗时 2s） reads exactly like 正在思考
     // （耗时 1s） — one style, not a bare ` · 2s`.
+    // The event log can close before the runtime finishes cancellation and
+    // snapshot persistence. Stopping is a live claim, not a historical turn.
+    if moment.activity == Activity::Stopping {
+        return Some(t(Msg::LiveStopping).into_owned());
+    }
     if state.turn.is_none() {
-        return moment
-            .recognizing_image
-            .then(|| t(Msg::LiveRecognizingImage).into_owned());
+        if goal_elapsed(moment).is_some()
+            && moment
+                .autonomy_samples
+                .get(&moment.viewing)
+                .is_some_and(|(running, _)| running.recovering)
+        {
+            return Some(t(Msg::LiveWaiting).into_owned());
+        }
+        if moment.recognizing_image {
+            return Some(t(Msg::LiveRecognizingImage).into_owned());
+        }
+        return (moment.turn_open && moment.activity == Activity::Working)
+            .then(|| t(Msg::LiveWaiting).into_owned());
     }
     match moment.activity {
         Activity::Idle => None,
@@ -517,34 +516,36 @@ fn doing(state: &State, moment: &Moment) -> Option<String> {
 ///
 /// The order is what a person does with them: the clock answers "is it stuck",
 /// the two token counts answer "is it getting anywhere", the cache share answers
-/// "is the context being re-sent or re-read", and the step number is context for
-/// all of them. That order is also the drop order at a narrow width — the last
-/// one is the first to go.
+/// "is the context being re-sent or re-read". Estimated generation throughput
+/// follows the authoritative token counts and cache share. On a
+/// narrow screen, the trailing figures are dropped whole.
 ///
-/// The step is left out at 1 because the turn opening *is* the first step —
-/// `第 1 步` on every turn would be a figure that never changes until suddenly it
-/// does.
-///
-/// Two of these are readings of the **last** request and two are sums over the
-/// turn, which is not an inconsistency but the only honest way to count them:
-/// `入` and `缓存` describe a context that is re-sent whole every round (so the
-/// latest reading *is* the current one), while `出` is work each round did once.
-/// A sum of `入` would be a number nothing measured, and a last-only `出` would
-/// throw away what the turn has produced. `耗时` is neither: it is a difference
-/// of two readings the host injected.
+/// Input is the latest context size; output and cache reuse cover the whole
+/// turn. Speed covers only the current request while it is generating.
+/// Elapsed time includes waiting and tools; generation time does not.
 fn parts(state: &State, moment: &Moment) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    // Compacting: its own clock and nothing else. Every other figure here
+    // Compacting keeps the cumulative goal clock, or its own phase clock for
+    // an ordinary turn. Every other figure here
     // describes the request that is NOT running — the generation the summary is
     // replacing — so drawing them beside it would report work that stopped.
     if let Some(since) = moment.compacting_since {
-        let ms = moment.now.as_millis().saturating_sub(since.as_millis());
+        let ms = goal_elapsed(moment)
+            .unwrap_or_else(|| moment.now.as_millis().saturating_sub(since.as_millis()));
         out.push(t(Msg::LiveElapsed { took: &short(ms) }).into_owned());
+        if goal_elapsed(moment).is_some() {
+            append_usage(&mut out, state, moment);
+        }
         return out;
     }
     // Recognising, before any turn: its own clock, shown the same 耗时 way the
     // turn's is. There is no turn to read figures off, so this is the whole group.
     if state.turn.is_none() {
+        if let Some(ms) = goal_elapsed(moment) {
+            out.push(t(Msg::LiveElapsed { took: &short(ms) }).into_owned());
+            append_usage(&mut out, state, moment);
+            return out;
+        }
         if moment.recognizing_image {
             if let Some(since) = moment.recognizing_since {
                 let ms = moment.now.as_millis().saturating_sub(since.as_millis());
@@ -556,38 +557,54 @@ fn parts(state: &State, moment: &Moment) -> Vec<String> {
     if let Some(ms) = elapsed(state, moment) {
         out.push(t(Msg::LiveElapsed { took: &short(ms) }).into_owned());
     }
-    if state.prompt > 0 {
-        out.push(
-            t(Msg::LiveIn {
-                tokens: &crate::content::token_count(state.prompt),
-            })
-            .into_owned(),
-        );
-    }
-    if state.output > 0 {
-        out.push(
-            t(Msg::LiveOut {
-                tokens: &crate::content::token_count(state.output),
-            })
-            .into_owned(),
-        );
-    }
-    if let Some(hit) = crate::content::cache_hit_rate(state.cached, state.prompt) {
-        out.push(t(Msg::LiveCached { hit: &hit }).into_owned());
-    }
-    if state.step > 1 {
-        out.push(t(Msg::LiveStep { step: state.step }).into_owned());
+    append_usage(&mut out, state, moment);
+    if let Some(rate) = moment.generation.rate(moment.now) {
+        out.push(t(Msg::LiveSpeed { rate }).into_owned());
     }
     out
 }
 
-/// How long the turn has been running, when both readings exist.
-///
-/// `None` when there is no turn, or when this screen did not see it open: a
-/// session attached mid-turn has no opening reading, and inventing one — zero,
-/// or the age of the session — would report a duration nobody measured.
+fn append_usage(out: &mut Vec<String>, state: &State, moment: &Moment) {
+    if goal_elapsed(moment).is_some() {
+        // Older checkpoints have no breakdown: never label one turn's readings
+        // as whole-goal totals when its earlier history is unknown.
+        if let Some(usage) = moment
+            .autonomy_samples
+            .get(&moment.viewing)
+            .and_then(|(running, _)| running.usage.as_ref())
+        {
+            out.extend(crate::content::usage_parts(
+                usage.input,
+                usage.output,
+                usage.cached,
+            ));
+        }
+    } else {
+        out.extend(crate::content::usage_parts(
+            state.cache_prompt,
+            state.output,
+            state.cached,
+        ));
+    }
+}
+
+/// Runtime's cumulative goal sample, advanced only by injected host time.
+/// A member must never inherit its lead's goal clock (or vice versa).
+fn goal_elapsed(moment: &Moment) -> Option<u64> {
+    moment.goal_elapsed_ms(&moment.viewing)
+}
+
+/// Goal time spans automatic turns; ordinary time belongs to the current turn.
+/// Committed timestamps survive view reconstruction; legacy records retain the
+/// existing local fallback rather than inventing an earlier start.
 fn elapsed(state: &State, moment: &Moment) -> Option<u64> {
+    if let Some(ms) = goal_elapsed(moment) {
+        return Some(ms);
+    }
     state.turn?;
+    if let (Some(now), Some(started)) = (moment.unix_ms, moment.turn_started_unix_ms) {
+        return Some(now.saturating_sub(started));
+    }
     let started = moment.turn_started?;
     Some(moment.now.as_millis().saturating_sub(started.as_millis()))
 }
@@ -1101,6 +1118,22 @@ mod tests {
     }
 
     #[test]
+    fn a_closed_log_does_not_hide_runtime_cancellation() {
+        let state = State::default();
+        let mut moment = Moment::default().at_tick(0);
+        moment.turn_open = true;
+        moment.activity = Activity::Stopping;
+        assert!(draw(&state, &moment, 80, 2).join(" ").contains("正在停止"));
+        moment.activity = Activity::Working;
+        assert!(draw(&state, &moment, 80, 2)
+            .join(" ")
+            .contains("正在等待模型"));
+        moment.turn_open = false;
+        moment.activity = Activity::Idle;
+        assert!(showing(&state, &moment).is_none());
+    }
+
+    #[test]
     fn the_line_says_recognizing_before_the_turn_exists() {
         // A picture going to a text-only model is recognised before the turn's
         // message is logged, so there is no turn yet — the line must still speak,
@@ -1136,7 +1169,7 @@ mod tests {
         // A turn is open, as it is for an auto-compaction: the line must still
         // hand over.
         state.turn = Some(1);
-        state.prompt = 300_000;
+        state.cache_prompt = 300_000;
         let mut moment = Moment::default().at_tick(0);
         moment.activity = Activity::Working;
         moment.turn_started = Some(Timestamp::millis(0));
@@ -1148,7 +1181,7 @@ mod tests {
         assert!(drawn.contains("正在压缩"), "{line:?}");
         assert!(drawn.contains("耗时 4s"), "its own clock: {line:?}");
         assert!(
-            !drawn.contains("正在思考") && !drawn.contains("入 "),
+            !drawn.contains("正在思考") && !drawn.contains("↑ "),
             "the paused request's verb and figures stay out: {line:?}"
         );
 
@@ -1219,7 +1252,7 @@ mod tests {
     #[test]
     fn the_figures_count_this_turn_and_only_this_turn() {
         let mut state = fold(&a_turn());
-        assert!(working(&state, 0)[0].contains("出 80"));
+        assert!(working(&state, 0)[0].contains("↓ 80"));
 
         // A second turn opens its own budget: those 80 were the last one's.
         Live::absorb(&mut state, &SessionEvent::TurnStart { turn: 2 });
@@ -1232,13 +1265,11 @@ mod tests {
         }
     }
 
-    /// The two ways of counting sit next to each other on purpose, and this is
-    /// what says which is which: the context is re-sent whole every round, so
-    /// only the latest reading describes it, while each round's output is new.
+    /// Input, output and weighted cache reuse cover every request in the turn.
     #[test]
-    fn the_context_is_the_last_round_and_the_output_is_the_whole_turn() {
+    fn input_output_and_cache_reuse_cover_the_turn() {
         let mut state = fold(&a_turn());
-        assert!(working(&state, 0)[0].contains("入 1.2K"));
+        assert!(working(&state, 0)[0].contains("↑ 1.2K"));
         assert!(working(&state, 0)[0].contains("缓存 33.33%"));
 
         Live::absorb(
@@ -1255,18 +1286,36 @@ mod tests {
         );
         let said = working(&state, 0)[0].clone();
         assert!(
-            said.contains("入 2.0K"),
-            "the latest context, not 1.2K + 2.0K: {said}"
+            said.contains("↑ 3.2K"),
+            "all input receipts in this turn: {said}"
         );
+        assert!(said.contains("↓ 100"), "the output adds up: {said}");
         assert!(
-            !said.contains("3.2K"),
-            "a sum of contexts counts the same tokens once per round: {said}"
+            said.contains("缓存 59.38%"),
+            "weighted reuse is (400 + 1500) / (1200 + 2000): {said}"
         );
-        assert!(said.contains("出 100"), "the output adds up: {said}");
-        assert!(
-            said.contains("缓存 75.00%"),
-            "the share comes off the same reading as the context: {said}"
-        );
+    }
+
+    #[test]
+    fn cumulative_cache_reuse_does_not_saturate_at_one_request_counter_width() {
+        let mut state = State::default();
+        Live::absorb(&mut state, &SessionEvent::TurnStart { turn: 1 });
+        for round in 1..=3 {
+            Live::absorb(
+                &mut state,
+                &SessionEvent::Usage {
+                    turn: 1,
+                    round,
+                    usage: TokenUsage {
+                        prompt: 2_000_000_000,
+                        cached: 1_000_000_000,
+                        completion: 1,
+                    },
+                },
+            );
+        }
+        let said = working(&state, 0)[0].clone();
+        assert!(said.contains("缓存 50.00%"), "{said}");
     }
 
     /// A provider that says nothing about caching has not told us the context
@@ -1289,8 +1338,8 @@ mod tests {
             },
         );
         let said = working(&state, 0)[0].clone();
-        assert!(said.contains("入 900"), "{said}");
-        assert!(said.contains("出 12"), "{said}");
+        assert!(said.contains("↑ 900"), "{said}");
+        assert!(said.contains("↓ 12"), "{said}");
         assert!(!said.contains("缓存") && !said.contains('%'), "{said}");
     }
 
@@ -1357,7 +1406,7 @@ mod tests {
         moment.turn_started = Some(Timestamp::millis(0));
 
         let roomy = line_at(&state, &moment, 60);
-        for want in ["耗时 12s", "入 1.2K", "出 80", "缓存 33.33%"] {
+        for want in ["耗时 12s", "↑ 1.2K", "↓ 80", "缓存 33.33%"] {
             assert!(roomy.contains(want), "{want} missing from {roomy}");
         }
 
@@ -1396,14 +1445,81 @@ mod tests {
     }
 
     #[test]
-    fn a_step_count_appears_once_the_turn_is_past_its_first_request() {
+    fn live_generation_adds_only_speed_to_the_existing_figures() {
+        let mut state = fold(&a_turn());
+        state.output = 20_100;
+        state.cache_prompt = 150_700;
+        state.cached = 145_413;
+        let mut moment = Moment::default().working();
+        moment.turn_started = Some(Timestamp::millis(0));
+        moment.now = Timestamp::millis(12_000);
+        moment.generation.absorb(
+            &SessionEvent::RequestHeader {
+                turn: 1,
+                round: 1,
+                model: "m".into(),
+                reason: atomcode_harness::session::HeaderReason::Append,
+            },
+            Timestamp::millis(0),
+        );
+        moment.generation.absorb(
+            &SessionEvent::AssistantChunk {
+                turn: 1,
+                round: 1,
+                delta: "a".repeat(400),
+                reasoning: true,
+            },
+            Timestamp::millis(10_000),
+        );
+        let line = line_at(&state, &moment, 180);
+        assert!(
+            line.contains("↑ 150.7K · ↓ 20.1K · 缓存 96.49% · 50 tok/s"),
+            "{line}"
+        );
+        assert!(!line.contains("均速"), "{line}");
+        assert!(!line.contains('≈'), "{line}");
+        assert!(!line.contains("第"), "{line}");
+        let narrow = line_at(&state, &moment, 20);
+        assert!(width::str_width(&narrow) <= 20);
+        assert!(!narrow.contains("tok/s"), "drop whole figures: {narrow}");
+
+        // Finished generation and the next first-token wait have no live speed.
+        for event in [
+            SessionEvent::Usage {
+                turn: 1,
+                round: 1,
+                usage: TokenUsage {
+                    prompt: 100,
+                    completion: 200,
+                    cached: 50,
+                },
+            },
+            SessionEvent::RequestHeader {
+                turn: 1,
+                round: 2,
+                model: "m".into(),
+                reason: HeaderReason::Append,
+            },
+        ] {
+            moment.generation.absorb(&event, moment.now);
+            Live::absorb(&mut state, &event);
+        }
+        moment.now = Timestamp::millis(120_000);
+        let waiting = line_at(&state, &moment, 180);
+        assert!(waiting.contains("正在等待模型"), "{waiting}");
+        assert!(!waiting.contains("tok/s"), "{waiting}");
+        assert!(!waiting.contains("均速"), "{waiting}");
+    }
+
+    #[test]
+    fn request_count_is_not_shown_on_the_live_line() {
         let mut state = fold(&a_turn());
         assert!(
             !working(&state, 0)[0].contains("第"),
             "the turn opening is the first step: there is nothing to count"
         );
         Live::absorb(&mut state, &SessionEvent::StepStart { turn: 1, step: 2 });
-        assert!(working(&state, 0)[0].contains("第 2 步"));
+        assert!(!working(&state, 0)[0].contains("第 2 步"));
     }
 
     #[test]
@@ -1441,5 +1557,238 @@ mod tests {
             }
             assert_eq!(Live::render(&state, &vp), lines, "not deterministic at {w}");
         }
+    }
+    #[test]
+    fn goal_usage_uses_runtime_totals_across_turns_and_between_turns() {
+        let mut state = fold(&a_turn());
+        let mut moment = Moment::default().working();
+        moment.viewing = "lead".into();
+        let running = atomcode_host_api::Running {
+            retry_in_secs: None,
+            goal_stage: None,
+            goal_detail: None,
+            kind: "goal".into(),
+            recovering: false,
+            what: "finish".into(),
+            round: 2,
+            of: None,
+            elapsed_secs: 60,
+            paused: None,
+            usage: Some(atomcode_host_api::TokenTotals {
+                input: 10_000,
+                output: 500,
+                cached: 7_000,
+            }),
+        };
+        moment
+            .autonomy_samples
+            .insert("lead".into(), (running, moment.now));
+        for turn in [Some(1), Some(2), None] {
+            state.turn = turn;
+            let said = parts(&state, &moment).join(" · ");
+            assert!(said.contains("↑ 10.0K"), "{said}");
+            assert!(said.contains("↓ 500"), "{said}");
+            assert!(said.contains("缓存 70.00%"), "{said}");
+            assert!(!said.contains("1.2K"), "not the local turn: {said}");
+        }
+        moment.autonomy_samples.get_mut("lead").unwrap().0.usage = None;
+        state.turn = Some(1);
+        assert!(
+            !parts(&state, &moment).join(" · ").contains("↑"),
+            "unknown checkpoint history is not a single-turn total"
+        );
+    }
+
+    #[test]
+    fn goal_elapsed_spans_turns_and_input_and_is_scoped_to_its_session() {
+        let mut state = fold(&a_turn());
+        let moment = std::sync::RwLock::new(Moment {
+            lead: "lead".into(),
+            viewing: "lead".into(),
+            now: Timestamp::millis(10_000),
+            turn_started: Some(Timestamp::millis(9_000)),
+            ..Moment::default().working()
+        });
+        let running = atomcode_host_api::Running {
+            usage: None,
+            kind: "goal".into(),
+            what: "finish".into(),
+            recovering: false,
+            retry_in_secs: None,
+            goal_stage: None,
+            goal_detail: None,
+            round: 1,
+            of: None,
+            elapsed_secs: 3_600,
+            paused: None,
+        };
+        crate::plugin::took_autonomy(&moment, "lead", Some(running));
+        let mut m = moment.write().unwrap();
+        m.now = Timestamp::millis(30_000);
+        assert_eq!(elapsed(&state, &m), Some(3_620_000));
+        Live::absorb(&mut state, &SessionEvent::TurnStart { turn: 2 });
+        m.turn_started = Some(m.now);
+        assert_eq!(
+            elapsed(&state, &m),
+            Some(3_620_000),
+            "automatic continuation does not reset goal time"
+        );
+        m.input = "another instruction".into();
+        assert_eq!(elapsed(&state, &m), Some(3_620_000));
+        let mut next = m.autonomy.clone().unwrap();
+        next.round = 2;
+        next.elapsed_secs = 3_620;
+        drop(m);
+        crate::plugin::took_autonomy(&moment, "lead", Some(next));
+        let mut m = moment.write().unwrap();
+        assert_eq!(
+            elapsed(&state, &m),
+            Some(3_620_000),
+            "fresh runtime sample keeps the cumulative value"
+        );
+        m.viewing = "member".into();
+        assert_eq!(elapsed(&state, &m), Some(0), "member uses its own turn");
+        m.viewing = "lead".into();
+        assert_eq!(
+            elapsed(&state, &m),
+            Some(3_620_000),
+            "view reconstruction keeps the goal sample"
+        );
+        m.compacting_since = Some(m.now);
+        assert_eq!(parts(&state, &m), vec!["耗时 1h00m"]);
+        m.compacting_since = None;
+        state.turn = None;
+        let mut recovery = m.autonomy.clone().unwrap();
+        recovery.recovering = true;
+        drop(m);
+        crate::plugin::took_autonomy(&moment, "lead", Some(recovery));
+        let m = moment.write().unwrap();
+        assert!(line_at(&state, &m, 160).contains("耗时 1h00m"));
+        assert_eq!(
+            parts(&state, &m),
+            vec!["耗时 1h00m"],
+            "goal evaluation/recovery between turns retains elapsed"
+        );
+        drop(m);
+        crate::plugin::took_autonomy(&moment, "lead", None);
+        assert_eq!(elapsed(&state, &moment.read().unwrap()), None);
+    }
+
+    #[test]
+    fn paused_goals_and_loops_use_the_ordinary_turn_clock() {
+        let state = fold(&a_turn());
+        let m = Moment {
+            viewing: "lead".into(),
+            now: Timestamp::millis(10_000),
+            turn_started: Some(Timestamp::millis(2_000)),
+            autonomy_samples: std::collections::HashMap::from([(
+                "lead".into(),
+                (
+                    atomcode_host_api::Running {
+                        usage: None,
+                        kind: "goal".into(),
+                        what: "finish".into(),
+                        recovering: false,
+                        retry_in_secs: None,
+                        goal_stage: None,
+                        goal_detail: None,
+                        round: 1,
+                        of: None,
+                        elapsed_secs: 3_600,
+                        paused: Some("paused".into()),
+                    },
+                    Timestamp::millis(0),
+                ),
+            )]),
+            ..Moment::default()
+        };
+        assert_eq!(elapsed(&state, &m), Some(8_000));
+        let mut m = m;
+        // The host also uses `paused` to describe automatic recovery waits;
+        // those still belong to the active goal's cumulative wall time.
+        m.autonomy_samples.get_mut("lead").unwrap().0.recovering = true;
+        assert_eq!(elapsed(&state, &m), Some(3_610_000));
+        m.autonomy_samples.get_mut("lead").unwrap().0.paused = None;
+        m.autonomy_samples.get_mut("lead").unwrap().0.kind = "loop".into();
+        assert_eq!(elapsed(&state, &m), Some(8_000));
+    }
+
+    #[test]
+    fn ordinary_elapsed_uses_committed_start_and_legacy_local_fallback() {
+        let state = fold(&a_turn());
+        let mut m = Moment {
+            now: Timestamp::millis(50_000),
+            turn_started: Some(Timestamp::millis(49_000)),
+            unix_ms: Some(10_000_000),
+            turn_started_unix_ms: Some(9_000_000),
+            ..Moment::default()
+        };
+        assert_eq!(elapsed(&state, &m), Some(1_000_000));
+        m.turn_started_unix_ms = None;
+        assert_eq!(elapsed(&state, &m), Some(1_000));
+    }
+    #[test]
+    fn lead_and_member_goal_clocks_survive_each_others_progress_and_end() {
+        let moment = std::sync::RwLock::new(Moment {
+            lead: "lead".into(),
+            viewing: "lead".into(),
+            now: Timestamp::millis(1_000),
+            ..Moment::default()
+        });
+        let lead = atomcode_host_api::Running {
+            retry_in_secs: None,
+            goal_stage: None,
+            goal_detail: None,
+            usage: None,
+            kind: "goal".into(),
+            what: "lead task".into(),
+            recovering: false,
+            round: 1,
+            of: None,
+            elapsed_secs: 100,
+            paused: None,
+        };
+        let mut member = lead.clone();
+        member.what = "member task".into();
+        member.elapsed_secs = 200;
+        crate::plugin::took_autonomy(&moment, "lead", Some(lead.clone()));
+        moment.write().unwrap().viewing = "member".into();
+        crate::plugin::took_autonomy(&moment, "member", Some(member.clone()));
+        moment.write().unwrap().now = Timestamp::millis(11_000);
+        assert_eq!(goal_elapsed(&moment.read().unwrap()), Some(210_000));
+        moment.write().unwrap().viewing = "lead".into();
+        assert_eq!(goal_elapsed(&moment.read().unwrap()), Some(110_000));
+        crate::plugin::took_autonomy(&moment, "lead", Some(lead));
+        assert_eq!(
+            goal_elapsed(&moment.read().unwrap()),
+            Some(110_000),
+            "duplicate progress cannot reset elapsed"
+        );
+        member.paused = Some("waiting".into());
+        crate::plugin::took_autonomy(&moment, "member", Some(member));
+        assert_eq!(goal_elapsed(&moment.read().unwrap()), Some(110_000));
+        moment.write().unwrap().viewing = "member".into();
+        assert_eq!(
+            goal_elapsed(&moment.read().unwrap()),
+            None,
+            "background pause is observed after switching"
+        );
+        moment.write().unwrap().viewing = "lead".into();
+        crate::plugin::took_autonomy(&moment, "member", None);
+        assert_eq!(
+            goal_elapsed(&moment.read().unwrap()),
+            Some(110_000),
+            "one session ending cannot clear another's clock"
+        );
+    }
+    #[test]
+    fn missing_sampling_hides_speed_and_keeps_elapsed_time() {
+        let state = fold(&a_turn());
+        let mut moment = Moment::default().working();
+        moment.now = Timestamp::millis(62_000);
+        moment.turn_started = Some(Timestamp::millis(0));
+        let line = line_at(&state, &moment, 180);
+        assert!(!line.contains("tok/s"), "{line}");
+        assert!(line.contains("耗时 1m02s"), "{line}");
     }
 }

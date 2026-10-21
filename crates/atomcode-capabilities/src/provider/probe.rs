@@ -15,7 +15,7 @@
 //! and a probe that fails on a working account teaches people to ignore it.
 
 use super::openai_compat::{
-    build_http_client, display_endpoint, extract_error_detail, names_a_missing_model,
+    build_account_http_client, display_endpoint, extract_error_detail, names_a_missing_model,
     provider_error_code, version_suggestion,
 };
 use std::time::Duration;
@@ -32,6 +32,7 @@ pub struct ProbeTarget {
     /// under a placeholder, and a "no such model" answer still proves the path.
     pub model: Option<String>,
     pub user_agent: Option<String>,
+    pub headers: atomcode_config::provider_headers::ProviderHeaders,
     pub skip_tls_verify: bool,
 }
 
@@ -291,6 +292,8 @@ async fn ask(
     if let Some(key) = target.api_key.as_deref().filter(|k| !k.trim().is_empty()) {
         request = request.bearer_auth(key.trim());
     }
+    request = super::apply_account_headers(request, &target.headers)
+        .map_err(|_| "Invalid HTTP headers".to_string())?;
     let response = request
         .send()
         .await
@@ -304,7 +307,9 @@ async fn ask(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let text = response.text().await.unwrap_or_default();
+    let text = target
+        .headers
+        .redact(&response.text().await.unwrap_or_default());
     Ok(classify(
         status,
         &content_type,
@@ -317,11 +322,12 @@ async fn ask(
 pub async fn probe_chat_endpoint(target: &ProbeTarget) -> ProbeVerdict {
     let url = format!("{}/chat/completions", target.base_url.trim_end_matches('/'));
     let shown = display_endpoint(&url);
-    let client = match build_http_client(
+    let client = match build_account_http_client(
         Duration::from_secs(5),
         target.skip_tls_verify,
         target.user_agent.clone(),
         false,
+        !target.headers.is_empty(),
     ) {
         Ok(client) => client,
         Err(e) => {

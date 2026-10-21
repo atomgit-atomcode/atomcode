@@ -147,6 +147,35 @@ mod tests {
         assert!(s.contains("fr"));
     }
 
+    #[test]
+    fn stream_recovery_notices_explain_attempts_and_terminal_reasons_in_both_languages() {
+        for locale in [Locale::En, Locale::ZhCn] {
+            let progress = t_with(
+                locale,
+                Msg::StreamRecoveryRetry {
+                    attempt: 2,
+                    max_recoveries: 3,
+                    delay_secs: 2,
+                },
+            );
+            assert!(progress.contains("2/3"));
+            for reason in [
+                Msg::StreamRecoveryUnsafeTools,
+                Msg::StreamRecoveryNoProgress,
+                Msg::StreamRecoveryExhausted { max_recoveries: 3 },
+                Msg::StreamRecoveryExhausted { max_recoveries: 0 },
+            ] {
+                let rendered = t_with(locale, reason);
+                assert!(!rendered.is_empty());
+                assert_eq!(has_cjk(&rendered), locale == Locale::ZhCn);
+            }
+            assert_ne!(
+                t_with(locale, Msg::StreamRecoveryExhausted { max_recoveries: 0 }),
+                t_with(locale, Msg::StreamRecoveryExhausted { max_recoveries: 3 })
+            );
+        }
+    }
+
     fn has_cjk(s: &str) -> bool {
         s.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
     }
@@ -910,6 +939,35 @@ mod tests {
                      or the screen's downgrade table will read it as another key"
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod worktree_message_tests {
+    use super::*;
+
+    #[test]
+    fn worktree_messages_explain_return_and_cleanup_in_both_languages() {
+        for (locale, no_merge, lost) in [
+            (Locale::ZhCn, "不提交或合并", "丢弃未提交内容"),
+            (
+                Locale::En,
+                "does not commit or merge",
+                "discards uncommitted content",
+            ),
+        ] {
+            let returned = t_with(
+                locale,
+                Msg::WorktreeReturned {
+                    path: "/repo/main-checkout",
+                },
+            );
+            assert!(returned.contains("/repo/main-checkout"));
+            assert!(returned.contains(no_merge));
+            let dirty = t_with(locale, Msg::WorktreeDirty { name: "topic" });
+            assert!(dirty.contains("topic") && dirty.contains(lost));
+            assert!(t_with(locale, Msg::WorktreeHelp).contains("--force"));
         }
     }
 }

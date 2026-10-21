@@ -2,7 +2,7 @@
   "name": "atomcode-tools",
   "displayName": "%atomcode.displayName%",
   "description": "%atomcode.description%",
-  "version": "5.2.3",
+  "version": "5.2.4",
   "publisher": "atomcode-tools",
   "license": "MIT",
   "repository": {
@@ -85,6 +85,22 @@
         "command": "atomcode.stop",
         "title": "%atomcode.commands.stop.title%",
         "icon": "$(stop-circle)"
+      },
+      {
+        "command": "atomcode.enableLanguageBridge",
+        "title": "%atomcode.commands.enableLanguageBridge.title%"
+      },
+      {
+        "command": "atomcode.disableLanguageBridge",
+        "title": "%atomcode.commands.disableLanguageBridge.title%"
+      },
+      {
+        "command": "atomcode.languageBridgeStatus",
+        "title": "%atomcode.commands.languageBridgeStatus.title%"
+      },
+      {
+        "command": "atomcode.copyLanguageBridgeBinding",
+        "title": "%atomcode.commands.copyLanguageBridgeBinding.title%"
       }
     ],
     "viewsContainers": {
@@ -239,5 +255,8 @@
     "marked": "^12.0.0",
     "react": "^19.2.5",
     "react-dom": "^19.2.5"
-  }
+  },
+  "extensionKind": [
+    "workspace"
+  ]
 }

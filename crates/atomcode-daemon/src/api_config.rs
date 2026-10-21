@@ -101,6 +101,7 @@ pub(crate) fn config_response(config: &Config) -> ConfigResponse {
                         discoverable: crate::api_provider::discovery_protocol(wire).is_some(),
                         probeable: wire == "openai",
                         id: id.clone(),
+                        header_names: account.headers.names(),
                         provider: account.provider,
                         display_name: account.display_name,
                         provider_type: preset.provider_type.wire().to_string(),
@@ -268,15 +269,29 @@ pub(crate) async fn get_config() -> impl IntoResponse {
     Json(config_response(&config)).into_response()
 }
 
-/// POST /config/reload - Reloads config from disk and returns it.
-pub(crate) async fn reload_config() -> impl IntoResponse {
+#[derive(serde::Serialize)]
+struct ConfigReloadResponse {
+    #[serde(flatten)]
+    config: ConfigResponse,
+    live_provider_sync: crate::live_api::LiveProviderSync,
+}
+
+/// POST /config/reload - Refresh config and reconcile the existing live provider.
+pub(crate) async fn reload_config(
+    axum::extract::State(state): axum::extract::State<crate::AppState>,
+) -> impl IntoResponse {
     let config = match load_config() {
         Ok(c) => c,
         Err(e) => {
             return json_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
         }
     };
-    Json(config_response(&config)).into_response()
+    let live = crate::live_api::sync_live_provider_config(&config, state.telemetry.clone()).await;
+    Json(ConfigReloadResponse {
+        config: config_response(&config),
+        live_provider_sync: live,
+    })
+    .into_response()
 }
 
 #[cfg(test)]
@@ -285,6 +300,7 @@ mod tests {
 
     fn provider(base_url: &str) -> ProviderConfig {
         ProviderConfig {
+            headers: Default::default(),
             provider_type: "openai".into(),
             api_key: None,
             model: "model".into(),
@@ -361,7 +377,8 @@ mod tests {
                 "taotoken": {
                     "provider": "openai",
                     "base_url": "https://taotoken.net/api/v1",
-                    "api_key": "must-not-leave-daemon"
+                    "api_key": "must-not-leave-daemon",
+                    "headers": { "X-Custom-Auth": "header-must-not-leave-daemon" }
                 }
             },
             "models": {
@@ -377,6 +394,7 @@ mod tests {
             .find(|account| account.id == "taotoken")
             .unwrap();
         assert!(account.has_api_key);
+        assert_eq!(account.header_names, ["x-custom-auth"]);
         assert_eq!(account.model_ids, ["taotoken/model-a"]);
         let json = serde_json::to_string(&response).unwrap();
         assert!(!json.contains("must-not-leave-daemon"));

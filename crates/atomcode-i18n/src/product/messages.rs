@@ -332,6 +332,75 @@ pub enum Msg<'a> {
     StatusMemoryScopeGlobal,
     StatusMemoryScopeProject,
     StatusMemoryScopeLocal,
+    StatusMemoryInjection,
+    MemoryEntryCatalog,
+    MemoryOriginalSource,
+
+    MemoryReviewTitle,
+    MemoryDiskPreview {
+        budget: usize,
+        chars: usize,
+    },
+    MemoryScopeSelection {
+        scope: &'a str,
+        path: &'a str,
+        loaded: usize,
+        selected: usize,
+        omitted: usize,
+        shortened: usize,
+    },
+    MemoryPartialRead,
+    MemoryReadFailed {
+        error: &'a str,
+    },
+    MemoryKnowledgeReview {
+        path: &'a str,
+        state: &'a str,
+    },
+    MemoryIndexIncluded,
+    MemoryIndexNotIncluded,
+    MemoryIndexLimited,
+    MemorySessionLogged {
+        present: bool,
+        matches: bool,
+    },
+    MemoryInjectionDisabled,
+    MemoryNotLoggedYet,
+    MemoryNotLogged,
+    MemoryEntrySelected,
+    MemoryEntryOmitted,
+    MemoryEntryInactive,
+    MemoryEntryExpired,
+    MemoryInvalidDays,
+    MemoryExpiryConflict,
+    MemoryFilteredDetails,
+    MemoryArgUnclosedQuote,
+    MemoryArgQuoteSpacing,
+    MemoryArgNeedsValue {
+        arg: &'a str,
+    },
+    MemoryArgUnknown {
+        arg: &'a str,
+    },
+    MemoryCommandSyntax,
+    MemoryIdKeywordConflict,
+    MemoryUnexpectedContent,
+    MemoryInvalidStatus,
+    MemoryJsonListOnly,
+    MemoryListFilters,
+    MemoryIdRequired,
+    MemoryRememberRequired,
+    MemoryForgetRequired,
+
+    MemoryEntryShortened,
+    MemoryInjectionIncomplete,
+    MemorySelectionWarning {
+        omitted: usize,
+        shortened: usize,
+        failures: usize,
+        partial: bool,
+    },
+
     StatusMemoryPresent {
         path: &'a str,
         scope: &'a str,
@@ -647,10 +716,9 @@ pub enum Msg<'a> {
     /// `ssh` (askpass): says it IS a password field, that nothing typed is
     /// shown or kept, and the two ways out.
     PasswordPromptHint,
-    /// Printed once at launch when the new screen was asked for (the default,
-    /// `--tui`, or `[ui] screen`) and this Windows console cannot execute the
-    /// escape sequences it draws in, so the classic screen opens instead.
-    ClassicScreenFallback,
+    /// Startup fails explicitly when the console cannot draw the sole TUI.
+    AnsiTerminalRequired,
+    ClassicScreenRetired,
     /// Title row of the `/resume` picker: current 1-based position in the
     /// filtered list, total sessions in the project, and the project name.
     SessionPickerTitle {
@@ -1256,6 +1324,10 @@ pub enum Msg<'a> {
     PluginHooksUntrusted {
         count: usize,
         names: &'a str,
+    },
+    /// Startup summary; detailed configuration errors belong in hooks list.
+    PluginHooksIncompatible {
+        count: usize,
     },
     PluginInstalling {
         plugin: &'a str,
@@ -2152,6 +2224,8 @@ pub enum Msg<'a> {
         base_url: &'a str,
     },
 
+    /// Short acknowledgement; the goal condition is already in the user message.
+    GoalStarted,
     // ── streaming liveness (atomcode-tuix spinner) ──
     /// Spinner hint shown when a streaming response has gone silent past the stall
     /// threshold. A silent stretch is OFTEN legitimate (slow first-byte prefill or
@@ -2165,6 +2239,20 @@ pub enum Msg<'a> {
         max_attempts: u32,
     },
     StreamRecoverySucceeded,
+    StreamRecoveryRetry {
+        attempt: u32,
+        max_recoveries: u32,
+        delay_secs: u64,
+    },
+    StreamRecoveryExhausted {
+        max_recoveries: u32,
+    },
+    StreamRecoveryUnsafeTools,
+    StreamRecoveryNoProgress,
+    /// Notice when received output is preserved and bounded continuation begins.
+    StreamRecoveryPreserved {
+        max_recoveries: u32,
+    },
     /// Labels for model-visible context the person did not type. The line they
     /// prefix is drawn muted, because the one thing it must never look like is
     /// the person speaking.
@@ -2247,6 +2335,13 @@ pub enum Msg<'a> {
     // is the argument hint a menu draws beside the name.
     CmdCatalogWorktree,
     CmdCatalogWorktreeUsage,
+    WorktreeReturned {
+        path: &'a str,
+    },
+    WorktreeDirty {
+        name: &'a str,
+    },
+    WorktreeHelp,
     CmdCatalogInit,
     CmdCatalogWorklog,
     CmdCatalogWorklogUsage,
@@ -2260,11 +2355,15 @@ pub enum Msg<'a> {
     CmdCatalogReview,
     CmdCatalogSkills,
     CmdCatalogSkillsUsage,
+    CmdCatalogSkillsEmpty,
+    CmdCatalogSkillDirs,
+    CmdCatalogSkillDiagnostics,
     /// The hint on a user-invoked skill's own row; its gloss is the skill's.
     CmdCatalogSkillUsage,
     /// A disk command with its own template, separate from a same-named skill.
     CmdCatalogPromptCommandUsage,
     CmdCatalogMemory,
+    CmdCatalogMemoryUsage,
     CmdCatalogRemember,
     CmdCatalogRememberUsage,
     CmdCatalogForget,

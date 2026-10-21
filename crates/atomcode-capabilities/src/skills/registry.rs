@@ -4,7 +4,7 @@
 
 use super::skill::{parse_skill_dir, parse_skill_file, Skill};
 use crate::ProductDirs;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -17,8 +17,19 @@ pub enum TemplateKind {
 
 pub type TemplateDirectory = (PathBuf, String, TemplateKind);
 
+/// A load failure or an intentionally overridden template. No file contents are retained.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkillDiagnostic {
+    pub path: PathBuf,
+    pub reason: String,
+    /// Overrides are informational; failures are surfaced as warnings.
+    pub warning: bool,
+}
+
 #[derive(Default)]
 struct SkillIndex {
+    directories: Vec<PathBuf>,
+    diagnostics: Vec<SkillDiagnostic>,
     skills: BTreeMap<String, Arc<Skill>>,
     commands: BTreeMap<String, Arc<Skill>>,
 }
@@ -52,6 +63,7 @@ pub struct SkillRegistry {
     /// ([`super::render::source_rank`]). Handed in by whoever knows where they
     /// are — [`Self::reload`] takes them from its [`SkillRoots`].
     native_roots: RwLock<Vec<PathBuf>>,
+    notified: RwLock<BTreeSet<String>>,
 }
 
 impl SkillRegistry {
@@ -59,6 +71,7 @@ impl SkillRegistry {
         Self {
             skills: RwLock::new(SkillIndex::default()),
             native_roots: RwLock::new(Vec::new()),
+            notified: RwLock::new(BTreeSet::new()),
         }
     }
 
@@ -85,14 +98,31 @@ impl SkillRegistry {
     /// every skill from after, never a half-scanned catalog — which is what a
     /// model would otherwise be told about mid-reload.
     pub fn reload_dirs(&self, dirs: &[PathBuf], namespaced: &[TemplateDirectory]) {
-        let fresh = Self::new();
-        for dir in dirs {
-            fresh.load_standard_dir(dir, None);
-        }
+        self.reload_dirs_with_explicit(dirs, namespaced, &[]);
+    }
+
+    pub fn reload_dirs_with_explicit(
+        &self,
+        dirs: &[PathBuf],
+        namespaced: &[TemplateDirectory],
+        explicit: &[PathBuf],
+    ) {
+        let fresh = Self::load_with_explicit(dirs, explicit);
         for (dir, namespace, kind) in namespaced {
             fresh.load_template_dir(dir, Some(namespace), *kind);
         }
         let next = std::mem::take(&mut *fresh.write());
+        // Forget resolved failures, so a later recurrence is reported again.
+        let current: BTreeSet<_> = next
+            .diagnostics
+            .iter()
+            .filter(|d| d.warning)
+            .map(|d| format!("[skills] {}: {}", d.path.display(), d.reason))
+            .collect();
+        self.notified
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|w| current.contains(w));
         *self.write() = next;
     }
 
@@ -102,11 +132,93 @@ impl SkillRegistry {
     /// Each dir is scanned for flat `*.md` files AND `*/SKILL.md` subdirectories; parse
     /// failures are skipped.
     pub fn load(dirs: &[PathBuf]) -> Self {
+        Self::load_with_explicit(dirs, &[])
+    }
+
+    /// Explicitly configured roots must report missing paths; implicit compatibility
+    /// roots may legitimately not exist.
+    pub fn load_with_explicit(dirs: &[PathBuf], explicit: &[PathBuf]) -> Self {
         let reg = Self::new();
+        reg.write().directories = dirs.to_vec();
         for dir in dirs {
-            reg.load_standard_dir(dir, None);
+            if explicit.contains(dir) && matches!(dir.try_exists(), Ok(false)) {
+                reg.diagnose(
+                    dir,
+                    "configured skill directory does not exist".into(),
+                    true,
+                );
+            } else {
+                reg.load_standard_dir(dir, None);
+            }
         }
         reg
+    }
+
+    pub fn directories(&self) -> Vec<PathBuf> {
+        self.read().directories.clone()
+    }
+
+    pub fn diagnostics(&self) -> Vec<SkillDiagnostic> {
+        self.read().diagnostics.clone()
+    }
+
+    pub fn take_new_warnings(&self) -> Vec<String> {
+        let warnings: Vec<_> = self
+            .read()
+            .diagnostics
+            .iter()
+            .filter(|d| d.warning)
+            .map(|d| format!("[skills] {}: {}", d.path.display(), d.reason))
+            .collect();
+        let mut notified = self.notified.write().unwrap_or_else(|e| e.into_inner());
+        warnings
+            .into_iter()
+            .filter(|w| notified.insert(w.clone()))
+            .collect()
+    }
+
+    fn diagnose(&self, path: &Path, reason: String, warning: bool) {
+        self.write().diagnostics.push(SkillDiagnostic {
+            path: path.to_path_buf(),
+            reason,
+            warning,
+        });
+    }
+
+    fn insert_parsed(&self, parsed: Result<Skill, String>, path: &Path, kind: TemplateKind) {
+        match parsed {
+            Ok(skill) => {
+                let mut index = self.write();
+                let name = skill.name.clone();
+                let source = skill.source_path.clone();
+                // Compare loaded definitions, not current disk contents: a file
+                // may have changed since the earlier source was scanned.
+                let same_definition = match kind {
+                    TemplateKind::Skill => index.skills.get(&name),
+                    TemplateKind::Command => index.commands.get(&name),
+                }
+                .is_some_and(|previous| {
+                    previous.description == skill.description
+                        && previous.template == skill.template
+                        && previous.allowed_tools == skill.allowed_tools
+                        && previous.user_invocable == skill.user_invocable
+                });
+                let previous = match kind {
+                    TemplateKind::Skill => index.skills.insert(name, Arc::new(skill)),
+                    TemplateKind::Command => index.commands.insert(name, Arc::new(skill)),
+                };
+                if let Some(previous) = previous {
+                    if previous.source_path != source && !same_definition {
+                        index.diagnostics.push(SkillDiagnostic {
+                            path: previous.source_path.clone(),
+                            reason: format!("overridden by {}", source.display()),
+                            warning: false,
+                        });
+                    }
+                }
+            }
+            Err(error) => self.diagnose(path, error, true),
+        }
     }
 
     /// Load one directory, optionally namespacing the skill names (`{ns}:{name}`).
@@ -142,37 +254,45 @@ impl SkillRegistry {
     ) {
         const MAX_DEPTH: usize = 8;
         if depth > MAX_DEPTH {
+            self.diagnose(
+                dir,
+                "skill scan depth limit exceeded (possible symlink cycle)".into(),
+                true,
+            );
             return;
         }
-        let Ok(rd) = std::fs::read_dir(dir) else {
-            return;
+        let rd = match std::fs::read_dir(dir) {
+            Ok(rd) => rd,
+            Err(error) => {
+                if depth > 0 || error.kind() != std::io::ErrorKind::NotFound {
+                    self.diagnose(dir, format!("cannot read skill directory: {error}"), true);
+                }
+                return;
+            }
         };
-        let mut entries: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+        let mut entries = Vec::new();
+        for entry in rd {
+            match entry {
+                Ok(entry) => entries.push(entry.path()),
+                Err(error) => {
+                    self.diagnose(dir, format!("cannot read directory entry: {error}"), true)
+                }
+            }
+        }
         entries.sort();
         for p in entries {
             if p.is_file() {
                 if depth == 0 && p.extension().and_then(|e| e.to_str()) == Some("md") {
-                    if let Ok(s) = parse_skill_file(&p, namespace) {
-                        let mut index = self.write();
-                        let s = Arc::new(s);
-                        // The source role, not markdown layout, determines
-                        // whether the template is a command or a skill.
-                        match kind {
-                            TemplateKind::Command => {
-                                index.commands.insert(s.name.clone(), s);
-                            }
-                            TemplateKind::Skill => {
-                                index.insert(s.name.clone(), s);
-                            }
-                        }
-                    }
+                    self.insert_parsed(parse_skill_file(&p, namespace), &p, kind);
                 }
             } else if p.is_dir() {
                 let skill_md = p.join("SKILL.md");
                 if skill_md.is_file() {
-                    if let Ok(s) = parse_skill_dir(&p, &skill_md, namespace) {
-                        self.write().insert(s.name.clone(), Arc::new(s));
-                    }
+                    self.insert_parsed(
+                        parse_skill_dir(&p, &skill_md, namespace),
+                        &skill_md,
+                        TemplateKind::Skill,
+                    );
                 } else {
                     self.scan_skill_dir(&p, namespace, depth + 1, kind);
                 }
@@ -257,17 +377,16 @@ impl SkillRegistry {
     /// slash-menu source), under the `skills:` namespace — matching the driver's
     /// slash-command convention. Mirrors core `SkillRegistry::reload`.
     ///
-    /// Returns per-skill load warnings for signature compatibility with core's
-    /// `reload` (driver call sites surface them). Currently always empty: this loader
-    /// silently skips unparseable skills — the SAME behavior the runtime skill path
-    /// uses — so no parse warnings are collected.
+    /// Reload the standard roots and return newly observed failures.
     pub fn reload(&self, roots: SkillRoots<'_>) -> Vec<String> {
         *self.write() = SkillIndex::default();
         self.set_native_roots(roots.native());
-        for dir in standard_skill_dirs(roots) {
+        let dirs = standard_skill_dirs(roots);
+        self.write().directories = dirs.clone();
+        for dir in dirs {
             self.load_standard_dir(&dir, Some("skills"));
         }
-        Vec::new()
+        self.take_new_warnings()
     }
 
     /// Skills a user can invoke from the `/` menu (frontmatter `user-invocable` not
@@ -424,6 +543,182 @@ pub fn skill_install_dirs(roots: SkillRoots<'_>) -> (PathBuf, PathBuf) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn versioned_installs_and_display_titles_have_safe_invocation_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let entries = [
+            ("atomgit-1.0.0", "# AtomGit", "atomgit"),
+            ("debug-pro-1.0.0", "# debug-pro", "debug-pro"),
+            ("test-runner-1.0.0", "# test-runner", "test-runner"),
+            (
+                "ffmpeg-video-editor-1.0.0",
+                "---\nname: FFmpeg Video Editor\n---\nbody",
+                "ffmpeg-video-editor",
+            ),
+            (
+                "market-research-1.0.0",
+                "---\nname: Market Research\nslug: market-research\n---\nbody",
+                "market-research",
+            ),
+            (
+                "self-improving-1.1.3",
+                "---\nname: Self-Improving Agent (With Self-Reflection)\n---\nbody",
+                "self-improving",
+            ),
+            (
+                "seo-1.0.3",
+                "---\nname: SEO (Site Audit + Content Writer + Competitor Analysis)\n---\nbody",
+                "seo",
+            ),
+            (
+                "social-media-scheduler-1.0.0",
+                "---\nname: Social Media Scheduler\n---\nbody",
+                "social-media-scheduler",
+            ),
+            (
+                "renamed-1.0.0",
+                "---\nname: explicit-name\n---\nbody",
+                "explicit-name",
+            ),
+        ];
+        for (dir, body, _) in entries {
+            std::fs::create_dir(tmp.path().join(dir)).unwrap();
+            std::fs::write(tmp.path().join(dir).join("SKILL.md"), body).unwrap();
+        }
+        let reg = SkillRegistry::load(&[tmp.path().to_path_buf()]);
+        assert!(reg.take_new_warnings().is_empty());
+        for (dir, _, name) in entries {
+            let skill = reg.get(name).expect(name);
+            assert_eq!(skill.skill_dir, tmp.path().join(dir));
+            assert_eq!(skill.source_path, tmp.path().join(dir).join("SKILL.md"));
+            assert!(skill.user_invocable);
+        }
+    }
+
+    #[test]
+    fn title_compatibility_does_not_relax_flat_command_validation() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("command.md"),
+            "---\nname: Invalid Command Title\n---\nbody",
+        )
+        .unwrap();
+        let reg = SkillRegistry::new();
+        reg.load_template_dir(tmp.path(), None, TemplateKind::Command);
+        assert!(reg.get("command").is_none());
+        assert_eq!(reg.take_new_warnings().len(), 1);
+    }
+
+    #[test]
+    fn identical_definitions_are_quiet_but_keep_the_higher_priority_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let low = tmp.path().join("low");
+        let high = tmp.path().join("high");
+        for root in [&low, &high] {
+            std::fs::create_dir_all(root.join("sample")).unwrap();
+            std::fs::write(
+                root.join("sample/SKILL.md"),
+                "---\nname: sample\ndescription: same\n---\nbody",
+            )
+            .unwrap();
+        }
+        let reg = SkillRegistry::load(&[low.clone(), high.clone()]);
+        assert!(reg.diagnostics().is_empty());
+        assert_eq!(
+            reg.get("sample").unwrap().source_path,
+            high.join("sample/SKILL.md")
+        );
+        std::fs::write(
+            high.join("sample/SKILL.md"),
+            "---\nname: sample\ndescription: same\nuser-invocable: false\n---\nbody",
+        )
+        .unwrap();
+        reg.reload_dirs(&[low, high], &[]);
+        assert_eq!(
+            reg.diagnostics().len(),
+            1,
+            "metadata changes remain visible"
+        );
+        assert!(!reg.diagnostics()[0].warning);
+        assert!(!reg.get("sample").unwrap().user_invocable);
+    }
+
+    #[test]
+    fn versioned_name_collisions_keep_existing_precedence_and_diagnostics() {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["sample-1.0.0", "sample-2.0.0"] {
+            std::fs::create_dir(tmp.path().join(name)).unwrap();
+            std::fs::write(tmp.path().join(name).join("SKILL.md"), name).unwrap();
+        }
+        let reg = SkillRegistry::load(&[tmp.path().to_path_buf()]);
+        assert_eq!(
+            reg.get("sample").unwrap().skill_dir,
+            tmp.path().join("sample-2.0.0")
+        );
+        let diagnostics = reg.diagnostics();
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].reason.contains("overridden by"));
+        assert!(!diagnostics[0].warning);
+    }
+
+    #[test]
+    fn failures_are_reported_once_and_can_recover_on_reload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("skills");
+        std::fs::create_dir_all(root.join("broken")).unwrap();
+        let broken = root.join("broken/SKILL.md");
+        std::fs::write(&broken, "---\nname: bad.name\n---\nPRIVATE BODY").unwrap();
+        let absent = tmp.path().join("missing");
+        let implicit = tmp.path().join("implicit");
+        let dirs = vec![root.clone(), absent.clone(), implicit];
+        let reg = SkillRegistry::load_with_explicit(&dirs, std::slice::from_ref(&absent));
+        assert_eq!(reg.diagnostics().len(), 2);
+        let warnings = reg.take_new_warnings();
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings
+            .iter()
+            .any(|s| s.contains("SKILL.md") && s.contains("invalid characters")));
+        assert!(!warnings.join("\n").contains("PRIVATE BODY"));
+        reg.reload_dirs_with_explicit(&dirs, &[], std::slice::from_ref(&absent));
+        assert!(reg.take_new_warnings().is_empty());
+        std::fs::write(&broken, "---\nname: fixed\n---\nworks").unwrap();
+        std::fs::create_dir(&absent).unwrap();
+        reg.reload_dirs_with_explicit(&dirs, &[], std::slice::from_ref(&absent));
+        assert!(reg.diagnostics().is_empty());
+        assert!(reg.get("fixed").is_some());
+        std::fs::write(&broken, "---\nname: invalid.name\n---\nagain").unwrap();
+        reg.reload_dirs_with_explicit(&dirs, &[], std::slice::from_ref(&absent));
+        assert_eq!(reg.take_new_warnings().len(), 1, "recurrence is reported");
+    }
+
+    #[test]
+    fn overridden_sources_are_visible_without_becoming_warnings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots: Vec<_> = ["low", "high"]
+            .iter()
+            .map(|name| tmp.path().join(name))
+            .collect();
+        for root in &roots {
+            std::fs::create_dir_all(root.join("same")).unwrap();
+            std::fs::write(
+                root.join("same/SKILL.md"),
+                format!("skill from {}", root.display()),
+            )
+            .unwrap();
+        }
+        let reg = SkillRegistry::load(&roots);
+        assert_eq!(
+            reg.get("same").unwrap().source_path,
+            roots[1].join("same/SKILL.md")
+        );
+        let diagnostics = reg.diagnostics();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].path, roots[0].join("same/SKILL.md"));
+        assert!(diagnostics[0].reason.contains("high"));
+        assert!(!diagnostics[0].warning);
+        assert!(reg.take_new_warnings().is_empty());
+    }
+
     #[test]
     fn install_dirs_are_the_winning_dirs_of_the_standard_list() {
         let dirs = ProductDirs::new("/custom/tree", ".ours");

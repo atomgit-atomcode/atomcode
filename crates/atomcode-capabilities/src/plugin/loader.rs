@@ -56,8 +56,9 @@ pub struct PluginCcHook {
     pub event: String,
     /// Optional tool-name matcher for `PreToolUse`/`PostToolUse`.
     pub matcher: Option<String>,
-    /// The shell command to run.
+    /// Legacy command text; explicit arguments are kept separate.
     pub command: String,
+    pub args: Vec<String>,
     /// CC timeout in SECONDS (the consumer converts to ms; `None` ⇒ its default).
     pub timeout_secs: Option<u64>,
     /// Plugin install dir — exported as `CLAUDE_PLUGIN_ROOT`/`ATOMCODE_PLUGIN_ROOT`.
@@ -78,6 +79,7 @@ fn expand_cc_hooks(cc_map: &CCHooksMap, plugin_root: &Path) -> Vec<PluginCcHook>
                     event: event.clone(),
                     matcher: group.matcher.clone(),
                     command: spec.command.clone(),
+                    args: spec.args.clone(),
                     timeout_secs: spec.timeout,
                     plugin_root: plugin_root.to_path_buf(),
                 });
@@ -129,7 +131,7 @@ pub fn plugin_file_cc_hooks(plugin_dir: &Path) -> Vec<PluginCcHook> {
     Vec::new()
 }
 
-/// Drop duplicate hooks by `(event, matcher, command)`, keeping first occurrence —
+/// Drop duplicate hooks by `(event, matcher, command, args)`, keeping first occurrence —
 /// so a plugin declaring the same hook both inline and in a file never double-fires.
 /// The matcher key normalizes `None` and `Some("")` to the same empty string so they
 /// collapse correctly (matching the hash normalization in `plugin_hook_set_hash`).
@@ -142,6 +144,7 @@ fn dedup_hooks(hooks: Vec<PluginCcHook>) -> Vec<PluginCcHook> {
                 h.event.clone(),
                 h.matcher.clone().unwrap_or_default(),
                 h.command.clone(),
+                h.args.clone(),
             ))
         })
         .collect()
@@ -165,7 +168,7 @@ fn plugin_file_cc_hooks_for(plugin_dir: &Path, manifest: &PluginManifest) -> Vec
 }
 
 /// All CC hooks a plugin contributes: inline (`plugin.json` hooks) + file-based
-/// (`hooks/hooks.json` / `hooks.json`), deduped by `(event, matcher, command)`.
+/// (`hooks/hooks.json` / `hooks.json`), deduped by `(event, matcher, command, args)`.
 fn plugin_all_cc_hooks(assets: &InstalledPluginAssets) -> Vec<PluginCcHook> {
     let mut hooks = Vec::new();
     if let Some(cc_map) = assets.manifest.inline_cc_hooks() {
@@ -191,6 +194,10 @@ pub fn installed_plugin_cc_hooks(dirs: &ProductDirs) -> Vec<PluginCcHook> {
         }
         let hash = crate::plugin::hook_trust::plugin_hook_set_hash(&hooks);
         let id = crate::plugin::hook_trust::plugin_id(&assets.plugin, &assets.marketplace);
+        if hash.starts_with("invalid:") {
+            tracing::warn!(plugin = %id, reason = %hash, "Plugin hooks withheld: incompatible configuration; repair script entry points or disable the plugin");
+            continue;
+        }
         if crate::plugin::hook_trust::is_trusted(&trust, &id, &hash) {
             out.extend(hooks);
         }
@@ -404,6 +411,35 @@ mod tests {
     use std::process::Command;
 
     #[test]
+    fn planning_hooks_keep_literal_args_and_distinct_actions() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("hooks")).unwrap();
+        std::fs::write(root.path().join("hooks/claude-hook.sh"), "exit 0\n").unwrap();
+        std::fs::write(root.path().join("hooks/hooks.json"), r#"{
+            "hooks": {"SessionStart": [{"hooks": [
+                {"command":"sh", "args":["${CLAUDE_PLUGIN_ROOT}/hooks/claude-hook.sh", "session-start"]},
+                {"command":"sh", "args":["${CLAUDE_PLUGIN_ROOT}/hooks/claude-hook.sh", "resume"]},
+                {"command":"sh", "args":["${CLAUDE_PLUGIN_ROOT}/hooks/claude-hook.sh", "session-start"]}
+            ]}]}
+        }"#).unwrap();
+        let hooks = dedup_hooks(plugin_file_cc_hooks(root.path()));
+        assert_eq!(hooks.len(), 2);
+        assert_eq!(hooks[0].command, "sh");
+        assert_eq!(
+            hooks[0].args,
+            [
+                "${CLAUDE_PLUGIN_ROOT}/hooks/claude-hook.sh",
+                "session-start"
+            ]
+        );
+        assert_eq!(hooks[1].args[1], "resume");
+        #[cfg(all(feature = "cc-hooks", unix))]
+        for hook in &hooks {
+            crate::cc_hooks::validate_plugin_hook(hook).unwrap();
+        }
+    }
+
+    #[test]
     fn file_cc_hooks_parses_cc_schema_from_hooks_subdir() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
@@ -468,6 +504,7 @@ mod tests {
             matcher: None,
             command: c.into(),
             timeout_secs: None,
+            args: Vec::new(),
             plugin_root: PathBuf::from("/x"),
         };
         let out = dedup_hooks(vec![mk("a"), mk("a"), mk("b")]);
@@ -504,6 +541,7 @@ mod tests {
             matcher: m.map(|s| s.into()),
             command: "c".into(),
             timeout_secs: None,
+            args: Vec::new(),
             plugin_root: std::path::PathBuf::from("/x"),
         };
         let out = dedup_hooks(vec![mk(None), mk(Some(""))]);
@@ -572,6 +610,7 @@ mod tests {
         let work = tempfile::tempdir().unwrap().keep();
         let repo = work.join("hp");
         std::fs::create_dir_all(repo.join("hooks")).unwrap();
+        std::fs::write(repo.join("echo"), "").unwrap();
         std::fs::write(
             repo.join("hooks/hooks.json"),
             r#"{"SessionStart":[{"hooks":[{"type":"command","command":"echo hi"}]}]}"#,
@@ -626,7 +665,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn grandfather_blesses_existing_then_new_installs_stay_untrusted() {
+    fn migration_never_grants_content_trust_without_user_authorization() {
         use crate::plugin::hook_trust::ensure_migrated;
         let _home = crate::plugin::test_support::isolated_home();
         let dirs = _home.dirs();
@@ -635,6 +674,7 @@ mod tests {
             let work = tempfile::tempdir().unwrap().keep();
             let repo = work.join(name);
             std::fs::create_dir_all(repo.join("hooks")).unwrap();
+            std::fs::write(repo.join("echo"), "").unwrap();
             std::fs::write(
                 repo.join("hooks/hooks.json"),
                 format!(
@@ -667,12 +707,12 @@ mod tests {
             "untrusted before migration"
         );
 
-        // Upgrade boundary → grandfather blesses the existing plugin.
+        // The migration boundary must not grant new content authorization.
         ensure_migrated(&dirs);
         assert_eq!(
             installed_plugin_cc_hooks(&dirs).len(),
-            1,
-            "existing plugin grandfathered"
+            0,
+            "existing plugins require explicit content authorization"
         );
 
         // A NEW plugin installed AFTER migration stays untrusted (marker set).
@@ -684,7 +724,7 @@ mod tests {
         let loaded = installed_plugin_cc_hooks(&dirs);
         assert_eq!(
             loaded.len(),
-            1,
+            0,
             "new post-migration plugin NOT auto-trusted"
         );
         assert!(loaded.iter().all(|h| h.command == "echo one"));
@@ -698,6 +738,7 @@ mod tests {
         let work = tempfile::tempdir().unwrap().keep();
         let repo = work.join("cp");
         std::fs::create_dir_all(repo.join("cfg")).unwrap();
+        std::fs::write(repo.join("echo"), "").unwrap();
         std::fs::write(
             repo.join("plugin.json"),
             r#"{"name":"cp","hooks":"cfg/h.json"}"#,

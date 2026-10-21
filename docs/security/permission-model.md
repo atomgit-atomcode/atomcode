@@ -35,6 +35,48 @@ Sandboxing and host-level permissions remain important defense layers.
 
 ## Core Concepts
 
+### Static Tool Permissions
+
+`[permissions]` in the user's `config.toml` and JSON `permissions.allow` /
+`permissions.deny` lists use the same matcher. JSON files are read from:
+
+- the product user directory: `settings.json` and `settings.local.json`
+- the current working directory's `.claude` directory: the same two names
+- the product project directory (normally `.atomcode`): the same two names
+
+The user directory respects `ATOMCODE_HOME`. Project discovery does not traverse
+ancestors. Prefer committing `settings.json` for team policy and keeping
+`settings.local.json` for personal settings. Other JSON fields are ignored.
+
+```json
+{
+  "permissions": {
+    "allow": ["Bash(python3 *)", "Bash(python *)"],
+    "deny": ["WebSearch", "WebFetch"]
+  }
+}
+```
+
+All scopes merge additively, including TOML; any matching deny wins over every
+allow. Empty lists do not erase other scopes. A matched allow skips ordinary
+approval but does not bypass credential, sensitive-path, plan-mode or delegated
+agent boundaries.
+
+A bare deny such as `WebSearch` removes the tool from the model's schema and
+blocks execution, including tools registered later. `/tools on` cannot reopen
+it. An argument-specific deny such as `Bash(rm -rf *)` leaves Bash available
+and rejects only matching calls, without prompting.
+
+The runtime reads settings when it fully builds its tool tree, including startup,
+session rebuilds and directory changes. A model-only provider patch or a
+skills-only fast reload keeps the existing rules; use a new session or restart
+to reliably apply edits. It does not watch files or write JSON settings back.
+Missing files are normal; unreadable files, malformed
+JSON, incorrectly typed permission fields and malformed rules fail the build
+explicitly. JSON failure is stricter than the older TOML malformed-rule warning
+behavior. Plugin hook subprocesses follow plugin trust, independently of tool
+permission rules.
+
 ### Working Directory Boundary
 
 All path checks begin by resolving the requested path and determining whether it stays within the current working directory.

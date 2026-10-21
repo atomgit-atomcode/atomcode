@@ -242,3 +242,16 @@ mod tests {
         }
     }
 }
+
+/// Explicitly expanding ignored content includes build/dependency directories,
+/// but never VCS metadata or the product's internal clones/artifacts.
+pub(crate) fn search_skip_dir_for(
+    dirs: &crate::ProductDirs,
+    respect_gitignore: bool,
+) -> crate::world::SkipDir {
+    if respect_gitignore {
+        return skip_dir_for(dirs);
+    }
+    let own: std::sync::Arc<str> = dirs.project_dir_name().into();
+    std::sync::Arc::new(move |name| matches!(name, ".git" | ".hg" | ".svn") || name == &*own)
+}

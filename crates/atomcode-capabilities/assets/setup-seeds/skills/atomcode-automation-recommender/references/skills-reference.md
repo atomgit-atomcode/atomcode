@@ -82,7 +82,7 @@ name: skill-name
 description: What this skill does and when to use it
 disable-model-invocation: true  # Only user can invoke (for side effects)
 user-invocable: false           # Only AtomCode can invoke (for background knowledge)
-allowed-tools: Read, Grep, Glob # Restrict tool access
+allowed-tools: Read, Grep, Glob # Preauthorize matching tools for this turn
 ---
 ```
 

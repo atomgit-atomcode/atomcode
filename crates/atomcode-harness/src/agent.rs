@@ -207,6 +207,41 @@ pub async fn ask_person(ctx: &Context, question: crate::seams::Question) -> Opti
     answer
 }
 
+/// Tool-facing ordinary question exchange. A pending result records that no
+/// answer arrived during the wait, not an answer selected on the user's behalf.
+/// The tool result carries the durable pending identity and late replies are
+/// admitted user messages rather than changes to that historical result.
+pub async fn ask_person_reply(
+    ctx: &Context,
+    question: crate::seams::Question,
+    call_id: Option<&str>,
+) -> crate::seams::QuestionReply {
+    use crate::seams::QuestionReply;
+    let Some(questions) = ctx.service::<crate::seams::UserQuestionsSvc>() else {
+        return QuestionReply::Unanswered;
+    };
+    record_asked(ctx, &question);
+    let reply = questions.ask_reply(&question, call_id).await;
+    match &reply {
+        QuestionReply::Answered(answer) => record_answered(ctx, Some(answer.clone())),
+        QuestionReply::Unanswered | QuestionReply::Failed(_) => record_answered(ctx, None),
+        QuestionReply::Pending(_) => {
+            if let Some(log) = person_session(ctx) {
+                crate::session::commit(
+                    &scoped(ctx),
+                    &log,
+                    SessionEvent::Answered {
+                        turn: log.current_turn(),
+                        answer: None,
+                        by: "pending foreground wait".into(),
+                    },
+                );
+            }
+        }
+    }
+    reply
+}
+
 /// Run `f` as this agent's turn: everything it awaits resolves in the agent's
 /// realm through [`scoped`].
 pub async fn as_agent<F: std::future::Future>(ctx: Context, f: F) -> F::Output {
@@ -410,6 +445,9 @@ pub enum InboxItem {
         /// The driver's id for the command that sent this, when it asked for a
         /// receipt. Never logged: it names a command, not a fact of the session.
         receipt: Option<atomcode_kernel::event::CommandId>,
+        /// Context owned by this message, never claimed by another turn or left
+        /// behind when this message is withdrawn.
+        context: Option<(String, InjectionOrigin)>,
     },
     /// Model-visible context that rides along with the next message. Never
     /// wakes anything on its own.
@@ -498,6 +536,17 @@ impl Inbox {
         images: Vec<ImageContent>,
         receipt: Option<atomcode_kernel::event::CommandId>,
     ) {
+        self.send_contextual(text, origin, images, receipt, None);
+    }
+
+    pub fn send_contextual(
+        &self,
+        text: impl Into<String>,
+        origin: MessageOrigin,
+        images: Vec<ImageContent>,
+        receipt: Option<atomcode_kernel::event::CommandId>,
+        context: Option<(String, InjectionOrigin)>,
+    ) {
         self.queue
             .lock()
             .expect("inbox poisoned")
@@ -506,6 +555,7 @@ impl Inbox {
                 origin,
                 images,
                 receipt,
+                context,
             });
     }
 
@@ -540,7 +590,11 @@ impl Inbox {
                     origin,
                     images,
                     receipt,
+                    context,
                 } => {
+                    if let Some(context) = context {
+                        claimed.injections.push(context);
+                    }
                     claimed.message = Some(text);
                     claimed.origin = origin;
                     claimed.images = images;
@@ -708,6 +762,22 @@ impl Agent {
         receipt: Option<atomcode_kernel::event::CommandId>,
     ) {
         self.inbox.send_receipted(text, origin, images, receipt);
+        self.woke();
+    }
+
+    /// Queue context atomically with the message that owns it. Unlike a free
+    /// injection, this cannot be claimed by a turn already starting or survive
+    /// cancellation of the message.
+    pub fn send_contextual(
+        &self,
+        text: impl Into<String>,
+        origin: MessageOrigin,
+        images: Vec<ImageContent>,
+        receipt: Option<atomcode_kernel::event::CommandId>,
+        context: (String, InjectionOrigin),
+    ) {
+        self.inbox
+            .send_contextual(text, origin, images, receipt, Some(context));
         self.woke();
     }
 
@@ -1255,5 +1325,54 @@ impl Agents {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+#[cfg(test)]
+mod contextual_inbox_tests {
+    use super::*;
+
+    #[test]
+    fn owned_context_is_claimed_only_with_its_message() {
+        let inbox = Inbox::new();
+        inbox.send("first");
+        inbox.send_contextual(
+            "second",
+            MessageOrigin::User,
+            vec![],
+            None,
+            Some(("reference".into(), InjectionOrigin::Continuation)),
+        );
+        assert!(inbox.claim_injections().is_empty());
+        let first = inbox.claim();
+        assert_eq!(first.message.as_deref(), Some("first"));
+        assert!(first.injections.is_empty());
+        let second = inbox.claim();
+        assert_eq!(second.message.as_deref(), Some("second"));
+        assert_eq!(
+            second.injections,
+            vec![("reference".into(), InjectionOrigin::Continuation)]
+        );
+    }
+
+    #[test]
+    fn withdrawal_removes_context_and_preserves_unrelated_injections() {
+        let inbox = Inbox::new();
+        inbox.inject("memory", InjectionOrigin::Memory);
+        inbox.send_contextual(
+            "cancelled",
+            MessageOrigin::User,
+            vec![],
+            None,
+            Some(("must disappear".into(), InjectionOrigin::Continuation)),
+        );
+        assert_eq!(inbox.withdraw_messages().len(), 1);
+        inbox.send("replacement");
+        let next = inbox.claim();
+        assert_eq!(next.message.as_deref(), Some("replacement"));
+        assert_eq!(
+            next.injections,
+            vec![("memory".into(), InjectionOrigin::Memory)]
+        );
     }
 }

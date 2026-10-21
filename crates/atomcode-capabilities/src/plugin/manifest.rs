@@ -175,6 +175,9 @@ pub struct CCHookSpec {
     #[serde(default = "default_hook_type", rename = "type")]
     pub kind: String,
     pub command: String,
+    /// Literal argv appended to the command; never interpolated into a shell.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
     /// CC's timeout is in seconds; we convert to ms in the adapter.
     #[serde(default)]
     pub timeout: Option<u64>,

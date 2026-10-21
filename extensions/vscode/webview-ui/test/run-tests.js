@@ -8,6 +8,8 @@ async function main() {
   const root = path.join(__dirname, '..', '..');
   const tempDir = mkdtempSync(path.join(tmpdir(), 'atomcode-vscode-webview-tests-'));
   const tests = [
+    'language-bridge.test.ts',
+    'language-bridge-lifecycle.test.ts',
     'rendering-regression.test.ts',
     'file-position.test.ts',
     'i18n-regression.test.ts',
@@ -19,6 +21,7 @@ async function main() {
     'auth-status.test.ts',
     'daemon-process-env.test.ts',
     'daemon-identity.test.ts',
+    'daemon-connection.test.ts',
     'provider-queue-regression.test.ts',
     'mode-state.test.ts',
     'mode-selector-style.test.ts',

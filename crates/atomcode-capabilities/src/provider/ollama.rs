@@ -68,10 +68,10 @@ pub struct OllamaConfig {
     /// Enable thinking (`think: true`) for thinking-capable models. A per-call
     /// `reasoning_effort` overrides this with a level string (`think: "high"`).
     pub think: bool,
-    /// Inter-token stream-idle watchdog (after the first byte of a stream).
+    /// Inter-token stream-idle watchdog (after the first content of a stream).
     pub idle_timeout: Duration,
-    /// FIRST-byte (prefill / TTFB) idle watchdog: no bytes for this long BEFORE the
-    /// first byte of a (re)opened stream ⇒ terminal error. Separate from (and ≥)
+    /// FIRST-content (prefill) watchdog: no content for this long BEFORE the
+    /// first content of a (re)opened stream ⇒ terminal error. Separate from (and ≥)
     /// `idle_timeout`; wired from the coding-layer `first_token_timeout`.
     pub first_token_timeout: Duration,
     pub connect_timeout: Duration,
@@ -79,6 +79,7 @@ pub struct OllamaConfig {
     /// User-Agent sent on every request. `None` ⇒ [`super::DEFAULT_USER_AGENT`]; the
     /// driver injects `atomcode/<version>` for gateway attribution.
     pub user_agent: Option<String>,
+    pub headers: atomcode_config::provider_headers::ProviderHeaders,
     /// Disable TLS certificate verification (self-signed / internal gateways).
     /// Mirrors core's `ProviderConfig::skip_tls_verify`. Default false.
     pub skip_tls_verify: bool,
@@ -108,6 +109,7 @@ impl OllamaConfig {
             connect_timeout: Duration::from_secs(30),
             retry: RetryPolicy::default(),
             user_agent: None,
+            headers: Default::default(),
             skip_tls_verify: false,
             effort_levels: Vec::new(),
             wire_dump_dir: None,
@@ -128,6 +130,11 @@ pub struct OllamaProvider {
 impl OllamaProvider {
     pub fn new(cfg: OllamaConfig) -> Result<Self, ProviderError> {
         let mut builder = crate::proxy::apply_async_proxy_policy(reqwest::Client::builder())
+            .redirect(if !cfg.headers.is_empty() {
+                reqwest::redirect::Policy::none()
+            } else {
+                reqwest::redirect::Policy::default()
+            })
             .connect_timeout(cfg.connect_timeout)
             // Reap idle keep-alives before the server does (see POOL_IDLE_TIMEOUT).
             .pool_idle_timeout(retry::POOL_IDLE_TIMEOUT)
@@ -189,10 +196,12 @@ impl LlmProvider for OllamaProvider {
 
         // Open the stream. A hard failure here returns `Err` so the kernel's
         // agent-layer open retry still applies.
-        let policy = self.cfg.retry.clone();
+        let policy = retry::policy_for_call(&self.cfg.retry, options);
+        let caller_recovers = options.request_recovery.is_some();
         let client = self.client.clone();
         let url = self.url.clone();
         let api_key = self.cfg.api_key.clone();
+        let headers = self.cfg.headers.clone();
         // Snapshot the session id once; reused across the open and any mid-stream reopen.
         let session_id = self.session_id.get().cloned().unwrap_or_default();
         let idle = self.cfg.idle_timeout;
@@ -203,6 +212,7 @@ impl LlmProvider for OllamaProvider {
             &url,
             &body,
             &api_key,
+            &headers,
             &session_id,
             &policy,
             rate_limit_retry_owner,
@@ -215,7 +225,7 @@ impl LlmProvider for OllamaProvider {
             // 1 initial open + up to 2 transparent reopens — a gateway resetting
             // connections under load can drop more than one attempt before a
             // healthy backend answers.
-            const MAX_STREAM_ATTEMPTS: u32 = 3;
+            let max_stream_attempts: u32 = if caller_recovers { 1 } else { 3 };
             let mut stream_attempt = 1u32;
             let mut reconnect_attempts = 0u32;
             let mut resp = resp;
@@ -225,22 +235,21 @@ impl LlmProvider for OllamaProvider {
                 let mut pending_metadata = Vec::new();
                 let byte_stream = resp.bytes_stream();
                 futures::pin_mut!(byte_stream);
-                // PHASE-AWARE byte-idle watchdog: prefill (before the first byte of this
-                // (re)opened stream) waits up to `first_token`; after the first byte we
-                // tighten to the inter-token `idle`. See openai_compat for the rationale.
-                // Reset per (re)open — a transparent reconnect restarts prefill.
-                let mut first_byte_seen = false;
+                // Heartbeats and metadata do not end prefill or extend the
+                // content deadline. Every decoded content event resets idle.
+                // A transparent reopen gets a fresh first-content budget.
+                let mut watchdog = super::StreamWatchdog::new(Some(first_token), Some(idle));
                 loop {
                     match retry::next_chunk_phased(
                         &mut byte_stream,
-                        first_token,
-                        idle,
-                        &mut first_byte_seen,
+                        &watchdog,
                     )
                     .await
                     {
                         Err(_elapsed) => {
-                            yield StreamEvent::Error(retry::stream_idle_error());
+                            let mut error = retry::stream_idle_error();
+                            error.retryable = caller_recovers && !emitted_replay_sensitive;
+                            yield StreamEvent::Error(error);
                             return;
                         }
                         Ok(None) => {
@@ -254,25 +263,26 @@ impl LlmProvider for OllamaProvider {
                                 {
                                     for metadata in pending_metadata.drain(..) { yield metadata; }
                                 }
+                                watchdog.observe(&ev);
                                 emitted_replay_sensitive |= retry::is_replay_sensitive_event(&ev);
                                 yield ev;
                             }
                             return;
                         }
                         Ok(Some(Err(e))) => {
-                            if !emitted_replay_sensitive && stream_attempt < MAX_STREAM_ATTEMPTS {
+                            if !emitted_replay_sensitive && stream_attempt < max_stream_attempts {
                                 reconnect_attempts += 1;
                                 // Brief, esc-interruptible backoff before reopening so an
                                 // immediate retry does not slam a gateway resetting under load.
                                 tokio::time::sleep(retry::compute_backoff(stream_attempt, &policy)).await;
-                                if let Ok(fresh) = open_stream(&client, &url, &body, &api_key, &session_id, &policy, rate_limit_retry_owner).await {
+                                if let Ok(fresh) = open_stream(&client, &url, &body, &api_key, &headers, &session_id, &policy, rate_limit_retry_owner).await {
                                     stream_attempt += 1;
                                     resp = fresh;
                                     continue 'reopen;
                                 }
                             }
                             yield StreamEvent::Error(ProviderError {
-                                retryable: false,
+                                retryable: caller_recovers && !emitted_replay_sensitive,
                                 code: retry::stream_read_error_code(&e),
                                 message: retry::stream_read_error_message(
                                     &e,
@@ -300,6 +310,7 @@ impl LlmProvider for OllamaProvider {
                                 {
                                     for metadata in pending_metadata.drain(..) { yield metadata; }
                                 }
+                                watchdog.observe(&ev);
                                 emitted_replay_sensitive |= retry::is_replay_sensitive_event(&ev);
                                 if matches!(ev, StreamEvent::Done { .. }) {
                                     saw_done = true;
@@ -313,7 +324,11 @@ impl LlmProvider for OllamaProvider {
             }
         };
 
-        Ok(s.boxed())
+        let headers = self.cfg.headers.clone();
+        Ok(
+            s.map(move |event| super::redact_header_error(event, &headers))
+                .boxed(),
+        )
     }
 }
 
@@ -324,6 +339,7 @@ async fn open_stream(
     url: &str,
     body: &Value,
     api_key: &str,
+    headers: &atomcode_config::provider_headers::ProviderHeaders,
     session_id: &str,
     policy: &RetryPolicy,
     rate_limit_retry_owner: atomcode_kernel::provider::RateLimitRetryOwner,
@@ -338,6 +354,7 @@ async fn open_stream(
         if !session_id.is_empty() {
             req = req.header("x-atomcode-session-id", session_id);
         }
+        req = super::apply_account_headers(req, headers)?;
         match req.send().await {
             Ok(resp) => {
                 let code = resp.status().as_u16();
@@ -355,7 +372,7 @@ async fn open_stream(
                     // authoritative rate-limit countdown for the self-heal (vs scraping text).
                     let retry_after_secs =
                         retry::parse_retry_after(resp.headers()).map(|d| d.as_secs());
-                    let text = resp.text().await.unwrap_or_default();
+                    let text = headers.redact(&resp.text().await.unwrap_or_default());
                     // Ollama errors are `{"error":"..."}` (a STRING).
                     let detail = serde_json::from_str::<Value>(&text)
                         .ok()

@@ -340,6 +340,16 @@ plexus_event!(
     TurnFinishing, "turn/finishing", Parallel, TurnOutcome
 );
 plexus_event!(TurnEnd, "turn/end", Emit, TurnOutcome);
+/// Ephemeral model tool output; never a persisted fact or executable call.
+#[derive(Clone, Debug)]
+pub struct ToolChunk {
+    pub session: String,
+    pub index: u32,
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub arguments: String,
+}
+plexus_event!(ToolCallChunk, "assistant/tool-chunk", Emit, ToolChunk);
 plexus_event!(AssistantChunk, "assistant/chunk", Emit, Chunk);
 plexus_event!(AssistantMessage, "assistant/message", Emit, Message);
 plexus_event!(ToolResultEvent, "tool/result", Emit, ToolResult);

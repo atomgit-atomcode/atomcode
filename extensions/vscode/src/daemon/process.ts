@@ -9,9 +9,10 @@ import { HealthResponse } from './types';
 import { DEFAULT_PORT } from '../config';
 import { normalizeDaemonEnvForUtf8Locale } from './env';
 import { daemonIdentityMatches } from './identity';
+import { acquireLaunchLock, daemonPorts, findCompatibleDaemon, isPortOccupied } from './connection';
 import type { ExpectedDaemonIdentity } from './identity';
 
-const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
 interface DaemonBinary {
   path: string;
@@ -19,7 +20,7 @@ interface DaemonBinary {
 }
 
 export class DaemonProcess {
-  private process?: child_process.ChildProcess;
+  private disposed = false;
   private client: DaemonClient;
   private readonly extensionUri: vscode.Uri;
   private readonly defaultPort: number;
@@ -49,67 +50,41 @@ export class DaemonProcess {
   }
 
   private async _ensureRunningImpl(): Promise<boolean> {
-    const health = await this.tryGetHealth();
-
-    if (health) {
-      const expected = this.getExpectedBundledIdentity();
-      if (daemonIdentityMatches(health, expected)) {
-        // Exact bundled build matches (or no bundled identity applies).
-        return true;
-      }
-
-      // Same-version daemon builds can expose different config/runtime schemas.
-      // Compare the executable hash as well so an older 5.1.0 process cannot
-      // survive an extension update that bundles a newer 5.1.0 daemon.
-      console.log(
-        `[AtomCode] Daemon identity mismatch: running=${health.version}/${health.binary_hash || 'unknown'}, `
-        + `expected=${expected.version || 'any'}/${expected.binaryHash || 'any'}. Restarting...`,
-      );
-
-      const shutdownOk = await this.shutdownDaemon();
-      if (shutdownOk) {
-        console.log('[AtomCode] Old daemon stopped successfully');
-      } else {
-        console.warn(
-          `[AtomCode] Refusing to start daemon because an incompatible daemon ${health.version} is still running`
-        );
-        vscode.window.showWarningMessage(
-          'AtomCode daemon build mismatch. AtomCode could not stop the old daemon. Please stop the old AtomCode daemon or reload VS Code.'
-        );
-        return false;
-      }
-
-      const started = await this.start();
-      if (!started) {
-        // start() failed — check if another window already started the correct version
-        const postHealth = await this.tryGetHealth();
-        if (postHealth && daemonIdentityMatches(postHealth, expected)) {
-          console.log(`[AtomCode] Daemon restarted to version ${postHealth.version}`);
-          return true;
-        }
-        return false;
-      }
-
-      // Verify new version after start
-      const newHealth = await this.tryGetHealth();
-      if (newHealth && daemonIdentityMatches(newHealth, expected)) {
-        console.log(`[AtomCode] Daemon restarted to version ${newHealth.version}`);
-        return true;
-      }
-
-      // Another window may have started a different version, but daemon is running
-      if (newHealth) {
-        console.warn(`[AtomCode] New daemon version ${newHealth.version} does not match expected ${expected}`);
-      }
+    const previousPort = this.client.getPort();
+    const expected = this.getExpectedBundledIdentity();
+    const binary = this.findBinary(this.defaultPort);
+    const identity = expected.binaryHash || expected.version || binary?.path || 'external';
+    const ports = daemonPorts(this.defaultPort, this.client.getPort(), identity);
+    const probes = new Map<number, DaemonClient>();
+    const probe = (port: number) => {
+      let client = probes.get(port);
+      if (!client) { client = new DaemonClient(port); probes.set(port, client); }
+      return client;
+    };
+    const port = await findCompatibleDaemon(ports, expected, this.autoStart, {
+      health: async (candidate) => {
+        try { return await probe(candidate).health(); } catch { return null; }
+      },
+      occupied: isPortOccupied,
+      lock: acquireLaunchLock,
+      start: (candidate) => this.start(candidate, expected, probe(candidate)),
+      wait: () => sleep(100),
+      active: () => !this.disposed,
+    });
+    if (port === null || this.disposed) {
+      if (!this.disposed) vscode.window.showWarningMessage(vscode.l10n.t(
+        'No compatible AtomCode daemon is available. Existing services were left running. Check the daemon binary or configure another daemon port.',
+      ));
       return false;
     }
-
-    // Daemon not running
-    if (!this.autoStart) {
-      return false;
+    this.client.setPort(port);
+    if (port !== this.defaultPort) {
+      if (port !== previousPort) vscode.window.setStatusBarMessage(vscode.l10n.t(
+        'AtomCode: using port {0}; existing services on port {1} were left running.', port, this.defaultPort,
+      ), 8000);
+      console.log(`[AtomCode] Using compatible daemon on port ${port}; port ${this.defaultPort} was left untouched.`);
     }
-
-    return this.start();
+    return true;
   }
 
   private getExpectedVersion(): string {
@@ -150,209 +125,33 @@ export class DaemonProcess {
     };
   }
 
-  private async tryGetHealth(): Promise<HealthResponse | null> {
-    try {
-      return await this.client.health();
-    } catch {
-      return null;
-    }
-  }
-
-  private async shutdownDaemon(): Promise<boolean> {
-    // Step 1: Try graceful shutdown via HTTP endpoint
-    try {
-      await this.client.shutdown();
-    } catch {
-      // Old daemon may not support /shutdown, or already exiting — ignore
-    }
-
-    // Step 2: Poll until daemon exits or timeout (5s for graceful)
-    // We only wait for the daemon we own (tracked by this.process) or the
-    // HTTP endpoint to stop responding. We do NOT kill arbitrary processes
-    // on the port — that would be unsafe for other users' services.
-    const deadline = Date.now() + 5000;
-    while (Date.now() < deadline) {
-      await sleep(100);
-      if (!(await this.client.isRunning())) {
-        return true;
-      }
-    }
-
-    // Step 3: If we spawned the daemon ourselves, send SIGTERM to our own child.
-    // This is safe because we own the process reference.
-    if (this.process && !this.process.killed) {
-      console.warn('[AtomCode] Graceful shutdown timed out, sending SIGTERM to owned daemon process');
-      try {
-        this.process.kill('SIGTERM');
-      } catch {
-        // Process may have already exited
-      }
-
-      // Wait for our child process to exit
-      const termDeadline = Date.now() + 2000;
-      while (Date.now() < termDeadline) {
-        await sleep(100);
-        if (!(await this.client.isRunning())) {
-          return true;
-        }
-      }
-
-      // Last resort: SIGKILL our own child process only
-      if (!this.process.killed) {
-        console.warn('[AtomCode] SIGTERM failed, sending SIGKILL to owned daemon process');
-        try {
-          this.process.kill('SIGKILL');
-        } catch { /* already exited */ }
-        await sleep(300);
-      }
-    }
-
-    if (!(await this.client.isRunning())) {
-      return true;
-    }
-
-    console.warn('[AtomCode] Daemon did not exit. It may have been started by another process.');
-    return false;
-  }
-
-  private async start(): Promise<boolean> {
-    const port = this.defaultPort;
-    // Recovery: if a PREVIOUS daemon wedged and is squatting the port (health fails but
-    // the process is alive), reap it before spawning so our fresh daemon can bind. Such
-    // a daemon isn't our owned child, so shutdownDaemon() can't SIGKILL it — leaving the
-    // port stuck ("started but not responding") across restarts and even reinstalls.
-    await this.reapWedgedDaemon(port);
+  private async start(port: number, expected: ExpectedDaemonIdentity, probe: DaemonClient): Promise<boolean> {
     const binary = this.findBinary(port);
-    if (!binary) {
-      vscode.window.showErrorMessage(
-        'AtomCode daemon not found for this platform. Reinstall the AtomCode extension, install atomcode, or set atomcode.daemon.binaryPath in settings.'
-      );
-      return false;
-    }
-
-    // Use the first workspace folder as cwd so the daemon can find project-level
-    // .mcp.json and detect repo_origin correctly.
+    if (!binary || this.disposed) return false;
     const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-
-    this.process = child_process.spawn(binary.path, binary.args, {
-      detached: true,
-      stdio: 'ignore',
-      windowsHide: true,
+    const child = child_process.spawn(binary.path, binary.args, {
+      detached: true, stdio: 'ignore', windowsHide: true,
       env: normalizeDaemonEnvForUtf8Locale(process.env),
       ...(cwd ? { cwd } : {}),
     });
-    this.process.unref();
-
-    // Wait up to 10s for daemon to be ready
-    for (let i = 0; i < 100; i++) {
-      await new Promise((r) => setTimeout(r, 100));
-      if (await this.client.isRunning()) {
-        return true;
-      }
-    }
-
-    vscode.window.showWarningMessage(
-      `AtomCode daemon started but not responding. Check if port ${port} is available.`
-    );
-    return false;
-  }
-
-  /** `$ATOMCODE_HOME` or `~/.atomcode` — mirrors the daemon's `Config::config_dir()`. */
-  private atomcodeHome(): string {
-    const env = process.env.ATOMCODE_HOME;
-    return env && env.length > 0 ? env : path.join(os.homedir(), '.atomcode');
-  }
-
-  /** Pidfile the daemon writes: `<home>/daemon-<port>.json`, keyed by port. */
-  private pidfilePath(port: number): string {
-    return path.join(this.atomcodeHome(), `daemon-${port}.json`);
-  }
-
-  /**
-   * Reap a WEDGED daemon that squats `port` but no longer answers /health. It may have
-   * been started by a previous VS Code session (not our owned child), so shutdownDaemon()
-   * can't kill it — the recovery gap that made the port stay stuck through restarts and
-   * reinstalls. Uses the daemon's own pidfile to identify the target and force-kills it
-   * ONLY after validating (a) health is genuinely dead now — a transient blip must not
-   * kill a daemon other windows are using, and (b) the pid is live AND an atomcode image
-   * — so a reused pid is never mis-killed. Best-effort; any failure falls through to a
-   * normal spawn (no worse than today).
-   */
-  private async reapWedgedDaemon(port: number): Promise<void> {
-    // (a) Only reap if the daemon is genuinely unresponsive. Retry a few times so a
-    // momentary hiccup doesn't kill a healthy daemon.
-    for (let i = 0; i < 3; i++) {
-      if (await this.client.isRunning()) {
-        return; // responded → healthy, do not touch
-      }
-      await sleep(200);
-    }
-
-    let pid: number | undefined;
-    try {
-      const info = JSON.parse(fs.readFileSync(this.pidfilePath(port), 'utf-8')) as { pid?: number };
-      pid = info.pid;
-    } catch {
-      return; // no/garbage pidfile → nothing to reap
-    }
-    if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0 || pid === process.pid) {
-      return;
-    }
-
-    // (b) Is the process alive? kill(pid, 0) throws (ESRCH) when it isn't.
-    try {
-      process.kill(pid, 0);
-    } catch {
-      return; // dead pid → stale pidfile, ignore
-    }
-    // (b) Validate it's actually an atomcode daemon before killing (PID-reuse guard).
-    if (!this.isAtomcodeProcess(pid)) {
-      return;
-    }
-
-    console.warn(`[AtomCode] Reaping wedged daemon pid=${pid} squatting port ${port}`);
-    try {
-      if (process.platform === 'win32') {
-        // /F force, /T also terminate any child tree.
-        child_process.execFileSync('taskkill', ['/F', '/T', '/PID', String(pid)], { stdio: 'ignore', windowsHide: true });
-      } else {
-        process.kill(pid, 'SIGKILL');
-      }
-    } catch {
-      // Best effort — if the kill fails, the spawn below will still surface the error.
-    }
-
-    // Wait for the OS to reap the process (and release the port) — up to ~5s, since a
-    // force-kill + socket teardown can lag on a loaded Windows box. If it outlasts this,
-    // the spawn below fails and the user's next attempt reaps again (pid now gone).
-    for (let i = 0; i < 50; i++) {
+    let failed = false;
+    child.once('error', () => { failed = true; });
+    child.unref();
+    const deadline = Date.now() + 10_000;
+    for (let i = 0; i < 100 && !this.disposed && Date.now() < deadline; i++) {
       await sleep(100);
-      try {
-        process.kill(pid, 0);
-      } catch {
-        return; // pid gone → port should now be free
-      }
+      let health: HealthResponse | null = null;
+      try { health = await probe.health(); } catch { /* not ready */ }
+      if (health && daemonIdentityMatches(health, expected)) return true;
+      if (failed || child.exitCode !== null || child.signalCode !== null) return false;
+      if (health) break; // An incompatible service won the bind race. Never stop it.
     }
-  }
-
-  /** Best-effort check that `pid`'s image is an atomcode daemon (guards PID reuse). */
-  private isAtomcodeProcess(pid: number): boolean {
-    try {
-      if (process.platform === 'win32') {
-        const out = child_process.execFileSync(
-          'tasklist',
-          ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'],
-          { encoding: 'utf-8', windowsHide: true }
-        );
-        return /atomcode/i.test(out);
-      }
-      const out = child_process.execFileSync('ps', ['-p', String(pid), '-o', 'comm='], {
-        encoding: 'utf-8',
-      });
-      return /atomcode/i.test(out);
-    } catch {
-      return false; // can't verify → don't kill (safe default)
+    // Only the child handle created by THIS start attempt may be signalled.
+    // Never POST /shutdown or infer process ownership from a pidfile/name.
+    if (!this.disposed && child.exitCode === null && child.signalCode === null) {
+      try { child.kill('SIGTERM'); } catch { /* already exited */ }
     }
+    return false;
   }
 
   /**
@@ -492,6 +291,6 @@ export class DaemonProcess {
     // Don't kill daemon on extension deactivate — it may be shared with other windows.
     // We intentionally do NOT kill the process here; the daemon has its own idle
     // timeout and will exit on its own when no longer needed.
-    this.process = undefined;
+    this.disposed = true;
   }
 }
