@@ -297,11 +297,26 @@ fn draw(view: &ProvidersView, panel: &Panel, row: Row, w: usize, caps: crate::ca
             )
         }
         Row::Pick(at) => pick_line(panel, at, w),
-        Row::Legend => Line::styled(
-            format!("  {}", crate::widget::keys(&legend(panel), caps)),
-            theme::fg(Role::Muted),
-        )
-        .truncate(w),
+        Row::Legend => {
+            let mut line = Line::styled("  ", theme::fg(Role::Muted));
+            for (index, (text, key)) in legend_buttons(view, panel, caps).into_iter().enumerate() {
+                if index > 0 {
+                    line.push(Span::styled(
+                        format!(" {} ", caps.g(crate::caps::Glyph::Separator)),
+                        theme::fg(Role::Muted),
+                    ));
+                }
+                line.push(Span::styled(
+                    text,
+                    theme::fg(if key.is_some() {
+                        Role::Accent
+                    } else {
+                        Role::Muted
+                    }),
+                ));
+            }
+            line.truncate(w)
+        }
     }
 }
 
@@ -928,6 +943,81 @@ fn legend(panel: &Panel) -> Vec<(String, String)> {
     }
 }
 
+/// Draw and hit-test the same button text, including terminal key names.
+fn legend_buttons(
+    view: &ProvidersView,
+    panel: &Panel,
+    caps: crate::caps::Caps,
+) -> Vec<(String, Option<crate::surface::KeyPress>)> {
+    use crate::surface::KeyPress;
+    let (editable, deletable) = match view.listed(panel).get(panel.cursor) {
+        Some(Listed::Account(i)) => view
+            .accounts()
+            .get(*i)
+            .map(|row| (!row.managed, !row.managed && row.configured))
+            .unwrap_or_default(),
+        Some(Listed::Model(i)) => view
+            .models()
+            .get(*i)
+            .map(|row| (!row.managed, !row.managed))
+            .unwrap_or_default(),
+        _ => (false, false),
+    };
+    legend(panel)
+        .into_iter()
+        .map(|(key, label)| {
+            let press = if panel.form.is_none() && panel.efforts.is_none() {
+                match key.as_str() {
+                    "^a" => Some(KeyPress::ctrl('a')),
+                    "^e" if editable => Some(KeyPress::ctrl('e')),
+                    "^d" if deletable => Some(KeyPress::ctrl('d')),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let text = crate::widget::keys(&[(key.clone(), label)], caps);
+            (
+                if matches!(key.as_str(), "^a" | "^e" | "^d") {
+                    format!("[ {text} ]")
+                } else {
+                    text
+                },
+                press,
+            )
+        })
+        .collect()
+}
+
+/// Only visible cells of a drawn action can activate its existing key path.
+pub fn action_at(
+    moment: &Moment,
+    vp: &Viewport<'_>,
+    col: usize,
+    row: usize,
+) -> Option<crate::surface::KeyPress> {
+    let panel = moment.providers_panel.as_ref()?;
+    if !matches!(
+        layout(&moment.providers, panel, vp.rect.h as usize).get(row),
+        Some(Row::Legend)
+    ) {
+        return None;
+    }
+    let mut start = 2;
+    let gap = width::str_width(&format!(
+        " {} ",
+        moment.caps.g(crate::caps::Glyph::Separator)
+    ));
+    for (text, key) in legend_buttons(&moment.providers, panel, moment.caps) {
+        let end = start + width::str_width(&text);
+        if col >= start && col < end && end <= vp.rect.w as usize {
+            return key;
+        }
+        start = end + gap;
+    }
+    None
+}
+
 /// Which listed row each screen row carries, for a click to read.
 ///
 /// Built by the same [`layout`] the frame used, so a click and the row it lights
@@ -1061,6 +1151,126 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn button_hit(m: &Moment, key: crate::surface::KeyPress) -> (usize, usize) {
+        let vp = Viewport::new(Rect::sized(240, 30), m);
+        (0..30)
+            .flat_map(|row| (0..240).map(move |col| (col, row)))
+            .find(|(col, row)| action_at(m, &vp, *col, *row) == Some(key))
+            .expect("button is visible")
+    }
+
+    #[test]
+    fn editing_by_click_and_keyboard_opens_the_same_selected_form() {
+        use crate::surface::KeyPress;
+        for tab in Tab::ALL {
+            let mut panel = Panel::new();
+            panel.show(tab);
+            let view = view();
+            view.settle_cursor(&mut panel);
+            let m = moment(Some(panel.clone()));
+            let (col, row) = button_hit(&m, KeyPress::ctrl('e'));
+            let vp = Viewport::new(Rect::sized(240, 30), &m);
+            let click = action_at(&m, &vp, col, row).unwrap();
+            let mut by_click = panel.clone();
+            let mut by_key = panel;
+            let mut secret = String::new();
+            assert_eq!(
+                crate::providers::key(&view, &mut by_click, &mut secret, click),
+                crate::providers::Step::Stay
+            );
+            crate::providers::key(&view, &mut by_key, &mut secret, KeyPress::ctrl('e'));
+            assert_eq!(by_click, by_key);
+            assert!(by_click.form.is_some());
+            let drawn_row = &lines(&m, 240, 30)[row];
+            let text: String = drawn_row
+                .spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect();
+            assert!(text.contains("[ ^e"), "{text}");
+            let narrow = Viewport::new(Rect::sized((col + 1) as u16, 30), &m);
+            assert_eq!(
+                action_at(&m, &narrow, col, row),
+                None,
+                "clipped buttons are inert"
+            );
+        }
+    }
+
+    #[test]
+    fn adding_and_deleting_buttons_use_the_existing_key_actions() {
+        use crate::surface::KeyPress;
+        let mut panel = Panel::new();
+        let view = view();
+        view.settle_cursor(&mut panel);
+        let m = moment(Some(panel.clone()));
+        let vp = Viewport::new(Rect::sized(240, 30), &m);
+        let mut secret = String::new();
+        let (col, row) = button_hit(&m, KeyPress::ctrl('a'));
+        let mut adding = panel.clone();
+        crate::providers::key(
+            &view,
+            &mut adding,
+            &mut secret,
+            action_at(&m, &vp, col, row).unwrap(),
+        );
+        assert!(adding.form.is_some());
+        for confirmation in [false, true] {
+            let m = moment(Some(panel.clone()));
+            let vp = Viewport::new(Rect::sized(240, 30), &m);
+            let (col, row) = button_hit(&m, KeyPress::ctrl('d'));
+            let step = crate::providers::key(
+                &view,
+                &mut panel,
+                &mut secret,
+                action_at(&m, &vp, col, row).unwrap(),
+            );
+            if confirmation {
+                assert!(matches!(step, crate::providers::Step::DeleteAccount { .. }));
+            } else {
+                assert_eq!(step, crate::providers::Step::Stay);
+                assert!(panel.pending_delete.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn an_add_row_has_no_edit_or_delete_button_action() {
+        let mut panel = Panel::new();
+        panel.cursor = view().listed(&panel).len() - 1;
+        let m = moment(Some(panel));
+        let vp = Viewport::new(Rect::sized(240, 30), &m);
+        for row in 0..30 {
+            for col in 0..240 {
+                assert!(
+                    !matches!(action_at(&m, &vp, col, row), Some(key) if key == crate::surface::KeyPress::ctrl('e') || key == crate::surface::KeyPress::ctrl('d'))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn managed_and_unconfigured_accounts_disable_unavailable_actions() {
+        use crate::surface::KeyPress;
+        for (managed, configured) in [(true, true), (false, false)] {
+            let mut row = account("offered", 0);
+            row.managed = managed;
+            row.configured = configured;
+            let view = ProvidersView::new(vec![row], vec![], vec![], vec![]);
+            let panel = Panel::new();
+            let buttons = legend_buttons(&view, &panel, crate::caps::Caps::default());
+            assert!(!buttons
+                .iter()
+                .any(|(_, key)| *key == Some(KeyPress::ctrl('d'))));
+            assert_eq!(
+                buttons
+                    .iter()
+                    .any(|(_, key)| *key == Some(KeyPress::ctrl('e'))),
+                !managed
+            );
+        }
     }
 
     fn picker_panel(picking: Picking) -> Panel {

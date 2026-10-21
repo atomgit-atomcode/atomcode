@@ -3540,6 +3540,17 @@ impl Host {
         crate::modules::providers::tab_at((x - rect.x) as usize)
     }
 
+    /// Action buttons share the panel's rendered geometry and keyboard dispatch.
+    pub fn providers_action_at(&self, x: u16, y: u16) -> Option<crate::surface::KeyPress> {
+        let rect = self.hits.lock().expect("hits poisoned").providers?;
+        if !rect.contains(x, y) {
+            return None;
+        }
+        let m = self.moment.read().expect("moment poisoned");
+        let vp = crate::moment::Viewport::new(rect, &m);
+        crate::modules::providers::action_at(&m, &vp, (x - rect.x) as usize, (y - rect.y) as usize)
+    }
+
     /// Which listed row is under the pointer, when it is on one.
     ///
     /// Read off the rect the panel was **drawn** in, for the reason

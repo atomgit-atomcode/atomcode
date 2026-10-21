@@ -2758,6 +2758,11 @@ impl UserInterface for Tui {
                             // as the settings one: chrome first, so a stray row
                             // cannot answer a press aimed at a tab.
                             if self.host.providers_open() {
+                                if let Some(key) = self.host.providers_action_at(x, y) {
+                                    self.run_providers_key(key);
+                                    stale = true;
+                                    continue;
+                                }
                                 if let Some(tab) = self.host.providers_tab_at(x, y) {
                                     let _ = self.host.show_providers_tab(tab);
                                     stale = true;
