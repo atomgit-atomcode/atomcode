@@ -31,7 +31,15 @@ those files exists, create a new `AGENTS.md` at the project root.
 
 Include this maintenance rule in the generated instruction file: when project structure, \
 build/test commands, architecture boundaries, development conventions, or other facts \
-documented there change, update this instruction file in the same change.";
+documented there change, update this instruction file in the same change. Replace stale \
+statements with current facts instead of appending a history of each change. Keep current \
+rules, commands, boundaries, and non-obvious gotchas in the instruction file; put detailed \
+incident reports, benchmark tables, experimental transcripts, and completed migration \
+stories in linked documentation. Read those documents only when relevant. The length \
+target applies to newly generated guidance, not permission to discard existing user rules. \
+For an existing long file, propose any relocation or removal and obtain explicit user \
+approval before doing it; preserve all active requirements and their scope. Never \
+silently summarize or truncate existing instructions to meet a size target.";
 
 pub const INIT_PROMPT_ZH_CN: &str = "\
 分析当前代码仓库，并在项目根目录创建（或完善）`AGENTS.md`，帮助 AI 编程代理正确地在该项目中工作。
@@ -48,7 +56,11 @@ pub const INIT_PROMPT_ZH_CN: &str = "\
 新的 `AGENTS.md`。
 
 在生成的项目指令中加入以下维护规则：当项目结构、构建测试命令、架构边界、开发约定，或该指令文件中
-记录的其他事实发生变化时，必须在同一次改动中同步更新该指令文件。最终文件使用简体中文编写。";
+记录的其他事实发生变化时，必须在同一次改动中同步更新该指令文件；用当前事实替换过期表述，不要逐次追加变更历史。
+指令文件保留当前规则、命令、架构边界和非显然注意事项；详细事故复盘、性能对比表、实验过程和已完成迁移记录放到
+有链接的文档中，仅在任务相关时读取。篇幅目标用于新生成的指导内容，不代表可以丢弃用户已有规则。
+对已有长文件，迁移或删除内容前先提出方案并取得用户明确同意，保留所有有效要求及其作用域；
+不得为了满足篇幅目标而静默摘要或截断已有指令。最终文件使用简体中文编写。";
 
 /// Build the effective `/init` prompt. Custom content is appended instead of
 /// replacing the built-in contract, so file-selection and preservation rules
