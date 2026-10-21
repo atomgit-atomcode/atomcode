@@ -1276,7 +1276,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(atomcode_home)]
     fn replay_builds_ordered_updates_from_snapshot_and_presentation() {
         let home = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
@@ -1346,7 +1346,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(atomcode_home)]
     fn replay_skips_hidden_entries_and_missing_anchors() {
         let home = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
@@ -1389,7 +1389,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(atomcode_home)]
     fn replay_reconstructs_tool_calls_with_results() {
         let home = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
@@ -1442,7 +1442,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(atomcode_home)]
     fn replay_pairs_duplicate_tool_call_ids_by_order_not_last_wins() {
         use crate::acp::replay::{build_replay_entries, ReplayEntry};
         let home = tempfile::tempdir().unwrap();
@@ -1493,7 +1493,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(atomcode_home)]
     fn replay_missing_session_is_an_error() {
         let home = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
