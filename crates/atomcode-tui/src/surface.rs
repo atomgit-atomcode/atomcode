@@ -172,6 +172,9 @@ pub trait Surface: Send + Sync {
     /// Paint. Must be total: a frame larger than the surface is clipped, never
     /// an error and never a panic.
     fn present(&self, frame: &Frame);
+    /// Arm once before the first paint. Real terminals report the first successful
+    /// frame flush; headless/custom surfaces do not claim terminal visibility.
+    fn time_first_frame(&self, _process: std::time::Instant, _ui: std::time::Instant) {}
     /// Called once on the way out. Restoring the terminal is not optional —
     /// leaving a shell in raw mode is worse than showing no UI at all.
     fn restore(&self) {}
@@ -832,6 +835,7 @@ pub struct Terminal {
     hover: std::sync::atomic::AtomicBool,
     caps: crate::caps::Caps,
     painted: LastPainted,
+    startup: Mutex<Option<(std::time::Instant, std::time::Instant)>>,
     link_hover: Mutex<link_pointer::LinkHover>,
     // X11 owns clipboard data in the writing process. Keep its event loop alive
     // until this terminal is dropped rather than losing the selection on return.
@@ -1298,6 +1302,7 @@ impl Terminal {
             hover: std::sync::atomic::AtomicBool::new(false),
             caps,
             painted: LastPainted::default(),
+            startup: Mutex::new(None),
             link_hover: Mutex::new(link_pointer::LinkHover::default()),
             #[cfg(target_os = "linux")]
             clipboard: Mutex::new(None),
@@ -2408,7 +2413,33 @@ impl LastPainted {
     }
 }
 
+fn write_frame_patch(
+    out: &mut impl std::io::Write,
+    patch: &str,
+    startup: &Mutex<Option<(std::time::Instant, std::time::Instant)>>,
+) -> std::io::Result<Option<(std::time::Duration, std::time::Duration)>> {
+    if patch.is_empty() {
+        return Ok(None);
+    }
+    out.write_all(patch.as_bytes())?;
+    out.flush()?;
+    let now = std::time::Instant::now();
+    Ok(startup
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .map(|(process, ui)| {
+            (
+                now.saturating_duration_since(process),
+                now.saturating_duration_since(ui),
+            )
+        }))
+}
+
 impl Surface for Terminal {
+    fn time_first_frame(&self, process: std::time::Instant, ui: std::time::Instant) {
+        *self.startup.lock().unwrap_or_else(|e| e.into_inner()) = Some((process, ui));
+    }
     fn describe(&self) -> String {
         "the terminal, full screen".into()
     }
@@ -2425,9 +2456,16 @@ impl Surface for Terminal {
         }
         let patch = self.patch(frame);
         let mut out = std::io::stdout();
-        if !patch.is_empty() {
-            let _ = out.write_all(patch.as_bytes());
-            let _ = out.flush();
+        match write_frame_patch(&mut out, &patch, &self.startup) {
+            Ok(Some((total, ui))) => {
+                tracing::info!(target: "atomcode_tui::startup", stage = "first_frame",
+                    total_ms = total.as_millis() as u64, ui_ms = ui.as_millis() as u64,
+                    "first TUI frame flushed to terminal");
+            }
+            // The diff was recorded before the write. Retry a full frame after a
+            // failed write/flush rather than treating missing bytes as painted.
+            Err(_) => self.painted.forget(),
+            Ok(None) => {}
         }
         if link_pointer::POINTER.enabled() && self.mouse() {
             let mut hover = self.link_hover.lock().expect("link hover poisoned");
@@ -3004,6 +3042,79 @@ pub fn from_crossterm(event: crossterm::event::Event) -> Option<Input> {
 
 #[cfg(test)]
 mod tests {
+    #[derive(Default)]
+    struct FrameWriter {
+        bytes: Vec<u8>,
+        flushes: usize,
+        fail_write: bool,
+        fail_flush: bool,
+    }
+
+    impl std::io::Write for FrameWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.fail_write {
+                return Err(std::io::Error::other("write failed"));
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes += 1;
+            if self.fail_flush {
+                Err(std::io::Error::other("flush failed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn first_frame_is_timed_only_once_after_a_nonempty_flush() {
+        let process = std::time::Instant::now();
+        let ui = std::time::Instant::now();
+        let clock = Mutex::new(Some((process, ui)));
+        let mut out = FrameWriter::default();
+        assert!(write_frame_patch(&mut out, "", &clock).unwrap().is_none());
+        assert_eq!(out.flushes, 0);
+        let (total, ui) = write_frame_patch(&mut out, "first frame", &clock)
+            .unwrap()
+            .unwrap();
+        assert!(total >= ui);
+        assert_eq!(out.bytes, b"first frame");
+        assert_eq!(out.flushes, 1);
+        assert!(write_frame_patch(&mut out, "second frame", &clock)
+            .unwrap()
+            .is_none());
+        assert_eq!(out.flushes, 2);
+        let unarmed = Mutex::new(None);
+        assert!(write_frame_patch(&mut out, "no timing requested", &unarmed)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn failed_frame_write_or_flush_does_not_consume_the_startup_sample() {
+        for fail_write in [true, false] {
+            let now = std::time::Instant::now();
+            let clock = Mutex::new(Some((now, now)));
+            let mut out = FrameWriter {
+                fail_write,
+                fail_flush: !fail_write,
+                ..Default::default()
+            };
+            assert!(write_frame_patch(&mut out, "first frame", &clock).is_err());
+            assert_eq!(out.flushes, usize::from(!fail_write));
+            out.fail_write = false;
+            out.fail_flush = false;
+            assert!(write_frame_patch(&mut out, "retry", &clock)
+                .unwrap()
+                .is_some());
+            assert!(write_frame_patch(&mut out, "next frame", &clock)
+                .unwrap()
+                .is_none());
+        }
+    }
+
     #[test]
     fn editing_key_repeats_preserve_modifiers_and_releases_stay_ignored() {
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};

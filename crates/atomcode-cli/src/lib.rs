@@ -1059,7 +1059,9 @@ model = "vendor-b"
         news: Option<crate::tui_changelog::Launch>,
         spawn: Option<crate::background::Spawn>,
         review_home: Option<crate::background::ReviewHome>,
+        process_start: std::time::Instant,
     ) -> Result<Option<Left>, String> {
+        let ui_start = std::time::Instant::now();
         // Here and not in `mount`: this is a person's launch, and `mount` is
         // also every test's — a test must not spend the one-time notice, nor
         // write its marker.
@@ -1091,6 +1093,9 @@ model = "vendor-b"
         )
         .await?;
         let ctx = mounted.app.context();
+        if let Some(surface) = ctx.service::<atomcode_tui::plugin::SurfaceSvc>() {
+            surface.time_first_frame(process_start, ui_start);
+        }
         let result = mounted.ui.run(&ctx, None).await;
         // 屏幕没了,后台的会话也停下:取消跑着的回合(半截回复落进日志),放掉租约
         // (`docs/plans/2026-09-25-bg-design.md` §五)。

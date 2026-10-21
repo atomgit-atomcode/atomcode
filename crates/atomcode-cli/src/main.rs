@@ -1141,6 +1141,7 @@ fn warn_console_encoding() {
 }
 
 fn main() {
+    let process_start = std::time::Instant::now();
     // `NSPasteboard` is not safe on the Tokio/blocking workers where the TUI
     // asks for clipboard images. A re-exec'd helper stops here, on the actual
     // OS main thread, and writes only its clipboard result to stdout.
@@ -1178,7 +1179,7 @@ fn main() {
     let child = std::thread::Builder::new()
         .name("atomcode-main".into())
         .stack_size(16 * 1024 * 1024)
-        .spawn(real_main)
+        .spawn(move || real_main(process_start))
         .expect("failed to spawn atomcode main thread");
     // Under `panic = "abort"` a panic in the child already aborts the whole
     // process, so `join` only returns an error on an abnormal thread exit;
@@ -1188,7 +1189,7 @@ fn main() {
     }
 }
 
-fn real_main() {
+fn real_main(process_start: std::time::Instant) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         // Worker threads (for `tokio::spawn`ed tasks) get a generous stack
@@ -1196,7 +1197,7 @@ fn real_main() {
         .thread_stack_size(8 * 1024 * 1024)
         .build()
         .expect("failed to build tokio runtime");
-    rt.block_on(async_main());
+    rt.block_on(async_main(process_start));
 }
 
 /// 启动时该说的那几句「你现在的处境和默认不一样」。
@@ -1310,8 +1311,7 @@ fn merge_startup_notices(
     }
 }
 
-async fn async_main() {
-    let process_start = std::time::Instant::now();
+async fn async_main(process_start: std::time::Instant) {
     // Wire `tracing::` diagnostics to `<config_dir>/logs/atomcode.log` (file-only,
     // TUI-safe). Must run before anything that emits traces so nothing is lost.
     init_file_logging();
@@ -1404,7 +1404,7 @@ async fn async_main() {
         eprintln!("\nPlease report this at: https://atomgit.com/atomgit_atomcode/atomcode/issues");
     }));
 
-    match run().await {
+    match run(process_start).await {
         Ok(code) => std::process::exit(code),
         Err(e) => {
             restore_terminal_if_tui();
@@ -1520,9 +1520,10 @@ fn set_env_command(env: &str) -> String {
     }
 }
 
-async fn run() -> Result<i32> {
+async fn run(process_start: std::time::Instant) -> Result<i32> {
     let _webui_relay = atomcode::webui_relay::ShutdownGuard;
-    let run_start = std::time::Instant::now();
+    // All total_ms values share the native-entry clock, including local upgrade setup.
+    let run_start = process_start;
     // -- Pre-parse --lang to set locale BEFORE clap renders --help --
     // clap help text is generated during parse, so we must resolve
     // the locale first (from --lang flag, env vars, or config) so that
@@ -2734,6 +2735,7 @@ async fn run() -> Result<i32> {
                     whats_new,
                     Some(spawn),
                     Some(review_home.clone()),
+                    process_start,
                 )
                 .await
                 .map_err(|why| anyhow::anyhow!(why));
