@@ -406,19 +406,29 @@ impl Content for WelcomeBlock {
         }
 
         // ---- The right column: a heading and the tips ----
+        let image_mascot = uses_image_mascot(ctx, content_w, self.brand.mascot.as_ref());
+        // Preserve the pixel layout's three random tips plus optional login.
+        let limit = if image_mascot {
+            5
+        } else {
+            3 + usize::from(self.tips.first().is_some_and(|(name, _)| name == "/login"))
+        };
+        let tips = &self.tips[..self.tips.len().min(limit)];
         let mut right: Vec<Line> = Vec::new();
-        if !self.tips.is_empty() {
+        if !tips.is_empty() {
             right.push(Line::styled(
                 width::take_width(&self.heading, content_w),
                 muted(),
             ));
-            let command_w = self
-                .tips
+            if image_mascot {
+                right.push(Line::empty());
+            }
+            let command_w = tips
                 .iter()
                 .map(|(command, _)| width::str_width(command))
                 .max()
                 .unwrap_or(0);
-            for (command, about) in &self.tips {
+            for (command, about) in tips {
                 // The columns line up on the widest command, but never at the cost
                 // of the row: command, gap and description together are clipped to
                 // `content_w`. A tip that does not fit is cut, never drawn past the
@@ -4063,6 +4073,31 @@ mod tests {
             ],
             brand: std::sync::Arc::new(Brand::default()),
             note: None,
+        }
+    }
+
+    #[test]
+    fn image_welcome_spaces_the_heading_and_shows_a_fifth_tip() {
+        let mut block = welcome();
+        block.tips = (1..=5)
+            .map(|n| (format!("/tip{n}"), "description".into()))
+            .collect();
+        let pixel_ctx = wctx(100, true);
+        let pixel = block.lines(&pixel_ctx);
+        let mut image_ctx = pixel_ctx;
+        image_ctx.caps.graphics = crate::caps::Graphics::ITerm2;
+        let image = block.lines(&image_ctx);
+        for (rows, gap, fifth) in [(&pixel, 1, false), (&image, 2, true)] {
+            let heading = rows
+                .iter()
+                .position(|row| row.plain().contains("上手提示"))
+                .unwrap();
+            let first = rows
+                .iter()
+                .position(|row| row.plain().contains("/tip1"))
+                .unwrap();
+            assert_eq!(first - heading, gap);
+            assert_eq!(rows.iter().any(|row| row.plain().contains("/tip5")), fifth);
         }
     }
 

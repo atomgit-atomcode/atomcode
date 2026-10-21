@@ -20,6 +20,8 @@ WezTerm uses its documented iTerm2-compatible image protocol: https://wezterm.or
 
 ## Click sequence
 
-A click on the visible image restarts one sequence: wait PNG for 1500 ms, go PNG for 1500 ms, then the original PNG. All frames share the existing 18 by 8 cell box. Pixel fallback remains static. Playback belongs to Moment, driven by the existing injected clock/event loop, and is reset on session view changes; no task or runtime/session-log state is added. Overlay-hidden or clipped images are not clickable.
+A click on the visible image restarts one sequence: wait PNG for 800 ms, go PNG for 800 ms, then the original PNG. All frames share the existing 18 by 8 cell box. Pixel fallback remains static. Playback belongs to Moment, driven by the existing injected clock/event loop, and is reset on session view changes; no task or runtime/session-log state is added. Overlay-hidden or clipped images are not clickable.
 
 Click-sequence validation: 1785 TUI tests passed, including phase boundaries, fixed geometry, click/restart, static pixel fallback, overlay hit testing and view reset. Compile gate and formatting passed. Assets are copied unchanged from the supplied PNGs. Animation has not yet been visually checked in a real terminal.
+
+Image welcome layout: insert one blank row below the tips heading and show up to five available commands. Preserve the pixel layout’s original spacing and three random tips plus optional pinned login.

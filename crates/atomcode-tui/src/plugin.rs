@@ -14227,7 +14227,7 @@ mod paste_habit_tests {
                 .png,
             crate::terminal_image::MASCOT_WAIT_PNG
         );
-        host.moment.write().unwrap().now = Timestamp::millis(2500);
+        host.moment.write().unwrap().now = Timestamp::millis(1800);
         assert_eq!(
             crate::terminal_image::visible(&host.compose((60, 24)))
                 .unwrap()
@@ -14237,7 +14237,7 @@ mod paste_habit_tests {
         tui.act(Action::ClickAt(rect.x + 1, rect.y + 1), &tui.client);
         assert_eq!(
             host.moment.read().unwrap().mascot_started,
-            Some(Timestamp::millis(2500))
+            Some(Timestamp::millis(1800))
         );
         assert_eq!(host.moment.read().unwrap().input, "keep draft");
         {
@@ -14251,7 +14251,7 @@ mod paste_habit_tests {
             host.moment.read().unwrap().mascot_started.is_none(),
             "pixel mascot stays static"
         );
-        host.moment.write().unwrap().mascot_started = Some(Timestamp::millis(2500));
+        host.moment.write().unwrap().mascot_started = Some(Timestamp::millis(1800));
         host.switch_view();
         assert!(host.moment.read().unwrap().mascot_started.is_none());
     }

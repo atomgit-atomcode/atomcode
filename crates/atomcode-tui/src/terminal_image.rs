@@ -11,7 +11,7 @@ pub const MASCOT_HEIGHT: u16 = 8;
 pub const MASCOT_PNG: &[u8] = include_bytes!("../assets/mascot.png");
 pub const MASCOT_WAIT_PNG: &[u8] = include_bytes!("../assets/mascot-wait.png");
 pub const MASCOT_GO_PNG: &[u8] = include_bytes!("../assets/mascot-go.png");
-const FRAME_MS: u64 = 1500;
+const FRAME_MS: u64 = 800;
 
 /// Time until the next boundary, from the host-injected clock. No repeating
 /// timer is needed once the original frame returns.
@@ -192,11 +192,11 @@ mod tests {
         let started = Some(Timestamp::millis(1000));
         let rect = visible(&frame()).unwrap().rect;
         for (at, expected, next_ms) in [
-            (1000, MASCOT_WAIT_PNG, Some(1500)),
-            (2499, MASCOT_WAIT_PNG, Some(1)),
-            (2500, MASCOT_GO_PNG, Some(1500)),
-            (3999, MASCOT_GO_PNG, Some(1)),
-            (4000, MASCOT_PNG, None),
+            (1000, MASCOT_WAIT_PNG, Some(800)),
+            (1799, MASCOT_WAIT_PNG, Some(1)),
+            (1800, MASCOT_GO_PNG, Some(800)),
+            (2599, MASCOT_GO_PNG, Some(1)),
+            (2600, MASCOT_PNG, None),
             (5000, MASCOT_PNG, None),
         ] {
             let now = Timestamp::millis(at);
