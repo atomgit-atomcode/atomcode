@@ -1878,7 +1878,12 @@ mod tests {
         };
         let line =
             Status::render(&State::default(), &Viewport::new(Rect::sized(120, 1), &m))[0].plain();
-        assert!(line.contains("~/proj"), "{line:?}");
+        // `~/proj` spelled the way this host spells it: Windows prints `~\proj`, and the
+        // point of the claim is the fold, not the separator.
+        let mut folded = String::from("~");
+        folded.push(std::path::MAIN_SEPARATOR);
+        folded.push_str("proj");
+        assert!(line.contains(&folded), "{line:?}");
         assert!(
             !line.contains(&cwd),
             "the absolute path must not appear: {line:?}"

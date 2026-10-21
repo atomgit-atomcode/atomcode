@@ -5065,8 +5065,13 @@ mod tests {
             "`unpinned-dir` 同理"
         );
         // 而真的子命令仍然是子命令。
+        // A path spelled the way this host spells it: `/srv/x` is not absolute on
+        // Windows, so the pin would ask the host to resolve it instead of reaching the
+        // missing places port — a different refusal than the one asserted here.
+        let target = if cfg!(windows) { r"C:\srv\x" } else { "/srv/x" };
         assert_eq!(
-            all.dispatch("/cd pin /srv/x", &app.context()).await,
+            all.dispatch(&format!("/cd pin {target}"), &app.context())
+                .await,
             Outcome::Refused(t(Msg::NoPlaces).into_owned()),
             "后面跟空格的才是子命令"
         );
@@ -5975,9 +5980,12 @@ mod tests {
     async fn status_says_the_working_directory() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (app, _client, all) = following(&working_in(dir.path()));
+        // The row folds the home directory the way the rest of the screen does, and a
+        // tempdir on Windows lives under it — so the where-line shows the folded form.
+        let shown = crate::text::collapse_home(&dir.path().display().to_string());
         match all.dispatch("/status", &app.context()).await {
             Outcome::Said(text) => assert!(
-                text.contains(&dir.path().display().to_string()),
+                text.contains(&shown),
                 "the where-line names the working directory:\n{text}"
             ),
             other => panic!("{other:?}"),

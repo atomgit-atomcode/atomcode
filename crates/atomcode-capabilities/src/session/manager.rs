@@ -4988,8 +4988,17 @@ mod tests {
         use std::hash::{Hash, Hasher};
 
         let p = Path::new("/Users/theo/Documents/workspace/atomcode");
+        // The production normalization, spelled out here rather than called: the claim is
+        // that the *scheme* does not drift, so it must not borrow the code under test.
+        // Windows folds case, and both hosts fold separators to `/`.
+        let mut normalized = p.to_string_lossy().replace('\\', "/");
+        if normalized.len() > 1 && normalized.ends_with('/') {
+            normalized.pop();
+        }
+        #[cfg(windows)]
+        let normalized = normalized.to_lowercase();
         let mut expected = DefaultHasher::new();
-        PathBuf::from(p.to_string_lossy().to_string()).hash(&mut expected);
+        PathBuf::from(normalized).hash(&mut expected);
         assert_eq!(
             SessionManager::project_hash(p, &test_dirs()),
             format!("{:016x}", expected.finish())

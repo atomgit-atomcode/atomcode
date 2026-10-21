@@ -839,25 +839,74 @@ mod tests {
 
     use super::*;
 
+    /// The fixture home, spelled the way this host spells paths.
+    ///
+    /// These tests are about the shape of a path — a whole segment under home folds, a
+    /// longer name that merely starts the same does not — and the fold compares whole
+    /// segments. A `/`-spelled fixture on Windows is a different shape, so it asserted
+    /// a fold the screen would never perform on that host.
+    fn home_fixture() -> std::path::PathBuf {
+        std::path::Path::new(if cfg!(windows) {
+            r"\home\me"
+        } else {
+            "/home/me"
+        })
+        .to_path_buf()
+    }
+
+    /// The native spelling of a path under `root`, ready to hand to the fold.
+    fn spelled_under(root: &std::path::Path, segments: &[&str]) -> String {
+        let mut path = root.to_path_buf();
+        for segment in segments {
+            path.push(segment);
+        }
+        path.display().to_string()
+    }
+
+    /// What the screen prints for a path under home: `~` and then native segments.
+    fn tilde(segments: &[&str]) -> String {
+        let mut spelled = String::from("~");
+        for segment in segments {
+            spelled.push(std::path::MAIN_SEPARATOR);
+            spelled.push_str(segment);
+        }
+        spelled
+    }
+
+    /// A path outside home, so "not underneath home" is testable on either host.
+    fn elsewhere(segments: &[&str]) -> String {
+        let root = if cfg!(windows) {
+            r"\elsewhere"
+        } else {
+            "/elsewhere"
+        };
+        spelled_under(std::path::Path::new(root), segments)
+    }
+
     #[test]
     fn collapse_home_rewrites_the_prefix_and_nothing_else() {
-        let home = std::path::Path::new("/home/me");
+        let home = home_fixture();
         assert_eq!(
-            collapse_home_with("/home/me/proj/a", Some(home)),
-            "~/proj/a"
+            collapse_home_with(&spelled_under(&home, &["proj", "a"]), Some(&home)),
+            tilde(&["proj", "a"])
         );
         // The segment boundary, which is the whole reason this is not a string
-        // prefix check: `/home/melon` must not become `~on`.
-        assert_eq!(
-            collapse_home_with("/home/melon/a", Some(home)),
-            "/home/melon/a"
-        );
+        // prefix check: `/home/melon` must not become `~on` — a sibling whose name
+        // merely starts with the last segment of home, not a child of home.
+        let parent = home.parent().expect("the fixture home has a parent");
+        let melon = spelled_under(parent, &["melon", "a"]);
+        assert_eq!(collapse_home_with(&melon, Some(&home)), melon);
         // Not underneath home: untouched.
-        assert_eq!(collapse_home_with("/tmp/a", Some(home)), "/tmp/a");
+        let outside = elsewhere(&["tmp", "a"]);
+        assert_eq!(collapse_home_with(&outside, Some(&home)), outside);
         // Home itself.
-        assert_eq!(collapse_home_with("/home/me", Some(home)), "~");
+        assert_eq!(
+            collapse_home_with(&home.display().to_string(), Some(&home)),
+            "~"
+        );
         // A home we could not determine is not a home we guess at.
-        assert_eq!(collapse_home_with("/home/me/a", None), "/home/me/a");
+        let under = spelled_under(&home, &["a"]);
+        assert_eq!(collapse_home_with(&under, None), under);
     }
 
     /// A command line folds every path in it, and only where a `~` would have
@@ -872,26 +921,39 @@ mod tests {
     /// a `~` after them.
     #[test]
     fn a_command_folds_the_home_paths_a_shell_would_have_expanded() {
-        let home = std::path::Path::new("/home/me");
-        let fold = |cmd: &str| collapse_home_in_command_with(cmd, Some(home));
-        assert_eq!(fold("ls /home/me/proj"), "ls ~/proj");
-        assert_eq!(fold("cd /home/me"), "cd ~");
+        let home = home_fixture();
+        let fold = |cmd: &str| collapse_home_in_command_with(cmd, Some(&home));
+        let proj = spelled_under(&home, &["proj"]);
+        let looking = format!("ls {proj}");
+        assert_eq!(fold(&looking), format!("ls {}", tilde(&["proj"])));
+        let staying = format!("cd {}", home.display());
+        assert_eq!(fold(&staying), "cd ~");
         // Several, and inside quotes, which is a word boundary.
-        assert_eq!(fold("diff \"/home/me/a\" /home/me/b"), "diff \"~/a\" ~/b");
-        assert_eq!(fold("X=/home/me/bin cmd"), "X=~/bin cmd");
+        let a = spelled_under(&home, &["a"]);
+        let b = spelled_under(&home, &["b"]);
+        let diffing = format!("diff \"{a}\" {b}");
+        assert_eq!(
+            fold(&diffing),
+            format!("diff \"{}\" {}", tilde(&["a"]), tilde(&["b"]))
+        );
+        let bin = spelled_under(&home, &["bin"]);
+        let assigning = format!("X={bin} cmd");
+        assert_eq!(fold(&assigning), format!("X={} cmd", tilde(&["bin"])));
         // Not a boundary: the shell would not have expanded these either.
-        assert_eq!(
-            fold("PATH=/usr/bin:/home/me/bin"),
-            "PATH=/usr/bin:/home/me/bin"
+        let path_list = format!("PATH=/usr/bin:{bin}");
+        assert_eq!(fold(&path_list), path_list);
+        let remote = format!("scp host:{a} .");
+        assert_eq!(fold(&remote), remote);
+        // A longer directory that merely starts the same is a different one — a
+        // sibling of home, not a child of it.
+        let sibling = spelled_under(
+            home.parent().expect("the fixture home has a parent"),
+            &["melon"],
         );
-        assert_eq!(fold("scp host:/home/me/a ."), "scp host:/home/me/a .");
-        // A longer directory that merely starts the same is a different one.
-        assert_eq!(fold("ls /home/melon"), "ls /home/melon");
+        let melon = format!("ls {sibling}");
+        assert_eq!(fold(&melon), melon);
         // Nothing to fold against leaves the line exactly as it is.
-        assert_eq!(
-            collapse_home_in_command_with("ls /home/me", None),
-            "ls /home/me"
-        );
+        assert_eq!(collapse_home_in_command_with(&looking, None), looking);
     }
 
     #[test]
@@ -899,9 +961,17 @@ mod tests {
         // `HOME=/home/me/` is something a shell can hand over, and with the naive
         // version every path failed the segment test — so the fold silently did
         // nothing and the welcome block printed the whole path.
-        let home = std::path::Path::new("/home/me/");
-        assert_eq!(collapse_home_with("/home/me/proj", Some(home)), "~/proj");
-        assert_eq!(collapse_home_with("/home/me", Some(home)), "~");
+        let mut written = home_fixture().display().to_string();
+        written.push(std::path::MAIN_SEPARATOR);
+        let home = std::path::PathBuf::from(written);
+        assert_eq!(
+            collapse_home_with(&spelled_under(&home, &["proj"]), Some(&home)),
+            tilde(&["proj"])
+        );
+        assert_eq!(
+            collapse_home_with(&home.display().to_string(), Some(&home)),
+            "~"
+        );
     }
 
     #[test]
@@ -920,23 +990,27 @@ mod tests {
     /// joined onto the working directory, and the answer is "cannot read it".
     #[test]
     fn a_typed_tilde_becomes_the_home_directory() {
-        let home = std::path::Path::new("/home/me");
+        let home = home_fixture();
         assert_eq!(
-            expand_home_with("~/notes.md", Some(home)),
-            "/home/me/notes.md"
+            expand_home_with("~/notes.md", Some(&home)),
+            spelled_under(&home, &["notes.md"])
         );
-        assert_eq!(expand_home_with("~", Some(home)), "/home/me");
+        assert_eq!(
+            expand_home_with("~", Some(&home)),
+            home.display().to_string()
+        );
 
         // `~foo` is another person's home in shell syntax and this does not
         // resolve those — guessing would open the wrong file silently.
-        assert_eq!(expand_home_with("~other/a", Some(home)), "~other/a");
+        assert_eq!(expand_home_with("~other/a", Some(&home)), "~other/a");
         // Not a leading segment: a real, if odd, relative path.
-        assert_eq!(expand_home_with("a/~/b", Some(home)), "a/~/b");
+        assert_eq!(expand_home_with("a/~/b", Some(&home)), "a/~/b");
         // Nothing to expand against: unchanged, so the caller's "cannot read
         // it" stays the honest answer rather than becoming a wrong path.
         assert_eq!(expand_home_with("~/notes.md", None), "~/notes.md");
         // Untouched paths pass through whatever the home is.
-        assert_eq!(expand_home_with("/tmp/a", Some(home)), "/tmp/a");
+        let outside = elsewhere(&["tmp", "a"]);
+        assert_eq!(expand_home_with(&outside, Some(&home)), outside);
     }
 
     /// Git-Bash/MSYS hands Windows a posix spelling for the home. Used verbatim, `~/x`

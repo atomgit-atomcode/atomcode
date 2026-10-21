@@ -5752,14 +5752,27 @@ mod tests {
     /// and it is the half that rests on nothing when only the folder is pinned.
     #[test]
     fn a_shell_row_folds_its_home_paths_and_a_file_row_does_not() {
-        let home = std::path::Path::new("/home/me");
+        // Spelled the way this host spells paths: the fold compares whole segments, so a
+        // `/`-spelled fixture on Windows asserted a fold the screen never performs there.
+        let home = std::path::Path::new(if cfg!(windows) {
+            r"\home\me"
+        } else {
+            "/home/me"
+        });
+        let proj = home.join("proj").display().to_string();
+        let file = home.join("a.rs").display().to_string();
+        let mut folded = String::from("~");
+        folded.push(std::path::MAIN_SEPARATOR);
+        folded.push_str("proj");
+        let command = serde_json::json!({ "command": format!("ls {proj}") }).to_string();
         assert_eq!(
-            subject_of_within("bash", r#"{"command":"ls /home/me/proj"}"#, Some(home)),
-            "ls ~/proj"
+            subject_of_within("bash", &command, Some(home)),
+            format!("ls {folded}")
         );
+        let opened = serde_json::json!({ "file_path": file }).to_string();
         assert_eq!(
-            subject_of_within("read_file", r#"{"file_path":"/home/me/a.rs"}"#, Some(home)),
-            "/home/me/a.rs",
+            subject_of_within("read_file", &opened, Some(home)),
+            file,
             "a path in a file card is not a shell word"
         );
     }

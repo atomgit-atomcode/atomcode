@@ -3331,9 +3331,12 @@ mod source_tests {
         // the instruction layers come from the loader's own answer and
         // everything else from asking the filesystem. A criterion satisfied by
         // one of them would leave the other free to say whatever it liked.
+        // Compared by path components, not by string suffix: the tail is written with
+        // `/` and Windows reports the same file with `\`, and a string test called that
+        // a missing file.
         let by_path = |ends: &str| -> &atomcode_host_api::SourceFile {
             all.iter()
-                .find(|file| file.path.ends_with(ends))
+                .find(|file| std::path::Path::new(&file.path).ends_with(ends))
                 .unwrap_or_else(|| panic!("{ends}: {all:#?}"))
         };
         assert!(

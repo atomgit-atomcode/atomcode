@@ -4963,14 +4963,23 @@ mod tests {
     #[test]
     fn a_failure_is_reported_once_with_where_the_data_could_live_instead() {
         use atomcode_capabilities::session::SessionStoreError;
+        // The raw code that means "permission denied" on this host: errno 13 on unix,
+        // access-denied (5) on Windows. Read as a plain number, errno 13 is *not*
+        // `PermissionDenied` there, so the advice below would never be offered and the
+        // test would assert the opposite of what it means.
+        let denied_code = if cfg!(windows) { 5 } else { 13 };
         let denied = SessionStoreError::Io {
             path: "/root/.x/sessions/47acaa0a9d16febb".into(),
-            source: std::io::Error::from_raw_os_error(13),
+            source: std::io::Error::from_raw_os_error(denied_code),
         };
         let middle = std::io::Error::new(std::io::ErrorKind::PermissionDenied, denied);
         let error = anyhow::Error::new(middle).context("coding runtime prepare failed");
         let said = super::error_report(&error);
-        assert_eq!(said.matches("os error 13").count(), 1, "said once: {said}");
+        assert_eq!(
+            said.matches(&format!("os error {denied_code}")).count(),
+            1,
+            "said once: {said}"
+        );
         assert!(
             said.contains(&super::set_env_command(
                 atomcode_config::distribution::HOME_ENV
@@ -4980,7 +4989,7 @@ mod tests {
 
         // A refusal that has nothing to do with the data directory is not met
         // with advice to move it (评审指出).
-        let elsewhere = anyhow::Error::new(std::io::Error::from_raw_os_error(13))
+        let elsewhere = anyhow::Error::new(std::io::Error::from_raw_os_error(denied_code))
             .context("reading ./src/main.rs");
         let said = super::error_report(&elsewhere);
         assert!(

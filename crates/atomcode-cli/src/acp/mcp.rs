@@ -150,7 +150,16 @@ mod tests {
     #[test]
     fn acp_mcp_server_configs_connects_stdio_and_http_ignores_sse() {
         let servers = vec![
-            McpServer::Stdio(McpServerStdio::new("fs", "/usr/bin/fs")),
+            // Spelled the way this host spells it: a `/usr/bin/…` command is not an
+            // absolute path on Windows, so the entry is skipped rather than connected.
+            McpServer::Stdio(McpServerStdio::new(
+                "fs",
+                if cfg!(windows) {
+                    r"C:\usr\bin\fs"
+                } else {
+                    "/usr/bin/fs"
+                },
+            )),
             McpServer::Http(
                 McpServerHttp::new("api", "https://api.example.com/mcp")
                     .headers(vec![HttpHeader::new("Authorization", "Bearer t")]),
@@ -169,7 +178,8 @@ mod tests {
         assert_eq!(configs[0].name, "fs");
         assert!(matches!(
             &configs[0].config,
-            McpTransportConfig::Stdio { command, .. } if command == "/usr/bin/fs"
+            McpTransportConfig::Stdio { command, .. }
+                if command == (if cfg!(windows) { r"C:\usr\bin\fs" } else { "/usr/bin/fs" })
         ));
         assert_eq!(configs[0].source, McpConfigSource::Driver);
         assert!(!configs[0].trust);
@@ -198,12 +208,20 @@ mod tests {
 
     #[test]
     fn acp_mcp_server_configs_skips_malformed_stdio_entries() {
+        // The absolute commands are spelled the way this host spells them: a
+        // `/usr/bin/…` one is relative on Windows, and then every entry is malformed —
+        // the fixture would assert nothing about the name check it is here for.
+        let absolute = if cfg!(windows) {
+            r"C:\usr\bin\server"
+        } else {
+            "/usr/bin/server"
+        };
         let servers = vec![
             // Relative command path — the protocol requires an absolute path.
             McpServer::Stdio(McpServerStdio::new("rel", "bin/server")),
             // Empty name cannot key the tool namespace.
-            McpServer::Stdio(McpServerStdio::new("", "/usr/bin/server")),
-            McpServer::Stdio(McpServerStdio::new("ok", "/usr/bin/server")),
+            McpServer::Stdio(McpServerStdio::new("", absolute)),
+            McpServer::Stdio(McpServerStdio::new("ok", absolute)),
         ];
         let (configs, ignored) = acp_mcp_server_configs(&servers);
         assert_eq!(configs.len(), 1);

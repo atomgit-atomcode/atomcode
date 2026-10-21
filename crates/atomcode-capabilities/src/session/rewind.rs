@@ -2495,8 +2495,13 @@ mod alternates_tests {
         let alt = store.join("objects/info/alternates");
         let contents = fs::read_to_string(&alt).unwrap();
         let real_objects = fs::canonicalize(work.join(".git/objects")).unwrap();
+        // The writer spells the path the way git reads it — verbatim prefix stripped,
+        // separators folded — so the expectation uses the same spelling. `canonicalize`
+        // alone hands back a `\\?\…` path on Windows, which the file never contains.
         assert!(
-            contents.trim().ends_with(&*real_objects.to_string_lossy()),
+            contents
+                .trim()
+                .ends_with(&git_alternate_path(&real_objects)),
             "alternates points at real objects: {contents}",
         );
         drop(cp);

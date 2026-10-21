@@ -789,14 +789,24 @@ mod tests {
 
     #[test]
     fn validate_additional_directories_accepts_absolute_rejects_relative() {
+        // Spelled the way this host spells paths: `/home/user/shared-lib` is not absolute
+        // on Windows, so the fixture would assert the opposite of what it means.
         let absolute = vec![
-            std::path::PathBuf::from("/home/user/shared-lib"),
-            std::path::PathBuf::from("/tmp/scratch"),
+            std::path::PathBuf::from(if cfg!(windows) {
+                r"C:\home\user\shared-lib"
+            } else {
+                "/home/user/shared-lib"
+            }),
+            std::path::PathBuf::from(if cfg!(windows) {
+                r"C:\scratch"
+            } else {
+                "/tmp/scratch"
+            }),
         ];
         assert!(validate_additional_directories(&absolute).is_ok());
 
         let mixed = vec![
-            std::path::PathBuf::from("/abs"),
+            std::path::PathBuf::from(if cfg!(windows) { r"C:\abs" } else { "/abs" }),
             std::path::PathBuf::from("rel"),
         ];
         let err = validate_additional_directories(&mixed).unwrap_err();

@@ -985,6 +985,13 @@ mod tests {
             "/original",
             atomcode_coding::config::product_dirs_from_env(),
         ));
+        // Spelled the way this host spells paths: a `/work` cwd is not absolute on
+        // Windows, so the refusal would be about that instead of the session id.
+        let (work, stored, asked) = if cfg!(windows) {
+            (r"C:\work", r"C:\a", r"C:\b")
+        } else {
+            ("/work", "/a", "/b")
+        };
         let sessions: Sessions =
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
@@ -994,7 +1001,7 @@ mod tests {
             None,
             &sessions,
             &SessionId::new("acp-missing"),
-            std::path::PathBuf::from("/work"),
+            std::path::PathBuf::from(work),
             &[],
             Vec::new(),
             Vec::new(),
@@ -1020,9 +1027,9 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("unknown session"));
 
-        // cwd mismatch: the stored session lives in /a, the request says /b.
+        // cwd mismatch: the stored session lives elsewhere than the request says.
         let scan = CatalogScan {
-            entries: vec![catalog_entry("s1", "stored", "/a")],
+            entries: vec![catalog_entry("s1", "stored", stored)],
             diagnostics: Vec::new(),
         };
         let err = handle_resume_session(
@@ -1030,7 +1037,7 @@ mod tests {
             None,
             &sessions,
             &wire_session_id("s1"),
-            std::path::PathBuf::from("/b"),
+            std::path::PathBuf::from(asked),
             &[],
             Vec::new(),
             Vec::new(),

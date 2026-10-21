@@ -1128,7 +1128,16 @@ mod tests {
         let other: McpServer =
             serde_json::from_value(serde_json::json!({"type": "sse", "name": "events"})).unwrap();
         let servers = vec![
-            McpServer::Stdio(McpServerStdio::new("fs", "/usr/bin/fs-server")),
+            // Spelled the way this host spells it: `/usr/bin/…` is not absolute on
+            // Windows, so the entry would be skipped instead of connected.
+            McpServer::Stdio(McpServerStdio::new(
+                "fs",
+                if cfg!(windows) {
+                    r"C:\usr\bin\fs-server"
+                } else {
+                    "/usr/bin/fs-server"
+                },
+            )),
             McpServer::Http(
                 McpServerHttp::new("api", "https://api.example.com/mcp")
                     .headers(vec![HttpHeader::new("Authorization", "Bearer t")]),

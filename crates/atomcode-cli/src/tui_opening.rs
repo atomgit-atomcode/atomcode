@@ -252,10 +252,16 @@ mod tests {
     /// important thing on the screen.
     #[test]
     fn the_keys_line_is_for_the_first_launch_and_the_welcomes_foot() {
+        // A name no filesystem has to refuse: `{:?}` of a `SystemTime` carries `:` and
+        // spaces, which Windows rejects in a path — the marker then never exists and the
+        // test reads as "the notice was spent" when nothing was ever written.
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or_default();
         let dir = std::env::temp_dir().join(format!(
-            "atomcode-keys-notice-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
+            "atomcode-keys-notice-{}-{stamp}",
+            std::process::id()
         ));
         let marker = keys_notice_marker(&dir);
 
