@@ -530,6 +530,32 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_byte_limited_search_returns_previews_and_reports_incomplete() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let mut file =
+            std::io::BufWriter::new(std::fs::File::create(dir.path().join("many.txt")).unwrap());
+        let row = format!("NEEDLE {}\n", "x".repeat(16 * 1024));
+        for _ in 0..400 {
+            file.write_all(row.as_bytes()).unwrap();
+        }
+        file.flush().unwrap();
+        let result = GrepTool::default()
+            .execute(
+                r#"{"pattern":"NEEDLE","context":0,"max_results":10000}"#,
+                &ctx(dir.path()),
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.contains("many.txt:1:NEEDLE"));
+        assert!(result.content.contains('…'));
+        assert!(result.content.contains("Scan incomplete"));
+        assert!(result.content.contains("result byte limit reached"));
+        assert!(!result.content.contains("Results capped at 10000 matches"));
+        assert!(!result.content.contains("No matches"));
+    }
+
     #[tokio::test]
     async fn capped_message_counts_matches_not_output_rows() {
         let d = tempfile::tempdir().unwrap();
