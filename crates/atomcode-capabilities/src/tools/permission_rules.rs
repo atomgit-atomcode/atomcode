@@ -299,11 +299,29 @@ fn match_targets(tool: &str, args: &str, cwd: &Path) -> Vec<String> {
     for raw in super::target_arg_values(args) {
         let resolved = resolve_path(&raw, cwd).to_string_lossy().to_string();
         if resolved != raw {
-            targets.push(resolved);
+            push_separator_variants(&mut targets, resolved);
         }
-        targets.push(raw);
+        push_separator_variants(&mut targets, raw);
     }
     targets
+}
+
+/// Add a path as written, plus — on Windows only — its other-separator twin.
+///
+/// Windows accepts both separators, so a rule a person wrote the way they read paths
+/// (`Read(src/**)`) has to reach the `\`-spelled target the platform produced, and a
+/// `\`-style rule the `/` target a model typed. Without the twin such a rule matched
+/// nothing and every matching call silently fell back to an approval prompt. On unix a
+/// backslash is an ordinary filename character, not a separator, so no twin is invented.
+fn push_separator_variants(targets: &mut Vec<String>, target: String) {
+    if cfg!(windows) {
+        for variant in [target.replace('/', "\\"), target.replace('\\', "/")] {
+            if variant != target && !targets.contains(&variant) {
+                targets.push(variant);
+            }
+        }
+    }
+    targets.push(target);
 }
 
 /// Middleware form of [`PermissionRules`]. Clone-cheap (Arc-backed).
@@ -651,6 +669,49 @@ mod tests {
                 &crate::tools::sensitive_path::test_guard(),
                 "read_file",
                 &outside,
+                &cwd()
+            ),
+            RuleDecision::NoMatch
+        );
+    }
+
+    /// A rule is written the way a person reads paths — usually with `/` — while Windows
+    /// hands the call a `\`-spelled argument. Without the twin such a rule matched nothing
+    /// and every one of those calls fell back to an approval prompt.
+    #[cfg(windows)]
+    #[test]
+    fn a_slash_rule_reaches_the_backslash_spelling_windows_produces() {
+        let r = rules(&["Read(C:/work/src/**)"], &[]);
+        let args = serde_json::json!({ "file_path": "C:\\work\\src\\main.rs" }).to_string();
+        assert_eq!(
+            r.decide(
+                &crate::tools::sensitive_path::test_guard(),
+                "read_file",
+                &args,
+                &cwd()
+            ),
+            RuleDecision::Allow
+        );
+        // The reverse: a rule written with Windows separators still reaches the `/`
+        // argument a model typed.
+        let r = rules(&[r"Read(C:\work\src\**)"], &[]);
+        let args = serde_json::json!({ "file_path": "C:/work/src/main.rs" }).to_string();
+        assert_eq!(
+            r.decide(
+                &crate::tools::sensitive_path::test_guard(),
+                "read_file",
+                &args,
+                &cwd()
+            ),
+            RuleDecision::Allow
+        );
+        // The twin must not widen a rule past the path it names.
+        let args = serde_json::json!({ "file_path": "C:\\work\\other\\main.rs" }).to_string();
+        assert_eq!(
+            r.decide(
+                &crate::tools::sensitive_path::test_guard(),
+                "read_file",
+                &args,
                 &cwd()
             ),
             RuleDecision::NoMatch

@@ -506,10 +506,67 @@ pub fn expand_home_with(path: &str, home: Option<&std::path::Path>) -> String {
 /// but blank variable is not an answer, and `~/proj` built from it would be
 /// wrong in a way nobody could see.
 pub(crate) fn home_dir() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
+    home_from_env(
+        std::env::var_os("HOME"),
+        std::env::var_os("USERPROFILE"),
+        cfg!(windows),
+    )
+}
+
+/// Pure core of [`home_dir`], so the Windows spellings can be exercised on any host.
+///
+/// On Windows `HOME` is frequently a Git-Bash/MSYS spelling (`/c/Users/me`) that no
+/// Windows API accepts: joined it produced `/c/Users/me\notes.md`, which the system
+/// reads as `C:\c\Users\me\notes.md` — a path nobody meant — and it never matched the
+/// `C:\…` paths this screen prints, so `~` was never collapsed either. Translate that
+/// spelling first; a native `HOME` or a `USERPROFILE` fallback is used as it stands.
+fn home_from_env(
+    home: Option<std::ffi::OsString>,
+    user_profile: Option<std::ffi::OsString>,
+    windows: bool,
+) -> Option<std::path::PathBuf> {
+    let usable = |raw: std::ffi::OsString| -> Option<String> {
+        let text = raw.to_string_lossy().into_owned();
+        if windows {
+            windows_home(&text)
+        } else {
+            // A set-but-blank variable is not an answer.
+            (!text.is_empty()).then_some(text)
+        }
+    };
+    home.and_then(usable)
+        .or_else(|| user_profile.and_then(usable))
         .map(std::path::PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
+/// A Windows home from an MSYS/Cygwin spelling: `/c/Users/me` and `/cygdrive/c/Users/me`
+/// both mean `C:\Users\me`. Anything else — a native `C:\…`, a `//server/share` UNC, an
+/// empty value — comes back unchanged (or refused), because guessing at a path a caller
+/// never wrote is how the wrong file gets opened.
+fn windows_home(text: &str) -> Option<String> {
+    if text.is_empty() {
+        return None;
+    }
+    let rest = match text
+        .strip_prefix("/cygdrive/")
+        .or_else(|| text.strip_prefix('/'))
+    {
+        Some(rest) => rest,
+        // Native `C:\…`, a drive-relative `C:…`, or a bare name: taken as written.
+        None => return Some(text.to_string()),
+    };
+    let (drive, tail) = rest.split_once('/').unwrap_or((rest, ""));
+    let mut letters = drive.chars();
+    let drive_letter = match (letters.next(), letters.next()) {
+        (Some(letter), None) if letter.is_ascii_alphabetic() => letter.to_ascii_uppercase(),
+        // `//server/share`, `/usr/local`, or an empty value: not this shape.
+        _ => return Some(text.to_string()),
+    };
+    if tail.is_empty() {
+        return Some(format!("{drive_letter}:\\"));
+    }
+    Some(format!("{drive_letter}:\\{}", tail.replace('/', "\\")))
 }
 
 // ── one line of text with a caret in it ──────────────────────────────────────
@@ -880,6 +937,58 @@ mod tests {
         assert_eq!(expand_home_with("~/notes.md", None), "~/notes.md");
         // Untouched paths pass through whatever the home is.
         assert_eq!(expand_home_with("/tmp/a", Some(home)), "/tmp/a");
+    }
+
+    /// Git-Bash/MSYS hands Windows a posix spelling for the home. Used verbatim, `~/x`
+    /// expanded to `/c/Users/me\x` — which Windows reads as `C:\c\Users\me\x` — and the
+    /// `C:\…` paths this screen prints never matched it, so `~` was never collapsed.
+    #[test]
+    fn a_posix_home_is_translated_only_on_windows() {
+        let home = Some(std::ffi::OsString::from("/c/Users/me"));
+        assert_eq!(
+            home_from_env(home.clone(), None, true),
+            Some(std::path::PathBuf::from("C:\\Users\\me"))
+        );
+        assert_eq!(
+            home_from_env(home, None, false),
+            Some(std::path::PathBuf::from("/c/Users/me"))
+        );
+    }
+
+    #[test]
+    fn cygwin_and_native_spellings_are_understood() {
+        assert_eq!(
+            windows_home("/cygdrive/d/work"),
+            Some("D:\\work".to_string())
+        );
+        assert_eq!(windows_home("/c"), Some("C:\\".to_string()));
+        // Already native: taken as written, not rewritten.
+        assert_eq!(
+            windows_home("C:\\Users\\me"),
+            Some("C:\\Users\\me".to_string())
+        );
+        // A UNC or a real posix path is not this shape: left exactly as written.
+        assert_eq!(
+            windows_home("//server/share"),
+            Some("//server/share".to_string())
+        );
+        assert_eq!(windows_home("/usr/local"), Some("/usr/local".to_string()));
+    }
+
+    /// A set-but-blank variable is not an answer, and it must not win the fallback.
+    #[test]
+    fn userprofile_answers_when_home_is_blank() {
+        let blank = Some(std::ffi::OsString::new());
+        let profile = Some(std::ffi::OsString::from("C:\\Users\\me"));
+        assert_eq!(
+            home_from_env(blank.clone(), profile.clone(), true),
+            Some(std::path::PathBuf::from("C:\\Users\\me"))
+        );
+        assert_eq!(
+            home_from_env(blank, profile, false),
+            Some(std::path::PathBuf::from("C:\\Users\\me"))
+        );
+        assert_eq!(home_from_env(None, None, true), None);
     }
 
     #[test]

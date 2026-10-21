@@ -767,6 +767,53 @@ fn last_json_line(stdout: &str) -> Option<Value> {
     serde_json::from_str(line.trim()).ok()
 }
 
+/// What a hook left on stdout — the three cases a decision site must tell apart.
+///
+/// The third is the one nobody can see: a hook that was meant to answer (`deny`, `ask`,
+/// `block`) printed text instead of a decision, so the call proceeded exactly as if no
+/// hook had run. On Windows that is the ordinary outcome of a POSIX-style
+/// `echo '{"…"}'`, whose quotes `cmd /C` leaves in place — the hook looks installed and
+/// silently does nothing.
+#[derive(Debug, PartialEq, Eq)]
+enum StdoutShape {
+    /// Nothing on stdout: the exit-code contract alone decides.
+    Silent,
+    /// JSON on the last non-empty line — a decision, usable or not.
+    Json,
+    /// Text that is not JSON: only actionable as "the hook did not speak".
+    NotJson,
+}
+
+fn stdout_shape(stdout: &str) -> StdoutShape {
+    if last_json_line(stdout).is_some() {
+        return StdoutShape::Json;
+    }
+    if stdout.trim().is_empty() {
+        StdoutShape::Silent
+    } else {
+        StdoutShape::NotJson
+    }
+}
+
+/// The decision this hook's stdout carries, naming the silent case in the log.
+///
+/// Sites where plain stdout is a *feature* — SessionStart context, UserPromptSubmit
+/// injection — keep calling [`last_json_line`] directly: there the same bytes reach the
+/// model, so nothing is lost and a warning would be noise. Here they reach nobody, and
+/// a hook that expected to decide quietly did not.
+fn decision_from_stdout(stdout: &str, event: HookEvent) -> Option<Decision> {
+    if let Some(value) = last_json_line(stdout) {
+        return serde_json::from_value::<Decision>(value).ok();
+    }
+    if stdout_shape(stdout) == StdoutShape::NotJson {
+        tracing::warn!(
+            event = ?event,
+            "hook stdout is not a JSON decision; the hook was ignored"
+        );
+    }
+    None
+}
+
 // ───────────────────────────── decision parsing ─────────────────────────────
 
 /// A permissive view over a hook's JSON decision, spanning the CC shape
@@ -1197,8 +1244,7 @@ impl CCExternalHooks {
             else {
                 continue;
             };
-            let decided =
-                last_json_line(&stdout).and_then(|v| serde_json::from_value::<Decision>(v).ok());
+            let decided = decision_from_stdout(&stdout, HookEvent::PreToolUse);
 
             // Apply an arg rewrite (CC updatedInput / atomcode modify).
             if let Some(d) = &decided {
@@ -1323,9 +1369,7 @@ impl CCExternalHooks {
             else {
                 continue;
             };
-            if let Some(d) =
-                last_json_line(&stdout).and_then(|v| serde_json::from_value::<Decision>(v).ok())
-            {
+            if let Some(d) = decision_from_stdout(&stdout, event) {
                 if let Some(new_out) = d
                     .hook_specific
                     .as_ref()
@@ -1366,6 +1410,37 @@ fn stronger(a: BeforeOutcome, b: BeforeOutcome) -> BeforeOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A hook that printed text instead of a decision used to be indistinguishable from
+    /// one that printed nothing: both proceeded. They are different facts — only the
+    /// first means the hook is silently not working — so the shape is its own answer,
+    /// and the warning rides on it.
+    #[test]
+    fn a_hook_that_printed_text_instead_of_a_decision_is_told_apart() {
+        assert_eq!(stdout_shape(""), StdoutShape::Silent);
+        assert_eq!(stdout_shape("   \n\n"), StdoutShape::Silent);
+        // Diagnostics ahead of the decision are still a decision.
+        assert_eq!(stdout_shape("checking…\n{}\n"), StdoutShape::Json);
+        assert_eq!(
+            stdout_shape("'{\"hookSpecificOutput\":{\"permissionDecision\":\"deny\"}}'"),
+            StdoutShape::NotJson
+        );
+    }
+
+    /// The Windows case this exists for: `echo '{"…"}'` under `cmd /C` keeps its quotes,
+    /// so the decision parses as ordinary text. The call then proceeds as if no hook had
+    /// run — which is why the shape is named in the log instead of shrugged at.
+    #[test]
+    fn quoting_a_decision_away_yields_no_decision() {
+        let quoted = "'{\"hookSpecificOutput\":{\"permissionDecision\":\"deny\"}}'";
+        assert!(decision_from_stdout(quoted, HookEvent::PreToolUse).is_none());
+        assert!(decision_from_stdout("", HookEvent::PreToolUse).is_none());
+        assert!(decision_from_stdout(
+            r#"{"hookSpecificOutput":{"permissionDecision":"deny"}}"#,
+            HookEvent::PreToolUse
+        )
+        .is_some());
+    }
 
     #[test]
     fn parse_event_both_spellings() {
