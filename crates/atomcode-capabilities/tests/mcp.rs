@@ -562,7 +562,12 @@ async fn stdio_correlates_replies_past_notifications_and_stale_ids() {
 // Real subprocess I/O must progress before the operation deadline.
 #[tokio::test]
 async fn malformed_stdio_result_is_not_replayed_or_received_by_the_next_call() {
-    for failure_mode in ["MCP_TEST_MALFORMED_ONCE", "MCP_TEST_INVALID_UTF8_ONCE"] {
+    for failure_mode in [
+        "MCP_TEST_MALFORMED_ONCE",
+        "MCP_TEST_INVALID_UTF8_ONCE",
+        "MCP_TEST_OVERSIZED_LENGTH_ONCE",
+        "MCP_TEST_OVERSIZED_LINE_ONCE",
+    ] {
         let temp = tempfile::tempdir().unwrap();
         let calls = temp.path().join("calls");
         let registry = McpRegistry::new(NO_TREE);
@@ -598,4 +603,18 @@ async fn malformed_stdio_result_is_not_replayed_or_received_by_the_next_call() {
             "one execution per explicit call, no hidden replay"
         );
     }
+}
+
+// Real subprocess pipes must make progress independently of the Tokio clock.
+#[tokio::test]
+async fn oversized_stdio_startup_response_fails_initialization() {
+    let registry = McpRegistry::new(NO_TREE);
+    let error = registry
+        .add_server(test_server_config_with_env(
+            "oversized-startup",
+            BTreeMap::from([("MCP_TEST_OVERSIZED_STARTUP_LENGTH".into(), "1".into())]),
+        ))
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("Content-Length exceeds 10 MiB"));
 }

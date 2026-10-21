@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
@@ -27,6 +27,11 @@ const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 /// Maximum non-protocol lines to skip before giving up.
 /// Protects against servers that spam stdout with logs.
 const MAX_SKIP_LINES: usize = 100;
+
+/// Maximum wire body, including NDJSON whitespace but excluding its CRLF.
+const MAX_MCP_MESSAGE_BYTES: usize = 10 * 1024 * 1024;
+/// Total header block budget, including the terminating blank line.
+const MAX_MCP_HEADER_BYTES: usize = 16 * 1024;
 
 /// stdio-based MCP client.
 pub struct StdioClient {
@@ -602,7 +607,7 @@ impl StdioClient {
                 let mut buf = String::new();
                 loop {
                     buf.clear();
-                    let n = reader.read_line(&mut buf).await?;
+                    let n = read_bounded_line(reader, &mut buf, MAX_MCP_MESSAGE_BYTES + 2).await?;
                     if n == 0 {
                         return Err(anyhow::Error::new(StdioConnectionClosed(
                             "MCP server closed stdout",
@@ -615,7 +620,12 @@ impl StdioClient {
                 buf
             };
 
-            let body = line.trim_end_matches(['\r', '\n']).trim_start();
+            let wire_body = line.strip_suffix('\n').unwrap_or(&line);
+            let wire_body = wire_body.strip_suffix('\r').unwrap_or(wire_body);
+            if wire_body.len() > MAX_MCP_MESSAGE_BYTES {
+                return Err(protocol_error("MCP stdio message exceeds 10 MiB"));
+            }
+            let body = wire_body.trim_start();
             let frame: Value = if body.starts_with('{') || body.starts_with('[') {
                 serde_json::from_str(body).map_err(protocol_error)?
             } else if strip_prefix_ci(body, "content-length:").is_some() {
@@ -672,39 +682,41 @@ impl StdioClient {
     /// Lines that look like NDJSON or `Content-Length` are **not** consumed; they are moved to
     /// [`Self::preread_line`] for [`Self::recv_jsonrpc_response`].
     async fn drain_startup_messages(&self) -> Result<()> {
-        let _ = tokio::time::timeout(Duration::from_millis(500), async {
-            loop {
+        tokio::time::timeout(Duration::from_millis(500), async {
+            for _ in 0..=MAX_SKIP_LINES {
                 let mut line = String::new();
                 let mut reader = self.reader.lock().await;
                 let Some(r) = reader.as_mut() else {
-                    return;
+                    return Ok(());
                 };
-                let read_res =
-                    tokio::time::timeout(Duration::from_millis(80), r.read_line(&mut line)).await;
+                let read_res = tokio::time::timeout(
+                    Duration::from_millis(80),
+                    read_bounded_line(r, &mut line, MAX_MCP_MESSAGE_BYTES + 2),
+                )
+                .await;
                 drop(reader);
 
                 match read_res {
-                    Err(_) | Ok(Err(_)) | Ok(Ok(0)) => return,
+                    Err(_) | Ok(Ok(0)) => return Ok(()),
+                    Ok(Err(error)) => return Err(error),
                     Ok(Ok(_)) => {
-                        let t = line.trim();
-                        if t.is_empty() {
-                            continue;
-                        }
-                        let js = t.trim_start();
+                        let js = line.trim();
                         if js.starts_with('{')
                             || js.starts_with('[')
                             || strip_prefix_ci(js, "content-length:").is_some()
                         {
                             *self.preread_line.lock().await = Some(line);
-                            return;
+                            return Ok(());
                         }
                     }
                 }
             }
+            Err(protocol_error(
+                "MCP stdio: too many startup non-protocol lines",
+            ))
         })
-        .await;
-
-        Ok(())
+        .await
+        .unwrap_or(Ok(()))
     }
 }
 
@@ -750,21 +762,68 @@ fn is_reconnectable_stdio_error(error: &anyhow::Error) -> bool {
     })
 }
 
-async fn read_content_length_message(
-    reader: &mut BufReader<ChildStdout>,
+/// Check before extending the accumulator, even when no newline ever arrives.
+/// The budget includes the line terminator. Callers own protocol-specific limits.
+async fn read_bounded_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    line: &mut String,
+    limit: usize,
+) -> Result<usize> {
+    let mut bytes = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            break;
+        }
+        let newline = available.iter().position(|&byte| byte == b'\n');
+        let count = newline.map_or(available.len(), |index| index + 1);
+        if count > limit.saturating_sub(bytes.len()) {
+            return Err(protocol_error(format!(
+                "MCP stdio line exceeds {limit} bytes"
+            )));
+        }
+        bytes.extend_from_slice(&available[..count]);
+        reader.consume(count);
+        if newline.is_some() {
+            break;
+        }
+    }
+    let count = bytes.len();
+    *line = String::from_utf8(bytes).map_err(protocol_error)?;
+    Ok(count)
+}
+
+async fn read_content_length_message<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
     mut line: String,
 ) -> Result<Value> {
     let mut content_length: Option<usize> = None;
+    let mut header_bytes = 0;
     loop {
+        if line.len() > MAX_MCP_HEADER_BYTES - header_bytes {
+            return Err(protocol_error("MCP stdio headers exceed 16 KiB"));
+        }
+        header_bytes += line.len();
         let t = line.trim_end_matches(['\r', '\n']).trim();
         if t.is_empty() {
             break;
         }
         if let Some(rest) = strip_prefix_ci(t, "content-length:") {
-            content_length = Some(rest.trim().parse().map_err(protocol_error)?);
+            if content_length.is_some() {
+                return Err(protocol_error("Duplicate Content-Length header"));
+            }
+            let raw = rest.trim();
+            if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(protocol_error("Invalid Content-Length header"));
+            }
+            let length: usize = raw.parse().map_err(protocol_error)?;
+            if length > MAX_MCP_MESSAGE_BYTES {
+                return Err(protocol_error("MCP stdio Content-Length exceeds 10 MiB"));
+            }
+            content_length = Some(length);
         }
         line.clear();
-        let n = reader.read_line(&mut line).await?;
+        let n = read_bounded_line(reader, &mut line, MAX_MCP_HEADER_BYTES - header_bytes).await?;
         if n == 0 {
             return Err(anyhow::Error::new(StdioConnectionClosed(
                 "MCP server closed stdout while reading headers",
@@ -836,6 +895,109 @@ impl Drop for StdioClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn bounded_lines_check_before_appending_and_preserve_following_frames() {
+        for capacity in [1, 8, 1024] {
+            let mut reader = BufReader::with_capacity(capacity, &b"1234\nnext\n"[..]);
+            let mut line = String::new();
+            assert_eq!(
+                read_bounded_line(&mut reader, &mut line, 5).await.unwrap(),
+                5
+            );
+            assert_eq!(line, "1234\n");
+            read_bounded_line(&mut reader, &mut line, 5).await.unwrap();
+            assert_eq!(line, "next\n");
+        }
+        for input in [b"123456".as_slice(), b"12345\n".as_slice()] {
+            let mut reader = BufReader::with_capacity(2, input);
+            let error = read_bounded_line(&mut reader, &mut String::new(), 5)
+                .await
+                .unwrap_err();
+            assert!(error.downcast_ref::<StdioProtocolError>().is_some());
+        }
+        let mut reader = BufReader::new(&b"tail"[..]);
+        let mut line = String::new();
+        assert_eq!(
+            read_bounded_line(&mut reader, &mut line, 4).await.unwrap(),
+            4
+        );
+        assert_eq!(line, "tail");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn content_length_rejects_oversized_invalid_and_duplicate_headers_without_a_body() {
+        for length in [
+            "999999999999",
+            "10485761",
+            "184467440737095516160",
+            "-1",
+            "+2",
+            "1.5",
+            "",
+            "abc",
+        ] {
+            // There is deliberately no body: rejection must happen from the
+            // header, before waiting for or allocating its claimed bytes.
+            let mut reader = BufReader::new(&b"\r\n"[..]);
+            let error =
+                read_content_length_message(&mut reader, format!("Content-Length: {length}\r\n"))
+                    .await
+                    .unwrap_err();
+            assert!(
+                error.downcast_ref::<StdioProtocolError>().is_some(),
+                "{length}: {error:#}"
+            );
+        }
+        for next in ["Content-Length: 2\r\n", "content-length: 3\r\n"] {
+            let mut reader = BufReader::new(next.as_bytes());
+            let error = read_content_length_message(&mut reader, "Content-Length: 2\r\n".into())
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("Duplicate Content-Length"));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn content_length_accepts_the_body_limit_and_keeps_the_next_frame() {
+        let body = format!("\"{}\"", "x".repeat(MAX_MCP_MESSAGE_BYTES - 2));
+        let input = format!("\r\n{body}{{}}\n");
+        let mut reader = BufReader::new(input.as_bytes());
+        let message =
+            read_content_length_message(&mut reader, format!("Content-Length: {}\r\n", body.len()))
+                .await
+                .unwrap();
+        assert_eq!(message.as_str().unwrap().len(), MAX_MCP_MESSAGE_BYTES - 2);
+        let mut next = String::new();
+        read_bounded_line(&mut reader, &mut next, MAX_MCP_MESSAGE_BYTES + 2)
+            .await
+            .unwrap();
+        assert_eq!(next, "{}\n");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn content_length_limits_the_complete_header_block() {
+        let first = "Content-Length: 2\r\n";
+        for extra in [0, 1] {
+            let padding = "x".repeat(MAX_MCP_HEADER_BYTES - first.len() - 6 + extra);
+            let rest = format!("X:{padding}\r\n\r\n{{}}");
+            let mut reader = BufReader::with_capacity(7, rest.as_bytes());
+            let result = read_content_length_message(&mut reader, first.into()).await;
+            if extra == 0 {
+                assert_eq!(result.unwrap(), serde_json::json!({}));
+            } else {
+                assert!(result
+                    .unwrap_err()
+                    .downcast_ref::<StdioProtocolError>()
+                    .is_some());
+            }
+        }
+        let header = format!("X:{}", "x".repeat(MAX_MCP_HEADER_BYTES));
+        let mut reader = BufReader::new(header.as_bytes());
+        assert!(read_content_length_message(&mut reader, first.into())
+            .await
+            .is_err());
+    }
 
     // --- Platform-independent tests for wrap_cmd_script logic ---
     // These run on ALL platforms (macOS, Linux, Windows) so we can

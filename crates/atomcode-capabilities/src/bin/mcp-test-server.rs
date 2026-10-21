@@ -13,6 +13,11 @@ fn main() -> io::Result<()> {
     let mut writer = stdout.lock();
     let mut initialized = false;
 
+    if std::env::var_os("MCP_TEST_OVERSIZED_STARTUP_LENGTH").is_some() {
+        writer.write_all(b"Content-Length: 999999999999\r\n\r\n")?;
+        writer.flush()?;
+    }
+
     loop {
         if initialized {
             sleep_from_env("MCP_TEST_READ_DELAY_MS")?;
@@ -134,6 +139,26 @@ fn main() -> io::Result<()> {
                     if !marker.exists() {
                         std::fs::write(marker, b"executed")?;
                         writer.write_all(&[0xff, b'\n'])?;
+                        writer.flush()?;
+                    }
+                }
+                if let Some(marker) = std::env::var_os("MCP_TEST_OVERSIZED_LINE_ONCE") {
+                    let marker = std::path::PathBuf::from(marker);
+                    if !marker.exists() {
+                        std::fs::write(marker, b"executed")?;
+                        writer.write_all(b"{\"text\":\"")?;
+                        for _ in 0..10 * 1024 {
+                            writer.write_all(&[b'x'; 1024])?;
+                        }
+                        writer.write_all(b"\"}\n")?;
+                        writer.flush()?;
+                    }
+                }
+                if let Some(marker) = std::env::var_os("MCP_TEST_OVERSIZED_LENGTH_ONCE") {
+                    let marker = std::path::PathBuf::from(marker);
+                    if !marker.exists() {
+                        std::fs::write(marker, b"executed")?;
+                        writer.write_all(b"Content-Length: 999999999999\r\n\r\n")?;
                         writer.flush()?;
                     }
                 }
