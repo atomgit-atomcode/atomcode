@@ -482,6 +482,13 @@ impl LiveViewHub {
     /// `binding`, never an unconditional reset: a successor that is already
     /// bound is left alone (`StaleBinding`).
     pub fn unbind_retired(&self, binding: &LiveBinding) -> Result<(), HubError> {
+        self.detach(binding)
+    }
+
+    /// Revoke this binding's shared view while its runtime may keep running.
+    /// This clears publication and remote control state, never cancels the
+    /// runtime, and cannot revoke a successor binding.
+    pub fn detach(&self, binding: &LiveBinding) -> Result<(), HubError> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         let current_binding_id = state
             .binding
@@ -2592,6 +2599,74 @@ mod tests {
             .unwrap_err(),
             HubError::StaleEvent
         );
+    }
+
+    #[test]
+    fn active_shared_views_can_be_revoked_and_reattached_without_cancelling() {
+        for phase in [RuntimePhase::InTurn, RuntimePhase::WaitingApproval] {
+            let hub = LiveViewHub::new();
+            let (control, commands) = control();
+            control.status.lock().unwrap().phase = phase;
+            let mut view = atomcode_coding::runtime::RuntimeLiveView::from_snapshot(
+                1,
+                "terminal".into(),
+                "/one".into(),
+                snapshot("history"),
+            );
+            view.events = vec![
+                SequencedRuntimeEvent {
+                    generation: 1,
+                    sequence: 1,
+                    event: CodingRuntimeEvent::Agent(AgentEvent::TurnStarted { turn: None }),
+                },
+                SequencedRuntimeEvent {
+                    generation: 1,
+                    sequence: 2,
+                    event: CodingRuntimeEvent::Request(atomcode_coding::RuntimeRequest {
+                        id: 42,
+                        kind: "approval".into(),
+                        payload: serde_json::json!({"tool":"bash"}),
+                        snapshot: None,
+                    }),
+                },
+            ];
+            view.sequence = Some(2);
+            let mut binding = hub
+                .bind_live_view(view.clone(), "p".into(), "f".into(), control.clone())
+                .unwrap();
+            // logout, then stop, then restart while the same runtime is active.
+            for _ in 0..3 {
+                assert_eq!(hub.unbind(&binding).unwrap_err(), HubError::ActiveTurn);
+                hub.detach(&binding).unwrap();
+                assert!(matches!(hub.join(), Err(HubError::Unbound)));
+                assert!(hub.respond(42, serde_json::Value::Null).is_err());
+                let next = hub
+                    .bind_live_view(view.clone(), "p".into(), "f".into(), control.clone())
+                    .unwrap();
+                assert_ne!(next.id, binding.id);
+                assert_eq!(hub.detach(&binding).unwrap_err(), HubError::StaleBinding);
+                assert_eq!(
+                    hub.publish(
+                        &binding,
+                        SequencedRuntimeEvent {
+                            generation: 1,
+                            sequence: 3,
+                            event: CodingRuntimeEvent::Agent(AgentEvent::TextDelta("late".into())),
+                        }
+                    )
+                    .unwrap_err(),
+                    HubError::StaleBinding
+                );
+                assert_eq!(hub.join().unwrap().binding, next);
+                binding = next;
+            }
+            assert!(
+                commands.lock().unwrap().is_empty(),
+                "detach must not dispatch cancel or shutdown"
+            );
+            assert_eq!(control.status().phase, phase);
+            hub.detach(&binding).unwrap();
+        }
     }
 
     /// A runtime that has been shut down is unbound even when the hub still

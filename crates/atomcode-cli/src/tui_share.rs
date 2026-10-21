@@ -96,35 +96,41 @@ pub async fn attach(config_path: &std::path::Path) -> Result<(), String> {
         .map_err(|error| format!("{error:?}"))?;
         *bound = Some(binding);
         atomcode_daemon::live_set_mode(mode);
-    }
-    // 第四个接点:那一端从现在起可以请这块屏幕跑一条命令。注册要在挂上之后
-    // ——`unregister_embedded_runtime` 会把这个槽清掉,先注册就白注册了。
-    let mut asked = atomcode_daemon::native_live::register_remote_command_sink();
-    let relay = relayed().0.clone();
-    let pump = tokio::spawn(async move {
-        while let Some(line) = asked.recv().await {
-            if relay.send(line).is_err() {
-                break;
+        // Keep sink and pump registration under the binding lock too: a detach
+        // must not complete and then have this attach resurrect its command sink.
+        // 第四个接点:那一端从现在起可以请这块屏幕跑一条命令。注册要在挂上之后
+        // ——`unregister_embedded_runtime` 会把这个槽清掉,先注册就白注册了。
+        let mut asked = atomcode_daemon::native_live::register_remote_command_sink();
+        let relay = relayed().0.clone();
+        let pump = tokio::spawn(async move {
+            while let Some(line) = asked.recv().await {
+                if relay.send(line).is_err() {
+                    break;
+                }
             }
+        });
+        if let Some(old) = relay_pump().lock().expect("pump poisoned").replace(pump) {
+            old.abort();
         }
-    });
-    if let Some(old) = relay_pump().lock().expect("pump poisoned").replace(pump) {
-        old.abort();
     }
     Ok(())
 }
 
 /// 摘下来。没挂着返回 `false`——`/sync off` 要能说出「本来就没共享」。
 pub fn detach() -> Result<bool, String> {
-    let taken = bound().lock().expect("binding poisoned").take();
-    let Some(binding) = taken else {
+    // Publication and attach use this same lock. Keep the local binding until
+    // the hub has revoked it, so failure cannot strand a still-bound hub with
+    // no event forwarding (and a permanently active turn flag).
+    let mut guard = bound().lock().expect("binding poisoned");
+    let Some(binding) = guard.as_ref() else {
         return Ok(false);
     };
+    atomcode_daemon::native_live::unregister_embedded_runtime(binding)
+        .map_err(|error| format!("{error:?}"))?;
+    *guard = None;
     if let Some(pump) = relay_pump().lock().expect("pump poisoned").take() {
         pump.abort();
     }
-    atomcode_daemon::native_live::unregister_embedded_runtime(&binding)
-        .map_err(|error| format!("{error:?}"))?;
     Ok(true)
 }
 
@@ -565,7 +571,9 @@ impl atomcode_tui::command::CommandSet for ShareCommands {
             },
             "app" if args == "stop" => {
                 let stopped = stop_for_phone();
-                let _ = detach();
+                if let Err(why) = detach() {
+                    return Outcome::Refused(why);
+                }
                 Outcome::Said(
                     match stopped {
                         true => tr(SMsg::AppStopped),
@@ -581,8 +589,10 @@ impl atomcode_tui::command::CommandSet for ShareCommands {
             "webui" if args == "stop" => {
                 crate::webui_relay::stop();
                 let said = atomcode_daemon::stop_server();
-                let _ = detach();
-                Outcome::Said(said)
+                match detach() {
+                    Ok(_) => Outcome::Said(said),
+                    Err(why) => Outcome::Refused(why),
+                }
             }
             "webui" => {
                 let options = match webui_options(args) {

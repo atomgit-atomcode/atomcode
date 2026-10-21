@@ -92,7 +92,9 @@ pub fn embedded_binding() -> Option<LiveBinding> {
 }
 
 pub fn unregister_embedded_runtime(binding: &LiveBinding) -> Result<(), HubError> {
-    hub().unbind(binding)?;
+    // Embedded execution belongs to the terminal. Revoking its shared view
+    // must work during a turn without cancelling that execution.
+    hub().detach(binding)?;
     let mut embedded = EMBEDDED_BINDING
         .lock()
         .unwrap_or_else(|error| error.into_inner());
