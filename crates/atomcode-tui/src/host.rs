@@ -1919,6 +1919,7 @@ impl Host {
             }
         }
         let mut m = self.moment.write().expect("moment poisoned");
+        m.mascot_started = None;
         m.mcp_panel = None;
         m.activity = crate::moment::Activity::Idle;
         m.scroll = crate::moment::ScrollPos::BOTTOM;
@@ -6847,6 +6848,8 @@ impl Host {
                 frame.place("context-menu", rect, menu.render(&vp));
             }
         }
+
+        crate::terminal_image::animate(&mut frame, moment.mascot_started, moment.now);
 
         debug_assert!(
             frame.containment_violations().is_empty(),

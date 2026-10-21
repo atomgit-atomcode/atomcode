@@ -2033,6 +2033,12 @@ impl UserInterface for Tui {
                 let left = until.saturating_duration_since(now);
                 timer = Some(timer.map_or(left, |t| t.min(left)));
             }
+            {
+                let m = self.host.moment.read().expect("moment poisoned");
+                if let Some(left) = crate::terminal_image::next_change(m.mascot_started, m.now) {
+                    timer = Some(timer.map_or(left, |every| every.min(left)));
+                }
+            }
             if self.host.mcp_needs_poll() {
                 let every = std::time::Duration::from_secs(1);
                 timer = Some(timer.map_or(every, |t| t.min(every)));
@@ -2439,6 +2445,9 @@ impl UserInterface for Tui {
                 // history — in the alternate screen that history is the shell's,
                 // so a wheel the terminal keeps would scroll the wrong thing.
                 Wake::Input(Input::Mouse(click, x, y)) => {
+                    if matches!(click, Click::Press | Click::Release) {
+                        clock.stamp(&mut self.host.moment.write().expect("moment poisoned"));
+                    }
                     // A shift-press is a press in everything but what it does
                     // to a held selection, which is decided where a press
                     // becomes a selection gesture (below).
@@ -2789,6 +2798,26 @@ impl UserInterface for Tui {
                                     continue;
                                 }
                             }
+                            // Repeated mascot clicks are still clicks, never
+                            // word/line selection over the reserved image cells.
+                            let graphics = self
+                                .host
+                                .moment
+                                .read()
+                                .expect("moment poisoned")
+                                .caps
+                                .graphics;
+                            let clicks = if clicks >= 2
+                                && crate::terminal_image::mascot_at(
+                                    &self.host.compose(self.surface.size()),
+                                    graphics,
+                                    x,
+                                    y,
+                                ) {
+                                1
+                            } else {
+                                clicks
+                            };
                             match clicks {
                                 // Forget the press so the release does not become
                                 // a `ClickAt` — which, not being a selection
@@ -8076,6 +8105,13 @@ impl Tui {
                     }
                 }
                 drop(m);
+                let frame = self.host.compose(self.surface.size());
+                let mut m = self.host.moment.write().expect("moment poisoned");
+                if crate::terminal_image::mascot_at(&frame, m.caps.graphics, x, y) {
+                    m.mascot_started = Some(m.now);
+                    return false;
+                }
+                drop(m);
                 // A click on a link opens it. The screen draws links as OSC 8
                 // for the terminal to open, but this screen captures the mouse,
                 // so the click comes here instead and the terminal never sees
@@ -8083,7 +8119,7 @@ impl Tui {
                 // off the frame as painted, so it is the text a person sees at
                 // that cell; asked before the fold, because a URL inside a tool
                 // result is something to open, not a reason to fold the call.
-                if let Some(url) = self.host.compose(self.surface.size()).link_at(x, y) {
+                if let Some(url) = frame.link_at(x, y) {
                     if let Some(url) = link_to_open(&url) {
                         self.open_link(url);
                         return false;
@@ -14151,6 +14187,73 @@ mod paste_habit_tests {
 
     fn typed(host: &Host) -> String {
         host.moment.read().expect("moment poisoned").input.clone()
+    }
+
+    #[test]
+    fn clicking_the_mascot_starts_and_restarts_only_image_playback() {
+        let (host, tui) = screen();
+        host.modules
+            .add_producer(crate::modules::transcript::Transcript::new())
+            .unwrap();
+        host.stream.write().unwrap().writer("welcome").emit(
+            crate::block::Coord::default(),
+            Arc::new(crate::content::WelcomeBlock {
+                cwd: "project".into(),
+                model: None,
+                version: "test",
+                heading: "Tips".into(),
+                tips: Vec::new(),
+                brand: Arc::new(crate::content::Brand::default()),
+                note: None,
+            }),
+        );
+        {
+            let mut m = host.moment.write().unwrap();
+            m.caps.graphics = crate::caps::Graphics::ITerm2;
+            m.now = Timestamp::millis(1000);
+            m.input = "keep draft".into();
+            m.caret = m.input.len();
+        }
+        let scene = host.compose((60, 24));
+        let rect = crate::terminal_image::visible(&scene).unwrap().rect;
+        tui.act(Action::ClickAt(rect.x + 1, rect.y + 1), &tui.client);
+        assert_eq!(
+            host.moment.read().unwrap().mascot_started,
+            Some(Timestamp::millis(1000))
+        );
+        assert_eq!(
+            crate::terminal_image::visible(&host.compose((60, 24)))
+                .unwrap()
+                .png,
+            crate::terminal_image::MASCOT_WAIT_PNG
+        );
+        host.moment.write().unwrap().now = Timestamp::millis(2500);
+        assert_eq!(
+            crate::terminal_image::visible(&host.compose((60, 24)))
+                .unwrap()
+                .png,
+            crate::terminal_image::MASCOT_GO_PNG
+        );
+        tui.act(Action::ClickAt(rect.x + 1, rect.y + 1), &tui.client);
+        assert_eq!(
+            host.moment.read().unwrap().mascot_started,
+            Some(Timestamp::millis(2500))
+        );
+        assert_eq!(host.moment.read().unwrap().input, "keep draft");
+        {
+            let mut m = host.moment.write().unwrap();
+            m.caps.graphics = crate::caps::Graphics::None;
+            m.mascot_started = None;
+        }
+        host.compose((60, 24));
+        tui.act(Action::ClickAt(rect.x + 1, rect.y + 1), &tui.client);
+        assert!(
+            host.moment.read().unwrap().mascot_started.is_none(),
+            "pixel mascot stays static"
+        );
+        host.moment.write().unwrap().mascot_started = Some(Timestamp::millis(2500));
+        host.switch_view();
+        assert!(host.moment.read().unwrap().mascot_started.is_none());
     }
 
     #[test]

@@ -548,6 +548,8 @@ pub struct Moment {
     /// clock read inside `render` — that would make the whole test loop
     /// non-deterministic while leaving it green.
     pub tick: u64,
+    /// Click-triggered mascot playback; UI-only, never persisted as a fact.
+    pub mascot_started: Option<Timestamp>,
     /// Injected wall time, for anything that needs a real interval (a
     /// countdown). Still injected: tests set it, `render` never reads a clock.
     pub now: Timestamp,

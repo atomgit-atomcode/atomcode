@@ -9,6 +9,65 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 pub const MASCOT_WIDTH: u16 = 18;
 pub const MASCOT_HEIGHT: u16 = 8;
 pub const MASCOT_PNG: &[u8] = include_bytes!("../assets/mascot.png");
+pub const MASCOT_WAIT_PNG: &[u8] = include_bytes!("../assets/mascot-wait.png");
+pub const MASCOT_GO_PNG: &[u8] = include_bytes!("../assets/mascot-go.png");
+const FRAME_MS: u64 = 1500;
+
+/// Time until the next boundary, from the host-injected clock. No repeating
+/// timer is needed once the original frame returns.
+pub(crate) fn next_change(
+    started: Option<crate::moment::Timestamp>,
+    now: crate::moment::Timestamp,
+) -> Option<std::time::Duration> {
+    let elapsed = now.0.saturating_sub(started?.0);
+    let boundary = if elapsed < FRAME_MS {
+        FRAME_MS
+    } else if elapsed < FRAME_MS * 2 {
+        FRAME_MS * 2
+    } else {
+        return None;
+    };
+    Some(std::time::Duration::from_millis(boundary - elapsed))
+}
+
+fn mascot_png(
+    started: Option<crate::moment::Timestamp>,
+    now: crate::moment::Timestamp,
+) -> &'static [u8] {
+    match started.map(|at| now.0.saturating_sub(at.0)) {
+        Some(elapsed) if elapsed < FRAME_MS => MASCOT_WAIT_PNG,
+        Some(elapsed) if elapsed < FRAME_MS * 2 => MASCOT_GO_PNG,
+        _ => MASCOT_PNG,
+    }
+}
+
+/// Change paint metadata after stream composition so settled content/cache keys
+/// never depend on animation time. Placement stays identical for every frame.
+pub(crate) fn animate(
+    frame: &mut Frame,
+    started: Option<crate::moment::Timestamp>,
+    now: crate::moment::Timestamp,
+) {
+    let png = mascot_png(started, now);
+    for part in &mut frame.parts {
+        for line in &mut part.lines {
+            if let Some(image) = line.image.as_mut() {
+                if image.png == MASCOT_PNG {
+                    image.png = png;
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn mascot_at(frame: &Frame, graphics: Graphics, x: u16, y: u16) -> bool {
+    supported(graphics)
+        && visible(frame).is_some_and(|image| {
+            image.rect.contains(x, y)
+                && [MASCOT_PNG, MASCOT_WAIT_PNG, MASCOT_GO_PNG].contains(&image.png)
+        })
+}
+
 // A single decorative image slot, owned by this application, not a global delete.
 const IMAGE_ID: u32 = 0x41544f4d;
 
@@ -125,6 +184,42 @@ mod tests {
         frame.place("welcome", Rect::new(0, 2, 80, 8), rows);
         frame.place("status", Rect::new(0, 23, 80, 1), vec![Line::raw("idle")]);
         frame
+    }
+
+    #[test]
+    fn a_click_sequence_has_fixed_geometry_and_a_finite_deadline() {
+        use crate::moment::Timestamp;
+        let started = Some(Timestamp::millis(1000));
+        let rect = visible(&frame()).unwrap().rect;
+        for (at, expected, next_ms) in [
+            (1000, MASCOT_WAIT_PNG, Some(1500)),
+            (2499, MASCOT_WAIT_PNG, Some(1)),
+            (2500, MASCOT_GO_PNG, Some(1500)),
+            (3999, MASCOT_GO_PNG, Some(1)),
+            (4000, MASCOT_PNG, None),
+            (5000, MASCOT_PNG, None),
+        ] {
+            let now = Timestamp::millis(at);
+            let mut scene = frame();
+            animate(&mut scene, started, now);
+            let image = visible(&scene).unwrap();
+            assert_eq!(image.png, expected);
+            assert_eq!(image.rect, rect, "animation must not change layout");
+            assert_eq!(next_change(started, now).map(|d| d.as_millis()), next_ms);
+            assert!(mascot_at(&scene, Graphics::ITerm2, rect.x, rect.y));
+            assert!(!mascot_at(&scene, Graphics::None, rect.x, rect.y));
+        }
+        assert!(next_change(None, Timestamp::millis(1000)).is_none());
+        for png in [MASCOT_WAIT_PNG, MASCOT_GO_PNG] {
+            let reader = png::Decoder::new(std::io::Cursor::new(png))
+                .read_info()
+                .unwrap();
+            assert_eq!((reader.info().width, reader.info().height), (512, 512));
+            assert_eq!(reader.info().color_type, png::ColorType::Rgba);
+        }
+        let mut covered = frame();
+        covered.place("menu", rect, vec![Line::raw("menu")]);
+        assert!(!mascot_at(&covered, Graphics::ITerm2, rect.x, rect.y));
     }
 
     #[test]
