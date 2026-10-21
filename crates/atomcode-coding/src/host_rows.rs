@@ -618,7 +618,10 @@ impl Waterfall<AgentRequest> for Bridge {
                 }
 
                 if response.tool_calls.is_empty() && !response.truncated {
-                    let mut messages = req.messages.clone();
+                    // Stop checks need the same execution positions as
+                    // pre_request: a mid-turn user message is steering, not a
+                    // new turn. Keep this metadata local to the hook view.
+                    let mut messages = with_logged_meta(&req.messages, &logged);
                     messages.push(message);
                     let convo = Conversation {
                         messages,
