@@ -1739,7 +1739,6 @@ pub enum Msg<'a> {
     LiveCached {
         hit: &'a str,
     },
-    LiveSpeedPending,
     LiveSpeed {
         rate: u64,
     },
