@@ -4100,7 +4100,11 @@ model = "missing-type"
 
     #[test]
     fn saved_config_roundtrips_language() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        // A path inside a temp dir, not a live `NamedTempFile`: the store writes by
+        // renaming over the target, and Windows refuses that while the target is held
+        // open — which a kept `NamedTempFile` is, for the whole test.
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("config.toml");
         let mut cfg = Config {
             language: Some(crate::locale::Locale::ZhCn),
             ..Config::with_default_provider("p")
@@ -4131,9 +4135,9 @@ model = "missing-type"
                 retry_max_attempts: None,
             },
         );
-        cfg.save(tmp.path()).unwrap();
+        cfg.save(&target).unwrap();
 
-        let loaded = Config::load(tmp.path()).unwrap();
+        let loaded = Config::load(&target).unwrap();
         assert_eq!(loaded.language, Some(crate::locale::Locale::ZhCn));
     }
 

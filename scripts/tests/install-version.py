@@ -13,6 +13,26 @@ CONSTANTS = "\n".join(line for line in SOURCE.splitlines() if line.startswith("R
 RESOLVER = SOURCE[SOURCE.index("release_tag() {"):SOURCE.index('\nBIN_NAME=')]
 
 
+def working_bash():
+    """A `bash` that actually runs, or None.
+
+    Windows ships a WSL launcher named `bash.exe`, so `shutil.which` alone is not an
+    answer: with no distribution installed it exits non-zero before running anything and
+    the failure reads as an installer bug. The shell that matters is one that runs.
+    """
+    found = shutil.which("bash")
+    if not found:
+        return None
+    try:
+        probe = subprocess.run([found, "-c", "exit 0"], capture_output=True)
+    except OSError:
+        return None
+    return found if probe.returncode == 0 else None
+
+
+BASH = working_bash()
+
+
 class InstallerVersion(unittest.TestCase):
     def resolve(self, api, manifest, override=None, api_status=0, manifest_status=0, shell=("sh",)):
         with tempfile.TemporaryDirectory() as directory:
@@ -69,9 +89,9 @@ printf 'RESULT=%s\\n' "$VERSION"
                 self.assertNotIn("RESULT=", result.stdout)
                 self.assertEqual(len(calls), 2)
 
-    @unittest.skipUnless(shutil.which("bash"), "bash is unavailable")
+    @unittest.skipUnless(BASH, "no working bash is available")
     def test_empty_api_metadata_still_falls_back_with_pipefail(self):
-        result, calls = self.resolve('{}', '{"version":"v9.8.5"}', shell=("bash", "-o", "pipefail"))
+        result, calls = self.resolve('{}', '{"version":"v9.8.5"}', shell=(BASH, "-o", "pipefail"))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("RESULT=v9.8.5", result.stdout)
         self.assertEqual(len(calls), 2)

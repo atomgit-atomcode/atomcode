@@ -1869,12 +1869,26 @@ mod tests {
         HookConfig::from_plugin_spec("PreToolUse", None, command.into(), None, root.into()).unwrap()
     }
 
+    /// A plugin entry point whose interpreter actually resolves on this host.
+    ///
+    /// The pre-check resolves a bare interpreter name against PATH and accepts only a real
+    /// program found there — `python3` on unix, and on Windows `.exe`/`.com` only, where
+    /// that name does not exist. The files below are the point (an entry script and its
+    /// imported helper); which interpreter runs them is not.
+    fn host_plugin_entry() -> &'static str {
+        if cfg!(windows) {
+            "python entry.py"
+        } else {
+            "python3 entry.py"
+        }
+    }
+
     #[test]
     fn a_loaded_plugin_cannot_execute_changed_content() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("entry.py"), "import helper").unwrap();
         std::fs::write(root.path().join("helper.py"), "safe = True").unwrap();
-        let config = plugin_config(root.path(), "python3 entry.py");
+        let config = plugin_config(root.path(), host_plugin_entry());
         assert!(plugin_hook_command(&config).is_ok());
         std::fs::write(root.path().join("helper.py"), "safe = False").unwrap();
         assert!(plugin_hook_command(&config)
@@ -1969,8 +1983,16 @@ mod tests {
                 "{command}"
             );
         }
+        // The bare script name needs no interpreter; the rest name one, and the pre-check
+        // accepts only a program this host resolves (`sh`/`bash`/`python3` are unix names,
+        // and Windows takes `.exe`/`.com` only). The rejection rules above are what this
+        // test is for, and they run everywhere.
+        assert!(
+            plugin_hook_command(&plugin_config(root.path(), "check.sh")).is_ok(),
+            "check.sh"
+        );
+        #[cfg(unix)]
         for command in [
-            "check.sh",
             "sh check.sh",
             "bash \"${CLAUDE_PLUGIN_ROOT}/check.sh\" --verbose",
             "python3 check.sh 'literal argument'",
@@ -2021,6 +2043,7 @@ mod tests {
         assert!(cc.before(&mut call, &tool, &rt).await.is_deny());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn before_denies_on_cc_deny() {
         // A hook that prints a CC deny decision blocks the call.
@@ -2068,6 +2091,7 @@ mod tests {
         assert!(out.stdout.contains("hooktest-ok"), "stdout: {}", out.stdout);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn before_ask_forces_approval_round_trip_and_fails_closed() {
         // REGRESSION: a hook `permissionDecision:"ask"` must FORCE a real approval prompt,
@@ -2106,6 +2130,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn user_prompt_block_returns_err() {
         let hook = HookConfig {
@@ -2358,6 +2383,7 @@ mod tests {
 
     /// Exit 2 WITH a deliberate reason DOES block (CC's bare exit-2 contract), and the
     /// reason is surfaced (stdout, then stderr) rather than an opaque "(exit 2)".
+    #[cfg(unix)]
     #[tokio::test]
     async fn before_deliberate_exit_2_blocks() {
         let out = run_before("echo BLOCKED; exit 2").await;
@@ -2408,6 +2434,7 @@ mod tests {
 
     /// UserPromptSubmit mirrors `before`: a DELIBERATE exit 2 (with a reason) blocks the
     /// prompt (Err), other non-zero does not (the prompt proceeds).
+    #[cfg(unix)]
     #[tokio::test]
     async fn user_prompt_exit_code_contract() {
         let cc = CCExternalHooks::new(vec![prompt_hook("echo BLOCKED; exit 2")], "/tmp");
@@ -2497,6 +2524,7 @@ mod tests {
 
     /// F3: a PostToolUse hook with a tool-name matcher now fires for the matching tool
     /// (the name `before` recorded for the call_id) and is skipped for a non-match.
+    #[cfg(unix)]
     #[tokio::test]
     async fn post_tool_use_honors_matcher() {
         let hook = HookConfig {
@@ -2554,6 +2582,7 @@ mod tests {
     /// PostToolUseFailure: a FAILED tool call (`is_error`) fires the failure event
     /// instead of PostToolUse, so a plugin can tell success from failure. Both
     /// events share the same payload/rewrite semantics.
+    #[cfg(unix)]
     #[tokio::test]
     async fn failed_tool_fires_post_tool_use_failure() {
         let ok_hook = HookConfig {
@@ -2640,6 +2669,7 @@ mod tests {
     /// E4: the call id is threaded into the tool payload, so a hook can correlate
     /// a PreToolUse with the matching Post frame (and tell concurrent same-name
     /// calls apart). The hook greps its own stdin for the id and blocks on a hit.
+    #[cfg(unix)]
     #[tokio::test]
     async fn call_id_is_threaded_into_the_tool_payload() {
         let hook = HookConfig {

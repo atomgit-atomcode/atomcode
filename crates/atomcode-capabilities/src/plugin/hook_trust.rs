@@ -249,7 +249,15 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("entry.py"), "import helper").unwrap();
         std::fs::write(root.path().join("helper.py"), "safe = True").unwrap();
-        let mut hook = mk("UserPromptSubmit", None, "python3 entry.py");
+        // The interpreter must be one this host resolves (twin in `cc_hooks`): the
+        // pre-check accepts a real program found on PATH, and Windows resolves `.exe`/
+        // `.com` only, where a bare `python3` does not exist.
+        let entry = if cfg!(windows) {
+            "python entry.py"
+        } else {
+            "python3 entry.py"
+        };
+        let mut hook = mk("UserPromptSubmit", None, entry);
         hook.plugin_root = root.path().into();
         let original = plugin_hook_set_hash(&[hook.clone()]);
         assert!(!original.starts_with("invalid:"));

@@ -6341,7 +6341,13 @@ mod tests {
         );
     }
 
+    /// Only where reqwest is built on rustls. The Windows build uses SChannel
+    /// (`native-tls`) so that `*.atomgit.com` is not RST as a rustls fingerprint, and
+    /// there `from_der` validates through the OS instead of deferring to `build()` — the
+    /// premise this proof rests on. The user-facing backstop is covered on both backends
+    /// by `build_http_client_recovers_from_malformed_ssl_cert_file_via_backstop`.
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn reqwest_aborts_whole_build_on_one_bad_root() {
         // ROOT-CAUSE PROOF (issue #514): `reqwest::Certificate::from_der` stores bytes
         // WITHOUT validating under rustls; validation is deferred to
