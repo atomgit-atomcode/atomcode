@@ -517,11 +517,12 @@ fn doing(state: &State, moment: &Moment) -> Option<String> {
 /// The order is what a person does with them: the clock answers "is it stuck",
 /// the two token counts answer "is it getting anywhere", the cache share answers
 /// "is the context being re-sent or re-read". Estimated generation throughput
-/// follows the authoritative token counts and precedes the cache share. On a
+/// follows the authoritative token counts and cache share. On a
 /// narrow screen, the trailing figures are dropped whole.
 ///
-/// Input is the latest context size; output, speed and cache reuse cover the
-/// whole turn. Elapsed time includes waiting and tools; generation time does not.
+/// Input is the latest context size; output and cache reuse cover the whole
+/// turn. Speed covers only the current request while it is generating.
+/// Elapsed time includes waiting and tools; generation time does not.
 fn parts(state: &State, moment: &Moment) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     // Compacting keeps the cumulative goal clock, or its own phase clock for
@@ -557,10 +558,9 @@ fn parts(state: &State, moment: &Moment) -> Vec<String> {
         out.push(t(Msg::LiveElapsed { took: &short(ms) }).into_owned());
     }
     append_usage(&mut out, state, moment);
-    out.push(match moment.generation.rate(moment.now) {
-        Some(rate) => t(Msg::LiveSpeed { rate }).into_owned(),
-        None => t(Msg::LiveSpeedPending).into_owned(),
-    });
+    if let Some(rate) = moment.generation.rate(moment.now) {
+        out.push(t(Msg::LiveSpeed { rate }).into_owned());
+    }
     out
 }
 
@@ -1483,8 +1483,7 @@ mod tests {
         assert!(width::str_width(&narrow) <= 20);
         assert!(!narrow.contains("tok/s"), "drop whole figures: {narrow}");
 
-        // Completion calibrates the estimate; tools and the next request's
-        // first-token wait retain it without adding wall time to generation.
+        // Finished generation and the next first-token wait have no live speed.
         for event in [
             SessionEvent::Usage {
                 turn: 1,
@@ -1508,7 +1507,7 @@ mod tests {
         moment.now = Timestamp::millis(120_000);
         let waiting = line_at(&state, &moment, 180);
         assert!(waiting.contains("正在等待模型"), "{waiting}");
-        assert!(waiting.contains("100 tok/s"), "{waiting}");
+        assert!(!waiting.contains("tok/s"), "{waiting}");
         assert!(!waiting.contains("均速"), "{waiting}");
     }
 
@@ -1783,12 +1782,13 @@ mod tests {
         );
     }
     #[test]
-    fn missing_sampling_shows_a_placeholder_instead_of_dropping_speed() {
+    fn missing_sampling_hides_speed_and_keeps_elapsed_time() {
         let state = fold(&a_turn());
         let mut moment = Moment::default().working();
         moment.now = Timestamp::millis(62_000);
         moment.turn_started = Some(Timestamp::millis(0));
         let line = line_at(&state, &moment, 180);
-        assert!(line.contains("— tok/s"), "{line}");
+        assert!(!line.contains("tok/s"), "{line}");
+        assert!(line.contains("耗时 1m02s"), "{line}");
     }
 }

@@ -1,4 +1,4 @@
-//! Ephemeral turn-average throughput. The host supplies time; replay invents none.
+//! Ephemeral current-request generation throughput. The host supplies time; replay invents none.
 use crate::moment::Timestamp;
 use atomcode_harness::session::SessionEvent;
 
@@ -8,16 +8,9 @@ struct Request {
     started: Option<Timestamp>,
     ended: Option<Timestamp>,
     chars: u64,
-    reported: Option<u32>,
 }
 
 impl Request {
-    fn measured(&self, now: Timestamp) -> bool {
-        self.ended.is_some()
-            && self.reported.is_some_and(|tokens| tokens > 0)
-            && self.reading(now).is_some()
-    }
-
     fn reading(&self, now: Timestamp) -> Option<(u64, u64)> {
         let started = self.started?;
         let ms = self
@@ -25,7 +18,7 @@ impl Request {
             .unwrap_or(now)
             .as_millis()
             .saturating_sub(started.as_millis());
-        let tokens = self.reported.map(u64::from).unwrap_or(self.chars / 4);
+        let tokens = self.chars / 4;
         (ms > 0).then_some((tokens, ms))
     }
 }
@@ -34,9 +27,6 @@ impl Request {
 pub struct Generation {
     turn: Option<u64>,
     request: Option<Request>,
-    completed_tokens: u64,
-    completed_ms: u64,
-    completed_reported: bool,
 }
 
 impl Generation {
@@ -62,17 +52,6 @@ impl Generation {
                 {
                     return;
                 }
-                if let Some(request) = self
-                    .request
-                    .take()
-                    .filter(|request| request.ended.is_some())
-                {
-                    if let Some((tokens, ms)) = request.reading(now) {
-                        self.completed_tokens = self.completed_tokens.saturating_add(tokens);
-                        self.completed_ms = self.completed_ms.saturating_add(ms);
-                        self.completed_reported |= request.measured(now);
-                    }
-                }
                 self.turn = Some(*turn);
                 self.request = Some(Request {
                     id,
@@ -89,13 +68,12 @@ impl Generation {
                     request.chars = request.chars.saturating_add(delta.chars().count() as u64);
                 }
             }
-            SessionEvent::Usage { turn, round, usage } => {
+            SessionEvent::Usage { turn, round, .. } => {
                 if let Some(request) = self
                     .request
                     .as_mut()
                     .filter(|request| request.id == (*turn, *round))
                 {
-                    request.reported = Some(usage.completion);
                     request.ended.get_or_insert(now);
                 }
             }
@@ -118,7 +96,7 @@ impl Generation {
                     .as_mut()
                     .filter(|request| request.ended.is_none())
                 {
-                    // Discard the failed attempt, keeping successful earlier requests.
+                    // Discard the failed attempt before measuring the retry.
                     *request = Request {
                         id: request.id,
                         ..Request::default()
@@ -144,30 +122,20 @@ impl Generation {
         false
     }
 
-    /// Streaming estimate only; provider usage corrects the rate at request end.
+    /// Streaming token estimate for the current request.
     pub fn tokens(&self) -> u64 {
         self.request.as_ref().map_or(0, |request| request.chars / 4)
     }
 
-    /// Weighted turn average. First-token waits and gaps between requests do not
-    /// enter the denominator. Reasoning and prose belong to the same generation.
+    /// Current generation only. Finished requests and first-token waits have
+    /// no live speed; each request starts a fresh sampling interval.
     pub fn rate(&self, now: Timestamp) -> Option<u64> {
-        let (tokens, ms) = self
-            .request
-            .as_ref()
-            .and_then(|request| request.reading(now))
-            .unwrap_or_default();
-        let tokens = self.completed_tokens.saturating_add(tokens);
-        let ms = self.completed_ms.saturating_add(ms);
-        (ms > 0
-            && tokens > 0
-            && (ms >= 1_000
-                || self.completed_reported
-                || self
-                    .request
-                    .as_ref()
-                    .is_some_and(|request| request.measured(now))))
-        .then(|| (tokens as f64 * 1_000.0 / ms as f64).round() as u64)
+        let request = self.request.as_ref()?;
+        if request.ended.is_some() {
+            return None;
+        }
+        let (tokens, ms) = request.reading(now)?;
+        (ms >= 1_000 && tokens > 0).then(|| (tokens as f64 * 1_000.0 / ms as f64).round() as u64)
     }
 }
 
@@ -218,7 +186,7 @@ mod tests {
         g.absorb(&event, Timestamp::millis(ms));
     }
     #[test]
-    fn averages_requests_and_holds_during_tools_and_first_token_waits() {
+    fn measures_each_request_and_hides_during_tools_and_first_token_waits() {
         let mut g = Generation::default();
         at(&mut g, header(1), 0);
         assert_eq!(g.rate(Timestamp::millis(60_000)), None);
@@ -228,21 +196,22 @@ mod tests {
         assert_eq!(g.rate(Timestamp::millis(62_000)), Some(100));
         at(&mut g, usage(1, 300), 62_000);
         at(&mut g, message(1), 62_000);
-        assert_eq!(g.rate(Timestamp::millis(90_000)), Some(150));
+        assert_eq!(g.rate(Timestamp::millis(90_000)), None);
         at(&mut g, header(2), 90_000);
-        assert_eq!(g.rate(Timestamp::millis(150_000)), Some(150));
+        assert_eq!(g.rate(Timestamp::millis(150_000)), None);
         at(&mut g, chunk(1, true, "late chunk"), 150_000);
         at(&mut g, usage(1, 999), 150_000);
         at(&mut g, chunk(2, false, &"a".repeat(400)), 150_000);
+        assert_eq!(g.rate(Timestamp::millis(152_000)), Some(50));
         at(&mut g, usage(2, 100), 154_000);
         assert_eq!(
             g.rate(Timestamp::millis(200_000)),
-            Some(67),
-            "400 tokens / 6 seconds, not the mean of request rates"
+            None,
+            "finished requests have no live speed"
         );
     }
     #[test]
-    fn retry_discards_partial_attempt_but_preserves_successful_requests() {
+    fn retry_discards_partial_attempt() {
         let mut g = Generation::default();
         at(&mut g, header(1), 0);
         at(&mut g, chunk(1, false, "你好世界"), 100);
@@ -261,12 +230,12 @@ mod tests {
             5_000,
         );
         assert_eq!(g.tokens(), 0);
-        assert_eq!(g.rate(Timestamp::millis(100_000)), Some(50));
+        assert_eq!(g.rate(Timestamp::millis(100_000)), None);
         at(&mut g, chunk(2, false, &"a".repeat(400)), 100_000);
         at(&mut g, message(2), 102_000);
-        // Also accept usage after the message without counting that request twice.
+        // Late usage must not revive a finished generation.
         at(&mut g, usage(2, 300), 110_000);
-        assert_eq!(g.rate(Timestamp::millis(120_000)), Some(100));
+        assert_eq!(g.rate(Timestamp::millis(120_000)), None);
         at(&mut g, SessionEvent::TurnStart { turn: 2 }, 130_000);
         at(&mut g, usage(2, 999), 131_000);
         assert_eq!(g.rate(Timestamp::millis(140_000)), None);
@@ -284,7 +253,7 @@ mod tests {
         assert_eq!(g.rate(Timestamp::millis(200_000)), None);
     }
     #[test]
-    fn pure_tool_output_measures_only_generation_and_holds_while_waiting() {
+    fn pure_tool_output_hides_speed_after_generation() {
         let mut g = Generation::default();
         at(&mut g, header(1), 0);
         assert!(!g.tool_stream(None, "", Timestamp::millis(50_000)));
@@ -292,10 +261,10 @@ mod tests {
         assert!(g.tool_stream(Some("read_file"), "{", Timestamp::millis(60_000)));
         g.tool_stream(None, &"a".repeat(400), Timestamp::millis(61_000));
         at(&mut g, usage(1, 94), 62_000);
-        assert_eq!(g.rate(Timestamp::millis(63_000)), Some(47));
+        assert_eq!(g.rate(Timestamp::millis(63_000)), None);
         assert!(!g.tool_stream(Some("late"), "late", Timestamp::millis(64_000)));
         at(&mut g, header(2), 70_000);
-        assert_eq!(g.rate(Timestamp::millis(130_000)), Some(47));
+        assert_eq!(g.rate(Timestamp::millis(130_000)), None);
     }
 
     #[test]
@@ -306,7 +275,7 @@ mod tests {
         g.tool_stream(Some("f"), &"b".repeat(399), Timestamp::millis(11_000));
         assert_eq!(g.rate(Timestamp::millis(12_000)), Some(100));
         at(&mut g, usage(1, 400), 12_000);
-        assert_eq!(g.rate(Timestamp::millis(99_000)), Some(200));
+        assert_eq!(g.rate(Timestamp::millis(99_000)), None);
         at(&mut g, SessionEvent::TurnStart { turn: 2 }, 100_000);
         at(
             &mut g,
@@ -335,7 +304,7 @@ mod tests {
         assert_eq!(g.rate(Timestamp::millis(180_000)), None);
     }
     #[test]
-    fn final_usage_can_measure_a_fast_tool_response_without_a_one_second_wait() {
+    fn fast_tool_response_does_not_leave_a_stale_speed() {
         let mut g = Generation::default();
         at(&mut g, header(1), 0);
         g.tool_stream(Some("read_file"), "{", Timestamp::millis(60_000));
@@ -345,8 +314,8 @@ mod tests {
             "streaming estimates still need a stable interval"
         );
         at(&mut g, usage(1, 94), 60_500);
-        assert_eq!(g.rate(Timestamp::millis(61_000)), Some(188));
+        assert_eq!(g.rate(Timestamp::millis(61_000)), None);
         at(&mut g, header(2), 70_000);
-        assert_eq!(g.rate(Timestamp::millis(120_000)), Some(188));
+        assert_eq!(g.rate(Timestamp::millis(120_000)), None);
     }
 }
