@@ -16,7 +16,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 const SEARCH: &str = "mcp_search";
-const MAX_MATCHES: usize = 5;
+const DEFAULT_MATCHES: usize = 8;
+const MAX_MATCHES: usize = 32;
 const DESCRIPTION_CHARS: usize = 240;
 
 fn is_mcp(name: &str) -> bool {
@@ -93,7 +94,7 @@ fn search(tools: &[ToolDef], args: SearchArgs, budget: usize) -> Value {
         b_score.cmp(a_score).then_with(|| a.name.cmp(&b.name))
     });
     let total = ranked.len();
-    let limit = args.limit.unwrap_or(MAX_MATCHES).clamp(1, MAX_MATCHES);
+    let limit = args.limit.unwrap_or(DEFAULT_MATCHES).clamp(1, MAX_MATCHES);
     let mut remaining = budget;
     let matches = ranked.into_iter().skip(args.offset).take(limit).map(|(_, tool)| {
         let bytes = schema_bytes(tool);
@@ -213,12 +214,12 @@ impl Tool for SearchTool {
         SEARCH
     }
     fn description(&self) -> &str {
-        "Find and load MCP tools by keywords in server/tool names or descriptions. Search before using an external capability whose schema is absent. Empty query browses the catalog; offset pages results. Loads at most five tools for the NEXT request, replacing the previous selection. Does not execute tools."
+        "Find and load MCP tools by keywords in server/tool names or descriptions. Search before using an external capability whose schema is absent. Empty query browses the catalog; offset pages results. Returns eight matches by default; limit can request up to 32. Full schemas load within the schema byte budget for the NEXT request, replacing the previous selection. Does not execute tools."
     }
     fn parameters_schema(&self) -> Value {
         json!({"type":"object","properties":{
             "query":{"type":"string","description":"Keywords or an exact mcp__server__tool name; empty string browses."},
-            "limit":{"type":"integer","minimum":1,"maximum":5},
+            "limit":{"type":"integer","minimum":1,"maximum":32,"default":8},
             "offset":{"type":"integer","minimum":0}
         },"required":["query"],"additionalProperties":false})
     }
@@ -234,7 +235,7 @@ impl Tool for SearchTool {
             _ => return ToolResult {
                 is_error: true,
                 content:
-                    "Expected query (at most 512 characters), optional limit (1..5), and offset."
+                    "Expected query (at most 512 characters), optional limit (1..32), and offset."
                         .into(),
                 ..Default::default()
             },
@@ -475,7 +476,7 @@ mod tests {
         let result = search(
             &tools,
             SearchArgs {
-                limit: Some(999),
+                limit: Some(5),
                 offset: 5,
                 ..Default::default()
             },
@@ -497,7 +498,32 @@ mod tests {
             .contains("schema"));
         let selected = search(&tools, SearchArgs::default(), 1_000);
         let names = selected["loaded_tools"].as_array().unwrap();
-        assert!(!names.is_empty() && names.len() < 5);
+        assert!(!names.is_empty() && names.len() < DEFAULT_MATCHES);
+    }
+
+    #[test]
+    fn match_limits_are_adjustable_and_selected_tools_survive_projection() {
+        let mut tools = (0..50)
+            .map(|i| tool(&format!("mcp__many__{i:02}"), 0))
+            .collect::<Vec<_>>();
+        tools.push(discovery());
+        for (limit, expected) in [(None, 8), (Some(16), 16), (Some(999), 32)] {
+            let found = search(
+                &tools,
+                SearchArgs {
+                    limit,
+                    ..Default::default()
+                },
+                schema_budget(128_000),
+            );
+            assert_eq!(found["matches"].as_array().unwrap().len(), expected);
+            let mut next = request(tools.clone(), pair("search", SEARCH, found));
+            project(&mut next, McpToolSearchMode::On, 128_000);
+            assert_eq!(
+                next.tools.iter().filter(|t| is_mcp(&t.name)).count(),
+                expected
+            );
+        }
     }
 
     #[test]
