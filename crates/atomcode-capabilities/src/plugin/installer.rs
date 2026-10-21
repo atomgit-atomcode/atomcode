@@ -1569,6 +1569,62 @@ mod tests {
         assert!(!root.path().join("out/special").exists());
     }
 
+    /// The Windows counterpart to the link test above.
+    ///
+    /// A junction is a reparse point and `FileType::is_symlink` reports it as one, so the
+    /// guard in `copy_plugin_tree` refuses it before `is_dir()` can put it on the stack —
+    /// which is what stops a junction pointing at an ancestor from cycling. Real NTFS
+    /// symlinks need Developer Mode or an elevated shell; a junction is what an ordinary
+    /// account can build, and it goes through the same line.
+    ///
+    /// Deliberately NOT a cycle: if the guard ever regresses this copy finishes and the
+    /// assertions fail, rather than hanging the suite. The cycle shares the same
+    /// `is_symlink` line, which the unix fixture above already pins.
+    #[cfg(windows)]
+    #[test]
+    fn plugin_copy_rejects_windows_junctions_and_removes_failed_staging() {
+        use std::os::windows::process::CommandExt;
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        std::fs::create_dir_all(target.join("sub")).unwrap();
+        let source = root.path().join("pkg");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("payload"), "data").unwrap();
+
+        let link = source.join("loop");
+        // `mklink` is a cmd builtin: hand the whole command over as one string, or cmd
+        // re-splits the paths and answers "Invalid parameter".
+        let mut cmd = Command::new("cmd");
+        cmd.arg("/C");
+        cmd.raw_arg(format!(
+            "mklink /J \"{}\" \"{}\"",
+            link.display(),
+            target.display()
+        ));
+        let made = cmd.status().unwrap();
+        if !made.success() || !link.exists() {
+            eprintln!("skipping: this host cannot create a junction (needs NTFS)");
+            return;
+        }
+
+        let copy_target = root.path().join("out/pkg");
+        let error = copy_plugin_tree(&source, &copy_target).unwrap_err();
+        assert!(error.to_string().contains("symbolic links"), "{error:#}");
+        assert!(!copy_target.exists());
+        assert_eq!(
+            std::fs::read_dir(copy_target.parent().unwrap())
+                .unwrap()
+                .count(),
+            0,
+            "failed stage leaked"
+        );
+        // As the source too: it is refused before anything is read through it.
+        assert!(copy_plugin_tree(&link, &root.path().join("out/as-source"))
+            .unwrap_err()
+            .to_string()
+            .contains("symbolic links"));
+    }
+
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
