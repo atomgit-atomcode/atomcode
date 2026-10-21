@@ -755,10 +755,7 @@ pub struct StatusPage {
 /// will not say who is signed in is not a reason to leave the working
 /// directory blank.
 ///
-/// One gathering for the two places that show it — the Status page and
-/// `/status` — so the command cannot come to say less than the page, which is
-/// what it did: the account and the plan's expiry were on the page and not in
-/// the command.
+/// Used by the Status panel, which `/status` opens directly.
 pub async fn gather_status(
     control: Arc<dyn atomcode_host_api::HostControl>,
     session: String,

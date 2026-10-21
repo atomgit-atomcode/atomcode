@@ -284,6 +284,8 @@ pub enum Action {
     /// second answer printed into the conversation. Opening, not toggling: a
     /// `/usage` typed while the panel is up moves it to the page.
     OpenUsage,
+    /// Open the settings panel on Status without toggling it closed.
+    OpenStatus,
     /// Pull the providers panel up over the composer, or put it away.
     ///
     /// Its own action rather than a parameter on [`Action::ToggleSettings`]:

@@ -1016,12 +1016,7 @@ fn status_lines(page: Option<&crate::settings::StatusPage>) -> Vec<UsageLine> {
     out
 }
 
-/// The Status page as text, for `/status`: the same rows, in the same order.
-///
-/// Walked from [`status_lines`] rather than written again, so the command and
-/// the page cannot drift. A file row says it was not found in words rather
-/// than with a mark: a command's answer is text, and which glyphs this terminal
-/// can draw is not known to it.
+/// Plain text projection of Status rows for remote clients without the local panel.
 pub fn status_text(page: &crate::settings::StatusPage) -> String {
     let mut out = Vec::new();
     for line in status_lines(Some(page)) {

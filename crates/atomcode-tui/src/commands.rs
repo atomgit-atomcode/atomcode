@@ -2305,94 +2305,7 @@ impl CommandSet for SessionCommands {
                     Err(error) => Outcome::Refused(refusal(error)),
                 }
             }
-            // What a person asks when they come back to a window and cannot
-            // remember which one it is. Everything here is already on screen
-            // somewhere — this is the one place that says it all at once.
-            "status" => {
-                let described = client.described();
-                // Everything the Status page says — who is signed in, the plan
-                // and when it runs out, what is left of the allowance, where the
-                // configuration came from — gathered and laid out by the same
-                // code the page uses. This command said only the session, the
-                // model and the directory, and the account and the plan's expiry
-                // the other front end's `/status` showed went missing.
-                if let Some(control) = control.clone() {
-                    let page = crate::settings::gather_status(
-                        control.clone(),
-                        root.clone(),
-                        described.clone(),
-                        None,
-                    )
-                    .await;
-                    let mut said = crate::modules::settings::status_text(&page);
-                    if let Ok(HostReply::Autonomy {
-                        running: Some(running),
-                    }) = control
-                        .call(HostCommand::Autonomy {
-                            session: root.clone(),
-                        })
-                        .await
-                    {
-                        said.push_str("\n\n");
-                        said.push_str(&t(Msg::StatusAutonomyLine {
-                            what: &running.what,
-                            round: running.round,
-                            took: &crate::text::spoken_duration(running.elapsed_secs),
-                        }));
-                    }
-                    return Outcome::Said(said);
-                }
-                let model = described
-                    .as_ref()
-                    .and_then(|d| d.model.clone())
-                    .unwrap_or_else(|| t(Msg::StatusNoModel).into_owned());
-                let effort = described
-                    .as_ref()
-                    .and_then(|d| d.reasoning_effort)
-                    .map(|level| level.as_str().to_string())
-                    .unwrap_or_else(|| t(Msg::StatusEffortDefault).into_owned());
-                let mut lines = vec![
-                    t(Msg::StatusSessionLine {
-                        session: &client.session(),
-                    })
-                    .into_owned(),
-                    t(Msg::StatusModelLine {
-                        model: &model,
-                        effort: &effort,
-                    })
-                    .into_owned(),
-                ];
-                // Where the session works is the host's to say; with no answer
-                // the line is left out rather than filled with the session id.
-                if let Ok(here) = working_dir(control.clone(), root.clone()).await {
-                    lines.push(
-                        t(Msg::StatusWhereLine {
-                            where_: &crate::text::collapse_home(&here),
-                        })
-                        .into_owned(),
-                    );
-                }
-                if let Some(control) = control {
-                    if let Ok(HostReply::Autonomy {
-                        running: Some(running),
-                    }) = control
-                        .call(HostCommand::Autonomy {
-                            session: root.clone(),
-                        })
-                        .await
-                    {
-                        lines.push(
-                            t(Msg::StatusAutonomyLine {
-                                what: &running.what,
-                                round: running.round,
-                                took: &crate::text::spoken_duration(running.elapsed_secs),
-                            })
-                            .into_owned(),
-                        );
-                    }
-                }
-                Outcome::Said(lines.join("\n"))
-            }
+            "status" => Outcome::Do(Action::OpenStatus),
             "whoami" => {
                 let control = match host(control) {
                     Ok(control) => control,
@@ -4037,11 +3950,9 @@ mod tests {
         }
     }
 
-    /// `/status` says what the Status page says: who is signed in, the plan and
-    /// when it runs out — which is what the other front end's `/status` showed
-    /// and this one had dropped — and where the configuration came from.
+    /// The Status panel retains account, plan and configuration details.
     #[tokio::test]
-    async fn status_says_who_is_signed_in_and_when_the_plan_runs_out() {
+    async fn status_panel_includes_identity_and_plan_expiry() {
         let app = bare();
         let client = Arc::new(crate::plugin::AgentClient::default());
         let (commands, _agent) = tokio::sync::mpsc::unbounded_channel();
@@ -4052,10 +3963,18 @@ mod tests {
             .provide::<crate::plugin::AgentClientSvc>(client.clone());
         let all = Arc::new(Commands::new());
         let _ = all.add(Arc::new(SessionCommands));
-        let said = match all.dispatch("/status", &app.context()).await {
-            Outcome::Said(said) => said,
-            other => panic!("{other:?}"),
-        };
+        assert!(matches!(
+            all.dispatch("/status", &app.context()).await,
+            Outcome::Do(Action::OpenStatus)
+        ));
+        let page = crate::settings::gather_status(
+            Arc::new(Answering),
+            "lead".into(),
+            client.described(),
+            None,
+        )
+        .await;
+        let said = crate::modules::settings::status_text(&page);
         for expected in [
             "lead",
             "lichao",
@@ -5987,21 +5906,16 @@ mod tests {
         }
     }
 
-    /// `/status` says where the session works, not which session it is twice.
+    /// Opening Status does not wait for host requests or print a transcript answer.
     #[tokio::test]
-    async fn status_says_the_working_directory() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (app, _client, all) = following(&working_in(dir.path()));
-        // The row folds the home directory the way the rest of the screen does, and a
-        // tempdir on Windows lives under it — so the where-line shows the folded form.
-        let shown = crate::text::collapse_home(&dir.path().display().to_string());
-        match all.dispatch("/status", &app.context()).await {
-            Outcome::Said(text) => assert!(
-                text.contains(&shown),
-                "the where-line names the working directory:\n{text}"
-            ),
-            other => panic!("{other:?}"),
-        }
+    async fn status_opens_the_status_page_without_waiting_for_the_host() {
+        let host = Arc::new(Recording::default());
+        let (app, _client, all) = following(&host);
+        assert!(matches!(
+            all.dispatch("/status", &app.context()).await,
+            Outcome::Do(Action::OpenStatus)
+        ));
+        assert!(host.asked.lock().unwrap().is_empty());
     }
 
     /// `/cd pin` with no directory marks the one the session is working in.

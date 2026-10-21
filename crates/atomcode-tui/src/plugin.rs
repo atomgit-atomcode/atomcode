@@ -8306,12 +8306,15 @@ impl Tui {
                 }
                 return false;
             }
-            // `/usage`: the same settings panel, on its Usage page. Refreshed
-            // like `/config` does, so the allowance is asked now rather than
-            // whatever the page last showed.
-            Action::OpenUsage => {
+            // Both commands open the same panel and refresh its current data.
+            Action::OpenStatus | Action::OpenUsage => {
+                let tab = if matches!(action, Action::OpenStatus) {
+                    crate::settings::Tab::Status
+                } else {
+                    crate::settings::Tab::Usage
+                };
                 drop(m);
-                self.host.open_settings_on(crate::settings::Tab::Usage);
+                self.host.open_settings_on(tab);
                 self.refresh_settings();
                 self.fetch_usage();
                 self.fetch_status();
@@ -9735,6 +9738,43 @@ impl Tui {
         let host = self.host.clone();
         tokio::spawn(async move {
             let outcome = commands.dispatch(&command, &ctx).await;
+            // A remote reader cannot see the local settings panel. Return its
+            // data as text without opening a modal on the desktop keyboard.
+            let outcome = if matches!(outcome, crate::command::Outcome::Do(Action::OpenStatus)) {
+                let client = ctx.service::<AgentClientSvc>();
+                if let Some(client) = client {
+                    if let Some(control) = client.control() {
+                        let title = host.moment.read().expect("moment poisoned").title.clone();
+                        let session = client.root();
+                        let page = crate::settings::gather_status(
+                            control.clone(),
+                            session.clone(),
+                            client.described(),
+                            title,
+                        )
+                        .await;
+                        let mut text = crate::modules::settings::status_text(&page);
+                        if let Ok(HostReply::Autonomy {
+                            running: Some(running),
+                        }) = control.call(HostCommand::Autonomy { session }).await
+                        {
+                            text.push_str("\n\n");
+                            text.push_str(&t(Msg::StatusAutonomyLine {
+                                what: &running.what,
+                                round: running.round,
+                                took: &crate::text::spoken_duration(running.elapsed_secs),
+                            }));
+                        }
+                        crate::command::Outcome::Said(text)
+                    } else {
+                        crate::command::Outcome::Refused(crate::remote::refusal())
+                    }
+                } else {
+                    crate::command::Outcome::Refused(crate::remote::refusal())
+                }
+            } else {
+                outcome
+            };
             // Back to whoever asked, before `deliver` consumes it. A modal or
             // an action has nothing to send: what they do shows up in the
             // session's own facts, which the far end is already watching.
@@ -14188,6 +14228,21 @@ mod paste_habit_tests {
             >::new()))
             .unwrap();
         (host, tui)
+    }
+
+    #[test]
+    fn status_and_usage_open_their_tabs_without_toggling_the_panel_closed() {
+        let (host, tui) = screen();
+        for (action, tab) in [
+            (Action::OpenStatus, crate::settings::Tab::Status),
+            (Action::OpenStatus, crate::settings::Tab::Status),
+            (Action::OpenUsage, crate::settings::Tab::Usage),
+            (Action::OpenStatus, crate::settings::Tab::Status),
+        ] {
+            tui.act(action, &tui.client);
+            let m = host.moment.read().unwrap();
+            assert_eq!(m.settings_panel.as_ref().unwrap().tab, tab);
+        }
     }
 
     fn typed(host: &Host) -> String {
