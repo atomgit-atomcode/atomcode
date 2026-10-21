@@ -262,6 +262,7 @@ mod tests {
                 basic_glyphs: true,
                 colors: crate::caps::Colors::Ansi16,
                 cell_background: true,
+                graphics: crate::caps::Graphics::None,
             },
         };
         let drawn = block

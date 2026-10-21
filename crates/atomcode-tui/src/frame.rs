@@ -9,7 +9,7 @@ use std::fmt;
 use std::sync::Arc;
 
 /// A rectangle in cells. Origin is top-left, `(0, 0)`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Rect {
     pub x: u16,
     pub y: u16,
@@ -257,6 +257,8 @@ pub struct Line {
     pub spans: Vec<Span>,
     /// Paint-only row surface; never padding in the logical text.
     pub background: Option<Color>,
+    /// Paint-only image anchored to this row; never part of copied text.
+    pub image: Option<crate::terminal_image::Image>,
 }
 
 impl Line {
@@ -268,6 +270,7 @@ impl Line {
         Self {
             spans: vec![Span::raw(text)],
             background: None,
+            image: None,
         }
     }
 
@@ -275,6 +278,7 @@ impl Line {
         Self {
             spans: vec![Span::styled(text, style)],
             background: None,
+            image: None,
         }
     }
 
@@ -282,6 +286,7 @@ impl Line {
         Self {
             spans,
             background: None,
+            image: None,
         }
     }
 
@@ -328,6 +333,7 @@ impl Line {
         Line {
             spans: out,
             background: self.background,
+            image: self.image,
         }
     }
 }
@@ -385,6 +391,7 @@ impl Line {
         Line {
             spans: out,
             background: self.background,
+            image: self.image,
         }
     }
 }

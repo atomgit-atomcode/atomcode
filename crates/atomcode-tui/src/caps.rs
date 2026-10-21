@@ -209,6 +209,28 @@ impl Default for Caps {
     }
 }
 
+/// Multiplexers can inherit the outer terminal's identity without forwarding
+/// its graphics protocol. Prefer pixels unless direct support is known.
+fn graphics_for(env: &impl Fn(&str) -> Option<String>) -> Graphics {
+    let term = env("TERM").unwrap_or_default();
+    if env("TMUX").is_some()
+        || env("STY").is_some()
+        || term.starts_with("screen")
+        || term.starts_with("tmux")
+    {
+        Graphics::None
+    } else if env("KITTY_WINDOW_ID").is_some()
+        || term == "xterm-kitty"
+        || env("TERM_PROGRAM").is_some_and(|v| v == "ghostty")
+    {
+        Graphics::Kitty
+    } else if env("TERM_PROGRAM").is_some_and(|v| v == "iTerm.app" || v == "WezTerm") {
+        Graphics::ITerm2
+    } else {
+        Graphics::None
+    }
+}
+
 /// Whether to ask the terminal for the keyboard protocol ([`crate::ansi::KEYS_ON`]).
 ///
 /// tuix's rule (`should_enable_kitty_keyboard`), which is not kept twice for
@@ -334,8 +356,6 @@ impl Caps {
     /// terminal.
     pub fn detect() -> Self {
         let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
-        let term = env("TERM").unwrap_or_default();
-
         let basic_glyphs = basic_glyphs_for(&env, cfg!(windows));
         let unicode = unicode_for(&env) && !basic_glyphs;
 
@@ -344,16 +364,7 @@ impl Caps {
         // Only what the environment states outright. Kitty and iTerm2 announce
         // themselves; sixel does not, and a guess here would have a component
         // send image escapes to a terminal that prints them as garbage.
-        let graphics = if env("KITTY_WINDOW_ID").is_some()
-            || term == "xterm-kitty"
-            || env("TERM_PROGRAM").is_some_and(|v| v == "ghostty" || v == "WezTerm")
-        {
-            Graphics::Kitty
-        } else if env("TERM_PROGRAM").is_some_and(|v| v == "iTerm.app") {
-            Graphics::ITerm2
-        } else {
-            Graphics::None
-        };
+        let graphics = graphics_for(&env);
 
         Self {
             unicode,
@@ -850,8 +861,42 @@ mod tests {
         }
     }
 
-    /// HarmonyOS's own Terminal names itself nowhere and still paints
-    /// backgrounds — so the mascot and the bars are drawn there.
+    #[test]
+    fn graphics_require_a_direct_supported_terminal() {
+        for (program, expected) in [
+            ("iTerm.app", Graphics::ITerm2),
+            ("ghostty", Graphics::Kitty),
+            ("WezTerm", Graphics::ITerm2),
+            ("Apple_Terminal", Graphics::None),
+        ] {
+            let env = |key: &str| match key {
+                "TERM" => Some("xterm-256color".into()),
+                "TERM_PROGRAM" => Some(program.into()),
+                _ => None,
+            };
+            assert_eq!(graphics_for(&env), expected);
+        }
+        for extra in [
+            ("TMUX", "/tmp/tmux"),
+            ("STY", "screen"),
+            ("TERM", "screen-256color"),
+        ] {
+            let env = |key: &str| {
+                if key == extra.0 {
+                    Some(extra.1.into())
+                } else if key == "TERM_PROGRAM" {
+                    Some("iTerm.app".into())
+                } else {
+                    None
+                }
+            };
+            assert_eq!(graphics_for(&env), Graphics::None);
+        }
+        let kitty = env_of(&[("TERM", "xterm-kitty")]);
+        assert_eq!(graphics_for(&kitty), Graphics::Kitty);
+    }
+
+    /// HarmonyOS's own Terminal names itself nowhere and still paints backgrounds.
     #[test]
     fn harmonyos_paints_backgrounds_though_it_names_no_terminal() {
         let bare = env_of(&[]);

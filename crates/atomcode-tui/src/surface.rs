@@ -2547,6 +2547,7 @@ impl Surface for Terminal {
         let mut out = std::io::stdout();
         let _ = link_pointer::POINTER.restore(&mut out);
         let _ = configure_pointer(&mut out, ansi::Pointer::Terminal);
+        let _ = out.write_all(crate::terminal_image::delete(self.caps.graphics).as_bytes());
         let _ = out.write_all(ansi::transcript_out().as_bytes());
         let _ = out.flush();
         console_wrap(true);
@@ -2600,6 +2601,7 @@ impl Surface for Terminal {
         let _ = link_pointer::POINTER.restore(&mut out);
         let _ = out.write_all(ansi::MOUSE_OFF.as_bytes());
         let _ = out.write_all(ansi::RESTORE_TITLE.as_bytes());
+        let _ = out.write_all(crate::terminal_image::delete(self.caps.graphics).as_bytes());
         let _ = out.write_all(ansi::leave().as_bytes());
         let _ = out.flush();
         let _ = crossterm::terminal::disable_raw_mode();
@@ -2714,6 +2716,10 @@ impl Surface for Terminal {
         clipboard_diagnostic("paste_text", read_clipboard_text)
     }
     fn restore(&self) {
+        if SCREEN_HELD.load(std::sync::atomic::Ordering::SeqCst) && !self.showing_transcript() {
+            let _ = std::io::stdout()
+                .write_all(crate::terminal_image::delete(self.caps.graphics).as_bytes());
+        }
         self.painted.forget();
         // The same path a panic takes, so an ordinary exit and a crash cannot
         // give the screen back two different ways — and so the second caller

@@ -292,7 +292,7 @@ impl Mascot {
     }
 }
 
-/// The shipped cat, **verbatim** from `atomcode-tuix` (`render/mascot.rs`).
+/// The fallback pixel cat, **verbatim** from `atomcode-tuix` (`render/mascot.rs`).
 ///
 /// **It is coarse, and that is the art.** 18 x 8 pixels is enough for two ears,
 /// two eyes and a chin — and no whiskers, no nose, no tail. Rendered large it
@@ -492,7 +492,11 @@ impl Content for WelcomeBlock {
         } else {
             // From the art, so a fork's taller or wider mascot lines the tips
             // up beside it without touching this calculation.
-            PAD + self.brand.mascot.as_ref().map_or(0, Mascot::cells)
+            if uses_image_mascot(ctx, content_w, self.brand.mascot.as_ref()) {
+                PAD + crate::terminal_image::MASCOT_WIDTH as usize
+            } else {
+                PAD + self.brand.mascot.as_ref().map_or(0, Mascot::cells)
+            }
         };
         let tips_col = left_w + gap;
         let right_w = right.iter().map(Line::width).max().unwrap_or(0);
@@ -541,6 +545,12 @@ impl Content for WelcomeBlock {
 /// How far the block is set in from the rect it was given.
 const PAD: usize = 2;
 
+fn uses_image_mascot(ctx: &RenderCtx, content_w: usize, art: Option<&Mascot>) -> bool {
+    crate::terminal_image::supported(ctx.caps.graphics)
+        && content_w >= crate::terminal_image::MASCOT_WIDTH as usize
+        && art.is_some_and(|art| *art == Mascot::default())
+}
+
 /// The mascot, as nine cells of two vertical pixels each.
 ///
 /// **With `cell_background`** the two pixels are the cell's foreground and
@@ -560,10 +570,28 @@ const PAD: usize = 2;
 ///
 /// Cut to `content_w`, like every other row: art wider than the rect it was given
 /// is a row running into its neighbour.
+
 fn mascot(ctx: &RenderCtx, content_w: usize, art: Option<&Mascot>) -> Vec<Line> {
     let Some(art) = art else {
         return Vec::new();
     };
+    if uses_image_mascot(ctx, content_w, Some(art)) {
+        let mut rows =
+            vec![
+                Line::raw(" ".repeat(PAD + crate::terminal_image::MASCOT_WIDTH as usize));
+                crate::terminal_image::MASCOT_HEIGHT as usize
+            ];
+        rows[0].image = Some(crate::terminal_image::Image {
+            rect: crate::frame::Rect::new(
+                PAD as u16,
+                0,
+                crate::terminal_image::MASCOT_WIDTH,
+                crate::terminal_image::MASCOT_HEIGHT,
+            ),
+            png: crate::terminal_image::MASCOT_PNG,
+        });
+        return rows;
+    }
     // `▀` and `▄` are all the art is made of, and a basic console font has
     // both ([`crate::caps::console_safe`]).
     let drawable = ctx.caps.colors != crate::caps::Colors::None
@@ -4047,6 +4075,7 @@ mod tests {
                 basic_glyphs: false,
                 colors: crate::caps::Colors::Ansi256,
                 cell_background,
+                graphics: crate::caps::Graphics::None,
             },
         }
     }
@@ -4102,6 +4131,7 @@ mod tests {
                 unicode: crate::caps::unicode_for(&env),
                 basic_glyphs: caps.basic_glyphs,
                 cell_background: crate::caps::cell_background_for(&env, false, false),
+                graphics: crate::caps::Graphics::None,
             },
         };
         let text = welcome()
@@ -4119,6 +4149,34 @@ mod tests {
             .iter()
             .map(Line::plain)
             .collect()
+    }
+
+    #[test]
+    fn welcome_uses_the_picture_only_when_the_terminal_and_brand_allow_it() {
+        for protocol in [crate::caps::Graphics::ITerm2, crate::caps::Graphics::Kitty] {
+            let mut ctx = wctx(80, true);
+            ctx.caps.graphics = protocol;
+            let rows = welcome().lines(&ctx);
+            let image = rows
+                .iter()
+                .find_map(|row| row.image)
+                .expect("image placement");
+            assert_eq!((image.rect.w, image.rect.h), (24, 10));
+            assert!(!rows.iter().any(|row| row.plain().contains('▀')));
+            ctx.width = 20;
+            let narrow = welcome().lines(&ctx);
+            assert!(narrow.iter().all(|row| row.image.is_none()));
+            assert!(narrow.iter().any(|row| row.plain().contains('▀')));
+            ctx.width = 80;
+            let mut custom = welcome();
+            std::sync::Arc::make_mut(&mut custom.brand)
+                .mascot
+                .as_mut()
+                .unwrap()
+                .palette
+                .insert('o', 123);
+            assert!(custom.lines(&ctx).iter().all(|row| row.image.is_none()));
+        }
     }
 
     #[test]

@@ -777,6 +777,7 @@ fn inset(kind: &str) -> u16 {
 /// naming one — the same reason [`blank_between`]'s row is [`Line::empty`].
 fn set_in_row(line: &Line, lead: Span, w: u16) -> Line {
     let mut spans = Vec::with_capacity(line.spans.len() + 1);
+    let inset = lead.width() as u16;
     spans.push(lead);
     spans.extend(line.spans.iter().cloned());
     // The caller rendered into `w - pad`, so this cut should never bite. It is
@@ -786,6 +787,10 @@ fn set_in_row(line: &Line, lead: Span, w: u16) -> Line {
     // `Line::truncate` copies unconditionally and this is a row of a frame.
     let mut out = Line::from_spans(spans);
     out.background = line.background;
+    out.image = line.image.map(|mut image| {
+        image.rect.x = image.rect.x.saturating_add(inset);
+        image
+    });
     if out.width() > w as usize {
         out = out.truncate(w as usize);
     }
@@ -7970,6 +7975,35 @@ mod tests {
         mods.add_view(Arc::new(Mounted::<input::Input>::new()))
             .unwrap();
         Host::new(mods, default_layout())
+    }
+
+    #[test]
+    fn the_welcome_image_survives_stream_composition_and_capability_changes() {
+        let h = host();
+        let block = crate::content::WelcomeBlock {
+            cwd: "project".into(),
+            model: None,
+            version: "test",
+            heading: "Tips".into(),
+            tips: Vec::new(),
+            brand: Arc::new(crate::content::Brand::default()),
+            note: None,
+        };
+        h.stream
+            .write()
+            .unwrap()
+            .writer("welcome")
+            .emit(crate::block::Coord::default(), Arc::new(block));
+        {
+            let mut m = h.moment.write().unwrap();
+            m.caps.graphics = crate::caps::Graphics::ITerm2;
+        }
+        let frame = h.compose((80, 32));
+        assert!(crate::terminal_image::visible(&frame).is_some());
+        h.moment.write().unwrap().caps.graphics = crate::caps::Graphics::None;
+        let fallback = h.compose((80, 32));
+        assert!(crate::terminal_image::visible(&fallback).is_none());
+        assert!(fallback.rows().join("\n").contains('▀'));
     }
 
     /// A command that takes a key is echoed with the key masked; any other

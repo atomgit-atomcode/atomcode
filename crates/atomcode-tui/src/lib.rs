@@ -85,6 +85,7 @@ pub mod sheet;
 /// `!cmd`：人自己在这台机器上跑一条命令。
 pub mod shell;
 pub mod surface;
+pub mod terminal_image;
 mod terminal_modes;
 pub mod text;
 pub mod theme;
