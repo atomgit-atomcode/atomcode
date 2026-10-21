@@ -8467,8 +8467,11 @@ impl Tui {
             Action::SelectTo(x, y) => {
                 if m.stream_selection.is_some() {
                     self.drag_in_conversation(&mut m, x, y, true);
-                } else if let Some(sel) = m.selection.as_mut() {
+                } else if let Some(mut sel) = m.selection {
                     sel.head = (x, y);
+                    m.selection = Some(self.host.field_rect().map_or(sel, |rect| {
+                        crate::modules::input::selection_without_prompt(&m, rect, sel)
+                    }));
                 }
                 return false;
             }
@@ -8483,6 +8486,12 @@ impl Tui {
                 drop(m);
                 let frame = self.host.compose(self.surface.size());
                 if let Some(sel) = frame.word_at(x, y) {
+                    let sel = {
+                        let m = self.host.moment.read().expect("moment poisoned");
+                        self.host.field_rect().map_or(sel, |rect| {
+                            crate::modules::input::selection_without_prompt(&m, rect, sel)
+                        })
+                    };
                     let text = frame.selected_text(&sel);
                     self.host.moment.write().expect("moment poisoned").selection = Some(sel);
                     if !text.is_empty() {
@@ -8497,6 +8506,12 @@ impl Tui {
                 drop(m);
                 let frame = self.host.compose(self.surface.size());
                 if let Some(sel) = frame.line_at(y) {
+                    let sel = {
+                        let m = self.host.moment.read().expect("moment poisoned");
+                        self.host.field_rect().map_or(sel, |rect| {
+                            crate::modules::input::selection_without_prompt(&m, rect, sel)
+                        })
+                    };
                     let text = frame.selected_text(&sel);
                     self.host.moment.write().expect("moment poisoned").selection = Some(sel);
                     if !text.is_empty() {
@@ -14136,6 +14151,47 @@ mod paste_habit_tests {
 
     fn typed(host: &Host) -> String {
         host.moment.read().expect("moment poisoned").input.clone()
+    }
+
+    #[test]
+    fn dragging_from_the_composer_stays_inside_it() {
+        for key in [Action::Backspace, Action::DeleteForward] {
+            let (host, tui) = screen();
+            {
+                let mut m = host.moment.write().unwrap();
+                m.input = "111英文 README：保留 AtomCode".into();
+                m.caret = m.input.len();
+            }
+            host.compose((60, 24));
+            let rect = host.field_rect().unwrap();
+            tui.act(Action::SelectFrom(rect.x + 5, rect.y + 1), &tui.client);
+            tui.act(Action::SelectTo(59, rect.bottom()), &tui.client);
+            let selection = host.moment.read().unwrap().selection.unwrap();
+            assert_eq!(selection.head.1, rect.y + 1);
+            tui.act(key, &tui.client);
+            assert_eq!(host.moment.read().unwrap().input, "111");
+        }
+    }
+
+    #[test]
+    fn composer_line_selection_excludes_the_prompt() {
+        for text in ["alpha 中文 beta", "x"] {
+            let (host, tui) = screen();
+            {
+                let mut m = host.moment.write().unwrap();
+                m.input = text.into();
+                m.caret = text.len();
+            }
+            host.compose((60, 24));
+            let rect = host.field_rect().expect("composer");
+            tui.act(Action::SelectLine(rect.x, rect.y + 1), &tui.client);
+            let selection = host.moment.read().unwrap().selection.expect("selection");
+            assert!(selection.anchor.0 >= rect.x + 2);
+            assert!(selection.head.0 >= rect.x + 2);
+            assert_eq!(host.compose((60, 24)).selected_text(&selection), text);
+            tui.act(Action::Backspace, &tui.client);
+            assert!(host.moment.read().unwrap().input.is_empty());
+        }
     }
 
     #[test]

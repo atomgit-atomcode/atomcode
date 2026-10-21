@@ -328,7 +328,57 @@ pub fn offset_at_cell(
     Some(offset_at(&moment.input, row, col, rect.w))
 }
 
-/// The selected bytes when both ends cover rendered composer text or its row padding.
+/// A selection starting on a composer text row stays inside the composer,
+/// even when the pointer moves onto neighbouring UI. Exclude its prompt too.
+pub fn selection_without_prompt(
+    moment: &crate::moment::Moment,
+    rect: crate::frame::Rect,
+    mut selection: crate::moment::Selection,
+) -> crate::moment::Selection {
+    if moment.secret.is_some() || rect.w <= PROMPT as u16 {
+        return selection;
+    }
+    let (rows, (caret_row, _), _) = lay(&moment.input, moment.caret, body_width(rect.w));
+    let room = typed_room(rect.h);
+    let first = caret_row.saturating_sub(room.saturating_sub(1));
+    let shown = room.min(rows.len().saturating_sub(first)).max(1);
+    let top = rect.y + RULE as u16;
+    let bottom = top + shown as u16;
+    if selection.anchor.0 < rect.x
+        || selection.anchor.0 >= rect.right()
+        || selection.anchor.1 < top
+        || selection.anchor.1 >= bottom
+    {
+        return selection;
+    }
+    selection.head = if selection.head.1 < top {
+        (rect.x, top)
+    } else if selection.head.1 >= bottom {
+        (rect.right() - 1, bottom - 1)
+    } else {
+        (
+            selection.head.0.clamp(rect.x, rect.right() - 1),
+            selection.head.1,
+        )
+    };
+    if selection_range(moment, rect, selection).is_some() {
+        let left = rect.x + PROMPT as u16;
+        let original = selection;
+        selection.anchor.0 = selection.anchor.0.max(left);
+        selection.head.0 = selection.head.0.max(left);
+        // Equal endpoints mean a click rather than a selection. Use adjacent
+        // padding for a one-cell draft, only if it covers the same text.
+        if selection.is_empty() {
+            selection.head.0 = selection.head.0.saturating_add(1);
+            if selection_range(moment, rect, selection) != selection_range(moment, rect, original) {
+                return original;
+            }
+        }
+    }
+    selection
+}
+
+/// The selected bytes on composer text rows, excluding the prompt and row padding.
 pub fn selection_range(
     moment: &crate::moment::Moment,
     rect: crate::frame::Rect,
@@ -356,7 +406,7 @@ pub fn selection_range(
     let text_bottom = text_top + shown as u16;
     let text_left = rect.x + PROMPT as u16;
     let valid =
-        |(x, y): (u16, u16)| x >= text_left && x < rect.right() && y >= text_top && y < text_bottom;
+        |(x, y): (u16, u16)| x >= rect.x && x < rect.right() && y >= text_top && y < text_bottom;
     if !valid(selection.anchor) || !valid(selection.head) {
         return None;
     }
@@ -369,6 +419,11 @@ pub fn selection_range(
         };
     let offset = |(x, y): (u16, u16), after: bool| {
         let row = first + usize::from(y - text_top);
+        // A selection may include the decorative prompt. Its cells map to
+        // the row start, without selecting the first grapheme themselves.
+        if x < text_left {
+            return starts[row];
+        }
         let col = usize::from(x - text_left);
         let line = &rows[row];
         let at = starts[row] + width::take_width(line, col).len();
@@ -1161,6 +1216,53 @@ mod tests {
         for selection in [forward, backward] {
             let range = selection_range(&m, rect, selection).expect("inside the composer");
             assert_eq!(&m.input[range], "b中");
+        }
+        for (anchor, head) in [((0, 6), (29, 6)), ((29, 6), (0, 6))] {
+            let selection = crate::moment::Selection { anchor, head };
+            let range = selection_range(&m, rect, selection).expect("prompt and text");
+            assert_eq!(&m.input[range], "ab中cd");
+            let clipped = selection_without_prompt(&m, rect, selection);
+            assert!(clipped.anchor.0 >= PROMPT as u16);
+            assert!(clipped.head.0 >= PROMPT as u16);
+        }
+        for head in [(100, 6), (100, 10), (0, 10)] {
+            let clipped = selection_without_prompt(
+                &m,
+                rect,
+                crate::moment::Selection {
+                    anchor: (4, 6),
+                    head,
+                },
+            );
+            assert_eq!(clipped.head, (29, 6));
+            let range = selection_range(&m, rect, clipped).expect("clamped to composer");
+            assert_eq!(&m.input[range], "中cd");
+        }
+        let above = selection_without_prompt(
+            &m,
+            rect,
+            crate::moment::Selection {
+                anchor: (4, 6),
+                head: (0, 0),
+            },
+        );
+        assert_eq!(above.head, (2, 6));
+        assert_eq!(&m.input[selection_range(&m, rect, above).unwrap()], "ab中");
+        for selection in [
+            crate::moment::Selection {
+                anchor: (0, 9),
+                head: (20, 9),
+            },
+            crate::moment::Selection {
+                anchor: (0, 4),
+                head: (20, 6),
+            },
+        ] {
+            assert_eq!(
+                selection_without_prompt(&m, rect, selection),
+                selection,
+                "selections starting outside the composer stay unrestricted"
+            );
         }
         let second_cell = crate::moment::Selection {
             anchor: (4, 6),

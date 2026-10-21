@@ -3851,6 +3851,42 @@ fn right_click_composer(s: &Session) {
 }
 
 #[tokio::test]
+async fn deleting_a_selection_that_includes_the_prompt_clears_the_draft() {
+    let dir = scratch("delete-composer-prompt-selection");
+    let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    let task = s.open().await;
+
+    for (index, key) in [Key::Delete, Key::Backspace].into_iter().enumerate() {
+        s.term.type_text("alpha 中文 beta");
+        s.quiet().await;
+        let field = s.term.last().unwrap().part("input").unwrap().rect;
+        let row = field.y + 1;
+        let (start, end) = if index == 0 {
+            (field.x, field.right() - 1)
+        } else {
+            (field.right() - 1, field.x)
+        };
+        s.term
+            .pointer(atomcode_tui::surface::Click::Press, start, row);
+        s.term.pointer(atomcode_tui::surface::Click::Drag, end, row);
+        s.term
+            .pointer(atomcode_tui::surface::Click::Release, end, row);
+        s.term.press(KeyPress::plain(key));
+        s.quiet().await;
+        let input = composer_text(&s);
+        assert!(!input.contains("alpha"), "selected draft remained: {input}");
+        assert!(
+            !input.contains("中文"),
+            "selected Unicode text remained: {input}"
+        );
+        assert!(!input.contains("beta"), "selected draft remained: {input}");
+    }
+
+    task.abort();
+    let _ = task.await;
+}
+
+#[tokio::test]
 async fn delete_removes_only_the_composer_selection() {
     let dir = scratch("delete-composer-selection");
     let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
