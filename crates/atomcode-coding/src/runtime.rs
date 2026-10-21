@@ -8,6 +8,9 @@ mod goal_questions;
 #[cfg(test)]
 mod goal_recovery_tests;
 
+mod live_view;
+pub use live_view::RuntimeLiveView;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
@@ -1078,6 +1081,8 @@ pub struct SequencedRuntimeEvent {
 pub type CodingRuntimeEvents = mpsc::UnboundedReceiver<SequencedRuntimeEvent>;
 
 struct GenerationTaggedRuntimeEvent {
+    view_only: bool,
+    view_seed: Option<(SessionSnapshot, RuntimeMode)>,
     generation: u64,
     event: CodingRuntimeEvent,
 }
@@ -1158,6 +1163,56 @@ impl RuntimeEventEmitter {
         }
     }
 
+    fn carry_live_view(&self, generation: u64) {
+        if let Some(tagged) = &self.tagged {
+            let _ = tagged.send(GenerationTaggedRuntimeEvent {
+                view_only: true,
+                view_seed: None,
+                generation,
+                event: CodingRuntimeEvent::Reconfigured {
+                    operation: ReconfigureKind::Provider,
+                },
+            });
+        }
+    }
+
+    fn seed_live_view(&self, generation: u64, runtime: &RuntimeResources) {
+        if let Some(tagged) = &self.tagged {
+            let seed = if runtime.parts.session.is_some() {
+                current_runtime_snapshot(runtime)
+            } else {
+                runtime.parts.runtime_resume_snapshot()
+            };
+            let _ = tagged.send(GenerationTaggedRuntimeEvent {
+                view_only: true,
+                view_seed: seed.map(|snapshot| (snapshot, current_mode(&runtime.parts))),
+                generation,
+                event: CodingRuntimeEvent::SessionChanged(session_changed(generation, runtime)),
+            });
+        }
+    }
+
+    fn session_changed(&self, changed: SessionChanged, resources: Option<&RuntimeResources>) {
+        let seed = resources.and_then(|runtime| {
+            if runtime.parts.session.is_some() {
+                current_runtime_snapshot(runtime)
+            } else {
+                runtime.parts.runtime_resume_snapshot()
+            }
+            .map(|snapshot| (snapshot, current_mode(&runtime.parts)))
+        });
+        let event = CodingRuntimeEvent::SessionChanged(changed);
+        let _ = self.raw.send(event.clone());
+        if let Some(tagged) = &self.tagged {
+            let _ = tagged.send(GenerationTaggedRuntimeEvent {
+                view_only: false,
+                generation: self.generation.load(Ordering::Acquire),
+                event,
+                view_seed: seed,
+            });
+        }
+    }
+
     fn send(&self, event: CodingRuntimeEvent) -> Result<(), ()> {
         if let CodingRuntimeEvent::GoalChanged(progress) = &event {
             *self.latest_goal.lock().expect("goal projection poisoned") = Some(progress.clone());
@@ -1178,7 +1233,9 @@ impl RuntimeEventEmitter {
             .map(|sender| {
                 sender
                     .send(GenerationTaggedRuntimeEvent {
+                        view_only: false,
                         generation: self.generation.load(Ordering::Acquire),
+                        view_seed: None,
                         event,
                     })
                     .is_ok()
@@ -1926,8 +1983,9 @@ fn estimate_after_tokens(tokens_before: usize, bytes_before: usize, bytes_after:
 }
 
 /// Cloneable, stable control handle held by a driver.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CodingRuntimeHandle {
+    live_view: Arc<Mutex<Option<RuntimeLiveView>>>,
     tx: mpsc::UnboundedSender<CodingRuntimeControl>,
     state: Arc<AtomicU64>,
     provider_unavailable_reason: Arc<AtomicU8>,
@@ -1944,6 +2002,15 @@ pub struct CodingRuntimeHandle {
     /// against the work it was meant for.
     stop: Arc<Mutex<CancellationToken>>,
     mcp_reconnecting: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl fmt::Debug for CodingRuntimeHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The presentation view can contain sensitive conversation/tool data.
+        f.debug_struct("CodingRuntimeHandle")
+            .field("status", &self.status())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2325,6 +2392,28 @@ impl CodingRuntimeHandle {
             .send(CodingRuntimeControl::PendingPolicyIntervention { done })
             .ok()?;
         result.await.ok().flatten()
+    }
+
+    /// Read the sequenced presentation view without waiting for an agent turn.
+    pub fn live_view(&self) -> Result<RuntimeLiveView, RuntimeError> {
+        let view = self.live_view.lock().expect("live view poisoned");
+        let view = view
+            .as_ref()
+            .filter(|view| view.valid)
+            .ok_or(RuntimeError::Unavailable)?;
+        let status = self.status();
+        if view.generation != status.generation
+            || matches!(
+                status.phase,
+                RuntimePhase::Reconfiguring
+                    | RuntimePhase::ShuttingDown
+                    | RuntimePhase::Stopped
+                    | RuntimePhase::Failed
+            )
+        {
+            return Err(RuntimeError::Busy);
+        }
+        Ok(view.clone())
     }
 
     pub async fn snapshot(&self) -> Result<Arc<SessionSnapshot>, RuntimeError> {
@@ -3350,6 +3439,24 @@ impl CodingRuntime {
             parts.take_up_resumed_session();
         }
 
+        *handle.live_view.lock().expect("live view poisoned") =
+            parts.session.as_ref().and_then(|binding| {
+                binding
+                    .manager
+                    .load_snapshot(&binding.id)
+                    .ok()
+                    .map(|snapshot| {
+                        let mut view = RuntimeLiveView::from_snapshot(
+                            handle.status().generation,
+                            binding.id.clone(),
+                            agent.working_dir.clone(),
+                            snapshot,
+                        );
+                        view.mode = current_mode(&parts);
+                        view
+                    })
+            });
+
         let (raw_event_tx, _raw_events) = mpsc::unbounded_channel();
         let (tagged_event_tx, mut tagged_events) = mpsc::unbounded_channel();
         let adapter = spawn_runtime_owner_with_optional_agent(
@@ -3409,12 +3516,25 @@ impl CodingRuntime {
                     }
                     event = tagged_events.recv(), if raw_open => match event {
                         Some(tagged) => {
+                            if tagged.view_only {
+                                if let Some(view) = task_handle.live_view.lock().expect("live view poisoned").as_mut() {
+                                    if matches!(&tagged.event, CodingRuntimeEvent::SessionChanged(_)) {
+                                        let sequence = view.sequence;
+                                        view.observe(&SequencedRuntimeEvent { generation: tagged.generation, sequence: sequence.unwrap_or(0), event: tagged.event }, tagged.view_seed);
+                                        view.sequence = sequence;
+                                    } else { view.carry_generation(tagged.generation); }
+                                }
+                                continue;
+                            }
                             let envelope = SequencedRuntimeEvent {
                                 generation: tagged.generation,
                                 sequence,
                                 event: tagged.event,
                             };
                             sequence = sequence.wrapping_add(1);
+                            if let Some(view) = task_handle.live_view.lock().expect("live view poisoned").as_mut() {
+                                view.observe(&envelope, tagged.view_seed);
+                            }
                             if event_tx.send(envelope).is_err() {
                                 receiver_dropped = true;
                                 break;
@@ -3448,6 +3568,13 @@ impl CodingRuntime {
                                 event: CodingRuntimeEvent::Agent(event),
                             };
                             sequence = sequence.wrapping_add(1);
+                            if let Some(view) = task_handle.live_view.lock().expect("live view poisoned").as_mut() {
+                                // Raw usage can race a provider-generation marker;
+                                // only tagged events establish a new identity.
+                                if view.generation == envelope.generation {
+                                    view.observe(&envelope, None);
+                                }
+                            }
                             if event_tx.send(envelope).is_err() {
                                 receiver_dropped = true;
                                 break;
@@ -3900,6 +4027,7 @@ pub fn coding_runtime_control_channel() -> (CodingRuntimeHandle, CodingRuntimeCo
     let submit_tx = tx.downgrade();
     (
         CodingRuntimeHandle {
+            live_view: Arc::new(Mutex::new(None)),
             tx,
             state: Arc::clone(&state),
             provider_unavailable_reason: Arc::clone(&provider_unavailable_reason),
@@ -6931,6 +7059,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                     runtime_phase_state(generation, resumed),
                                     Ordering::Release,
                                 );
+                                runtime_event_tx.carry_live_view(generation);
                                 let _ = runtime_event_tx.send(
                                     CodingRuntimeEvent::ProviderChanged {
                                         provider: provider.clone(),
@@ -7081,6 +7210,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 let reasoning_effort = runtime.config.chat_options.reasoning_effort;
                                 let reasoning_effort_applicable =
                                     runtime.config.supports_reasoning_effort;
+                                runtime_event_tx.seed_live_view(generation, &runtime);
                                 replay_pending_resume_prompt(
                                     &agent,
                                     Some(&mut runtime),
@@ -7902,8 +8032,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             runtime_phase_state(generation, RuntimePhase::Ready),
                             Ordering::Release,
                         );
-                        let _ = runtime_event_tx
-                            .send(CodingRuntimeEvent::SessionChanged(changed.clone()));
+                        runtime_event_tx.session_changed(changed.clone(), resources.as_ref());
                         if changes_session {
                             if let Some(intervention) = pending_policy_intervention.take() {
                                 let _ = runtime_event_tx.send(
@@ -8032,6 +8161,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             observed_tokens = None;
                             conversation_revision = conversation_revision.wrapping_add(1);
                             let snapshot = Arc::new(truncated);
+                            runtime_event_tx.seed_live_view(generation, &runtime);
                             resources = Some(runtime);
                             controls.state.store(
                                 runtime_phase_state(generation, RuntimePhase::Ready),
@@ -8103,6 +8233,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                         atomcode_harness::session::InjectionOrigin::Reminder,
                                     );
                                 }
+                                runtime_event_tx.seed_live_view(generation, &runtime);
                                 resources = Some(runtime);
                                 controls.state.store(
                                     runtime_phase_state(generation, RuntimePhase::Ready),
@@ -8250,9 +8381,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                         runtime_phase_state(generation, RuntimePhase::Ready),
                                         Ordering::Release,
                                     );
-                                    let _ = runtime_event_tx.send(
-                                        CodingRuntimeEvent::SessionChanged(changed.clone()),
-                                    );
+                                    runtime_event_tx.session_changed(changed.clone(), resources.as_ref());
                                     if let Some(intervention) = pending_policy_intervention.take()
                                     {
                                         let _ = runtime_event_tx.send(
@@ -8372,9 +8501,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                     runtime_phase_state(generation, RuntimePhase::Ready),
                                     Ordering::Release,
                                 );
-                                let _ = runtime_event_tx.send(
-                                    CodingRuntimeEvent::SessionChanged(changed.clone()),
-                                );
+                                runtime_event_tx.session_changed(changed.clone(), resources.as_ref());
                                 if let Some(intervention) = pending_policy_intervention.take() {
                                     let _ = runtime_event_tx.send(
                                         CodingRuntimeEvent::PolicyInterventionCleared {

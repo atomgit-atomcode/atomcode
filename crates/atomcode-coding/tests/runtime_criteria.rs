@@ -6580,3 +6580,96 @@ mod criteria {
         what_the_configuration_lost_is_said_when_the_runtime_starts,
     );
 }
+
+/// Sharing can initialize while the provider is still running; the strong
+/// snapshot API continues to wait for a complete turn.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_live_view_is_available_before_the_running_turn_finishes() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+            .await
+            .unwrap();
+    turn(&mut runtime, "history").await;
+    recorder.answer_delay_ms.store(60_000, Ordering::SeqCst);
+    runtime
+        .handle
+        .submit(UserInput::from("slow turn"))
+        .await
+        .unwrap();
+    loop {
+        let event = runtime.events.recv().await.unwrap();
+        if matches!(
+            event.event,
+            CodingRuntimeEvent::Agent(atomcode_kernel::event::AgentEvent::TurnStarted { .. })
+        ) {
+            break;
+        }
+    }
+    let view = runtime.handle.live_view().unwrap();
+    assert!(view
+        .snapshot
+        .messages
+        .iter()
+        .any(|message| message.text == "history"));
+    assert!(view.events.iter().any(|event| matches!(
+        event.event,
+        CodingRuntimeEvent::Agent(atomcode_kernel::event::AgentEvent::TurnStarted { .. })
+    )));
+    assert!(tokio::time::timeout(
+        std::time::Duration::from_millis(10),
+        runtime.handle.snapshot()
+    )
+    .await
+    .is_err());
+    let generation = runtime
+        .handle
+        .reassemble_provider(start(env.project.path(), &recorder, SessionMode::Fresh).agent)
+        .await
+        .unwrap();
+    loop {
+        if matches!(
+            runtime.events.recv().await.unwrap().event,
+            CodingRuntimeEvent::ProviderChanged { .. }
+        ) {
+            break;
+        }
+    }
+    let view = runtime.handle.live_view().unwrap();
+    assert_eq!(view.generation, generation.0);
+    assert!(view
+        .events
+        .iter()
+        .all(|event| event.generation == generation.0));
+    assert!(view.events.iter().any(|event| matches!(
+        event.event,
+        CodingRuntimeEvent::Agent(atomcode_kernel::event::AgentEvent::TurnStarted { .. })
+    )));
+    assert!(!format!("{:?}", runtime.handle).contains("slow turn"));
+    runtime.handle.cancel().await.unwrap();
+    loop {
+        if matches!(
+            runtime.events.recv().await.unwrap().event,
+            CodingRuntimeEvent::TurnFinished(_)
+        ) {
+            break;
+        }
+    }
+    let view = runtime.handle.live_view().unwrap();
+    assert!(!view.events.iter().any(|event| matches!(
+        event.event,
+        CodingRuntimeEvent::Agent(atomcode_kernel::event::AgentEvent::TurnStarted { .. })
+    )));
+    let changed = runtime.handle.fresh_session().await.unwrap();
+    loop {
+        let event = runtime.events.recv().await.unwrap();
+        if matches!(event.event, CodingRuntimeEvent::SessionChanged(_)) {
+            break;
+        }
+    }
+    let view = runtime.handle.live_view().unwrap();
+    assert_eq!(Some(view.session_id), changed.session_id);
+    assert!(view.snapshot.messages.is_empty());
+    runtime.handle.shutdown().await.unwrap();
+}

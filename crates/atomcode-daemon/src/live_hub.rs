@@ -264,11 +264,115 @@ impl LiveViewHub {
         snapshot: SessionSnapshot,
         control: Arc<dyn LiveRuntimeControl>,
     ) -> Result<LiveBinding, HubError> {
+        self.bind_initial(
+            session_id,
+            working_dir,
+            provider,
+            provider_fingerprint,
+            snapshot,
+            control,
+            false,
+        )
+    }
+
+    /// Bind a complete presentation view without waiting for turn completion.
+    /// Build replay privately, then install it atomically so joiners never see
+    /// a baseline without its in-flight turn and pending requests.
+    pub fn bind_live_view(
+        &self,
+        view: atomcode_coding::runtime::RuntimeLiveView,
+        provider: String,
+        provider_fingerprint: String,
+        control: Arc<dyn LiveRuntimeControl>,
+    ) -> Result<LiveBinding, HubError> {
+        let status = control.status();
+        if status.generation != view.generation {
+            return Err(HubError::StaleBinding);
+        }
+        let staged = Self::new();
+        let binding = staged.bind_initial(
+            view.session_id,
+            view.working_dir,
+            provider,
+            provider_fingerprint,
+            (*view.snapshot).clone(),
+            control.clone(),
+            true,
+        )?;
+        for event in view.events {
+            staged.publish(&binding, event)?;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.turn_active
+            || state.binding.as_ref().is_some_and(|bound| {
+                matches!(
+                    bound.control.status().phase,
+                    RuntimePhase::InTurn
+                        | RuntimePhase::WaitingApproval
+                        | RuntimePhase::Reconfiguring
+                )
+            })
+        {
+            return Err(HubError::ActiveTurn);
+        }
+        let current = control.status();
+        if current.generation != view.generation
+            || matches!(
+                current.phase,
+                RuntimePhase::Reconfiguring
+                    | RuntimePhase::ShuttingDown
+                    | RuntimePhase::Stopped
+                    | RuntimePhase::Failed
+            )
+        {
+            return Err(HubError::StaleBinding);
+        }
+        let mut next = staged
+            .state
+            .into_inner()
+            .unwrap_or_else(|error| error.into_inner());
+        next.next_binding_id = state.next_binding_id + 1;
+        if let Some(bound) = next.binding.as_mut() {
+            bound.identity.id = next.next_binding_id;
+        }
+        for event in &mut next.replay {
+            event.cursor += state.next_cursor;
+            event.binding_id = next.next_binding_id;
+        }
+        next.next_cursor += state.next_cursor;
+        next.turn_active |= matches!(
+            current.phase,
+            RuntimePhase::InTurn | RuntimePhase::WaitingApproval
+        );
+        next.last_runtime_sequence = view.sequence;
+        let binding = next
+            .binding
+            .as_ref()
+            .expect("staged binding")
+            .identity
+            .clone();
+        *state = next;
+        Ok(binding)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bind_initial(
+        &self,
+        session_id: impl Into<String>,
+        working_dir: PathBuf,
+        provider: impl Into<String>,
+        provider_fingerprint: impl Into<String>,
+        snapshot: SessionSnapshot,
+        control: Arc<dyn LiveRuntimeControl>,
+        allow_active: bool,
+    ) -> Result<LiveBinding, HubError> {
         let status = control.status();
         match status.phase {
-            RuntimePhase::InTurn | RuntimePhase::WaitingApproval | RuntimePhase::Reconfiguring => {
+            RuntimePhase::Reconfiguring => return Err(HubError::ActiveTurn),
+            RuntimePhase::InTurn | RuntimePhase::WaitingApproval if !allow_active => {
                 return Err(HubError::ActiveTurn)
             }
+            RuntimePhase::InTurn | RuntimePhase::WaitingApproval => {}
             RuntimePhase::ShuttingDown | RuntimePhase::Stopped | RuntimePhase::Failed => {
                 return Err(HubError::RuntimeUnavailable);
             }
@@ -1416,6 +1520,90 @@ mod tests {
         session_change_is_noop, HubError, HubState, LiveBinding, LiveRuntimeControl, LiveViewEvent,
         LiveViewHub, PendingWebSteer,
     };
+
+    #[test]
+    fn a_live_view_binds_during_a_turn_and_keeps_requests_and_sequence_watermark() {
+        let hub = LiveViewHub::new();
+        let (previous, _) = control();
+        hub.bind("previous", "/old".into(), snapshot("previous"), previous)
+            .unwrap();
+        let (control, _) = control();
+        control.status.lock().unwrap().phase = RuntimePhase::WaitingApproval;
+        assert!(matches!(
+            hub.bind("s", "/one".into(), snapshot("history"), control.clone()),
+            Err(HubError::ActiveTurn)
+        ));
+        let mut view = atomcode_coding::runtime::RuntimeLiveView::from_snapshot(
+            1,
+            "s".into(),
+            "/one".into(),
+            snapshot("history"),
+        );
+        view.events = vec![
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 4,
+                event: CodingRuntimeEvent::Agent(AgentEvent::TurnStarted { turn: None }),
+            },
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 5,
+                event: CodingRuntimeEvent::Agent(AgentEvent::TextDelta("partial".into())),
+            },
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 6,
+                event: CodingRuntimeEvent::Request(atomcode_coding::RuntimeRequest {
+                    id: 42,
+                    kind: "approval".into(),
+                    payload: serde_json::json!({"tool":"bash"}),
+                    snapshot: None,
+                }),
+            },
+        ];
+        view.sequence = Some(6);
+        let binding = hub
+            .bind_live_view(
+                view.clone(),
+                "provider".into(),
+                "fingerprint".into(),
+                control.clone(),
+            )
+            .unwrap();
+        assert_eq!(binding.id, 2);
+        let joined = hub.join().unwrap();
+        assert_eq!(joined.snapshot.messages[0].text, "history");
+        assert_eq!(joined.replay.len(), 3);
+        assert!(joined
+            .replay
+            .iter()
+            .all(|event| event.binding_id == binding.id));
+        assert!(hub.state.lock().unwrap().pending_requests.contains_key(&42));
+        assert!(hub.state.lock().unwrap().turn_active);
+        assert_eq!(
+            hub.publish(&binding, view.events[2].clone()),
+            Err(HubError::StaleEvent)
+        );
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 7,
+                event: CodingRuntimeEvent::Agent(AgentEvent::TextDelta("new".into())),
+            },
+        )
+        .unwrap();
+        assert_eq!(hub.join().unwrap().replay.len(), 4);
+        assert!(matches!(
+            hub.bind_live_view(view.clone(), "p".into(), "f".into(), control.clone()),
+            Err(HubError::ActiveTurn)
+        ));
+        control.status.lock().unwrap().generation = 2;
+        assert!(matches!(
+            LiveViewHub::new().bind_live_view(view, "p".into(), "f".into(), control),
+            Err(HubError::StaleBinding)
+        ));
+    }
 
     #[test]
     fn web_steer_correlation_uses_runtime_payload_and_returns_client_identity() {

@@ -70,13 +70,6 @@ pub async fn attach(config_path: &std::path::Path) -> Result<(), String> {
         .clone()
         .ok_or_else(|| tr(SMsg::HostUnavailable).into_owned())?;
     let handle = live.handle();
-    let session_id = live.session();
-    // 运行时此刻在哪儿,不是启动时在哪儿:`/cd` 之后再开 `/webui`,拿启动目录去挂,
-    // 下一条「换了会话」就会被当成身份变了,网页端随之连不上。
-    let working_dir = match handle.context_stats().await {
-        Ok(stats) => stats.working_dir,
-        Err(_) => live.working_dir(),
-    };
     let config =
         atomcode_config::config::Config::load(config_path).map_err(|error| error.to_string())?;
     let (selection, _model) = resolved_selection(&config);
@@ -84,24 +77,24 @@ pub async fn attach(config_path: &std::path::Path) -> Result<(), String> {
         return Err(tr(SMsg::ShareNoModel).into_owned());
     }
     let fingerprint = atomcode_daemon::native_live::provider_fingerprint(&config, &selection)?;
-    // 快照是网页端的开场:它进来时对话已经进行了一半,得先看到之前说了什么。
-    let snapshot = handle.snapshot().await.map_err(|error| error.to_string())?;
-    // 句柄给的是共享的那一份;hub 要自己的一份,它此后会跟着网页端的事件往前走。
-    let snapshot = (*snapshot).clone();
-    let binding = atomcode_daemon::native_live::register_embedded_runtime(
-        session_id.to_string(),
-        working_dir.to_path_buf(),
-        selection,
-        fingerprint,
-        snapshot,
-        Arc::new(handle.clone()),
-    )
-    .map_err(|error| format!("{error:?}"))?;
-    *bound().lock().expect("binding poisoned") = Some(binding);
-    // 远端那边的「模式」徽标读的是 daemon 里的一个全局值,不是事件流。挂上时先
-    // 把当前模式告诉它,否则手机和网页顶上写的是默认值——看着像你没在 plan 里,
-    // 而你在。
-    if let Ok(mode) = handle.mode().await {
+    {
+        // Publication takes the same lock. Anything already represented by the
+        // captured view is rejected by the hub's sequence watermark; newer
+        // events cannot fall into the gap before this binding is installed.
+        let mut bound = bound().lock().expect("binding poisoned");
+        if bound.is_some() {
+            return Ok(());
+        }
+        let view = handle.live_view().map_err(|error| error.to_string())?;
+        let mode = view.mode;
+        let binding = atomcode_daemon::native_live::register_embedded_live_view(
+            view,
+            selection,
+            fingerprint,
+            Arc::new(handle.clone()),
+        )
+        .map_err(|error| format!("{error:?}"))?;
+        *bound = Some(binding);
         atomcode_daemon::live_set_mode(mode);
     }
     // 第四个接点:那一端从现在起可以请这块屏幕跑一条命令。注册要在挂上之后
@@ -192,7 +185,12 @@ pub fn publish(event: &SequencedRuntimeEvent) {
     let Some(binding) = guard.as_ref() else {
         return;
     };
-    let _ = atomcode_daemon::native_live::publish(binding, event.clone());
+    if atomcode_daemon::native_live::publish(binding, event.clone()).is_err() {
+        // Bootstrap already includes these delayed events. Their side effects
+        // must be deduplicated too: an old SessionChanged must not schedule a
+        // snapshot handover using the replacement session's live handle.
+        return;
+    }
     // 换了会话(`/clear`、`/resume`、`/cd`):hub 收到这条就把手上的快照作废,等
     // 新会话的快照交上来 —— 在那之前网页端连不上、发的话一律被拒。经典界面换完
     // 会话自己交;这块屏幕原先不交,于是 hub 一直等到下一个终端回合跑完。
