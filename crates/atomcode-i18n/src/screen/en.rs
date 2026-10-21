@@ -1194,9 +1194,15 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SourceUnreadable => "unreadable, not loaded".into(),
         Msg::SourceNotLoaded => "not loaded".into(),
         Msg::SourceDiskChanged => "disk changed; resume to refresh instructions".into(),
-        Msg::SourceSkillDirs => "Skill scan directories".into(),
+        Msg::SourceSkillDirs => crate::product::t_with(crate::Locale::En, crate::product::Msg::CmdCatalogSkillDirs),
         Msg::SourceSkills => "Loaded skills".into(),
-        Msg::SourceSkillDiagnostics => "Skill loading diagnostics".into(),
+        Msg::SourceSkillDiagnostics => crate::product::t_with(crate::Locale::En, crate::product::Msg::CmdCatalogSkillDiagnostics),
+        Msg::SourceSkillSummary { loaded, directories, overridden, failed } => {
+            let mut text = format!("{loaded} loaded · {directories} scan directories");
+            if overridden > 0 { text.push_str(&format!(" · {overridden} overridden")); }
+            if failed > 0 { text.push_str(&format!(" · {failed} loading failures")); }
+            text.push_str("\nUse /skills for details."); text.into()
+        },
         Msg::SourceInstructionFiles => "instruction files".into(),
         Msg::SourceMemoryFiles => "memory files".into(),
         Msg::HostNoEditableConfig => "this host has no configuration that can be changed".into(),

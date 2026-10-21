@@ -1481,6 +1481,9 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
                 .into(),
         Msg::CmdCatalogSkills =>
             "Which skills are installed; give names and they are used together".into(),
+        Msg::CmdCatalogSkillsEmpty => "No skills installed".into(),
+        Msg::CmdCatalogSkillDirs => "Skill scan directories".into(),
+        Msg::CmdCatalogSkillDiagnostics => "Skill loading diagnostics".into(),
         Msg::CmdCatalogSkillsUsage => "[name… [what to tell them]]".into(),
         Msg::CmdCatalogSkillUsage => "[what to tell it]".into(),
         Msg::CmdCatalogPromptCommandUsage => "[command arguments]".into(),

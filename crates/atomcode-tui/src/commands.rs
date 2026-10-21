@@ -4019,6 +4019,7 @@ mod tests {
                 },
                 HostCommand::Sources { .. } => HostReply::Sources {
                     groups: vec![atomcode_host_api::SourceGroup {
+                        summary: None,
                         label: "指令文件".into(),
                         files: vec![atomcode_host_api::SourceFile {
                             detail: None,

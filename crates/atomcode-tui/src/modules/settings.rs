@@ -990,6 +990,10 @@ fn status_lines(page: Option<&crate::settings::StatusPage>) -> Vec<UsageLine> {
     for group in &page.sources {
         out.push(UsageLine::Gap);
         out.push(UsageLine::Head(group.label.clone()));
+        if let Some(summary) = &group.summary {
+            out.extend(summary.lines().map(|line| UsageLine::Note(line.to_owned())));
+            continue;
+        }
         for file in &group.files {
             let same_as = seen
                 .iter()
@@ -2207,6 +2211,7 @@ mod tests {
         use atomcode_host_api::{SourceFile, SourceGroup};
         let page = crate::settings::StatusPage {
             sources: vec![SourceGroup {
+                summary: None,
                 label: "Instructions".into(),
                 files: vec![SourceFile {
                     label: "Project".into(),
@@ -3481,6 +3486,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn status_summary_replaces_verbose_source_rows_in_text_and_on_screen() {
+        let data = crate::settings::StatusPage {
+            sources: vec![atomcode_host_api::SourceGroup {
+                label: "Skills".into(),
+                summary: Some("86 loaded · 10 directories · 1 failure\n/skills for details".into()),
+                files: vec![atomcode_host_api::SourceFile {
+                    label: "diagnostic".into(),
+                    path: "/private/invalid/SKILL.md".into(),
+                    present: true,
+                    detail: Some("verbose failure reason".into()),
+                }],
+            }],
+            ..Default::default()
+        };
+        let text = status_text(&data);
+        let screen = drawn(&status_page(data), 100, 40).join("\n");
+        for output in [text, screen] {
+            assert!(output.contains("86 loaded"));
+            assert!(output.contains("/skills"));
+            assert!(!output.contains("SKILL.md"));
+            assert!(!output.contains("verbose failure reason"));
+        }
+    }
+
     /// A file the session was configured from is listed **whether or not it is
     /// there**, and says which.
     ///
@@ -3500,6 +3530,7 @@ mod tests {
             session: "abc".into(),
             cwd: "/w".into(),
             sources: vec![SourceGroup {
+                summary: None,
                 label: "指令文件".into(),
                 files: vec![
                     SourceFile {
@@ -3550,6 +3581,7 @@ mod tests {
             session: "abc".into(),
             cwd: "/home/me".into(),
             sources: vec![SourceGroup {
+                summary: None,
                 label: "记忆文件".into(),
                 files: vec![
                     SourceFile {

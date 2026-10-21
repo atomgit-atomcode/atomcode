@@ -1990,6 +1990,7 @@ fn source_groups(
     };
     let mut groups = vec![
         SourceGroup {
+            summary: None,
             label: tr(SMsg::SourceConfigFile).into_owned(),
             files: vec![file(
                 &tr(SMsg::SourceSettings),
@@ -1997,6 +1998,7 @@ fn source_groups(
             )],
         },
         SourceGroup {
+            summary: None,
             label: tr(SMsg::SourceInstructionFiles).into_owned(),
             files: assets
                 .instructions
@@ -2045,6 +2047,7 @@ fn source_groups(
                 .collect(),
         },
         SourceGroup {
+            summary: None,
             label: tr(SMsg::SourceMemoryFiles).into_owned(),
             files: vec![
                 file(
@@ -2072,49 +2075,49 @@ fn source_groups(
             ],
         },
     ];
-    if !assets.skill_dirs.is_empty() {
-        groups.push(SourceGroup {
-            label: tr(SMsg::SourceSkillDirs).into_owned(),
-            files: assets
-                .skill_dirs
-                .iter()
-                .map(|path| SourceFile {
-                    label: tr(SMsg::SourceSkillDirs).into_owned(),
-                    path: path.display().to_string(),
-                    present: path.is_dir(),
-                    detail: None,
-                })
-                .collect(),
-        });
-    }
-    if !assets.skills.is_empty() {
-        groups.push(SourceGroup {
-            label: tr(SMsg::SourceSkills).into_owned(),
-            files: assets
-                .skills
-                .iter()
-                .map(|(name, path)| SourceFile {
-                    label: name.clone(),
-                    path: path.display().to_string(),
-                    present: true,
-                    detail: Some(tr(SMsg::SourceLoaded).into_owned()),
-                })
-                .collect(),
-        });
-    }
-    if !assets.skill_diagnostics.is_empty() {
-        groups.push(SourceGroup {
+    if !assets.skill_dirs.is_empty()
+        || !assets.skills.is_empty()
+        || !assets.skill_diagnostics.is_empty()
+    {
+        let mut files: Vec<_> = assets
+            .skill_dirs
+            .iter()
+            .map(|path| SourceFile {
+                label: tr(SMsg::SourceSkillDirs).into_owned(),
+                path: path.display().to_string(),
+                present: path.is_dir(),
+                detail: None,
+            })
+            .collect();
+        files.extend(assets.skills.iter().map(|(name, path)| SourceFile {
+            label: name.clone(),
+            path: path.display().to_string(),
+            present: true,
+            detail: Some(tr(SMsg::SourceLoaded).into_owned()),
+        }));
+        files.extend(assets.skill_diagnostics.iter().map(|d| SourceFile {
             label: tr(SMsg::SourceSkillDiagnostics).into_owned(),
-            files: assets
-                .skill_diagnostics
-                .iter()
-                .map(|d| SourceFile {
-                    label: tr(SMsg::SourceSkillDiagnostics).into_owned(),
-                    path: d.path.display().to_string(),
-                    present: true,
-                    detail: Some(d.reason.clone()),
+            path: d.path.display().to_string(),
+            present: true,
+            detail: Some(d.reason.clone()),
+        }));
+        let failed = assets
+            .skill_diagnostics
+            .iter()
+            .filter(|d| d.warning)
+            .count();
+        groups.push(SourceGroup {
+            label: "Skills".into(),
+            summary: Some(
+                tr(SMsg::SourceSkillSummary {
+                    loaded: assets.skills.len(),
+                    directories: assets.skill_dirs.len(),
+                    overridden: assets.skill_diagnostics.len() - failed,
+                    failed,
                 })
-                .collect(),
+                .into_owned(),
+            ),
+            files,
         });
     }
     groups
@@ -3240,6 +3243,46 @@ pub fn refused(error: RuntimeError) -> HostError {
 mod source_tests {
     use super::source_groups;
     use atomcode_i18n::screen::{t as tr, Msg as SMsg};
+
+    #[test]
+    fn skill_sources_keep_details_but_provide_a_bounded_status_summary() {
+        let project = tempfile::tempdir().unwrap();
+        let assets = atomcode_coding::runtime::RuntimeAssetSources {
+            skill_dirs: vec![project.path().join("skills")],
+            skills: vec![(
+                "sample".into(),
+                project.path().join("skills/sample/SKILL.md"),
+            )],
+            skill_diagnostics: vec![
+                atomcode_capabilities::skills::SkillDiagnostic {
+                    path: project.path().join("old/SKILL.md"),
+                    reason: "overridden by new".into(),
+                    warning: false,
+                },
+                atomcode_capabilities::skills::SkillDiagnostic {
+                    path: project.path().join("invalid/SKILL.md"),
+                    reason: "invalid name".into(),
+                    warning: true,
+                },
+            ],
+            ..Default::default()
+        };
+        let groups = source_groups(project.path(), &assets);
+        let skills = groups.iter().find(|group| group.label == "Skills").unwrap();
+        assert_eq!(skills.files.len(), 4, "detailed sources remain available");
+        let summary = skills.summary.as_ref().unwrap();
+        assert_eq!(
+            summary,
+            &tr(SMsg::SourceSkillSummary {
+                loaded: 1,
+                directories: 1,
+                overridden: 1,
+                failed: 1
+            })
+        );
+        assert!(!summary.contains("SKILL.md"));
+        assert!(summary.contains("/skills"));
+    }
 
     /// Every file the session is configured from is reported, and the ones that
     /// are not there are reported as not there.

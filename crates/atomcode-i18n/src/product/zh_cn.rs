@@ -1440,6 +1440,9 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             "让评审员看一遍现在的改动;只读,不改".into(),
         Msg::CmdCatalogSkills =>
             "装了哪些 skill;给名字就把它们一起用上".into(),
+        Msg::CmdCatalogSkillsEmpty => "一个 skill 都没装".into(),
+        Msg::CmdCatalogSkillDirs => "Skill 扫描目录".into(),
+        Msg::CmdCatalogSkillDiagnostics => "Skill 加载诊断".into(),
         Msg::CmdCatalogSkillsUsage => "[名字… [给它们的话]]".into(),
         Msg::CmdCatalogSkillUsage => "[给它的话]".into(),
         Msg::CmdCatalogPromptCommandUsage => "[命令参数]".into(),

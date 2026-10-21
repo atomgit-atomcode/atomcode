@@ -191,12 +191,24 @@ impl SkillRegistry {
                 let mut index = self.write();
                 let name = skill.name.clone();
                 let source = skill.source_path.clone();
+                // Compare loaded definitions, not current disk contents: a file
+                // may have changed since the earlier source was scanned.
+                let same_definition = match kind {
+                    TemplateKind::Skill => index.skills.get(&name),
+                    TemplateKind::Command => index.commands.get(&name),
+                }
+                .is_some_and(|previous| {
+                    previous.description == skill.description
+                        && previous.template == skill.template
+                        && previous.allowed_tools == skill.allowed_tools
+                        && previous.user_invocable == skill.user_invocable
+                });
                 let previous = match kind {
                     TemplateKind::Skill => index.skills.insert(name, Arc::new(skill)),
                     TemplateKind::Command => index.commands.insert(name, Arc::new(skill)),
                 };
                 if let Some(previous) = previous {
-                    if previous.source_path != source {
+                    if previous.source_path != source && !same_definition {
                         index.diagnostics.push(SkillDiagnostic {
                             path: previous.source_path.clone(),
                             reason: format!("overridden by {}", source.display()),
@@ -598,6 +610,40 @@ mod tests {
     }
 
     #[test]
+    fn identical_definitions_are_quiet_but_keep_the_higher_priority_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let low = tmp.path().join("low");
+        let high = tmp.path().join("high");
+        for root in [&low, &high] {
+            std::fs::create_dir_all(root.join("sample")).unwrap();
+            std::fs::write(
+                root.join("sample/SKILL.md"),
+                "---\nname: sample\ndescription: same\n---\nbody",
+            )
+            .unwrap();
+        }
+        let reg = SkillRegistry::load(&[low.clone(), high.clone()]);
+        assert!(reg.diagnostics().is_empty());
+        assert_eq!(
+            reg.get("sample").unwrap().source_path,
+            high.join("sample/SKILL.md")
+        );
+        std::fs::write(
+            high.join("sample/SKILL.md"),
+            "---\nname: sample\ndescription: same\nuser-invocable: false\n---\nbody",
+        )
+        .unwrap();
+        reg.reload_dirs(&[low, high], &[]);
+        assert_eq!(
+            reg.diagnostics().len(),
+            1,
+            "metadata changes remain visible"
+        );
+        assert!(!reg.diagnostics()[0].warning);
+        assert!(!reg.get("sample").unwrap().user_invocable);
+    }
+
+    #[test]
     fn versioned_name_collisions_keep_existing_precedence_and_diagnostics() {
         let tmp = tempfile::tempdir().unwrap();
         for name in ["sample-1.0.0", "sample-2.0.0"] {
@@ -654,7 +700,11 @@ mod tests {
             .collect();
         for root in &roots {
             std::fs::create_dir_all(root.join("same")).unwrap();
-            std::fs::write(root.join("same/SKILL.md"), "same skill").unwrap();
+            std::fs::write(
+                root.join("same/SKILL.md"),
+                format!("skill from {}", root.display()),
+            )
+            .unwrap();
         }
         let reg = SkillRegistry::load(&roots);
         assert_eq!(

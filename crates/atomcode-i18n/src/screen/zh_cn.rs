@@ -1124,9 +1124,15 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SourceUnreadable => "无法读取，未加载".into(),
         Msg::SourceNotLoaded => "未加载".into(),
         Msg::SourceDiskChanged => "磁盘已变更；恢复会话时刷新指令".into(),
-        Msg::SourceSkillDirs => "Skill 扫描目录".into(),
+        Msg::SourceSkillDirs => crate::product::t_with(crate::Locale::ZhCn, crate::product::Msg::CmdCatalogSkillDirs),
         Msg::SourceSkills => "已加载的 skill".into(),
-        Msg::SourceSkillDiagnostics => "Skill 加载诊断".into(),
+        Msg::SourceSkillDiagnostics => crate::product::t_with(crate::Locale::ZhCn, crate::product::Msg::CmdCatalogSkillDiagnostics),
+        Msg::SourceSkillSummary { loaded, directories, overridden, failed } => {
+            let mut text = format!("已加载 {loaded} 个 · 扫描目录 {directories} 个");
+            if overridden > 0 { text.push_str(&format!(" · 同名覆盖 {overridden} 个")); }
+            if failed > 0 { text.push_str(&format!(" · 加载失败 {failed} 个")); }
+            text.push_str("\n输入 /skills 查看详情"); text.into()
+        },
         Msg::SourceInstructionFiles => "指令文件".into(),
         Msg::SourceMemoryFiles => "记忆文件".into(),
         Msg::HostNoEditableConfig => "这个宿主没有可改的配置".into(),

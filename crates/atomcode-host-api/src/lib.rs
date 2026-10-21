@@ -807,6 +807,9 @@ pub struct UsageStats {
 /// it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceGroup {
+    /// Compact status text; files remain available to detailed source consumers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
     pub label: String,
     pub files: Vec<SourceFile>,
 }
@@ -1527,6 +1530,14 @@ pub struct HostConnection {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn source_summaries_are_optional_on_existing_wire_replies() {
+        let old = serde_json::json!({"label":"sources", "files":[]});
+        let group: super::SourceGroup = serde_json::from_value(old.clone()).unwrap();
+        assert!(group.summary.is_none());
+        assert_eq!(serde_json::to_value(group).unwrap(), old);
+    }
+
     use super::*;
 
     /// Each command, reply, event and error exactly once. The matches are
@@ -1986,6 +1997,7 @@ mod tests {
             },
             HostReply::Sources {
                 groups: vec![SourceGroup {
+                    summary: None,
                     label: "指令文件".into(),
                     files: vec![SourceFile {
                         label: "项目共享".into(),

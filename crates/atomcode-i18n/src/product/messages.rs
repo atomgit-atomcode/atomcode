@@ -2355,6 +2355,9 @@ pub enum Msg<'a> {
     CmdCatalogReview,
     CmdCatalogSkills,
     CmdCatalogSkillsUsage,
+    CmdCatalogSkillsEmpty,
+    CmdCatalogSkillDirs,
+    CmdCatalogSkillDiagnostics,
     /// The hint on a user-invoked skill's own row; its gloss is the skill's.
     CmdCatalogSkillUsage,
     /// A disk command with its own template, separate from a same-named skill.

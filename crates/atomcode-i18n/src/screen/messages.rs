@@ -1855,6 +1855,12 @@ pub enum Msg<'a> {
     SourceSkillDirs,
     SourceSkills,
     SourceSkillDiagnostics,
+    SourceSkillSummary {
+        loaded: usize,
+        directories: usize,
+        overridden: usize,
+        failed: usize,
+    },
     SourceInstructionFiles,
     SourceMemoryFiles,
     HostNoEditableConfig,

@@ -727,19 +727,58 @@ impl crate::commands::CatalogCommand for ListSkills {
         if !args.is_empty() {
             return self.run_them(agent, args);
         }
-        let listed = self.0.list();
-        if listed.is_empty() {
-            return Ok("一个 skill 都没装".into());
-        }
-        Ok(listed
-            .into_iter()
-            .map(|(name, about)| format!("{name} · {about}"))
-            .collect::<Vec<_>>()
-            .join("\n"))
+        Ok(self.listing())
     }
 }
 
 impl ListSkills {
+    fn listing(&self) -> String {
+        let listed = self.0.all();
+        let mut sections = Vec::new();
+        if listed.is_empty() {
+            sections.push(t(Msg::CmdCatalogSkillsEmpty).into_owned());
+        } else {
+            sections.push(
+                listed
+                    .into_iter()
+                    .map(|skill| {
+                        format!(
+                            "{} · {}\n  {}",
+                            skill.name,
+                            skill.description,
+                            skill.source_path.display()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+        }
+        let dirs = self.0.directories();
+        if !dirs.is_empty() {
+            sections.push(format!(
+                "{}\n{}",
+                t(Msg::CmdCatalogSkillDirs),
+                dirs.iter()
+                    .map(|path| format!("  {}", path.display()))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
+        }
+        let diagnostics = self.0.diagnostics();
+        if !diagnostics.is_empty() {
+            sections.push(format!(
+                "{}\n{}",
+                t(Msg::CmdCatalogSkillDiagnostics),
+                diagnostics
+                    .iter()
+                    .map(|d| format!("  {}\n    {}", d.path.display(), d.reason))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
+        }
+        sections.join("\n\n")
+    }
+
     fn run_them(&self, agent: Arc<crate::agent::Agent>, args: &str) -> Result<String, String> {
         let (names, task) = skills_and_task(args, |token| {
             self.0
@@ -1291,6 +1330,47 @@ impl Plugin for McpPlugin {
 #[cfg(test)]
 mod tests {
     use super::skills_and_task;
+
+    #[test]
+    fn skill_listing_keeps_loaded_paths_and_failures_even_without_loaded_skills() {
+        let tmp = std::env::temp_dir().join(format!(
+            "harness-skill-list-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&tmp).unwrap();
+        std::fs::create_dir(tmp.as_path().join("sample")).unwrap();
+        std::fs::write(
+            tmp.as_path().join("sample/SKILL.md"),
+            "---\nname: sample\ndescription: test\n---\nbody",
+        )
+        .unwrap();
+        let registry =
+            std::sync::Arc::new(atomcode_capabilities::skills::SkillRegistry::load(&[tmp
+                .as_path()
+                .to_path_buf()]));
+        let command = super::ListSkills(registry.clone());
+        let output = command.listing();
+        assert!(output.contains("sample · test"));
+        assert!(output.contains(&tmp.as_path().join("sample/SKILL.md").display().to_string()));
+        std::fs::write(
+            tmp.as_path().join("sample/SKILL.md"),
+            "---\nname: invalid.name\n---\nbody",
+        )
+        .unwrap();
+        registry.reload_dirs(&[tmp.as_path().to_path_buf()], &[]);
+        assert!(registry.is_empty());
+        let output = command.listing();
+        assert!(
+            output.contains("SKILL.md"),
+            "failures-only catalogs still have details"
+        );
+        assert!(output.contains("invalid"));
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
 
     /// Where the names stop and the task starts.
     ///
