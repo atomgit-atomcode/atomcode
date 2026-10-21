@@ -532,6 +532,90 @@ pub fn skill_install_dirs(roots: SkillRoots<'_>) -> (PathBuf, PathBuf) {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn versioned_installs_and_display_titles_have_safe_invocation_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let entries = [
+            ("atomgit-1.0.0", "# AtomGit", "atomgit"),
+            ("debug-pro-1.0.0", "# debug-pro", "debug-pro"),
+            ("test-runner-1.0.0", "# test-runner", "test-runner"),
+            (
+                "ffmpeg-video-editor-1.0.0",
+                "---\nname: FFmpeg Video Editor\n---\nbody",
+                "ffmpeg-video-editor",
+            ),
+            (
+                "market-research-1.0.0",
+                "---\nname: Market Research\nslug: market-research\n---\nbody",
+                "market-research",
+            ),
+            (
+                "self-improving-1.1.3",
+                "---\nname: Self-Improving Agent (With Self-Reflection)\n---\nbody",
+                "self-improving",
+            ),
+            (
+                "seo-1.0.3",
+                "---\nname: SEO (Site Audit + Content Writer + Competitor Analysis)\n---\nbody",
+                "seo",
+            ),
+            (
+                "social-media-scheduler-1.0.0",
+                "---\nname: Social Media Scheduler\n---\nbody",
+                "social-media-scheduler",
+            ),
+            (
+                "renamed-1.0.0",
+                "---\nname: explicit-name\n---\nbody",
+                "explicit-name",
+            ),
+        ];
+        for (dir, body, _) in entries {
+            std::fs::create_dir(tmp.path().join(dir)).unwrap();
+            std::fs::write(tmp.path().join(dir).join("SKILL.md"), body).unwrap();
+        }
+        let reg = SkillRegistry::load(&[tmp.path().to_path_buf()]);
+        assert!(reg.take_new_warnings().is_empty());
+        for (dir, _, name) in entries {
+            let skill = reg.get(name).expect(name);
+            assert_eq!(skill.skill_dir, tmp.path().join(dir));
+            assert_eq!(skill.source_path, tmp.path().join(dir).join("SKILL.md"));
+            assert!(skill.user_invocable);
+        }
+    }
+
+    #[test]
+    fn title_compatibility_does_not_relax_flat_command_validation() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("command.md"),
+            "---\nname: Invalid Command Title\n---\nbody",
+        )
+        .unwrap();
+        let reg = SkillRegistry::new();
+        reg.load_template_dir(tmp.path(), None, TemplateKind::Command);
+        assert!(reg.get("command").is_none());
+        assert_eq!(reg.take_new_warnings().len(), 1);
+    }
+
+    #[test]
+    fn versioned_name_collisions_keep_existing_precedence_and_diagnostics() {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["sample-1.0.0", "sample-2.0.0"] {
+            std::fs::create_dir(tmp.path().join(name)).unwrap();
+            std::fs::write(tmp.path().join(name).join("SKILL.md"), name).unwrap();
+        }
+        let reg = SkillRegistry::load(&[tmp.path().to_path_buf()]);
+        assert_eq!(
+            reg.get("sample").unwrap().skill_dir,
+            tmp.path().join("sample-2.0.0")
+        );
+        let diagnostics = reg.diagnostics();
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].reason.contains("overridden by"));
+        assert!(!diagnostics[0].warning);
+    }
+
+    #[test]
     fn failures_are_reported_once_and_can_recover_on_reload() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("skills");

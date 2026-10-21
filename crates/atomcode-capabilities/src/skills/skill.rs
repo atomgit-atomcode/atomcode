@@ -498,7 +498,27 @@ pub(crate) fn parse_skill_file(path: &Path, namespace: Option<&str>) -> Result<S
         path.parent().unwrap_or(Path::new(".")),
         path,
         namespace,
+        false,
     )
+}
+
+/// Installers commonly append a stable version to the directory. Keep that
+/// packaging detail out of the invocation name; source/resource paths stay intact.
+fn unversioned_install_name(name: &str) -> &str {
+    let Some((base, version)) = name.rsplit_once('-') else {
+        return name;
+    };
+    let parts: Vec<_> = version.split('.').collect();
+    if parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+        && validate_skill_name(base).is_ok()
+    {
+        base
+    } else {
+        name
+    }
 }
 
 /// Parse a directory-style `<dir>/SKILL.md` (name = directory name unless overridden).
@@ -512,7 +532,14 @@ pub(crate) fn parse_skill_dir(
         .file_name()
         .and_then(|s| s.to_str())
         .ok_or("invalid directory name")?;
-    build_skill(&content, dir_name, skill_dir, skill_md, namespace)
+    build_skill(
+        &content,
+        unversioned_install_name(dir_name),
+        skill_dir,
+        skill_md,
+        namespace,
+        true,
+    )
 }
 
 fn build_skill(
@@ -521,12 +548,26 @@ fn build_skill(
     skill_dir: &Path,
     source: &Path,
     namespace: Option<&str>,
+    directory_style: bool,
 ) -> Result<Skill, String> {
     let (fm, template) = parse_frontmatter(content);
     if let Some(error) = fm.tools_error {
         return Err(error);
     }
-    let base = fm.name.as_deref().unwrap_or(default_name);
+    let declared_name = fm.name.as_deref().unwrap_or(default_name);
+    // Some catalogs use `name` as a human-readable title. The install name
+    // supplies a safe identifier in that case, rather than dropping the skill.
+    // Identifier-shaped invalid names still fail with an explicit diagnostic.
+    let base = if directory_style
+        && validate_skill_name(declared_name).is_err()
+        && fm.name.is_some()
+        && declared_name.chars().any(char::is_whitespace)
+        && validate_skill_name(default_name).is_ok()
+    {
+        default_name
+    } else {
+        declared_name
+    };
     validate_skill_name(base)?;
     let name = make_name(base, namespace);
     let description = if fm.description.is_empty() {
@@ -590,7 +631,8 @@ mod tests {
                         "test",
                         Path::new("."),
                         Path::new("SKILL.md"),
-                        None
+                        None,
+                        true,
                     )
                     .is_err(),
                     "{content}"
@@ -611,6 +653,7 @@ mod tests {
                         Path::new("."),
                         Path::new("SKILL.md"),
                         None,
+                        true,
                     )
                     .unwrap_err();
                     assert!(error.contains("duplicate allowed-tools"), "{error}");
@@ -637,6 +680,7 @@ mod tests {
                 Path::new("."),
                 Path::new("SKILL.md"),
                 None,
+                true,
             )
             .unwrap();
             assert_eq!(skill.name, "setup");
