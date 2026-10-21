@@ -107,11 +107,18 @@ struct Args {
     todos: Vec<RawItem>,
 }
 
-/// Parse the persisted/public full-list shape. This intentionally keeps the
-/// historical structural contract: older transcripts may contain vague labels
-/// such as `task 1`, and replay must not reinterpret those once-valid calls as
-/// missing state. New tool calls additionally pass [`validate_new_todo_plan`].
-pub fn parse_todos(args: &str) -> Result<Vec<TodoItem>, String> {
+// Providers may fill unused fields in a flat schema. Only a nonempty full
+// list overrides add/update; their default empty todos must not erase the plan.
+fn is_incremental_action(value: &serde_json::Value) -> bool {
+    matches!(
+        value.get("action").and_then(|v| v.as_str()),
+        Some("add" | "update")
+    ) && value
+        .get("todos")
+        .is_none_or(|todos| todos.as_array().is_some_and(Vec::is_empty))
+}
+
+fn todo_arguments(args: &str) -> Result<serde_json::Value, String> {
     let mut value: serde_json::Value = serde_json::from_str(args)
         .map_err(|e| format!("todowrite: invalid arguments: {e}. Expected {{\"todos\":[{{\"content\":\"…\",\"status\":\"pending|in_progress|completed\"}}]}}."))?;
     // Keep transcript-derived state aligned with RepairToolArgsMiddleware. The
@@ -126,6 +133,18 @@ pub fn parse_todos(args: &str) -> Result<Vec<TodoItem>, String> {
                 value["todos"] = decoded;
             }
         }
+    }
+    Ok(value)
+}
+
+/// Parse the persisted/public full-list shape. This intentionally keeps the
+/// historical structural contract: older transcripts may contain vague labels
+/// such as `task 1`, and replay must not reinterpret those once-valid calls as
+/// missing state. New tool calls additionally pass [`validate_new_todo_plan`].
+pub fn parse_todos(args: &str) -> Result<Vec<TodoItem>, String> {
+    let value = todo_arguments(args)?;
+    if is_incremental_action(&value) {
+        return Err("todowrite: incremental action is not a full-list plan.".into());
     }
     let a: Args = serde_json::from_value(value)
         .map_err(|e| format!("todowrite: invalid arguments: {e}. Expected {{\"todos\":[{{\"content\":\"…\",\"status\":\"pending|in_progress|completed\"}}]}}."))?;
@@ -426,7 +445,7 @@ impl Tool for TodoTool {
             "properties": {
                 "todos": {
                     "type": "array",
-                    "description": "PLAN/RE-PLAN: the full task list — REPLACES the previous list.",
+                    "description": "PLAN/RE-PLAN: the full task list — REPLACES the previous list. Omit when using action=add/update; their empty default array is ignored.",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -449,14 +468,15 @@ impl Tool for TodoTool {
         String::new()
     }
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(args) else {
-            return err("todowrite: invalid JSON arguments.".to_string());
+        let v = match todo_arguments(args) {
+            Ok(value) => value,
+            Err(error) => return err(error),
         };
         // Full-list (re)plan shape. Echo an ASCII-safe NUMBERED list as the tool result (goes
         // into the transcript; the renderer draws the pretty version separately). The
         // `<glyph> <id>. <content>` shape seeds the TUI title cache so later `action=update
         // id=N` rows show task names.
-        if v.get("todos").is_some() {
+        if v.get("todos").is_some() && !is_incremental_action(&v) {
             return match validate_new_todo_plan(args) {
                 Ok(todos) => ok(render_todos_numbered(&todos, false)),
                 Err(e) => err(e),
@@ -507,6 +527,38 @@ mod tests {
             progress: atomcode_kernel::tool::ProgressSink::noop(),
             requester: None,
         }
+    }
+
+    #[tokio::test]
+    async fn default_empty_todos_do_not_erase_incremental_updates() {
+        let initial = r#"{"action":"update","id":0,"status":"pending","todos":[{"content":"inspect session loading","status":"in_progress"},{"content":"verify runtime recovery","status":"pending"}]}"#;
+        assert!(
+            is_todo_plan(initial),
+            "a real full list wins over default action fields"
+        );
+        for empty in [serde_json::json!([]), serde_json::json!("[]")] {
+            let update = serde_json::json!({"action":"update","id":1,"status":"completed","content":"","todos":empty}).to_string();
+            assert!(!is_todo_plan(&update));
+            let result = TodoTool::new().execute(&update, &ctx()).await;
+            assert!(
+                !result.is_error && result.content.contains("#1"),
+                "{}",
+                result.content
+            );
+            let list = reduce_todos([(TOOL_NAME, initial), (TOOL_NAME, update.as_str())]);
+            assert_eq!(list.len(), 2);
+            assert_eq!(list[0].status, TodoStatus::Completed);
+            assert_eq!(list[1].status, TodoStatus::Pending);
+        }
+        let add = r#"{"action":"add","content":"check final diff","todos":[]}"#;
+        assert!(!TodoTool::new().execute(add, &ctx()).await.is_error);
+        assert_eq!(
+            reduce_todos([(TOOL_NAME, initial), (TOOL_NAME, add)]).len(),
+            3
+        );
+        // An explicitly supplied empty plan without an incremental action still clears.
+        assert!(is_todo_plan(r#"{"todos":[]}"#));
+        assert!(reduce_todos([(TOOL_NAME, initial), (TOOL_NAME, r#"{"todos":[]}"#)]).is_empty());
     }
 
     #[test]
