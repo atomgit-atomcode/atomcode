@@ -523,7 +523,11 @@ impl AgentClient {
                     ),
                 );
         }
-        if name == "memory" {
+        let memory_listing = (name == "memory")
+            .then(|| atomcode_capabilities::memory::input::parse("list", args).ok())
+            .flatten()
+            .filter(|input| input.is_listing());
+        if memory_listing.is_some() {
             self.view
                 .lock()
                 .expect("client poisoned")
@@ -534,7 +538,7 @@ impl AgentClient {
             id,
             session,
             name: name.to_string(),
-            args: if name == "memory" && !args.trim_start().starts_with("--json") {
+            args: if memory_listing.as_ref().is_some_and(|input| !input.json) {
                 format!("--json {}", args.trim())
             } else {
                 args.to_string()
@@ -14826,7 +14830,11 @@ fn memory_tabs(output: &str) -> Option<Vec<crate::sheet::DocTab>> {
     use crate::i18n::product::{t, Msg};
     use atomcode_capabilities::memory::store::MemorySection;
     let sections: Vec<MemorySection> = serde_json::from_str(output).ok()?;
-    sections
+    let review = sections
+        .iter()
+        .find_map(|section| section.review.as_ref())
+        .cloned();
+    let mut tabs: Vec<_> = sections
         .into_iter()
         .map(|section| {
             let label = match section.scope.as_str() {
@@ -14835,22 +14843,61 @@ fn memory_tabs(output: &str) -> Option<Vec<crate::sheet::DocTab>> {
                 "local" => Msg::StatusMemoryScopeLocal,
                 _ => return None,
             };
-            let body = if section.text.trim().is_empty() {
+            let mut body = if section.text.trim().is_empty() {
                 crate::i18n::t(crate::i18n::Msg::MemoryEmpty).into_owned()
             } else {
                 section.text
             };
+            if !section.entries.is_empty() {
+                let catalog: String = section
+                    .entries
+                    .iter()
+                    .map(|entry| entry.describe())
+                    .collect();
+                body = format!(
+                    "### {}\n\n{catalog}\n---\n\n### {}\n\n{body}",
+                    t(Msg::MemoryEntryCatalog),
+                    t(Msg::MemoryOriginalSource)
+                );
+            }
             Some(crate::sheet::DocTab::new(
                 t(label),
                 format!("## {}\n\n{body}", section.path.display()),
             ))
         })
-        .collect()
+        .collect::<Option<Vec<_>>>()?;
+    if let Some(review) = review {
+        tabs.insert(
+            0,
+            crate::sheet::DocTab::new(t(Msg::StatusMemoryInjection), review),
+        );
+    }
+    Some(tabs)
 }
 
 #[cfg(test)]
 mod memory_tab_tests {
     use super::*;
+    #[test]
+    fn memory_review_is_separate_from_unmodified_source_tabs() {
+        let tabs = memory_tabs(r##"[{"scope":"project","path":"/project/memory.md","text":"- original","review":"# Memory status\nWARNING: omitted"}]"##).unwrap();
+        assert_eq!(tabs.len(), 2);
+        assert!(tabs[1].markdown.contains("- original"));
+        assert!(!tabs[1].markdown.contains("WARNING"));
+        assert!(tabs[0].markdown.contains("WARNING: omitted"));
+    }
+    #[test]
+    fn every_source_entry_has_a_visible_id_even_without_a_prompt_candidate() {
+        let entry = atomcode_capabilities::memory::entry::MemoryEntry::legacy("OLD_FACT");
+        let id = entry.metadata.id.clone();
+        let output = serde_json::json!([{"scope":"project","path":"/project/memory.md","text":"# notes\n- OLD_FACT\n","entries":[entry]}]).to_string();
+        let tabs = memory_tabs(&output).unwrap();
+        assert!(tabs[0].markdown.contains(&id));
+        assert!(
+            tabs[0].markdown.contains("# notes\n- OLD_FACT"),
+            "original source remains available"
+        );
+    }
     #[test]
     fn memory_sources_have_separate_tabs_even_when_empty() {
         let _locale = crate::i18n::test_lock();
@@ -15002,5 +15049,53 @@ mod tool_generation_tests {
         tui.client.view.lock().unwrap().on_screen = "member".into();
         assert!(!tui.on_event(fragment()));
         assert_eq!(host.moment.read().unwrap().generation, before);
+    }
+}
+
+#[cfg(test)]
+mod memory_transport_tests {
+    use super::*;
+    struct NoopHost;
+    #[async_trait]
+    impl HostControl for NoopHost {
+        async fn call(&self, _: HostCommand) -> Result<HostReply, atomcode_host_api::HostError> {
+            Ok(HostReply::Done)
+        }
+        fn subscribe(&self) -> mpsc::UnboundedReceiver<HostEvent> {
+            mpsc::unbounded_channel().1
+        }
+    }
+    #[test]
+    fn only_memory_listings_request_json_and_open_the_viewer() {
+        for (args, listing, expected) in [
+            ("", true, "--json "),
+            (
+                "list --topic architecture",
+                true,
+                "--json list --topic architecture",
+            ),
+            ("list --json", true, "list --json"),
+            (
+                "update m-example replacement",
+                false,
+                "update m-example replacement",
+            ),
+            ("pin m-example", false, "pin m-example"),
+            ("deprecate m-example", false, "deprecate m-example"),
+            ("--unknown", false, "--unknown"),
+        ] {
+            let client = AgentClient::default();
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            client.connect(sender, Arc::new(NoopHost));
+            client.invoke("memory", args);
+            let AgentCommand::Invoke { args: actual, .. } = receiver.try_recv().unwrap() else {
+                panic!("expected command invocation");
+            };
+            assert_eq!(actual, expected);
+            assert_eq!(
+                !client.view.lock().unwrap().memory_invocations.is_empty(),
+                listing
+            );
+        }
     }
 }

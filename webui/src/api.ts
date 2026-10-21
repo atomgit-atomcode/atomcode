@@ -1229,9 +1229,10 @@ export async function postLiveProvider(
 
 export type CommandResult =
   | { kind: 'undo'; undone: number }
-  | { kind: 'remember'; scope: 'global' | 'project' }
+  | { kind: 'remember'; scope: 'global' | 'project' | 'local'; text?: string }
+  | { kind: 'memory_action'; text: string }
   | { kind: 'forget'; removed: string[] }
-  | { kind: 'memory'; global: string[]; project: string[] }
+  | { kind: 'memory'; global: string[]; project: string[]; local?: string[]; text?: string }
   | { kind: 'context'; used_tokens: number; total_messages: number; ctx_window: number; utilization: number; ctx_name: string }
   | { kind: 'compact'; applied: boolean; removed_messages: number; before_tokens: number; after_tokens: number }
   | { kind: 'whoami'; logged_in: boolean; username?: string; name?: string; email?: string }

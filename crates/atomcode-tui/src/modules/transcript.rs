@@ -638,7 +638,25 @@ impl Producer for Transcript {
                     at,
                     Arc::new(InjectedBlock {
                         kind: origin_kind(origin),
-                        origin: origin_label(origin),
+                        origin: if matches!(origin, InjectionOrigin::Memory) {
+                            text.lines()
+                                .find(|line| {
+                                    line.starts_with(
+                                        atomcode_capabilities::memory::context::WARNING_PREFIX,
+                                    ) || (line.starts_with("[... ")
+                                        && line.contains("older memory ")
+                                        && line.contains("omitted to fit the budget; run /memory"))
+                                })
+                                .map(|_| {
+                                    atomcode_i18n::product::t(
+                                        atomcode_i18n::product::Msg::MemoryInjectionIncomplete,
+                                    )
+                                    .into_owned()
+                                })
+                                .unwrap_or_else(|| origin_label(origin))
+                        } else {
+                            origin_label(origin)
+                        },
                         text,
                         result,
                     }),
@@ -1074,6 +1092,25 @@ mod tests {
             t.absorb(&conformance::logged(i, f), &mut w);
         }
         s
+    }
+
+    #[test]
+    fn incomplete_memory_is_visible_even_when_the_injection_is_folded() {
+        let _locale = atomcode_i18n::test_lock();
+        atomcode_i18n::set_locale(atomcode_i18n::Locale::En);
+        for text in [
+            "=== MEMORY ===\nMemory warning: 48 entries omitted to fit the budget; run /memory to review.\n- kept",
+            "=== MEMORY ===\n- kept\n[... 48 older memory entries omitted to fit the budget; run /memory to review]",
+        ] {
+            let stream = fold(&[SessionEvent::Injected { turn: 1, text: text.into(), origin: InjectionOrigin::Memory }]);
+            let summary = stream.slots()[0].block().content.summary(&crate::block::RenderCtx::bare(100)).plain();
+            assert!(summary.contains("Memory incompletely loaded"), "{summary}");
+            assert!(summary.contains("/memory"), "{summary}");
+            let body = stream.slots()[0].block().content.lines(&crate::block::RenderCtx::bare(300))
+                .iter().map(|line| line.plain()).collect::<Vec<_>>().join("\n");
+            assert!(body.contains("omitted"), "{body}");
+            assert!(body.contains("48"), "{body}");
+        }
     }
 
     /// Every line of every block, joined — for judging that something was said

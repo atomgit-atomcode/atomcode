@@ -2104,10 +2104,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
             pushCommandNotice(res.undone > 0 ? t('cmd.undo.done', { n: res.undone }) : t('cmd.undo.none'));
             return;
           }
-          if (res.kind === 'remember') { pushCommandNotice(t('cmd.remember.done', { scope: res.scope })); return; }
+          if (res.kind === 'remember') { pushCommandNotice(res.text ?? t('cmd.remember.done', { scope: res.scope })); return; }
+          if (res.kind === 'memory_action') { pushCommandNotice(res.text); return; }
           if (res.kind === 'forget') { pushCommandNotice(t('cmd.forget.done', { n: res.removed.length })); return; }
           if (res.kind === 'memory') {
-            const lines = [...res.global.map((e) => `[global] ${e}`), ...res.project.map((e) => `[project] ${e}`)];
+            if (res.text !== undefined) { pushCommandNotice(res.text); return; }
+            const lines = [...res.global.map((e) => `[global] ${e}`), ...res.project.map((e) => `[project] ${e}`), ...(res.local ?? []).map((e) => `[local] ${e}`)];
             pushCommandNotice(lines.length ? `${t('cmd.memory.header')}\n${lines.join('\n')}` : t('cmd.memory.empty'));
             return;
           }

@@ -393,6 +393,7 @@ dependencies = [
  "async-trait",
  "atomcode-auth",
  "atomcode-config",
+ "atomcode-i18n",
  "atomcode-kernel",
  "base64",
  "chardetng",

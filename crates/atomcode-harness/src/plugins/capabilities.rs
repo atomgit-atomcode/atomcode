@@ -472,6 +472,10 @@ struct MemoryRow {
     /// wrong place.
     #[serde(default)]
     global: Option<String>,
+    /// Optional project knowledge routing index. Relative paths resolve from
+    /// the project root; omission discovers <project dir>/knowledge/INDEX.md.
+    #[serde(default)]
+    knowledge_index: Option<String>,
 }
 
 impl Default for MemoryRow {
@@ -480,6 +484,7 @@ impl Default for MemoryRow {
             project_root: None,
             inject: true,
             global: None,
+            knowledge_index: None,
         }
     }
 }
@@ -826,6 +831,9 @@ struct MemoryCommand {
     /// would write somewhere else than the tool the model uses — the two doors
     /// onto one memory disagreeing about where it is.
     global: PathBuf,
+    knowledge_index: PathBuf,
+    prepared: String,
+    inject: bool,
 }
 
 #[async_trait]
@@ -839,78 +847,148 @@ impl crate::commands::CatalogCommand for MemoryCommand {
         }
     }
 
-    async fn run(&self, _agent: Arc<crate::agent::Agent>, args: &str) -> Result<String, String> {
+    async fn run(&self, agent: Arc<crate::agent::Agent>, args: &str) -> Result<String, String> {
         use atomcode_kernel::tool::ToolContext;
-        let (sections, args) = if self.action == "list" {
-            args.strip_prefix("--json")
-                .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
-                .map_or((false, args), |rest| (true, rest.trim()))
-        } else {
-            (false, args)
-        };
-        // 哪一层。写在前面的 `--global` / `--local` 是人会打的写法,而不认
-        // 它的后果是**把那两个字当成要记住的话写进项目那一层** ——
-        // 记下了、记错了地方、而且记进去的是一句没人写的话。
-        let (scope, content) = match args.trim() {
-            rest if rest.starts_with("--") => {
-                let (flag, tail) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
-                match flag {
-                    "--global" | "-g" => (Some("global"), tail.trim()),
-                    "--local" => (Some("local"), tail.trim()),
-                    "--project" => (Some("project"), tail.trim()),
-                    other => {
-                        return Err(format!(
-                            "不认识 `{other}`;只有 --global / --local / --project"
-                        ))
-                    }
-                }
-            }
-            rest => (None, rest),
-        };
-        if self.action != "list" && content.is_empty() {
-            return Err(t(Msg::CmdCustomArgRequired { name: self.name }).into_owned());
-        }
-        if sections {
-            use atomcode_capabilities::memory::store::MemorySection;
+        let input = atomcode_capabilities::memory::input::parse(self.action, args)?;
+        let sections = input.json;
+        let scope = input.call.get("scope").and_then(serde_json::Value::as_str);
+        let topic = input.call.get("topic").and_then(serde_json::Value::as_str);
+        let status = input
+            .call
+            .get("status")
+            .cloned()
+            .map(serde_json::from_value::<atomcode_capabilities::memory::entry::MemoryStatus>)
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        let expired = input
+            .call
+            .get("expired")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let within = input
+            .call
+            .get("expiring_within_days")
+            .and_then(serde_json::Value::as_u64)
+            .map(|v| v as u32);
+        let expiry_filtered = expired || within.is_some();
+        if input.call["action"] == "list" {
+            use atomcode_capabilities::memory::{context::MemoryContext, store::MemorySection};
             let project_dir = self.dirs.project(&self.project);
+            let global = MemoryStore::new(self.global.clone());
+            let project = MemoryStore::project(&project_dir);
+            let local = MemoryStore::local(&project_dir);
+            let name = self
+                .project
+                .file_name()
+                .map(|s| s.to_string_lossy())
+                .unwrap_or_else(|| "project".into());
+            let preview =
+                MemoryContext::load(&global, &project, &local, &name, &self.knowledge_index);
+            let events = agent.session().events();
+            let logged = events.iter().rev().find_map(|e| match &e.event {
+                SessionEvent::Injected {
+                    text,
+                    origin: InjectionOrigin::Memory,
+                    ..
+                } => Some(text.as_str()),
+                _ => None,
+            });
+            let mut review = t(Msg::MemoryReviewTitle).into_owned();
+            match logged {
+                Some(text) => {
+                    let present = atomcode_kernel::session::derive_messages(&events)
+                        .iter()
+                        .any(|m| m.text == text);
+                    review.push_str(&t(Msg::MemorySessionLogged {
+                        present,
+                        matches: text == preview.prompt,
+                    }));
+                    review.push_str(text);
+                    review.push_str("\n\n");
+                }
+                None if !self.inject => review.push_str(&t(Msg::MemoryInjectionDisabled)),
+                None if !events
+                    .iter()
+                    .any(|e| matches!(e.event, SessionEvent::TurnStart { .. })) =>
+                {
+                    review.push_str(&t(Msg::MemoryNotLoggedYet));
+                    review.push_str(&self.prepared);
+                    review.push_str("\n\n");
+                }
+                None => review.push_str(&t(Msg::MemoryNotLogged)),
+            }
+            if topic.is_some() || status.is_some() || expiry_filtered {
+                review.push_str(&t(Msg::MemoryFilteredDetails));
+            }
+            review.push_str(&preview.review_with_expiry(topic, status, expired, within));
             let stores = [
-                ("project", MemoryStore::project(&project_dir)),
-                ("global", MemoryStore::new(self.global.clone())),
-                ("local", MemoryStore::local(&project_dir)),
+                ("project", &project),
+                ("global", &global),
+                ("local", &local),
             ];
-            let sections = stores
+            let mut output = stores
                 .iter()
                 .filter(|(name, _)| scope.is_none_or(|scope| scope == *name))
                 .map(|(name, store)| {
-                    store
-                        .full_text()
-                        .map(|text| MemorySection {
-                            scope: (*name).into(),
-                            path: store.path().into(),
-                            text,
-                        })
-                        .map_err(|error| format!("{}: {error}", store.path().display()))
+                    let (entries, text) = match store.entries() {
+                        Ok(entries) => {
+                            let entries: Vec<_> = entries
+                                .into_iter()
+                                .filter(|entry| {
+                                    entry.matches(topic, status)
+                                        && entry.matches_expiry(
+                                            preview.evaluated_at,
+                                            expired,
+                                            within,
+                                        )
+                                })
+                                .collect();
+                            let text = if topic.is_some() || status.is_some() || expiry_filtered {
+                                entries.iter().map(|entry| entry.describe()).collect()
+                            } else {
+                                store.full_text().unwrap_or_else(|e| {
+                                    t(Msg::MemoryReadFailed {
+                                        error: &e.to_string(),
+                                    })
+                                    .into_owned()
+                                })
+                            };
+                            (entries, text)
+                        }
+                        Err(e) => (
+                            Vec::new(),
+                            t(Msg::MemoryReadFailed {
+                                error: &e.to_string(),
+                            })
+                            .into_owned(),
+                        ),
+                    };
+                    MemorySection {
+                        scope: (*name).into(),
+                        path: store.path().into(),
+                        text,
+                        review: None,
+                        entries,
+                    }
                 })
-                .collect::<Result<Vec<_>, _>>()?;
-            return serde_json::to_string(&sections).map_err(|error| error.to_string());
+                .collect::<Vec<_>>();
+            if sections {
+                if let Some(first) = output.first_mut() {
+                    first.review = Some(review);
+                }
+                return serde_json::to_string(&output).map_err(|e| e.to_string());
+            }
+            for section in output {
+                review.push_str(&format!(
+                    "\n## {} — {}\n\n{}\n",
+                    section.scope,
+                    section.path.display(),
+                    section.text
+                ));
+            }
+            return Ok(review);
         }
-        let mut call = serde_json::json!({ "action": self.action });
-        if let Some(scope) = scope {
-            call["scope"] = serde_json::Value::String(scope.into());
-        }
-        if !content.is_empty() {
-            // Under the name this action reads it by. `forget` takes a
-            // `keyword` and `remember` a `content`, and sending one as the
-            // other is refused by the tool — which is what `/forget` did from
-            // the day it was added until a criterion ran it
-            // (`a_product_can_keep_its_users_state_out_of_the_atomcode_home`).
-            let key = if self.action == "forget" {
-                "keyword"
-            } else {
-                "content"
-            };
-            call[key] = serde_json::Value::String(content.to_string());
-        }
+        let call = input.call;
         let result = atomcode_capabilities::tools::MemoryTool::new(self.dirs.clone())
             .with_global(self.global.clone())
             .execute(
@@ -932,10 +1010,9 @@ impl crate::commands::CatalogCommand for MemoryCommand {
 
 /// User memory, injected as a **logged fact** rather than a hidden prepend.
 ///
-/// The production stack injects memory through a lifecycle hook, which means the
-/// text reaches the model without being a session event. Here it is appended to
-/// the log with its provenance, so the invariant holds and a transcript shows
-/// exactly what the model was told and why.
+/// This row owns production injection through the existing session log. The
+/// standalone kernel hook is not mounted here. Resume keeps the original fact;
+/// /memory compares it with a newly derived disk preview without rewriting it.
 pub struct MemoryPlugin;
 
 #[async_trait]
@@ -974,12 +1051,25 @@ impl Plugin for MemoryPlugin {
             .global
             .map(PathBuf::from)
             .unwrap_or_else(|| MemoryStore::global(dirs.user()).path().to_path_buf());
-        let merged = MemoryStore::merged_for_prompt(
+        let knowledge_index = row
+            .knowledge_index
+            .map(PathBuf::from)
+            .map(|path| {
+                if path.is_absolute() {
+                    path
+                } else {
+                    project.join(path)
+                }
+            })
+            .unwrap_or_else(|| project_dir.join("knowledge/INDEX.md"));
+        let memory = atomcode_capabilities::memory::context::MemoryContext::load(
             &MemoryStore::new(global.clone()),
             &MemoryStore::project(&project_dir),
             &MemoryStore::local(&project_dir),
             &project_name,
+            &knowledge_index,
         );
+        let merged = memory.prompt;
         // The write half. Until this the agent could read the user's memory but
         // never add to it, which made "remember that I prefer X" a request only
         // a human could carry out — in a system whose whole point is that the
@@ -1000,12 +1090,15 @@ impl Plugin for MemoryPlugin {
         for command in [
             Arc::new(MemoryCommand {
                 name: "memory",
-                usage: None,
+                usage: Some(Msg::CmdCatalogMemoryUsage),
                 summary: Msg::CmdCatalogMemory,
                 action: "list",
                 project: project.clone(),
                 dirs: dirs.clone(),
                 global: global.clone(),
+                knowledge_index: knowledge_index.clone(),
+                prepared: merged.clone(),
+                inject: row.inject,
             }) as Arc<dyn crate::commands::CatalogCommand>,
             Arc::new(MemoryCommand {
                 name: "remember",
@@ -1015,6 +1108,9 @@ impl Plugin for MemoryPlugin {
                 project: project.clone(),
                 dirs: dirs.clone(),
                 global: global.clone(),
+                knowledge_index: knowledge_index.clone(),
+                prepared: merged.clone(),
+                inject: row.inject,
             }),
             Arc::new(MemoryCommand {
                 name: "forget",
@@ -1024,6 +1120,9 @@ impl Plugin for MemoryPlugin {
                 project: project.clone(),
                 dirs: dirs.clone(),
                 global: global.clone(),
+                knowledge_index: knowledge_index.clone(),
+                prepared: merged.clone(),
+                inject: row.inject,
             }),
         ] {
             crate::commands::register(ctx, command)?;
@@ -1034,17 +1133,29 @@ impl Plugin for MemoryPlugin {
             "memory",
             11,
             format!(
-                "MEMORY — three tiers, merged on the first turn of every session:\n\
+                "MEMORY — three file-backed scopes:\n\
                  \u{20}\u{20}global   {}   (every project)\n\
                  \u{20}\u{20}project  {}   (this repo, committed)\n\
                  \u{20}\u{20}local    {}   (this repo on this machine only)\n\
-                 Write with the `memory` tool: \
-                 `{{action: remember|forget|list, content, scope: project|local|global}}`. \
+                 First-turn injection enabled for new sessions: {}. \
                  Memory is what someone chose to state; for everything that was \
-                 merely *said*, use `recall` instead.",
+                 merely *said*, use `recall` instead. \
+                 /memory shows latest disk selection separately from session-logged injection. \
+                 /memory --topic TOPIC filters entries; /memory pin|unpin ID sets priority; \
+                 /memory update ID [--topic TOPIC] [--status active|outdated|deprecated] [CONTENT] \
+                 updates that scoped record; /forget --id ID deprecates it reversibly. \
+                 /remember --ttl-days N CONTENT sets an optional expiry; /memory update ID --ttl-days N renews it, \
+                 --clear-expiry removes it; /memory --expired or --expiring-within N lists affected entries. \
+                 Expiry excludes entries from new session selection, retaining files and existing logged context. \
+                 --global/--project/--local select a scope (project is the mutation default). \
+                 Optional knowledge routing index: {}. When injection is enabled only its bounded index is included; \
+                 read relevant linked files on demand with existing file/search tools. \
+                 Missing index means no knowledge library; create it to opt in.",
                 global.display(),
                 MemoryStore::project(&project_dir).path().display(),
                 MemoryStore::local(&project_dir).path().display(),
+                row.inject,
+                knowledge_index.display(),
             ),
         );
 

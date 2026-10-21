@@ -1,18 +1,9 @@
-//! `MemoryHook` — injects (and on resume REFRESHES) the merged `memory.md` entries.
+//! Standalone kernel adapter for merged memory context.
 //!
-//! FRESH session: the kernel pushes the persona first, then fires `session_start`,
-//! so the memory lands as the second system message — a stable, session-frozen
-//! prefix (cache-safe).
-//!
-//! RESUME: production rebuilds its system prompt from the CURRENT `memory.md` in
-//! every new process, so a `--resume` after `/remember`/`/forget` sees the updated
-//! memory. The snapshot, however, carries the OLD injected message (seeding
-//! contract). To match production the hook RECONCILES at the resume boundary:
-//! refresh the existing `=== MEMORY ===` message in place, inject one if the
-//! snapshot has none (the session started with empty stores), or remove it if the
-//! memory is now empty. A resume is a NEW wire session — there is no in-flight
-//! request prefix yet — so this rewrite cannot break the within-session append-only
-//! cache red-line, and when `memory.md` is unchanged the refresh is byte-identical.
+//! Fresh kernels receive a system message after persona; on resume this adapter
+//! reconciles its own message with current disk sources. Coding products do not
+//! mount this hook: their harness memory row commits one `Injected` fact and
+//! resumes it from the authoritative session log without rewriting history.
 
 use std::path::Path;
 
@@ -28,8 +19,8 @@ use crate::ProductDirs;
 const MEMORY_HEADER: &str = "=== MEMORY ===";
 
 /// Pushes/refreshes `MemoryStore::merged_for_prompt(global, project, local, …)` as a
-/// system message at session start; silent when all three stores are empty. Read-only
-/// and infallible — a missing/unreadable `memory.md` is an empty store, never an error.
+/// system message at session start; silent when sources are empty. Read-only
+/// and infallible: missing files are empty, while read failures appear in diagnostics.
 pub struct MemoryHook {
     global: MemoryStore,
     project: MemoryStore,
@@ -97,7 +88,7 @@ impl LifecycleHooks for MemoryHook {
         match existing {
             Some(i) if merged.is_empty() => {
                 // Everything was /forget-gotten since the snapshot — drop the block,
-                // exactly as production's rebuilt prompt would.
+                // This standalone adapter refreshes its own system message.
                 convo.messages.remove(i);
             }
             Some(i) => {

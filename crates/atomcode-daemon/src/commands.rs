@@ -44,6 +44,10 @@ pub(crate) enum CommandResult {
     },
     Remember {
         scope: String,
+        text: String,
+    },
+    MemoryAction {
+        text: String,
     },
     Forget {
         removed: Vec<String>,
@@ -52,6 +56,7 @@ pub(crate) enum CommandResult {
         global: Vec<String>,
         project: Vec<String>,
         local: Vec<String>,
+        text: String,
     },
     Context {
         used_tokens: usize,
@@ -404,65 +409,84 @@ async fn exec_context(
     })
 }
 
-/// 解析 `/remember` 参数：可选前缀 `--global`。返回 (是否全局, 去掉前缀并 trim 后的内容)。
-pub(crate) fn parse_remember_arg(arg: &str) -> (bool, &str) {
-    let arg = arg.trim();
-    if let Some(rest) = arg.strip_prefix("--global") {
-        if rest.is_empty() || rest.starts_with(char::is_whitespace) {
-            return (true, rest.trim());
+/// Stateless memory uses the same syntax and mutator as the live command catalog.
+/// Keep original response kinds for original requests; new actions carry text.
+async fn exec_memory_command(
+    working_dir: &Path,
+    command: &str,
+    arg: &str,
+    dirs: atomcode_capabilities::ProductDirs,
+) -> anyhow::Result<CommandResult> {
+    use atomcode_kernel::tool::{ProgressSink, Tool, ToolContext};
+    let base = match command {
+        "remember" => "remember",
+        "forget" => "forget",
+        _ => "list",
+    };
+    let input =
+        atomcode_capabilities::memory::input::parse(base, arg).map_err(anyhow::Error::msg)?;
+    let action = input.call["action"].as_str().unwrap();
+    // Preserve the old keyword-deletion result (actual removed strings), with
+    // all managed stores still enforcing strict parsing and atomic writes.
+    if action == "forget" && input.call.as_object().unwrap().len() == 2 {
+        return exec_forget(working_dir, input.call["keyword"].as_str().unwrap(), &dirs);
+    }
+    let result = atomcode_capabilities::tools::MemoryTool::new(dirs.clone())
+        .execute(
+            &input.call.to_string(),
+            &ToolContext {
+                working_dir: working_dir.into(),
+                cancel: tokio_util::sync::CancellationToken::new(),
+                progress: ProgressSink::noop(),
+                requester: None,
+            },
+        )
+        .await;
+    if result.is_error {
+        anyhow::bail!("{}", result.content);
+    }
+    if action == "remember" {
+        return Ok(CommandResult::Remember {
+            scope: input.call["scope"].as_str().unwrap_or("project").into(),
+            text: result.content,
+        });
+    }
+    if action == "list" && input.call.as_object().unwrap().len() == 1 {
+        // Compatibility arrays retain the old active-content projection;
+        // the shared tool above validated and rendered the complete records.
+        return Ok(CommandResult::Memory {
+            global: MemoryStore::global(dirs.user()).load(),
+            project: MemoryStore::project(&dirs.project(working_dir)).load(),
+            local: MemoryStore::local(&dirs.project(working_dir)).load(),
+            text: result.content,
+        });
+    }
+    Ok(CommandResult::MemoryAction {
+        text: result.content,
+    })
+}
+
+fn exec_forget(
+    working_dir: &Path,
+    keyword: &str,
+    dirs: &atomcode_capabilities::ProductDirs,
+) -> anyhow::Result<CommandResult> {
+    let mut removed = Vec::new();
+    for store in [
+        MemoryStore::global(dirs.user()),
+        MemoryStore::project(&dirs.project(working_dir)),
+        MemoryStore::local(&dirs.project(working_dir)),
+    ] {
+        match store.remove_matching(keyword) {
+            Ok(entries) => removed.extend(entries),
+            Err(error) => anyhow::bail!(
+                "memory: deletion failed after {} entries were removed: {}: {error}",
+                removed.len(),
+                store.path().display()
+            ),
         }
     }
-    (false, arg)
-}
-
-fn exec_remember(working_dir: &Path, arg: &str) -> anyhow::Result<CommandResult> {
-    let (global, content) = parse_remember_arg(arg);
-    if content.is_empty() {
-        anyhow::bail!("remember needs content");
-    }
-    let store = if global {
-        MemoryStore::global(atomcode_coding::config::product_dirs_from_env().user())
-    } else {
-        MemoryStore::project(&atomcode_coding::config::product_dirs_from_env().project(working_dir))
-    };
-    store.append(content)?;
-    Ok(CommandResult::Remember {
-        scope: if global { "global" } else { "project" }.to_string(),
-    })
-}
-
-fn exec_forget(working_dir: &Path, arg: &str) -> anyhow::Result<CommandResult> {
-    let keyword = arg.trim();
-    if keyword.is_empty() {
-        anyhow::bail!("forget needs a keyword");
-    }
-    let mut removed = MemoryStore::global(atomcode_coding::config::product_dirs_from_env().user())
-        .remove_matching(keyword)?;
-    removed.extend(
-        MemoryStore::project(
-            &atomcode_coding::config::product_dirs_from_env().project(working_dir),
-        )
-        .remove_matching(keyword)?,
-    );
-    removed.extend(
-        MemoryStore::local(&atomcode_coding::config::product_dirs_from_env().project(working_dir))
-            .remove_matching(keyword)?,
-    );
     Ok(CommandResult::Forget { removed })
-}
-
-fn exec_memory(working_dir: &Path) -> anyhow::Result<CommandResult> {
-    Ok(CommandResult::Memory {
-        global: MemoryStore::global(atomcode_coding::config::product_dirs_from_env().user()).load(),
-        project: MemoryStore::project(
-            &atomcode_coding::config::product_dirs_from_env().project(working_dir),
-        )
-        .load(),
-        local: MemoryStore::local(
-            &atomcode_coding::config::product_dirs_from_env().project(working_dir),
-        )
-        .load(),
-    })
 }
 
 async fn exec_compact(
@@ -840,9 +864,15 @@ pub(crate) async fn run_command(
             &req.arg,
             req.project_hash.as_deref(),
         ),
-        "remember" => exec_remember(&working_dir, &req.arg),
-        "forget" => exec_forget(&working_dir, &req.arg),
-        "memory" => exec_memory(&working_dir),
+        "remember" | "forget" | "memory" => {
+            exec_memory_command(
+                &working_dir,
+                &req.command,
+                &req.arg,
+                atomcode_coding::config::product_dirs_from_env(),
+            )
+            .await
+        }
         "context" => {
             exec_context(
                 &working_dir,
@@ -1189,41 +1219,76 @@ mod tests {
             .all(|entry| entry.text != "removed"));
     }
 
-    #[test]
-    fn parse_remember_arg_detects_global() {
-        assert_eq!(parse_remember_arg("--global 记住这个"), (true, "记住这个"));
-        assert_eq!(parse_remember_arg("普通事实"), (false, "普通事实"));
-        assert_eq!(
-            parse_remember_arg("  --global   trimmed  "),
-            (true, "trimmed")
+    #[tokio::test]
+    async fn stateless_memory_uses_shared_flags_expiry_and_exact_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let dirs =
+            atomcode_capabilities::ProductDirs::new(dir.path().join("user"), ".test-product");
+        let wd = dir.path().join("project");
+        let store = MemoryStore::local(&dirs.project(&wd));
+        let result = exec_memory_command(
+            &wd,
+            "remember",
+            "--local --ttl-days 7 --topic runtime temporary fact",
+            dirs.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, CommandResult::Remember { scope, .. } if scope == "local"));
+        let entry = store.entries().unwrap().remove(0);
+        assert_eq!(entry.content, "temporary fact");
+        assert_eq!(entry.metadata.topic.as_deref(), Some("runtime"));
+        assert!(entry.metadata.expires_at.is_some());
+        let query = exec_memory_command(&wd, "memory", "--local --expiring-within 7", dirs.clone())
+            .await
+            .unwrap();
+        assert!(
+            matches!(query, CommandResult::MemoryAction { text } if text.contains(&entry.metadata.id))
         );
-        assert_eq!(parse_remember_arg("--globalfoo"), (false, "--globalfoo"));
-    }
-
-    #[test]
-    fn remember_then_memory_roundtrip_project_scope() {
-        // hermetic：project 作用域写到 working_dir/.atomcode/memory.md
-        let dir = tempfile::tempdir().unwrap();
-        let wd = dir.path();
-        exec_remember(wd, "阿童木用 Rust 写").unwrap();
-        let store =
-            MemoryStore::project(&atomcode_coding::config::product_dirs_from_env().project(wd));
-        assert!(store.load().iter().any(|e| e.contains("阿童木用 Rust 写")));
-    }
-
-    #[test]
-    fn forget_removes_project_entry() {
-        let dir = tempfile::tempdir().unwrap();
-        let wd = dir.path();
-        exec_remember(wd, "delete-me fact").unwrap();
-        exec_remember(wd, "keep-me fact").unwrap();
-        // exec_forget 也会扫全局，但全局此刻应无匹配；断言项目侧被删。
-        let _ = exec_forget(wd, "delete-me");
-        let remaining =
-            MemoryStore::project(&atomcode_coding::config::product_dirs_from_env().project(wd))
-                .load();
-        assert!(!remaining.iter().any(|e| e.contains("delete-me")));
-        assert!(remaining.iter().any(|e| e.contains("keep-me")));
+        exec_memory_command(
+            &wd,
+            "forget",
+            &format!("--local --id {}", entry.metadata.id),
+            dirs.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            store.entries().unwrap()[0].metadata.status,
+            atomcode_capabilities::memory::entry::MemoryStatus::Deprecated
+        );
+        exec_memory_command(
+            &wd,
+            "memory",
+            &format!(
+                "--local update {} --status active --clear-expiry",
+                entry.metadata.id
+            ),
+            dirs.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(store.entries().unwrap()[0].metadata.expires_at.is_none());
+        let before = store.full_text().unwrap();
+        assert!(
+            exec_memory_command(&wd, "remember", "--ttl-days 0 invalid", dirs.clone())
+                .await
+                .is_err()
+        );
+        assert_eq!(store.full_text().unwrap(), before);
+        let result = exec_memory_command(&wd, "memory", "", dirs.clone())
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, CommandResult::Memory { text, local, .. } if text.contains(&entry.metadata.id) && local == vec!["temporary fact"])
+        );
+        let result = exec_memory_command(&wd, "forget", "temporary", dirs.clone())
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, CommandResult::Forget { removed } if removed == vec!["temporary fact"])
+        );
+        assert!(store.entries().unwrap().is_empty());
     }
 
     #[test]
