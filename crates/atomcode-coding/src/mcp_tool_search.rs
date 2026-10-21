@@ -164,19 +164,26 @@ fn project(request: &mut ModelRequest, mode: McpToolSearchMode, window: u32) {
     // in that case rather than hide every schema behind an unavailable door.
     let can_search = request.tools.iter().any(|tool| tool.name == SEARCH);
     let budget = schema_budget(window);
+    let admitted_mcp_bytes = request
+        .tools
+        .iter()
+        .filter(|tool| is_mcp(&tool.name))
+        .fold(0usize, |sum, tool| sum.saturating_add(schema_bytes(tool)));
+    let admitted_mcp_tools = request
+        .tools
+        .iter()
+        .filter(|tool| is_mcp(&tool.name))
+        .count();
     let deferred = can_search
         && match mode {
             McpToolSearchMode::Off => false,
             McpToolSearchMode::On => true,
-            McpToolSearchMode::Auto => {
-                request
-                    .tools
-                    .iter()
-                    .filter(|tool| is_mcp(&tool.name))
-                    .fold(0usize, |sum, tool| sum.saturating_add(schema_bytes(tool)))
-                    > budget
-            }
+            McpToolSearchMode::Auto => admitted_mcp_bytes > budget,
         };
+    tracing::info!(turn = request.turn, round = request.round, mode = ?mode,
+        context_window = window, schema_budget_bytes = budget, admitted_mcp_bytes,
+        admitted_mcp_tools, search_available = can_search, deferred,
+        "MCP schema projection decision (JSON bytes, not tokens)");
     if !deferred {
         // Keep the small discovery tool in auto mode, even for eager catalogs.
         // This also makes retrying an already-projected request idempotent.
@@ -336,6 +343,67 @@ mod tests {
             ),
             Message::tool_result(id, result.to_string(), false),
         ]
+    }
+
+    #[test]
+    fn forced_on_pilots_moderate_catalogs_on_a_million_token_model() {
+        let mut tools = (0..34)
+            .map(|i| tool(&format!("mcp__pilot__tool_{i:02}"), 1500))
+            .collect::<Vec<_>>();
+        tools.push(discovery());
+        tools.push(tool("read_file", 0));
+        let original = request(tools.clone(), vec![Message::user("inspect")]);
+        let mut auto = original.clone();
+        project(&mut auto, McpToolSearchMode::Auto, 1_000_000);
+        assert_eq!(
+            auto.tools.len(),
+            tools.len(),
+            "auto retains its existing threshold"
+        );
+        let mut off = original.clone();
+        project(&mut off, McpToolSearchMode::Off, 1_000_000);
+        assert_eq!(off.tools.len(), tools.len());
+        let mut first = original.clone();
+        project(&mut first, McpToolSearchMode::On, 1_000_000);
+        assert_eq!(
+            first
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![SEARCH, "read_file"]
+        );
+        let eager_bytes = serde_json::to_vec(&original.tools).unwrap().len();
+        let lazy_bytes = serde_json::to_vec(&first.tools).unwrap().len();
+        assert!(
+            lazy_bytes * 10 < eager_bytes,
+            "schema reduction: {eager_bytes} -> {lazy_bytes}"
+        );
+        let found = search(
+            &tools,
+            SearchArgs {
+                query: "mcp__pilot__tool_17".into(),
+                limit: Some(1),
+                ..Default::default()
+            },
+            schema_budget(1_000_000),
+        );
+        let mut next = request(tools.clone(), pair("pilot-search", SEARCH, found));
+        project(&mut next, McpToolSearchMode::On, 1_000_000);
+        let loaded = next
+            .tools
+            .iter()
+            .find(|tool| tool.name == "mcp__pilot__tool_17")
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(loaded).unwrap(),
+            serde_json::to_value(&tools[17]).unwrap()
+        );
+        assert!(next.tools.iter().any(|tool| tool.name == "read_file"));
+        assert_eq!(
+            next.tools.iter().filter(|tool| is_mcp(&tool.name)).count(),
+            1
+        );
     }
 
     #[test]

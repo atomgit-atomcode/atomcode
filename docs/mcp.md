@@ -341,3 +341,15 @@ EOF
 ## 10. 服务专项文档
 
 - [GitHub MCP OAuth 使用说明](./mcp/github.md)
+
+### 检查实际输入占用
+
+请求发送前，INFO 日志中的 `provider input size breakdown` 记录最终请求的大小分类：
+
+- `parts_json_bytes` 按系统消息、用户消息、助手消息、工具结果、核心工具 schema、MCP schema 和封装字段划分；各项之和等于 `request_json_bytes`。
+- `tagged_text_bytes` 是另一个视角：按文本标记识别项目/用户指令、技能目录、记忆和 SessionStart hook，记录原始 UTF-8 字节数。标记分类只用于诊断，不影响权限或请求内容，也不能与 JSON 分类相加。
+- 日志只记录分类、数量和大小，不记录提示正文、工具参数或凭据。完整 wire dump 仍需显式开启。
+
+`MCP schema projection decision` 同时记录模式、模型上下文、schema 预算、MCP 大小和是否启用按需加载。当前 `auto` 的预算随上下文增大：1M 上下文对应约 400KB，42KB 的 MCP 目录不会触发。希望对这类目录试点时，可将上述 `tool_search` 设为 `on`；用 `off` 恢复全量发送，或设回 `auto` 恢复自动策略。设置按现有配置加载机制生效，已运行会话不会因编辑文件自动改变。
+
+这些是字节计量，不是分词器或计费 token 数。比较时应保持同一模型和工具配置，分别检查新会话首轮与搜索加载后的请求；真实 token 以 provider 返回的 usage 为准。

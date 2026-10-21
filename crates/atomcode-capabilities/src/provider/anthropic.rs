@@ -242,7 +242,11 @@ impl LlmProvider for AnthropicProvider {
             });
         }
         let body = build_request_body(&self.cfg.model, messages, tools, options, &self.cfg);
-        super::wire_dump_request(self.cfg.wire_dump_dir.as_deref(), &self.cfg.model, &body); // byte-level dump (ATOMCODE_WIRE_DUMP=1)
+        super::record_request_diagnostics(
+            self.cfg.wire_dump_dir.as_deref(),
+            &self.cfg.model,
+            &body,
+        );
 
         // Open the stream. A hard failure here returns `Err` so the kernel's
         // agent-layer open retry still applies.
