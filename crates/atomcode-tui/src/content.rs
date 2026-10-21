@@ -4161,7 +4161,7 @@ mod tests {
                 .iter()
                 .find_map(|row| row.image)
                 .expect("image placement");
-            assert_eq!((image.rect.w, image.rect.h), (24, 10));
+            assert_eq!((image.rect.w, image.rect.h), (18, 8));
             assert!(!rows.iter().any(|row| row.plain().contains('▀')));
             ctx.width = 20;
             let narrow = welcome().lines(&ctx);

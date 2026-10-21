@@ -6,8 +6,8 @@ use crate::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 
-pub const MASCOT_WIDTH: u16 = 24;
-pub const MASCOT_HEIGHT: u16 = 10;
+pub const MASCOT_WIDTH: u16 = 18;
+pub const MASCOT_HEIGHT: u16 = 8;
 pub const MASCOT_PNG: &[u8] = include_bytes!("../assets/mascot.png");
 // A single decorative image slot, owned by this application, not a global delete.
 const IMAGE_ID: u32 = 0x41544f4d;
@@ -117,12 +117,12 @@ mod tests {
 
     fn frame() -> Frame {
         let mut frame = Frame::new(80, 24);
-        let mut rows = vec![Line::raw(" ".repeat(26)); 10];
+        let mut rows = vec![Line::raw(" ".repeat(20)); 8];
         rows[0].image = Some(Image {
-            rect: Rect::new(2, 0, 24, 10),
+            rect: Rect::new(2, 0, 18, 8),
             png: MASCOT_PNG,
         });
-        frame.place("welcome", Rect::new(0, 2, 80, 10), rows);
+        frame.place("welcome", Rect::new(0, 2, 80, 8), rows);
         frame.place("status", Rect::new(0, 23, 80, 1), vec![Line::raw("idle")]);
         frame
     }
@@ -139,7 +139,7 @@ mod tests {
     fn protocol_payloads_are_the_original_png_and_preserve_the_cursor() {
         let image = visible(&frame()).unwrap();
         let iterm = draw(image, Graphics::ITerm2);
-        assert!(iterm.contains(";width=24;height=10;preserveAspectRatio=1:"));
+        assert!(iterm.contains(";width=18;height=8;preserveAspectRatio=1:"));
         let encoded = iterm
             .split_once(':')
             .unwrap()
@@ -176,9 +176,9 @@ mod tests {
     fn clipping_and_overlays_suppress_the_image() {
         let mut frame = frame();
         assert!(visible(&frame).is_some());
-        frame.parts[0].rect.h = 9;
+        frame.parts[0].rect.h = 7;
         assert!(visible(&frame).is_none());
-        frame.parts[0].rect.h = 10;
+        frame.parts[0].rect.h = 8;
         frame.place("menu", Rect::new(3, 4, 8, 2), vec![Line::raw("menu")]);
         assert!(visible(&frame).is_none());
     }
@@ -207,7 +207,7 @@ mod tests {
             assert!(restored
                 .patch_from(Some(&covered))
                 .contains("\x1b7\x1b[4;3H"));
-            frame.size.h = 13;
+            frame.size.h = 11;
             assert!(
                 visible(&frame).is_none(),
                 "bottom edge must not cause scrolling"
@@ -241,7 +241,7 @@ mod tests {
             frame.parts[0].lines[0].image = None;
             let removed = Lines::of(&frame, caps, Some(&repainted));
             let erase = removed.patch_from(Some(&repainted));
-            assert!(erase.contains("\x1b[12;1H"), "erase the image's bottom row");
+            assert!(erase.contains("\x1b[10;1H"), "erase the image's bottom row");
             assert!(!erase.contains(protocol));
             if graphics == Graphics::Kitty {
                 assert!(erase.contains("a=d,d=I"));
