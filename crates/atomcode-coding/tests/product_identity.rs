@@ -292,7 +292,9 @@ async fn describe_self_names_the_product_s_session_store() {
     let env = env();
     let recorder = Arc::new(Recorder::default());
     let mut runtime = env.started(&recorder, other_product()).await;
-    recorder.call("describe_self", json!({}));
+    // Store setup documentation belongs to operations; the default overview
+    // intentionally omits full capability documentation.
+    recorder.call("describe_self", json!({"aspect": "operations"}));
     let results = turn(&mut runtime, "where is this conversation kept?").await;
     let report = &results
         .iter()
