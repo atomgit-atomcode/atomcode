@@ -8914,14 +8914,18 @@ impl Recorded {
                     marketplace: "official".into(),
                     description: "把代码排整齐".into(),
                     installed: installed.then_some(Scope::User),
-                    hook_trusted: installed.then_some(trusted),
+                    hook_trust: installed.then_some(if trusted {
+                        atomcode_tui::plugins::HookTrust::Trusted
+                    } else {
+                        atomcode_tui::plugins::HookTrust::Untrusted
+                    }),
                 },
                 PluginRow {
                     name: "lens".into(),
                     marketplace: "official".into(),
                     description: "看一眼改了什么".into(),
                     installed: None,
-                    hook_trusted: None,
+                    hook_trust: None,
                 },
             ],
             vec![MarketRow {

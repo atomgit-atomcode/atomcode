@@ -159,7 +159,7 @@ fn save_trust(user_dir: &Path, map: &TrustMap) -> Result<()> {
 pub fn trust(user_dir: &Path, plugin_id: &str, hash: &str) -> Result<()> {
     anyhow::ensure!(
         !hash.starts_with("invalid:"),
-        "plugin {plugin_id} hooks cannot be trusted: {hash}"
+        "plugin {plugin_id} hook configuration is incompatible; update or repair its script entry points. Run atomcode hooks list for details; reauthorization cannot fix this."
     );
     let mut map = load_trust(user_dir);
     map.insert(plugin_id.to_string(), hash.to_string());
@@ -242,6 +242,23 @@ mod tests {
                 &hash
             ));
         }
+    }
+
+    #[test]
+    fn incompatible_authorization_errors_do_not_dump_hashes_or_commands() {
+        let root = tempfile::tempdir().unwrap();
+        let error = trust(
+            root.path(),
+            "weixin@channel",
+            "invalid:secret-hash: node -e sensitive-command",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("weixin@channel"));
+        assert!(error.contains("hooks list"));
+        assert!(!error.contains("secret-hash"));
+        assert!(!error.contains("sensitive-command"));
+        assert!(load_trust(root.path()).is_empty());
     }
 
     #[test]

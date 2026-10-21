@@ -1568,6 +1568,10 @@ pub enum Msg<'a> {
     PluginTabMarkets,
     PluginHookTrustedShort,
     PluginHookUntrustedShort,
+    PluginHookIncompatibleShort,
+    PluginHooksIncompatible {
+        id: &'a str,
+    },
     PluginActionTrust,
     PluginActionUntrust,
     PluginActionTrustAbout,

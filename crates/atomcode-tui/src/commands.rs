@@ -7702,7 +7702,7 @@ mod plugin_tests {
             marketplace: market.into(),
             description: String::new(),
             installed: None,
-            hook_trusted: None,
+            hook_trust: None,
         }
     }
 

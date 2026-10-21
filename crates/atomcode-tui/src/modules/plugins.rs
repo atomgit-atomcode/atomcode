@@ -347,12 +347,12 @@ fn listed_line(
             if let Some(scope) = row.installed {
                 about.push(scope.short().to_string());
             }
-            if let Some(trusted) = row.hook_trusted {
+            if let Some(trust) = row.hook_trust {
                 about.push(
-                    t(if trusted {
-                        Msg::PluginHookTrustedShort
-                    } else {
-                        Msg::PluginHookUntrustedShort
+                    t(match trust {
+                        crate::plugins::HookTrust::Trusted => Msg::PluginHookTrustedShort,
+                        crate::plugins::HookTrust::Untrusted => Msg::PluginHookUntrustedShort,
+                        crate::plugins::HookTrust::Incompatible => Msg::PluginHookIncompatibleShort,
                     })
                     .into_owned(),
                 );
@@ -643,7 +643,7 @@ mod tests {
             marketplace: market.into(),
             description: about.into(),
             installed,
-            hook_trusted: None,
+            hook_trust: None,
         }
     }
 
@@ -788,7 +788,7 @@ mod tests {
     #[test]
     fn an_installed_plugin_shows_its_hook_trust_state() {
         let mut row = plugin("hooks", "official", "does work", Some(Scope::User));
-        row.hook_trusted = Some(false);
+        row.hook_trust = Some(crate::plugins::HookTrust::Untrusted);
         let m = Moment {
             plugins: PluginsView::new(vec![row], vec![]),
             plugins_panel: Some(Panel::new()),

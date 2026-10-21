@@ -1003,6 +1003,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PluginTabMarkets => "marketplaces".into(),
         Msg::PluginHookTrustedShort => "hooks trusted".into(),
         Msg::PluginHookUntrustedShort => "hooks not trusted".into(),
+        Msg::PluginHookIncompatibleShort => "hooks incompatible".into(),
+        Msg::PluginHooksIncompatible { id } => format!("Hooks from `{id}` are incompatible. Update or repair the plugin; run atomcode hooks list for details. Reauthorization cannot fix this.").into(),
         Msg::PluginActionTrust => "trust hooks".into(),
         Msg::PluginActionUntrust => "untrust hooks".into(),
         Msg::PluginActionTrustAbout => "allow this plugin's current hook commands to run".into(),

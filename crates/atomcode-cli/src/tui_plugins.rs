@@ -358,7 +358,16 @@ impl Plugins for DiskPlugins {
         );
         let mut plugins = merge(&markets, &installed, &about);
         for row in &mut plugins {
-            row.hook_trusted = hook_status(&trust, &row.name, &row.marketplace).map(|s| s.trusted);
+            row.hook_trust = hook_status(&trust, &row.name, &row.marketplace).map(|s| {
+                use atomcode_tui::plugins::HookTrust;
+                if s.hash.starts_with("invalid:") {
+                    HookTrust::Incompatible
+                } else if s.trusted {
+                    HookTrust::Trusted
+                } else {
+                    HookTrust::Untrusted
+                }
+            });
         }
         let markets = markets
             .into_iter()
@@ -444,6 +453,9 @@ impl Plugins for DiskPlugins {
         let Some(status) = hook_status(&status, plugin, market) else {
             return Err(tr(SMsg::PluginHasNoHooks { id: &id }).into_owned());
         };
+        if status.hash.starts_with("invalid:") {
+            return Err(tr(SMsg::PluginHooksIncompatible { id: &id }).into_owned());
+        }
         atomcode_capabilities::plugin::hook_trust::trust(
             dirs.user(),
             &status.plugin_id,
@@ -760,7 +772,7 @@ fn merge(
                 marketplace: market.name.clone(),
                 description: about(&market.name, name, here),
                 installed: here.map(|i| scope_out(&i.scope)),
-                hook_trusted: None,
+                hook_trust: None,
             });
         }
     }
@@ -780,7 +792,7 @@ fn merge(
             marketplace: info.marketplace.clone(),
             description: about(&info.marketplace, &info.plugin, Some(info)),
             installed: Some(scope_out(&info.scope)),
-            hook_trusted: None,
+            hook_trust: None,
         });
     }
     rows

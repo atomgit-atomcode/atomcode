@@ -942,6 +942,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PluginTabMarkets => "市场".into(),
         Msg::PluginHookTrustedShort => "hook 已信任".into(),
         Msg::PluginHookUntrustedShort => "hook 未信任".into(),
+        Msg::PluginHookIncompatibleShort => "hook 配置不兼容".into(),
+        Msg::PluginHooksIncompatible { id } => format!("`{id}` 的 hook 配置不兼容。请更新或修复插件；运行 atomcode hooks list 查看详情，重新授权不能解决。").into(),
         Msg::PluginActionTrust => "信任 hook".into(),
         Msg::PluginActionUntrust => "取消信任 hook".into(),
         Msg::PluginActionTrustAbout => "允许这个插件当前的 hook 命令运行".into(),

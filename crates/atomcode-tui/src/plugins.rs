@@ -70,6 +70,14 @@ impl Scope {
     }
 }
 
+/// Hook authorization is distinct from whether its entry points are compatible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HookTrust {
+    Trusted,
+    Untrusted,
+    Incompatible,
+}
+
 /// 一个插件，如启动器所见。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PluginRow {
@@ -81,8 +89,8 @@ pub struct PluginRow {
     pub description: String,
     /// 已经装上了就是它装在哪个范围;`None` 是还没装。
     pub installed: Option<Scope>,
-    /// 只有装着且带 hook 的插件有值；值是当前 hook 集合是否已获信任。
-    pub hook_trusted: Option<bool>,
+    /// 只有装着且带 hook 的插件有值；不兼容的配置不能通过授权修复。
+    pub hook_trust: Option<HookTrust>,
 }
 
 impl PluginRow {
@@ -316,17 +324,17 @@ pub struct PluginForm {
     pub plugin: String,
     pub marketplace: String,
     pub scope: Scope,
-    pub hook_trusted: Option<bool>,
+    pub hook_trust: Option<HookTrust>,
     pub at: usize,
 }
 
 impl PluginForm {
     pub fn actions(&self) -> Vec<PluginAction> {
         let mut actions = Vec::new();
-        match self.hook_trusted {
-            Some(false) => actions.push(PluginAction::Trust),
-            Some(true) => actions.push(PluginAction::Untrust),
-            None => {}
+        match self.hook_trust {
+            Some(HookTrust::Untrusted) => actions.push(PluginAction::Trust),
+            Some(HookTrust::Trusted) => actions.push(PluginAction::Untrust),
+            None | Some(HookTrust::Incompatible) => {}
         }
         actions.extend([PluginAction::Update, PluginAction::Uninstall]);
         actions
@@ -688,7 +696,7 @@ fn enter(view: &PluginsView, panel: &mut Panel, at: Option<Listed>) -> Step {
                     plugin: row.name.clone(),
                     marketplace: row.marketplace.clone(),
                     scope,
-                    hook_trusted: row.hook_trusted,
+                    hook_trust: row.hook_trust,
                     at: 0,
                 }),
                 // 还没装的:先问装到哪儿去。
@@ -1039,7 +1047,7 @@ mod tests {
             marketplace: market.into(),
             description: about.into(),
             installed,
-            hook_trusted: None,
+            hook_trust: None,
         }
     }
 
@@ -1200,7 +1208,7 @@ mod tests {
     #[test]
     fn an_installed_plugin_offers_the_action_for_its_current_hook_trust() {
         let mut untrusted = plugin("hooks", "official", "", Some(Scope::User));
-        untrusted.hook_trusted = Some(false);
+        untrusted.hook_trust = Some(HookTrust::Untrusted);
         let view = PluginsView::new(vec![untrusted], vec![]);
         let mut panel = Panel::new();
         run(&view, &mut panel, &[press(Key::Enter)]);
@@ -1213,7 +1221,7 @@ mod tests {
         );
 
         let mut trusted = plugin("hooks", "official", "", Some(Scope::User));
-        trusted.hook_trusted = Some(true);
+        trusted.hook_trust = Some(HookTrust::Trusted);
         let view = PluginsView::new(vec![trusted], vec![]);
         let mut panel = Panel::new();
         run(&view, &mut panel, &[press(Key::Enter)]);
@@ -1223,6 +1231,21 @@ mod tests {
                 plugin: "hooks".into(),
                 marketplace: "official".into(),
             }
+        );
+    }
+
+    #[test]
+    fn incompatible_hooks_do_not_offer_authorization() {
+        let form = PluginForm {
+            plugin: "weixin".into(),
+            marketplace: "channel".into(),
+            scope: Scope::User,
+            hook_trust: Some(HookTrust::Incompatible),
+            at: 0,
+        };
+        assert_eq!(
+            form.actions(),
+            [PluginAction::Update, PluginAction::Uninstall]
         );
     }
 

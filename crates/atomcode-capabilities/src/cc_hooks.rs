@@ -394,6 +394,24 @@ fn plugin_interpreter(name: &str) -> Result<PathBuf, String> {
     Err("plugin interpreter was not found in an absolute PATH directory".into())
 }
 
+// Recognize only a fixed import wrapper with literal path arguments. Never
+// evaluate its JavaScript; the result still passes normal containment checks.
+fn import_wrapper_path(command: &str) -> Option<String> {
+    let arguments = command.strip_prefix(
+        "node -e \"import(require('node:url').pathToFileURL(require('node:path').join(process.env.CLAUDE_PLUGIN_ROOT,"
+    )?.strip_suffix(")).href)\"")?;
+    let parts: Option<Vec<_>> = arguments
+        .split(',')
+        .map(|part| {
+            let literal = part.trim().strip_prefix('\'')?.strip_suffix('\'')?;
+            // No JS escapes, interpolation, or quote injection into the normalized
+            // command. More complex expressions need a regular script entry point.
+            (!literal.is_empty() && !literal.contains(['\'', '"', '\\'])).then_some(literal)
+        })
+        .collect();
+    Some(parts?.join("/"))
+}
+
 /// Plugin hooks are executable entry points, not arbitrary shell programs.
 /// Keep argument boundaries and execute the exact canonical path we checked.
 fn plugin_hook_command(hook: &HookConfig) -> Result<tokio::process::Command, String> {
@@ -408,9 +426,8 @@ fn plugin_hook_command(hook: &HookConfig) -> Result<tokio::process::Command, Str
     let normalized = original
         .strip_prefix("node -e \"require(require('path').join(process.env.CLAUDE_PLUGIN_ROOT.split(String.fromCharCode(92)).join('/'), '")
         .and_then(|rest| rest.strip_suffix("'))\""))
-        .or_else(|| original
-            .strip_prefix("node -e \"import(require('node:url').pathToFileURL(require('node:path').join(process.env.CLAUDE_PLUGIN_ROOT,'")
-            .and_then(|rest| rest.strip_suffix("')).href)\"")))
+        .map(str::to_owned)
+        .or_else(|| import_wrapper_path(original))
         .map(|path| format!("node \"${{CLAUDE_PLUGIN_ROOT}}/{path}\""));
     if let Some(expected) = &hook.plugin_content_hash {
         let current = crate::plugin::hook_trust::plugin_content_hash(root)
@@ -1928,6 +1945,39 @@ mod tests {
         assert!(plugin_hook_command(&plugin_config(root.path(), "ordinary.cmd")).is_err());
         let escape = hook.command.replace("run-hook.cmd", "../run-hook.cmd");
         assert!(plugin_hook_command(&plugin_config(root.path(), &escape)).is_err());
+    }
+
+    #[test]
+    fn channel_multi_segment_import_uses_a_checked_script_path() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("atomcode/src with spaces");
+        std::fs::create_dir_all(&directory).unwrap();
+        let script = directory.join("start-detached.js");
+        std::fs::write(&script, "export {};\n").unwrap();
+        let wrapper = |arguments: &str| {
+            format!("node -e \"import(require('node:url').pathToFileURL(require('node:path').join(process.env.CLAUDE_PLUGIN_ROOT,{arguments})).href)\"")
+        };
+        let hook = plugin_config(
+            root.path(),
+            &wrapper("'atomcode', 'src with spaces', 'start-detached.js'"),
+        );
+        let command = plugin_hook_command(&hook).unwrap();
+        assert_eq!(
+            command.as_std().get_args().collect::<Vec<_>>(),
+            [std::fs::canonicalize(script).unwrap().as_os_str()]
+        );
+        for arguments in [
+            "'..','outside.js'",
+            "'atomcode',process.env.ENTRY",
+            "'atomcode','missing.js'",
+            "'atomcode',require('evil')",
+            "'atomcode','src with spaces','start-detached.js');evil('//')",
+        ] {
+            assert!(
+                plugin_hook_command(&plugin_config(root.path(), &wrapper(arguments))).is_err(),
+                "{arguments}"
+            );
+        }
     }
 
     #[test]
