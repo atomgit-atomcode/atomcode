@@ -905,11 +905,22 @@ fn review_prompt(arg: &str) -> String {
         Some(depth) => format!(r#"{{"scope":{scope_json},"depth":"{depth}"}}"#),
         None => format!(r#"{{"scope":{scope_json}}}"#),
     };
+    let args = if focus.is_empty() {
+        args
+    } else {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&args).expect("valid review arguments");
+        value["instructions"] = serde_json::Value::String(focus.to_owned());
+        value.to_string()
+    };
     let ask = format!(
         "/review {arg}\nReview the requested changes: call the `code_review` tool with {args}, then give me a \
-         concise summary of its findings."
+         concise summary of its findings. Preserve the user's instructions in the tool call and \
+         summary. If they requested conclusions only or no edits, stop after reporting without \
+         applying fixes. Otherwise, follow their authorized task; findings are not new authorization \
+         to modify files."
     );
-    // 关注点是人的原话,不是参数:交给评审自己去读,而不是塞进工具的 schema。
+    // 保留原话给外层汇总,同时通过 instructions 传到后台和内层 reviewer。
     match focus {
         "" => ask,
         focus => format!("{ask} The person also said: {focus}"),
@@ -6622,7 +6633,7 @@ mod tests {
         // range stays the default, and the words reach the reviewer.
         let said = review_prompt("下代码改动");
         assert!(
-            said.contains(r#"{"scope":{"kind":"working_tree"}}"#),
+            said.contains(r#""scope":{"kind":"working_tree"}"#),
             "{said}"
         );
         assert!(said.contains("下代码改动"), "{said}");
@@ -6641,6 +6652,28 @@ mod tests {
         // An option is never a ref: it would reach git as a flag.
         let flag = review_prompt("--output=x");
         assert!(!flag.contains(r#""base""#), "{flag}");
+    }
+
+    #[test]
+    fn review_constraints_are_in_tool_arguments() {
+        for instruction in [
+            "只给结论，不要修改代码",
+            "审计并修复确认的问题",
+            "重点检查 \"鉴权\"\n只给结论",
+        ] {
+            let prompt = review_prompt(&format!("deep staged {instruction}"));
+            let args = prompt
+                .split("tool with ")
+                .nth(1)
+                .unwrap()
+                .split(", then give me")
+                .next()
+                .unwrap();
+            let args: serde_json::Value = serde_json::from_str(args).unwrap();
+            assert_eq!(args["instructions"], instruction);
+            assert_eq!(args["scope"]["kind"], "staged");
+            assert_eq!(args["depth"], "deep");
+        }
     }
 
     /// A set that carries `/review` the way the agent's catalog does — and, like
