@@ -204,16 +204,20 @@ OAuth 登录要把令牌存进宿主的文档时用 `login_mcp_oauth_saving_to`�
 
 ```toml
 [tools.mcp]
-tool_search = "auto" # 默认；也可选 "on" 或 "off"
+tool_search = "on" # 默认；也可选 "auto" 或 "off"
 ```
 
 - `auto`：按工具定义的 JSON 字节数 / 4 估算 token；MCP 定义合计超过当前模型上下文
   窗口的 10% 时，改为按需加载。小目录继续完整提供定义。
-- `on`：始终按需加载 MCP 定义。
+- `on`（默认）：始终按需加载 MCP 定义；无需手动添加配置。
 - `off`：恢复每轮完整提供 MCP 定义，不挂载搜索工具。
 
 设置修改后经能力重载生效。CLI、TUI、WebUI/daemon、ACP 使用同一个 coding runtime
 实现；没有 Anthropic 专有 API 或 `tool_reference` 依赖。
+
+未配置该项（包括已有配置文件缺少该项）时使用 `on`；显式设置的 `auto` 或 `off` 保持不变。
+模型需要先搜索再调用尚未加载的 MCP 工具，可能多一次模型请求；如发现工具搜索不可靠，
+可显式设为 `off` 恢复全量定义。核心工具继续直接提供。
 
 按需加载时，模型先调用普通工具 `mcp_search`，用 server 名、工具名或描述中的关键词
 查找工具；空 `query` 浏览目录，`offset` 翻页，`limit` 为 1–32（默认 8）。返回值只有工具名、短描述、
@@ -350,6 +354,6 @@ EOF
 - `tagged_text_bytes` 是另一个视角：按文本标记识别项目/用户指令、技能目录、记忆和 SessionStart hook，记录原始 UTF-8 字节数。标记分类只用于诊断，不影响权限或请求内容，也不能与 JSON 分类相加。
 - 日志只记录分类、数量和大小，不记录提示正文、工具参数或凭据。完整 wire dump 仍需显式开启。
 
-`MCP schema projection decision` 同时记录模式、模型上下文、schema 预算、MCP 大小和是否启用按需加载。当前 `auto` 的预算随上下文增大：1M 上下文对应约 400KB，42KB 的 MCP 目录不会触发。希望对这类目录试点时，可将上述 `tool_search` 设为 `on`；用 `off` 恢复全量发送，或设回 `auto` 恢复自动策略。设置按现有配置加载机制生效，已运行会话不会因编辑文件自动改变。
+`MCP schema projection decision` 同时记录模式、模型上下文、schema 预算、MCP 大小和是否启用按需加载。默认 `on` 不依赖目录大小触发；显式选择 `auto` 时预算随上下文增大：1M 上下文对应约 400KB，42KB 的 MCP 目录不会触发。用 `off` 恢复全量发送，或选择 `auto` 使用比例阈值策略。设置按现有配置加载机制生效，已运行会话不会因编辑文件自动改变。
 
 这些是字节计量，不是分词器或计费 token 数。比较时应保持同一模型和工具配置，分别检查新会话首轮与搜索加载后的请求；真实 token 以 provider 返回的 usage 为准。

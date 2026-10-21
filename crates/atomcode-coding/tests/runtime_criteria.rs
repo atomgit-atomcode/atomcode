@@ -2753,6 +2753,8 @@ fn start_with_mcp_server(
     trust: bool,
 ) -> CodingRuntimeStart {
     let mut start = start(project, recorder, SessionMode::Fresh);
+    // Observe connection/publication changes without discovery filtering the request.
+    start.agent.mcp_tool_search = atomcode_config::config::McpToolSearchMode::Off;
     start.prepare.mcp = true;
     start.prepare.extra_mcp_servers = vec![atomcode_capabilities::mcp::McpServerConfig {
         name: "t".into(),
@@ -2833,6 +2835,8 @@ async fn an_mcp_servers_tools_are_offered_and_run() {
     let script = write_mcp_server(scratch.path(), &spawns);
     let recorder = Arc::new(Recorder::default());
     let mut start = start(env.project.path(), &recorder, SessionMode::Fresh);
+    // Observe connection/publication changes without discovery filtering the request.
+    start.agent.mcp_tool_search = atomcode_config::config::McpToolSearchMode::Off;
     start.prepare.mcp = true;
     start.prepare.extra_mcp_servers = vec![atomcode_capabilities::mcp::McpServerConfig {
         name: "t".into(),
@@ -3430,6 +3434,8 @@ async fn withdrawing_mcp_takes_the_tools_off_the_model() {
     let script = write_mcp_server(scratch.path(), &spawns);
     let recorder = Arc::new(Recorder::default());
     let mut start = start(env.project.path(), &recorder, SessionMode::Fresh);
+    // Observe connection/publication changes without discovery filtering the request.
+    start.agent.mcp_tool_search = atomcode_config::config::McpToolSearchMode::Off;
     start.prepare.mcp = true;
     start.prepare.extra_mcp_servers = vec![atomcode_capabilities::mcp::McpServerConfig {
         name: "t".into(),

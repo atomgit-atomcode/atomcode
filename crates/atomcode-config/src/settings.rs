@@ -787,24 +787,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mcp_schema_search_is_editable_and_defaults_to_auto() {
+    fn mcp_schema_search_is_editable_and_defaults_to_on() {
         let setting = SETTINGS
             .iter()
             .find(|s| s.id == "tools.mcp.tool_search")
             .unwrap();
         let mut document = "# keep\n".parse::<DocumentMut>().unwrap();
         let config: Config = toml::from_str("").unwrap();
-        assert_eq!(setting.value(&config), "auto");
+        assert_eq!(setting.value(&config), "on");
+        for text in ["", "[tools]", "[tools.mcp]"] {
+            let parsed: Config = toml::from_str(text).unwrap();
+            assert_eq!(setting.value(&parsed), "on");
+        }
         for mode in ["on", "off", "auto"] {
             setting.patch(&mut document, mode).unwrap();
             let config: Config = toml::from_str(&document.to_string()).unwrap();
             assert_eq!(setting.value(&config), mode);
+            let saved = toml::to_string(&config).unwrap();
+            let restored: Config = toml::from_str(&saved).unwrap();
+            assert_eq!(setting.value(&restored), mode);
         }
         assert!(setting.patch(&mut document, "invalid").is_err());
         assert!(toml::from_str::<Config>("[tools.mcp]\ntool_search='invalid'").is_err());
         assert!(!toml::to_string(&config).unwrap().contains("[tools.mcp]"));
         setting.reset(&mut document);
         assert!(!document.to_string().contains("tool_search"));
+        let reset: Config = toml::from_str(&document.to_string()).unwrap();
+        assert_eq!(setting.value(&reset), "on");
         assert!(document.to_string().contains("# keep"));
     }
 

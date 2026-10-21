@@ -347,7 +347,7 @@ mod tests {
     }
 
     #[test]
-    fn forced_on_pilots_moderate_catalogs_on_a_million_token_model() {
+    fn default_mode_defers_moderate_catalogs_on_a_million_token_model() {
         let mut tools = (0..34)
             .map(|i| tool(&format!("mcp__pilot__tool_{i:02}"), 1500))
             .collect::<Vec<_>>();
@@ -365,7 +365,7 @@ mod tests {
         project(&mut off, McpToolSearchMode::Off, 1_000_000);
         assert_eq!(off.tools.len(), tools.len());
         let mut first = original.clone();
-        project(&mut first, McpToolSearchMode::On, 1_000_000);
+        project(&mut first, McpToolSearchMode::default(), 1_000_000);
         assert_eq!(
             first
                 .tools

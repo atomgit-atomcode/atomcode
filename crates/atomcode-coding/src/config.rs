@@ -448,7 +448,7 @@ pub fn describe_config_file_for(
          `claude-code`, `model`, `permission`, `timeout_secs`, `enabled`), add the Codex \
          or Claude Code CLI as a delegate where the front end allows it.\n\
          - `[tools.todo]` `enabled`, and `eager` = `auto` | `preferred` | `always`.\n\
-         - `[tools.mcp]` `tool_search`: `auto` (default), `on`, or `off`; \
+         - `[tools.mcp]` `tool_search`: `on` (default), `auto`, or `off`; \
          lazily expose large MCP schemas through `mcp_search`, without changing approvals.\n\
          - `[tools.search]` `respect_gitignore`, `include_hidden`, `follow_symlinks`, `timeout_secs`, `max_entries`: Glob/Grep discovery defaults; per-project search.toml under the product settings directory overrides individual keys; permissions still apply.\n\
          - `[tools.output]` `threshold_bytes`: a tool result larger than this (default \
