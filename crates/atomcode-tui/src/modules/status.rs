@@ -198,13 +198,10 @@ impl View for Status {
         let activity: Option<(String, Style)> = match vp.moment.activity {
             // The warning gold, for identifiability: the terminal's own white blended
             // into the quiet figures beside it, so the running indicator carries the
-            // gold that makes "it is still going" read at a glance. `停止中` keeps the
-            // error red below.
+            // gold that makes "it is still going" read at a glance.
             Activity::Working => Some((working_indicator(vp.moment), theme::fg(Role::Warning))),
-            Activity::Stopping => {
-                Some((t(Msg::StatusStopping).into_owned(), theme::fg(Role::Error)))
-            }
-            Activity::Idle => None,
+            // The live line already says the turn is stopping.
+            Activity::Stopping | Activity::Idle => None,
         };
         if let Some((text, _)) = &activity {
             reserved += width::str_width(text) + sep_w;
