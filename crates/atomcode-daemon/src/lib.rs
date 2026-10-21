@@ -5685,6 +5685,155 @@ async fn shutdown_signal(mut shutdown_rx: watch::Receiver<bool>) {
     }
 }
 
+async fn owner_stopped(mut receiver: watch::Receiver<bool>) {
+    while !*receiver.borrow_and_update() {
+        if receiver.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
+async fn serve_http(
+    listener: tokio::net::TcpListener,
+    mut app: axum::Router,
+    shutdown: watch::Receiver<bool>,
+    owner: Option<watch::Sender<bool>>,
+) -> std::io::Result<()> {
+    if owner.is_some() {
+        let receiver = shutdown.clone();
+        app = app.layer(axum::middleware::from_fn(
+            move |request, next: axum::middleware::Next| {
+                let receiver = receiver.clone();
+                async move {
+                    let response = tokio::select! {
+                        biased;
+                        _ = owner_stopped(receiver.clone()) => {
+                            return axum::response::Response::builder()
+                                .status(StatusCode::SERVICE_UNAVAILABLE)
+                                .header(header::CONNECTION, "close")
+                                .body(axum::body::Body::empty()).unwrap();
+                        }
+                        response = next.run(request) => response,
+                    };
+                    let (parts, body) = response.into_parts();
+                    let body = body.into_data_stream().take_until(owner_stopped(receiver));
+                    axum::response::Response::from_parts(parts, axum::body::Body::from_stream(body))
+                }
+            },
+        ));
+    }
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            shutdown_signal(shutdown).await;
+            // The host, HTTP /shutdown, and OS signals converge on the same fact.
+            // Streaming bodies must see it too, otherwise graceful shutdown can
+            // wait forever for an old EventSource connection.
+            if let Some(owner) = owner {
+                owner.send_replace(true);
+            }
+        })
+        .await
+}
+
+#[cfg(test)]
+mod embedded_http_stop_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn restarting_with_a_reused_http_client_accepts_only_the_new_instance_token() {
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let mut port = 0;
+        let mut previous = None;
+        for _ in 0..3 {
+            let tokens = auth_token::WebuiTokenStore::new();
+            let token = tokens.mint();
+            let app = axum::Router::new().route(
+                "/",
+                axum::routing::get(move |headers: axum::http::HeaderMap| {
+                    let tokens = tokens.clone();
+                    async move {
+                        let supplied = headers
+                            .get(header::AUTHORIZATION)
+                            .and_then(|h| h.to_str().ok());
+                        match auth_token::token_from_header(supplied) {
+                            Some(token) if tokens.is_valid(&token) => StatusCode::OK,
+                            _ => StatusCode::UNAUTHORIZED,
+                        }
+                    }
+                }),
+            );
+            let (listener, actual_port) = bind_scanning("127.0.0.1", port, 100).await.unwrap();
+            port = actual_port;
+            let (stop, receiver) = watch::channel(false);
+            let task = tokio::spawn(serve_http(listener, app, receiver, Some(stop.clone())));
+            let url = format!("http://127.0.0.1:{port}/");
+            let response = client.get(&url).bearer_auth(&token).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            response.bytes().await.unwrap(); // Return the connection to the browser-like pool.
+            if let Some(old_token) = previous {
+                let response = client
+                    .get(&url)
+                    .bearer_auth(old_token)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+                response.bytes().await.unwrap();
+            }
+            stop.send_replace(true);
+            task.await.unwrap().unwrap();
+            previous = Some(token);
+        }
+    }
+
+    #[tokio::test]
+    async fn stopping_an_embedded_server_closes_pending_streaming_bodies() {
+        let stream = futures::stream::once(async {
+            Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(b"data: started\n\n"))
+        })
+        .chain(futures::stream::pending());
+        let body = Arc::new(std::sync::Mutex::new(Some(axum::body::Body::from_stream(
+            stream,
+        ))));
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::get(move || {
+                let body = body.clone();
+                async move { body.lock().unwrap().take().unwrap() }
+            }),
+        );
+        let (listener, port) = bind_scanning("127.0.0.1", 0, 100).await.unwrap();
+        let (stop, receiver) = watch::channel(false);
+        let task = tokio::spawn(serve_http(listener, app, receiver, Some(stop.clone())));
+        let mut response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.chunk().await.unwrap().unwrap(),
+            "data: started\n\n"
+        );
+        stop.send_replace(true);
+        task.await.unwrap().unwrap();
+        assert!(!matches!(response.chunk().await, Ok(Some(_))));
+    }
+
+    #[tokio::test]
+    async fn stopping_before_server_bootstrap_is_not_lost() {
+        let (listener, _) = bind_scanning("127.0.0.1", 0, 100).await.unwrap();
+        let (stop, _) = watch::channel(false);
+        stop.send_replace(true);
+        let receiver = stop.subscribe();
+        serve_http(listener, axum::Router::new(), receiver, Some(stop.clone()))
+            .await
+            .unwrap();
+    }
+}
+
 /// Install a panic hook that emits a scrubbed `Event::Panic` telemetry event
 /// before delegating to the default hook (preserving stderr output). (R9.1-R9.4)
 fn install_panic_hook(telemetry: Arc<Telemetry>) {
@@ -5791,8 +5940,9 @@ struct WebuiHandle {
     port: u16,
     /// server 绑定的地址（如 `127.0.0.1` / `0.0.0.0`）；换绑前需先 stop。
     host: String,
-    /// server task 的 abort handle；用于 `/webui stop` 停止。
+    /// Task completion monitor; stopping must drain HTTP connections, not abort accept.
     abort: tokio::task::AbortHandle,
+    shutdown: watch::Sender<bool>,
     relay_url: Option<String>,
     relay_error: Option<String>,
 }
@@ -6012,6 +6162,7 @@ pub async fn launch_webui(host: &str, port: u16, sync: bool, open_browser: bool)
         }
         tracing::info!(target: "atomcode::webui", %host, port = actual_port, "webui listening");
         let tokens = auth_token::WebuiTokenStore::new();
+        let (shutdown, _) = watch::channel(false);
         let opts = ServerOpts {
             host: host.to_string(),
             port: actual_port,
@@ -6033,6 +6184,7 @@ pub async fn launch_webui(host: &str, port: u16, sync: bool, open_browser: bool)
             working_dir_override: std::env::current_dir().ok(),
             // 预绑定的监听器：run_server 直接复用，跳过内部 bind。
             prebound_listener: Some(listener),
+            owner_shutdown: Some(shutdown.clone()),
             // webui 模式不需要 app user_id 校验。
             app_user_id: None,
             // 进程内 webui 不写 token 文件（token 通过 WebuiTokenStore 共享）。
@@ -6051,6 +6203,7 @@ pub async fn launch_webui(host: &str, port: u16, sync: bool, open_browser: bool)
                 port: actual_port,
                 host: host.to_string(),
                 abort: task.abort_handle(),
+                shutdown,
                 relay_url: None,
                 relay_error: None,
             });
@@ -6157,7 +6310,7 @@ mod webui_qr_tests {
 pub fn stop_server() -> String {
     let mut guard = WEBUI.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(handle) = guard.take() {
-        handle.abort.abort();
+        handle.shutdown.send_replace(true);
         "已停止 webui server".to_string()
     } else {
         "webui server 未在运行".to_string()
@@ -6176,6 +6329,7 @@ struct AppServerHandle {
     port: u16,
     host: String,
     abort: tokio::task::AbortHandle,
+    shutdown: watch::Sender<bool>,
 }
 
 static APP_SERVER: std::sync::Mutex<Option<AppServerHandle>> = std::sync::Mutex::new(None);
@@ -6213,6 +6367,7 @@ pub async fn ensure_app_server(
     let (listener, actual_port) = bind_scanning(host, port, 100)
         .await
         .map_err(|e| format!("绑定 {host}:{port} 失败（{e:#}）"))?;
+    let (shutdown, _) = watch::channel(false);
     let opts = ServerOpts {
         host: host.to_string(),
         port: actual_port,
@@ -6226,6 +6381,7 @@ pub async fn ensure_app_server(
         quiet: true,
         working_dir_override: std::env::current_dir().ok(),
         prebound_listener: Some(listener),
+        owner_shutdown: Some(shutdown.clone()),
         app_user_id: user_id,
         // App 进程内启动器不写 token 文件（使用 require_app_user_id 校验）。
         daemon_token_file: None,
@@ -6241,6 +6397,7 @@ pub async fn ensure_app_server(
             port: actual_port,
             host: host.to_string(),
             abort: task.abort_handle(),
+            shutdown,
         });
     }
     Ok((host.to_string(), actual_port))
@@ -6250,7 +6407,7 @@ pub async fn ensure_app_server(
 pub fn stop_app_server() -> bool {
     let mut guard = APP_SERVER.lock().unwrap();
     if let Some(handle) = guard.take() {
-        handle.abort.abort();
+        handle.shutdown.send_replace(true);
         true
     } else {
         false
@@ -6831,6 +6988,8 @@ pub struct ServerOpts {
     /// 预绑定的监听器。进程内 webui 启动器先绑定端口（拿到真实端口、支持动态端口）
     /// 再传入，`run_server` 直接复用、跳过内部 bind。独立二进制传 None，照旧自行 bind。
     pub prebound_listener: Option<tokio::net::TcpListener>,
+    /// Host-owned server lifetime. Stops HTTP connections without stopping the agent.
+    pub owner_shutdown: Option<watch::Sender<bool>>,
     /// App 远程访问模式期望的 user_id。非空时 daemon 启用 `X-Atom-User-Id` 请求头校验。
     pub app_user_id: Option<String>,
     /// 独立/IDE daemon 模式：写入 `~/.atomcode/daemon-<port>.json` 的 token。
@@ -6886,6 +7045,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         quiet,
         working_dir_override,
         prebound_listener,
+        owner_shutdown,
         daemon_token_file: token_file_token,
         ..
     } = opts;
@@ -6984,7 +7144,10 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     );
 
     // Step 7: Build AppState (R1.4)
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let shutdown_tx = owner_shutdown
+        .clone()
+        .unwrap_or_else(|| watch::channel(false).0);
+    let shutdown_rx = shutdown_tx.subscribe();
     let last_activity = Arc::new(std::sync::atomic::AtomicI64::new(now_unix_ms()));
     let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let project_store = Arc::new(RwLock::new(project_state));
@@ -7334,8 +7497,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     .await;
 
     // Step 13: Serve with graceful shutdown (R10.1-R10.5)
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(shutdown_rx))
+    serve_http(listener, app, shutdown_rx, owner_shutdown)
         .await
         .unwrap_or_else(|e| tracing::error!(?e, "axum::serve error"));
 
