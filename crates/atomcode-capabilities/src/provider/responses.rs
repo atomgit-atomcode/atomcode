@@ -735,7 +735,11 @@ impl LlmProvider for ResponsesProvider {
             options
         };
         let body = build_request_body(&self.cfg.model, messages, tools, options, &self.cfg);
-        super::wire_dump_request(self.cfg.wire_dump_dir.as_deref(), &self.cfg.model, &body);
+        super::record_request_diagnostics(
+            self.cfg.wire_dump_dir.as_deref(),
+            &self.cfg.model,
+            &body,
+        );
         let body_bytes = match serde_json::to_vec(&body) {
             Ok(b) => b,
             Err(e) => {

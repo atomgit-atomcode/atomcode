@@ -1502,6 +1502,32 @@ mod search_memory_tests {
     }
 
     #[tokio::test]
+    async fn overlapping_search_context_is_emitted_once_with_match_markers_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overlap.txt");
+        std::fs::write(
+            &path,
+            "before\nNEEDLE first\nbetween\nNEEDLE second\nafter\n",
+        )
+        .unwrap();
+        let result = LocalFs::unfenced().search(&path, &query(2)).await.unwrap();
+        assert_eq!(result.matches, 2);
+        let rows: Vec<_> = result
+            .lines
+            .iter()
+            .map(|row| match row {
+                SearchLine::Match { line, .. } => (*line, true),
+                SearchLine::Context { line, .. } => (*line, false),
+                SearchLine::Break => panic!("overlapping windows should form one group"),
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(1, false), (2, true), (3, false), (4, true), (5, false)]
+        );
+    }
+
+    #[tokio::test]
     async fn long_matches_and_context_are_bounded_before_retention() {
         let dir = tempfile::tempdir().unwrap();
         let mut file = std::fs::File::create(dir.path().join("long.txt")).unwrap();

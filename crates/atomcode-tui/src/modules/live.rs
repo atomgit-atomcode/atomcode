@@ -22,8 +22,8 @@
 //! Nothing is invented. A figure with no fact behind it is left out rather than
 //! printed as zero: no reading yet means no number, not `0 tok`.
 //!
-//! Input shows the latest request's context size. Output, cache reuse and
-//! generation throughput describe the whole turn. Cache reuse weights every
+//! Input shows the latest request's context size. Output and cache reuse cover
+//! the whole turn; throughput shows the current or latest generation. Cache reuse weights every
 //! request's cached tokens by its input tokens; this measures reuse across the
 //! turn, rather than pretending the repeated inputs are a larger context.
 //! `耗时` is the goal's cumulative wall time, or the current ordinary turn's.
@@ -521,7 +521,7 @@ fn doing(state: &State, moment: &Moment) -> Option<String> {
 /// narrow screen, the trailing figures are dropped whole.
 ///
 /// Input is the latest context size; output and cache reuse cover the whole
-/// turn. Speed covers only the current request while it is generating.
+/// turn. Speed follows current generation and retains its last completed reading during tools and waits.
 /// Elapsed time includes waiting and tools; generation time does not.
 fn parts(state: &State, moment: &Moment) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -558,34 +558,29 @@ fn parts(state: &State, moment: &Moment) -> Vec<String> {
         out.push(t(Msg::LiveElapsed { took: &short(ms) }).into_owned());
     }
     append_usage(&mut out, state, moment);
-    if let Some(rate) = moment.generation.rate(moment.now) {
-        out.push(t(Msg::LiveSpeed { rate }).into_owned());
-    }
     out
 }
 
 fn append_usage(out: &mut Vec<String>, state: &State, moment: &Moment) {
-    if goal_elapsed(moment).is_some() {
-        // Older checkpoints have no breakdown: never label one turn's readings
-        // as whole-goal totals when its earlier history is unknown.
-        if let Some(usage) = moment
+    let (input, output, cached) = if goal_elapsed(moment).is_some() {
+        // Never label one turn's usage as whole-goal usage for old checkpoints.
+        moment
             .autonomy_samples
             .get(&moment.viewing)
             .and_then(|(running, _)| running.usage.as_ref())
-        {
-            out.extend(crate::content::usage_parts(
-                usage.input,
-                usage.output,
-                usage.cached,
-            ));
-        }
+            .map_or((0, 0, 0), |usage| (usage.input, usage.output, usage.cached))
     } else {
-        out.extend(crate::content::usage_parts(
-            state.cache_prompt,
-            state.output,
-            state.cached,
-        ));
+        (state.cache_prompt, state.output, state.cached)
+    };
+    let mut figures = crate::content::usage_parts(input, output, cached);
+    if moment.compacting_since.is_none() {
+        if let Some(rate) = moment.generation.rate(moment.now) {
+            // usage_parts emits input, output, then optional cache share.
+            let before_cache = usize::from(input > 0) + usize::from(output > 0);
+            figures.insert(before_cache, t(Msg::LiveSpeed { rate }).into_owned());
+        }
     }
+    out.extend(figures);
 }
 
 /// Runtime's cumulative goal sample, advanced only by injected host time.
@@ -1473,7 +1468,7 @@ mod tests {
         );
         let line = line_at(&state, &moment, 180);
         assert!(
-            line.contains("↑ 150.7K · ↓ 20.1K · 缓存 96.49% · 50 tok/s"),
+            line.contains("↑ 150.7K · ↓ 20.1K · 50 tok/s · 缓存 96.49%"),
             "{line}"
         );
         assert!(!line.contains("均速"), "{line}");
@@ -1483,7 +1478,7 @@ mod tests {
         assert!(width::str_width(&narrow) <= 20);
         assert!(!narrow.contains("tok/s"), "drop whole figures: {narrow}");
 
-        // Finished generation and the next first-token wait have no live speed.
+        // Finished speed remains visible while waiting for the next first token.
         for event in [
             SessionEvent::Usage {
                 turn: 1,
@@ -1507,7 +1502,15 @@ mod tests {
         moment.now = Timestamp::millis(120_000);
         let waiting = line_at(&state, &moment, 180);
         assert!(waiting.contains("正在等待模型"), "{waiting}");
-        assert!(!waiting.contains("tok/s"), "{waiting}");
+        assert!(waiting.contains("100 tok/s"), "{waiting}");
+        assert!(
+            waiting.find("100 tok/s").unwrap() < waiting.find("缓存").unwrap(),
+            "{waiting}"
+        );
+        assert!(
+            !waiting.contains("上轮") && !waiting.contains('约'),
+            "{waiting}"
+        );
         assert!(!waiting.contains("均速"), "{waiting}");
     }
 

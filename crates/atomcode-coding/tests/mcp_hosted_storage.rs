@@ -254,13 +254,17 @@ impl Env {
             atomcode_config::distribution::PROJECT_DIR_NAME,
         )
         .with_home_dir_name(atomcode_config::distribution::HOME_DIR_NAME);
-        CodingAgentConfig::new(
+        let mut config = CodingAgentConfig::new(
             "key",
             "https://example.test/v1",
             "model-a",
             self.project.path(),
             dirs,
-        )
+        );
+        // Storage/lifecycle assertions observe publication directly through eager schemas.
+        // The discovery test below explicitly uses the product default instead.
+        config.mcp_tool_search = atomcode_config::config::McpToolSearchMode::Off;
+        config
     }
 
     fn start(
@@ -803,12 +807,21 @@ async fn a_host_kept_config_that_cannot_be_read_fails_and_is_left_as_it_is() {
 /// Wall-clock test because it coordinates an actual subprocess over pipes.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_large_mcp_catalog_is_searched_then_called_without_schema_history_bloat() {
+    run_mcp_discovery(12_000).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn default_discovery_searches_small_catalogs_before_calling_original_tools() {
+    run_mcp_discovery(600).await;
+}
+
+async fn run_mcp_discovery(schema_chars: usize) {
     use atomcode_kernel::tool::ToolCall;
     let env = Env::new();
     let recorder = Arc::new(Recorder::default());
     let tools = (0..34).map(|n| json!({
         "name": format!("inspect_{n:02}"), "description":"inspect reverse engineering function",
-        "inputSchema":{"type":"object","properties":{"address":{"type":"string","description":"x".repeat(12_000)}}}
+        "inputSchema":{"type":"object","properties":{"address":{"type":"string","description":"x".repeat(schema_chars)}}}
     })).collect::<Vec<_>>();
     let script = write_mcp_server_with_tools(env.scratch.path(), &env.spawns(), json!(tools));
     let user_config = Sealed::holding(
@@ -832,7 +845,9 @@ async fn a_large_mcp_catalog_is_searched_then_called_without_schema_history_bloa
             StreamEvent::Done { truncated: false },
         ]);
     }
-    let mut runtime = started(env.start(&recorder, &user_config, &tokens)).await;
+    let mut start = env.start(&recorder, &user_config, &tokens);
+    start.agent.mcp_tool_search = Default::default();
+    let mut runtime = started(start).await;
     runtime
         .handle
         .wait_mcp_ready(std::time::Duration::from_secs(10))
@@ -857,7 +872,7 @@ async fn a_large_mcp_catalog_is_searched_then_called_without_schema_history_bloa
         .collect::<Vec<_>>();
     assert_eq!(selected.len(), 1);
     assert_eq!(selected[0].name, "mcp__rea__inspect_17");
-    assert!(selected[0].parameters.to_string().len() > 12_000);
+    assert!(selected[0].parameters.to_string().len() > schema_chars);
     let search_result = requests[1]
         .1
         .iter()

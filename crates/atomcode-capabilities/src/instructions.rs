@@ -190,6 +190,48 @@ mod tests {
     use std::fs;
 
     #[test]
+    fn large_loaded_bodies_do_not_warn_or_change_instructions() {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path().join("home");
+        let project = d.path().join("project");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        let body = "规".repeat(10_000);
+        fs::write(home.join("ATOMCODE.md"), &body).unwrap();
+        fs::write(project.join("AGENTS.md"), &body).unwrap();
+        let loaded = load_instructions(&home, &project);
+        let before = loaded.text().to_string();
+        let warnings = loaded.warnings();
+        assert!(warnings.is_empty());
+        assert_eq!(loaded.text(), before);
+        assert_eq!(
+            before.matches(&body).count(),
+            2,
+            "even duplicate rules remain intact"
+        );
+        assert_eq!(fs::read_to_string(project.join("AGENTS.md")).unwrap(), body);
+    }
+
+    #[test]
+    fn large_sources_keep_only_the_existing_shadow_warning() {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path().join("missing");
+        fs::write(d.path().join(".atomcode.md"), "x".repeat(32 * 1024)).unwrap();
+        fs::write(d.path().join("AGENTS.md"), "y".repeat(32 * 1024)).unwrap();
+        let loaded = load_instructions(&home, d.path());
+        assert_eq!(
+            loaded.warnings().len(),
+            1,
+            "only the existing shadow warning"
+        );
+        assert!(!loaded.warnings()[0].contains("Large loaded"));
+        fs::write(d.path().join(".atomcode.user.md"), "z").unwrap();
+        let loaded = load_instructions(&home, d.path());
+        assert_eq!(loaded.warnings().len(), 1);
+        assert!(!loaded.text().contains("yyyy"));
+    }
+
+    #[test]
     fn selected_empty_or_unreadable_file_still_shadows_the_other_candidates() {
         let d = tempfile::tempdir().unwrap();
         let preferred = d.path().join(".atomcode.md");

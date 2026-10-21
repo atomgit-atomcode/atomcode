@@ -16,7 +16,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 const SEARCH: &str = "mcp_search";
-const MAX_MATCHES: usize = 5;
+const DEFAULT_MATCHES: usize = 8;
+const MAX_MATCHES: usize = 32;
 const DESCRIPTION_CHARS: usize = 240;
 
 fn is_mcp(name: &str) -> bool {
@@ -93,7 +94,7 @@ fn search(tools: &[ToolDef], args: SearchArgs, budget: usize) -> Value {
         b_score.cmp(a_score).then_with(|| a.name.cmp(&b.name))
     });
     let total = ranked.len();
-    let limit = args.limit.unwrap_or(MAX_MATCHES).clamp(1, MAX_MATCHES);
+    let limit = args.limit.unwrap_or(DEFAULT_MATCHES).clamp(1, MAX_MATCHES);
     let mut remaining = budget;
     let matches = ranked.into_iter().skip(args.offset).take(limit).map(|(_, tool)| {
         let bytes = schema_bytes(tool);
@@ -164,19 +165,26 @@ fn project(request: &mut ModelRequest, mode: McpToolSearchMode, window: u32) {
     // in that case rather than hide every schema behind an unavailable door.
     let can_search = request.tools.iter().any(|tool| tool.name == SEARCH);
     let budget = schema_budget(window);
+    let admitted_mcp_bytes = request
+        .tools
+        .iter()
+        .filter(|tool| is_mcp(&tool.name))
+        .fold(0usize, |sum, tool| sum.saturating_add(schema_bytes(tool)));
+    let admitted_mcp_tools = request
+        .tools
+        .iter()
+        .filter(|tool| is_mcp(&tool.name))
+        .count();
     let deferred = can_search
         && match mode {
             McpToolSearchMode::Off => false,
             McpToolSearchMode::On => true,
-            McpToolSearchMode::Auto => {
-                request
-                    .tools
-                    .iter()
-                    .filter(|tool| is_mcp(&tool.name))
-                    .fold(0usize, |sum, tool| sum.saturating_add(schema_bytes(tool)))
-                    > budget
-            }
+            McpToolSearchMode::Auto => admitted_mcp_bytes > budget,
         };
+    tracing::info!(turn = request.turn, round = request.round, mode = ?mode,
+        context_window = window, schema_budget_bytes = budget, admitted_mcp_bytes,
+        admitted_mcp_tools, search_available = can_search, deferred,
+        "MCP schema projection decision (JSON bytes, not tokens)");
     if !deferred {
         // Keep the small discovery tool in auto mode, even for eager catalogs.
         // This also makes retrying an already-projected request idempotent.
@@ -206,12 +214,12 @@ impl Tool for SearchTool {
         SEARCH
     }
     fn description(&self) -> &str {
-        "Find and load MCP tools by keywords in server/tool names or descriptions. Search before using an external capability whose schema is absent. Empty query browses the catalog; offset pages results. Loads at most five tools for the NEXT request, replacing the previous selection. Does not execute tools."
+        "Find and load MCP tools by keywords in server/tool names or descriptions. Search before using an external capability whose schema is absent. Empty query browses the catalog; offset pages results. Returns eight matches by default; limit can request up to 32. Full schemas load within the schema byte budget for the NEXT request, replacing the previous selection. Does not execute tools."
     }
     fn parameters_schema(&self) -> Value {
         json!({"type":"object","properties":{
             "query":{"type":"string","description":"Keywords or an exact mcp__server__tool name; empty string browses."},
-            "limit":{"type":"integer","minimum":1,"maximum":5},
+            "limit":{"type":"integer","minimum":1,"maximum":32,"default":8},
             "offset":{"type":"integer","minimum":0}
         },"required":["query"],"additionalProperties":false})
     }
@@ -227,7 +235,7 @@ impl Tool for SearchTool {
             _ => return ToolResult {
                 is_error: true,
                 content:
-                    "Expected query (at most 512 characters), optional limit (1..5), and offset."
+                    "Expected query (at most 512 characters), optional limit (1..32), and offset."
                         .into(),
                 ..Default::default()
             },
@@ -339,6 +347,67 @@ mod tests {
     }
 
     #[test]
+    fn default_mode_defers_moderate_catalogs_on_a_million_token_model() {
+        let mut tools = (0..34)
+            .map(|i| tool(&format!("mcp__pilot__tool_{i:02}"), 1500))
+            .collect::<Vec<_>>();
+        tools.push(discovery());
+        tools.push(tool("read_file", 0));
+        let original = request(tools.clone(), vec![Message::user("inspect")]);
+        let mut auto = original.clone();
+        project(&mut auto, McpToolSearchMode::Auto, 1_000_000);
+        assert_eq!(
+            auto.tools.len(),
+            tools.len(),
+            "auto retains its existing threshold"
+        );
+        let mut off = original.clone();
+        project(&mut off, McpToolSearchMode::Off, 1_000_000);
+        assert_eq!(off.tools.len(), tools.len());
+        let mut first = original.clone();
+        project(&mut first, McpToolSearchMode::default(), 1_000_000);
+        assert_eq!(
+            first
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![SEARCH, "read_file"]
+        );
+        let eager_bytes = serde_json::to_vec(&original.tools).unwrap().len();
+        let lazy_bytes = serde_json::to_vec(&first.tools).unwrap().len();
+        assert!(
+            lazy_bytes * 10 < eager_bytes,
+            "schema reduction: {eager_bytes} -> {lazy_bytes}"
+        );
+        let found = search(
+            &tools,
+            SearchArgs {
+                query: "mcp__pilot__tool_17".into(),
+                limit: Some(1),
+                ..Default::default()
+            },
+            schema_budget(1_000_000),
+        );
+        let mut next = request(tools.clone(), pair("pilot-search", SEARCH, found));
+        project(&mut next, McpToolSearchMode::On, 1_000_000);
+        let loaded = next
+            .tools
+            .iter()
+            .find(|tool| tool.name == "mcp__pilot__tool_17")
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(loaded).unwrap(),
+            serde_json::to_value(&tools[17]).unwrap()
+        );
+        assert!(next.tools.iter().any(|tool| tool.name == "read_file"));
+        assert_eq!(
+            next.tools.iter().filter(|tool| is_mcp(&tool.name)).count(),
+            1
+        );
+    }
+
+    #[test]
     fn a_large_catalog_is_lazy_and_only_search_matches_load_next_request() {
         let mut tools = (0..34)
             .map(|i| tool(&format!("mcp__rea__tool_{i:02}"), 12_000))
@@ -407,7 +476,7 @@ mod tests {
         let result = search(
             &tools,
             SearchArgs {
-                limit: Some(999),
+                limit: Some(5),
                 offset: 5,
                 ..Default::default()
             },
@@ -429,7 +498,32 @@ mod tests {
             .contains("schema"));
         let selected = search(&tools, SearchArgs::default(), 1_000);
         let names = selected["loaded_tools"].as_array().unwrap();
-        assert!(!names.is_empty() && names.len() < 5);
+        assert!(!names.is_empty() && names.len() < DEFAULT_MATCHES);
+    }
+
+    #[test]
+    fn match_limits_are_adjustable_and_selected_tools_survive_projection() {
+        let mut tools = (0..50)
+            .map(|i| tool(&format!("mcp__many__{i:02}"), 0))
+            .collect::<Vec<_>>();
+        tools.push(discovery());
+        for (limit, expected) in [(None, 8), (Some(16), 16), (Some(999), 32)] {
+            let found = search(
+                &tools,
+                SearchArgs {
+                    limit,
+                    ..Default::default()
+                },
+                schema_budget(128_000),
+            );
+            assert_eq!(found["matches"].as_array().unwrap().len(), expected);
+            let mut next = request(tools.clone(), pair("search", SEARCH, found));
+            project(&mut next, McpToolSearchMode::On, 128_000);
+            assert_eq!(
+                next.tools.iter().filter(|t| is_mcp(&t.name)).count(),
+                expected
+            );
+        }
     }
 
     #[test]

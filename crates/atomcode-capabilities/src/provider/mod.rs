@@ -18,6 +18,7 @@
 mod anthropic;
 mod atomgit_sign;
 pub mod discovery;
+mod input_profile;
 mod latency;
 mod ollama;
 mod openai_compat;
@@ -52,7 +53,8 @@ pub(crate) const DEFAULT_USER_AGENT: &str = "atomcode";
 /// nanosecond (the timestamp alone isn't a tiebreaker under concurrency).
 static WIRE_DUMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// BYTE-LEVEL outbound-request dump for wire diagnosis. No-op unless `ATOMCODE_WIRE_DUMP=1`.
+/// Record size-only diagnostics of the final outgoing body for every adapter.
+/// Full request dumps remain opt-in through `ATOMCODE_WIRE_DUMP=1`.
 /// Writes the EXACT JSON body an adapter built (post-projection, pre-send) to
 /// `<dir>/<seq>-<ts>-<model>.req.json`, `dir` being the config's `wire_dump_dir` (the host
 /// passes `<user tree>/wire-dump`). Best-effort: any failure (env unset, no dir, unwritable
@@ -63,7 +65,8 @@ static WIRE_DUMP_SEQ: AtomicU64 = AtomicU64::new(0);
 /// these bytes). The kernel has NO byte seam by design — byte framing is intrinsically the
 /// adapter's concern (each backend's JSON differs), so every adapter routes its built body
 /// through here. Ported from core's v1 `ATOMCODE_WIRE_DUMP` (same env + `wire-dump/` dir).
-pub(crate) fn wire_dump_request(dir: Option<&std::path::Path>, model: &str, body: &Value) {
+pub(crate) fn record_request_diagnostics(dir: Option<&std::path::Path>, model: &str, body: &Value) {
+    input_profile::log(model, body);
     if std::env::var("ATOMCODE_WIRE_DUMP").ok().as_deref() != Some("1") {
         return;
     }
@@ -72,7 +75,7 @@ pub(crate) fn wire_dump_request(dir: Option<&std::path::Path>, model: &str, body
     }
 }
 
-/// The pure writer behind [`wire_dump_request`] — testable without mutating the
+/// The pure writer behind [`record_request_diagnostics`] — testable without mutating the
 /// process-global `$ATOMCODE_WIRE_DUMP`. Best-effort.
 fn wire_dump_to(dir: &std::path::Path, model: &str, body: &Value) {
     if std::fs::create_dir_all(dir).is_err() {

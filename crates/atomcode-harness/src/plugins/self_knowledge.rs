@@ -188,7 +188,7 @@ impl Introspect {
         told.join("\n\n")
     }
 
-    fn tools(&self) -> String {
+    fn tools(&self, names_only: bool) -> String {
         let Some(toolbox) = self.ctx.service::<ToolsSvc>() else {
             return "tools: no tool catalog is mounted.".into();
         };
@@ -198,9 +198,12 @@ impl Introspect {
         }
         let mut out = format!("{} tools are registered right now:\n", defs.len());
         for def in defs {
-            // One line each: the model already has the full schemas in its
-            // request, so repeating them here would burn context to say
-            // something it can already see.
+            if names_only {
+                out.push_str(&format!("  {}\n", def.name));
+                continue;
+            }
+            // Explicit detailed queries retain the descriptions. A single line
+            // can contain the entire description; overview must not include it.
             let first = def
                 .description
                 .lines()
@@ -210,6 +213,22 @@ impl Introspect {
             out.push_str(&format!("  {} — {}\n", def.name, first));
         }
         out
+    }
+
+    fn overview(&self) -> String {
+        format!(
+            "{}\n\n{}\n\n{}\n\n\
+             This is a compact overview; tool descriptions and parameter schemas are already \
+             supplied with the request. Identity comes from the current system persona. \
+             For more detail call describe_self with aspect: session (session state/storage), \
+             services (mounted slots), tools (tool descriptions), models (delegation catalog), \
+             operations (current model and capability setup, as described by their owning rows), \
+             settings (editable settings), or all (full report except settings). \
+             Query only the aspect needed for the person's question.",
+            self.session(),
+            self.services(),
+            self.tools(true)
+        )
     }
 }
 
@@ -238,7 +257,10 @@ impl Tool for DescribeSelf {
          install a skill or an MCP server. This reports YOU, the running agent — \
          not the project you are working in. Every answer is generated from the \
          running system, so none of it can be out of date; it is read-only and \
-         cheap, so prefer calling it over answering such a question from memory."
+         cheap when queried narrowly. For a simple identity question use `aspect: overview` \
+         (the default); it returns session information and tool names without repeating tool \
+         descriptions or setup documentation. Select a specific aspect for follow-up questions. \
+         Use `all` only when the person needs the full report."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -247,8 +269,8 @@ impl Tool for DescribeSelf {
             "properties": {
                 "aspect": {
                     "type": "string",
-                    "enum": ["session", "services", "tools", "models", "operations", "settings", "all"],
-                    "description": "session = which session this is, and what the rows that keep it say about where and how; services = what is mounted; tools = the live catalog; models = what `task` and `team` may be delegated to, read live; operations = how to change things and add capabilities (model, memory, skills, MCP servers, plugins, layout); settings = the user-settings catalog including language. Defaults to everything but settings."
+                    "enum": ["overview", "session", "services", "tools", "models", "operations", "settings", "all"],
+                    "description": "overview (default) = compact session/services/tool-name overview with pointers to details; session = which session this is, and what the rows that keep it say about where and how; services = what is mounted; tools = the live catalog; models = what `task` and `team` may be delegated to, read live; operations = how to change things and add capabilities (model, memory, skills, MCP servers, plugins, layout); settings = the user-settings catalog including language. Use all only for a full report (excluding settings); prefer a specific aspect."
                 }
             }
         })
@@ -263,31 +285,29 @@ impl Tool for DescribeSelf {
     }
 
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
-        // A malformed argument reports everything rather than failing: the tool
-        // exists to answer "what am I", and refusing to answer over a typo in an
-        // optional field would be the one failure mode that matters here.
+        // Keep typo/missing-argument recovery read-only and useful, but bounded:
+        // a malformed optional field must not expand into the full report.
         let aspect = serde_json::from_str::<Value>(args)
             .ok()
             .and_then(|v| v.get("aspect")?.as_str().map(str::to_string))
-            .unwrap_or_else(|| "all".into());
+            .unwrap_or_else(|| "overview".into());
 
         let body = match aspect.as_str() {
             "session" => self.inner.session(),
             "services" => self.inner.services(),
-            "tools" => self.inner.tools(),
+            "tools" => self.inner.tools(false),
             "models" => self.inner.models(),
             "operations" => self.inner.operations(),
             "settings" => self.inner.settings(),
-            // `all` deliberately omits `settings`: it is a 26-row table that
-            // answers a question nobody asked most of the time, and a default
-            // that dumps everything trains the reader to skim.
-            _ => format!(
+            // Preserve the explicit full report for existing callers.
+            "all" => format!(
                 "{}\n\n{}\n\n{}\n\n{}",
                 self.inner.session(),
                 self.inner.services(),
-                self.inner.tools(),
+                self.inner.tools(false),
                 self.inner.operations()
             ),
+            _ => self.inner.overview(),
         };
         ToolResult {
             call_id: String::new(),
@@ -349,7 +369,9 @@ were trained on.
 So when a question is about the running agent — what you are or are made of, \
 what you can do, which tools, models, skills, or MCP servers you have, how to \
 change or extend any of that, which session this is, or where your own state is \
-kept — call `describe_self` FIRST and answer from its report, rather than \
+kept — call `describe_self` FIRST and answer from its report. Use the default \
+`aspect: overview` for simple identity questions; request only the relevant aspect \
+for details, and `all` only for an explicitly comprehensive report, rather than \
 guessing or searching the repository; do the same before helping someone install \
 a skill or an MCP server. Reading the source of a build is not the same as \
 reading the tree that is running. This is about the running agent, not the \

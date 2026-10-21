@@ -2753,6 +2753,8 @@ fn start_with_mcp_server(
     trust: bool,
 ) -> CodingRuntimeStart {
     let mut start = start(project, recorder, SessionMode::Fresh);
+    // Observe connection/publication changes without discovery filtering the request.
+    start.agent.mcp_tool_search = atomcode_config::config::McpToolSearchMode::Off;
     start.prepare.mcp = true;
     start.prepare.extra_mcp_servers = vec![atomcode_capabilities::mcp::McpServerConfig {
         name: "t".into(),
@@ -2800,7 +2802,9 @@ async fn what_the_model_is_told_about_mcp_only_names_ways_this_build_has() {
     start.prepare.mcp = true;
     let mut runtime = CodingRuntime::start(start).await.unwrap();
 
-    turn(&mut runtime, "describe mcp").await;
+    // MCP setup is documented under operations. `mcp` is not a valid aspect;
+    // the old test only saw it through the former full-report typo fallback.
+    turn(&mut runtime, "describe operations").await;
     let said = last_tool_result(&recorder);
     runtime.handle.shutdown().await.unwrap();
 
@@ -2831,6 +2835,8 @@ async fn an_mcp_servers_tools_are_offered_and_run() {
     let script = write_mcp_server(scratch.path(), &spawns);
     let recorder = Arc::new(Recorder::default());
     let mut start = start(env.project.path(), &recorder, SessionMode::Fresh);
+    // Observe connection/publication changes without discovery filtering the request.
+    start.agent.mcp_tool_search = atomcode_config::config::McpToolSearchMode::Off;
     start.prepare.mcp = true;
     start.prepare.extra_mcp_servers = vec![atomcode_capabilities::mcp::McpServerConfig {
         name: "t".into(),
@@ -3428,6 +3434,8 @@ async fn withdrawing_mcp_takes_the_tools_off_the_model() {
     let script = write_mcp_server(scratch.path(), &spawns);
     let recorder = Arc::new(Recorder::default());
     let mut start = start(env.project.path(), &recorder, SessionMode::Fresh);
+    // Observe connection/publication changes without discovery filtering the request.
+    start.agent.mcp_tool_search = atomcode_config::config::McpToolSearchMode::Off;
     start.prepare.mcp = true;
     start.prepare.extra_mcp_servers = vec![atomcode_capabilities::mcp::McpServerConfig {
         name: "t".into(),
