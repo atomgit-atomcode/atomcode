@@ -188,11 +188,30 @@ impl Tool for WebSearchTool {
     }
 }
 
+// Do not expose Location, response bodies, or URLs: they may contain credentials.
+fn redirect_error(status: reqwest::StatusCode) -> Option<String> {
+    status.is_redirection().then(|| {
+        format!(
+            "web_search: HTTP {}; redirects are disabled for search requests.",
+            status.as_u16()
+        )
+    })
+}
+
 impl WebSearchTool {
-    fn client() -> Result<reqwest::Client, String> {
+    fn client_builder() -> reqwest::ClientBuilder {
         crate::proxy::apply_async_proxy_policy(reqwest::Client::builder())
+            // Search endpoints are fixed HTTPS APIs. Never send a query or key to
+            // a server-selected destination, including through Referer headers.
+            .redirect(reqwest::redirect::Policy::none())
+            .https_only(true)
+            .referer(false)
             .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
             .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko)")
+    }
+
+    fn client() -> Result<reqwest::Client, String> {
+        Self::client_builder()
             .build()
             .map_err(|e| format!("failed to build HTTP client: {e}"))
     }
@@ -229,6 +248,9 @@ impl WebSearchTool {
                 ));
             }
         };
+        if let Some(message) = redirect_error(resp.status()) {
+            return fail(message);
+        }
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             // Surface the server's error body. Exa's 429 body states the cause and the fix
@@ -276,6 +298,9 @@ impl WebSearchTool {
                 return fail(format!("web_search: request failed for '{query}': {e}."));
             }
         };
+        if let Some(message) = redirect_error(resp.status()) {
+            return fail(message);
+        }
         if !resp.status().is_success() {
             // Same treatment as the Exa path: a block/limit page's body carries the reason.
             let status = resp.status().as_u16();
@@ -513,6 +538,60 @@ fn strip_html_tags(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn search_client_rejects_non_https_urls() {
+        let client = WebSearchTool::client().unwrap();
+        for url in [
+            "http://127.0.0.1:1/",
+            "file:///etc/passwd",
+            "gopher://127.0.0.1/",
+        ] {
+            assert!(client.get(url).send().await.unwrap_err().is_builder());
+        }
+    }
+
+    #[tokio::test]
+    async fn search_client_does_not_follow_redirects() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Only the transport scheme is relaxed for this local fixture; production
+        // HTTPS enforcement is exercised separately above.
+        let client = WebSearchTool::client_builder()
+            .https_only(false)
+            .no_proxy()
+            .build()
+            .unwrap();
+        for status in [301, 302, 303, 307, 308] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                stream.read(&mut request).await.unwrap();
+                stream.write_all(format!(
+                    "HTTP/1.1 {status} Redirect\r\nLocation: http://{address}/target?exaApiKey=test-secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                ).as_bytes()).await.unwrap();
+                // Keep the destination available: following it would yield 200.
+                let (mut stream, _) = listener.accept().await.unwrap();
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+            });
+            let response = client
+                .get(format!("http://{address}/"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), status);
+            let error = redirect_error(response.status()).unwrap();
+            assert!(error.contains("redirects are disabled"));
+            assert!(!error.contains("test-secret"));
+            server.abort();
+        }
+        assert!(redirect_error(reqwest::StatusCode::OK).is_none());
+        assert!(redirect_error(reqwest::StatusCode::TOO_MANY_REQUESTS).is_none());
+    }
 
     #[test]
     #[serial_test::serial]
