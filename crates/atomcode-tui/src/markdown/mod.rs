@@ -123,7 +123,7 @@ pub fn render_settled(text: &str, w: u16, base: Style) -> Rendered {
             flush_table(&mut table_rows, &mut out, w, base);
             match in_code.take() {
                 Some(lang) => {
-                    out.extend(code_block(&code_lines, &lang, w));
+                    out.extend(code_block(&code_lines, &lang, w, base));
                     code_lines.clear();
                 }
                 None => in_code = Some(rest.trim().to_string()),
@@ -148,8 +148,13 @@ pub fn render_settled(text: &str, w: u16, base: Style) -> Rendered {
     // An unterminated fence is common in a stream that is still arriving; show
     // what there is rather than swallowing it. A table block that never got its
     // closing blank line is the same case.
-    if in_code.is_some() && !code_lines.is_empty() {
-        out.extend(code_block(&code_lines, "", w));
+    if let Some(lang) = in_code.filter(|_| !code_lines.is_empty()) {
+        let visible_lang = if is_plaintext(&lang) {
+            lang.as_str()
+        } else {
+            ""
+        };
+        out.extend(code_block(&code_lines, visible_lang, w, base));
     }
     flush_table(&mut table_rows, &mut out, w, base);
     Rendered {
@@ -814,10 +819,21 @@ pub(crate) fn wrap_spans(spans: &[Span], w: u16, prefix: &str, prefix_style: Sty
     out.into_iter().map(|l| l.truncate(w as usize)).collect()
 }
 
-/// A fenced block: a coloured language label and highlighted source. Keep the
-/// source free of printable decoration: terminal selection copies every glyph,
-/// including a gutter bar, into commands and indentation-sensitive code.
-fn code_block(lines: &[String], lang: &str, w: u16) -> Vec<Line> {
+fn is_plaintext(lang: &str) -> bool {
+    ["text", "txt", "plaintext"]
+        .iter()
+        .any(|alias| lang.eq_ignore_ascii_case(alias))
+}
+
+/// Plaintext fences retain literal layout without code chrome; code fences
+/// keep a language label and highlighted source without copyable decoration.
+fn code_block(lines: &[String], lang: &str, w: u16, base: Style) -> Vec<Line> {
+    if is_plaintext(lang) {
+        return lines
+            .iter()
+            .flat_map(|line| wrap_spans(&[Span::styled(line.clone(), base)], w, "", base))
+            .collect();
+    }
     let background = Color::role(Role::PanelBg);
     let mut out = Vec::new();
     if !lang.is_empty() {
@@ -1638,6 +1654,29 @@ mod tests {
             .iter()
             .all(|line| line.background == Some(Color::role(Role::PanelBg))));
         assert_eq!(out[1].plain(), "ls");
+    }
+
+    #[test]
+    fn plaintext_fences_are_literal_prose_during_and_after_streaming() {
+        let base = Style::new().fg(Color::role(Role::Secondary));
+        for lang in ["text", "txt", "plaintext", "TEXT"] {
+            for closing in ["", "\n```"] {
+                let out = render(
+                    &format!("```{lang}\n  target/release/atomcode\n# literal *text*{closing}"),
+                    80,
+                    base,
+                );
+                assert_eq!(
+                    out.iter().map(Line::plain).collect::<Vec<_>>(),
+                    ["  target/release/atomcode", "# literal *text*"]
+                );
+                assert!(out.iter().all(|line| line.background.is_none()));
+                assert!(out
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .all(|span| span.style == base));
+            }
+        }
     }
 
     #[test]
