@@ -8,7 +8,6 @@ struct Request {
     started: Option<Timestamp>,
     ended: Option<Timestamp>,
     chars: u64,
-    completion: Option<u64>,
 }
 
 impl Request {
@@ -19,7 +18,7 @@ impl Request {
             .unwrap_or(now)
             .as_millis()
             .saturating_sub(started.as_millis());
-        let tokens = self.completion.unwrap_or(self.chars / 4);
+        let tokens = self.chars / 4;
         (ms > 0).then_some((tokens, ms))
     }
 }
@@ -58,6 +57,7 @@ impl Generation {
                 self.turn = Some(*turn);
                 self.request = Some(Request {
                     id,
+                    started: Some(now),
                     ..Request::default()
                 });
             }
@@ -71,14 +71,12 @@ impl Generation {
                     request.chars = request.chars.saturating_add(delta.chars().count() as u64);
                 }
             }
-            SessionEvent::Usage { turn, round, usage } => {
+            SessionEvent::Usage { turn, round, .. } => {
                 if let Some(request) = self
                     .request
                     .as_mut()
                     .filter(|request| request.id == (*turn, *round))
                 {
-                    request.completion =
-                        (usage.completion > 0).then_some(u64::from(usage.completion));
                     request.ended.get_or_insert(now);
                 }
             }
@@ -104,6 +102,7 @@ impl Generation {
                     // Discard the failed attempt before measuring the retry.
                     *request = Request {
                         id: request.id,
+                        started: Some(now),
                         ..Request::default()
                     };
                 }
@@ -113,7 +112,7 @@ impl Generation {
     }
 
     /// The handle's live tool name/argument fragments share generation time
-    /// with prose and reasoning. Metadata-only frames do not start the clock.
+    /// with prose and reasoning. Metadata-only frames contribute no output.
     pub fn tool_stream(&mut self, name: Option<&str>, arguments: &str, now: Timestamp) -> bool {
         let chars = name.map_or(0, |name| name.chars().count()) + arguments.chars().count();
         if chars == 0 {
@@ -133,12 +132,14 @@ impl Generation {
     }
 
     /// Live generation, then the last finished measurement through tools and
-    /// first-token waits. Finished durations are frozen; no tool/idle time enters
-    /// the denominator. A new turn or session clears this ephemeral projection.
+    /// first-token waits. Like tuix, estimate tokens as phase characters / 4
+    /// over the model phase (including first-token wait), never tool time.
+    /// Usage totals can include invisible reasoning and do not replace this estimate.
+    /// Finished durations are frozen. A new turn or session clears this projection.
     pub fn rate(&self, now: Timestamp) -> Option<u64> {
         let measured = self.request.as_ref().and_then(|request| {
             let (tokens, ms) = request.reading(now)?;
-            if tokens == 0 || (request.ended.is_none() && ms < 250) {
+            if tokens == 0 || ms < 1_000 {
                 return None;
             }
             Some((tokens as f64 * 1_000.0 / ms as f64).round() as u64)
@@ -151,6 +152,18 @@ impl Generation {
 mod tests {
     use super::*;
     use atomcode_kernel::stream::TokenUsage;
+
+    #[test]
+    fn buffered_output_and_hidden_usage_share_no_shortened_denominator() {
+        let mut g = Generation::default();
+        at(&mut g, header(1), 0);
+        at(&mut g, chunk(1, false, &"a".repeat(4_000)), 59_900);
+        at(&mut g, usage(1, 100_000), 60_000);
+        // tuix formula: 4000 chars / 4 / 60s, not billing tokens / 0.1s.
+        assert_eq!(g.rate(Timestamp::millis(120_000)), Some(17));
+        at(&mut g, header(2), 120_000);
+        assert_eq!(g.rate(Timestamp::millis(180_000)), Some(17));
+    }
 
     fn header(round: u32) -> SessionEvent {
         SessionEvent::RequestHeader {
@@ -199,23 +212,23 @@ mod tests {
         at(&mut g, header(1), 0);
         assert_eq!(g.rate(Timestamp::millis(60_000)), None);
         at(&mut g, chunk(1, true, &"a".repeat(400)), 60_000);
-        assert_eq!(g.rate(Timestamp::millis(60_249)), None);
-        assert_eq!(g.rate(Timestamp::millis(60_250)), Some(400));
+        assert_eq!(g.rate(Timestamp::millis(60_249)), Some(2));
+        assert_eq!(g.rate(Timestamp::millis(60_250)), Some(2));
         at(&mut g, chunk(1, false, &"a".repeat(400)), 61_000);
-        assert_eq!(g.rate(Timestamp::millis(62_000)), Some(100));
+        assert_eq!(g.rate(Timestamp::millis(62_000)), Some(3));
         at(&mut g, usage(1, 300), 62_000);
         at(&mut g, message(1), 62_000);
-        assert_eq!(g.rate(Timestamp::millis(90_000)), Some(150));
+        assert_eq!(g.rate(Timestamp::millis(90_000)), Some(3));
         at(&mut g, header(2), 90_000);
-        assert_eq!(g.rate(Timestamp::millis(150_000)), Some(150));
+        assert_eq!(g.rate(Timestamp::millis(150_000)), Some(3));
         at(&mut g, chunk(1, true, "late chunk"), 150_000);
         at(&mut g, usage(1, 999), 150_000);
         at(&mut g, chunk(2, false, &"a".repeat(400)), 150_000);
-        assert_eq!(g.rate(Timestamp::millis(152_000)), Some(50));
+        assert_eq!(g.rate(Timestamp::millis(152_000)), Some(2));
         at(&mut g, usage(2, 100), 154_000);
         assert_eq!(
             g.rate(Timestamp::millis(200_000)),
-            Some(25),
+            Some(2),
             "finished speed excludes the subsequent tool and idle time"
         );
     }
@@ -239,12 +252,12 @@ mod tests {
             5_000,
         );
         assert_eq!(g.tokens(), 0);
-        assert_eq!(g.rate(Timestamp::millis(100_000)), Some(50));
+        assert_eq!(g.rate(Timestamp::millis(100_000)), Some(0));
         at(&mut g, chunk(2, false, &"a".repeat(400)), 100_000);
         at(&mut g, message(2), 102_000);
-        // Late usage calibrates tokens without extending the finished interval.
+        // Late billing usage must not replace the visible-output estimate.
         at(&mut g, usage(2, 300), 110_000);
-        assert_eq!(g.rate(Timestamp::millis(120_000)), Some(150));
+        assert_eq!(g.rate(Timestamp::millis(120_000)), Some(1));
         at(&mut g, SessionEvent::TurnStart { turn: 2 }, 130_000);
         at(&mut g, usage(2, 999), 131_000);
         assert_eq!(g.rate(Timestamp::millis(140_000)), None);
@@ -257,8 +270,8 @@ mod tests {
         at(&mut g, message(1), 0);
         assert_eq!(g.rate(Timestamp::millis(100_000)), None);
         at(&mut g, header(2), 100_000);
-        at(&mut g, chunk(2, false, "abcd"), 101_000);
-        at(&mut g, usage(2, 1), 101_000);
+        at(&mut g, chunk(2, false, "abcd"), 100_999);
+        at(&mut g, usage(2, 1), 100_999);
         assert_eq!(g.rate(Timestamp::millis(200_000)), None);
     }
     #[test]
@@ -270,10 +283,10 @@ mod tests {
         assert!(g.tool_stream(Some("read_file"), "{", Timestamp::millis(60_000)));
         g.tool_stream(None, &"a".repeat(400), Timestamp::millis(61_000));
         at(&mut g, usage(1, 94), 62_000);
-        assert_eq!(g.rate(Timestamp::millis(63_000)), Some(47));
+        assert_eq!(g.rate(Timestamp::millis(63_000)), Some(2));
         assert!(!g.tool_stream(Some("late"), "late", Timestamp::millis(64_000)));
         at(&mut g, header(2), 70_000);
-        assert_eq!(g.rate(Timestamp::millis(130_000)), Some(47));
+        assert_eq!(g.rate(Timestamp::millis(130_000)), Some(2));
     }
 
     #[test]
@@ -282,9 +295,9 @@ mod tests {
         at(&mut g, header(1), 0);
         at(&mut g, chunk(1, true, &"a".repeat(400)), 10_000);
         g.tool_stream(Some("f"), &"b".repeat(399), Timestamp::millis(11_000));
-        assert_eq!(g.rate(Timestamp::millis(12_000)), Some(100));
+        assert_eq!(g.rate(Timestamp::millis(12_000)), Some(17));
         at(&mut g, usage(1, 400), 12_000);
-        assert_eq!(g.rate(Timestamp::millis(99_000)), Some(200));
+        assert_eq!(g.rate(Timestamp::millis(99_000)), Some(17));
         at(&mut g, SessionEvent::TurnStart { turn: 2 }, 100_000);
         at(
             &mut g,
@@ -313,18 +326,18 @@ mod tests {
         assert_eq!(g.rate(Timestamp::millis(180_000)), None);
     }
     #[test]
-    fn fast_tool_response_uses_real_usage_after_a_short_sampling_interval() {
+    fn short_response_cannot_turn_billing_usage_into_a_speed_spike() {
         let mut g = Generation::default();
         at(&mut g, header(1), 0);
-        g.tool_stream(Some("read_file"), "{", Timestamp::millis(60_000));
+        g.tool_stream(Some("read_file"), "{", Timestamp::millis(100));
         assert_eq!(
-            g.rate(Timestamp::millis(60_249)),
+            g.rate(Timestamp::millis(249)),
             None,
             "streaming estimates still need a stable interval"
         );
-        at(&mut g, usage(1, 94), 60_500);
-        assert_eq!(g.rate(Timestamp::millis(61_000)), Some(188));
+        at(&mut g, usage(1, 94), 500);
+        assert_eq!(g.rate(Timestamp::millis(61_000)), None);
         at(&mut g, header(2), 70_000);
-        assert_eq!(g.rate(Timestamp::millis(120_000)), Some(188));
+        assert_eq!(g.rate(Timestamp::millis(120_000)), None);
     }
 }

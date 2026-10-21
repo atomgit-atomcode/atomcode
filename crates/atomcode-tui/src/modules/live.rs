@@ -1468,7 +1468,7 @@ mod tests {
         );
         let line = line_at(&state, &moment, 180);
         assert!(
-            line.contains("↑ 150.7K · ↓ 20.1K · 50 tok/s · 缓存 96.49%"),
+            line.contains("↑ 150.7K · ↓ 20.1K · 8 tok/s · 缓存 96.49%"),
             "{line}"
         );
         assert!(!line.contains("均速"), "{line}");
@@ -1502,9 +1502,9 @@ mod tests {
         moment.now = Timestamp::millis(120_000);
         let waiting = line_at(&state, &moment, 180);
         assert!(waiting.contains("正在等待模型"), "{waiting}");
-        assert!(waiting.contains("100 tok/s"), "{waiting}");
+        assert!(waiting.contains("8 tok/s"), "{waiting}");
         assert!(
-            waiting.find("100 tok/s").unwrap() < waiting.find("缓存").unwrap(),
+            waiting.find("8 tok/s").unwrap() < waiting.find("缓存").unwrap(),
             "{waiting}"
         );
         assert!(

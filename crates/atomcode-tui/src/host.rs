@@ -7955,7 +7955,7 @@ mod tests {
                 .unwrap()
                 .generation
                 .rate(crate::moment::Timestamp::millis(12_000)),
-            Some(50)
+            Some(8)
         );
         h.absorb(&SessionEvent::TurnEnd {
             turn: 1,
