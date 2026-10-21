@@ -11,9 +11,6 @@ use std::path::{Path, PathBuf};
 /// Per-tier size cap (v1 parity): a runaway instructions file can't blow the prompt.
 const MAX_INSTRUCTIONS_BYTES: usize = 1024 * 1024; // 1 MiB
 
-// Advisory only: changing which instructions are loaded requires an explicit user choice.
-const LARGE_INSTRUCTIONS_BYTES: usize = 16 * 1024;
-
 /// Project-root filenames checked IN ORDER for the project tier; the FIRST existing wins.
 /// Includes the ecosystem names (`AGENTS.md`, `CLAUDE.md`) so a repo's existing agent
 /// instructions are honored (matches v1).
@@ -62,8 +59,7 @@ impl LoadedInstructions {
                 && s.state != InstructionState::Shadowed
                 && s.state != InstructionState::Missing
         });
-        let mut warnings: Vec<_> = self
-            .sources
+        self.sources
             .iter()
             .filter_map(|source| {
                 let reason = match source.state {
@@ -84,40 +80,7 @@ impl LoadedInstructions {
                     source.path.display()
                 ))
             })
-            .collect();
-        let loaded: Vec<_> = self
-            .sources
-            .iter()
-            .filter(|source| source.state == InstructionState::Loaded)
-            .collect();
-        let bytes: usize = loaded
-            .iter()
-            .filter_map(|source| source.body.as_deref())
-            .map(str::len)
-            .sum();
-        if bytes > LARGE_INSTRUCTIONS_BYTES {
-            let chars: usize = loaded
-                .iter()
-                .filter_map(|source| source.body.as_deref())
-                .map(|body| body.chars().count())
-                .sum();
-            let sources = loaded
-                .iter()
-                .map(|source| {
-                    let body = source.body.as_deref().unwrap_or_default();
-                    format!(
-                        "{} {}: {} UTF-8 bytes, {} characters",
-                        source.scope,
-                        source.path.display(),
-                        body.len(),
-                        body.chars().count()
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("; ");
-            warnings.push(format!("[instructions] Large loaded instruction bodies: {bytes} UTF-8 bytes, {chars} characters (advisory threshold: {LARGE_INSTRUCTIONS_BYTES} bytes). Sources: {sources}. Review long instructions for history or repetition; move details to linked documents only with your approval. This notice does not shorten or rewrite instructions. Sizes are not token counts."));
-        }
-        warnings
+            .collect()
     }
 
     /// Compare against disk without changing the text the runtime actually uses.
@@ -227,29 +190,19 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn large_loaded_bodies_are_reported_without_changing_instructions() {
+    fn large_loaded_bodies_do_not_warn_or_change_instructions() {
         let d = tempfile::tempdir().unwrap();
         let home = d.path().join("home");
         let project = d.path().join("project");
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(&project).unwrap();
-        let body = "规".repeat(LARGE_INSTRUCTIONS_BYTES / 6 + 1);
-        assert!(body.len() < LARGE_INSTRUCTIONS_BYTES);
+        let body = "规".repeat(10_000);
         fs::write(home.join("ATOMCODE.md"), &body).unwrap();
         fs::write(project.join("AGENTS.md"), &body).unwrap();
         let loaded = load_instructions(&home, &project);
         let before = loaded.text().to_string();
         let warnings = loaded.warnings();
-        assert_eq!(warnings.len(), 1);
-        let warning = &warnings[0];
-        assert!(warning.contains(&format!(
-            "{} UTF-8 bytes, {} characters",
-            body.len() * 2,
-            body.chars().count() * 2
-        )));
-        assert!(warning.contains("GLOBAL") && warning.contains("PROJECT"));
-        assert!(warning.contains("ATOMCODE.md") && warning.contains("AGENTS.md"));
-        assert!(!warning.contains(&body));
+        assert!(warnings.is_empty());
         assert_eq!(loaded.text(), before);
         assert_eq!(
             before.matches(&body).count(),
@@ -260,19 +213,11 @@ mod tests {
     }
 
     #[test]
-    fn size_notice_ignores_shadowed_sources_and_respects_the_advisory_boundary() {
+    fn large_sources_keep_only_the_existing_shadow_warning() {
         let d = tempfile::tempdir().unwrap();
         let home = d.path().join("missing");
-        fs::write(
-            d.path().join(".atomcode.md"),
-            "x".repeat(LARGE_INSTRUCTIONS_BYTES),
-        )
-        .unwrap();
-        fs::write(
-            d.path().join("AGENTS.md"),
-            "y".repeat(LARGE_INSTRUCTIONS_BYTES + 1),
-        )
-        .unwrap();
+        fs::write(d.path().join(".atomcode.md"), "x".repeat(32 * 1024)).unwrap();
+        fs::write(d.path().join("AGENTS.md"), "y".repeat(32 * 1024)).unwrap();
         let loaded = load_instructions(&home, d.path());
         assert_eq!(
             loaded.warnings().len(),
@@ -282,10 +227,7 @@ mod tests {
         assert!(!loaded.warnings()[0].contains("Large loaded"));
         fs::write(d.path().join(".atomcode.user.md"), "z").unwrap();
         let loaded = load_instructions(&home, d.path());
-        assert_eq!(loaded.warnings().len(), 2);
-        assert!(
-            loaded.warnings()[1].contains(&format!("{} UTF-8 bytes", LARGE_INSTRUCTIONS_BYTES + 1))
-        );
+        assert_eq!(loaded.warnings().len(), 1);
         assert!(!loaded.text().contains("yyyy"));
     }
 
