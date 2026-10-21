@@ -1864,6 +1864,7 @@ async fn run() -> Result<i32> {
                     quiet: false,
                     working_dir_override: None,
                     prebound_listener: None,
+                    owner_shutdown: None,
                     app_user_id: None,
                     daemon_token_file,
                 })
