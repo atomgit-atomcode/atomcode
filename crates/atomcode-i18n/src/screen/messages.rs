@@ -363,23 +363,16 @@ pub enum Msg<'a> {
     RewindCodeNotEnabled,
     /// This session is not written down, so there is nothing to put back.
     RewindCodeNoSession,
-    /// It is on, but the checkpoint could not be set up — the host's own words
-    /// about this machine, which are a fact rather than a sentence to write.
-    RewindCodeFailed {
-        why: &'a str,
-    },
+    /// Checkpoint details are logged, not expanded in the panel.
+    RewindCodeFailed,
     RewindPanelTurnNoFiles,
     RewindLegendChoose,
     RewindLegendContinue,
     RewindLegendGo,
     RewindLegendBack,
     RewindLegendClose,
-    RewindPointsUnreadable {
-        why: &'a str,
-    },
-    RewindFailed {
-        why: &'a str,
-    },
+    RewindPointsUnreadable,
+    RewindFailed,
     NoRewindPanel,
     NoResumePanel,
     NoSheetPanel,

@@ -139,46 +139,21 @@ impl RewindState {
         point
     }
 
-    fn note_missing(
-        &mut self,
-        missing: Vec<MissingRewindPoint>,
-        status: &SnapshotPersistenceStatus,
-    ) {
-        let mut newly_missing = Vec::new();
+    fn note_missing(&mut self, missing: Vec<MissingRewindPoint>) {
         self.missing_workspaces.clear();
         for point in missing {
-            let mut first_notice = false;
             for object in &point.objects {
                 if self
                     .reported_missing
                     .insert((point.turn_id, object.clone()))
                 {
-                    first_notice = true;
+                    // Old unavailable checkpoints are diagnostic information.
+                    // Keep them quarantined and reject an explicit code restore,
+                    // without interrupting ordinary conversation or resume.
                     tracing::warn!(turn_id = point.turn_id, object = %object, "rewind snapshot root is missing");
                 }
             }
-            if first_notice {
-                newly_missing.push(point.turn_id.to_string());
-            }
             self.missing_workspaces.insert(point.turn_id, point.objects);
-        }
-        if !newly_missing.is_empty() {
-            let turns = newly_missing
-                .iter()
-                .take(10)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ");
-            let extra = newly_missing.len().saturating_sub(10);
-            let suffix = if extra > 0 {
-                format!(" (+{extra} more)")
-            } else {
-                String::new()
-            };
-            status.report_auxiliary_warning(format!(
-                "code rewind is unavailable for turn(s) {turns}{suffix}: workspace snapshot objects are missing. \
-                 Conversation history is preserved; other valid rewind points and new checkpoints remain enabled."
-            ));
         }
     }
 }
@@ -316,7 +291,7 @@ impl SnapshotHook {
         };
         if let Some(checkpoint) = rewind.checkpoint.as_ref() {
             match checkpoint.missing_points(&rewind.points) {
-                Ok(missing) => rewind.note_missing(missing, &persistence_status),
+                Ok(missing) => rewind.note_missing(missing),
                 Err(error) => {
                     tracing::warn!(%error, "could not inspect rewind snapshot roots on open")
                 }
@@ -836,7 +811,7 @@ impl SnapshotHook {
     fn collect_rewind_references(&self, rewind: &mut RewindState) {
         if let Some(checkpoint) = rewind.checkpoint.as_ref() {
             match checkpoint.retain_points_report(&rewind.points) {
-                Ok(missing) => rewind.note_missing(missing, &self.persistence_status),
+                Ok(missing) => rewind.note_missing(missing),
                 // The ledger already committed. Keeping extra references is safe;
                 // do not report a failed rewind or roll back a successful commit.
                 Err(error) => {
@@ -855,7 +830,7 @@ impl SnapshotHook {
         if let Some(checkpoint) = rewind.checkpoint.as_ref() {
             let protected = Self::transition_points(&previous, &points);
             let missing = checkpoint.retain_points_report(&protected)?;
-            rewind.note_missing(missing, &self.persistence_status);
+            rewind.note_missing(missing);
         }
         let ledger = RewindLedger {
             version: LEDGER_VERSION,
@@ -868,7 +843,7 @@ impl SnapshotHook {
         if let Err(error) = saved {
             if let Some(checkpoint) = rewind.checkpoint.as_ref() {
                 match checkpoint.retain_points_report(&previous) {
-                    Ok(missing) => rewind.note_missing(missing, &self.persistence_status),
+                    Ok(missing) => rewind.note_missing(missing),
                     Err(compensation) => {
                         return Err(WorkspaceCheckpointError::Compensation {
                             operation: error.to_string(),
@@ -1438,7 +1413,7 @@ impl LifecycleHooks for SnapshotHook {
             if let Some(checkpoint) = rewind.checkpoint.as_ref() {
                 let protected = Self::transition_points(&previous_points, &ledger.points);
                 match checkpoint.retain_points_report(&protected) {
-                    Ok(missing) => rewind.note_missing(missing, &self.persistence_status),
+                    Ok(missing) => rewind.note_missing(missing),
                     Err(error) => {
                         self.persistence_status.report_auxiliary_warning(format!(
                             "this turn's rewind point could not be kept ({error}); \
@@ -1456,7 +1431,7 @@ impl LifecycleHooks for SnapshotHook {
             if let Err(error) = saved {
                 if let Some(checkpoint) = rewind.checkpoint.as_ref() {
                     if let Ok(missing) = checkpoint.retain_points_report(&previous_points) {
-                        rewind.note_missing(missing, &self.persistence_status);
+                        rewind.note_missing(missing);
                     }
                 }
                 rewind.points = previous_points;
@@ -1649,9 +1624,9 @@ mod tests {
             .join(id);
         std::fs::remove_file(store.join("objects").join(&tree[..2]).join(&tree[2..])).unwrap();
         finish_workspace_turn(&hook, &worktree, 2).await;
-        let warning = hook.persistence_status.take_auxiliary_warning().unwrap();
         assert!(
-            warning.contains("turn(s) 1") && warning.contains("Conversation history is preserved")
+            hook.persistence_status.take_auxiliary_warning().is_none(),
+            "missing historical checkpoints must not interrupt the conversation"
         );
         let points = hook.rewind_points();
         assert_eq!(points.len(), 2);
@@ -1689,10 +1664,13 @@ mod tests {
             reopened.rewind_points()[0].before_tree.is_none(),
             "resume rechecks roots without rewriting history"
         );
-        assert!(reopened
-            .persistence_status
-            .take_auxiliary_warning()
-            .is_some());
+        assert!(
+            reopened
+                .persistence_status
+                .take_auxiliary_warning()
+                .is_none(),
+            "resume must not announce unavailable historical checkpoints"
+        );
         finish_workspace_turn(&reopened, &worktree, 4).await;
         assert!(reopened
             .persistence_status

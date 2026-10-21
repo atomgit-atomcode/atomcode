@@ -159,10 +159,16 @@ fn why_not(why: atomcode_host_api::CodeUnavailable) -> CodeOff {
     match why {
         Why::NotEnabled => CodeOff::NotEnabled,
         Why::NoSession => CodeOff::NoSession,
-        Why::Failed { message } => CodeOff::Failed(message),
+        Why::Failed { message } => {
+            tracing::warn!(error = %message, "code rewind is unavailable");
+            CodeOff::Failed(message)
+        }
         // 契约是 `non_exhaustive` 的:一个这个构建还不认识的原因,照样是「回不去」,
         // 而不是「回得去」。少给一次回退是误差,多给一次是把人的工作区搅了。
-        other => CodeOff::Failed(format!("{other:?}")),
+        other => {
+            tracing::warn!(reason = ?other, "code rewind is unavailable");
+            CodeOff::Failed(format!("{other:?}"))
+        }
     }
 }
 

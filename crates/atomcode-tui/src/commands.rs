@@ -1657,7 +1657,12 @@ impl CommandSet for SessionCommands {
                         })
                         .into_owned(),
                     ),
-                    Ok(other) => Outcome::Refused(format!("{other:?}")),
+                    Ok(other) => Outcome::Refused(crate::rewind::failure(&format!(
+                        "unexpected rewind reply: {other:?}"
+                    ))),
+                    Err(HostError::Failed { message }) => {
+                        Outcome::Refused(crate::rewind::failure(&message))
+                    }
                     Err(error) => Outcome::Refused(refusal(error)),
                 }
             }
@@ -4080,6 +4085,31 @@ mod tests {
                 based_on: 7,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn rewind_failure_keeps_multiline_git_details_out_of_the_screen() {
+        let _locale = crate::i18n::test_lock();
+        let detail =
+            "workspace snapshot objects are missing\nfatal: long Git diagnostic\n".repeat(100);
+        for line in ["/rewind 2 代码", "/undo"] {
+            let host = Arc::new(Recording::default());
+            host.replies
+                .lock()
+                .unwrap()
+                .push_back(Err(HostError::Failed {
+                    message: detail.clone(),
+                }));
+            let (app, _client, all) = following(&host);
+            assert_eq!(
+                all.dispatch(line, &app.context()).await,
+                Outcome::Refused(t(Msg::RewindFailed).into_owned())
+            );
+        }
+        let unavailable = crate::rewind::CodeOff::Failed(detail).say();
+        assert_eq!(unavailable, t(Msg::RewindCodeFailed));
+        assert!(!unavailable.contains("fatal:"));
+        assert!(!unavailable.contains('\n'));
     }
 
     /// `/cost` 按模型分开算,而不是 `/context` 的别名。

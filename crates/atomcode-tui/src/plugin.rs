@@ -4137,7 +4137,10 @@ impl Tui {
                 }
                 Err(why) => {
                     host.said(
-                        t(Msg::RewindPointsUnreadable { why: &why }).into_owned(),
+                        {
+                            tracing::warn!(error = %why, "could not load rewind points");
+                            t(Msg::RewindPointsUnreadable).into_owned()
+                        },
                         true,
                     );
                 }
@@ -4988,7 +4991,7 @@ impl Tui {
                     }
                 }
                 Err(why) => {
-                    host.rewind_note(Some(t(Msg::RewindFailed { why: &why }).into_owned()));
+                    host.rewind_note(Some(crate::rewind::failure(&why)));
                 }
             }
             if let Some(keys) = keys {

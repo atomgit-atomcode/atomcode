@@ -239,15 +239,15 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::RewindPanelScopeAsk => "  going back there takes what with it?".into(),
         Msg::RewindCodeNotEnabled => "workspace rewind is turned off by ATOMCODE_CODE_REWIND; unset it to turn it back on".into(),
         Msg::RewindCodeNoSession => "this session is not written down, so the workspace cannot go back".into(),
-        Msg::RewindCodeFailed { why } => format!("the workspace cannot go back: {why}").into(),
+        Msg::RewindCodeFailed => "Code rewind is unavailable. You can rewind conversation only. See the logs for details.".into(),
         Msg::RewindPanelTurnNoFiles => "this turn changed no file — only the conversation can go back".into(),
         Msg::RewindLegendChoose => "choose".into(),
         Msg::RewindLegendContinue => "continue".into(),
         Msg::RewindLegendGo => "go back".into(),
         Msg::RewindLegendBack => "one step back".into(),
         Msg::RewindLegendClose => "cancel".into(),
-        Msg::RewindPointsUnreadable { why } => format!("the turns could not be read: {why}").into(),
-        Msg::RewindFailed { why } => format!("it did not go back: {why}").into(),
+        Msg::RewindPointsUnreadable => "Could not load rewind points. Please try again. See the logs for details.".into(),
+        Msg::RewindFailed => "Rewind did not complete. Retry or choose another point. See the logs for details.".into(),
         Msg::NoRewindPanel => "this screen has no rewind panel: the launcher provided no `tui-panel-rewind`".into(),
         Msg::NoResumeStore => {
             "this screen cannot throw a session away: the launcher provided no `tui-resume-store`"

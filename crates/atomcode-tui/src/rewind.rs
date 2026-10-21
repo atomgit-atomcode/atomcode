@@ -26,7 +26,7 @@ use crate::surface::{Key, KeyPress, Mods};
 /// **是个分类,不是一句话。** 这三种是三件不同的事:一个是人自己能打开的开关,一个
 /// 是这次会话的性质,一个是这台机器上的一次失败。话由屏幕按人选的语言说
 /// (`atomcode_host_api::CodeUnavailable` 同形,分开一份的理由同 [`Point`]);只有第
-/// 三种带着宿主的原话,因为那是关于这台机器的事实,不是一句可以预先写好的话。
+/// 三种保留宿主的诊断原话；界面只显示简短说明，详细原因由宿主记入日志。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CodeOff {
     /// 这个构建默认不记工作区检查点(省磁盘),人可以打开。
@@ -43,10 +43,16 @@ impl CodeOff {
         match self {
             Self::NotEnabled => t(Msg::RewindCodeNotEnabled),
             Self::NoSession => t(Msg::RewindCodeNoSession),
-            Self::Failed(why) => t(Msg::RewindCodeFailed { why }),
+            Self::Failed(_) => t(Msg::RewindCodeFailed),
         }
         .into_owned()
     }
+}
+
+/// Keep diagnostic chains in the log, not in the conversation or panel.
+pub(crate) fn failure(detail: &str) -> String {
+    tracing::warn!(error = detail, "rewind did not complete");
+    t(Msg::RewindFailed).into_owned()
 }
 
 /// 一个回合动过的一个文件,照面板需要的样子:`rewind.rs +484 -12`。
@@ -534,10 +540,9 @@ mod tests {
         assert!(panel.note.is_some(), "说了为什么");
     }
 
-    /// 整棵树回不去的时候(没有快照、不是 git 树),宿主给的原话要出现在面板上,而不是
-    /// 让人以为自己按错了。
+    /// 代码回退不可用时，面板给出简短说明和替代操作，不展开宿主诊断。
     #[test]
-    fn a_workspace_that_cannot_go_back_says_the_hosts_own_words() {
+    fn a_workspace_that_cannot_go_back_shows_a_short_actionable_note() {
         let view = RewindView::new(
             vec![Point {
                 turn: 1,
@@ -552,10 +557,13 @@ mod tests {
         key(&view, &mut panel, press(Key::Enter));
         key(&view, &mut panel, press(Key::Down));
         assert_eq!(key(&view, &mut panel, press(Key::Enter)), Step::Stay);
+        assert_eq!(
+            panel.note.as_deref(),
+            Some(t(Msg::RewindCodeFailed).as_ref())
+        );
         assert!(
-            panel.note.as_deref().unwrap_or_default().contains("git"),
-            "宿主说的原话要传到人眼前: {:?}",
-            panel.note
+            !panel.note.as_deref().unwrap_or_default().contains("git"),
+            "raw host diagnostics must stay out of the panel"
         );
     }
 
