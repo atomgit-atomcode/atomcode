@@ -1077,11 +1077,15 @@ mod tests {
             .unwrap();
 
         // Marketplace repo whose manifest references the plugin repo by URL.
+        // Built as JSON, not pasted into a template: `display()` carries Windows
+        // backslashes and a raw `\` is not a valid JSON escape, so the manifest failed to
+        // parse before any installer code ran.
         let plugin_url = format!("file://{}", plugin_repo.display());
-        let manifest = format!(
-            r#"{{"name":"mp_ext","plugins":[{{"name":"ext","source":{{"source":"url","url":"{}"}}}}]}}"#,
-            plugin_url
-        );
+        let manifest = serde_json::json!({
+            "name": "mp_ext",
+            "plugins": [{"name": "ext", "source": {"source": "url", "url": plugin_url}}],
+        })
+        .to_string();
         let mp_repo = make_repo("mp_ext", Some(&manifest));
         add_marketplace(&dirs, &format!("file://{}", mp_repo.display())).unwrap();
 
@@ -1108,10 +1112,11 @@ mod tests {
         std::fs::create_dir_all(local_src.join("skills/x")).unwrap();
         std::fs::write(local_src.join("skills/x/SKILL.md"), "body").unwrap();
 
-        let manifest = format!(
-            r#"{{"name":"mp_local","plugins":[{{"name":"loc","source":{{"source":"local","path":"{}"}}}}]}}"#,
-            local_src.display()
-        );
+        let manifest = serde_json::json!({
+            "name": "mp_local",
+            "plugins": [{"name": "loc", "source": {"source": "local", "path": local_src}}],
+        })
+        .to_string();
         let mp_repo = make_repo("mp_local", Some(&manifest));
         add_marketplace(&dirs, &format!("file://{}", mp_repo.display())).unwrap();
         let info = install(&dirs, "loc", "mp_local", InstallScope::User).unwrap();
@@ -1151,10 +1156,11 @@ mod tests {
             .unwrap();
         std::fs::create_dir_all(repo.join(".atomcode-plugin")).unwrap();
         let url = format!("file://{}", repo.display());
-        let manifest = format!(
-            r#"{{"name":"self_ref","plugins":[{{"name":"self_ref","source":{{"source":"url","url":"{}"}}}}]}}"#,
-            url
-        );
+        let manifest = serde_json::json!({
+            "name": "self_ref",
+            "plugins": [{"name": "self_ref", "source": {"source": "url", "url": url}}],
+        })
+        .to_string();
         std::fs::write(repo.join(".atomcode-plugin/marketplace.json"), manifest).unwrap();
         std::fs::write(repo.join("README"), "x").unwrap();
         Command::new("git")
@@ -1351,10 +1357,13 @@ mod tests {
         let (upstream, branch) = make_subdir_upstream("pkg/tool");
         let upstream_url = format!("file://{}", upstream.display());
 
-        let manifest = format!(
-            r#"{{"name":"mp_gs","plugins":[{{"name":"tool","source":{{"source":"git-subdir","url":"{}","path":"pkg/tool","ref":"{}"}}}}]}}"#,
-            upstream_url, branch
-        );
+        let manifest = serde_json::json!({
+            "name": "mp_gs",
+            "plugins": [{"name": "tool", "source": {
+                "source": "git-subdir", "url": upstream_url, "path": "pkg/tool", "ref": branch,
+            }}],
+        })
+        .to_string();
         let mp_repo = make_repo("mp_gs", Some(&manifest));
         add_marketplace(&dirs, &format!("file://{}", mp_repo.display())).unwrap();
 
