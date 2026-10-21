@@ -597,6 +597,130 @@ fn env() -> Env {
     }
 }
 
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
+async fn extra_skill_roots_and_loaded_instruction_status_survive_a_live_reload() {
+    use atomcode_capabilities::instructions::InstructionState;
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let extra = env.project.path().join("extra-skills");
+    std::fs::create_dir_all(extra.join("migration-probe")).unwrap();
+    std::fs::write(
+        extra.join("migration-probe/SKILL.md"),
+        "---\nname: migration-probe\ndescription: migration probe\n---\nold skill",
+    )
+    .unwrap();
+    std::fs::create_dir_all(extra.join("broken")).unwrap();
+    std::fs::write(
+        extra.join("broken/SKILL.md"),
+        "---\nname: bad.name\n---\nprivate text",
+    )
+    .unwrap();
+    let old_path = env.project.path().join(".atomcode.md");
+    let new_path = env.project.path().join("AGENTS.md");
+    std::fs::write(&old_path, "ORIGINAL_INSTRUCTION_PROBE").unwrap();
+    std::fs::write(&new_path, "SHADOWED_INSTRUCTION_PROBE").unwrap();
+    let mut input = start(env.project.path(), &recorder, SessionMode::Fresh);
+    input.prepare.skill_dirs = None;
+    input.agent.extra_skill_dirs = vec!["extra-skills".into()];
+    let mut runtime = CodingRuntime::start(input).await.unwrap();
+    let initial = runtime.handle.context_stats_with(true).await.unwrap();
+    assert!(initial
+        .system_prompt
+        .as_ref()
+        .unwrap()
+        .contains("ORIGINAL_INSTRUCTION_PROBE"));
+    assert!(!initial
+        .system_prompt
+        .as_ref()
+        .unwrap()
+        .contains("SHADOWED_INSTRUCTION_PROBE"));
+    let assets = initial.assets.unwrap();
+    assert!(assets
+        .skills
+        .iter()
+        .any(|(name, _)| name == "migration-probe"));
+    assert!(assets
+        .skill_diagnostics
+        .iter()
+        .any(|d| d.warning && d.path.ends_with("broken/SKILL.md")));
+    assert!(assets
+        .instructions
+        .iter()
+        .any(|s| s.path == new_path && s.state == InstructionState::Shadowed));
+    let mut warnings = Vec::new();
+    while let Ok(event) = runtime.events.try_recv() {
+        if let CodingRuntimeEvent::ControllerWarning(warning) = event.event {
+            warnings.push(warning);
+        }
+    }
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("broken") && w.contains("invalid characters")),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("AGENTS.md") && w.contains("shadowed")),
+        "{warnings:?}"
+    );
+    assert!(!warnings.join("\n").contains("private text"));
+    std::fs::remove_file(&old_path).unwrap();
+    std::fs::write(&new_path, "UPDATED_INSTRUCTION_PROBE").unwrap();
+    std::fs::create_dir_all(extra.join("newly-added")).unwrap();
+    std::fs::write(extra.join("newly-added/SKILL.md"), "new skill").unwrap();
+    runtime.handle.reload_capabilities().await.unwrap();
+    let reloaded = runtime.handle.context_stats_with(true).await.unwrap();
+    let prompt = reloaded.system_prompt.unwrap();
+    assert!(prompt.contains("ORIGINAL_INSTRUCTION_PROBE"));
+    assert!(!prompt.contains("UPDATED_INSTRUCTION_PROBE"));
+    let assets = reloaded.assets.unwrap();
+    assert!(assets.skills.iter().any(|(name, _)| name == "newly-added"));
+    assert!(assets
+        .instructions
+        .iter()
+        .any(|s| s.path == old_path && s.state == InstructionState::Loaded && s.disk_changed));
+    runtime.handle.reload_capabilities().await.unwrap();
+    let _ = runtime.handle.context_stats().await.unwrap();
+    let mut warnings = Vec::new();
+    while let Ok(event) = runtime.events.try_recv() {
+        if let CodingRuntimeEvent::ControllerWarning(warning) = event.event {
+            warnings.push(warning);
+        }
+    }
+    assert!(
+        !warnings.iter().any(|w| w.contains("invalid characters")),
+        "unchanged failures repeat: {warnings:?}"
+    );
+    assert_eq!(
+        warnings
+            .iter()
+            .filter(|w| w.contains("Files on disk changed"))
+            .count(),
+        1,
+        "{warnings:?}"
+    );
+    // Full reprepare (as on resume/config reload) adopts the new instruction source.
+    runtime
+        .handle
+        .reload_capabilities_with_plugin_skills(Some(Vec::new()))
+        .await
+        .unwrap();
+    let refreshed = runtime.handle.context_stats_with(true).await.unwrap();
+    let prompt = refreshed.system_prompt.unwrap();
+    assert!(prompt.contains("UPDATED_INSTRUCTION_PROBE"));
+    assert!(!prompt.contains("ORIGINAL_INSTRUCTION_PROBE"));
+    assert!(!refreshed
+        .assets
+        .unwrap()
+        .instructions
+        .iter()
+        .any(|s| s.disk_changed));
+    runtime.handle.shutdown().await.unwrap();
+}
+
 // ---- scenarios -----------------------------------------------------------
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -2438,7 +2562,7 @@ async fn a_change_to_the_tools_is_told() {
         1,
         "{seen:#?}"
     );
-    assert_eq!(told(&seen, "reloaded plugins").len(), 1, "{seen:#?}");
+    assert_eq!(told(&seen, "reloaded skills").len(), 1, "{seen:#?}");
     assert!(
         told(&seen, "withdrew every MCP tool").is_empty(),
         "a reload was told as a withdrawal: {seen:#?}"

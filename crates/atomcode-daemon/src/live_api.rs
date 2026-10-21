@@ -297,6 +297,7 @@ pub(crate) fn chat_runtime_config(
         atomcode_coding::config::permission_rules_from_config(&config.permissions);
     atomcode_coding::CodingRuntimeConfig {
         startup_warnings,
+        extra_skill_dirs: config.skills.extra_dirs.clone(),
         dirs: atomcode_coding::config::product_dirs_from_env(),
         api_key: p.and_then(|p| p.api_key.clone()).unwrap_or_default(),
         base_url: p.and_then(|p| p.base_url.clone()).unwrap_or_default(),

@@ -945,11 +945,8 @@ pub struct LoadedSkills {
     pub registry: Arc<atomcode_capabilities::skills::SkillRegistry>,
     /// The catalog as rendered for the prompt.
     pub catalog: Option<String>,
-    /// Scanned in this order; a skill in a later directory replaces an earlier
-    /// one of the same name.
-    pub dirs: Vec<std::path::PathBuf>,
-    /// Where a new skill goes — `(every project, this project)` — when `dirs`
-    /// is the standard list. `None` when the driver named its own directories.
+    /// Where a new skill goes — `(every project, this project)` — when the roots
+    /// are the standard list. `None` when the driver named its own directories.
     pub install: Option<(std::path::PathBuf, std::path::PathBuf)>,
     /// Installed plugins whose skills were loaded, under each plugin's name.
     pub plugins: Vec<String>,
@@ -959,19 +956,31 @@ impl SkillsHostPlugin {
     /// The directories this runtime actually scanned — a driver may name its
     /// own — rather than the standard list the harness row describes.
     fn describe(&self, ctx: &Context) {
+        let plugin = Self(self.0.clone());
+        atomcode_harness::plugins::self_knowledge::describes_live(
+            ctx,
+            atomcode_harness::seams::Aspect::Operations,
+            "skills",
+            13,
+            move |_| Some(plugin.description_text()),
+        );
+    }
+
+    fn description_text(&self) -> String {
         let loaded = &self.0;
+        let dirs = loaded.registry.directories();
         let mut text = format!("SKILLS — {} loaded.", loaded.registry.len());
-        if loaded.dirs.is_empty() && loaded.plugins.is_empty() {
+        if dirs.is_empty() && loaded.plugins.is_empty() {
             text.push_str(" This runtime was started without skill directories.");
         } else {
-            if !loaded.dirs.is_empty() {
+            if !dirs.is_empty() {
                 text.push_str(
                     " A skill is `<name>/SKILL.md` (with any files it uses beside it), or \
                      a single `<name>.md`, inside one of these directories, scanned in \
                      this order — a later one's skill replaces an earlier one's of the \
                      same name:",
                 );
-                for dir in &loaded.dirs {
+                for dir in &dirs {
                     text.push_str(&format!("\n  {}", dir.display()));
                 }
                 text.push_str(
@@ -984,7 +993,7 @@ impl SkillsHostPlugin {
                      ---\n\
                      then the instructions. `$ARGUMENTS` in them is replaced by what the \
                      skill was invoked with. A file whose name is invalid is skipped \
-                     without a warning.\n",
+                     with its path and reason reported as a loading warning.\n",
                 );
             }
             if let Some((every_project, this_project)) = &loaded.install {
@@ -1008,7 +1017,7 @@ impl SkillsHostPlugin {
             }
             text.push_str("`list_skills` shows what is loaded; `use_skill` loads one.");
         }
-        atomcode_harness::plugins::self_knowledge::describes(ctx, "skills", 13, text);
+        text
     }
 }
 
@@ -1391,6 +1400,8 @@ impl Plugin for CcHooksHostPlugin {
 
 // ---- the session context block --------------------------------------------
 
+atomcode_plexus::plexus_service!(LoadedContextSvc => atomcode_capabilities::session::SessionContextHook, "loaded-context", Core, "The instruction snapshot this runtime mounted");
+
 /// `session-context`: environment, project instructions and a git snapshot,
 /// contributed to the system prompt once per tree.
 ///
@@ -1415,11 +1426,17 @@ impl Plugin for SessionContextPlugin {
     fn inject(&self) -> &'static [&'static str] {
         &["system-prompt"]
     }
+    fn provides(&self) -> &'static [&'static str] {
+        &["loaded-context"]
+    }
     fn description(&self) -> &'static str {
         "environment, project instructions and a session-start git snapshot, in the system prompt"
     }
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
         let block = self.hook.block(self.stored.as_deref());
+        let _ = ctx
+            .provide::<LoadedContextSvc>(self.hook.clone())
+            .map_err(|e| e.to_string())?;
         // Withdrawn with the row, like every other fragment.
         atomcode_harness::plugins::tools::contribute_prompt(ctx, "project-instructions", 1, &block);
         Ok(())

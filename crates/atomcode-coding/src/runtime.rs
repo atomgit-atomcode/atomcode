@@ -627,6 +627,17 @@ pub struct RuntimeContextStats {
     /// 每个别的调用方要的都是一个数。人想看它的那一刻很具体:agent 表现得
     /// 像是被告知了一件谁也不记得告诉过它的事。
     pub system_prompt: Option<String>,
+    /// On-demand asset status, captured from the mounted services rather than
+    /// reconstructed by a driver. Populated only with `context_stats_with(true)`.
+    pub assets: Option<RuntimeAssetSources>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeAssetSources {
+    pub instructions: Vec<atomcode_capabilities::instructions::InstructionSource>,
+    pub skill_dirs: Vec<std::path::PathBuf>,
+    pub skills: Vec<(String, std::path::PathBuf)>,
+    pub skill_diagnostics: Vec<atomcode_capabilities::skills::SkillDiagnostic>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -6415,6 +6426,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             model: runtime.config.model.clone(),
                             working_dir: runtime.config.working_dir.clone(),
                             system_prompt,
+                            assets: prompt.then(|| runtime_asset_sources(runtime)),
                         }));
                     }
                     Some(CodingRuntimeControl::WaitMcpReady {
@@ -7530,7 +7542,17 @@ fn spawn_runtime_owner_with_optional_agent(
                                         .load().is_ok_and(|configs| configs.is_empty())))
                         {
                             if reload_skills_live(&runtime).is_ok() {
-                                tell(&runtime, Some(crate::told::reloaded()));
+                                tell(&runtime, Some(crate::told::skills_reloaded()));
+                                if let Some(loaded) = runtime.parts.skill_registry() {
+                                    for warning in loaded.registry.take_new_warnings() {
+                                        let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(warning));
+                                    }
+                                }
+                                if runtime.parts.session_context_hook.take_change_notice() {
+                                    let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(
+                                        "[instructions] Files on disk changed; skill reload kept this session's loaded instructions. Resume the session to load the edited instructions.".into()
+                                    ));
+                                }
                                 let _ = runtime_event_tx.send(
                                     CodingRuntimeEvent::Reconfiguring {
                                         operation: ReconfigureKind::Reprepare,
@@ -7825,6 +7847,19 @@ fn spawn_runtime_owner_with_optional_agent(
                             continue;
                         }
                         preserve_sessionless_snapshot(&mut runtime, &stop_report);
+                        // Report newly introduced optional-asset failures after the
+                        // replacement has committed, without repeating unchanged ones.
+                        let mut previous_warnings = runtime.parts.session_context_hook.instructions().warnings();
+                        previous_warnings.extend(runtime.config.startup_warnings.clone());
+                        if let Some(skills) = runtime.parts.skill_registry() {
+                            previous_warnings.extend(skills.registry.diagnostics().into_iter().filter(|d| d.warning)
+                                .map(|d| format!("[skills] {}: {}", d.path.display(), d.reason)));
+                        }
+                        for warning in candidate.parts.take_startup_warnings() {
+                            if !previous_warnings.contains(&warning) {
+                                let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(warning));
+                            }
+                        }
                         runtime = candidate;
                         if matches!(operation, ReconfigureKind::ResumeSession)
                             && !reuses_current_session
@@ -10529,10 +10564,7 @@ fn harness_host_state(
         plugins: prepare.host_plugins.plugins.clone(),
         identity: prepare.identity.clone(),
         session_context: Some(crate::on_harness::HostContext {
-            hook: Arc::new(atomcode_capabilities::session::SessionContextHook::new(
-                &config.working_dir,
-                config.dirs.user(),
-            )),
+            hook: Arc::clone(&parts.session_context_hook),
             stored: stored_prompt,
         }),
         session,
@@ -11042,6 +11074,27 @@ fn record_code_rewind(live: &atomcode_harness::agent::Agent, turn: u64) {
     );
 }
 
+fn runtime_asset_sources(runtime: &RuntimeResources) -> RuntimeAssetSources {
+    let mut sources = RuntimeAssetSources::default();
+    let Some(app) = &runtime.harness_app else {
+        return sources;
+    };
+    let ctx = app.context();
+    if let Some(hook) = ctx.service::<crate::host_rows::LoadedContextSvc>() {
+        sources.instructions = hook.instructions().sources_on_disk();
+    }
+    if let Some(registry) = ctx.service::<atomcode_harness::seams::SkillsSvc>() {
+        sources.skill_dirs = registry.directories();
+        sources.skills = registry
+            .all()
+            .into_iter()
+            .map(|skill| (skill.name.clone(), skill.source_path.clone()))
+            .collect();
+        sources.skill_diagnostics = registry.diagnostics();
+    }
+    sources
+}
+
 /// Read the skills on disk again, into the registry the live tree is already
 /// serving, and re-render the catalog the model is told about
 /// (`docs/adr/0022` §2).
@@ -11063,30 +11116,14 @@ fn reload_skills_live(runtime: &RuntimeResources) -> Result<usize, ()> {
         .ok_or(())?;
     // The directories prepare decided on, the same way it decided them: a
     // driver that named its own is not second-guessed here.
-    let dirs = match runtime.prepare.skill_dirs.clone() {
-        Some(dirs) => dirs,
-        None => {
-            let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-            atomcode_capabilities::skills::standard_skill_dirs(
-                atomcode_capabilities::skills::SkillRoots {
-                    home: &home,
-                    project: &runtime.config.working_dir,
-                    dirs: &runtime.config.dirs,
-                },
-            )
-        }
-    };
-    registry.reload_dirs(&dirs, &runtime.prepare.plugin_skill_dirs);
+    let (dirs, explicit, _) = crate::parts::resolve_skill_dirs(&runtime.config, &runtime.prepare);
+    registry.reload_dirs_with_explicit(&dirs, &runtime.prepare.plugin_skill_dirs, &explicit);
     atomcode_harness::plugins::capabilities::register_skill_commands(&ctx, &registry)
         .map_err(|_| ())?;
     // The catalog is ranked against the project's own instruction files, as at
     // mount — a reload that dropped the ranking would quietly reorder the
     // prompt prefix.
-    let instructions = atomcode_capabilities::session::SessionContextHook::new(
-        &runtime.config.working_dir,
-        runtime.config.dirs.user(),
-    )
-    .instruction_text();
+    let instructions = runtime.parts.session_context_hook.instruction_text();
     if let Some(prompts) = ctx.service::<atomcode_harness::seams::SystemPromptSvc>() {
         let (id, rank) = crate::on_harness::SKILLS_FRAGMENT;
         match registry.render_catalog_prioritizing(&instructions) {

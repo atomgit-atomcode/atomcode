@@ -16,7 +16,7 @@
 //! legacy session carries none. `/cd` is a NEW SESSION (the driver re-prepares in the new dir),
 //! so `session_start` runs fresh there.
 
-use crate::instructions::render_instructions;
+use crate::instructions::{load_instructions, LoadedInstructions};
 use async_trait::async_trait;
 use atomcode_kernel::hook::LifecycleHooks;
 use atomcode_kernel::message::{Conversation, Message, Role};
@@ -40,6 +40,9 @@ pub struct SessionContextHook {
     /// The user tree (`~/.atomcode`) — the GLOBAL instructions tier's base.
     home: PathBuf,
     worktree: std::sync::OnceLock<Result<PathBuf, String>>,
+    instructions: std::sync::OnceLock<LoadedInstructions>,
+    freeze_instructions: bool,
+    change_notified: std::sync::atomic::AtomicBool,
 }
 
 impl SessionContextHook {
@@ -50,14 +53,49 @@ impl SessionContextHook {
             working_dir: working_dir.into(),
             home: home.into(),
             worktree: std::sync::OnceLock::new(),
+            instructions: std::sync::OnceLock::new(),
+            freeze_instructions: false,
+            change_notified: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Pin instructions for a coding runtime generation, so preparation,
+    /// mounting and source reporting share the same bytes. Standalone kernel
+    /// embedders retain the default re-read-on-session-start behavior.
+    pub fn with_frozen_instructions(mut self) -> Self {
+        self.freeze_instructions = true;
+        let _ = self.instructions();
+        self
     }
 
     /// The exact instruction tiers this hook will inject. Exposed so other
     /// prompt assembly (notably the budgeted skill catalog) can preserve skills
     /// explicitly named by project rules without reimplementing precedence.
     pub fn instruction_text(&self) -> String {
-        render_instructions(&self.home, &self.working_dir)
+        if self.freeze_instructions {
+            self.instructions().text().to_string()
+        } else {
+            load_instructions(&self.home, &self.working_dir)
+                .text()
+                .to_string()
+        }
+    }
+
+    pub fn instructions(&self) -> &LoadedInstructions {
+        self.instructions
+            .get_or_init(|| load_instructions(&self.home, &self.working_dir))
+    }
+
+    /// One notice per loaded context; source inspection continues to show the
+    /// mismatch even after the notice has been emitted.
+    pub fn take_change_notice(&self) -> bool {
+        self.instructions()
+            .sources_on_disk()
+            .iter()
+            .any(|s| s.disk_changed)
+            && !self
+                .change_notified
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The context block for a session, as a host that holds the prompt itself
@@ -408,6 +446,22 @@ mod tests {
         // Nothing saved, or a saved prompt with no block: fresh.
         assert_eq!(hook.block(None), hook.render());
         assert_eq!(hook.block(Some("You are AtomCode")), hook.render());
+    }
+
+    #[test]
+    fn only_an_explicitly_frozen_context_pins_instruction_bytes() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("AGENTS.md");
+        std::fs::write(&path, "old rule").unwrap();
+        let live = SessionContextHook::new(d.path(), d.path().join("home"));
+        let frozen =
+            SessionContextHook::new(d.path(), d.path().join("home")).with_frozen_instructions();
+        assert!(live.instruction_text().contains("old rule"));
+        std::fs::write(&path, "new rule").unwrap();
+        assert!(live.instruction_text().contains("new rule"));
+        assert!(frozen.instruction_text().contains("old rule"));
+        assert!(frozen.take_change_notice());
+        assert!(!frozen.take_change_notice());
     }
 
     #[tokio::test]

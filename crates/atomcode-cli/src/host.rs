@@ -1971,30 +1971,24 @@ fn preview_of(session: &str) -> Result<Vec<String>, HostError> {
     Ok(lines)
 }
 
-/// The files a coding session is configured from, grouped the way a person
-/// looks for them.
-///
-/// **A file that is not there is reported as not there.** That is the answer
-/// this question is usually asked for: "my instructions are being ignored" is
-/// almost always "that file is not where you thought it was", and a list that
-/// showed only what it found would answer a different question — one whose
-/// answer is always "everything is fine".
-///
-/// A named function rather than inline in the handler so it can be judged
-/// without a runtime: what this carries is a list of paths, and a list of paths
-/// is exactly the kind of thing that goes quietly wrong.
-fn source_groups(working_dir: &std::path::Path) -> Vec<atomcode_host_api::SourceGroup> {
+/// The runtime's loaded asset sources, alongside local configuration/memory paths.
+/// Instruction and skill status comes from mounted services. Disk inspection may
+/// mark changes but never replaces the loaded source with a new candidate.
+fn source_groups(
+    working_dir: &std::path::Path,
+    assets: &atomcode_coding::runtime::RuntimeAssetSources,
+) -> Vec<atomcode_host_api::SourceGroup> {
+    use atomcode_capabilities::instructions::InstructionState;
     use atomcode_capabilities::memory::MemoryStore;
-    use atomcode_config::config::instructions::{InstructionLevel, LayeredInstructions};
     use atomcode_host_api::{SourceFile, SourceGroup};
 
     let file = |label: &str, path: std::path::PathBuf| SourceFile {
         label: label.to_string(),
         present: path.is_file(),
+        detail: None,
         path: path.display().to_string(),
     };
-    let instructions = LayeredInstructions::load(working_dir);
-    vec![
+    let mut groups = vec![
         SourceGroup {
             label: tr(SMsg::SourceConfigFile).into_owned(),
             files: vec![file(
@@ -2004,30 +1998,49 @@ fn source_groups(working_dir: &std::path::Path) -> Vec<atomcode_host_api::Source
         },
         SourceGroup {
             label: tr(SMsg::SourceInstructionFiles).into_owned(),
-            files: instructions
-                .status_lines(working_dir)
-                .into_iter()
-                .map(|line| SourceFile {
-                    label: match line.level {
-                        InstructionLevel::Global => atomcode_config::i18n::t(
+            files: assets
+                .instructions
+                .iter()
+                .filter(|source| {
+                    source.state != InstructionState::Missing
+                        || source.disk_changed
+                        || source.scope != "PROJECT"
+                        || source.path.file_name().is_some_and(|n| n == ".atomcode.md")
+                            && !assets.instructions.iter().any(|s| {
+                                s.scope == "PROJECT" && s.state != InstructionState::Missing
+                            })
+                })
+                .map(|source| {
+                    let scope = match source.scope {
+                        "GLOBAL" => atomcode_config::i18n::t(
                             atomcode_config::i18n::Msg::StatusInstructionScopeGlobal,
-                        )
-                        .into_owned(),
-                        InstructionLevel::Project => atomcode_config::i18n::t(
-                            atomcode_config::i18n::Msg::StatusInstructionScopeProject,
-                        )
-                        .into_owned(),
-                        InstructionLevel::User => atomcode_config::i18n::t(
+                        ),
+                        "USER" => atomcode_config::i18n::t(
                             atomcode_config::i18n::Msg::StatusInstructionScopeUser,
-                        )
-                        .into_owned(),
-                    },
-                    // The loader's own answer, not a second `is_file` here: it
-                    // is the one that decided whether this file is in play, and
-                    // a page that disagreed with it would be reporting on a
-                    // different run than the one that is happening.
-                    present: line.found,
-                    path: line.path.display().to_string(),
+                        ),
+                        _ => atomcode_config::i18n::t(
+                            atomcode_config::i18n::Msg::StatusInstructionScopeProject,
+                        ),
+                    };
+                    let state = match source.state {
+                        InstructionState::Loaded => tr(SMsg::SourceLoaded),
+                        InstructionState::Shadowed => tr(SMsg::SourceShadowed),
+                        InstructionState::Empty => tr(SMsg::SourceEmpty),
+                        InstructionState::Unreadable => tr(SMsg::SourceUnreadable),
+                        InstructionState::Missing => tr(SMsg::SourceNotLoaded),
+                    };
+                    let changed = if source.disk_changed {
+                        format!(" · {}", tr(SMsg::SourceDiskChanged))
+                    } else {
+                        String::new()
+                    };
+                    SourceFile {
+                        label: scope.into_owned(),
+                        path: source.path.display().to_string(),
+                        // Loaded bytes remain available even after the file is removed.
+                        present: source.state != InstructionState::Missing || source.disk_changed,
+                        detail: Some(format!("{state}{changed}")),
+                    }
                 })
                 .collect(),
         },
@@ -2058,7 +2071,53 @@ fn source_groups(working_dir: &std::path::Path) -> Vec<atomcode_host_api::Source
                 ),
             ],
         },
-    ]
+    ];
+    if !assets.skill_dirs.is_empty() {
+        groups.push(SourceGroup {
+            label: tr(SMsg::SourceSkillDirs).into_owned(),
+            files: assets
+                .skill_dirs
+                .iter()
+                .map(|path| SourceFile {
+                    label: tr(SMsg::SourceSkillDirs).into_owned(),
+                    path: path.display().to_string(),
+                    present: path.is_dir(),
+                    detail: None,
+                })
+                .collect(),
+        });
+    }
+    if !assets.skills.is_empty() {
+        groups.push(SourceGroup {
+            label: tr(SMsg::SourceSkills).into_owned(),
+            files: assets
+                .skills
+                .iter()
+                .map(|(name, path)| SourceFile {
+                    label: name.clone(),
+                    path: path.display().to_string(),
+                    present: true,
+                    detail: Some(tr(SMsg::SourceLoaded).into_owned()),
+                })
+                .collect(),
+        });
+    }
+    if !assets.skill_diagnostics.is_empty() {
+        groups.push(SourceGroup {
+            label: tr(SMsg::SourceSkillDiagnostics).into_owned(),
+            files: assets
+                .skill_diagnostics
+                .iter()
+                .map(|d| SourceFile {
+                    label: tr(SMsg::SourceSkillDiagnostics).into_owned(),
+                    path: d.path.display().to_string(),
+                    present: true,
+                    detail: Some(d.reason.clone()),
+                })
+                .collect(),
+        });
+    }
+    groups
 }
 
 fn reasoning_persistence_reply(saved: Result<(), String>) -> HostReply {
@@ -2194,9 +2253,13 @@ impl HostControl for RuntimeControl {
                 // The runtime's own working directory, not the process's: a
                 // session that has been `cd`-ed reads a different project's
                 // files, and the page is about the session.
-                let now = self.handle.context_stats().await.map_err(refused)?;
+                let now = self
+                    .handle
+                    .context_stats_with(true)
+                    .await
+                    .map_err(refused)?;
                 Ok(HostReply::Sources {
-                    groups: source_groups(&now.working_dir),
+                    groups: source_groups(&now.working_dir, &now.assets.unwrap_or_default()),
                 })
             }
             HostCommand::ListSessions { working_dir } => Ok(HostReply::Sessions {
@@ -3186,12 +3249,66 @@ mod source_tests {
     /// the file is somewhere else — a list that showed only what it found
     /// would be a list that can never say that.
     #[test]
+    fn source_panel_reports_the_loaded_file_after_it_was_renamed() {
+        let project = tempfile::tempdir().unwrap();
+        let old = project.path().join(".atomcode.md");
+        let new = project.path().join("AGENTS.md");
+        std::fs::write(&old, "original instructions").unwrap();
+        let loaded = atomcode_capabilities::instructions::load_instructions(
+            &project.path().join("home"),
+            project.path(),
+        );
+        std::fs::rename(&old, &new).unwrap();
+        let assets = atomcode_coding::runtime::RuntimeAssetSources {
+            instructions: loaded.sources_on_disk(),
+            ..Default::default()
+        };
+        let groups = source_groups(project.path(), &assets);
+        let files: Vec<_> = groups.iter().flat_map(|g| &g.files).collect();
+        let original = files
+            .iter()
+            .find(|f| f.path == old.display().to_string())
+            .unwrap();
+        assert!(original.present, "the bytes are still loaded");
+        assert_eq!(
+            original.detail,
+            Some(format!(
+                "{} · {}",
+                tr(SMsg::SourceLoaded),
+                tr(SMsg::SourceDiskChanged)
+            ))
+        );
+        let renamed = files
+            .iter()
+            .find(|f| f.path == new.display().to_string())
+            .unwrap();
+        assert_eq!(
+            renamed.detail,
+            Some(format!(
+                "{} · {}",
+                tr(SMsg::SourceNotLoaded),
+                tr(SMsg::SourceDiskChanged)
+            ))
+        );
+    }
+
+    #[test]
     fn a_configuration_file_that_is_not_there_is_still_reported() {
         let project = tempfile::tempdir().expect("a temp dir");
         // One instruction file present, the rest of the layers absent.
         std::fs::write(project.path().join("AGENTS.md"), "# 项目").expect("write");
 
-        let groups = source_groups(project.path());
+        let instructions = atomcode_capabilities::instructions::load_instructions(
+            &project.path().join("nohome"),
+            project.path(),
+        );
+        let groups = source_groups(
+            project.path(),
+            &atomcode_coding::runtime::RuntimeAssetSources {
+                instructions: instructions.sources_on_disk(),
+                ..Default::default()
+            },
+        );
         // Read from the table rather than spelled out, so this asserts *which
         // three groups* there are and not one language's words for them.
         let labels: Vec<&str> = groups.iter().map(|group| group.label.as_str()).collect();

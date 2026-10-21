@@ -459,22 +459,20 @@ fn first_paragraph(template: &str) -> String {
 
 fn validate_skill_name(name: &str) -> Result<(), String> {
     if name.is_empty() || name.len() > 64 {
-        return Err(format!("skill name '{name}' must be 1-64 characters"));
+        return Err("skill name must be 1-64 characters".into());
     }
     if !name
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '/')
     {
-        return Err(format!("skill name '{name}' has invalid characters"));
+        return Err("skill name has invalid characters".into());
     }
     if name.starts_with(['/', '-'])
         || name.ends_with(['/', '-'])
         || name.contains("//")
         || name.contains("--")
     {
-        return Err(format!(
-            "skill name '{name}' has a bad slash/hyphen position"
-        ));
+        return Err("skill name has a bad slash/hyphen position".into());
     }
     Ok(())
 }

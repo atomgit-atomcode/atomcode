@@ -1,10 +1,10 @@
 //! Three-tier project-instructions loader (global / project / user) — the v2 port of
 //! v1 `config/instructions.rs`. Each tier is a markdown file injected into the session
-//! context block under a header carrying its source path. Pure (paths in, string out) so
-//! it is testable without touching the real home dir; [`SessionContextHook`] supplies the
+//! context block under a header carrying its source path. Caller-supplied paths keep
+//! it testable without touching the real home dir; [`SessionContextHook`] supplies the
 //! config-root and project paths.
 //!
-//! [`SessionContextHook`]: super::context::SessionContextHook
+//! [`SessionContextHook`]: crate::session::SessionContextHook
 
 use std::path::{Path, PathBuf};
 
@@ -22,33 +22,133 @@ const PROJECT_NAMES: [&str; 5] = [
     "claude.md",
 ];
 
-/// Render the global / project / user instruction tiers as headered blocks joined by blank
-/// lines. Empty string when none exist (the caller then omits the section). `home` = the
-/// config root (`~/.atomcode`); `project` = the workspace root.
-pub fn render_instructions(home: &Path, project: &Path) -> String {
-    let mut out: Vec<String> = Vec::new();
-    let global = home.join("ATOMCODE.md");
-    if let Some(body) = read_tier(&global) {
-        out.push(format!(
-            "=== GLOBAL INSTRUCTIONS ({}) ===\n{body}",
-            global.display()
-        ));
+/// State of a source when this context was loaded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstructionState {
+    Loaded,
+    Missing,
+    Empty,
+    Unreadable,
+    Shadowed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstructionSource {
+    pub scope: &'static str,
+    pub path: PathBuf,
+    pub state: InstructionState,
+    /// The disk no longer matches this loaded snapshot. This does not reload it.
+    pub disk_changed: bool,
+    body: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LoadedInstructions {
+    pub sources: Vec<InstructionSource>,
+    text: String,
+}
+
+impl LoadedInstructions {
+    pub fn text(&self) -> &str {
+        &self.text
     }
-    if let Some(proj) = project_file(project) {
-        if let Some(body) = read_tier(&proj) {
+
+    pub fn warnings(&self) -> Vec<String> {
+        let project = self.sources.iter().find(|s| {
+            s.scope == "PROJECT"
+                && s.state != InstructionState::Shadowed
+                && s.state != InstructionState::Missing
+        });
+        self.sources
+            .iter()
+            .filter_map(|source| {
+                let reason = match source.state {
+                    InstructionState::Empty => {
+                        "selected instruction file is empty; no instructions loaded".to_string()
+                    }
+                    InstructionState::Unreadable => {
+                        "selected instruction file cannot be read as UTF-8; no instructions loaded"
+                            .to_string()
+                    }
+                    InstructionState::Shadowed => {
+                        format!("not loaded: shadowed by {}", project?.path.display())
+                    }
+                    _ => return None,
+                };
+                Some(format!(
+                    "[instructions] {}: {reason}",
+                    source.path.display()
+                ))
+            })
+            .collect()
+    }
+
+    /// Compare against disk without changing the text the runtime actually uses.
+    pub fn sources_on_disk(&self) -> Vec<InstructionSource> {
+        self.sources
+            .iter()
+            .cloned()
+            .map(|mut source| {
+                let (state, body) = read_source(&source.path);
+                source.disk_changed = if source.state == InstructionState::Shadowed {
+                    state == InstructionState::Missing
+                } else {
+                    state != source.state || body != source.body
+                };
+                source.body = None; // A driver's status result never carries instruction contents.
+                source
+            })
+            .collect()
+    }
+}
+
+pub fn load_instructions(home: &Path, project: &Path) -> LoadedInstructions {
+    let mut sources = Vec::new();
+    let mut out = Vec::new();
+    let mut add = |path: PathBuf, scope: &'static str, shadowed: bool| {
+        let (mut state, body) = read_source(&path);
+        if shadowed && state != InstructionState::Missing {
+            state = InstructionState::Shadowed;
+        }
+        if state == InstructionState::Loaded {
             out.push(format!(
-                "=== PROJECT INSTRUCTIONS ({}) ===\n{body}",
-                proj.display()
+                "=== {scope} INSTRUCTIONS ({}) ===\n{}",
+                path.display(),
+                body.as_deref().unwrap_or_default()
             ));
         }
+        sources.push(InstructionSource {
+            scope,
+            path,
+            state,
+            disk_changed: false,
+            body,
+        });
+    };
+    add(home.join("ATOMCODE.md"), "GLOBAL", false);
+    let mut selected = false;
+    let mut seen = std::collections::BTreeSet::new();
+    for name in PROJECT_NAMES {
+        let path = project.join(name);
+        // CLAUDE.md and claude.md can name the same file on Windows/macOS.
+        if path.is_file() && !seen.insert(path.canonicalize().unwrap_or_else(|_| path.clone())) {
+            continue;
+        }
+        add(path.clone(), "PROJECT", selected);
+        selected |= path.is_file();
     }
-    let user = project.join(".atomcode.user.md");
-    if let Some(body) = read_tier(&user) {
-        out.push(format!(
-            "=== USER INSTRUCTIONS ({}) ===\n{body}",
-            user.display()
-        ));
+    add(project.join(".atomcode.user.md"), "USER", false);
+    LoadedInstructions {
+        sources,
+        text: render_blocks(out),
     }
+}
+
+pub fn render_instructions(home: &Path, project: &Path) -> String {
+    load_instructions(home, project).text
+}
+
+fn render_blocks(out: Vec<String>) -> String {
     if out.is_empty() {
         return String::new();
     }
@@ -64,32 +164,23 @@ they do not describe or override the host application or active configured model
     format!("{PREAMBLE}\n\n{}", out.join("\n\n"))
 }
 
-/// The first existing project-tier file (precedence order), if any.
-fn project_file(project: &Path) -> Option<PathBuf> {
-    PROJECT_NAMES
-        .iter()
-        .map(|n| project.join(n))
-        .find(|p| p.is_file())
-}
-
-/// Read a tier file → its trimmed body, or `None` if missing/non-file/empty. Capped at
-/// [`MAX_INSTRUCTIONS_BYTES`] (truncated with a marker).
-fn read_tier(path: &Path) -> Option<String> {
+fn read_source(path: &Path) -> (InstructionState, Option<String>) {
     if !path.is_file() {
-        return None;
+        return (InstructionState::Missing, None);
     }
-    let body = std::fs::read_to_string(path).ok()?;
-    let body = body.trim();
-    if body.is_empty() {
-        return None;
-    }
-    if body.len() > MAX_INSTRUCTIONS_BYTES {
-        let cut: String = body.chars().take(MAX_INSTRUCTIONS_BYTES).collect();
-        Some(format!(
-            "{cut}\n[truncated: instructions file exceeds 1 MiB]"
-        ))
-    } else {
-        Some(body.to_string())
+    match std::fs::read_to_string(path) {
+        Err(_) => (InstructionState::Unreadable, None),
+        Ok(body) if body.trim().is_empty() => (InstructionState::Empty, Some(body)),
+        Ok(body) => {
+            let body = body.trim();
+            let body = if body.len() > MAX_INSTRUCTIONS_BYTES {
+                let cut: String = body.chars().take(MAX_INSTRUCTIONS_BYTES).collect();
+                format!("{cut}\n[truncated: instructions file exceeds 1 MiB]")
+            } else {
+                body.to_string()
+            };
+            (InstructionState::Loaded, Some(body))
+        }
     }
 }
 
@@ -97,6 +188,66 @@ fn read_tier(path: &Path) -> Option<String> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn selected_empty_or_unreadable_file_still_shadows_the_other_candidates() {
+        let d = tempfile::tempdir().unwrap();
+        let preferred = d.path().join(".atomcode.md");
+        let agents = d.path().join("AGENTS.md");
+        fs::write(&agents, "must not be injected").unwrap();
+        for (bytes, state) in [
+            (b"   ".as_slice(), InstructionState::Empty),
+            (b"\xff".as_slice(), InstructionState::Unreadable),
+        ] {
+            fs::write(&preferred, bytes).unwrap();
+            let loaded = load_instructions(&d.path().join("nohome"), d.path());
+            assert!(loaded.text().is_empty());
+            assert_eq!(
+                loaded
+                    .sources
+                    .iter()
+                    .find(|s| s.path == preferred)
+                    .unwrap()
+                    .state,
+                state
+            );
+            assert_eq!(
+                loaded
+                    .sources
+                    .iter()
+                    .find(|s| s.path == agents)
+                    .unwrap()
+                    .state,
+                InstructionState::Shadowed
+            );
+            let warnings = loaded.warnings().join("\n");
+            assert!(warnings.contains(".atomcode.md") && warnings.contains("AGENTS.md"));
+            assert!(!warnings.contains("must not be injected"));
+        }
+    }
+
+    #[test]
+    fn source_status_keeps_loaded_bytes_after_edit_or_rename() {
+        let d = tempfile::tempdir().unwrap();
+        let preferred = d.path().join(".atomcode.md");
+        fs::write(&preferred, "old loaded rule").unwrap();
+        let loaded = load_instructions(&d.path().join("nohome"), d.path());
+        fs::rename(&preferred, d.path().join("AGENTS.md")).unwrap();
+        let status = loaded.sources_on_disk();
+        let old = status.iter().find(|s| s.path == preferred).unwrap();
+        assert_eq!(old.state, InstructionState::Loaded);
+        assert!(old.disk_changed);
+        let new = status
+            .iter()
+            .find(|s| s.path.ends_with("AGENTS.md"))
+            .unwrap();
+        assert_eq!(new.state, InstructionState::Missing);
+        assert!(new.disk_changed, "new file has not been injected");
+        assert!(loaded.text().contains("old loaded rule"));
+        let refreshed = load_instructions(&d.path().join("nohome"), d.path());
+        assert!(refreshed.text().contains("AGENTS.md"));
+        assert!(!refreshed.sources_on_disk().iter().any(|s| s.disk_changed));
+    }
 
     #[test]
     fn project_tier_picks_first_existing_name() {

@@ -503,8 +503,18 @@ impl Default for GoalRecoveryConfig {
     }
 }
 
+/// Additional trusted skill roots. Relative paths use the runtime working directory;
+/// `~` uses the user's home. Existing standard roots keep higher priority.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SkillsConfig {
+    pub extra_dirs: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default)]
+    pub skills: SkillsConfig,
     /// Legacy default selection (a `[providers.*]` key). `#[serde(default)]` so a
     /// pure new-schema config selecting via `default_model` needs neither legacy
     /// field. Superseded by `default_model` (design §14.1).
@@ -1066,6 +1076,7 @@ impl Default for Config {
             team: Default::default(),
             loop_config: Default::default(),
             coding: CodingConfig::default(),
+            skills: SkillsConfig::default(),
             tools: ToolsConfig::default(),
             permissions: PermissionsConfig::default(),
             vision_preprocessor_provider: None,
@@ -2743,6 +2754,17 @@ pub enum SeedOutcome {
 mod tests {
     use super::*;
 
+    #[test]
+    fn extra_skill_directories_roundtrip_and_default_to_empty() {
+        let old: Config = toml::from_str("default_provider = 'test'").unwrap();
+        assert!(old.skills.extra_dirs.is_empty());
+        let mut config = old;
+        config.skills.extra_dirs = vec!["~/.other/skills".into(), r"C:\Users\person\skills".into()];
+        let rendered = toml::to_string_pretty(&config).unwrap();
+        let restored: Config = toml::from_str(&rendered).unwrap();
+        assert_eq!(restored.skills, config.skills);
+    }
+
     /// Which screen opens is a setting, and a config that does not mention it
     /// keeps this build's default — an upgrade must not move anyone's screen
     /// (`docs/tui-replaces-tuix-plan.md` M6.2).
@@ -3838,6 +3860,7 @@ model = "missing-type"
             team: Default::default(),
             loop_config: Default::default(),
             coding: CodingConfig::default(),
+            skills: SkillsConfig::default(),
             tools: ToolsConfig {
                 todo: TodoToolConfig {
                     enabled: false,

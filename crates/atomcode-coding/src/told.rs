@@ -160,6 +160,14 @@ pub(crate) fn mcp_withdrawn() -> String {
     reminder("The person withdrew every MCP tool from this session.")
 }
 
+pub(crate) fn skills_reloaded() -> String {
+    reminder(
+        "The person reloaded skills. Skill availability may have changed; the loaded \
+         project instructions and MCP connections were kept. Skill reload does not \
+         reload config.toml or project instruction files.",
+    )
+}
+
 pub(crate) fn reloaded() -> String {
     reminder(
         "The person reloaded plugins, skills and MCP servers; the tools and skills available \

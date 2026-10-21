@@ -4010,6 +4010,7 @@ mod tests {
                     groups: vec![atomcode_host_api::SourceGroup {
                         label: "指令文件".into(),
                         files: vec![atomcode_host_api::SourceFile {
+                            detail: None,
                             label: "项目".into(),
                             path: "/work/AGENTS.md".into(),
                             present: false,

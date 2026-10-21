@@ -737,7 +737,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "Signed out of MCP server '{server}': its stored OAuth token was removed (if there was one); reloading MCP."
         )
         .into(),
-        Msg::Reloaded => "the skills, the MCP servers and the config were read again".into(),
+        Msg::Reloaded => "Reload complete. See /status for loaded instruction sources; a lightweight skill reload keeps instruction text unchanged.".into(),
         Msg::SignedOut => "signed out; /login signs in again".into(),
         Msg::SignedIn => "signed in".into(),
 
@@ -1186,6 +1186,15 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::HostHeld => "held".into(),
         Msg::SourceConfigFile => "config file".into(),
         Msg::SourceSettings => "settings".into(),
+        Msg::SourceLoaded => "loaded".into(),
+        Msg::SourceShadowed => "shadowed, not loaded".into(),
+        Msg::SourceEmpty => "empty, not loaded".into(),
+        Msg::SourceUnreadable => "unreadable, not loaded".into(),
+        Msg::SourceNotLoaded => "not loaded".into(),
+        Msg::SourceDiskChanged => "disk changed; resume to refresh instructions".into(),
+        Msg::SourceSkillDirs => "Skill scan directories".into(),
+        Msg::SourceSkills => "Loaded skills".into(),
+        Msg::SourceSkillDiagnostics => "Skill loading diagnostics".into(),
         Msg::SourceInstructionFiles => "instruction files".into(),
         Msg::SourceMemoryFiles => "memory files".into(),
         Msg::HostNoEditableConfig => "this host has no configuration that can be changed".into(),

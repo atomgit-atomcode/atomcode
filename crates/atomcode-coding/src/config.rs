@@ -21,6 +21,8 @@ pub struct CodingAgentConfig {
     /// (`CodingRuntimeEvent::ControllerWarning`), which every front end renders;
     /// not stderr, which a full-screen front end is holding.
     pub startup_warnings: Vec<String>,
+    /// Explicit trusted skill roots from `[skills].extra_dirs`.
+    pub extra_skill_dirs: Vec<String>,
     /// Where the product keeps its data — the one place this runtime learns it.
     /// Every capability that persists or guards something (skills, memory, MCP,
     /// sessions, plugins, the credential gates) is built from this, and nothing
@@ -260,6 +262,8 @@ pub fn settle_dir_names(dirs: &atomcode_capabilities::ProductDirs) {
 pub struct CodingRuntimeConfig {
     /// See [`CodingAgentConfig::startup_warnings`].
     pub startup_warnings: Vec<String>,
+    /// Explicit trusted skill roots from `[skills].extra_dirs`.
+    pub extra_skill_dirs: Vec<String>,
     /// See [`CodingAgentConfig::dirs`].
     pub dirs: atomcode_capabilities::ProductDirs,
     pub api_key: String,
@@ -410,6 +414,12 @@ pub fn describe_config_file_for(
          `default_model` wins. An `api_key` may be written `${{VAR}}`. `capable_model` \
          ranks models for `task` and `team`: the lowest rank is the fast tier, the \
          highest the capable one.\n\
+         - `[skills]` `extra_dirs`: additional trusted skill roots, e.g. [`~/shared-skills`]. \
+         Relative paths use the session working directory; `~` uses the user home. Standard \
+         roots take precedence over extra roots; later extra roots win among themselves. \
+         Skill files can contain executable workflows. Existing permission checks still apply. \
+         Directory configuration is read when this runtime is configured; skill reload re-reads \
+         those directories, not config.toml.\n\
          - `evaluator_provider`: the model that judges whether a `/goal` is met.\n\
          - `[goal.recovery]`: transient goal outage recovery, using the selected model. \
          `max_attempts` (default 12) and `max_elapsed_secs` (1800) bound new retries; \
@@ -534,6 +544,7 @@ impl CodingRuntimeConfig {
             .extend(crate::parts::resolve_external_subagents(&config.subagent, interactive).1);
         Self {
             startup_warnings,
+            extra_skill_dirs: config.skills.extra_dirs.clone(),
             dirs,
             api_key: r.and_then(|r| r.api_key.clone()).unwrap_or_default(),
             base_url: r.and_then(|r| r.base_url.clone()).unwrap_or_default(),
@@ -608,6 +619,7 @@ impl CodingRuntimeConfig {
             self.dirs.clone(),
         );
         config.startup_warnings = self.startup_warnings.clone();
+        config.extra_skill_dirs = self.extra_skill_dirs.clone();
         config.context_window = self.context_window;
         config.supports_vision = self.supports_vision;
         config.supports_reasoning_effort =
@@ -1094,6 +1106,7 @@ impl CodingAgentConfig {
         let model = model.into();
         Self {
             startup_warnings: Vec::new(),
+            extra_skill_dirs: Vec::new(),
             dirs,
             api_key: api_key.into(),
             base_url: base_url.into(),
@@ -1154,6 +1167,25 @@ impl CodingAgentConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_skill_roots_reach_the_agent_config() {
+        let mut source = atomcode_config::config::Config::default();
+        source.skills.extra_dirs = vec!["~/external/skills".into()];
+        let runtime = CodingRuntimeConfig::from_config(
+            &source,
+            std::path::Path::new("/project"),
+            atomcode_capabilities::ProductDirs::new("/home/test", ".test"),
+            None,
+            None,
+            false,
+            true,
+        );
+        assert_eq!(
+            runtime.agent_config().extra_skill_dirs,
+            source.skills.extra_dirs
+        );
+    }
 
     /// The home the config file is in is the product's: AtomCode's by default,
     /// in the words it always used, and the configured product's otherwise.

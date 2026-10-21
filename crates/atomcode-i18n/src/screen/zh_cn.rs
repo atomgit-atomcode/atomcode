@@ -680,7 +680,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "已注销 MCP 服务 '{server}':保存的 OAuth Token 已移除(如有),正在重载 MCP。"
         )
         .into(),
-        Msg::Reloaded => "已重新读取 skills、MCP 与配置".into(),
+        Msg::Reloaded => "重新加载完成；已加载的指令来源可在 /status 查看。轻量 skill 重载不刷新指令正文".into(),
         Msg::SignedOut => "已登出;/login 重新登录".into(),
         Msg::SignedIn => "已登录".into(),
 
@@ -1116,6 +1116,15 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::HostHeld => "停着".into(),
         Msg::SourceConfigFile => "配置文件".into(),
         Msg::SourceSettings => "设置".into(),
+        Msg::SourceLoaded => "已加载".into(),
+        Msg::SourceShadowed => "被遮蔽，未加载".into(),
+        Msg::SourceEmpty => "空文件，未加载".into(),
+        Msg::SourceUnreadable => "无法读取，未加载".into(),
+        Msg::SourceNotLoaded => "未加载".into(),
+        Msg::SourceDiskChanged => "磁盘已变更；恢复会话时刷新指令".into(),
+        Msg::SourceSkillDirs => "Skill 扫描目录".into(),
+        Msg::SourceSkills => "已加载的 skill".into(),
+        Msg::SourceSkillDiagnostics => "Skill 加载诊断".into(),
         Msg::SourceInstructionFiles => "指令文件".into(),
         Msg::SourceMemoryFiles => "记忆文件".into(),
         Msg::HostNoEditableConfig => "这个宿主没有可改的配置".into(),

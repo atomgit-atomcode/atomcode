@@ -516,6 +516,78 @@ fn register_atomgit_capabilities(
     Ok(())
 }
 
+/// One resolver shared by prepare and live reload. Standard roots outrank extras;
+/// exact driver overrides continue to suppress all default/configured discovery.
+pub(crate) fn resolve_skill_dirs(
+    cfg: &CodingAgentConfig,
+    opts: &PrepareOptions,
+) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<String>) {
+    let home = dirs::home_dir();
+    resolve_skill_dirs_at(cfg, opts, home.as_deref())
+}
+
+fn resolve_skill_dirs_at(
+    cfg: &CodingAgentConfig,
+    opts: &PrepareOptions,
+    home: Option<&std::path::Path>,
+) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<String>) {
+    if !opts.tools {
+        return (Vec::new(), Vec::new(), Vec::new());
+    }
+    if let Some(dirs) = &opts.skill_dirs {
+        return (dirs.clone(), dirs.clone(), Vec::new());
+    }
+    let mut warnings = Vec::new();
+    let mut extra = Vec::new();
+    for value in &cfg.extra_skill_dirs {
+        let path = if value == "~" || value.starts_with("~/") || value.starts_with("~\\") {
+            let Some(home) = home else {
+                warnings.push(
+                    "[skills] cannot expand ~ in extra_dirs: user home is unavailable".into(),
+                );
+                continue;
+            };
+            home.join(value.get(2..).unwrap_or(""))
+        } else if value.is_empty() || value.starts_with('~') {
+            warnings.push(
+                "[skills] extra_dirs entries must be nonempty paths; ~user is not supported".into(),
+            );
+            continue;
+        } else {
+            let path = PathBuf::from(value);
+            if path.is_absolute() {
+                path
+            } else {
+                cfg.working_dir.join(path)
+            }
+        };
+        extra.push(path.canonicalize().unwrap_or(path));
+    }
+    let mut dirs = extra.clone();
+    dirs.extend(standard_skill_dirs(SkillRoots {
+        home: home.unwrap_or(std::path::Path::new(".")),
+        project: &cfg.working_dir,
+        dirs: &cfg.dirs,
+    }));
+    let mut seen = std::collections::BTreeSet::new();
+    dirs.reverse();
+    dirs.retain(|p| {
+        // A single physical directory can intentionally supply both flat
+        // commands and skills. Deduplicate aliases only within the same role.
+        let command_root = p.file_name().is_some_and(|name| name == "commands");
+        seen.insert((p.canonicalize().unwrap_or_else(|_| p.clone()), command_root))
+    });
+    dirs.reverse();
+    // A configured alias of a standard directory stays explicit, but keeps the
+    // standard directory's place in the precedence list.
+    let explicit = dirs
+        .iter()
+        .filter(|p| extra.contains(&p.canonicalize().unwrap_or_else(|_| (*p).clone())))
+        .cloned()
+        .collect();
+    (dirs, explicit, warnings)
+}
+
 /// Everything `assemble` composes — and everything a respawn must REUSE so state
 /// survives (approval grants, hook state, session identity).
 pub struct CodingParts {
@@ -525,6 +597,7 @@ pub struct CodingParts {
     /// could not read). The runtime sends each as a `ControllerWarning` when
     /// it starts; nothing here writes to stderr.
     startup_warnings: Vec<String>,
+    pub(crate) session_context_hook: Arc<SessionContextHook>,
     registry: ToolRegistry,
     tool_names: Vec<String>,
     /// Capability-graph decision made at prepare time. Like request-user-input,
@@ -866,29 +939,22 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // injection observe the exact same instruction-file precedence and bytes.
     crate::runtime::record_startup_phase("tools", tools_started.elapsed(), None);
     let context_started = std::time::Instant::now();
-    let session_context_hook = Arc::new(SessionContextHook::new(&cfg.working_dir, cfg.dirs.user()));
+    let session_context_hook = Arc::new(
+        SessionContextHook::new(&cfg.working_dir, cfg.dirs.user()).with_frozen_instructions(),
+    );
     let instruction_text = session_context_hook.instruction_text();
     crate::runtime::record_startup_phase("instructions", context_started.elapsed(), None);
     let skills_started = std::time::Instant::now();
 
     // Skills: standard home+project precedence unless the caller supplied dirs.
-    let skill_dirs = if opts.tools {
-        opts.skill_dirs.clone().unwrap_or_else(|| {
-            let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-            standard_skill_dirs(SkillRoots {
-                home: &home,
-                project: &cfg.working_dir,
-                dirs: &cfg.dirs,
-            })
-        })
-    } else {
-        Vec::new()
-    };
+    let (skill_dirs, explicit_skill_dirs, directory_warnings) = resolve_skill_dirs(cfg, &opts);
+    startup_warnings.extend(directory_warnings);
+    startup_warnings.extend(session_context_hook.instructions().warnings());
     // Plugin-contributed skills: each (dir, namespace) pair registered as
     // `<namespace>:<skill-name>`, matching the slash-menu's core registry
     // convention. Empty when the driver saw no installed plugins (the L1
     // capabilities crate cannot reach the core plugin loader by design).
-    let skills = SkillRegistry::load(&skill_dirs);
+    let skills = SkillRegistry::load_with_explicit(&skill_dirs, &explicit_skill_dirs);
     // Our own trees rank first in the catalog, whatever they are named — the
     // host handed them in, so this is the one place that knows. Set whether or
     // not the driver named its own dirs: a skill under our tree is ours either
@@ -906,11 +972,11 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // Render the catalog BEFORE the registry is moved into the tools; injected as a
     // leading system message by SkillCatalogHook below (without it the model never
     // learns which skills exist — only the use_skill/list_skills tools were mounted).
+    startup_warnings.extend(skills.take_new_warnings());
     let skill_catalog = skills.render_catalog_prioritizing(&instruction_text);
     let skill_registry = opts.tools.then(|| crate::host_rows::LoadedSkills {
         registry: Arc::clone(&skills),
         catalog: skill_catalog.clone(),
-        dirs: skill_dirs.clone(),
         // Only for the standard list: a driver that named its own directories
         // decided where skills come from, and this runtime cannot say where a
         // new one belongs in that.
@@ -1168,6 +1234,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
 
     Ok(CodingParts {
         startup_warnings,
+        session_context_hook,
         runtime_commands: None,
         tool_switches: atomcode_harness::seams::ToolSwitches::new(),
         tool_catalog: Arc::new(std::sync::RwLock::new(None)),
@@ -2193,6 +2260,82 @@ mod tests {
     use super::*;
     use crate::config::CodingAgentConfig;
     use atomcode_capabilities::session::PresentationFile;
+
+    #[cfg(unix)]
+    #[test]
+    fn aliased_standard_command_and_skill_roots_keep_both_source_roles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let project = tmp.path().join("project");
+        let skill_root = home.join(".claude/skills");
+        std::fs::create_dir_all(&skill_root).unwrap();
+        std::fs::write(skill_root.join("shared.md"), "shared workflow").unwrap();
+        std::os::unix::fs::symlink(&skill_root, home.join(".claude/commands")).unwrap();
+        let cfg = CodingAgentConfig::new(
+            "",
+            "",
+            "test",
+            &project,
+            atomcode_capabilities::ProductDirs::new(home.join("ours"), ".ours"),
+        );
+        let (dirs, _, _) =
+            super::resolve_skill_dirs_at(&cfg, &PrepareOptions::default(), Some(&home));
+        let registry = atomcode_capabilities::skills::SkillRegistry::load(&dirs);
+        assert!(
+            registry.get("shared").is_some(),
+            "the skill source stays loaded"
+        );
+        assert!(
+            registry.slash_commands().iter().any(|s| s.name == "shared"),
+            "deduplication must retain a command source even when it aliases a skill root"
+        );
+    }
+
+    #[test]
+    fn extra_skill_roots_expand_deduplicate_and_keep_native_precedence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let project = tmp.path().join("project");
+        let native = project.join(".ours/skills");
+        std::fs::create_dir_all(&native).unwrap();
+        let mut cfg = CodingAgentConfig::new(
+            "",
+            "",
+            "test",
+            &project,
+            atomcode_capabilities::ProductDirs::new(home.join("ours"), ".ours"),
+        );
+        cfg.extra_skill_dirs = vec![
+            "~/shared".into(),
+            "relative".into(),
+            native.display().to_string(),
+            "~/shared".into(),
+        ];
+        let opts = PrepareOptions::default();
+        let (dirs, explicit, warnings) = super::resolve_skill_dirs_at(&cfg, &opts, Some(&home));
+        assert!(warnings.is_empty());
+        assert_eq!(
+            dirs.iter().filter(|p| **p == home.join("shared")).count(),
+            1
+        );
+        assert!(dirs.contains(&project.join("relative")));
+        assert_eq!(dirs.last().unwrap(), &native);
+        assert!(explicit.contains(&native));
+        let exact = PrepareOptions {
+            skill_dirs: Some(vec![]),
+            ..opts
+        };
+        assert!(super::resolve_skill_dirs_at(&cfg, &exact, Some(&home))
+            .0
+            .is_empty());
+        cfg.extra_skill_dirs = vec!["~user/unsupported".into(), "".into()];
+        assert_eq!(
+            super::resolve_skill_dirs_at(&cfg, &PrepareOptions::default(), Some(&home))
+                .2
+                .len(),
+            2
+        );
+    }
 
     #[test]
     fn external_profiles_convert_and_guard_bypass() {

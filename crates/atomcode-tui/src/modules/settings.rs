@@ -1004,6 +1004,9 @@ fn status_lines(page: Option<&crate::settings::StatusPage>) -> Vec<UsageLine> {
                 path: file.path.clone(),
                 same_as,
             });
+            if let Some(detail) = &file.detail {
+                out.push(UsageLine::Note(format!("    {detail}")));
+            }
         }
     }
     out
@@ -2199,6 +2202,30 @@ pub fn value_column(row: &crate::settings::SettingRow) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn source_details_show_loaded_state_without_hiding_the_path() {
+        use atomcode_host_api::{SourceFile, SourceGroup};
+        let page = crate::settings::StatusPage {
+            sources: vec![SourceGroup {
+                label: "Instructions".into(),
+                files: vec![SourceFile {
+                    label: "Project".into(),
+                    path: "/work/AGENTS.md".into(),
+                    present: true,
+                    detail: Some("loaded; disk changed, resume to refresh".into()),
+                }],
+            }],
+            ..Default::default()
+        };
+        let shown = status_text(&page);
+        assert!(shown.contains("/work/AGENTS.md"));
+        assert!(shown.contains("loaded; disk changed"));
+        let rows = status_lines(Some(&page));
+        assert!(rows
+            .iter()
+            .any(|row| matches!(row, UsageLine::Note(note) if note.contains("disk changed"))));
+    }
+
     #[test]
     fn shortcut_capture_is_visible_and_hides_catalog_click_targets() {
         let view = SettingsView::new(vec![row(
@@ -3479,11 +3506,13 @@ mod tests {
                         label: "项目共享".into(),
                         path: "/w/AGENTS.md".into(),
                         present: true,
+                        detail: None,
                     },
                     SourceFile {
                         label: "用户全局".into(),
                         path: "/w/ATOMCODE.md".into(),
                         present: false,
+                        detail: None,
                     },
                 ],
             }],
@@ -3527,11 +3556,13 @@ mod tests {
                         label: "全局".into(),
                         path: "/home/me/.tree/memory.md".into(),
                         present: false,
+                        detail: None,
                     },
                     SourceFile {
                         label: "项目".into(),
                         path: "/home/me/.tree/memory.md".into(),
                         present: false,
+                        detail: None,
                     },
                 ],
             }],

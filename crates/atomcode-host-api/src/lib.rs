@@ -818,6 +818,9 @@ pub struct SourceFile {
     pub label: String,
     pub path: String,
     pub present: bool,
+    /// Loaded-state or diagnostic detail, independent of file existence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// What the account is subscribed to.
@@ -1988,6 +1991,7 @@ mod tests {
                         label: "项目共享".into(),
                         path: "/w/AGENTS.md".into(),
                         present: true,
+                        detail: None,
                     }],
                 }],
             },
@@ -2063,6 +2067,19 @@ mod tests {
             }
         }
         all
+    }
+
+    #[test]
+    fn older_source_files_without_details_still_decode() {
+        let old = r#"{"label":"Project","path":"/work/AGENTS.md","present":true}"#;
+        let source: SourceFile = serde_json::from_str(old).unwrap();
+        assert!(source.detail.is_none());
+        let detailed = SourceFile {
+            detail: Some("loaded; disk changed".into()),
+            ..source
+        };
+        let wire = serde_json::to_string(&detailed).unwrap();
+        assert_eq!(serde_json::from_str::<SourceFile>(&wire).unwrap(), detailed);
     }
 
     #[test]
