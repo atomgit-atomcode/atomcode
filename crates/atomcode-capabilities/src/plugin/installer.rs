@@ -70,6 +70,9 @@ fn install_external(
     let plugins_root = paths::plugins_root(dirs.user()).ok_or_else(|| anyhow!("no plugin home"))?;
     let target_rel = format!("installed/{}/{}", marketplace, plugin_key);
     let target_abs = plugins_root.join(&target_rel);
+    if let ExternalSource::Local { path } = ext {
+        validate_copy_paths(&expand_local_path(path)?, &target_abs)?;
+    }
     if target_abs.exists() {
         // The directory already exists. This can happen when a previous
         // install was cancelled (Esc) after the clone succeeded but before
@@ -121,7 +124,7 @@ fn install_external(
         }
         ExternalSource::Local { path } => {
             let src = expand_local_path(path)?;
-            copy_dir_recursive(&src, &target_abs)
+            copy_plugin_tree(&src, &target_abs)
                 .with_context(|| format!("copy {}", src.display()))?;
         }
     }
@@ -303,33 +306,105 @@ fn expand_local_path(path: &str) -> Result<PathBuf> {
     Ok(expanded)
 }
 
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        if ty.is_dir() {
-            copy_dir_recursive(&from, &to)?;
-        } else if ty.is_symlink() {
-            // Resolve symlinks by copying the target file. Avoids leaving
-            // dangling links inside the install dir.
-            let resolved = std::fs::read_link(&from)?;
-            let abs = if resolved.is_absolute() {
-                resolved
-            } else {
-                from.parent().unwrap_or(Path::new(".")).join(resolved)
-            };
-            if abs.is_dir() {
-                copy_dir_recursive(&abs, &to)?;
-            } else {
-                std::fs::copy(&abs, &to)?;
+/// Resolve a destination even when its final directories do not yet exist.
+/// Existing symlinks are resolved before containment checks; dangling aliases fail.
+fn resolve_copy_destination(path: &Path) -> Result<PathBuf> {
+    let mut cursor = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::canonicalize(&cursor) {
+            Ok(mut resolved) => {
+                for component in missing.into_iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
             }
-        } else {
-            std::fs::copy(&from, &to)?;
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A dangling symlink must not be treated as an absent directory.
+                if std::fs::symlink_metadata(&cursor).is_ok() {
+                    return Err(error.into());
+                }
+                missing.push(
+                    cursor
+                        .file_name()
+                        .ok_or_else(|| anyhow!("invalid plugin copy destination"))?
+                        .to_os_string(),
+                );
+                if !cursor.pop() {
+                    return Err(error.into());
+                }
+            }
+            Err(error) => return Err(error.into()),
         }
     }
+}
+
+fn validate_copy_paths(src: &Path, dst: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(src)?;
+    if metadata.file_type().is_symlink() {
+        bail!(
+            "symbolic links are not supported in plugin copies: {}",
+            src.display()
+        );
+    }
+    if !metadata.is_dir() {
+        bail!("plugin copy source is not a directory: {}", src.display());
+    }
+    let source = std::fs::canonicalize(src)?;
+    let target = resolve_copy_destination(dst)?;
+    if target.starts_with(&source) || source.starts_with(&target) {
+        bail!(
+            "plugin copy source and destination overlap: {} -> {}",
+            src.display(),
+            dst.display()
+        );
+    }
+    Ok(())
+}
+
+fn copy_plugin_tree(src: &Path, dst: &Path) -> Result<()> {
+    validate_copy_paths(src, dst)?;
+    if std::fs::symlink_metadata(dst).is_ok() {
+        bail!("plugin copy destination already exists: {}", dst.display());
+    }
+    let target = resolve_copy_destination(dst)?;
+    let parent = target
+        .parent()
+        .ok_or_else(|| anyhow!("plugin copy destination has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let staging = tempfile::Builder::new()
+        .prefix(".plugin-copy-")
+        .tempdir_in(parent)?;
+    // An explicit stack avoids consuming the call stack for deeply nested
+    // ordinary directories. Never expand links into another directory walk.
+    let mut pending = vec![(src.to_path_buf(), staging.path().to_path_buf())];
+    while let Some((source, destination)) = pending.pop() {
+        for entry in std::fs::read_dir(&source)? {
+            let entry = entry?;
+            let ty = entry.file_type()?;
+            let from = entry.path();
+            let to = destination.join(entry.file_name());
+            if ty.is_symlink() {
+                bail!(
+                    "symbolic links are not supported in plugin copies: {}",
+                    from.display()
+                );
+            } else if ty.is_dir() {
+                std::fs::create_dir(&to)?;
+                pending.push((from, to));
+            } else if ty.is_file() {
+                std::fs::copy(&from, &to)?;
+            } else {
+                bail!("unsupported file type in plugin copy: {}", from.display());
+            }
+        }
+    }
+    std::fs::rename(staging.path(), &target)
+        .with_context(|| format!("activate plugin copy {}", dst.display()))?;
     Ok(())
 }
 
@@ -626,6 +701,7 @@ pub fn install(
             // Destination: project-level plugins dir.
             let dest_rel = format!("installed/{}/{}", marketplace, plugin_key);
             let dest_abs = project_root.join(&dest_rel);
+            validate_copy_paths(&source_abs, &dest_abs)?;
             if dest_abs.exists() {
                 // The directory already exists — same residual-detect logic
                 // as install_external: if the plugin is NOT recorded in the
@@ -657,7 +733,7 @@ pub fn install(
             }
 
             // Copy the plugin files into the project directory.
-            copy_dir_recursive(&source_abs, &dest_abs)
+            copy_plugin_tree(&source_abs, &dest_abs)
                 .with_context(|| format!("copy plugin to project dir {}", dest_abs.display()))?;
 
             // Record in project-level installed_plugins.json.
@@ -1384,5 +1460,195 @@ mod tests {
         assert_eq!(listed[0].plugin, "probe");
         assert_eq!(listed[0].marketplace, "mp");
         assert_eq!(listed[0].scope, InstallScope::User);
+    }
+
+    #[test]
+    fn plugin_copy_preserves_files_and_rejects_overlapping_trees_before_writing() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir_all(source.join("nested/empty")).unwrap();
+        std::fs::write(source.join("nested/data"), b"plugin bytes").unwrap();
+        let target = root.path().join("installed/plugin");
+        copy_plugin_tree(&source, &target).unwrap();
+        assert_eq!(
+            std::fs::read(target.join("nested/data")).unwrap(),
+            b"plugin bytes"
+        );
+        assert!(target.join("nested/empty").is_dir());
+        assert_eq!(
+            std::fs::read_dir(target.parent().unwrap()).unwrap().count(),
+            1
+        );
+        for destination in [
+            source.clone(),
+            source.join("inside/plugin"),
+            root.path().to_path_buf(),
+        ] {
+            assert!(copy_plugin_tree(&source, &destination)
+                .unwrap_err()
+                .to_string()
+                .contains("overlap"));
+        }
+        assert!(!source.join("inside").exists());
+        assert!(copy_plugin_tree(&source, &target).is_err());
+        assert_eq!(
+            std::fs::read(target.join("nested/data")).unwrap(),
+            b"plugin bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugin_copy_rejects_all_symlinks_and_removes_failed_staging() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        for (name, link) in [
+            ("self", "."),
+            ("parent", ".."),
+            ("dangling", "missing"),
+            ("file", "payload"),
+            ("two-link", "other"),
+        ] {
+            let source = root.path().join(name);
+            std::fs::create_dir(&source).unwrap();
+            std::fs::write(source.join("payload"), "data").unwrap();
+            symlink(link, source.join("loop")).unwrap();
+            if name == "two-link" {
+                symlink("loop", source.join("other")).unwrap();
+            }
+            let target = root.path().join("out").join(name);
+            let error = copy_plugin_tree(&source, &target).unwrap_err();
+            assert!(error.to_string().contains("symbolic links"), "{error:#}");
+            assert!(!target.exists());
+            assert_eq!(
+                std::fs::read_dir(target.parent().unwrap()).unwrap().count(),
+                0,
+                "failed stage leaked"
+            );
+        }
+        let source = root.path().join("ordinary");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("executable"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(
+            source.join("executable"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let alias = root.path().join("alias");
+        symlink(&source, &alias).unwrap();
+        assert!(copy_plugin_tree(&alias, &root.path().join("out/root-alias")).is_err());
+        assert!(copy_plugin_tree(&source, &alias.join("inside"))
+            .unwrap_err()
+            .to_string()
+            .contains("overlap"));
+        let target = root.path().join("out/ordinary");
+        copy_plugin_tree(&source, &target).unwrap();
+        assert_eq!(
+            std::fs::metadata(target.join("executable"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        // Special files must be rejected without opening them (a FIFO could block).
+        std::os::unix::net::UnixListener::bind(source.join("socket")).unwrap();
+        assert!(copy_plugin_tree(&source, &root.path().join("out/special"))
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported file type"));
+        assert!(!root.path().join("out/special").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn install_local_cycle_fails_without_publishing_or_registering_plugin() {
+        let home = isolated_home();
+        let dirs = home.dirs();
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("payload"), "data").unwrap();
+        std::os::unix::fs::symlink(".", source.path().join("loop")).unwrap();
+        let manifest = serde_json::json!({"name":"mp_cycle", "plugins":[{"name":"cycle", "source":{"source":"local","path":source.path()}}]}).to_string();
+        let repo = make_repo("mp_cycle", Some(&manifest));
+        add_marketplace(&dirs, &format!("file://{}", repo.display())).unwrap();
+        let error = install(&dirs, "cycle", "mp_cycle", InstallScope::User).unwrap_err();
+        assert!(format!("{error:#}").contains("symbolic links"));
+        let plugins = paths::plugins_root(dirs.user()).unwrap();
+        assert!(!plugins.join("installed/mp_cycle/cycle").exists());
+        assert_eq!(
+            std::fs::read_dir(plugins.join("installed/mp_cycle"))
+                .unwrap()
+                .count(),
+            0
+        );
+        let state =
+            load_installed_plugins_file(&paths::installed_plugins_file(dirs.user()).unwrap())
+                .unwrap();
+        assert!(!state.plugins.contains_key("cycle@mp_cycle"));
+        // A source containing the destination is rejected before stale cleanup.
+        let target = plugins.join("installed/mp_cycle/cycle");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("KEEP"), "must remain").unwrap();
+        let error = install_external(
+            &dirs,
+            "cycle",
+            "mp_cycle",
+            &ExternalSource::Local {
+                path: plugins.display().to_string(),
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("overlap"));
+        assert_eq!(
+            std::fs::read_to_string(target.join("KEEP")).unwrap(),
+            "must remain"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn project_and_local_copies_reject_cycles_before_registering_and_can_retry() {
+        struct RestoreCwd(PathBuf);
+        impl Drop for RestoreCwd {
+            fn drop(&mut self) {
+                std::env::set_current_dir(&self.0).unwrap();
+            }
+        }
+        let home = isolated_home();
+        let dirs = home.dirs();
+        let manifest = r#"{"name":"mp_copy","plugins":[{"name":"copy","source":"./payload"}]}"#;
+        let repo = make_repo("mp_copy", Some(manifest));
+        add_marketplace(&dirs, &format!("file://{}", repo.display())).unwrap();
+        let source = paths::marketplaces_root(dirs.user())
+            .unwrap()
+            .join("mp_copy/payload");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("payload"), "data").unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let _restore = RestoreCwd(std::env::current_dir().unwrap());
+        std::env::set_current_dir(project.path()).unwrap();
+        for scope in [InstallScope::Project, InstallScope::Local] {
+            std::os::unix::fs::symlink("..", source.join("loop")).unwrap();
+            let error = install(&dirs, "copy", "mp_copy", scope.clone()).unwrap_err();
+            assert!(format!("{error:#}").contains("symbolic links"));
+            let target = paths::project_plugins_root(&dirs, project.path(), &scope)
+                .unwrap()
+                .join("installed/mp_copy/copy");
+            assert!(!target.exists());
+            let state_path =
+                paths::project_installed_plugins_file(&dirs, project.path(), &scope).unwrap();
+            assert!(!load_installed_plugins_file(&state_path)
+                .unwrap()
+                .plugins
+                .contains_key("copy@mp_copy"));
+            std::fs::remove_file(source.join("loop")).unwrap();
+            install(&dirs, "copy", "mp_copy", scope.clone()).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(target.join("payload")).unwrap(),
+                "data"
+            );
+        }
     }
 }
