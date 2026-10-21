@@ -2800,7 +2800,9 @@ async fn what_the_model_is_told_about_mcp_only_names_ways_this_build_has() {
     start.prepare.mcp = true;
     let mut runtime = CodingRuntime::start(start).await.unwrap();
 
-    turn(&mut runtime, "describe mcp").await;
+    // MCP setup is documented under operations. `mcp` is not a valid aspect;
+    // the old test only saw it through the former full-report typo fallback.
+    turn(&mut runtime, "describe operations").await;
     let said = last_tool_result(&recorder);
     runtime.handle.shutdown().await.unwrap();
 
