@@ -25,7 +25,9 @@ impl Tool for ListSymbolsTool {
     fn description(&self) -> &str {
         "List the functions, classes, structs, methods and other symbols defined in a \
          source file, each with its line range. Faster and more precise than read_file \
-         for understanding a file's structure before editing. Supports Rust, Python, \
+         for understanding a file's structure before editing. Use the returned ranges to read \
+         only relevant code with read_file; avoid following a large symbol listing with \
+         reads of every symbol or the whole module. Supports Rust, Python, \
          JS/TS/TSX, Go, Java, C/C++, C#, HTML, PHP. Relative paths resolve against the \
          working directory."
     }

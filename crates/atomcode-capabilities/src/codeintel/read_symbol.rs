@@ -26,7 +26,9 @@ impl Tool for ReadSymbolTool {
     fn description(&self) -> &str {
         "Read the complete source of a single symbol (function / class / struct / method) \
          by name, with line numbers. More precise than read_file — returns exactly the \
-         symbol. Use list_symbols first to discover names. Relative paths resolve against \
+         symbol. Use list_symbols first to discover names and line ranges. For a large symbol, \
+         prefer read_file with offset/limit or ranges to inspect only the relevant section; \
+         avoid rereading source already in context. Relative paths resolve against \
          the working directory."
     }
     fn parameters_schema(&self) -> serde_json::Value {
