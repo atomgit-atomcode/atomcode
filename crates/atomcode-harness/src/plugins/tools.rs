@@ -184,7 +184,9 @@ impl Plugin for BashToolPlugin {
             51,
             "Use `bash` for builds, tests, and git. Quote paths that contain spaces. \
              Anything meant to keep running — a dev server, a watcher, `npm run dev` — goes through \
-             `bash_start`: read its output with `bash_poll` and stop it with `bash_kill`. Do not \
+             `bash_start`: read its output with `bash_poll` and stop it with `bash_kill`. \
+             Long builds/tests also use `bash_start`, then `bash_poll` with wait_ms up to 60000 \
+             (returns early on output or exit), instead of shell sleep or duplicate builds. Do not \
              background it inside `bash` (`&`, `nohup`, `start`); a `bash` call is for a command that \
              finishes.",
         );
