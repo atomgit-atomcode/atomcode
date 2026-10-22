@@ -112,75 +112,12 @@ pub const RESPONSES_COMPATIBLE: ProviderPreset = ProviderPreset {
 /// vendor defaults and may be overridden per account.
 pub const PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
-        id: "deepseek-messages",
-        display_name: "DeepSeek (Messages API)",
-        provider_type: ProviderType::DeepSeekMessages,
-        default_base_url: Some("https://api.deepseek.com/anthropic"),
-        auth_kind: AuthKind::ApiKey,
-        api_key_env: Some("DEEPSEEK_API_KEY"),
-        model_source: ModelSource::Manual,
-    },
-    ProviderPreset {
-        id: "atomgit",
-        display_name: "AtomGit",
-        provider_type: ProviderType::OpenAi,
-        default_base_url: Some("https://llm-api.atomgit.com/v1"),
-        auth_kind: AuthKind::ApiKey,
-        api_key_env: None,
-        model_source: ModelSource::DiscoveryApi,
-    },
-    ProviderPreset {
-        id: "taotoken",
-        display_name: "TaoToken",
-        provider_type: ProviderType::OpenAi,
-        default_base_url: Some("https://taotoken.net/api/v1"),
-        auth_kind: AuthKind::ApiKey,
-        api_key_env: None,
-        model_source: ModelSource::Manual,
-    },
-    ProviderPreset {
-        id: "aliyun",
-        display_name: "Alibaba Cloud Model Studio",
-        provider_type: ProviderType::OpenAi,
-        default_base_url: Some("https://dashscope.aliyuncs.com/compatible-mode/v1"),
-        auth_kind: AuthKind::ApiKey,
-        api_key_env: Some("DASHSCOPE_API_KEY"),
-        model_source: ModelSource::Manual,
-    },
-    ProviderPreset {
-        id: "volcengine",
-        display_name: "Volcengine Ark",
-        provider_type: ProviderType::OpenAi,
-        default_base_url: Some("https://ark.cn-beijing.volces.com/api/v3"),
-        auth_kind: AuthKind::ApiKey,
-        api_key_env: Some("ARK_API_KEY"),
-        model_source: ModelSource::Manual,
-    },
-    ProviderPreset {
-        id: "xiaomi-mimo",
-        display_name: "Xiaomi MiMo",
-        provider_type: ProviderType::OpenAi,
-        default_base_url: Some("https://api.xiaomimimo.com/v1"),
-        auth_kind: AuthKind::ApiKey,
-        api_key_env: Some("MIMO_API_KEY"),
-        model_source: ModelSource::Manual,
-    },
-    ProviderPreset {
         id: "deepseek",
         display_name: "DeepSeek",
         provider_type: ProviderType::OpenAi,
         default_base_url: Some("https://api.deepseek.com/v1"),
         auth_kind: AuthKind::ApiKey,
         api_key_env: Some("DEEPSEEK_API_KEY"),
-        model_source: ModelSource::DiscoveryApi,
-    },
-    ProviderPreset {
-        id: "longcat",
-        display_name: "LongCat",
-        provider_type: ProviderType::OpenAi,
-        default_base_url: Some("https://api.longcat.chat/openai/v1"),
-        auth_kind: AuthKind::ApiKey,
-        api_key_env: Some("LONGCAT_API_KEY"),
         model_source: ModelSource::DiscoveryApi,
     },
     ProviderPreset {
@@ -198,7 +135,7 @@ pub const PRESETS: &[ProviderPreset] = &[
         // than the token-based `/api/paas/v4`. A separate preset so it is one-click
         // selectable instead of a manual base-url override.
         id: "zhipu-coding",
-        display_name: "Zhipu Coding Plan",
+        display_name: "Zhipu AI Coding Plan",
         provider_type: ProviderType::OpenAi,
         default_base_url: Some("https://open.bigmodel.cn/api/coding/paas/v4"),
         auth_kind: AuthKind::ApiKey,
@@ -206,13 +143,22 @@ pub const PRESETS: &[ProviderPreset] = &[
         model_source: ModelSource::Manual,
     },
     ProviderPreset {
-        id: "moonshot",
-        display_name: "Moonshot",
+        id: "openrouter",
+        display_name: "OpenRouter",
         provider_type: ProviderType::OpenAi,
-        default_base_url: Some("https://api.moonshot.cn/v1"),
+        default_base_url: Some("https://openrouter.ai/api/v1"),
         auth_kind: AuthKind::ApiKey,
-        api_key_env: Some("MOONSHOT_API_KEY"),
+        api_key_env: Some("OPENROUTER_API_KEY"),
         model_source: ModelSource::DiscoveryApi,
+    },
+    ProviderPreset {
+        id: "taotoken",
+        display_name: "TaoToken",
+        provider_type: ProviderType::OpenAi,
+        default_base_url: Some("https://taotoken.net/api/v1"),
+        auth_kind: AuthKind::ApiKey,
+        api_key_env: None,
+        model_source: ModelSource::Manual,
     },
     ProviderPreset {
         id: "minimax",
@@ -221,6 +167,75 @@ pub const PRESETS: &[ProviderPreset] = &[
         default_base_url: Some("https://api.minimaxi.com/v1"),
         auth_kind: AuthKind::ApiKey,
         api_key_env: Some("MINIMAX_API_KEY"),
+        model_source: ModelSource::Manual,
+    },
+    ProviderPreset {
+        // The subscription uses its own key. Do not inherit a pay-as-you-go
+        // MINIMAX_API_KEY when a person selects the Token Plan offer.
+        // https://platform.minimax.cn/docs/m-plan/intro
+        // https://platform.minimax.cn/docs/api-reference/text-openai-api
+        id: "minimax-token-plan",
+        display_name: "MiniMax Token Plan",
+        provider_type: ProviderType::OpenAi,
+        default_base_url: Some("https://api.minimax.cn/v1"),
+        auth_kind: AuthKind::ApiKey,
+        api_key_env: Some("MINIMAX_TOKEN_PLAN_API_KEY"),
+        model_source: ModelSource::Manual,
+    },
+    ProviderPreset {
+        id: "moonshot",
+        display_name: "Moonshot AI",
+        provider_type: ProviderType::OpenAi,
+        default_base_url: Some("https://api.moonshot.cn/v1"),
+        auth_kind: AuthKind::ApiKey,
+        api_key_env: Some("MOONSHOT_API_KEY"),
+        model_source: ModelSource::DiscoveryApi,
+    },
+    ProviderPreset {
+        id: "aliyun",
+        display_name: "Alibaba Cloud Model Studio",
+        provider_type: ProviderType::OpenAi,
+        default_base_url: Some("https://dashscope.aliyuncs.com/compatible-mode/v1"),
+        auth_kind: AuthKind::ApiKey,
+        api_key_env: Some("DASHSCOPE_API_KEY"),
+        model_source: ModelSource::Manual,
+    },
+    ProviderPreset {
+        id: "xiaomi-mimo",
+        display_name: "Xiaomi MiMo",
+        provider_type: ProviderType::OpenAi,
+        default_base_url: Some("https://api.xiaomimimo.com/v1"),
+        auth_kind: AuthKind::ApiKey,
+        api_key_env: Some("MIMO_API_KEY"),
+        model_source: ModelSource::Manual,
+    },
+    ProviderPreset {
+        id: "longcat",
+        display_name: "LongCat",
+        provider_type: ProviderType::OpenAi,
+        default_base_url: Some("https://api.longcat.chat/openai/v1"),
+        auth_kind: AuthKind::ApiKey,
+        api_key_env: Some("LONGCAT_API_KEY"),
+        model_source: ModelSource::DiscoveryApi,
+    },
+    ProviderPreset {
+        id: "volcengine",
+        display_name: "Volcengine Ark",
+        provider_type: ProviderType::OpenAi,
+        default_base_url: Some("https://ark.cn-beijing.volces.com/api/v3"),
+        auth_kind: AuthKind::ApiKey,
+        api_key_env: Some("ARK_API_KEY"),
+        model_source: ModelSource::Manual,
+    },
+    ProviderPreset {
+        // Coding Plan must use its dedicated path; /api/v3 is billed separately.
+        // https://docs.volcengine.com/docs/ark/coding-plan-personal-get-started
+        id: "volcengine-coding",
+        display_name: "Volcengine Ark Coding Plan",
+        provider_type: ProviderType::OpenAi,
+        default_base_url: Some("https://ark.cn-beijing.volces.com/api/coding/v3"),
+        auth_kind: AuthKind::ApiKey,
+        api_key_env: Some("ARK_CODING_API_KEY"),
         model_source: ModelSource::Manual,
     },
     ProviderPreset {
@@ -233,12 +248,21 @@ pub const PRESETS: &[ProviderPreset] = &[
         model_source: ModelSource::DiscoveryApi,
     },
     ProviderPreset {
-        id: "openrouter",
-        display_name: "OpenRouter",
-        provider_type: ProviderType::OpenAi,
-        default_base_url: Some("https://openrouter.ai/api/v1"),
+        id: "deepseek-messages",
+        display_name: "DeepSeek (Messages API)",
+        provider_type: ProviderType::DeepSeekMessages,
+        default_base_url: Some("https://api.deepseek.com/anthropic"),
         auth_kind: AuthKind::ApiKey,
-        api_key_env: Some("OPENROUTER_API_KEY"),
+        api_key_env: Some("DEEPSEEK_API_KEY"),
+        model_source: ModelSource::Manual,
+    },
+    ProviderPreset {
+        id: "atomgit",
+        display_name: "AtomGit",
+        provider_type: ProviderType::OpenAi,
+        default_base_url: Some("https://llm-api.atomgit.com/v1"),
+        auth_kind: AuthKind::ApiKey,
+        api_key_env: None,
         model_source: ModelSource::DiscoveryApi,
     },
     ProviderPreset {
@@ -360,7 +384,7 @@ mod tests {
         );
 
         let coding = preset("zhipu-coding").expect("zhipu-coding preset");
-        assert_eq!(coding.display_name, "Zhipu Coding Plan");
+        assert_eq!(coding.display_name, "Zhipu AI Coding Plan");
         assert_eq!(coding.provider_type, ProviderType::OpenAi);
         assert_eq!(
             coding.default_base_url,
@@ -370,6 +394,26 @@ mod tests {
             coding.api_key_env, token.api_key_env,
             "same ZHIPUAI_API_KEY"
         );
+    }
+
+    #[test]
+    fn subscription_presets_keep_their_credential_and_billing_boundaries() {
+        let minimax = preset("minimax-token-plan").unwrap();
+        assert_eq!(minimax.default_base_url, Some("https://api.minimax.cn/v1"));
+        assert_ne!(minimax.api_key_env, preset("minimax").unwrap().api_key_env);
+        let ark = preset("volcengine-coding").unwrap();
+        assert_eq!(
+            ark.default_base_url,
+            Some("https://ark.cn-beijing.volces.com/api/coding/v3")
+        );
+        assert_ne!(ark.api_key_env, preset("volcengine").unwrap().api_key_env);
+        for subscription in [minimax, ark] {
+            assert_eq!(subscription.provider_type, ProviderType::OpenAi);
+            assert!(
+                !crate::config::is_codingplan_provider_name(subscription.id),
+                "user-owned API accounts, not the /login gateway"
+            );
+        }
     }
 
     #[test]

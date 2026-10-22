@@ -133,6 +133,9 @@ enum Row {
     /// What the form is for: `添加账号`, `改 deepseek`, …
     FormHead,
     Legend,
+    Capabilities(usize),
+    DiscoveryError,
+    AccountSection(bool),
     /// The model picker over the add form: the listing is on its way.
     PickLoading,
     /// …what is typed to filter it.
@@ -194,6 +197,14 @@ fn layout(view: &ProvidersView, panel: &Panel, h: usize) -> Vec<Row> {
             for at in 0..fields {
                 rows.push(Row::Field(at));
             }
+            if let Form::Model(form) = form {
+                if !form.model.is_empty() {
+                    rows.extend((0..3).map(Row::Capabilities));
+                }
+                if form.discovery_error.is_some() {
+                    rows.push(Row::DiscoveryError);
+                }
+            }
             rows.push(Row::Blank);
             rows.push(Row::Legend);
         }
@@ -202,33 +213,40 @@ fn layout(view: &ProvidersView, panel: &Panel, h: usize) -> Vec<Row> {
             rows.push(Row::Search);
             rows.push(Row::BoxBottom);
             let listed = view.listed(panel);
-            if listed.is_empty() {
+            let mut entries = Vec::new();
+            let mut section = None;
+            for (at, item) in listed.iter().enumerate() {
+                if let Listed::Account(i) = item {
+                    let configured = view.accounts()[*i].configured;
+                    if section != Some(configured) {
+                        entries.push(Row::AccountSection(configured));
+                        section = Some(configured);
+                    }
+                }
+                entries.push(Row::Listed(at));
+            }
+            if entries.is_empty() {
                 rows.push(Row::Nothing);
             } else {
-                // The room the list has, once the chrome above and the blank
-                // and legend below have taken theirs. `h` of `usize::MAX` is the
-                // question `height` asks — "how many would it take" — and then
-                // the answer is the whole list, still capped at what a panel may
-                // take of the screen.
+                // Section headings consume the same row budget as entries.
+                // The cursor still refers to the selectable list's indices.
                 let cap = h.saturating_sub(rows.len() + 2).min(MOST);
-                let (from, to) = if listed.len() > cap {
-                    // The row that says how much is out of sight comes out of
-                    // the same budget. Counting it afterwards is how a panel
-                    // ends up one row taller than the rect it was given — which
-                    // is what `a_long_list_keeps_the_cursor_in_view` caught.
+                let cursor = entries
+                    .iter()
+                    .position(|row| *row == Row::Listed(panel.cursor))
+                    .unwrap_or(0);
+                let (from, to) = if entries.len() > cap {
                     let room = cap.saturating_sub(1).max(1);
-                    let (from, to) = window(listed.len(), panel.cursor, room);
+                    let (from, to) = window(entries.len(), cursor, room);
                     rows.push(Row::Scroll {
                         above: from,
-                        below: listed.len() - to,
+                        below: entries.len() - to,
                     });
                     (from, to)
                 } else {
-                    (0, listed.len())
+                    (0, entries.len())
                 };
-                for at in from..to {
-                    rows.push(Row::Listed(at));
-                }
+                rows.extend_from_slice(&entries[from..to]);
             }
             rows.push(Row::Blank);
             rows.push(Row::Legend);
@@ -279,6 +297,60 @@ fn draw(view: &ProvidersView, panel: &Panel, row: Row, w: usize, caps: crate::ca
             theme::fg(Role::Brand),
         ),
         Row::Field(at) => field_line(view, panel, at, w, caps),
+        Row::AccountSection(configured) => Line::styled(
+            format!(
+                "  {}",
+                t(if configured {
+                    Msg::ProviderConnected
+                } else {
+                    Msg::ProviderAvailable
+                })
+            ),
+            theme::fg(Role::Muted),
+        )
+        .truncate(w),
+        Row::Capabilities(at) => {
+            let text = match &panel.form {
+                Some(Form::Model(form)) => match at {
+                    0 => capability_text(
+                        form.window.or_else(|| {
+                            form.window_typed
+                                .as_deref()
+                                .and_then(crate::providers::parse_window)
+                        }),
+                        form.max_tokens,
+                        None,
+                        None,
+                        &[],
+                    ),
+                    1 => format!(
+                        "{} · {}",
+                        t(Msg::FieldVision),
+                        t(match form.vision {
+                            Some(true) => Msg::VisionYes,
+                            Some(false) => Msg::VisionNo,
+                            None => Msg::ProviderCapabilitiesUnknown,
+                        })
+                    ),
+                    _ => capability_text(
+                        None,
+                        None,
+                        None,
+                        form.effort.as_deref(),
+                        &form.declared_efforts(view),
+                    ),
+                },
+                _ => String::new(),
+            };
+            Line::styled(format!("  {text}"), theme::fg(Role::Muted)).truncate(w)
+        }
+        Row::DiscoveryError => {
+            let text = match &panel.form {
+                Some(Form::Model(form)) => form.discovery_error.as_deref().unwrap_or_default(),
+                _ => "",
+            };
+            Line::styled(format!("  {text}"), theme::fg(Role::Warning)).truncate(w)
+        }
         Row::PickLoading => Line::styled(
             width::take_width(&format!("  {}", t(Msg::ProviderDiscovering)), w),
             theme::fg(Role::Muted),
@@ -320,6 +392,52 @@ fn draw(view: &ProvidersView, panel: &Panel, row: Row, w: usize, caps: crate::ca
     }
 }
 
+fn capability_text(
+    window: Option<usize>,
+    output: Option<usize>,
+    vision: Option<bool>,
+    effort: Option<&str>,
+    levels: &[String],
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(window) = window {
+        parts.push(format!(
+            "{} {}",
+            t(Msg::FieldWindow),
+            crate::content::token_count(window as u32)
+        ));
+    }
+    if let Some(output) = output {
+        parts.push(format!(
+            "{} {}",
+            t(Msg::ProviderOutputLimit),
+            crate::content::token_count(output as u32)
+        ));
+    }
+    if let Some(vision) = vision {
+        parts.push(format!(
+            "{} {}",
+            t(Msg::FieldVision),
+            t(if vision {
+                Msg::VisionYes
+            } else {
+                Msg::VisionNo
+            })
+        ));
+    }
+    if !levels.is_empty() {
+        parts.push(format!("{} {}", t(Msg::FieldEffort), levels.join("/")));
+    }
+    if let Some(effort) = effort {
+        parts.push(format!("{} {effort}", t(Msg::StatusEffortDefault)));
+    }
+    if parts.is_empty() {
+        t(Msg::ProviderCapabilitiesUnknown).into_owned()
+    } else {
+        parts.join(" · ")
+    }
+}
+
 /// One row of the model picker: the id, and the context window the listing
 /// gave at the right when it gave one. The row the arrows are on is lit.
 fn pick_line(panel: &Panel, at: usize, w: usize) -> Line {
@@ -341,11 +459,17 @@ fn pick_line(panel: &Panel, at: usize, w: usize) -> Line {
     };
     let here = at == *cursor;
     let mark = if here { "› " } else { "  " };
-    let window = item
-        .window
-        .map(|n| crate::content::token_count(n as u32))
-        .unwrap_or_default();
+    let window = capability_text(
+        item.window,
+        None,
+        item.vision,
+        None,
+        item.levels.as_deref().unwrap_or_default(),
+    );
+    // Keep the model id legible even when its capability list is long.
     let left = format!("  {mark}{}", item.id);
+    let minimum = width::str_width(&left).min(w / 2).max(16).min(w);
+    let window = width::take_width(&window, w.saturating_sub(minimum + 1));
     let room = w.saturating_sub(width::str_width(&window) + 1);
     let left = width::take_width(&left, room);
     let pad = w.saturating_sub(width::str_width(&left) + width::str_width(&window));
@@ -360,6 +484,10 @@ fn pick_line(panel: &Panel, at: usize, w: usize) -> Line {
 
 fn form_title(panel: &Panel) -> String {
     match &panel.form {
+        Some(Form::Account(form)) if form.preset.is_some() => t(Msg::ProviderConnectTitle {
+            id: form.preset.as_deref().unwrap_or_default(),
+        })
+        .into_owned(),
         Some(Form::Account(form)) => match &form.editing {
             Some(id) => t(Msg::ProviderFormEdit { id }).into_owned(),
             None => t(Msg::ProviderFormAddAccount).into_owned(),
@@ -473,7 +601,12 @@ fn listed_parts(
             let Some(row) = view.accounts().get(i) else {
                 return None;
             };
-            let mut about = vec![row.protocol.clone()];
+            let host = row.endpoint_host();
+            let mut about = vec![if host.is_empty() {
+                row.protocol.clone()
+            } else {
+                host.to_string()
+            }];
             if row.configured {
                 about.push(t(Msg::ProviderModelCount { n: row.models }).into_owned());
                 about.push(
@@ -487,8 +620,6 @@ fn listed_parts(
                 if row.managed {
                     about.push(t(Msg::ProviderManaged).into_owned());
                 }
-            } else {
-                about.push(t(Msg::ProviderUnconfigured).into_owned());
             }
             let on = view
                 .models()
@@ -855,6 +986,18 @@ fn legend(panel: &Panel) -> Vec<(String, String)> {
                 vec![(t(Msg::ProviderPickKeys).into_owned(), String::new())]
             }
         },
+        Some(Form::Account(form)) if form.preset.is_some() => vec![
+            key("⏎", Msg::ProviderContinue),
+            key("^o", Msg::ProviderAdvanced),
+            key("esc", Msg::LegendCancel),
+        ],
+        Some(Form::Model(form)) if form.connecting => vec![
+            key("⏎", Msg::ProviderConnectUse),
+            key("^s", Msg::ProviderSaveOnly),
+            key("^o", Msg::ProviderAdvanced),
+            key("^f", Msg::ProviderDiscoverHint),
+            key("esc", Msg::LegendBack),
+        ],
         // Adding, on the model field: the id can be picked rather than typed.
         Some(Form::Model(form)) if form.focus == ModelField::Model && form.editing.is_none() => {
             vec![
@@ -966,7 +1109,16 @@ fn legend_buttons(
     legend(panel)
         .into_iter()
         .map(|(key, label)| {
-            let press = if panel.form.is_none() && panel.efforts.is_none() {
+            let press = if panel.form.is_some() {
+                match key.as_str() {
+                    "^o" => Some(KeyPress::ctrl('o')),
+                    "^s" => Some(KeyPress::ctrl('s')),
+                    "^f" => Some(KeyPress::ctrl('f')),
+                    "⏎" => Some(KeyPress::plain(crate::surface::Key::Enter)),
+                    "esc" => Some(KeyPress::plain(crate::surface::Key::Esc)),
+                    _ => None,
+                }
+            } else if panel.efforts.is_none() {
                 match key.as_str() {
                     "^a" => Some(KeyPress::ctrl('a')),
                     "^e" if editable => Some(KeyPress::ctrl('e')),
@@ -1063,6 +1215,7 @@ pub fn geometry(moment: &Moment, vp: &Viewport<'_>) -> Geometry {
             .into_iter()
             .map(|row| match row {
                 Row::Listed(at) if listed.get(at).is_some_and(|row| row.selectable()) => Some(at),
+                Row::Pick(at) => Some(at),
                 _ => None,
             })
             .collect(),
@@ -1293,10 +1446,12 @@ mod tests {
             crate::providers::Discovered {
                 id: "qwen3-coder".into(),
                 window: Some(256_000),
+                ..Default::default()
             },
             crate::providers::Discovered {
                 id: "glm-5".into(),
                 window: None,
+                ..Default::default()
             },
         ];
         let m = moment(Some(picker_panel(Picking::Ready {
@@ -1337,6 +1492,29 @@ mod tests {
             screen.contains("^f") && screen.contains("从服务端拉取"),
             "{screen}"
         );
+    }
+
+    #[test]
+    fn account_rows_show_and_search_the_actual_host_without_credentials() {
+        let mut row = account("custom", 0);
+        row.endpoint = "https://user:secret@proxy.example:8443/v1?key=private".into();
+        let view = ProvidersView::new(vec![row], Vec::new(), Vec::new(), Vec::new());
+        let m = Moment {
+            providers: view.clone(),
+            providers_panel: Some(Panel::new()),
+            ..Moment::default()
+        };
+        let text = drawn(&m, 120, 24);
+        assert!(text.contains("proxy.example:8443"), "{text}");
+        assert!(
+            !text.contains("secret") && !text.contains("private") && !text.contains("/v1"),
+            "{text}"
+        );
+        let panel = Panel {
+            query: "proxy.example".into(),
+            ..Panel::new()
+        };
+        assert!(view.listed(&panel).contains(&Listed::Account(0)));
     }
 
     #[test]
@@ -1513,6 +1691,23 @@ mod tests {
         assert!(out.contains("200k"), "{out}");
         assert!(out.contains("200k、1m"), "{out}");
         assert!(out.contains("换回预设"), "{out}");
+    }
+
+    #[test]
+    fn a_connection_hides_address_and_offers_clickable_advanced_settings() {
+        use crate::surface::KeyPress;
+        let v = view();
+        let form = AccountForm::connect(&v, v.account("deepseek").unwrap());
+        let m = moment(Some(Panel {
+            form: Some(Form::Account(form)),
+            ..Panel::new()
+        }));
+        let text = drawn(&m, 120, 24);
+        assert!(text.contains(&t(Msg::FieldKey).to_string()), "{text}");
+        assert!(!text.contains("https://"), "{text}");
+        let (col, row) = button_hit(&m, KeyPress::ctrl('o'));
+        let vp = Viewport::new(Rect::sized(120, 24), &m);
+        assert_eq!(action_at(&m, &vp, col, row), Some(KeyPress::ctrl('o')));
     }
 
     #[test]

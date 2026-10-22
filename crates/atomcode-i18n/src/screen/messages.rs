@@ -459,6 +459,25 @@ pub enum Msg<'a> {
     ProviderDiscovering,
     /// …beside an empty model field: the key that opens it.
     ProviderDiscoverHint,
+    ProviderAdvanced,
+    ProviderContinue,
+    ProviderConnectUse,
+    ProviderSaveOnly,
+    ProviderConnected,
+    ProviderAvailable,
+    ProviderCapabilitiesUnknown,
+    ProviderOutputLimit,
+    ProviderSavedSwitchFailed {
+        id: &'a str,
+        error: &'a str,
+    },
+    ProviderSavedSwitching {
+        id: &'a str,
+    },
+    ProviderConnectTitle {
+        id: &'a str,
+    },
+
     /// …its keys.
     ProviderPickKeys,
     /// …its filter line.

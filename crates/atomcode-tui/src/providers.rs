@@ -75,6 +75,18 @@ pub struct AccountRow {
     pub configured: bool,
 }
 
+impl AccountRow {
+    /// Display only the endpoint's authority, never its path, query or userinfo.
+    /// This is a label; transport URL validation remains the port's job.
+    pub fn endpoint_host(&self) -> &str {
+        self.endpoint
+            .split_once("://")
+            .map(|(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or_default())
+            .map(|authority| authority.rsplit('@').next().unwrap_or_default())
+            .unwrap_or_default()
+    }
+}
+
 /// One model: what a person selects when they pick what to talk to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelRow {
@@ -316,7 +328,7 @@ impl ProvidersView {
         match panel.tab {
             Tab::Accounts => {
                 for (i, a) in self.accounts.iter().enumerate() {
-                    if hit(&[&a.id, &a.label, &a.protocol]) {
+                    if hit(&[&a.id, &a.label, &a.protocol, a.endpoint_host()]) {
                         out.push(Listed::Account(i));
                     }
                 }
@@ -546,6 +558,8 @@ pub struct AccountForm {
     /// Whether the protocol may be moved. A legacy entry's wire and a managed
     /// account's are not this panel's to change.
     pub locked: bool,
+    pub preset: Option<String>,
+    pub advanced: bool,
 }
 
 impl AccountForm {
@@ -565,6 +579,8 @@ impl AccountForm {
             focus: AccountField::Name,
             caret: 0,
             locked: false,
+            preset: None,
+            advanced: true,
         }
     }
 
@@ -602,7 +618,26 @@ impl AccountForm {
             },
             caret: if locked { endpoint_len } else { 0 },
             locked,
+            preset: None,
+            advanced: true,
         }
+    }
+
+    /// Connecting a catalog offer is an add, with its vendor identity intact.
+    pub fn connect(view: &ProvidersView, row: &AccountRow) -> Self {
+        let mut form = Self::edit(view, row);
+        form.editing = None;
+        form.name = row.id.clone();
+        form.preset = Some(row.id.clone());
+        form.advanced = false;
+        form.locked = false;
+        form.focus = if form.needs_key(view) {
+            AccountField::Key
+        } else {
+            AccountField::Endpoint
+        };
+        form.caret = 0;
+        form
     }
 
     /// The fields this form actually has, in the order Tab walks them.
@@ -612,6 +647,13 @@ impl AccountForm {
     /// would disagree the first time a field grew a condition.
     pub fn fields(&self, view: &ProvidersView) -> Vec<AccountField> {
         let mut out = Vec::new();
+        if !self.advanced {
+            return if self.needs_key(view) {
+                vec![AccountField::Key]
+            } else {
+                vec![AccountField::Endpoint]
+            };
+        }
         if self.editing.is_none() {
             out.push(AccountField::Name);
         }
@@ -667,6 +709,7 @@ impl AccountForm {
     /// protocol suggested: a person who typed their own endpoint and then
     /// cycled the protocol to see what else is on offer must not find it gone.
     fn cycle_protocol(&mut self, view: &ProvidersView, forward: bool) {
+        self.preset = None;
         let protocols = view.protocols();
         if protocols.is_empty() {
             return;
@@ -814,12 +857,25 @@ pub struct ModelForm {
     /// Picking the model from what the endpoint lists (Ctrl+F on the model
     /// field), instead of typing it. `None` is the form as usual.
     pub picking: Option<Picking>,
+    pub advanced: bool,
+    pub connecting: bool,
+    pub discovery_id: u64,
+    pub discovery_error: Option<String>,
+    pub known_levels: Option<Vec<String>>,
+    pub discovered_model: Option<String>,
+    pub name: Option<String>,
+    pub max_tokens: Option<usize>,
 }
 
 /// One model the account's endpoint lists, as the picker shows it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Discovered {
     pub id: String,
+    pub name: Option<String>,
+    pub max_tokens: Option<usize>,
+    pub vision: Option<bool>,
+    pub effort: Option<String>,
+    pub levels: Option<Vec<String>>,
     /// The context window the listing gave, when it gave one.
     pub window: Option<usize>,
 }
@@ -843,7 +899,14 @@ pub fn picked_rows<'a>(items: &'a [Discovered], query: &str) -> Vec<&'a Discover
     let query = query.trim().to_lowercase();
     items
         .iter()
-        .filter(|item| query.is_empty() || item.id.to_lowercase().contains(&query))
+        .filter(|item| {
+            query.is_empty()
+                || item.id.to_lowercase().contains(&query)
+                || item
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.to_lowercase().contains(&query))
+        })
         .collect()
 }
 
@@ -873,7 +936,24 @@ impl ModelForm {
             focus: ModelField::Account,
             caret: 0,
             picking: None,
+            advanced: true,
+            connecting: false,
+            discovery_id: 0,
+            discovery_error: None,
+            known_levels: None,
+            discovered_model: None,
+            name: None,
+            max_tokens: None,
         })
+    }
+
+    pub fn start_discovery(&mut self) {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        self.discovery_error = None;
+        self.discovery_id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.picking = Some(Picking::Loading {
+            account: self.account_id().to_string(),
+        });
     }
 
     /// An edit form filled from a row. `None` for a row whose account is gone.
@@ -901,14 +981,39 @@ impl ModelForm {
             caret: row.model.len(),
             focus: ModelField::Model,
             picking: None,
+            advanced: true,
+            connecting: false,
+            discovery_id: 0,
+            discovery_error: None,
+            known_levels: None,
+            discovered_model: None,
+            name: None,
+            max_tokens: None,
         })
     }
 
     /// Take a row the picker offered: its id in the model field, and the
-    /// context window its listing gave — on a preset when it is one, as typed
-    /// otherwise. Nothing else is touched; the rest is the person's to set.
-    pub fn take_discovered(&mut self, item: &Discovered) {
+    /// context and capability metadata it actually declared. Missing fields
+    /// stay unknown; capabilities from a previous pick are never inherited.
+    pub fn take_discovered(&mut self, view: &ProvidersView, item: &Discovered) {
         self.model = item.id.clone();
+        self.discovered_model = Some(item.id.clone());
+        self.name = item.name.clone();
+        self.max_tokens = item.max_tokens;
+        self.vision = item.vision;
+        self.effort = item.effort.clone();
+        self.known_levels = item.levels.clone();
+        self.levels = view
+            .efforts()
+            .iter()
+            .map(|level| {
+                item.levels
+                    .as_ref()
+                    .is_some_and(|levels| levels.contains(level))
+            })
+            .collect();
+        self.window = None;
+        self.window_typed = None;
         self.caret = self.model.len();
         self.focus = ModelField::Model;
         if let Some(window) = item.window {
@@ -922,6 +1027,20 @@ impl ModelForm {
         self.picking = None;
     }
 
+    fn clear_discovered(&mut self) {
+        if self.discovered_model.take().is_none() {
+            return;
+        }
+        self.name = None;
+        self.max_tokens = None;
+        self.vision = None;
+        self.effort = None;
+        self.known_levels = None;
+        self.levels.fill(false);
+        self.window = None;
+        self.window_typed = None;
+    }
+
     pub fn account_id(&self) -> &str {
         self.accounts
             .get(self.account)
@@ -933,12 +1052,25 @@ impl ModelForm {
     /// account that has none stored yet.
     pub fn needs_key(&self, view: &ProvidersView) -> bool {
         self.editing.is_none()
-            && view
-                .account(self.account_id())
-                .is_some_and(|a| !a.has_key && !a.managed)
+            && view.account(self.account_id()).is_some_and(|a| {
+                !a.has_key
+                    && !a.managed
+                    && view
+                        .protocols()
+                        .iter()
+                        .find(|protocol| protocol.label == a.protocol)
+                        .is_none_or(|protocol| protocol.needs_key)
+            })
     }
 
     pub fn fields(&self, view: &ProvidersView) -> Vec<ModelField> {
+        if !self.advanced {
+            return if self.needs_key(view) {
+                vec![ModelField::Key, ModelField::Model]
+            } else {
+                vec![ModelField::Model]
+            };
+        }
         let mut out = Vec::new();
         if self.editing.is_none() {
             out.push(ModelField::Account);
@@ -953,7 +1085,9 @@ impl ModelForm {
             out.push(ModelField::Levels);
         }
         out.push(ModelField::Window);
-        out.push(ModelField::Default);
+        if !self.connecting {
+            out.push(ModelField::Default);
+        }
         out
     }
 
@@ -1082,7 +1216,13 @@ impl ModelForm {
     /// Off, then each level this build offers, then round.
     fn cycle_effort(&mut self, view: &ProvidersView, forward: bool) {
         let mut ring: Vec<Option<String>> = vec![None];
-        ring.extend(view.efforts().iter().cloned().map(Some));
+        ring.extend(
+            view.efforts()
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| self.known_levels.is_none() || self.levels.get(*i) == Some(&true))
+                .map(|(_, level)| Some(level.clone())),
+        );
         if ring.len() < 2 {
             return;
         }
@@ -1104,9 +1244,23 @@ impl ModelForm {
         }
     }
 
+    pub fn declared_efforts(&self, view: &ProvidersView) -> Vec<String> {
+        self.declared_levels(view).unwrap_or_default()
+    }
+
     /// The levels to persist: `None` when every level is on, which is what
     /// "unrestricted" means and what a list of all of them would only pin.
     fn declared_levels(&self, view: &ProvidersView) -> Option<Vec<String>> {
+        if let Some(known) = &self.known_levels {
+            if view
+                .efforts()
+                .iter()
+                .zip(&self.levels)
+                .all(|(level, on)| *on == known.contains(level))
+            {
+                return Some(known.clone());
+            }
+        }
         if self.levels.iter().all(|on| *on) || self.levels.iter().all(|on| !*on) {
             return None;
         }
@@ -1235,10 +1389,13 @@ impl std::fmt::Debug for AccountDraft {
 }
 
 /// What a person typed into a model form, on its way to the port.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct ModelDraft {
     pub account: String,
     pub model: String,
+    pub name: Option<String>,
+    pub max_tokens: Option<usize>,
+    pub use_now: bool,
     /// `None` leaves it to whatever this protocol usually holds.
     pub window: Option<usize>,
     pub vision: Option<bool>,
@@ -1256,6 +1413,9 @@ impl std::fmt::Debug for ModelDraft {
         f.debug_struct("ModelDraft")
             .field("account", &self.account)
             .field("model", &self.model)
+            .field("name", &self.name)
+            .field("max_tokens", &self.max_tokens)
+            .field("use_now", &self.use_now)
             .field("window", &self.window)
             .field("vision", &self.vision)
             .field("effort", &self.effort)
@@ -1414,10 +1574,27 @@ fn list_key(view: &ProvidersView, panel: &mut Panel, secret: &mut String, press:
                 let Some(row) = view.accounts().get(i) else {
                     return Step::Stay;
                 };
+                if !row.configured {
+                    secret.clear();
+                    panel.form = Some(Form::Account(AccountForm::connect(view, row)));
+                    return Step::Stay;
+                }
                 panel.tab = Tab::Models;
                 panel.drill = Some(row.id.clone());
                 panel.query.clear();
                 panel.cursor = 0;
+                if row.models == 0 && !row.managed {
+                    if let Some(mut form) = ModelForm::add(view, Some(&row.id)) {
+                        form.connecting = true;
+                        form.advanced = false;
+                        form.focus = ModelField::Model;
+                        form.start_discovery();
+                        panel.form = Some(Form::Model(form));
+                        return Step::Discover {
+                            account: row.id.clone(),
+                        };
+                    }
+                }
                 Step::Stay
             }
             Some(Listed::Model(i)) => match view.models().get(i) {
@@ -1498,7 +1675,13 @@ fn begin_edit(view: &ProvidersView, panel: &mut Panel, secret: &mut String, at: 
             .accounts()
             .get(i)
             .filter(|row| !row.managed)
-            .map(|row| Form::Account(AccountForm::edit(view, row))),
+            .map(|row| {
+                Form::Account(if row.configured {
+                    AccountForm::edit(view, row)
+                } else {
+                    AccountForm::connect(view, row)
+                })
+            }),
         Some(Listed::Model(i)) => view
             .models()
             .get(i)
@@ -1552,10 +1735,20 @@ fn account_key(
     secret: &mut String,
     press: KeyPress,
 ) -> Step {
+    let previous_protocol = form.protocol;
     match (press.key, press.mods) {
         (Key::Esc, _) | (Key::Char('c'), Mods::CTRL) => {
             leave_form(panel, secret);
             return Step::Stay;
+        }
+        (Key::Char('o'), Mods::CTRL) => {
+            form.advanced = !form.advanced;
+            form.focus = form
+                .fields(view)
+                .first()
+                .copied()
+                .unwrap_or(AccountField::Key);
+            form.caret = form.focused_len();
         }
         (Key::Enter, _) => return save_account(view, panel, &form, secret),
         (Key::Tab, _) | (Key::Down, _) => form.step_focus(view, true),
@@ -1604,6 +1797,10 @@ fn account_key(
         }
         _ => {}
     }
+    if form.protocol != previous_protocol {
+        secret.clear();
+        form.key_len = 0;
+    }
     panel.form = Some(Form::Account(form));
     Step::Stay
 }
@@ -1636,10 +1833,17 @@ fn save_account(
         panel.form = Some(Form::Account(form));
         return Step::Stay;
     }
-    let key = (!secret.trim().is_empty()).then(|| secret.trim().to_string());
+    if form.editing.is_none() && form.needs_key(view) && secret.trim().is_empty() {
+        let mut form = form.clone();
+        form.focus = AccountField::Key;
+        panel.form = Some(Form::Account(form));
+        return Step::Stay;
+    }
+    let key =
+        (form.needs_key(view) && !secret.trim().is_empty()).then(|| secret.trim().to_string());
     let draft = AccountDraft {
         name,
-        protocol: protocol.id.clone(),
+        protocol: form.preset.clone().unwrap_or_else(|| protocol.id.clone()),
         endpoint,
         key,
     };
@@ -1656,10 +1860,11 @@ fn model_key(
     press: KeyPress,
 ) -> Step {
     if form.picking.is_some() {
-        picker_key(&mut form, press);
+        picker_key(view, &mut form, press);
         panel.form = Some(Form::Model(form));
         return Step::Stay;
     }
+    let previous = (form.account_id().to_string(), form.model.clone());
     match (press.key, press.mods) {
         (Key::Esc, _) | (Key::Char('c'), Mods::CTRL) => {
             leave_form(panel, secret);
@@ -1674,11 +1879,18 @@ fn model_key(
             if account.is_empty() {
                 return Step::Stay;
             }
-            form.picking = Some(Picking::Loading {
-                account: account.clone(),
-            });
+            form.start_discovery();
             panel.form = Some(Form::Model(form));
             return Step::Discover { account };
+        }
+        (Key::Char('o'), Mods::CTRL) => {
+            form.advanced = !form.advanced;
+            form.focus = ModelField::Model;
+            form.caret = form.model.len();
+        }
+        (Key::Char('s'), Mods::CTRL) if form.connecting => {
+            form.connecting = false;
+            return save_model(view, panel, &form, secret);
         }
         (Key::Enter, _) => return save_model(view, panel, &form, secret),
         (Key::Tab, _) | (Key::Down, _) => form.step_focus(view, true),
@@ -1762,13 +1974,20 @@ fn model_key(
         }
         _ => {}
     }
+    if previous.0 != form.account_id() {
+        secret.clear();
+        form.key_len = 0;
+    }
+    if previous != (form.account_id().to_string(), form.model.clone()) {
+        form.clear_discovered();
+    }
     panel.form = Some(Form::Model(form));
     Step::Stay
 }
 
 /// A key while the picker is up: arrows walk it, typing filters it, Enter
 /// takes the row, Esc puts it away — and the form under it is as it was.
-fn picker_key(form: &mut ModelForm, press: KeyPress) {
+fn picker_key(view: &ProvidersView, form: &mut ModelForm, press: KeyPress) {
     let Some(picking) = form.picking.as_mut() else {
         return;
     };
@@ -1803,7 +2022,7 @@ fn picker_key(form: &mut ModelForm, press: KeyPress) {
             else {
                 return;
             };
-            form.take_discovered(&item);
+            form.take_discovered(view, &item);
         }
         _ => {}
     }
@@ -1832,6 +2051,7 @@ pub fn discovered(
         Ok(items) => items,
         Err(why) => {
             form.picking = None;
+            form.discovery_error = Some(why.clone());
             return Some(why);
         }
     };
@@ -1893,6 +2113,9 @@ fn save_model(
     let draft = ModelDraft {
         account,
         model,
+        name: form.name.clone(),
+        max_tokens: form.max_tokens,
+        use_now: form.connecting,
         window,
         vision: form.vision,
         effort: form.effort.clone(),
@@ -1968,12 +2191,16 @@ pub fn paste(panel: &mut Panel, secret: &mut String, text: &str) -> bool {
                 }
                 return form.window_typed != before;
             }
+            let model_field = form.focus == ModelField::Model;
             let Some((field, caret)) = form.text_and_caret() else {
                 return false;
             };
             let at = snap(field, *caret);
             field.insert_str(at, &line);
             *caret = at + line.len();
+            if model_field {
+                form.clear_discovered();
+            }
             true
         }
         // No form: the list's own box is a filter, and pasting into a filter is
@@ -2897,11 +3124,143 @@ mod tests {
         assert_eq!(parse_window("inf"), None);
     }
 
+    #[test]
+    fn changing_a_target_never_reuses_the_previous_targets_typed_key() {
+        let mut view = view();
+        let mut form = AccountForm::add(&view);
+        form.name = "local".into();
+        form.focus = AccountField::Protocol;
+        form.key_len = 10;
+        let mut panel = Panel {
+            form: Some(Form::Account(form)),
+            ..Panel::new()
+        };
+        let mut secret = "sk-private".to_string();
+        key(&view, &mut panel, &mut secret, press(Key::Right)); // switch to keyless Ollama
+        assert!(secret.is_empty());
+        let Step::SaveAccount { draft, .. } =
+            key(&view, &mut panel, &mut secret, press(Key::Enter))
+        else {
+            panic!("save local");
+        };
+        assert_eq!(draft.protocol, "ollama");
+        assert_eq!(draft.key, None);
+
+        for account in Arc::make_mut(&mut view.accounts) {
+            account.has_key = false;
+        }
+        let mut form = ModelForm::add(&view, Some("deepseek")).unwrap();
+        form.focus = ModelField::Account;
+        form.key_len = 10;
+        panel.form = Some(Form::Model(form));
+        secret = "sk-private".into();
+        key(&view, &mut panel, &mut secret, press(Key::Right)); // another account
+        assert!(secret.is_empty());
+        let Some(Form::Model(form)) = panel.form.as_mut() else {
+            panic!("model form");
+        };
+        assert_eq!(form.account_id(), "local");
+        assert_eq!(form.key_len, 0);
+        form.advanced = false;
+        assert_eq!(form.fields(&view), vec![ModelField::Key, ModelField::Model]);
+        Arc::make_mut(&mut view.accounts)[1].protocol = "Ollama".into();
+        assert_eq!(
+            form.fields(&view),
+            vec![ModelField::Model],
+            "local models do not ask for a credential"
+        );
+    }
+
+    #[test]
+    fn connecting_a_preset_only_requires_the_key_and_preserves_the_vendor() {
+        let view = view();
+        let mut offer = account("deepseek", 0);
+        offer.configured = false;
+        offer.has_key = false;
+        let form = AccountForm::connect(&view, &offer);
+        assert_eq!(form.fields(&view), vec![AccountField::Key]);
+        assert_eq!(form.focus, AccountField::Key);
+        assert_eq!(form.editing, None);
+        let mut panel = Panel {
+            form: Some(Form::Account(form)),
+            ..Panel::new()
+        };
+        let mut secret = String::new();
+        assert_eq!(
+            key(&view, &mut panel, &mut secret, press(Key::Enter)),
+            Step::Stay
+        );
+        assert!(paste(&mut panel, &mut secret, "sk-private"));
+        assert!(!format!("{panel:?}").contains("sk-private"));
+        let Step::SaveAccount { id, draft } =
+            key(&view, &mut panel, &mut secret, press(Key::Enter))
+        else {
+            panic!("connect");
+        };
+        assert_eq!(id, None);
+        assert_eq!(draft.name, "deepseek");
+        assert_eq!(draft.protocol, "deepseek");
+        assert_eq!(draft.key.as_deref(), Some("sk-private"));
+        assert!(secret.is_empty());
+    }
+
+    #[test]
+    fn discovery_populates_a_compact_confirmation_and_does_not_leak_to_another_model() {
+        let view = view();
+        let mut form = ModelForm::add(&view, Some("local")).unwrap();
+        form.connecting = true;
+        form.advanced = false;
+        let item = Discovered {
+            id: "flash".into(),
+            name: Some("Flash".into()),
+            window: Some(1048576),
+            max_tokens: Some(393216),
+            vision: Some(true),
+            effort: Some("high".into()),
+            levels: Some(vec!["low".into(), "high".into(), "max".into()]),
+        };
+        form.take_discovered(&view, &item);
+        assert_eq!(form.fields(&view), vec![ModelField::Model]);
+        let mut panel = Panel {
+            form: Some(Form::Model(form.clone())),
+            ..Panel::new()
+        };
+        let mut secret = String::new();
+        let Step::SaveModel { draft, .. } = key(&view, &mut panel, &mut secret, press(Key::Enter))
+        else {
+            panic!("save");
+        };
+        assert_eq!(draft.window, Some(1048576));
+        assert_eq!(draft.max_tokens, Some(393216));
+        assert_eq!(draft.vision, Some(true));
+        assert_eq!(draft.effort.as_deref(), Some("high"));
+        assert_eq!(
+            draft.levels,
+            Some(vec!["low".into(), "high".into(), "max".into()])
+        );
+        assert!(draft.use_now);
+        assert!(!draft.default);
+        panel.form = Some(Form::Model(form.clone()));
+        let Step::SaveModel { draft, .. } = key(&view, &mut panel, &mut secret, ctrl('s')) else {
+            panic!("save only");
+        };
+        assert!(!draft.use_now);
+        panel.form = Some(Form::Model(form));
+        paste(&mut panel, &mut secret, "-other");
+        let Some(Form::Model(form)) = &panel.form else {
+            panic!("form");
+        };
+        assert_eq!(form.max_tokens, None);
+        assert_eq!(form.vision, None);
+        assert_eq!(form.window_typed, None);
+    }
+
     fn listed(ids: &[(&str, Option<usize>)]) -> Vec<Discovered> {
         ids.iter()
             .map(|(id, window)| Discovered {
                 id: (*id).into(),
                 window: *window,
+                ..Default::default()
             })
             .collect()
     }

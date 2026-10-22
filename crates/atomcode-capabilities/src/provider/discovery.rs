@@ -21,7 +21,7 @@ pub const DISCOVERY_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 pub const DISCOVERY_MAX_MODELS: usize = 2_000;
 
 /// One model an endpoint lists, with what it said about it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscoveredModel {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -30,6 +30,12 @@ pub struct DiscoveredModel {
     pub context_window: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_vision: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort_levels: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 /// Everything in one call: the listing of the endpoint at `base_url`, spoken in
@@ -74,6 +80,27 @@ struct OpenAiModelEntry {
     context_length: Option<usize>,
     max_tokens: Option<usize>,
     max_output_tokens: Option<usize>,
+    #[serde(default, deserialize_with = "optional_metadata")]
+    input_modalities: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "optional_metadata")]
+    effort: Option<ModelEffort>,
+}
+
+/// Optional vendor extensions must not invalidate an otherwise usable listing.
+/// Unknown shapes are left unknown, just like omitted metadata.
+fn optional_metadata<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).ok())
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelEffort {
+    supported_levels: Vec<String>,
+    default_level: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -157,7 +184,7 @@ pub fn parse_discovered_models(
                 id,
                 name: None,
                 context_window: None,
-                max_tokens: None,
+                ..Default::default()
             })
             .collect()
     } else {
@@ -167,8 +194,24 @@ pub fn parse_discovered_models(
             .map(|entry| DiscoveredModel {
                 id: entry.id,
                 name: entry.name.or(entry.display_name),
-                context_window: entry.context_window.or(entry.context_length),
-                max_tokens: entry.max_output_tokens.or(entry.max_tokens),
+                context_window: entry
+                    .context_window
+                    .or(entry.context_length)
+                    .filter(|n| *n > 0),
+                max_tokens: entry
+                    .max_output_tokens
+                    .or(entry.max_tokens)
+                    .filter(|n| *n > 0),
+                supports_vision: entry
+                    .input_modalities
+                    .as_ref()
+                    .map(|m| m.iter().any(|m| m == "image")),
+                reasoning_effort: entry.effort.as_ref().and_then(|e| {
+                    e.default_level
+                        .clone()
+                        .filter(|v| e.supported_levels.contains(v))
+                }),
+                reasoning_effort_levels: entry.effort.map(|e| e.supported_levels),
             })
             .collect()
     };
@@ -296,4 +339,77 @@ pub fn normalize_discovered_models(mut models: Vec<DiscoveredModel>) -> Vec<Disc
     models.dedup_by(|a, b| a.id == b.id);
     models.truncate(DISCOVERY_MAX_MODELS);
     models
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+
+    #[test]
+    fn a_rich_listing_declares_capabilities_without_model_name_heuristics() {
+        let models = parse_discovered_models(
+            "openai",
+            br#"{"data":[
+            {"id":"vendor/arbitrary-name","name":"Flash","context_window":1048576,
+             "max_output_tokens":393216,"input_modalities":["text","image"],
+             "effort":{"supported_levels":["low","high","max"],"default_level":"high"}},
+            {"id":"text-only","input_modalities":["text"]},
+            {"id":"unknown"}
+        ]}"#,
+        )
+        .unwrap();
+        let rich = models
+            .iter()
+            .find(|m| m.id == "vendor/arbitrary-name")
+            .unwrap();
+        assert_eq!(rich.context_window, Some(1048576));
+        assert_eq!(rich.max_tokens, Some(393216));
+        assert_eq!(rich.supports_vision, Some(true));
+        assert_eq!(rich.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(
+            rich.reasoning_effort_levels.as_deref(),
+            Some(["low".into(), "high".into(), "max".into()].as_slice())
+        );
+        assert_eq!(
+            models
+                .iter()
+                .find(|m| m.id == "text-only")
+                .unwrap()
+                .supports_vision,
+            Some(false)
+        );
+        let unknown = models.iter().find(|m| m.id == "unknown").unwrap();
+        assert_eq!(unknown.supports_vision, None);
+        assert_eq!(unknown.reasoning_effort_levels, None);
+    }
+
+    #[test]
+    fn unrecognised_optional_metadata_does_not_hide_the_model_list() {
+        let models = parse_discovered_models(
+            "openai",
+            br#"{"data":[
+            {"id":"a","input_modalities":"text","effort":"high"},
+            {"id":"b","input_modalities":["image"],"effort":{"default_level":"high"}},
+            {"id":"c","effort":{"supported_levels":["low"],"default_level":"low"}}
+        ]}"#,
+        )
+        .unwrap();
+        assert_eq!(models.len(), 3);
+        assert_eq!(models[0].supports_vision, None);
+        assert_eq!(models[0].reasoning_effort_levels, None);
+        assert_eq!(models[1].supports_vision, Some(true));
+        assert_eq!(models[1].reasoning_effort, None);
+        assert_eq!(models[2].reasoning_effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn an_invalid_default_is_not_advertised_as_a_supported_effort() {
+        let models = parse_discovered_models(
+            "openai",
+            br#"{"data":[{"id":"x",
+            "effort":{"supported_levels":["low"],"default_level":"max"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(models[0].reasoning_effort, None);
+    }
 }

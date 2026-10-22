@@ -319,6 +319,17 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "This protocol has no model listing; type the model id by hand.".into()
         }
         Msg::ProviderDiscovering => "Fetching the model list from the endpoint… (Esc to cancel)".into(),
+        Msg::ProviderAdvanced => "advanced settings".into(),
+        Msg::ProviderContinue => "continue".into(),
+        Msg::ProviderConnectUse => "connect and use".into(),
+        Msg::ProviderSaveOnly => "save only".into(),
+        Msg::ProviderConnected => "connected".into(),
+        Msg::ProviderAvailable => "add a connection".into(),
+        Msg::ProviderCapabilitiesUnknown => "capabilities not declared".into(),
+        Msg::ProviderOutputLimit => "max output".into(),
+        Msg::ProviderSavedSwitchFailed { id, error } => format!("Saved {id}, but could not start switching: {error}. Retry from the model list.").into(),
+        Msg::ProviderSavedSwitching { id } => format!("Saved {id}; switching…").into(),
+        Msg::ProviderConnectTitle { id } => format!("connect {id}").into(),
         Msg::ProviderDiscoverHint => "fetch from the endpoint".into(),
         Msg::ProviderPickKeys => "↑↓ pick · Enter fill in · Esc back · type to filter".into(),
         Msg::ProviderPickFilter { query } => format!("filter: {query}").into(),

@@ -1894,6 +1894,7 @@ mod tests {
             name: None,
             context_window: None,
             max_tokens: None,
+            ..Default::default()
         };
         let normalized =
             normalize_discovered_models(vec![model("z"), model(""), model("a"), model("z")]);

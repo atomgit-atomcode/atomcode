@@ -364,9 +364,9 @@ impl Providers for ConfigProviders {
                 account: &draft.account,
                 model: &draft.model,
                 id: None,
-                display_name: None,
+                display_name: draft.name.as_deref(),
                 window: draft.window,
-                max_tokens: None,
+                max_tokens: draft.max_tokens,
                 vision: draft.vision,
                 effort: draft.effort.as_deref(),
                 levels: draft.levels.as_deref(),
@@ -389,7 +389,7 @@ impl Providers for ConfigProviders {
                     effort: Edit::from_option(draft.effort.as_deref()),
                     levels: Edit::from_option(draft.levels.as_deref()),
                     display_name: Edit::Keep,
-                    max_tokens: Edit::Keep,
+                    max_tokens: draft.max_tokens.map(Edit::Set).unwrap_or(Edit::Keep),
                     reasoning_history: Edit::Keep,
                     default: draft.default,
                 },
@@ -432,6 +432,11 @@ impl Providers for ConfigProviders {
                         .map(|model| atomcode_tui::providers::Discovered {
                             id: model.id,
                             window: model.context_window,
+                            name: model.name,
+                            max_tokens: model.max_tokens,
+                            vision: model.supports_vision,
+                            effort: model.reasoning_effort,
+                            levels: model.reasoning_effort_levels,
                         })
                         .collect()
                 })
@@ -635,6 +640,39 @@ rank = 2
 
     fn text(path: &PathBuf) -> String {
         std::fs::read_to_string(path).expect("the file is there")
+    }
+
+    #[test]
+    fn configured_accounts_precede_the_prioritised_vendor_offers() {
+        let (port, _) = port("preset-priority");
+        let rows = port.rows();
+        assert_eq!(rows.accounts()[0].id, "mine");
+        assert!(rows.accounts()[0].configured);
+        let offers = rows
+            .accounts()
+            .iter()
+            .filter(|row| !row.configured)
+            .map(|row| row.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &offers[..14],
+            &[
+                "deepseek",
+                "zhipu",
+                "zhipu-coding",
+                "openrouter",
+                "taotoken",
+                "minimax",
+                "minimax-token-plan",
+                "moonshot",
+                "aliyun",
+                "xiaomi-mimo",
+                "longcat",
+                "volcengine",
+                "volcengine-coding",
+                "siliconflow",
+            ]
+        );
     }
 
     /// The bug this module was written to end: `/provider` used to read
@@ -982,6 +1020,36 @@ rank = 2
     }
 
     #[test]
+    fn discovered_capabilities_are_persisted_together_without_setting_a_new_default() {
+        let (port, path) = port("discovered-capabilities");
+        let id = port
+            .add_model(&ModelDraft {
+                account: "mine".into(),
+                model: "flash".into(),
+                name: Some("Flash".into()),
+                window: Some(1048576),
+                max_tokens: Some(393216),
+                vision: Some(true),
+                effort: Some("high".into()),
+                levels: Some(vec!["low".into(), "high".into(), "max".into()]),
+                use_now: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let config = Config::load(&path).unwrap();
+        let model = &config.models[&id];
+        assert_eq!(model.context_window, 1048576);
+        assert_eq!(model.max_tokens, Some(393216));
+        assert_eq!(model.supports_vision, Some(true));
+        assert_eq!(model.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(model.display_name.as_deref(), Some("Flash"));
+        assert_eq!(
+            config.effective_model_selection().as_deref(),
+            Some("mine/a")
+        );
+    }
+
+    #[test]
     fn adding_a_model_names_it_after_its_account_and_can_take_the_session_with_it() {
         let (port, path) = port("add-model");
         let id = port
@@ -994,6 +1062,7 @@ rank = 2
                 levels: Some(vec!["low".into(), "high".into()]),
                 default: true,
                 key: None,
+                ..Default::default()
             })
             .expect("it writes");
         assert_eq!(id, "mine/c");
@@ -1013,11 +1082,14 @@ rank = 2
     #[test]
     fn adding_a_model_to_an_offer_configures_its_account_too() {
         let (port, path) = port("materialise");
+        // The fixture also has a legacy DeepSeek account. Its catalog offer
+        // is not a new account, regardless of where display priority puts it.
+        let existing = port.load().logical_accounts();
         let offer = port
             .rows()
             .accounts()
             .iter()
-            .find(|a| !a.configured)
+            .find(|a| !a.configured && !existing.contains_key(&a.id))
             .map(|a| a.id.clone())
             .expect("there is an offer");
         port.add_model(&ModelDraft {
@@ -1029,6 +1101,7 @@ rank = 2
             levels: None,
             default: false,
             key: Some("sk-offer".into()),
+            ..Default::default()
         })
         .expect("it writes");
         let out = text(&path);
@@ -1058,6 +1131,7 @@ rank = 2
             levels: None,
             default: true,
             key: None,
+            ..Default::default()
         })
         .expect("it writes");
         let out = text(&path);
@@ -1079,6 +1153,7 @@ rank = 2
                 levels: None,
                 default: false,
                 key: None,
+                ..Default::default()
             },
         )
         .expect("it writes");
@@ -1110,6 +1185,7 @@ rank = 2
                     levels: None,
                     default: false,
                     key: None,
+                    ..Default::default()
                 },
             )
             .is_err());

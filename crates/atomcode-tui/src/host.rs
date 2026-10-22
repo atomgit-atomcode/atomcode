@@ -3386,18 +3386,73 @@ impl Host {
         true
     }
 
-    /// What an endpoint listed for the providers panel's picker — see
-    /// [`crate::providers::discovered`]. Answers what to tell the person when
-    /// there is nothing to pick.
+    /// Start model selection immediately after saving a new connection.
+    pub fn connect_provider_models(&self, account: &str) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let view = m.providers.clone();
+        if !view
+            .account(account)
+            .is_some_and(|row| row.configured && !row.managed)
+        {
+            return false;
+        }
+        let Some(panel) = m.providers_panel.as_mut() else {
+            return false;
+        };
+        let Some(mut form) = crate::providers::ModelForm::add(&view, Some(account)) else {
+            return false;
+        };
+        form.connecting = true;
+        form.advanced = false;
+        form.focus = crate::providers::ModelField::Model;
+        form.start_discovery();
+        panel.form = Some(crate::providers::Form::Model(form));
+        true
+    }
+
+    pub fn provider_discovery_id(&self) -> Option<u64> {
+        let m = self.moment.read().expect("moment poisoned");
+        match m.providers_panel.as_ref()?.form.as_ref()? {
+            crate::providers::Form::Model(form) if form.picking.is_some() => {
+                Some(form.discovery_id)
+            }
+            _ => None,
+        }
+    }
+
+    /// A cancelled request cannot fill a replacement picker, even for the same account.
     pub fn providers_discovered(
         &self,
         account: &str,
+        request: u64,
         listed: Result<Vec<crate::providers::Discovered>, String>,
     ) -> Option<String> {
         let mut m = self.moment.write().expect("moment poisoned");
         let view = m.providers.clone();
         let panel = m.providers_panel.as_mut()?;
+        if !matches!(&panel.form, Some(crate::providers::Form::Model(form)) if form.discovery_id == request)
+        {
+            return None;
+        }
         crate::providers::discovered(&view, panel, account, listed)
+    }
+
+    /// Restore an unsuccessful write without asking the person to type again.
+    pub fn restore_provider_form(&self, mut panel: crate::providers::Panel, key: Option<String>) {
+        let count = key.as_deref().unwrap_or_default().chars().count();
+        match panel.form.as_mut() {
+            Some(crate::providers::Form::Account(form)) => form.key_len = count,
+            Some(crate::providers::Form::Model(form)) => form.key_len = count,
+            None => {}
+        }
+        let mut m = self.moment.write().expect("moment poisoned");
+        if m.providers_panel.is_some() {
+            m.providers_panel = Some(panel);
+            *self
+                .providers_secret
+                .lock()
+                .expect("provider secret poisoned") = key.unwrap_or_default();
+        }
     }
 
     /// Run one key against the providers panel: the panel it writes back, and
@@ -3454,6 +3509,27 @@ impl Host {
             return false;
         }
         let mut m = self.moment.write().expect("moment poisoned");
+        if let Some(crate::providers::Form::Model(form)) = m
+            .providers_panel
+            .as_mut()
+            .and_then(|panel| panel.form.as_mut())
+        {
+            if let Some(crate::providers::Picking::Ready {
+                items,
+                query,
+                cursor,
+            }) = form.picking.as_mut()
+            {
+                let rows = crate::providers::picked_rows(items, query).len();
+                *cursor = if by < 0 {
+                    cursor.saturating_sub(by.unsigned_abs() as usize)
+                } else {
+                    cursor.saturating_add(by as usize)
+                }
+                .min(rows.saturating_sub(1));
+                return true;
+            }
+        }
         let rows = match m.providers_panel.as_ref() {
             // A form has no list to walk, and a wheel over it must not scroll
             // the conversation behind it either — it is still the panel's.
@@ -3514,7 +3590,14 @@ impl Host {
         let view = m.providers.clone();
         match m.providers_panel.as_mut() {
             Some(panel) => {
-                let moved = panel.show(tab);
+                let closed_form = panel.form.take().is_some();
+                if closed_form {
+                    self.providers_secret
+                        .lock()
+                        .expect("provider secret poisoned")
+                        .clear();
+                }
+                let moved = panel.show(tab) || closed_form;
                 view.settle_cursor(panel);
                 moved
             }
@@ -3581,6 +3664,27 @@ impl Host {
     /// Point the panel at a listed row. True when it moved.
     pub fn point_providers_at(&self, row: usize) -> bool {
         let mut m = self.moment.write().expect("moment poisoned");
+        if let Some(crate::providers::Form::Model(form)) = m
+            .providers_panel
+            .as_mut()
+            .and_then(|panel| panel.form.as_mut())
+        {
+            if let Some(crate::providers::Picking::Ready {
+                items,
+                query,
+                cursor,
+            }) = form.picking.as_mut()
+            {
+                let want = row.min(
+                    crate::providers::picked_rows(items, query)
+                        .len()
+                        .saturating_sub(1),
+                );
+                let changed = *cursor != want;
+                *cursor = want;
+                return changed;
+            }
+        }
         let rows = match m.providers_panel.as_ref() {
             Some(panel) => m.providers.listed(panel).len(),
             None => return false,

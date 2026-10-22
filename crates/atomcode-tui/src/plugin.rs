@@ -3750,14 +3750,42 @@ impl Tui {
     ///
     /// **True when a frame is owed.**
     fn run_providers_key(&self, press: crate::surface::KeyPress) -> bool {
+        let before = if press.key == crate::surface::Key::Enter
+            || press == crate::surface::KeyPress::ctrl('s')
+        {
+            self.host
+                .moment
+                .read()
+                .expect("moment poisoned")
+                .providers_panel
+                .clone()
+        } else {
+            None
+        };
         let (changed, asked) = self.host.providers_key(press);
         let Some(step) = asked else {
             return changed;
         };
+        let key = match &step {
+            crate::providers::Step::SaveAccount { draft, .. } => draft.key.clone(),
+            crate::providers::Step::SaveModel { draft, .. } => draft.key.clone(),
+            _ => None,
+        };
+        let is_write = matches!(
+            &step,
+            crate::providers::Step::SaveAccount { .. } | crate::providers::Step::SaveModel { .. }
+        );
         match self.apply_provider_step(step) {
             Ok(Some(said)) => self.host.say(&said, false),
             Ok(None) => {}
-            Err(why) => self.host.say(&why, true),
+            Err(why) => {
+                if is_write {
+                    if let Some(panel) = before {
+                        self.host.restore_provider_form(panel, key);
+                    }
+                }
+                self.host.say(&why, true);
+            }
         }
         self.refresh_providers();
         true
@@ -3770,13 +3798,10 @@ impl Tui {
     /// screen has no idea what the configuration accepts, which is the whole
     /// reason the port exists.
     ///
-    /// **Writing the file is not making it so.** Every write here changes what
-    /// the agent would be built from, so each one is followed by
-    /// `HostCommand::Reload`, which reads the configuration again and rebuilds
-    /// what changed — the same road the settings panel takes
-    /// (`Tui::reload_if_a_change_needs_it`), and for the same reason: "the file
-    /// changed but the session did not" is the state a person must not be left
-    /// in silently.
+    /// Existing configuration edits request `HostCommand::Reload`. A new
+    /// connection first saves its account without touching the live model;
+    /// selecting a model then uses the existing `/model` command, whose runtime
+    /// result reports activation separately from persistence.
     fn apply_provider_step(&self, step: crate::providers::Step) -> Result<Option<String>, String> {
         use crate::providers::Step;
         // Switching model is not a write at all: it is the gesture `/model <id>`
@@ -3785,17 +3810,18 @@ impl Tui {
         // one layer down rides the same road, as `/effort <level>` — the same
         // line a person would type, in the order they would type them.
         if let Step::Use { id, effort } = &step {
-            let keys = self.wake.lock().expect("wake poisoned").clone();
-            if let Some(keys) = keys {
-                // 一条命令把两件事说完。分两条派发是不行的:换模型那条自己会
-                // 把档位再问一遍(`Action::PickEffort`),面板刚被这一挑选关上
-                // 就又弹回来,永远收不了尾。
-                let line = match effort {
-                    Some(level) => format!("/model {id} {level}"),
-                    None => format!("/model {id}"),
-                };
-                let _ = keys.send(Wake::Chose(Some(line)));
-            }
+            let keys = self
+                .wake
+                .lock()
+                .expect("wake poisoned")
+                .clone()
+                .ok_or_else(|| t(Msg::ScreenNotConnectedProviders).into_owned())?;
+            let line = match effort {
+                Some(level) => format!("/model {id} {level}"),
+                None => format!("/model {id}"),
+            };
+            keys.send(Wake::Chose(Some(line)))
+                .map_err(|_| t(Msg::ScreenNotConnectedProviders).into_owned())?;
             self.host.close_providers();
             return Ok(None);
         }
@@ -3808,9 +3834,13 @@ impl Tui {
         // Listing an endpoint's models writes nothing, so it is not followed by
         // a reload: the answer fills the picker the form put up, off the frame.
         if let Step::Discover { account } = step {
+            let Some(request) = self.host.provider_discovery_id() else {
+                return Ok(None);
+            };
             let Some(listing) = port.discover(&account) else {
                 let said = self.host.providers_discovered(
                     &account,
+                    request,
                     Err(t(Msg::ProviderDiscoverUnsupported).into_owned()),
                 );
                 return said.map_or(Ok(None), Err);
@@ -3819,7 +3849,7 @@ impl Tui {
             let keys = self.wake.lock().expect("wake poisoned").clone();
             tokio::spawn(async move {
                 let listed = listing.await;
-                if let Some(said) = host.providers_discovered(&account, listed) {
+                if let Some(said) = host.providers_discovered(&account, request, listed) {
                     host.say(&said, true);
                 }
                 if let Some(keys) = keys {
@@ -3849,6 +3879,16 @@ impl Tui {
                 // the one thing left to do.
                 self.host.show_providers(port.rows());
                 self.host.walk_into_provider(&id);
+                if self.host.connect_provider_models(&id) {
+                    if let Err(why) = self.apply_provider_step(Step::Discover {
+                        account: id.clone(),
+                    }) {
+                        self.host.say(&why, true);
+                    }
+                    // Saving a new credential does not change the live model.
+                    // The selected model is activated through /model below.
+                    return Ok(Some(t(Msg::ProviderAddedAddModel { id: &id }).into_owned()));
+                }
                 Some(t(Msg::ProviderAddedAddModel { id: &id }).into_owned())
             }
             Step::SaveModel {
@@ -3861,6 +3901,30 @@ impl Tui {
             }
             Step::SaveModel { id: None, draft } => {
                 let id = port.add_model(&draft)?;
+                if draft.use_now {
+                    self.refresh_providers();
+                    // Supply an explicit effort (or default) so /model does not
+                    // ask the person to choose a second time.
+                    if let Err(error) = self.apply_provider_step(Step::Use {
+                        id: id.clone(),
+                        effort: Some(draft.effort.clone().unwrap_or_else(|| "default".into())),
+                    }) {
+                        // The model is already saved. Keep it available to pick
+                        // again instead of restoring an add form that would duplicate it.
+                        self.host.say(
+                            t(Msg::ProviderSavedSwitchFailed {
+                                id: &id,
+                                error: &error,
+                            })
+                            .into_owned(),
+                            true,
+                        );
+                        return Ok(None);
+                    }
+                    return Ok(Some(
+                        t(Msg::ProviderSavedSwitching { id: &id }).into_owned(),
+                    ));
+                }
                 check = Some((draft.account.clone(), Some(id.clone())));
                 Some(t(Msg::ProviderAdded { id: &id }).into_owned())
             }
@@ -12955,7 +13019,231 @@ mod paste_burst_tests {
 mod provider_probe_tests {
     use super::*;
     use crate::providers::{AccountDraft, ModelDraft, ProbeFuture, Providers, ProvidersView, Step};
+    use crate::surface::{Key, KeyPress};
     use atomcode_plexus::{App, ConfigTree, PluginRegistry};
+
+    #[derive(Default)]
+    struct Connects {
+        saved: std::sync::atomic::AtomicBool,
+        fail: std::sync::atomic::AtomicBool,
+        models: std::sync::Mutex<Vec<ModelDraft>>,
+    }
+
+    impl Providers for Connects {
+        fn rows(&self) -> ProvidersView {
+            use crate::providers::{AccountRow, Protocol};
+            let configured = self.saved.load(std::sync::atomic::Ordering::SeqCst);
+            ProvidersView::new(
+                vec![AccountRow {
+                    id: "deepseek".into(),
+                    label: "DeepSeek".into(),
+                    protocol: "OpenAI".into(),
+                    endpoint: "https://api.deepseek.com/v1".into(),
+                    models: 0,
+                    configured,
+                    has_key: configured,
+                    managed: false,
+                }],
+                vec![],
+                vec![Protocol {
+                    id: "openai-compatible".into(),
+                    label: "OpenAI".into(),
+                    endpoint: None,
+                    needs_key: true,
+                }],
+                vec!["low".into(), "high".into(), "max".into()],
+            )
+        }
+        fn add_account(&self, draft: &AccountDraft) -> Result<String, String> {
+            assert_eq!(draft.key.as_deref(), Some("sk-private"));
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("write failed".into());
+            }
+            self.saved.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok("deepseek".into())
+        }
+        fn edit_account(&self, _: &str, _: &AccountDraft) -> Result<(), String> {
+            Ok(())
+        }
+        fn delete_account(&self, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn add_model(&self, draft: &ModelDraft) -> Result<String, String> {
+            self.models.lock().unwrap().push(draft.clone());
+            Ok(format!("deepseek/{}", draft.model))
+        }
+        fn edit_model(&self, _: &str, _: &ModelDraft) -> Result<(), String> {
+            Ok(())
+        }
+        fn delete_model(&self, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn discover(&self, _: &str) -> Option<crate::providers::DiscoverFuture> {
+            Some(Box::pin(async {
+                Ok(vec![crate::providers::Discovered {
+                    id: "flash".into(),
+                    window: Some(1048576),
+                    max_tokens: Some(393216),
+                    vision: Some(true),
+                    effort: Some("high".into()),
+                    levels: Some(vec!["low".into(), "high".into(), "max".into()]),
+                    ..Default::default()
+                }])
+            }))
+        }
+    }
+
+    fn open_connect(host: &Host, port: &Connects) {
+        let mut m = host.moment.write().unwrap();
+        m.providers = port.rows();
+        m.providers_panel = Some(crate::providers::Panel::new());
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_connection_only_needs_a_key_and_a_model_and_sends_one_switch() {
+        let port = Arc::new(Connects::default());
+        let (host, tui, mut woken) = screen_with(port.clone());
+        open_connect(&host, &port);
+        tui.run_providers_key(KeyPress::plain(Key::Enter));
+        assert!(host.providers_paste("sk-private"));
+        tui.run_providers_key(KeyPress::plain(Key::Enter));
+        checked(&mut woken).await;
+        tui.run_providers_key(KeyPress::plain(Key::Enter)); // pick
+        tui.run_providers_key(KeyPress::plain(Key::Enter)); // connect and use
+        let Some(Wake::Chose(Some(line))) = woken.recv().await else {
+            panic!("switch");
+        };
+        assert_eq!(line, "/model deepseek/flash high");
+        assert!(!host.providers_open());
+        let models = port.models.lock().unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].vision, Some(true));
+        assert_eq!(models[0].window, Some(1048576));
+        assert_eq!(models[0].max_tokens, Some(393216));
+        assert_eq!(
+            models[0].levels.as_deref(),
+            Some(["low".into(), "high".into(), "max".into()].as_slice())
+        );
+        assert!(woken.try_recv().is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_failed_connection_write_keeps_the_key_for_retry() {
+        let port = Arc::new(Connects::default());
+        port.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (host, tui, mut woken) = screen_with(port.clone());
+        open_connect(&host, &port);
+        tui.run_providers_key(KeyPress::plain(Key::Enter));
+        host.providers_paste("sk-private");
+        tui.run_providers_key(KeyPress::plain(Key::Enter));
+        assert!(!port.saved.load(std::sync::atomic::Ordering::SeqCst));
+        {
+            let m = host.moment.read().unwrap();
+            let Some(crate::providers::Form::Account(form)) =
+                &m.providers_panel.as_ref().unwrap().form
+            else {
+                panic!("retains form");
+            };
+            assert_eq!(form.key_len, 10);
+            assert!(!format!("{form:?}").contains("sk-private"));
+        }
+        port.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        tui.run_providers_key(KeyPress::plain(Key::Enter));
+        checked(&mut woken).await;
+        assert!(port.saved.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn an_old_listing_cannot_fill_a_new_picker_for_the_same_account() {
+        let port = Arc::new(Connects::default());
+        port.saved.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (host, _, _) = screen_with(port.clone());
+        open_connect(&host, &port);
+        assert!(host.connect_provider_models("deepseek"));
+        let old = host.provider_discovery_id().unwrap();
+        assert!(host.connect_provider_models("deepseek"));
+        let new = host.provider_discovery_id().unwrap();
+        assert_ne!(old, new);
+        host.providers_discovered("deepseek", old, Err("stale".into()));
+        let m = host.moment.read().unwrap();
+        let Some(crate::providers::Form::Model(form)) = &m.providers_panel.as_ref().unwrap().form
+        else {
+            panic!("model");
+        };
+        assert!(matches!(
+            form.picking,
+            Some(crate::providers::Picking::Loading { .. })
+        ));
+        assert_eq!(form.discovery_error, None);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_saved_model_is_kept_when_the_switch_cannot_be_dispatched() {
+        let port = Arc::new(Connects::default());
+        let (host, tui, woken) = screen_with(port.clone());
+        open_connect(&host, &port);
+        drop(woken);
+        assert_eq!(
+            tui.apply_provider_step(Step::SaveModel {
+                id: None,
+                draft: ModelDraft {
+                    account: "deepseek".into(),
+                    model: "flash".into(),
+                    use_now: true,
+                    ..Default::default()
+                }
+            })
+            .unwrap(),
+            None
+        );
+        assert_eq!(port.models.lock().unwrap().len(), 1);
+        assert!(host.providers_open());
+        let m = host.moment.read().unwrap();
+        assert!(m.providers_panel.as_ref().unwrap().form.is_none());
+        assert!(m.notice.as_ref().unwrap().refused);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn clicking_a_discovered_model_picks_that_row_and_changing_tabs_cancels_discovery() {
+        let port = Arc::new(Connects::default());
+        port.saved.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (host, _, _) = screen_with(port.clone());
+        open_connect(&host, &port);
+        assert!(!host.connect_provider_models("missing"));
+        host.connect_provider_models("deepseek");
+        let request = host.provider_discovery_id().unwrap();
+        host.providers_discovered(
+            "deepseek",
+            request,
+            Ok(vec![
+                crate::providers::Discovered {
+                    id: "first".into(),
+                    ..Default::default()
+                },
+                crate::providers::Discovered {
+                    id: "second".into(),
+                    ..Default::default()
+                },
+            ]),
+        );
+        assert!(host.point_providers_at(1));
+        host.providers_key(KeyPress::plain(Key::Enter));
+        {
+            let m = host.moment.read().unwrap();
+            let Some(crate::providers::Form::Model(form)) =
+                &m.providers_panel.as_ref().unwrap().form
+            else {
+                panic!("model");
+            };
+            assert_eq!(form.model, "second");
+        }
+        host.connect_provider_models("deepseek");
+        let request = host.provider_discovery_id().unwrap();
+        host.show_providers_tab(crate::providers::Tab::Accounts);
+        host.providers_discovered("deepseek", request, Err("cancelled".into()));
+        let m = host.moment.read().unwrap();
+        assert!(m.providers_panel.as_ref().unwrap().form.is_none());
+    }
 
     /// A port that takes every write and answers every check with what it was
     /// asked about — so the test can see which account, and which model, the
@@ -13231,6 +13519,7 @@ mod provider_probe_tests {
                 levels: None,
                 default: false,
                 key: None,
+                ..Default::default()
             },
         })
         .expect("the write lands");

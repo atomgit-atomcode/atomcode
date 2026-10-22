@@ -536,6 +536,9 @@ export interface ProviderPresetInfo {
 
 export interface DiscoveredModelInfo {
   id: string;
+  supports_vision?: boolean;
+  reasoning_effort_levels?: string[];
+  reasoning_effort?: string;
   name?: string;
   context_window?: number;
   max_tokens?: number;
