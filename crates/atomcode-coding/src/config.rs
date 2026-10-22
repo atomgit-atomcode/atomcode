@@ -56,6 +56,8 @@ pub struct CodingAgentConfig {
     /// See `atomcode_config::config::AtomGitToolConfig` for the excluded paths
     /// (`GitPushLabelMiddleware`, raw REST via `bash`).
     pub atomgit_enabled: bool,
+    /// Request-only AtomGit schema discovery.
+    pub atomgit_tool_search: bool,
     /// `[tools.output] threshold_bytes`: spill a tool result above this many
     /// bytes instead of the default. `None` leaves the row as the tree mounts it.
     pub tool_output_threshold_bytes: Option<usize>,
@@ -279,6 +281,8 @@ pub struct CodingRuntimeConfig {
     pub todo: atomcode_config::config::TodoToolConfig,
     /// Resolved `[tools.atomgit]` switch — see `CodingAgentConfig::atomgit_enabled`.
     pub atomgit_enabled: bool,
+    /// Request-only AtomGit schema discovery.
+    pub atomgit_tool_search: bool,
     /// See `CodingAgentConfig::tool_output_threshold_bytes`.
     pub tool_output_threshold_bytes: Option<usize>,
     /// `[tools.mcp] tool_search`: model-facing schema projection, not permissions.
@@ -457,6 +461,7 @@ pub fn describe_config_file_for(
          `claude-code`, `model`, `permission`, `timeout_secs`, `enabled`), add the Codex \
          or Claude Code CLI as a delegate where the front end allows it.\n\
          - `[tools.todo]` `enabled`, and `eager` = `auto` | `preferred` | `always`.\n\
+         - `[tools.atomgit]` `tool_search` (default true): discover AtomGit schemas via `builtin_search`; false sends them eagerly.\n\
          - `[tools.mcp]` `tool_search`: `on` (default), `auto`, or `off`; \
          lazily expose large MCP schemas through `mcp_search`, without changing approvals.\n\
          - `[tools.search]` `respect_gitignore`, `include_hidden`, `follow_symlinks`, `timeout_secs`, `max_entries`: Glob/Grep discovery defaults; per-project search.toml under the product settings directory overrides individual keys; permissions still apply.\n\
@@ -570,6 +575,7 @@ impl CodingRuntimeConfig {
                 config.tools.atomgit.enabled,
             ),
             tool_output_threshold_bytes: config.tools.output.threshold_bytes,
+            atomgit_tool_search: config.tools.atomgit.tool_search,
             mcp_tool_search: config.tools.mcp.tool_search,
             tool_search: config.tools.search.clone(),
             provider_name: r.map(|r| r.selection_id.clone()).unwrap_or_default(),
@@ -645,6 +651,7 @@ impl CodingRuntimeConfig {
         config.preferred_language = self.preferred_language;
         config.todo = self.todo.clone();
         config.atomgit_enabled = self.atomgit_enabled;
+        config.atomgit_tool_search = self.atomgit_tool_search;
         config.tool_output_threshold_bytes = self.tool_output_threshold_bytes;
         config.mcp_tool_search = self.mcp_tool_search;
         config.tool_search = self.tool_search.clone();
@@ -1129,6 +1136,7 @@ impl CodingAgentConfig {
             preferred_language: None,
             todo: Default::default(),
             atomgit_enabled: true,
+            atomgit_tool_search: true,
             tool_output_threshold_bytes: None,
             mcp_tool_search: Default::default(),
             tool_search: Default::default(),

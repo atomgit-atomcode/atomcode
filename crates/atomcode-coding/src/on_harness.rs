@@ -852,6 +852,11 @@ pub fn config_rows(cfg: &crate::CodingAgentConfig) -> Result<Layer, String> {
         .with_project_file(&cfg.dirs.project(&cfg.working_dir).join("search.toml"))
         .map_err(|e| e.to_string())?;
     let mut out = model_rows(cfg)?
+        .patch(
+            "builtin-tool-search",
+            serde_json::json!({"enabled": cfg.atomgit_tool_search}),
+        )
+        .map_err(|e| e.to_string())?
         .patch("tool-search-world", search)
         .map_err(|e| e.to_string())?
         .patch(
@@ -1992,6 +1997,7 @@ fn compose_hosted(
         // Unconditional, unlike the recap: writing the instruction file needs a
         // repository and a model, which any assembly that gets this far has.
         .insert(Entry::named("init"))
+        .insert(Entry::named("builtin-tool-search"))
         .when(host.mcp.is_some(), |layer| {
             layer.swap("mcp", "mcp-host").enable("mcp")
         })
@@ -2111,6 +2117,7 @@ fn compose_hosted(
             crate::host_rows::NativeCompactionCheckpointPlugin(hook),
         ));
     }
+    registry.register(Arc::new(crate::mcp_tool_search::BuiltinSearchPlugin));
     if let Some(publication) = host.mcp {
         registry.register(Arc::new(crate::host_rows::McpHostPlugin::new(publication)));
     }

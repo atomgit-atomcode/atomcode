@@ -309,6 +309,7 @@ pub(crate) fn chat_runtime_config(
             config.language,
         )),
         todo: config.tools.todo.clone(),
+        atomgit_tool_search: config.tools.atomgit.tool_search,
         atomgit_enabled: atomcode_config::config::atomgit_enabled_from_env(
             std::env::var("ATOMCODE_ATOMGIT").ok().as_deref(),
             config.tools.atomgit.enabled,

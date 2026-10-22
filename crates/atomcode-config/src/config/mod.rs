@@ -145,11 +145,16 @@ impl Default for TodoToolConfig {
 #[serde(default)]
 pub struct AtomGitToolConfig {
     pub enabled: bool,
+    /// Offer AtomGit schemas through builtin_search; false restores eager loading.
+    pub tool_search: bool,
 }
 
 impl Default for AtomGitToolConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            tool_search: true,
+        }
     }
 }
 

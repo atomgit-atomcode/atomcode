@@ -489,7 +489,7 @@ project you are working in.";
 const ATOMGIT_TOOL_USAGE: &str = "\n\n## ATOMGIT TOOLS:\n\
 For AtomGit repository, pull-request, and issue operations, prefer the dedicated \
 `atomgit_repo`, `atomgit_pr`, and `atomgit_issue` tools (and `atomgit_api` for any other \
-AtomGit REST endpoint): they obtain the current OAuth credential internally and preserve the \
+AtomGit REST endpoint). If their schemas are absent, use `builtin_search` first. They obtain the current OAuth credential internally and preserve the \
 approval boundary. Never read AtomGit auth files or print access tokens, and never pass a \
 credential through `bash`/`curl`. Read-only, unauthenticated public API queries via bash are \
 fine when you just need to look something up.";

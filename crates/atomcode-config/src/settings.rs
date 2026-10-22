@@ -196,6 +196,14 @@ pub static SETTINGS: &[SettingSpec] = &[
         ApplyPolicy::CapabilityReprepare,
     ),
     bool_setting(
+        "tools.atomgit.tool_search",
+        &["tools", "atomgit", "tool_search"],
+        "AtomGit tool schema search",
+        "AtomGit 工具 schema 按需加载",
+        &["lazy", "schema", "builtin_search"],
+        ApplyPolicy::CapabilityReprepare,
+    ),
+    bool_setting(
         "tools.atomgit.enabled",
         &["tools", "atomgit", "enabled"],
         "AtomGit tools",
@@ -532,6 +540,7 @@ impl SettingSpec {
             "tools.search.max_entries" => config.tools.search.max_entries.to_string(),
             "tools.mcp.tool_search" => format!("{:?}", config.tools.mcp.tool_search).to_lowercase(),
             "tools.todo.enabled" => config.tools.todo.enabled.to_string(),
+            "tools.atomgit.tool_search" => config.tools.atomgit.tool_search.to_string(),
             "tools.atomgit.enabled" => config.tools.atomgit.enabled.to_string(),
             "tools.todo.eager" => format!("{:?}", config.tools.todo.eager).to_lowercase(),
             "coding.max_rounds" => config.coding.max_rounds.to_string(),
@@ -827,6 +836,35 @@ mod tests {
         let config: Config = toml::from_str(&document.to_string()).unwrap();
         assert!(config.compaction.token_limit.is_none());
         assert!(document.to_string().contains("# preserve"));
+    }
+
+    #[test]
+    fn atomgit_schema_search_defaults_on_and_can_be_reset() {
+        let setting = SETTINGS
+            .iter()
+            .find(|s| s.id == "tools.atomgit.tool_search")
+            .unwrap();
+        assert_eq!(setting.apply, ApplyPolicy::CapabilityReprepare);
+        for text in ["", "[tools.atomgit]", "[tools.atomgit]\nenabled=false"] {
+            let config: Config = toml::from_str(text).unwrap();
+            assert_eq!(setting.value(&config), "true");
+        }
+        let mut document = "# keep\n".parse::<DocumentMut>().unwrap();
+        setting.patch(&mut document, "false").unwrap();
+        let config: Config = toml::from_str(&document.to_string()).unwrap();
+        assert!(!config.tools.atomgit.tool_search);
+        assert!(config.tools.atomgit.enabled);
+        let restored: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert!(!restored.tools.atomgit.tool_search);
+        setting.reset(&mut document);
+        assert!(
+            toml::from_str::<Config>(&document.to_string())
+                .unwrap()
+                .tools
+                .atomgit
+                .tool_search
+        );
+        assert!(document.to_string().contains("# keep"));
     }
 
     #[test]

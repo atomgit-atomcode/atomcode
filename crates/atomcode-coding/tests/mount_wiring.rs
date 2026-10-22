@@ -834,3 +834,170 @@ async fn recent_context_cleanup_keeps_the_ui_diff_and_replays_the_model_view() {
     );
     mounted.shutdown().await;
 }
+
+/// The production mount must project schemas, rather than merely test a helper.
+#[cfg(feature = "atomgit")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomgit_env)]
+async fn atomgit_discovery_loads_full_schemas_without_changing_the_executable_catalog() {
+    use atomcode_kernel::{
+        stream::StreamEvent,
+        tool::{ToolCall, ToolDef},
+    };
+    use std::sync::Mutex;
+    struct Recorder(Mutex<Vec<Vec<ToolDef>>>);
+    #[async_trait::async_trait]
+    impl LlmProvider for Recorder {
+        fn model_name(&self) -> &str {
+            "discovery-test"
+        }
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            tools: &[ToolDef],
+            _: &atomcode_kernel::provider::ChatOptions,
+        ) -> Result<
+            futures::stream::BoxStream<'static, StreamEvent>,
+            atomcode_kernel::stream::ProviderError,
+        > {
+            let mut requests = self.0.lock().unwrap();
+            requests.push(tools.to_vec());
+            let event = if requests.len() == 1 && tools.iter().any(|t| t.name == "builtin_search") {
+                StreamEvent::ToolCall(ToolCall {
+                    id: "discover".into(),
+                    name: "builtin_search".into(),
+                    arguments: r#"{"query":"atomgit_issue","limit":1}"#.into(),
+                })
+            } else {
+                StreamEvent::TextDelta("done".into())
+            };
+            Ok(Box::pin(futures::stream::iter(vec![
+                event,
+                StreamEvent::Done { truncated: false },
+            ])))
+        }
+    }
+    let project = tempfile::tempdir().unwrap();
+    let mut cfg = CodingAgentConfig::new(
+        "k",
+        "http://localhost",
+        "discovery-test",
+        project.path(),
+        atomcode_coding::config::product_dirs_from_env(),
+    );
+    let mut eager: Vec<ToolDef> = Vec::new();
+    let mut lazy: Vec<ToolDef> = Vec::new();
+    for enabled in [false, true] {
+        let mut file = atomcode_config::config::Config::default();
+        file.tools.atomgit.tool_search = enabled;
+        let runtime = atomcode_coding::CodingRuntimeConfig::from_config(
+            &file,
+            project.path(),
+            cfg.dirs.clone(),
+            None,
+            None,
+            false,
+            false,
+        );
+        assert_eq!(runtime.agent_config().atomgit_tool_search, enabled);
+        cfg.atomgit_tool_search = enabled;
+        let recorder = Arc::new(Recorder(Mutex::new(Vec::new())));
+        let mut mounted = support::mount(&cfg, quiet_options(), recorder.clone()).await;
+        let catalog = mounted
+            .context()
+            .service::<atomcode_harness::seams::ToolsSvc>()
+            .unwrap()
+            .defs();
+        for name in ["atomgit_repo", "atomgit_issue", "atomgit_pr", "atomgit_api"] {
+            assert!(catalog.iter().any(|t| t.name == name));
+        }
+        turn(&mut mounted.handle, "inspect issue capabilities", allow()).await;
+        let requests = recorder.0.lock().unwrap().clone();
+        if enabled {
+            assert!(requests.len() >= 2);
+            assert!(!requests[0].iter().any(|t| t.name.starts_with("atomgit_")));
+            assert!(requests[0]
+                .iter()
+                .any(|t| t.name == "builtin_search" && t.description.contains("atomgit_issue")));
+            let original = eager.iter().find(|t| t.name == "atomgit_issue").unwrap();
+            assert!(
+                requests[1].contains(original),
+                "search must expose the same complete schema as eager loading"
+            );
+            assert_eq!(
+                requests[1]
+                    .iter()
+                    .filter(|t| t.name.starts_with("atomgit_"))
+                    .count(),
+                1
+            );
+            lazy = requests[0].clone();
+        } else {
+            assert!(!requests[0].iter().any(|t| t.name == "builtin_search"));
+            assert_eq!(
+                requests[0]
+                    .iter()
+                    .filter(|t| t.name.starts_with("atomgit_"))
+                    .count(),
+                4
+            );
+            eager = requests[0].clone();
+        }
+        mounted.shutdown().await;
+    }
+    let eager_bytes = serde_json::to_vec(&eager).unwrap().len();
+    let lazy_bytes = serde_json::to_vec(&lazy).unwrap().len();
+    eprintln!(
+        "production builtin tool JSON bytes: eager={eager_bytes}, lazy={lazy_bytes}, saved={}",
+        eager_bytes - lazy_bytes
+    );
+    assert!(lazy_bytes < eager_bytes);
+    let unaffected = |tools: Vec<ToolDef>| {
+        tools
+            .into_iter()
+            .filter(|t| !t.name.starts_with("atomgit_") && t.name != "builtin_search")
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(unaffected(eager), unaffected(lazy));
+}
+
+#[cfg(feature = "atomgit")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomgit_env)]
+async fn atomgit_discovery_follows_the_admitted_catalog_when_env_overrides_disabled_config() {
+    struct RestoreEnv(Option<std::ffi::OsString>);
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var("ATOMCODE_ATOMGIT", value),
+                None => std::env::remove_var("ATOMCODE_ATOMGIT"),
+            }
+        }
+    }
+    let _restore = RestoreEnv(std::env::var_os("ATOMCODE_ATOMGIT"));
+    std::env::set_var("ATOMCODE_ATOMGIT", "1");
+    let project = tempfile::tempdir().unwrap();
+    let mut cfg = CodingAgentConfig::new(
+        "k",
+        "http://localhost",
+        "canned",
+        project.path(),
+        atomcode_coding::config::product_dirs_from_env(),
+    );
+    cfg.atomgit_enabled = false;
+    let mounted = support::mount(&cfg, quiet_options(), Arc::new(CannedProvider)).await;
+    let catalog = mounted
+        .context()
+        .service::<atomcode_harness::seams::ToolsSvc>()
+        .unwrap()
+        .defs();
+    assert!(
+        catalog.iter().any(|tool| tool.name == "atomgit_repo"),
+        "the environment enables registration"
+    );
+    assert!(
+        catalog.iter().any(|tool| tool.name == "builtin_search"),
+        "discovery must follow the actually admitted tools, not a stale configuration flag"
+    );
+    mounted.shutdown().await;
+}
