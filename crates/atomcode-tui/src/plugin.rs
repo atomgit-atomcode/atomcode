@@ -2362,6 +2362,10 @@ impl UserInterface for Tui {
                     }
                     stale = true;
                 }
+                // Reports already in flight may outlive a handoff. They cannot
+                // open our menu or read a clipboard while the terminal owns
+                // selection and paste (notably PuTTY over SSH).
+                Wake::Input(Input::Mouse(..)) if !self.surface.mouse() => {}
                 // A late motion packet can outlive the menu that requested it.
                 // Reassert the intended mode, but motion alone does not prove
                 // that the terminal reclaimed the mouse. Do not announce that.
@@ -12715,6 +12719,34 @@ mod paste_burst_tests {
             seen.push(input);
         }
         seen
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn native_terminal_pastes_preserve_unicode_and_newlines_without_submitting() {
+        let text = "中文粘贴🙂\n第二行 e\u{301}\n第三行内容\n";
+        for script in [
+            vec![(0, Event::Paste(text.replace('\n', "\r\n")))],
+            text.chars()
+                .map(|c| (0, if c == '\n' { enter() } else { press(c) }))
+                .collect(),
+        ] {
+            let seen = pumped_with(script, true).await;
+            assert_eq!(seen.len(), 1, "a paste must not leak Enter key events");
+            let (host, tui) = assemble(Headless::new(80, 24));
+            for input in seen {
+                let Input::Paste(pasted) = input else {
+                    panic!("paste became keystrokes")
+                };
+                tui.act(Action::Paste(pasted), &tui.client);
+            }
+            let moment = host.moment.read().unwrap();
+            assert_eq!(
+                crate::moment::expand_pastes(&moment.input, &moment.pastes),
+                text
+            );
+            assert!(!moment.pending_working);
+            assert!(!moment.turn_open);
+        }
     }
 
     /// Zero-gap scripts check event ordering, not a wall-clock threshold.

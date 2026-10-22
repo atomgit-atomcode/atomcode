@@ -325,6 +325,40 @@ fn mouse_reported_for(ohos: bool, env: impl Fn(&str) -> Option<String>) -> bool 
     }
 }
 
+/// SSH cannot read the client terminal's clipboard. A client may identify only
+/// as xterm (PuTTY's usual case), so native selection/paste is the conservative
+/// startup policy for all SSH connections, not a guess about mouse capability.
+/// Ctrl+G may still explicitly take the mouse; ATOMCODE_MOUSE=1 opts in at launch.
+pub(crate) fn take_mouse_at_start() -> bool {
+    take_mouse_at_start_for(|key| {
+        std::env::var_os(key).map(|value| value.to_string_lossy().into_owned())
+    })
+}
+
+fn take_mouse_at_start_for(env: impl Fn(&str) -> Option<String>) -> bool {
+    if let Some(forced) = env("ATOMCODE_MOUSE").filter(|value| !value.is_empty()) {
+        return forced == "1" || forced.eq_ignore_ascii_case("true");
+    }
+    let putty = ["TERM", "TERM_PROGRAM"]
+        .into_iter()
+        .any(|key| env(key).is_some_and(|value| value.to_ascii_lowercase().starts_with("putty")));
+    !remote_session_for(&env) && !putty
+}
+
+/// Shared boundary for startup policy and clipboard access: a server clipboard
+/// must never stand in for the SSH client's clipboard, even with X11 forwarding.
+pub(crate) fn remote_session() -> bool {
+    remote_session_for(&|key| {
+        std::env::var_os(key).map(|value| value.to_string_lossy().into_owned())
+    })
+}
+
+fn remote_session_for(env: &impl Fn(&str) -> Option<String>) -> bool {
+    ["SSH_CONNECTION", "SSH_TTY", "SSH_CLIENT"]
+        .into_iter()
+        .any(|key| env(key).is_some())
+}
+
 impl Caps {
     /// The plainest terminal: ASCII, no colour. What CI and a pipe get.
     pub fn plain() -> Self {
@@ -852,7 +886,9 @@ pub fn glyph(unicode: bool, glyph: Glyph) -> &'static str {
 mod tests {
     use super::*;
 
-    fn env_of(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+    fn env_of<'a>(
+        pairs: &'a [(&'static str, &'static str)],
+    ) -> impl Fn(&str) -> Option<String> + 'a {
         move |k: &str| {
             pairs
                 .iter()
@@ -937,6 +973,56 @@ mod tests {
         assert!(mouse_reported_for(true, |k| (k == "ATOMCODE_MOUSE").then(|| "1".into())));
         assert!(mouse_reported_for(false, |_| None));
         assert!(!mouse_reported_for(false, |k| (k == "ATOMCODE_MOUSE").then(|| "0".into())));
+    }
+
+    #[test]
+    fn ssh_and_putty_keep_native_selection_at_start_without_disabling_mouse_support() {
+        for vars in [
+            vec![
+                ("SSH_CONNECTION", "client 123 server 22"),
+                ("TERM", "xterm"),
+            ],
+            vec![("SSH_TTY", "/dev/pts/0"), ("TERM", "xterm-256color")],
+            vec![("SSH_CLIENT", "client 123 22")],
+            vec![("TERM", "putty-256color")],
+            vec![("TERM_PROGRAM", "PuTTY")],
+        ] {
+            let env = env_of(&vars);
+            assert!(!take_mouse_at_start_for(&env), "{vars:?}");
+            assert!(
+                mouse_reported_for(false, &env),
+                "Ctrl+G must remain available"
+            );
+        }
+        assert!(take_mouse_at_start_for(env_of(&[(
+            "TERM",
+            "xterm-256color"
+        )])));
+        assert!(take_mouse_at_start_for(env_of(&[])));
+    }
+
+    #[test]
+    fn explicit_mouse_opt_in_overrides_native_startup_preference() {
+        for forced in ["1", "true", "TRUE"] {
+            assert!(take_mouse_at_start_for(env_of(&[
+                ("SSH_TTY", "/dev/pts/0"),
+                ("ATOMCODE_MOUSE", forced)
+            ])));
+        }
+        for forced in ["0", "false"] {
+            assert!(!take_mouse_at_start_for(env_of(&[(
+                "ATOMCODE_MOUSE",
+                forced
+            )])));
+        }
+    }
+
+    #[test]
+    fn every_ssh_indicator_keeps_clipboard_access_remote() {
+        assert!(!remote_session_for(&env_of(&[])));
+        for key in ["SSH_CONNECTION", "SSH_TTY", "SSH_CLIENT"] {
+            assert!(remote_session_for(&env_of(&[(key, "")])));
+        }
     }
 
     /// A classic Windows console window is the basic one; a terminal that

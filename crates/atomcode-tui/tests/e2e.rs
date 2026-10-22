@@ -10627,6 +10627,20 @@ async fn the_wheel_as_arrows_scrolls_while_the_mouse_is_handed_back() {
     // swipe), because the two are the same bytes as a keypress.
     s.term.press(KeyPress::ctrl('g'));
     until(&s, &handed).await;
+    // In-flight reports must not bring the app's menu back or paste the
+    // server-side clipboard after native terminal selection was restored.
+    let input_before = part_text(&s, "input");
+    let input = s.term.last().unwrap().part("input").unwrap().rect;
+    s.term
+        .pointer(atomcode_tui::surface::Click::RightPress, input.x, input.y);
+    s.quiet().await;
+    assert!(s.term.last().unwrap().part("context-menu").is_none());
+    s.term
+        .set_clipboard_text("SERVER_CLIPBOARD_MUST_NOT_BE_PASTED");
+    s.term
+        .pointer(atomcode_tui::surface::Click::MiddlePress, input.x, input.y);
+    s.quiet().await;
+    assert_eq!(part_text(&s, "input"), input_before);
     // On a narrow terminal the tip row cuts at its end; how to take the mouse
     // back is at the front, so it is never what gets cut.
     s.term.resize(60, 24);

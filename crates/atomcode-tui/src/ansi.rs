@@ -253,7 +253,9 @@ pub const MOUSE_ON: &str = "\x1b[?1002h\x1b[?1006h";
 /// turned on and off while the program runs, so "the mouse is off" can be
 /// asked for at a moment when motion is still on — and a shell that inherits
 /// 1003 prints a stream of escape sequences every time the pointer moves.
-pub const MOUSE_OFF: &str = "\x1b[?1003l\x1b[?1006l\x1b[?1002l";
+// Also clear inherited X10 and urxvt modes, as crossterm's DisableMouseCapture
+// does. A terminal handoff must not leave a preceding program's reports active.
+pub const MOUSE_OFF: &str = "\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?1002l\x1b[?1000l";
 
 /// Ask the terminal to report the pointer moving with no button held (DECSET
 /// 1003, "any-event" tracking).
@@ -1397,5 +1399,11 @@ mod tests {
             "the pointer cannot be handed back while still reporting free motion"
         );
         assert!(MOUSE_ON.contains("?1006h") && MOUSE_OFF.contains("?1006l"));
+        for mode in [1000, 1002, 1003, 1006, 1015] {
+            assert!(
+                MOUSE_OFF.contains(&format!("\x1b[?{mode}l")),
+                "inherited mode {mode} survived handoff"
+            );
+        }
     }
 }
