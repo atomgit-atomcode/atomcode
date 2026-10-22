@@ -2345,6 +2345,7 @@ fn render_network_section(cfg: &NetworkConfig) -> String {
     out.push_str(
         "# - follow_system  -> follow the launch environment / system proxy state (default)\n",
     );
+    out.push_str("#   Model requests refresh this state; a refused loopback proxy temporarily goes direct.\n");
     out.push_str(
         "# - default_proxy  -> pin the proxy values below and reuse them on future launches\n",
     );

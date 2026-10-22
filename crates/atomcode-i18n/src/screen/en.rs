@@ -1455,7 +1455,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProxyTakes => "[follow_system | default_proxy | no_proxy]".into(),
         Msg::ProxyPickerTitle { current } => format!("Outbound proxy (now: {current})").into(),
         Msg::ProxyFollowSystemAbout => {
-            "the launch environment's proxy, with the system proxy filling gaps (default)".into()
+            "follow environment/system proxies; model requests go direct if a local proxy stops, and reconnect when it returns (default)".into()
         }
         Msg::ProxyDefaultProxyAbout { captured } => {
             format!("pin the proxy this launch started with into the config: {captured}").into()

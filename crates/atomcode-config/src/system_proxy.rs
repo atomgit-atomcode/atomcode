@@ -1,7 +1,7 @@
 //! Best-effort read of the OS static system proxy (the same manual proxy the
 //! system browser uses), plus the pure parsers that turn platform-native proxy
-//! descriptions into `HTTP(S)_PROXY` / `NO_PROXY` values. All resolution is
-//! best-effort and fail-open: any error yields an empty `SystemProxy`.
+//! descriptions into `HTTP(S)_PROXY` / `NO_PROXY` values. Startup resolution is
+//! best-effort; live refresh distinguishes read errors from a disabled proxy.
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SystemProxy {
@@ -146,17 +146,17 @@ pub(crate) fn parse_scutil_proxy(raw: &str) -> SystemProxy {
 /// unsupported OS yields an empty `SystemProxy` (callers then fall back to
 /// direct / env-var behavior).
 pub fn resolve() -> SystemProxy {
-    // Read the OS proxy once per process (mirrors `STARTUP_ENV` in proxy.rs).
-    // `apply_process_proxy_config` re-runs on every `/proxy` change, so re-spawning
-    // scutil / re-reading the registry each time would be wasted work.
-    static CACHE: std::sync::OnceLock<SystemProxy> = std::sync::OnceLock::new();
-    CACHE.get_or_init(resolve_uncached).clone()
+    try_resolve().unwrap_or_default()
 }
 
-fn resolve_uncached() -> SystemProxy {
+/// Fresh OS settings, distinguishing a disabled proxy from a failed read. Live
+/// refresh must not interpret a read failure as permission to bypass a proxy.
+pub fn try_resolve() -> Option<SystemProxy> {
+    // VPN clients change these settings while the process is running. Callers
+    // must refresh at request boundaries rather than retain a startup-only cache.
     #[cfg(windows)]
     {
-        resolve_windows().unwrap_or_default()
+        resolve_windows()
     }
     #[cfg(target_os = "macos")]
     {
@@ -164,7 +164,7 @@ fn resolve_uncached() -> SystemProxy {
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
-        SystemProxy::default()
+        Some(SystemProxy::default())
     }
 }
 
@@ -173,19 +173,27 @@ fn resolve_windows() -> Option<SystemProxy> {
     use winreg::enums::HKEY_CURRENT_USER;
     use winreg::RegKey;
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let settings = hkcu
-        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
-        .ok()?;
-    let enabled: u32 = settings.get_value("ProxyEnable").unwrap_or(0);
+    let settings =
+        match hkcu.open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Internet Settings") {
+            Ok(settings) => settings,
+            // A user without Internet Settings has no static system proxy. Other
+            // errors must not turn an existing proxy into a direct route.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Some(SystemProxy::default())
+            }
+            Err(_) => return None,
+        };
+    let enabled: u32 = optional_registry_value(settings.get_value("ProxyEnable"))?;
     if enabled == 0 {
         return Some(SystemProxy::default());
     }
-    let server: String = settings.get_value("ProxyServer").unwrap_or_default();
+    let server: String = settings.get_value("ProxyServer").ok()?;
+    if server.trim().is_empty() {
+        return None;
+    }
     let (http, https) = parse_win_proxy_server(&server);
-    let no_proxy = settings
-        .get_value::<String, _>("ProxyOverride")
-        .ok()
-        .and_then(|o| parse_win_bypass(&o));
+    let bypass: String = optional_registry_value(settings.get_value("ProxyOverride"))?;
+    let no_proxy = parse_win_bypass(&bypass);
     Some(SystemProxy {
         http,
         https,
@@ -193,19 +201,117 @@ fn resolve_windows() -> Option<SystemProxy> {
     })
 }
 
+#[cfg(any(windows, test))]
+fn optional_registry_value<T: Default>(value: std::io::Result<T>) -> Option<T> {
+    match value {
+        Ok(value) => Some(value),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(T::default()),
+        Err(_) => None,
+    }
+}
+
 #[cfg(target_os = "macos")]
-fn resolve_macos() -> SystemProxy {
-    match std::process::Command::new("scutil").arg("--proxy").output() {
-        Ok(out) if out.status.success() => {
-            parse_scutil_proxy(&String::from_utf8_lossy(&out.stdout))
+fn resolve_macos() -> Option<SystemProxy> {
+    let stdout = command_stdout_before(
+        std::process::Command::new("scutil").arg("--proxy"),
+        std::time::Duration::from_secs(1),
+    )?;
+    let text = String::from_utf8_lossy(&stdout);
+    text.trim_start()
+        .starts_with("<dictionary>")
+        .then(|| parse_scutil_proxy(&text))
+}
+
+/// Do not leave a stuck scutil behind after the async request is cancelled or
+/// times out. Poll the short-lived child here on the blocking pool, kill and
+/// reap it on failure, and only read its small stdout after a successful exit.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn command_stdout_before(
+    command: &mut std::process::Command,
+    timeout: std::time::Duration,
+) -> Option<Vec<u8>> {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return if status.success() {
+                    child.wait_with_output().ok().map(|out| out.stdout)
+                } else {
+                    None
+                };
+            }
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
         }
-        _ => SystemProxy::default(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registry_read_errors_are_not_treated_as_disabled_proxy_settings() {
+        use std::io::ErrorKind;
+        assert_eq!(
+            optional_registry_value::<u32>(Err(ErrorKind::NotFound.into())),
+            Some(0)
+        );
+        assert_eq!(
+            optional_registry_value::<u32>(Err(ErrorKind::PermissionDenied.into())),
+            None
+        );
+        assert_eq!(
+            optional_registry_value::<String>(Err(ErrorKind::Other.into())),
+            None
+        );
+        assert_eq!(optional_registry_value(Ok(1u32)), Some(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn system_proxy_query_deadline_kills_a_stuck_child() {
+        use std::time::{Duration, Instant};
+        let started = Instant::now();
+        let stdout = command_stdout_before(
+            std::process::Command::new("/bin/sh").args(["-c", "exec sleep 5"]),
+            Duration::from_millis(20),
+        );
+        assert!(stdout.is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn system_proxy_query_returns_only_successful_stdout() {
+        use std::process::Command;
+        use std::time::Duration;
+        assert_eq!(
+            command_stdout_before(
+                Command::new("/bin/sh").args(["-c", "printf proxy"]),
+                Duration::from_secs(1)
+            ),
+            Some(b"proxy".to_vec())
+        );
+        assert!(command_stdout_before(
+            Command::new("/bin/sh").args(["-c", "exit 1"]),
+            Duration::from_secs(1)
+        )
+        .is_none());
+    }
 
     #[test]
     fn win_proxy_server_single_applies_to_both() {

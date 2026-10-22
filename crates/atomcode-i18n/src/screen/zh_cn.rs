@@ -1362,7 +1362,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdAboutProxy => "出站代理：跟随系统、固定当前代理，或不走代理".into(),
         Msg::ProxyTakes => "[follow_system | default_proxy | no_proxy]".into(),
         Msg::ProxyPickerTitle { current } => format!("出站代理（现在：{current}）").into(),
-        Msg::ProxyFollowSystemAbout => "用启动时环境里的代理，缺的由系统代理补上（默认）".into(),
+        Msg::ProxyFollowSystemAbout => "跟随环境和系统代理；模型请求在本地代理关闭时自动直连，恢复后重新使用（默认）".into(),
         Msg::ProxyDefaultProxyAbout { captured } => {
             format!("把这次启动时的代理固定写进配置，以后每次都用它：{captured}").into()
         }

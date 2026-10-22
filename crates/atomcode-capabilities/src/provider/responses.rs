@@ -62,15 +62,19 @@ impl ResponsesProvider {
         let initial_tls12 = atomcode_config::tls::should_cap_url(&url);
         let custom_headers = !cfg.headers.is_empty();
         let client = std::sync::Arc::new(
-            super::openai_compat::SwappableClient::new(initial_tls12, move |tls12| {
-                super::openai_compat::build_account_http_client(
-                    connect_timeout,
-                    skip_tls_verify,
-                    user_agent.clone(),
-                    tls12,
-                    custom_headers,
-                )
-            })?
+            super::openai_compat::SwappableClient::new_with_proxy(
+                initial_tls12,
+                move |tls12, proxy| {
+                    super::openai_compat::build_account_http_client_with_proxy(
+                        connect_timeout,
+                        skip_tls_verify,
+                        user_agent.clone(),
+                        tls12,
+                        custom_headers,
+                        proxy,
+                    )
+                },
+            )?
             .with_headers(cfg.headers.clone()),
         );
         Ok(Self {

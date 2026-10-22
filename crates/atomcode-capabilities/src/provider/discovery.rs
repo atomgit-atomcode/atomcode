@@ -217,18 +217,27 @@ fn discovery_client(
     transport: &DiscoveryTransport,
     timeout: Duration,
     trust_os_roots: bool,
-) -> reqwest::Result<reqwest::Client> {
-    let mut client = crate::proxy::apply_async_proxy_policy(reqwest::Client::builder())
-        .timeout(timeout)
-        .redirect(reqwest::redirect::Policy::none())
-        .danger_accept_invalid_certs(transport.skip_tls_verify);
+    proxy: Option<&atomcode_config::proxy::ProxyConfig>,
+) -> Result<reqwest::Client, atomcode_kernel::stream::ProviderError> {
+    let mut client = super::auto_proxy::apply(
+        crate::proxy::apply_async_proxy_policy(reqwest::Client::builder()),
+        proxy,
+    )?
+    .timeout(timeout)
+    .redirect(reqwest::redirect::Policy::none())
+    .danger_accept_invalid_certs(transport.skip_tls_verify);
     if trust_os_roots && !cfg!(target_os = "windows") {
         client = super::openai_compat::add_trusted_roots(client);
     }
     if let Some(user_agent) = transport.user_agent.as_deref() {
         client = client.user_agent(user_agent);
     }
-    client.build()
+    client
+        .build()
+        .map_err(|_| atomcode_kernel::stream::ProviderError {
+            message: "discovery client build failed".into(),
+            ..Default::default()
+        })
 }
 
 pub async fn fetch_discovery_body(
@@ -240,8 +249,11 @@ pub async fn fetch_discovery_body(
     // No redirects: a key is bound to the endpoint it was saved for, and a 30x
     // to another host would carry it there — reqwest strips `Authorization`
     // across hosts, but not Anthropic's `x-api-key`.
-    let client = discovery_client(transport, timeout, true)
-        .or_else(|_| discovery_client(transport, timeout, false))
+    let proxy = super::auto_proxy::for_request()
+        .await
+        .map_err(|_| DiscoveryRequestError::Transport)?;
+    let client = discovery_client(transport, timeout, true, proxy.as_ref())
+        .or_else(|_| discovery_client(transport, timeout, false, proxy.as_ref()))
         .map_err(|_| DiscoveryRequestError::Transport)?;
     let mut request = client.get(url).header("accept", "application/json");
     if protocol == "anthropic" {
