@@ -3661,6 +3661,25 @@ impl Host {
         crate::modules::providers::geometry(&m, &vp).listed_at((y - rect.y) as usize)
     }
 
+    /// Clicking a discovered model checks it; list rows keep their Enter action.
+    pub(crate) fn provider_row_key(&self) -> crate::surface::KeyPress {
+        let m = self.moment.read().expect("moment poisoned");
+        let picking = matches!(
+            m.providers_panel
+                .as_ref()
+                .and_then(|panel| panel.form.as_ref()),
+            Some(crate::providers::Form::Model(crate::providers::ModelForm {
+                picking: Some(crate::providers::Picking::Ready { .. }),
+                ..
+            }))
+        );
+        crate::surface::KeyPress::plain(if picking {
+            crate::surface::Key::Char(' ')
+        } else {
+            crate::surface::Key::Enter
+        })
+    }
+
     /// Point the panel at a listed row. True when it moved.
     pub fn point_providers_at(&self, row: usize) -> bool {
         let mut m = self.moment.write().expect("moment poisoned");

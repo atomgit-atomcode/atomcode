@@ -50,3 +50,15 @@ Reviewed the final provider/UI/discovery diff, credential data flow, cancellatio
 Final audit regression: all 2,556 selected config, TUI, provider and discovery tests passed, including the cross-target credential and optional-metadata compatibility regressions. The final priority begins DeepSeek, Zhipu AI, Zhipu AI Coding Plan, OpenRouter, TaoToken, MiniMax and MiniMax Token Plan. WebUI typecheck/all 292 tests were already verified with no subsequent WebUI changes. Only task-related files are included in the commit; untracked previews, browser artifacts and unrelated directories remain outside it.
 
 Pre-commit workspace/default and feature compilation gates passed, including both negative controls. cargo fmt --all -- --check and git diff --check passed; Cargo.lock is unchanged and free of the prohibited crypto packages.
+
+
+## Follow-up: select multiple models and expose mouse actions
+
+Baseline: release/v5.2.5 at d8fed29d090ea9ce416decc244ee22e9692cbb84, tracked tree clean; unrelated untracked files retained. Rechecked provider selection, TUI dispatch, ConfigProviders, ProviderBook::add_models and their recent history. TUI owns checked selections and discovery identity; ProviderBook remains the only configuration writer, using its existing atomic add_models transaction. Runtime still receives only one /model command for the chosen active model. A failed batch restores the selection; a failed switch after persistence leaves saved models available. No runtime or session ownership changes.
+
+Space checks multiple discovered models; Enter reviews them with the highlighted checked model first (or the first checked model when the highlight is unchecked). Each model retains its own declared metadata. Existing models remain filtered. Adding under a connected account automatically discovers models with its saved credentials. Each editable model has its own right-hand Edit button sharing draw/hit geometry; account Edit and bottom Manual add actions precede navigation hints so they remain visible; manual add opens the advanced form without discovery. Discovery also has clickable Continue, toggle, Manual add and Back controls.
+
+
+Follow-up validation: the full TUI and ConfigProviders run passed 1,846 tests; one old footer-edit rendering assertion was updated for the requested per-model row button, then passed its targeted rerun. Coverage includes independent model capabilities, filtered multi-selection, save-only, atomic duplicate rejection, batch retry, single model switch, row-specific edit hits and 80-column bottom actions. No live provider key was used. Unrelated concurrent workspace edits are excluded from this change.
+
+Final follow-up compilation gate passed all default/feature checks and both negative controls. cargo fmt --all -- --check and git diff --cached --check passed. Cargo.lock is unchanged, its index flag is normal, and hkdf/hmac/zeroize_derive are absent. Protocol selection remains on the account manual-add/advanced forms (Chat Completions, Responses, Anthropic, Ollama and DeepSeek Messages); models reuse their account's protocol and credentials.

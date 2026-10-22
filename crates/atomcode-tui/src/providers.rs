@@ -863,6 +863,8 @@ pub struct ModelForm {
     pub discovery_error: Option<String>,
     pub known_levels: Option<Vec<String>>,
     pub discovered_model: Option<String>,
+    /// Additional checked models, saved atomically with the displayed model.
+    pub selected: Vec<Discovered>,
     pub name: Option<String>,
     pub max_tokens: Option<usize>,
 }
@@ -942,6 +944,7 @@ impl ModelForm {
             discovery_error: None,
             known_levels: None,
             discovered_model: None,
+            selected: Vec::new(),
             name: None,
             max_tokens: None,
         })
@@ -950,6 +953,7 @@ impl ModelForm {
     pub fn start_discovery(&mut self) {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         self.discovery_error = None;
+        self.selected.clear();
         self.discovery_id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.picking = Some(Picking::Loading {
             account: self.account_id().to_string(),
@@ -987,6 +991,7 @@ impl ModelForm {
             discovery_error: None,
             known_levels: None,
             discovered_model: None,
+            selected: Vec::new(),
             name: None,
             max_tokens: None,
         })
@@ -1028,6 +1033,7 @@ impl ModelForm {
     }
 
     fn clear_discovered(&mut self) {
+        self.selected.clear();
         if self.discovered_model.take().is_none() {
             return;
         }
@@ -1455,6 +1461,9 @@ pub enum Step {
         id: Option<String>,
         draft: ModelDraft,
     },
+    SaveModels {
+        drafts: Vec<ModelDraft>,
+    },
     DeleteAccount {
         id: String,
     },
@@ -1551,10 +1560,8 @@ fn list_key(view: &ProvidersView, panel: &mut Panel, secret: &mut String, press:
         }
         // Add, on the tab that is showing. ctrl-a rather than a letter, because
         // the letters are the filter.
-        (Key::Char('a'), Mods::CTRL) => {
-            begin_add(view, panel, secret);
-            Step::Stay
-        }
+        (Key::Char('a'), Mods::CTRL) => begin_add(view, panel, secret, true),
+        (Key::Char('n'), Mods::CTRL) => begin_add(view, panel, secret, false),
         (Key::Char('e'), Mods::CTRL) => {
             begin_edit(view, panel, secret, at);
             Step::Stay
@@ -1563,10 +1570,7 @@ fn list_key(view: &ProvidersView, panel: &mut Panel, secret: &mut String, press:
         (Key::Enter, _) => match at {
             // 光标停不到小标题上,所以这一支只为穷尽而写。
             Some(Listed::Group(_)) => Step::Stay,
-            Some(Listed::Add) => {
-                begin_add(view, panel, secret);
-                Step::Stay
-            }
+            Some(Listed::Add) => begin_add(view, panel, secret, true),
             // Walking into an account shows what is under it. The models tab
             // with one account's models on it is the same list a person would
             // have filtered to by hand.
@@ -1647,12 +1651,12 @@ fn list_key(view: &ProvidersView, panel: &mut Panel, secret: &mut String, press:
 ///
 /// On the models tab with nowhere to put one, nothing opens: the row that would
 /// have opened it is not listed either, so this is only reachable by ctrl-a.
-fn begin_add(view: &ProvidersView, panel: &mut Panel, secret: &mut String) {
+fn begin_add(view: &ProvidersView, panel: &mut Panel, secret: &mut String, discover: bool) -> Step {
     secret.clear();
     panel.pending_delete = None;
     // 挑强度那一层没有「加」:档位是模型声明的,不是一个能新添的东西。
     if panel.efforts.is_some() {
-        return;
+        return Step::Stay;
     }
     panel.form = match panel.tab {
         Tab::Accounts => Some(Form::Account(AccountForm::add(view))),
@@ -1660,6 +1664,22 @@ fn begin_add(view: &ProvidersView, panel: &mut Panel, secret: &mut String) {
         // would have opened one is not listed either.
         Tab::Models => ModelForm::add(view, panel.drill.as_deref()).map(Form::Model),
     };
+    if let Some(Form::Model(form)) = panel.form.as_mut() {
+        if discover
+            && view
+                .accounts()
+                .iter()
+                .any(|row| row.id == form.account_id() && row.configured)
+        {
+            form.advanced = false;
+            form.focus = ModelField::Model;
+            form.start_discovery();
+            return Step::Discover {
+                account: form.account_id().into(),
+            };
+        }
+    }
+    Step::Stay
 }
 
 /// Open the edit form for the row the cursor is on, when it is one this panel
@@ -1859,6 +1879,14 @@ fn model_key(
     secret: &mut String,
     press: KeyPress,
 ) -> Step {
+    if press == KeyPress::ctrl('n') && form.editing.is_none() {
+        form.picking = None;
+        form.selected.clear();
+        form.advanced = true;
+        form.focus = ModelField::Model;
+        panel.form = Some(Form::Model(form));
+        return Step::Stay;
+    }
     if form.picking.is_some() {
         picker_key(view, &mut form, press);
         panel.form = Some(Form::Model(form));
@@ -1993,6 +2021,7 @@ fn picker_key(view: &ProvidersView, form: &mut ModelForm, press: KeyPress) {
     };
     if matches!(press.key, Key::Esc) || press == KeyPress::ctrl('c') {
         form.picking = None;
+        form.selected.clear();
         return;
     }
     let Picking::Ready {
@@ -2011,18 +2040,39 @@ fn picker_key(view: &ProvidersView, form: &mut ModelForm, press: KeyPress) {
             query.pop();
             *cursor = 0;
         }
+        (Key::Char(' '), Mods::NONE) => {
+            if let Some(item) = picked_rows(items, query).get(*cursor) {
+                if let Some(at) = form
+                    .selected
+                    .iter()
+                    .position(|selected| selected.id == item.id)
+                {
+                    form.selected.remove(at);
+                } else {
+                    form.selected.push((*item).clone());
+                }
+            }
+        }
         (Key::Char(c), Mods::NONE) | (Key::Char(c), Mods::SHIFT) => {
             query.push(c);
             *cursor = 0;
         }
         (Key::Enter, _) => {
-            let Some(item) = picked_rows(items, query)
+            let highlighted = picked_rows(items, query)
                 .get(*cursor)
-                .map(|row| (*row).clone())
-            else {
-                return;
+                .map(|row| (*row).clone());
+            let active = if form.selected.is_empty() {
+                let Some(item) = highlighted else {
+                    return;
+                };
+                item
+            } else {
+                highlighted
+                    .filter(|item| form.selected.iter().any(|row| row.id == item.id))
+                    .unwrap_or_else(|| form.selected[0].clone())
             };
-            form.take_discovered(view, &item);
+            form.selected.retain(|row| row.id != active.id);
+            form.take_discovered(view, &active);
         }
         _ => {}
     }
@@ -2124,8 +2174,29 @@ fn save_model(
         key: (form.needs_key(view) && !secret.trim().is_empty()).then(|| secret.trim().to_string()),
     };
     let id = form.editing.clone();
+    let mut drafts = vec![draft];
+    for item in &form.selected {
+        drafts.push(ModelDraft {
+            account: form.account_id().into(),
+            model: item.id.clone(),
+            name: item.name.clone(),
+            max_tokens: item.max_tokens,
+            window: item.window,
+            vision: item.vision,
+            effort: item.effort.clone(),
+            levels: item.levels.clone(),
+            ..ModelDraft::default()
+        });
+    }
     leave_form(panel, secret);
-    Step::SaveModel { id, draft }
+    if drafts.len() == 1 {
+        Step::SaveModel {
+            id,
+            draft: drafts.remove(0),
+        }
+    } else {
+        Step::SaveModels { drafts }
+    }
 }
 
 /// Put pasted text into the field that has the keyboard.
@@ -2243,6 +2314,11 @@ pub trait Providers: Send + Sync {
 
     /// Add a model to an account, answering with its selection id.
     fn add_model(&self, draft: &ModelDraft) -> Result<String, String>;
+
+    /// Save a selection in one transaction; ports must not partially write a batch.
+    fn add_models(&self, _drafts: &[ModelDraft]) -> Result<Vec<String>, String> {
+        Err("Batch model saving is unavailable".into())
+    }
 
     fn edit_model(&self, id: &str, draft: &ModelDraft) -> Result<(), String>;
 
@@ -2942,7 +3018,7 @@ mod tests {
             &view,
             &mut panel,
             &mut secret,
-            &[press(Key::Right), ctrl('a')],
+            &[press(Key::Right), ctrl('n')],
         );
         // The account cycles, the model name is typed, and the window is picked.
         let Some(Form::Model(mut form)) = panel.form.clone() else {
@@ -2975,7 +3051,7 @@ mod tests {
             &view,
             &mut panel,
             &mut secret,
-            &[press(Key::Right), ctrl('a')],
+            &[press(Key::Right), ctrl('n')],
         );
         let Some(Form::Model(mut form)) = panel.form.clone() else {
             panic!("the model form is up");
@@ -3044,7 +3120,7 @@ mod tests {
             &view,
             &mut panel,
             &mut secret,
-            &[press(Key::Right), ctrl('a')],
+            &[press(Key::Right), ctrl('n')],
         );
         let Some(Form::Model(mut form)) = panel.form.clone() else {
             panic!("the model form is up");
@@ -3270,6 +3346,112 @@ mod tests {
             Some(Form::Model(form)) => form.picking.clone(),
             _ => None,
         }
+    }
+
+    #[test]
+    fn checked_models_keep_individual_capabilities_and_only_one_is_used() {
+        let view = view();
+        let mut form = ModelForm::add(&view, Some("deepseek")).unwrap();
+        form.connecting = true;
+        form.advanced = false;
+        form.start_discovery();
+        let mut panel = Panel {
+            form: Some(Form::Model(form)),
+            ..Panel::new()
+        };
+        let mut secret = String::new();
+        let flash = Discovered {
+            id: "flash".into(),
+            window: Some(1_000_000),
+            vision: Some(true),
+            effort: Some("high".into()),
+            ..Default::default()
+        };
+        let pro = Discovered {
+            id: "pro".into(),
+            window: Some(256_000),
+            vision: Some(false),
+            effort: Some("low".into()),
+            max_tokens: Some(32000),
+            ..Default::default()
+        };
+        discovered(&view, &mut panel, "deepseek", Ok(vec![flash, pro]));
+        key(&view, &mut panel, &mut secret, press(Key::Char(' ')));
+        key(&view, &mut panel, &mut secret, press(Key::Down));
+        key(&view, &mut panel, &mut secret, press(Key::Char(' ')));
+        key(&view, &mut panel, &mut secret, press(Key::Enter));
+        let mut save_only = panel.clone();
+        let Step::SaveModels { drafts } = key(&view, &mut save_only, &mut secret, ctrl('s')) else {
+            panic!("save only");
+        };
+        assert_eq!(drafts.len(), 2);
+        assert!(drafts.iter().all(|draft| !draft.use_now && !draft.default));
+        let Step::SaveModels { drafts } = key(&view, &mut panel, &mut secret, press(Key::Enter))
+        else {
+            panic!("batch");
+        };
+        assert_eq!(drafts.len(), 2);
+        assert_eq!(drafts[0].model, "pro");
+        assert!(drafts[0].use_now);
+        assert_eq!(drafts[0].max_tokens, Some(32000));
+        assert_eq!(drafts[0].vision, Some(false));
+        assert_eq!(drafts[1].model, "flash");
+        assert!(!drafts[1].use_now);
+        assert_eq!(drafts[1].window, Some(1_000_000));
+        assert_eq!(drafts[1].vision, Some(true));
+    }
+
+    #[test]
+    fn checks_survive_filters_can_be_removed_and_can_confirm_without_a_visible_row() {
+        let view = view();
+        let mut form = ModelForm::add(&view, Some("local")).unwrap();
+        form.start_discovery();
+        let mut panel = Panel {
+            form: Some(Form::Model(form)),
+            ..Panel::new()
+        };
+        let mut secret = String::new();
+        discovered(
+            &view,
+            &mut panel,
+            "local",
+            Ok(listed(&[("flash", None), ("pro", None)])),
+        );
+        for k in [Key::Char(' '), Key::Char(' '), Key::Down, Key::Char(' ')] {
+            key(&view, &mut panel, &mut secret, press(k));
+        }
+        paste(&mut panel, &mut secret, "no-match");
+        key(&view, &mut panel, &mut secret, press(Key::Enter));
+        let Some(Form::Model(form)) = &panel.form else {
+            panic!("confirmation");
+        };
+        assert_eq!(form.model, "pro");
+        assert!(form.selected.is_empty(), "the unchecked flash is not saved");
+    }
+
+    #[test]
+    fn adding_to_a_connected_account_discovers_but_manual_add_does_not() {
+        let view = view();
+        let mut panel = Panel::new();
+        panel.tab = Tab::Models;
+        panel.drill = Some("deepseek".into());
+        let mut secret = String::new();
+        assert_eq!(
+            key(&view, &mut panel, &mut secret, ctrl('a')),
+            Step::Discover {
+                account: "deepseek".into()
+            }
+        );
+        assert!(matches!(picking(&panel), Some(Picking::Loading { .. })));
+        key(&view, &mut panel, &mut secret, ctrl('n'));
+        let Some(Form::Model(form)) = &panel.form else {
+            panic!("manual form");
+        };
+        assert!(form.advanced);
+        assert!(form.picking.is_none());
+        assert!(form.selected.is_empty());
+        assert!(discovered(&view, &mut panel, "deepseek", Ok(listed(&[("late", None)]))).is_none());
+        assert!(picking(&panel).is_none());
     }
 
     /// Ctrl+F on the model field of an add form asks for the account's listing;

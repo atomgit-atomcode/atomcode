@@ -460,6 +460,9 @@ pub enum Msg<'a> {
     /// …beside an empty model field: the key that opens it.
     ProviderDiscoverHint,
     ProviderAdvanced,
+    ProviderManualAdd,
+    ProviderAdditionalModels,
+    ProviderEdit,
     ProviderContinue,
     ProviderConnectUse,
     ProviderSaveOnly,

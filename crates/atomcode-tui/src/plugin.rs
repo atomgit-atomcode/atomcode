@@ -2759,6 +2759,11 @@ impl UserInterface for Tui {
                             // cannot answer a press aimed at a tab.
                             if self.host.providers_open() {
                                 if let Some(key) = self.host.providers_action_at(x, y) {
+                                    if key == crate::surface::KeyPress::ctrl('e') {
+                                        if let Some(row) = self.host.providers_row_at(x, y) {
+                                            self.host.point_providers_at(row);
+                                        }
+                                    }
                                     self.run_providers_key(key);
                                     stale = true;
                                     continue;
@@ -2768,15 +2773,11 @@ impl UserInterface for Tui {
                                     stale = true;
                                     continue;
                                 }
-                                // And a press on one of its rows takes that row,
-                                // through the return key's own path — so a click
-                                // that walks into an account and a keypress that
-                                // does cannot come to mean different things.
+                                // Discovery rows toggle their checkboxes; other
+                                // rows use the same Enter path as the keyboard.
                                 if let Some(row) = self.host.providers_row_at(x, y) {
                                     let _ = self.host.point_providers_at(row);
-                                    self.run_providers_key(crate::surface::KeyPress::plain(
-                                        crate::surface::Key::Enter,
-                                    ));
+                                    self.run_providers_key(self.host.provider_row_key());
                                     stale = true;
                                     continue;
                                 }
@@ -3769,11 +3770,16 @@ impl Tui {
         let key = match &step {
             crate::providers::Step::SaveAccount { draft, .. } => draft.key.clone(),
             crate::providers::Step::SaveModel { draft, .. } => draft.key.clone(),
+            crate::providers::Step::SaveModels { drafts } => {
+                drafts.first().and_then(|draft| draft.key.clone())
+            }
             _ => None,
         };
         let is_write = matches!(
             &step,
-            crate::providers::Step::SaveAccount { .. } | crate::providers::Step::SaveModel { .. }
+            crate::providers::Step::SaveAccount { .. }
+                | crate::providers::Step::SaveModel { .. }
+                | crate::providers::Step::SaveModels { .. }
         );
         match self.apply_provider_step(step) {
             Ok(Some(said)) => self.host.say(&said, false),
@@ -3927,6 +3933,30 @@ impl Tui {
                 }
                 check = Some((draft.account.clone(), Some(id.clone())));
                 Some(t(Msg::ProviderAdded { id: &id }).into_owned())
+            }
+            Step::SaveModels { drafts } => {
+                let ids = port.add_models(&drafts)?;
+                self.refresh_providers();
+                if let Some((draft, id)) = drafts.iter().zip(&ids).find(|(draft, _)| draft.use_now)
+                {
+                    if let Err(error) = self.apply_provider_step(Step::Use {
+                        id: id.clone(),
+                        effort: Some(draft.effort.clone().unwrap_or_else(|| "default".into())),
+                    }) {
+                        self.host.say(
+                            t(Msg::ProviderSavedSwitchFailed { id, error: &error }).into_owned(),
+                            true,
+                        );
+                        return Ok(None);
+                    }
+                    return Ok(Some(t(Msg::ProviderSavedSwitching { id }).into_owned()));
+                }
+                Some(
+                    t(Msg::ProviderAdded {
+                        id: &ids.join(", "),
+                    })
+                    .into_owned(),
+                )
             }
             Step::DeleteAccount { id } => {
                 port.delete_account(&id)?;
@@ -13072,6 +13102,16 @@ mod provider_probe_tests {
             self.models.lock().unwrap().push(draft.clone());
             Ok(format!("deepseek/{}", draft.model))
         }
+        fn add_models(&self, drafts: &[ModelDraft]) -> Result<Vec<String>, String> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("write failed".into());
+            }
+            self.models.lock().unwrap().extend_from_slice(drafts);
+            Ok(drafts
+                .iter()
+                .map(|draft| format!("deepseek/{}", draft.model))
+                .collect())
+        }
         fn edit_model(&self, _: &str, _: &ModelDraft) -> Result<(), String> {
             Ok(())
         }
@@ -13125,6 +13165,56 @@ mod provider_probe_tests {
             Some(["low".into(), "high".into(), "max".into()].as_slice())
         );
         assert!(woken.try_recv().is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_batch_can_be_retried_without_partial_writes_and_switches_once() {
+        let port = Arc::new(Connects::default());
+        port.saved.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (host, tui, mut woken) = screen_with(port.clone());
+        open_connect(&host, &port);
+        host.connect_provider_models("deepseek");
+        let request = host.provider_discovery_id().unwrap();
+        host.providers_discovered(
+            "deepseek",
+            request,
+            Ok(vec![
+                crate::providers::Discovered {
+                    id: "flash".into(),
+                    ..Default::default()
+                },
+                crate::providers::Discovered {
+                    id: "pro".into(),
+                    effort: Some("high".into()),
+                    ..Default::default()
+                },
+            ]),
+        );
+        for key in [Key::Char(' '), Key::Down, Key::Char(' '), Key::Enter] {
+            tui.run_providers_key(KeyPress::plain(key));
+        }
+        port.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        tui.run_providers_key(KeyPress::plain(Key::Enter));
+        assert!(port.models.lock().unwrap().is_empty());
+        {
+            let m = host.moment.read().unwrap();
+            let Some(crate::providers::Form::Model(form)) =
+                &m.providers_panel.as_ref().unwrap().form
+            else {
+                panic!("restored");
+            };
+            assert_eq!(form.selected.len(), 1);
+            assert_eq!(form.model, "pro");
+        }
+        port.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        tui.run_providers_key(KeyPress::plain(Key::Enter));
+        let Some(Wake::Chose(Some(line))) = woken.recv().await else {
+            panic!("switch");
+        };
+        assert_eq!(line, "/model deepseek/pro high");
+        assert_eq!(port.models.lock().unwrap().len(), 2);
+        assert!(woken.try_recv().is_err());
+        assert!(!host.providers_open());
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -13227,6 +13317,21 @@ mod provider_probe_tests {
             ]),
         );
         assert!(host.point_providers_at(1));
+        assert_eq!(host.provider_row_key(), KeyPress::plain(Key::Char(' ')));
+        host.providers_key(host.provider_row_key());
+        {
+            let m = host.moment.read().unwrap();
+            let Some(crate::providers::Form::Model(form)) =
+                &m.providers_panel.as_ref().unwrap().form
+            else {
+                panic!("picker");
+            };
+            assert_eq!(form.selected[0].id, "second");
+            assert!(
+                form.picking.is_some(),
+                "clicks leave the list available for more checks"
+            );
+        }
         host.providers_key(KeyPress::plain(Key::Enter));
         {
             let m = host.moment.read().unwrap();

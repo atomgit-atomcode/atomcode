@@ -319,6 +319,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "This protocol has no model listing; type the model id by hand.".into()
         }
         Msg::ProviderDiscovering => "Fetching the model list from the endpoint… (Esc to cancel)".into(),
+        Msg::ProviderAdditionalModels => "Also add".into(),
+        Msg::ProviderManualAdd => "Manual add".into(),
+        Msg::ProviderEdit => "Edit".into(),
         Msg::ProviderAdvanced => "advanced settings".into(),
         Msg::ProviderContinue => "continue".into(),
         Msg::ProviderConnectUse => "connect and use".into(),
@@ -331,7 +334,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderSavedSwitching { id } => format!("Saved {id}; switching…").into(),
         Msg::ProviderConnectTitle { id } => format!("connect {id}").into(),
         Msg::ProviderDiscoverHint => "fetch from the endpoint".into(),
-        Msg::ProviderPickKeys => "↑↓ pick · Enter fill in · Esc back · type to filter".into(),
+        Msg::ProviderPickKeys => "↑↓ pick · Space select · Enter confirm (current first) · Esc back · type to filter".into(),
         Msg::ProviderPickFilter { query } => format!("filter: {query}").into(),
         Msg::DiscoverNotAListing => "the endpoint did not answer with a model list".into(),
         Msg::DiscoverTimedOut => "the endpoint did not answer within 10 seconds".into(),

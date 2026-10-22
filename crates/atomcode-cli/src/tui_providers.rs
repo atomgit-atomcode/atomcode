@@ -376,6 +376,32 @@ impl Providers for ConfigProviders {
             .map_err(said)
     }
 
+    fn add_models(&self, drafts: &[ModelDraft]) -> Result<Vec<String>, String> {
+        let first = drafts.first().ok_or("No models selected")?;
+        if drafts.iter().any(|draft| draft.account != first.account) {
+            return Err("Models must belong to one account".into());
+        }
+        let inputs: Vec<_> = drafts
+            .iter()
+            .map(|draft| ModelInput {
+                account: &draft.account,
+                model: &draft.model,
+                id: None,
+                display_name: draft.name.as_deref(),
+                window: draft.window,
+                max_tokens: draft.max_tokens,
+                vision: draft.vision,
+                effort: draft.effort.as_deref(),
+                levels: draft.levels.as_deref(),
+                key: draft.key.as_deref(),
+                default: draft.default,
+            })
+            .collect();
+        self.book()
+            .add_models(&first.account, &inputs, true)
+            .map_err(said)
+    }
+
     /// The panel shows every field it owns, so each one is set or cleared —
     /// and the two it does not show (a display name, an output cap) are kept.
     fn edit_model(&self, id: &str, draft: &ModelDraft) -> Result<(), String> {
@@ -1075,6 +1101,59 @@ rank = 2
             "{out}"
         );
         assert!(out.contains(r#"default_model = "mine/c""#), "{out}");
+    }
+
+    #[test]
+    fn selected_models_are_written_atomically_and_keep_their_capabilities() {
+        let (port, path) = port("batch-models");
+        let drafts = vec![
+            ModelDraft {
+                account: "mine".into(),
+                model: "flash".into(),
+                window: Some(1_000_000),
+                vision: Some(true),
+                ..Default::default()
+            },
+            ModelDraft {
+                account: "mine".into(),
+                model: "pro".into(),
+                window: Some(256_000),
+                max_tokens: Some(32000),
+                vision: Some(false),
+                ..Default::default()
+            },
+        ];
+        let ids = port.add_models(&drafts).unwrap();
+        assert_eq!(ids, vec!["mine/flash", "mine/pro"]);
+        let config = port.load();
+        assert_eq!(config.models[&ids[0]].context_window, 1_000_000);
+        assert_eq!(config.models[&ids[1]].context_window, 256_000);
+        let before = text(&path);
+        let invalid = vec![
+            ModelDraft {
+                account: "mine".into(),
+                model: "new".into(),
+                ..Default::default()
+            },
+            drafts[0].clone(),
+        ];
+        assert!(port.add_models(&invalid).is_err());
+        assert_eq!(
+            text(&path),
+            before,
+            "a duplicate cannot partially save a batch"
+        );
+        assert!(port
+            .add_models(&[
+                drafts[0].clone(),
+                ModelDraft {
+                    account: "other".into(),
+                    model: "x".into(),
+                    ..Default::default()
+                }
+            ])
+            .is_err());
+        assert_eq!(text(&path), before);
     }
 
     /// Picking a vendor off the offers and giving it a model is what configures
