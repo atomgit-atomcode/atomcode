@@ -179,7 +179,7 @@ impl Plugin for BashToolPlugin {
         let bash = BashTool::new(sensitive.clone()).with_output_preview_provider(provider.clone());
         let poll = Arc::new(
             atomcode_capabilities::tools::bash::BashPollTool::with_output_preview_provider(
-                provider,
+                provider.clone(),
             ),
         );
         // The background trio beside it: a dev server, a watcher or anything
@@ -188,9 +188,10 @@ impl Plugin for BashToolPlugin {
             ctx,
             vec![
                 Arc::new(bash),
-                Arc::new(atomcode_capabilities::tools::bash::BashStartTool::new(
-                    sensitive,
-                )),
+                Arc::new(
+                    atomcode_capabilities::tools::bash::BashStartTool::new(sensitive)
+                        .with_output_preview_provider(provider),
+                ),
                 poll,
                 Arc::new(atomcode_capabilities::tools::bash::BashKillTool),
             ],

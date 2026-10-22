@@ -130,6 +130,8 @@ impl Shared {
 
 struct Job {
     command: String,
+    /// Pending presentation note, consumed by the first poll rather than repeated.
+    exit_status_note: bool,
     shared: Arc<Shared>,
     /// Absolute byte offset already returned by a previous `poll`.
     delivered: usize,
@@ -157,6 +159,7 @@ pub(crate) struct PollResult {
     pub(crate) status: Status,
     /// The shell exited but what it started is still running (see [`Shared`]).
     pub(crate) left_running: bool,
+    pub(crate) exit_status_note: bool,
 }
 
 /// Full job termination, after inherited output pipes have closed. Observing
@@ -205,6 +208,7 @@ pub(crate) async fn start(
     command: &str,
     ctx: &ToolContext,
 ) -> Result<String, String> {
+    let exit_status_note = super::exit_diagnostic::may_mask_status(command);
     // Bound the store BEFORE spawning so a runaway starter can't grow it (or leak processes)
     // without limit; count under the lock, drop it before the await-y spawn below.
     if store().lock().unwrap().len() >= MAX_BACKGROUND_JOBS {
@@ -272,6 +276,7 @@ pub(crate) async fn start(
         id.clone(),
         Job {
             command: command.to_string(),
+            exit_status_note,
             shared,
             delivered: 0,
             kill: kill_tx,
@@ -294,6 +299,7 @@ pub(crate) fn poll(job_id: &str) -> Result<PollResult, String> {
     job.delivered = new_delivered;
     let status = job.shared.status.lock().unwrap().clone();
     let left_running = job.shared.left_running();
+    let exit_status_note = std::mem::take(&mut job.exit_status_note);
     let world = Arc::clone(&job.world);
     let diagnostic_code = match status {
         Status::Exited(code)
@@ -319,6 +325,7 @@ pub(crate) fn poll(job_id: &str) -> Result<PollResult, String> {
         truncated,
         status,
         left_running,
+        exit_status_note,
     })
 }
 
@@ -614,6 +621,7 @@ struct PollArgs {
 /// `bash_start` — spawn a command in the background and return its job id.
 pub struct BashStartTool {
     world: Arc<dyn Shell>,
+    output_preview: Option<crate::tools::output_artifact::ArtifactStoreProvider>,
     /// What counts as a sensitive target — the same grant floor `bash` uses.
     sensitive: crate::tools::sensitive_path::SensitivePaths,
 }
@@ -636,7 +644,19 @@ impl BashStartTool {
         world: Arc<dyn Shell>,
         sensitive: crate::tools::sensitive_path::SensitivePaths,
     ) -> Self {
-        Self { world, sensitive }
+        Self {
+            world,
+            sensitive,
+            output_preview: None,
+        }
+    }
+
+    pub fn with_output_preview_provider(
+        mut self,
+        provider: crate::tools::output_artifact::ArtifactStoreProvider,
+    ) -> Self {
+        self.output_preview = Some(provider);
+        self
     }
 }
 
@@ -646,6 +666,7 @@ impl Tool for BashStartTool {
         "bash_start"
     }
     fn description(&self) -> &str {
+        macro_rules! base { () => {
         "Start a shell command in the BACKGROUND and return a job id immediately (does not \
          wait for it to finish). Use this instead of a large `timeout` for work that legitimately \
          runs longer than the foreground `bash` limit (builds, servers, long test suites). \
@@ -653,6 +674,23 @@ impl Tool for BashStartTool {
          reports it exited), and stop \
          it early with `bash_kill`. Keep build output streaming: `| tail` hides progress and \
          may mask a failed build's exit code. Same shell, working directory, and environment as `bash`."
+        }; }
+        if self
+            .output_preview
+            .as_ref()
+            .and_then(|provider| provider())
+            .is_some()
+        {
+            concat!(
+                "For short build/install/test output, start the original command unchanged; \
+                 do not append `| head`, `| tail` or `| tee`, or end with a status-printing \
+                 echo. Instead set `output_tail_lines: 12` on `bash_poll`, not on `bash_start`; \
+                 the poll preserves process status and links saved captured output.\n\n",
+                base!()
+            )
+        } else {
+            base!()
+        }
     }
     fn parameters_schema(&self) -> Value {
         json!({
@@ -736,7 +774,11 @@ impl Tool for PreviewedPoll {
         BashPollTool.name()
     }
     fn description(&self) -> &str {
-        BashPollTool.description()
+        if (self.0)().is_some() {
+            poll_description(true)
+        } else {
+            BashPollTool.description()
+        }
     }
     fn parameters_schema(&self) -> Value {
         let mut schema = BashPollTool.parameters_schema();
@@ -754,12 +796,8 @@ impl Tool for PreviewedPoll {
     }
 }
 
-#[async_trait]
-impl Tool for BashPollTool {
-    fn name(&self) -> &str {
-        "bash_poll"
-    }
-    fn description(&self) -> &str {
+fn poll_description(preview: bool) -> &'static str {
+    macro_rules! base { () => {
         "Read output produced by a background `bash_start` job since your last poll, plus \
          whether it is still running or has exited. Waits up to wait_ms (default 10000, max \
          60000), returning early on output or exit; 0 checks immediately. Use this instead \
@@ -768,6 +806,27 @@ impl Tool for BashPollTool {
          When a poll has no new output and still reports running, avoid repeated waiting \
          narration or a new status update for each check. Report meaningful new output, \
          completion, failure, or a changed plan instead. Read-only."
+    }; }
+    if preview {
+        concat!(
+            "Use `output_tail_lines: 12` to return only a short output tail while keeping \
+             the job's real status. Read omitted captured output with `fetch_output` when \
+             saved. Request preview here instead of piping the original build/test through \
+             head/tail/tee or ending it with a status-printing echo.\n\n",
+            base!()
+        )
+    } else {
+        base!()
+    }
+}
+
+#[async_trait]
+impl Tool for BashPollTool {
+    fn name(&self) -> &str {
+        "bash_poll"
+    }
+    fn description(&self) -> &str {
+        poll_description(false)
     }
     fn parameters_schema(&self) -> Value {
         json!({
@@ -829,6 +888,9 @@ async fn execute_poll(
                     ""
                 };
                 preview.shell_tail(&mut result, lines, &poll_status_line(&r), true, notice);
+            }
+            if r.exit_status_note && matches!(r.status, Status::Running | Status::Exited(0)) {
+                super::exit_diagnostic::append_note(&mut result, preview.is_some());
             }
             result
         }
@@ -1153,14 +1215,83 @@ mod tests {
         tokio::sync::mpsc::UnboundedSender<Chunk>,
         Arc<PollProcess>,
     ) {
+        poll_job_for("build").await
+    }
+
+    async fn poll_job_for(
+        command: &str,
+    ) -> (
+        String,
+        tokio::sync::mpsc::UnboundedSender<Chunk>,
+        Arc<PollProcess>,
+    ) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let process = Arc::new(PollProcess {
             chunks: tokio::sync::Mutex::new(rx),
             finish: tokio_util::sync::CancellationToken::new(),
         });
         let world: Arc<dyn Shell> = Arc::new(PollWorld(process.clone()));
-        let id = start(&world, "build", &ctx(Path::new("."))).await.unwrap();
+        let id = start(&world, command, &ctx(Path::new("."))).await.unwrap();
         (id, tx, process)
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn wrapped_status_note_is_delivered_once_outside_the_poll_preview() {
+        for available in [false, true] {
+            let d = tempfile::tempdir().unwrap();
+            let tool: Box<dyn Tool> = if available {
+                Box::new(BashPollTool::with_output_preview(Arc::new(
+                    crate::tools::ArtifactStore::new(d.path()),
+                )))
+            } else {
+                Box::new(BashPollTool)
+            };
+            let (id, tx, process) = poll_job_for("cargo test | tail -10").await;
+            tx.send(Chunk::Stdout(b"first\nlast\n".to_vec())).unwrap();
+            tokio::task::yield_now().await;
+            // Rejected arguments consume neither the note nor the output cursor.
+            let invalid = json!({"job_id":id,"wait_ms":0,"output_tail_lines":0}).to_string();
+            assert!(tool.execute(&invalid, &ctx(d.path())).await.is_error);
+            let mut args = json!({"job_id":id,"wait_ms":0});
+            if available {
+                args["output_tail_lines"] = json!(1);
+            }
+            let first = tool.execute(&args.to_string(), &ctx(d.path())).await;
+            assert!(!first.is_error);
+            assert!(
+                first.content.contains("last\nstatus: running"),
+                "{}",
+                first.content
+            );
+            assert_eq!(
+                first
+                    .content
+                    .matches(super::super::exit_diagnostic::MARKER)
+                    .count(),
+                1
+            );
+            assert_eq!(first.content.contains("output_tail_lines"), available);
+            if available {
+                let files: Vec<_> = std::fs::read_dir(d.path())
+                    .unwrap()
+                    .map(|e| e.unwrap())
+                    .collect();
+                assert_eq!(files.len(), 1);
+                let captured = std::fs::read_to_string(files[0].path()).unwrap();
+                assert_eq!(captured, "first\nlast\nstatus: running");
+            }
+            let next = tool.execute(&args.to_string(), &ctx(d.path())).await;
+            assert_eq!(next.content, "status: running");
+            process.finish.cancel();
+            drop(tx);
+            let (remaining, status) = drain(&id).await;
+            assert_eq!(status, Status::Exited(0));
+            assert!(!remaining.contains(super::super::exit_diagnostic::MARKER));
+            assert!(
+                poll(&id).is_err(),
+                "terminal collection still removes the job"
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

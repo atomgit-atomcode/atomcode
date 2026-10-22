@@ -115,6 +115,11 @@ async fn shell_preview_is_advertised_only_by_the_configured_shell_row() {
             .get("output_tail_lines")
             .is_some());
     }
+    for name in ["bash", "bash_start", "bash_poll"] {
+        let tool = tools.get(name).unwrap();
+        assert!(tool.description().contains("output_tail_lines"), "{name}");
+        assert!(tool.description().contains("echo"), "{name}");
+    }
     assert!(tools.get("fetch_output").is_some());
     off(&mut app, "tool-output-artifact").await;
     let tools = app.context().service::<ToolsSvc>().unwrap();
@@ -122,6 +127,16 @@ async fn shell_preview_is_advertised_only_by_the_configured_shell_row() {
         assert!(tools.get(name).unwrap().parameters_schema()["properties"]
             .get("output_tail_lines")
             .is_none());
+    }
+    for name in ["bash", "bash_start", "bash_poll"] {
+        assert!(
+            !tools
+                .get(name)
+                .unwrap()
+                .description()
+                .contains("output_tail_lines"),
+            "{name} must not describe an unavailable parameter"
+        );
     }
     assert!(tools.get("fetch_output").is_none());
 }

@@ -177,7 +177,7 @@ impl Plugin for BashWorldToolPlugin {
             .with_output_preview_provider(provider.clone());
         let poll = Arc::new(
             atomcode_capabilities::tools::bash::BashPollTool::with_output_preview_provider(
-                provider,
+                provider.clone(),
             ),
         );
         super::tools::mount(
@@ -188,7 +188,8 @@ impl Plugin for BashWorldToolPlugin {
                     atomcode_capabilities::tools::bash::BashStartTool::with_world(
                         shell.clone(),
                         sensitive,
-                    ),
+                    )
+                    .with_output_preview_provider(provider),
                 ),
                 poll,
                 Arc::new(atomcode_capabilities::tools::bash::BashKillTool),
