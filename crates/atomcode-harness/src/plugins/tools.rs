@@ -188,7 +188,10 @@ impl Plugin for BashToolPlugin {
              Long builds/tests also use `bash_start`, then `bash_poll` with wait_ms up to 60000 \
              (returns early on output or exit), instead of shell sleep or duplicate builds. Do not \
              background it inside `bash` (`&`, `nohup`, `start`); a `bash` call is for a command that \
-             finishes.",
+             finishes. For builds/tests, check the original command's exit status before claiming \
+             success. Piping to head/tail/tee can hide failure. For long output, save a task log, \
+             capture the command's status before inspecting it, then return that status using \
+             the current shell's syntax. Read the relevant error before retrying.",
         );
         Ok(())
     }
