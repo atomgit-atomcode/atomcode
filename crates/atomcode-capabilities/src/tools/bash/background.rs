@@ -38,6 +38,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedReceiver;
+use tracing::instrument::WithSubscriber;
 
 /// Per-job output is bounded so a chatty long-runner can't grow the process heap without
 /// limit (cf. the grep-OOM lesson). Past this, the OLDEST bytes are dropped and the next
@@ -106,6 +107,8 @@ impl Buf {
 }
 
 struct Shared {
+    /// Observed lifetime after the world returns a process handle, not CPU time.
+    started_at: tokio::time::Instant,
     changed: tokio::sync::Notify,
     output: Mutex<Buf>,
     status: Mutex<Status>,
@@ -177,12 +180,34 @@ pub(crate) async fn start(
         cwd: Some(ctx.working_dir.clone()),
         env: Vec::new(),
     };
-    let process = world.spawn(command, &options).await.map_err(|e| match e {
-        crate::world::SpawnError::Unsupported(reason) => reason,
-        crate::world::SpawnError::Failed(reason) => format!("bash_start: {reason}"),
+    let spawn_started = tokio::time::Instant::now();
+    let process = world.spawn(command, &options).await.map_err(|e| {
+        tracing::info!(
+            pid = std::process::id(),
+            spawn_ms = spawn_started.elapsed().as_millis() as u64,
+            outcome = if matches!(&e, crate::world::SpawnError::Unsupported(_)) {
+                "unsupported"
+            } else {
+                "failed"
+            },
+            "background_job_start_failed"
+        );
+        match e {
+            crate::world::SpawnError::Unsupported(reason) => reason,
+            crate::world::SpawnError::Failed(reason) => format!("bash_start: {reason}"),
+        }
     })?;
 
+    let id = next_id();
+    let started_at = tokio::time::Instant::now();
+    tracing::info!(
+        pid = std::process::id(),
+        job_id = id.as_str(),
+        spawn_ms = (started_at - spawn_started).as_millis() as u64,
+        "background_job_started"
+    );
     let shared = Arc::new(Shared {
+        started_at,
         changed: tokio::sync::Notify::new(),
         output: Mutex::new(Buf {
             tail: Vec::new(),
@@ -194,14 +219,16 @@ pub(crate) async fn start(
         left_running: std::sync::atomic::AtomicBool::new(false),
     });
     let (kill_tx, kill_rx) = tokio::sync::mpsc::unbounded_channel();
-    tokio::spawn(reader_task(
-        process,
-        Arc::clone(&shared),
-        kill_rx,
-        Arc::clone(world),
-    ));
-
-    let id = next_id();
+    tokio::spawn(
+        reader_task(
+            process,
+            Arc::clone(&shared),
+            kill_rx,
+            Arc::clone(world),
+            id.clone(),
+        )
+        .with_current_subscriber(),
+    );
     store().lock().unwrap().insert(
         id.clone(),
         Job {
@@ -259,12 +286,21 @@ pub(crate) fn poll(job_id: &str) -> Result<PollResult, String> {
 /// Wait without consuming output or holding the job store lock. The existing reader
 /// remains the only process owner; cancelling this wait leaves the job available.
 async fn wait_for_poll(job_id: &str, wait_ms: u64, ctx: &ToolContext) -> Result<(), String> {
+    let wait_started = tokio::time::Instant::now();
     let (shared, delivered) = {
         let guard = store().lock().unwrap();
         let job = guard.get(job_id).ok_or_else(|| {
             format!("bash_poll: no background job '{job_id}' (already finished-and-collected, or never started)")
         })?;
         (Arc::clone(&job.shared), job.delivered)
+    };
+    // Construct only after looking up an internal job id: arbitrary caller input
+    // from an invalid id must not be copied into diagnostic logs.
+    let mut timing = PollWaitTiming {
+        job_id,
+        started_at: wait_started,
+        requested_wait_ms: wait_ms,
+        outcome: "abandoned",
     };
     let initial_status = shared.status.lock().unwrap().clone();
     let initial_left_running = shared.left_running();
@@ -277,6 +313,7 @@ async fn wait_for_poll(job_id: &str, wait_ms: u64, ctx: &ToolContext) -> Result<
         tokio::pin!(changed);
         changed.as_mut().enable();
         if ctx.cancel.is_cancelled() {
+            timing.outcome = "cancelled";
             return Err("bash_poll: wait cancelled; the job was not stopped and its output remains available.".into());
         }
         let has_output = shared.output.lock().unwrap().total > delivered;
@@ -287,16 +324,49 @@ async fn wait_for_poll(job_id: &str, wait_ms: u64, ctx: &ToolContext) -> Result<
             || status != initial_status
             || left_running != initial_left_running
         {
+            timing.outcome = if has_output {
+                "output"
+            } else if !matches!(status, Status::Running) && !left_running {
+                "finished"
+            } else {
+                "status_changed"
+            };
             return Ok(());
         }
         tokio::select! {
             biased;
             _ = ctx.cancel.cancelled() => {
+                timing.outcome = "cancelled";
                 return Err("bash_poll: wait cancelled; the job was not stopped and its output remains available.".into());
             }
-            _ = tokio::time::sleep_until(deadline) => return Ok(()),
+            _ = tokio::time::sleep_until(deadline) => {
+                timing.outcome = "deadline";
+                return Ok(());
+            }
             _ = &mut changed => {}
         }
+    }
+}
+
+/// Observability only. Dropping a caller's wait never owns or stops its process.
+struct PollWaitTiming<'a> {
+    job_id: &'a str,
+    started_at: tokio::time::Instant,
+    requested_wait_ms: u64,
+    outcome: &'static str,
+}
+
+impl Drop for PollWaitTiming<'_> {
+    fn drop(&mut self) {
+        tracing::debug!(
+            pid = std::process::id(),
+            job_id = self.job_id,
+            requested_wait_ms = self.requested_wait_ms,
+            effective_wait_ms = self.requested_wait_ms.min(MAX_POLL_WAIT_MS),
+            waited_ms = self.started_at.elapsed().as_millis() as u64,
+            outcome = self.outcome,
+            "background_poll_wait_finished"
+        );
     }
 }
 
@@ -383,6 +453,7 @@ async fn reader_task(
     shared: Arc<Shared>,
     mut kill_rx: UnboundedReceiver<()>,
     world: Arc<dyn Shell>,
+    job_id: String,
 ) {
     let mut pump = tokio::spawn(pump(Arc::clone(&process), Arc::clone(&shared), world));
     let mut killed = false;
@@ -402,6 +473,15 @@ async fn reader_task(
             },
         }
     };
+    let exited_at = tokio::time::Instant::now();
+    tracing::info!(
+        pid = std::process::id(),
+        job_id = job_id.as_str(),
+        observed_runtime_ms = (exited_at - shared.started_at).as_millis() as u64,
+        exit_code = code,
+        kill_requested = killed,
+        "background_job_exited"
+    );
     // A normal fast exit closes its pipes, so the pump completes at once and no time is
     // spent here.
     if tokio::time::timeout(POST_EXIT_DRAIN_GRACE, &mut pump)
@@ -436,6 +516,15 @@ async fn reader_task(
     set_status(&shared, killed, code);
     shared.left_running.store(false, Ordering::Release);
     shared.changed.notify_waiters();
+    let finished_at = tokio::time::Instant::now();
+    tracing::info!(
+        pid = std::process::id(),
+        job_id = job_id.as_str(),
+        job_elapsed_ms = (finished_at - shared.started_at).as_millis() as u64,
+        post_exit_ms = (finished_at - exited_at).as_millis() as u64,
+        kill_requested = killed,
+        "background_job_finished"
+    );
     // `process` drops here. A shell that was killed takes its tree with it through the
     // local world's reaper (pgroup / job object); one that exited by itself had nothing
     // left holding its output by now.
@@ -905,6 +994,294 @@ mod tests {
         let world: Arc<dyn Shell> = Arc::new(PollWorld(process.clone()));
         let id = start(&world, "build", &ctx(Path::new("."))).await.unwrap();
         (id, tx, process)
+    }
+
+    #[derive(Clone, Default)]
+    struct TimingCapture(Arc<Mutex<Vec<serde_json::Map<String, Value>>>>);
+
+    struct TimingFields<'a>(&'a mut serde_json::Map<String, Value>);
+
+    impl tracing::field::Visit for TimingFields<'_> {
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.0.insert(field.name().into(), json!(value));
+        }
+        fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+            self.0.insert(field.name().into(), json!(value));
+        }
+        fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+            self.0.insert(field.name().into(), json!(value));
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().into(), json!(value));
+        }
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .insert(field.name().into(), json!(format!("{value:?}")));
+        }
+    }
+
+    impl tracing::Subscriber for TimingCapture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = serde_json::Map::new();
+            fields.insert("level".into(), json!(event.metadata().level().as_str()));
+            event.record(&mut TimingFields(&mut fields));
+            self.0.lock().unwrap().push(fields);
+        }
+    }
+
+    struct TimedPollWorld(Arc<dyn Process>, Duration);
+
+    #[async_trait]
+    impl Shell for TimedPollWorld {
+        fn describe(&self) -> String {
+            "scripted delayed spawn".into()
+        }
+        async fn spawn(
+            &self,
+            _: &str,
+            _: &SpawnOptions,
+        ) -> Result<Arc<dyn Process>, crate::world::SpawnError> {
+            tokio::time::sleep(self.1).await;
+            Ok(self.0.clone())
+        }
+    }
+
+    struct TimedRejectedWorld(bool);
+
+    #[async_trait]
+    impl Shell for TimedRejectedWorld {
+        fn describe(&self) -> String {
+            "scripted rejected spawn".into()
+        }
+        async fn spawn(
+            &self,
+            _: &str,
+            _: &SpawnOptions,
+        ) -> Result<Arc<dyn Process>, crate::world::SpawnError> {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            Err(if self.0 {
+                crate::world::SpawnError::Unsupported("PRIVATE_SPAWN_ERROR".into())
+            } else {
+                crate::world::SpawnError::Failed("PRIVATE_SPAWN_ERROR".into())
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn rejected_spawn_timing_does_not_log_commands_paths_or_error_text() {
+        let capture = TimingCapture::default();
+        async {
+            for unsupported in [true, false] {
+                let world: Arc<dyn Shell> = Arc::new(TimedRejectedWorld(unsupported));
+                let error = start(&world, "PRIVATE_COMMAND", &ctx(Path::new("PRIVATE_CWD")))
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    error,
+                    if unsupported {
+                        "PRIVATE_SPAWN_ERROR"
+                    } else {
+                        "bash_start: PRIVATE_SPAWN_ERROR"
+                    }
+                );
+            }
+        }
+        .with_subscriber(capture.clone())
+        .await;
+        let events = capture.0.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        for event in events.iter() {
+            assert_eq!(event["message"], "background_job_start_failed");
+            assert_eq!(event["level"], "INFO");
+            assert_eq!(event["spawn_ms"], 30);
+            assert!(!event.contains_key("job_id"));
+        }
+        assert_eq!(events[0]["outcome"], "unsupported");
+        assert_eq!(events[1]["outcome"], "failed");
+        assert!(!serde_json::to_string(&*events)
+            .unwrap()
+            .contains("PRIVATE_"));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn timing_logs_separate_spawn_runtime_and_poll_wait_without_logging_content() {
+        let capture = TimingCapture::default();
+        let id = async {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let process = Arc::new(PollProcess {
+                chunks: tokio::sync::Mutex::new(rx),
+                finish: tokio_util::sync::CancellationToken::new(),
+            });
+            let world: Arc<dyn Shell> =
+                Arc::new(TimedPollWorld(process.clone(), Duration::from_millis(100)));
+            let id = start(&world, "PRIVATE_COMMAND", &ctx(Path::new("PRIVATE_CWD")))
+                .await
+                .unwrap();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                tx.send(Chunk::Stdout(b"PRIVATE_OUTPUT\n".to_vec()))
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                process.finish.cancel();
+            });
+            let args = json!({"job_id": id, "wait_ms": 60000}).to_string();
+            let first = BashPollTool.execute(&args, &ctx(Path::new("."))).await;
+            assert_eq!(first.content, "PRIVATE_OUTPUT\nstatus: running");
+            let second = BashPollTool.execute(&args, &ctx(Path::new("."))).await;
+            assert_eq!(second.content, "status: exited (code 0)");
+            id
+        }
+        .with_subscriber(capture.clone())
+        .await;
+        let events = capture.0.lock().unwrap();
+        let find = |message: &str| events.iter().find(|e| e["message"] == message).unwrap();
+        assert_eq!(find("background_job_started")["spawn_ms"], 100);
+        let exit = find("background_job_exited");
+        assert_eq!(exit["observed_runtime_ms"], 500);
+        assert_eq!(exit["exit_code"], 0);
+        assert_eq!(exit["kill_requested"], false);
+        let finished = find("background_job_finished");
+        assert_eq!(finished["job_elapsed_ms"], 500);
+        assert_eq!(finished["post_exit_ms"], 0);
+        let polls: Vec<_> = events
+            .iter()
+            .filter(|e| e["message"] == "background_poll_wait_finished")
+            .collect();
+        assert_eq!(polls.len(), 2);
+        assert_eq!(polls[0]["outcome"], "output");
+        assert_eq!(polls[0]["waited_ms"], 200);
+        assert_eq!(polls[1]["outcome"], "finished");
+        assert_eq!(polls[1]["waited_ms"], 300);
+        for event in events.iter() {
+            assert_eq!(event["job_id"], id);
+            assert_eq!(event["pid"], std::process::id());
+        }
+        let serialized = serde_json::to_string(&*events).unwrap();
+        assert!(
+            !serialized.contains("PRIVATE_"),
+            "commands, paths and output must stay out of timing logs"
+        );
+    }
+
+    struct LingeringProcess {
+        exit: tokio_util::sync::CancellationToken,
+        close_output: tokio_util::sync::CancellationToken,
+    }
+
+    #[async_trait]
+    impl Process for LingeringProcess {
+        async fn next_chunk(&self) -> Option<Chunk> {
+            self.close_output.cancelled().await;
+            None
+        }
+        async fn wait(&self) -> Result<Exit, String> {
+            self.exit.cancelled().await;
+            Ok(Exit {
+                code: Some(0),
+                signal: None,
+            })
+        }
+        async fn kill(&self) {
+            self.exit.cancel();
+            self.close_output.cancel();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn timing_logs_do_not_count_lingering_output_as_process_runtime() {
+        let capture = TimingCapture::default();
+        async {
+            let process = Arc::new(LingeringProcess {
+                exit: tokio_util::sync::CancellationToken::new(),
+                close_output: tokio_util::sync::CancellationToken::new(),
+            });
+            let world: Arc<dyn Shell> = Arc::new(TimedPollWorld(process.clone(), Duration::ZERO));
+            let id = start(&world, "build", &ctx(Path::new("."))).await.unwrap();
+            let started = tokio::time::Instant::now();
+            tokio::spawn(async move {
+                tokio::time::sleep_until(started + Duration::from_millis(100)).await;
+                process.exit.cancel();
+                tokio::time::sleep_until(started + Duration::from_millis(700)).await;
+                process.close_output.cancel();
+            });
+            assert_eq!(drain(&id).await.1, Status::Exited(0));
+        }
+        .with_subscriber(capture.clone())
+        .await;
+        let events = capture.0.lock().unwrap();
+        let exit = events
+            .iter()
+            .find(|e| e["message"] == "background_job_exited")
+            .unwrap();
+        let finished = events
+            .iter()
+            .find(|e| e["message"] == "background_job_finished")
+            .unwrap();
+        assert_eq!(exit["observed_runtime_ms"], 100);
+        assert_eq!(finished["job_elapsed_ms"], 700);
+        assert_eq!(finished["post_exit_ms"], 600);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn timing_logs_cover_timeout_cancel_and_dropped_wait_without_stopping_the_job() {
+        let capture = TimingCapture::default();
+        async {
+            let (id, _tx, process) = poll_job().await;
+            let context = ctx(Path::new("."));
+            wait_for_poll(&id, 20, &context).await.unwrap();
+            let cancel = context.cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                cancel.cancel();
+            });
+            assert!(wait_for_poll(&id, 1000, &context).await.is_err());
+            let fresh = ctx(Path::new("."));
+            let mut pending = Box::pin(wait_for_poll(&id, 10000, &fresh));
+            tokio::select! {
+                _ = &mut pending => panic!("the silent job should still be running"),
+                _ = tokio::time::sleep(Duration::from_millis(75)) => {}
+            }
+            drop(pending);
+            assert!(
+                !process.finish.is_cancelled(),
+                "timing observers must not stop the job"
+            );
+            assert!(wait_for_poll("PRIVATE_INVALID_JOB", 1000, &fresh)
+                .await
+                .is_err());
+            kill(&id).unwrap();
+            assert_eq!(drain(&id).await.1, Status::Killed);
+        }
+        .with_subscriber(capture.clone())
+        .await;
+        let events = capture.0.lock().unwrap();
+        let polls: Vec<_> = events
+            .iter()
+            .filter(|e| e["message"] == "background_poll_wait_finished")
+            .collect();
+        assert_eq!(polls.len(), 3);
+        for (event, reason, elapsed) in [
+            (polls[0], "deadline", 20),
+            (polls[1], "cancelled", 100),
+            (polls[2], "abandoned", 75),
+        ] {
+            assert_eq!(event["level"], "DEBUG");
+            assert_eq!(event["outcome"], reason);
+            assert_eq!(event["waited_ms"], elapsed);
+        }
+        assert!(!serde_json::to_string(&*events)
+            .unwrap()
+            .contains("PRIVATE_INVALID_JOB"));
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
