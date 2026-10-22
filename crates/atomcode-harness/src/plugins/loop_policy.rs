@@ -959,6 +959,32 @@ struct ToolLoopGuard {
     stop_after: u32,
 }
 
+/// A bounded wait on a live background job can legitimately return the same
+/// status for many rounds. Its last line is the tool's status, after stdout.
+/// Sub-second checks, missing jobs, errors and terminal results keep the normal
+/// loop protection. No process state or lifecycle is owned by this policy.
+fn pending_background_wait(call: &atomcode_kernel::tool::ToolCall, result: &ToolResult) -> bool {
+    if call.name != "bash_poll" || result.is_error {
+        return false;
+    }
+    let Ok(args) = serde_json::from_str::<Value>(&call.arguments) else {
+        return false;
+    };
+    if args
+        .get("wait_ms")
+        .filter(|wait| !wait.is_null())
+        .is_some_and(|wait| !wait.as_u64().is_some_and(|ms| ms >= 1000))
+    {
+        return false;
+    }
+    let status = result.content.lines().last().unwrap_or_default();
+    status == "status: running"
+        || (status.starts_with("status: exited (code ")
+            && status.ends_with(
+                "; what it started is still running and writing here — keep polling, or stop it with bash_kill",
+            ))
+}
+
 /// The exact-repeat guard has stronger evidence than a generic "you repeated
 /// yourself" reminder: this call already completed successfully with this same
 /// model-visible result. Say that explicitly for state-update tools, otherwise a
@@ -1015,6 +1041,14 @@ impl Waterfall<ToolsExecute> for ToolLoopGuard {
     async fn handle(&self, exec: &mut ToolExec, next: Next<'_, ToolsExecute>) -> ToolResult {
         let signature = format!("{}::{}", exec.call.name, exec.call.arguments);
         let mut result = next.run(exec).await;
+        if pending_background_wait(&exec.call, &result) {
+            self.state
+                .lock()
+                .expect("loop guard poisoned")
+                .counts
+                .clear();
+            return result;
+        }
         let key = format!("{signature}=>{}", result.content);
 
         let mut state = self.state.lock().expect("loop guard poisoned");
@@ -1073,6 +1107,8 @@ impl Listener<TurnStopping> for ToolLoopGuard {
 /// in seconds; one that spends minutes per round is spending neither tokens nor
 /// the budget fast, and still meets every other stop (round cap, runaway fuse,
 /// a person).
+/// Successful bounded background waits are also excluded even when they return
+/// sooner: output or exit can wake one before `poll_after`.
 struct RepeatFuse {
     ctx: Context,
     nudge_at: u32,
@@ -1145,6 +1181,11 @@ impl Waterfall<ToolsExecuteBatch> for RepeatFuse {
         if self
             .poll_after
             .is_some_and(|after| started.elapsed() >= after)
+            || batch.calls.iter().any(|call| {
+                results.iter().any(|result| {
+                    result.call_id == call.id && pending_background_wait(call, result)
+                })
+            })
         {
             let mut state = self.state.lock().expect("repeat fuse poisoned");
             if state.signature == round_signature(&batch.calls) {
@@ -1239,7 +1280,8 @@ impl Plugin for RepeatFusePlugin {
             #[serde(default = "default_stop_at")]
             stop_at: u32,
             /// A round that ran this long is a wait, not a repeat; `0`
-            /// counts every round.
+            /// disables this elapsed-time exemption. Live bounded background
+            /// waits remain exempt independently of their duration.
             #[serde(default = "default_poll_after_secs")]
             poll_after_secs: u64,
         }
@@ -1316,7 +1358,7 @@ impl Plugin for ToolLoopGuardPlugin {
 
 #[cfg(test)]
 mod focused_policy_tests {
-    use super::{exact_repeat_warning, retry_backoff};
+    use super::{exact_repeat_warning, pending_background_wait, retry_backoff};
     use crate::events::{Authorization, ToolExec};
     use atomcode_kernel::tool::{ToolCall, ToolResult};
     use std::time::Duration;
@@ -1368,6 +1410,36 @@ mod focused_policy_tests {
             round: 3,
             authorization: Authorization::default(),
             working_dir: std::path::PathBuf::from("."),
+        }
+    }
+
+    #[test]
+    fn only_successful_bounded_waits_on_live_jobs_are_polling() {
+        for (name, args, content, is_error, pending) in [
+            ("bash_poll", r#"{"job_id":"bg-1"}"#, "status: running", false, true),
+            ("bash_poll", r#"{"job_id":"bg-1","wait_ms":null}"#, "status: running", false, true),
+            ("bash_poll", r#"{"job_id":"bg-1","wait_ms":60000}"#, "status: running", false, true),
+            ("bash_poll", r#"{"job_id":"bg-1","wait_ms":0}"#, "status: running", false, false),
+            ("bash_poll", r#"{"job_id":"bg-1","wait_ms":1}"#, "status: running", false, false),
+            ("bash_poll", r#"{"job_id":"bg-1","wait_ms":999}"#, "status: running", false, false),
+            ("bash_poll", r#"{"job_id":"bg-1","wait_ms":1000}"#, "status: running", false, true),
+            ("bash_poll", r#"{"job_id":"bg-1"}"#, "no background job", true, false),
+            ("bash_poll", r#"{"job_id":"bg-1"}"#, "status: running", true, false),
+            ("bash_poll", r#"{"job_id":"bg-1"}"#, "status: exited (code 0)", false, false),
+            ("bash_poll", r#"{"job_id":"bg-1"}"#, "status: killed", false, false),
+            ("read_file", r#"{"file_path":"log"}"#, "status: running", false, false),
+            ("bash_poll", r#"{"job_id":"bg-1","wait_ms":-1}"#, "status: running", false, false),
+            ("bash_poll", "invalid", "status: running", false, false),
+            ("bash_poll", r#"{"job_id":"bg-1"}"#, "status: exited (code 0); what it started is still running and writing here — keep polling, or stop it with bash_kill", false, true),
+        ] {
+            let exec = exec(name, args);
+            let result = ToolResult {
+                call_id: exec.call.id.clone(),
+                content: content.into(),
+                is_error,
+                images: Vec::new(),
+            };
+            assert_eq!(pending_background_wait(&exec.call, &result), pending, "{name} {args} {content}");
         }
     }
 

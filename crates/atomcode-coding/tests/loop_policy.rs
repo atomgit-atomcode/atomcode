@@ -714,6 +714,95 @@ async fn without_a_utility_model_the_summary_falls_back_to_the_model_free_list()
 
 // ---- tool-loop guard ----------------------------------------------------
 
+struct PendingPollTool;
+
+#[async_trait]
+impl atomcode_kernel::tool::Tool for PendingPollTool {
+    fn name(&self) -> &str {
+        "bash_poll"
+    }
+    fn description(&self) -> &str {
+        "Scripted bounded background wait"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type":"object","properties":{"job_id":{"type":"string"},"wait_ms":{"type":"integer"}},"required":["job_id"]})
+    }
+    fn read_only_hint(&self) -> bool {
+        true
+    }
+    async fn execute(
+        &self,
+        _: &str,
+        _: &atomcode_kernel::tool::ToolContext,
+    ) -> atomcode_kernel::tool::ToolResult {
+        atomcode_kernel::tool::ToolResult {
+            call_id: String::new(),
+            content: "status: running".into(),
+            is_error: false,
+            images: Vec::new(),
+        }
+    }
+}
+
+struct PendingPollRow;
+
+#[async_trait]
+impl atomcode_plexus::Plugin for PendingPollRow {
+    fn name(&self) -> &'static str {
+        "test-pending-poll"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["tools"]
+    }
+    async fn apply(
+        &self,
+        ctx: &atomcode_plexus::Context,
+        _: &serde_json::Value,
+    ) -> Result<(), String> {
+        plugins::tools::mount(ctx, vec![Arc::new(PendingPollTool)])
+    }
+}
+
+/// Both guards used to stop a real, silent build after a few successful polls.
+/// Preserve the immediate-poll fuse, but let bounded live waits reach the round cap.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn bounded_background_waits_are_not_tool_loops_but_busy_polls_still_are() {
+    for (wait, expected) in [
+        ("", StopReason::MaxRounds),
+        (", wait_ms = 60000", StopReason::MaxRounds),
+        (", wait_ms = 0", StopReason::ToolLoopDetected),
+        (", wait_ms = 1", StopReason::ToolLoopDetected),
+    ] {
+        for guard in ["tool-loop-guard", "repeat-fuse"] {
+            let dir = scratch("pending-poll");
+            let script = always_calls("bash_poll", &format!("{{ job_id = \"bg-1\"{wait} }}"));
+            let other = if guard == "tool-loop-guard" {
+                "repeat-fuse"
+            } else {
+                "tool-loop-guard"
+            };
+            let rows = format!(
+                "[[patch]]\nid = \"tool-bash-world\"\nname = \"test-pending-poll\"\n\n\
+                 [[patch]]\nid = \"round-cap\"\nconfig = {{ max_rounds = 8 }}\n\n\
+                 [[remove]]\nid = \"{other}\"\n"
+            );
+            let mut registry = atomcode_coding::on_harness::catalog();
+            registry.register(Arc::new(PendingPollRow));
+            let mut app = App::new(registry, tree(&dir, &script, &[&rows]));
+            app.start().await.unwrap();
+            let outcome = run_turn(&app, "watch the build").await.unwrap();
+            assert_eq!(outcome.stop, expected, "guard {guard}, wait args {wait}");
+            let messages = app.context().only_session().unwrap().derive_messages();
+            if expected == StopReason::MaxRounds {
+                assert!(!messages
+                    .iter()
+                    .any(|m| m.text.contains("Do NOT call `bash_poll`")
+                        || m.text.contains("SAME tool call")));
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn the_guard_warns_then_ends_a_turn_that_is_not_progressing() {
     let dir = scratch("guard");

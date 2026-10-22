@@ -50,6 +50,9 @@ const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 /// the overflow into a clear, actionable error rather than a silent leak.
 const MAX_BACKGROUND_JOBS: usize = 64;
 
+const DEFAULT_POLL_WAIT_MS: u64 = 10_000;
+const MAX_POLL_WAIT_MS: u64 = 60_000;
+
 /// After the tracked shell exits, how long its pipes get to close before the job counts as
 /// having left something running. A grandchild that inherited stdout (`some-daemon &`)
 /// keeps the pipe open after the shell itself exits; past this the job reports the shell's
@@ -103,6 +106,7 @@ impl Buf {
 }
 
 struct Shared {
+    changed: tokio::sync::Notify,
     output: Mutex<Buf>,
     status: Mutex<Status>,
     /// Diagnostic facts survive incremental polling without retaining unbounded stderr.
@@ -179,6 +183,7 @@ pub(crate) async fn start(
     })?;
 
     let shared = Arc::new(Shared {
+        changed: tokio::sync::Notify::new(),
         output: Mutex::new(Buf {
             tail: Vec::new(),
             total: 0,
@@ -251,6 +256,50 @@ pub(crate) fn poll(job_id: &str) -> Result<PollResult, String> {
     })
 }
 
+/// Wait without consuming output or holding the job store lock. The existing reader
+/// remains the only process owner; cancelling this wait leaves the job available.
+async fn wait_for_poll(job_id: &str, wait_ms: u64, ctx: &ToolContext) -> Result<(), String> {
+    let (shared, delivered) = {
+        let guard = store().lock().unwrap();
+        let job = guard.get(job_id).ok_or_else(|| {
+            format!("bash_poll: no background job '{job_id}' (already finished-and-collected, or never started)")
+        })?;
+        (Arc::clone(&job.shared), job.delivered)
+    };
+    let initial_status = shared.status.lock().unwrap().clone();
+    let initial_left_running = shared.left_running();
+    let deadline =
+        tokio::time::Instant::now() + Duration::from_millis(wait_ms.min(MAX_POLL_WAIT_MS));
+    loop {
+        // Register BEFORE inspecting state so an output/exit racing this check
+        // cannot be missed. Notifications are hints; state is authoritative.
+        let changed = shared.changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        if ctx.cancel.is_cancelled() {
+            return Err("bash_poll: wait cancelled; the job was not stopped and its output remains available.".into());
+        }
+        let has_output = shared.output.lock().unwrap().total > delivered;
+        let status = shared.status.lock().unwrap().clone();
+        let left_running = shared.left_running();
+        if has_output
+            || (!matches!(status, Status::Running) && !left_running)
+            || status != initial_status
+            || left_running != initial_left_running
+        {
+            return Ok(());
+        }
+        tokio::select! {
+            biased;
+            _ = ctx.cancel.cancelled() => {
+                return Err("bash_poll: wait cancelled; the job was not stopped and its output remains available.".into());
+            }
+            _ = tokio::time::sleep_until(deadline) => return Ok(()),
+            _ = &mut changed => {}
+        }
+    }
+}
+
 /// Signal the job's reader to kill the whole process tree — including what the shell left
 /// running after it exited. The status flips to `Killed`; the entry is reaped by the next
 /// `poll` (which also delivers any final output). Returns what to tell the model: a job
@@ -305,6 +354,7 @@ async fn pump(process: Arc<dyn Process>, shared: Arc<Shared>, world: Arc<dyn She
             }
         }
         shared.output.lock().unwrap().append(chunk.bytes());
+        shared.changed.notify_waiters();
     }
 }
 
@@ -320,6 +370,7 @@ fn set_status(shared: &Shared, killed: bool, code: i32) {
     } else {
         Status::Exited(code)
     };
+    shared.changed.notify_waiters();
 }
 
 /// Owns the process for its whole life: pumps output, answers a kill, reaps on exit.
@@ -384,6 +435,7 @@ async fn reader_task(
     }
     set_status(&shared, killed, code);
     shared.left_running.store(false, Ordering::Release);
+    shared.changed.notify_waiters();
     // `process` drops here. A shell that was killed takes its tree with it through the
     // local world's reaper (pgroup / job object); one that exited by itself had nothing
     // left holding its output by now.
@@ -417,6 +469,13 @@ struct StartArgs {
 #[derive(Deserialize)]
 struct JobArgs {
     job_id: String,
+}
+
+#[derive(Deserialize)]
+struct PollArgs {
+    job_id: String,
+    #[serde(default)]
+    wait_ms: Option<u64>,
 }
 
 /// `bash_start` — spawn a command in the background and return its job id.
@@ -457,8 +516,10 @@ impl Tool for BashStartTool {
         "Start a shell command in the BACKGROUND and return a job id immediately (does not \
          wait for it to finish). Use this instead of a large `timeout` for work that legitimately \
          runs longer than the foreground `bash` limit (builds, servers, long test suites). \
-         Collect its output later with `bash_poll` (repeat until it reports it exited), and stop \
-         it early with `bash_kill`. Same shell, working directory, and environment as `bash`."
+         Collect its output later with `bash_poll` (waits for output or exit; repeat until it \
+         reports it exited), and stop \
+         it early with `bash_kill`. Keep build output streaming: `| tail` hides progress and \
+         may mask a failed build's exit code. Same shell, working directory, and environment as `bash`."
     }
     fn parameters_schema(&self) -> Value {
         json!({
@@ -500,8 +561,9 @@ impl Tool for BashStartTool {
         };
         match start(&self.world, &a.command, ctx).await {
             Ok(id) => ok(format!(
-                "Started background job {id}. Collect output with bash_poll {{\"job_id\":\"{id}\"}} \
-                 (repeat until it reports it exited); stop it with bash_kill {{\"job_id\":\"{id}\"}}."
+                "Started background job {id}. Collect output with bash_poll {{\"job_id\":\"{id}\",\"wait_ms\":60000}} \
+                 (returns early on output or exit; repeat until it reports it exited). Do not use \
+                 sleep or restart the same command while waiting. Stop it with bash_kill {{\"job_id\":\"{id}\"}}."
             )),
             Err(e) => err(e),
         }
@@ -519,7 +581,10 @@ impl Tool for BashPollTool {
     }
     fn description(&self) -> &str {
         "Read output produced by a background `bash_start` job since your last poll, plus \
-         whether it is still running or has exited. Poll repeatedly until it reports it exited. \
+         whether it is still running or has exited. Waits up to wait_ms (default 10000, max \
+         60000), returning early on output or exit; 0 checks immediately. Use this instead \
+         of shell sleep, and repeat until it reports it exited. A wait timeout leaves the \
+         job running; it does not mean failure. Do not restart a running build. \
          When a poll has no new output and still reports running, avoid repeated waiting \
          narration or a new status update for each check. Report meaningful new output, \
          completion, failure, or a changed plan instead. Read-only."
@@ -528,7 +593,8 @@ impl Tool for BashPollTool {
         json!({
             "type": "object",
             "properties": {
-                "job_id": { "type": "string", "description": "The job id returned by bash_start" }
+                "job_id": { "type": "string", "description": "The job id returned by bash_start" },
+                "wait_ms": { "type": "integer", "minimum": 0, "default": 10000, "description": "Maximum wait in milliseconds, clamped to 60000; returns early on output or exit. Use 0 for an immediate check." }
             },
             "required": ["job_id"]
         })
@@ -536,8 +602,8 @@ impl Tool for BashPollTool {
     fn read_only_hint(&self) -> bool {
         true
     }
-    async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
-        let a: JobArgs = match serde_json::from_str(args) {
+    async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
+        let a: PollArgs = match serde_json::from_str(args) {
             Ok(a) => a,
             Err(e) => {
                 return err(format!(
@@ -545,6 +611,11 @@ impl Tool for BashPollTool {
                 ))
             }
         };
+        if let Err(e) =
+            wait_for_poll(&a.job_id, a.wait_ms.unwrap_or(DEFAULT_POLL_WAIT_MS), ctx).await
+        {
+            return err(e);
+        }
         match poll(&a.job_id) {
             Ok(r) => {
                 let mut body = String::new();
@@ -777,6 +848,156 @@ mod tests {
             .unwrap();
         process.drained.notified().await;
         (id, process)
+    }
+
+    struct PollProcess {
+        chunks: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Chunk>>,
+        finish: tokio_util::sync::CancellationToken,
+    }
+
+    #[async_trait]
+    impl Process for PollProcess {
+        async fn next_chunk(&self) -> Option<Chunk> {
+            let mut chunks = self.chunks.lock().await;
+            tokio::select! {
+                _ = self.finish.cancelled() => None,
+                chunk = chunks.recv() => chunk,
+            }
+        }
+        async fn wait(&self) -> Result<Exit, String> {
+            self.finish.cancelled().await;
+            Ok(Exit {
+                code: Some(0),
+                signal: None,
+            })
+        }
+        async fn kill(&self) {
+            self.finish.cancel();
+        }
+    }
+
+    struct PollWorld(Arc<PollProcess>);
+
+    #[async_trait]
+    impl Shell for PollWorld {
+        fn describe(&self) -> String {
+            "scripted build".into()
+        }
+        async fn spawn(
+            &self,
+            _: &str,
+            _: &SpawnOptions,
+        ) -> Result<Arc<dyn Process>, crate::world::SpawnError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    async fn poll_job() -> (
+        String,
+        tokio::sync::mpsc::UnboundedSender<Chunk>,
+        Arc<PollProcess>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let process = Arc::new(PollProcess {
+            chunks: tokio::sync::Mutex::new(rx),
+            finish: tokio_util::sync::CancellationToken::new(),
+        });
+        let world: Arc<dyn Shell> = Arc::new(PollWorld(process.clone()));
+        let id = start(&world, "build", &ctx(Path::new("."))).await.unwrap();
+        (id, tx, process)
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_waiting_poll_returns_early_on_output_then_on_exit() {
+        let (id, tx, process) = poll_job().await;
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            tx.send(Chunk::Stdout(b"compiled module\n".to_vec()))
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            process.finish.cancel();
+        });
+        let args = json!({"job_id": id, "wait_ms": 60000}).to_string();
+        let started = tokio::time::Instant::now();
+        let first = BashPollTool.execute(&args, &ctx(Path::new("."))).await;
+        assert!(!first.is_error, "{}", first.content);
+        assert!(first.content.contains("compiled module"));
+        assert!(first.content.ends_with("status: running"));
+        assert_eq!(started.elapsed(), Duration::from_millis(200));
+        let second = BashPollTool.execute(&args, &ctx(Path::new("."))).await;
+        assert!(!second.is_error, "{}", second.content);
+        assert!(
+            !second.content.contains("compiled module"),
+            "output is incremental"
+        );
+        assert!(second.content.ends_with("status: exited (code 0)"));
+        assert_eq!(started.elapsed(), Duration::from_millis(500));
+        assert!(poll(&id).is_err(), "a collected terminal job is reaped");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn poll_wait_is_bounded_and_does_not_stop_a_silent_job() {
+        let (id, _tx, process) = poll_job().await;
+        for (args, expected_ms) in [
+            (json!({"job_id": id}), 10000),
+            (json!({"job_id": id, "wait_ms": null}), 10000),
+            (json!({"job_id": id, "wait_ms": 0}), 0),
+            (json!({"job_id": id, "wait_ms": u64::MAX}), 60000),
+        ] {
+            let started = tokio::time::Instant::now();
+            let result = BashPollTool
+                .execute(&args.to_string(), &ctx(Path::new(".")))
+                .await;
+            assert!(!result.is_error, "{}", result.content);
+            assert_eq!(result.content, "status: running");
+            assert_eq!(started.elapsed(), Duration::from_millis(expected_ms));
+            assert!(
+                !process.finish.is_cancelled(),
+                "a poll timeout must not kill the build"
+            );
+        }
+        kill(&id).unwrap();
+        assert_eq!(drain(&id).await.1, Status::Killed);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn cancelling_a_poll_preserves_the_job_and_unread_output() {
+        let (id, tx, process) = poll_job().await;
+        let context = ctx(Path::new("."));
+        let cancel = context.cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cancel.cancel();
+        });
+        let args = json!({"job_id": id}).to_string();
+        let started = tokio::time::Instant::now();
+        let result = BashPollTool.execute(&args, &context).await;
+        assert!(result.is_error);
+        assert!(result.content.contains("wait cancelled"));
+        assert_eq!(started.elapsed(), Duration::from_millis(100));
+        assert!(!process.finish.is_cancelled());
+        tx.send(Chunk::Stdout(b"still building\n".to_vec()))
+            .unwrap();
+        // Even a pre-cancelled poll must not consume this chunk.
+        assert!(BashPollTool.execute(&args, &context).await.is_error);
+        let output = BashPollTool.execute(&args, &ctx(Path::new("."))).await;
+        assert!(output.content.contains("still building"));
+        kill(&id).unwrap();
+        assert_eq!(drain(&id).await.1, Status::Killed);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_missing_job_poll_fails_without_waiting() {
+        let started = tokio::time::Instant::now();
+        let result = BashPollTool
+            .execute(
+                r#"{"job_id":"bg-never-started","wait_ms":60000}"#,
+                &ctx(Path::new(".")),
+            )
+            .await;
+        assert!(result.is_error);
+        assert!(result.content.contains("no background job"));
+        assert_eq!(started.elapsed(), Duration::ZERO);
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
