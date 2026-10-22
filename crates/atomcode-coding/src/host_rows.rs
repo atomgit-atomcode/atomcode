@@ -2379,6 +2379,25 @@ impl Plugin for CapabilityCommandsPlugin {
         "goal, loop, the local-context queue, the policy intervention and `worktree`, as commands"
     }
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        // This policy belongs to the host that actually observes completions,
+        // not to the portable shell tool or a second waiting state machine.
+        atomcode_harness::plugins::tools::contribute_prompt(
+            ctx,
+            "background-completion-policy",
+            52,
+            "This host supports background completion notifications. For bounded work that \
+             may take a long time, including downloads, SDK installation, builds and tests, \
+             prefer bash_start with notify_on_exit=true. Keep the real operation in that \
+             tracked job so its exit status and output are available. While it runs, do \
+             independent work if useful; otherwise end your response and wait for the host \
+             notification, then collect output with bash_poll and check the result. Do not \
+             spend repeated model requests waiting with shell sleep, ls, pgrep, or empty \
+             polls. A file existing or a process disappearing does not prove success. \
+             Leave completion notifications off for servers and watchers. If a job was \
+             already started without notifications, use bash_poll to collect or wait for \
+             that tracked job; do not restart the operation just to enable notifications. \
+             Do not claim an untracked external process is being observed by the host.",
+        );
         atomcode_harness::plugins::self_knowledge::describes(ctx, "background-completion", 42,
             "The host supports optional background-job completion notifications. It resumes this session when explicitly observed work terminates; cancellation and runtime replacement retire pending notifications. A /loop keeps its chosen cadence, and a paused goal is not resumed by a notification.");
         for command in [
