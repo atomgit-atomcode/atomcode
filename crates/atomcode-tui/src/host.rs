@@ -6989,7 +6989,7 @@ impl Host {
         // Last, over everything, including a modal: the selection is a
         // rectangle on the screen, and the screen is what was pointed at.
         if let Some(sel) = moment.selection {
-            frame.highlight_with_colors(&sel, moment.caps.colors != crate::caps::Colors::None);
+            frame.highlight_for_caps(&sel, moment.caps);
         }
 
         // Last of all, and after the selection on purpose: the context menu is

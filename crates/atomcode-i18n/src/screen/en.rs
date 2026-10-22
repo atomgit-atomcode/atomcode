@@ -1503,7 +1503,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CopySendFailed => "Copy request could not be sent. Press Ctrl+G, select again, and copy through the terminal.".into(),
         Msg::CopyTooLarge => "Selection exceeds the terminal copy limit (100,000 bytes); nothing sent. Select less text or use Ctrl+G to copy through the terminal.".into(),
         Msg::CopyRemoteHandedOver => "SSH copy is unconfirmed. If paste fails, press Ctrl+G, select again, and copy in the terminal (Mac: Cmd+C).".into(),
-        Msg::ClipboardRemoteText => "SSH cannot read your local clipboard. Paste through the terminal (Mac: Cmd+V).".into(),
+        Msg::ClipboardRemoteText => "Paste through your terminal over SSH: Shift+Insert in PuTTY, Cmd+V on Mac. Ctrl+V cannot read your local clipboard.".into(),
         Msg::ClipboardRemoteImage => "SSH cannot read your local image clipboard. Upload the image and use /paste <path>.".into(),
         Msg::CopyHandedOver => "Copy request sent. Paste to confirm.".into(),
         Msg::CopyCouldNotStart => "Copy could not start. Please retry after the current copy finishes.".into(),

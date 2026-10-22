@@ -8049,6 +8049,15 @@ impl Tui {
                 return false;
             }
             Action::AttachImage => {
+                // Ctrl+V is a paste attempt, not evidence of an image. SSH has
+                // no access to the client's clipboard; keep this guidance on
+                // the replaceable tip row instead of appending red errors.
+                if self.surface.remote_clipboard() {
+                    drop(m);
+                    self.host
+                        .say(t(Msg::ClipboardRemoteText).into_owned(), false);
+                    return false;
+                }
                 // Read first, mutate second: a clipboard with no image in it
                 // must leave the composer exactly as it was, and "exactly as it
                 // was" is easier to keep true when nothing was touched yet.
@@ -14980,6 +14989,42 @@ mod paste_habit_tests {
         assert!(!m.stopping);
         assert!(!m.quit_armed);
         assert!(m.asking.is_some());
+    }
+
+    struct RemotePasteSurface;
+    impl Surface for RemotePasteSurface {
+        fn describe(&self) -> String {
+            "remote paste".into()
+        }
+        fn size(&self) -> (u16, u16) {
+            (60, 24)
+        }
+        fn present(&self, _: &crate::frame::Frame) {}
+        fn remote_clipboard(&self) -> bool {
+            true
+        }
+        fn clipboard_text(&self) -> Option<String> {
+            panic!("must not read server clipboard")
+        }
+        fn clipboard_image(&self) -> Option<atomcode_kernel::message::ImageContent> {
+            panic!("must not read server clipboard")
+        }
+    }
+
+    #[test]
+    fn ctrl_v_over_ssh_gives_one_plain_paste_hint_without_reading_a_clipboard() {
+        let (host, tui) = assemble(Arc::new(RemotePasteSurface));
+        host.moment.write().unwrap().input = "draft 中文".into();
+        let before = host.stream.read().unwrap().len();
+        for _ in 0..3 {
+            assert!(!tui.act(Action::AttachImage, &tui.client));
+        }
+        assert_eq!(host.stream.read().unwrap().len(), before);
+        let moment = host.moment.read().unwrap();
+        assert_eq!(moment.input, "draft 中文");
+        let notice = moment.notice.as_ref().unwrap();
+        assert_eq!(notice.text, t(Msg::ClipboardRemoteText));
+        assert!(!notice.refused);
     }
 
     /// What people who copy with a drag paste with: the middle button, the
