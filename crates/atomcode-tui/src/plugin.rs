@@ -7032,6 +7032,7 @@ impl Tui {
                 true
             }
             AgentEvent::Compacted {
+                trigger,
                 committed,
                 bytes_before,
                 bytes_after,
@@ -7049,8 +7050,18 @@ impl Tui {
                         .write()
                         .expect("moment poisoned")
                         .note_fold(bytes_before, bytes_after);
-                    self.say(&t(Msg::Compacted));
-                } else {
+                    // Automatic cleanup also arrives as Compacted. Genuine
+                    // summary folds already have their own transcript notice.
+                    if matches!(
+                        trigger,
+                        atomcode_kernel::message::CompactTrigger::Manual { .. }
+                    ) {
+                        self.say(&t(Msg::Compacted));
+                    }
+                } else if matches!(
+                    trigger,
+                    atomcode_kernel::message::CompactTrigger::Manual { .. }
+                ) {
                     self.say(&t(Msg::NothingWorthCompacting));
                 }
                 true
