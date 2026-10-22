@@ -249,24 +249,32 @@ impl Tool for ExternalSubagentTool {
 
 /// Register one tool per enabled profile whose backing binary is present on
 /// `PATH`. Profiles whose binary is missing are skipped rather than failing
-/// assembly. Returns the registered tool names, and one line per profile that
-/// was skipped — for the host to tell the person (not stderr, which a
-/// full-screen front end may be holding).
+/// assembly; their absence is logged without a startup notice. Returns the
+/// registered tool names and actionable configuration warnings for the host
+/// to display (not stderr, which a full-screen front end may be holding).
 pub fn register_external_subagent_tools(
     registry: &mut ToolRegistry,
     profiles: &[ExternalSubagentProfile],
+) -> (Vec<String>, Vec<String>) {
+    register_external_subagent_tools_with(registry, profiles, binary_on_path)
+}
+
+fn register_external_subagent_tools_with(
+    registry: &mut ToolRegistry,
+    profiles: &[ExternalSubagentProfile],
+    binary_available: impl Fn(&str) -> bool,
 ) -> (Vec<String>, Vec<String>) {
     let mut registered = Vec::new();
     let mut skipped = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for profile in profiles {
-        if !binary_on_path(profile.kind.binary()) {
-            skipped.push(format!(
-                "subagent: `{}` ({}) not registered — binary `{}` not found on PATH",
-                profile.name,
-                profile.kind,
-                profile.kind.binary()
-            ));
+        if !binary_available(profile.kind.binary()) {
+            tracing::info!(
+                profile = %profile.name,
+                kind = %profile.kind,
+                binary = profile.kind.binary(),
+                "optional external subagent skipped: binary not found on PATH"
+            );
             continue;
         }
         let backend = build_backend(profile);
@@ -413,10 +421,46 @@ mod tests {
     }
 
     #[test]
-    fn register_skips_missing_binary() {
-        // A profile whose kind maps to a binary that certainly is not on PATH:
-        // we cannot rename the binary, but we CAN assert that a nonexistent PATH
-        // yields no registration by checking binary_on_path directly.
-        assert!(!binary_on_path("atomcode-definitely-not-a-real-binary-xyz"));
+    fn missing_optional_binaries_do_not_produce_startup_warnings() {
+        let mut registry = ToolRegistry::new();
+        let profiles = [
+            ExternalSubagentProfile::new("codex", SubagentKind::Codex),
+            ExternalSubagentProfile::new("claude-code", SubagentKind::ClaudeCode),
+        ];
+        let (registered, warnings) =
+            register_external_subagent_tools_with(&mut registry, &profiles, |_| false);
+        assert!(registered.is_empty());
+        assert!(registry
+            .mount(&["subagent_codex"])
+            .get("subagent_codex")
+            .is_none());
+        assert!(registry
+            .mount(&["subagent_claude_code"])
+            .get("subagent_claude_code")
+            .is_none());
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn available_optional_agents_still_register_and_collisions_still_warn() {
+        let mut registry = ToolRegistry::new();
+        let profiles = [
+            ExternalSubagentProfile::new("claude-code", SubagentKind::ClaudeCode),
+            ExternalSubagentProfile::new("claude_code", SubagentKind::ClaudeCode),
+            ExternalSubagentProfile::new("codex", SubagentKind::Codex),
+        ];
+        let (registered, warnings) =
+            register_external_subagent_tools_with(&mut registry, &profiles, |_| true);
+        assert_eq!(registered, ["subagent_claude_code", "subagent_codex"]);
+        assert!(registry
+            .mount(&["subagent_claude_code"])
+            .get("subagent_claude_code")
+            .is_some());
+        assert!(registry
+            .mount(&["subagent_codex"])
+            .get("subagent_codex")
+            .is_some());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("collides"));
     }
 }

@@ -1663,8 +1663,9 @@ impl UserInterface for Tui {
                     .collect()
             })
             .unwrap_or_default();
-        let notices_held_since = std::time::Instant::now();
-        if !opening_notices.is_empty() {
+        let notices_held_since = tokio::time::Instant::now();
+        let mut opening_events = Vec::new();
+        {
             let wake = wake_tx.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(OPENING_NOTICE_WAIT).await;
@@ -1978,6 +1979,11 @@ impl UserInterface for Tui {
                     stale |= say_opening_notices(&mut opening_notices);
                 }
             }
+            if !owes_opening || notices_held_since.elapsed() >= OPENING_NOTICE_WAIT {
+                for event in opening_events.drain(..) {
+                    stale |= self.on_event(event);
+                }
+            }
             if stale && (coalesced >= COALESCE_LIMIT || wake.is_empty()) {
                 // The reading the frame about to be painted is drawn from. Facts
                 // absorb against whatever the last one was — a frame at most out
@@ -2160,6 +2166,16 @@ impl UserInterface for Tui {
                 // streamed delta is already in the transcript by the time it is
                 // projected into this event, and this is the same news again.
                 // `on_event` says which arrivals did move it.
+                // Runtime startup warnings use the event channel, rather than
+                // OpeningNoticesSvc. Give both paths the same welcome ordering.
+                // Terminal errors still take effect immediately.
+                Wake::Event(
+                    event @ AgentEvent::Error {
+                        ends_turn: false, ..
+                    },
+                ) if owes_opening && notices_held_since.elapsed() < OPENING_NOTICE_WAIT => {
+                    opening_events.push(event);
+                }
                 Wake::Event(event) => stale |= self.on_event(event),
                 // The host put another session in place of this one: draw that
                 // one, from its first fact, in a stream of its own.

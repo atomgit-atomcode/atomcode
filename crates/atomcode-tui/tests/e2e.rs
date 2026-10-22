@@ -670,6 +670,66 @@ impl Session {
     }
 }
 
+/// Runtime warnings can already be queued before the screen subscribes.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_startup_warning_is_drawn_after_the_welcome() {
+    use atomcode_kernel::event::AgentEvent;
+    let dir = scratch("startup-warning-order");
+    let s = start_with_connection(
+        tree(&dir, &replay(r#"{ text = "Ready." }"#), &[]),
+        |connection| {
+            let atomcode_host_api::HostConnection {
+                session,
+                commands,
+                mut events,
+                control,
+            } = connection;
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            tx.send(AgentEvent::Error {
+                message: "subagent binary missing at startup".into(),
+                http_status: None,
+                code: None,
+                retryable: None,
+                retry_after_secs: None,
+                ends_turn: false,
+            })
+            .unwrap();
+            tokio::spawn(async move {
+                while let Some(event) = events.recv().await {
+                    if tx.send(event).is_err() {
+                        break;
+                    }
+                }
+            });
+            atomcode_host_api::HostConnection {
+                session,
+                commands,
+                events: rx,
+                control,
+            }
+        },
+    )
+    .await;
+    // Headless::settle measures real quiet time; the mascot keeps ticking on
+    // this paused clock, so wait for the observable output directly instead.
+    let ui = s.ui.clone();
+    let ctx = s.app.clone();
+    let task = tokio::spawn(async move { ui.run(&ctx, None).await });
+    until(&s, "subagent binary missing at startup").await;
+    let screen = s.screen();
+    assert!(
+        screen.find("上手提示").unwrap()
+            < screen.find("subagent binary missing at startup").unwrap(),
+        "{screen}"
+    );
+    assert_eq!(
+        screen.matches("subagent binary missing at startup").count(),
+        1
+    );
+    task.abort();
+    let _ = task.await;
+}
+
 // ---- the flow a person actually performs --------------------------------
 
 #[tokio::test]

@@ -398,8 +398,9 @@ impl Content for WelcomeBlock {
         }
         // Under them, dim and without a bullet: an aside about the screen, not
         // a fact about the session.
-        // One line each: the keys line and the release's news are two asides.
+        // Separate the asides from the session facts with one blank row.
         if let Some(note) = self.note.as_deref().filter(|n| !n.trim().is_empty()) {
+            below.push(Line::default());
             for line in note.lines().filter(|line| !line.trim().is_empty()) {
                 below.extend(wrapped(line, content_w as u16, muted(), ""));
             }
@@ -4492,6 +4493,8 @@ mod tests {
             .position(|r| r.contains("已更新到"))
             .expect("news");
         assert_eq!(news, keys + 1, "{rows:#?}");
+        assert!(rows[keys - 1].trim().is_empty(), "{rows:#?}");
+        assert!(!rows[keys - 2].trim().is_empty(), "{rows:#?}");
         assert!(rows.iter().all(|r| !r.contains('\n')));
     }
 
