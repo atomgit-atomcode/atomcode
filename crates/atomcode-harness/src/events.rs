@@ -21,7 +21,7 @@
 
 use std::sync::Mutex;
 
-use atomcode_kernel::message::Message;
+use atomcode_kernel::message::{Message, ReasoningBlock};
 use atomcode_kernel::provider::ChatOptions;
 use atomcode_kernel::stream::TokenUsage;
 use atomcode_kernel::tool::{ToolCall, ToolDef, ToolResult};
@@ -126,6 +126,7 @@ impl RequestError {
         if !partial.text.is_empty()
             || !partial.tool_calls.is_empty()
             || !partial.reasoning.is_empty()
+            || !partial.reasoning_blocks.is_empty()
         {
             self.partial = Some(Box::new(partial));
         }
@@ -161,6 +162,10 @@ impl std::fmt::Display for RequestError {
 pub struct ModelResponse {
     pub text: String,
     pub reasoning: String,
+    /// Completed provider-bound thinking blocks, replayed with their signature.
+    pub reasoning_blocks: Vec<ReasoningBlock>,
+    pub provider_response_id: Option<String>,
+    pub provider_model: Option<String>,
     pub tool_calls: Vec<ToolCall>,
     pub usage: Option<TokenUsage>,
     /// The provider cut the response at its output-token limit

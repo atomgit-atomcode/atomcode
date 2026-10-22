@@ -6,11 +6,10 @@
 //! message; `None` lets it stop. The kernel's `max_continuations` fuse bounds
 //! the loop, and our own state nudges ONCE per edit-batch so we never spin.
 //!
-//! Language-agnostic: detection keys on tool NAMES (edit_file / write_file / bash) and, for
-//! bash, EXCLUDES a small denylist of read-only / navigation commands (`ls`, `echo`, `cat`,
-//! …) so a throwaway `bash ls` after an edit no longer counts as "verified". It never
-//! enumerates build commands (no cargo/npm allowlist) — a real check of ANY language still
-//! counts. The nudge text lists `cargo check` / `tsc --noEmit` only as examples.
+//! Detection excludes read-only commands and common preparation commands, while keeping
+//! custom check scripts eligible. A background check must have a known start receipt and
+//! a successful terminal poll, and must have started after the latest edit. Command
+//! classification is a heuristic; successful execution does not prove business correctness.
 
 use std::collections::HashMap;
 
@@ -164,7 +163,7 @@ fn segment_is_work(seg: &str) -> bool {
         "dirname", "realpath", "readlink", ":",
     ];
     const WRAPPERS: &[&str] = &["sudo", "env", "time", "nice", "command", "exec"];
-    let mut tokens = seg.split_whitespace();
+    let mut tokens = seg.split_whitespace().peekable();
     loop {
         let Some(tok) = tokens.next() else {
             return false; // only env-assignments / wrappers, no real command → not work
@@ -173,11 +172,80 @@ fn segment_is_work(seg: &str) -> bool {
         if tok.contains('=') && !tok.starts_with('-') {
             continue;
         }
-        let head = tok.rsplit('/').next().unwrap_or(tok);
+        let head = tok.rsplit(['/', '\\']).next().unwrap_or(tok);
+        let head = head
+            .strip_suffix(".cmd")
+            .or_else(|| head.strip_suffix(".exe"))
+            .unwrap_or(head);
         if WRAPPERS.contains(&head) {
             continue; // `sudo`/`env`/`time` … → look at the wrapped command
         }
-        return !READONLY.contains(&head);
+        if READONLY.contains(&head)
+            || matches!(
+                head,
+                "mkdir"
+                    | "rmdir"
+                    | "touch"
+                    | "cp"
+                    | "mv"
+                    | "rm"
+                    | "ln"
+                    | "chmod"
+                    | "chown"
+                    | "curl"
+                    | "wget"
+                    | "download"
+                    | "install"
+                    | "brew"
+                    | "apt"
+                    | "apt-get"
+            )
+        {
+            return false;
+        }
+        // Preparation is not validation. Keep custom scripts and unfamiliar
+        // runners eligible rather than maintaining a language-specific allowlist.
+        let operation = tokens.next().unwrap_or("");
+        if matches!(head, "npm" | "pnpm" | "yarn" | "bun")
+            && matches!(
+                operation,
+                "install"
+                    | "i"
+                    | "ci"
+                    | "add"
+                    | "update"
+                    | "upgrade"
+                    | "remove"
+                    | "uninstall"
+                    | "init"
+                    | "create"
+            )
+        {
+            return false;
+        }
+        if matches!(head, "pip" | "pip3")
+            && matches!(operation, "install" | "uninstall" | "download")
+        {
+            return false;
+        }
+        if matches!(head, "python" | "python3")
+            && operation == "-m"
+            && tokens.peek() == Some(&"pip")
+        {
+            return false;
+        }
+        if head == "uv" && matches!(operation, "sync" | "add" | "remove" | "pip" | "venv") {
+            return false;
+        }
+        if head == "cargo"
+            && matches!(
+                operation,
+                "fetch" | "install" | "add" | "remove" | "update" | "clean" | "new" | "init"
+            )
+        {
+            return false;
+        }
+        return true;
     }
 }
 
@@ -188,18 +256,47 @@ fn current_real_user_start(messages: &[Message]) -> usize {
         .unwrap_or(0)
 }
 
-/// Scan the conversation: returns the tool_call_id of the most recent successful edit
-/// IF it has no VERIFYING `bash` after it (i.e. unverified), else `None`. A `bash` that is
-/// merely read-only (`ls`/`echo`/…) does not count — see [`bash_verifies`].
+/// The final status emitted by bash_poll, not status-looking program output.
+/// A shell that exited while its child still writes carries a suffix and is
+/// deliberately not terminal here.
+pub(crate) fn background_exit_code(output: &str) -> Option<i32> {
+    output
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())?
+        .trim()
+        .strip_prefix("status: exited (code ")?
+        .strip_suffix(')')?
+        .parse()
+        .ok()
+}
+
+fn started_job(output: &str) -> Option<&str> {
+    let (id, _) = output
+        .strip_prefix("Started background job ")?
+        .split_once(". Collect output with bash_poll ")?;
+    (!id.is_empty() && !id.chars().any(char::is_whitespace)).then_some(id)
+}
+
+fn poll_job(arguments: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()?
+        .get("job_id")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// A successful check must belong to the latest edit batch. Background receipts
+/// additionally need a successful start acknowledgement and a terminal exit.
+/// Commands remain plausible checks, not proof that a business goal was met.
 pub fn unverified_edit(messages: &[Message], workspace: &Path) -> Option<NudgedEdit> {
     let start = current_real_user_start(messages);
-    // Tool-call ids are assigned by the assistant message that precedes the matching
-    // tool-result message, so a single forward pass can resolve a result's tool name.
     let mut names: HashMap<&str, &str> = HashMap::new();
-    // bash tool_call id → its command string (to tell a real check from an `ls` dodge).
     let mut bash_cmds: HashMap<&str, String> = HashMap::new();
-    // edit/write tool_call id → its `file_path` (to gate out-of-workspace throwaway writes).
     let mut edit_paths: HashMap<&str, String> = HashMap::new();
+    let mut poll_jobs: HashMap<&str, String> = HashMap::new();
+    let mut invoked_after: HashMap<&str, Option<String>> = HashMap::new();
+    let mut jobs: HashMap<String, (bool, Option<String>)> = HashMap::new();
     let mut last_edit_id: Option<String> = None;
     let mut bash_after_edit = false;
 
@@ -208,11 +305,16 @@ pub fn unverified_edit(messages: &[Message], workspace: &Path) -> Option<NudgedE
             Role::Assistant => {
                 for tc in &msg.tool_calls {
                     names.insert(tc.id.as_str(), tc.name.as_str());
-                    if tc.name == "bash" {
+                    if matches!(tc.name.as_str(), "bash" | "bash_start") {
                         if let Some(cmd) = bash_command(&tc.arguments) {
                             bash_cmds.insert(tc.id.as_str(), cmd);
+                            invoked_after.insert(tc.id.as_str(), last_edit_id.clone());
                         }
-                    } else if tc.name == "edit_file" || tc.name == "write_file" {
+                    } else if tc.name == "bash_poll" {
+                        if let Some(job) = poll_job(&tc.arguments) {
+                            poll_jobs.insert(tc.id.as_str(), job);
+                        }
+                    } else if matches!(tc.name.as_str(), "edit_file" | "write_file") {
                         if let Some(p) = edit_path(&tc.arguments) {
                             edit_paths.insert(tc.id.as_str(), p);
                         }
@@ -220,32 +322,48 @@ pub fn unverified_edit(messages: &[Message], workspace: &Path) -> Option<NudgedE
                 }
             }
             Role::Tool => {
-                if msg.is_error {
-                    continue;
-                }
                 let Some(id) = msg.tool_call_id.as_deref() else {
                     continue;
                 };
                 match names.get(id).copied() {
-                    // Only edits WITHIN the workspace arm the cadence — a throwaway write
-                    // outside the project (e.g. /tmp) is not code to compile-check. A missing
-                    // /unparseable path is treated as in-workspace (conservative — keep the nudge).
-                    // A doc/data write (a `.md` report, `.csv`, `.log`) is also skipped: it is
-                    // not compilable code, so it must not arm "run cargo check" on a non-coding
-                    // turn (see [`path_is_noncode_doc`]).
                     Some("edit_file") | Some("write_file")
-                        if edit_paths
-                            .get(id)
-                            .is_none_or(|p| path_in_workspace_lexical(p, workspace))
+                        if !msg.is_error
+                            && edit_paths
+                                .get(id)
+                                .is_none_or(|p| path_in_workspace_lexical(p, workspace))
                             && !edit_paths.get(id).is_some_and(|p| path_is_noncode_doc(p)) =>
                     {
                         last_edit_id = Some(id.to_string());
                         bash_after_edit = false;
                     }
-                    // Only a real check counts — a read-only/navigation command does NOT verify.
-                    Some("bash") => {
-                        if bash_cmds.get(id).is_some_and(|c| bash_verifies(c)) {
-                            bash_after_edit = true;
+                    Some("bash")
+                        if bash_cmds.get(id).is_some_and(|c| bash_verifies(c))
+                            && invoked_after.get(id) == Some(&last_edit_id) =>
+                    {
+                        bash_after_edit = !msg.is_error;
+                    }
+                    Some("bash_start") if !msg.is_error => {
+                        if let (Some(job), Some(command), Some(edit)) = (
+                            started_job(&msg.text),
+                            bash_cmds.get(id),
+                            invoked_after.get(id),
+                        ) {
+                            let check = bash_verifies(command);
+                            jobs.insert(job.to_string(), (check, edit.clone()));
+                            if check && edit == &last_edit_id {
+                                bash_after_edit = false;
+                            }
+                        }
+                    }
+                    Some("bash_poll") => {
+                        if let Some((true, edit)) = poll_jobs.get(id).and_then(|job| jobs.get(job))
+                        {
+                            if edit == &last_edit_id {
+                                // A failed read, running job, killed process or nonzero
+                                // exit is never a successful completed check.
+                                bash_after_edit =
+                                    !msg.is_error && background_exit_code(&msg.text) == Some(0);
+                            }
                         }
                     }
                     _ => {}
@@ -367,6 +485,155 @@ mod tests {
             owed_anywhere(&msgs).is_some(),
             "an unverified edit owes a check"
         );
+    }
+
+    fn background_call(id: &str, name: &str, argument: &str) -> Message {
+        let args = if name == "bash_start" {
+            serde_json::json!({"command": argument})
+        } else {
+            serde_json::json!({"job_id": argument})
+        };
+        Message::assistant(
+            "",
+            vec![ToolCall {
+                id: id.into(),
+                name: name.into(),
+                arguments: args.to_string(),
+            }],
+        )
+    }
+
+    fn start_receipt(id: &str, job: &str) -> Message {
+        Message::tool_result(id, format!("Started background job {job}. Collect output with bash_poll {{\"job_id\":\"{job}\"}}"), false)
+    }
+
+    #[test]
+    fn preparing_dependencies_or_files_does_not_discharge_verification() {
+        for cmd in [
+            "npm install",
+            "npm.cmd ci",
+            "pnpm add typescript",
+            "bun install",
+            "yarn install",
+            "pip3 install pytest",
+            "python3 -m pip install pytest",
+            "uv sync",
+            "cargo fetch",
+            "mkdir build",
+            "curl https://example.com/tool",
+        ] {
+            let messages = vec![
+                assistant_call("edit", "edit_file"),
+                tool_result("edit", false),
+                bash_call("prepare", cmd),
+                tool_result("prepare", false),
+            ];
+            assert!(
+                owed_anywhere(&messages).is_some(),
+                "preparation cannot verify: {cmd}"
+            );
+        }
+        for cmd in [
+            "npm install && npm test",
+            "./custom-project-validation",
+            "python3 tools/acceptance.py",
+            "cargo nextest run",
+        ] {
+            let messages = vec![
+                assistant_call("edit", "edit_file"),
+                tool_result("edit", false),
+                bash_call("check", cmd),
+                tool_result("check", false),
+            ];
+            assert!(
+                owed_anywhere(&messages).is_none(),
+                "custom checks remain supported: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn background_verification_requires_a_known_successful_terminal_receipt() {
+        for (status, failed_read, passed) in [
+            ("status: exited (code 0)", false, true),
+            ("status: exited (code 1)", false, false),
+            ("status: exited (code -1)", false, false),
+            ("status: killed", false, false),
+            ("status: running", false, false),
+            ("status: exited (code 0)\nstatus: running", false, false),
+            (
+                "status: exited (code 0); what it started is still running",
+                false,
+                false,
+            ),
+            ("status: exited (code 0)", true, false),
+        ] {
+            let messages = vec![
+                assistant_call("edit", "edit_file"),
+                tool_result("edit", false),
+                background_call("start", "bash_start", "npm test"),
+                start_receipt("start", "bg-1"),
+                background_call("poll", "bash_poll", "bg-1"),
+                Message::tool_result("poll", status, failed_read),
+            ];
+            assert_eq!(
+                owed_anywhere(&messages).is_none(),
+                passed,
+                "{status}, failed_read={failed_read}"
+            );
+        }
+    }
+
+    #[test]
+    fn background_preparation_and_unrelated_job_ids_cannot_verify_an_edit() {
+        for (command, job, failed_start) in [
+            ("npm install", "bg-1", false),
+            ("npm test", "bg-elsewhere", false),
+            ("npm test", "bg-1", true),
+        ] {
+            let mut start = start_receipt("start", "bg-1");
+            start.is_error = failed_start;
+            let messages = vec![
+                assistant_call("edit", "edit_file"),
+                tool_result("edit", false),
+                background_call("start", "bash_start", command),
+                start,
+                background_call("poll", "bash_poll", job),
+                Message::tool_result("poll", "status: exited (code 0)", false),
+            ];
+            assert!(
+                owed_anywhere(&messages).is_some(),
+                "{command}, {job}, failed_start={failed_start}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_background_check_cannot_validate_an_edit_made_after_it_started() {
+        let messages = vec![
+            assistant_call("edit1", "edit_file"),
+            tool_result("edit1", false),
+            background_call("start", "bash_start", "npm test"),
+            start_receipt("start", "bg-1"),
+            assistant_call("edit2", "edit_file"),
+            tool_result("edit2", false),
+            background_call("poll", "bash_poll", "bg-1"),
+            Message::tool_result("poll", "status: exited (code 0)", false),
+        ];
+        assert!(owed_anywhere(&messages).is_some());
+    }
+
+    #[test]
+    fn a_later_failing_check_is_not_hidden_by_an_earlier_success() {
+        let mut messages = vec![
+            assistant_call("edit", "edit_file"),
+            tool_result("edit", false),
+            bash_call("ok", "npm test"),
+            tool_result("ok", false),
+        ];
+        assert!(owed_anywhere(&messages).is_none());
+        messages.extend([bash_call("failed", "npm test"), tool_result("failed", true)]);
+        assert!(owed_anywhere(&messages).is_some());
     }
 
     #[test]

@@ -8,6 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 
+use crate::discipline::background_exit_code as goal_background_exit_code;
+
 use async_trait::async_trait;
 use atomcode_kernel::message::{Message, Role};
 use atomcode_kernel::provider::{ChatOptions, LlmProvider, ToolChoice};
@@ -1440,17 +1442,6 @@ fn goal_execution_call(call: &atomcode_kernel::tool::ToolCall) -> bool {
 
 // Raw tool-reported status is evidence to inspect, never automatic success:
 // for example `program | tee file` may exit zero while program printed an error.
-fn goal_background_exit_code(output: &str) -> Option<i32> {
-    output
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())?
-        .trim()
-        .strip_prefix("status: exited (code ")?
-        .strip_suffix(')')?
-        .parse()
-        .ok()
-}
 
 fn goal_verification_candidate(call: &atomcode_kernel::tool::ToolCall, output: &str) -> bool {
     if !goal_execution_call(call) {

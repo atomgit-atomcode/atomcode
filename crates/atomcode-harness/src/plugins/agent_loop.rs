@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use atomcode_kernel::message::Message;
+use atomcode_kernel::message::{Message, ReasoningBlock};
 use atomcode_kernel::provider::{ChatOptions, LlmProvider, ToolChoice};
 use atomcode_kernel::stream::StreamEvent;
 use atomcode_kernel::tool::{ToolCall, ToolDef, ToolResult};
@@ -331,6 +331,7 @@ async fn stream_once(
         .await
         .map_err(|e| RequestError::from_provider(&e))?;
     let mut out = ModelResponse::default();
+    let mut reasoning_block_text = String::new();
     let mut saw_tool_stream = false;
     let mut watchdog = atomcode_capabilities::provider::StreamWatchdog::new(first_content, idle);
     loop {
@@ -404,6 +405,7 @@ async fn stream_once(
                     reasoning: true,
                 });
                 out.reasoning.push_str(&text);
+                reasoning_block_text.push_str(&text);
             }
             StreamEvent::ToolCall(call) => {
                 // Complete calls are not a first-token observation. Their
@@ -426,7 +428,19 @@ async fn stream_once(
                     arguments,
                 });
             }
-            StreamEvent::Usage(usage) => out.usage = Some(usage),
+            StreamEvent::ReasoningSignature { opaque, provider } => {
+                out.reasoning_blocks.push(ReasoningBlock {
+                    text: std::mem::take(&mut reasoning_block_text),
+                    opaque: Some(opaque),
+                    provider: Some(provider),
+                });
+            }
+            StreamEvent::ResponseId(id) => out.provider_response_id = Some(id),
+            StreamEvent::ResponseModel(model) => out.provider_model = Some(model),
+            StreamEvent::Usage(usage) => out
+                .usage
+                .get_or_insert_with(Default::default)
+                .merge_max(usage),
             // Hand back what was already produced: the tokens were paid for,
             // and a retry that starts from nothing repeats work the model has
             // already done.
@@ -847,7 +861,7 @@ impl PluginAgentLoop {
                     text: response.text.clone(),
                     reasoning: response.reasoning.clone(),
                     tool_calls: response.tool_calls.clone(),
-                    reasoning_blocks: Vec::new(),
+                    reasoning_blocks: response.reasoning_blocks.clone(),
                     meta: Some(meta),
                 },
             );
@@ -1040,7 +1054,7 @@ fn partial_reply(events: &[LoggedEvent], turn: u64) -> Option<SessionEvent> {
 /// `request_id` continues the session's own sequence — one past the highest id
 /// any logged response already holds — rather than restarting per process, so a
 /// session resumed from a store that kept those ids does not mint duplicates.
-fn response_meta(
+pub(super) fn response_meta(
     session: &SessionLog,
     provider: &dyn LlmProvider,
     response: &ModelResponse,
@@ -1065,6 +1079,8 @@ fn response_meta(
     let used_tokens = tokens.prompt;
     atomcode_kernel::message::MessageMeta {
         tokens,
+        provider_response_id: response.provider_response_id.clone(),
+        provider_model: response.provider_model.clone(),
         elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
         ctx_window,
         used_tokens,
@@ -1319,6 +1335,54 @@ mod content_deadline_tests {
         assert_eq!(started.elapsed(), Duration::from_secs(121));
         assert_eq!(error.partial.unwrap().text, "saved");
     }
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_partial_response_keeps_completed_signatures_and_provider_identity() {
+        let partial = run(&TimedProvider(vec![
+            (0, StreamEvent::ResponseId("partial-id".into())),
+            (0, StreamEvent::ResponseModel("actual-model".into())),
+            (
+                0,
+                StreamEvent::ReasoningSignature {
+                    opaque: "redacted-signature".into(),
+                    provider: "signed-provider".into(),
+                },
+            ),
+            (200, StreamEvent::TextDelta("too late".into())),
+        ]))
+        .await
+        .unwrap_err()
+        .partial
+        .expect("a redacted signed block is partial content");
+        assert!(partial.reasoning.is_empty());
+        assert_eq!(partial.reasoning_blocks.len(), 1);
+        assert_eq!(
+            partial.reasoning_blocks[0].opaque.as_deref(),
+            Some("redacted-signature")
+        );
+        assert_eq!(partial.provider_response_id.as_deref(), Some("partial-id"));
+        assert_eq!(partial.provider_model.as_deref(), Some("actual-model"));
+
+        let partial = run(&TimedProvider(vec![
+            (0, StreamEvent::Reasoning("completed".into())),
+            (
+                0,
+                StreamEvent::ReasoningSignature {
+                    opaque: "signature".into(),
+                    provider: "signed-provider".into(),
+                },
+            ),
+            (0, StreamEvent::Reasoning("unfinished".into())),
+            (200, StreamEvent::TextDelta("too late".into())),
+        ]))
+        .await
+        .unwrap_err()
+        .partial
+        .unwrap();
+        assert_eq!(partial.reasoning, "completedunfinished");
+        assert_eq!(partial.reasoning_blocks.len(), 1);
+        assert_eq!(partial.reasoning_blocks[0].text, "completed");
+    }
+
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_stalled_tool_fragment_is_not_marked_safe_to_replay() {
         let error = run(&TimedProvider(vec![
