@@ -2345,13 +2345,21 @@ async fn run(process_start: std::time::Instant) -> Result<i32> {
             // it, and is not what "continue" means: it is left out.
             let from_bucket = atomcode_daemon::legacy_convert::catalog_for_bucket(&working_dir)?
                 .into_iter()
-                .find(|entry| entry.message_count > 0 && !entry.delegated())
+                .find(|entry| {
+                    entry.message_count > 0
+                        && !entry.delegated()
+                        && entry.working_directory_available()
+                })
                 .map(|entry| entry.id);
             match from_bucket {
                 Some(id) => Some(id),
                 None => atomcode_daemon::legacy_convert::catalog_for_project(&working_dir)?
                     .into_iter()
-                    .find(|entry| entry.message_count > 0 && !entry.delegated())
+                    .find(|entry| {
+                        entry.message_count > 0
+                            && !entry.delegated()
+                            && entry.working_directory_available()
+                    })
                     .map(|entry| entry.id),
             }
         }

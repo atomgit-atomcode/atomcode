@@ -1674,7 +1674,9 @@ impl RuntimeControl {
         let all: Vec<(String, StoredSession)> = scan
             .entries
             .into_iter()
-            .filter(|entry| entry.message_count > 0 && !entry.delegated())
+            .filter(|entry| {
+                entry.message_count > 0 && !entry.delegated() && entry.working_directory_available()
+            })
             .map(|entry| {
                 (
                     entry.project_bucket,

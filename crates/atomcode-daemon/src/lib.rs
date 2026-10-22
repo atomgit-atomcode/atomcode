@@ -386,6 +386,8 @@ pub struct ChangeDirResponse {
 pub struct SearchQuery {
     /// Search keyword for session name
     pub q: String,
+    #[serde(default)]
+    pub include_unavailable: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1479,32 +1481,6 @@ fn response_project_hash(path: &std::path::Path) -> String {
     hash_path(path)
 }
 
-/// System temp directory prefixes to exclude from the project list.
-/// These are directories that are not meaningful as user projects.
-fn is_system_temp_dir(path: &std::path::Path) -> bool {
-    let path_str = path.to_string_lossy();
-    // Unix/Linux/macOS temp dirs
-    if path_str.starts_with("/tmp/") || path_str == "/tmp" {
-        return true;
-    }
-    if path_str.starts_with("/var/tmp/") || path_str == "/var/tmp" {
-        return true;
-    }
-    // Windows temp dirs
-    if path_str.contains("\\Temp\\")
-        || path_str.contains("\\TEMP\\")
-        || path_str.ends_with("\\Temp")
-        || path_str.ends_with("\\TEMP")
-    {
-        return true;
-    }
-    // /private/tmp (macOS symlink target for /tmp)
-    if path_str.starts_with("/private/tmp/") || path_str == "/private/tmp" {
-        return true;
-    }
-    false
-}
-
 /// List all projects (scans sessions directory)
 fn list_projects() -> std::io::Result<Vec<ProjectInfo>> {
     let root = NativeSessionManager::sessions_root(
@@ -1524,9 +1500,6 @@ fn projects_from_catalog(
     let mut by_project = std::collections::BTreeMap::<String, ProjectInfo>::new();
     for entry in entries {
         // A project is counted by what its session list shows.
-        if is_system_temp_dir(&entry.working_dir) {
-            continue;
-        }
         let created_at = u64::try_from(entry.created_at_ms.max(0)).unwrap_or(0) / 1_000;
         let updated_at = u64::try_from(entry.updated_at_ms.max(0)).unwrap_or(0) / 1_000;
         let project = by_project
@@ -1573,6 +1546,7 @@ pub struct SessionSummary {
     pub message_count: usize,
     #[serde(default)]
     pub file_size: u64,
+    pub working_directory_available: bool,
 }
 
 fn catalog_scan_in_root(
@@ -1680,6 +1654,7 @@ fn catalog_entry_to_session_summary(
         updated_at: u64::try_from(entry.updated_at_ms.max(0)).unwrap_or(0) / 1_000,
         message_count: entry.message_count,
         file_size: 0,
+        working_directory_available: entry.working_directory_available(),
     }
 }
 
@@ -1746,6 +1721,9 @@ fn catalog_entry_is_visible(
     // Background work done for another conversation (a review): its result
     // went back there, and it is not listed beside it.
     if entry.delegated() {
+        return false;
+    }
+    if !entry.working_directory_available() {
         return false;
     }
     if entry.message_count > 0 {
@@ -2876,24 +2854,30 @@ async fn append_session_messages(
 }
 
 /// Search sessions by name across all projects
-fn search_sessions_by_name(keyword: &str) -> std::io::Result<Vec<SessionMetaWithProject>> {
+fn search_sessions_by_name(
+    keyword: &str,
+    include_unavailable: bool,
+) -> std::io::Result<Vec<SessionMetaWithProject>> {
     search_sessions_by_name_in_root(
         &NativeSessionManager::sessions_root(
             atomcode_coding::config::product_dirs_from_env().user(),
         ),
         keyword,
+        include_unavailable,
     )
 }
 
 fn search_sessions_by_name_in_root(
     sessions_root: &std::path::Path,
     keyword: &str,
+    include_unavailable: bool,
 ) -> std::io::Result<Vec<SessionMetaWithProject>> {
     let keyword_lower = keyword.to_lowercase();
     let mut entries: Vec<_> = catalog_scan_in_root(sessions_root)?
         .entries
         .into_iter()
         .filter(|entry| entry.message_count > 0 && !entry.delegated())
+        .filter(|entry| include_unavailable || entry.working_directory_available())
         .collect();
     crate::legacy_convert::repair_catalog_names_for_display_in_root(sessions_root, &mut entries);
     Ok(entries
@@ -2965,7 +2949,7 @@ async fn session_reference_candidates(
 
 /// GET /sessions/search?q=keyword - Search sessions by name
 async fn search_sessions(Query(query): Query<SearchQuery>) -> impl IntoResponse {
-    if query.q.trim().is_empty() {
+    if query.q.trim().is_empty() && !query.include_unavailable {
         return (
             StatusCode::BAD_REQUEST,
             Json("Search keyword cannot be empty"),
@@ -2974,7 +2958,11 @@ async fn search_sessions(Query(query): Query<SearchQuery>) -> impl IntoResponse 
     }
 
     let keyword = query.q;
-    match run_session_catalog_io(move || search_sessions_by_name(&keyword)).await {
+    match run_session_catalog_io(move || {
+        search_sessions_by_name(&keyword, query.include_unavailable)
+    })
+    .await
+    {
         Ok(sessions) => Json(sessions).into_response(),
         Err(e) => {
             let msg = format!("Failed to search sessions: {}", e);
@@ -8957,7 +8945,7 @@ mod tests {
         let snapshot = atomcode_kernel::message::SessionSnapshot::new(vec![
             atomcode_kernel::message::Message::user("修复 VS Code 历史标题"),
         ]);
-        let mut meta = SessionMeta::new(session_id, "/project", 1);
+        let mut meta = SessionMeta::new(session_id, tmp.path().to_string_lossy(), 1);
         meta.owner = StorageOwner::Native;
         meta.message_count = 1;
         manager
@@ -8994,7 +8982,7 @@ mod tests {
         let manager =
             std::sync::Arc::new(SessionManager::with_root(tmp.path().join(project_bucket)));
         let lease = manager.acquire_lease(session_id).unwrap();
-        let mut meta = SessionMeta::new(session_id, "/project", 1);
+        let mut meta = SessionMeta::new(session_id, tmp.path().to_string_lossy(), 1);
         meta.owner = StorageOwner::Native;
         manager
             .commit_native_import(
@@ -9008,7 +8996,7 @@ mod tests {
         let hook = SnapshotHook::new(
             manager.clone(),
             session_id,
-            "/project",
+            tmp.path().to_string_lossy(),
             &atomcode_coding::config::product_dirs_from_env(),
         )
         .with_lease(lease);
@@ -9046,7 +9034,7 @@ mod tests {
             ("conversation", 1, false),
             ("fork", 1, true),
         ] {
-            let mut meta = SessionMeta::new(id, "/project", 1);
+            let mut meta = SessionMeta::new(id, tmp.path().to_string_lossy(), 1);
             meta.owner = StorageOwner::Native;
             meta.message_count = messages;
             if fork {
@@ -9097,7 +9085,7 @@ mod tests {
         let manager = SessionManager::with_root(tmp.path().join(project_bucket));
         for id in ["active-empty", "unused-empty"] {
             manager
-                .write_meta(&SessionMeta::new(id, "/project", 1))
+                .write_meta(&SessionMeta::new(id, tmp.path().to_string_lossy(), 1))
                 .unwrap();
         }
         let active = CatalogLocation {
@@ -9179,7 +9167,7 @@ mod tests {
         let snapshot = atomcode_kernel::message::SessionSnapshot::new(vec![
             atomcode_kernel::message::Message::user("可搜索的历史标题"),
         ]);
-        let mut meta = SessionMeta::new(session_id, "/project", 1);
+        let mut meta = SessionMeta::new(session_id, tmp.path().to_string_lossy(), 1);
         meta.owner = StorageOwner::Native;
         meta.message_count = 1;
         manager
@@ -9193,7 +9181,7 @@ mod tests {
         drop(lease);
 
         let global = list_all_sessions_in_root(tmp.path(), None).unwrap();
-        let search = search_sessions_by_name_in_root(tmp.path(), "可搜索").unwrap();
+        let search = search_sessions_by_name_in_root(tmp.path(), "可搜索", false).unwrap();
 
         assert_eq!(global.len(), 1);
         assert_eq!(global[0].meta.name, "可搜索的历史标题");
@@ -9211,6 +9199,7 @@ mod tests {
             serde_json::from_slice(include_bytes!("../tests/fixtures/session/legacy_full.json"))
                 .unwrap();
         let session_id = legacy["id"].as_str().unwrap().to_string();
+        legacy["working_dir"] = serde_json::json!(tmp.path());
         legacy["name"] = serde_json::Value::String(format!("session-{session_id}"));
         legacy["user_renamed"] = serde_json::Value::Bool(false);
         legacy["ai_named"] = serde_json::Value::Bool(false);
@@ -9229,6 +9218,76 @@ mod tests {
         assert!(!project.join(format!("{session_id}.ui.json")).exists());
     }
 
+    #[tokio::test]
+    async fn unavailable_workspaces_leave_default_catalogs_but_keep_readable_history() {
+        use atomcode_capabilities::session::{PresentationFile, SessionManager, SessionMeta};
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let bucket = "0123456789abcdef";
+        let manager = SessionManager::with_root(root.path().join(bucket));
+        let lease = manager.acquire_lease("history").unwrap();
+        let mut meta = SessionMeta::new("history", workspace.path().to_string_lossy(), 1);
+        meta.owner = atomcode_capabilities::session::StorageOwner::Native;
+        meta.name = "saved automation".into();
+        meta.message_count = 1;
+        let snapshot = atomcode_kernel::message::SessionSnapshot::new(vec![
+            atomcode_kernel::message::Message::user("keep this history"),
+        ]);
+        manager
+            .commit_native_import(
+                &lease,
+                Some(&snapshot),
+                Some(&PresentationFile::default()),
+                &meta,
+            )
+            .unwrap();
+        drop(lease);
+        assert_eq!(
+            list_all_sessions_in_root(root.path(), None).unwrap().len(),
+            1
+        );
+        workspace.close().unwrap();
+        assert!(list_all_sessions_in_root(root.path(), None)
+            .unwrap()
+            .is_empty());
+        assert!(list_sessions_in_root(root.path(), bucket, None)
+            .unwrap()
+            .is_empty());
+        assert!(projects_from_catalog(
+            root.path(),
+            catalog_scan_in_root(root.path()).unwrap().entries,
+            None
+        )
+        .is_empty());
+        assert!(search_sessions_by_name_in_root(root.path(), "saved", false)
+            .unwrap()
+            .is_empty());
+        let history = search_sessions_by_name_in_root(root.path(), "", true).unwrap();
+        assert_eq!(history.len(), 1);
+        assert!(!history[0].meta.working_directory_available);
+        assert_eq!(
+            resolve_session_in_root(root.path(), "history")
+                .unwrap()
+                .unwrap()
+                .meta
+                .id,
+            "history"
+        );
+        let loaded = manager.load_native_session("history").unwrap();
+        assert_eq!(loaded.snapshot.messages[0].text, "keep this history");
+        // The active conversation must not disappear if its directory is removed.
+        let active = atomcode_capabilities::session::CatalogLocation {
+            id: "history".into(),
+            project_bucket: bucket.into(),
+        };
+        assert_eq!(
+            list_all_sessions_in_root(root.path(), Some(&active))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
     #[test]
     fn daemon_global_listing_keeps_latest_fifty_sessions() {
         use atomcode_capabilities::session::{SessionManager, SessionMeta};
@@ -9237,7 +9296,7 @@ mod tests {
         let manager = SessionManager::with_root(tmp.path().join("0123456789abcdef"));
         for index in 0..51 {
             let id = format!("history-{index:02}");
-            let mut meta = SessionMeta::new(&id, "/project", index);
+            let mut meta = SessionMeta::new(&id, tmp.path().to_string_lossy(), index);
             meta.name = format!("history title {index:02}");
             meta.message_count = 1;
             manager.write_meta(&meta).unwrap();

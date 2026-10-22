@@ -288,6 +288,7 @@ export interface SessionMeta {
   updated_at: number;
   message_count: number;
   file_size?: number;
+  working_directory_available?: boolean;
 }
 
 export interface SessionMetaWithProject extends SessionMeta {
@@ -366,8 +367,8 @@ export async function listProjectSessions(projectHash: string): Promise<SessionM
 
 // Cross-project session search by name, UNCAPPED. Backs the search modal so it
 // can find a session in ANY project (the sidebar list itself is per-project).
-export async function searchSessions(q: string): Promise<SessionMetaWithProject[]> {
-  const resp = await apiFetch(`/sessions/search?q=${encodeURIComponent(q)}`, {
+export async function searchSessions(q: string, includeUnavailable = false): Promise<SessionMetaWithProject[]> {
+  const resp = await apiFetch(`/sessions/search?q=${encodeURIComponent(q)}${includeUnavailable ? "&include_unavailable=true" : ""}`, {
     headers: authHeaders(),
   });
   if (!resp.ok) throw new Error(`search sessions failed: ${resp.status}`);

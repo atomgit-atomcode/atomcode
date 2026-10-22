@@ -645,3 +645,24 @@ test('reasoning effort sends xhigh and exposes active-turn rejection for a visib
     await assert.rejects(postLiveReasoningEffort('xhigh'), (error: unknown) => error instanceof ReasoningEffortError && !error.activeTurn);
   } finally { globalThis.fetch = originalFetch; }
 });
+
+
+test('unavailable history is opt-in and remains available for read-only retrieval', async () => {
+  const calls: string[] = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: RequestInfo | URL) => {
+    calls.push(String(url));
+    return new Response('[]', { status: 200 });
+  }) as typeof fetch;
+  try {
+    const { searchSessions } = await import('./api.ts');
+    await searchSessions('automation');
+    await searchSessions('', true);
+    assert.deepEqual(calls, [
+      '/sessions/search?q=automation',
+      '/sessions/search?q=&include_unavailable=true',
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

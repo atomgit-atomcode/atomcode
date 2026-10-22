@@ -401,6 +401,24 @@ export function Sidebar({
   // the loaded list — which would only ever see the current project).
   const [searchResults, setSearchResults] = useState<SessionMetaWithProject[]>([]);
   const [searchBusy, setSearchBusy] = useState(false);
+  const [includeUnavailable, setIncludeUnavailable] = useState(false);
+  const [historyPreview, setHistoryPreview] = useState<{ title: string; text: string } | null>(null);
+  const previewGeneration = useRef(0);
+
+  async function previewUnavailableSession(session: SessionMetaWithProject) {
+    const generation = ++previewGeneration.current;
+    setHistoryPreview({ title: session.name, text: t('sidebar.searching') });
+    setSearchOpen(false);
+    try {
+      const detail = await getSession(session.project_hash, session.id);
+      if (generation !== previewGeneration.current) return;
+      setHistoryPreview({ title: session.name, text: sessionMessagesToMarkdownLines(detail.messages, detail.name).join('\n') });
+    } catch (error) {
+      if (generation !== previewGeneration.current) return;
+      setHistoryPreview({ title: session.name, text: t('sidebar.historyLoadFailed', { error: String(error) }) });
+    }
+  }
+
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const [renameTarget, setRenameTarget] = useState<SessionMetaWithProject | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<SessionMetaWithProject | null>(null);
@@ -728,6 +746,18 @@ export function Sidebar({
     }
   }
 
+  useEffect(() => {
+    if (!historyPreview) return;
+    const close = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        ++previewGeneration.current;
+        setHistoryPreview(null);
+      }
+    };
+    document.addEventListener('keydown', close);
+    return () => document.removeEventListener('keydown', close);
+  }, [historyPreview !== null]);
+
   // Settings menu: fixed-anchored above its button; close on outside/scroll/resize.
   useEffect(() => {
     if (!settingsMenuOpen) return;
@@ -943,7 +973,7 @@ export function Sidebar({
   useEffect(() => {
     if (!searchOpen) return;
     const q = searchQuery.trim();
-    if (!q) {
+    if (!q && !includeUnavailable) {
       setSearchResults([]);
       setSearchBusy(false);
       return;
@@ -951,7 +981,7 @@ export function Sidebar({
     setSearchBusy(true);
     let cancelled = false;
     const timer = setTimeout(() => {
-      searchSessions(q)
+      searchSessions(q, includeUnavailable)
         .then((r) => {
           if (!cancelled) setSearchResults(r);
         })
@@ -966,7 +996,7 @@ export function Sidebar({
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [searchQuery, searchOpen]);
+  }, [searchQuery, searchOpen, includeUnavailable]);
 
   // The settings popup (3 entries). Fixed-positioned, but portaled to <body>:
   // on mobile the sidebar becomes a `transform`ed off-canvas drawer, which
@@ -1591,17 +1621,25 @@ export function Sidebar({
                 autofocus
               />
             </div>
+            <label style={{ display: 'block', padding: '8px 16px' }}>
+              <input type="checkbox" checked={includeUnavailable} onChange={(e) => {
+                setSearchResults([]);
+                setSearchBusy(true);
+                setIncludeUnavailable((e.target as HTMLInputElement).checked);
+              }} /> {t('sidebar.includeUnavailable')}
+            </label>
             <div class="search-results">
               {(() => {
                 const q = searchQuery.trim();
                 // Non-empty query → cross-project results from the endpoint;
                 // empty → only the current project's already-loaded history.
-                const results = q ? searchResults : currentProjectSessions;
-                const currentProjectLoading = !q && loadingProjects.has(currentWorkspaceHash);
-                if ((q && searchBusy && results.length === 0) || currentProjectLoading) {
+                const remoteSearch = !!q || includeUnavailable;
+                const results = remoteSearch ? searchResults : currentProjectSessions;
+                const currentProjectLoading = !remoteSearch && loadingProjects.has(currentWorkspaceHash);
+                if ((remoteSearch && searchBusy && results.length === 0) || currentProjectLoading) {
                   return <div class="search-empty">{t('sidebar.searching')}</div>;
                 }
-                if (!q && failedProjects.has(currentWorkspaceHash)) {
+                if (!remoteSearch && failedProjects.has(currentWorkspaceHash)) {
                   return (
                     <button
                       class="sidebar-project-retry"
@@ -1635,10 +1673,13 @@ export function Sidebar({
                         <button
                           key={s.id}
                           class={'search-result-item' + (s.id === activeSessionId ? ' active' : '')}
-                          onClick={() => { onSelect(s); setSearchOpen(false); }}
+                          onClick={() => {
+                            if (s.working_directory_available === false) void previewUnavailableSession(s);
+                            else { onSelect(s); setSearchOpen(false); }
+                          }}
                         >
                           <span class="search-result-name">{label}</span>
-                          <span class="search-result-dir">{dir}</span>
+                          <span class="search-result-dir">{dir}{s.working_directory_available === false && ` · ${t('sidebar.unavailableWorkspace')}`}</span>
                           <span class="search-result-time">{formatTime(s.updated_at || s.created_at, t, timeNow)}</span>
                         </button>
                       );
@@ -1650,6 +1691,16 @@ export function Sidebar({
           </div>
         </div>,
         document.body,
+      )}
+
+      {historyPreview && createPortal(
+        <div class="modal-overlay" onClick={(e) => { if (e.target === e.currentTarget) { ++previewGeneration.current; setHistoryPreview(null); } }}>
+          <div class="modal-card" role="dialog" aria-modal="true" aria-label={historyPreview.title} style={{ width: 'min(900px, 90vw)' }}>
+            <div class="modal-header"><h3>{historyPreview.title}</h3><button onClick={() => { ++previewGeneration.current; setHistoryPreview(null); }} aria-label={t('sidebar.closeHistory')}>×</button></div>
+            <p style={{ padding: '0 16px' }}>{t('sidebar.unavailableWorkspace')}</p>
+            <pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', overflow: 'auto', maxHeight: '65vh', padding: '16px' }}>{historyPreview.text}</pre>
+          </div>
+        </div>, document.body,
       )}
 
       {/* Per-session actions menu. Fixed + portaled to <body> so neither the
