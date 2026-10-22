@@ -154,6 +154,10 @@ impl PluginAgentLoop {
     /// One model call, wrapped in the `agent/request` waterfall. Listeners see
     /// the assembled request and may rewrite it, wrap the answer, or return one
     /// of their own without ever reaching the provider.
+    #[tracing::instrument(
+        name = "agent_request", skip_all,
+        fields(session_id = %session.id(), parent_session_id = session.header().parent.as_deref().unwrap_or(""), inherited_events = session.header().inherited, turn, round)
+    )]
     async fn request(
         &self,
         provider: Arc<dyn LlmProvider>,
@@ -167,6 +171,7 @@ impl PluginAgentLoop {
         let text_only = req.options.tool_choice == ToolChoice::None;
         let request_started = std::time::Instant::now();
         let mut timing = crate::diagnostics::PhaseTiming::start("request_pipeline");
+        let diagnostic_session = session.clone();
         let result = agent_ctx
             .waterfall::<AgentRequest, _>(&mut req, move |req| {
                 tracing::debug!(
@@ -212,6 +217,23 @@ impl PluginAgentLoop {
             })
             .await;
         timing.returned();
+        let response = match &result {
+            Ok(response) => Some(response),
+            Err(error) => error.partial.as_deref(),
+        };
+        let usage = response
+            .and_then(|response| response.usage)
+            .unwrap_or_default();
+        tracing::info!(
+            outcome = if result.is_ok() { "ok" } else { "error" },
+            usage_reported = response.is_some_and(|response| response.usage.is_some()),
+            prompt_tokens = usage.prompt,
+            cached_tokens = usage.cached,
+            completion_tokens = usage.completion,
+            elapsed_ms = request_started.elapsed().as_millis() as u64,
+            log_through = diagnostic_session.last_seq(),
+            "agent request completed"
+        );
         result
     }
 
@@ -295,7 +317,7 @@ impl PluginAgentLoop {
 #[tracing::instrument(
     name = "llm_call",
     skip_all,
-    fields(purpose = "main_reply", turn, round, session_id = %session.id())
+    fields(purpose = "main_reply", turn, round, session_id = %session.id(), request_id = session.next_request_id())
 )]
 async fn stream_once(
     provider: &dyn LlmProvider,
@@ -1062,18 +1084,7 @@ pub(super) fn response_meta(
     round: u32,
     elapsed: std::time::Duration,
 ) -> atomcode_kernel::message::MessageMeta {
-    let request_id = session
-        .events()
-        .iter()
-        .filter_map(|logged| match &logged.event {
-            SessionEvent::AssistantMessage {
-                meta: Some(meta), ..
-            } => Some(meta.request_id),
-            _ => None,
-        })
-        .max()
-        .unwrap_or(0)
-        + 1;
+    let request_id = session.next_request_id();
     let tokens = response.usage.unwrap_or_default();
     let ctx_window = provider.context_window();
     let used_tokens = tokens.prompt;

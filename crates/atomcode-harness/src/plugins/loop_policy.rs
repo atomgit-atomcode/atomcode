@@ -761,6 +761,7 @@ fn truncate(text: &str, max: usize) -> String {
 struct CompactBeforeRequest {
     ctx: Context,
     threshold: f32,
+    token_limit: Option<u32>,
     /// The turn each session last tried a quick and a slow compaction in.
     tried: Mutex<HashMap<String, (u64, [bool; 2])>>,
 }
@@ -806,7 +807,12 @@ impl Waterfall<AgentRequest> for CompactBeforeRequest {
             .map(|p| p.context_window())
             .unwrap_or(0);
         let used = last_prompt_tokens(&session);
-        if window == 0 || used == 0 || (used as f32) < (window as f32 * self.threshold) {
+        let trigger_tokens = self
+            .token_limit
+            .map_or(window as f32 * self.threshold, |limit| {
+                (window as f32 * self.threshold).min(limit as f32)
+            });
+        if window == 0 || used == 0 || (used as f32) < trigger_tokens {
             return next.run(req).await;
         }
 
@@ -907,10 +913,21 @@ impl Plugin for CompactionPlugin {
 /// wants compaction to fire at the same pressure. Both rows call this, and a
 /// replacement strategy that forgot to would be a strategy that never runs.
 pub fn mount_compaction_trigger(ctx: &Context, threshold: f32) {
+    mount_compaction_trigger_with_limit(ctx, threshold, None);
+}
+
+/// Use the same bounded trigger with an optional earlier absolute token budget.
+/// The provider's physical context window remains unchanged.
+pub fn mount_compaction_trigger_with_limit(
+    ctx: &Context,
+    threshold: f32,
+    token_limit: Option<u32>,
+) {
     let _ = ctx.on_waterfall::<AgentRequest>(
         Arc::new(CompactBeforeRequest {
             ctx: ctx.clone(),
             threshold,
+            token_limit,
             tried: Mutex::new(HashMap::new()),
         }),
         false,

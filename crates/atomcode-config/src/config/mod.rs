@@ -511,8 +511,23 @@ pub struct SkillsConfig {
     pub extra_dirs: Vec<String>,
 }
 
+/// Optional absolute prompt budget. Omission preserves window-relative compaction.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CompactionConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_limit: Option<std::num::NonZeroU32>,
+}
+impl CompactionConfig {
+    fn is_default(&self) -> bool {
+        self.token_limit.is_none()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default, skip_serializing_if = "CompactionConfig::is_default")]
+    pub compaction: CompactionConfig,
     #[serde(default)]
     pub skills: SkillsConfig,
     /// Legacy default selection (a `[providers.*]` key). `#[serde(default)]` so a
@@ -1063,6 +1078,7 @@ impl Default for Config {
             default_provider: String::new(),
             evaluator_provider: None,
             goal: GoalConfig::default(),
+            compaction: CompactionConfig::default(),
             default_workdir: None,
             providers: HashMap::new(),
             provider_accounts: HashMap::new(),
@@ -3845,6 +3861,7 @@ model = "missing-type"
             default_provider: "p".to_string(),
             evaluator_provider: None,
             goal: GoalConfig::default(),
+            compaction: CompactionConfig::default(),
             default_workdir: None,
             providers: HashMap::new(),
             provider_accounts: HashMap::new(),

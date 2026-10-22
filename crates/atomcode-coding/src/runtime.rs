@@ -4353,7 +4353,7 @@ fn spawn_runtime_owner_with_optional_agent(
     mut resources: Option<RuntimeResources>,
     wakeup_rx: Option<mpsc::UnboundedReceiver<WakeupRequest>>,
 ) -> KernelRuntimeAdapter {
-    let (kernel_command_tx, mut kernel_command_rx) = mpsc::unbounded_channel();
+    let (kernel_command_tx, mut kernel_command_rx) = mpsc::unbounded_channel::<AgentCommand>();
     let (kernel_event_tx, kernel_event_rx) = mpsc::unbounded_channel();
     let (owner_tx, mut owner_rx) = mpsc::unbounded_channel();
     let (_closed_wakeup_tx, closed_wakeup_rx) = mpsc::unbounded_channel();
@@ -4434,6 +4434,7 @@ fn spawn_runtime_owner_with_optional_agent(
         let mut loop_state: Option<LoopState> = None;
         let mut pending_wakeup: Option<WakeupRequest> = None;
         let mut held_turn: Option<(u64, StopReason, Arc<SessionSnapshot>, RuntimeTurnStats)> = None;
+        let mut background_jobs = crate::background_jobs::BackgroundJobs::default();
         // Whether the agent itself has work: a turn open, or a message handed
         // to it that it will open one for. Not the same as `active_turn`: a held
         // turn is one this owner keeps open after the agent finished it, and the
@@ -4463,6 +4464,14 @@ fn spawn_runtime_owner_with_optional_agent(
             });
         }
         loop {
+            background_jobs.retain_generation(generation);
+            if cancel_pending
+                || persistence_failure.is_some()
+                || pending_policy_intervention.is_some()
+                || !agent_available
+            {
+                background_jobs.reset(generation);
+            }
             if let Err(error) = goal_checkpoints.sync(
                 resources.as_ref(),
                 &mut goal,
@@ -4551,8 +4560,38 @@ fn spawn_runtime_owner_with_optional_agent(
                 }
             }
             let question_deadline = goal_questions.deadline();
+            let background_deadline = goal
+                .as_ref()
+                .filter(|state| {
+                    state.active
+                        && held_turn.is_some()
+                        && !kernel_turn_open
+                        && background_jobs.pending()
+                })
+                .and_then(|state| {
+                    if state.cap_reached().is_some() {
+                        Some(tokio::time::Instant::now())
+                    } else {
+                        state.deadline()
+                    }
+                });
             tokio::select! {
                 biased;
+                _ = tokio::time::sleep_until(background_deadline.unwrap_or_else(|| tokio::time::Instant::now() + std::time::Duration::from_secs(86400))), if background_deadline.is_some() => {
+                    if let Some(state) = goal.as_mut() {
+                        if let Some(why) = state.cap_reached() {
+                            state.pause_at_cap(goal_cap_stop_note(why, state.max_rounds));
+                            let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                        }
+                    }
+                    background_jobs.reset(generation);
+                    if let Some((turn_id, _reason, snapshot, stats)) = held_turn.take() {
+                        active_turn = None;
+                        terminal_reason = None;
+                        let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed { turn_id, reason: StopReason::MaxRounds, snapshot, stats }));
+                        controls.state.store(runtime_phase_state(generation, RuntimePhase::Ready), Ordering::Release);
+                    }
+                }
                 _ = tokio::time::sleep_until(question_deadline), if !goal_questions.waiting.is_empty() => {
                     let due: Vec<_> = goal_questions.waiting.iter()
                         .filter(|(_, (at, _))| *at <= tokio::time::Instant::now())
@@ -4945,15 +4984,20 @@ fn spawn_runtime_owner_with_optional_agent(
                             finish_reason = Some(StopReason::Stopped);
                         }
                         GoalResult::NotMet(verdict) => {
-                            // A round that made ZERO tool calls did nothing but talk. When the
-                            // evaluator ALSO judges the goal unmet, re-injecting "keep working"
-                            // just spins — usually because the goal isn't a concrete, verifiable
-                            // objective (e.g. an empty/vague goal like "需要"). Stop after
-                            // MAX_STALLED_ROUNDS such rounds instead of burning every round up to
-                            // max_rounds.
+                            // Known background work waits for its completion event. Otherwise
+                            // repeated identical observational receipts do not count as new
+                            // progress; unknown commands/mutations remain conservative. Stop
+                            // after the existing bounded number of stagnant rounds.
+                            if background_jobs.pending() {
+                                if let Some(state) = goal.as_mut() {
+                                    state.last_reason = Some("waiting for explicitly requested background completion".into());
+                                    let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                                }
+                                continue;
+                            }
                             let made_progress = held_turn
                                 .as_ref()
-                                .map(|(_, _, _, stats)| stats.tool_call_count > 0)
+                                .map(|(_, _, snapshot, _)| crate::background_jobs::made_progress(&snapshot.messages))
                                 .unwrap_or(false);
                             if let Some(state) = goal.as_mut() {
                                 state.last_reason = Some(verdict.clone());
@@ -4967,7 +5011,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                     // Terminal stall — finish WITHOUT bumping `round` (mirrors the
                                     // Inconclusive/Error arms; the stalled round isn't a new run).
                                     let note = format!(
-                                        "stopped: no tool calls for {} consecutive rounds and the goal is still unmet — it likely isn't a concrete, verifiable objective. Give a specific goal and run /loop again.",
+                                        "stopped: no new tool evidence for {} consecutive rounds and the goal is still unmet. Check the blocker and provide a concrete next step.",
                                         state.no_progress
                                     );
                                     state.finish(GoalTerminal::Stopped, note.clone());
@@ -5164,7 +5208,15 @@ fn spawn_runtime_owner_with_optional_agent(
                             state.last_reason = Some(wakeup.reason);
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::LoopChanged(state.progress()));
                         }
-                        if send_agent_command(&agent, AgentCommand::SendMessage { text: wakeup.prompt, images: vec![] }) {
+                        let command = if pending_local_context.is_empty() {
+                            AgentCommand::SendMessage { text: wakeup.prompt, images: vec![] }
+                        } else {
+                            AgentCommand::SendMessageWithContext {
+                                text: wakeup.prompt, images: vec![],
+                                context: pending_local_context.drain(..).collect::<Vec<_>>().join("\n\n"),
+                            }
+                        };
+                        if send_agent_command(&agent, command) {
                             held_turn = None;
                             terminal_reason = None;
                             turn_stats = RuntimeTurnStats::default();
@@ -6247,6 +6299,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         generation: request_generation,
                         done,
                     }) => {
+                        if request_generation == generation { background_jobs.reset(generation); }
                         if request_generation == generation {
                             goal_questions.close(resources.as_ref(), &mut pending_requests, &runtime_event_tx);
                         }
@@ -8770,6 +8823,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         }
                     }
                     Some(CodingRuntimeControl::StopGoal { generation: request_generation, done }) => {
+                        if request_generation == generation { background_jobs.reset(generation); }
                         if request_generation == generation {
                             goal_questions.close(resources.as_ref(), &mut pending_requests, &runtime_event_tx);
                         }
@@ -8875,6 +8929,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         }
                     }
                     Some(CodingRuntimeControl::StopLoop { generation: request_generation, done }) => {
+                        if request_generation == generation { background_jobs.reset(generation); }
                         if !native_protocol || request_generation != generation {
                             let _ = done.send(Err(RuntimeError::Unavailable));
                             continue;
@@ -8992,6 +9047,9 @@ fn spawn_runtime_owner_with_optional_agent(
                 },
                 command = kernel_command_rx.recv() => match command {
                     Some(command) => {
+                        if matches!(command.clone().untagged(), AgentCommand::Cancel | AgentCommand::Shutdown) {
+                            background_jobs.reset(generation);
+                        }
                         let _ = send_agent_command(&agent, command);
                     }
                     None => break,
@@ -9602,6 +9660,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 ));
                             }
                             AgentEvent::ToolResult { result } => {
+                                if !cancel_pending { background_jobs.result(&result); }
                                 // A driver's own shorter timeout, or a withdrawn
                                 // dialog, may finish the tool before our deadline.
                                 // Never resurrect that closed wait as pending.
@@ -9619,6 +9678,9 @@ fn spawn_runtime_owner_with_optional_agent(
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::Agent(AgentEvent::ToolResult {result}));
                             }
                             event @ AgentEvent::ToolStarted { .. } => {
+                                if let AgentEvent::ToolStarted { ref call } = event {
+                                    background_jobs.started(call);
+                                }
                                 turn_stats.tool_call_count =
                                     turn_stats.tool_call_count.saturating_add(1);
                                 if let Some(state) = goal.as_mut().filter(|state| state.active || (cancel_pending && state.phase == GoalPhase::Paused)) {
@@ -9714,6 +9776,42 @@ fn spawn_runtime_owner_with_optional_agent(
                         break;
                     },
                 },
+                completion = background_jobs.next(), if background_jobs.pending() => {
+                    if cancel_pending || controls.stop_now().is_cancelled() || persistence_failure.is_some() || pending_policy_intervention.is_some() || !agent_available {
+                        continue;
+                    }
+                    let text = format!(
+                        "Background job {} has finished (exit code: {:?}, killed: {}). Use bash_poll with job_id {:?} to collect its output. This is a process completion notification, not proof that the task succeeded.",
+                        completion.job_id, completion.exit_code, completion.killed, completion.job_id,
+                    );
+                    if loop_state.is_some() || goal.as_ref().is_some_and(|state| !state.active) {
+                        // A completion cannot shorten the person's /loop cadence
+                        // or re-engage a paused goal. Carry it with the next input.
+                        pending_local_context.push(text);
+                        continue;
+                    }
+                    // A goal parked after evaluation owes one continuation, not
+                    // another evaluator request against the unchanged snapshot.
+                    if held_turn.is_some() && !kernel_turn_open {
+                        if let Some(state) = goal.as_mut().filter(|state| state.active) {
+                            state.round = state.round.saturating_add(1);
+                            state.invalidate_work();
+                            state.evaluation_ready = false;
+                            state.evaluation_only = false;
+                            let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                        }
+                    }
+                    if send_agent_command(&agent, AgentCommand::SendSyntheticMessage { text }) {
+                        if held_turn.is_some() && !kernel_turn_open {
+                            held_turn = None;
+                            terminal_reason = None;
+                            turn_stats = RuntimeTurnStats::default();
+                        }
+                    } else {
+                        agent_available = false;
+                    }
+                }
+
             }
         }
         // However the owner ends, nothing is left to claim what the agent had
@@ -21820,6 +21918,199 @@ mod tests {
             "goal terminal must be Met"
         );
 
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn an_explicit_background_job_notifies_once_and_cancel_forgets_it() {
+        for action in 0..4 {
+            let (_handle, mut commands, events, mut runtime_events, _wake, _active, adapter) =
+                controller_test_runtime(Arc::new(GoalNotMetProviderFactory::default())).await;
+            let (call, result, finish) = crate::background_jobs::tests::job(true).await;
+            events.send(AgentEvent::ToolStarted { call }).unwrap();
+            events.send(AgentEvent::ToolResult { result }).unwrap();
+            while !matches!(
+                runtime_events.recv().await,
+                Some(CodingRuntimeEvent::Agent(AgentEvent::ToolResult { .. }))
+            ) {}
+            if action == 1 {
+                adapter.commands.send(AgentCommand::Cancel).unwrap();
+                assert!(matches!(commands.recv().await, Some(AgentCommand::Cancel)));
+            }
+            let mut replacement_guard = None;
+            if action == 2 {
+                let (replacement, replacement_commands, replacement_events) = fake_agent();
+                adapter.replace_agent(replacement).await.unwrap();
+                commands = replacement_commands;
+                replacement_guard = Some(replacement_events);
+            }
+            if action == 3 {
+                events
+                    .send(AgentEvent::PolicyIntervention {
+                        intervention: PolicyIntervention::credential_shell_blocked(),
+                    })
+                    .unwrap();
+                loop {
+                    if matches!(
+                        runtime_events.recv().await,
+                        Some(CodingRuntimeEvent::Agent(
+                            AgentEvent::PolicyIntervention { .. }
+                        ))
+                    ) {
+                        break;
+                    }
+                }
+            }
+            finish.cancel();
+            let next =
+                tokio::time::timeout(std::time::Duration::from_secs(1), commands.recv()).await;
+            if action != 0 {
+                assert!(
+                    next.is_err(),
+                    "cancelled, replaced or policy-blocked wait must not wake the agent"
+                );
+            } else {
+                assert!(
+                    matches!(next, Ok(Some(AgentCommand::SendSyntheticMessage { text })) if text.contains("Background job") && text.contains("bash_poll"))
+                );
+            }
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(1), commands.recv())
+                    .await
+                    .is_err()
+            );
+            adapter.shutdown().await.unwrap();
+            drop(replacement_guard);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_goal_waits_for_explicit_background_completion_instead_of_spinning() {
+        goal_wait_case(false).await;
+        goal_wait_case(true).await;
+    }
+
+    async fn goal_wait_case(time_cap: bool) {
+        let mut config = native_start(false).agent;
+        config.goal_max_duration_secs = if time_cap { 10 } else { 0 };
+        let (handle, mut commands, events, mut runtime_events, _wake, _active, _adapter) =
+            controller_test_runtime_with_config(
+                Arc::new(GoalNotMetProviderFactory::default()),
+                config,
+            )
+            .await;
+        handle.start_goal("finish bounded build").await.unwrap();
+        assert!(matches!(
+            commands.recv().await,
+            Some(AgentCommand::SendMessage { .. })
+        ));
+        let (call, result, finish) = crate::background_jobs::tests::job(true).await;
+        let snapshot = SessionSnapshot::new(vec![
+            Message::user("finish bounded build"),
+            Message::assistant("", vec![call.clone()]),
+            Message::tool_result(&call.id, &result.content, false),
+        ]);
+        events.send(AgentEvent::ToolStarted { call }).unwrap();
+        events.send(AgentEvent::ToolResult { result }).unwrap();
+        events
+            .send(AgentEvent::TurnComplete {
+                turn: None,
+                reason: StopReason::Stopped,
+                provider_failure: None,
+            })
+            .unwrap();
+        assert!(matches!(
+            commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        events.send(AgentEvent::Snapshot { snapshot }).unwrap();
+        loop {
+            if matches!(runtime_events.recv().await, Some(CodingRuntimeEvent::GoalChanged(progress))
+                if progress.last_reason.as_deref() == Some("waiting for explicitly requested background completion"))
+            {
+                break;
+            }
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), commands.recv())
+                .await
+                .is_err()
+        );
+        if time_cap {
+            tokio::time::advance(std::time::Duration::from_secs(10)).await;
+            loop {
+                if matches!(
+                    runtime_events.recv().await,
+                    Some(CodingRuntimeEvent::TurnFinished(
+                        TurnCompletion::Completed {
+                            reason: StopReason::MaxRounds,
+                            ..
+                        }
+                    ))
+                ) {
+                    break;
+                }
+            }
+        }
+        finish.cancel();
+        let next = tokio::time::timeout(std::time::Duration::from_secs(1), commands.recv()).await;
+        if time_cap {
+            assert!(next.is_err(), "budget expiry must suppress late completion");
+        } else {
+            assert!(
+                matches!(next, Ok(Some(AgentCommand::SendSyntheticMessage { text })) if text.contains("Background job"))
+            );
+        }
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn background_completion_does_not_shorten_the_persons_loop_cadence() {
+        let (handle, mut commands, events, _runtime_events, _wake, _active, _adapter) =
+            controller_test_runtime(Arc::new(GoalNotMetProviderFactory::default())).await;
+        handle.start_loop("watch build", Some(60)).await.unwrap();
+        assert!(matches!(
+            commands.recv().await,
+            Some(AgentCommand::SendMessage { .. })
+        ));
+        let (call, result, finish) = crate::background_jobs::tests::job(true).await;
+        events.send(AgentEvent::ToolStarted { call }).unwrap();
+        events.send(AgentEvent::ToolResult { result }).unwrap();
+        events
+            .send(AgentEvent::TurnComplete {
+                turn: None,
+                reason: StopReason::Stopped,
+                provider_failure: None,
+            })
+            .unwrap();
+        assert!(matches!(
+            commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        events
+            .send(AgentEvent::Snapshot {
+                snapshot: SessionSnapshot::new(vec![
+                    Message::user("watch build"),
+                    Message::assistant("waiting", vec![]),
+                ]),
+            })
+            .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), commands.recv())
+                .await
+                .is_err()
+        );
+        finish.cancel();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), commands.recv())
+                .await
+                .is_err()
+        );
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        assert!(
+            matches!(commands.recv().await, Some(AgentCommand::SendMessageWithContext { text, context, .. })
+            if text == "watch build" && context.contains("Background job"))
+        );
         handle.shutdown().await.unwrap();
     }
 

@@ -9,4 +9,4 @@ mod verify;
 
 pub use verify::{unverified_edit, NudgedEdit, NUDGE};
 
-pub(crate) use verify::background_exit_code;
+pub(crate) use verify::{background_exit_code, started_job};

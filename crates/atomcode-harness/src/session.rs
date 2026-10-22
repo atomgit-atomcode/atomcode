@@ -130,6 +130,34 @@ impl SessionLog {
         self.events.read().expect("session log poisoned").clone()
     }
 
+    /// Last committed fact, without copying the event payloads.
+    pub fn last_seq(&self) -> SeqNo {
+        self.events
+            .read()
+            .expect("session log poisoned")
+            .last()
+            .map(|e| e.seq)
+            .unwrap_or(0)
+    }
+
+    /// Ordinal of the next logged response. Scanning metadata does not copy
+    /// the (potentially large) stored tool payloads.
+    pub(crate) fn next_request_id(&self) -> u64 {
+        self.events
+            .read()
+            .expect("session log poisoned")
+            .iter()
+            .filter_map(|logged| match &logged.event {
+                SessionEvent::AssistantMessage {
+                    meta: Some(meta), ..
+                } => Some(meta.request_id),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
+    }
+
     /// Events after `cursor`, for an incremental consumer (persistence, a UI
     /// that already rendered a prefix).
     pub fn since(&self, cursor: SeqNo) -> Vec<LoggedEvent> {
@@ -253,6 +281,9 @@ pub fn apply_compaction(
     decision: crate::seams::CompactionDecision,
 ) -> SeqNo {
     let turn = log.current_turn();
+    let rewrites = decision.rewrites.len();
+    let summary_text_bytes = decision.summary.len();
+    let folded_through = decision.through;
     let mut last = 0;
     if !decision.rewrites.is_empty() {
         last = commit(
@@ -286,6 +317,17 @@ pub fn apply_compaction(
                 detail: note,
                 retry: None,
             },
+        );
+    }
+    if last != 0 {
+        tracing::info!(
+            session_id = log.id(),
+            turn,
+            log_through = last,
+            rewrites,
+            summary_text_bytes,
+            folded_through,
+            "context compaction facts committed"
         );
     }
     last

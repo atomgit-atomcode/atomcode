@@ -49,6 +49,7 @@ fn _isolate_atomcode_home() {
     atomcode_kernel::test_support::isolate_home();
 }
 
+mod background_jobs;
 pub mod config;
 mod controllers;
 pub mod discipline;

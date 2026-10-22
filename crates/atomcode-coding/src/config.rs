@@ -171,6 +171,10 @@ pub struct CodingAgentConfig {
     ///
     /// [`StubCompaction`]: atomcode_capabilities::compaction::StubCompaction
     pub compact_threshold: f32,
+    /// Optional absolute prompt-token budget for earlier automatic compaction.
+    /// None preserves window-relative behavior. Read from `[compaction].token_limit`
+    /// in config.toml; the mounted `compaction-coding` row carries the same value.
+    pub compact_token_limit: Option<u32>,
     /// `web_search` backend: `"exa"` (default, globally reachable, keyless) or
     /// `"duckduckgo"`/`"ddg"` (legacy HTML scraping, blocked in some regions). `None`/empty
     /// /unknown ⇒ Exa. Mirrors v1's `[web_search] provider` config knob — without this the
@@ -262,6 +266,8 @@ pub fn settle_dir_names(dirs: &atomcode_capabilities::ProductDirs) {
 pub struct CodingRuntimeConfig {
     /// See [`CodingAgentConfig::startup_warnings`].
     pub startup_warnings: Vec<String>,
+    /// Optional absolute prompt budget from `[compaction].token_limit`.
+    pub compact_token_limit: Option<u32>,
     /// Explicit trusted skill roots from `[skills].extra_dirs`.
     pub extra_skill_dirs: Vec<String>,
     /// See [`CodingAgentConfig::dirs`].
@@ -431,6 +437,9 @@ pub fn describe_config_file_for(
          Omit the table to disable long waits; zero short attempts disables both stages. \
          Existing goal caps and permissions still apply. Automatic retries stop on process exit; \
          native persistent sessions restore unfinished goals paused for review.\n\
+         - `[compaction]` `token_limit`: optional positive prompt-token budget for earlier \
+         automatic history summarization; omit to keep the window-relative policy. \
+         Applied when the agent is rebuilt; the model's physical context window is unchanged.\n\
          - `[permissions]` `allow` / `deny`: rules such as `Bash(git *)`, `Read(<path>)` or \
          `mcp__<server>__<tool>`. `deny` wins, and `allow` never opens a sensitive path.\n\
          - `[coding]` `max_rounds` (per turn; 0 = no cap; `ATOMCODE_TURN_MAX_ROUNDS` wins), \
@@ -544,6 +553,7 @@ impl CodingRuntimeConfig {
             .extend(crate::parts::resolve_external_subagents(&config.subagent, interactive).1);
         Self {
             startup_warnings,
+            compact_token_limit: config.compaction.token_limit.map(|limit| limit.get()),
             extra_skill_dirs: config.skills.extra_dirs.clone(),
             dirs,
             api_key: r.and_then(|r| r.api_key.clone()).unwrap_or_default(),
@@ -620,6 +630,7 @@ impl CodingRuntimeConfig {
         );
         config.startup_warnings = self.startup_warnings.clone();
         config.extra_skill_dirs = self.extra_skill_dirs.clone();
+        config.compact_token_limit = self.compact_token_limit;
         config.context_window = self.context_window;
         config.supports_vision = self.supports_vision;
         config.supports_reasoning_effort =
@@ -1145,6 +1156,7 @@ impl CodingAgentConfig {
             thinking_type: None,
             thinking_keep: None,
             compact_threshold: 0.7,
+            compact_token_limit: None,
             web_search_provider: None,
             web_search_api_key: None,
             lsp: Default::default(),

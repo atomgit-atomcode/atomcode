@@ -271,7 +271,7 @@ pub(crate) fn background_exit_code(output: &str) -> Option<i32> {
         .ok()
 }
 
-fn started_job(output: &str) -> Option<&str> {
+pub(crate) fn started_job(output: &str) -> Option<&str> {
     let (id, _) = output
         .strip_prefix("Started background job ")?
         .split_once(". Collect output with bash_poll ")?;

@@ -224,6 +224,7 @@ pub struct OverflowCompaction {
     inner: StubCompaction,
     /// Provider used ONLY by tier 2 to summarize the drained span. `None` ⇒ tier 2 plain-drains.
     summary_provider: Option<Arc<dyn LlmProvider>>,
+    auto_token_limit: Option<u32>,
 }
 
 impl OverflowCompaction {
@@ -231,7 +232,35 @@ impl OverflowCompaction {
         Self {
             inner,
             summary_provider,
+            auto_token_limit: None,
         }
+    }
+
+    /// Optional earlier auto-summary budget, independent of the physical model window.
+    pub fn with_auto_token_limit(mut self, limit: Option<u32>) -> Self {
+        self.auto_token_limit = limit.filter(|limit| *limit > 0);
+        self
+    }
+
+    fn recent_budget(&self, view: &CompactionView<'_>) -> usize {
+        self.auto_token_limit
+            .map_or(recent_keep_budget(view.ctx_window), |limit| {
+                recent_keep_budget(view.ctx_window).min(limit as usize / 4)
+            })
+    }
+
+    fn auto_mark(&self, view: &CompactionView<'_>) -> u64 {
+        let ratio = (view.ctx_window as f32 * AUTO_DRAIN_UTILIZATION) as u64;
+        self.auto_token_limit
+            .map_or(ratio, |limit| ratio.min(u64::from(limit)))
+    }
+
+    fn auto_due(&self, view: &CompactionView<'_>) -> bool {
+        (view.utilization >= AUTO_DRAIN_UTILIZATION
+            || self
+                .auto_token_limit
+                .is_some_and(|limit| view.used_tokens >= limit))
+            && auto_drain_would_help(view, self.recent_budget(view), self.auto_mark(view))
     }
 
     /// Aggressive stub of every tool result in `[from, to)` over `AGGRESSIVE_STUB_MIN`.
@@ -307,8 +336,7 @@ impl OverflowCompaction {
             0 => {
                 // Exempt RECENT reads (within the recent-keep span) from the aggressive
                 // stub so the model keeps the files it just read; older reads still stub.
-                let read_exempt_from =
-                    recent_keep_boundary(msgs, recent_keep_budget(view.ctx_window), floor);
+                let read_exempt_from = recent_keep_boundary(msgs, self.recent_budget(view), floor);
                 let mut rewrites =
                     Self::aggressive_stub_rewrites(msgs, floor, msgs.len(), read_exempt_from);
                 if rewrites.is_empty() {
@@ -354,11 +382,8 @@ impl OverflowCompaction {
                 // calls, which stubbing tool results alone can't reduce). Without the
                 // split, `active_turn_start` returns the turn start → noop on a one-turn
                 // overflow → the doomed request fires anyway.
-                let drain_to = recent_keep_boundary_splitting(
-                    msgs,
-                    recent_keep_budget(view.ctx_window),
-                    floor,
-                );
+                let drain_to =
+                    recent_keep_boundary_splitting(msgs, self.recent_budget(view), floor);
                 if drain_to <= floor {
                     return CompactionPlan::noop(); // nothing older than the kept window
                 }
@@ -415,8 +440,7 @@ impl OverflowCompaction {
         // Splitting variant: when the active turn ALONE exceeds the keep-budget (a single
         // long turn), drain its older prefix rather than falling back to the gentle stub
         // (which noops on one turn → the misleading "conversation is short").
-        let drain_to =
-            recent_keep_boundary_splitting(msgs, recent_keep_budget(view.ctx_window), floor);
+        let drain_to = recent_keep_boundary_splitting(msgs, self.recent_budget(view), floor);
         if drain_to <= floor || !span_has_non_anchor(&msgs[floor..drain_to]) {
             // Nothing older than the active turn, OR the only drainable content is a prior
             // anchor (re-summarizing it alone is wasteful and only degrades it) — fall back
@@ -790,9 +814,7 @@ impl CompactionStrategy for OverflowCompaction {
             // sacred-floor-protected first message / active turn (e.g. one over-window
             // paste), summarizing the small drainable remainder can't cut pressure, so
             // an LLM summary + cache-bust every turn would be pure waste — stay on stub.
-            CompactTrigger::Auto { .. }
-                if view.utilization >= AUTO_DRAIN_UTILIZATION && auto_drain_would_help(view) =>
-            {
+            CompactTrigger::Auto { .. } if self.auto_due(view) => {
                 self.manual_plan(view, None).await
             }
             _ => self.inner.plan(view).await,
@@ -818,7 +840,7 @@ impl CompactionStrategy for OverflowCompaction {
         let proactive_drains = || {
             drains(recent_keep_boundary(
                 view.messages,
-                recent_keep_budget(view.ctx_window),
+                self.recent_budget(view),
                 floor,
             ))
         };
@@ -826,11 +848,7 @@ impl CompactionStrategy for OverflowCompaction {
         match &view.trigger {
             CompactTrigger::Manual { .. } => proactive_drains(),
             CompactTrigger::Overflow { attempt } => *attempt >= 2 && overflow_drains(),
-            CompactTrigger::Auto { .. } => {
-                view.utilization >= AUTO_DRAIN_UTILIZATION
-                    && proactive_drains()
-                    && auto_drain_would_help(view)
-            }
+            CompactTrigger::Auto { .. } => self.auto_due(view) && proactive_drains(),
         }
     }
 }
@@ -844,32 +862,36 @@ impl CompactionStrategy for OverflowCompaction {
 /// floor) does NOT trigger a futile LLM summary + cache-bust on every turn. Returns
 /// `true` (allow escalation) when there is no basis to estimate (window/usage unknown),
 /// matching the pre-guard behavior for the normal long-session case.
-fn auto_drain_would_help(view: &CompactionView<'_>) -> bool {
+fn auto_drain_would_help(view: &CompactionView<'_>, recent_budget: usize, mark: u64) -> bool {
     let floor = view.sacred_floor;
     // Estimate against the ACTUAL drain boundary the AUTO path (manual_plan) will use —
     // it keeps ~25% recent verbatim, so the surviving remainder is larger than a
     // keep-only-the-active-turn estimate. Using the wrong (wider) drain span here would
     // green-light a drain that can't cut pressure → re-summarize + cache-bust every turn.
-    let drain_to = recent_keep_boundary(view.messages, recent_keep_budget(view.ctx_window), floor);
+    let drain_to = recent_keep_boundary(view.messages, recent_budget, floor);
     if drain_to <= floor {
         return false; // nothing drainable
     }
     if view.ctx_window == 0 || view.used_tokens == 0 {
         return true; // no basis to estimate — allow (long-session default)
     }
-    let total_bytes: usize = view.messages.iter().map(|m| m.text.len()).sum();
-    if total_bytes == 0 {
+    let total_estimate: usize = view
+        .messages
+        .iter()
+        .map(|m| m.estimate_tokens() as usize)
+        .sum();
+    if total_estimate == 0 {
         return false;
     }
-    let drainable_bytes: usize = view.messages[floor..drain_to]
+    let drainable_estimate: usize = view.messages[floor..drain_to]
         .iter()
-        .map(|m| m.text.len())
+        .map(|m| m.estimate_tokens() as usize)
         .sum();
-    let remaining_bytes = total_bytes.saturating_sub(drainable_bytes);
-    // Token estimate of what survives the drain, by byte share of the recorded usage.
+    let remaining_estimate = total_estimate.saturating_sub(drainable_estimate);
+    // Attribute recorded usage by local message estimates, including tool arguments
+    // and images; text alone misses large write/edit arguments.
     let remaining_tokens =
-        (remaining_bytes as u64).saturating_mul(view.used_tokens as u64) / total_bytes as u64;
-    let mark = (view.ctx_window as f32 * AUTO_DRAIN_UTILIZATION) as u64;
+        (remaining_estimate as u64).saturating_mul(view.used_tokens as u64) / total_estimate as u64;
     remaining_tokens < mark
 }
 
@@ -1910,6 +1932,50 @@ mod tests {
             utilization,
             sacred_floor: floor,
         }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn absolute_auto_budget_summarizes_below_the_physical_window_threshold() {
+        let mut conv = Conversation::new();
+        conv.messages = vec![
+            Message::system("policy"),
+            Message::user("original goal"),
+            Message::assistant("old work ".repeat(20_000), vec![]),
+            Message::user("second request"),
+            Message::assistant("more old work ".repeat(20_000), vec![]),
+            Message::user("current request"),
+            Message::assistant("current work", vec![]),
+        ];
+        let v = CompactionView {
+            messages: &conv.messages,
+            trigger: CompactTrigger::Auto { utilization: 0.2 },
+            ctx_window: 1_000_000,
+            used_tokens: 200_000,
+            utilization: 0.2,
+            sacred_floor: conv.sacred_floor(),
+        };
+        let default = OverflowCompaction::new(
+            StubCompaction::default(),
+            Some(Arc::new(CannedSummaryProvider)),
+        );
+        assert!(!default.will_summarize(&v));
+        let bounded = OverflowCompaction::new(
+            StubCompaction::default(),
+            Some(Arc::new(CannedSummaryProvider)),
+        )
+        .with_auto_token_limit(Some(100_000));
+        assert!(bounded.will_summarize(&v));
+        assert_eq!(bounded.recent_budget(&v), 25_000);
+        let plan = bounded.plan(&v).await;
+        assert!(plan.summary.is_some());
+        assert_eq!(plan.drain_from, v.sacred_floor);
+        assert!(plan.drain_to > plan.drain_from);
+        assert!(plan.drain_to < conv.messages.len());
+        let below = CompactionView {
+            used_tokens: 99_999,
+            ..v
+        };
+        assert!(!bounded.will_summarize(&below));
     }
 
     /// The user's core ask: auto-compaction must ACTUALLY reduce context (like

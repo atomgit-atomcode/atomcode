@@ -2256,6 +2256,8 @@ pub(crate) struct CompactionCodingPlugin(pub(crate) atomcode_review::SharedRevie
 
 #[derive(serde::Deserialize)]
 struct CompactionCodingRow {
+    #[serde(default)]
+    token_limit: Option<u32>,
     #[serde(default = "default_compaction_threshold")]
     threshold: f32,
 }
@@ -2265,6 +2267,7 @@ fn default_compaction_threshold() -> f32 {
 }
 
 struct CodingCompaction {
+    token_limit: Option<u32>,
     provider: atomcode_review::SharedReviewProvider,
 }
 
@@ -2277,7 +2280,8 @@ impl CodingCompaction {
             atomcode_capabilities::compaction::OverflowCompaction::new(
                 atomcode_capabilities::compaction::StubCompaction::default(),
                 provider,
-            ),
+            )
+            .with_auto_token_limit(self.token_limit),
             writes,
         )
     }
@@ -2286,9 +2290,11 @@ impl CodingCompaction {
 #[async_trait]
 impl atomcode_harness::seams::Compaction for CodingCompaction {
     fn describe(&self) -> String {
-        "fold old tool output under pressure; past 0.78 of the window, or on request, have the \
-         conversation's model summarize older turns; on an overflow, stub, truncate, then summarize"
-            .into()
+        let budget = self
+            .token_limit
+            .map(|limit| format!(" or {limit} prompt tokens"))
+            .unwrap_or_default();
+        format!("fold old tool output under pressure; past 0.78 of the window{budget}, or on request, have the conversation's model summarize older turns; on an overflow, stub, truncate, then summarize")
     }
 
     fn calls_model(
@@ -2328,12 +2334,20 @@ impl Plugin for CompactionCodingPlugin {
         } else {
             serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
         };
+        if row.token_limit == Some(0) {
+            return Err("compaction token_limit must be positive or omitted".into());
+        }
         let _ = ctx
             .provide::<atomcode_harness::seams::CompactionSvc>(Arc::new(CodingCompaction {
+                token_limit: row.token_limit,
                 provider: self.0.clone(),
             }))
             .map_err(|e| e.to_string())?;
-        atomcode_harness::plugins::loop_policy::mount_compaction_trigger(ctx, row.threshold);
+        atomcode_harness::plugins::loop_policy::mount_compaction_trigger_with_limit(
+            ctx,
+            row.threshold,
+            row.token_limit,
+        );
         Ok(())
     }
 }
@@ -2365,6 +2379,8 @@ impl Plugin for CapabilityCommandsPlugin {
         "goal, loop, the local-context queue, the policy intervention and `worktree`, as commands"
     }
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        atomcode_harness::plugins::self_knowledge::describes(ctx, "background-completion", 42,
+            "The host supports optional background-job completion notifications. It resumes this session when explicitly observed work terminates; cancellation and runtime replacement retire pending notifications. A /loop keeps its chosen cadence, and a paused goal is not resumed by a notification.");
         for command in [
             Arc::new(GoalCommand(self.0.clone()))
                 as Arc<dyn atomcode_harness::commands::CatalogCommand>,

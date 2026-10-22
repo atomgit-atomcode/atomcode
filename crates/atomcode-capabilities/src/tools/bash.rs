@@ -108,7 +108,9 @@ unsafe fn detach_child_from_controlling_tty() {
 /// it can reuse the private spawn/reaper primitives (`build_command`, `PgroupChild`,
 /// `detach_child_from_controlling_tty`) without widening their visibility.
 pub(crate) mod background;
-pub use background::{BashKillTool, BashPollTool, BashStartTool};
+pub use background::{
+    observe_completion, BackgroundCompletion, BashKillTool, BashPollTool, BashStartTool,
+};
 
 /// `bash`, run in whichever execution world it was handed.
 ///

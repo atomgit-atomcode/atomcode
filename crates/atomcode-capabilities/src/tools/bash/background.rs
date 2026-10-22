@@ -110,6 +110,7 @@ struct Shared {
     /// Observed lifetime after the world returns a process handle, not CPU time.
     started_at: tokio::time::Instant,
     changed: tokio::sync::Notify,
+    finished: std::sync::atomic::AtomicBool,
     output: Mutex<Buf>,
     status: Mutex<Status>,
     /// Diagnostic facts survive incremental polling without retaining unbounded stderr.
@@ -156,6 +157,43 @@ pub(crate) struct PollResult {
     pub(crate) status: Status,
     /// The shell exited but what it started is still running (see [`Shared`]).
     pub(crate) left_running: bool,
+}
+
+/// Full job termination, after inherited output pipes have closed. Observing
+/// does not consume incremental output or remove the job from the poll store.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackgroundCompletion {
+    pub job_id: String,
+    pub exit_code: Option<i32>,
+    pub killed: bool,
+}
+
+/// Subscribe synchronously, before a poll can collect and remove this job.
+/// Dropping the future only stops observation; it never kills the process.
+pub fn observe_completion(
+    job_id: &str,
+) -> Option<futures::future::BoxFuture<'static, BackgroundCompletion>> {
+    let shared = store().lock().unwrap().get(job_id)?.shared.clone();
+    let job_id = job_id.to_owned();
+    Some(Box::pin(async move {
+        loop {
+            let notified = shared.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if shared.finished.load(Ordering::Acquire) {
+                let status = shared.status.lock().unwrap().clone();
+                return BackgroundCompletion {
+                    job_id,
+                    exit_code: match status {
+                        Status::Exited(code) => Some(code),
+                        _ => None,
+                    },
+                    killed: status == Status::Killed,
+                };
+            }
+            notified.await;
+        }
+    }))
 }
 
 /// Spawn `command` in `world`, register it, and return its job id. The world is what
@@ -209,6 +247,7 @@ pub(crate) async fn start(
     let shared = Arc::new(Shared {
         started_at,
         changed: tokio::sync::Notify::new(),
+        finished: std::sync::atomic::AtomicBool::new(false),
         output: Mutex::new(Buf {
             tail: Vec::new(),
             total: 0,
@@ -515,6 +554,7 @@ async fn reader_task(
     }
     set_status(&shared, killed, code);
     shared.left_running.store(false, Ordering::Release);
+    shared.finished.store(true, Ordering::Release);
     shared.changed.notify_waiters();
     let finished_at = tokio::time::Instant::now();
     tracing::info!(
@@ -553,6 +593,8 @@ fn poll_status_line(r: &PollResult) -> String {
 #[derive(Deserialize)]
 struct StartArgs {
     command: String,
+    #[serde(default)]
+    notify_on_exit: bool,
 }
 
 #[derive(Deserialize)]
@@ -614,7 +656,9 @@ impl Tool for BashStartTool {
         json!({
             "type": "object",
             "properties": {
-                "command": { "type": "string", "description": "The shell command to run in the background" }
+                "command": { "type": "string", "description": "The shell command to run in the background" },
+                "notify_on_exit": { "type": "boolean", "default": false,
+                    "description": "Request a completion notification from a supporting host for bounded work (builds/tests). Leave false for servers/watchers or manual polling. After notification, use bash_poll to collect output." }
             },
             "required": ["command"]
         })
@@ -649,6 +693,13 @@ impl Tool for BashStartTool {
             }
         };
         match start(&self.world, &a.command, ctx).await {
+            Ok(id) if a.notify_on_exit => ok(format!(
+                "Started background job {id}. Collect output with bash_poll {{\"job_id\":\"{id}\",\"wait_ms\":60000}} \
+                 after the requested host completion notification. Do useful independent work, or finish \
+                 this response and wait for the notification; do not repeatedly poll just to wait. \
+                 A host without notification support still requires manual polling. \
+                 Stop it with bash_kill {{\"job_id\":\"{id}\"}}."
+            )),
             Ok(id) => ok(format!(
                 "Started background job {id}. Collect output with bash_poll {{\"job_id\":\"{id}\",\"wait_ms\":60000}} \
                  (returns early on output or exit; repeat until it reports it exited). Do not use \
@@ -994,6 +1045,46 @@ mod tests {
         let world: Arc<dyn Shell> = Arc::new(PollWorld(process.clone()));
         let id = start(&world, "build", &ctx(Path::new("."))).await.unwrap();
         (id, tx, process)
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn completion_observation_does_not_consume_output_or_depend_on_poll_store() {
+        let (id, process) = auth_job(
+            vec![Chunk::Stdout(b"preserved output".to_vec())],
+            Exit {
+                code: Some(0),
+                signal: None,
+            },
+        )
+        .await;
+        let observer = observe_completion(&id).expect("registered job");
+        process.finish.cancel();
+        let (output, status) = drain(&id).await;
+        assert_eq!(status, Status::Exited(0));
+        // The observer was subscribed before poll removed the job.
+        assert_eq!(observer.await.exit_code, Some(0));
+        assert_eq!(output, "preserved output");
+        assert!(observe_completion(&id).is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn completion_waits_for_lingering_children_and_leaves_output_for_poll() {
+        let process = Arc::new(LingeringProcess {
+            exit: tokio_util::sync::CancellationToken::new(),
+            close_output: tokio_util::sync::CancellationToken::new(),
+        });
+        let world: Arc<dyn Shell> = Arc::new(TimedPollWorld(process.clone(), Duration::ZERO));
+        let id = start(&world, "build", &ctx(Path::new("."))).await.unwrap();
+        let mut observer = observe_completion(&id).unwrap();
+        process.exit.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), &mut observer)
+                .await
+                .is_err()
+        );
+        process.close_output.cancel();
+        assert_eq!(observer.await.exit_code, Some(0));
+        assert_eq!(drain(&id).await.1, Status::Exited(0));
     }
 
     #[derive(Clone, Default)]

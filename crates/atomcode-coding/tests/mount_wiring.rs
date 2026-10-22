@@ -43,6 +43,38 @@ async fn the_runtime_mounts_distinct_first_content_and_idle_budgets() {
     assert!(dump.contains("\"stream_idle_ms\": 120000"), "{dump}");
 }
 
+#[tokio::test]
+async fn the_configured_absolute_compaction_budget_reaches_the_existing_strategy_row() {
+    let project = tempfile::tempdir().unwrap();
+    let mut file: atomcode_config::config::Config =
+        toml::from_str("[compaction]\ntoken_limit=200000").unwrap();
+    let runtime = atomcode_coding::CodingRuntimeConfig::from_config(
+        &file,
+        project.path(),
+        atomcode_coding::config::product_dirs_from_env(),
+        None,
+        None,
+        false,
+        false,
+    );
+    let cfg = runtime.agent_config();
+    assert_eq!(cfg.compact_token_limit, Some(200_000));
+    let mounted = support::mount(&cfg, quiet_options(), Arc::new(CannedProvider)).await;
+    assert!(mounted.dump().contains("\"token_limit\": 200000"));
+    mounted.shutdown().await;
+    file.compaction.token_limit = None;
+    let runtime = atomcode_coding::CodingRuntimeConfig::from_config(
+        &file,
+        project.path(),
+        atomcode_coding::config::product_dirs_from_env(),
+        None,
+        None,
+        false,
+        false,
+    );
+    assert!(runtime.agent_config().compact_token_limit.is_none());
+}
+
 /// Answers with a little text and a usage report — enough for a metering
 /// decorator to fold a `TokenUsage` and emit one `LlmChat`.
 struct CannedProvider;

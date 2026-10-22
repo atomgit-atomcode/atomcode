@@ -105,6 +105,18 @@ const MODE_SWITCH_KEYS: &[&str] = &["shift_tab", "tab"];
 const SCROLLBARS: &[&str] = &["auto", "always", "hidden"];
 
 pub static SETTINGS: &[SettingSpec] = &[
+    SettingSpec {
+        id: "compaction.token_limit",
+        path: &["compaction", "token_limit"],
+        label_en: "Automatic compaction token budget",
+        label_zh: "自动压缩 token 预算",
+        aliases: &["context", "compact", "上下文"],
+        kind: SettingKind::Integer {
+            min: 1,
+            max: 4_294_967_295,
+        },
+        apply: ApplyPolicy::AgentReassemble,
+    },
     bool_setting(
         "auto_update",
         &["auto_update"],
@@ -506,6 +518,11 @@ impl SettingSpec {
 
     pub fn value(&self, config: &Config) -> String {
         match self.id {
+            "compaction.token_limit" => config
+                .compaction
+                .token_limit
+                .map(|limit| limit.to_string())
+                .unwrap_or_default(),
             "auto_update" => config.auto_update.to_string(),
             "keep_interrupted_context" => config.keep_interrupted_context.to_string(),
             "tools.search.respect_gitignore" => config.tools.search.respect_gitignore.to_string(),
@@ -785,6 +802,32 @@ pub fn patch_selection_retry_max_attempts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn compaction_budget_is_optional_positive_and_resettable() {
+        let setting = SETTINGS
+            .iter()
+            .find(|s| s.id == "compaction.token_limit")
+            .unwrap();
+        let mut document = "# preserve\n".parse::<DocumentMut>().unwrap();
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(setting.value(&config), "");
+        assert!(!toml::to_string(&config).unwrap().contains("[compaction]"));
+        setting.patch(&mut document, "200000").unwrap();
+        let config: Config = toml::from_str(&document.to_string()).unwrap();
+        assert_eq!(setting.value(&config), "200000");
+        let restored: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(restored.compaction, config.compaction);
+        for invalid in ["0", "-1", "4294967296"] {
+            assert!(setting.patch(&mut document, invalid).is_err());
+            assert!(
+                toml::from_str::<Config>(&format!("[compaction]\ntoken_limit={invalid}")).is_err()
+            );
+        }
+        setting.patch(&mut document, "").unwrap();
+        let config: Config = toml::from_str(&document.to_string()).unwrap();
+        assert!(config.compaction.token_limit.is_none());
+        assert!(document.to_string().contains("# preserve"));
+    }
 
     #[test]
     fn mcp_schema_search_is_editable_and_defaults_to_on() {
@@ -828,20 +871,32 @@ mod tests {
     /// that alias read as a credential leak and failed the suite.
     ///
     /// So: identity is checked against every word, search text only against the ones that name
-    /// a secret's VALUE. No setting needs "api_key" or "token" to be discoverable — those
-    /// appearing in a label means a secret is being edited here, whatever the id says.
+    /// a secret's VALUE. The one explicitly typed, positive context token budget
+    /// is not a credential; it may say "token" but never "api_key" or "apikey".
     #[test]
     fn catalog_excludes_provider_model_and_credentials() {
         const SECRET_VALUE_WORDS: &[&str] = &["api_key", "apikey", "token"];
         const CONCEPT_WORDS: &[&str] = &["provider", "model", "credential"];
 
         for setting in SETTINGS {
+            let public_budget = setting.id == "compaction.token_limit"
+                && setting.path == ["compaction", "token_limit"]
+                && matches!(
+                    setting.kind,
+                    SettingKind::Integer {
+                        min: 1,
+                        max: 4_294_967_295
+                    }
+                );
             let identity = std::iter::once(setting.id)
                 .chain(setting.path.iter().copied())
                 .collect::<Vec<_>>()
                 .join(".")
                 .to_lowercase();
             for forbidden in SECRET_VALUE_WORDS.iter().chain(CONCEPT_WORDS) {
+                if *forbidden == "token" && public_budget {
+                    continue;
+                }
                 assert!(
                     !identity.contains(forbidden),
                     "{} is a {forbidden} setting; it does not belong in the generic catalog",
@@ -856,6 +911,9 @@ mod tests {
                 .join(".")
                 .to_lowercase();
             for forbidden in SECRET_VALUE_WORDS {
+                if *forbidden == "token" && public_budget {
+                    continue;
+                }
                 assert!(
                     !search_text.contains(forbidden),
                     "{} surfaces {forbidden} in its label or aliases",

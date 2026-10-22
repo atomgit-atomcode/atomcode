@@ -802,6 +802,8 @@ struct RepeatFusePatch {
 #[derive(serde::Serialize)]
 struct CompactionTailPatch {
     threshold: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token_limit: Option<u32>,
     /// Carried because a patch replaces the whole config and base sets it. Only
     /// the model-free row reads it: `compaction-coding`, which the product swaps
     /// in, keeps recent turns by token budget.
@@ -933,6 +935,7 @@ pub fn config_rows(cfg: &crate::CodingAgentConfig) -> Result<Layer, String> {
             "compaction-tail",
             CompactionTailPatch {
                 threshold: cfg.compact_threshold,
+                token_limit: cfg.compact_token_limit,
                 keep_turns: 2,
             },
         )

@@ -188,7 +188,11 @@ impl Waterfall<AgentRequest> for Maintain {
                     .iter()
                     .map(|(index, text)| req.messages[*index].text.len() - text.len())
                     .sum();
-                tracing::debug!(target: "atomcode::context", rewrites = replacements.len(), saved_text_bytes = saved_bytes, "committed recent context cleanup");
+                tracing::info!(target: "atomcode::context",
+                    session_id = log.id(), turn = req.turn, round = req.round,
+                    log_through = log.last_seq(),
+                    rewrites = replacements.len(), saved_text_bytes = saved_bytes,
+                    "committed recent context cleanup");
                 for (index, text) in replacements {
                     req.messages[index].text = text;
                 }
