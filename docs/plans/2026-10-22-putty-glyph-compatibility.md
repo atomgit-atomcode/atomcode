@@ -18,13 +18,14 @@ Chinese, colors and basic box drawing remain. No missing-glyph feedback exists
 for the server to detect after rendering; this is a conservative startup policy,
 not a promise that arbitrary user/model Unicode can always render.
 
-Mouse policy is unchanged: the current release branch already gives SSH native
-selection/paste at startup. v5.2.2 and v5.2.3 both captured mouse input; v5.2.3
-changed clipboard handling and notices. Treat the reported copy/paste regression
-separately from missing decorative glyphs.
+Mouse behavior is separate from this glyph fallback. SSH/PuTTY now follows the
+configured mouse default again; Ctrl+G and `--no-mouse` remain the native-selection
+escape hatches. v5.2.2 and v5.2.3 both captured mouse input; v5.2.3 changed clipboard
+handling and notices. The copy/paste regression still needs real-client comparison;
+restoring the mouse default is not a claim that it has been fixed.
 
 Tests cover PuTTY and anonymous SSH, known modern clients, local Unix, explicit
 overrides and Chinese preservation. Windows PuTTY acceptance remains manual.
 
-Validation: all 1,826 TUI tests passed; the full compile gate, cargo fmt check,
+Validation after restoring the mouse default: all 1,825 TUI tests passed; the full compile gate, cargo fmt check,
 diff check and Cargo.lock checks passed.
