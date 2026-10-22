@@ -3422,13 +3422,16 @@ impl SessionManager {
         Ok(timestamps)
     }
 
-    /// Load the FULL per-turn transcript for `id` from `<id>.jsonl` — the same
-    /// never-compacted ground truth the `recall` tool reads. Unlike the runtime
+    /// Load the FULL per-turn history from the event log, or the transcript of
+    /// an older session — the same ground truth the `recall` tool reads. Unlike the runtime
     /// snapshot, this is UNAFFECTED by compaction, so a UI can show the complete
     /// session trajectory (including turns compaction dropped from the snapshot).
     /// A missing file is an empty transcript (the session may not have completed a
     /// turn yet); memory is bounded by the same `MAX_JSONL_*` caps recall uses.
     pub fn load_transcript_records(&self, id: &str) -> SessionResult<Vec<TurnRecord>> {
+        if self.is_event_session(id) {
+            return Ok(super::events::turn_records(id, &self.load_events(id)?));
+        }
         let path = self.jsonl_path(id)?;
         match fs::symlink_metadata(&path) {
             Ok(_) => {}
