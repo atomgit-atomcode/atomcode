@@ -138,7 +138,8 @@ pub struct Caps {
     /// Windows ships, Consolas — have the box set but not the decorative one,
     /// so with full Unicode the prompt, the notice flag and every mode icon
     /// arrived as `□`; with plain ASCII the panels became `+--+`. This is the
-    /// third answer between the two.
+    /// third answer between the two. PuTTY and unidentified SSH clients also
+    /// use this conservative set because the server cannot inspect their font.
     pub basic_glyphs: bool,
     pub colors: Colors,
     /// The colours the terminal actually renders: its background, and its
@@ -339,10 +340,35 @@ fn take_mouse_at_start_for(env: impl Fn(&str) -> Option<String>) -> bool {
     if let Some(forced) = env("ATOMCODE_MOUSE").filter(|value| !value.is_empty()) {
         return forced == "1" || forced.eq_ignore_ascii_case("true");
     }
-    let putty = ["TERM", "TERM_PROGRAM"]
+    !remote_session_for(&env) && !putty_for(&env)
+}
+
+fn putty_for(env: &dyn Fn(&str) -> Option<String>) -> bool {
+    ["TERM", "TERM_PROGRAM"]
         .into_iter()
-        .any(|key| env(key).is_some_and(|value| value.to_ascii_lowercase().starts_with("putty")));
-    !remote_session_for(&env) && !putty
+        .any(|key| env(key).is_some_and(|value| value.to_ascii_lowercase().starts_with("putty")))
+}
+
+/// An anonymous SSH xterm says nothing about the client's font. Prefer the
+/// existing basic decorations unless a known capable client identifies itself.
+fn remote_basic_glyphs_for(env: &dyn Fn(&str) -> Option<String>) -> bool {
+    if putty_for(env) {
+        return true;
+    }
+    if !remote_session_for(&|key| env(key)) {
+        return false;
+    }
+    let modern = env("WT_SESSION").is_some()
+        || env("VTE_VERSION").is_some()
+        || env("TERM_PROGRAM").is_some_and(|v| {
+            matches!(
+                v.as_str(),
+                "iTerm.app" | "WezTerm" | "Apple_Terminal" | "vscode" | "mintty" | "ghostty"
+            )
+        })
+        || env("TERMINAL_EMULATOR").as_deref() == Some("JetBrains-JediTerm")
+        || env("TERM").is_some_and(|v| matches!(v.as_str(), "xterm-kitty" | "xterm-ghostty"));
+    !modern
 }
 
 /// Shared boundary for startup policy and clipboard access: a server clipboard
@@ -602,16 +628,18 @@ pub fn unicode_for(env: &dyn Fn(&str) -> Option<String>) -> bool {
 }
 
 /// Whether this is a console whose font has only the basic glyph set
-/// ([`Caps::basic_glyphs`]): Windows, no terminal that announces itself — not
+/// ([`Caps::basic_glyphs`]): PuTTY or an unidentified SSH client, or Windows
+/// with no terminal that announces itself — not
 /// Windows Terminal (`WT_SESSION`), not mintty or VS Code (`TERM_PROGRAM`), not
 /// a JetBrains terminal — and nobody saying the font has them
 /// (`ATOMCODE_UNICODE`) or that it has none (`ATOMCODE_ASCII`, plain ASCII).
 pub fn basic_glyphs_for(env: &dyn Fn(&str) -> Option<String>, windows: bool) -> bool {
-    windows
-        && env("WT_SESSION").is_none()
-        && env("TERM_PROGRAM").is_none()
-        && !env("TERM").is_some_and(|t| t.contains("jediterm"))
-        && env("TERMINAL_EMULATOR").as_deref() != Some("JetBrains-JediTerm")
+    ((remote_basic_glyphs_for(env) && unicode_for(env))
+        || (windows
+            && env("WT_SESSION").is_none()
+            && env("TERM_PROGRAM").is_none()
+            && !env("TERM").is_some_and(|t| t.contains("jediterm"))
+            && env("TERMINAL_EMULATOR").as_deref() != Some("JetBrains-JediTerm")))
         && !env("ATOMCODE_UNICODE").is_some_and(|v| v != "0")
         && !env("ATOMCODE_ASCII").is_some_and(|v| v != "0")
 }
@@ -1025,9 +1053,55 @@ mod tests {
         }
     }
 
+    #[test]
+    fn anonymous_ssh_and_putty_automatically_use_existing_basic_glyphs() {
+        for vars in [
+            vec![("TERM", "putty-256color")],
+            vec![("TERM", "xterm"), ("TERM_PROGRAM", "PuTTY")],
+            vec![("TERM", "xterm"), ("SSH_CONNECTION", "client server")],
+            vec![("TERM", "xterm-256color"), ("SSH_TTY", "/dev/pts/0")],
+            vec![("SSH_CLIENT", "client 123 22")],
+        ] {
+            assert!(basic_glyphs_for(&env_of(&vars), false), "{vars:?}");
+        }
+        // Reuse the shared rewrite instead of adding another render path.
+        let text = downgrade_keeping("❯ 你好 ⎿ ✓", false, true);
+        assert!(text.contains("你好"));
+        assert!(text.contains('└'));
+        assert!(!text.contains(['❯', '⎿', '✓']));
+    }
+
+    #[test]
+    fn known_modern_clients_and_local_unix_keep_their_existing_glyphs() {
+        assert!(!basic_glyphs_for(&env_of(&[("TERM", "xterm")]), false));
+        for (key, value) in [
+            ("TERM_PROGRAM", "iTerm.app"),
+            ("TERM_PROGRAM", "WezTerm"),
+            ("WT_SESSION", "window"),
+            ("VTE_VERSION", "7600"),
+            ("TERM", "xterm-kitty"),
+            ("TERMINAL_EMULATOR", "JetBrains-JediTerm"),
+        ] {
+            assert!(!basic_glyphs_for(
+                &env_of(&[("SSH_CONNECTION", "remote"), (key, value)]),
+                false
+            ));
+        }
+        for (key, value) in [
+            ("ATOMCODE_ASCII", "1"),
+            ("ATOMCODE_UNICODE", "1"),
+            ("LANG", "C"),
+        ] {
+            assert!(!basic_glyphs_for(
+                &env_of(&[("SSH_TTY", "/dev/pts/0"), (key, value)]),
+                false
+            ));
+        }
+    }
+
     /// A classic Windows console window is the basic one; a terminal that
     /// announces itself, a JetBrains terminal, a person's stated answer, and
-    /// anything not on Windows are not.
+    /// local Unix are not. Remote clients have their own conservative policy.
     #[test]
     fn only_a_classic_windows_console_is_basic() {
         assert!(basic_glyphs_for(&env_of(&[]), true));
