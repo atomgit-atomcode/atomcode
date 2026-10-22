@@ -72,6 +72,7 @@ pub mod telemetry;
 mod told;
 pub mod vision;
 
+mod context_maintenance;
 mod execution_policy;
 pub mod host_rows;
 mod init_prompt;

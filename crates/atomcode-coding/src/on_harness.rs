@@ -608,6 +608,9 @@ name = "chat-options"
 [[insert]]
 name = "tool-intent"
 
+[[insert]]
+name = "context-maintenance"
+
 # The driver protocol: this is what `CodingRuntimeHandle` drives.
 [[insert]]
 name = "ui-handle"
@@ -1479,6 +1482,7 @@ pub fn plugins() -> Vec<Arc<dyn Plugin>> {
         // call should say about itself is a presentation decision
         // (`docs/adr/0024`, and `tool_intent`'s own module doc).
         Arc::new(crate::tool_intent::ToolIntentPlugin),
+        Arc::new(crate::context_maintenance::ContextMaintenancePlugin),
         // The review specialization's rows. Here, not in the harness: which
         // reviewer and which reviewer prompt is this product's answer, and the
         // mechanism must not depend on a specialization to offer `/review`.

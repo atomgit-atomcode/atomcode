@@ -659,3 +659,146 @@ async fn search_defaults_reach_the_shipping_tools_and_project_overrides_are_scop
         mounted.shutdown().await;
     }
 }
+
+/// A real edit retains the driver's diff while the next request and replay use
+/// the same short receipt; repeated whole-file reads retire the stale version.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn recent_context_cleanup_keeps_the_ui_diff_and_replays_the_model_view() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    };
+    struct Editor {
+        step: AtomicUsize,
+        seen: Mutex<Vec<Vec<Message>>>,
+    }
+    #[async_trait::async_trait]
+    impl LlmProvider for Editor {
+        fn model_name(&self) -> &str {
+            "context-cleanup"
+        }
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            _: &[atomcode_kernel::tool::ToolDef],
+            _: &atomcode_kernel::provider::ChatOptions,
+        ) -> Result<
+            futures::stream::BoxStream<'static, atomcode_kernel::stream::StreamEvent>,
+            atomcode_kernel::stream::ProviderError,
+        > {
+            use atomcode_kernel::{stream::StreamEvent, tool::ToolCall};
+            self.seen.lock().unwrap().push(messages.to_vec());
+            let step = self.step.fetch_add(1, Ordering::SeqCst);
+            let call = match step {
+                0 | 2 => Some(("read_file", serde_json::json!({"file_path":"a.txt"}))),
+                1 => Some((
+                    "edit_file",
+                    serde_json::json!({"file_path":"a.txt","old_string":"original","new_string":"updated"}),
+                )),
+                _ => None,
+            };
+            let mut events = Vec::new();
+            if let Some((name, args)) = call {
+                events.push(StreamEvent::ToolCall(ToolCall {
+                    id: format!("cleanup-{step}"),
+                    name: name.into(),
+                    arguments: args.to_string(),
+                }));
+            } else {
+                events.push(StreamEvent::TextDelta("done".into()));
+            }
+            events.push(StreamEvent::Done { truncated: false });
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join("a.txt"),
+        format!("original {}\n", "kept ".repeat(30)),
+    )
+    .unwrap();
+    let cfg = CodingAgentConfig::new(
+        "k",
+        "http://localhost",
+        "context-cleanup",
+        project.path(),
+        atomcode_coding::config::product_dirs_from_env(),
+    );
+    let provider = Arc::new(Editor {
+        step: AtomicUsize::new(0),
+        seen: Mutex::new(Vec::new()),
+    });
+    let mut mounted = support::mount(
+        &cfg,
+        PrepareOptions {
+            tools: true,
+            ..quiet_options()
+        },
+        provider.clone(),
+    )
+    .await;
+    let turn = support::turn(&mut mounted.handle, "edit then read", support::allow()).await;
+    assert!(turn.error.is_none(), "{turn:?}");
+    let edit = turn
+        .tool_results
+        .iter()
+        .find(|r| r.call_id == "cleanup-1")
+        .expect("edit result");
+    assert!(!edit.is_error, "{}", edit.content);
+    assert!(
+        edit.content.contains("@@ "),
+        "the driver keeps the actual diff"
+    );
+    let seen = provider.seen.lock().unwrap();
+    let last = seen.last().unwrap();
+    let receipt = last
+        .iter()
+        .find(|m| m.tool_call_id.as_deref() == Some("cleanup-1"))
+        .unwrap();
+    assert!(
+        receipt.text.starts_with("Edited ") && !receipt.text.contains("@@ "),
+        "{}",
+        receipt.text
+    );
+    assert!(last
+        .iter()
+        .find(|m| m.tool_call_id.as_deref() == Some("cleanup-0"))
+        .unwrap()
+        .text
+        .contains("Superseded"));
+    let receipt_text = receipt.text.clone();
+    drop(seen);
+    let log = mounted
+        .context()
+        .service::<atomcode_harness::seams::AgentsSvc>()
+        .unwrap()
+        .list()[0]
+        .session();
+    let events = log.events();
+    let decoded: Vec<_> = events
+        .iter()
+        .map(|logged| atomcode_kernel::session::LoggedEvent {
+            seq: logged.seq,
+            at: logged.at,
+            event: serde_json::from_str(&serde_json::to_string(&logged.event).unwrap()).unwrap(),
+        })
+        .collect();
+    let records = atomcode_capabilities::session::events::turn_records(log.id(), &decoded);
+    assert!(
+        records
+            .iter()
+            .flat_map(|turn| &turn.tools)
+            .any(|tool| tool.name == "edit_file" && tool.result.contains("@@ ")),
+        "presentation readers retain the original diff after replay"
+    );
+    let replay = atomcode_kernel::session::derive_messages(&decoded);
+    assert_eq!(
+        replay
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("cleanup-1"))
+            .unwrap()
+            .text,
+        receipt_text
+    );
+    mounted.shutdown().await;
+}
