@@ -157,6 +157,9 @@ impl Plugin for BashWorldToolPlugin {
     fn inject(&self) -> &'static [&'static str] {
         &["product-dirs", "tools", "shell"]
     }
+    fn uses(&self) -> &'static [&'static str] {
+        &["output-artifacts"]
+    }
     fn description(&self) -> &'static str {
         "shell execution, routed through the `shell` seam"
     }
@@ -169,17 +172,25 @@ impl Plugin for BashWorldToolPlugin {
         // for `tool-bash`.
         let sensitive =
             atomcode_capabilities::tools::SensitivePaths::of(&*crate::product_dirs(ctx)?);
+        let provider = super::tools::shell_output_provider(ctx);
+        let bash = BashTool::with_world(shell.clone(), sensitive.clone())
+            .with_output_preview_provider(provider.clone());
+        let poll = Arc::new(
+            atomcode_capabilities::tools::bash::BashPollTool::with_output_preview_provider(
+                provider,
+            ),
+        );
         super::tools::mount(
             ctx,
             vec![
-                Arc::new(BashTool::with_world(shell.clone(), sensitive.clone())),
+                Arc::new(bash),
                 Arc::new(
                     atomcode_capabilities::tools::bash::BashStartTool::with_world(
                         shell.clone(),
                         sensitive,
                     ),
                 ),
-                Arc::new(atomcode_capabilities::tools::bash::BashPollTool),
+                poll,
                 Arc::new(atomcode_capabilities::tools::bash::BashKillTool),
             ],
         )?;
@@ -194,10 +205,8 @@ impl Plugin for BashWorldToolPlugin {
                  Long builds/tests also use `bash_start`, then `bash_poll` with wait_ms up to 60000 \
                  (returns early on output or exit), instead of shell sleep or duplicate builds. Do not \
                  background it inside `bash` (`&`, `nohup`, `start`); a `bash` call is for a command that \
-                 finishes. For builds/tests, check the original command's exit status before claiming \
-                 success. Piping to head/tail/tee can hide failure. For long output, save a task log, \
-                 capture the command's status before inspecting it, then return that status using \
-                 the current shell's syntax. Read the relevant error before retrying.",
+                 finishes. Preserve the original build/test exit status; output-filtering or \
+                 status-printing wrappers can hide failures.",
                 shell.describe()
             ),
         );

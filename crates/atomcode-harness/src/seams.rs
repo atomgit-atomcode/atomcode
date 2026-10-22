@@ -27,6 +27,7 @@ plexus_service!(LlmSvc => dyn LlmProvider, "llm", Seam, "Model adapter");
 plexus_service!(LlmUtilitySvc => dyn LlmProvider, "llm-utility", Seam, "The model for side calls whose result a program consumes — titles, summaries, suggestions — not the conversation");
 plexus_service!(ModelsSvc => dyn Models, "models", Seam, "Every model this host can build a provider for, so a row can run a child on a different one");
 plexus_service!(ToolsSvc => ToolBox, "tools", Core, "The live tool catalog");
+plexus_service!(OutputArtifactsSvc => atomcode_capabilities::tools::ArtifactStore, "output-artifacts", Core, "The existing captured-output store and fetch_output owner");
 plexus_service!(SystemPromptSvc => PromptRegistry, "system-prompt", Core, "Ordered prompt fragments");
 // Never sent to the model unprompted. It is answered when asked, so a row can
 // describe a knob in as much detail as the knob deserves without that detail

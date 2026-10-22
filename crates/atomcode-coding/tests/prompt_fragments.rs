@@ -104,6 +104,28 @@ async fn the_personas_row_takes_its_identity_away_when_it_goes() {
     );
 }
 
+#[tokio::test]
+async fn shell_preview_is_advertised_only_by_the_configured_shell_row() {
+    use atomcode_harness::seams::ToolsSvc;
+    let dir = scratch("shell-preview");
+    let mut app = mounted(&dir).await;
+    let tools = app.context().service::<ToolsSvc>().unwrap();
+    for name in ["bash", "bash_poll"] {
+        assert!(tools.get(name).unwrap().parameters_schema()["properties"]
+            .get("output_tail_lines")
+            .is_some());
+    }
+    assert!(tools.get("fetch_output").is_some());
+    off(&mut app, "tool-output-artifact").await;
+    let tools = app.context().service::<ToolsSvc>().unwrap();
+    for name in ["bash", "bash_poll"] {
+        assert!(tools.get(name).unwrap().parameters_schema()["properties"]
+            .get("output_tail_lines")
+            .is_none());
+    }
+    assert!(tools.get("fetch_output").is_none());
+}
+
 /// The catalog the rest of coding's skill steering points at ("the
 /// `=== AVAILABLE SKILLS ===` catalog above") must not outlive the row that
 /// listed it.

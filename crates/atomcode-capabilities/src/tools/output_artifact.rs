@@ -28,6 +28,9 @@ pub struct ArtifactStore {
     dir: PathBuf,
 }
 
+/// Resolve a host-owned optional store when a call/schema is built, not at mount.
+pub type ArtifactStoreProvider = Arc<dyn Fn() -> Option<Arc<ArtifactStore>> + Send + Sync>;
+
 impl ArtifactStore {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self { dir: dir.into() }
@@ -77,6 +80,27 @@ impl ArtifactStore {
 }
 
 pub const THRESHOLD_BYTES: usize = 50 * 1024;
+
+pub(crate) fn shell_preview_lines(
+    requested: Option<u64>,
+    available: bool,
+) -> Result<Option<usize>, String> {
+    match requested {
+        None => Ok(None),
+        Some(_) if !available => {
+            Err("output_tail_lines requires a configured output artifact store".into())
+        }
+        Some(lines @ 1..=2000) => Ok(Some(lines as usize)),
+        Some(_) => Err("output_tail_lines must be between 1 and 2000".into()),
+    }
+}
+
+pub(crate) fn add_shell_preview_schema(schema: &mut serde_json::Value) {
+    schema["properties"]["output_tail_lines"] = serde_json::json!({
+        "type": "integer", "minimum": 1, "maximum": 2000,
+        "description": "Optional final output lines to show (1–2000, also bounded to a 12KiB UTF-8 preview). Execution is unchanged; process status is retained separately. Omitted captured text is saved as an artifact when within storage limits. Use this instead of shell output filters."
+    });
+}
 /// Stable prefix embedded in a conversation-visible result when the complete
 /// tool output was replaced by an artifact-backed head/tail preview.
 pub const ARTIFACT_TRUNCATION_MARKER_PREFIX: &str = "[atomcode: output truncated";
@@ -169,6 +193,52 @@ pub struct ArtifactMiddleware {
 }
 
 impl ArtifactMiddleware {
+    /// A caller-requested shell preview. Only presentation changes; the caller
+    /// supplies the status from its process result, never from output text.
+    pub(crate) fn shell_tail(
+        &self,
+        result: &mut atomcode_kernel::tool::ToolResult,
+        lines: usize,
+        status: &str,
+        status_in_body: bool,
+        notice: &str,
+    ) {
+        let captured = result.content.trim_end_matches('\n');
+        let body = if status_in_body {
+            captured
+                .strip_suffix(status)
+                .map(|s| s.trim_end_matches('\n'))
+                .unwrap_or(captured)
+        } else {
+            captured
+        };
+        let line_start = body
+            .rmatch_indices('\n')
+            .nth(lines - 1)
+            .map_or(0, |(i, _)| i + 1);
+        let start = line_start.max(tail_start(body, PREVIEW_TAIL));
+        if start > 0 {
+            let capture = if result.content.len() > MAX_ARTIFACT_BYTES {
+                format!("Full captured result unavailable (exceeds {MAX_ARTIFACT_BYTES}-byte artifact ceiling).")
+            } else {
+                match self.store.put(result.content.as_bytes()) {
+                    Ok(id) => format!("Full captured result saved as artifact {id}; read with fetch_output(artifact_id=\"{id}\", offset=0, limit={FETCH_MAX_LIMIT})."),
+                    Err(_) => "Full captured result unavailable (could not be saved).".into(),
+                }
+            };
+            result.content = format!(
+                "{notice}{ARTIFACT_TRUNCATION_MARKER_PREFIX} — tail preview; earlier bytes 0–{start} omitted. {capture}]\n{}",
+                &body[start..],
+            );
+        }
+        if !result.content.ends_with(status) {
+            if !result.content.ends_with('\n') {
+                result.content.push('\n');
+            }
+            result.content.push_str(status);
+        }
+    }
+
     pub fn new(store: Arc<ArtifactStore>) -> Self {
         Self {
             store,
@@ -260,6 +330,97 @@ impl atomcode_kernel::middleware::ToolMiddleware for ArtifactMiddleware {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn requested_shell_tail_keeps_status_and_saves_utf8_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(super::ArtifactStore::new(dir.path()));
+        let preview = super::ArtifactMiddleware::new(store.clone());
+        let full = "首行错误\n继续\n末行\n[exit code 23]";
+        let mut result = atomcode_kernel::tool::ToolResult {
+            content: full.into(),
+            ..Default::default()
+        };
+        preview.shell_tail(&mut result, 2, "[exit code 23]", true, "");
+        assert!(!result.content.contains("首行错误"));
+        assert!(result.content.ends_with("末行\n[exit code 23]"));
+        let id = super::artifact_id(full.as_bytes());
+        assert_eq!(
+            store.get(&id, 0, full.len()).unwrap().unwrap(),
+            full.as_bytes()
+        );
+        assert!(result.content.contains(&id));
+        assert!(!result.is_error);
+    }
+
+    #[test]
+    fn shell_tail_storage_failure_and_ceiling_do_not_claim_saved_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("file");
+        std::fs::write(&blocker, "not a directory").unwrap();
+        for (path, full, reason) in [
+            (blocker, "first\nlast".to_string(), "could not be saved"),
+            (
+                dir.path().join("ceiling"),
+                format!("{}\nlast", "x".repeat(super::MAX_ARTIFACT_BYTES)),
+                "artifact ceiling",
+            ),
+        ] {
+            let store = std::sync::Arc::new(super::ArtifactStore::new(&path));
+            let preview = super::ArtifactMiddleware::new(store);
+            let mut result = atomcode_kernel::tool::ToolResult {
+                content: full,
+                ..Default::default()
+            };
+            preview.shell_tail(
+                &mut result,
+                1,
+                "[exit code 23]",
+                false,
+                "[earlier output dropped]\n",
+            );
+            assert!(result.content.contains(reason));
+            assert!(!result.content.contains("saved as artifact"));
+            assert!(result.content.starts_with("[earlier output dropped]"));
+            assert!(result.content.ends_with("last\n[exit code 23]"));
+        }
+    }
+
+    #[test]
+    fn shell_preview_validation_is_explicit() {
+        assert_eq!(super::shell_preview_lines(None, false).unwrap(), None);
+        assert_eq!(super::shell_preview_lines(Some(1), true).unwrap(), Some(1));
+        assert_eq!(
+            super::shell_preview_lines(Some(2000), true).unwrap(),
+            Some(2000)
+        );
+        for n in [0, 2001, u64::MAX] {
+            assert!(super::shell_preview_lines(Some(n), true).is_err());
+        }
+        assert!(super::shell_preview_lines(Some(12), false).is_err());
+    }
+
+    #[test]
+    fn a_single_huge_utf8_line_is_bounded_without_losing_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(super::ArtifactStore::new(dir.path()));
+        let preview = super::ArtifactMiddleware::new(store.clone());
+        let full = format!("{}\n[exit code 0]", "🦀".repeat(super::PREVIEW_TAIL));
+        let mut result = atomcode_kernel::tool::ToolResult {
+            content: full.clone(),
+            ..Default::default()
+        };
+        preview.shell_tail(&mut result, 1, "[exit code 0]", true, "");
+        assert!(result.content.len() < super::PREVIEW_TAIL + 1024);
+        assert!(result.content.ends_with("[exit code 0]"));
+        assert!(!result.content.contains('�'));
+        assert_eq!(
+            store
+                .get(&super::artifact_id(full.as_bytes()), 0, full.len())
+                .unwrap()
+                .unwrap(),
+            full.as_bytes()
+        );
+    }
     #[test]
     fn threshold_env_override_defaults_byte_identical_and_clamps() {
         use super::{

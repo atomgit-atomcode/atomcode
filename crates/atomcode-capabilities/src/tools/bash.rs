@@ -120,6 +120,7 @@ pub use background::{
 /// how to present the result.
 pub struct BashTool {
     world: Arc<dyn crate::world::Shell>,
+    output_preview: Option<super::output_artifact::ArtifactStoreProvider>,
     /// What counts as a sensitive target (the "allow all" floor and the grant scope).
     sensitive: SensitivePaths,
 }
@@ -139,7 +140,24 @@ impl BashTool {
 
     /// Run commands through `world` instead of this machine.
     pub fn with_world(world: Arc<dyn crate::world::Shell>, sensitive: SensitivePaths) -> Self {
-        Self { world, sensitive }
+        Self {
+            world,
+            sensitive,
+            output_preview: None,
+        }
+    }
+
+    /// Use the host's existing artifact store for optional per-call previews.
+    pub fn with_output_preview(self, store: Arc<super::ArtifactStore>) -> Self {
+        self.with_output_preview_provider(Arc::new(move || Some(store.clone())))
+    }
+
+    pub fn with_output_preview_provider(
+        mut self,
+        provider: super::output_artifact::ArtifactStoreProvider,
+    ) -> Self {
+        self.output_preview = Some(provider);
+        self
     }
 }
 
@@ -148,6 +166,8 @@ struct Args {
     command: String,
     #[serde(default)]
     timeout: Option<u64>,
+    #[serde(default)]
+    output_tail_lines: Option<u64>,
 }
 
 #[async_trait]
@@ -170,14 +190,23 @@ impl Tool for BashTool {
         )
     }
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
+        let mut schema = json!({
             "type": "object",
             "properties": {
                 "command": { "type": "string", "description": "The shell command to run" },
                 "timeout": { "type": "integer", "description": "Max seconds to wait (default 60, max 300)" }
             },
             "required": ["command"]
-        })
+        });
+        if self
+            .output_preview
+            .as_ref()
+            .and_then(|provider| provider())
+            .is_some()
+        {
+            super::output_artifact::add_shell_preview_schema(&mut schema);
+        }
+        schema
     }
     fn risk(&self, args: &str) -> RiskLevel {
         // Parse the command out of args; a parse failure is conservatively Risky.
@@ -256,6 +285,18 @@ impl Tool for BashTool {
                 ))
             }
         };
+        let output_preview = self
+            .output_preview
+            .as_ref()
+            .and_then(|provider| provider())
+            .map(super::ArtifactMiddleware::new);
+        let preview_lines = match super::output_artifact::shell_preview_lines(
+            a.output_tail_lines,
+            output_preview.is_some(),
+        ) {
+            Ok(lines) => lines,
+            Err(error) => return err(format!("bash: {error}")),
+        };
         // Keep the RAW request so we can (a) avoid telling a caller that already asked for
         // more than the ceiling to "pass a larger timeout", and (b) surface the clamp up
         // front — the model otherwise believes its larger request was honored and only
@@ -301,11 +342,19 @@ impl Tool for BashTool {
             // behind: a timeout landing in the post-exit drain would kill what the
             // command had just started and call a finished command a timeout.
             res = process.collect_within(Some(dur)) => match res {
-                Ok(Some(collected)) => format_output(
-                    &self.world.decode(&collected.stdout),
-                    &self.world.decode(&collected.stderr),
-                    collected.exit.code,
-                ),
+                Ok(Some(collected)) => {
+                    let mut result = format_output(
+                        &self.world.decode(&collected.stdout),
+                        &self.world.decode(&collected.stderr),
+                        collected.exit.code,
+                    );
+                    if let (Some(lines), Some(preview)) = (preview_lines, &output_preview) {
+                        let status = collected.exit.code.map(|code| format!("[exit code {code}]"))
+                            .unwrap_or_else(|| "[process terminated by signal]".into());
+                        preview.shell_tail(&mut result, lines, &status, collected.exit.code != Some(0), "");
+                    }
+                    result
+                },
                 Err(e) => err(format!("bash: error running command: {e}")),
                 // Don't echo the command (see the cancel arm); point at the actionable knob —
                 // a larger `timeout` — BUT only while that knob still has room. Once the run
@@ -4970,6 +5019,61 @@ mod tests {
             .await;
         assert!(!r.is_error, "{}", r.content);
         assert!(r.content.contains("hello"), "{}", r.content);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_tail_preserves_failure_without_a_pipeline() {
+        let d = tempfile::tempdir().unwrap();
+        let store = Arc::new(super::super::ArtifactStore::new(d.path().join("artifacts")));
+        let tool = BashTool::default().with_output_preview(store.clone());
+        assert!(tool.parameters_schema()["properties"]
+            .get("output_tail_lines")
+            .is_some());
+        let args =
+            json!({"command":"echo first; echo second; echo last; exit 23", "output_tail_lines":2})
+                .to_string();
+        let result = tool.execute(&args, &ctx(d.path())).await;
+        assert!(!result.is_error);
+        assert!(!result.content.contains("first"));
+        assert!(
+            result.content.ends_with("last\n[exit code 23]"),
+            "{}",
+            result.content
+        );
+        let full = "first\nsecond\nlast\n[exit code 23]";
+        let id = super::super::artifact_id(full.as_bytes());
+        assert_eq!(store.get(&id, 0, 1024).unwrap().unwrap(), full.as_bytes());
+
+        for lines in [0, 2001] {
+            let args = json!({"command":"echo ran > should-not-exist", "output_tail_lines":lines})
+                .to_string();
+            assert!(tool.execute(&args, &ctx(d.path())).await.is_error);
+        }
+        assert!(!d.path().join("should-not-exist").exists());
+        assert!(
+            BashTool::default()
+                .execute(&args, &ctx(d.path()))
+                .await
+                .is_error
+        );
+        let success = tool
+            .execute(
+                r#"{"command":"echo ok","output_tail_lines":1}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert_eq!(success.content, "ok\n[exit code 0]");
+        let piped = tool
+            .execute(
+                r#"{"command":"(exit 23) | cat","output_tail_lines":1}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(
+            piped.content.ends_with("[exit code 0]"),
+            "explicit pipelines keep their own status"
+        );
     }
 
     #[tokio::test]

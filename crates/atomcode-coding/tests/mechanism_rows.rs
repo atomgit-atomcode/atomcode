@@ -792,6 +792,73 @@ async fn an_oversized_tool_result_is_shown_head_and_tail_and_saved_whole() {
 }
 
 #[tokio::test]
+async fn a_failed_shell_keeps_its_status_and_full_log_when_previewed() {
+    let dir = scratch("artifact-failed-shell");
+    let padding = atomcode_capabilities::tools::output_artifact::THRESHOLD_BYTES + 8 * 1024;
+    let command = format!(
+        "printf 'x%.0s' $(seq 1 {padding}); printf '\\nE_COMPILE_PREVIEW_PROBE\\n'; \
+         printf 'y%.0s' $(seq 1 {padding}); exit 23"
+    );
+    let (text, artifacts) = spilled(&dir, &command).await;
+    assert!(text.contains("fetch_output(artifact_id="), "{text}");
+    assert!(text.contains("[exit code 23]"), "{text}");
+    assert!(
+        !text.contains("E_COMPILE_PREVIEW_PROBE"),
+        "the middle of this log should require fetching the artifact"
+    );
+
+    let entries: Vec<_> = std::fs::read_dir(&artifacts)
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .collect();
+    assert_eq!(entries.len(), 1);
+    let id = entries[0].file_name().into_string().unwrap();
+    let store = atomcode_capabilities::tools::ArtifactStore::new(&artifacts);
+    let middle = store.get(&id, padding, 128).unwrap().unwrap();
+    assert!(String::from_utf8(middle)
+        .unwrap()
+        .contains("E_COMPILE_PREVIEW_PROBE"));
+    let saved = std::fs::read_to_string(entries[0].path()).unwrap();
+    assert_eq!(saved.matches('x').count(), padding + 1); // "exit code" has one x.
+    assert_eq!(saved.matches('y').count(), padding);
+    assert!(
+        saved.ends_with("[exit code 23]"),
+        "status must also be saved"
+    );
+}
+
+#[tokio::test]
+async fn both_shell_rows_offer_native_tail_without_changing_execution() {
+    for row in ["tool-bash", "tool-bash-world"] {
+        let dir = scratch(row);
+        let artifacts = dir.join("artifacts");
+        let other = if row == "tool-bash" {
+            "tool-bash-world"
+        } else {
+            "tool-bash"
+        };
+        let config = format!(
+            "[[patch]]\nid = {other:?}\ndisabled = true\n\n\
+             [[patch]]\nid = {row:?}\ndisabled = false\n\n\
+             [[patch]]\nid = \"approval\"\nconfig = {{ mode = \"yolo\" }}\n\n\
+             [[insert]]\nname = \"tool-output-artifact\"\nconfig = {{ dir = {:?} }}",
+            artifacts.to_string_lossy()
+        );
+        let script = script_one(
+            "bash",
+            r#"{command = "echo first; echo last; exit 23", output_tail_lines = 1}"#,
+        );
+        let app = start(tree(&dir, &script, &[&config])).await;
+        run_turn(&app, "run it").await.unwrap();
+        let text = transcript(&app);
+        assert!(text.contains("[exit code 23]"), "{text}");
+        assert!(!text.contains("first"), "{text}");
+        assert!(text.contains("fetch_output(artifact_id="), "{text}");
+        assert_eq!(std::fs::read_dir(&artifacts).unwrap().count(), 1);
+    }
+}
+
+#[tokio::test]
 async fn a_small_tool_result_is_left_alone() {
     // The negative control. Without it, a row that truncated everything — or one
     // that did nothing and let some other layer do the cutting — reads the same.

@@ -607,6 +607,8 @@ struct PollArgs {
     job_id: String,
     #[serde(default)]
     wait_ms: Option<u64>,
+    #[serde(default)]
+    output_tail_lines: Option<u64>,
 }
 
 /// `bash_start` — spawn a command in the background and return its job id.
@@ -714,6 +716,44 @@ impl Tool for BashStartTool {
 #[derive(Default)]
 pub struct BashPollTool;
 
+impl BashPollTool {
+    pub fn with_output_preview(store: Arc<crate::tools::ArtifactStore>) -> impl Tool {
+        Self::with_output_preview_provider(Arc::new(move || Some(store.clone())))
+    }
+
+    pub fn with_output_preview_provider(
+        provider: crate::tools::output_artifact::ArtifactStoreProvider,
+    ) -> impl Tool {
+        PreviewedPoll(provider)
+    }
+}
+
+struct PreviewedPoll(crate::tools::output_artifact::ArtifactStoreProvider);
+
+#[async_trait]
+impl Tool for PreviewedPoll {
+    fn name(&self) -> &str {
+        BashPollTool.name()
+    }
+    fn description(&self) -> &str {
+        BashPollTool.description()
+    }
+    fn parameters_schema(&self) -> Value {
+        let mut schema = BashPollTool.parameters_schema();
+        if (self.0)().is_some() {
+            crate::tools::output_artifact::add_shell_preview_schema(&mut schema);
+        }
+        schema
+    }
+    fn read_only_hint(&self) -> bool {
+        BashPollTool.read_only_hint()
+    }
+    async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
+        let preview = (self.0)().map(crate::tools::ArtifactMiddleware::new);
+        execute_poll(args, ctx, preview.as_ref()).await
+    }
+}
+
 #[async_trait]
 impl Tool for BashPollTool {
     fn name(&self) -> &str {
@@ -743,34 +783,56 @@ impl Tool for BashPollTool {
         true
     }
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
-        let a: PollArgs = match serde_json::from_str(args) {
-            Ok(a) => a,
-            Err(e) => {
-                return err(format!(
-                    "bash_poll: invalid arguments: {e}. Expected {{\"job_id\":\"<id>\"}}."
-                ))
-            }
-        };
-        if let Err(e) =
-            wait_for_poll(&a.job_id, a.wait_ms.unwrap_or(DEFAULT_POLL_WAIT_MS), ctx).await
-        {
-            return err(e);
+        execute_poll(args, ctx, None).await
+    }
+}
+
+async fn execute_poll(
+    args: &str,
+    ctx: &ToolContext,
+    preview: Option<&crate::tools::ArtifactMiddleware>,
+) -> ToolResult {
+    let a: PollArgs = match serde_json::from_str(args) {
+        Ok(a) => a,
+        Err(e) => {
+            return err(format!(
+                "bash_poll: invalid arguments: {e}. Expected {{\"job_id\":\"<id>\"}}."
+            ))
         }
-        match poll(&a.job_id) {
-            Ok(r) => {
-                let mut body = String::new();
-                if r.truncated {
-                    body.push_str("[earlier output dropped — buffer is capped]\n");
-                }
-                body.push_str(&r.text);
-                if !body.is_empty() && !body.ends_with('\n') {
-                    body.push('\n');
-                }
-                body.push_str(&poll_status_line(&r));
-                ok(body)
+    };
+    let preview_lines = match crate::tools::output_artifact::shell_preview_lines(
+        a.output_tail_lines,
+        preview.is_some(),
+    ) {
+        Ok(lines) => lines,
+        Err(error) => return err(format!("bash_poll: {error}")),
+    };
+    if let Err(e) = wait_for_poll(&a.job_id, a.wait_ms.unwrap_or(DEFAULT_POLL_WAIT_MS), ctx).await {
+        return err(e);
+    }
+    match poll(&a.job_id) {
+        Ok(r) => {
+            let mut body = String::new();
+            if r.truncated {
+                body.push_str("[earlier output dropped — buffer is capped]\n");
             }
-            Err(e) => err(e),
+            body.push_str(&r.text);
+            if !body.is_empty() && !body.ends_with('\n') {
+                body.push('\n');
+            }
+            body.push_str(&poll_status_line(&r));
+            let mut result = ok(body);
+            if let (Some(lines), Some(preview)) = (preview_lines, preview) {
+                let notice = if r.truncated {
+                    "[earlier output dropped — buffer is capped]\n"
+                } else {
+                    ""
+                };
+                preview.shell_tail(&mut result, lines, &poll_status_line(&r), true, notice);
+            }
+            result
         }
+        Err(e) => err(e),
     }
 }
 
@@ -857,6 +919,60 @@ mod tests {
             progress: atomcode_kernel::tool::ProgressSink::noop(),
             requester: None,
         }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn poll_tail_keeps_drop_notice_status_and_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::tools::ArtifactStore::new(dir.path()));
+        let tool = BashPollTool::with_output_preview(store.clone());
+        let (id, tx, _process) = poll_job().await;
+        let mut bytes = vec![b'x'; MAX_OUTPUT_BYTES + 100];
+        bytes.extend_from_slice(b"\nlast output\n");
+        tx.send(Chunk::Stdout(bytes)).unwrap();
+        tokio::task::yield_now().await;
+        let args = json!({"job_id":id,"wait_ms":0,"output_tail_lines":2}).to_string();
+        let result = tool.execute(&args, &ctx(Path::new("."))).await;
+        assert!(
+            result.content.starts_with("[earlier output dropped"),
+            "{}",
+            result.content
+        );
+        assert!(result.content.ends_with("last output\nstatus: running"));
+        let files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|f| f.unwrap())
+            .collect();
+        assert_eq!(files.len(), 1);
+        let captured = std::fs::read_to_string(files[0].path()).unwrap();
+        assert!(captured.starts_with("[earlier output dropped"));
+        assert!(captured.len() > result.content.len());
+        let immediate = json!({"job_id":id,"wait_ms":0}).to_string();
+        assert_eq!(
+            BashPollTool
+                .execute(&immediate, &ctx(Path::new(".")))
+                .await
+                .content,
+            "status: running"
+        );
+
+        tx.send(Chunk::Stdout(b"unread\n".to_vec())).unwrap();
+        tokio::task::yield_now().await;
+        let invalid = json!({"job_id":id,"wait_ms":0,"output_tail_lines":0}).to_string();
+        assert!(tool.execute(&invalid, &ctx(Path::new("."))).await.is_error);
+        assert!(
+            BashPollTool
+                .execute(&args, &ctx(Path::new(".")))
+                .await
+                .is_error
+        );
+        assert!(BashPollTool
+            .execute(&immediate, &ctx(Path::new(".")))
+            .await
+            .content
+            .starts_with("unread\n"));
+        kill(&id).unwrap();
+        drain(&id).await;
     }
 
     /// Poll at 20ms until finished (nothing left running) or a ~2s budget, accumulating
