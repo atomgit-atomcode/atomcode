@@ -915,7 +915,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::MouseHandedBack => "鼠标已交还终端 · ctrl+g 收回 · /raw 跨屏选 · 滚轮滚动 · ctrl+p/n 历史 · ctrl+t 展开 · ctrl+o 思考".into(),
         Msg::MouseUnreportedAtStart => "这个终端不上报鼠标 · 直接拖选 · 滚轮或 Fn+↑/↓ 翻页 · /raw 跨屏选 · ↑↓ 历史 · ctrl+t 展开 · ctrl+o 思考".into(),
         Msg::MouseUnreported => "这个终端不上报鼠标,鼠标留给终端 · 直接拖选 · 滚轮或 Fn+↑/↓ 翻页".into(),
-        Msg::MouseHandedBackAtStart => "鼠标在终端手里 · ctrl+g 收回 · /raw 跨屏选 · 滚轮滚动 · ctrl+p/n 历史 · ctrl+t 展开 · ctrl+o 思考".into(),
+        Msg::MouseHandedBackAtStart => "鼠标已交还终端 · 拖选复制、右键粘贴 · Ctrl+T 展开/收起工具输出".into(),
         Msg::ReasoningNotReceived => "尚未收到思考内容；收到后会实时展示。".into(),
         Msg::ReasoningHiddenHint => "思考过程已收起 · ctrl-o 展开/隐藏 · 工具输出用 ctrl-t".into(),
         Msg::NoProviderPanel => "这个屏幕没有 provider 面板:启动器没有提供 `tui-panel-providers`".into(),

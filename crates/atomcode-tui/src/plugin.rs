@@ -1644,6 +1644,23 @@ impl UserInterface for Tui {
         let mut welcome_note = ctx
             .service::<OpeningNoticesSvc>()
             .and_then(|notices| notices.welcome_note.clone());
+        let launcher_note_pending = welcome_note.is_some();
+        let native_mouse_notice = (!self.surface.mouse()).then(|| {
+            t(if crate::caps::mouse_reported() {
+                Msg::MouseHandedBackAtStart
+            } else {
+                Msg::MouseUnreportedAtStart
+            })
+            .into_owned()
+        });
+        // Part of the welcome's foot, below cwd/model. Never emit a standalone
+        // startup mouse message that could race ahead of the product header.
+        if let Some(notice) = native_mouse_notice.as_deref() {
+            welcome_note = Some(match welcome_note {
+                Some(note) if !note.trim().is_empty() => format!("{notice}\n{note}"),
+                _ => notice.to_string(),
+            });
+        }
         //
         // Held until the welcome has been drawn, and said right under it: drawn
         // the moment the screen came up, they stood above the welcome — the
@@ -1720,20 +1737,10 @@ impl UserInterface for Tui {
                 tokio::spawn(async move { read_input(keys_tx, move || !surface.mouse()).await })
             }
         };
-        // `[ui] mouse = false`: the pointer is the terminal's from the first
-        // frame, so ↑/↓ scroll and the history is on ctrl-p/ctrl-n — said once,
-        // on the tip row, where nobody has to have pressed ctrl-g to learn it.
-        if !self.surface.mouse() {
-            // A terminal that reports no mouse is told what does work there —
-            // not about a ctrl-g that would take nothing, or a wheel that sends
-            // nothing.
-            let tip = if crate::caps::mouse_reported() {
-                Msg::MouseHandedBackAtStart
-            } else {
-                Msg::MouseUnreportedAtStart
-            };
-            self.host
-                .say_for(t(tip).into_owned(), false, MOUSE_NOTICE_MS * 2);
+        // Keep the existing transient hint too; the welcome carries the durable
+        // startup explanation even when another tip replaces this one.
+        if let Some(tip) = native_mouse_notice {
+            self.host.say_for(tip, false, MOUSE_NOTICE_MS * 2);
         }
 
         // Before anything is typed: would a turn be taken at all?
@@ -1946,7 +1953,7 @@ impl UserInterface for Tui {
                         let opened = self
                             .host
                             .open_conversation(crate::block::Coord::default(), &open);
-                        if opened && welcome_note.take().is_some() {
+                        if opened && welcome_note.take().is_some() && launcher_note_pending {
                             // Drawn: only now is it spent on the launcher's side.
                             if let Some(seen) = self
                                 .ctx
@@ -8054,9 +8061,7 @@ impl Tui {
                 // the replaceable tip row instead of appending red errors.
                 if self.surface.remote_clipboard() {
                     drop(m);
-                    self.host
-                        .say(t(Msg::ClipboardRemoteText).into_owned(), false);
-                    return false;
+                    return self.paste_clipboard_text(client);
                 }
                 // Read first, mutate second: a clipboard with no image in it
                 // must leave the composer exactly as it was, and "exactly as it
@@ -9634,18 +9639,18 @@ impl Tui {
     /// middle button, and Ctrl+V with no picture to attach. Returns `true` to
     /// quit, as `act` does.
     fn paste_clipboard_text(&self, client: &AgentClient) -> bool {
+        // Every paste gesture has the same SSH boundary. Do not read the
+        // server clipboard or turn ordinary client-paste guidance into an error.
+        if self.surface.remote_clipboard() {
+            self.host
+                .say(t(Msg::ClipboardRemoteText).into_owned(), false);
+            return false;
+        }
         let Some(text) = self.surface.clipboard_text().filter(|t| !t.is_empty()) else {
             // A refusal of the gesture, so it belongs on the tip row with the
             // rest of them rather than in the conversation.
-            self.host.say(
-                t(if self.surface.remote_clipboard() {
-                    Msg::ClipboardRemoteText
-                } else {
-                    Msg::ClipboardHasNoTextShort
-                })
-                .into_owned(),
-                true,
-            );
+            self.host
+                .say(t(Msg::ClipboardHasNoTextShort).into_owned(), true);
             return false;
         };
         self.act(Action::Paste(text), client)
@@ -15012,16 +15017,27 @@ mod paste_habit_tests {
     }
 
     #[test]
-    fn ctrl_v_over_ssh_gives_one_plain_paste_hint_without_reading_a_clipboard() {
+    fn every_paste_gesture_over_ssh_gives_one_plain_hint_without_reading_a_clipboard() {
         let (host, tui) = assemble(Arc::new(RemotePasteSurface));
-        host.moment.write().unwrap().input = "draft 中文".into();
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.input = "draft 中文".into();
+            moment.caret = moment.input.len();
+        }
         let before = host.stream.read().unwrap().len();
         for _ in 0..3 {
             assert!(!tui.act(Action::AttachImage, &tui.client));
+            assert!(!tui.run_menu_item("paste", &tui.client));
+            assert!(!tui.paste_clipboard_text(&tui.client));
+            assert!(!host.moment.read().unwrap().notice.as_ref().unwrap().refused);
         }
+        assert_eq!(host.moment.read().unwrap().input, "draft 中文");
+        // Receiving actual pasted text still edits the composer normally.
+        assert!(!tui.act(Action::Paste("远端粘贴".into()), &tui.client));
         assert_eq!(host.stream.read().unwrap().len(), before);
         let moment = host.moment.read().unwrap();
-        assert_eq!(moment.input, "draft 中文");
+        assert!(moment.input.contains("draft 中文"));
+        assert!(moment.input.contains("远端粘贴"));
         let notice = moment.notice.as_ref().unwrap();
         assert_eq!(notice.text, t(Msg::ClipboardRemoteText));
         assert!(!notice.refused);

@@ -802,9 +802,9 @@ pub struct UiConfig {
     /// Shift to drag-select natively when they want to. Read once at startup (like
     /// `theme`); `--no-mouse` overrides it off for one launch, Ctrl+G toggles it
     /// live. Default on locally — except on HarmonyOS, whose terminal reports no
-    /// mouse at all (see [`default_mouse`]). SSH and PuTTY follow the same
-    /// configured default; Ctrl+G or `--no-mouse` can hand selection and paste
-    /// back to the terminal.
+    /// mouse at all (see [`default_mouse`]). SSH/PuTTY start with native terminal
+    /// copy/paste even when enabled here. Ctrl+G toggles application mouse live;
+    /// ATOMCODE_MOUSE=1 explicitly opts in at startup.
     #[serde(default = "default_mouse")]
     pub mouse: bool,
     /// Conversation scrollbar visibility in the full-screen UI; read at startup.

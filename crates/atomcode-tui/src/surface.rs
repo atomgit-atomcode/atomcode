@@ -1256,7 +1256,10 @@ impl Terminal {
         // used to keep the *asked-for* value while the terminal was told off,
         // so the first re-statement took the mouse back and selection died.
         let link_terminal = link_pointer::detect();
-        let (_, mouse) = starting_pointer(mouse, crate::caps::mouse_reported());
+        let (_, mouse) = starting_pointer(
+            mouse && crate::caps::take_mouse_at_start(),
+            crate::caps::mouse_reported(),
+        );
         let pointer = ansi::Pointer::from_intents(
             mouse,
             link_terminal != link_pointer::TerminalKind::Unsupported,

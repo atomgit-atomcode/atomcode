@@ -670,6 +670,28 @@ impl Session {
     }
 }
 
+/// A native-mouse launch explains its mode inside the welcome, never above it.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_native_mouse_launch_places_its_reminder_below_the_welcome() {
+    use atomcode_tui::surface::Surface as _;
+    let dir = scratch("native-mouse-reminder");
+    let s = start(tree(&dir, &replay(r#"{ text = "Ready." }"#), &[])).await;
+    s.term.set_mouse(false);
+    let ui = s.ui.clone();
+    let ctx = s.app.clone();
+    let task = tokio::spawn(async move { ui.run(&ctx, None).await });
+    until(&s, "鼠标已交还终端").await;
+    let screen = s.screen();
+    assert!(
+        screen.find("上手提示").unwrap() < screen.find("鼠标已交还终端").unwrap(),
+        "{screen}"
+    );
+    assert!(screen.contains("Ctrl+T"), "{screen}");
+    assert!(!s.term.mouse());
+    task.abort();
+    let _ = task.await;
+}
+
 /// Runtime warnings can already be queued before the screen subscribes.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn a_startup_warning_is_drawn_after_the_welcome() {

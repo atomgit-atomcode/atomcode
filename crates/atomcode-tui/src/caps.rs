@@ -326,6 +326,20 @@ fn mouse_reported_for(ohos: bool, env: impl Fn(&str) -> Option<String>) -> bool 
     }
 }
 
+/// Prefer client-owned copy/paste for SSH (which may identify only as xterm)
+/// and explicit PuTTY terminals. This is a startup preference, not a capability
+/// gate: Ctrl+G can still take the mouse later.
+pub(crate) fn take_mouse_at_start() -> bool {
+    take_mouse_at_start_for(|key| std::env::var_os(key).map(|v| v.to_string_lossy().into_owned()))
+}
+
+fn take_mouse_at_start_for(env: impl Fn(&str) -> Option<String>) -> bool {
+    if let Some(forced) = env("ATOMCODE_MOUSE").filter(|v| !v.is_empty()) {
+        return forced == "1" || forced.eq_ignore_ascii_case("true");
+    }
+    !remote_session_for(&env) && !putty_for(&env)
+}
+
 fn putty_for(env: &dyn Fn(&str) -> Option<String>) -> bool {
     ["TERM", "TERM_PROGRAM"]
         .into_iter()
@@ -996,7 +1010,26 @@ mod tests {
             vec![("TERM_PROGRAM", "PuTTY")],
         ] {
             let env = env_of(&vars);
+            assert!(!take_mouse_at_start_for(&env), "{vars:?}");
             assert!(mouse_reported_for(false, &env), "{vars:?}");
+        }
+    }
+
+    #[test]
+    fn local_mouse_defaults_and_explicit_overrides_are_preserved() {
+        assert!(take_mouse_at_start_for(env_of(&[])));
+        assert!(take_mouse_at_start_for(env_of(&[("TERM", "xterm")])));
+        for value in ["1", "true", "TRUE"] {
+            assert!(take_mouse_at_start_for(env_of(&[
+                ("SSH_TTY", "/dev/pts/0"),
+                ("ATOMCODE_MOUSE", value)
+            ])));
+        }
+        for value in ["0", "false"] {
+            assert!(!take_mouse_at_start_for(env_of(&[(
+                "ATOMCODE_MOUSE",
+                value
+            )])));
         }
     }
 
