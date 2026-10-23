@@ -199,6 +199,8 @@ pub struct CodingAgentConfig {
     /// convenience gates so a matched rule skips (or blocks) the prompt. Shared, so a
     /// `/model` swap re-assembling the agent keeps the same parsed rules.
     pub permission_rules: std::sync::Arc<atomcode_capabilities::tools::PermissionRules>,
+    /// Initial mode only; runtime rebuilds preserve the live flags instead.
+    pub initial_mode: crate::runtime::RuntimeMode,
     /// Per-provider User-Agent override (`ProviderConfig::user_agent`). `None` ⇒
     /// `build_provider` falls back to the product `atomcode/<version>` so the gateway
     /// can attribute/slice traffic by version. Restores parity with v1's
@@ -312,6 +314,8 @@ pub struct CodingRuntimeConfig {
     pub credential_shell_policy: atomcode_capabilities::tools::CredentialShellPolicy,
     /// Parsed `[permissions]` allow/deny rules (see `CodingAgentConfig::permission_rules`).
     pub permission_rules: std::sync::Arc<atomcode_capabilities::tools::PermissionRules>,
+    /// Initial mode only; runtime rebuilds preserve the live flags instead.
+    pub initial_mode: crate::runtime::RuntimeMode,
     pub user_agent: Option<String>,
     pub headers: atomcode_config::provider_headers::ProviderHeaders,
     pub skip_tls_verify: bool,
@@ -444,7 +448,7 @@ pub fn describe_config_file_for(
          - `[compaction]` `token_limit`: optional positive prompt-token budget for earlier \
          automatic history summarization; omit to keep the window-relative policy. \
          Applied when the agent is rebuilt; the model's physical context window is unchanged.\n\
-         - `[permissions]` `allow` / `deny`: rules such as `Bash(git *)`, `Read(<path>)` or \
+         - `[permissions]` `default_mode`: startup mode (`build`, `plan`, `accept-edits`, `auto`); explicit -y overrides it; temporary mode switches do not save it. `allow` / `deny`: rules such as `Bash(git *)`, `Read(<path>)` or \
          `mcp__<server>__<tool>`. `deny` wins, and `allow` never opens a sensitive path.\n\
          - `[coding]` `max_rounds` (per turn; 0 = no cap; `ATOMCODE_TURN_MAX_ROUNDS` wins), \
          `repeat_stop_rounds` (stop a turn after this many rounds of the very same tool \
@@ -594,6 +598,15 @@ impl CodingRuntimeConfig {
             thinking_enabled: r.and_then(|r| r.thinking_enabled),
             thinking_type: r.and_then(|r| r.thinking_type.clone()),
             thinking_keep: r.and_then(|r| r.thinking_keep.clone()),
+            initial_mode: if dangerously_skip_permissions {
+                crate::runtime::RuntimeMode::Auto
+            } else {
+                config
+                    .permissions
+                    .default_mode
+                    .map(Into::into)
+                    .unwrap_or_default()
+            },
             dangerously_skip_permissions,
             interactive,
             keep_interrupted_context: config.keep_interrupted_context,
@@ -634,6 +647,7 @@ impl CodingRuntimeConfig {
             &self.working_dir,
             self.dirs.clone(),
         );
+        config.initial_mode = self.initial_mode;
         config.startup_warnings = self.startup_warnings.clone();
         config.extra_skill_dirs = self.extra_skill_dirs.clone();
         config.compact_token_limit = self.compact_token_limit;
@@ -1171,6 +1185,7 @@ impl CodingAgentConfig {
             keep_interrupted_context: false,
             credential_shell_policy: Default::default(),
             permission_rules: Default::default(),
+            initial_mode: Default::default(),
             user_agent: None,
             headers: Default::default(),
             skip_tls_verify: false,
@@ -1186,6 +1201,48 @@ impl CodingAgentConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn configured_initial_mode_and_explicit_skip_reach_agent_config() {
+        use crate::runtime::RuntimeMode;
+        for (name, expected) in [
+            ("build", RuntimeMode::Build),
+            ("plan", RuntimeMode::Plan),
+            ("accept-edits", RuntimeMode::AcceptEdits),
+            ("auto", RuntimeMode::Auto),
+        ] {
+            let config = toml::from_str::<atomcode_config::Config>(&format!(
+                "[permissions]\ndefault_mode = {name:?}\n"
+            ))
+            .unwrap();
+            for skip in [false, true] {
+                let runtime = super::CodingRuntimeConfig::from_config(
+                    &config,
+                    std::path::Path::new("/work"),
+                    super::product_dirs_from_env(),
+                    None,
+                    None,
+                    skip,
+                    false,
+                );
+                assert_eq!(
+                    runtime.agent_config().initial_mode,
+                    if skip { RuntimeMode::Auto } else { expected }
+                );
+            }
+        }
+        let config = atomcode_config::Config::default();
+        let runtime = super::CodingRuntimeConfig::from_config(
+            &config,
+            std::path::Path::new("/work"),
+            super::product_dirs_from_env(),
+            None,
+            None,
+            false,
+            false,
+        );
+        assert_eq!(runtime.agent_config().initial_mode, RuntimeMode::Build);
+    }
+
     use super::*;
 
     #[test]

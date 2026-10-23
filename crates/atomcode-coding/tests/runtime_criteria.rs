@@ -2632,6 +2632,29 @@ async fn the_ui_language_does_not_reach_the_persona() {
     runtime.handle.shutdown().await.unwrap();
 }
 
+/// Defaults seed the live flags before mount; rebuilding keeps the person's
+/// temporary override rather than applying the startup default again.
+async fn startup_modes_seed_the_owner_and_reload_preserves_a_temporary_switch() {
+    for mode in [
+        RuntimeMode::Build,
+        RuntimeMode::Plan,
+        RuntimeMode::AcceptEdits,
+        RuntimeMode::Auto,
+    ] {
+        let env = env();
+        let recorder = Arc::new(Recorder::default());
+        let mut input = start(env.project.path(), &recorder, SessionMode::Fresh);
+        input.agent.initial_mode = mode;
+        let runtime = CodingRuntime::start(input).await.unwrap();
+        assert_eq!(runtime.handle.mode().await.unwrap(), mode);
+        assert_eq!(runtime.handle.live_view().unwrap().mode, mode);
+        runtime.handle.set_mode(mode.next()).await.unwrap();
+        runtime.handle.reload_capabilities().await.unwrap();
+        assert_eq!(runtime.handle.mode().await.unwrap(), mode.next());
+        runtime.handle.shutdown().await.unwrap();
+    }
+}
+
 /// A `[permissions]` deny rule refuses the call it names, without asking.
 async fn a_permission_rule_refuses_what_it_denies() {
     let env = env();
@@ -2641,6 +2664,7 @@ async fn a_permission_rule_refuses_what_it_denies() {
         atomcode_capabilities::tools::PermissionRules::parse(&[], &["write_file".to_string()]);
     assert!(invalid.is_empty());
     start.agent.permission_rules = Arc::new(rules);
+    start.agent.initial_mode = RuntimeMode::Auto;
     let mut runtime = CodingRuntime::start(start).await.unwrap();
 
     turn(&mut runtime, "write denied.txt").await;
@@ -6525,6 +6549,7 @@ mod criteria {
         an_undo_is_told_that_the_files_stayed,
         the_ui_language_does_not_reach_the_persona,
         a_permission_rule_refuses_what_it_denies,
+        startup_modes_seed_the_owner_and_reload_preserves_a_temporary_switch,
         a_round_budget_ends_the_turn,
         #[cfg(unix)]
         what_the_model_is_told_about_mcp_only_names_ways_this_build_has,

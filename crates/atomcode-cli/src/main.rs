@@ -2040,7 +2040,7 @@ async fn run(process_start: std::time::Instant) -> Result<i32> {
                         SessionConfigOption::select(
                             atomcode::acp::options::MODE_CONFIG_ID,
                             "Mode",
-                            atomcode_coding::RuntimeMode::Build.wire(),
+                            runtime_cfg.initial_mode.wire(),
                             modes
                                 .iter()
                                 .map(|m| {
@@ -3176,13 +3176,6 @@ pub(crate) async fn spawn_native_cli_runtime(
         None => atomcode_coding::CodingRuntime::start_with_bootstrap(start, bootstrap).await,
     }
     .map_err(anyhow::Error::new)?;
-    if cfg.dangerously_skip_permissions {
-        runtime
-            .handle
-            .set_mode(atomcode_coding::RuntimeMode::Auto)
-            .await
-            .map_err(anyhow::Error::new)?;
-    }
     Ok((runtime, agent, continued_session))
 }
 

@@ -344,6 +344,11 @@ pub(crate) fn chat_runtime_config(
             config.coding.shell_guard_policy,
         ),
         permission_rules: std::sync::Arc::new(permission_rules),
+        initial_mode: config
+            .permissions
+            .default_mode
+            .map(Into::into)
+            .unwrap_or_default(),
         user_agent: p.and_then(|p| p.user_agent.clone()),
         headers: p.map(|p| p.headers.clone()).unwrap_or_default(),
         skip_tls_verify: p.map(|p| p.skip_tls_verify).unwrap_or(false),
@@ -3282,13 +3287,19 @@ mod tests {
             },
             "test".into(),
         );
+        let mut config = atomcode_config::Config::default();
+        config.permissions.default_mode = Some(atomcode_config::config::DefaultExecutionMode::Plan);
         let runtime = live_runtime_config(
-            &atomcode_config::config::Config::default(),
+            &config,
             "missing-test-provider",
             &std::env::temp_dir(),
             telemetry,
         );
         assert!(runtime.interactive);
+        assert_eq!(
+            runtime.agent_config().initial_mode,
+            atomcode_coding::RuntimeMode::Plan
+        );
         assert_eq!(
             crate::kernel_runtime::coding_config_from_runtime(&runtime).request_timeout,
             None

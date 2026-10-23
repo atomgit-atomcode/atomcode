@@ -44,6 +44,10 @@ impl std::fmt::Debug for EngineConfig {
 }
 
 impl EngineConfig {
+    pub fn initial_mode(&self) -> atomcode_coding::RuntimeMode {
+        self.config.initial_mode
+    }
+
     pub fn from_coding_config(config: CodingAgentConfig) -> Self {
         Self {
             config,
@@ -208,6 +212,7 @@ mod tests {
         original.thinking_keep = Some("all".into());
         original.keep_interrupted_context = true;
         original.loop_max_rounds = 41;
+        original.initial_mode = atomcode_coding::RuntimeMode::Plan;
 
         let cfg = EngineConfig::from_coding_config(original)
             .to_coding_config(std::path::PathBuf::from("/session"));
@@ -224,6 +229,7 @@ mod tests {
         assert_eq!(cfg.thinking_keep.as_deref(), Some("all"));
         assert!(cfg.keep_interrupted_context);
         assert_eq!(cfg.loop_max_rounds, 41);
+        assert_eq!(cfg.initial_mode, atomcode_coding::RuntimeMode::Plan);
         assert_eq!(cfg.working_dir, std::path::PathBuf::from("/session"));
         assert_eq!(cfg.request_timeout, None);
     }

@@ -7074,6 +7074,17 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
             None
         }
     };
+    // An embedded TUI has already published its live mode. A standalone daemon
+    // seeds the same default before accepting chat/live requests.
+    if native_live::binding().is_err() {
+        live_api::live_set_mode(
+            startup_config
+                .as_ref()
+                .and_then(|config| config.permissions.default_mode)
+                .map(Into::into)
+                .unwrap_or_default(),
+        );
+    }
     let cfg_telemetry = startup_config
         .as_ref()
         .map(|c| c.telemetry.clone())

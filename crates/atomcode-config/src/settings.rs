@@ -106,6 +106,15 @@ const SCROLLBARS: &[&str] = &["auto", "always", "hidden"];
 
 pub static SETTINGS: &[SettingSpec] = &[
     SettingSpec {
+        id: "permissions.default_mode",
+        path: &["permissions", "default_mode"],
+        label_en: "Default execution mode (new runtime)",
+        label_zh: "默认执行模式（下次启动生效）",
+        aliases: &["mode", "permissions", "模式", "权限"],
+        kind: SettingKind::Choice(&["build", "plan", "accept-edits", "auto"]),
+        apply: ApplyPolicy::NextStartup,
+    },
+    SettingSpec {
         id: "compaction.token_limit",
         path: &["compaction", "token_limit"],
         label_en: "Automatic compaction token budget",
@@ -526,6 +535,12 @@ impl SettingSpec {
 
     pub fn value(&self, config: &Config) -> String {
         match self.id {
+            "permissions.default_mode" => config
+                .permissions
+                .default_mode
+                .map(|mode| mode.as_str())
+                .unwrap_or("build")
+                .to_string(),
             "compaction.token_limit" => config
                 .compaction
                 .token_limit
@@ -810,6 +825,32 @@ pub fn patch_selection_retry_max_attempts(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn default_mode_setting_preserves_rules_and_can_be_reset() {
+        let spec = super::SETTINGS
+            .iter()
+            .find(|s| s.id == "permissions.default_mode")
+            .unwrap();
+        assert_eq!(spec.apply, super::ApplyPolicy::NextStartup);
+        let mut doc = "[permissions]\nallow = [\"Read(src/**)\"]\ndeny = [\"Bash(rm *)\"]\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        for mode in ["build", "plan", "accept-edits", "auto"] {
+            spec.patch(&mut doc, mode).unwrap();
+            let config: crate::Config = toml::from_str(&doc.to_string()).unwrap();
+            assert_eq!(spec.value(&config), mode);
+            assert_eq!(config.permissions.deny, ["Bash(rm *)"]);
+        }
+        let before = doc.to_string();
+        assert!(spec.patch(&mut doc, "typo").is_err());
+        assert_eq!(doc.to_string(), before);
+        spec.reset(&mut doc);
+        let config: crate::Config = toml::from_str(&doc.to_string()).unwrap();
+        assert_eq!(spec.value(&config), "build");
+        assert_eq!(config.permissions.allow, ["Read(src/**)"]);
+        assert!(config.permissions.default_mode.is_none());
+    }
+
     use super::*;
     #[test]
     fn compaction_budget_is_optional_positive_and_resettable() {

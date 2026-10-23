@@ -302,6 +302,27 @@ impl OutputToolConfig {
     }
 }
 
+/// Default execution mode for newly constructed coding runtimes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DefaultExecutionMode {
+    Build,
+    Plan,
+    AcceptEdits,
+    Auto,
+}
+
+impl DefaultExecutionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Build => "build",
+            Self::Plan => "plan",
+            Self::AcceptEdits => "accept-edits",
+            Self::Auto => "auto",
+        }
+    }
+}
+
 /// `[permissions]` — user-declared pre-authorization for tool calls, so the common
 /// commands in a project stop prompting without reaching for the all-or-nothing
 /// `--dangerously-skip-permissions`.
@@ -313,12 +334,16 @@ impl OutputToolConfig {
 ///
 /// ```toml
 /// [permissions]
+/// default_mode = "build" # plan / accept-edits / auto
 /// allow = ["Bash(git *)", "Bash(cargo test*)", "Read(src/**)"]
 /// deny  = ["Bash(rm -rf *)"]
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PermissionsConfig {
+    /// Startup mode; temporary mode changes never write this value back.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_mode: Option<DefaultExecutionMode>,
     /// Calls matching any of these run WITHOUT an approval prompt.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow: Vec<String>,
@@ -328,9 +353,9 @@ pub struct PermissionsConfig {
 }
 
 impl PermissionsConfig {
-    /// No rules declared — the table carries nothing and is omitted on save.
+    /// No startup mode or rules declared — omit the empty table on save.
     pub fn is_empty(&self) -> bool {
-        self.allow.is_empty() && self.deny.is_empty()
+        self.default_mode.is_none() && self.allow.is_empty() && self.deny.is_empty()
     }
 }
 
@@ -2997,6 +3022,32 @@ kind = "claude-code"
             text.contains("[permissions]"),
             "a non-empty table must persist"
         );
+    }
+
+    #[test]
+    fn default_execution_mode_round_trips_without_losing_rules() {
+        for mode in ["build", "plan", "accept-edits", "auto"] {
+            let input = format!("[permissions]\ndefault_mode = {mode:?}\nallow = [\"Read(src/**)\"]\ndeny = [\"Bash(rm *)\"]\n");
+            let config: Config = toml::from_str(&input).unwrap();
+            assert_eq!(config.permissions.default_mode.unwrap().as_str(), mode);
+            let text = toml::to_string(&config).unwrap();
+            let restored: Config = toml::from_str(&text).unwrap();
+            assert_eq!(
+                restored.permissions.default_mode,
+                config.permissions.default_mode
+            );
+            assert_eq!(restored.permissions.allow, config.permissions.allow);
+            assert_eq!(restored.permissions.deny, config.permissions.deny);
+        }
+        let config: Config = toml::from_str("[permissions]\ndefault_mode = \"auto\"\n").unwrap();
+        assert!(!config.permissions.is_empty());
+        assert!(toml::to_string(&config).unwrap().contains("[permissions]"));
+        for value in ["typo", "bypass", "accept_edits", ""] {
+            assert!(toml::from_str::<Config>(&format!(
+                "[permissions]\ndefault_mode = {value:?}\n"
+            ))
+            .is_err());
+        }
     }
 
     /// `[permissions]` must parse from TOML and default to empty when absent — an older

@@ -45,9 +45,9 @@ pub fn runtime_mode_from_id(id: &str) -> Option<RuntimeMode> {
     }
 }
 
-/// Initial `SessionModeState`: kernel default mode (`build`) plus all modes.
-pub fn session_mode_state() -> SessionModeState {
-    SessionModeState::new(RuntimeMode::Build.wire(), session_modes())
+/// Initial mode plus the full mode catalog; wire names stay unchanged.
+pub fn session_mode_state(mode: RuntimeMode) -> SessionModeState {
+    SessionModeState::new(mode.wire(), session_modes())
 }
 
 /// Apply a client-supplied value to one option in the catalog, in place.
@@ -346,9 +346,15 @@ mod tests {
         let modes = session_modes();
         let ids: Vec<&str> = modes.iter().map(|m| m.id.0.as_ref()).collect();
         assert_eq!(ids, vec!["build", "accept_edits", "bypass", "plan"]);
-        let state = session_mode_state();
+        let state = session_mode_state(RuntimeMode::Build);
         assert_eq!(state.current_mode_id.0.as_ref(), "build");
         assert_eq!(state.available_modes.len(), 4);
+        for mode in [K::Plan, K::AcceptEdits, K::Auto] {
+            assert_eq!(
+                session_mode_state(mode).current_mode_id.0.as_ref(),
+                mode.wire()
+            );
+        }
     }
 
     #[test]

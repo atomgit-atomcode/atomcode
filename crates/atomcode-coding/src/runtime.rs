@@ -558,6 +558,18 @@ pub enum RuntimeMode {
     Plan,
 }
 
+impl From<atomcode_config::config::DefaultExecutionMode> for RuntimeMode {
+    fn from(mode: atomcode_config::config::DefaultExecutionMode) -> Self {
+        use atomcode_config::config::DefaultExecutionMode as ConfigMode;
+        match mode {
+            ConfigMode::Build => Self::Build,
+            ConfigMode::Plan => Self::Plan,
+            ConfigMode::AcceptEdits => Self::AcceptEdits,
+            ConfigMode::Auto => Self::Auto,
+        }
+    }
+}
+
 impl RuntimeMode {
     pub fn next(self) -> Self {
         match self {
@@ -3357,6 +3369,7 @@ impl CodingRuntime {
             .await
             .map_err(runtime_start_prepare_error)?
         };
+        set_mode_flags(&parts, agent.initial_mode);
         parts.register_extra_tool(Arc::new(ScheduleWakeupTool::new(
             wakeup_tx.clone(),
             Arc::clone(&loop_active),
@@ -6537,18 +6550,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             continue;
                         }
                         let before = current_mode(&runtime.parts);
-                        runtime.parts.plan_mode.store(
-                            matches!(mode, RuntimeMode::Plan),
-                            Ordering::Release,
-                        );
-                        runtime.parts.bypass_mode.store(
-                            matches!(mode, RuntimeMode::Auto),
-                            Ordering::Release,
-                        );
-                        runtime.parts.accept_edits.store(
-                            matches!(mode, RuntimeMode::AcceptEdits),
-                            Ordering::Release,
-                        );
+                        set_mode_flags(&runtime.parts, mode);
                         tell(runtime, crate::told::mode_changed(before, mode));
                         let _ = runtime_event_tx.send(CodingRuntimeEvent::ModeChanged { mode });
                         let _ = done.send(Ok(()));
@@ -11494,6 +11496,18 @@ fn tell(runtime: &RuntimeResources, said: Option<String>) {
     if let Some(agent) = live_root_agent(runtime) {
         agent.note(said, atomcode_harness::session::InjectionOrigin::Reminder);
     }
+}
+
+fn set_mode_flags(parts: &crate::CodingParts, mode: RuntimeMode) {
+    parts
+        .plan_mode
+        .store(matches!(mode, RuntimeMode::Plan), Ordering::Release);
+    parts
+        .bypass_mode
+        .store(matches!(mode, RuntimeMode::Auto), Ordering::Release);
+    parts
+        .accept_edits
+        .store(matches!(mode, RuntimeMode::AcceptEdits), Ordering::Release);
 }
 
 /// The execution mode, decoded from the three flags `SetMode` writes — not a
