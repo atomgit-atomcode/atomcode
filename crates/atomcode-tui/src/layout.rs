@@ -110,16 +110,16 @@ impl Layout {
 
     /// Apply one op. Never panics, never leaves an invalid tree, and never
     /// silently does nothing — a refusal always says why.
-    pub fn apply(&self, op: &LayoutOp, known: &[String]) -> Result<(), LayoutError> {
+    pub fn apply(&self, op: &LayoutOp, known: &[&str]) -> Result<(), LayoutError> {
         let current = self.tree();
         let on_screen: Vec<String> = current.modules();
 
         let next = match op {
             LayoutOp::Show { module, side, size } => {
-                if !known.iter().any(|k| k == module) {
+                if !known.iter().any(|k| module == *k) {
                     return Err(LayoutError::NoSuchModule {
                         name: module.clone(),
-                        available: known.to_vec(),
+                        available: known.iter().copied().map(String::from).collect(),
                     });
                 }
                 if on_screen.contains(module) {
@@ -160,11 +160,8 @@ impl Layout {
 mod tests {
     use super::*;
 
-    fn known() -> Vec<String> {
-        ["status", "input", "mascot", "findings"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect()
+    fn known() -> Vec<&'static str> {
+        vec!["status", "input", "mascot", "findings"]
     }
 
     fn layout() -> Layout {
