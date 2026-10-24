@@ -421,12 +421,11 @@ impl Plugin for MascotPanel {
         let m: Arc<Modules> = mods.clone();
         let l = layout.clone();
         let _ = ctx.effect(move || {
-            let known = m.view_ids();
             let _ = l.apply(
                 &LayoutOp::Hide {
                     module: id.to_string(),
                 },
-                &known,
+                &[],
             );
             m.remove_view(id);
         });
@@ -477,12 +476,11 @@ impl Plugin for TeamPanel {
         let m: Arc<Modules> = mods.clone();
         let l = layout.clone();
         let _ = ctx.effect(move || {
-            let known = m.view_ids();
             let _ = l.apply(
                 &LayoutOp::Hide {
                     module: id.to_string(),
                 },
-                &known,
+                &[],
             );
             m.remove_view(id);
         });

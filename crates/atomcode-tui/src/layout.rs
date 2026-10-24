@@ -110,6 +110,7 @@ impl Layout {
 
     /// Apply one op. Never panics, never leaves an invalid tree, and never
     /// silently does nothing — a refusal always says why.
+    /// `known` validates Show; Hide only checks the current tree and accepts `&[]`.
     pub fn apply(&self, op: &LayoutOp, known: &[&str]) -> Result<(), LayoutError> {
         let current = self.tree();
         let on_screen: Vec<String> = current.modules();
@@ -186,7 +187,7 @@ mod tests {
             &LayoutOp::Hide {
                 module: "mascot".into(),
             },
-            &known(),
+            &[],
         )
         .unwrap();
         assert_eq!(l.tree(), before, "back to exactly where it started");
