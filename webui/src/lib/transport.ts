@@ -9,16 +9,35 @@ export function validRelayCredentials(value: unknown): value is RelayCredentials
     && typeof v.token === 'string' && credential.test(v.token);
 }
 
+/** Short fragment keys encode lowercase hex credential bytes as Base64URL. */
+function compactHex(value: string | null): string | null {
+  if (!value || !/^[A-Za-z0-9_-]{11,171}$/.test(value) || value.length % 4 === 1) return null;
+  try {
+    const bytes = atob(value.replace(/-/g, '+').replace(/_/g, '/'));
+    const canonical = btoa(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    if (canonical !== value) return null;
+    return Array.from(bytes, ch => ch.charCodeAt(0).toString(16).padStart(2, '0')).join('');
+  } catch { return null; }
+}
+
+function hasPairing(params: URLSearchParams): boolean {
+  return params.has('relay') || params.has('r') || params.has('t');
+}
+
 export function loadRelayCredentials(
   hash: string,
   storage?: Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>,
 ): RelayCredentials | null {
   const params = new URLSearchParams(hash.replace(/^#/, ''));
-  if (params.has('relay')) {
-    const value = { route: params.get('relay'), token: params.get('token') };
+  if (hasPairing(params)) {
+    const short = params.has('r') || params.has('t');
+    const value = short
+      ? { route: compactHex(params.get('r')), token: compactHex(params.get('t')) }
+      : { route: params.get('relay'), token: params.get('token') };
+    const mixed = short && (params.has('relay') || params.has('token'));
     // A replacement pairing must never silently reuse the old machine.
     try { storage?.removeItem(STORAGE_KEY); } catch { /* private mode */ }
-    if (!validRelayCredentials(value)) return null;
+    if (mixed || !validRelayCredentials(value)) return null;
     try { storage?.setItem(STORAGE_KEY, JSON.stringify(value)); } catch { /* memory-only */ }
     return value;
   }
@@ -49,7 +68,7 @@ if (relayPage) {
   let storage: Storage | undefined;
   try { storage = sessionStorage; } catch { /* memory-only */ }
   relay = loadRelayCredentials(location.hash, storage);
-  if (new URLSearchParams(location.hash.slice(1)).has('relay') && relayPairingSaved(relay, storage)) {
+  if (hasPairing(new URLSearchParams(location.hash.slice(1))) && relayPairingSaved(relay, storage)) {
     history.replaceState(null, '', location.pathname + location.search);
   }
 }

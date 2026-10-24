@@ -88,11 +88,34 @@ fn relay_base(base: &str) -> Result<(String, String), String> {
 }
 
 fn mobile_url(base: &str, route: &str, token: &str, sync: bool) -> String {
+    use base64::Engine;
+    // Encode the original bytes, not the hexadecimal text. The short keys
+    // identify this format; arbitrary injected credentials keep the legacy URL.
+    let compact = |value: &str| -> Option<String> {
+        if value.len() % 2 != 0 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let bytes = (0..value.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&value[i..i + 2], 16).ok())
+            .collect::<Option<Vec<_>>>()?;
+        let restored = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        if restored != value {
+            return None;
+        }
+        Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+    };
+    let fragment = match (compact(route), compact(token)) {
+        (Some(route), Some(token)) => format!("r={route}&t={token}"),
+        _ => format!(
+            "relay={}&token={}",
+            crate::tui_share::escaped(route),
+            crate::tui_share::escaped(token)
+        ),
+    };
     format!(
-        "{base}/webui/{}#relay={}&token={}",
-        if sync { "?sync=1" } else { "" },
-        crate::tui_share::escaped(route),
-        crate::tui_share::escaped(token)
+        "{base}/webui/{}#{fragment}",
+        if sync { "?sync=1" } else { "" }
     )
 }
 
@@ -250,6 +273,26 @@ mod tests {
             url.fragment(),
             Some("relay=route-secret&token=webui-secret")
         );
+    }
+    #[test]
+    fn compact_mobile_link_preserves_every_credential_byte() {
+        let route = "c0058cf6c0f274dfe7994b84ee2a4b5097f1ade1c510da538065cd367e69fac1";
+        let token = "fa3ea824a5ef913362a3f552fdea1cb9";
+        let compact = mobile_url("https://relay.example", route, token, true);
+        assert_eq!(compact, "https://relay.example/webui/?sync=1#r=wAWM9sDydN_nmUuE7ipLUJfxreHFENpTgGXNNn5p-sE&t=-j6oJKXvkTNio_VS_eocuQ");
+        let legacy = format!("https://relay.example/webui/?sync=1#relay={route}&token={token}");
+        assert!(compact.len() < legacy.len());
+        let old_qr = atomcode_tui::qr::code(&legacy).expect("legacy QR");
+        let new_qr = atomcode_tui::qr::code(&compact).expect("compact QR");
+        assert!(new_qr.rows < old_qr.rows);
+        assert!(new_qr.columns < old_qr.columns);
+
+        // Case-sensitive/injected credentials must never be normalized.
+        assert!(
+            mobile_url("https://relay.example", "ABCDEF0123456789", token, false)
+                .contains("#relay=")
+        );
+        assert!(!mobile_url("https://relay.example", route, token, false).contains('?'));
     }
     #[test]
     fn remote_credentials_require_tls_and_no_url_credentials() {

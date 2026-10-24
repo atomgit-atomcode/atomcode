@@ -65,3 +65,25 @@ test('a pairing fragment is removed only after the exact pairing survives storag
   assert.deepEqual(loadRelayCredentials(hash, readOnly), credentials);
   assert.equal(relayPairingSaved(credentials, readOnly), false, 'never reload into the old machine');
 });
+
+
+test('compact pairing restores the original credentials and survives reload', () => {
+  const original = { route: 'c0058cf6c0f274dfe7994b84ee2a4b5097f1ade1c510da538065cd367e69fac1', token: 'fa3ea824a5ef913362a3f552fdea1cb9' };
+  // Fixed fixture shared with the Rust URL producer.
+  const hash = '#r=wAWM9sDydN_nmUuE7ipLUJfxreHFENpTgGXNNn5p-sE&t=-j6oJKXvkTNio_VS_eocuQ';
+  const saved = new Map<string, string>();
+  const storage = { getItem: (key: string) => saved.get(key) ?? null, setItem: (key: string, value: string) => { saved.set(key, value); }, removeItem: (key: string) => { saved.delete(key); } };
+  assert.deepEqual(loadRelayCredentials(hash, storage), original);
+  assert.deepEqual(loadRelayCredentials('', storage), original);
+  assert.equal(relayPairingSaved(original, storage), true);
+  const [, init] = relayRequest(loadRelayCredentials(hash)!, '/project');
+  assert.equal(new Headers(init.headers).get('X-Atom-Token'), original.route);
+  assert.equal(new Headers(init.headers).get('Authorization'), 'Bearer ' + original.token);
+});
+
+test('malformed or mixed compact links fail closed instead of reusing stored credentials', () => {
+  const storage = { getItem: () => JSON.stringify(credentials), removeItem: () => {} };
+  for (const hash of ['#r=bad&t=bad', '#t=-j6oJKXvkTNio_VS_eocuQ', '#r=AAAAAAAAAAA&t=AAAAAAAAAAB', '#r=AAAAAAAAAAA&t=AAAAAAAAAAA&relay=old', '#r=AAAAAAAAAAA&t=AAAAAAAAAAA&token=old']) {
+    assert.equal(loadRelayCredentials(hash, storage), null, hash);
+  }
+});
