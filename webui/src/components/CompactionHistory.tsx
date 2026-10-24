@@ -3,17 +3,39 @@ import { getSessionTranscript, type TranscriptTurn } from '../api';
 import { useT } from '../settings';
 
 /** Read-only history; it never replaces the active conversation or composer. */
-export function CompactionHistory({ projectHash, sessionId }: { projectHash: string; sessionId: string }) {
+export function CompactionHistory({ projectHash, sessionId, focusTurn, onNavigate }: {
+  projectHash: string; sessionId: string; focusTurn?: { turnId: number; request: number; record?: TranscriptTurn } | null; onNavigate?: (node: HTMLElement) => void;
+}) {
   const t = useT();
   const [open, setOpen] = useState(false);
   const [turns, setTurns] = useState<TranscriptTurn[] | null>(null);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const pending = useRef<AbortController | null>(null);
+  const [focusedTurn, setFocusedTurn] = useState<number | null>(null);
+  const targetRef = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    if (focusTurn?.record) {
+      pending.current?.abort();
+      setOpen(true); setBusy(false); setError('');
+      setFocusedTurn(focusTurn.turnId); setTurns([focusTurn.record]);
+    } else if (focusTurn) void load(focusTurn.turnId);
+    else if (focusedTurn !== null) { pending.current?.abort(); setBusy(false); }
+  }, [focusTurn]);
+  useEffect(() => {
+    if (!open || focusedTurn === null || !turns || !focusTurn || focusedTurn !== focusTurn.turnId) return;
+    const frame = requestAnimationFrame(() => {
+      const node = targetRef.current;
+      if (!node) return;
+      if (onNavigate) onNavigate(node);
+      else node.scrollIntoView({ block: 'start', behavior: 'auto' });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [open, focusedTurn, turns, focusTurn]);
   useEffect(() => () => pending.current?.abort(), []);
-  async function load() {
+  async function load(target: number | null = null) {
     setOpen(true);
-    if (busy) return;
+    setFocusedTurn(target);
     pending.current?.abort();
     const controller = new AbortController();
     pending.current = controller;
@@ -34,11 +56,15 @@ export function CompactionHistory({ projectHash, sessionId }: { projectHash: str
       {t(open ? 'chat.historyClose' : 'chat.historyOpen')}
     </button>
     {open && <div class="compaction-history-records">
+      {focusedTurn !== null && <button type="button" onClick={() => void load()}>{t('chat.turnNavShowAll')}</button>}
       <p>{t('chat.historyExplanation')}</p>
       {busy && <p role="status">{t('chat.historyLoading')}</p>}
-      {error && <p role="alert">{t('chat.historyFailed')} {error} <button onClick={() => void load()}>{t('chat.historyRetry')}</button></p>}
+      {error && <p role="alert">{t('chat.historyFailed')} {error} <button onClick={() => void load(focusedTurn)}>{t('chat.historyRetry')}</button></p>}
       {turns?.length === 0 && <p>{t('chat.historyEmpty')}</p>}
-      {turns?.map(turn => <article key={turn.turn_id}>
+      {focusedTurn !== null && turns && !turns.some(turn => turn.turn_id === focusedTurn) && <p role="status">{t('chat.historyEmpty')}</p>}
+      {turns?.filter(turn => focusedTurn === null || turn.turn_id === focusedTurn).map(turn => <article key={turn.turn_id}
+        class={focusedTurn === turn.turn_id ? 'turn-nav-history-target' : undefined}
+        ref={el => { if (turn.turn_id === focusedTurn) targetRef.current = el; }}>
         <div>{t('chat.historyTurn')} {turn.turn_id}{turn.undone ? ` · ${t('chat.historyUndone')}` : ''}</div>
         <div>{t('chat.historyUser')}</div><pre>{turn.user}</pre>
         <div>{t('chat.historyAssistant')}</div><pre>{turn.assistant}</pre>

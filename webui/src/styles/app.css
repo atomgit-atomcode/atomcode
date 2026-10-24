@@ -4077,3 +4077,50 @@ body {
     display: none;
   }
 }
+
+/* Turn navigation floats over the outer gutter; it never resizes the reading lane. */
+.turn-nav-rail {
+  position: absolute; right: 8px; top: 20%; z-index: 22;
+  width: 32px; max-height: 52%; display: flex; flex-direction: column;
+  border-radius: 12px; color: var(--app-secondary-foreground);
+  background: var(--app-primary-background);
+  background: color-mix(in srgb, var(--app-primary-background) 94%, transparent);
+  border: 1px solid var(--app-border-subtle); box-shadow: 0 3px 14px #0000000b;
+}
+.turn-nav-rail.is-expanded { background: var(--app-primary-background); width: min(300px, calc(100% - 32px)); box-shadow: 0 8px 32px #00000018; }
+.turn-nav-toggle { width: 100%; min-height: 36px; display: flex; align-items: center; justify-content: center; gap: 10px; border: 0; background: transparent; color: inherit; cursor: pointer; border-radius: 10px; }
+.turn-nav-toggle span { flex: 1; text-align: left; font-size: 12px; font-weight: 600; }
+.turn-nav-toggle small { margin-left: 8px; font-weight: normal; opacity: .7; }
+.turn-nav-tabs { display: flex; gap: 4px; padding: 0 8px 7px; border-bottom: 1px solid var(--app-border-subtle); }
+.turn-nav-tabs button { flex: 1; font-size: 11px; padding: 5px; border-radius: 5px; color: inherit; border: 0; background: transparent; cursor: pointer; }
+.turn-nav-tabs .is-active { color: var(--app-primary-foreground); background: var(--app-secondary-background); }
+.turn-nav-list { overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; height: min(340px, 38vh); height: min(340px, 38dvh); min-height: 0; scrollbar-width: thin; }
+.turn-nav-track { position: relative; }
+.turn-nav-node { position: absolute; left: 0; width: 100%; display: flex; align-items: center; gap: 10px; padding: 0 8px; border: 0; background: transparent; color: inherit; cursor: pointer; text-align: left; }
+.turn-nav-mark { width: 14px; height: 2px; flex-shrink: 0; border-radius: 2px; background: currentColor; opacity: .35; transition: opacity .15s, height .15s; }
+.turn-nav-node:hover, .turn-nav-node:focus-visible { background: var(--app-secondary-background); color: var(--app-primary-foreground); }
+.turn-nav-node.is-active .turn-nav-mark { opacity: 1; height: 4px; background: var(--app-accent-color); }
+.turn-nav-node.is-undone .turn-nav-mark { opacity: .3; background: transparent; border-top: 2px dashed currentColor; }
+.turn-nav-summary { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 3px; }
+.turn-nav-summary > span, .turn-nav-summary small { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.turn-nav-summary > span { font-size: 12px; color: var(--app-primary-foreground); }
+.turn-nav-summary b { font-size: 10px; font-weight: normal; opacity: .6; margin-right: 4px; }
+.turn-nav-summary small { font-size: 10px; opacity: .75; }
+.turn-nav-summary em { font-style: normal; }
+.turn-nav-status, .turn-nav-footnote { padding: 8px 10px; font-size: 11px; margin: 0; }
+.turn-nav-status button { color: inherit; text-decoration: underline; border: 0; background: none; cursor: pointer; }
+.turn-nav-footnote { border-top: 1px solid var(--app-border-subtle); opacity: .7; line-height: 1.5; }
+.turn-nav-rail button:focus-visible { outline: 2px solid var(--app-accent-color); outline-offset: -2px; }
+.turn-nav-history-target { scroll-margin-top: 20px; animation: turn-nav-flash 1.8s ease-out; }
+@keyframes turn-nav-flash { from { background: #8294ee30; } to { background: transparent; } }
+@media (max-width: 768px) {
+  .turn-nav-rail { right: 6px; top: 64px; max-height: 46%; }
+  .turn-nav-rail:not(.is-expanded) .turn-nav-list { display: none; }
+  .turn-nav-toggle { min-height: 44px; }
+  .turn-nav-rail.is-expanded { width: min(300px, calc(100% - 24px)); }
+  .turn-nav-tabs button { min-height: 36px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .turn-nav-mark { transition: none; }
+  .turn-nav-history-target { animation: none; outline: 2px solid var(--app-accent-color); }
+}

@@ -46,6 +46,9 @@ import { beginModeSwitch, completeModeSwitch, failModeSwitch, initModeState, mod
 import { Markdown } from './Markdown';
 import { isRetainedHistoryUserMessage } from '../lib/historyMessages';
 import { CompactionHistory } from './CompactionHistory';
+import { TurnNavRail } from './TurnNavRail';
+import type { TranscriptTurn } from '../api';
+import { deriveTurnNavigation, turnAtReadingLine, createTurnNavigationIntent } from '../lib/turnNavigation';
 import { ModelSelector } from './ModelSelector';
 import { ModeSelector } from './ModeSelector';
 import { AttachMenu } from './AttachMenu';
@@ -647,6 +650,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   // stays put. A ref (not state) avoids re-rendering on every scroll event.
   const scrollRef = useRef<HTMLDivElement>(null);
   const atBottomRef = useRef(true);
+  const [activeNavIndex, setActiveNavIndex] = useState(0);
+  const [navHighlight, setNavHighlight] = useState<number | null>(null);
+  const navFlashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const navScrollIntent = useRef(createTurnNavigationIntent());
+  const [historyTarget, setHistoryTarget] = useState<{ turnId: number; request: number; scope: string; record: TranscriptTurn } | null>(null);
+
   const scrollRestorationRef = useRef<ReturnType<typeof createScrollRestoration> | null>(null);
   const [showJumpBtn, setShowJumpBtn] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -1076,6 +1085,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   const recomputeAtBottom = () => {
     const el = scrollRef.current;
     if (!el || document.visibilityState === 'hidden') return;
+    const navigationFollow = navScrollIntent.current.onScroll(el);
+    if (navigationFollow !== null) {
+      atBottomRef.current = navigationFollow;
+      setShowJumpBtn(!navigationFollow);
+      return;
+    }
     const atBottom = scrollRestorationRef.current
       ? scrollRestorationRef.current.onScroll()
       : (el.clientHeight > 0 ? el.scrollHeight - el.scrollTop - el.clientHeight <= BOTTOM_SLACK : null);
@@ -1084,6 +1099,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     setShowJumpBtn((v) => (v === !atBottom ? v : !atBottom));
   };
   const scrollToBottom = (behavior: ScrollBehavior = 'auto') => {
+    navScrollIntent.current.interact();
+    if (behavior === 'smooth') navScrollIntent.current.followBottom();
     scrollRestorationRef.current?.interact();
     atBottomRef.current = true;
     setShowJumpBtn(false);
@@ -3219,6 +3236,61 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   }, [messages, searchTrim, searchOpen]);
   // 匹配消息 origIdx → DOM 节点,供 ↑/↓/Enter 滚动定位。每次渲染重填。
   const matchRefs = useRef<Record<number, HTMLElement | null>>({});
+  const navigationScope = `${activeSession?.project_hash ?? ''}/${sessionId ?? ''}`;
+  const navTurns = useMemo(() => deriveTurnNavigation(messages,
+    new Set(pendingSteers.filter(steer => steer.confirmed).map(steer => steer.id))), [messages, pendingSteers]);
+  function updateActiveTurn() {
+    const el = scrollRef.current;
+    if (!el || navTurns.length === 0) return;
+    const readingLine = el.getBoundingClientRect().top + 48;
+    const index = turnAtReadingLine(navTurns.length, i =>
+      matchRefs.current[navTurns[i].messageIndex]?.getBoundingClientRect().top ?? Infinity, readingLine);
+    setActiveNavIndex(previous => previous === index ? previous : index);
+  }
+  function interactWithTimeline() {
+    navScrollIntent.current.interact();
+    scrollRestorationRef.current?.interact();
+    setHistoryTarget(null);
+  }
+  function releaseNavigationFollow() {
+    navScrollIntent.current.interact();
+    scrollRestorationRef.current?.interact();
+    atBottomRef.current = false;
+    setShowJumpBtn(true);
+  }
+  function navigateNode(node: HTMLElement) {
+    const viewport = scrollRef.current;
+    if (!viewport) return;
+    releaseNavigationFollow();
+    const top = viewport.scrollTop + node.getBoundingClientRect().top - viewport.getBoundingClientRect().top - 20;
+    const target = Math.max(0, Math.min(top, viewport.scrollHeight - viewport.clientHeight));
+    navScrollIntent.current.jumpTo(target);
+    viewport.scrollTo({ top: target,
+      behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
+  }
+  function navigateTurn(messageIndex: number) {
+    const node = matchRefs.current[messageIndex];
+    if (!node) return;
+    setHistoryTarget(null);
+    navigateNode(node);
+    setNavHighlight(messageIndex);
+    if (navFlashTimer.current) clearTimeout(navFlashTimer.current);
+    navFlashTimer.current = setTimeout(() => setNavHighlight(null), 1800);
+  }
+  function navigateHistoricalTurn(record: TranscriptTurn) {
+    releaseNavigationFollow();
+    navScrollIntent.current.jumpTo(Infinity); // Hold follow while the read-only record is loading.
+    setHistoryTarget(previous => ({ turnId: record.turn_id, record, request: (previous?.request ?? 0) + 1, scope: navigationScope }));
+  }
+  useEffect(() => {
+    setHistoryTarget(null); setNavHighlight(null); setActiveNavIndex(0); navScrollIntent.current.interact();
+    return () => { if (navFlashTimer.current) clearTimeout(navFlashTimer.current); };
+  }, [navigationScope]);
+  useEffect(() => {
+    const frame = requestAnimationFrame(updateActiveTurn);
+    return () => cancelAnimationFrame(frame);
+  }, [navTurns, navigationScope]);
+
   const [matchIdx, setMatchIdxState] = useState(0);
   // P3 修复: 用 ref 镜像 matchIdx,让事件处理器在快速连击时永远读到最新值
   const matchIdxRef = useRef(0);
@@ -3679,15 +3751,15 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   return (
     <>
       {/* Message timeline */}
-      <div class="messages-container" ref={scrollRef} onScroll={recomputeAtBottom}
-        onWheel={() => scrollRestorationRef.current?.interact()}
-        onTouchStart={() => scrollRestorationRef.current?.interact()}
-        onPointerDown={() => scrollRestorationRef.current?.interact()}
-        onKeyDown={() => scrollRestorationRef.current?.interact()}>
+      <div class="messages-container" ref={scrollRef} onScroll={() => { recomputeAtBottom(); updateActiveTurn(); }}
+        onWheel={interactWithTimeline}
+        onTouchStart={interactWithTimeline}
+        onPointerDown={interactWithTimeline}
+        onKeyDown={interactWithTimeline}>
         <div class="timeline-inner">
         {sessionId && activeSession?.id === sessionId && activeSession.project_hash && <CompactionHistory
           key={`${activeSession.project_hash}/${sessionId}`}
-          projectHash={activeSession.project_hash} sessionId={sessionId}
+          projectHash={activeSession.project_hash} sessionId={sessionId} focusTurn={historyTarget?.scope === navigationScope ? historyTarget : null} onNavigate={navigateNode}
         />}
         {messages.length === 0 && !historyHint && !restoring && loading && (
           <div class="messages-empty">
@@ -3747,7 +3819,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
             const isLast = idx === lastVisibleIdx;
             const setMatchRef = (el: HTMLElement | null) => { matchRefs.current[origIdx] = el; };
             const timeLabel = formatMsgTime(msg.ts);
-            const isActiveSearchMatch = searchOpen && searchTrim ? (origIdx === matchPositions[matchIdx]) : false;
+            const isActiveSearchMatch = origIdx === navHighlight || (searchOpen && searchTrim ? (origIdx === matchPositions[matchIdx]) : false);
 
             if (msg.role === 'user') {
               return (
@@ -3857,6 +3929,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
           </div>
         )}
       </div>
+
+      <TurnNavRail key={`${activeSession?.project_hash ?? ''}/${sessionId ?? ''}`}
+        items={navTurns} activeIndex={activeNavIndex}
+        projectHash={activeSession?.id === sessionId ? activeSession.project_hash : undefined}
+        sessionId={sessionId ?? undefined} streaming={loading}
+        onNavigate={navigateTurn} onHistory={navigateHistoricalTurn} />
 
       {/* 浮动搜索框:默认隐藏,Cmd/Ctrl+F 呼出,Esc/× 关闭。仿浏览器 Find-in-page 样式:
           长条胶囊、无图标、右侧依次 ↑ ↓ ×。position:absolute 钉在容器右上角,不占布局空间。
