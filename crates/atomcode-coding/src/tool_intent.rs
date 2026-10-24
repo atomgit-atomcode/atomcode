@@ -75,7 +75,11 @@ const INTENT_GUIDE: &str = "Every tool call carries an `intent` argument: one sh
      saying WHY you are making this call — the purpose, not the mechanics, in the language the \
      person is speaking. It is shown to the person on the call's own line, so give a reason they \
      would recognise (\"finding where credentials are loaded\", not \"reading a file\"). Fill it \
-     in on every call.";
+     in on every call. This visible tool title is the announcement for a routine action: do not \
+     repeat its purpose in assistant prose immediately before or after the call. Use prose for \
+     new findings, meaningful outcomes, blockers, changed plans, or decisions the person needs \
+     to make. During retries, name the changed condition in the intent instead of repeating \
+     the overall goal; report the cause or a change of approach once when it is useful.";
 
 pub struct ToolIntentPlugin;
 
