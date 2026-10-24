@@ -4030,3 +4030,50 @@ body {
 .session-reference-chips { display: flex; flex-wrap: wrap; gap: 6px; padding: 4px 0; }
 .session-reference-chip { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--app-input-border); border-radius: 8px; padding: 3px 8px; font-size: 12px; }
 .session-reference-chip button { border: 0; background: transparent; color: inherit; cursor: pointer; }
+
+/* Access recovery covers the mounted app without discarding draft or layout. */
+.auth-required-overlay { position: fixed; inset: 0; z-index: 1000; overflow: auto; background: var(--app-primary-background, #fff); }
+.btn-auth-retry { min-height: 44px; padding: 8px 16px; border: 1px solid var(--app-input-border); border-radius: 8px; background: var(--app-input-background); color: inherit; cursor: pointer; }
+.btn-auth-retry:disabled { opacity: .6; cursor: wait; }
+
+@media (max-width: 768px) {
+  /* Focus inside reveals the existing toolbar. Attachments/errors stay visible. */
+  .input-box:not(:focus-within):not(.has-input-detail) {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 6px;
+  }
+  .input-box:not(:focus-within):not(.has-input-detail) .message-input {
+    grid-column: 1;
+    grid-row: 1;
+    height: 44px !important; /* overrides a previous multiline inline height */
+    min-height: 44px;
+    max-height: 44px;
+    padding: 10px 4px;
+    overflow: hidden;
+  }
+  .input-box:not(:focus-within):not(.has-input-detail) .input-footer,
+  .input-box:not(:focus-within):not(.has-input-detail) .input-footer-actions {
+    display: contents;
+  }
+  .input-box:not(:focus-within):not(.has-input-detail) .input-footer-primary,
+  .input-box:not(:focus-within):not(.has-input-detail) .mode-selector,
+  .input-box:not(:focus-within):not(.has-input-detail) .model-controls,
+  .input-box:not(:focus-within):not(.has-input-detail) .session-reference-chips,
+  .input-box:not(:focus-within):not(.has-input-detail) .input-turn-controls > .btn-send {
+    display: none;
+  }
+  .input-box:not(:focus-within):not(.has-input-detail) .input-turn-controls {
+    grid-column: 2;
+    grid-row: 1;
+  }
+  .input-box:not(:focus-within):not(.has-input-detail):not(.is-running) .input-turn-controls {
+    display: none;
+  }
+  .input-box:not(:focus-within):not(.has-input-detail) ~ .input-subbar,
+  .input-box:not(:focus-within):not(.has-input-detail) ~ .turn-stats {
+    display: none;
+  }
+}

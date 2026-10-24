@@ -106,6 +106,7 @@ import {
   shouldApplySteerProviderFallback,
   type PendingLiveSteer,
 } from '../lib/liveSteer';
+import { createScrollRestoration } from '../lib/scrollRestoration';
 import { hasCoarsePointer, shouldSendComposerOnEnter } from '../lib/composerKeyboard';
 import { randomId } from '../lib/randomId';
 import { completedTurnStats, formatTurnDuration, formatTurnTokens, turnCacheHit } from '../lib/turnStats';
@@ -641,12 +642,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   const lastLiveActivityRef = useRef<number>(Date.now());
   // Pending reconnect backoff timer, so teardown can cancel it.
   const reconnectTimerRef = useRef<number | null>(null);
-  const bottomRef = useRef<HTMLDivElement>(null);
   // Scroll container + "am I at the bottom?" tracking. Auto-follow during streaming
   // ONLY while the user is at the bottom; scrolling up releases the follow so history
   // stays put. A ref (not state) avoids re-rendering on every scroll event.
   const scrollRef = useRef<HTMLDivElement>(null);
   const atBottomRef = useRef(true);
+  const scrollRestorationRef = useRef<ReturnType<typeof createScrollRestoration> | null>(null);
   const [showJumpBtn, setShowJumpBtn] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [coarsePointer, setCoarsePointer] = useState(hasCoarsePointer);
@@ -1074,19 +1075,24 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   const BOTTOM_SLACK = 80;
   const recomputeAtBottom = () => {
     const el = scrollRef.current;
-    if (!el) return;
-    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= BOTTOM_SLACK;
+    if (!el || document.visibilityState === 'hidden') return;
+    const atBottom = scrollRestorationRef.current
+      ? scrollRestorationRef.current.onScroll()
+      : (el.clientHeight > 0 ? el.scrollHeight - el.scrollTop - el.clientHeight <= BOTTOM_SLACK : null);
+    if (atBottom === null) return;
     atBottomRef.current = atBottom;
     setShowJumpBtn((v) => (v === !atBottom ? v : !atBottom));
   };
   const scrollToBottom = (behavior: ScrollBehavior = 'auto') => {
+    scrollRestorationRef.current?.interact();
     atBottomRef.current = true;
     setShowJumpBtn(false);
     // Completion stats belong to the previous turn. Clear them as soon as a
     // new message is actually delivered so stale data is never shown while
     // the next turn is running or after an early transport failure.
     setTurnStats(null);
-    bottomRef.current?.scrollIntoView({ behavior });
+    const el = scrollRef.current;
+    if (el) el.scrollTo({ top: el.scrollHeight, behavior });
   };
 
   // Follow streaming output ONLY while the user is at the bottom. Scrolling up
@@ -1094,8 +1100,61 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   // atBottomRef=false), so history stays put mid-stream. Instant behavior so the
   // programmatic scroll lands immediately and the next scroll event reads "at bottom".
   useEffect(() => {
-    if (atBottomRef.current) bottomRef.current?.scrollIntoView({ behavior: 'auto' });
+    if (document.visibilityState !== 'hidden') scrollRestorationRef.current?.layout();
   }, [messages, tokens, queued.length]);
+
+  useEffect(() => {
+    const restore = createScrollRestoration({
+      viewport: () => scrollRef.current,
+      session: () => activeIdRef.current,
+      following: () => atBottomRef.current,
+      setFollowing: (following) => {
+        atBottomRef.current = following;
+        setShowJumpBtn(!following);
+      },
+      schedule: (run) => requestAnimationFrame(run),
+      cancel: (id) => cancelAnimationFrame(id),
+    });
+    scrollRestorationRef.current = restore;
+    const visibility = () => {
+      if (document.visibilityState === 'hidden') restore.suspend();
+      else restore.resume();
+    };
+    const pagehide = () => restore.suspend();
+    const pageshow = () => restore.resume();
+    const layout = () => { if (document.visibilityState !== 'hidden') restore.layout(); };
+    document.addEventListener('visibilitychange', visibility);
+    window.addEventListener('pagehide', pagehide);
+    window.addEventListener('pageshow', pageshow);
+    window.addEventListener('resize', layout);
+    window.visualViewport?.addEventListener('resize', layout);
+    restore.layout();
+    return () => {
+      restore.dispose();
+      scrollRestorationRef.current = null;
+      document.removeEventListener('visibilitychange', visibility);
+      window.removeEventListener('pagehide', pagehide);
+      window.removeEventListener('pageshow', pageshow);
+      window.removeEventListener('resize', layout);
+      window.visualViewport?.removeEventListener('resize', layout);
+    };
+  }, []);
+
+  // Track both viewport height (keyboard/composer) and delayed content layout.
+  // The observer reconnects as landing/chat branches mount different elements.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(() => {
+      if (document.visibilityState !== 'hidden') scrollRestorationRef.current?.layout();
+    });
+    observer.observe(el);
+    const content = el.querySelector('.timeline-inner');
+    if (content) observer.observe(content);
+    scrollRestorationRef.current?.layout();
+    return () => observer.disconnect();
+  }, [messages.length === 0, restoring, sessionId]);
+
 
   // Abort the live (/live) stream + cancel any pending reconnect timer if the
   // component unmounts while sync is on.
@@ -1518,8 +1577,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       // Older sessions may not have transcript records; leave those timestamps absent
       // instead of relabelling the whole conversation with the reconnect wall clock.
       const loaded = sessionMessagesToDisplay(e.messages);
-      // Live snapshot (session switch / reconnect) → start at the bottom.
-      atBottomRef.current = true;
+      // A new session starts at the bottom. Reconnection to the same session
+      // must preserve whether the reader was following or inspecting history.
+      if (e.session_id && activeIdRef.current !== e.session_id) {
+        scrollRestorationRef.current?.interact();
+        atBottomRef.current = true;
+        setShowJumpBtn(false);
+      }
       // A persisted snapshot does not carry live activity. Replay emits the
       // authoritative input/state observations immediately after it; only those
       // may restore `busy`. In particular, a history ending in a user message can
@@ -3225,8 +3289,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       : cleanCwd;
 
   // 输入框只渲染一份，按落地/常规两处择一挂载（避免两个 textarea 抢同一 ref）。
+  const canStop = busy || recoveryPolicy.allowStop || Boolean(goalProgress?.recovery);
   const inputBox = (
-    <div class="input-box">
+    <div class={'input-box' + (canStop ? ' is-running' : '') + (pendingImages.length || attachError ? ' has-input-detail' : '')}>
       {attachError && (
         <div class="input-attach-error" role="alert">
           <span>{attachError}</span>
@@ -3389,7 +3454,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
             onDefaultChange={followDefaultProvider}
           />
           <div class="input-turn-controls">
-            {busy || recoveryPolicy.allowStop || Boolean(goalProgress?.recovery) ? (
+            {canStop ? (
               <>
                 {/* /live folds this into the active turn; /chat queues it for the next turn. */}
                 {recoveryPolicy.allowSend && (input.trim() || pendingImages.length > 0) && (
@@ -3402,7 +3467,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
                     ↑
                   </button>
                 )}
-                <button class="btn-stop" onClick={handleStop} title={t('chat.stop')} aria-label={t('chat.stop')}>
+                <button class="btn-stop"
+                  // Keep a compact Stop from moving under the pointer when
+                  // :focus-within would otherwise expand the whole toolbar.
+                  onPointerDown={(e) => e.preventDefault()}
+                  onClick={handleStop} title={t('chat.stop')} aria-label={t('chat.stop')}>
                   <span class="stop-square" />
                 </button>
               </>
@@ -3610,7 +3679,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   return (
     <>
       {/* Message timeline */}
-      <div class="messages-container" ref={scrollRef} onScroll={recomputeAtBottom}>
+      <div class="messages-container" ref={scrollRef} onScroll={recomputeAtBottom}
+        onWheel={() => scrollRestorationRef.current?.interact()}
+        onTouchStart={() => scrollRestorationRef.current?.interact()}
+        onPointerDown={() => scrollRestorationRef.current?.interact()}
+        onKeyDown={() => scrollRestorationRef.current?.interact()}>
         <div class="timeline-inner">
         {sessionId && activeSession?.id === sessionId && activeSession.project_hash && <CompactionHistory
           key={`${activeSession.project_hash}/${sessionId}`}
@@ -3767,7 +3840,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
           </div>
         )}
 
-        <div ref={bottomRef} />
+        <div />
         </div>
         {/* Zero-height sticky seat, following Harness: the control belongs to the
             conversation scroller and is centered on the same content lane. */}

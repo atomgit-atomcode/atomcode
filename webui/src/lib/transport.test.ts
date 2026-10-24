@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createApiFetch, loadRelayCredentials, relayRequest } from './transport.ts';
+import { createApiFetch, loadRelayCredentials, relayRequest, relayPairingSaved } from './transport.ts';
 const credentials = { route: 'route-01234567890123456789', token: 'webui-01234567890123456789' };
 
 test('relay HTTP and SSE preserve body/signal and separate both credentials', () => {
@@ -43,4 +43,25 @@ test('an unpaired relay page asks to pair again without contacting local endpoin
   const local = createApiFetch(false, null, fetchFn);
   assert.equal((await local('/project')).status, 200);
   assert.equal(calls, 1);
+});
+
+
+test('a pairing fragment is removed only after the exact pairing survives storage', () => {
+  const saved = new Map<string, string>();
+  const storage = { getItem: (key: string) => saved.get(key) ?? null, setItem: (key: string, value: string) => { saved.set(key, value); }, removeItem: (key: string) => { saved.delete(key); } };
+  const hash = `#relay=${credentials.route}&token=${credentials.token}`;
+  assert.equal(relayPairingSaved(loadRelayCredentials(hash, storage), storage), true);
+  assert.equal(relayPairingSaved(credentials), false);
+  assert.equal(relayPairingSaved(null, storage), false);
+  const blocked = {
+    getItem: () => { throw new Error('blocked'); },
+    setItem: () => { throw new Error('blocked'); },
+    removeItem: () => { throw new Error('blocked'); },
+  };
+  assert.deepEqual(loadRelayCredentials(hash, blocked), credentials);
+  assert.equal(relayPairingSaved(credentials, blocked), false, 'retain the original fragment for reload');
+  const different = { ...credentials, route: 'another-machine-route-12345' };
+  const readOnly = { getItem: () => JSON.stringify(different), setItem: () => { throw new Error('quota'); }, removeItem: () => { throw new Error('readonly'); } };
+  assert.deepEqual(loadRelayCredentials(hash, readOnly), credentials);
+  assert.equal(relayPairingSaved(credentials, readOnly), false, 'never reload into the old machine');
 });

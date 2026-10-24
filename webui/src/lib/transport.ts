@@ -28,13 +28,28 @@ export function loadRelayCredentials(
   } catch { return null; }
 }
 
+/** Only scrub the pairing fragment after this tab can actually restore it.
+ * Private mode/quota/read-only storage must not turn a working link into an
+ * unrecoverable page after a browser reload or mobile page eviction. */
+export function relayPairingSaved(
+  credentials: RelayCredentials | null,
+  storage?: Pick<Storage, 'getItem'>,
+): boolean {
+  if (!credentials || !storage) return false;
+  try {
+    const saved: unknown = JSON.parse(storage.getItem(STORAGE_KEY) ?? 'null');
+    return validRelayCredentials(saved)
+      && saved.route === credentials.route && saved.token === credentials.token;
+  } catch { return false; }
+}
+
 const relayPage = typeof location !== 'undefined' && location.pathname.startsWith('/webui/');
 let relay: RelayCredentials | null = null;
 if (relayPage) {
   let storage: Storage | undefined;
   try { storage = sessionStorage; } catch { /* memory-only */ }
   relay = loadRelayCredentials(location.hash, storage);
-  if (new URLSearchParams(location.hash.slice(1)).has('relay')) {
+  if (new URLSearchParams(location.hash.slice(1)).has('relay') && relayPairingSaved(relay, storage)) {
     history.replaceState(null, '', location.pathname + location.search);
   }
 }
@@ -69,3 +84,6 @@ export function createApiFetch(
 }
 
 export const apiFetch = createApiFetch(relayPage, relay);
+
+/** UI may explain a rejected existing link without exposing either secret. */
+export function hasRelayPairing(): boolean { return relay !== null; }

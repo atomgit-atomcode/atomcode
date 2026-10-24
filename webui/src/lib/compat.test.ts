@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { missingCssSince, signedIn } from './compat.ts';
+import { missingCssSince, signedIn, probeWebuiAccess } from './compat.ts';
 
 test('a browser missing what the page uses is told the version that has it', () => {
   // Chromium 99 (Huawei's browser): none of the three.
@@ -21,9 +21,13 @@ test('a browser missing what the page uses is told the version that has it', () 
   );
 });
 
-test('only a definite 401 means the page was opened without the link', async () => {
+test('a definite access denial requires the link; transport failures do not', async () => {
   const replying = (status: number) => (async () => new Response('{}', { status })) as typeof fetch;
   assert.equal(await signedIn(replying(401)), false);
+  assert.equal(await signedIn(replying(403)), false);
+  assert.equal(await probeWebuiAccess(replying(401)), 'denied');
+  assert.equal(await probeWebuiAccess(replying(503)), 'unavailable');
+  assert.equal(await probeWebuiAccess(replying(200)), 'allowed');
   assert.equal(await signedIn(replying(200)), true);
   assert.equal(await signedIn(replying(500)), true);
   const down = (async () => {
