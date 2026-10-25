@@ -326,18 +326,26 @@ fn mouse_reported_for(ohos: bool, env: impl Fn(&str) -> Option<String>) -> bool 
     }
 }
 
-/// Prefer client-owned copy/paste for SSH (which may identify only as xterm)
-/// and explicit PuTTY terminals. This is a startup preference, not a capability
-/// gate: Ctrl+G can still take the mouse later.
+/// Prefer client-owned copy/paste for SSH (which may identify only as xterm),
+/// explicit PuTTY terminals, and local browser terminal servers. This is a
+/// startup preference, not a capability gate: Ctrl+G can take the mouse later.
 pub(crate) fn take_mouse_at_start() -> bool {
-    take_mouse_at_start_for(|key| std::env::var_os(key).map(|v| v.to_string_lossy().into_owned()))
+    take_mouse_at_start_with_browser(
+        |key| std::env::var_os(key).map(|v| v.to_string_lossy().into_owned()),
+        crate::browser_terminal::detected(),
+    )
 }
 
+#[cfg(test)]
 fn take_mouse_at_start_for(env: impl Fn(&str) -> Option<String>) -> bool {
+    take_mouse_at_start_with_browser(env, false)
+}
+
+fn take_mouse_at_start_with_browser(env: impl Fn(&str) -> Option<String>, browser: bool) -> bool {
     if let Some(forced) = env("ATOMCODE_MOUSE").filter(|v| !v.is_empty()) {
         return forced == "1" || forced.eq_ignore_ascii_case("true");
     }
-    !remote_session_for(&env) && !putty_for(&env)
+    !browser && !remote_session_for(&env) && !putty_for(&env)
 }
 
 fn putty_for(env: &dyn Fn(&str) -> Option<String>) -> bool {
@@ -369,11 +377,13 @@ fn remote_basic_glyphs_for(env: &dyn Fn(&str) -> Option<String>) -> bool {
 }
 
 /// Shared boundary for startup policy and clipboard access: a server clipboard
-/// must never stand in for the SSH client's clipboard, even with X11 forwarding.
+/// must never stand in for the SSH/browser client's clipboard, even with X11
+/// forwarding.
 pub(crate) fn remote_session() -> bool {
-    remote_session_for(&|key| {
-        std::env::var_os(key).map(|value| value.to_string_lossy().into_owned())
-    })
+    crate::browser_terminal::detected()
+        || remote_session_for(&|key| {
+            std::env::var_os(key).map(|value| value.to_string_lossy().into_owned())
+        })
 }
 
 fn remote_session_for(env: &impl Fn(&str) -> Option<String>) -> bool {
@@ -1031,6 +1041,24 @@ mod tests {
                 value
             )])));
         }
+    }
+
+    #[test]
+    fn browser_terminals_hand_back_the_mouse_without_ssh_and_allow_an_override() {
+        let env = env_of(&[("TERM", "xterm-256color")]);
+        assert!(!take_mouse_at_start_with_browser(&env, true));
+        assert!(take_mouse_at_start_with_browser(&env, false));
+        assert!(mouse_reported_for(false, &env));
+        for value in ["1", "true", "TRUE"] {
+            assert!(take_mouse_at_start_with_browser(
+                env_of(&[("ATOMCODE_MOUSE", value)]),
+                true
+            ));
+        }
+        assert!(!take_mouse_at_start_with_browser(
+            env_of(&[("ATOMCODE_MOUSE", "0")]),
+            true
+        ));
     }
 
     #[test]

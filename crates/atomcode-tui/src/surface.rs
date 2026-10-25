@@ -3325,7 +3325,8 @@ mod tests {
     fn remote_copy_explains_the_native_selection_fallback() {
         let message = Copied::RemoteHandedOver.words("已复制");
         assert!(!message.starts_with("已复制"));
-        assert!(message.contains("SSH"));
+        // Browser terminals share this path without an SSH connection.
+        assert!(!message.contains("SSH"));
         assert!(message.contains("Ctrl+G"));
         assert!(message.contains("Cmd+C"));
     }

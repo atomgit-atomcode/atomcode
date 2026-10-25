@@ -41,6 +41,7 @@ pub mod ask;
 pub mod attach;
 pub mod bg;
 pub mod block;
+mod browser_terminal;
 pub mod caps;
 pub mod clip_hint;
 pub mod command;
