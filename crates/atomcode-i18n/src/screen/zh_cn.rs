@@ -505,20 +505,19 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SavedTo { path } => format!("存到 {path}").into(),
         Msg::SaveWouldOverwrite { path } => format!("{path} 已经在那儿了,而且不是 .md —— 换个名字,或者自己先删掉").into(),
         Msg::SaveFailed { error } => format!("存不下:{error}").into(),
-        // 与经典界面同一句话(`atomcode-tuix` 的 `usage_monitor`):同一个人在两边看到
-        // 的是同一个数字、同一个窗口、同一个恢复时刻。
-        Msg::AllowanceNear { label, percent } =>
-            format!("Token使用量 {percent}%，{label}滚动窗口").into(),
+        // Footer 只保留用量与恢复时间，窗口说明留在 /usage，避免挤占模型和目录。
+        Msg::AllowanceNear { label: _, percent } =>
+            format!("额度已用 {percent}%").into(),
         Msg::AllowanceNearWithReset {
-            label,
+            label: _,
             percent,
             resets_at,
-        } => format!("Token使用量 {percent}%，{label}滚动窗口 重置于 {resets_at}").into(),
+        } => format!("额度已用 {percent}% · {resets_at} 重置").into(),
         Msg::AllowanceNearWithCountdown {
-            label,
+            label: _,
             percent,
             duration,
-        } => format!("Token使用量 {percent}%，{label}滚动窗口 {duration}后重置").into(),
+        } => format!("额度已用 {percent}% · {duration}后重置").into(),
         Msg::AllowanceExhaustedOpenRouter { label } => {
             format!("{label}额度已用尽 —— 输入 /openrouter 一键接入 OpenRouter 免费模型").into()
         }

@@ -542,21 +542,19 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SavedTo { path } => format!("saved to {path}").into(),
         Msg::SaveWouldOverwrite { path } => format!("{path} already exists and is not a .md — pick another name, or remove it first").into(),
         Msg::SaveFailed { error } => format!("could not save: {error}").into(),
-        // The same sentence the other front end says (`atomcode-tuix`'s
-        // `usage_monitor`): one person on two screens reads one number, one
-        // window and one reset time.
-        Msg::AllowanceNear { label, percent } =>
-            format!("{percent}% of the {label} window used").into(),
+        // Keep the footer compact; window explanations belong in /usage.
+        Msg::AllowanceNear { label: _, percent } =>
+            format!("Quota used {percent}%").into(),
         Msg::AllowanceNearWithReset {
-            label,
+            label: _,
             percent,
             resets_at,
-        } => format!("{percent}% of the {label} window used  resets at {resets_at}").into(),
+        } => format!("Quota used {percent}% · resets {resets_at}").into(),
         Msg::AllowanceNearWithCountdown {
-            label,
+            label: _,
             percent,
             duration,
-        } => format!("{percent}% of the {label} window used  resets in {duration}").into(),
+        } => format!("Quota used {percent}% · resets in {duration}").into(),
         Msg::AllowanceExhaustedOpenRouter { label } => {
             format!("{label} allowance used up — type /openrouter to connect OpenRouter's free models").into()
         }
