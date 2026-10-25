@@ -9856,6 +9856,18 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn chat_offers_the_mcp_tools_on_its_first_turn() {
+        // Pin eager offering: the default deliberately defers schemas to mcp_search.
+        check_chat_first_turn_mcp(Some(atomcode_config::config::McpToolSearchMode::Off)).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn chat_defers_mcp_schemas_to_discovery_by_default() {
+        check_chat_first_turn_mcp(None).await;
+    }
+
+    #[cfg(unix)]
+    async fn check_chat_first_turn_mcp(mode: Option<atomcode_config::config::McpToolSearchMode>) {
         let home = ScopedChatHome::new();
         let dir = home._dir.path().to_path_buf();
         let script = dir.join("mcp-server.sh");
@@ -9889,6 +9901,9 @@ done
 
         let (main_url, main_request, main_task) = spawn_openai_sse("done").await;
         let mut config = Config::with_default_provider("main");
+        if let Some(mode) = mode {
+            config.tools.mcp.tool_search = mode;
+        }
         config
             .providers
             .insert("main".into(), test_provider("deepseek-v4-flash", main_url));
@@ -9932,10 +9947,32 @@ done
             .await
             .expect("the provider must be called")
             .expect("request captured");
-        assert!(
-            request.contains("mcp__t__echo"),
-            "the first /chat turn went out without the MCP tool"
-        );
+        let (_, body) = request.split_once("\r\n\r\n").expect("HTTP request body");
+        let body: serde_json::Value = serde_json::from_str(body).expect("provider JSON");
+        let names = body["tools"]
+            .as_array()
+            .expect("offered tools")
+            .iter()
+            .filter_map(|tool| {
+                tool.pointer("/function/name")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .collect::<Vec<_>>();
+        if mode.is_some() {
+            assert!(
+                names.contains(&"mcp__t__echo"),
+                "first eager /chat turn missing MCP tool: {names:?}"
+            );
+        } else {
+            assert!(
+                names.contains(&"mcp_search"),
+                "first /chat turn missing MCP discovery: {names:?}"
+            );
+            assert!(
+                !names.contains(&"mcp__t__echo"),
+                "default mode must defer MCP schemas: {names:?}"
+            );
+        }
         main_task.await.expect("provider task");
     }
 
