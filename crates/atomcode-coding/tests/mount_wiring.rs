@@ -1001,3 +1001,54 @@ async fn atomgit_discovery_follows_the_admitted_catalog_when_env_overrides_disab
     );
     mounted.shutdown().await;
 }
+
+#[tokio::test]
+async fn host_automation_tools_mount_on_the_lead_without_widening_delegation() {
+    struct AutomationBackend;
+    impl atomcode_capabilities::tools::automation::AutomationService for AutomationBackend {
+        fn call(
+            &self,
+            _: &str,
+            _: serde_json::Value,
+            _: &Path,
+            _: &tokio_util::sync::CancellationToken,
+        ) -> Result<serde_json::Value, String> {
+            Ok(serde_json::json!({"tasks":[]}))
+        }
+    }
+    let project = tempfile::tempdir().unwrap();
+    let mut cfg = CodingAgentConfig::new(
+        "placeholder",
+        "http://localhost",
+        "test",
+        project.path(),
+        atomcode_coding::config::product_dirs_from_env(),
+    );
+    cfg.automation = Some(Arc::new(AutomationBackend));
+    let mut options = quiet_options();
+    options.tools = true;
+    options.subagents = atomcode_coding::SubagentPolicy::Enabled;
+    let mounted = support::mount(&cfg, options, Arc::new(CannedProvider)).await;
+    let tools = mounted
+        .context()
+        .service::<atomcode_harness::seams::ToolsSvc>()
+        .unwrap();
+    for name in [
+        "schedule_create",
+        "schedule_list",
+        "schedule_update",
+        "schedule_delete",
+    ] {
+        assert!(tools.get(name).is_some(), "lead tool {name} is missing");
+    }
+    let delegated = mounted
+        .context()
+        .service::<atomcode_harness::seams::SubagentsSvc>()
+        .unwrap();
+    assert!(
+        !delegated.describe().contains("schedule_"),
+        "{}",
+        delegated.describe()
+    );
+    mounted.shutdown().await;
+}

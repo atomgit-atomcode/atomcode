@@ -15,6 +15,8 @@ use atomcode_kernel::agent::ToolLoopPolicy;
 /// stalled provider or silent driver can never park a turn forever.
 #[derive(Clone)]
 pub struct CodingAgentConfig {
+    /// Host-injected persistent automation service; absent in generic library agents.
+    pub automation: Option<Arc<dyn atomcode_capabilities::tools::automation::AutomationService>>,
     /// What the configuration asked for that was left out or changed — a
     /// malformed permission rule, an external agent with an unknown kind — said
     /// in one line each. The runtime tells the person when it starts
@@ -1137,6 +1139,7 @@ impl CodingAgentConfig {
     ) -> Self {
         let model = model.into();
         Self {
+            automation: None,
             startup_warnings: Vec::new(),
             extra_skill_dirs: Vec::new(),
             dirs,

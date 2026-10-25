@@ -768,6 +768,19 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     let mut startup_warnings: Vec<String> = cfg.startup_warnings.clone();
     let turn_execution_policy = Arc::new(TurnExecutionPolicy::new());
 
+    // Host management tools are offered only to the lead registry. Delegated
+    // toolsets below are explicitly selected and never inherit this service.
+    if opts.tools {
+        if let Some(service) = &cfg.automation {
+            for tool in atomcode_capabilities::tools::automation::automation_tools(service.clone())
+            {
+                names.push(tool.name().to_string());
+                host_only_tools.push(tool.name().to_string());
+                registry.register(tool);
+            }
+        }
+    }
+
     // Always-on core: neutral fs/bash toolset + codeintel. Vision gating: a VL model
     // (e.g. Qwen3-VL) makes read_file hand image files to the model as pictures. Uses the
     // SAME canonical detector as the user-paste path (`model_suggests_vision`) so one

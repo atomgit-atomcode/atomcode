@@ -38,6 +38,7 @@ pub mod ast_grep;
 /// AtomGit REST tools (repo / pr / issue). Opt-in `atomgit` feature.
 #[cfg(feature = "atomgit")]
 pub mod atomgit;
+pub mod automation;
 pub mod bash;
 pub mod bash_workspace_gate;
 pub mod cd;

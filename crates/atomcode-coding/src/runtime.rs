@@ -9222,6 +9222,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 // prompt. Non-approval requests (notably request_user_input)
                                 // must still round-trip through the driver.
                                 let bypass_approval = kind == APPROVAL_KIND
+                                    && payload.get("requires_explicit_approval").and_then(serde_json::Value::as_bool) != Some(true)
                                     && resources.as_ref().is_some_and(|runtime| {
                                         runtime.parts.bypass_mode.load(Ordering::Acquire)
                                     });
@@ -19550,6 +19551,22 @@ mod tests {
         ));
         assert_eq!(handle.status().phase, RuntimePhase::InTurn);
         assert!(runtime_events.try_recv().is_err());
+
+        kernel_events.send(AgentEvent::Request {
+            id: 44, kind: APPROVAL_KIND.into(),
+            payload: serde_json::json!({"tool":"schedule_create","requires_explicit_approval":true}),
+        }).unwrap();
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::Request(RuntimeRequest { id: 44, .. }))
+        ));
+        assert!(kernel_commands.try_recv().is_err());
+        handle.respond(44, serde_json::Value::Null).await.unwrap();
+        assert!(
+            matches!(kernel_commands.recv().await, Some(AgentCommand::Respond { id:44, value }) if value.is_null())
+        );
+        assert!(matches!(runtime_events.recv().await,
+            Some(CodingRuntimeEvent::RequestResolved { id:44, kind }) if kind == APPROVAL_KIND));
 
         kernel_events
             .send(AgentEvent::Request {

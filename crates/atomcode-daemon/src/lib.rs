@@ -30,6 +30,7 @@ mod api_codingplan;
 mod api_config;
 mod api_provider;
 mod api_provider_accounts;
+mod api_schedule;
 pub mod approval_mode;
 mod commands;
 pub(crate) mod kernel_runtime;
@@ -7193,6 +7194,10 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     // Bearer 携带）；只有 `--no-auth` 或 App 中继路径（webui_tokens=None）才
     // enforce_token=false，此时 auth_token.rs 的中间件直接放行。
     let protected = Router::new()
+        .merge(api_schedule::routes(
+            state.project.clone(),
+            api_schedule::system_service(),
+        ))
         // Shutdown endpoint (R7.1)
         .route("/shutdown", post(shutdown_handler))
         // Session APIs
@@ -8276,6 +8281,156 @@ mod tests {
             bind_port: 13456,
             webui_cookie_name: auth_token::webui_cookie_name(13456),
         }
+    }
+
+    #[tokio::test]
+    async fn automation_http_requires_auth_and_preserves_revision_and_replay_semantics() {
+        use tower::ServiceExt;
+        let home = ScopedChatHome::new();
+        let mut state = chat_test_state(&home);
+        state.enforce_token = true;
+        state.webui_tokens.insert("automation-test-token".into());
+        let service = atomcode_schedule::service::Service::new(
+            atomcode_schedule::Store::new(home._dir.path().join("schedules")),
+            None,
+        );
+        let app = api_schedule::routes::<AppState>(state.project.clone(), service.clone())
+            .route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                auth_token::require_webui_token,
+            ))
+            .with_state(state);
+        let request = |method: &str, path: &str, body: serde_json::Value, authorized: bool| {
+            let mut builder = axum::http::Request::builder()
+                .method(method)
+                .uri(path)
+                .header("content-type", "application/json");
+            if authorized {
+                builder = builder.header("authorization", "Bearer automation-test-token");
+            }
+            builder
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap()
+        };
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    "GET",
+                    "/schedules/events",
+                    serde_json::Value::Null,
+                    false
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let unauthorized = app
+            .clone()
+            .oneshot(request("GET", "/schedules", serde_json::Value::Null, false))
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        let task = serde_json::json!({"id":"http-task","title":"Review","prompt":"Review changes","cwd":home._dir.path(),"schedule":{"kind":"daily","time":"09:00"}});
+        let create = serde_json::json!({"request_id":"create-http","action":"create","task":task});
+        assert_eq!(
+            app.clone()
+                .oneshot(request("POST", "/schedules", create.clone(), false))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let other = tempfile::tempdir().unwrap();
+        let mut outside = task.clone();
+        outside["id"] = serde_json::json!("other-project");
+        outside["cwd"] = serde_json::json!(other.path());
+        let denied =
+            serde_json::json!({"request_id":"outside-http","action":"create","task":outside});
+        assert_eq!(
+            app.clone()
+                .oneshot(request("POST", "/schedules", denied, true))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(service.catalog().unwrap().is_empty());
+        let response = app
+            .clone()
+            .oneshot(request("POST", "/schedules", create.clone(), true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let first: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let revision = first["entry"]["revision"].as_str().unwrap();
+        assert_eq!(first["entry"]["registration"], "error");
+        let replay = app
+            .clone()
+            .oneshot(request("POST", "/schedules", create.clone(), true))
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(service.catalog().unwrap().len(), 1);
+        let conflict = serde_json::json!({"request_id":"conflict-http","action":"update","task":task,"expected":"outdated"});
+        assert_eq!(
+            app.clone()
+                .oneshot(request("POST", "/schedules", conflict, true))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        let lease = service.store.begin("http-task").unwrap();
+        lease.session("native-recorded-session").unwrap();
+        lease
+            .finish("error", Some("provider unavailable".into()))
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(request(
+                "GET",
+                "/schedules/http-task/history",
+                serde_json::Value::Null,
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let events: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(events["events"].as_array().unwrap().len(), 3);
+        assert_eq!(events["events"][1]["session_id"], "native-recorded-session");
+        let remove = serde_json::json!({"request_id":"delete-http","action":"delete","id":"http-task","expected":revision});
+        for _ in 0..2 {
+            assert_eq!(
+                app.clone()
+                    .oneshot(request("POST", "/schedules", remove.clone(), true))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::OK
+            );
+        }
+        // A late create acknowledgement must not recreate a task deleted later.
+        assert_eq!(
+            app.oneshot(request("POST", "/schedules", create, true))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert!(service.catalog().unwrap().is_empty());
+        assert_eq!(service.store.history("http-task").unwrap().len(), 3);
     }
 
     #[test]

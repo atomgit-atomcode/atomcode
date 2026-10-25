@@ -804,9 +804,8 @@ async fn the_proxy_mode_is_chosen_here_and_kept_in_the_file() {
     let _ = tokio::time::timeout(Duration::from_secs(5), running).await;
 }
 
-/// `/schedule` lists what is scheduled on this machine — read-only, and it says
-/// where adding and removing live (the OS scheduler runs them, screen or no
-/// screen).
+/// `/schedule` opens the shared task manager without starting a model turn.
+/// Creation can be inspected and cancelled entirely from the keyboard.
 #[tokio::test]
 async fn scheduled_tasks_are_listed_here() {
     let home = tempfile::tempdir().unwrap();
@@ -854,17 +853,27 @@ async fn scheduled_tasks_are_listed_here() {
     });
 
     term.type_line("/schedule");
-    let mut screen_text = String::new();
-    for _ in 0..200 {
-        screen_text = term.text();
-        if screen_text.contains("atomcode schedule add") {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    until_text(&term, "automation picker", |text| {
+        text.contains("新建任务") && text.contains("自动化任务")
+    })
+    .await;
+    term.press(atomcode_tui::surface::KeyPress::plain(
+        atomcode_tui::surface::Key::Enter,
+    ));
+    until_text(&term, "task creation wizard", |text| {
+        text.contains("任务名称")
+    })
+    .await;
+    term.press(atomcode_tui::surface::KeyPress::plain(
+        atomcode_tui::surface::Key::Esc,
+    ));
+    until_text(&term, "cancelled task editor", |text| {
+        !text.contains("任务名称")
+    })
+    .await;
     assert!(
-        screen_text.contains("atomcode schedule add"),
-        "an empty list still says how one is made:\n{screen_text}"
+        !home.path().join("schedules").exists(),
+        "cancel must not save or register a job"
     );
     assert_eq!(
         count.0.load(Ordering::SeqCst),
@@ -872,6 +881,9 @@ async fn scheduled_tasks_are_listed_here() {
         "nothing was sent as a prompt"
     );
 
+    term.press(atomcode_tui::surface::KeyPress::plain(
+        atomcode_tui::surface::Key::Esc,
+    ));
     term.press(atomcode_tui::surface::KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), running).await;
 }

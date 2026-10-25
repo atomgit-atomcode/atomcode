@@ -4,6 +4,7 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { Chat } from './components/Chat';
 import { Sidebar } from './components/Sidebar';
+import { Automation } from './components/Automation';
 import { ThemeDialog, LanguageDialog, RemoteAccessDialog, NotificationsDialog } from './components/SettingsDialogs';
 import { ModelConfigDialog } from './components/ModelProviders';
 import { RenameDialog, DeleteDialog } from './components/SessionDialogs';
@@ -45,6 +46,8 @@ export function App() {
   const [projectHash, setProjectHash] = useState('');
   const [pending, setPending] = useState<any | null>(null);
   const [showCwd, setShowCwd] = useState(false);
+  const [showAutomation, setShowAutomation] = useState(false);
+  const automationNavigation = useRef(0);
   const [settingsSection, setSettingsSection] = useState<SettingsSection | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -384,6 +387,7 @@ export function App() {
         activeSessionId={sessionId}
         onSelect={handleSelectSession}
         onNew={handleNewSession}
+        onOpenAutomation={() => { automationNavigation.current++; setSidebarOpen(false); setShowAutomation(true); }}
         onNewInProject={handleNewInProject}
         open={sidebarOpen}
         collapsed={sidebarCollapsed}
@@ -511,6 +515,13 @@ export function App() {
       </div>
 
       {/* ===== Modals ===== */}
+      {showAutomation && <Automation cwd={cwd} onClose={() => { automationNavigation.current++; setShowAutomation(false); }} onSession={async (id) => {
+        const generation = automationNavigation.current;
+        const session = await resolveSession(id);
+        if (generation !== automationNavigation.current) return;
+        if (!session) throw new Error('Execution session is unavailable');
+        handleSelectSession(session); setShowAutomation(false);
+      }} />}
       {showCwd && (
         <CwdPicker
           current={cwd}

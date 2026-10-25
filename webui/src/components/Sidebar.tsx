@@ -25,6 +25,7 @@ interface SidebarProps {
   activeSessionId: string | null;
   onSelect: (session: SessionMetaWithProject) => void;
   onNew: () => void;
+  onOpenAutomation?: () => void;
   /** Start a new session in a SPECIFIC project's working directory (the per-row
    *  `+` in the workspace tree). Wired to the same "switch cwd + open" path as
    *  the project switcher. */
@@ -320,6 +321,7 @@ export function Sidebar({
   activeSessionId,
   onSelect,
   onNew,
+  onOpenAutomation,
   onNewInProject,
   onOpenSettings,
   open,
@@ -1293,6 +1295,7 @@ export function Sidebar({
           >
             <PlusIcon />
           </button>
+          {onOpenAutomation && <button class="rail-btn" onClick={onOpenAutomation} title={lang === 'zh' ? '自动化任务' : 'Automations'} aria-label={lang === 'zh' ? '自动化任务' : 'Automations'}><span aria-hidden="true">◷</span></button>}
           <button
             class="rail-btn"
             onClick={onToggleCollapse}
@@ -1365,6 +1368,9 @@ export function Sidebar({
       </div>
 
       <div class="sidebar-actions">
+        {onOpenAutomation && <button class="sidebar-action" onClick={onOpenAutomation} title={lang === 'zh' ? '自动化任务' : 'Automations'}>
+          <span aria-hidden="true">◷</span><span>{lang === 'zh' ? '自动化任务' : 'Automations'}</span>
+        </button>}
         <button class="sidebar-action" onClick={onNew}>
           <span class="sidebar-action-icon"><PlusIcon /></span>
           <span class="sidebar-action-label">{t('sidebar.newChat')}</span>

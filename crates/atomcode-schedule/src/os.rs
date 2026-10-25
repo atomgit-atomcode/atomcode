@@ -3,12 +3,31 @@ use atomcode_config::schedule::{Schedule, ScheduleTask};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// The daemon manages jobs but is not the CLI executor. Fail explicitly when
+/// its sibling executable is missing rather than installing an unusable job.
+pub fn execution_binary() -> anyhow::Result<std::path::PathBuf> {
+    let current = std::env::current_exe()?;
+    if current.file_stem().and_then(|s| s.to_str()) == Some("atomcode-daemon") {
+        let cli = current.with_file_name(if cfg!(windows) {
+            "atomcode.exe"
+        } else {
+            "atomcode"
+        });
+        if !cli.is_file() {
+            anyhow::bail!("AtomCode CLI executable is required beside the daemon");
+        }
+        return Ok(cli);
+    }
+    Ok(current)
+}
+
 // ---- InstallState ----
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum InstallState {
     Installed,
     Missing,
+    Unknown(String),
 }
 
 // ---- CommandRunner ----
@@ -19,9 +38,56 @@ pub trait CommandRunner {
 
 pub struct RealCommandRunner;
 
+impl RealCommandRunner {
+    fn run_with_timeout(
+        &self,
+        program: &str,
+        args: &[String],
+        timeout: std::time::Duration,
+    ) -> std::io::Result<std::process::Output> {
+        use std::process::{Command, Stdio};
+        use wait_timeout::ChildExt;
+        let mut child = Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        match child.wait_timeout(timeout) {
+            Ok(Some(_)) => child.wait_with_output(),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait_with_output();
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("{program} scheduler command timed out"),
+                ))
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait_with_output();
+                Err(error)
+            }
+        }
+    }
+}
 impl CommandRunner for RealCommandRunner {
     fn run(&self, program: &str, args: &[String]) -> std::io::Result<std::process::Output> {
-        std::process::Command::new(program).args(args).output()
+        self.run_with_timeout(program, args, std::time::Duration::from_secs(5))
+    }
+}
+
+fn query_registration(runner: &dyn CommandRunner, program: &str, args: &[String]) -> InstallState {
+    match runner.run(program, args) {
+        Ok(output) if output.status.success() => InstallState::Installed,
+        Ok(output) => InstallState::Unknown(format!(
+            "{program}: {}",
+            String::from_utf8_lossy(&output.stderr)
+                .chars()
+                .take(512)
+                .collect::<String>()
+        )),
+        Err(error) => InstallState::Unknown(format!("{program}: {error}")),
     }
 }
 
@@ -39,6 +105,9 @@ fn run_checked(runner: &dyn CommandRunner, prog: &str, args: &[String]) -> anyho
 
 pub trait OsScheduler {
     fn install(&self, task: &ScheduleTask) -> anyhow::Result<()>;
+    fn install_at(&self, task: &ScheduleTask, _task_root: &std::path::Path) -> anyhow::Result<()> {
+        self.install(task)
+    }
     fn uninstall(&self, id: &str) -> anyhow::Result<()>;
     fn status(&self, id: &str) -> InstallState;
 }
@@ -129,60 +198,44 @@ impl Launchd {
 #[cfg(any(test, target_os = "macos"))]
 impl OsScheduler for Launchd {
     fn install(&self, task: &ScheduleTask) -> anyhow::Result<()> {
-        #[cfg(not(unix))]
-        {
-            anyhow::bail!("launchd is only available on macOS/Unix");
-        }
-        let trigger = launchd_calendar(&task.schedule)?;
-        let exe = std::env::current_exe()?;
-        let exe_str = exe.to_string_lossy();
-        let plist_content = Self::render_plist(&task.id, &exe_str, &trigger);
-        std::fs::create_dir_all(&self.root)?;
-        let path = self.plist_path(&task.id);
-        std::fs::write(&path, plist_content)?;
-        let uid = get_uid();
-        let label = Self::label(&task.id);
-        // Best-effort bootout before bootstrap to make install idempotent.
-        // If the service is not currently loaded, bootout returns an error which
-        // we intentionally ignore.
-        let _ = self.runner.run(
-            "launchctl",
-            &["bootout".to_string(), format!("gui/{uid}/{label}")],
-        );
-        let domain = format!("gui/{uid}");
-        run_checked(
-            self.runner.as_ref(),
-            "launchctl",
-            &[
-                "bootstrap".to_string(),
-                domain,
-                path.to_string_lossy().to_string(),
-            ],
-        )?;
-        Ok(())
+        self.install_in(task, None)
+    }
+    fn install_at(&self, task: &ScheduleTask, root: &std::path::Path) -> anyhow::Result<()> {
+        self.install_in(task, Some(root))
     }
 
     fn uninstall(&self, id: &str) -> anyhow::Result<()> {
+        if !self.plist_path(id).exists() {
+            return Ok(());
+        }
         let uid = get_uid();
         let domain_target = format!("gui/{uid}/{}", Self::label(id));
-        let _ = self
-            .runner
-            .run("launchctl", &["bootout".to_string(), domain_target]);
+        let unloaded = run_checked(
+            self.runner.as_ref(),
+            "launchctl",
+            &["bootout".to_string(), domain_target],
+        );
         let path = self.plist_path(id);
         match std::fs::remove_file(&path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
-        Ok(())
+        unloaded
     }
 
     fn status(&self, id: &str) -> InstallState {
-        if self.plist_path(id).exists() {
-            InstallState::Installed
-        } else {
-            InstallState::Missing
+        if !self.plist_path(id).exists() {
+            return InstallState::Missing;
         }
+        query_registration(
+            self.runner.as_ref(),
+            "launchctl",
+            &[
+                "print".into(),
+                format!("gui/{}/{}", get_uid(), Self::label(id)),
+            ],
+        )
     }
 }
 
@@ -235,38 +288,19 @@ impl SystemdTimer {
 #[cfg(any(test, not(any(target_os = "macos", target_os = "windows"))))]
 impl OsScheduler for SystemdTimer {
     fn install(&self, task: &ScheduleTask) -> anyhow::Result<()> {
-        let cal = systemd_calendar(&task.schedule)?;
-        let exe = std::env::current_exe()?;
-        let exe_str = exe.to_string_lossy();
-        std::fs::create_dir_all(&self.root)?;
-        std::fs::write(
-            self.service_path(&task.id),
-            Self::render_service(&task.id, &exe_str),
-        )?;
-        std::fs::write(
-            self.timer_path(&task.id),
-            Self::render_timer(&task.id, &cal),
-        )?;
-        run_checked(
-            self.runner.as_ref(),
-            "systemctl",
-            &["--user".to_string(), "daemon-reload".to_string()],
-        )?;
-        run_checked(
-            self.runner.as_ref(),
-            "systemctl",
-            &[
-                "--user".to_string(),
-                "enable".to_string(),
-                "--now".to_string(),
-                Self::timer_name(&task.id),
-            ],
-        )?;
-        Ok(())
+        self.install_in(task, None)
+    }
+    fn install_at(&self, task: &ScheduleTask, root: &std::path::Path) -> anyhow::Result<()> {
+        self.install_in(task, Some(root))
     }
 
     fn uninstall(&self, id: &str) -> anyhow::Result<()> {
-        let _ = self.runner.run(
+        if !self.timer_path(id).exists() && !self.service_path(id).exists() {
+            return Ok(());
+        }
+
+        let disabled = run_checked(
+            self.runner.as_ref(),
             "systemctl",
             &[
                 "--user".to_string(),
@@ -282,19 +316,24 @@ impl OsScheduler for SystemdTimer {
                 Err(e) => return Err(e.into()),
             }
         }
-        let _ = self.runner.run(
+        let reloaded = run_checked(
+            self.runner.as_ref(),
             "systemctl",
             &["--user".to_string(), "daemon-reload".to_string()],
         );
-        Ok(())
+        disabled?;
+        reloaded
     }
 
     fn status(&self, id: &str) -> InstallState {
-        if self.timer_path(id).exists() {
-            InstallState::Installed
-        } else {
-            InstallState::Missing
+        if !self.timer_path(id).exists() {
+            return InstallState::Missing;
         }
+        query_registration(
+            self.runner.as_ref(),
+            "systemctl",
+            &["--user".into(), "is-enabled".into(), Self::timer_name(id)],
+        )
     }
 }
 
@@ -315,27 +354,16 @@ impl TaskSched {
 #[cfg(any(test, target_os = "windows"))]
 impl OsScheduler for TaskSched {
     fn install(&self, task: &ScheduleTask) -> anyhow::Result<()> {
-        let exe = std::env::current_exe()?;
-        let exe_str = exe.to_string_lossy();
-        let tr = format!("\"{}\" schedule run {}", exe_str, task.id);
-        let tn = Self::task_name(&task.id);
-        let sched_args = schtasks_args(&task.schedule)?;
-        let mut args = vec![
-            "/Create".to_string(),
-            "/F".to_string(),
-            "/TN".to_string(),
-            tn,
-            "/TR".to_string(),
-            tr,
-        ];
-        args.extend(sched_args);
-        run_checked(self.runner.as_ref(), "schtasks", &args)?;
-        Ok(())
+        self.install_in(task, None)
+    }
+    fn install_at(&self, task: &ScheduleTask, root: &std::path::Path) -> anyhow::Result<()> {
+        self.install_in(task, Some(root))
     }
 
     fn uninstall(&self, id: &str) -> anyhow::Result<()> {
         let tn = Self::task_name(id);
-        let _ = self.runner.run(
+        run_checked(
+            self.runner.as_ref(),
             "schtasks",
             &[
                 "/Delete".to_string(),
@@ -343,8 +371,7 @@ impl OsScheduler for TaskSched {
                 "/TN".to_string(),
                 tn,
             ],
-        );
-        Ok(())
+        )
     }
 
     fn status(&self, id: &str) -> InstallState {
@@ -352,13 +379,11 @@ impl OsScheduler for TaskSched {
         // For a reliable cross-platform test path, we rely on the runner returning
         // success to indicate the task exists. In real usage, we'd parse output.
         let tn = Self::task_name(id);
-        let result = self
-            .runner
-            .run("schtasks", &["/Query".to_string(), "/TN".to_string(), tn]);
-        match result {
-            Ok(out) if out.status.success() => InstallState::Installed,
-            _ => InstallState::Missing,
-        }
+        query_registration(
+            self.runner.as_ref(),
+            "schtasks",
+            &["/Query".into(), "/TN".into(), tn],
+        )
     }
 }
 
@@ -1165,5 +1190,205 @@ mod tests {
             !plist.contains("&b"),
             "plist must not contain bare & followed by b: {plist}"
         );
+    }
+    #[test]
+    fn every_os_registration_keeps_the_explicit_product_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let task_root = temp.path().join("profile & spaces").join("schedules");
+        #[cfg(unix)]
+        {
+            let launchd = Launchd {
+                root: temp.path().join("launchd"),
+                runner: FakeRunner::new(),
+            };
+            launchd
+                .install_at(&sample_task("root-test"), &task_root)
+                .unwrap();
+            let plist = std::fs::read_to_string(launchd.plist_path("root-test")).unwrap();
+            assert!(plist.contains("<string>--store</string>"));
+            assert!(plist.contains("profile &amp; spaces"));
+        }
+        let systemd = SystemdTimer {
+            root: temp.path().join("systemd"),
+            runner: FakeRunner::new(),
+        };
+        systemd
+            .install_at(&sample_task("root-test"), &task_root)
+            .unwrap();
+        let service = std::fs::read_to_string(systemd.service_path("root-test")).unwrap();
+        assert!(service.contains("--store \""));
+        assert!(service.contains("profile & spaces"));
+        let runner = FakeRunner::new();
+        let windows = TaskSched {
+            runner: runner.clone(),
+        };
+        windows
+            .install_at(&sample_task("root-test"), &task_root)
+            .unwrap();
+        let calls = runner.calls();
+        let command = calls
+            .iter()
+            .flat_map(|(_, args)| args.windows(2))
+            .find(|pair| pair[0] == "/TR")
+            .unwrap();
+        assert!(command[1].contains("--store \""));
+        assert!(command[1].contains("profile & spaces"));
+    }
+    #[test]
+    fn a_registration_file_is_not_reported_as_active_when_os_query_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let scheduler = SystemdTimer {
+            root: temp.path().to_path_buf(),
+            runner: FakeRunner::failing("systemctl", "is-enabled"),
+        };
+        scheduler.install(&sample_task("query-test")).unwrap();
+        assert!(matches!(
+            scheduler.status("query-test"),
+            InstallState::Unknown(_)
+        ));
+    }
+}
+
+#[cfg(any(test, target_os = "macos"))]
+impl Launchd {
+    fn install_in(
+        &self,
+        task: &ScheduleTask,
+        task_root: Option<&std::path::Path>,
+    ) -> anyhow::Result<()> {
+        #[cfg(not(unix))]
+        {
+            anyhow::bail!("launchd is only available on macOS/Unix");
+        }
+        let trigger = launchd_calendar(&task.schedule)?;
+        let exe = execution_binary()?;
+        let exe_str = exe.to_string_lossy();
+        let mut plist_content = Self::render_plist(&task.id, &exe_str, &trigger);
+        if let Some(root) = task_root {
+            plist_content = plist_content.replacen(
+                "\t</array>",
+                &format!(
+                    "\t\t<string>--store</string>\n\t\t<string>{}</string>\n\t</array>",
+                    xml_escape(&root.to_string_lossy())
+                ),
+                1,
+            );
+        }
+        std::fs::create_dir_all(&self.root)?;
+        let path = self.plist_path(&task.id);
+        std::fs::write(&path, plist_content)?;
+        let uid = get_uid();
+        let label = Self::label(&task.id);
+        // Best-effort bootout before bootstrap to make install idempotent.
+        // If the service is not currently loaded, bootout returns an error which
+        // we intentionally ignore.
+        let _ = self.runner.run(
+            "launchctl",
+            &["bootout".to_string(), format!("gui/{uid}/{label}")],
+        );
+        let domain = format!("gui/{uid}");
+        run_checked(
+            self.runner.as_ref(),
+            "launchctl",
+            &[
+                "bootstrap".to_string(),
+                domain,
+                path.to_string_lossy().to_string(),
+            ],
+        )?;
+        Ok(())
+    }
+}
+
+#[cfg(any(test, not(any(target_os = "macos", target_os = "windows"))))]
+impl SystemdTimer {
+    fn install_in(
+        &self,
+        task: &ScheduleTask,
+        task_root: Option<&std::path::Path>,
+    ) -> anyhow::Result<()> {
+        let cal = systemd_calendar(&task.schedule)?;
+        let exe = execution_binary()?;
+        let exe_str = exe.to_string_lossy();
+        std::fs::create_dir_all(&self.root)?;
+        let mut service = Self::render_service(&task.id, &exe_str);
+        if let Some(root) = task_root {
+            let quoted = root
+                .to_string_lossy()
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('%', "%%")
+                .replace('$', "$$");
+            service = service.replace(
+                &format!(" schedule run {}\n", task.id),
+                &format!(" schedule run {} --store \"{quoted}\"\n", task.id),
+            );
+        }
+        std::fs::write(self.service_path(&task.id), service)?;
+        std::fs::write(
+            self.timer_path(&task.id),
+            Self::render_timer(&task.id, &cal),
+        )?;
+        run_checked(
+            self.runner.as_ref(),
+            "systemctl",
+            &["--user".to_string(), "daemon-reload".to_string()],
+        )?;
+        run_checked(
+            self.runner.as_ref(),
+            "systemctl",
+            &[
+                "--user".to_string(),
+                "enable".to_string(),
+                "--now".to_string(),
+                Self::timer_name(&task.id),
+            ],
+        )?;
+        Ok(())
+    }
+}
+
+#[cfg(any(test, target_os = "windows"))]
+impl TaskSched {
+    fn install_in(
+        &self,
+        task: &ScheduleTask,
+        task_root: Option<&std::path::Path>,
+    ) -> anyhow::Result<()> {
+        let exe = execution_binary()?;
+        let exe_str = exe.to_string_lossy();
+        let mut tr = format!("\"{}\" schedule run {}", exe_str, task.id);
+        if let Some(root) = task_root {
+            tr.push_str(&format!(" --store \"{}\"", root.to_string_lossy()));
+        }
+        let tn = Self::task_name(&task.id);
+        let sched_args = schtasks_args(&task.schedule)?;
+        let mut args = vec![
+            "/Create".to_string(),
+            "/F".to_string(),
+            "/TN".to_string(),
+            tn,
+            "/TR".to_string(),
+            tr,
+        ];
+        args.extend(sched_args);
+        run_checked(self.runner.as_ref(), "schtasks", &args)?;
+        Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod command_liveness_tests {
+    use super::*;
+    #[test]
+    fn an_unresponsive_scheduler_command_is_terminated_and_reaped() {
+        let error = RealCommandRunner
+            .run_with_timeout(
+                "/bin/sleep",
+                &["60".into()],
+                std::time::Duration::from_millis(20),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     }
 }
