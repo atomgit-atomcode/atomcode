@@ -296,6 +296,8 @@ interface ChatProps {
   onLanding?: (landing: boolean) => void;
   /** 侧栏「技能」菜单选中的技能：变化时把 `/name ` 插入输入框。 */
   skillInsert?: { name: string; seq: number } | null;
+  /** A scoped new-task request. Prefill only; never submits or writes a task. */
+  composerInsert?: { text: string; seq: number; sessionId: string } | null;
 }
 
 function formatArgs(args: unknown): string {
@@ -451,7 +453,7 @@ function detectSkillContent(text: string): string | null {
   return title || null;
 }
 
-export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermission, onPermissionResolved, activeSession, restoring, onLiveTurnDone, onOptimisticSession, onOpenCwd, onCwdChanged, onLanding, skillInsert, onSessionRenamed }: ChatProps) {
+export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermission, onPermissionResolved, activeSession, restoring, onLiveTurnDone, onOptimisticSession, onOpenCwd, onCwdChanged, onLanding, skillInsert, composerInsert, onSessionRenamed }: ChatProps) {
   const t = useT();
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
@@ -3350,6 +3352,14 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     insertAtCursor(`/${skillInsert.name} `, true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [skillInsert]);
+
+  const lastComposerInsert = useRef<number | null>(null);
+  useEffect(() => {
+    if (!composerInsert || composerInsert.sessionId !== sessionId || lastComposerInsert.current === composerInsert.seq) return;
+    lastComposerInsert.current = composerInsert.seq;
+    // Keep any existing unsent text; inserting a task request never sends it.
+    insertAtCursor([input, composerInsert.text].filter(value => value.trim()).join('\n\n'), true);
+  }, [composerInsert, sessionId]);
 
   // 落地页副标题：项目名 + 缩写路径。
   const cleanCwd = cwd.replace(/\/+$/, '');

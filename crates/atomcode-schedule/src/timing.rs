@@ -63,6 +63,18 @@ fn clock(time: &str) -> Result<(u32, u32)> {
     Ok((h, m))
 }
 
+pub(crate) fn normalized_schedule(rule: &Schedule) -> Result<Schedule> {
+    let mut normalized = rule.clone();
+    match &mut normalized {
+        Schedule::Daily { time } | Schedule::Weekly { time, .. } => {
+            let (hour, minute) = clock(time)?;
+            *time = format!("{hour:02}:{minute:02}");
+        }
+        _ => {}
+    }
+    Ok(normalized)
+}
+
 pub fn next(task: &ScheduleTask, now: i64) -> Option<NextRun> {
     let current = Local.timestamp_opt(now, 0).single()?;
     let at = next_in(task, current)?;

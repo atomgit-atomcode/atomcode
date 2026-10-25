@@ -275,7 +275,8 @@ impl SystemdTimer {
     fn render_timer(id: &str, cal: &OnCalendar) -> String {
         let on_cal = match cal {
             OnCalendar::Calendar(s) => format!("OnCalendar={s}"),
-            OnCalendar::Interval(s) => format!("OnUnitActiveSec={s}"),
+            // The first occurrence cannot depend on a service that has never run.
+            OnCalendar::Interval(s) => format!("OnActiveSec={s}\nOnUnitActiveSec={s}"),
         };
         format!(
             "[Unit]\nDescription=Atomcode scheduler timer: {id}\n\n\
@@ -892,6 +893,22 @@ mod tests {
             "expected OnUnitActiveSec=15min, got: {timer_content}"
         );
         assert!(timer_content.contains("Persistent=true"));
+        assert!(
+            timer_content.contains("OnActiveSec=15min"),
+            "first occurrence must have its own trigger"
+        );
+        task.schedule = Schedule::Interval { every_minutes: 20 };
+        sched.install(&task).unwrap();
+        let calls = runner.calls();
+        assert!(calls.iter().any(|(program, args)| program == "systemctl"
+            && args == &["--user", "stop", "atomcode-schedule-t2.timer"]));
+        assert!(
+            !calls.iter().any(|(_, args)| args
+                .iter()
+                .any(|arg| arg == "atomcode-schedule-t2.service")
+                && args.iter().any(|arg| arg == "stop")),
+            "changing a timer must leave an active job alone"
+        );
     }
 
     #[test]
@@ -1308,6 +1325,15 @@ impl SystemdTimer {
         task_root: Option<&std::path::Path>,
     ) -> anyhow::Result<()> {
         let cal = systemd_calendar(&task.schedule)?;
+        if matches!(cal, OnCalendar::Interval(_)) && self.timer_path(&task.id).exists() {
+            // Restart only the timer's activation baseline when changing its
+            // rule. Never stop a service/job that is already running.
+            run_checked(
+                self.runner.as_ref(),
+                "systemctl",
+                &["--user".into(), "stop".into(), Self::timer_name(&task.id)],
+            )?;
+        }
         let exe = execution_binary()?;
         let exe_str = exe.to_string_lossy();
         std::fs::create_dir_all(&self.root)?;

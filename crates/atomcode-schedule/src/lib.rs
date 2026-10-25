@@ -276,8 +276,14 @@ impl Store {
         let path = self.path(&task.id)?;
         let _lock = self.lock()?;
         match expected {
-            Some(expected) if self.get(&task.id)?.revision != expected => {
-                bail!("task changed; reload before editing")
+            Some(expected) => {
+                let current = self.get(&task.id)?;
+                if current.revision != expected {
+                    bail!("task changed; reload before editing");
+                }
+                if serde_json::to_value(&current.task)? == serde_json::to_value(task)? {
+                    return Ok(current);
+                }
             }
             None if path.exists() => bail!("task already exists"),
             _ => {}

@@ -1,3 +1,4 @@
+import { ScheduleIcon } from './Automation';
 // Session sidebar (Claude-Code-inspired: brand + collapse at top, CC-style
 // new-conversation row, live-filtered session list, settings at the bottom;
 // collapses to an icon rail).
@@ -1295,7 +1296,7 @@ export function Sidebar({
           >
             <PlusIcon />
           </button>
-          {onOpenAutomation && <button class="rail-btn" onClick={onOpenAutomation} title={lang === 'zh' ? '自动化任务' : 'Automations'} aria-label={lang === 'zh' ? '自动化任务' : 'Automations'}><span aria-hidden="true">◷</span></button>}
+          {onOpenAutomation && <button class="rail-btn" onClick={onOpenAutomation} title={lang === 'zh' ? '自动化任务' : 'Automations'} aria-label={lang === 'zh' ? '自动化任务' : 'Automations'}><ScheduleIcon/></button>}
           <button
             class="rail-btn"
             onClick={onToggleCollapse}
@@ -1369,7 +1370,7 @@ export function Sidebar({
 
       <div class="sidebar-actions">
         {onOpenAutomation && <button class="sidebar-action" onClick={onOpenAutomation} title={lang === 'zh' ? '自动化任务' : 'Automations'}>
-          <span aria-hidden="true">◷</span><span>{lang === 'zh' ? '自动化任务' : 'Automations'}</span>
+          <ScheduleIcon/><span>{lang === 'zh' ? '自动化任务' : 'Automations'}</span>
         </button>}
         <button class="sidebar-action" onClick={onNew}>
           <span class="sidebar-action-icon"><PlusIcon /></span>

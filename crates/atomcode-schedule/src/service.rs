@@ -80,16 +80,48 @@ impl Service {
         self.save_locked(task, expected)
     }
     fn save_locked(&self, task: &ScheduleTask, expected: Option<&str>) -> Result<Entry> {
+        let previous = expected.map(|_| self.store.get(&task.id)).transpose()?;
+        if let (Some(previous), Some(expected)) = (&previous, expected) {
+            if previous.revision != expected {
+                anyhow::bail!("task changed; reload before editing");
+            }
+        }
         let mut normalized = task.clone();
-        if expected.is_none() {
-            normalized.created_at = crate::now();
+        normalized.schedule = timing::normalized_schedule(&task.schedule)?;
+        let same_rule = previous.as_ref().is_some_and(|previous| {
+            timing::normalized_schedule(&previous.task.schedule)
+                .ok()
+                .and_then(|rule| serde_json::to_value(rule).ok())
+                == serde_json::to_value(&normalized.schedule).ok()
+        });
+        let registration_changed = previous.as_ref().is_none_or(|previous| {
+            (task.enabled && !same_rule) || previous.task.enabled != task.enabled
+        });
+        if let Some(previous) = &previous {
+            normalized.created_at = previous.task.created_at;
+            if same_rule {
+                // Preserve an equivalent legacy clock spelling and its revision.
+                normalized.schedule = previous.task.schedule.clone();
+            }
+            if matches!(
+                normalized.schedule,
+                atomcode_config::schedule::Schedule::Interval { .. }
+            ) && (!same_rule || (!previous.task.enabled && normalized.enabled))
+            {
+                normalized.created_at = crate::now();
+            }
         } else {
-            normalized.created_at = self.store.get(&task.id)?.task.created_at;
+            normalized.created_at = crate::now();
         }
         let definition = self.store.put(&normalized, expected)?;
+        if !registration_changed {
+            // Content edits must not restart OS interval timers. A failed
+            // registration remains visible until an explicit repair or rule edit.
+            return self.entry(definition, None);
+        }
         let error = match &self.os {
             Some(os) => if task.enabled {
-                os.install_at(task, &self.store.root)
+                os.install_at(&normalized, &self.store.root)
             } else {
                 os.uninstall(&task.id)
             }
@@ -402,5 +434,104 @@ impl Service {
         }
         save(&receipt)?;
         Ok(receipt)
+    }
+}
+
+#[cfg(test)]
+mod edit_timing_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    #[derive(Default)]
+    struct Scheduler {
+        installs: AtomicUsize,
+        removals: AtomicUsize,
+    }
+    impl OsScheduler for Scheduler {
+        fn install(&self, _: &ScheduleTask) -> Result<()> {
+            self.installs.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn uninstall(&self, _: &str) -> Result<()> {
+            self.removals.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn status(&self, _: &str) -> InstallState {
+            InstallState::Installed
+        }
+    }
+    fn task() -> ScheduleTask {
+        serde_json::from_value(serde_json::json!({"id":"edit", "title":"Review", "prompt":"Original", "cwd":std::env::temp_dir(),"created_at":1000,"schedule":{"kind":"interval","every_minutes":10}})).unwrap()
+    }
+    #[test]
+    fn content_edits_and_noops_keep_the_timer_and_stale_noops_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let scheduler = Arc::new(Scheduler::default());
+        let service = Service::new(Store::new(dir.path()), Some(scheduler.clone()));
+        let original = service.store.put(&task(), None).unwrap();
+        let mut changed = original.task.clone();
+        changed.title = "Renamed".into();
+        changed.prompt = "New instruction".into();
+        let saved = service.save(&changed, Some(&original.revision)).unwrap();
+        assert_eq!(saved.definition.task.created_at, 1000);
+        assert_eq!(scheduler.installs.load(Ordering::SeqCst), 0);
+        let bytes = std::fs::read(service.store.path("edit").unwrap()).unwrap();
+        let repeated = service
+            .save(&saved.definition.task, Some(&saved.definition.revision))
+            .unwrap();
+        assert_eq!(repeated.definition.revision, saved.definition.revision);
+        assert_eq!(
+            bytes,
+            std::fs::read(service.store.path("edit").unwrap()).unwrap()
+        );
+        assert!(service
+            .save(&saved.definition.task, Some(&original.revision))
+            .is_err());
+        assert_eq!(scheduler.installs.load(Ordering::SeqCst), 0);
+    }
+    #[test]
+    fn editing_a_paused_task_does_not_touch_registration_and_resuming_reanchors_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let scheduler = Arc::new(Scheduler::default());
+        let service = Service::new(Store::new(dir.path()), Some(scheduler.clone()));
+        let mut paused = task();
+        paused.enabled = false;
+        let original = service.store.put(&paused, None).unwrap();
+        paused.schedule = atomcode_config::schedule::Schedule::Interval { every_minutes: 20 };
+        let edited = service.save(&paused, Some(&original.revision)).unwrap();
+        assert_eq!(scheduler.removals.load(Ordering::SeqCst), 0);
+        assert_eq!(scheduler.installs.load(Ordering::SeqCst), 0);
+        // A resumed OS interval starts afresh, including when its old anchor is stale.
+        let mut resumed = edited.definition.task.clone();
+        resumed.enabled = true;
+        resumed.created_at = 1000;
+        let resumed = service
+            .save(&resumed, Some(&edited.definition.revision))
+            .unwrap();
+        assert!(resumed.definition.task.created_at > 1000);
+        assert_eq!(scheduler.installs.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn interval_changes_reset_the_anchor_but_equivalent_clock_edits_do_not_register() {
+        let dir = tempfile::tempdir().unwrap();
+        let scheduler = Arc::new(Scheduler::default());
+        let service = Service::new(Store::new(dir.path()), Some(scheduler.clone()));
+        let original = service.store.put(&task(), None).unwrap();
+        let mut changed = original.task;
+        changed.schedule = atomcode_config::schedule::Schedule::Interval { every_minutes: 20 };
+        let saved = service.save(&changed, Some(&original.revision)).unwrap();
+        assert!(saved.definition.task.created_at > 1000);
+        assert_eq!(scheduler.installs.load(Ordering::SeqCst), 1);
+        let mut daily = task();
+        daily.id = "daily".into();
+        daily.schedule = atomcode_config::schedule::Schedule::Daily {
+            time: "9:00".into(),
+        };
+        let original = service.store.put(&daily, None).unwrap();
+        daily.schedule = atomcode_config::schedule::Schedule::Daily {
+            time: "09:00".into(),
+        };
+        let saved = service.save(&daily, Some(&original.revision)).unwrap();
+        assert_eq!(saved.definition.revision, original.revision);
+        assert_eq!(scheduler.installs.load(Ordering::SeqCst), 1);
     }
 }
