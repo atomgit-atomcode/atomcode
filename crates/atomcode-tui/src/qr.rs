@@ -28,12 +28,10 @@ use crate::block::{hash_of, Content, ContentHash, RenderCtx};
 use crate::frame::{Color, Line, Span, Style};
 use crate::raster::{Cell, Raster};
 
-/// The light margin a scanner needs around the code, in modules.
-///
-/// Four is what the specification asks for. It is not decoration: without it a
-/// scanner cannot tell where the code ends, and a code drawn tight against a
-/// panel border reads as noise.
-const QUIET_ZONE: usize = 4;
+/// Compact terminal margin, in modules. Keep an explicit white surround rather
+/// than relying on the terminal's theme. This uses two modules instead of the
+/// standard four-module margin to avoid a large white card on screen.
+const QUIET_ZONE: usize = 2;
 
 const BLACK: crate::theme::Rgb = (0, 0, 0);
 const WHITE: crate::theme::Rgb = (255, 255, 255);
@@ -164,8 +162,8 @@ mod tests {
     fn the_quiet_zone_is_drawn_and_it_is_light() {
         let raster = code("https://example.com/login?code=abc").expect("it fits");
         for column in 0..raster.columns {
-            // Two whole cells is four module rows: the quiet zone exactly.
-            for row in 0..2 {
+            // One cell holds the two-module quiet zone.
+            for row in 0..(QUIET_ZONE / 2) as u16 {
                 let cell = at(&raster, column, row);
                 assert_eq!(
                     (cell.fg, cell.bg),
