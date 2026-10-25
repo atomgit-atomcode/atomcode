@@ -311,16 +311,53 @@ async fn the_persona_is_a_fragment_not_a_privileged_message() {
 }
 
 #[tokio::test]
-async fn an_unknown_tool_names_what_is_actually_mounted() {
+async fn an_unrelated_unknown_tool_does_not_dump_the_catalog() {
     let dir = scratch("unknown");
     let app = start(tree(&script_one("no_such_tool", "{}"), &dir, &[])).await;
     run_turn(&app, "go").await.unwrap();
     let text = transcript(&app);
     assert!(text.contains("unknown tool `no_such_tool`"), "{text}");
     assert!(
-        text.contains("read_file"),
-        "the error lists the live catalog"
+        !text.contains("mounted:") && !text.contains("read_file"),
+        "unrelated tools must not be listed: {text}"
     );
+}
+
+#[tokio::test]
+async fn an_unknown_tool_suggests_but_never_executes_a_nearby_write() {
+    let dir = scratch("unknown-write");
+    let target = dir.join("must-not-exist.txt");
+    let script = script_one(
+        "writ_file",
+        &format!(
+            r#"{{ file_path = {:?}, content = "must not run" }}"#,
+            target.to_string_lossy()
+        ),
+    );
+    let yolo = "[[patch]]\nid = \"approval\"\nconfig = { mode = \"yolo\" }";
+    let app = start(tree(&script, &dir, &[yolo])).await;
+    run_turn(&app, "go").await.unwrap();
+    let text = transcript(&app);
+    assert!(text.contains("unknown tool `writ_file`"), "{text}");
+    assert!(text.contains("`write_file`"), "{text}");
+    assert!(
+        !target.exists(),
+        "a suggestion must never execute the write"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_tool_does_not_suggest_a_hidden_tool() {
+    let dir = scratch("unknown-hidden");
+    let app = start(tree(&script_one("read_flie", "{}"), &dir, &[])).await;
+    app.context()
+        .service::<ToolsSvc>()
+        .unwrap()
+        .turn_off("read_file");
+    run_turn(&app, "go").await.unwrap();
+    let text = transcript(&app);
+    assert!(text.contains("unknown tool `read_flie`"), "{text}");
+    assert!(!text.contains("`read_file`"), "{text}");
 }
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
