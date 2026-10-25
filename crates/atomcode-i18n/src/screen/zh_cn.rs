@@ -1302,9 +1302,9 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         )
         .into(),
         Msg::ShareNoModel => "还没有配好模型——先 /login 或 /model".into(),
-        Msg::CmdAboutWebui => "浏览器共享，手机可扫码走中继(--local 仅本机;stop 结束)".into(),
-        Msg::WebuiTakes => "[--local | lan | --host <地址>] [--port <端口>] [--no-open] | stop".into(),
-        Msg::WebuiInvalidArguments { argument } => format!("/webui 参数 `{argument}` 无效或缺少参数值。用法：/webui [lan | --host <地址>] [--port <0-65535>] [--no-open]，或 /webui stop。").into(),
+        Msg::CmdAboutWebui => "打开本机网页；remote 开启中继，lan 开启局域网；stop 结束".into(),
+        Msg::WebuiTakes => "[remote | lan | --host <地址>] [--port <端口>] [--no-open] | stop".into(),
+        Msg::WebuiInvalidArguments { argument } => format!("/webui 参数 `{argument}` 无效或缺少参数值。用法：/webui [remote | lan | --host <地址>] [--port <0-65535>] [--no-open]，或 /webui stop。").into(),
         Msg::CmdAboutSync => "共享这个会话,但什么也不打开(off 停止)".into(),
         Msg::SyncTakes => "[off]".into(),
         Msg::CmdAboutDesktop => "打开桌面端".into(),

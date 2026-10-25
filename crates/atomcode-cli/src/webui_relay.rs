@@ -44,17 +44,19 @@ pub async fn launch(
     open_browser: bool,
     remote: bool,
 ) -> WebuiLaunch {
-    if !remote || !atomcode_config::endpoints::relay_enabled() {
+    if !atomcode_config::endpoints::relay_enabled() {
         stop();
     }
     let mut launched = atomcode_daemon::launch_webui(host, port, sync, open_browser).await;
+    if !remote && matches!(host, "127.0.0.1" | "localhost" | "::1") {
+        launched.qr_url = None;
+    }
     if remote && atomcode_config::endpoints::relay_enabled() {
         if let Some(target) = &launched.relay_target {
             match start(target, sync).await {
                 Ok(url) => {
-                    launched
-                        .message
-                        .push_str(&format!("\n手机浏览器扫码访问（中继）：{url}"));
+                    launched.message =
+                        format!("手机浏览器扫码访问（中继）：{url}\n{}", launched.message);
                     launched.qr_url = Some(url);
                 }
                 Err(error) => {
@@ -88,34 +90,13 @@ fn relay_base(base: &str) -> Result<(String, String), String> {
 }
 
 fn mobile_url(base: &str, route: &str, token: &str, sync: bool) -> String {
-    use base64::Engine;
-    // Encode the original bytes, not the hexadecimal text. The short keys
-    // identify this format; arbitrary injected credentials keep the legacy URL.
-    let compact = |value: &str| -> Option<String> {
-        if value.len() % 2 != 0 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return None;
-        }
-        let bytes = (0..value.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&value[i..i + 2], 16).ok())
-            .collect::<Option<Vec<_>>>()?;
-        let restored = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
-        if restored != value {
-            return None;
-        }
-        Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
-    };
-    let fragment = match (compact(route), compact(token)) {
-        (Some(route), Some(token)) => format!("r={route}&t={token}"),
-        _ => format!(
-            "relay={}&token={}",
-            crate::tui_share::escaped(route),
-            crate::tui_share::escaped(token)
-        ),
-    };
+    // Protocol 1 predates compact fragments. Until the relay explicitly
+    // advertises support, use the format understood by both old and new UI.
     format!(
-        "{base}/webui/{}#{fragment}",
-        if sync { "?sync=1" } else { "" }
+        "{base}/webui/{}#relay={}&token={}",
+        if sync { "?sync=1" } else { "" },
+        crate::tui_share::escaped(route),
+        crate::tui_share::escaped(token),
     )
 }
 
@@ -275,23 +256,21 @@ mod tests {
         );
     }
     #[test]
-    fn compact_mobile_link_preserves_every_credential_byte() {
+    fn mobile_link_is_understood_by_protocol_one_frontends() {
         let route = "c0058cf6c0f274dfe7994b84ee2a4b5097f1ade1c510da538065cd367e69fac1";
         let token = "fa3ea824a5ef913362a3f552fdea1cb9";
-        let compact = mobile_url("https://relay.example", route, token, true);
-        assert_eq!(compact, "https://relay.example/webui/?sync=1#r=wAWM9sDydN_nmUuE7ipLUJfxreHFENpTgGXNNn5p-sE&t=-j6oJKXvkTNio_VS_eocuQ");
-        let legacy = format!("https://relay.example/webui/?sync=1#relay={route}&token={token}");
-        assert!(compact.len() < legacy.len());
-        let old_qr = atomcode_tui::qr::code(&legacy).expect("legacy QR");
-        let new_qr = atomcode_tui::qr::code(&compact).expect("compact QR");
-        assert!(new_qr.rows < old_qr.rows);
-        assert!(new_qr.columns < old_qr.columns);
-
-        // Case-sensitive/injected credentials must never be normalized.
-        assert!(
-            mobile_url("https://relay.example", "ABCDEF0123456789", token, false)
-                .contains("#relay=")
-        );
+        let url = mobile_url("https://relay.example", route, token, true);
+        let parsed = reqwest::Url::parse(&url).unwrap();
+        let pairs: std::collections::HashMap<_, _> = reqwest::Url::parse(&format!(
+            "https://example.test/?{}",
+            parsed.fragment().unwrap()
+        ))
+        .unwrap()
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+        assert_eq!(pairs.get("relay").map(String::as_str), Some(route));
+        assert_eq!(pairs.get("token").map(String::as_str), Some(token));
         assert!(!mobile_url("https://relay.example", route, token, false).contains('?'));
     }
     #[test]

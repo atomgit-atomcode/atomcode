@@ -6250,8 +6250,10 @@ pub async fn launch_webui(host: &str, port: u16, sync: bool, open_browser: bool)
     // 绑定了非回环地址：给出访问 URL + 安全/作用域提示。
     if !is_loopback_authority(&bound_host) {
         if is_wildcard {
-            // 主 URL（local_url）已是局域网 IP（若探测到），它在本机自身也可访问
-            // （0.0.0.0 监听所有接口，含回环），故无需再单列 127.0.0.1 那条冗余链接。
+            // The LAN address is primary; retain loopback as a local fallback.
+            msg.push_str(&format!(
+                "\n本机备用：http://127.0.0.1:{actual_port}/?token={token}{sync_suffix}"
+            ));
             msg.push_str(
                 "\n⚠️ 主地址为局域网 IP，仅同一网络内的设备可访问；公网访问请用隧道（如 cloudflared / Tailscale）。无 TLS，凡能访问者凭 token 即可进入。",
             );
@@ -6546,6 +6548,54 @@ fn pgy_probe() -> PgyInfo {
     PgyInfo { installed, ipv4 }
 }
 
+fn relay_tunnel_status(
+    bind_host: String,
+    port: u16,
+    url: Option<String>,
+    error: Option<String>,
+) -> TunnelStatus {
+    let qr_svg = url
+        .as_ref()
+        .and_then(|url| qrcode::QrCode::new(url.as_bytes()).ok())
+        .map(|code| {
+            code.render::<qrcode::render::svg::Color>()
+                .min_dimensions(200, 200)
+                .quiet_zone(true)
+                .build()
+        });
+    TunnelStatus {
+        mode: "relay",
+        relay_error: error,
+        bind_host,
+        port,
+        reachable: url.is_some(),
+        pgy: PgyInfo {
+            installed: false,
+            ipv4: None,
+        },
+        remote_url: url,
+        qr_svg,
+    }
+}
+
+#[cfg(test)]
+mod relay_presentation_tests {
+    use super::*;
+
+    #[test]
+    fn phone_dialog_keeps_the_exact_host_published_url() {
+        let url = "https://relay.example/webui/?sync=1#relay=route-0123456789012345&token=token-0123456789012345";
+        let status = relay_tunnel_status("127.0.0.1".into(), 13457, Some(url.into()), None);
+        assert_eq!(status.remote_url.as_deref(), Some(url));
+        assert!(status.reachable);
+        assert!(status.qr_svg.is_some());
+        let failed = relay_tunnel_status("127.0.0.1".into(), 13457, None, Some("offline".into()));
+        assert!(failed.remote_url.is_none());
+        assert!(failed.qr_svg.is_none());
+        assert!(!failed.reachable);
+    }
+}
+
 /// GET /tunnel/status - 远程访问探测：绑定地址、蒲公英状态、远程 URL + 二维码。
 async fn get_tunnel_status(
     State(state): State<AppState>,
@@ -6559,28 +6609,12 @@ async fn get_tunnel_status(
             .map(|h| (h.relay_url.clone(), h.relay_error.clone()))
     };
     if let Some((url, error)) = relay.filter(|(url, error)| url.is_some() || error.is_some()) {
-        let qr_svg = url
-            .as_ref()
-            .and_then(|url| qrcode::QrCode::new(url.as_bytes()).ok())
-            .map(|code| {
-                code.render::<qrcode::render::svg::Color>()
-                    .min_dimensions(200, 200)
-                    .quiet_zone(true)
-                    .build()
-            });
-        return Json(TunnelStatus {
-            mode: "relay",
-            relay_error: error,
-            bind_host: state.bind_host.clone(),
-            port: state.bind_port,
-            reachable: url.is_some(),
-            pgy: PgyInfo {
-                installed: false,
-                ipv4: None,
-            },
-            remote_url: url,
-            qr_svg,
-        });
+        return Json(relay_tunnel_status(
+            state.bind_host.clone(),
+            state.bind_port,
+            url,
+            error,
+        ));
     }
     let pgy = tokio::task::spawn_blocking(pgy_probe)
         .await
@@ -6612,8 +6646,17 @@ async fn get_tunnel_status(
         )
     });
 
-    let (remote_url, qr_svg) = match (&pgy.ipv4, &token) {
-        (Some(ip), Some(tok)) if pgy_reachable => {
+    // Match the address selected by launch_webui for wildcard LAN binding.
+    // A phone on the LAN does not require the optional Pgy VPN.
+    let remote_ip = if matches!(state.bind_host.as_str(), "0.0.0.0" | "::") {
+        primary_lan_ipv4().or_else(|| pgy.ipv4.clone())
+    } else if reachable {
+        Some(state.bind_host.clone())
+    } else {
+        None
+    };
+    let (remote_url, qr_svg) = match (&remote_ip, &token) {
+        (Some(ip), Some(tok)) if reachable || pgy_reachable => {
             // sync=1：手机端扫码/打开后接入与 TUI 的实时同步会话（与本机
             // 自动打开浏览器的 URL 一致）。二维码由该 url 生成，故一并带上。
             let url = format!("http://{}:{}/?token={}&sync=1", ip, state.bind_port, tok);

@@ -652,14 +652,16 @@ fn webui_options(args: &str) -> Result<WebuiOptions, String> {
     let mut host = None;
     let mut port = None;
     let mut open_browser = true;
-    let mut remote = true;
+    let mut remote = false;
+    let mut local = false;
     let mut tokens = args.split_whitespace();
     let invalid = |argument: &str| tr(SMsg::WebuiInvalidArguments { argument }).into_owned();
     while let Some(token) = tokens.next() {
         match token {
             "lan" | "0.0.0.0" if host.is_none() => host = Some("0.0.0.0".to_string()),
             "--no-open" => open_browser = false,
-            "--local" => remote = false,
+            "--local" => local = true,
+            "remote" | "--remote" if !remote => remote = true,
             _ if token == "--host" || token.starts_with("--host=") => {
                 let value = token
                     .strip_prefix("--host=")
@@ -683,7 +685,10 @@ fn webui_options(args: &str) -> Result<WebuiOptions, String> {
             _ => return Err(invalid(token)),
         }
     }
-    remote &= host.is_none();
+    if remote && (local || host.is_some()) {
+        return Err(invalid(args));
+    }
+    open_browser &= !remote && host.is_none();
     Ok(WebuiOptions {
         remote,
         host: host.unwrap_or_else(|| "127.0.0.1".to_string()),
@@ -879,9 +884,24 @@ mod tests {
     }
 
     #[test]
-    fn webui_uses_relay_by_default_but_explicit_local_and_lan_do_not() {
-        assert!(webui_options("").unwrap().remote);
-        assert!(webui_options("--no-open").unwrap().remote);
+    fn webui_sharing_is_explicit_and_does_not_open_a_local_browser() {
+        assert!(webui_options("").unwrap().open_browser);
+        assert!(!webui_options("").unwrap().remote);
+        assert!(!webui_options("--no-open").unwrap().remote);
+        for args in ["remote", "--remote", "remote --no-open"] {
+            let options = webui_options(args).unwrap();
+            assert!(options.remote);
+            assert!(!options.open_browser);
+        }
+        assert!(!webui_options("lan").unwrap().open_browser);
+        for args in [
+            "remote lan",
+            "remote --local",
+            "remote --host localhost",
+            "remote remote",
+        ] {
+            assert!(webui_options(args).is_err(), "{args}");
+        }
         for args in ["--local", "lan", "--host 127.0.0.1", "--host 192.168.1.9"] {
             assert!(!webui_options(args).unwrap().remote, "{args}");
         }
