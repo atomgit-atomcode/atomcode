@@ -4089,6 +4089,7 @@ body {
 }
 .turn-nav-rail.is-expanded { background: var(--app-primary-background); width: min(300px, calc(100% - 32px)); box-shadow: 0 8px 32px #00000018; }
 .turn-nav-toggle { width: 100%; min-height: 36px; display: flex; align-items: center; justify-content: center; gap: 10px; border: 0; background: transparent; color: inherit; cursor: pointer; border-radius: 10px; }
+.turn-nav-rail.is-expanded .turn-nav-toggle { padding-inline: 12px; }
 .turn-nav-toggle span { flex: 1; text-align: left; font-size: 12px; font-weight: 600; }
 .turn-nav-toggle small { margin-left: 8px; font-weight: normal; opacity: .7; }
 .turn-nav-tabs { display: flex; gap: 4px; padding: 0 8px 7px; border-bottom: 1px solid var(--app-border-subtle); }

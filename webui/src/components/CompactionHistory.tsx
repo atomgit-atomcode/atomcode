@@ -51,9 +51,13 @@ export function CompactionHistory({ projectHash, sessionId, focusTurn, onNavigat
       if (!controller.signal.aborted) setBusy(false);
     }
   }
+  // The navigation rail owns history discovery; only render after a selection.
+  if (!open) return null;
   return <section class="compaction-history">
-    <button type="button" aria-expanded={open} onClick={() => open ? setOpen(false) : void load()}>
-      {t(open ? 'chat.historyClose' : 'chat.historyOpen')}
+    <button type="button" aria-expanded={open} onClick={() => {
+      pending.current?.abort(); setBusy(false); setOpen(false);
+    }}>
+      {t('chat.historyClose')}
     </button>
     {open && <div class="compaction-history-records">
       {focusedTurn !== null && <button type="button" onClick={() => void load()}>{t('chat.turnNavShowAll')}</button>}
