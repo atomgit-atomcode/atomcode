@@ -210,6 +210,28 @@ fn selected_in(messages: &[Message], catalog: Catalog) -> BTreeSet<String> {
 fn project(request: &mut ModelRequest, mode: McpToolSearchMode, window: u32) {
     project_in(request, mode, window, Catalog::Mcp)
 }
+fn log_projection_result(
+    request: &ModelRequest,
+    catalog: Catalog,
+    admitted_tools: usize,
+    admitted_schema_bytes: usize,
+    retained_tools: usize,
+    retained_schema_bytes: usize,
+) {
+    tracing::info!(
+        turn = request.turn,
+        round = request.round,
+        catalog = catalog.search_name(),
+        admitted_tools,
+        admitted_schema_bytes,
+        retained_tools,
+        retained_schema_bytes,
+        hidden_tools = admitted_tools.saturating_sub(retained_tools),
+        hidden_schema_bytes = admitted_schema_bytes.saturating_sub(retained_schema_bytes),
+        "Tool schema projection result (ToolDef JSON bytes, not provider wire bytes or tokens)"
+    );
+}
+
 fn project_in(request: &mut ModelRequest, mode: McpToolSearchMode, window: u32, catalog: Catalog) {
     // A policy or switch can disable search itself. Preserve usable eager tools
     // in that case rather than hide every schema behind an unavailable door.
@@ -241,6 +263,14 @@ fn project_in(request: &mut ModelRequest, mode: McpToolSearchMode, window: u32, 
     if !deferred {
         // Keep the small discovery tool in auto mode, even for eager catalogs.
         // This also makes retrying an already-projected request idempotent.
+        log_projection_result(
+            request,
+            catalog,
+            admitted_tools,
+            admitted_schema_bytes,
+            admitted_tools,
+            admitted_schema_bytes,
+        );
         return;
     }
     if let Catalog::Builtin = catalog {
@@ -268,6 +298,7 @@ fn project_in(request: &mut ModelRequest, mode: McpToolSearchMode, window: u32, 
     }
     let selected = selected_in(&request.messages, catalog);
     let mut remaining = budget;
+    let mut retained_tools = 0;
     request.tools.retain(|tool| {
         if !catalog.contains(&tool.name) {
             return true;
@@ -275,11 +306,20 @@ fn project_in(request: &mut ModelRequest, mode: McpToolSearchMode, window: u32, 
         let bytes = schema_bytes(tool);
         if selected.contains(&tool.name) && bytes <= remaining {
             remaining -= bytes;
+            retained_tools += 1;
             true
         } else {
             false
         }
     });
+    log_projection_result(
+        request,
+        catalog,
+        admitted_tools,
+        admitted_schema_bytes,
+        retained_tools,
+        budget - remaining,
+    );
 }
 
 struct SearchTool(Catalog);
@@ -957,15 +997,15 @@ mod tests {
             .unwrap();
         let _root = root.provide::<ToolsSvc>(parent).unwrap();
         let child = root.isolate();
-        let tools = Arc::new(ToolBox::with_policy(ToolPolicy::new(
+        let child_tools = Arc::new(ToolBox::with_policy(ToolPolicy::new(
             vec![],
             vec!["atomgit_pr".into()],
         )));
         for name in ["atomgit_issue", "atomgit_pr", "atomgit_repo"] {
-            tools.register(Arc::new(Stub(tool(name, 0)))).unwrap();
+            child_tools.register(Arc::new(Stub(tool(name, 0)))).unwrap();
         }
-        tools.turn_off("atomgit_repo");
-        let _child = child.provide::<ToolsSvc>(tools.clone()).unwrap();
+        child_tools.turn_off("atomgit_repo");
+        let _child = child.provide::<ToolsSvc>(child_tools.clone()).unwrap();
         BuiltinSearchPlugin
             .apply(&child, &json!({"enabled": true}))
             .await
@@ -988,7 +1028,7 @@ mod tests {
                 json!(["atomgit_issue"])
             );
         }
-        tools.unregister("atomgit_issue");
+        child_tools.unregister("atomgit_issue");
         let result = atomcode_harness::agent::as_agent(
             child.clone(),
             SearchTool(Catalog::Builtin).execute(r#"{"query":""}"#, &ctx),

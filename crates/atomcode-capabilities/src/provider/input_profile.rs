@@ -1,4 +1,4 @@
-//! Size-only diagnostics of the final provider body, never prompt contents.
+//! Size and tool-name diagnostics of the final provider body, never prompt contents.
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 
@@ -22,6 +22,14 @@ fn bytes(value: &Value) -> usize {
     count.0
 }
 
+const LARGEST_CORE_TOOLS: usize = 10;
+
+#[derive(Debug, Serialize)]
+pub(super) struct ToolSize {
+    name: String,
+    tool_json_bytes: usize,
+}
+
 #[derive(Debug, Default, Serialize)]
 pub(super) struct InputProfile {
     pub request_json_bytes: usize,
@@ -31,6 +39,8 @@ pub(super) struct InputProfile {
     pub tagged_text_bytes: BTreeMap<&'static str, usize>,
     pub mcp_tools: usize,
     pub core_tools: usize,
+    /// A bounded subset of tools_core, not another disjoint accounting category.
+    pub largest_core_tools: Vec<ToolSize>,
 }
 fn add(map: &mut BTreeMap<&'static str, usize>, key: &'static str, n: usize) {
     *map.entry(key).or_default() += n;
@@ -131,6 +141,10 @@ pub(super) fn profile(body: &Value) -> InputProfile {
                 "tools_mcp"
             } else {
                 result.core_tools += 1;
+                result.largest_core_tools.push(ToolSize {
+                    name: name.to_owned(),
+                    tool_json_bytes: n,
+                });
                 "tools_core"
             };
             add(&mut result.parts_json_bytes, category, n);
@@ -141,6 +155,12 @@ pub(super) fn profile(body: &Value) -> InputProfile {
             2 + tools.len().saturating_sub(1),
         );
     }
+    result.largest_core_tools.sort_by(|a, b| {
+        b.tool_json_bytes
+            .cmp(&a.tool_json_bytes)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    result.largest_core_tools.truncate(LARGEST_CORE_TOOLS);
     for key in ["system", "instructions"] {
         if let Some(value) = body.get(key) {
             add(&mut result.parts_json_bytes, "system", bytes(value));
@@ -212,6 +232,64 @@ mod tests {
             assert!(!serde_json::to_string(&report).unwrap().contains(secret));
             assert!(!format!("{report:?}").contains(secret));
         }
+    }
+
+    #[test]
+    fn largest_core_tools_are_bounded_and_measure_final_wire_definitions_without_content() {
+        let secret = "PRIVATE-DESCRIPTION-AND-PARAMETERS";
+        for shape in ["openai", "anthropic", "responses"] {
+            let make = |name: &str, padding: usize| {
+                let schema = json!({"type":"object","properties":{"value":{"type":"string","description":secret}}});
+                let description = format!("{secret}{}", "x".repeat(padding));
+                match shape {
+                    "openai" => {
+                        json!({"type":"function","function":{"name":name,"description":description,"parameters":schema}})
+                    }
+                    "anthropic" => {
+                        json!({"name":name,"description":description,"input_schema":schema})
+                    }
+                    _ => {
+                        json!({"type":"function","name":name,"description":description,"parameters":schema})
+                    }
+                }
+            };
+            let mut tools = (0..15)
+                .map(|i| make(&format!("native_{i:02}"), i * 20))
+                .collect::<Vec<_>>();
+            tools.push(make("mcp__demo__huge", 20_000));
+            let report = profile(&json!({"tools":tools}));
+            assert_eq!(report.core_tools, 15);
+            assert_eq!(report.mcp_tools, 1);
+            assert_eq!(report.largest_core_tools.len(), 10);
+            for (size, original) in report
+                .largest_core_tools
+                .iter()
+                .zip(tools[..15].iter().rev())
+            {
+                let original_name = original
+                    .pointer("/function/name")
+                    .or_else(|| original.get("name"))
+                    .unwrap();
+                assert_eq!(size.name, original_name.as_str().unwrap());
+                assert_eq!(size.tool_json_bytes, bytes(original));
+            }
+            assert_eq!(report.largest_core_tools.last().unwrap().name, "native_05");
+            assert!(!serde_json::to_string(&report).unwrap().contains(secret));
+            assert!(!format!("{report:?}").contains(secret));
+            assert_eq!(
+                report.parts_json_bytes.values().sum::<usize>(),
+                report.request_json_bytes
+            );
+        }
+        let tied = profile(&json!({"tools":[{"name":"zz"},{"name":"aa"},{"name":"bb"}]}));
+        assert_eq!(
+            tied.largest_core_tools
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["aa", "bb", "zz"]
+        );
+        assert!(profile(&json!({"tools":[]})).largest_core_tools.is_empty());
     }
 
     #[test]
