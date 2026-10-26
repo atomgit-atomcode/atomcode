@@ -1,3 +1,4 @@
+import { loadAfterSessionSwitch } from '../lib/sessionSwitch';
 import { useSkills, refreshSkills, invalidateSkills } from '../skills';
 import type { LiveGoalProgress } from '../api';
 // Task 13 — Chat view with streaming rendering
@@ -682,6 +683,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   // 已为哪个 sessionId 触发过历史加载（或它是本 Chat 自建的会话）。用于避免
   // project_hash 迟到（刷新后由 App 异步回填）导致的重复加载 / 覆盖当前对话。
   const loadedForRef = useRef<string | null>(null);
+  const switchReadyRef = useRef<{ id: string; generation: number; ready: Promise<boolean> } | null>(null);
+  const historyAbortRef = useRef<AbortController | null>(null);
+  useEffect(() => () => { historyAbortRef.current?.abort(); }, []);
   // Cache of session messages, used to preserve in-progress streaming turns when switching sessions.
   const messageCacheRef = useRef<Map<string, Message[]>>(new Map());
   // A notice for the session being switched back to: put in once that session's
@@ -870,6 +874,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         messageCacheRef.current.set(prevId, messagesRef.current);
       }
 
+      historyAbortRef.current?.abort();
       activeIdRef.current = sessionId;
       todoTitlesRef.current.clear();
       resetTodoBatch(true, false);
@@ -940,21 +945,21 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       // 不会回环：远端 session_switched 事件的 handler 会先把 activeIdRef 设为该 id，
       // 故由广播回流引起的 sessionId 变化进不来这个分支（条件已不成立），不会再次广播。
       if (sync && sessionId) {
-        postLiveSwitchSession(sessionId)
+        const ready = postLiveSwitchSession(sessionId)
           .then((result) => {
-            if (sessionGenerationRef.current !== switchGeneration) return;
+            if (sessionGenerationRef.current !== switchGeneration) return false;
             // Another atomcode held it, so the runtime opened a copy: follow it
             // there and say so — the original is untouched where it is open.
             if (result.ok && result.forkedFrom && result.sessionId) {
               noticeAfterSwitchRef.current = t('sync.sessionForked');
               onSessionId(result.sessionId);
-              return;
+              return false;
             }
-            if (result.ok) return;
+            if (result.ok) return true;
             if (result.activeTurn && prevId) {
               noticeAfterSwitchRef.current = t('cmd.session.busy');
               onSessionId(prevId);
-              return;
+              return false;
             }
             // The runtime answered and said no (the session is held by another
             // atomcode, say): it is still there and still shared, so go back to
@@ -967,18 +972,22 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
                 ? t('sync.sessionInUse')
                 : t('sync.switchFailed', { error: why });
               onSessionId(prevId);
-              return;
+              return false;
             }
             throw new Error(result.error ?? 'live runtime rejected the session switch');
           })
           .catch((error) => {
-            if (sessionGenerationRef.current !== switchGeneration) return;
+            if (sessionGenerationRef.current !== switchGeneration) return false;
             stopLiveStream();
             setSync(false);
             setBusy(false);
             setQueued([]);
             reportFailure(t('sync.switchFailed', { error: String(error) }));
+            loadedForRef.current = null;
+            setLoading(false);
+            return false;
           });
+        switchReadyRef.current = { id: sessionId, generation: switchGeneration, ready };
       }
     }
 
@@ -1005,8 +1014,19 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     }
     const loadId = sessionId;
     const loadGeneration = sessionGenerationRef.current;
-    Promise.allSettled([getSession(projectHash, loadId), getActiveChatSessions()])
-      .then(([sessionResult, activeResult]) => {
+    const historyController = new AbortController();
+    historyAbortRef.current?.abort();
+    historyAbortRef.current = historyController;
+    const pendingSwitch = switchReadyRef.current;
+    const accepted = pendingSwitch?.id === loadId && pendingSwitch.generation === loadGeneration
+      ? pendingSwitch.ready : undefined;
+    loadAfterSessionSwitch(accepted,
+      () => !historyController.signal.aborted && activeIdRef.current === loadId
+        && sessionGenerationRef.current === loadGeneration,
+      () => Promise.allSettled([getSession(projectHash, loadId, historyController.signal), getActiveChatSessions()]))
+      .then((results) => {
+        if (!results || historyController.signal.aborted) return;
+        const [sessionResult, activeResult] = results;
         // Generation also covers A -> B -> A; id equality alone is insufficient.
         if (
           activeIdRef.current !== loadId ||

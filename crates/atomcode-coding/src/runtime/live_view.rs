@@ -19,6 +19,15 @@ pub struct RuntimeLiveView {
 }
 
 impl RuntimeLiveView {
+    pub(super) fn has_pending_blocking_request(&self) -> bool {
+        self.pending.values().any(|event| {
+            matches!(&event.event,
+            CodingRuntimeEvent::Request(request)
+                if !atomcode_capabilities::tools::request_user_input::is_continued_question(
+                    &request.kind, &request.payload))
+        })
+    }
+
     pub fn from_snapshot(
         generation: u64,
         session_id: String,
@@ -297,6 +306,37 @@ mod tests {
         );
         assert_eq!(view.sequence, Some(4));
         assert_eq!(view.snapshot.messages[0].text, "new base");
+    }
+
+    #[test]
+    fn blocking_request_state_tracks_resolution_even_without_transcript_replay() {
+        let mut view = view();
+        view.valid = false;
+        view.observe(
+            &event(
+                1,
+                CodingRuntimeEvent::Request(RuntimeRequest {
+                    id: 42,
+                    kind: "approval".into(),
+                    payload: serde_json::json!({}),
+                    snapshot: None,
+                }),
+            ),
+            None,
+        );
+        assert!(view.has_pending_blocking_request());
+        view.observe(
+            &event(
+                2,
+                CodingRuntimeEvent::RequestResolved {
+                    id: 42,
+                    kind: "approval".into(),
+                },
+            ),
+            None,
+        );
+        assert!(!view.has_pending_blocking_request());
+        assert!(!view.valid);
     }
 
     #[test]

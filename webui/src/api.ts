@@ -976,9 +976,11 @@ export async function deleteProject(hash: string): Promise<void> {
 export async function getSession(
   projectHash: string,
   sessionId: string,
+  signal?: AbortSignal,
 ): Promise<SessionDetail> {
   const resp = await apiFetch(`/projects/${projectHash}/sessions/${sessionId}`, {
     headers: authHeaders(),
+    signal,
   });
   if (!resp.ok) {
     throw new Error(`getSession failed with status ${resp.status}`);

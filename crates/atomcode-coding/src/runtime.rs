@@ -2406,6 +2406,21 @@ impl CodingRuntimeHandle {
         result.await.ok().flatten()
     }
 
+    /// Current request control state, without cloning transcript or tool data.
+    /// Returns None across an unavailable/generation boundary. Control state
+    /// stays readable even when transcript replay has exceeded its bound.
+    pub fn has_pending_blocking_request(&self) -> Option<bool> {
+        let status = self.status();
+        if matches!(status.phase, RuntimePhase::Stopped | RuntimePhase::Failed) {
+            return Some(false);
+        }
+        let view = self.live_view.lock().expect("live view poisoned");
+        let view = view
+            .as_ref()
+            .filter(|view| view.generation == status.generation)?;
+        Some(view.has_pending_blocking_request())
+    }
+
     /// Read the sequenced presentation view without waiting for an agent turn.
     pub fn live_view(&self) -> Result<RuntimeLiveView, RuntimeError> {
         let view = self.live_view.lock().expect("live view poisoned");

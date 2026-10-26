@@ -1725,6 +1725,9 @@ fn catalog_entry_is_visible(
     if entry.delegated() {
         return false;
     }
+    if crate::native_live::background_session_hidden(&entry.id) {
+        return false;
+    }
     if !entry.working_directory_available() {
         return false;
     }
@@ -2888,7 +2891,11 @@ fn search_sessions_by_name_in_root(
     let mut entries: Vec<_> = catalog_scan_in_root(sessions_root)?
         .entries
         .into_iter()
-        .filter(|entry| entry.message_count > 0 && !entry.delegated())
+        .filter(|entry| {
+            entry.message_count > 0
+                && !entry.delegated()
+                && !crate::native_live::background_session_hidden(&entry.id)
+        })
         .filter(|entry| include_unavailable || entry.working_directory_available())
         .collect();
     crate::legacy_convert::repair_catalog_names_for_display_in_root(sessions_root, &mut entries);
