@@ -83,6 +83,33 @@ impl StreamWatchdog {
 mod tests {
     use super::*;
     #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_slow_but_progressing_stream_can_outlive_both_timeout_budgets() {
+        let mut watchdog = StreamWatchdog::new(
+            Some(Duration::from_secs(600)),
+            Some(Duration::from_secs(300)),
+        );
+        let started = Instant::now();
+        for _ in 0..5 {
+            let chunk = futures::stream::once(async {
+                tokio::time::sleep(Duration::from_secs(240)).await;
+                StreamEvent::TextDelta("more".into())
+            });
+            futures::pin_mut!(chunk);
+            let event = watchdog
+                .next(&mut chunk)
+                .await
+                .expect("progress within the idle window")
+                .expect("chunk");
+            watchdog.observe(&event);
+        }
+        assert_eq!(started.elapsed(), Duration::from_secs(1200));
+        assert_eq!(
+            watchdog.deadline().unwrap() - Instant::now(),
+            Duration::from_secs(300)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn expired_deadlines_cannot_be_bypassed_by_ready_events() {
         let w = StreamWatchdog::new(Some(Duration::from_secs(1)), Some(Duration::from_secs(1)));
         tokio::time::advance(Duration::from_secs(2)).await;

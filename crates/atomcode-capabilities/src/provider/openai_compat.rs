@@ -920,7 +920,7 @@ impl LlmProvider for OpenAiCompatProvider {
                             // Do not replay here: partial deltas may already be visible.
                             // The owner can continue from preserved safe progress.
                             request_span.in_scope(|| tracing::warn!(error_origin = "stream_watchdog", stream_attempt, had_replay_sensitive_output = emitted_replay_sensitive, "provider stream diagnostic"));
-                            let mut error = retry::stream_idle_error();
+                            let mut error = retry::stream_idle_error(&watchdog);
                             error.retryable = caller_recovers && !emitted_replay_sensitive;
                             yield StreamEvent::Error(error);
                             return;

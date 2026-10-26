@@ -312,7 +312,7 @@ impl LlmProvider for AnthropicProvider {
                     .await
                     {
                         Err(_elapsed) => {
-                            let mut error = retry::stream_idle_error();
+                            let mut error = retry::stream_idle_error(&watchdog);
                             error.retryable = caller_recovers && !emitted_replay_sensitive;
                             yield StreamEvent::Error(error);
                             return;
