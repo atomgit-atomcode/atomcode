@@ -2091,6 +2091,10 @@ pub struct LspConfig {
     /// avoid surprising the user with binary spawns.
     #[serde(default)]
     pub auto_detect: bool,
+    #[serde(default)]
+    pub features: crate::lsp_registry::LspFeatures,
+    #[serde(default)]
+    pub trace: crate::lsp_registry::LspTrace,
     /// Custom server configurations keyed by file extension.
     #[serde(default)]
     pub servers: std::collections::HashMap<String, crate::lsp_registry::LspServerConfig>,
@@ -2112,6 +2116,8 @@ impl Default for LspConfig {
             ide_connection_file: None,
             enabled: false,
             auto_detect: false,
+            features: Default::default(),
+            trace: Default::default(),
             servers: Default::default(),
             diagnostics_settle_delay_ms: default_diagnostics_settle_delay_ms(),
         }
@@ -2145,7 +2151,9 @@ fn migrate_legacy_lsp_default(cfg: &mut Config) {
         && cfg.lsp.diagnostics_settle_delay_ms == 150
         && cfg.lsp.servers.is_empty()
         && cfg.lsp.ide_connection_file.is_none()
-        && cfg.lsp.ide_discovery_dir.is_none();
+        && cfg.lsp.ide_discovery_dir.is_none()
+        && cfg.lsp.features == crate::lsp_registry::LspFeatures::default()
+        && cfg.lsp.trace == crate::lsp_registry::LspTrace::Off;
     if looks_auto_written {
         cfg.lsp = LspConfig::default();
     }
@@ -3650,6 +3658,8 @@ model = "missing-type"
             ide_connection_file: None,
             enabled: true,
             auto_detect: true,
+            features: Default::default(),
+            trace: Default::default(),
             servers: Default::default(),
             diagnostics_settle_delay_ms: 150,
         });
@@ -3674,6 +3684,7 @@ model = "missing-type"
                 command: "my-custom-rust-ls".to_string(),
                 args: vec![],
                 root_markers: vec![],
+                options: Default::default(),
             },
         );
         let mut cfg = blank_config_with_lsp(LspConfig {
@@ -3681,6 +3692,8 @@ model = "missing-type"
             ide_connection_file: None,
             enabled: true,
             auto_detect: true,
+            features: Default::default(),
+            trace: Default::default(),
             servers,
             diagnostics_settle_delay_ms: 150,
         });
@@ -3693,6 +3706,8 @@ model = "missing-type"
             ide_connection_file: None,
             enabled: true,
             auto_detect: true,
+            features: Default::default(),
+            trace: Default::default(),
             servers: Default::default(),
             diagnostics_settle_delay_ms: 500,
         });
@@ -3706,6 +3721,8 @@ model = "missing-type"
             ide_connection_file: None,
             enabled: true,
             auto_detect: false,
+            features: Default::default(),
+            trace: Default::default(),
             servers: Default::default(),
             diagnostics_settle_delay_ms: 150,
         });

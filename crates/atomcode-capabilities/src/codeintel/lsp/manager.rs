@@ -3,28 +3,43 @@
 //! production `lsp/manager.rs` (the event-channel / telemetry
 //! coupling is dropped; absence of a server binary degrades gracefully).
 
+use super::super::{lsp_policy::LspMode, LspSettings};
 use super::client::LspClient;
 use super::registry::{extension_to_language_id, LspServerRegistry};
 use super::types::{Diagnostic, Location};
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 /// How long to wait after syncing a document for the server to publish diagnostics.
 const SETTLE_DELAY_MS: u64 = 350;
 const STARTUP_TIMEOUT_SECS: u64 = 30;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct ClientKey {
     root: PathBuf,
     command: String,
     args: Vec<String>,
+    identity: String,
+}
+
+impl std::fmt::Debug for ClientKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientKey")
+            .field("root", &self.root)
+            .field("command", &self.command)
+            .field("identity", &"[private]")
+            .finish_non_exhaustive()
+    }
 }
 
 pub struct LspManager {
+    policy: LspSettings,
+    generation: RwLock<()>,
     /// (canonical project root, server command/args) → running client. Extensions that
     /// map to the same server share a process, while different workspaces remain isolated.
     clients: Mutex<HashMap<ClientKey, Arc<LspClient>>>,
@@ -49,6 +64,8 @@ impl LspManager {
 
     pub fn with_registry_and_delay(registry: LspServerRegistry, settle_delay_ms: u64) -> Self {
         Self {
+            policy: Default::default(),
+            generation: RwLock::new(()),
             clients: Mutex::new(HashMap::new()),
             startup_locks: Mutex::new(HashMap::new()),
             unavailable: Mutex::new(HashMap::new()),
@@ -56,6 +73,76 @@ impl LspManager {
             settle_delay_ms,
         }
     }
+    pub fn with_policy(mut self, policy: LspSettings) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    pub fn feature_mode(&self, path: &Path, operation: &str) -> LspMode {
+        let service = Self::ext_of(path).and_then(|ext| self.registry.get(&ext));
+        service
+            .map(|s| s.options.features.mode(operation, &self.policy.features))
+            .unwrap_or_else(|| self.policy.features.mode(operation, &Default::default()))
+    }
+
+    pub fn check_feature(&self, path: &Path, operation: &str) -> Result<(), String> {
+        if Self::ext_of(path)
+            .and_then(|ext| self.registry.get(&ext))
+            .is_some_and(|server| server.options.disabled)
+        {
+            return Err("language server is disabled by configuration".into());
+        }
+        if self.feature_mode(path, operation) == LspMode::Off {
+            return Err(format!("LSP {operation} is disabled by configuration"));
+        }
+        Ok(())
+    }
+
+    pub async fn reload(&self, cancel: &CancellationToken) -> Result<Value, String> {
+        let _generation = tokio::select! { guard = self.generation.write() => guard, _ = cancel.cancelled() => return Err("LSP reload cancelled".into()) };
+        let clients = std::mem::take(&mut *self.clients.lock().await);
+        let count = clients.len();
+        // Detach first: a cancelled shutdown must never republish a stale connection.
+        self.unavailable.lock().await.clear();
+        self.startup_locks.lock().await.clear();
+        futures::future::join_all(
+            clients
+                .into_values()
+                .map(|client| async move { client.shutdown().await }),
+        )
+        .await;
+        Ok(
+            json!({"status":"reloaded","closed_clients":count,"message":"Initialization/settings files will be reread on the next query. Server command and policy changes require runtime reload."}),
+        )
+    }
+
+    pub async fn status(&self) -> Value {
+        let clients = self.clients.lock().await;
+        json!({"source":"local","connections":clients.values().map(|client| client.status()).collect::<Vec<_>>(),"configured_extensions":self.registry.available_extensions(),"startup_failures":self.unavailable.lock().await.len(),"trace":self.policy.trace,"trace_file":self.policy.trace_file,"init_options_off":self.policy.init_options_off})
+    }
+
+    pub async fn probe(
+        &self,
+        root: &Path,
+        path: &Path,
+        cancel: &CancellationToken,
+    ) -> Result<Value, String> {
+        let started = tokio::time::Instant::now();
+        let client = self.get_or_start_server(root, path, cancel).await?;
+        let mut status = client.status();
+        status["elapsed_ms"] = json!(started.elapsed().as_millis());
+        status["trace_file"] = json!(self.policy.trace_file);
+        let operations = [
+            "definition",
+            "hover",
+            "references",
+            "diagnostics",
+            "document_symbols",
+        ];
+        status["features"] = Value::Object(operations.iter().map(|operation| ((*operation).to_owned(), json!({"mode":self.feature_mode(path,operation),"advertised":client.supports(operation)}))).collect());
+        Ok(status)
+    }
+
     pub fn settle_delay_ms(&self) -> u64 {
         self.settle_delay_ms
     }
@@ -103,6 +190,7 @@ impl LspManager {
             root,
             command: config.command.clone(),
             args: config.args.clone(),
+            identity: String::new(),
         }
     }
 
@@ -115,6 +203,7 @@ impl LspManager {
         path: &Path,
         cancel: &CancellationToken,
     ) -> Result<Arc<LspClient>, String> {
+        let _generation = tokio::select! { guard = self.generation.read() => guard, _ = cancel.cancelled() => return Err("LSP startup cancelled".into()) };
         let Some(extension) = Self::ext_of(path) else {
             return Err("file has no supported extension".into());
         };
@@ -122,7 +211,32 @@ impl LspManager {
             return Err(format!("no language server configured for .{extension}"));
         };
         let server_root = Self::server_root(root, path, &config.root_markers);
-        let key = Self::client_key(server_root, config);
+        let absolute_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            root.join(path)
+        };
+        let prepared = tokio::select! {
+            result = super::options::prepare(config,&self.policy,&server_root,&absolute_path) => result?,
+            _ = cancel.cancelled() => return Err("LSP configuration resolution cancelled".into()),
+        };
+        let mut key = Self::client_key(server_root, config);
+        let diagnostics_enabled = self.feature_mode(path, "diagnostics") != LspMode::Off;
+        key.identity = json!([
+            prepared.initialization,
+            prepared.settings,
+            diagnostics_enabled
+        ])
+        .to_string();
+        let trace = super::trace::Trace::open(
+            self.policy.trace_file.as_deref(),
+            self.policy.trace,
+            prepared.redactions.clone(),
+        )?;
+        trace.record(
+            "configuration",
+            &json!({"source":prepared.source,"root":key.root}),
+        );
         if let Some(client) = self.clients.lock().await.get(&key).cloned() {
             return Ok(client);
         }
@@ -157,7 +271,7 @@ impl LspManager {
         }
         let startup = tokio::time::timeout(
             Duration::from_secs(STARTUP_TIMEOUT_SECS),
-            LspClient::spawn(config, &key.root),
+            LspClient::spawn_prepared(config, &key.root, prepared, trace, diagnostics_enabled),
         );
         let startup = tokio::select! {
             result = startup => result,
@@ -234,7 +348,15 @@ impl LspManager {
         character: u32,
         cancel: &CancellationToken,
     ) -> Result<Vec<Location>, String> {
+        self.check_feature(path, "definition")?;
         let client = self.sync_document(root, path, content, cancel).await?;
+        if self.feature_mode(path, "definition") == LspMode::Auto && !client.supports("definition")
+        {
+            return Err(format!(
+                "LSP server does not advertise support for {} (use mode=on to explicitly try)",
+                "definition"
+            ));
+        }
         let (line, character) = client.wire_position(content, line, character)?;
         client.definition(path, line, character, cancel).await
     }
@@ -248,7 +370,15 @@ impl LspManager {
         character: u32,
         cancel: &CancellationToken,
     ) -> Result<Vec<Location>, String> {
+        self.check_feature(path, "references")?;
         let client = self.sync_document(root, path, content, cancel).await?;
+        if self.feature_mode(path, "references") == LspMode::Auto && !client.supports("references")
+        {
+            return Err(format!(
+                "LSP server does not advertise support for {} (use mode=on to explicitly try)",
+                "references"
+            ));
+        }
         let (line, character) = client.wire_position(content, line, character)?;
         client.references(path, line, character, cancel).await
     }
@@ -262,7 +392,14 @@ impl LspManager {
         character: u32,
         cancel: &CancellationToken,
     ) -> Result<serde_json::Value, String> {
+        self.check_feature(path, "hover")?;
         let client = self.sync_document(root, path, content, cancel).await?;
+        if self.feature_mode(path, "hover") == LspMode::Auto && !client.supports("hover") {
+            return Err(format!(
+                "LSP server does not advertise support for {} (use mode=on to explicitly try)",
+                "hover"
+            ));
+        }
         let (line, character) = client.wire_position(content, line, character)?;
         client.hover(path, line, character, cancel).await
     }
@@ -273,11 +410,15 @@ impl LspManager {
         path: &Path,
         cancel: &CancellationToken,
     ) -> Result<(), String> {
+        self.check_feature(path, "diagnostics")?;
         let client = self.get_or_start_server(root, path, cancel).await?;
         client.refresh_pull_diagnostics(path, cancel).await
     }
 
     pub async fn diagnostics(&self, path: &Path) -> Vec<Diagnostic> {
+        if self.check_feature(path, "diagnostics").is_err() {
+            return vec![];
+        }
         let clients: Vec<_> = self.clients.lock().await.values().cloned().collect();
         clients
             .into_iter()
@@ -290,7 +431,14 @@ impl LspManager {
 
     pub async fn all_diagnostics(&self) -> Vec<Diagnostic> {
         let clients: Vec<_> = self.clients.lock().await.values().cloned().collect();
-        clients.iter().flat_map(|c| c.all_diagnostics()).collect()
+        clients
+            .iter()
+            .flat_map(|c| c.all_diagnostics())
+            .filter(|diagnostic| {
+                self.check_feature(Path::new(&diagnostic.file), "diagnostics")
+                    .is_ok()
+            })
+            .collect()
     }
 
     pub async fn has_servers(&self) -> bool {
@@ -324,9 +472,98 @@ mod tests {
                 command: "atomcode-no-such-lsp-binary-xyz".into(),
                 args: vec![],
                 root_markers: vec![],
+                options: Default::default(),
             },
         );
         r
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn reload_closes_clients_and_resolves_in_flight_requests() {
+        use super::super::jsonrpc;
+        use tokio::io::{AsyncWriteExt, BufReader};
+        let workspace = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(workspace.path()).unwrap();
+        let manager = Arc::new(LspManager::with_registry(missing_binary_registry()));
+        let config = manager.registry.get("rs").unwrap();
+        let (client_end, server_end) = tokio::io::duplex(8192);
+        let (cr, cw) = tokio::io::split(client_end);
+        let (sr, mut sw) = tokio::io::split(server_end);
+        let (hover_started, hover_seen) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut reader = BufReader::new(sr);
+            let mut hover_started = Some(hover_started);
+            loop {
+                let Ok(body) = jsonrpc::read_message(&mut reader).await else {
+                    break;
+                };
+                let message: Value = serde_json::from_slice(&body).unwrap();
+                match message["method"].as_str() {
+                    Some("initialize") => {
+                        let reply = json!({"jsonrpc":"2.0","id":message["id"],"result":{"capabilities":{"hoverProvider":true}}});
+                        sw.write_all(&jsonrpc::encode(&serde_json::to_vec(&reply).unwrap()))
+                            .await
+                            .unwrap();
+                    }
+                    Some("textDocument/hover") => {
+                        let _ = hover_started.take().unwrap().send(());
+                    }
+                    Some("shutdown") => {
+                        let reply = json!({"jsonrpc":"2.0","id":message["id"],"result":null});
+                        sw.write_all(&jsonrpc::encode(&serde_json::to_vec(&reply).unwrap()))
+                            .await
+                            .unwrap();
+                    }
+                    Some("exit") => break,
+                    _ => {}
+                }
+            }
+        });
+        let client = LspClient::connect(
+            Box::new(cr),
+            Box::new(cw),
+            url::Url::from_file_path(&root).unwrap().to_string(),
+        )
+        .await
+        .unwrap();
+        let mut key = LspManager::client_key(root.clone(), config);
+        key.identity = json!([Value::Null, json!({}), true]).to_string();
+        manager
+            .clients
+            .lock()
+            .await
+            .insert(key.clone(), Arc::new(client));
+        manager
+            .unavailable
+            .lock()
+            .await
+            .insert(key, "old failure".into());
+        let work = manager.clone();
+        let file = root.join("main.rs");
+        let query = tokio::spawn(async move {
+            work.hover(
+                &root,
+                &file,
+                "fn main() {}",
+                1,
+                1,
+                &CancellationToken::new(),
+            )
+            .await
+        });
+        hover_seen.await.unwrap();
+        assert_eq!(
+            manager.reload(&CancellationToken::new()).await.unwrap()["closed_clients"],
+            1
+        );
+        let error = query.await.unwrap().unwrap_err();
+        assert!(
+            error.contains("shutdown") || error.contains("stream closed"),
+            "{error}"
+        );
+        assert!(!manager.has_servers().await);
+        assert!(manager.unavailable.lock().await.is_empty());
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -353,7 +590,9 @@ mod tests {
         let manager = LspManager::with_registry(missing_binary_registry());
         let workspace = tempfile::tempdir().unwrap();
         let config = manager.registry.get("rs").unwrap();
-        let key = LspManager::client_key(std::fs::canonicalize(workspace.path()).unwrap(), config);
+        let mut key =
+            LspManager::client_key(std::fs::canonicalize(workspace.path()).unwrap(), config);
+        key.identity = json!([Value::Null, json!({}), true]).to_string();
         let startup_lock = Arc::new(Mutex::new(()));
         manager
             .startup_locks
@@ -387,6 +626,7 @@ mod tests {
             command: "typescript-language-server".into(),
             args: vec!["--stdio".into()],
             root_markers: vec![],
+            options: Default::default(),
         };
         let ka = LspManager::client_key(a.path().to_path_buf(), &config);
         let kb = LspManager::client_key(b.path().to_path_buf(), &config);

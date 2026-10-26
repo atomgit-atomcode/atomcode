@@ -15,6 +15,7 @@ use clap::{ArgGroup, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 
 mod headless_json;
+mod lsp_cmd;
 mod review;
 mod schedule_cmd;
 mod telemetry_cmd;
@@ -779,6 +780,9 @@ enum Commands {
     /// Manage MCP server entries in `.mcp.json` (similar to `claude mcp add`)
     #[command(subcommand)]
     Mcp(McpCli),
+    /// Diagnose a configured local language server.
+    #[command(subcommand)]
+    Lsp(lsp_cmd::LspCli),
     /// Start the HTTP daemon for IDE integration (VS Code extension connects to this)
     Daemon {
         /// Port to listen on
@@ -1842,6 +1846,19 @@ async fn run(process_start: std::time::Instant) -> Result<i32> {
                 println!("\n  Starting AtomCode...\n");
                 HEADLESS_MODE.store(false, Ordering::Relaxed);
                 // Fall through to TUI startup below
+            }
+            Commands::Lsp(command) => {
+                HEADLESS_MODE.store(true, Ordering::Relaxed);
+                let result = lsp_cmd::run(
+                    command,
+                    &config_path_for_tel,
+                    resolve_working_dir(cli.dir.clone()),
+                )
+                .await;
+                telemetry
+                    .shutdown(std::time::Duration::from_millis(500))
+                    .await;
+                return result.map(|()| 0);
             }
             Commands::Daemon {
                 port,
@@ -3909,6 +3926,7 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
         Commands::Setup { .. } => {
             unreachable!("Setup is handled inline in run() before handle_command")
         }
+        Commands::Lsp(_) => unreachable!("Lsp is handled inline in run before handle_command"),
         Commands::Plugin(sub) => handle_plugin_cli(sub),
         Commands::Mcp(McpCli::Add {
             name,
@@ -4975,6 +4993,59 @@ fn install_panic_hook(telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>) 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lsp_probe_cli_has_bounded_read_only_methods_and_complete_positions() {
+        assert!(Cli::try_parse_from([
+            "atomcode",
+            "lsp",
+            "probe",
+            "--file",
+            "src/main.cj",
+            "--method",
+            "definition",
+            "--line",
+            "13",
+            "--col",
+            "26",
+            "--trace",
+            "verbose"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "atomcode",
+            "lsp",
+            "probe",
+            "--file",
+            "src/main.cj",
+            "--method",
+            "rename",
+            "--line",
+            "13",
+            "--col",
+            "26"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "atomcode",
+            "lsp",
+            "probe",
+            "--file",
+            "src/main.cj",
+            "--method",
+            "hover"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "atomcode",
+            "lsp",
+            "probe",
+            "--file",
+            "src/main.cj",
+            "--no-lsp-init-options"
+        ])
+        .is_ok());
+    }
+
     #[test]
     fn explicit_missing_config_is_rejected_but_a_missing_default_is_allowed() {
         let dir = tempfile::tempdir().unwrap();

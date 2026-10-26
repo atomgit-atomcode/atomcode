@@ -348,6 +348,29 @@ pub struct CodingRuntimeConfig {
     pub web_search_api_key: Option<String>,
 }
 
+fn lsp_mode(
+    mode: atomcode_config::lsp_registry::LspMode,
+) -> atomcode_capabilities::codeintel::lsp_policy::LspMode {
+    use atomcode_capabilities::codeintel::lsp_policy::LspMode as R;
+    use atomcode_config::lsp_registry::LspMode as C;
+    match mode {
+        C::On => R::On,
+        C::Auto => R::Auto,
+        C::Off => R::Off,
+    }
+}
+fn lsp_features(
+    features: &atomcode_config::lsp_registry::LspFeatures,
+) -> atomcode_capabilities::codeintel::lsp_policy::LspFeatures {
+    atomcode_capabilities::codeintel::lsp_policy::LspFeatures {
+        definition: features.definition.map(lsp_mode),
+        references: features.references.map(lsp_mode),
+        hover: features.hover.map(lsp_mode),
+        diagnostics: features.diagnostics.map(lsp_mode),
+        document_symbols: features.document_symbols.map(lsp_mode),
+    }
+}
+
 pub fn lsp_settings_from_config(
     config: &atomcode_config::config::LspConfig,
 ) -> atomcode_capabilities::codeintel::LspSettings {
@@ -357,6 +380,18 @@ pub fn lsp_settings_from_config(
         enabled: config.enabled,
         auto_detect: config.auto_detect,
         settle_delay_ms: config.diagnostics_settle_delay_ms,
+        features: lsp_features(&config.features),
+        trace: match config.trace {
+            atomcode_config::lsp_registry::LspTrace::Off => {
+                atomcode_capabilities::codeintel::lsp_policy::LspTrace::Off
+            }
+            atomcode_config::lsp_registry::LspTrace::Messages => {
+                atomcode_capabilities::codeintel::lsp_policy::LspTrace::Messages
+            }
+            atomcode_config::lsp_registry::LspTrace::Verbose => {
+                atomcode_capabilities::codeintel::lsp_policy::LspTrace::Verbose
+            }
+        },
         servers: config
             .servers
             .iter()
@@ -367,10 +402,20 @@ pub fn lsp_settings_from_config(
                         command: server.command.clone(),
                         args: server.args.clone(),
                         root_markers: server.root_markers.clone(),
+                        options: atomcode_capabilities::codeintel::lsp_policy::LspOptions {
+                            disabled: server.options.disabled,
+                            init_options_mode: lsp_mode(server.options.init_options_mode),
+                            init_options_file: server.options.init_options_file.clone(),
+                            init_options: server.options.init_options.clone(),
+                            settings_file: server.options.settings_file.clone(),
+                            settings: server.options.settings.clone(),
+                            features: lsp_features(&server.options.features),
+                        },
                     },
                 )
             })
             .collect(),
+        ..Default::default()
     }
 }
 
@@ -476,7 +521,10 @@ pub fn describe_config_file_for(
          preview that `fetch_output` reads past; `ATOMCODE_TOOL_OUTPUT_THRESHOLD_BYTES` \
          wins.\n\
          - `[lsp]` `enabled`, `auto_detect`, `ide_discovery_dir` (opt-in private window discovery), `ide_connection_file` (private IDE window binding path), and `[lsp.servers.<extension>]` = \
-         `{{ command, args, root_markers }}`.\n\
+         `{{ command, args, root_markers, disabled, init_options_file or init_options, init_options_mode = on|auto|off, settings_file or settings }}`. \
+         `[lsp.features]` and service `features` select definition/references/hover/diagnostics/document_symbols with on|auto|off. \
+         `[lsp] trace = off|messages|verbose` enables bounded, redacted protocol logging. Relative LSP JSON files use the user config directory. \
+         Use the lsp tool probe/status/reload operations to diagnose initialization and reread JSON files; command/policy changes require a new runtime.\n\
          - `[web_search]` `provider` = `exa` | `duckduckgo`, and `api_key` for Exa; the \
          `ATOMCODE_WEB_SEARCH_PROVIDER` and `EXA_API_KEY` environment variables win.\n\
          - `keep_interrupted_context` (keep a cancelled turn's partial work; default \
@@ -566,7 +614,7 @@ impl CodingRuntimeConfig {
             startup_warnings,
             compact_token_limit: config.compaction.token_limit.map(|limit| limit.get()),
             extra_skill_dirs: config.skills.extra_dirs.clone(),
-            dirs,
+            dirs: dirs.clone(),
             api_key: r.and_then(|r| r.api_key.clone()).unwrap_or_default(),
             base_url: r.and_then(|r| r.base_url.clone()).unwrap_or_default(),
             model: r.map(|r| r.model.clone()).unwrap_or_default(),
@@ -635,7 +683,14 @@ impl CodingRuntimeConfig {
             // TUI spawn sites and `event_loop::reload_runtime_provider_from`).
             round_cap_checkpoint: false,
             next_prompt_suggestions: false,
-            lsp: lsp_settings_from_config(&config.lsp),
+            lsp: {
+                let mut lsp = lsp_settings_from_config(&config.lsp);
+                lsp.config_dir = Some(dirs.user().to_path_buf());
+                lsp.trace_file = Some(dirs.user().join("logs").join("lsp.log"));
+                lsp.init_options_off = std::env::var("ATOMCODE_LSP_INIT_OPTIONS")
+                    .is_ok_and(|v| v.eq_ignore_ascii_case("off"));
+                lsp
+            },
             web_search_provider: web_search_from_config(&config.web_search).0,
             web_search_api_key: web_search_from_config(&config.web_search).1,
         }
@@ -1386,6 +1441,7 @@ mod tests {
                 command: "custom-ra".into(),
                 args: vec!["--stdio".into()],
                 root_markers: vec!["Cargo.toml".into()],
+                options: Default::default(),
             },
         );
         let runtime = CodingRuntimeConfig::from_config(

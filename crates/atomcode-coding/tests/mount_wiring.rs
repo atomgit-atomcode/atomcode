@@ -378,6 +378,19 @@ async fn a_configured_credential_never_enters_the_config_tree() {
     let project = tempfile::tempdir().unwrap();
     let mut file = atomcode_config::config::Config::default();
     file.web_search.api_key = Some(SENTINEL.into());
+    file.lsp.enabled = true;
+    file.lsp.servers.insert(
+        "rs".into(),
+        atomcode_config::lsp_registry::LspServerConfig {
+            command: "unused-lsp-credential-test".into(),
+            args: vec![],
+            root_markers: vec![],
+            options: atomcode_config::lsp_registry::LspOptions {
+                init_options: Some(serde_json::json!({"token":SENTINEL})),
+                ..Default::default()
+            },
+        },
+    );
     let cfg = atomcode_coding::CodingRuntimeConfig::from_config(
         &file,
         project.path(),
@@ -399,6 +412,15 @@ async fn a_configured_credential_never_enters_the_config_tree() {
         ..quiet_options()
     };
     let mounted = support::mount(&cfg, opts, Arc::new(CannedProvider)).await;
+    assert!(
+        mounted
+            .context()
+            .service::<atomcode_harness::seams::ToolsSvc>()
+            .unwrap()
+            .get("lsp")
+            .is_some(),
+        "the credential-bearing LSP instance really mounted"
+    );
     let dump = mounted.dump();
     assert!(
         dump.contains("tool-web-keyed"),
