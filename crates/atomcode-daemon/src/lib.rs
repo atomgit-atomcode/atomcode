@@ -41,6 +41,7 @@ mod login_state;
 mod login_state_tests;
 pub mod native_live;
 mod runtime_host;
+mod transcript_view;
 /// File-sink diagnostic trace (`ctrace!` macro), enabled via `ATOMCODE_TUIX_LOG`.
 /// Daemon owns this sink; the historical environment name is retained for
 /// existing diagnostic scripts.
@@ -2323,14 +2324,24 @@ async fn get_session_detail(Path((hash, id)): Path<(String, String)>) -> impl In
 #[derive(serde::Serialize)]
 struct SessionTranscript {
     session_id: String,
-    turns: Vec<atomcode_capabilities::session::TurnRecord>,
+    turns: Vec<transcript_view::TranscriptTurn>,
 }
 
 /// GET /projects/:hash/sessions/:id/transcript - Full never-compacted per-turn
 /// trajectory. READ-ONLY: it does not touch the runtime snapshot, compaction, or
 /// what the model sees — it only exposes the transcript that is already written on
 /// every turn. Serves the UI's "view compacted history" affordance.
-async fn get_session_transcript(Path((hash, id)): Path<(String, String)>) -> impl IntoResponse {
+#[derive(Default, serde::Deserialize)]
+struct TranscriptQuery {
+    turn_id: Option<u64>,
+    #[serde(default)]
+    detail: bool,
+}
+
+async fn get_session_transcript(
+    Path((hash, id)): Path<(String, String)>,
+    Query(query): Query<TranscriptQuery>,
+) -> impl IntoResponse {
     // Gate on the session resolving, mirroring `get_session_detail`'s 404 semantics.
     match crate::legacy_convert::load_catalog_session_view_in_project(&hash, &id) {
         Ok(Some(_)) => {}
@@ -2352,7 +2363,7 @@ async fn get_session_transcript(Path((hash, id)): Path<(String, String)>) -> imp
             )
             .join(&task_hash),
         );
-        manager.load_transcript_records(&task_id)
+        transcript_view::load(&manager, &task_id, query.turn_id, query.detail)
     })
     .await;
     match loaded {

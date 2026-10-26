@@ -986,7 +986,13 @@ export async function getSession(
   return resp.json();
 }
 
+export interface TranscriptStep {
+  text: string;
+  reasoning: string;
+  tools: { id: string; name: string; args: string; result: string | null; is_error: boolean | null }[];
+}
 export interface TranscriptTurn {
+  steps?: TranscriptStep[];
   turn_id: number;
   user: string;
   assistant: string;
@@ -995,8 +1001,13 @@ export interface TranscriptTurn {
   undone: boolean;
 }
 
-export async function getSessionTranscript(projectHash: string, sessionId: string, signal?: AbortSignal): Promise<{ session_id: string; turns: TranscriptTurn[] }> {
-  const resp = await apiFetch(`/projects/${encodeURIComponent(projectHash)}/sessions/${encodeURIComponent(sessionId)}/transcript`, { headers: authHeaders(), signal });
+export async function getSessionTranscript(projectHash: string, sessionId: string, signal?: AbortSignal, detail?: { turnId?: number; all?: boolean }): Promise<{ session_id: string; turns: TranscriptTurn[] }> {
+  const query = new URLSearchParams();
+  if (detail?.turnId != null) query.set('turn_id', String(detail.turnId));
+  if (detail?.all) query.set('detail', 'true');
+  const params = query.toString();
+  const suffix = params ? `?${params}` : '';
+  const resp = await apiFetch(`/projects/${encodeURIComponent(projectHash)}/sessions/${encodeURIComponent(sessionId)}/transcript${suffix}`, { headers: authHeaders(), signal });
   if (!resp.ok) throw new Error(`history request failed: ${resp.status}`);
   return resp.json();
 }

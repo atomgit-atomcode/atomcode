@@ -3249,10 +3249,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       matchRefs.current[navTurns[i].messageIndex]?.getBoundingClientRect().top ?? Infinity, readingLine);
     setActiveNavIndex(previous => previous === index ? previous : index);
   }
-  function interactWithTimeline() {
+  function interactWithTimeline(event: Event) {
     navScrollIntent.current.interact();
     scrollRestorationRef.current?.interact();
-    setHistoryTarget(null);
+    // Reading/expanding archived tools is still interaction within that view.
+    if (!(event.target instanceof Element && event.target.closest('.compaction-history'))) {
+      setHistoryTarget(null);
+    }
   }
   function releaseNavigationFollow() {
     navScrollIntent.current.interact();
@@ -3273,8 +3276,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   function navigateTurn(messageIndex: number) {
     const node = matchRefs.current[messageIndex];
     if (!node) return;
+    const generation = sessionGenerationRef.current;
     setHistoryTarget(null);
-    navigateNode(node);
+    // Let the archived view unmount before measuring the current message.
+    requestAnimationFrame(() => {
+      if (generation === sessionGenerationRef.current && node.isConnected) navigateNode(node);
+    });
     setNavHighlight(messageIndex);
     if (navFlashTimer.current) clearTimeout(navFlashTimer.current);
     navFlashTimer.current = setTimeout(() => setNavHighlight(null), 1800);
@@ -3767,7 +3774,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         onPointerDown={interactWithTimeline}
         onKeyDown={interactWithTimeline}>
         <div class="timeline-inner">
-        {sessionId && activeSession?.id === sessionId && activeSession.project_hash && <CompactionHistory
+        {sessionId && activeSession?.id === sessionId && activeSession.project_hash && historyTarget?.scope === navigationScope && <CompactionHistory
           key={`${activeSession.project_hash}/${sessionId}`}
           projectHash={activeSession.project_hash} sessionId={sessionId} focusTurn={historyTarget?.scope === navigationScope ? historyTarget : null} onNavigate={navigateNode}
         />}

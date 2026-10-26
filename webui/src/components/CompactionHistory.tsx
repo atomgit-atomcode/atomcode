@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { getSessionTranscript, type TranscriptTurn } from '../api';
+import { Markdown } from './Markdown';
 import { useT } from '../settings';
 
 /** Read-only history; it never replaces the active conversation or composer. */
@@ -15,7 +16,7 @@ export function CompactionHistory({ projectHash, sessionId, focusTurn, onNavigat
   const [focusedTurn, setFocusedTurn] = useState<number | null>(null);
   const targetRef = useRef<HTMLElement | null>(null);
   useEffect(() => {
-    if (focusTurn?.record) {
+    if (focusTurn?.record?.steps) {
       pending.current?.abort();
       setOpen(true); setBusy(false); setError('');
       setFocusedTurn(focusTurn.turnId); setTurns([focusTurn.record]);
@@ -43,7 +44,7 @@ export function CompactionHistory({ projectHash, sessionId, focusTurn, onNavigat
     setError('');
     setTurns(null);
     try {
-      const result = await getSessionTranscript(projectHash, sessionId, controller.signal);
+      const result = await getSessionTranscript(projectHash, sessionId, controller.signal, target === null ? { all: true } : { turnId: target });
       if (!controller.signal.aborted) setTurns(result.turns);
     } catch (err) {
       if (!controller.signal.aborted) setError(String(err));
@@ -70,12 +71,26 @@ export function CompactionHistory({ projectHash, sessionId, focusTurn, onNavigat
         class={focusedTurn === turn.turn_id ? 'turn-nav-history-target' : undefined}
         ref={el => { if (turn.turn_id === focusedTurn) targetRef.current = el; }}>
         <div>{t('chat.historyTurn')} {turn.turn_id}{turn.undone ? ` · ${t('chat.historyUndone')}` : ''}</div>
-        <div>{t('chat.historyUser')}</div><pre>{turn.user}</pre>
-        <div>{t('chat.historyAssistant')}</div><pre>{turn.assistant}</pre>
-        {(turn.reasoning || turn.tools?.length) && <details><summary>{t('chat.historyDetails')}</summary>
-          {turn.reasoning && <pre>{turn.reasoning}</pre>}
-          {turn.tools?.map((tool, index) => <div key={index}><strong>{tool.name}</strong><pre>{tool.args}</pre><pre>{tool.result}</pre></div>)}
-        </details>}
+        <div class="history-user"><span class="history-role">{t('chat.historyUser')}</span><div class="history-user-text">{turn.user}</div></div>
+        <div class="history-steps">
+          {turn.steps ? turn.steps.map((step, index) => <section class="history-step" key={index}>
+            {step.reasoning && <details class="history-reasoning"><summary>{t('chat.historyDetails')}</summary><Markdown content={step.reasoning} /></details>}
+            {step.text && <div class="history-assistant"><Markdown content={step.text} /></div>}
+            {step.tools.map(tool => <details class="history-tool" key={tool.id}>
+              <summary><strong>{tool.name}</strong><span class={tool.is_error ? 'history-tool-failed' : 'history-tool-status'}>{t(tool.result === null ? 'tool.incomplete' : tool.is_error ? 'tool.failed' : 'tool.done')}</span></summary>
+              <div class="history-tool-detail"><span class="history-role">{t('tool.args')}</span><pre>{tool.args}</pre>
+                {tool.result !== null && <><span class="history-role">{t('tool.output')}</span><pre>{tool.result}</pre></>}
+              </div>
+            </details>)}
+          </section>) : <>
+            <p class="field-hint">{t('chat.historyMerged')}</p>
+            <span class="history-role">{t('chat.historyAssistant')}</span><Markdown content={turn.assistant} />
+            {(turn.reasoning || turn.tools?.length) && <details><summary>{t('chat.historyDetails')}</summary>
+              {turn.reasoning && <Markdown content={turn.reasoning} />}
+              {turn.tools?.map((tool, index) => <details class="history-tool" key={index}><summary>{tool.name}</summary><pre>{tool.args}</pre><pre>{tool.result}</pre></details>)}
+            </details>}
+          </>}
+        </div>
       </article>)}
     </div>}
   </section>;
