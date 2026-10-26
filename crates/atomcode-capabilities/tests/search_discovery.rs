@@ -120,7 +120,7 @@ async fn entry_limit_is_incomplete_not_a_claim_of_absence_and_mount_defaults_can
         .contains("No files matching"));
 }
 #[tokio::test]
-async fn progress_names_the_scope_and_cancellation_is_not_an_empty_result() {
+async fn routine_search_is_quiet_and_cancellation_is_not_an_empty_result() {
     let tmp = tempfile::tempdir().unwrap();
     setup(tmp.path());
     let mut c = context(tmp.path());
@@ -132,11 +132,10 @@ async fn progress_names_the_scope_and_cancellation_is_not_an_empty_result() {
     GlobTool::new(dirs(tmp.path()))
         .execute(r#"{"pattern":"*.txt"}"#, &c)
         .await;
-    assert!(seen
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|s| s.contains("Searching") && s.contains("30s")));
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "routine scan details stay out of UI notices"
+    );
     c.cancel.cancel();
     for result in [
         GlobTool::new(dirs(tmp.path()))
@@ -500,8 +499,8 @@ async fn metadata_queries_are_bounded_and_cancellable_before_the_walk() {
                     }
                 );
                 assert!(
-                    !seen.lock().unwrap().is_empty(),
-                    "progress must precede metadata lookup"
+                    seen.lock().unwrap().is_empty(),
+                    "routine search progress must not populate UI notices"
                 );
             }
         }
