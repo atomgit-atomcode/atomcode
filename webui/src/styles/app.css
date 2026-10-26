@@ -4008,11 +4008,7 @@ body {
   cursor: pointer;
 }
 
-.retained-history-badge, .compaction-history { color: var(--app-secondary-foreground); font-size: .85rem; margin-block: .5rem; }
-.compaction-history button { cursor: pointer; text-decoration: underline; }
-.compaction-history-records { max-height: 60vh; overflow: auto; padding: 1rem; border: 1px solid var(--app-border-subtle); border-radius: .5rem; }
-.compaction-history-records pre { white-space: pre-wrap; overflow-wrap: anywhere; font-family: inherit; }
-.compaction-history-records article { border-bottom: 1px solid var(--app-border-subtle); padding-block: .75rem; }
+.retained-history-badge { color: var(--app-secondary-foreground); font-size: .85rem; margin-block: .5rem; }
 
 .goal-recovery-status {
   padding: 8px 12px;
@@ -4126,17 +4122,13 @@ body {
   .turn-nav-history-target { animation: none; outline: 2px solid var(--app-accent-color); }
 }
 
-/* Read-only archived turns preserve assistant/tool step order. */
-.compaction-history-records .history-user { margin: 14px 0 20px; padding: 12px 16px; background: var(--app-secondary-background); border-radius: 12px; color: var(--app-primary-foreground); }
-.history-role { display: block; font-size: .75rem; color: var(--app-secondary-foreground); margin-bottom: 6px; }
-.history-steps { color: var(--app-primary-foreground); font-size: .95rem; line-height: 1.65; }
-.history-step { margin: 0 0 18px; }
-.history-tool { margin: 8px 0; border: 1px solid var(--app-border-subtle); border-radius: 8px; }
-.history-tool > summary { padding: 9px 12px; cursor: pointer; overflow-wrap: anywhere; }
-.history-tool-status, .history-tool-failed { float: right; font-size: .8rem; margin-left: 12px; color: var(--app-secondary-foreground); }
-.history-tool-failed { color: var(--app-error-color, #b42318); }
-.history-tool-detail { padding: 0 12px 12px; min-width: 0; }
-.history-tool-detail pre { max-height: 240px; overflow: auto; padding: 8px; background: var(--app-secondary-background); border-radius: 6px; font-size: .8rem; }
-.history-reasoning { color: var(--app-secondary-foreground); margin-bottom: 10px; }
 
-.history-user-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* Archived turns share the normal timeline lane and its single scrollbar. */
+.timeline-history-turn { display: flex; flex-direction: column; min-width: 0; }
+.timeline-history-turn.is-undone { opacity: .65; }
+.timeline-history-status { padding: 12px 0; color: var(--app-secondary-foreground); font-size: .85rem; text-align: center; }
+.timeline-history-status button { cursor: pointer; color: inherit; text-decoration: underline; }
+
+.timeline-history-status.is-loading { position: sticky; top: 0; z-index: 4; height: 0; min-height: 0; flex: 0 0 0; padding: 0; pointer-events: none; }
+.timeline-history-status.is-loading > span { display: inline-block; padding: 4px 10px; border-radius: 8px; background: var(--app-primary-background); }

@@ -1,6 +1,7 @@
 /** Navigation is a projection of visible messages, never a second conversation. */
 export interface NavigationMessage {
   role: string;
+  ts?: number;
   parts: readonly { kind: string; text?: string }[];
   retainedHistory?: boolean;
   images?: readonly unknown[];
@@ -8,6 +9,7 @@ export interface NavigationMessage {
 }
 export interface TurnNavigationItem {
   key: string;
+  ts?: number;
   messageIndex: number;
   endIndex: number;
   user: string;
@@ -31,7 +33,7 @@ export function deriveTurnNavigation(messages: readonly NavigationMessage[], pen
   const turns: TurnNavigationItem[] = [];
   messages.forEach((message, index) => {
     if (message.role === 'user') {
-      turns.push({ key: `message-${index}`, messageIndex: index, endIndex: index,
+      turns.push({ ts: message.ts, key: `message-${index}`, messageIndex: index, endIndex: index,
         user: textOf(message), assistant: '', retained: !!message.retainedHistory,
         pending: message.pendingSteerId !== undefined && pendingIds.has(message.pendingSteerId) });
     } else if (turns.length) {
@@ -81,4 +83,44 @@ export function createTurnNavigationIntent() {
       return null; // Delegate ordinary scroll and browser restoration to their existing owner.
     },
   };
+}
+
+export interface ArchivedNavigationTurn {
+  user_truncated?: boolean;
+  turn_id: number;
+  user: string;
+  started_at?: number;
+  undone: boolean;
+}
+
+/** Linear merge: timestamps identify current turns, unique summaries support old
+ * records. Retained compaction prompts are represented by their original record. */
+export function mergeTurnNavigation<T extends ArchivedNavigationTurn>(records: readonly T[], items: readonly TurnNavigationItem[]) {
+  const counts = new Map<string, number>();
+  for (const record of records) if (!record.undone) {
+    const text = navigationSummary(record.user);
+    counts.set(text, (counts.get(text) ?? 0) + 1);
+  }
+  const byTime = new Map<number, number[]>();
+  const byText = new Map<string, number[]>();
+  items.forEach((item, index) => {
+    if (item.retained) return;
+    if (item.ts != null) byTime.set(item.ts, [...(byTime.get(item.ts) ?? []), index]);
+    byText.set(item.user, [...(byText.get(item.user) ?? []), index]);
+  });
+  const covered = new Set<number>();
+  const entries = records.map(record => {
+    const text = navigationSummary(record.user);
+    let matches = record.started_at != null ? byTime.get(record.started_at) : undefined;
+    if (!matches?.length && !record.user_truncated && counts.get(text) === 1) {
+      matches = (byText.get(text) ?? []).filter(index => record.started_at == null || items[index].ts == null);
+    }
+    const live = !record.undone && matches?.length === 1 ? matches[0] : -1;
+    if (live >= 0) covered.add(live);
+    return { record: record as T | null, live };
+  });
+  items.forEach((item, live) => {
+    if (!covered.has(live) && !(records.length && item.retained)) entries.push({ record: null, live });
+  });
+  return entries;
 }

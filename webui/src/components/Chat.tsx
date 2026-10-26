@@ -47,6 +47,7 @@ import { beginModeSwitch, completeModeSwitch, failModeSwitch, initModeState, mod
 import { Markdown } from './Markdown';
 import { isRetainedHistoryUserMessage } from '../lib/historyMessages';
 import { CompactionHistory } from './CompactionHistory';
+import { historyMessages } from '../lib/inlineHistory';
 import { TurnNavRail } from './TurnNavRail';
 import type { TranscriptTurn } from '../api';
 import { deriveTurnNavigation, turnAtReadingLine, createTurnNavigationIntent } from '../lib/turnNavigation';
@@ -657,7 +658,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   const [navHighlight, setNavHighlight] = useState<number | null>(null);
   const navFlashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const navScrollIntent = useRef(createTurnNavigationIntent());
-  const [historyTarget, setHistoryTarget] = useState<{ turnId: number; request: number; scope: string; record: TranscriptTurn } | null>(null);
+  const [historyTarget, setHistoryTarget] = useState<{ turnId: number; request: number; scope: string } | null>(null);
+  const [activeHistoryTurn, setActiveHistoryTurn] = useState<number | null>(null);
+  const [historyReset, setHistoryReset] = useState(0);
+  const [historyDisplay, setHistoryDisplay] = useState({ active: false, showLive: true, liveStart: 0 });
 
   const scrollRestorationRef = useRef<ReturnType<typeof createScrollRestoration> | null>(null);
   const [showJumpBtn, setShowJumpBtn] = useState(false);
@@ -1113,7 +1117,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       setShowJumpBtn(!navigationFollow);
       return;
     }
-    const atBottom = scrollRestorationRef.current
+    const atBottom = historyDisplay.active && !historyDisplay.showLive ? false : scrollRestorationRef.current
       ? scrollRestorationRef.current.onScroll()
       : (el.clientHeight > 0 ? el.scrollHeight - el.scrollTop - el.clientHeight <= BOTTOM_SLACK : null);
     if (atBottom === null) return;
@@ -1122,6 +1126,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   };
   const scrollToBottom = (behavior: ScrollBehavior = 'auto') => {
     navScrollIntent.current.interact();
+    setHistoryTarget(null); setHistoryReset(value => value + 1);
+    setHistoryDisplay({ active: false, showLive: true, liveStart: 0 });
     if (behavior === 'smooth') navScrollIntent.current.followBottom();
     scrollRestorationRef.current?.interact();
     atBottomRef.current = true;
@@ -1131,7 +1137,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     // the next turn is running or after an early transport failure.
     setTurnStats(null);
     const el = scrollRef.current;
-    if (el) el.scrollTo({ top: el.scrollHeight, behavior });
+    const generation = sessionGenerationRef.current;
+    if (el) requestAnimationFrame(() => {
+      if (generation === sessionGenerationRef.current && scrollRef.current === el && el.isConnected) {
+        el.scrollTo({ top: el.scrollHeight, behavior });
+      }
+    });
   };
 
   // Follow streaming output ONLY while the user is at the bottom. Scrolling up
@@ -2619,6 +2630,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     // Actually sending a message (immediate OR drained from the queue) re-engages
     // auto-follow — the user wants to see their message + the reply. Placed HERE, not in
     // sendMessage, so merely QUEUEING a message while reading history doesn't yank them.
+    setHistoryTarget(null); setHistoryReset(value => value + 1);
+    setHistoryDisplay({ active: false, showLive: true, liveStart: 0 });
     atBottomRef.current = true;
     setShowJumpBtn(false);
     const startsNewTurn = !busyRef.current;
@@ -3243,7 +3256,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const searchTrim = search.trim().toLowerCase();
   // 不过滤时间线，而是展示完整消息流
-  const visibleMessages = useMemo(() => messages.map((m, origIdx) => ({ msg: m, origIdx })), [messages]);
+  const visibleMessages = useMemo(() => !historyDisplay.showLive ? [] : messages.map((m, origIdx) => ({ msg: m, origIdx }))
+    .filter(({ origIdx }) => !historyDisplay.active || origIdx >= historyDisplay.liveStart), [messages, historyDisplay]);
   const lastVisibleIdx = visibleMessages.length - 1;
   // 计算匹配的原始消息索引列表
   const matchPositions = useMemo(() => {
@@ -3269,13 +3283,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       matchRefs.current[navTurns[i].messageIndex]?.getBoundingClientRect().top ?? Infinity, readingLine);
     setActiveNavIndex(previous => previous === index ? previous : index);
   }
-  function interactWithTimeline(event: Event) {
+  function interactWithTimeline(_event: Event) {
     navScrollIntent.current.interact();
     scrollRestorationRef.current?.interact();
-    // Reading/expanding archived tools is still interaction within that view.
-    if (!(event.target instanceof Element && event.target.closest('.compaction-history'))) {
-      setHistoryTarget(null);
-    }
+    // Reading older messages must not close the inline history window.
   }
   function releaseNavigationFollow() {
     navScrollIntent.current.interact();
@@ -3294,25 +3305,26 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
   }
   function navigateTurn(messageIndex: number) {
-    const node = matchRefs.current[messageIndex];
-    if (!node) return;
     const generation = sessionGenerationRef.current;
-    setHistoryTarget(null);
-    // Let the archived view unmount before measuring the current message.
+    setHistoryTarget(null); setHistoryReset(value => value + 1);
+    setHistoryDisplay({ active: false, showLive: true, liveStart: 0 });
+    // Let the archived window reset before measuring the current message.
     requestAnimationFrame(() => {
-      if (generation === sessionGenerationRef.current && node.isConnected) navigateNode(node);
+      const node = matchRefs.current[messageIndex];
+      if (generation === sessionGenerationRef.current && node?.isConnected) navigateNode(node);
     });
     setNavHighlight(messageIndex);
     if (navFlashTimer.current) clearTimeout(navFlashTimer.current);
     navFlashTimer.current = setTimeout(() => setNavHighlight(null), 1800);
   }
   function navigateHistoricalTurn(record: TranscriptTurn) {
-    releaseNavigationFollow();
+    releaseNavigationFollow(); setActiveHistoryTurn(record.turn_id);
     navScrollIntent.current.jumpTo(Infinity); // Hold follow while the read-only record is loading.
-    setHistoryTarget(previous => ({ turnId: record.turn_id, record, request: (previous?.request ?? 0) + 1, scope: navigationScope }));
+    setHistoryTarget(previous => ({ turnId: record.turn_id, request: (previous?.request ?? 0) + 1, scope: navigationScope }));
   }
   useEffect(() => {
-    setHistoryTarget(null); setNavHighlight(null); setActiveNavIndex(0); navScrollIntent.current.interact();
+    setHistoryTarget(null); setHistoryReset(value => value + 1); setHistoryDisplay({ active: false, showLive: true, liveStart: 0 });
+    setNavHighlight(null); setActiveNavIndex(0); navScrollIntent.current.interact();
     return () => { if (navFlashTimer.current) clearTimeout(navFlashTimer.current); };
   }, [navigationScope]);
   useEffect(() => {
@@ -3333,7 +3345,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     setMatchIdx(newIdx);
     const targetOrigIdx = matchPositions[newIdx];
     const node = matchRefs.current[targetOrigIdx];
-    if (node) node.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    if (node?.isConnected) node.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    else navigateTurn(targetOrigIdx);
   };
 
   // Cmd/Ctrl+F 打开搜索并聚焦;Esc 关闭。绑定在 window 层级,焦点在输入框/按钮/
@@ -3794,9 +3807,25 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         onPointerDown={interactWithTimeline}
         onKeyDown={interactWithTimeline}>
         <div class="timeline-inner">
-        {sessionId && activeSession?.id === sessionId && activeSession.project_hash && historyTarget?.scope === navigationScope && <CompactionHistory
+        {sessionId && activeSession?.id === sessionId && activeSession.project_hash && <CompactionHistory
           key={`${activeSession.project_hash}/${sessionId}`}
-          projectHash={activeSession.project_hash} sessionId={sessionId} focusTurn={historyTarget?.scope === navigationScope ? historyTarget : null} onNavigate={navigateNode}
+          projectHash={activeSession.project_hash} sessionId={sessionId} messages={messages} reset={historyReset}
+          focusTurn={historyTarget?.scope === navigationScope ? historyTarget : null}
+          viewport={() => scrollRef.current} onBeforeRead={releaseNavigationFollow} onNavigate={navigateNode}
+          onWindow={(active, showLive, liveStart) => {
+            setHistoryDisplay({ active, showLive, liveStart });
+            if (!active) setActiveHistoryTurn(null);
+          }}
+          onReadingTurn={id => setActiveHistoryTurn(previous => previous === id ? previous : id)}
+          renderTurn={turn => {
+            const [user, assistant] = historyMessages(turn);
+            return <>
+              <UserMessageView msg={user} timeLabel={formatMsgTime(user.ts)} search={search} isActiveSearchMatch={false} />
+              <AssistantMessageView msg={assistant} isLast={false} busy={false} lastIdx={-1} isLastInTurn={true}
+                turnText={messageFullText(assistant)} artifacts={[]} sessionId={sessionId}
+                timeLabel={formatMsgTime(assistant.ts)} search={search} isActiveSearchMatch={false} />
+            </>;
+          }}
         />}
         {messages.length === 0 && !historyHint && !restoring && loading && (
           <div class="messages-empty">
@@ -3910,7 +3939,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         })()}
 
         {/* 排队中的消息：执行中输入、待当前回合结束后自动发送，可点 × 撤回。 */}
-        {queued.map((q) => (
+        {historyDisplay.showLive && queued.map((q) => (
           <div
             key={`q-${q.id}`}
             class="user-message-wrapper queued"
@@ -3941,7 +3970,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
           </div>
         ))}
 
-        {pendingSteers.some((item) => item.confirmed) && (
+        {historyDisplay.showLive && pendingSteers.some((item) => item.confirmed) && (
           <div class="steer-pending-status" role="status">
             {t('chat.steerPending', {
               count: pendingSteers.filter((item) => item.confirmed).length,
@@ -3968,9 +3997,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       </div>
 
       <TurnNavRail key={`${activeSession?.project_hash ?? ''}/${sessionId ?? ''}`}
-        items={navTurns} activeIndex={activeNavIndex}
+        items={navTurns} activeIndex={activeNavIndex} activeHistoryTurn={activeHistoryTurn}
         projectHash={activeSession?.id === sessionId ? activeSession.project_hash : undefined}
-        sessionId={sessionId ?? undefined} streaming={loading}
+        sessionId={sessionId ?? undefined} streaming={busy}
         onNavigate={navigateTurn} onHistory={navigateHistoricalTurn} />
 
       {/* 浮动搜索框:默认隐藏,Cmd/Ctrl+F 呼出,Esc/× 关闭。仿浏览器 Find-in-page 样式:

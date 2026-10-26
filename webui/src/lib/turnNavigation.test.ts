@@ -75,3 +75,21 @@ test('returning to bottom keeps following through content growth; gestures and s
   intent.jumpTo(Infinity); intent.interact();
   assert.equal(intent.onScroll(viewport), null);
 });
+
+test('unified navigation uses timestamps, retains undone history and adds unfinished live turns', async () => {
+  const { mergeTurnNavigation } = await import('./turnNavigation.ts');
+  const items = deriveTurnNavigation([message('user', 'repeat', { ts: 1000, retainedHistory: true }),
+    message('user', 'repeat', { ts: 2000 }), message('assistant', 'answer'), message('user', 'new', { ts: 3000 })]);
+  const records = [{ turn_id: 1, user: 'repeat', started_at: 1000, undone: false },
+    { turn_id: 2, user: 'repeat', started_at: 2000, undone: false },
+    { turn_id: 3, user: 'undone', started_at: 2500, undone: true }];
+  assert.deepEqual(mergeTurnNavigation(records, items).map(e => [e.record?.turn_id ?? null, e.live]),
+    [[1, -1], [2, 1], [3, -1], [null, 2]]);
+});
+test('unified navigation never maps repeated or truncated legacy previews onto the wrong current message', async () => {
+  const { mergeTurnNavigation } = await import('./turnNavigation.ts');
+  const items = deriveTurnNavigation([message('user', 'repeat')]);
+  const records = [1, 2].map(turn_id => ({ turn_id, user: 'repeat', undone: false }));
+  assert.deepEqual(mergeTurnNavigation(records, items).map(e => e.live), [-1, -1, 0]);
+  assert.deepEqual(mergeTurnNavigation([{ ...records[0], user_truncated: true }], items).map(e => e.live), [-1, 0]);
+});

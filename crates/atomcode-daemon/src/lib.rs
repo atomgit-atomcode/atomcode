@@ -2333,18 +2333,82 @@ struct SessionTranscript {
 /// GET /projects/:hash/sessions/:id/transcript - Full never-compacted per-turn
 /// trajectory. READ-ONLY: it does not touch the runtime snapshot, compaction, or
 /// what the model sees — it only exposes the transcript that is already written on
-/// every turn. Serves the UI's "view compacted history" affordance.
+/// every turn. Serves the inline timeline detail and lightweight navigation index.
 #[derive(Default, serde::Deserialize)]
 struct TranscriptQuery {
     turn_id: Option<u64>,
+    turn_ids: Option<String>,
+    #[serde(default)]
+    summary: bool,
     #[serde(default)]
     detail: bool,
+}
+
+impl TranscriptQuery {
+    fn selected_turns(&self) -> Result<Vec<u64>, &'static str> {
+        match (&self.turn_ids, self.turn_id) {
+            (Some(_), Some(_)) => Err("Use turn_id or turn_ids, not both"),
+            (None, one) => Ok(one.into_iter().collect()),
+            (Some(ids), None) => {
+                let parsed = ids
+                    .split(',')
+                    .take(7)
+                    .map(str::parse::<u64>)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| "Invalid turn_ids")?;
+                if parsed.is_empty() || parsed.len() > 6 {
+                    return Err("Select between one and six turns");
+                }
+                Ok(parsed)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod transcript_query_tests {
+    use super::TranscriptQuery;
+
+    #[test]
+    fn batches_are_bounded_and_do_not_silently_become_all_history() {
+        let query = |ids: &str| TranscriptQuery {
+            turn_ids: Some(ids.into()),
+            ..Default::default()
+        };
+        assert_eq!(query("1,4,9").selected_turns().unwrap(), vec![1, 4, 9]);
+        for invalid in ["", "1,", "oops", "1,2,3,4,5,6,7"] {
+            assert!(query(invalid).selected_turns().is_err());
+        }
+        assert!(TranscriptQuery {
+            turn_id: Some(1),
+            ..query("2")
+        }
+        .selected_turns()
+        .is_err());
+        assert_eq!(
+            TranscriptQuery {
+                turn_id: Some(8),
+                ..Default::default()
+            }
+            .selected_turns()
+            .unwrap(),
+            vec![8]
+        );
+        assert!(TranscriptQuery::default()
+            .selected_turns()
+            .unwrap()
+            .is_empty());
+    }
 }
 
 async fn get_session_transcript(
     Path((hash, id)): Path<(String, String)>,
     Query(query): Query<TranscriptQuery>,
 ) -> impl IntoResponse {
+    let selected = match query.selected_turns() {
+        Ok(selected) => selected,
+        Err(error) => return (StatusCode::BAD_REQUEST, Json(error)).into_response(),
+    };
     // Gate on the session resolving, mirroring `get_session_detail`'s 404 semantics.
     match crate::legacy_convert::load_catalog_session_view_in_project(&hash, &id) {
         Ok(Some(_)) => {}
@@ -2366,7 +2430,11 @@ async fn get_session_transcript(
             )
             .join(&task_hash),
         );
-        transcript_view::load(&manager, &task_id, query.turn_id, query.detail)
+        let mut turns = transcript_view::load(&manager, &task_id, &selected, query.detail)?;
+        if query.summary {
+            transcript_view::summarize(&mut turns);
+        }
+        Ok::<_, atomcode_capabilities::session::SessionStoreError>(turns)
     })
     .await;
     match loaded {

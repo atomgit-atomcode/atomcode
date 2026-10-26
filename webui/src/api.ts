@@ -994,6 +994,9 @@ export interface TranscriptStep {
   tools: { id: string; name: string; args: string; result: string | null; is_error: boolean | null }[];
 }
 export interface TranscriptTurn {
+  user_truncated?: boolean;
+  started_at?: number;
+  ts?: number;
   steps?: TranscriptStep[];
   turn_id: number;
   user: string;
@@ -1003,10 +1006,12 @@ export interface TranscriptTurn {
   undone: boolean;
 }
 
-export async function getSessionTranscript(projectHash: string, sessionId: string, signal?: AbortSignal, detail?: { turnId?: number; all?: boolean }): Promise<{ session_id: string; turns: TranscriptTurn[] }> {
+export async function getSessionTranscript(projectHash: string, sessionId: string, signal?: AbortSignal, detail?: { turnId?: number; turnIds?: number[]; all?: boolean; index?: boolean }): Promise<{ session_id: string; turns: TranscriptTurn[] }> {
   const query = new URLSearchParams();
   if (detail?.turnId != null) query.set('turn_id', String(detail.turnId));
+  if (detail?.turnIds) query.set('turn_ids', detail.turnIds.join(','));
   if (detail?.all) query.set('detail', 'true');
+  if (detail?.index) query.set('summary', 'true');
   const params = query.toString();
   const suffix = params ? `?${params}` : '';
   const resp = await apiFetch(`/projects/${encodeURIComponent(projectHash)}/sessions/${encodeURIComponent(sessionId)}/transcript${suffix}`, { headers: authHeaders(), signal });
