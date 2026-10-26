@@ -681,6 +681,7 @@ export interface PgyInfo {
 }
 
 export interface TunnelStatus {
+  relay_start_supported?: boolean;
   mode?: 'relay' | 'lan';
   relay_error?: string | null;
   bind_host: string;
@@ -698,6 +699,19 @@ export async function getTunnelStatus(): Promise<TunnelStatus> {
   const resp = await apiFetch('/tunnel/status', { headers: authHeaders() });
   if (!resp.ok) throw new Error(`tunnel status failed: ${resp.status}`);
   return resp.json();
+}
+
+/** Explicitly enable remote access through the current terminal host. */
+export async function startTunnelRelay(signal?: AbortSignal): Promise<TunnelStatus> {
+  const resp = await apiFetch('/tunnel/start', {
+    method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+    body: '{}', signal,
+  });
+  if (!resp.ok) {
+    const body = await resp.json().catch(() => null);
+    throw new Error(body?.error ?? `relay start failed: ${resp.status}`);
+  }
+  return getTunnelStatus();
 }
 
 // --- Provider CRUD ---

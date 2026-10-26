@@ -5934,6 +5934,7 @@ struct WebuiHandle {
     shutdown: watch::Sender<bool>,
     relay_url: Option<String>,
     relay_error: Option<String>,
+    relay_starter: Option<WebuiRelayStarter>,
 }
 
 static WEBUI: std::sync::Mutex<Option<WebuiHandle>> = std::sync::Mutex::new(None);
@@ -5949,6 +5950,23 @@ pub fn webui_port() -> Option<u16> {
         .as_ref()
         .filter(|handle| !handle.abort.is_finished())
         .map(|handle| handle.port)
+}
+
+/// Host-owned side effect; credentials remain in memory, outside runtime config.
+pub type WebuiRelayStarter = Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+pub fn set_webui_relay_starter(target: &WebuiRelayTarget, starter: WebuiRelayStarter) {
+    let mut guard = WEBUI.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(handle) = guard
+        .as_mut()
+        .filter(|h| h.port == target.port && h.tokens.is_valid(&target.token))
+    {
+        handle.relay_starter = Some(starter);
+    }
 }
 
 /// Host-owned tunnel presentation; never used as an authentication bypass.
@@ -6083,6 +6101,7 @@ pub struct WebuiLaunch {
     pub relay_target: Option<WebuiRelayTarget>,
 }
 
+#[derive(Clone)]
 pub struct WebuiRelayTarget {
     pub port: u16,
     pub endpoint: String,
@@ -6195,6 +6214,7 @@ pub async fn launch_webui(host: &str, port: u16, sync: bool, open_browser: bool)
                 shutdown,
                 relay_url: None,
                 relay_error: None,
+                relay_starter: None,
             });
         }
         (tokens, actual_port, host.to_string())
@@ -6419,6 +6439,7 @@ struct PgyInfo {
 
 #[derive(serde::Serialize)]
 struct TunnelStatus {
+    relay_start_supported: bool,
     mode: &'static str,
     relay_error: Option<String>,
     /// server 绑定地址（127.0.0.1=仅本机；0.0.0.0/具体 IP=可被其它设备访问）。
@@ -6564,6 +6585,7 @@ fn relay_tunnel_status(
                 .build()
         });
     TunnelStatus {
+        relay_start_supported: true,
         mode: "relay",
         relay_error: error,
         bind_host,
@@ -6596,6 +6618,35 @@ mod relay_presentation_tests {
     }
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StartWebuiRelayRequest {}
+
+/// Explicit, authenticated action; GET status never enables sharing.
+async fn start_webui_relay(
+    State(state): State<AppState>,
+    Json(_): Json<StartWebuiRelayRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let starter = {
+        let guard = WEBUI.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .as_ref()
+            .filter(|h| h.port == state.bind_port && !h.abort.is_finished())
+            .and_then(|h| h.relay_starter.clone())
+    };
+    let error = |status, message: String| (status, Json(serde_json::json!({"error": message})));
+    let starter = starter.ok_or_else(|| {
+        error(
+            StatusCode::NOT_IMPLEMENTED,
+            "当前宿主不支持从网页开启中继".into(),
+        )
+    })?;
+    let url = starter()
+        .await
+        .map_err(|message| error(StatusCode::BAD_GATEWAY, message))?;
+    Ok(Json(serde_json::json!({"url": url})))
+}
+
 /// GET /tunnel/status - 远程访问探测：绑定地址、蒲公英状态、远程 URL + 二维码。
 async fn get_tunnel_status(
     State(state): State<AppState>,
@@ -6606,9 +6657,17 @@ async fn get_tunnel_status(
         guard
             .as_ref()
             .filter(|h| h.port == state.bind_port)
-            .map(|h| (h.relay_url.clone(), h.relay_error.clone()))
+            .map(|h| {
+                (
+                    h.relay_url.clone(),
+                    h.relay_error.clone(),
+                    h.relay_starter.is_some(),
+                )
+            })
     };
-    if let Some((url, error)) = relay.filter(|(url, error)| url.is_some() || error.is_some()) {
+    let relay_start_supported = relay.as_ref().is_some_and(|(_, _, available)| *available);
+    if let Some((url, error, _)) = relay.filter(|(url, error, _)| url.is_some() || error.is_some())
+    {
         return Json(relay_tunnel_status(
             state.bind_host.clone(),
             state.bind_port,
@@ -6672,6 +6731,7 @@ async fn get_tunnel_status(
     };
 
     Json(TunnelStatus {
+        relay_start_supported,
         mode: "lan",
         relay_error: None,
         bind_host: state.bind_host.clone(),
@@ -7283,6 +7343,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         )
         // 远程访问状态（Tailscale 探测 + 绑定可达性 + 二维码）
         .route("/tunnel/status", get(get_tunnel_status))
+        .route("/tunnel/start", post(start_webui_relay))
         // Live session API (阶段②)
         .route("/live", get(live_api::live_stream))
         .route("/live/message", post(live_api::live_message))
@@ -9974,6 +10035,102 @@ done
             );
         }
         main_task.await.expect("provider task");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn webui_relay_start_requires_auth_and_json_before_calling_the_host() {
+        use tower::ServiceExt;
+        let home = ScopedChatHome::new();
+        let mut state = chat_test_state(&home);
+        state.enforce_token = true;
+        let token = state.webui_tokens.mint();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = calls.clone();
+        let task = tokio::spawn(std::future::pending::<()>());
+        let (shutdown, _) = watch::channel(false);
+        *WEBUI.lock().unwrap() = Some(WebuiHandle {
+            tokens: state.webui_tokens.clone(),
+            port: state.bind_port,
+            host: state.bind_host.clone(),
+            abort: task.abort_handle(),
+            shutdown,
+            relay_url: None,
+            relay_error: None,
+            relay_starter: Some(Arc::new(move || {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async {
+                    Ok("https://relay.example/webui/#relay=dummy&token=dummy".into())
+                })
+            })),
+        });
+        let cookie = format!("{}={token}", state.webui_cookie_name);
+        let app = axum::Router::new()
+            .route("/tunnel/start", post(start_webui_relay))
+            .route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                auth_token::require_webui_token,
+            ))
+            .with_state(state);
+        for (authorization, content_type, body, expected) in [
+            (false, "application/json", "{}", StatusCode::UNAUTHORIZED),
+            (true, "text/plain", "{}", StatusCode::UNSUPPORTED_MEDIA_TYPE),
+            (
+                true,
+                "application/json",
+                r#"{"endpoint":"https://attacker.example"}"#,
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+        ] {
+            let mut request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/tunnel/start")
+                .header("content-type", content_type);
+            if authorization {
+                request = request.header("authorization", format!("Bearer {token}"));
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(axum::body::Body::from(body)).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/tunnel/start")
+                    .header("content-type", "application/json")
+                    .header("cookie", cookie)
+                    .body(axum::body::Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["url"],
+            "https://relay.example/webui/#relay=dummy&token=dummy"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        WEBUI.lock().unwrap().take();
+        task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn webui_relay_start_reports_an_unsupported_host() {
+        let home = ScopedChatHome::new();
+        let result = start_webui_relay(
+            State(chat_test_state(&home)),
+            Json(StartWebuiRelayRequest {}),
+        )
+        .await;
+        assert_eq!(result.unwrap_err().0, StatusCode::NOT_IMPLEMENTED);
     }
 
     // 回归：限流事件必须作为独立的 `rate_limited` ChatEvent 下发（非 error/warning），

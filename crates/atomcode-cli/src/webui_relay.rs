@@ -51,16 +51,27 @@ pub async fn launch(
     if !remote && matches!(host, "127.0.0.1" | "localhost" | "::1") {
         launched.qr_url = None;
     }
+    if atomcode_config::endpoints::relay_enabled() {
+        if let Some(target) = &launched.relay_target {
+            let callback_target = target.clone();
+            atomcode_daemon::set_webui_relay_starter(
+                target,
+                std::sync::Arc::new(move || {
+                    let target = callback_target.clone();
+                    Box::pin(async move { start_for_webui(&target, sync).await })
+                }),
+            );
+        }
+    }
     if remote && atomcode_config::endpoints::relay_enabled() {
         if let Some(target) = &launched.relay_target {
-            match start(target, sync).await {
+            match start_for_webui(target, sync).await {
                 Ok(url) => {
                     launched.message =
                         format!("手机浏览器扫码访问（中继）：{url}\n{}", launched.message);
                     launched.qr_url = Some(url);
                 }
                 Err(error) => {
-                    atomcode_daemon::set_webui_relay_access(target, None, Some(error.clone()));
                     launched
                         .message
                         .push_str(&format!("\n中继访问未启动：{error}。本机地址仍可使用。"));
@@ -69,6 +80,17 @@ pub async fn launch(
         }
     }
     launched
+}
+
+async fn start_for_webui(target: &WebuiRelayTarget, sync: bool) -> Result<String, String> {
+    // Commands and the authenticated browser action use the same tunnel owner.
+    match start(target, sync).await {
+        Ok(url) => Ok(url),
+        Err(error) => {
+            atomcode_daemon::set_webui_relay_access(target, None, Some(error.clone()));
+            Err(error)
+        }
+    }
 }
 
 fn relay_base(base: &str) -> Result<(String, String), String> {
