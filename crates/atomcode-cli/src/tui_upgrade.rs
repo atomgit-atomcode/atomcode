@@ -14,6 +14,8 @@
 //! restart itself happens after the screen has put the terminal back:
 //! [`take_restart`] is read by the launcher once `tui_front::run` returns.
 
+mod installed;
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -27,6 +29,11 @@ use atomcode_tui::plugin::{CommandsSvc, UpdateCheckSvc};
 use atomcode_tui::update::UpdateCheck;
 use atomcode_updater::UpgradeEvent;
 use serde_json::Value;
+
+/// Capture before slow startup work so another window cannot replace the baseline.
+pub fn remember_running_installation() {
+    let _ = installed::InstalledBinary::capture();
+}
 
 /// The row's name.
 pub const ROW: &str = "tui-upgrade";
@@ -91,7 +98,9 @@ impl Plugin for UpgradeRow {
     }
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
         let _ = ctx
-            .provide::<UpdateCheckSvc>(Arc::new(Latest))
+            .provide::<UpdateCheckSvc>(Arc::new(Latest {
+                installed: installed::InstalledBinary::capture(),
+            }))
             .map_err(|e| e.to_string())?;
         let commands = ctx.require::<CommandsSvc>().map_err(|e| e.to_string())?;
         let ui = ctx.require::<UiSvc>().map_err(|e| e.to_string())?;
@@ -104,10 +113,21 @@ impl Plugin for UpgradeRow {
 }
 
 /// "Is a newer build out", as the classic screen's footer answers it.
-struct Latest;
+struct Latest {
+    installed: Option<Arc<installed::InstalledBinary>>,
+}
 
 #[async_trait]
 impl UpdateCheck for Latest {
+    async fn local_change(&self) -> Option<atomcode_tui::update::InstalledChange> {
+        self.installed
+            .as_ref()
+            .filter(|watch| watch.changed())
+            .map(|_| atomcode_tui::update::InstalledChange {
+                hint: t(Msg::InstalledBinaryChangedHint).into_owned(),
+                message: t(Msg::InstalledBinaryChanged).into_owned(),
+            })
+    }
     async fn available(&self) -> Option<String> {
         // A download already staged by an earlier run is news without asking
         // anyone; the network is only asked when there is none, and never when

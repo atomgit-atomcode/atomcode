@@ -1314,6 +1314,12 @@ async fn async_main(process_start: std::time::Instant) {
     // Wire `tracing::` diagnostics to `<config_dir>/logs/atomcode.log` (file-only,
     // TUI-safe). Must run before anything that emits traces so nothing is lost.
     init_file_logging();
+    atomcode::tui_upgrade::remember_running_installation();
+    tracing::info!(
+        running_version = VERSION,
+        process_id = std::process::id(),
+        "running atomcode build"
+    );
     warn_console_encoding();
     // Detached upgrade-prep worker mode. The parent atomcode spawns a
     // subprocess with this env var set; that subprocess does one full

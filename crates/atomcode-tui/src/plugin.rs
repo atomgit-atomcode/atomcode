@@ -1781,17 +1781,37 @@ impl UserInterface for Tui {
             });
         }
 
-        // Whether a newer build is out: asked once, off the loop, and only said
+        // Remote availability is asked once; local replacement is watched thereafter.
+        // The hint is only said
         // if there is one. The launcher decides the words (a package manager
         // upgrades some installs, not `/upgrade`); the row draws them.
         if let Some(check) = ctx.service::<UpdateCheckSvc>() {
             let host = self.host.clone();
             let keys = wake_tx.clone();
             tokio::spawn(async move {
-                if let Some(hint) = check.available().await {
-                    host.moment.write().expect("moment poisoned").update = Some(hint);
-                    let _ = keys.send(Wake::Fact);
-                }
+                crate::update::watch(
+                    check,
+                    |notice| {
+                        match notice {
+                            crate::update::UpdateNotice::Available(hint) => {
+                                host.moment.write().expect("moment poisoned").update = Some(hint);
+                                let _ = keys.send(Wake::Fact);
+                            }
+                            crate::update::UpdateNotice::Installed(change) => {
+                                host.moment.write().expect("moment poisoned").update =
+                                    Some(change.hint);
+                                // A busy footer may have no room, so also leave one visible message.
+                                deliver(
+                                    &host,
+                                    &keys,
+                                    crate::command::Outcome::Said(change.message),
+                                );
+                            }
+                        }
+                    },
+                    keys.closed(),
+                )
+                .await;
             });
         }
 

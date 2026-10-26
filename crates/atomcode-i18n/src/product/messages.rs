@@ -1071,6 +1071,8 @@ pub enum Msg<'a> {
     /// was put off (the person chose to stay when asked about background
     /// sessions): nothing to download, only to restart.
     UpgradeRestartPending,
+    InstalledBinaryChangedHint,
+    InstalledBinaryChanged,
     UpgradeUnknownArg {
         arg: &'a str,
     },
