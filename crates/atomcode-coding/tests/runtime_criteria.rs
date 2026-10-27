@@ -6621,10 +6621,10 @@ mod criteria {
 async fn a_live_view_is_available_before_the_running_turn_finishes() {
     let env = env();
     let recorder = Arc::new(Recorder::default());
-    let mut runtime =
-        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
-            .await
-            .unwrap();
+    let mut initial = start(env.project.path(), &recorder, SessionMode::Fresh);
+    // A configured alias is not the model reported by the mounted provider.
+    initial.agent.model = "configured-alias".into();
+    let mut runtime = CodingRuntime::start(initial).await.unwrap();
     turn(&mut runtime, "history").await;
     recorder.answer_delay_ms.store(60_000, Ordering::SeqCst);
     runtime
@@ -6642,6 +6642,7 @@ async fn a_live_view_is_available_before_the_running_turn_finishes() {
         }
     }
     let view = runtime.handle.live_view().unwrap();
+    assert_eq!(view.model.as_deref(), Some("recorder"));
     assert!(view
         .snapshot
         .messages
@@ -6657,9 +6658,11 @@ async fn a_live_view_is_available_before_the_running_turn_finishes() {
     )
     .await
     .is_err());
+    let mut replacement = start(env.project.path(), &recorder, SessionMode::Fresh).agent;
+    replacement.model = "reconfigured-alias".into();
     let generation = runtime
         .handle
-        .reassemble_provider(start(env.project.path(), &recorder, SessionMode::Fresh).agent)
+        .reassemble_provider(replacement)
         .await
         .unwrap();
     loop {
@@ -6671,6 +6674,7 @@ async fn a_live_view_is_available_before_the_running_turn_finishes() {
         }
     }
     let view = runtime.handle.live_view().unwrap();
+    assert_eq!(view.model.as_deref(), Some("recorder"));
     assert_eq!(view.generation, generation.0);
     assert!(view
         .events
@@ -6705,5 +6709,6 @@ async fn a_live_view_is_available_before_the_running_turn_finishes() {
     let view = runtime.handle.live_view().unwrap();
     assert_eq!(Some(view.session_id), changed.session_id);
     assert!(view.snapshot.messages.is_empty());
+    assert_eq!(view.model.as_deref(), Some("recorder"));
     runtime.handle.shutdown().await.unwrap();
 }

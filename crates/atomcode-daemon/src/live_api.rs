@@ -701,6 +701,7 @@ pub(crate) enum LiveWireEvent {
         session_name: String,
         project_hash: String,
         provider: String,
+        model: Option<String>,
         /// 当前审批模式（build / accept_edits / bypass / plan），
         /// 让新连上的 tab 立刻显示正确的模式 pill。
         mode: String,
@@ -712,7 +713,12 @@ pub(crate) enum LiveWireEvent {
         goal: Option<LiveGoalSnapshot>,
     },
     #[serde(rename = "provider")]
-    Provider { provider: String },
+    Provider {
+        provider: String,
+        model: Option<String>,
+    },
+    #[serde(rename = "model")]
+    Model { model: Option<String> },
     #[serde(rename = "reasoning_effort")]
     ReasoningEffort {
         provider: String,
@@ -1018,6 +1024,11 @@ impl NativeLiveWireProjector {
                     auto_resuming,
                     server_message,
                 },
+                Kernel::Described { description } if description.session == self.session_id => {
+                    LiveWireEvent::Model {
+                        model: description.model,
+                    }
+                }
                 Kernel::ToolCallStreaming { .. }
                 | Kernel::ToolBatchStarted { .. }
                 | Kernel::ToolBatchCompleted { .. }
@@ -1143,8 +1154,12 @@ impl NativeLiveWireProjector {
                 }
             }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::ProviderChanged {
-                provider, ..
-            }) => LiveWireEvent::Provider { provider },
+                provider,
+                model,
+            }) => LiveWireEvent::Provider {
+                provider,
+                model: Some(model),
+            },
             crate::live_hub::LiveViewEvent::Runtime(Runtime::ReasoningEffortChanged {
                 provider,
                 effort,
@@ -1545,6 +1560,7 @@ pub(crate) async fn live_stream(
             session_name,
             project_hash,
             provider: join.binding.provider.clone(),
+            model: join.model.clone(),
             mode: live_current_mode_wire(),
             working_dir: snapshot_wd.to_string_lossy().to_string(),
             goal: initial_goal.as_ref().map(goal_snapshot),
@@ -2781,6 +2797,44 @@ pub(crate) async fn live_mcp_trust(State(state): State<AppState>) -> impl IntoRe
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn model_wire_uses_runtime_names_and_ignores_member_descriptions() {
+        use atomcode_coding::CodingRuntimeEvent;
+        use atomcode_kernel::{agent::AgentDescription, event::AgentEvent};
+        let mut projector = super::NativeLiveWireProjector {
+            session_id: "lead".into(),
+            ..Default::default()
+        };
+        let change = projector
+            .project(crate::live_hub::LiveViewEvent::Runtime(
+                CodingRuntimeEvent::ProviderChanged {
+                    provider: "alias".into(),
+                    model: "lumen-alpha".into(),
+                },
+            ))
+            .unwrap();
+        let wire = serde_json::to_value(change).unwrap();
+        assert_eq!(wire["type"], "provider");
+        assert_eq!(wire["provider"], "alias");
+        assert_eq!(wire["model"], "lumen-alpha");
+        let described = |session: &str| {
+            crate::live_hub::LiveViewEvent::Runtime(CodingRuntimeEvent::Agent(
+                AgentEvent::Described {
+                    description: AgentDescription {
+                        session: session.into(),
+                        model: Some("actual-model".into()),
+                        ..Default::default()
+                    }
+                    .into(),
+                },
+            ))
+        };
+        assert!(projector.project(described("member")).is_none());
+        let wire = serde_json::to_value(projector.project(described("lead")).unwrap()).unwrap();
+        assert_eq!(wire["type"], "model");
+        assert_eq!(wire["model"], "actual-model");
+    }
+
     #[test]
     fn live_effort_parser_accepts_canonical_levels_without_loosening_endpoint_limits() {
         for level in atomcode_config::config::REASONING_EFFORT_LEVELS {

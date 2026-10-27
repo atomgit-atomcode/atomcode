@@ -31,7 +31,7 @@ import type { LiveGoalProgress } from '../api';
 import { rankSessionReferences, sessionReferenceToken, sessionReferenceTokens } from '../lib/sessionReferences';
 import { sessionReferenceCandidates } from '../api';
 import { VNode } from 'preact';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, listDir, searchFiles, changeDir, postConfigReload, postCommand, postLiveCompact, postUserInputAnswer, postLivePolicyInterventionResolution, openWorkspaceFile, type CommandResult, type RoutedUserInputRequest, type PolicyInterventionEvent, type TurnStats } from '../api';
 import {
   parseSlashCommand,
@@ -52,6 +52,7 @@ import { TurnNavRail } from './TurnNavRail';
 import type { TranscriptTurn } from '../api';
 import { deriveTurnNavigation, turnAtReadingLine, createTurnNavigationIntent } from '../lib/turnNavigation';
 import { ModelSelector } from './ModelSelector';
+import { mayFollowModelDefault, type RuntimeModelIdentity } from '../lib/modelIdentity';
 import { ModeSelector } from './ModeSelector';
 import { AttachMenu } from './AttachMenu';
 import { FilePicker } from './FilePicker';
@@ -569,8 +570,17 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   } | null>(null);
   const providerRef = useRef<string | null>(null);
   const providerPinnedRef = useRef(false);
+  const [runtimeModel, setRuntimeModel] = useState<RuntimeModelIdentity | null>(null);
+  const runtimeModelRef = useRef<RuntimeModelIdentity | null>(null);
+  function rememberRuntimeModel(identity: RuntimeModelIdentity | null) {
+    if (runtimeModelRef.current?.provider !== identity?.provider || runtimeModelRef.current?.model !== identity?.model) {
+      setReasoningEffort(null);
+    }
+    runtimeModelRef.current = identity;
+    setRuntimeModel(identity);
+  }
   const followDefaultProvider = useCallback((name: string) => {
-    if (!providerPinnedRef.current) {
+    if (mayFollowModelDefault(providerPinnedRef.current, runtimeModelRef.current, syncRef.current || busyRef.current)) {
       providerRef.current = name;
       setProvider(name);
     }
@@ -615,6 +625,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   useEffect(() => { if (!sync) setGoalProgress(null); }, [sync]);
   const syncRef = useRef(sync);
   syncRef.current = sync;
+  useLayoutEffect(() => {
+    rememberRuntimeModel(null);
+    // A selection made in standalone chat is not a pending shared-runtime switch.
+    if (sync) providerPinnedRef.current = false;
+  }, [sync]);
   // Pending live-session permission request (shown as PermissionCard, calls /live/permission).
   // Kept separate from the non-sync `onPermission` prop so the /chat path is untouched.
   const [livePending, setLivePending] = useState<{ tool_name: string; reason: string; call_id: string; arguments: string; allow_all_bash?: boolean } | null>(null);
@@ -883,6 +898,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       todoTitlesRef.current.clear();
       resetTodoBatch(true, false);
       providerPinnedRef.current = false;
+      rememberRuntimeModel(null);
       loadedForRef.current = null;
       optimisticFiredRef.current = false;
       pendingSelfEchoRef.current = [];
@@ -1655,6 +1671,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       setUserInputReq(null);
       setHistoryHint(null);
       // 连上时回显当前生效的模型，让下拉框与 TUI / 其他端保持一致。
+      if (e.provider) rememberRuntimeModel({ provider: e.provider, model: e.model });
       if (e.provider && !providerPinnedRef.current) {
         providerRef.current = e.provider;
         setProvider(e.provider);
@@ -1679,9 +1696,15 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     // pin——pin 只用于防止「重连快照」回退一次尚未传播的本地切换，不该挡真实的变更事件，
     // 否则本端切过一次模型后就永远不再跟随 TUI 的模型切换（S1）。
     if (e.type === 'provider') {
+      rememberRuntimeModel({ provider: e.provider, model: e.model });
       providerRef.current = e.provider;
       setProvider(e.provider);
       providerPinnedRef.current = false;
+      return;
+    }
+    if (e.type === 'model') {
+      const current = runtimeModelRef.current;
+      if (current) rememberRuntimeModel({ ...current, model: e.model });
       return;
     }
     if (e.type === 'reasoning_effort') {
@@ -2353,6 +2376,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   function handleEvent(event: SSEEvent) {
     switch (event.type) {
       case 'runtime_info':
+        rememberRuntimeModel({ provider: event.provider, model: event.model });
         providerRef.current = event.provider;
         setProvider(event.provider);
         break;
@@ -3571,6 +3595,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
             busy={busy}
             onError={pushCommandNotice}
             value={provider}
+            runtime={sync || busy ? runtimeModel : null}
             liveEffort={reasoningEffort?.provider === provider ? reasoningEffort.effort : undefined}
             onChange={(p) => switchProvider(p)}
             onDefaultChange={followDefaultProvider}

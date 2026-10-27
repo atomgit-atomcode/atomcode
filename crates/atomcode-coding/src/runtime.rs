@@ -168,6 +168,7 @@ pub enum CodingRuntimeEvent {
     },
     ProviderChanged {
         provider: String,
+        /// Model reported by the mounted provider, independently of its configured alias.
         model: String,
     },
     /// The active runtime adopted a new reasoning-effort setting. This is
@@ -1094,7 +1095,7 @@ pub type CodingRuntimeEvents = mpsc::UnboundedReceiver<SequencedRuntimeEvent>;
 
 struct GenerationTaggedRuntimeEvent {
     view_only: bool,
-    view_seed: Option<(SessionSnapshot, RuntimeMode)>,
+    view_seed: Option<(SessionSnapshot, RuntimeMode, Option<String>)>,
     generation: u64,
     event: CodingRuntimeEvent,
 }
@@ -1197,7 +1198,13 @@ impl RuntimeEventEmitter {
             };
             let _ = tagged.send(GenerationTaggedRuntimeEvent {
                 view_only: true,
-                view_seed: seed.map(|snapshot| (snapshot, current_mode(&runtime.parts))),
+                view_seed: seed.map(|snapshot| {
+                    (
+                        snapshot,
+                        current_mode(&runtime.parts),
+                        current_runtime_model(runtime),
+                    )
+                }),
                 generation,
                 event: CodingRuntimeEvent::SessionChanged(session_changed(generation, runtime)),
             });
@@ -1211,7 +1218,13 @@ impl RuntimeEventEmitter {
             } else {
                 runtime.parts.runtime_resume_snapshot()
             }
-            .map(|snapshot| (snapshot, current_mode(&runtime.parts)))
+            .map(|snapshot| {
+                (
+                    snapshot,
+                    current_mode(&runtime.parts),
+                    current_runtime_model(runtime),
+                )
+            })
         });
         let event = CodingRuntimeEvent::SessionChanged(changed);
         let _ = self.raw.send(event.clone());
@@ -3481,6 +3494,10 @@ impl CodingRuntime {
                             snapshot,
                         );
                         view.mode = current_mode(&parts);
+                        view.model = harness_providers
+                            .as_ref()
+                            .and_then(|providers| providers.current())
+                            .map(|provider| provider.model_name().to_owned());
                         view
                     })
             });
@@ -7105,7 +7122,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 tell(&runtime, crate::told::reconfigured(&runtime.config, &next));
                                 runtime.config = next;
                                 let provider = runtime.config.provider_name.clone();
-                                let model = runtime.config.model.clone();
+                                let model = current_runtime_model(&runtime).unwrap_or_default();
                                 let reasoning_effort =
                                     runtime.config.chat_options.reasoning_effort;
                                 let reasoning_effort_applicable =
@@ -7276,7 +7293,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 cancel_pending = false;
                                 compaction_suspended = false;
                                 let provider = runtime.config.provider_name.clone();
-                                let model = runtime.config.model.clone();
+                                let model = current_runtime_model(&runtime).unwrap_or_default();
                                 let reasoning_effort = runtime.config.chat_options.reasoning_effort;
                                 let reasoning_effort_applicable =
                                     runtime.config.supports_reasoning_effort;
@@ -11784,6 +11801,15 @@ fn persist_runtime_snapshot(
         runtime.parts.set_runtime_resume(snapshot.clone());
         Ok(())
     }
+}
+
+/// Display identity from the model mounted in this runtime, never the config file.
+fn current_runtime_model(runtime: &RuntimeResources) -> Option<String> {
+    runtime
+        .harness_providers
+        .as_ref()?
+        .current()
+        .map(|provider| provider.model_name().to_owned())
 }
 
 fn current_runtime_snapshot(runtime: &RuntimeResources) -> Option<SessionSnapshot> {
@@ -19643,10 +19669,12 @@ mod tests {
             }
         ));
         assert_eq!(second.generation, 1);
+        // The factory mounts MockProvider even when config names "next-model".
+        // The selection stays configured above; presentation reports the mounted model.
         assert!(matches!(
             second.event,
             CodingRuntimeEvent::ProviderChanged { ref provider, ref model }
-                if provider == "next-provider" && model == "next-model"
+                if provider == "next-provider" && model == "mock"
         ));
         assert_eq!(third.generation, 1);
         assert!(matches!(

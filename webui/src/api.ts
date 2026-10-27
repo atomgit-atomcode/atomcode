@@ -1067,9 +1067,10 @@ export interface LiveGoalProgress {
 }
 
 export type LiveWireEvent =
-  | { type: 'snapshot'; messages: SessionMessage[]; session_id: string; project_hash: string; provider: string; mode: ApprovalMode; goal?: LiveGoalProgress | null }
+  | { type: 'snapshot'; messages: SessionMessage[]; session_id: string; project_hash: string; provider: string; model?: string | null; mode: ApprovalMode; goal?: LiveGoalProgress | null }
   | ({ type: 'goal_changed' } & LiveGoalProgress)
-  | { type: 'provider'; provider: string }
+  | { type: 'provider'; provider: string; model?: string | null }
+  | { type: 'model'; model: string | null }
   | { type: 'reasoning_effort'; provider: string; effort: string | null; applicable: boolean }
   | { type: 'mode'; mode: ApprovalMode }
   | { type: 'user'; text: string; images?: ImageData[]; client_input_id?: string }
