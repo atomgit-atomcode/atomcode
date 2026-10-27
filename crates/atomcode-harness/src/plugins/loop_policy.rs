@@ -762,16 +762,14 @@ struct CompactBeforeRequest {
     ctx: Context,
     threshold: f32,
     token_limit: Option<u32>,
-    /// The turn each session last tried a quick and a slow compaction in.
+    /// Attempts in each session’s current turn and context-pressure cycle.
     tried: Mutex<HashMap<String, (u64, [bool; 2])>>,
 }
 
 impl CompactBeforeRequest {
-    /// At most one attempt per stage — a quick one, one that calls a model — per
-    /// turn. The trigger runs before every request and pressure does not fall
-    /// between two rounds of one turn; a strategy that found nothing worth doing
-    /// at the first would be asked again at every round after it, and one that
-    /// calls a model would bill for it each time.
+    /// At most one attempt per stage per turn or pressure cycle. A no-op or
+    /// failed summary must not bill again on every request while pressure stays
+    /// high. A later provider report below the trigger rearms both stages.
     fn first_try(&self, session: &str, turn: u64, slow: bool) -> bool {
         let mut tried = self.tried.lock().expect("compaction attempts poisoned");
         let entry = tried
@@ -812,7 +810,14 @@ impl Waterfall<AgentRequest> for CompactBeforeRequest {
             .map_or(window as f32 * self.threshold, |limit| {
                 (window as f32 * self.threshold).min(limit as f32)
             });
-        if window == 0 || used == 0 || (used as f32) < trigger_tokens {
+        if window == 0 || used == 0 {
+            return next.run(req).await;
+        }
+        if (used as f32) < trigger_tokens {
+            self.tried
+                .lock()
+                .expect("compaction attempts poisoned")
+                .remove(session.id());
             return next.run(req).await;
         }
 

@@ -27,3 +27,34 @@ or file contents. These are implementation checks, not model-quality tests.
 The Rust companion regression in `atomcode-coding/tests/runtime_criteria.rs`
 covers provider swaps, capability reloads, config rebuilds, and directory changes,
 including a host layer that explicitly tries to include a tool.
+
+## Automatic compaction during one long turn
+
+```sh
+python3 evals/design-convergence/auto_compaction_probe.py \
+  --binary target/release/atomcode --output /tmp/auto-compaction.json
+```
+
+This probe runs the native CLI with tools enabled, a temporary product home and
+project, and a loopback fake OpenAI-compatible provider. Its model name is
+`deepseek-v4.1-flash-1017`, with a configured 512,000-token window. Provider usage
+is deliberately synthetic: two peaks at 460,800 tokens (90%), with a low reading
+between them, inside a single user turn. Large assistant messages and distinct
+fixture reads exercise the real request projection and automatic trigger.
+
+A pass requires successful CLI exit, exactly one persisted user message, at least
+two persisted `compacted` facts, and at least two summary requests followed by a
+smaller actual main-model request body. It invokes no manual compact command.
+Output stores request sizes, usage counts and selected event kinds, not message
+bodies. This verifies automatic scheduling, persistence and actual request
+reduction; it does not validate DeepSeek tokenization, summary quality, Windows
+rendering, or the exact cause of a screenshot without its session log.
+
+2026-10-27 verification: the previous binary (SHA-256
+`0d4ceb27ce58e503fa3041b44a372e48a3578a80b06d115eb2e7a3dbcbde68fb`)
+failed: only one summary/compaction, delayed until request 10. The patched binary
+(SHA-256 `f84c25e530ac2f306b824281af40b7fa7645aa9c3374e9d72bc7e613c6809cd2`)
+passed: compaction before requests 5 and 9, with main request bytes falling
+640,044 → 460,352 and 1,001,426 → 460,352 respectively. Corresponding Rust
+regressions cover a long active-turn prefix and rearming after a low provider
+reading; the existing constant-pressure no-op test still limits slow attempts.

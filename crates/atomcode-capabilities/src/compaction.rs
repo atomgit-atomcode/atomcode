@@ -853,9 +853,8 @@ impl CompactionStrategy for OverflowCompaction {
     /// `AUTO_DRAIN_UTILIZATION` AND whose drain would actually reduce pressure
     /// (`auto_drain_would_help`). When there is nothing older than the kept window to
     /// drain it falls back to the fast inner stub (drain ≤ floor) and is NOT announced.
-    /// Must predict with the SAME boundary each path actually uses: the proactive
-    /// (auto/manual) drain keeps ~25% recent (`recent_keep_boundary`); the emergency
-    /// overflow ladder keeps only the active turn (`active_turn_start(1)`).
+    /// Predict with the same recent-budget split as the actual plans. In particular,
+    /// a long active turn has a drainable prefix even before another user turn starts.
     fn will_summarize(&self, view: &CompactionView<'_>) -> bool {
         let floor = view.sacred_floor;
         // Mirror the plans' guard exactly: a summarize happens only when the drained span
@@ -865,16 +864,15 @@ impl CompactionStrategy for OverflowCompaction {
             drain_to > floor && span_has_non_anchor(&view.messages[floor..drain_to])
         };
         let proactive_drains = || {
-            drains(recent_keep_boundary(
+            drains(recent_keep_boundary_splitting(
                 view.messages,
                 self.recent_budget(view),
                 floor,
             ))
         };
-        let overflow_drains = || drains(active_turn_start(view.messages, 1).max(floor));
         match &view.trigger {
             CompactTrigger::Manual { .. } => proactive_drains(),
-            CompactTrigger::Overflow { attempt } => *attempt >= 2 && overflow_drains(),
+            CompactTrigger::Overflow { attempt } => *attempt >= 2 && proactive_drains(),
             CompactTrigger::Auto { .. } => self.auto_due(view) && proactive_drains(),
         }
     }
@@ -895,7 +893,7 @@ fn auto_drain_would_help(view: &CompactionView<'_>, recent_budget: usize, mark: 
     // it keeps ~25% recent verbatim, so the surviving remainder is larger than a
     // keep-only-the-active-turn estimate. Using the wrong (wider) drain span here would
     // green-light a drain that can't cut pressure → re-summarize + cache-bust every turn.
-    let drain_to = recent_keep_boundary(view.messages, recent_budget, floor);
+    let drain_to = recent_keep_boundary_splitting(view.messages, recent_budget, floor);
     if drain_to <= floor {
         return false; // nothing drainable
     }
@@ -922,33 +920,12 @@ fn auto_drain_would_help(view: &CompactionView<'_>, recent_budget: usize, mark: 
     remaining_tokens < mark
 }
 
-/// Index at which the kept window (the `keep_recent_turns` most-recent turns) begins;
-/// everything before it is "old" and eligible to stub. A turn starts at a NON-synthetic
-/// [`Role::User`] message (synthetic users are kernel-injected summaries / resume notes,
-/// not real turns). Returns `0` when there are not strictly MORE than `keep_recent_turns`
-/// real turns — i.e. nothing is old yet (mirrors core's `turns.len() <= keep_recent_turns`).
-fn active_turn_start(msgs: &[Message], keep_recent_turns: usize) -> usize {
-    if keep_recent_turns == 0 {
-        return msgs.len();
-    }
-    let starts: Vec<usize> = msgs
-        .iter()
-        .enumerate()
-        .filter(|(_, m)| m.role == Role::User && !m.synthetic)
-        .map(|(i, _)| i)
-        .collect();
-    if starts.len() <= keep_recent_turns {
-        return 0; // not enough turns to have anything older than the kept window
-    }
-    starts[starts.len() - keep_recent_turns]
-}
-
 /// Drain boundary that keeps the most-recent WHOLE turns whose combined token
 /// estimate fits within `keep_budget_tokens` — but ALWAYS at least the active
 /// turn. Turn-aligned (a turn starts at a non-synthetic [`Role::User`] message)
 /// so a drain never splits a turn / orphans a tool call from its result.
 /// `msgs[..boundary]` is drained+summarized; `msgs[boundary..]` is kept verbatim.
-/// Clamped to `>= floor`. Replaces the old `active_turn_start(msgs, 1)` so a big
+/// Clamped to `>= floor`, so a big
 /// context window retains proportionally more recent history (see
 /// `recent_keep_budget`); a single turn larger than the budget degrades to
 /// keeping just that active turn.
@@ -2142,8 +2119,56 @@ mod tests {
         assert_eq!(plan.drain_to, 0, "moderate auto = no drain (stub only)");
     }
 
+    /// A long active turn must expose its old prefix to automatic summarization.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn auto_summarizes_a_single_long_turn_at_ninety_percent() {
+        let mut conversation = Conversation::new();
+        conversation.messages = vec![Message::system("persona"), Message::user("keep working")];
+        for round in 0..12 {
+            conversation.messages.push(Message::assistant(
+                format!("round {round}: {}", "x".repeat(180_000)),
+                vec![],
+            ));
+        }
+        let floor = conversation.sacred_floor();
+        let strategy = OverflowCompaction::new(
+            StubCompaction::default(),
+            Some(Arc::new(CannedSummaryProvider)),
+        );
+        let view = CompactionView {
+            messages: &conversation.messages,
+            trigger: CompactTrigger::Auto { utilization: 0.9 },
+            ctx_window: 512_000,
+            used_tokens: 460_800,
+            utilization: 0.9,
+            sacred_floor: floor,
+        };
+        assert!(
+            strategy.will_summarize(&view),
+            "the active turn itself can have an old drainable prefix"
+        );
+        let plan = strategy.plan(&view).await;
+        assert!(
+            plan.summary.is_some(),
+            "90% must not silently remain a no-op for one long turn"
+        );
+        assert!(plan.drain_to > floor);
+        conversation.apply_plan(plan, floor);
+        assert!(conversation
+            .messages
+            .iter()
+            .any(|message| message.text.starts_with(ANCHOR_SENTINEL)));
+        assert!(
+            conversation
+                .messages
+                .iter()
+                .any(|message| message.text.starts_with("round 11:")),
+            "latest work must survive"
+        );
+    }
+
     /// At ~80% — the zone where models start nagging to "start a new conversation" —
-    /// Auto must ESCALATE to a real drain+summary (AUTO_DRAIN_UTILIZATION < 0.80),
+    /// auto must ESCALATE to a real drain+summary (AUTO_DRAIN_UTILIZATION < 0.80),
     /// so context is reduced before the model panics. Regression guard for lowering
     /// the drain gate below 0.80.
     #[tokio::test]
@@ -2538,24 +2563,22 @@ mod tests {
     }
 
     #[test]
-    fn emergency_boundary_keeps_less_than_proactive() {
-        // Small old turns that FIT the proactive 25% keep budget. The proactive drain
-        // (auto/manual) keeps them (boundary back at the floor); the emergency overflow
-        // ladder keeps ONLY the active turn (boundary at the active user) — it drains more.
+    fn summary_prediction_keeps_recent_history_for_manual_and_overflow() {
         let msgs = vec![
             Message::system("p"),
             Message::user(big("u1")),
             Message::assistant(big("a1"), vec![]),
-            Message::user("active"), // index 3 — the active turn
+            Message::user("active"),
         ];
-        let floor = 1;
-        let proactive = recent_keep_boundary(&msgs, recent_keep_budget(128_000), floor);
-        let emergency = active_turn_start(&msgs, 1).max(floor);
-        assert_eq!(emergency, 3, "emergency keeps only the active turn");
-        assert!(
-            proactive < emergency,
-            "emergency drains more (keeps less) than proactive: {proactive} vs {emergency}"
+        let strategy = OverflowCompaction::new(
+            StubCompaction::default(),
+            Some(Arc::new(CannedSummaryProvider)),
         );
+        let mut view = manual_view(&msgs, 1, None);
+        view.ctx_window = 128_000;
+        assert!(!strategy.will_summarize(&view));
+        view.trigger = CompactTrigger::Overflow { attempt: 2 };
+        assert!(!strategy.will_summarize(&view));
     }
 
     #[test]

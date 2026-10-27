@@ -545,7 +545,7 @@ impl atomcode_harness::seams::Compaction for Reluctant {
     }
 }
 
-struct ReluctantRow(Arc<AtomicU32>);
+struct ReluctantRow(Arc<AtomicU32>, f32);
 
 #[async_trait]
 impl atomcode_plexus::Plugin for ReluctantRow {
@@ -566,7 +566,7 @@ impl atomcode_plexus::Plugin for ReluctantRow {
         let _ = ctx
             .provide::<CompactionSvc>(Arc::new(Reluctant(self.0.clone())))
             .map_err(|e| e.to_string())?;
-        plugins::loop_policy::mount_compaction_trigger(ctx, 0.0000001);
+        plugins::loop_policy::mount_compaction_trigger(ctx, self.1);
         Ok(())
     }
 }
@@ -591,7 +591,7 @@ async fn a_slow_compaction_is_tried_once_a_turn_and_its_start_is_always_closed()
                 [[remove]]\nid = \"repeat-fuse\"\n\n[[remove]]\nid = \"tool-loop-guard\"";
     let asked = Arc::new(AtomicU32::new(0));
     let mut registry = atomcode_coding::on_harness::catalog();
-    registry.register(Arc::new(ReluctantRow(asked.clone())));
+    registry.register(Arc::new(ReluctantRow(asked.clone(), 0.0000001)));
     let mut app = App::new(registry, tree(&dir, &script, &[swap]));
     app.start().await.expect("must mount");
 
@@ -1121,5 +1121,63 @@ async fn closing_is_cancellable_and_does_not_consume_queued_input() {
     assert_eq!(
         agent.inbox().claim().message.as_deref(),
         Some("next request")
+    );
+}
+
+struct PressureCycle(AtomicU32);
+#[async_trait]
+impl Waterfall<AgentRequest> for PressureCycle {
+    async fn handle(
+        &self,
+        req: &mut ModelRequest,
+        next: Next<'_, AgentRequest>,
+    ) -> Result<ModelResponse, RequestError> {
+        let mut response = next.run(req).await?;
+        let index = self.0.fetch_add(1, Ordering::SeqCst);
+        response.usage = Some(atomcode_kernel::stream::TokenUsage {
+            prompt: if index == 1 { 10 } else { 100 },
+            completion: 1,
+            cached: 0,
+        });
+        Ok(response)
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn automatic_compaction_rearms_after_pressure_falls_and_grows_in_one_turn() {
+    let dir = scratch("pressure-cycles");
+    std::fs::write(dir.join("a.txt"), "x").unwrap();
+    let call =
+        r#"{ text = "again", calls = [ { name = "read_file", args = { file_path = "a.txt" } } ] }"#;
+    let script = format!(
+        r#"[[patch]]
+id = "llm"
+name = "llm-replay"
+config = {{ script = [ {call}, {call}, {call}, {call}, {{ text = "done" }} ] }}
+"#
+    );
+    let swap = r#"[[remove]]
+id = "compaction-tail"
+[[insert]]
+id = "compaction-reluctant"
+name = "compaction-reluctant"
+[[remove]]
+id = "repeat-fuse"
+[[remove]]
+id = "tool-loop-guard"
+"#;
+    let asked = Arc::new(AtomicU32::new(0));
+    let mut registry = atomcode_coding::on_harness::catalog();
+    registry.register(Arc::new(ReluctantRow(asked.clone(), 0.0005)));
+    let mut app = App::new(registry, tree(&dir, &script, &[swap]));
+    app.start().await.unwrap();
+    let _guard = app
+        .context()
+        .on_waterfall::<AgentRequest>(Arc::new(PressureCycle(AtomicU32::new(0))), false);
+    run_turn(&app, "one long task").await.unwrap();
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        2,
+        "falling below the trigger must permit the next pressure cycle in the same turn"
     );
 }
