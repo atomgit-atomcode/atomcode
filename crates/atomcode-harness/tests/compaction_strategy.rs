@@ -17,7 +17,7 @@ use atomcode_kernel::message::{
     CompactTrigger, CompactionPlan, CompactionStrategy, CompactionView, Message, Role,
 };
 use atomcode_kernel::provider::{ChatOptions, LlmProvider};
-use atomcode_kernel::session::visible_turns;
+use atomcode_kernel::session::{visible_turns, InjectionOrigin};
 use atomcode_kernel::stream::{ProviderError, StreamEvent};
 use atomcode_kernel::tool::{ToolCall, ToolDef};
 use futures::stream::BoxStream;
@@ -583,4 +583,54 @@ async fn failed_summaries_keep_agreed_design_in_the_native_session_projection() 
             no_orphan_results(&visible).unwrap();
         }
     }
+}
+
+/// The default coding strategy keeps a first-turn memory injection across the
+/// summary: memory stands for the session, not for the history it folds.
+#[tokio::test]
+async fn a_memory_injection_survives_the_summary() {
+    let mut w = Writer::new();
+    w.turn = 1;
+    w.log.append(SessionEvent::TurnStart { turn: 1 });
+    w.log.append(SessionEvent::Injected {
+        turn: 1,
+        text: "=== MEMORY ===\n- prefers tabs".into(),
+        origin: InjectionOrigin::Memory,
+    });
+    w.log.append(SessionEvent::UserMessage {
+        turn: 1,
+        text: "first".into(),
+        images: vec![],
+    });
+    w.answer(&bulk("one", 20_000));
+
+    w.turn = 2;
+    w.round = 0;
+    w.log.append(SessionEvent::TurnStart { turn: 2 });
+    w.log.append(SessionEvent::UserMessage {
+        turn: 2,
+        text: "second".into(),
+        images: vec![],
+    });
+    w.answer(&bulk("two", 20_000));
+
+    w.turn = 3;
+    w.round = 0;
+    w.log.append(SessionEvent::TurnStart { turn: 3 });
+    w.log.append(SessionEvent::UserMessage {
+        turn: 3,
+        text: "third".into(),
+        images: vec![],
+    });
+    w.answer(&bulk("three", 20_000));
+
+    let strategy = strategy(Some(Summarizer::new()));
+    let decision = decide_with_strategy(&strategy, &w.log, &pressure(16_000, 13_000))
+        .await
+        .expect("a summary");
+    w.apply(decision);
+    assert!(
+        w.seen().iter().any(|m| m.text.contains("prefers tabs")),
+        "memory must survive the summary"
+    );
 }

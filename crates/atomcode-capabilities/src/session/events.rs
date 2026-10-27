@@ -2242,4 +2242,84 @@ mod tests {
             }
         )));
     }
+
+    #[test]
+    fn events_to_become_keeps_memory_out_of_a_summary() {
+        let events = vec![
+            logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+            logged(
+                2,
+                0,
+                SessionEvent::Injected {
+                    turn: 1,
+                    text: "=== MEMORY ===\n- prefers tabs".into(),
+                    origin: InjectionOrigin::Memory,
+                },
+            ),
+            logged(
+                3,
+                0,
+                SessionEvent::UserMessage {
+                    turn: 1,
+                    text: "one".into(),
+                    images: vec![],
+                },
+            ),
+            logged(
+                4,
+                0,
+                SessionEvent::AssistantMessage {
+                    turn: 1,
+                    round: 1,
+                    text: "ok1".into(),
+                    reasoning: String::new(),
+                    tool_calls: vec![],
+                    reasoning_blocks: vec![],
+                    meta: None,
+                },
+            ),
+            logged(5, 0, SessionEvent::TurnStart { turn: 2 }),
+            logged(
+                6,
+                0,
+                SessionEvent::UserMessage {
+                    turn: 2,
+                    text: "two".into(),
+                    images: vec![],
+                },
+            ),
+            logged(
+                7,
+                0,
+                SessionEvent::AssistantMessage {
+                    turn: 2,
+                    round: 1,
+                    text: "ok2".into(),
+                    reasoning: String::new(),
+                    tool_calls: vec![],
+                    reasoning_blocks: vec![],
+                    meta: None,
+                },
+            ),
+        ];
+        let mut memory = Message::system("=== MEMORY ===\n- prefers tabs");
+        memory.synthetic = true;
+        let target = vec![
+            memory,
+            Message::user("two"),
+            Message::assistant("ok2", vec![]),
+        ];
+        let change = events_to_become(&events, &target);
+        assert!(!change.iter().any(|event| matches!(
+            event,
+            SessionEvent::Compacted { summary, .. } if summary.contains("prefers tabs")
+        )));
+        assert!(change.iter().any(|event| matches!(
+            event,
+            SessionEvent::Injected {
+                origin: InjectionOrigin::Memory,
+                ..
+            }
+        )));
+    }
 }
