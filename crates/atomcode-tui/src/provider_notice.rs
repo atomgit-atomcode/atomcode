@@ -5,6 +5,19 @@ use crate::frame::Line;
 use crate::i18n::{t, Msg};
 use std::sync::Arc;
 
+fn authentication_expired(error: &str) -> bool {
+    use atomcode_i18n::product::{t_with, Locale, Msg};
+    // The provider's terminal auth error has no HTTP prefix. Match only its
+    // known headline, including persisted errors from the other UI language.
+    let error = error
+        .trim()
+        .strip_prefix("provider error: ")
+        .unwrap_or(error.trim());
+    [Locale::En, Locale::ZhCn]
+        .into_iter()
+        .any(|locale| error == t_with(locale, Msg::ChatAuthExpired))
+}
+
 fn status(error: &str) -> Option<u16> {
     // Read an explicit outer status, never digits in model names or stack traces.
     let error = error
@@ -25,6 +38,10 @@ fn status(error: &str) -> Option<u16> {
 }
 
 pub(crate) fn reason(error: &str) -> String {
+    if authentication_expired(error) {
+        return atomcode_i18n::product::t(atomcode_i18n::product::Msg::ChatAuthExpired)
+            .into_owned();
+    }
     let lower = error.to_ascii_lowercase();
     let code = status(error);
     let msg = match code {
@@ -66,6 +83,9 @@ pub(crate) fn reason(error: &str) -> String {
 }
 
 pub(crate) fn advice(error: &str) -> String {
+    if authentication_expired(error) {
+        return reason(error);
+    }
     let action = match status(error) {
         Some(401) => Msg::ProviderCheckCredentials,
         Some(403) => Msg::ProviderCheckAccess,
@@ -131,6 +151,29 @@ mod tests {
 
     fn plain(lines: Vec<Line>) -> String {
         lines.iter().map(Line::plain).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn expired_login_keeps_its_action_in_the_folded_summary() {
+        use atomcode_i18n::product::{t_with, Locale, Msg as ProductMsg};
+        for locale in [Locale::En, Locale::ZhCn] {
+            let raw = t_with(locale, ProductMsg::ChatAuthExpired);
+            for error in [raw.to_string(), format!("provider error: {raw}")] {
+                assert!(reason(&error).contains("/login"));
+                assert_eq!(advice(&error), reason(&error));
+                let block = DiagnosticBlock {
+                    summary: Arc::new(NoticeBlock {
+                        detail: advice(&error),
+                    }),
+                    detail: error.clone(),
+                };
+                assert!(plain(block.summary_lines(&RenderCtx::bare(80))).contains("/login"));
+                assert_eq!(block.detail, error);
+            }
+        }
+        // An arbitrary provider key rejection must not suggest product login.
+        assert!(!advice("HTTP 401: invalid API key").contains("/login"));
+        assert!(!authentication_expired("server says please /login"));
     }
 
     #[test]
