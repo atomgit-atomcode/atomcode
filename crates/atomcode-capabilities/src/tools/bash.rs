@@ -2532,9 +2532,9 @@ pub fn bash_invocations(source: &str) -> Option<Vec<BashInvocation>> {
     Some(invocations)
 }
 
-/// Paths named by shell redirections (`<`, `>`, `>>`, `>|`, `&>`), with descriptors,
-/// operators and fd dups omitted. A parse failure yields no paths.
-pub(crate) fn bash_redirect_paths(source: &str) -> Vec<String> {
+/// Paths read through shell input redirection (`< file`). Output redirection is a
+/// write and is handled by the workspace gate; fd dups and heredocs are not files.
+pub(crate) fn bash_input_redirect_paths(source: &str) -> Vec<String> {
     let Some(tree) = parse_bash(source) else {
         return Vec::new();
     };
@@ -2543,14 +2543,21 @@ pub(crate) fn bash_redirect_paths(source: &str) -> Vec<String> {
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
         if node.kind() == "file_redirect" {
-            for index in 0..node.named_child_count() as u32 {
-                let Some(child) = node.named_child(index) else {
+            let mut is_input = false;
+            for index in 0..node.child_count() as u32 {
+                let Some(child) = node.child(index) else {
                     continue;
                 };
-                if !matches!(
-                    child.kind(),
-                    "word" | "raw_string" | "string" | "concatenation" | "number"
-                ) {
+                if !child.is_named() {
+                    is_input |= child.utf8_text(bytes).is_ok_and(|text| text == "<");
+                    continue;
+                }
+                if !is_input
+                    || !matches!(
+                        child.kind(),
+                        "word" | "raw_string" | "string" | "concatenation" | "number"
+                    )
+                {
                     continue;
                 }
                 if let Ok(text) = child.utf8_text(bytes) {
@@ -4752,6 +4759,16 @@ mod tests {
             "a remote script piped to a shell after `&` must stay Risky"
         );
         assert!(check_destructive_command("echo ready & echo done").is_none());
+    }
+
+    #[test]
+    fn input_redirect_paths_ignore_outputs_and_fd_dups() {
+        assert_eq!(
+            bash_input_redirect_paths("cat < .atomcode/config.toml"),
+            vec![".atomcode/config.toml"]
+        );
+        assert!(bash_input_redirect_paths("echo x > out.txt").is_empty());
+        assert!(bash_input_redirect_paths("echo x 2>&1").is_empty());
     }
 
     #[test]

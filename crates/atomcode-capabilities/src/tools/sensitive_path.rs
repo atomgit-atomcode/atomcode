@@ -201,8 +201,8 @@ impl SensitivePaths {
                     }
                 }
             }
-            // Redirection targets are paths too: `cat < .atomcode/config.toml`.
-            for target in super::bash::bash_redirect_paths(command) {
+            // Input redirection targets are paths too: `cat < .atomcode/config.toml`.
+            for target in super::bash::bash_input_redirect_paths(command) {
                 if !looks_like_path(&target) {
                     continue;
                 }
