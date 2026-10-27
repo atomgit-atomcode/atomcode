@@ -635,6 +635,7 @@ impl crate::commands::CatalogCommand for StopMember {
             usage: None,
             summary: "Stop this team member. Its log is kept, and says it was stopped.".into(),
             target: atomcode_kernel::agent::CommandTarget::Agent,
+            ..Default::default()
         }
     }
 

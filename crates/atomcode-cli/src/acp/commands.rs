@@ -832,12 +832,14 @@ mod tests {
                 usage: Some("<要什么>".into()),
                 summary: "让这个会话自己干到某个目标".into(),
                 target: CommandTarget::Session,
+                ..Default::default()
             },
             CommandDescription {
                 name: "status".into(),
                 usage: None,
                 summary: "agent 自己那份说明".into(),
                 target: CommandTarget::Session,
+                ..Default::default()
             },
         ];
 

@@ -202,6 +202,7 @@ mod tests {
                 usage: None,
                 summary: String::new(),
                 target: CommandTarget::Session,
+                ..Default::default()
             }
         }
         async fn run(&self, _agent: Arc<Agent>, _args: &str) -> Result<String, String> {
@@ -220,6 +221,7 @@ mod tests {
                 usage: None,
                 summary: String::new(),
                 target: CommandTarget::Session,
+                ..Default::default()
             }
         }
         async fn run(&self, _agent: Arc<Agent>, _args: &str) -> Result<String, String> {

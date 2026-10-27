@@ -7197,6 +7197,7 @@ impl atomcode_harness::commands::CatalogCommand for EchoCommand {
             usage: Some("<text>".into()),
             summary: "say it back".into(),
             target: atomcode_kernel::agent::CommandTarget::Session,
+            ..Default::default()
         }
     }
     async fn run(
