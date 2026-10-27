@@ -887,6 +887,10 @@ fn last_turn(events: &[LoggedEvent]) -> u64 {
         .unwrap_or(0)
 }
 
+/// First line of the memory block `MemoryContext` injects. A synthetic system
+/// message carrying it is memory, not a compaction summary.
+const MEMORY_INJECTION_HEADER: &str = "=== MEMORY ===";
+
 /// The facts a stored conversation is made of, numbered from `first_seq`.
 ///
 /// The one crossing from a snapshot into a log: converting a session stored as
@@ -915,10 +919,15 @@ pub fn events_from_snapshot(snapshot: &SessionSnapshot, first_seq: SeqNo) -> Vec
         match message.role {
             Role::System => {
                 if message.synthetic {
+                    let origin = if message.text.starts_with(MEMORY_INJECTION_HEADER) {
+                        InjectionOrigin::Memory
+                    } else {
+                        InjectionOrigin::CompactionSummary
+                    };
                     events.push(SessionEvent::Injected {
                         turn,
                         text: message.text.clone(),
-                        origin: InjectionOrigin::CompactionSummary,
+                        origin,
                     });
                 }
             }
@@ -2206,5 +2215,31 @@ mod tests {
         assert!(!manager.index_path("s2").unwrap().exists());
         assert!(!manager.events_path("s2").unwrap().exists());
         assert!(manager.load_native_session("s1").is_ok());
+    }
+
+    #[test]
+    fn snapshot_memory_is_replayed_as_memory_not_as_a_compaction_summary() {
+        let mut memory = Message::system("=== MEMORY ===\n- prefers tabs");
+        memory.synthetic = true;
+        let snapshot = SessionSnapshot::new(vec![
+            Message::system("You are AtomCode"),
+            memory,
+            Message::user("hello"),
+        ]);
+        let events = events_from_snapshot(&snapshot, 1);
+        let origin = events.iter().find_map(|logged| match &logged.event {
+            SessionEvent::Injected { text, origin, .. } if text.contains("prefers tabs") => {
+                Some(origin)
+            }
+            _ => None,
+        });
+        assert_eq!(origin, Some(&InjectionOrigin::Memory));
+        assert!(!events.iter().any(|logged| matches!(
+            &logged.event,
+            SessionEvent::Injected {
+                origin: InjectionOrigin::CompactionSummary,
+                ..
+            }
+        )));
     }
 }
