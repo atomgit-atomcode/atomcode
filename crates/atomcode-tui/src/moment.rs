@@ -1246,7 +1246,7 @@ impl Moment {
     /// turn is very much in flight. `pending_working` closes that gap, so a stop
     /// gesture the instant after a send still stops.
     /// The rest of an earlier line that starts with what is typed, as drawn
-    /// dim after the caret and taken by →. `None` while it is held back after a
+    /// dim after the caret and taken by → or Tab. `None` while it is held back after a
     /// deletion ([`Moment::completion_held`]). The one question both the
     /// drawing and the key ask, so the key never takes a completion nobody can
     /// see.

@@ -10305,15 +10305,8 @@ async fn a_guess_at_what_to_say_next_is_taken_by_plain_tab() {
         "收下那句话和切模式是两件事,那一按只能干前一件"
     );
 
-    // And it takes it only on an empty line. With words in the field — here the
-    // same sentence, now in the history, typed back as a prefix — plain Tab is
-    // the mode key again, and it does **not** quietly complete from history
-    // instead: that would be a key nobody advertised ahead of one this row does.
-    //
-    // Judged on the mode and not on the text: the completion is drawn as a dim
-    // ghost *inside* the line (`modules::input`), so scraping the composer cannot
-    // tell "offered" from "taken" — while a Tab that took something never
-    // reaches the mode key at all.
+    // Sending stores the accepted suggestion in history. Its visible suffix
+    // then also takes precedence over the optional plain-Tab mode shortcut.
     s.term.press(KeyPress::plain(Key::Enter));
     s.quiet().await;
     // 输入行里读不出「收下了」和「还挂着」的差别(同一串字,只差颜色);发出去的
@@ -10333,16 +10326,29 @@ async fn a_guess_at_what_to_say_next_is_taken_by_plain_tab() {
     );
     s.term.type_text("接着");
     s.term.press(KeyPress::plain(Key::Tab));
+    s.quiet().await;
+    assert!(
+        host.asked.lock().expect("asked poisoned").is_empty(),
+        "visible history completion takes Tab before the mode shortcut"
+    );
+    assert_eq!(
+        transcript(&s).matches("接着把登录那条补上").count(),
+        1,
+        "Tab only fills the draft; it must not submit"
+    );
+    s.term.press(KeyPress::plain(Key::Enter));
+    let mut completed = false;
     for _ in 0..200 {
-        if !host.asked.lock().expect("asked poisoned").is_empty() {
+        if transcript(&s).matches("接着把登录那条补上").count() >= 2 {
+            completed = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    assert_eq!(
-        host.asked.lock().expect("asked poisoned").as_slice(),
-        &[atomcode_host_api::Mode::AcceptEdits],
-        "行里有字的时候,Tab 还是那个模式键"
+    assert!(
+        completed,
+        "Enter must submit the completed history entry:\n{}",
+        s.screen()
     );
     task.abort();
 }

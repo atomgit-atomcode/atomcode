@@ -3288,13 +3288,10 @@ impl UserInterface for Tui {
                 {
                     stale = true;
                 }
-                // Plain Tab takes the guess at what to say next — the gesture the
-                // hint row names, and the reference front end's. Above the mode
-                // key and below the arms before it, which is that order ported:
-                // the menu and the team panel own Tab while they are up, and a
-                // guess on an empty line owns it ahead of the mode, so Tab always
-                // means what the row advertising it says.
-                Wake::Input(Input::Key(press)) if self.take_the_guess(press) => {
+                // Plain Tab accepts the visible inline suggestion/history suffix.
+                // Menus and team navigation keep precedence; completion beats the
+                // optional plain-Tab mode shortcut only when text is accepted.
+                Wake::Input(Input::Key(press)) if self.complete_with_tab(press) => {
                     stale = true;
                 }
                 // Shift+Tab steps the execution mode on, and plain Tab too where
@@ -7351,29 +7348,15 @@ impl Tui {
         Ok(path)
     }
 
-    /// Plain `Tab` takes the guess at what to say next, when there is one and
-    /// the line is empty. `true` when it took something, which is the arm's
-    /// whole condition — nothing to take and the press goes on to be whatever it
-    /// was, the mode key included.
-    ///
-    /// The reference front end's gesture, kept: its hint row said `Tab: …` and
-    /// either key took it. Which press this is depends on the field's state
-    /// rather than on the keymap table, the same reason [`Self::is_mode_cycle_key`]
-    /// is a method — and it sits **above** that key and **below** the menu and
-    /// the team panel, which is the order the reference used: a list that is up
-    /// and a panel somebody opened both own Tab, and a guess on an empty line is
-    /// the completion this key is otherwise for.
-    ///
-    /// [`take_suggestion`] and not [`accept_ghost`], deliberately: the latter
-    /// would also complete from history on a *non-empty* line, which the hint
-    /// row does not advertise and which would take the mode key's job away
-    /// wherever `ui.mode_switch_key = "tab"`.
-    fn take_the_guess(&self, press: crate::surface::KeyPress) -> bool {
+    /// Accept visible inline completion with plain Tab, before the optional
+    /// plain-Tab mode shortcut. With nothing to complete the key falls through.
+    /// Menus and team navigation are handled first by the input loop.
+    fn complete_with_tab(&self, press: crate::surface::KeyPress) -> bool {
         use crate::surface::{Key, Mods};
         if press.key != Key::Tab || press.mods != Mods::NONE {
             return false;
         }
-        take_suggestion(&mut self.host.moment.write().expect("moment poisoned"))
+        accept_ghost(&mut self.host.moment.write().expect("moment poisoned"))
     }
 
     /// Whether this press steps the execution mode on.
@@ -10457,7 +10440,7 @@ fn pages_the_conversation(press: crate::surface::KeyPress) -> bool {
 
 /// Whether this action puts a pending guess away: every gesture on the field
 /// but the ones that take it. → takes it (`accept_ghost`), Tab takes it
-/// (`take_the_guess`), and a submit clears it on its own — what is left here is
+/// (`complete_with_tab`), and a submit clears it on its own — what is left here is
 /// editing, moving the caret, and Esc. Scrolling, selecting and folding are
 /// about the conversation, not the field, and leave it where it is.
 fn dismisses_suggestion(action: &Action) -> bool {
@@ -10483,12 +10466,8 @@ fn dismisses_suggestion(action: &Action) -> bool {
 
 /// Take the guess at what to say next into an empty field, if there is one.
 ///
-/// **Only** the guess, and only there. A non-empty line belongs to the
-/// completion ([`crate::text::ghost`]), which is a different gesture — so this is
-/// not [`accept_ghost`], whose other branch also answers with the rest of a
-/// history entry. Tab shares this, and Tab sits ahead of the mode key when the
-/// setting makes it the mode key: a key that silently completed from history
-/// there would be a key nobody advertised, ahead of one somebody did.
+/// This handles only the empty-line guess. Non-empty input is completed by
+/// `accept_ghost`, which both right-arrow and plain Tab use.
 ///
 /// The one place that writes it, so `→` and Tab cannot come to mean two
 /// different things.
@@ -10514,6 +10493,9 @@ fn take_suggestion(m: &mut crate::moment::Moment) -> bool {
 /// `true` when it took something, which is the caller's cue that right meant
 /// "accept" rather than "move".
 fn accept_ghost(m: &mut crate::moment::Moment) -> bool {
+    if m.secret.is_some() {
+        return false;
+    }
     // An empty field with a guess on it: right takes the guess. The history
     // ghost below never fires here — it answers with the rest of a line that
     // starts with what is typed, and nothing is typed — so the two cannot both
@@ -11255,6 +11237,21 @@ mod history_tests {
         let mut m = said(&["cargo nextest run"], "cargo ");
         m.history_at = Some(0);
         assert!(!accept_ghost(&mut m));
+    }
+
+    #[test]
+    fn hidden_or_dismissed_history_cannot_be_inserted_by_a_completion_key() {
+        let mut m = said(&["你好"], "你");
+        m.secret = Some(crate::secret::Asking::default());
+        assert!(!accept_ghost(&mut m));
+        assert_eq!(m.input, "你");
+        m.secret = None;
+        m.completion_held = true;
+        assert!(!accept_ghost(&mut m));
+        m.completion_held = false;
+        assert!(accept_ghost(&mut m));
+        assert_eq!(m.input, "你好");
+        assert_eq!(m.caret, "你好".len());
     }
 
     #[test]
