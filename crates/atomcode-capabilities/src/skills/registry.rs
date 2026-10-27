@@ -2,7 +2,7 @@
 //! directories (the standard `~/.claude/skills` etc. precedence is a driver concern —
 //! see [`standard_skill_dirs`], which takes our own dirs from the caller too). Ported from production `skill.rs` `SkillRegistry`.
 
-use super::skill::{parse_skill_dir, parse_skill_file, Skill};
+use super::skill::{parse_skill_dir, parse_skill_file, Parsed, Skill};
 use crate::ProductDirs;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -185,12 +185,23 @@ impl SkillRegistry {
         });
     }
 
-    fn insert_parsed(&self, parsed: Result<Skill, String>, path: &Path, kind: TemplateKind) {
+    fn insert_parsed(&self, parsed: Result<Parsed, String>, path: &Path, kind: TemplateKind) {
         match parsed {
-            Ok(skill) => {
+            Ok(parsed) => {
                 let mut index = self.write();
+                let skill = parsed.skill;
                 let name = skill.name.clone();
                 let source = skill.source_path.clone();
+                // A bad `args:` value is a warning, not a load failure: the
+                // skill still loads with its default, so the typo is reported
+                // without dropping the command from the menu.
+                for warning in parsed.warnings {
+                    index.diagnostics.push(SkillDiagnostic {
+                        path: path.to_path_buf(),
+                        reason: warning,
+                        warning: true,
+                    });
+                }
                 // Compare loaded definitions, not current disk contents: a file
                 // may have changed since the earlier source was scanned.
                 let same_definition = match kind {
@@ -202,6 +213,7 @@ impl SkillRegistry {
                         && previous.template == skill.template
                         && previous.allowed_tools == skill.allowed_tools
                         && previous.user_invocable == skill.user_invocable
+                        && previous.args_requirement == skill.args_requirement
                 });
                 let previous = match kind {
                     TemplateKind::Skill => index.skills.insert(name, Arc::new(skill)),
@@ -909,6 +921,7 @@ mod tests {
             template: "A".into(),
             allowed_tools: Vec::new(),
             user_invocable: true,
+            args_requirement: atomcode_kernel::agent::ArgsRequirement::Unspecified,
             skill_dir: PathBuf::from("a"),
             source_path: PathBuf::from("a"),
         });
@@ -918,6 +931,7 @@ mod tests {
             template: "B".into(),
             allowed_tools: Vec::new(),
             user_invocable: true,
+            args_requirement: atomcode_kernel::agent::ArgsRequirement::Unspecified,
             skill_dir: PathBuf::from("b"),
             source_path: PathBuf::from("b"),
         });
@@ -940,6 +954,7 @@ mod tests {
             template: "V".into(),
             allowed_tools: Vec::new(),
             user_invocable: true,
+            args_requirement: atomcode_kernel::agent::ArgsRequirement::Unspecified,
             skill_dir: PathBuf::from("v"),
             source_path: PathBuf::from("v"),
         });
@@ -949,6 +964,7 @@ mod tests {
             template: "H".into(),
             allowed_tools: Vec::new(),
             user_invocable: false,
+            args_requirement: atomcode_kernel::agent::ArgsRequirement::Unspecified,
             skill_dir: PathBuf::from("h"),
             source_path: PathBuf::from("h"),
         });

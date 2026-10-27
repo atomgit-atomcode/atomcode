@@ -2388,6 +2388,7 @@ fn on_the_session(name: &str, usage: Option<&str>, summary: &str) -> CommandDesc
         usage: usage.map(str::to_string),
         summary: summary.into(),
         target: atomcode_kernel::agent::CommandTarget::Session,
+        ..Default::default()
     }
 }
 

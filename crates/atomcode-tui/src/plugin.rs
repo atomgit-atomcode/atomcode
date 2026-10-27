@@ -9279,7 +9279,53 @@ impl Tui {
         let option_owner = name
             .split_once(char::is_whitespace)
             .and_then(|(base, _)| self.host.commands.find(base));
-        if command.is_some_and(|c| !c.options.is_empty() || c.require_arg)
+        // A command the person declared as `args: optional` or `args:
+        // required` also completes onto the line when the line holds only its
+        // name — the person picked it to type an argument, not to run it bare.
+        // Distinct from `require_arg`: that flag is about commands the *front
+        // end* decides need an argument, this one is about commands the
+        // *person* declared do. `Unspecified` (disk silent) and `None` (the
+        // command does not take an argument) keep the legacy shape — dispatch
+        // bare on the one Enter — which is why the check is on
+        // `args_requirement`, not on `require_arg`.
+        //
+        // "The line holds only the name" means the person picked this command
+        // without having typed an argument — the input is a single token, so
+        // it may be a prefix (`/ren`) or the full name (`/rename`), but it
+        // has nothing after it. If the person has already typed arguments
+        // (`/rename hello`), the tokens are two or more and the pick is a
+        // dispatch, not a completion.
+        let line_is_bare_pick = {
+            let line = self
+                .host
+                .moment
+                .read()
+                .expect("moment poisoned")
+                .input
+                .clone();
+            line.trim_start_matches('/').split_whitespace().count() <= 1
+        };
+        // `Required` is routed here the same as `Optional`: the person's
+        // first Enter on a required command asks for the argument's slot, and
+        // the *dispatch* answers "give me an argument first" only when they
+        // submit it still bare (see `Commands::dispatch`'s refusal). Routing
+        // Required straight into a bare dispatch would refuse on the first
+        // Enter, which is not what a single Enter on the lit row means.
+        //
+        // The `options.is_empty()` guard keeps the args_requirement branch
+        // from hijacking a command with a closed options set — that flow is
+        // owned by the existing `!c.options.is_empty()` check below.
+        let argument_completion_bare_pick = command.as_ref().is_some_and(|c| {
+            c.options.is_empty()
+                && line_is_bare_pick
+                && matches!(
+                    c.args_requirement,
+                    atomcode_kernel::agent::ArgsRequirement::Optional
+                        | atomcode_kernel::agent::ArgsRequirement::Required
+                )
+        });
+        if argument_completion_bare_pick
+            || command.is_some_and(|c| !c.options.is_empty() || c.require_arg)
             || option_owner.is_some_and(|c| c.require_arg)
         {
             self.complete_command(name);
@@ -9319,8 +9365,20 @@ impl Tui {
         let option_owner = name
             .split_once(char::is_whitespace)
             .and_then(|(base, _)| self.host.commands.find(base));
-        let takes = command.as_ref().is_some_and(|c| c.takes.is_some())
-            || option_owner.as_ref().is_some_and(|c| c.require_arg);
+        // A command whose disk declaration says it wants an argument also gets
+        // the trailing space — `optional` and `required` both mean something
+        // goes after the name, same as the front end's `takes`. Folding them
+        // in keeps the caret where the person expects it after a completion.
+        // `None` (the command takes no argument) and `Unspecified` get no
+        // trailing space.
+        let takes = command.as_ref().is_some_and(|c| {
+            c.takes.is_some()
+                || matches!(
+                    c.args_requirement,
+                    atomcode_kernel::agent::ArgsRequirement::Optional
+                        | atomcode_kernel::agent::ArgsRequirement::Required
+                )
+        }) || option_owner.as_ref().is_some_and(|c| c.require_arg);
         let text = if takes {
             format!("/{name} ")
         } else {
@@ -14633,30 +14691,35 @@ mod skills_menu_tests {
                     usage: Some("[名字… [给它们的话]]".into()),
                     summary: "浏览技能".into(),
                     target: atomcode_kernel::agent::CommandTarget::Session,
+                    ..Default::default()
                 },
                 atomcode_kernel::agent::CommandDescription {
                     name: "brainstorming".into(),
                     usage: Some(skill_usage.clone()),
                     summary: "先梳理需求".into(),
                     target: atomcode_kernel::agent::CommandTarget::Session,
+                    ..Default::default()
                 },
                 atomcode_kernel::agent::CommandDescription {
                     name: "code".into(),
                     usage: Some(skill_usage),
                     summary: "实现代码".into(),
                     target: atomcode_kernel::agent::CommandTarget::Session,
+                    ..Default::default()
                 },
                 atomcode_kernel::agent::CommandDescription {
                     name: "init".into(),
                     usage: None,
                     summary: "生成项目说明".into(),
                     target: atomcode_kernel::agent::CommandTarget::Session,
+                    ..Default::default()
                 },
                 atomcode_kernel::agent::CommandDescription {
                     name: "worklog".into(),
                     usage: Some("[日期]".into()),
                     summary: "生成工作复盘".into(),
                     target: atomcode_kernel::agent::CommandTarget::Session,
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -14873,6 +14936,199 @@ mod skills_menu_tests {
         assert!(host.commands.starts_turn("/init"));
         assert!(host.commands.starts_turn("/worklog"));
         assert!(host.commands.starts_turn("/worklog yesterday"));
+    }
+}
+
+/// The four disk `args:` states as the slash menu routes them on Enter.
+/// One test per state, so a routing regression names itself. The
+/// assertion is always on the routing *decision*: whether the pick
+/// completes onto the line (the person still needs to type an argument
+/// and press Enter again) or dispatches as-is (the person's one Enter
+/// runs the command, and the dispatch itself decides whether to refuse).
+///
+/// `Required` and `Optional` both complete onto the line: the person picked
+/// the command to type an argument, so the first Enter opens the argument's
+/// slot and the dispatch refuses only when they submit it still bare. `None`
+/// and `Unspecified` dispatch as-is — neither one takes an argument.
+///
+/// The `Required` refusal (bare submission after completion) is asserted in
+/// [`crate::command::tests`] against `Commands::dispatch` directly; here we
+/// only verify the routing that puts the command on the line first.
+#[cfg(test)]
+mod args_requirement_menu_tests {
+    use super::*;
+    use crate::command::{Command, CommandSet, Outcome};
+    use atomcode_kernel::agent::ArgsRequirement;
+
+    /// The owning set these picks route into. A completion never reaches it;
+    /// a dispatch does (and the dispatch is what may then refuse). It records
+    /// nothing — the routing is observed through the moment's history, which
+    /// `remember_command` writes synchronously before the dispatch is spawned.
+    struct Owned(&'static [Command]);
+    #[async_trait]
+    impl CommandSet for Owned {
+        fn id(&self) -> &'static str {
+            "owned"
+        }
+        fn commands(&self) -> Vec<Command> {
+            self.0.to_vec()
+        }
+        async fn run(&self, _name: &str, _args: &str, _ctx: &Context) -> Outcome {
+            Outcome::Said("ok".into())
+        }
+    }
+
+    /// Assemble a screen with a single command carrying the given disk
+    /// declaration. `require_arg` stays `false` — that flag is about the
+    /// front end's own judgement (`goal`, `skills` with a populated
+    /// sub-menu), and this test module only exercises the disk signal.
+    fn screen_with(requirement: ArgsRequirement) -> (Arc<Host>, Tui) {
+        let (host, tui) = assemble(Headless::new(80, 24));
+        let cmd = Command::new("cmd", "does a thing").with_args_requirement(requirement);
+        host.commands
+            .add(Arc::new(Owned(
+                Box::leak(Box::new([cmd])) as &'static [Command]
+            )))
+            .unwrap();
+        (host, tui)
+    }
+
+    fn type_line(host: &Host, line: &str) {
+        let mut m = host.moment.write().expect("moment poisoned");
+        m.input = line.into();
+        m.caret = line.len();
+        m.history.clear();
+        m.history_at = None;
+    }
+
+    #[tokio::test]
+    async fn optional_bare_pick_completes_onto_the_line() {
+        let (host, tui) = screen_with(ArgsRequirement::Optional);
+        type_line(&host, "/cmd");
+        assert!(
+            !tui.take_command("cmd", &tui.client),
+            "the pick does not report a dispatch"
+        );
+        let m = host.moment.read().expect("moment poisoned");
+        assert_eq!(
+            m.input, "/cmd ",
+            "Optional + bare → line completed onto the trailing space"
+        );
+        assert_eq!(
+            m.caret,
+            m.input.len(),
+            "caret past the space, ready to type"
+        );
+        assert!(
+            m.history.is_empty(),
+            "completing must not dispatch — the argument is still to be typed"
+        );
+    }
+
+    #[tokio::test]
+    async fn none_bare_pick_dispatches_onto_the_line() {
+        // `None` is the declaration that the command takes no argument at all,
+        // so a bare pick runs it immediately — completing it onto the line
+        // would leave the person staring at an argument slot that cannot be
+        // filled. `Unspecified` shares the route: the disk is silent there
+        // too, and legacy commands must keep dispatching on one Enter.
+        for requirement in [ArgsRequirement::None, ArgsRequirement::Unspecified] {
+            let (host, tui) = screen_with(requirement);
+            type_line(&host, "/cmd");
+            assert!(!tui.take_command("cmd", &tui.client));
+            let m = host.moment.read().expect("moment poisoned");
+            assert_eq!(
+                m.input, "",
+                "{requirement:?} + bare → dispatch path clears the line"
+            );
+            assert!(
+                !m.history.is_empty(),
+                "{requirement:?} + bare → dispatches on one Enter, does not complete"
+            );
+        }
+    }
+
+    /// The guard that decides between the two routes: a line holding only the
+    /// command's name completes, a line with something after it dispatches and
+    /// must not overwrite what the person already typed.
+    #[tokio::test]
+    async fn optional_pick_with_typed_arguments_dispatches() {
+        let (host, tui) = screen_with(ArgsRequirement::Optional);
+        type_line(&host, "/cmd hello world");
+        assert!(!tui.take_command("cmd", &tui.client));
+        let m = host.moment.read().expect("moment poisoned");
+        assert!(
+            !m.history.is_empty(),
+            "typed arguments must dispatch, not re-complete onto the line"
+        );
+    }
+
+    #[tokio::test]
+    async fn required_bare_pick_completes_onto_the_line() {
+        // The person picked a required command to type its argument, so the
+        // first Enter opens the argument's slot rather than refusing — the
+        // refusal comes when they submit it still bare (see
+        // `crate::command::tests` against `Commands::dispatch`).
+        let (host, tui) = screen_with(ArgsRequirement::Required);
+        type_line(&host, "/cmd");
+        assert!(
+            !tui.take_command("cmd", &tui.client),
+            "the pick does not report a dispatch — the argument is still to be typed"
+        );
+        let m = host.moment.read().expect("moment poisoned");
+        assert_eq!(
+            m.input, "/cmd ",
+            "Required + bare → line completed onto the trailing space"
+        );
+        assert_eq!(
+            m.caret,
+            m.input.len(),
+            "caret past the space, ready to type"
+        );
+        assert!(
+            m.history.is_empty(),
+            "completing must not dispatch — the argument is still to be typed"
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_trailing_space_follows_the_declaration() {
+        // A name completed onto the line gets a trailing space only when
+        // something belongs after it: the disk's `optional` / `required` and
+        // the front end's own `takes` do, `None` and `Unspecified` do not.
+        for (requirement, expects_space) in [
+            (ArgsRequirement::Optional, true),
+            (ArgsRequirement::Required, true),
+            (ArgsRequirement::None, false),
+            (ArgsRequirement::Unspecified, false),
+        ] {
+            let (host, tui) = screen_with(requirement);
+            type_line(&host, "/cmd");
+            tui.complete_command("cmd");
+            let m = host.moment.read().expect("moment poisoned");
+            assert_eq!(
+                m.input,
+                if expects_space { "/cmd " } else { "/cmd" },
+                "{requirement:?} → trailing space {expects_space}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unspecified_bare_pick_dispatches_as_before() {
+        // The legacy shape. Every command that predates the `args:`
+        // declaration lands here, and this is the path that must not
+        // change under this feature — a person's Enter on a legacy
+        // command runs the command, exactly as before.
+        let (host, tui) = screen_with(ArgsRequirement::Unspecified);
+        type_line(&host, "/cmd");
+        assert!(!tui.take_command("cmd", &tui.client));
+        let m = host.moment.read().expect("moment poisoned");
+        assert!(m.input.is_empty(), "Unspecified + bare → dispatch path");
+        assert!(
+            !m.history.is_empty(),
+            "a legacy command still dispatches on one Enter — the load-bearing path"
+        );
     }
 }
 

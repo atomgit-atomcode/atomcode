@@ -109,6 +109,7 @@ impl crate::commands::CatalogCommand for TodoCommand {
             usage: Some("[add <task>|clear]".into()),
             summary: "计划清单;add 加一项,clear 清空".into(),
             target: atomcode_kernel::agent::CommandTarget::Session,
+            ..Default::default()
         }
     }
 
