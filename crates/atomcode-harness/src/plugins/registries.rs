@@ -223,6 +223,7 @@ impl crate::commands::CatalogCommand for ToolsCommand {
             usage: Some("[off|on <名字或 mcp__server__*>]".into()),
             summary: "模型现在能调哪些工具,以及临时关掉/放回其中一些".into(),
             target: atomcode_kernel::agent::CommandTarget::Session,
+            ..Default::default()
         }
     }
 

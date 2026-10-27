@@ -767,6 +767,7 @@ mod tests {
                 usage: Some("<member>".into()),
                 summary: "stop a member".into(),
                 target: crate::agent::CommandTarget::Agent,
+                ..Default::default()
             }],
         };
         for event in [

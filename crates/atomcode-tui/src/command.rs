@@ -8,6 +8,8 @@
 
 use crate::i18n::{t, Msg};
 use std::borrow::Cow;
+
+use atomcode_kernel::agent::ArgsRequirement;
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
@@ -55,6 +57,18 @@ pub struct Command {
     /// never drawn with it: the conversation echoes only the name. A key on
     /// screen stays in the scrollback, a screenshot and a shared screen.
     pub secret_args: bool,
+    /// Whether the command's argument is required. Mirrors the agent's
+    /// description: `Required` refuses a bare dispatch (`/cmd` with nothing
+    /// after it); `Optional` and `None` complete onto the line for the
+    /// argument to be typed; `Unspecified` keeps legacy behaviour — a
+    /// command that has not opted in to this declaration dispatches as
+    /// before.
+    ///
+    /// Distinct from [`require_arg`](Self::require_arg): that flag is about
+    /// the *pick* (take the row, stop on the line); this one is about the
+    /// *dispatch* (refuse a bare run). A command can be `Required` and yet
+    /// not `require_arg`, or vice versa.
+    pub args_requirement: ArgsRequirement,
 }
 
 /// One value a command offers to pick inline in the slash menu.
@@ -108,6 +122,7 @@ impl Command {
             options: Vec::new(),
             require_arg: false,
             secret_args: false,
+            args_requirement: ArgsRequirement::Unspecified,
         }
     }
     pub const fn taking(name: &'static str, takes: &'static str, about: &'static str) -> Self {
@@ -119,6 +134,7 @@ impl Command {
             options: Vec::new(),
             require_arg: false,
             secret_args: false,
+            args_requirement: ArgsRequirement::Unspecified,
         }
     }
     /// The same, described by the language table.
@@ -138,6 +154,7 @@ impl Command {
             options: Vec::new(),
             require_arg: false,
             secret_args: false,
+            args_requirement: ArgsRequirement::Unspecified,
         }
     }
     /// [`said`](Self::said) for a command that takes something.
@@ -154,12 +171,20 @@ impl Command {
             options: Vec::new(),
             require_arg: false,
             secret_args: false,
+            args_requirement: ArgsRequirement::Unspecified,
         }
     }
 
     /// The same command, reachable by these extra names.
     pub const fn with_aliases(mut self, aliases: &'static [&'static str]) -> Self {
         self.aliases = aliases;
+        self
+    }
+
+    /// The same command, declaring how its argument is required. Defaults to
+    /// `Unspecified`, which keeps a legacy command dispatching as before.
+    pub const fn with_args_requirement(mut self, requirement: ArgsRequirement) -> Self {
+        self.args_requirement = requirement;
         self
     }
 
@@ -609,6 +634,33 @@ impl Commands {
                 name,
                 found: owner.is_some(),
             });
+        }
+        // A command that declared `args: required` and was run with nothing
+        // after its name refuses locally. This is the composer's own answer
+        // to that gesture — the person typed the slash command here, so the
+        // local UI refuses it before the owning set runs, and a refusal here
+        // produces no agent turn at all (no Invoke, no inject, no message in
+        // the session log). The owning set refuses the same case itself (see
+        // `RunSkill::run`), so a driver that sends `Invoke` without a
+        // composer in between — an ACP client, a headless run, the daemon —
+        // gets the same refusal rather than running the command with an
+        // empty argument.
+        //
+        // Only `Required` opts in. `Optional`, `None` and `Unspecified`
+        // dispatch as before: the empty-args case is the ordinary shape of
+        // every command that has not yet written `args: required` on disk,
+        // and folding it into a refusal would be a behaviour change without
+        // a person asking for one.
+        let command = self.find(name);
+        if matches!(
+            command.as_ref().map(|c| c.args_requirement),
+            Some(atomcode_kernel::agent::ArgsRequirement::Required)
+        ) && args.trim().is_empty()
+        {
+            return Outcome::Refused(
+                crate::i18n::product::t(crate::i18n::product::Msg::CmdCustomArgRequired { name })
+                    .into_owned(),
+            );
         }
         match owner {
             Some(set) => set.run(name, args, ctx).await,
@@ -1145,5 +1197,79 @@ mod tests {
         let c = registry();
         c.remove("row-a");
         assert_eq!(c.all().len(), 1);
+    }
+
+    /// A command that declared `args: required` and is run bare refuses
+    /// locally — no dispatch into the owning set, no Invoke crossing the
+    /// seam. Everything else — `optional`, `none`, `unspecified`, and a
+    /// bare run of a required command with an argument present — dispatches
+    /// as before.
+    #[tokio::test]
+    async fn a_required_command_refuses_a_bare_dispatch() {
+        use atomcode_kernel::agent::ArgsRequirement;
+        // The refusal message is localized; lock an English locale so the
+        // assertion on the message's wording is deterministic.
+        let _locale = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
+        let c = Commands::new();
+        // `Fake` keeps a `&'static [Command]`, so a stack-built array must be
+        // leaked to satisfy that lifetime. The test runs in its own process,
+        // and the leak is one small slice — cheaper than a parallel
+        // CommandSet that would not.
+        let commands: &'static [Command] = Box::leak(Box::new([
+            Command::new("rename", "rename a session")
+                .with_args_requirement(ArgsRequirement::Required),
+            Command::new("greet", "greet someone").with_args_requirement(ArgsRequirement::Optional),
+            Command::new("plain", "does its thing")
+                .with_args_requirement(ArgsRequirement::Unspecified),
+        ]));
+        c.add(Arc::new(Fake("row-req", commands))).unwrap();
+        let app = atomcode_plexus::App::new(
+            atomcode_plexus::PluginRegistry::new(),
+            atomcode_plexus::ConfigTree::default(),
+        );
+        let ctx = app.context();
+
+        // Required + bare → refused. The message is localized, so both
+        // locales are asserted against their own full wording — a translation
+        // that falls back to the other language, or loses the usage tail,
+        // must be caught here rather than only seen on screen.
+        crate::i18n::set_locale(crate::i18n::Locale::En);
+        let en = match c.dispatch("/rename", &ctx).await {
+            Outcome::Refused(msg) => msg,
+            other => panic!("expected refusal, got {other:?}"),
+        };
+        assert_eq!(
+            en,
+            "/rename requires an argument. Usage: /rename <your-input>"
+        );
+        crate::i18n::set_locale(crate::i18n::Locale::ZhCn);
+        let zh = match c.dispatch("/rename", &ctx).await {
+            Outcome::Refused(msg) => msg,
+            other => panic!("expected refusal, got {other:?}"),
+        };
+        assert_eq!(zh, "/rename 需要提供参数。用法：/rename <你的输入>");
+        crate::i18n::set_locale(crate::i18n::Locale::En);
+        // Required + a whitespace-only argument is still a bare dispatch.
+        match c.dispatch("/rename   ", &ctx).await {
+            Outcome::Refused(_) => {}
+            other => panic!("expected refusal, got {other:?}"),
+        }
+        // Required + a real argument dispatches.
+        assert_eq!(
+            c.dispatch("/rename hello", &ctx).await,
+            Outcome::Said("rename(hello)".into())
+        );
+        // Optional + bare still dispatches — a refusal would be a behaviour
+        // change for a command that never asked for one.
+        assert_eq!(
+            c.dispatch("/greet", &ctx).await,
+            Outcome::Said("greet()".into())
+        );
+        // Unspecified + bare dispatches — the legacy shape, preserved.
+        assert_eq!(
+            c.dispatch("/plain", &ctx).await,
+            Outcome::Said("plain()".into())
+        );
     }
 }
