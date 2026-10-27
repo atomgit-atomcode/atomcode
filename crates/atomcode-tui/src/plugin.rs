@@ -1798,9 +1798,12 @@ impl UserInterface for Tui {
                                 let _ = keys.send(Wake::Fact);
                             }
                             crate::update::UpdateNotice::Installed(change) => {
-                                host.moment.write().expect("moment poisoned").update =
-                                    Some(change.hint);
-                                // A busy footer may have no room, so also leave one visible message.
+                                {
+                                    let mut moment = host.moment.write().expect("moment poisoned");
+                                    moment.update = None;
+                                    moment.restart_hint = Some(change.hint);
+                                }
+                                // Also retain the one-time explanation in the conversation.
                                 deliver(
                                     &host,
                                     &keys,
