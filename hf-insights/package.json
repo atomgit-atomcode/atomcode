@@ -1,0 +1,19 @@
+{
+  "name": "hf-model-oracle",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Hugging Face model ecosystem observatory and trend oracle",
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "refresh": "node server.mjs --refresh-once",
+    "test": "node --test server.test.mjs verify-data.test.mjs",
+    "verify:data": "node verify-data.mjs"
+  },
+  "dependencies": {
+    "undici": "^7.16.0"
+  },
+  "engines": {
+    "node": ">=22.22.0"
+  }
+}
