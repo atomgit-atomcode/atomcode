@@ -121,9 +121,9 @@ impl SensitivePaths {
             .is_some_and(|value| self.decoded_json_references(&value))
     }
 
-    /// Check file targets in the same world and directory the tool uses. Only
-    /// path arguments are resolved: search patterns, URLs and query text are
-    /// not filesystem paths. The raw check still covers shell commands.
+    /// Check file targets in the same world and directory the tool uses. `file_path` /
+    /// `path` arguments and shell command operands are resolved; search patterns, URLs
+    /// and query text are not treated as paths.
     pub async fn references_in(
         &self,
         args: &str,
@@ -164,7 +164,82 @@ impl SensitivePaths {
                 }
             }
         }
+        // Shell tools carry their paths as command operands. Resolve each operand against
+        // the command's effective directory, including a preceding literal `cd`, so a
+        // relative credential spelling is classified like the absolute one.
+        if let Some(command) = value.get("command").and_then(|v| v.as_str()) {
+            let mut cwd = working_dir.to_path_buf();
+            for invocation in super::bash_invocations(command).unwrap_or_default() {
+                if shell_command_name(&invocation.command) == "cd" {
+                    if let Some(target) = invocation
+                        .arguments
+                        .iter()
+                        .find(|argument| !argument.starts_with('-'))
+                    {
+                        let target = target.trim_matches(|c| c == '\'' || c == '"');
+                        if !target.is_empty() && !target.contains('$') && !target.contains('`') {
+                            let path = super::resolve_path(target, &cwd);
+                            if looks_like_path(target) && self.path_is_sensitive(&path) {
+                                return true;
+                            }
+                            cwd = path;
+                        }
+                    }
+                    continue;
+                }
+                for argument in &invocation.arguments {
+                    let argument = argument.trim_matches(|c| c == '\'' || c == '"');
+                    if !looks_like_path(argument) {
+                        continue;
+                    }
+                    let path = super::resolve_path(argument, &cwd);
+                    if self
+                        .resolved_target_is_sensitive(path, world, &mut real_user)
+                        .await
+                    {
+                        return true;
+                    }
+                }
+            }
+            // Redirection targets are paths too: `cat < .atomcode/config.toml`.
+            for target in super::bash::bash_redirect_paths(command) {
+                if !looks_like_path(&target) {
+                    continue;
+                }
+                let path = super::resolve_path(&target, working_dir);
+                if self
+                    .resolved_target_is_sensitive(path, world, &mut real_user)
+                    .await
+                {
+                    return true;
+                }
+            }
+        }
         false
+    }
+
+    /// True if `path` or the real path it resolves to is sensitive for this world.
+    async fn resolved_target_is_sensitive(
+        &self,
+        path: PathBuf,
+        world: &dyn crate::world::FileSystem,
+        real_user: &mut Option<Option<PathBuf>>,
+    ) -> bool {
+        if self.path_is_sensitive(&path) {
+            return true;
+        }
+        let Ok(real) = world.canonicalize(&path).await else {
+            return false;
+        };
+        if self.path_is_sensitive(&real) {
+            return true;
+        }
+        let user = match &*real_user {
+            Some(user) => user,
+            None => real_user.insert(world.canonicalize(&self.user_dir).await.ok()),
+        };
+        user.as_ref()
+            .is_some_and(|user| is_credential_path(&real, user))
     }
 
     /// File grants follow the resolved target rather than a relative spelling
@@ -286,6 +361,23 @@ fn env_dot_reference_is_sensitive(a: &str) -> bool {
         rest = after;
     }
     false
+}
+
+/// The command word without quotes or a directory prefix, for recognizing `cd`.
+fn shell_command_name(command: &str) -> &str {
+    command
+        .trim_matches(|c| c == '\'' || c == '"')
+        .rsplit(|c| c == '/' || c == '\\')
+        .next()
+        .unwrap_or(command)
+}
+
+/// Shell operands are untyped. Only a path-shaped word is classified; a bare search word
+/// such as `grep credentials` must not be mistaken for a file.
+fn looks_like_path(raw: &str) -> bool {
+    raw.starts_with(|c: char| matches!(c, '.' | '/' | '~' | '\\'))
+        || raw.contains(|c: char| c == '/' || c == '\\')
+        || Path::new(raw).extension().is_some()
 }
 
 /// The user's real home directory. Used to anchor `~/.ssh` / `~/.aws` / `~/.gnupg`
@@ -562,6 +654,58 @@ mod tests {
         assert_ne!(
             guard.file_target_scope(args, &user, &world).await,
             guard.file_target_scope(args, &project, &world).await
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_operands_resolve_against_the_execution_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let user = temp.path().join(".ours");
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::write(user.join("config.toml"), "FAKE_KEY").unwrap();
+        let guard = super::SensitivePaths::new(&user, ".ours");
+        let world = crate::world::LocalFs::unfenced();
+
+        assert!(
+            guard
+                .references_in(
+                    r#"{"command":"cat .ours/config.toml"}"#,
+                    temp.path(),
+                    &world
+                )
+                .await,
+            "a relative shell operand must resolve against the working directory"
+        );
+        assert!(
+            guard
+                .references_in(
+                    r#"{"command":"cat < .ours/config.toml"}"#,
+                    temp.path(),
+                    &world
+                )
+                .await,
+            "an input redirection target is a path too"
+        );
+        assert!(
+            guard
+                .references_in(
+                    r#"{"command":"cd .ours && cat config.toml"}"#,
+                    temp.path(),
+                    &world
+                )
+                .await,
+            "a literal cd moves the base for later operands"
+        );
+        assert!(
+            !guard
+                .references_in(r#"{"command":"grep credentials src"}"#, temp.path(), &world)
+                .await,
+            "a bare search word is not a path"
+        );
+        assert!(
+            !guard
+                .references_in(r#"{"command":"cat src/main.rs"}"#, temp.path(), &world)
+                .await
         );
     }
 

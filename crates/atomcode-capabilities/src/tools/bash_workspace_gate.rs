@@ -160,9 +160,9 @@ fn strip_quotes(t: &str) -> &str {
     }
 }
 
-/// Quote-aware split of a command line into pipeline/list segments on unquoted `; && || | \n`.
-/// A `|` immediately following an unquoted `>` is the noclobber-override redirect `>|`, NOT a
-/// pipeline separator — it is dropped so the redirect target stays in the same segment.
+/// Quote-aware split of a command line into pipeline/list segments on unquoted
+/// `; && || | & \n`. A single `&` backgrounds the preceding command and starts a new one; `>&`
+/// and `>|` are redirects, so their operator stays in the current segment.
 fn split_segments(cmd: &str) -> Vec<String> {
     let chars: Vec<char> = cmd.chars().collect();
     let mut segs = Vec::new();
@@ -214,6 +214,18 @@ fn split_segments(cmd: &str) -> Vec<String> {
                 segs.push(std::mem::take(&mut cur));
                 prev_nonspace = None;
                 i += 2;
+            }
+            '&' if prev_nonspace == Some('>') => {
+                // `>&file` / `2>&1`: the `&` belongs to the redirect, not a background list.
+                cur.push(c);
+                prev_nonspace = Some(c);
+                i += 1;
+            }
+            '&' => {
+                // A single `&` backgrounds the preceding command; the rest is a new command.
+                segs.push(std::mem::take(&mut cur));
+                prev_nonspace = None;
+                i += 1;
             }
             '|' if i + 1 < chars.len() && chars[i + 1] == '|' => {
                 segs.push(std::mem::take(&mut cur));
@@ -1235,6 +1247,44 @@ mod tests {
         assert_eq!(
             scan("git commit -m 'cd into dir and rm stuff'"),
             BashScan::NotDestructive
+        );
+    }
+
+    #[test]
+    fn background_operator_separates_commands() {
+        assert_eq!(
+            scan("echo ready & rm /outside/x.txt"),
+            BashScan::Targets(vec!["/outside/x.txt".into()])
+        );
+        // `&>` is a redirect; splitting it still exposes its target to the scan.
+        assert_eq!(
+            scan("echo ready &> /outside/log.txt"),
+            BashScan::Targets(vec!["/outside/log.txt".into()])
+        );
+        // `>&` belongs to the redirect, not to the background separator.
+        assert_eq!(
+            split_segments("echo ok 2>&1 & rm /outside/x.txt"),
+            vec!["echo ok 2>&1 ", " rm /outside/x.txt"]
+        );
+    }
+
+    #[tokio::test]
+    async fn backgrounded_out_of_workspace_rm_prompts() {
+        let ws = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let target = std::path::PathBuf::from("C:/atomcode-test-outside-rm/bg.txt");
+        #[cfg(not(windows))]
+        let target = std::path::PathBuf::from("/atomcode-test-outside-rm/bg.txt");
+        let gate = BashWorkspaceGate::pinned(
+            ws.path().to_path_buf(),
+            crate::tools::sensitive_path::test_guard(),
+        );
+        let tool = bash_tool();
+        let mut call = bash_call(&format!("echo ready & rm {}", target.to_str().unwrap()));
+        let out = gate.before(&mut call, &tool, &silent_rt()).await;
+        assert!(
+            out.is_deny(),
+            "a backgrounded out-of-workspace rm must prompt (fail closed), got {out:?}"
         );
     }
 
