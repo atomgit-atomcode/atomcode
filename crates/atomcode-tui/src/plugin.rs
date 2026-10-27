@@ -213,6 +213,9 @@ struct Link {
 /// person has looked at (`docs/adr/0023` §3).
 #[derive(Default)]
 struct Views {
+    /// Receipt after a switched session's initial history, on the same event
+    /// stream as its facts. Until it arrives, intermediate backfill is not painted.
+    replay_receipt: Option<CommandId>,
     /// The session the host gave: the lead, when there is a team.
     root: String,
     /// The one on screen — the root, or a member of its team.
@@ -593,12 +596,44 @@ impl AgentClient {
     /// Draw `session` from its first fact. Whatever was followed before — the
     /// session and any member looked at — is let go.
     pub(crate) fn follow(&self, session: &str) {
+        self.follow_inner(session, false);
+    }
+
+    fn follow_switched(&self, session: &str) {
+        self.follow_inner(session, true);
+    }
+
+    fn replaying(&self) -> bool {
+        self.view
+            .lock()
+            .expect("client poisoned")
+            .replay_receipt
+            .is_some()
+    }
+
+    fn finish_replay(&self, command: &str) -> bool {
+        let mut views = self.view.lock().expect("client poisoned");
+        if views.replay_receipt.as_deref() != Some(command) {
+            return false;
+        }
+        views.replay_receipt = None;
+        true
+    }
+
+    fn follow_inner(&self, session: &str, switched: bool) {
+        let receipt = switched.then(|| {
+            format!(
+                "tui-replay-{}",
+                self.receipts.fetch_add(1, Ordering::SeqCst)
+            )
+        });
         let previous = {
             let mut views = self.view.lock().expect("client poisoned");
             let previous: Vec<String> = views.sessions.keys().cloned().collect();
             *views = Views {
                 root: session.to_string(),
                 on_screen: session.to_string(),
+                replay_receipt: receipt.clone(),
                 ..Views::default()
             };
             views
@@ -609,9 +644,16 @@ impl AgentClient {
         for old in previous.into_iter().filter(|old| old != session) {
             self.command(AgentCommand::Unsubscribe { session: old });
         }
-        self.command(AgentCommand::Subscribe {
+        let subscribe = AgentCommand::Subscribe {
             session: session.to_string(),
             from: 0,
+        };
+        self.command(match receipt {
+            Some(id) => AgentCommand::Tagged {
+                id,
+                command: Box::new(subscribe),
+            },
+            None => subscribe,
         });
     }
 
@@ -2014,7 +2056,7 @@ impl UserInterface for Tui {
                     stale |= self.on_event(event);
                 }
             }
-            if stale && (coalesced >= COALESCE_LIMIT || wake.is_empty()) {
+            if stale && !client.replaying() && (coalesced >= COALESCE_LIMIT || wake.is_empty()) {
                 // The reading the frame about to be painted is drawn from. Facts
                 // absorb against whatever the last one was — a frame at most out
                 // of date, and the only reading available between commits.
@@ -2233,7 +2275,7 @@ impl UserInterface for Tui {
                         if let Some(dir) = session_dir_of(&client, &session).await {
                             self.host.set_session_dir(&dir);
                         }
-                        client.follow(&session);
+                        client.follow_switched(&session);
                         {
                             let mut m = self.host.moment.write().expect("moment poisoned");
                             m.lead = session.clone();
@@ -6423,8 +6465,19 @@ impl Tui {
     fn on_event(&self, event: AgentEvent) -> bool {
         // Before anything else, and whoever is on screen: the arms below drop
         // the lead's turn events while a member is looked at.
+        let replay_ended = match &event {
+            AgentEvent::Accepted { command, .. } | AgentEvent::Rejected { command, .. } => {
+                self.client.finish_replay(command)
+            }
+            _ => false,
+        };
         let settled = self.settle_asks(&event);
-        self.on_event_drawn(event) || settled
+        let changed = self.on_event_drawn(event);
+        if replay_ended {
+            self.host.moment.write().expect("moment poisoned").scroll =
+                crate::moment::ScrollPos::BOTTOM;
+        }
+        changed || settled || replay_ended
     }
 
     fn on_event_drawn(&self, event: AgentEvent) -> bool {
@@ -15855,5 +15908,47 @@ mod memory_transport_tests {
                 listing
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod switched_replay_tests {
+    use super::*;
+    #[test]
+    fn only_the_current_subscription_receipt_finishes_replay() {
+        let client = AgentClient::default();
+        client.follow_switched("first");
+        let first = client.view.lock().unwrap().replay_receipt.clone().unwrap();
+        client.follow_switched("second");
+        let second = client.view.lock().unwrap().replay_receipt.clone().unwrap();
+        assert!(!client.finish_replay(&first));
+        assert!(client.replaying());
+        assert!(client.finish_replay(&second));
+        assert!(!client.replaying());
+    }
+    #[test]
+    fn a_rejected_subscription_releases_the_frame_and_old_facts_stay_out() {
+        let (host, tui) = assemble(crate::surface::Headless::new(80, 24));
+        tui.client.follow_switched("current");
+        let receipt = tui
+            .client
+            .view
+            .lock()
+            .unwrap()
+            .replay_receipt
+            .clone()
+            .unwrap();
+        assert!(tui.on_event(AgentEvent::Rejected {
+            command: receipt,
+            error: atomcode_kernel::event::CommandError::Unavailable
+        }));
+        assert!(!tui.client.replaying());
+        assert!(host.moment.read().unwrap().scroll.is_at_bottom());
+        assert!(!tui.client.keep(&Committed {
+            session: "old".into(),
+            seq: 1,
+            at: 0,
+            event: atomcode_kernel::session::SessionEvent::TurnStart { turn: 1 }
+        }));
     }
 }

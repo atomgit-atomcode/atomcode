@@ -1088,7 +1088,12 @@ impl Background {
                 AgentCommand::SendMessage { .. } | AgentCommand::SendMessageWithContext { .. } => {
                     Kind::Send
                 }
-                // 带回执的订阅与退出照常转:回执要那一个 runtime 答。
+                AgentCommand::Subscribe { session, from } => Kind::Subscribe {
+                    session: session.clone(),
+                    from: *from,
+                },
+                // The foreground gate must open for receipted subscriptions too.
+                // Their runtime answers only after it enqueues the history.
                 _ => Kind::Other,
             },
             AgentCommand::Unsubscribe { .. } => Kind::Unsubscribe,
@@ -1152,6 +1157,13 @@ impl Background {
                 match subscribed {
                     Some(Ok(())) => {
                         let _ = front_end.events().send(pending);
+                        if let AgentCommand::Tagged { id, .. } = &command {
+                            let _ = front_end.events().send(AgentEvent::Accepted {
+                                command: id.clone(),
+                                turn: None,
+                                steered: false,
+                            });
+                        }
                     }
                     _ => {
                         let _ = commands.send(command);

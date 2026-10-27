@@ -120,6 +120,26 @@ impl LlmProvider for Model {
                 }),
             ])));
         }
+        // A history long enough to cross the painter's ordinary coalescing
+        // boundary. File reads are real, local and require no subprocess.
+        if !tools.is_empty()
+            && last.is_some_and(|message| {
+                message.role == Role::User && message.text == "older replay tool history"
+            })
+        {
+            let mut events = (0..180)
+                .map(|index| {
+                    StreamEvent::ToolCall(ToolCall {
+                        id: format!("history-{index}"),
+                        name: "read_file".into(),
+                        arguments: serde_json::json!({"file_path":format!("history-{index}.txt")})
+                            .to_string(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            events.push(StreamEvent::Done { truncated: false });
+            return Ok(Box::pin(futures::stream::iter(events)));
+        }
         // `review it`: the model reaches for `code_review` on its own, the way a
         // person's "审查下代码改动" makes it.
         if !tools.is_empty()
@@ -744,6 +764,64 @@ async fn a_history_and_fresh_foreground() -> (Rig, String) {
     })
     .await;
     (rig, history)
+}
+
+/// Opening a long session from the actual /bg list must paint its tail, not
+/// animate its old tool output through multiple frames.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+async fn opening_bg_list_paints_the_latest_history_without_intermediate_replay() {
+    let rig = Rig::new().await;
+    for index in 0..180 {
+        std::fs::write(
+            rig.project.path().join(format!("history-{index}.txt")),
+            format!("historical tool payload {index}"),
+        )
+        .unwrap();
+    }
+    rig.term.type_line("older replay tool history");
+    rig.until_screen("answer 1").await;
+    rig.until("history idle", |rig| rig.client.root_settled())
+        .await;
+    assert!(
+        rig.client.events().len() > 256,
+        "the replay must cross a normal repaint boundary"
+    );
+    let target = rig.client.root();
+    rig.term.type_line("/background");
+    rig.until("fresh foreground", |rig| rig.client.root() != target)
+        .await;
+    rig.term.type_line("/bg list");
+    rig.until_screen(&t(Msg::BgPlaceholder)).await;
+    let before = rig.term.frame_count();
+    rig.term.press(KeyPress {
+        key: Key::Enter,
+        mods: Mods::default(),
+    });
+    rig.until("latest reply on the opened session", |rig| {
+        let text = rig.term.text();
+        rig.client.root() == target
+            && text.contains("answer 1")
+            && !text.contains(&*t(Msg::BgPlaceholder))
+    })
+    .await;
+    let frames = rig.term.frames();
+    let opened = &frames[before..];
+    assert!(opened
+        .iter()
+        .any(|frame| frame.rows().join("\n").contains("answer 1")));
+    for frame in opened {
+        let text = frame.rows().join("\n");
+        assert!(
+            !text.contains("history-") || text.contains("answer 1"),
+            "history was painted before its latest reply:\n{text}"
+        );
+    }
+    assert!(
+        rig.client.events().len() > 256,
+        "history remains available for scrolling"
+    );
+    rig.quit().await;
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
