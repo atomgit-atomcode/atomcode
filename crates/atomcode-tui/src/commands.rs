@@ -1406,7 +1406,10 @@ impl CommandSet for SessionCommands {
                     // types `/cd` — after which this listed another project's
                     // sessions and called them this one's. Asked of the host,
                     // the way `/cd` asks.
-                    let here = working_dir(Some(control.clone()), client.root()).await.ok();
+                    let here = match working_dir(Some(control.clone()), client.root()).await {
+                        Ok(here) => Some(here),
+                        Err(error) => return Outcome::Refused(error),
+                    };
                     return match control
                         .call(HostCommand::ListSessions { working_dir: here })
                         .await

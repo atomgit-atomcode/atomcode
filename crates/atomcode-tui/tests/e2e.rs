@@ -3846,6 +3846,8 @@ async fn the_pointer_lights_and_chooses_a_slash_menu_row() {
     // And a press there takes *that* row. `/resume` wants an argument and has no
     // closed set to offer, so taking it dispatches the bare command, which opens
     // the session picker — the row under the pointer, not the first row.
+    // This minimal host has no Context command: resume now refuses that
+    // missing scope rather than silently listing every project.
     s.term.pointer(
         atomcode_tui::surface::Click::Press,
         panel.x + 3,
@@ -3859,7 +3861,8 @@ async fn the_pointer_lights_and_chooses_a_slash_menu_row() {
     s.quiet().await;
     assert!(
         s.term.last().unwrap().part("resume").is_some()
-            || s.screen().contains("没有别的存下的会话"),
+            || s.screen().contains("没有别的存下的会话")
+            || s.screen().contains("this host does not do that"),
         "the press did not take the row it landed on:\n{}",
         s.screen()
     );
@@ -8328,6 +8331,7 @@ async fn a_session_is_deleted_from_the_panel_by_two_presses_and_not_by_one() {
     let s = start_with_resume(
         tree_persistent(&root, &home, &replay(r#"{ text = "ANSWERED" }"#)),
         store.clone(),
+        root.display().to_string(),
     )
     .await;
     let task = s.open().await;
@@ -8939,11 +8943,62 @@ impl Plugin for ResumePanelRow {
     }
 }
 
+/// The tree fixture's JSONL headers have no cwd. Its isolated store contains
+/// only this test project's sessions, so supply the missing directory metadata
+/// at the fixture boundary before applying the requested scope.
+struct ResumeFixtureControl {
+    inner: Arc<dyn atomcode_host_api::HostControl>,
+    here: String,
+}
+
+#[async_trait]
+impl atomcode_host_api::HostControl for ResumeFixtureControl {
+    fn subscribe(&self) -> tokio::sync::mpsc::UnboundedReceiver<atomcode_host_api::HostEvent> {
+        self.inner.subscribe()
+    }
+
+    async fn call(
+        &self,
+        command: atomcode_host_api::HostCommand,
+    ) -> Result<atomcode_host_api::HostReply, atomcode_host_api::HostError> {
+        use atomcode_host_api::{HostCommand, HostReply};
+        if let HostCommand::ListSessions { working_dir } = command {
+            let reply = self
+                .inner
+                .call(HostCommand::ListSessions { working_dir: None })
+                .await?;
+            if let HostReply::Sessions { mut sessions } = reply {
+                for session in &mut sessions {
+                    session.working_dir = Some(self.here.clone());
+                }
+                sessions
+                    .retain(|session| working_dir.is_none() || session.working_dir == working_dir);
+                return Ok(HostReply::Sessions { sessions });
+            }
+            return Ok(reply);
+        }
+        self.inner.call(command).await
+    }
+}
+
 /// Start the screen with a resume port behind it.
-async fn start_with_resume(setup: Setup, resume: Arc<dyn atomcode_tui::resume::Resume>) -> Session {
+async fn start_with_resume(
+    setup: Setup,
+    resume: Arc<dyn atomcode_tui::resume::Resume>,
+    here: String,
+) -> Session {
     start_full(
         setup,
-        |control| control,
+        |mut connection| {
+            connection.control = Arc::new(WorksIn {
+                inner: Arc::new(ResumeFixtureControl {
+                    inner: connection.control,
+                    here: here.clone(),
+                }),
+                here,
+            });
+            connection
+        },
         Ports {
             resume: Some(resume),
             ..Default::default()

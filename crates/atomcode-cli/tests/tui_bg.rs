@@ -928,6 +928,59 @@ async fn failed_running_resume_leaves_the_foreground_and_slots_unchanged() {
     rig.quit().await;
 }
 
+/// Even a stale/manual target must be rejected before a busy foreign session
+/// is forked. Its recorded working directory deliberately matches this project:
+/// storage identity, rather than that display field, governs the lease.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+async fn a_foreign_busy_resume_is_rejected_without_a_fork_or_project_rebinding() {
+    use atomcode_capabilities::session::SessionManager;
+    let (rig, history) = a_history_and_fresh_foreground().await;
+    let dirs = atomcode_coding::config::product_dirs_from_env();
+    let bucket = SessionManager::project_hash(rig.project.path(), &dirs);
+    let root = SessionManager::sessions_root(dirs.user());
+    let foreign = root.join("0123456789abcdef");
+    std::fs::create_dir_all(&foreign).unwrap();
+    for file in std::fs::read_dir(root.join(&bucket)).unwrap() {
+        let file = file.unwrap();
+        let name = file.file_name();
+        if name.to_string_lossy().starts_with(&format!("{history}."))
+            && file.path().extension().is_none_or(|ext| ext != "lease")
+        {
+            std::fs::copy(file.path(), foreign.join(name)).unwrap();
+        }
+    }
+    let manager = SessionManager::with_root(foreign.clone());
+    let target = "foreign-busy-session";
+    let (_fork, _lease) = manager
+        .fork_native_session(&history, target, atomcode_capabilities::session::now_ms())
+        .unwrap();
+    assert!(SessionManager::scan_all(dirs.user())
+        .entries
+        .iter()
+        .any(|entry| entry.id == target));
+    let before = std::fs::read_dir(&foreign).unwrap().count();
+    let current = rig.client.root();
+    let result = rig
+        .control()
+        .call(HostCommand::Resume {
+            session: current.clone(),
+            target: target.into(),
+        })
+        .await;
+    assert!(
+        matches!(result, Err(HostError::Failed { .. })),
+        "{result:?}"
+    );
+    assert_eq!(rig.client.root(), current);
+    assert_eq!(std::fs::read_dir(&foreign).unwrap().count(), before);
+    assert_eq!(
+        SessionManager::project_hash(rig.project.path(), &dirs),
+        bucket
+    );
+    rig.quit().await;
+}
+
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 #[serial_test::serial(atomcode_home)]
 async fn resume_history_does_not_move_a_foreground_waiting_for_input() {
