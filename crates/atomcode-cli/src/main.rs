@@ -15,9 +15,9 @@ use clap::{ArgGroup, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 
 mod headless_json;
+mod lsp_cmd;
 mod review;
 mod schedule_cmd;
-mod schedule_os;
 mod telemetry_cmd;
 mod vision;
 use atomcode::uninstall;
@@ -780,6 +780,9 @@ enum Commands {
     /// Manage MCP server entries in `.mcp.json` (similar to `claude mcp add`)
     #[command(subcommand)]
     Mcp(McpCli),
+    /// Diagnose a configured local language server.
+    #[command(subcommand)]
+    Lsp(lsp_cmd::LspCli),
     /// Start the HTTP daemon for IDE integration (VS Code extension connects to this)
     Daemon {
         /// Port to listen on
@@ -1315,6 +1318,12 @@ async fn async_main(process_start: std::time::Instant) {
     // Wire `tracing::` diagnostics to `<config_dir>/logs/atomcode.log` (file-only,
     // TUI-safe). Must run before anything that emits traces so nothing is lost.
     init_file_logging();
+    atomcode::tui_upgrade::remember_running_installation();
+    tracing::info!(
+        running_version = VERSION,
+        process_id = std::process::id(),
+        "running atomcode build"
+    );
     warn_console_encoding();
     // Detached upgrade-prep worker mode. The parent atomcode spawns a
     // subprocess with this env var set; that subprocess does one full
@@ -1559,12 +1568,34 @@ async fn run(process_start: std::time::Instant) -> Result<i32> {
 
     // No --help was passed. Parse normally to get the Cli struct.
     let cli = Cli::parse();
+    // OS schedulers do not inherit a terminal's custom product home. Resolve
+    // that explicit host input before loading config, auth or session services.
+    if let Some(Commands::Schedule(schedule_cmd::ScheduleCli::Run {
+        store: Some(root), ..
+    })) = &cli.command
+    {
+        if !root.is_absolute() || root.file_name().and_then(|s| s.to_str()) != Some("schedules") {
+            anyhow::bail!("--store must be an absolute schedules directory");
+        }
+        let home = root
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("schedule store has no product directory"))?;
+        std::env::set_var("ATOMCODE_HOME", home);
+    }
     // Configuration errors happen before run_headless; keep its stdout free
     // of terminal restore escapes even when startup fails early.
     HEADLESS_MODE.store(
         cli.prompt.is_some() || cli.prompt_file.is_some(),
         Ordering::Relaxed,
     );
+
+    // Scheduled execution owns its configuration error boundary: admit a run
+    // first so malformed config/provider startup failures receive a terminal
+    // fact instead of exiting in the generic CLI bootstrap without history.
+    if let Some(Commands::Schedule(sub @ schedule_cmd::ScheduleCli::Run { .. })) = &cli.command {
+        HEADLESS_MODE.store(true, Ordering::Relaxed);
+        return schedule_cmd::handle_schedule(sub.clone()).await;
+    }
 
     // ── Askpass early exit ────────────────────────────────────────────────────
     // Handle `atomcode __askpass <prompt>` before ANY TUI/telemetry setup.
@@ -1816,6 +1847,19 @@ async fn run(process_start: std::time::Instant) -> Result<i32> {
                 HEADLESS_MODE.store(false, Ordering::Relaxed);
                 // Fall through to TUI startup below
             }
+            Commands::Lsp(command) => {
+                HEADLESS_MODE.store(true, Ordering::Relaxed);
+                let result = lsp_cmd::run(
+                    command,
+                    &config_path_for_tel,
+                    resolve_working_dir(cli.dir.clone()),
+                )
+                .await;
+                telemetry
+                    .shutdown(std::time::Duration::from_millis(500))
+                    .await;
+                return result.map(|()| 0);
+            }
             Commands::Daemon {
                 port,
                 client,
@@ -2040,7 +2084,7 @@ async fn run(process_start: std::time::Instant) -> Result<i32> {
                         SessionConfigOption::select(
                             atomcode::acp::options::MODE_CONFIG_ID,
                             "Mode",
-                            atomcode_coding::RuntimeMode::Build.wire(),
+                            runtime_cfg.initial_mode.wire(),
                             modes
                                 .iter()
                                 .map(|m| {
@@ -2345,13 +2389,21 @@ async fn run(process_start: std::time::Instant) -> Result<i32> {
             // it, and is not what "continue" means: it is left out.
             let from_bucket = atomcode_daemon::legacy_convert::catalog_for_bucket(&working_dir)?
                 .into_iter()
-                .find(|entry| entry.message_count > 0 && !entry.delegated())
+                .find(|entry| {
+                    entry.message_count > 0
+                        && !entry.delegated()
+                        && entry.working_directory_available()
+                })
                 .map(|entry| entry.id);
             match from_bucket {
                 Some(id) => Some(id),
                 None => atomcode_daemon::legacy_convert::catalog_for_project(&working_dir)?
                     .into_iter()
-                    .find(|entry| entry.message_count > 0 && !entry.delegated())
+                    .find(|entry| {
+                        entry.message_count > 0
+                            && !entry.delegated()
+                            && entry.working_directory_available()
+                    })
                     .map(|entry| entry.id),
             }
         }
@@ -3074,7 +3126,7 @@ pub(crate) async fn spawn_native_cli_runtime(
     atomcode_coding::CodingAgentConfig,
     Option<ContinuedCliSession>,
 )> {
-    let mut agent = cfg.agent_config();
+    let mut agent = atomcode::automation_agent_config(cfg);
     agent.round_cap_checkpoint = round_cap_checkpoint;
     let (session, imported_lease, continued_session) = if ephemeral {
         (atomcode_coding::SessionMode::Disabled, None, None)
@@ -3168,13 +3220,6 @@ pub(crate) async fn spawn_native_cli_runtime(
         None => atomcode_coding::CodingRuntime::start_with_bootstrap(start, bootstrap).await,
     }
     .map_err(anyhow::Error::new)?;
-    if cfg.dangerously_skip_permissions {
-        runtime
-            .handle
-            .set_mode(atomcode_coding::RuntimeMode::Auto)
-            .await
-            .map_err(anyhow::Error::new)?;
-    }
     Ok((runtime, agent, continued_session))
 }
 
@@ -3237,6 +3282,38 @@ pub(crate) async fn run_native_headless(
     is_admin: bool,
     strict_unattended: bool,
 ) -> Result<(i32, Option<String>)> {
+    let (code, text, _diagnostic) = run_native_headless_detailed(
+        notifications_cfg,
+        runtime,
+        prompt,
+        provider_name,
+        model_name,
+        verbose,
+        output_format,
+        capture,
+        working_dir,
+        skip_permissions,
+        is_admin,
+        strict_unattended,
+    )
+    .await?;
+    Ok((code, text))
+}
+
+pub(crate) async fn run_native_headless_detailed(
+    notifications_cfg: atomcode_config::config::NotificationConfig,
+    runtime: atomcode_coding::CodingRuntime,
+    prompt: String,
+    provider_name: String,
+    model_name: String,
+    verbose: bool,
+    output_format: HeadlessOutputFormat,
+    capture: bool,
+    working_dir: PathBuf,
+    skip_permissions: bool,
+    is_admin: bool,
+    strict_unattended: bool,
+) -> Result<(i32, Option<String>, Option<String>)> {
     use atomcode_capabilities::tools::{ApprovalRequest, ApprovalResponse, APPROVAL_KIND};
     use atomcode_coding::{CodingRuntimeEvent, TurnCompletion, UserInput};
     use atomcode_kernel::event::{AgentEvent as KernelEvent, StopReason};
@@ -3263,6 +3340,7 @@ pub(crate) async fn run_native_headless(
     } = runtime;
     let jsonl = output_format == HeadlessOutputFormat::Jsonl;
     let captured = capture.then(String::new);
+    let mut failure_diagnostic: Option<String> = None;
     if jsonl {
         write_headless_json_event(&headless_json::HeadlessEvent::RunStarted {
             schema_version: 1,
@@ -3288,7 +3366,7 @@ pub(crate) async fn run_native_headless(
             })?;
             let _ = handle.shutdown().await;
             let _ = task.await;
-            return Ok((1, captured));
+            return Ok((1, captured, Some(error.to_string())));
         }
         let _ = handle.shutdown().await;
         let _ = task.await;
@@ -3310,7 +3388,7 @@ pub(crate) async fn run_native_headless(
             })?;
             let _ = handle.shutdown().await;
             let _ = task.await;
-            return Ok((1, captured));
+            return Ok((1, captured, Some(error.to_string())));
         }
         let _ = handle.shutdown().await;
         let _ = task.await;
@@ -3459,6 +3537,7 @@ pub(crate) async fn run_native_headless(
                 retry_after_secs: _,
             }) => {
                 close_native_thinking(&mut thinking_line_open);
+                failure_diagnostic = Some(message.chars().take(8192).collect());
                 if jsonl {
                     write_headless_json_event(&headless_json::HeadlessEvent::Error {
                         message,
@@ -3726,7 +3805,10 @@ pub(crate) async fn run_native_headless(
     }
     let _ = handle.shutdown().await;
     let _ = task.await;
-    Ok((exit_code, captured))
+    if exit_code != 0 && exit_code != 130 && failure_diagnostic.is_none() {
+        failure_diagnostic = Some("Run failed; see the execution session for details".into());
+    }
+    Ok((exit_code, captured, failure_diagnostic))
 }
 
 /// Drive `atomcode_capabilities::setup::run` end-to-end and return the CLI exit code
@@ -3844,6 +3926,7 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
         Commands::Setup { .. } => {
             unreachable!("Setup is handled inline in run() before handle_command")
         }
+        Commands::Lsp(_) => unreachable!("Lsp is handled inline in run before handle_command"),
         Commands::Plugin(sub) => handle_plugin_cli(sub),
         Commands::Mcp(McpCli::Add {
             name,
@@ -4910,6 +4993,59 @@ fn install_panic_hook(telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>) 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lsp_probe_cli_has_bounded_read_only_methods_and_complete_positions() {
+        assert!(Cli::try_parse_from([
+            "atomcode",
+            "lsp",
+            "probe",
+            "--file",
+            "src/main.cj",
+            "--method",
+            "definition",
+            "--line",
+            "13",
+            "--col",
+            "26",
+            "--trace",
+            "verbose"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "atomcode",
+            "lsp",
+            "probe",
+            "--file",
+            "src/main.cj",
+            "--method",
+            "rename",
+            "--line",
+            "13",
+            "--col",
+            "26"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "atomcode",
+            "lsp",
+            "probe",
+            "--file",
+            "src/main.cj",
+            "--method",
+            "hover"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "atomcode",
+            "lsp",
+            "probe",
+            "--file",
+            "src/main.cj",
+            "--no-lsp-init-options"
+        ])
+        .is_ok());
+    }
+
     #[test]
     fn explicit_missing_config_is_rejected_but_a_missing_default_is_allowed() {
         let dir = tempfile::tempdir().unwrap();

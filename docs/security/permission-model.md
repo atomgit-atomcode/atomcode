@@ -35,6 +35,29 @@ Sandboxing and host-level permissions remain important defense layers.
 
 ## Core Concepts
 
+### Default execution mode
+
+Choose the startup mode in the user `config.toml`, or use `/config` to edit
+`permissions.default_mode`:
+
+```toml
+[permissions]
+default_mode = "auto" # build / plan / accept-edits / auto
+deny = ["Bash(rm -rf *)"]
+```
+
+When unset, the startup mode remains Build. Explicit `-y` /
+`--dangerously-skip-permissions` takes precedence over this default. Deny rules
+and hard safety boundaries still apply in Auto mode. Invalid mode names are
+rejected during config parsing; existing wire names are unchanged.
+
+The setting takes effect when a new runtime starts (restart to apply it).
+Shift+Tab and mode commands change only the current runtime; reloads preserve
+that choice and do not write it back to the default. Explicit driver modes,
+such as a scheduled job or a WebUI request, continue to override startup defaults.
+JSON permission files import allow/deny rules only; their `defaultMode` field
+does not select AtomCode's startup mode.
+
 ### Static Tool Permissions
 
 `[permissions]` in the user's `config.toml` and JSON `permissions.allow` /

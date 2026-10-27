@@ -17,6 +17,7 @@
 
 mod anthropic;
 mod atomgit_sign;
+mod auto_proxy;
 pub mod discovery;
 mod input_profile;
 mod latency;

@@ -43,10 +43,21 @@ where
 
 /// Preserve a typed idle failure for the owner's progress-aware recovery.
 /// The adapter must not replay a request after deltas reached its consumer.
-pub(crate) fn stream_idle_error() -> atomcode_kernel::stream::ProviderError {
+pub(crate) fn stream_idle_error(
+    watchdog: &super::StreamWatchdog,
+) -> atomcode_kernel::stream::ProviderError {
+    let limit = watchdog
+        .budget()
+        .map(|budget| format!("; limit {}ms", budget.as_millis()))
+        .unwrap_or_default();
     atomcode_kernel::stream::ProviderError {
         code: Some(atomcode_kernel::stream::STREAM_IDLE_TIMEOUT_CODE.into()),
-        message: "stream idle timeout".into(),
+        message: format!(
+            "stream idle timeout ({}): no content for {}ms{}",
+            watchdog.phase(),
+            watchdog.silent_for().as_millis(),
+            limit
+        ),
         retryable: false,
         ..Default::default()
     }
@@ -547,13 +558,41 @@ mod tests {
 
     #[test]
     fn idle_failure_is_typed_for_continuation_not_blind_replay() {
-        let error = stream_idle_error();
+        let watchdog = super::super::StreamWatchdog::new(
+            Some(Duration::from_secs(600)),
+            Some(Duration::from_secs(300)),
+        );
+        let error = stream_idle_error(&watchdog);
         assert_eq!(
             error.code.as_deref(),
             Some(atomcode_kernel::stream::STREAM_IDLE_TIMEOUT_CODE)
         );
         assert!(!error.retryable);
         assert_eq!(error.http_status, None);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn idle_failure_reports_the_actual_content_phase_and_budget() {
+        let mut watchdog = super::super::StreamWatchdog::new(
+            Some(Duration::from_secs(600)),
+            Some(Duration::from_secs(300)),
+        );
+        tokio::time::advance(Duration::from_secs(600)).await;
+        watchdog.observe(&StreamEvent::Usage(Default::default()));
+        let first = stream_idle_error(&watchdog);
+        assert_eq!(
+            first.message,
+            "stream idle timeout (first_content): no content for 600000ms; limit 600000ms"
+        );
+        watchdog.observe(&StreamEvent::Reasoning("thinking".into()));
+        tokio::time::advance(Duration::from_secs(300)).await;
+        let idle = stream_idle_error(&watchdog);
+        assert_eq!(
+            idle.message,
+            "stream idle timeout (stream_idle): no content for 300000ms; limit 300000ms"
+        );
+        assert_eq!(first.code, idle.code);
+        assert!(!idle.retryable);
     }
 
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};

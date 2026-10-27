@@ -895,6 +895,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         // ── /upgrade ──
         Msg::UpgradePackageManaged =>
             "This build is managed by HarmonyBrew. Run `brew upgrade atomcode` to upgrade.".into(),
+        Msg::InstalledBinaryChangedHint => "This window runs the old version · restart to apply".into(),
+        Msg::InstalledBinaryChanged => "This window still runs the old version. Exit normally and use the session resume command shown on exit to start the updated version.".into(),
         Msg::UpgradeRestartPending =>
             "The new version is already installed; there is no need to upgrade again. Quit (/quit) and start atomcode again to use it.".into(),
         Msg::UpgradeUnknownArg { arg } =>

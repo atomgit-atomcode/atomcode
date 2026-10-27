@@ -249,12 +249,13 @@ impl CommandSet for OpenRouterCommands {
                 }
             };
             let say = |line: String| {
-                ui.say(&line);
+                // Each progress item gets one empty row before the next item.
+                ui.say(&format!("{line}\n"));
                 painted();
             };
             connect(&world, mode, &say);
         });
-        Outcome::Said(tr(SMsg::OpenRouterConnecting).into_owned())
+        Outcome::Said(format!("{}\n", tr(SMsg::OpenRouterConnecting)))
     }
 }
 

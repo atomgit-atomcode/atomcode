@@ -15,7 +15,7 @@
 //! 日志里的事实,重订阅不会再发一次。
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use async_trait::async_trait;
@@ -23,6 +23,7 @@ use atomcode_capabilities::session::manager::SessionOrigin;
 use atomcode_coding::front_end::FrontEnd;
 use atomcode_coding::runtime::{RuntimePhase, UserInput};
 use atomcode_coding::{CodingAgentConfig, CodingRuntime};
+use atomcode_daemon::native_live::EmbeddedSessions as _;
 use atomcode_harness::feed::Feed;
 use atomcode_host_api::{
     BackgroundSession, BackgroundState, BackgroundStats, HostCommand, HostConnection, HostControl,
@@ -131,8 +132,6 @@ struct Live {
     id: u64,
     control: Arc<RuntimeControl>,
     commands: mpsc::UnboundedSender<AgentCommand>,
-    /// 现在是不是屏幕上那一个——共享只发它的事件。
-    shown: Arc<AtomicBool>,
     track: Arc<Mutex<Track>>,
     /// 放到后台的时刻,unix 毫秒。
     since: u64,
@@ -336,7 +335,6 @@ pub fn connect(
             config,
         },
         host_config.clone(),
-        true,
     )?;
     let background = Arc::new_cyclic(|me: &Weak<Background>| Background {
         state: Mutex::new(State {
@@ -377,6 +375,8 @@ pub fn connect(
         });
     }
     crate::tui_share::remember(background.front_control());
+    let owner: Arc<dyn atomcode_daemon::native_live::EmbeddedSessions> = background.clone();
+    atomcode_daemon::native_live::register_embedded_sessions(Arc::downgrade(&owner));
 
     let routing = background.clone();
     tokio::spawn(async move {
@@ -441,15 +441,12 @@ fn attach(
     id: u64,
     spawned: Spawned,
     host_config: Option<Arc<dyn HostConfig>>,
-    shown: bool,
 ) -> Result<(Live, Pumps), String> {
-    let flag = Arc::new(AtomicBool::new(shown));
     let (connection, control) = crate::host::attach(
         spawned.runtime,
         spawned.front_end,
         spawned.config,
         host_config,
-        Some(flag.clone()),
         // Only the session the screen opens on is asked `Readiness` at start.
         id == 0,
     )?;
@@ -464,7 +461,6 @@ fn attach(
             id,
             control,
             commands,
-            shown: flag,
             track: track.clone(),
             since: now_ms(),
             origin: own,
@@ -1092,7 +1088,12 @@ impl Background {
                 AgentCommand::SendMessage { .. } | AgentCommand::SendMessageWithContext { .. } => {
                     Kind::Send
                 }
-                // 带回执的订阅与退出照常转:回执要那一个 runtime 答。
+                AgentCommand::Subscribe { session, from } => Kind::Subscribe {
+                    session: session.clone(),
+                    from: *from,
+                },
+                // The foreground gate must open for receipted subscriptions too.
+                // Their runtime answers only after it enqueues the history.
                 _ => Kind::Other,
             },
             AgentCommand::Unsubscribe { .. } => Kind::Unsubscribe,
@@ -1156,6 +1157,13 @@ impl Background {
                 match subscribed {
                     Some(Ok(())) => {
                         let _ = front_end.events().send(pending);
+                        if let AgentCommand::Tagged { id, .. } = &command {
+                            let _ = front_end.events().send(AgentEvent::Accepted {
+                                command: id.clone(),
+                                turn: None,
+                                steered: false,
+                            });
+                        }
                     }
                     _ => {
                         let _ = commands.send(command);
@@ -1262,8 +1270,17 @@ impl Background {
     /// 前台能不能换走。
     fn may_move(front: &Live) -> Result<(), HostError> {
         use atomcode_i18n::screen::{t as tr, Msg as SMsg};
-        if crate::tui_share::sharing() {
-            return Err(Self::busy(tr(SMsg::BgRefusedWhileSharing).into_owned()));
+        // Request publication can precede the status watch's WaitingApproval
+        // update. A question already shown on screen must not be left behind.
+        // A WebUI response bypasses the TUI's cached request. Read current
+        // runtime control state so a resolved question cannot strand navigation.
+        let waiting = front
+            .control
+            .runtime()
+            .has_pending_blocking_request()
+            .unwrap_or(true);
+        if waiting {
+            return Err(Self::busy(tr(SMsg::BgRefusedWhileAsking).into_owned()));
         }
         match front.control.runtime().status().phase {
             RuntimePhase::WaitingApproval => {
@@ -1276,23 +1293,19 @@ impl Background {
         }
     }
 
-    async fn spawn_at(&self, working_dir: PathBuf, shown: bool) -> Result<Live, HostError> {
-        let (live, pumps) = self.prepare_at(working_dir, shown).await?;
+    async fn spawn_at(&self, working_dir: PathBuf) -> Result<Live, HostError> {
+        let (live, pumps) = self.prepare_at(working_dir).await?;
         pumps.pump(self.me.clone());
         Ok(live)
     }
 
     /// Keep a candidate's events private until its session is ready to display.
-    async fn prepare_at(
-        &self,
-        working_dir: PathBuf,
-        shown: bool,
-    ) -> Result<(Live, Pumps), HostError> {
+    async fn prepare_at(&self, working_dir: PathBuf) -> Result<(Live, Pumps), HostError> {
         let spawned = (self.spawn)(working_dir)
             .await
             .map_err(|message| HostError::Failed { message })?;
         let id = self.next.fetch_add(1, Ordering::SeqCst);
-        let (live, pumps) = attach(id, spawned, self.host_config.clone(), shown)
+        let (live, pumps) = attach(id, spawned, self.host_config.clone())
             .map_err(|message| HostError::Failed { message })?;
         if live.control.session_id().is_empty() {
             stop(live).await;
@@ -1308,11 +1321,21 @@ impl Background {
         Self::busy(tr(SMsg::BgSlotsFull { most: MOST }).into_owned())
     }
 
+    /// An idle parent still owns the destination for an unfinished delegation.
+    /// Keep it alive until the result is committed, rather than retiring it as
+    /// an ordinary idle history tab during a shared navigation.
+    fn retain_front(state: &State) -> bool {
+        let session = state.front.control.session_id();
+        in_turn(&state.front)
+            || state.slots.iter().any(|slot| {
+                slot.origin == session
+                    && matches!(*slot.mark.lock().expect("mark poisoned"), Mark::Pending(_))
+            })
+    }
+
     /// 把 `incoming` 放到前台。返回被换下来的那个。调用方持着 `op`。
     fn put_in_front(&self, state: &mut State, incoming: Live) -> Live {
-        incoming.shown.store(true, Ordering::SeqCst);
         let outgoing = std::mem::replace(&mut state.front, incoming);
-        outgoing.shown.store(false, Ordering::SeqCst);
         if in_turn(&outgoing) {
             // 正在跑的那个回合还没有结局,上一个回合的结局不算数了。
             outgoing.track.lock().expect("track poisoned").ended = None;
@@ -1338,13 +1361,37 @@ impl Background {
         .working_dir_now()
         .await;
         // 新 runtime 起好之前不碰槽位表:起不来的话,前台原样不动。
-        let fresh = self.spawn_at(working_dir, true).await?;
+        let fresh = self.spawn_at(working_dir).await?;
         let fresh_session = fresh.control.session_id();
-        let slot = {
+        let mut fresh = Some(fresh);
+        let result = {
+            let exiting = self.exit_front.lock().expect("exit poisoned");
             let mut state = self.state.lock().expect("background poisoned");
-            let outgoing = self.put_in_front(&mut state, fresh);
-            state.slots.push(outgoing);
-            state.slots.len() as u32
+            Self::may_move(&state.front).and_then(|_| {
+                if exiting.is_some()
+                    || state.front.control.session_id() != session
+                    || state.front.control.runtime().is_stopped()
+                {
+                    return Err(HostError::NotFound);
+                }
+                crate::tui_share::follow_with(
+                    fresh.as_ref().expect("candidate").control.clone(),
+                    || {
+                        let outgoing =
+                            self.put_in_front(&mut state, fresh.take().expect("candidate"));
+                        state.slots.push(outgoing);
+                        state.slots.len() as u32
+                    },
+                )
+                .map_err(|message| HostError::Failed { message })
+            })
+        };
+        let slot = match result {
+            Ok(slot) => slot,
+            Err(error) => {
+                stop(fresh.expect("uncommitted candidate")).await;
+                return Err(error);
+            }
         };
         self.announce(HostEvent::SessionChanged {
             session: fresh_session,
@@ -1381,17 +1428,20 @@ impl Background {
                 .position(|slot| slot.control.session_id() == target)
                 .ok_or(HostError::NotFound)?;
             Self::may_move(&state.front)?;
-            let keep = has_conversation(&state.front) || in_turn(&state.front);
-            let incoming = state.slots.remove(at);
-            let mark = incoming.mark.clone();
-            let outgoing = self.put_in_front(&mut state, incoming);
-            let closed = if keep {
-                state.slots.insert(at, outgoing);
-                None
-            } else {
-                Some(outgoing)
-            };
-            (closed, mark)
+            crate::tui_share::follow_with(state.slots[at].control.clone(), || {
+                let keep = has_conversation(&state.front) || in_turn(&state.front);
+                let incoming = state.slots.remove(at);
+                let mark = incoming.mark.clone();
+                let outgoing = self.put_in_front(&mut state, incoming);
+                let closed = if keep {
+                    state.slots.insert(at, outgoing);
+                    None
+                } else {
+                    Some(outgoing)
+                };
+                (closed, mark)
+            })
+            .map_err(|message| HostError::Failed { message })?
         };
         take_up(&mark, &target);
         self.announce(HostEvent::SessionChanged {
@@ -1409,6 +1459,10 @@ impl Background {
     /// is prepared privately. Failed preparation never changes the slot table.
     async fn resume(&self, session: String, target: String) -> Result<HostReply, HostError> {
         let _op = self.op.lock().await;
+        self.resume_locked(session, target).await
+    }
+
+    async fn resume_locked(&self, session: String, target: String) -> Result<HostReply, HostError> {
         let front = {
             let state = self.state.lock().expect("background poisoned");
             if state.front.control.session_id() != session {
@@ -1420,14 +1474,20 @@ impl Background {
         if self.in_background(&target) {
             return self.foreground_locked(session, target).await;
         }
-        if target == session || !in_turn(&self.state.lock().expect("background poisoned").front) {
+        if target == session
+            || (!crate::tui_share::sharing()
+                && !in_turn(&self.state.lock().expect("background poisoned").front))
+        {
             return front.call(HostCommand::Resume { session, target }).await;
         }
-        if self.state.lock().expect("background poisoned").slots.len() >= MOST {
-            return Err(Self::full());
+        {
+            let state = self.state.lock().expect("background poisoned");
+            if state.slots.len() >= MOST && Self::retain_front(&state) {
+                return Err(Self::full());
+            }
         }
         let working_dir = front.working_dir_now().await;
-        let (mut incoming, mut pumps) = self.prepare_at(working_dir, false).await?;
+        let (mut incoming, mut pumps) = self.prepare_at(working_dir).await?;
         let reply = match incoming
             .control
             .call(HostCommand::Resume {
@@ -1453,6 +1513,7 @@ impl Background {
             pumps.track.lock().expect("track poisoned").saw(&event);
         }
         let mut incoming = Some(incoming);
+        let mut retired = None;
         let switched = {
             // Match record_exit_front's lock order: an exit already recorded
             // during preparation must not acquire a replacement foreground.
@@ -1466,9 +1527,20 @@ impl Background {
             } else if let Err(error) = Self::may_move(&state.front) {
                 Err(error)
             } else {
-                let outgoing = self.put_in_front(&mut state, incoming.take().expect("candidate"));
-                state.slots.push(outgoing);
-                Ok(())
+                crate::tui_share::follow_with(
+                    incoming.as_ref().expect("candidate").control.clone(),
+                    || {
+                        let retain = Self::retain_front(&state);
+                        let outgoing =
+                            self.put_in_front(&mut state, incoming.take().expect("candidate"));
+                        if retain {
+                            state.slots.push(outgoing);
+                        } else {
+                            retired = Some(outgoing);
+                        }
+                    },
+                )
+                .map_err(|message| HostError::Failed { message })
             }
         };
         if let Err(error) = switched {
@@ -1481,6 +1553,9 @@ impl Background {
             previous: Some(session),
         });
         self.announce_list();
+        if let Some(retired) = retired {
+            stop(retired).await;
+        }
         Ok(reply)
     }
 
@@ -1562,24 +1637,37 @@ impl Background {
         let files = scope
             .as_deref()
             .and_then(|scope| changed_files(&working_dir, scope));
-        let mut live = self.spawn_at(working_dir.clone(), false).await?;
+        let mut live = self.spawn_at(working_dir.clone()).await?;
         // 它是替**前台那个**干的:干完把结果投回去,而不是留在这里等人来读。
         live.origin = control.session_id();
         // 结果落进那段对话之后,盘上才标它不是人的一段对话(见 `Mark`)。
         live.mark = Arc::new(Mutex::new(Mark::Pending(working_dir)));
         live.name = name;
         live.task = one_line(&text);
-        if let Err(error) = live.control.runtime().submit(UserInput::from(text)).await {
-            // 没接下任务的会话不留槽:它只会是一行什么都不做的空会话。
-            stop(live).await;
-            return Err(crate::host::refused(error));
-        }
         let session = live.control.session_id();
+        let id = live.id;
+        let handle = live.control.runtime().clone();
+        // Register visibility before submit can commit the first user message.
+        // The operation lock prevents navigation/drop during this reservation.
         let slot = {
             let mut state = self.state.lock().expect("background poisoned");
             state.slots.push(live);
             state.slots.len() as u32
         };
+        if let Err(error) = handle.submit(UserInput::from(text)).await {
+            let failed = {
+                let mut state = self.state.lock().expect("background poisoned");
+                let at = state
+                    .slots
+                    .iter()
+                    .position(|live| live.id == id)
+                    .expect("reserved slot");
+                state.slots.remove(at)
+            };
+            stop(failed).await;
+            self.announce_list();
+            return Err(crate::host::refused(error));
+        }
         self.announce_list();
         Ok(HostReply::Backgrounded {
             session,
@@ -1715,6 +1803,16 @@ impl Background {
 impl HostControl for Background {
     async fn call(&self, command: HostCommand) -> Result<HostReply, HostError> {
         match command {
+            HostCommand::ListSessions { working_dir } => {
+                let mut reply = self
+                    .front_control()
+                    .call(HostCommand::ListSessions { working_dir })
+                    .await?;
+                if let HostReply::Sessions { sessions } = &mut reply {
+                    sessions.retain(|session| !self.hidden(&session.id));
+                }
+                Ok(reply)
+            }
             HostCommand::Background { session } => self.background(session).await,
             HostCommand::BackgroundSessions => Ok(HostReply::BackgroundSessions {
                 sessions: self.list(),
@@ -1737,6 +1835,65 @@ impl HostControl for Background {
         let (tx, rx) = mpsc::unbounded_channel();
         self.watchers.lock().expect("watchers poisoned").push(tx);
         rx
+    }
+}
+
+#[async_trait]
+impl atomcode_daemon::native_live::EmbeddedSessions for Background {
+    fn owns(&self, session: &str) -> bool {
+        let state = self.state.lock().expect("background poisoned");
+        state.front.control.session_id() == session
+            || state
+                .slots
+                .iter()
+                .any(|slot| slot.control.session_id() == session)
+    }
+
+    fn hidden(&self, session: &str) -> bool {
+        let state = self.state.lock().expect("background poisoned");
+        state.slots.iter().any(|slot| {
+            slot.control.session_id() == session
+                && match *slot.mark.lock().expect("mark poisoned") {
+                    Mark::Home(_) => true,
+                    Mark::Pending(_) => slot.name.as_deref() == Some("code-review"),
+                    Mark::Own | Mark::TakenUp => false,
+                }
+        })
+    }
+
+    async fn switch(
+        &self,
+        expected: String,
+        target: String,
+    ) -> Result<atomcode_daemon::native_live::Resumed, String> {
+        let _op = self.op.lock().await;
+        let reply = self
+            .resume_locked(expected, target.clone())
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        // The operation already committed. Do not ask for another full replay:
+        // it can exceed its bound while the incoming turn is still running,
+        // which must not turn a successful switch into a reported failure.
+        let front = self.front_control();
+        let changed = match atomcode_daemon::native_live::embedded_binding()
+            .filter(|binding| binding.session_id == front.session_id())
+        {
+            Some(binding) => atomcode_coding::SessionChanged {
+                generation: atomcode_coding::RuntimeGeneration(binding.generation),
+                session_id: Some(binding.session_id),
+                working_dir: binding.working_dir,
+            },
+            // Sharing may have been explicitly detached during preparation.
+            None => atomcode_coding::SessionChanged {
+                generation: atomcode_coding::RuntimeGeneration(front.runtime().status().generation),
+                session_id: Some(front.session_id()),
+                working_dir: front.working_dir_now().await,
+            },
+        };
+        Ok(atomcode_daemon::native_live::Resumed {
+            forked_from: matches!(reply, HostReply::DoneWithNote { .. }).then_some(target),
+            changed,
+        })
     }
 }
 

@@ -66,11 +66,7 @@ pub async fn execute_one(
                 let Some(tool) = toolbox.get(&call.name) else {
                     return error_result(
                         &call.id,
-                        &format!(
-                            "unknown tool `{}`; mounted: {}",
-                            call.name,
-                            toolbox.names().join(", ")
-                        ),
+                        &unknown_tool_message(&call.name, &toolbox.names()),
                     );
                 };
                 if let (Some(progress), Some(log)) = (
@@ -154,11 +150,112 @@ pub async fn execute_one(
     result
 }
 
+/// Suggestions describe only the live catalog. They never repair or dispatch a call.
+fn unknown_tool_message(name: &str, available: &[String]) -> String {
+    let leaf = |name: &str| {
+        name.rsplit("__")
+            .next()
+            .unwrap_or(name)
+            .to_ascii_lowercase()
+    };
+    let requested = leaf(name);
+    let mut candidates: Vec<_> = available
+        .iter()
+        .filter_map(|candidate| {
+            nearby_tool_name(&requested, &leaf(candidate)).map(|distance| (distance, candidate))
+        })
+        .collect();
+    candidates.sort_unstable();
+    candidates.dedup_by(|a, b| a.1 == b.1);
+    let suggestions: Vec<_> = candidates
+        .into_iter()
+        .take(3)
+        .map(|(_, candidate)| format!("`{candidate}`"))
+        .collect();
+    if suggestions.is_empty() {
+        format!("unknown tool `{name}`. Use a name from the available tool definitions.")
+    } else {
+        format!(
+            "unknown tool `{name}`. Related available tools: {}. Check their definitions before calling again.",
+            suggestions.join(", ")
+        )
+    }
+}
+
+/// A small edit-distance window handles typos without suggesting unrelated tools.
+/// Bound both names so malformed model output cannot cause quadratic unbounded work.
+fn nearby_tool_name(requested: &str, candidate: &str) -> Option<usize> {
+    let requested: Vec<_> = requested.chars().take(129).collect();
+    let candidate: Vec<_> = candidate.chars().take(129).collect();
+    if requested.is_empty() || requested.len() > 128 || candidate.len() > 128 {
+        return None;
+    }
+    let limit = if requested.len() < 4 { 1 } else { 2 };
+    if requested.len().abs_diff(candidate.len()) > limit {
+        return None;
+    }
+    let mut previous: Vec<_> = (0..=candidate.len()).collect();
+    let mut current = vec![0; candidate.len() + 1];
+    for (i, left) in requested.iter().enumerate() {
+        current[0] = i + 1;
+        for (j, right) in candidate.iter().enumerate() {
+            current[j + 1] = (previous[j + 1] + 1)
+                .min(current[j] + 1)
+                .min(previous[j] + usize::from(left != right));
+        }
+        if current.iter().all(|&distance| distance > limit) {
+            return None;
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    let distance = previous[candidate.len()];
+    (distance <= limit).then_some(distance)
+}
+
 pub fn error_result(call_id: &str, message: &str) -> ToolResult {
     ToolResult {
         call_id: call_id.to_string(),
         content: message.to_string(),
         is_error: true,
         images: vec![],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unknown_tool_message;
+
+    #[test]
+    fn tool_suggestions_are_bounded_and_stable_across_catalog_order() {
+        let mut names: Vec<String> = [
+            "mcp__gamma__read_file",
+            "write_file",
+            "mcp__delta__read_file",
+            "mcp__beta__read_file",
+            "mcp__alpha__read_file",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let message = unknown_tool_message("read_flie", &names);
+        names.reverse();
+        assert_eq!(message, unknown_tool_message("read_flie", &names));
+        assert_eq!(
+            names.iter().filter(|name| message.contains(*name)).count(),
+            3
+        );
+        assert!(message.contains("mcp__alpha__read_file"));
+        assert!(!message.contains("write_file"));
+    }
+
+    #[test]
+    fn tool_suggestions_preserve_live_names_and_handle_malformed_names() {
+        let names = vec!["read_file".to_string()];
+        assert!(unknown_tool_message("READ_FILE", &names).contains("`read_file`"));
+        for requested in ["".to_string(), "读取文件".repeat(100), "build".to_string()] {
+            let message = unknown_tool_message(&requested, &names);
+            assert!(message.contains("unknown tool"));
+            assert!(!message.contains("`read_file`"));
+        }
     }
 }

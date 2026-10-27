@@ -10,7 +10,6 @@ use std::sync::Arc;
 
 use atomcode_capabilities::tools::PermissionRules;
 use atomcode_capabilities::ProductDirs;
-use atomcode_config::config::PermissionsConfig;
 use serde::Deserialize;
 
 #[derive(Clone, Debug, Default)]
@@ -22,10 +21,19 @@ pub struct PermissionSettings {
     pub sources: Vec<PathBuf>,
 }
 
+// JSON scopes import rules only. A TOML startup mode (or Claude's
+// defaultMode) must not change the live mode on a capability reload or /cd.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct RuleSettings {
+    allow: Vec<String>,
+    deny: Vec<String>,
+}
+
 #[derive(Deserialize)]
 struct Settings {
     #[serde(default)]
-    permissions: PermissionsConfig,
+    permissions: RuleSettings,
 }
 
 pub(crate) fn load(
@@ -248,6 +256,7 @@ mod tests {
         for value in [
             serde_json::json!({}),
             serde_json::json!({"hooks": {}, "env": {"KEY": "not-for-the-model"}}),
+            serde_json::json!({"permissions": {"defaultMode": "bypassPermissions", "default_mode": "not-a-toml-mode"}}),
         ] {
             write(&path, value);
             let settings = load(&PermissionRules::default(), &dirs, root.path()).unwrap();

@@ -62,12 +62,13 @@ export function dismissCompatNotice(): void {
 /**
  * Whether this browser may use the daemon at all.
  *
- * `false` only for a definite 401: the page was opened without the link the
- * terminal printed (a second browser, a bookmark, a cleared cookie). Anything
- * else — a network error, a daemon that does not ask for a token — lets the
- * app load and report for itself.
+ * Probe a protected endpoint rather than conflating an account OAuth failure
+ * or an offline relay with WebUI access. Network/5xx failures are unavailable,
+ * never evidence that access has been reauthorized.
  */
-export async function signedIn(fetchFn: typeof fetch = fetch, token = ''): Promise<boolean> {
+export type WebuiAccess = 'allowed' | 'denied' | 'unavailable';
+
+export async function probeWebuiAccess(fetchFn: typeof fetch = fetch, token = ''): Promise<WebuiAccess> {
   const headers: Record<string, string> = { 'X-AtomCode-Client': 'webui' };
   if (token) headers.Authorization = 'Bearer ' + token;
   // The app waits on this before it draws anything, so it must not hang: a
@@ -76,10 +77,16 @@ export async function signedIn(fetchFn: typeof fetch = fetch, token = ''): Promi
   const timer = setTimeout(() => controller.abort(), 3000);
   try {
     const resp = await fetchFn('/project', { headers, signal: controller.signal });
-    return resp.status !== 401;
+    if (resp.status === 401 || resp.status === 403) return 'denied';
+    return resp.ok ? 'allowed' : 'unavailable';
   } catch {
-    return true;
+    return 'unavailable';
   } finally {
     clearTimeout(timer);
   }
+}
+
+/** Initial transport failures leave the app to report/reconnect for itself. */
+export async function signedIn(fetchFn: typeof fetch = fetch, token = ''): Promise<boolean> {
+  return (await probeWebuiAccess(fetchFn, token)) !== 'denied';
 }

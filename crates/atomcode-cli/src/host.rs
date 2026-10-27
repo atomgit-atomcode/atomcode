@@ -176,7 +176,7 @@ pub fn connect(
     config: CodingAgentConfig,
     host_config: Option<Arc<dyn HostConfig>>,
 ) -> Result<HostConnection, String> {
-    let (connection, control) = attach(runtime, front_end, config, host_config, None, false)?;
+    let (connection, control) = attach(runtime, front_end, config, host_config, false)?;
     // 共享(`/webui` / `/sync` / `/app`)要的是这个 runtime 的句柄,而句柄不在
     // 宿主契约里——它是产品的东西。接上时交给那一层,它自己判断现在共享没有。
     crate::tui_share::remember(control);
@@ -197,22 +197,19 @@ pub fn connect_screen(
     config: CodingAgentConfig,
     host_config: Option<Arc<dyn HostConfig>>,
 ) -> Result<HostConnection, String> {
-    let (connection, control) = attach(runtime, front_end, config, host_config, None, true)?;
+    let (connection, control) = attach(runtime, front_end, config, host_config, true)?;
     crate::tui_share::remember(control);
     Ok(connection)
 }
 
 /// [`connect`], for a host that holds more than one runtime
-/// (`crate::background`): the control comes back as itself, and `shown` says
-/// whether this runtime is the one on screen now — only that one's events are
-/// published to a share. `None` is "always", which is what a host with one
-/// runtime means.
+/// (`crate::background`): the control comes back as itself. Shared event
+/// publication checks the foreground runtime identity under the sharing lock.
 pub(crate) fn attach(
     runtime: CodingRuntime,
     front_end: Arc<FrontEnd>,
     config: CodingAgentConfig,
     host_config: Option<Arc<dyn HostConfig>>,
-    shown: Option<Arc<std::sync::atomic::AtomicBool>>,
     // The screen asks `Readiness` as it starts (see [`connect_screen`]).
     asks_readiness: bool,
 ) -> Result<(HostConnection, Arc<RuntimeControl>), String> {
@@ -251,16 +248,12 @@ pub(crate) fn attach(
             //
             // 只有屏幕上的那个 runtime 的事件才算:后台会话(`crate::background`)
             // 的回合不是共享出去的那段对话。
-            let on_screen = shown.as_ref().map_or(true, |shown| {
-                shown.load(std::sync::atomic::Ordering::SeqCst)
-            });
-            if on_screen {
-                crate::tui_share::publish(&sequenced);
-                // 模式换了也要单独说一声,理由同 attach:远端的徽标读的是那个全局值。
-                if let CodingRuntimeEvent::ModeChanged { mode } = &sequenced.event {
-                    crate::tui_share::mode_changed(*mode);
-                }
-            }
+            // Check runtime identity under the sharing lock, not a flag read
+            // before it: a foreground handover may happen between those reads.
+            crate::tui_share::publish_from(
+                crate::tui_share::Live::runtime_id(watched.as_ref()),
+                &sequenced,
+            );
             // A provider serving again, by either road back: a model switch
             // (`ProviderChanged`) or a reload — `/login`, onboarding — which
             // reprepares and reports `Reconfigured`. Losing it after that is
@@ -530,6 +523,20 @@ pub(crate) fn attach(
 }
 
 impl crate::tui_share::Live for RuntimeControl {
+    fn runtime_id(&self) -> usize {
+        self as *const Self as usize
+    }
+    fn provider_info(&self) -> Result<(String, String), String> {
+        let config = self.config.lock().expect("config poisoned");
+        let provider = config.provider_name.clone();
+        let fingerprint = config
+            .subagent_config
+            .as_ref()
+            .map(|source| atomcode_daemon::native_live::provider_fingerprint(source, &provider))
+            .transpose()?
+            .unwrap_or_default();
+        Ok((provider, fingerprint))
+    }
     fn handle(&self) -> atomcode_coding::CodingRuntimeHandle {
         self.handle.clone()
     }
@@ -1674,7 +1681,9 @@ impl RuntimeControl {
         let all: Vec<(String, StoredSession)> = scan
             .entries
             .into_iter()
-            .filter(|entry| entry.message_count > 0 && !entry.delegated())
+            .filter(|entry| {
+                entry.message_count > 0 && !entry.delegated() && entry.working_directory_available()
+            })
             .map(|entry| {
                 (
                     entry.project_bucket,

@@ -298,6 +298,19 @@ pub struct CatalogEntry {
 }
 
 impl CatalogEntry {
+    /// Whether the original workspace can still be offered for resume. A
+    /// missing path (or a file replacing it) is unavailable; transient I/O and
+    /// permission errors do not silently hide a person's history.
+    pub fn working_directory_available(&self) -> bool {
+        match fs::metadata(&self.working_dir) {
+            Ok(meta) => meta.is_dir(),
+            Err(error) => !matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ),
+        }
+    }
+
     /// Work done in the background for another conversation: found by id,
     /// but not offered in a picker or to `--continue`.
     pub fn delegated(&self) -> bool {
@@ -3422,13 +3435,16 @@ impl SessionManager {
         Ok(timestamps)
     }
 
-    /// Load the FULL per-turn transcript for `id` from `<id>.jsonl` — the same
-    /// never-compacted ground truth the `recall` tool reads. Unlike the runtime
+    /// Load the FULL per-turn history from the event log, or the transcript of
+    /// an older session — the same ground truth the `recall` tool reads. Unlike the runtime
     /// snapshot, this is UNAFFECTED by compaction, so a UI can show the complete
     /// session trajectory (including turns compaction dropped from the snapshot).
     /// A missing file is an empty transcript (the session may not have completed a
     /// turn yet); memory is bounded by the same `MAX_JSONL_*` caps recall uses.
     pub fn load_transcript_records(&self, id: &str) -> SessionResult<Vec<TurnRecord>> {
+        if self.is_event_session(id) {
+            return Ok(super::events::turn_records(id, &self.load_events(id)?));
+        }
         let path = self.jsonl_path(id)?;
         match fs::symlink_metadata(&path) {
             Ok(_) => {}
@@ -4920,6 +4936,30 @@ mod tests {
     use crate::product_dirs::test_dirs;
     use atomcode_kernel::message::Message;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn catalog_workspace_availability_is_live_and_does_not_reject_temp_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("tmp-workspace");
+        fs::create_dir(&workspace).unwrap();
+        let manager =
+            SessionManager::with_root(root.path().join("sessions").join("0123456789abcdef"));
+        manager
+            .write_meta(&SessionMeta::new("history", workspace.to_string_lossy(), 1))
+            .unwrap();
+        let entry = SessionManager::scan_catalog(&root.path().join("sessions"))
+            .entries
+            .pop()
+            .unwrap();
+        assert!(entry.working_directory_available());
+        fs::remove_dir(&workspace).unwrap();
+        assert!(!entry.working_directory_available());
+        fs::write(&workspace, "a file replaced the directory").unwrap();
+        assert!(!entry.working_directory_available());
+        fs::remove_file(&workspace).unwrap();
+        fs::create_dir(&workspace).unwrap();
+        assert!(entry.working_directory_available());
+    }
 
     fn snap(texts: &[&str]) -> SessionSnapshot {
         SessionSnapshot::new(texts.iter().map(|t| Message::user(*t)).collect())

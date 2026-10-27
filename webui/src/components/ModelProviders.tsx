@@ -43,6 +43,7 @@ import {
   modelBody,
   adoptPicked,
   parseTokens,
+  providerHost,
   formatTokens,
   apiKeyProblem,
   validBaseUrl,
@@ -660,7 +661,10 @@ function AddProviderCard({
         <label class="add-model-label">{mode === 'preset' ? t('providers.vendor') : t('providers.protocol')}</label>
         <Select
           value={draft.provider}
-          options={choices.map((p) => ({ value: p.id, label: p.display_name }))}
+          options={choices.map((p) => {
+            const host = providerHost(p.default_base_url);
+            return { value: p.id, label: host ? `${p.display_name} · ${host}` : p.display_name };
+          })}
           onChange={(v) => setDraft({ ...typed, provider: v })}
         />
       </div>
@@ -1109,6 +1113,8 @@ function ModelPicker({
                     </span>
                     <code>{m.id}</code>
                     {m.context_window ? <small>{formatTokens(m.context_window)}</small> : null}
+                    {m.supports_vision === true && <small>{t('providers.visionOn')}</small>}
+                    {!!m.reasoning_effort_levels?.length && <small>{m.reasoning_effort_levels.join(' / ')}</small>}
                     {exists && <small>{t('providers.pickAlready')}</small>}
                   </button>
                 );

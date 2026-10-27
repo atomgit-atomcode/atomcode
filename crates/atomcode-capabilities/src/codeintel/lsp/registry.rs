@@ -9,6 +9,7 @@ pub struct LspServerConfig {
     pub command: String,
     pub args: Vec<String>,
     pub root_markers: Vec<String>,
+    pub options: super::super::lsp_policy::LspOptions,
 }
 
 pub struct LspServerRegistry {
@@ -32,6 +33,7 @@ impl LspServerRegistry {
                     command: command.to_string(),
                     args: args.iter().map(|s| s.to_string()).collect(),
                     root_markers: markers.iter().map(|s| s.to_string()).collect(),
+                    options: Default::default(),
                 },
             );
         };
@@ -134,6 +136,7 @@ mod tests {
                 command: "custom-ra".into(),
                 args: vec![],
                 root_markers: vec![],
+                options: Default::default(),
             },
         );
         assert_eq!(r.get("rs").unwrap().command, "custom-ra");

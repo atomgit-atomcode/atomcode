@@ -411,3 +411,9 @@ theme = "auto"
 # follow_symlinks = false
 # timeout_secs = 30     # 1..300 seconds
 # max_entries = 100000 # 1..1000000 visited entries
+
+# AtomGit schemas are discovered through builtin_search by default.
+# Set false to include all AtomGit tool schemas in every model request.
+[tools.atomgit]
+# enabled = true
+# tool_search = true

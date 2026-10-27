@@ -867,6 +867,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         // ── /upgrade ──
         Msg::UpgradePackageManaged =>
             "本版本由 HarmonyBrew 管理，请运行 `brew upgrade atomcode` 升级".into(),
+        Msg::InstalledBinaryChangedHint => "当前窗口仍运行旧版本，重启后生效".into(),
+        Msg::InstalledBinaryChanged => "当前窗口仍运行旧版本，重启后生效。请正常退出，并按退出时的会话恢复提示重新启动。".into(),
         Msg::UpgradeRestartPending =>
             "新版本已经装好了，不用再升级一次：退出（/quit）后重新打开 atomcode 就会用上。".into(),
         Msg::UpgradeUnknownArg { arg } =>

@@ -228,6 +228,35 @@ fn follow_system_env(
     }
 }
 
+/// A fresh, request-local policy for automatic network recovery. Explicit
+/// environment proxies keep their startup precedence over OS settings. Does not
+/// mutate the process environment or persist a temporary direct route.
+///
+/// `None` preserves the existing builder policy for fixed/no-proxy modes and
+/// standalone embedders that have not installed the product's process policy.
+pub fn refreshed_follow_system_config() -> anyhow::Result<Option<ProxyConfig>> {
+    if env::var(MODE_ENV).ok().as_deref() != Some(ProxyMode::FollowSystem.as_str()) {
+        return Ok(None);
+    }
+    let system = crate::system_proxy::try_resolve()
+        .ok_or_else(|| anyhow::anyhow!("could not refresh system proxy settings"))?;
+    Ok(Some(follow_system_config(startup_env(), &system)))
+}
+
+fn follow_system_config(
+    snapshot: &ProxyEnvSnapshot,
+    system: &crate::system_proxy::SystemProxy,
+) -> ProxyConfig {
+    let resolved = follow_system_env(snapshot, system);
+    ProxyConfig {
+        mode: ProxyMode::FollowSystem,
+        no_proxy: bypass_for(&resolved),
+        http: resolved.http,
+        https: resolved.https,
+        all: resolved.all,
+    }
+}
+
 /// Hosts that must never be reached through a proxy, whatever the user or the OS asked for.
 ///
 /// A proxy resolves `127.0.0.1` against ITSELF, so proxying loopback either fails outright or —
@@ -308,6 +337,40 @@ pub fn apply_process_proxy_config(cfg: &ProxyConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn follow_system_refresh_observes_os_changes_without_retaining_old_proxy() {
+        let snapshot = ProxyEnvSnapshot::default();
+        let on = crate::system_proxy::SystemProxy {
+            https: Some("http://127.0.0.1:7890".into()),
+            ..Default::default()
+        };
+        assert_eq!(follow_system_config(&snapshot, &on).https, on.https);
+        let off = follow_system_config(&snapshot, &crate::system_proxy::SystemProxy::default());
+        assert!(off.https.is_none());
+        assert!(off.no_proxy.is_none());
+        assert_eq!(follow_system_config(&snapshot, &on).https, on.https);
+    }
+
+    #[test]
+    fn follow_system_refresh_keeps_startup_env_precedence_and_local_bypass() {
+        let snapshot = ProxyEnvSnapshot {
+            all: Some("http://proxy.corp:8080".into()),
+            no_proxy: Some("*.corp".into()),
+            ..Default::default()
+        };
+        let sys = crate::system_proxy::SystemProxy {
+            https: Some("http://127.0.0.1:7890".into()),
+            ..Default::default()
+        };
+        let cfg = follow_system_config(&snapshot, &sys);
+        assert!(cfg.https.is_none());
+        assert_eq!(cfg.all, snapshot.all);
+        assert_eq!(
+            cfg.no_proxy.as_deref(),
+            Some("*.corp,localhost,127.0.0.1,::1")
+        );
+    }
 
     #[test]
     fn proxy_config_is_read_from_this_distribution_not_a_hardcoded_one() {

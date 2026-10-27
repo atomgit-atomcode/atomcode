@@ -263,10 +263,18 @@ impl View for Todo {
         // rect — it counts the header itself, so handing it the full height
         // would push one item below the fold to make room for a blank row.
         let budget = (vp.rect.h as usize).saturating_sub(margin);
+        let compact_rows = compact(items, budget);
+        // A disclosure hint promises more content. Do not advertise it when
+        // the compact panel already shows every item (including completed ones).
+        let can_expand = compact_rows
+            .iter()
+            .filter(|row| matches!(row, Row::Item { .. }))
+            .count()
+            < items.len();
         let rows = if vp.moment.todo_expanded {
             expanded(items, budget, vp.moment.todo_offset)
         } else {
-            compact(items, budget)
+            compact_rows
         };
         let (completed, in_progress, total) = todo_counts(items);
         let open = total.saturating_sub(completed + in_progress);
@@ -314,14 +322,18 @@ impl View for Todo {
                     counts,
                 ),
                 El::styled(
-                    format!(
-                        " · {}",
-                        crate::i18n::product::t(if vp.moment.todo_expanded {
-                            crate::i18n::product::Msg::LidCollapseHint
-                        } else {
-                            crate::i18n::product::Msg::LidExpandHint
-                        })
-                    ),
+                    if can_expand {
+                        format!(
+                            " · {}",
+                            crate::i18n::product::t(if vp.moment.todo_expanded {
+                                crate::i18n::product::Msg::LidCollapseHint
+                            } else {
+                                crate::i18n::product::Msg::LidExpandHint
+                            })
+                        )
+                    } else {
+                        String::new()
+                    },
                     counts,
                 ),
             ])
@@ -616,6 +628,44 @@ mod tests {
         let full = Todo::render(&state, &Viewport::new(Rect::sized(100, 10), &expanded));
         assert!(full.iter().any(|line| line.plain().contains("done")));
         assert!(full.iter().any(|line| line.plain().contains("last")));
+    }
+
+    #[test]
+    fn disclosure_hint_only_appears_when_compact_view_hides_items() {
+        let _locale = crate::i18n::test_lock();
+        for count in [3, 4, 5] {
+            let todos: Vec<_> = (0..count)
+                .map(|i| {
+                    serde_json::json!({
+                        "content": format!("task {i}"), "status": "pending"
+                    })
+                })
+                .collect();
+            let state = fold(&[plan(&serde_json::json!({"todos": todos}).to_string())]);
+            for expanded in [false, true] {
+                let moment = Moment {
+                    todo_expanded: expanded,
+                    ..Moment::default()
+                };
+                let rows = Todo::render(&state, &Viewport::new(Rect::sized(100, 10), &moment));
+                let hint = crate::i18n::product::t(if expanded {
+                    crate::i18n::product::Msg::LidCollapseHint
+                } else {
+                    crate::i18n::product::Msg::LidExpandHint
+                });
+                assert_eq!(
+                    rows.iter().any(|row| row.plain().contains(hint.as_ref())),
+                    count > 4
+                );
+            }
+        }
+        let state = fold(&[plan(
+            r#"{"todos":[{"content":"done","status":"completed"},{"content":"next","status":"pending"}]}"#,
+        )]);
+        let moment = Moment::default();
+        let rows = Todo::render(&state, &Viewport::new(Rect::sized(100, 10), &moment));
+        let hint = crate::i18n::product::t(crate::i18n::product::Msg::LidExpandHint);
+        assert!(rows.iter().any(|row| row.plain().contains(hint.as_ref())));
     }
 
     #[test]

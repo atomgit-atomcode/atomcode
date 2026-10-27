@@ -23,6 +23,7 @@ enum Scenario {
     Waiting,
     Cancel,
     Error,
+    Reconcile,
 }
 
 struct Script {
@@ -83,10 +84,17 @@ impl LlmProvider for Script {
                 StreamEvent::TextDelta("Which branch should I verify?".into())
             }
             2 => StreamEvent::TextDelta("This function parses the input.".into()),
+            3 if matches!(self.scenario, Scenario::Reconcile) => todo(
+                "waiting",
+                r#"{"action":"update","id":1,"status":"pending"}"#,
+            ),
             3 => todo(
                 "verified",
                 r#"{"action":"update","id":1,"status":"completed"}"#,
             ),
+            _ if matches!(self.scenario, Scenario::Reconcile) => {
+                StreamEvent::TextDelta("The remaining step needs a user decision.".into())
+            }
             _ => StreamEvent::TextDelta("Verified.".into()),
         };
         Ok(Box::pin(futures::stream::iter([
@@ -219,6 +227,30 @@ async fn answering_a_steering_question_continues_in_the_same_turn() {
 async fn a_task_waiting_for_an_answer_does_not_continue_itself() {
     let (script, _, _) = run(Scenario::Waiting).await;
     assert_eq!(script.requests.lock().unwrap().len(), 2);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn reconciling_an_open_plan_does_not_restart_the_turn_again() {
+    let (script, events, messages) = run(Scenario::Reconcile).await;
+    assert_eq!(
+        script.requests.lock().unwrap().len(),
+        4,
+        "plan, answer, one reconciliation reminder, then stop"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, CodingRuntimeEvent::TurnFinished(_)))
+            .count(),
+        1
+    );
+    let todos = derive_current_todos(&messages);
+    assert_eq!(todos.len(), 1);
+    assert_eq!(
+        todos[0].status,
+        TodoStatus::Pending,
+        "waiting work must not be falsely completed or erased"
+    );
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]

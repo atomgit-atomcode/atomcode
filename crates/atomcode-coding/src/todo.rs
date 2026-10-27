@@ -372,8 +372,10 @@ fn current_execution_start(convo: &Conversation) -> usize {
 const MAX_COMPLETION_NUDGES: usize = 3;
 
 /// Whether this turn may be nudged again: under [`MAX_COMPLETION_NUDGES`], and — when it
-/// was nudged already — only if the model called a tool since. A nudge answered with more
-/// talk is a model that means to stop, and asking again would only spin.
+/// was nudged already — only if the model called a non-todo tool since. Reconciling the
+/// list is the requested bookkeeping, not new work that earns another reminder. Otherwise
+/// each status update can rearm the nudge and turn a design discussion into more work.
+/// A nudge answered with more talk likewise must not spin.
 ///
 /// It used to be once per turn. A long turn spent that early, and when the model later
 /// ended a reply on the step it was about to take ("运行测试：") without taking it, the turn
@@ -394,9 +396,9 @@ fn completion_nudge_allowed(convo: &Conversation) -> bool {
     match nudges.last() {
         None => true,
         Some(_) if nudges.len() >= MAX_COMPLETION_NUDGES => false,
-        Some(&last) => turn[last + 1..]
-            .iter()
-            .any(|m| m.role == Role::Assistant && !m.tool_calls.is_empty()),
+        Some(&last) => turn[last + 1..].iter().any(|m| {
+            m.role == Role::Assistant && m.tool_calls.iter().any(|call| !is_todo_call(&call.name))
+        }),
     }
 }
 
@@ -1567,6 +1569,62 @@ mod tests {
                 .is_none(),
             "nudged, and nothing was done since → let it stop (no spin)"
         );
+    }
+
+    #[tokio::test]
+    async fn only_reconciling_the_list_does_not_rearm_the_completion_nudge() {
+        for name in ["todo", "todowrite"] {
+            for arguments in [
+                r#"{"action":"update","id":1,"status":"pending"}"#,
+                r#"{"todos":[{"content":"waiting for a decision","status":"pending"}]}"#,
+            ] {
+                let convo = convo_of(vec![
+                    Message::user("discuss the design"),
+                    todowrite_msg(
+                        r#"{"todos":[{"content":"waiting for a decision","status":"pending"}]}"#,
+                    ),
+                    Message::assistant("waiting for a decision", vec![]),
+                    Message::synthetic_user(TODO_COMPLETION_NUDGE),
+                    Message::assistant(
+                        "",
+                        vec![ToolCall {
+                            id: "reconcile".into(),
+                            name: name.into(),
+                            arguments: arguments.into(),
+                        }],
+                    ),
+                    Message::assistant("the remaining decision needs user input", vec![]),
+                ]);
+                assert!(
+                    TodoHook::default()
+                        .offer_continuation(&convo)
+                        .await
+                        .is_none(),
+                    "list maintenance alone must not trigger another nudge: {name} {arguments}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn other_tool_work_still_rearms_after_a_list_update_in_the_same_batch() {
+        let mut work = worked();
+        work.tool_calls.push(ToolCall {
+            id: "update".into(),
+            name: "todowrite".into(),
+            arguments: r#"{"action":"update","id":1,"status":"in_progress"}"#.into(),
+        });
+        let convo = convo_of(vec![
+            Message::user("do it"),
+            todowrite_msg(r#"{"todos":[{"content":"a","status":"in_progress"}]}"#),
+            Message::synthetic_user(TODO_COMPLETION_NUDGE),
+            work,
+            Message::assistant("next step", vec![]),
+        ]);
+        assert!(TodoHook::default()
+            .offer_continuation(&convo)
+            .await
+            .is_some());
     }
 
     /// A tool call made between two stops: the work the model did after a nudge.

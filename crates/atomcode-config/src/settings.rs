@@ -105,6 +105,27 @@ const MODE_SWITCH_KEYS: &[&str] = &["shift_tab", "tab"];
 const SCROLLBARS: &[&str] = &["auto", "always", "hidden"];
 
 pub static SETTINGS: &[SettingSpec] = &[
+    SettingSpec {
+        id: "permissions.default_mode",
+        path: &["permissions", "default_mode"],
+        label_en: "Default execution mode (new runtime)",
+        label_zh: "默认执行模式（下次启动生效）",
+        aliases: &["mode", "permissions", "模式", "权限"],
+        kind: SettingKind::Choice(&["build", "plan", "accept-edits", "auto"]),
+        apply: ApplyPolicy::NextStartup,
+    },
+    SettingSpec {
+        id: "compaction.token_limit",
+        path: &["compaction", "token_limit"],
+        label_en: "Automatic compaction token budget",
+        label_zh: "自动压缩 token 预算",
+        aliases: &["context", "compact", "上下文"],
+        kind: SettingKind::Integer {
+            min: 1,
+            max: 4_294_967_295,
+        },
+        apply: ApplyPolicy::AgentReassemble,
+    },
     bool_setting(
         "auto_update",
         &["auto_update"],
@@ -181,6 +202,14 @@ pub static SETTINGS: &[SettingSpec] = &[
         "Todo tool",
         "Todo 工具",
         &["task list"],
+        ApplyPolicy::CapabilityReprepare,
+    ),
+    bool_setting(
+        "tools.atomgit.tool_search",
+        &["tools", "atomgit", "tool_search"],
+        "AtomGit tool schema search",
+        "AtomGit 工具 schema 按需加载",
+        &["lazy", "schema", "builtin_search"],
         ApplyPolicy::CapabilityReprepare,
     ),
     bool_setting(
@@ -506,6 +535,17 @@ impl SettingSpec {
 
     pub fn value(&self, config: &Config) -> String {
         match self.id {
+            "permissions.default_mode" => config
+                .permissions
+                .default_mode
+                .map(|mode| mode.as_str())
+                .unwrap_or("build")
+                .to_string(),
+            "compaction.token_limit" => config
+                .compaction
+                .token_limit
+                .map(|limit| limit.to_string())
+                .unwrap_or_default(),
             "auto_update" => config.auto_update.to_string(),
             "keep_interrupted_context" => config.keep_interrupted_context.to_string(),
             "tools.search.respect_gitignore" => config.tools.search.respect_gitignore.to_string(),
@@ -515,6 +555,7 @@ impl SettingSpec {
             "tools.search.max_entries" => config.tools.search.max_entries.to_string(),
             "tools.mcp.tool_search" => format!("{:?}", config.tools.mcp.tool_search).to_lowercase(),
             "tools.todo.enabled" => config.tools.todo.enabled.to_string(),
+            "tools.atomgit.tool_search" => config.tools.atomgit.tool_search.to_string(),
             "tools.atomgit.enabled" => config.tools.atomgit.enabled.to_string(),
             "tools.todo.eager" => format!("{:?}", config.tools.todo.eager).to_lowercase(),
             "coding.max_rounds" => config.coding.max_rounds.to_string(),
@@ -784,7 +825,88 @@ pub fn patch_selection_retry_max_attempts(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn default_mode_setting_preserves_rules_and_can_be_reset() {
+        let spec = super::SETTINGS
+            .iter()
+            .find(|s| s.id == "permissions.default_mode")
+            .unwrap();
+        assert_eq!(spec.apply, super::ApplyPolicy::NextStartup);
+        let mut doc = "[permissions]\nallow = [\"Read(src/**)\"]\ndeny = [\"Bash(rm *)\"]\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        for mode in ["build", "plan", "accept-edits", "auto"] {
+            spec.patch(&mut doc, mode).unwrap();
+            let config: crate::Config = toml::from_str(&doc.to_string()).unwrap();
+            assert_eq!(spec.value(&config), mode);
+            assert_eq!(config.permissions.deny, ["Bash(rm *)"]);
+        }
+        let before = doc.to_string();
+        assert!(spec.patch(&mut doc, "typo").is_err());
+        assert_eq!(doc.to_string(), before);
+        spec.reset(&mut doc);
+        let config: crate::Config = toml::from_str(&doc.to_string()).unwrap();
+        assert_eq!(spec.value(&config), "build");
+        assert_eq!(config.permissions.allow, ["Read(src/**)"]);
+        assert!(config.permissions.default_mode.is_none());
+    }
+
     use super::*;
+    #[test]
+    fn compaction_budget_is_optional_positive_and_resettable() {
+        let setting = SETTINGS
+            .iter()
+            .find(|s| s.id == "compaction.token_limit")
+            .unwrap();
+        let mut document = "# preserve\n".parse::<DocumentMut>().unwrap();
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(setting.value(&config), "");
+        assert!(!toml::to_string(&config).unwrap().contains("[compaction]"));
+        setting.patch(&mut document, "200000").unwrap();
+        let config: Config = toml::from_str(&document.to_string()).unwrap();
+        assert_eq!(setting.value(&config), "200000");
+        let restored: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(restored.compaction, config.compaction);
+        for invalid in ["0", "-1", "4294967296"] {
+            assert!(setting.patch(&mut document, invalid).is_err());
+            assert!(
+                toml::from_str::<Config>(&format!("[compaction]\ntoken_limit={invalid}")).is_err()
+            );
+        }
+        setting.patch(&mut document, "").unwrap();
+        let config: Config = toml::from_str(&document.to_string()).unwrap();
+        assert!(config.compaction.token_limit.is_none());
+        assert!(document.to_string().contains("# preserve"));
+    }
+
+    #[test]
+    fn atomgit_schema_search_defaults_on_and_can_be_reset() {
+        let setting = SETTINGS
+            .iter()
+            .find(|s| s.id == "tools.atomgit.tool_search")
+            .unwrap();
+        assert_eq!(setting.apply, ApplyPolicy::CapabilityReprepare);
+        for text in ["", "[tools.atomgit]", "[tools.atomgit]\nenabled=false"] {
+            let config: Config = toml::from_str(text).unwrap();
+            assert_eq!(setting.value(&config), "true");
+        }
+        let mut document = "# keep\n".parse::<DocumentMut>().unwrap();
+        setting.patch(&mut document, "false").unwrap();
+        let config: Config = toml::from_str(&document.to_string()).unwrap();
+        assert!(!config.tools.atomgit.tool_search);
+        assert!(config.tools.atomgit.enabled);
+        let restored: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert!(!restored.tools.atomgit.tool_search);
+        setting.reset(&mut document);
+        assert!(
+            toml::from_str::<Config>(&document.to_string())
+                .unwrap()
+                .tools
+                .atomgit
+                .tool_search
+        );
+        assert!(document.to_string().contains("# keep"));
+    }
 
     #[test]
     fn mcp_schema_search_is_editable_and_defaults_to_on() {
@@ -828,20 +950,32 @@ mod tests {
     /// that alias read as a credential leak and failed the suite.
     ///
     /// So: identity is checked against every word, search text only against the ones that name
-    /// a secret's VALUE. No setting needs "api_key" or "token" to be discoverable — those
-    /// appearing in a label means a secret is being edited here, whatever the id says.
+    /// a secret's VALUE. The one explicitly typed, positive context token budget
+    /// is not a credential; it may say "token" but never "api_key" or "apikey".
     #[test]
     fn catalog_excludes_provider_model_and_credentials() {
         const SECRET_VALUE_WORDS: &[&str] = &["api_key", "apikey", "token"];
         const CONCEPT_WORDS: &[&str] = &["provider", "model", "credential"];
 
         for setting in SETTINGS {
+            let public_budget = setting.id == "compaction.token_limit"
+                && setting.path == ["compaction", "token_limit"]
+                && matches!(
+                    setting.kind,
+                    SettingKind::Integer {
+                        min: 1,
+                        max: 4_294_967_295
+                    }
+                );
             let identity = std::iter::once(setting.id)
                 .chain(setting.path.iter().copied())
                 .collect::<Vec<_>>()
                 .join(".")
                 .to_lowercase();
             for forbidden in SECRET_VALUE_WORDS.iter().chain(CONCEPT_WORDS) {
+                if *forbidden == "token" && public_budget {
+                    continue;
+                }
                 assert!(
                     !identity.contains(forbidden),
                     "{} is a {forbidden} setting; it does not belong in the generic catalog",
@@ -856,6 +990,9 @@ mod tests {
                 .join(".")
                 .to_lowercase();
             for forbidden in SECRET_VALUE_WORDS {
+                if *forbidden == "token" && public_budget {
+                    continue;
+                }
                 assert!(
                     !search_text.contains(forbidden),
                     "{} surfaces {forbidden} in its label or aliases",

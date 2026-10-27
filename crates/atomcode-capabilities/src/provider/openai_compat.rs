@@ -371,13 +371,14 @@ impl OpenAiCompatProvider {
         let initial_tls12 = atomcode_config::tls::should_cap_url(&url);
         let custom_headers = !cfg.headers.is_empty();
         let client = std::sync::Arc::new(
-            SwappableClient::new(initial_tls12, move |tls12| {
-                build_account_http_client(
+            SwappableClient::new_with_proxy(initial_tls12, move |tls12, proxy| {
+                build_account_http_client_with_proxy(
                     connect_timeout,
                     skip_tls_verify,
                     user_agent.clone(),
                     tls12,
                     custom_headers,
+                    proxy,
                 )
             })?
             .with_headers(cfg.headers.clone()),
@@ -414,12 +415,31 @@ pub(crate) fn build_http_client(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn build_account_http_client(
     connect_timeout: std::time::Duration,
     skip_tls_verify: bool,
     user_agent: Option<String>,
     force_tls12: bool,
     custom_headers: bool,
+) -> Result<reqwest::Client, ProviderError> {
+    build_account_http_client_with_proxy(
+        connect_timeout,
+        skip_tls_verify,
+        user_agent,
+        force_tls12,
+        custom_headers,
+        None,
+    )
+}
+
+pub(crate) fn build_account_http_client_with_proxy(
+    connect_timeout: std::time::Duration,
+    skip_tls_verify: bool,
+    user_agent: Option<String>,
+    force_tls12: bool,
+    custom_headers: bool,
+    proxy: Option<&atomcode_config::proxy::ProxyConfig>,
 ) -> Result<reqwest::Client, ProviderError> {
     // First attempt: webpki base + OS native store + SSL_CERT_FILE (add_trusted_roots).
     match build_http_client_inner(
@@ -429,6 +449,7 @@ pub(crate) fn build_account_http_client(
         force_tls12,
         true,
         custom_headers,
+        proxy,
     ) {
         Ok(client) => Ok(client),
         Err(first) => {
@@ -451,6 +472,7 @@ pub(crate) fn build_account_http_client(
                 force_tls12,
                 false,
                 custom_headers,
+                proxy,
             )
         }
     }
@@ -466,22 +488,26 @@ fn build_http_client_inner(
     force_tls12: bool,
     trust_os_roots: bool,
     custom_headers: bool,
+    proxy: Option<&atomcode_config::proxy::ProxyConfig>,
 ) -> Result<reqwest::Client, ProviderError> {
-    let mut builder = crate::proxy::apply_async_proxy_policy(reqwest::Client::builder())
-        .redirect(if custom_headers {
-            reqwest::redirect::Policy::none()
-        } else {
-            reqwest::redirect::Policy::default()
-        })
-        .connect_timeout(connect_timeout)
-        // Drop idle keep-alive connections before the gateway LB does, so
-        // we don't reuse a server-closed socket (the "error sending
-        // request" / ConnectionReset class). See POOL_IDLE_TIMEOUT.
-        .pool_idle_timeout(retry::POOL_IDLE_TIMEOUT)
-        // Product UA so the gateway can attribute/slice traffic by version
-        // (parity with core's `build_http_client`). Driver injects the real
-        // `atomcode/<version>`; bare fallback when unset.
-        .user_agent(user_agent.as_deref().unwrap_or(super::DEFAULT_USER_AGENT));
+    let mut builder = super::auto_proxy::apply(
+        crate::proxy::apply_async_proxy_policy(reqwest::Client::builder()),
+        proxy,
+    )?
+    .redirect(if custom_headers {
+        reqwest::redirect::Policy::none()
+    } else {
+        reqwest::redirect::Policy::default()
+    })
+    .connect_timeout(connect_timeout)
+    // Drop idle keep-alive connections before the gateway LB does, so
+    // we don't reuse a server-closed socket (the "error sending
+    // request" / ConnectionReset class). See POOL_IDLE_TIMEOUT.
+    .pool_idle_timeout(retry::POOL_IDLE_TIMEOUT)
+    // Product UA so the gateway can attribute/slice traffic by version
+    // (parity with core's `build_http_client`). Driver injects the real
+    // `atomcode/<version>`; bare fallback when unset.
+    .user_agent(user_agent.as_deref().unwrap_or(super::DEFAULT_USER_AGENT));
     if force_tls12 {
         builder = builder.max_tls_version(reqwest::tls::Version::TLS_1_2);
     }
@@ -579,17 +605,29 @@ pub(crate) fn add_trusted_roots(mut builder: reqwest::ClientBuilder) -> reqwest:
     builder
 }
 
-/// An HTTP client held behind a rebuild seam. `get()` hands out the current client
-/// (cheap: `reqwest::Client` is `Arc` inside); `rebuild()` constructs a fresh client
+/// An HTTP client held behind a rebuild seam. `for_request()` refreshes automatic
+/// proxy routing; `rebuild()` constructs a fresh client with that same route
 /// — hence a brand-new, EMPTY connection pool — and atomically swaps it in. This is
 /// the automatic form of the manual `/login` remedy for the "poisoned pool" failure:
 /// once a keep-alive connection is silently half-closed, only a fresh pool recovers,
 /// because every reuse of the old pool re-hands-out the dead socket.
 pub(crate) struct SwappableClient {
     pub(crate) headers: atomcode_config::provider_headers::ProviderHeaders,
-    current: std::sync::RwLock<(reqwest::Client, bool)>,
+    current: std::sync::RwLock<(
+        reqwest::Client,
+        bool,
+        Option<atomcode_config::proxy::ProxyConfig>,
+    )>,
+    refresh: tokio::sync::Mutex<()>,
     #[allow(clippy::type_complexity)]
-    build: Box<dyn Fn(bool) -> Result<reqwest::Client, ProviderError> + Send + Sync>,
+    build: Box<
+        dyn Fn(
+                bool,
+                Option<&atomcode_config::proxy::ProxyConfig>,
+            ) -> Result<reqwest::Client, ProviderError>
+            + Send
+            + Sync,
+    >,
 }
 
 impl SwappableClient {
@@ -601,14 +639,29 @@ impl SwappableClient {
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn new(
         force_tls12: bool,
         build: impl Fn(bool) -> Result<reqwest::Client, ProviderError> + Send + Sync + 'static,
     ) -> Result<Self, ProviderError> {
-        let initial = build(force_tls12)?;
+        Self::new_with_proxy(force_tls12, move |tls12, _| build(tls12))
+    }
+
+    pub(crate) fn new_with_proxy(
+        force_tls12: bool,
+        build: impl Fn(
+                bool,
+                Option<&atomcode_config::proxy::ProxyConfig>,
+            ) -> Result<reqwest::Client, ProviderError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Result<Self, ProviderError> {
+        let initial = build(force_tls12, None)?;
         Ok(Self {
             headers: Default::default(),
-            current: std::sync::RwLock::new((initial, force_tls12)),
+            current: std::sync::RwLock::new((initial, force_tls12, None)),
+            refresh: tokio::sync::Mutex::new(()),
             build: Box::new(build),
         })
     }
@@ -617,12 +670,52 @@ impl SwappableClient {
     /// the guarded `reqwest::Client` is ALWAYS a valid client, so a lock poisoned by an
     /// unrelated panic must not turn every subsequent request into a hard panic — that would
     /// re-create the exact "wedged until restart" failure this seam exists to prevent.
+    #[cfg(test)]
     pub(crate) fn get(&self) -> reqwest::Client {
         self.current
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .0
             .clone()
+    }
+
+    /// Refresh before an existing OPEN attempt, never by replaying the turn or
+    /// allocating another retry. Cancellation drops this future; the blocking
+    /// resolver only returns data and cannot later mutate this client.
+    pub(crate) async fn for_request(&self) -> Result<reqwest::Client, ProviderError> {
+        self.for_request_with(super::auto_proxy::for_request())
+            .await
+    }
+
+    async fn for_request_with(
+        &self,
+        refresh: impl std::future::Future<
+            Output = Result<Option<atomcode_config::proxy::ProxyConfig>, ProviderError>,
+        >,
+    ) -> Result<reqwest::Client, ProviderError> {
+        let _refresh = self.refresh.lock().await;
+        let proxy = refresh.await?;
+        self.with_proxy(proxy)
+    }
+
+    fn with_proxy(
+        &self,
+        proxy: Option<atomcode_config::proxy::ProxyConfig>,
+    ) -> Result<reqwest::Client, ProviderError> {
+        let mut current = self.current.write().unwrap_or_else(|p| p.into_inner());
+        if current.2 != proxy {
+            let fresh = (self.build)(current.1, proxy.as_ref())?;
+            if proxy
+                .as_ref()
+                .is_some_and(|cfg| cfg.http.is_none() && cfg.https.is_none())
+            {
+                tracing::info!("代理路由已更新，正在直连（本地代理恢复后会自动重新使用）");
+            } else {
+                tracing::info!("network proxy route refreshed; connection pool rebuilt");
+            }
+            *current = (fresh, current.1, proxy);
+        }
+        Ok(current.0.clone())
     }
 
     pub(crate) fn is_tls12(&self) -> bool {
@@ -632,8 +725,10 @@ impl SwappableClient {
     /// Rebuild with a fresh (empty) pool and swap it in. On failure the old
     /// client remains valid, but the caller receives the build error explicitly.
     pub(crate) fn rebuild(&self, force_tls12: bool) -> Result<reqwest::Client, ProviderError> {
-        let fresh = (self.build)(force_tls12)?;
-        *self.current.write().unwrap_or_else(|p| p.into_inner()) = (fresh.clone(), force_tls12);
+        let mut current = self.current.write().unwrap_or_else(|p| p.into_inner());
+        let fresh = (self.build)(force_tls12, current.2.as_ref())?;
+        current.0 = fresh.clone();
+        current.1 = force_tls12;
         Ok(fresh)
     }
 }
@@ -825,7 +920,7 @@ impl LlmProvider for OpenAiCompatProvider {
                             // Do not replay here: partial deltas may already be visible.
                             // The owner can continue from preserved safe progress.
                             request_span.in_scope(|| tracing::warn!(error_origin = "stream_watchdog", stream_attempt, had_replay_sensitive_output = emitted_replay_sensitive, "provider stream diagnostic"));
-                            let mut error = retry::stream_idle_error();
+                            let mut error = retry::stream_idle_error(&watchdog);
                             error.retryable = caller_recovers && !emitted_replay_sensitive;
                             yield StreamEvent::Error(error);
                             return;
@@ -1171,7 +1266,7 @@ async fn open_stream_attempts(
         first_wire_attempt = false;
         // Take the CURRENT client each attempt: a transport-error retry below
         // rebuilds it, so the retried attempt gets a fresh (empty) pool.
-        let http = client.get();
+        let http = client.for_request().await?;
         let mut req = http
             .post(url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -3318,6 +3413,142 @@ mod tests {
     }
 
     // ---- request building ----
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn auto_proxy_cancelled_refresh_cannot_replace_client_later() {
+        let client = std::sync::Arc::new(
+            SwappableClient::new_with_proxy(false, |_, _| {
+                Ok(reqwest::Client::builder().no_proxy().build().unwrap())
+            })
+            .unwrap(),
+        );
+        let (started, waiting) = tokio::sync::oneshot::channel();
+        let (complete, result) = tokio::sync::oneshot::channel();
+        let pending_client = client.clone();
+        let request = tokio::spawn(async move {
+            pending_client
+                .for_request_with(async move {
+                    started.send(()).unwrap();
+                    result.await.unwrap()
+                })
+                .await
+        });
+        waiting.await.unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert!(complete.send(Ok(Some(Default::default()))).is_err());
+        assert!(client.current.read().unwrap().2.is_none());
+        // The cancelled request must also release the refresh lock.
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            client.for_request_with(async { Ok(Some(Default::default())) }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(client.current.read().unwrap().2.is_some());
+    }
+
+    #[test]
+    fn auto_proxy_route_changes_rebuild_once_and_transport_rebuild_keeps_route() {
+        use atomcode_config::proxy::ProxyConfig;
+        let builds = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = builds.clone();
+        let client = SwappableClient::new_with_proxy(true, move |tls12, cfg| {
+            captured.lock().unwrap().push((tls12, cfg.cloned()));
+            Ok(reqwest::Client::builder().no_proxy().build().unwrap())
+        })
+        .unwrap();
+        let cfg = Some(ProxyConfig::default());
+        client.with_proxy(cfg.clone()).unwrap();
+        client.with_proxy(cfg.clone()).unwrap();
+        assert_eq!(
+            builds.lock().unwrap().len(),
+            2,
+            "same route keeps the connection pool"
+        );
+        client.rebuild(true).unwrap();
+        assert_eq!(builds.lock().unwrap().last(), Some(&(true, cfg.clone())));
+        assert!(client.is_tls12());
+        client.with_proxy(None).unwrap();
+        assert_eq!(builds.lock().unwrap().last(), Some(&(true, None)));
+    }
+
+    #[test]
+    fn auto_proxy_failed_refresh_keeps_old_client_and_route() {
+        let client = SwappableClient::new_with_proxy(false, |_, cfg| {
+            if cfg.is_some() {
+                Err(ProviderError {
+                    message: "route build failed".into(),
+                    ..Default::default()
+                })
+            } else {
+                Ok(reqwest::Client::builder().no_proxy().build().unwrap())
+            }
+        })
+        .unwrap();
+        let error = client.with_proxy(Some(Default::default())).unwrap_err();
+        assert_eq!(error.message, "route build failed");
+        assert!(client.current.read().unwrap().2.is_none());
+        client.rebuild(false).unwrap();
+    }
+
+    // Real sockets are required to prove route selection (not a virtual-clock test).
+    #[tokio::test]
+    async fn auto_proxy_requests_switch_to_direct_then_back_and_honor_no_proxy() {
+        use atomcode_config::proxy::ProxyConfig;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let origin = MockServer::start().await;
+        let proxy = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200).set_body_string("direct"))
+            .mount(&origin)
+            .await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200).set_body_string("proxied"))
+            .mount(&proxy)
+            .await;
+        let client = SwappableClient::new_with_proxy(false, |_, cfg| {
+            super::super::auto_proxy::apply(reqwest::Client::builder().no_proxy(), cfg)?
+                .build()
+                .map_err(|_| ProviderError {
+                    message: "build failed".into(),
+                    ..Default::default()
+                })
+        })
+        .unwrap();
+        let configured = ProxyConfig {
+            http: Some(proxy.uri()),
+            https: Some(proxy.uri()),
+            ..Default::default()
+        };
+        for (cfg, expected) in [
+            (configured.clone(), "proxied"),
+            (ProxyConfig::default(), "direct"),
+            (configured.clone(), "proxied"),
+            (
+                ProxyConfig {
+                    no_proxy: Some("127.0.0.1".into()),
+                    ..configured
+                },
+                "direct",
+            ),
+        ] {
+            let http = client.with_proxy(Some(cfg)).unwrap();
+            assert_eq!(
+                http.get(origin.uri())
+                    .send()
+                    .await
+                    .unwrap()
+                    .text()
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
+        assert_eq!(proxy.received_requests().await.unwrap().len(), 2);
+        assert_eq!(origin.received_requests().await.unwrap().len(), 2);
+    }
 
     #[test]
     fn format_messages_maps_roles_and_tool_result() {

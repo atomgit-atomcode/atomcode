@@ -219,7 +219,10 @@ export function reasoningEditBody(r: ReasoningDraft): {
  * form or the account. A row the person already tuned is left as it is. */
 export function adoptPicked(
   current: ModelDraft[],
-  picked: { id: string; name?: string; context_window?: number; max_tokens?: number }[],
+  picked: {
+    id: string; name?: string; context_window?: number; max_tokens?: number;
+    supports_vision?: boolean; reasoning_effort_levels?: string[]; reasoning_effort?: string;
+  }[],
   existing: string[] = [],
 ): ModelDraft[] {
   const have = new Set([...existing, ...current.map((m) => m.model.trim()).filter(Boolean)]);
@@ -232,6 +235,18 @@ export function adoptPicked(
       displayName: p.name && p.name !== p.id ? p.name : '',
       window: p.context_window ? formatTokens(p.context_window) : '',
       maxTokens: p.max_tokens ? formatTokens(p.max_tokens) : '',
+      vision: p.supports_vision ?? null,
+      reasoning: {
+        enabled: !!p.reasoning_effort_levels?.length,
+        levels: p.reasoning_effort_levels ?? [],
+        effort: p.reasoning_effort_levels?.includes(p.reasoning_effort ?? '') ? p.reasoning_effort! : null,
+      },
     }));
   return [...kept, ...added];
+}
+
+/** The actual service host beside a provider name; exclude paths and credentials. */
+export function providerHost(endpoint?: string | null): string {
+  if (!endpoint) return '';
+  try { return new URL(endpoint).host; } catch { return ''; }
 }

@@ -30,7 +30,9 @@
 //! the host was asked to say for a moment, with the reading it expires at
 //! travelling alongside it — and, when nothing is being said, the offer of a
 //! picture on the clipboard ([`Moment::clipboard_caption`](crate::moment::Moment::clipboard_caption)),
-//! which is the same kind of thing: something the person could do next. So the
+//! which is the same kind of thing: something the person could do next. A host
+//! restart reminder also lives here, below transient notices and waiting work,
+//! so it never competes with model/directory/context on the status row. So the
 //! state below stays empty and every tip is read off the moment, the way the
 //! live line reads its clock.
 
@@ -88,6 +90,12 @@ impl View for Tip {
             // this one; drawing it here would put it above the box and double it
             // up with the row below.
             .filter(|n| !n.below && n.is_live(vp.moment.now));
+        let restart = vp
+            .moment
+            .restart_hint
+            .as_deref()
+            .filter(|_| vp.moment.secret.is_none());
+        let quiet = live.is_none() && vp.moment.bg.waiting_caption().is_none();
         let (text, role) = match live {
             Some(n) if n.refused => (n.text.clone(), Role::Error),
             Some(n) => (n.text.clone(), Role::Muted),
@@ -121,7 +129,7 @@ impl View for Tip {
         // rename pill's position on the input rule. Preserve a tip on the left.
         if vp.moment.secret.is_none() {
             if let Some(goal) = vp.moment.autonomy.as_ref().filter(|a| a.kind == "goal") {
-                let (mut label, badge_role) = if goal.paused.is_some() && !goal.recovering {
+                let (mut label, mut badge_role) = if goal.paused.is_some() && !goal.recovering {
                     ("Goal paused · /goal report".to_owned(), Role::Warning)
                 } else if goal.recovering {
                     let elapsed = vp
@@ -153,10 +161,10 @@ impl View for Tip {
                 } else {
                     ("Goal active".to_owned(), Role::Accent)
                 };
-                let text = if text.is_empty() && !goal.recovering {
-                    goal.paused.as_deref().unwrap_or(&text)
+                let mut text = if text.is_empty() && !goal.recovering {
+                    goal.paused.as_deref().unwrap_or(&text).to_owned()
                 } else {
-                    &text
+                    text.clone()
                 };
                 let available = w.saturating_sub(1) as usize;
                 if crate::width::str_width(&label) > available {
@@ -168,6 +176,22 @@ impl View for Tip {
                         "Goal active"
                     }
                     .to_owned();
+                }
+                // A quiet, wide row can keep goal state on the left and the
+                // restart reminder on the right. Narrow rows preserve the goal.
+                if quiet {
+                    if let Some(hint) = restart.filter(|hint| {
+                        crate::width::str_width(hint) + crate::width::str_width(&label) + 1
+                            <= available
+                    }) {
+                        text = if text.is_empty() {
+                            label
+                        } else {
+                            format!("{label} · {text}")
+                        };
+                        label = hint.to_owned();
+                        badge_role = Role::Muted;
+                    }
                 }
                 let badge_width = crate::width::str_width(&label);
                 if available >= badge_width {
@@ -184,6 +208,13 @@ impl View for Tip {
                 }
             }
         }
+        let (text, role) = if quiet {
+            restart
+                .map(|hint| (hint.to_owned(), Role::Muted))
+                .unwrap_or((text, role))
+        } else {
+            (text, role)
+        };
         // One cell short of the edge. A row written into its last column is one
         // miscounted width away from the console wrapping its last character onto
         // the next row — the composer's rule, which is not redrawn, so the stray
@@ -242,6 +273,42 @@ mod tests {
     }
 
     #[test]
+    fn restart_reminder_is_above_the_composer_and_leaves_footer_information_alone() {
+        let hint = "当前窗口仍运行旧版本，重启后生效";
+        let moment = Moment {
+            restart_hint: Some(hint.into()),
+            cwd: "~/work/project".into(),
+            model: "lumen-alpha".into(),
+            ..Moment::default()
+        };
+        let tip = draw_at(&moment, 100, 1);
+        assert_eq!(tip.len(), 1);
+        assert!(tip[0].plain().ends_with(&format!("{hint} ")));
+        let vp = Viewport::new(Rect::sized(160, 1), &moment);
+        let footer =
+            crate::modules::status::Status::render(&crate::modules::status::State::default(), &vp);
+        let footer = footer[0].plain();
+        assert!(!footer.contains(hint));
+        assert!(footer.contains("lumen-alpha") && footer.contains("~/work/project"));
+        for w in [0, 1, 8, 20, 40] {
+            let rows = draw_at(&moment, w, 1);
+            assert!(rows.len() <= 1);
+            assert!(rows.iter().all(|row| row.width() <= w as usize));
+        }
+    }
+
+    #[test]
+    fn transient_refusal_takes_priority_then_the_restart_reminder_returns() {
+        let mut moment = Moment::default().with_notice("copy failed", true, Timestamp::millis(0));
+        moment.restart_hint = Some("restart to apply".into());
+        let line = draw_at(&moment, 80, 1)[0].plain();
+        assert!(line.contains("copy failed") && !line.contains("restart to apply"));
+        moment.now = Timestamp::millis(10_000);
+        let line = draw_at(&moment, 80, 1)[0].plain();
+        assert!(line.ends_with("restart to apply ") && !line.contains("copy failed"));
+    }
+
+    #[test]
     fn goal_status_and_tips_share_one_row_even_on_narrow_terminals() {
         let mut m = Moment::default();
         m.autonomy = Some(atomcode_host_api::Running {
@@ -266,6 +333,35 @@ mod tests {
                 assert!(rows[0].plain().contains("Goal active"));
             }
         }
+    }
+
+    #[test]
+    fn restart_and_goal_share_a_wide_tip_without_hiding_the_goal_on_narrow_rows() {
+        let mut moment = Moment::default();
+        moment.autonomy = Some(atomcode_host_api::Running {
+            usage: None,
+            recovering: false,
+            retry_in_secs: None,
+            goal_stage: None,
+            goal_detail: None,
+            kind: "goal".into(),
+            what: "objective".into(),
+            round: 1,
+            of: None,
+            elapsed_secs: 1,
+            paused: None,
+        });
+        moment.restart_hint = Some("restart to apply".into());
+        let wide = draw_at(&moment, 80, 1)[0].plain();
+        assert!(
+            wide.contains("Goal active") && wide.ends_with("restart to apply"),
+            "{wide:?}"
+        );
+        let narrow = draw_at(&moment, 14, 1)[0].plain();
+        assert!(
+            narrow.contains("Goal active") && !narrow.contains("restart"),
+            "{narrow:?}"
+        );
     }
 
     #[test]

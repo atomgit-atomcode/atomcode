@@ -147,19 +147,21 @@ impl AnthropicProvider {
         let user_agent = cfg.user_agent.clone();
         let skip_tls_verify = cfg.skip_tls_verify;
         let client = std::sync::Arc::new(
-            super::openai_compat::SwappableClient::new(false, move |_| {
-                let mut builder =
-                    crate::proxy::apply_async_proxy_policy(reqwest::Client::builder())
-                        .redirect(if custom_headers {
-                            reqwest::redirect::Policy::none()
-                        } else {
-                            reqwest::redirect::Policy::default()
-                        })
-                        .connect_timeout(connect_timeout)
-                        // Reap idle keep-alives before the server does (see POOL_IDLE_TIMEOUT).
-                        .pool_idle_timeout(retry::POOL_IDLE_TIMEOUT)
-                        // Product UA for gateway attribution (parity with core's build_http_client).
-                        .user_agent(user_agent.as_deref().unwrap_or(super::DEFAULT_USER_AGENT));
+            super::openai_compat::SwappableClient::new_with_proxy(false, move |_, proxy| {
+                let mut builder = super::auto_proxy::apply(
+                    crate::proxy::apply_async_proxy_policy(reqwest::Client::builder()),
+                    proxy,
+                )?
+                .redirect(if custom_headers {
+                    reqwest::redirect::Policy::none()
+                } else {
+                    reqwest::redirect::Policy::default()
+                })
+                .connect_timeout(connect_timeout)
+                // Reap idle keep-alives before the server does (see POOL_IDLE_TIMEOUT).
+                .pool_idle_timeout(retry::POOL_IDLE_TIMEOUT)
+                // Product UA for gateway attribution (parity with core's build_http_client).
+                .user_agent(user_agent.as_deref().unwrap_or(super::DEFAULT_USER_AGENT));
                 if skip_tls_verify {
                     builder = builder.danger_accept_invalid_certs(true);
                 }
@@ -310,7 +312,7 @@ impl LlmProvider for AnthropicProvider {
                     .await
                     {
                         Err(_elapsed) => {
-                            let mut error = retry::stream_idle_error();
+                            let mut error = retry::stream_idle_error(&watchdog);
                             error.retryable = caller_recovers && !emitted_replay_sensitive;
                             yield StreamEvent::Error(error);
                             return;
@@ -495,7 +497,7 @@ async fn open_stream_attempts(
     let mut attempt = 1u32;
     let mut timeout_pool_refreshed = false;
     loop {
-        let http = client.get();
+        let http = client.for_request().await?;
         let mut req = http
             .post(url)
             .header("anthropic-version", anthropic_version)

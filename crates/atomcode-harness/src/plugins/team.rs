@@ -259,6 +259,23 @@ fn built_in_roles() -> Vec<Role> {
     ]
 }
 
+/// What a file's first line actually says, for an error that has to be acted
+/// on. The line is quoted as it is, trimmed and shortened: a person reading
+/// "this one begins with `---`" needs to see what the file really said, and a
+/// file whose first line is a paragraph must not print the paragraph.
+fn beginning_of(line: &str) -> String {
+    let text = line.trim();
+    if text.is_empty() {
+        return "an empty line".to_string();
+    }
+    let short: String = text.chars().take(40).flat_map(char::escape_debug).collect();
+    if text.chars().count() > 40 {
+        format!("{short}…")
+    } else {
+        short
+    }
+}
+
 /// One role from `<dir>/<id>.md`: a frontmatter of `key: value` lines
 /// between `---` fences, then the persona.
 ///
@@ -280,12 +297,20 @@ fn parse_role_file(path: &Path) -> Result<Role, String> {
         .ok_or_else(|| format!("{}: not a role file name", path.display()))?
         .to_string();
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    // A file written by a Windows editor carries a UTF-8 BOM. It is invisible
+    // in the text and in every editor, and it made a perfectly good role file
+    // look like it began with something other than the fence.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
     let mut lines = text.lines();
     let Some(first) = lines.next() else {
         return Err(format!("{}: empty", path.display()));
     };
     if first.trim() != "---" {
-        return Err(format!("{}: a role file begins with `---`", path.display()));
+        return Err(format!(
+            "{}: a role file begins with `---`; this one begins with `{}`",
+            path.display(),
+            beginning_of(first)
+        ));
     }
     let mut permission = None;
     let mut difficulty = None;
@@ -423,17 +448,56 @@ fn parse_role_file(path: &Path) -> Result<Role, String> {
     })
 }
 
+/// One directory of role files, and whose it is.
+///
+/// Under the person's own home tree a role file is **theirs**: they may name
+/// any model the host can build. One that came with a project arrived with a
+/// clone, and is held to what the model may pick for itself (`Role::model`).
+struct RoleDir {
+    path: PathBuf,
+    /// The person's own — not the project's.
+    from_person: bool,
+}
+
 /// Built-in roles, then each directory in order; a file with a built-in's
 /// name replaces it. A directory that does not exist is simply empty.
 ///
 /// A file that does not parse is skipped, not fatal, and comes back in the
 /// second list as `(role id, why)` — so a delegation to it can say why the role
 /// is not there instead of calling it unknown.
-fn load_roles(dirs: &[PathBuf]) -> Result<(Vec<Role>, Vec<(String, String)>), String> {
+fn load_roles(dirs: &[RoleDir]) -> Result<(Vec<Role>, Vec<(String, String)>), String> {
     let mut roles = built_in_roles();
     let mut skipped = Vec::new();
-    for (index, dir) in dirs.iter().enumerate() {
-        let Ok(entries) = std::fs::read_dir(dir) else {
+    // The project's own directory and the person's home are the **same path**
+    // when the working directory is the person's home: a person who opens
+    // AtomCode in `~` gets `~/.atomcode/agents` twice, because the project dir
+    // is `<cwd>/.atomcode` and the home tree is `~/.atomcode`. Every role file
+    // in it was then read twice — so every problem with it was said twice, and
+    // a role that parses was loaded twice.
+    //
+    // One path is read once. The two readings of the same path are still told
+    // apart: a file that sits in the home tree is the person's, whichever
+    // door led to it.
+    //
+    // The key is the canonical path (two spellings of one directory are one
+    // directory), but the directory is *read* at the path it was named by, so
+    // a file's name in an error is the one the person would type.
+    let mut unique: Vec<(PathBuf, PathBuf, bool)> = Vec::new();
+    for dir in dirs {
+        if std::fs::read_dir(&dir.path).is_err() {
+            continue;
+        }
+        let key = std::fs::canonicalize(&dir.path).unwrap_or_else(|_| dir.path.clone());
+        // Retain the last occurrence's position so A, B, A still lets A
+        // override B. Trust belongs to the directory, not its load position.
+        let from_person = match unique.iter().position(|(path, _, _)| *path == key) {
+            Some(index) => unique.remove(index).2 || dir.from_person,
+            None => dir.from_person,
+        };
+        unique.push((key, dir.path.clone(), from_person));
+    }
+    for (_, dir, from_person) in unique {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
         let mut files: Vec<PathBuf> = entries
@@ -469,8 +533,8 @@ fn load_roles(dirs: &[PathBuf]) -> Result<(Vec<Role>, Vec<(String, String)>), St
                     continue;
                 }
             };
-            // The first directory is the project's own; see `Role::model`.
-            role.from_project = index == 0;
+            // A file the person's own tree holds is theirs; see `Role::model`.
+            role.from_project = !from_person;
             match roles.iter_mut().find(|r| r.id == role.id) {
                 Some(existing) => *existing = role,
                 None => roles.push(role),
@@ -1714,10 +1778,22 @@ impl Plugin for TeamPlugin {
             .map(PathBuf::from)
             .unwrap_or_else(|| product.user().to_path_buf());
         let mut dirs = vec![
-            product.project(&project).join("agents"),
-            home.join("agents"),
+            // The project's own: a role file that arrived with a clone.
+            RoleDir {
+                path: product.project(&project).join("agents"),
+                from_person: false,
+            },
+            // The person's own tree: theirs to fill, and theirs to name a model.
+            RoleDir {
+                path: home.join("agents"),
+                from_person: true,
+            },
         ];
-        dirs.extend(row.roles_dirs.iter().map(PathBuf::from));
+        // Extra directories the host named: the person's, like the tree above.
+        dirs.extend(row.roles_dirs.iter().map(|dir| RoleDir {
+            path: PathBuf::from(dir),
+            from_person: true,
+        }));
         let (roles, skipped_roles) = load_roles(&dirs)?;
         let role_list = roles
             .iter()
@@ -1956,5 +2032,190 @@ impl Plugin for TeamPlugin {
             ),
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("atomcode-team-roles-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    #[test]
+    fn repeated_directories_keep_last_override_precedence_and_project_restrictions() {
+        let dir = scratch("precedence");
+        let project = dir.join("project");
+        let personal = dir.join("personal");
+        for (path, persona) in [(&project, "project"), (&personal, "personal")] {
+            std::fs::create_dir_all(path).unwrap();
+            std::fs::write(
+                path.join("librarian.md"),
+                format!("---\npermission: explore\ndifficulty: simple\n---\n{persona}\n"),
+            )
+            .unwrap();
+        }
+        let (roles, _) = load_roles(&[
+            RoleDir {
+                path: project.clone(),
+                from_person: false,
+            },
+            RoleDir {
+                path: personal,
+                from_person: true,
+            },
+            RoleDir {
+                path: project,
+                from_person: false,
+            },
+        ])
+        .unwrap();
+        let role = roles.iter().find(|r| r.id == "librarian").unwrap();
+        assert_eq!(role.persona, "project");
+        assert!(
+            role.from_project,
+            "a distinct project directory stays restricted"
+        );
+    }
+
+    #[test]
+    fn malformed_file_previews_escape_controls_and_bound_unicode_characters() {
+        assert_eq!(beginning_of("\u{1b}[31mhello"), "\\u{1b}[31mhello");
+        assert_eq!(
+            beginning_of(&"中".repeat(41)),
+            format!("{}…", "中".repeat(40))
+        );
+    }
+
+    /// The project's own directory and the person's home are the **same path**
+    /// when the working directory is the person's home — which is what a person
+    /// who opens AtomCode in `~` has. Every role file in it was read twice, so
+    /// every problem with it was said twice: three bad files, six lines on the
+    /// screen, and the second copy said nothing the first one had not.
+    #[test]
+    fn one_directory_is_read_once_even_when_two_doors_lead_to_it() {
+        let dir = scratch("same-dir");
+        let agents = dir.join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("broken.md"),
+            "---\nname: broken\ndescription: x\n---\nnope\n",
+        )
+        .unwrap();
+
+        let (roles, skipped) = load_roles(&[
+            RoleDir {
+                path: agents.clone(),
+                from_person: false,
+            },
+            RoleDir {
+                path: agents,
+                from_person: true,
+            },
+        ])
+        .expect("load");
+
+        assert_eq!(
+            skipped.len(),
+            1,
+            "one bad file is one problem, not two: {skipped:?}"
+        );
+        assert!(
+            !roles.iter().any(|r| r.id == "broken"),
+            "a file that does not parse is not a role"
+        );
+    }
+
+    /// A role that parses is loaded once too — and it is still the person's own,
+    /// because the home tree is the person's whichever door led to it.
+    #[test]
+    fn a_role_in_the_home_tree_is_the_persons_even_when_the_project_reaches_it_too() {
+        let dir = scratch("same-dir-ok");
+        let agents = dir.join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("librarian.md"),
+            "---\npermission: explore\ndifficulty: simple\nmodel: some-model\n---\nYou catalogue.\n",
+        )
+        .unwrap();
+
+        let (roles, skipped) = load_roles(&[
+            RoleDir {
+                path: agents.clone(),
+                from_person: false,
+            },
+            RoleDir {
+                path: agents,
+                from_person: true,
+            },
+        ])
+        .expect("load");
+
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let role = roles.iter().find(|r| r.id == "librarian").expect("loaded");
+        assert!(
+            !role.from_project,
+            "a file in the person's home tree is theirs, whichever door found it"
+        );
+    }
+
+    /// A file written by a Windows editor carries a UTF-8 BOM. It is invisible
+    /// in every editor, and it made a perfectly good role file look like it
+    /// began with something other than the fence — so the role was left out and
+    /// the person was told to add a `---` that was already there.
+    #[test]
+    fn a_role_file_written_with_a_byte_order_mark_is_still_a_role_file() {
+        let dir = scratch("bom");
+        let agents = dir.join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("librarian.md"),
+            "\u{feff}---\npermission: explore\ndifficulty: simple\n---\nYou catalogue.\n",
+        )
+        .unwrap();
+
+        let (roles, skipped) = load_roles(&[RoleDir {
+            path: agents,
+            from_person: true,
+        }])
+        .expect("load");
+
+        assert!(skipped.is_empty(), "a BOM is not a problem: {skipped:?}");
+        assert!(
+            roles.iter().any(|r| r.id == "librarian"),
+            "the role is on offer"
+        );
+    }
+
+    /// The error says what the file actually begins with. "A role file begins
+    /// with `---`" left a person who had written `name: ...` at the top of the
+    /// file looking for the place to put one.
+    #[test]
+    fn the_error_says_what_the_file_really_begins_with() {
+        let dir = scratch("says-why");
+        let agents = dir.join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("designer.md"),
+            "---\nname: designer\ndescription: designs\n---\nYou design.\n",
+        )
+        .unwrap();
+
+        let (_, skipped) = load_roles(&[RoleDir {
+            path: agents,
+            from_person: true,
+        }])
+        .expect("load");
+
+        let (_, why) = skipped.first().expect("skipped");
+        assert!(
+            why.contains("`permission` is required") && why.contains("`difficulty` is required"),
+            "both missing fields are named at once: {why}"
+        );
     }
 }

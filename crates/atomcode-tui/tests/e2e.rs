@@ -670,6 +670,88 @@ impl Session {
     }
 }
 
+/// A native-mouse launch explains its mode inside the welcome, never above it.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_native_mouse_launch_places_its_reminder_below_the_welcome() {
+    use atomcode_tui::surface::Surface as _;
+    let dir = scratch("native-mouse-reminder");
+    let s = start(tree(&dir, &replay(r#"{ text = "Ready." }"#), &[])).await;
+    s.term.set_mouse(false);
+    let ui = s.ui.clone();
+    let ctx = s.app.clone();
+    let task = tokio::spawn(async move { ui.run(&ctx, None).await });
+    until(&s, "鼠标已交还终端").await;
+    let screen = s.screen();
+    assert!(
+        screen.find("上手提示").unwrap() < screen.find("鼠标已交还终端").unwrap(),
+        "{screen}"
+    );
+    assert!(screen.contains("Ctrl+T"), "{screen}");
+    assert!(!s.term.mouse());
+    task.abort();
+    let _ = task.await;
+}
+
+/// Runtime warnings can already be queued before the screen subscribes.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_startup_warning_is_drawn_after_the_welcome() {
+    use atomcode_kernel::event::AgentEvent;
+    let dir = scratch("startup-warning-order");
+    let s = start_with_connection(
+        tree(&dir, &replay(r#"{ text = "Ready." }"#), &[]),
+        |connection| {
+            let atomcode_host_api::HostConnection {
+                session,
+                commands,
+                mut events,
+                control,
+            } = connection;
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            tx.send(AgentEvent::Error {
+                message: "subagent binary missing at startup".into(),
+                http_status: None,
+                code: None,
+                retryable: None,
+                retry_after_secs: None,
+                ends_turn: false,
+            })
+            .unwrap();
+            tokio::spawn(async move {
+                while let Some(event) = events.recv().await {
+                    if tx.send(event).is_err() {
+                        break;
+                    }
+                }
+            });
+            atomcode_host_api::HostConnection {
+                session,
+                commands,
+                events: rx,
+                control,
+            }
+        },
+    )
+    .await;
+    // Headless::settle measures real quiet time; the mascot keeps ticking on
+    // this paused clock, so wait for the observable output directly instead.
+    let ui = s.ui.clone();
+    let ctx = s.app.clone();
+    let task = tokio::spawn(async move { ui.run(&ctx, None).await });
+    until(&s, "subagent binary missing at startup").await;
+    let screen = s.screen();
+    assert!(
+        screen.find("上手提示").unwrap()
+            < screen.find("subagent binary missing at startup").unwrap(),
+        "{screen}"
+    );
+    assert_eq!(
+        screen.matches("subagent binary missing at startup").count(),
+        1
+    );
+    task.abort();
+    let _ = task.await;
+}
+
 // ---- the flow a person actually performs --------------------------------
 
 #[tokio::test]
@@ -10224,15 +10306,8 @@ async fn a_guess_at_what_to_say_next_is_taken_by_plain_tab() {
         "收下那句话和切模式是两件事,那一按只能干前一件"
     );
 
-    // And it takes it only on an empty line. With words in the field — here the
-    // same sentence, now in the history, typed back as a prefix — plain Tab is
-    // the mode key again, and it does **not** quietly complete from history
-    // instead: that would be a key nobody advertised ahead of one this row does.
-    //
-    // Judged on the mode and not on the text: the completion is drawn as a dim
-    // ghost *inside* the line (`modules::input`), so scraping the composer cannot
-    // tell "offered" from "taken" — while a Tab that took something never
-    // reaches the mode key at all.
+    // Sending stores the accepted suggestion in history. Its visible suffix
+    // then also takes precedence over the optional plain-Tab mode shortcut.
     s.term.press(KeyPress::plain(Key::Enter));
     s.quiet().await;
     // 输入行里读不出「收下了」和「还挂着」的差别(同一串字,只差颜色);发出去的
@@ -10252,16 +10327,29 @@ async fn a_guess_at_what_to_say_next_is_taken_by_plain_tab() {
     );
     s.term.type_text("接着");
     s.term.press(KeyPress::plain(Key::Tab));
+    s.quiet().await;
+    assert!(
+        host.asked.lock().expect("asked poisoned").is_empty(),
+        "visible history completion takes Tab before the mode shortcut"
+    );
+    assert_eq!(
+        transcript(&s).matches("接着把登录那条补上").count(),
+        1,
+        "Tab only fills the draft; it must not submit"
+    );
+    s.term.press(KeyPress::plain(Key::Enter));
+    let mut completed = false;
     for _ in 0..200 {
-        if !host.asked.lock().expect("asked poisoned").is_empty() {
+        if transcript(&s).matches("接着把登录那条补上").count() >= 2 {
+            completed = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    assert_eq!(
-        host.asked.lock().expect("asked poisoned").as_slice(),
-        &[atomcode_host_api::Mode::AcceptEdits],
-        "行里有字的时候,Tab 还是那个模式键"
+    assert!(
+        completed,
+        "Enter must submit the completed history entry:\n{}",
+        s.screen()
     );
     task.abort();
 }
@@ -10628,6 +10716,20 @@ async fn the_wheel_as_arrows_scrolls_while_the_mouse_is_handed_back() {
     // swipe), because the two are the same bytes as a keypress.
     s.term.press(KeyPress::ctrl('g'));
     until(&s, &handed).await;
+    // In-flight reports must not bring the app's menu back or paste the
+    // server-side clipboard after native terminal selection was restored.
+    let input_before = part_text(&s, "input");
+    let input = s.term.last().unwrap().part("input").unwrap().rect;
+    s.term
+        .pointer(atomcode_tui::surface::Click::RightPress, input.x, input.y);
+    s.quiet().await;
+    assert!(s.term.last().unwrap().part("context-menu").is_none());
+    s.term
+        .set_clipboard_text("SERVER_CLIPBOARD_MUST_NOT_BE_PASTED");
+    s.term
+        .pointer(atomcode_tui::surface::Click::MiddlePress, input.x, input.y);
+    s.quiet().await;
+    assert_eq!(part_text(&s, "input"), input_before);
     // On a narrow terminal the tip row cuts at its end; how to take the mouse
     // back is at the front, so it is never what gets cut.
     s.term.resize(60, 24);

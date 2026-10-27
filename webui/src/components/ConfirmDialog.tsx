@@ -1,7 +1,7 @@
 // Generic confirmation modal. Replaces native window.confirm/alert so every
 // destructive confirmation shares the webui modal style (matches DeleteDialog).
 
-import { useEffect, useState } from 'preact/hooks';
+import { useLayoutEffect, useId, useRef, useState } from 'preact/hooks';
 
 interface ConfirmDialogProps {
   title: string;
@@ -30,11 +30,26 @@ export function ConfirmDialog({
   onClose,
 }: ConfirmDialogProps) {
   const [busy, setBusy] = useState(false);
+  const card = useRef<HTMLDivElement>(null);
+  const titleId = useId();
+  useLayoutEffect(() => {
+    const previous = document.activeElement as HTMLElement | null;
+    card.current?.querySelector<HTMLButtonElement>('.modal-footer button')?.focus();
+    return () => { if (previous?.isConnected) previous.focus(); };
+  }, []);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     function onKey(e: KeyboardEvent) {
-      if (e.key === 'Escape' && !busy) onClose();
+      if (e.key === 'Escape' && !busy) { e.preventDefault(); e.stopPropagation(); onClose(); }
+      if (e.key === 'Tab') {
+        const buttons = Array.from(card.current?.querySelectorAll<HTMLButtonElement>('button:not(:disabled)') || []);
+        const first = buttons[0], last = buttons[buttons.length - 1];
+        if (!first) { e.preventDefault(); card.current?.focus(); }
+        else if (!card.current?.contains(document.activeElement)) { e.preventDefault(); first.focus(); }
+        else if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+        else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+      }
     }
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
@@ -60,11 +75,11 @@ export function ConfirmDialog({
         if (e.target === e.currentTarget && !busy) onClose();
       }}
     >
-      <div class="modal-card modal-card-sm">
+      <div class="modal-card modal-card-sm" ref={card} role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1}>
         <div class="modal-header">
           <span>{icon}</span>
-          <h3>{title}</h3>
-          <button class="ghost-btn modal-close" onClick={onClose} aria-label={cancelLabel}>
+          <h3 id={titleId}>{title}</h3>
+          <button class="ghost-btn modal-close" disabled={busy} onClick={onClose} aria-label={cancelLabel}>
             ×
           </button>
         </div>

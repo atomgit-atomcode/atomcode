@@ -1,3 +1,4 @@
+import { loadAfterSessionSwitch } from '../lib/sessionSwitch';
 import { useSkills, refreshSkills, invalidateSkills } from '../skills';
 import type { LiveGoalProgress } from '../api';
 // Task 13 — Chat view with streaming rendering
@@ -30,7 +31,7 @@ import type { LiveGoalProgress } from '../api';
 import { rankSessionReferences, sessionReferenceToken, sessionReferenceTokens } from '../lib/sessionReferences';
 import { sessionReferenceCandidates } from '../api';
 import { VNode } from 'preact';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, listDir, searchFiles, changeDir, postConfigReload, postCommand, postLiveCompact, postUserInputAnswer, postLivePolicyInterventionResolution, openWorkspaceFile, type CommandResult, type RoutedUserInputRequest, type PolicyInterventionEvent, type TurnStats } from '../api';
 import {
   parseSlashCommand,
@@ -46,7 +47,12 @@ import { beginModeSwitch, completeModeSwitch, failModeSwitch, initModeState, mod
 import { Markdown } from './Markdown';
 import { isRetainedHistoryUserMessage } from '../lib/historyMessages';
 import { CompactionHistory } from './CompactionHistory';
+import { historyMessages } from '../lib/inlineHistory';
+import { TurnNavRail } from './TurnNavRail';
+import type { TranscriptTurn } from '../api';
+import { deriveTurnNavigation, turnAtReadingLine, createTurnNavigationIntent } from '../lib/turnNavigation';
 import { ModelSelector } from './ModelSelector';
+import { mayFollowModelDefault, type RuntimeModelIdentity } from '../lib/modelIdentity';
 import { ModeSelector } from './ModeSelector';
 import { AttachMenu } from './AttachMenu';
 import { FilePicker } from './FilePicker';
@@ -106,6 +112,7 @@ import {
   shouldApplySteerProviderFallback,
   type PendingLiveSteer,
 } from '../lib/liveSteer';
+import { createScrollRestoration } from '../lib/scrollRestoration';
 import { hasCoarsePointer, shouldSendComposerOnEnter } from '../lib/composerKeyboard';
 import { randomId } from '../lib/randomId';
 import { completedTurnStats, formatTurnDuration, formatTurnTokens, turnCacheHit } from '../lib/turnStats';
@@ -292,6 +299,8 @@ interface ChatProps {
   onLanding?: (landing: boolean) => void;
   /** 侧栏「技能」菜单选中的技能：变化时把 `/name ` 插入输入框。 */
   skillInsert?: { name: string; seq: number } | null;
+  /** A scoped new-task request. Prefill only; never submits or writes a task. */
+  composerInsert?: { text: string; seq: number; sessionId: string } | null;
 }
 
 function formatArgs(args: unknown): string {
@@ -447,7 +456,7 @@ function detectSkillContent(text: string): string | null {
   return title || null;
 }
 
-export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermission, onPermissionResolved, activeSession, restoring, onLiveTurnDone, onOptimisticSession, onOpenCwd, onCwdChanged, onLanding, skillInsert, onSessionRenamed }: ChatProps) {
+export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermission, onPermissionResolved, activeSession, restoring, onLiveTurnDone, onOptimisticSession, onOpenCwd, onCwdChanged, onLanding, skillInsert, composerInsert, onSessionRenamed }: ChatProps) {
   const t = useT();
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
@@ -561,8 +570,17 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   } | null>(null);
   const providerRef = useRef<string | null>(null);
   const providerPinnedRef = useRef(false);
+  const [runtimeModel, setRuntimeModel] = useState<RuntimeModelIdentity | null>(null);
+  const runtimeModelRef = useRef<RuntimeModelIdentity | null>(null);
+  function rememberRuntimeModel(identity: RuntimeModelIdentity | null) {
+    if (runtimeModelRef.current?.provider !== identity?.provider || runtimeModelRef.current?.model !== identity?.model) {
+      setReasoningEffort(null);
+    }
+    runtimeModelRef.current = identity;
+    setRuntimeModel(identity);
+  }
   const followDefaultProvider = useCallback((name: string) => {
-    if (!providerPinnedRef.current) {
+    if (mayFollowModelDefault(providerPinnedRef.current, runtimeModelRef.current, syncRef.current || busyRef.current)) {
       providerRef.current = name;
       setProvider(name);
     }
@@ -607,6 +625,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   useEffect(() => { if (!sync) setGoalProgress(null); }, [sync]);
   const syncRef = useRef(sync);
   syncRef.current = sync;
+  useLayoutEffect(() => {
+    rememberRuntimeModel(null);
+    // A selection made in standalone chat is not a pending shared-runtime switch.
+    if (sync) providerPinnedRef.current = false;
+  }, [sync]);
   // Pending live-session permission request (shown as PermissionCard, calls /live/permission).
   // Kept separate from the non-sync `onPermission` prop so the /chat path is untouched.
   const [livePending, setLivePending] = useState<{ tool_name: string; reason: string; call_id: string; arguments: string; allow_all_bash?: boolean } | null>(null);
@@ -641,12 +664,21 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   const lastLiveActivityRef = useRef<number>(Date.now());
   // Pending reconnect backoff timer, so teardown can cancel it.
   const reconnectTimerRef = useRef<number | null>(null);
-  const bottomRef = useRef<HTMLDivElement>(null);
   // Scroll container + "am I at the bottom?" tracking. Auto-follow during streaming
   // ONLY while the user is at the bottom; scrolling up releases the follow so history
   // stays put. A ref (not state) avoids re-rendering on every scroll event.
   const scrollRef = useRef<HTMLDivElement>(null);
   const atBottomRef = useRef(true);
+  const [activeNavIndex, setActiveNavIndex] = useState(0);
+  const [navHighlight, setNavHighlight] = useState<number | null>(null);
+  const navFlashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const navScrollIntent = useRef(createTurnNavigationIntent());
+  const [historyTarget, setHistoryTarget] = useState<{ turnId: number; request: number; scope: string } | null>(null);
+  const [activeHistoryTurn, setActiveHistoryTurn] = useState<number | null>(null);
+  const [historyReset, setHistoryReset] = useState(0);
+  const [historyDisplay, setHistoryDisplay] = useState({ active: false, showLive: true, liveStart: 0 });
+
+  const scrollRestorationRef = useRef<ReturnType<typeof createScrollRestoration> | null>(null);
   const [showJumpBtn, setShowJumpBtn] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [coarsePointer, setCoarsePointer] = useState(hasCoarsePointer);
@@ -670,6 +702,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   // 已为哪个 sessionId 触发过历史加载（或它是本 Chat 自建的会话）。用于避免
   // project_hash 迟到（刷新后由 App 异步回填）导致的重复加载 / 覆盖当前对话。
   const loadedForRef = useRef<string | null>(null);
+  const switchReadyRef = useRef<{ id: string; generation: number; ready: Promise<boolean> } | null>(null);
+  const historyAbortRef = useRef<AbortController | null>(null);
+  useEffect(() => () => { historyAbortRef.current?.abort(); }, []);
   // Cache of session messages, used to preserve in-progress streaming turns when switching sessions.
   const messageCacheRef = useRef<Map<string, Message[]>>(new Map());
   // A notice for the session being switched back to: put in once that session's
@@ -858,10 +893,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         messageCacheRef.current.set(prevId, messagesRef.current);
       }
 
+      historyAbortRef.current?.abort();
       activeIdRef.current = sessionId;
       todoTitlesRef.current.clear();
       resetTodoBatch(true, false);
       providerPinnedRef.current = false;
+      rememberRuntimeModel(null);
       loadedForRef.current = null;
       optimisticFiredRef.current = false;
       pendingSelfEchoRef.current = [];
@@ -928,21 +965,21 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       // 不会回环：远端 session_switched 事件的 handler 会先把 activeIdRef 设为该 id，
       // 故由广播回流引起的 sessionId 变化进不来这个分支（条件已不成立），不会再次广播。
       if (sync && sessionId) {
-        postLiveSwitchSession(sessionId)
+        const ready = postLiveSwitchSession(sessionId)
           .then((result) => {
-            if (sessionGenerationRef.current !== switchGeneration) return;
+            if (sessionGenerationRef.current !== switchGeneration) return false;
             // Another atomcode held it, so the runtime opened a copy: follow it
             // there and say so — the original is untouched where it is open.
             if (result.ok && result.forkedFrom && result.sessionId) {
               noticeAfterSwitchRef.current = t('sync.sessionForked');
               onSessionId(result.sessionId);
-              return;
+              return false;
             }
-            if (result.ok) return;
+            if (result.ok) return true;
             if (result.activeTurn && prevId) {
               noticeAfterSwitchRef.current = t('cmd.session.busy');
               onSessionId(prevId);
-              return;
+              return false;
             }
             // The runtime answered and said no (the session is held by another
             // atomcode, say): it is still there and still shared, so go back to
@@ -955,18 +992,22 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
                 ? t('sync.sessionInUse')
                 : t('sync.switchFailed', { error: why });
               onSessionId(prevId);
-              return;
+              return false;
             }
             throw new Error(result.error ?? 'live runtime rejected the session switch');
           })
           .catch((error) => {
-            if (sessionGenerationRef.current !== switchGeneration) return;
+            if (sessionGenerationRef.current !== switchGeneration) return false;
             stopLiveStream();
             setSync(false);
             setBusy(false);
             setQueued([]);
             reportFailure(t('sync.switchFailed', { error: String(error) }));
+            loadedForRef.current = null;
+            setLoading(false);
+            return false;
           });
+        switchReadyRef.current = { id: sessionId, generation: switchGeneration, ready };
       }
     }
 
@@ -993,8 +1034,19 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     }
     const loadId = sessionId;
     const loadGeneration = sessionGenerationRef.current;
-    Promise.allSettled([getSession(projectHash, loadId), getActiveChatSessions()])
-      .then(([sessionResult, activeResult]) => {
+    const historyController = new AbortController();
+    historyAbortRef.current?.abort();
+    historyAbortRef.current = historyController;
+    const pendingSwitch = switchReadyRef.current;
+    const accepted = pendingSwitch?.id === loadId && pendingSwitch.generation === loadGeneration
+      ? pendingSwitch.ready : undefined;
+    loadAfterSessionSwitch(accepted,
+      () => !historyController.signal.aborted && activeIdRef.current === loadId
+        && sessionGenerationRef.current === loadGeneration,
+      () => Promise.allSettled([getSession(projectHash, loadId, historyController.signal), getActiveChatSessions()]))
+      .then((results) => {
+        if (!results || historyController.signal.aborted) return;
+        const [sessionResult, activeResult] = results;
         // Generation also covers A -> B -> A; id equality alone is insufficient.
         if (
           activeIdRef.current !== loadId ||
@@ -1074,19 +1126,39 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   const BOTTOM_SLACK = 80;
   const recomputeAtBottom = () => {
     const el = scrollRef.current;
-    if (!el) return;
-    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= BOTTOM_SLACK;
+    if (!el || document.visibilityState === 'hidden') return;
+    const navigationFollow = navScrollIntent.current.onScroll(el);
+    if (navigationFollow !== null) {
+      atBottomRef.current = navigationFollow;
+      setShowJumpBtn(!navigationFollow);
+      return;
+    }
+    const atBottom = historyDisplay.active && !historyDisplay.showLive ? false : scrollRestorationRef.current
+      ? scrollRestorationRef.current.onScroll()
+      : (el.clientHeight > 0 ? el.scrollHeight - el.scrollTop - el.clientHeight <= BOTTOM_SLACK : null);
+    if (atBottom === null) return;
     atBottomRef.current = atBottom;
     setShowJumpBtn((v) => (v === !atBottom ? v : !atBottom));
   };
   const scrollToBottom = (behavior: ScrollBehavior = 'auto') => {
+    navScrollIntent.current.interact();
+    setHistoryTarget(null); setHistoryReset(value => value + 1);
+    setHistoryDisplay({ active: false, showLive: true, liveStart: 0 });
+    if (behavior === 'smooth') navScrollIntent.current.followBottom();
+    scrollRestorationRef.current?.interact();
     atBottomRef.current = true;
     setShowJumpBtn(false);
     // Completion stats belong to the previous turn. Clear them as soon as a
     // new message is actually delivered so stale data is never shown while
     // the next turn is running or after an early transport failure.
     setTurnStats(null);
-    bottomRef.current?.scrollIntoView({ behavior });
+    const el = scrollRef.current;
+    const generation = sessionGenerationRef.current;
+    if (el) requestAnimationFrame(() => {
+      if (generation === sessionGenerationRef.current && scrollRef.current === el && el.isConnected) {
+        el.scrollTo({ top: el.scrollHeight, behavior });
+      }
+    });
   };
 
   // Follow streaming output ONLY while the user is at the bottom. Scrolling up
@@ -1094,8 +1166,61 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   // atBottomRef=false), so history stays put mid-stream. Instant behavior so the
   // programmatic scroll lands immediately and the next scroll event reads "at bottom".
   useEffect(() => {
-    if (atBottomRef.current) bottomRef.current?.scrollIntoView({ behavior: 'auto' });
+    if (document.visibilityState !== 'hidden') scrollRestorationRef.current?.layout();
   }, [messages, tokens, queued.length]);
+
+  useEffect(() => {
+    const restore = createScrollRestoration({
+      viewport: () => scrollRef.current,
+      session: () => activeIdRef.current,
+      following: () => atBottomRef.current,
+      setFollowing: (following) => {
+        atBottomRef.current = following;
+        setShowJumpBtn(!following);
+      },
+      schedule: (run) => requestAnimationFrame(run),
+      cancel: (id) => cancelAnimationFrame(id),
+    });
+    scrollRestorationRef.current = restore;
+    const visibility = () => {
+      if (document.visibilityState === 'hidden') restore.suspend();
+      else restore.resume();
+    };
+    const pagehide = () => restore.suspend();
+    const pageshow = () => restore.resume();
+    const layout = () => { if (document.visibilityState !== 'hidden') restore.layout(); };
+    document.addEventListener('visibilitychange', visibility);
+    window.addEventListener('pagehide', pagehide);
+    window.addEventListener('pageshow', pageshow);
+    window.addEventListener('resize', layout);
+    window.visualViewport?.addEventListener('resize', layout);
+    restore.layout();
+    return () => {
+      restore.dispose();
+      scrollRestorationRef.current = null;
+      document.removeEventListener('visibilitychange', visibility);
+      window.removeEventListener('pagehide', pagehide);
+      window.removeEventListener('pageshow', pageshow);
+      window.removeEventListener('resize', layout);
+      window.visualViewport?.removeEventListener('resize', layout);
+    };
+  }, []);
+
+  // Track both viewport height (keyboard/composer) and delayed content layout.
+  // The observer reconnects as landing/chat branches mount different elements.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(() => {
+      if (document.visibilityState !== 'hidden') scrollRestorationRef.current?.layout();
+    });
+    observer.observe(el);
+    const content = el.querySelector('.timeline-inner');
+    if (content) observer.observe(content);
+    scrollRestorationRef.current?.layout();
+    return () => observer.disconnect();
+  }, [messages.length === 0, restoring, sessionId]);
+
 
   // Abort the live (/live) stream + cancel any pending reconnect timer if the
   // component unmounts while sync is on.
@@ -1518,8 +1643,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       // Older sessions may not have transcript records; leave those timestamps absent
       // instead of relabelling the whole conversation with the reconnect wall clock.
       const loaded = sessionMessagesToDisplay(e.messages);
-      // Live snapshot (session switch / reconnect) → start at the bottom.
-      atBottomRef.current = true;
+      // A new session starts at the bottom. Reconnection to the same session
+      // must preserve whether the reader was following or inspecting history.
+      if (e.session_id && activeIdRef.current !== e.session_id) {
+        scrollRestorationRef.current?.interact();
+        atBottomRef.current = true;
+        setShowJumpBtn(false);
+      }
       // A persisted snapshot does not carry live activity. Replay emits the
       // authoritative input/state observations immediately after it; only those
       // may restore `busy`. In particular, a history ending in a user message can
@@ -1541,6 +1671,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       setUserInputReq(null);
       setHistoryHint(null);
       // 连上时回显当前生效的模型，让下拉框与 TUI / 其他端保持一致。
+      if (e.provider) rememberRuntimeModel({ provider: e.provider, model: e.model });
       if (e.provider && !providerPinnedRef.current) {
         providerRef.current = e.provider;
         setProvider(e.provider);
@@ -1565,9 +1696,15 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     // pin——pin 只用于防止「重连快照」回退一次尚未传播的本地切换，不该挡真实的变更事件，
     // 否则本端切过一次模型后就永远不再跟随 TUI 的模型切换（S1）。
     if (e.type === 'provider') {
+      rememberRuntimeModel({ provider: e.provider, model: e.model });
       providerRef.current = e.provider;
       setProvider(e.provider);
       providerPinnedRef.current = false;
+      return;
+    }
+    if (e.type === 'model') {
+      const current = runtimeModelRef.current;
+      if (current) rememberRuntimeModel({ ...current, model: e.model });
       return;
     }
     if (e.type === 'reasoning_effort') {
@@ -2239,6 +2376,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   function handleEvent(event: SSEEvent) {
     switch (event.type) {
       case 'runtime_info':
+        rememberRuntimeModel({ provider: event.provider, model: event.model });
         providerRef.current = event.provider;
         setProvider(event.provider);
         break;
@@ -2516,6 +2654,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     // Actually sending a message (immediate OR drained from the queue) re-engages
     // auto-follow — the user wants to see their message + the reply. Placed HERE, not in
     // sendMessage, so merely QUEUEING a message while reading history doesn't yank them.
+    setHistoryTarget(null); setHistoryReset(value => value + 1);
+    setHistoryDisplay({ active: false, showLive: true, liveStart: 0 });
     atBottomRef.current = true;
     setShowJumpBtn(false);
     const startsNewTurn = !busyRef.current;
@@ -3140,7 +3280,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const searchTrim = search.trim().toLowerCase();
   // 不过滤时间线，而是展示完整消息流
-  const visibleMessages = useMemo(() => messages.map((m, origIdx) => ({ msg: m, origIdx })), [messages]);
+  const visibleMessages = useMemo(() => !historyDisplay.showLive ? [] : messages.map((m, origIdx) => ({ msg: m, origIdx }))
+    .filter(({ origIdx }) => !historyDisplay.active || origIdx >= historyDisplay.liveStart), [messages, historyDisplay]);
   const lastVisibleIdx = visibleMessages.length - 1;
   // 计算匹配的原始消息索引列表
   const matchPositions = useMemo(() => {
@@ -3155,6 +3296,66 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   }, [messages, searchTrim, searchOpen]);
   // 匹配消息 origIdx → DOM 节点,供 ↑/↓/Enter 滚动定位。每次渲染重填。
   const matchRefs = useRef<Record<number, HTMLElement | null>>({});
+  const navigationScope = `${activeSession?.project_hash ?? ''}/${sessionId ?? ''}`;
+  const navTurns = useMemo(() => deriveTurnNavigation(messages,
+    new Set(pendingSteers.filter(steer => steer.confirmed).map(steer => steer.id))), [messages, pendingSteers]);
+  function updateActiveTurn() {
+    const el = scrollRef.current;
+    if (!el || navTurns.length === 0) return;
+    const readingLine = el.getBoundingClientRect().top + 48;
+    const index = turnAtReadingLine(navTurns.length, i =>
+      matchRefs.current[navTurns[i].messageIndex]?.getBoundingClientRect().top ?? Infinity, readingLine);
+    setActiveNavIndex(previous => previous === index ? previous : index);
+  }
+  function interactWithTimeline(_event: Event) {
+    navScrollIntent.current.interact();
+    scrollRestorationRef.current?.interact();
+    // Reading older messages must not close the inline history window.
+  }
+  function releaseNavigationFollow() {
+    navScrollIntent.current.interact();
+    scrollRestorationRef.current?.interact();
+    atBottomRef.current = false;
+    setShowJumpBtn(true);
+  }
+  function navigateNode(node: HTMLElement) {
+    const viewport = scrollRef.current;
+    if (!viewport) return;
+    releaseNavigationFollow();
+    const top = viewport.scrollTop + node.getBoundingClientRect().top - viewport.getBoundingClientRect().top - 20;
+    const target = Math.max(0, Math.min(top, viewport.scrollHeight - viewport.clientHeight));
+    navScrollIntent.current.jumpTo(target);
+    viewport.scrollTo({ top: target,
+      behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
+  }
+  function navigateTurn(messageIndex: number) {
+    const generation = sessionGenerationRef.current;
+    setHistoryTarget(null); setHistoryReset(value => value + 1);
+    setHistoryDisplay({ active: false, showLive: true, liveStart: 0 });
+    // Let the archived window reset before measuring the current message.
+    requestAnimationFrame(() => {
+      const node = matchRefs.current[messageIndex];
+      if (generation === sessionGenerationRef.current && node?.isConnected) navigateNode(node);
+    });
+    setNavHighlight(messageIndex);
+    if (navFlashTimer.current) clearTimeout(navFlashTimer.current);
+    navFlashTimer.current = setTimeout(() => setNavHighlight(null), 1800);
+  }
+  function navigateHistoricalTurn(record: TranscriptTurn) {
+    releaseNavigationFollow(); setActiveHistoryTurn(record.turn_id);
+    navScrollIntent.current.jumpTo(Infinity); // Hold follow while the read-only record is loading.
+    setHistoryTarget(previous => ({ turnId: record.turn_id, request: (previous?.request ?? 0) + 1, scope: navigationScope }));
+  }
+  useEffect(() => {
+    setHistoryTarget(null); setHistoryReset(value => value + 1); setHistoryDisplay({ active: false, showLive: true, liveStart: 0 });
+    setNavHighlight(null); setActiveNavIndex(0); navScrollIntent.current.interact();
+    return () => { if (navFlashTimer.current) clearTimeout(navFlashTimer.current); };
+  }, [navigationScope]);
+  useEffect(() => {
+    const frame = requestAnimationFrame(updateActiveTurn);
+    return () => cancelAnimationFrame(frame);
+  }, [navTurns, navigationScope]);
+
   const [matchIdx, setMatchIdxState] = useState(0);
   // P3 修复: 用 ref 镜像 matchIdx,让事件处理器在快速连击时永远读到最新值
   const matchIdxRef = useRef(0);
@@ -3168,7 +3369,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     setMatchIdx(newIdx);
     const targetOrigIdx = matchPositions[newIdx];
     const node = matchRefs.current[targetOrigIdx];
-    if (node) node.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    if (node?.isConnected) node.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    else navigateTurn(targetOrigIdx);
   };
 
   // Cmd/Ctrl+F 打开搜索并聚焦;Esc 关闭。绑定在 window 层级,焦点在输入框/按钮/
@@ -3215,6 +3417,14 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [skillInsert]);
 
+  const lastComposerInsert = useRef<number | null>(null);
+  useEffect(() => {
+    if (!composerInsert || composerInsert.sessionId !== sessionId || lastComposerInsert.current === composerInsert.seq) return;
+    lastComposerInsert.current = composerInsert.seq;
+    // Keep any existing unsent text; inserting a task request never sends it.
+    insertAtCursor([input, composerInsert.text].filter(value => value.trim()).join('\n\n'), true);
+  }, [composerInsert, sessionId]);
+
   // 落地页副标题：项目名 + 缩写路径。
   const cleanCwd = cwd.replace(/\/+$/, '');
   const cwdIdx = cleanCwd.lastIndexOf('/');
@@ -3225,8 +3435,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       : cleanCwd;
 
   // 输入框只渲染一份，按落地/常规两处择一挂载（避免两个 textarea 抢同一 ref）。
+  const canStop = busy || recoveryPolicy.allowStop || Boolean(goalProgress?.recovery);
   const inputBox = (
-    <div class="input-box">
+    <div class={'input-box' + (canStop ? ' is-running' : '') + (pendingImages.length || attachError ? ' has-input-detail' : '')}>
       {attachError && (
         <div class="input-attach-error" role="alert">
           <span>{attachError}</span>
@@ -3384,12 +3595,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
             busy={busy}
             onError={pushCommandNotice}
             value={provider}
+            runtime={sync || busy ? runtimeModel : null}
             liveEffort={reasoningEffort?.provider === provider ? reasoningEffort.effort : undefined}
             onChange={(p) => switchProvider(p)}
             onDefaultChange={followDefaultProvider}
           />
           <div class="input-turn-controls">
-            {busy || recoveryPolicy.allowStop || Boolean(goalProgress?.recovery) ? (
+            {canStop ? (
               <>
                 {/* /live folds this into the active turn; /chat queues it for the next turn. */}
                 {recoveryPolicy.allowSend && (input.trim() || pendingImages.length > 0) && (
@@ -3402,7 +3614,11 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
                     ↑
                   </button>
                 )}
-                <button class="btn-stop" onClick={handleStop} title={t('chat.stop')} aria-label={t('chat.stop')}>
+                <button class="btn-stop"
+                  // Keep a compact Stop from moving under the pointer when
+                  // :focus-within would otherwise expand the whole toolbar.
+                  onPointerDown={(e) => e.preventDefault()}
+                  onClick={handleStop} title={t('chat.stop')} aria-label={t('chat.stop')}>
                   <span class="stop-square" />
                 </button>
               </>
@@ -3610,11 +3826,31 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   return (
     <>
       {/* Message timeline */}
-      <div class="messages-container" ref={scrollRef} onScroll={recomputeAtBottom}>
+      <div class="messages-container" ref={scrollRef} onScroll={() => { recomputeAtBottom(); updateActiveTurn(); }}
+        onWheel={interactWithTimeline}
+        onTouchStart={interactWithTimeline}
+        onPointerDown={interactWithTimeline}
+        onKeyDown={interactWithTimeline}>
         <div class="timeline-inner">
         {sessionId && activeSession?.id === sessionId && activeSession.project_hash && <CompactionHistory
           key={`${activeSession.project_hash}/${sessionId}`}
-          projectHash={activeSession.project_hash} sessionId={sessionId}
+          projectHash={activeSession.project_hash} sessionId={sessionId} messages={messages} reset={historyReset}
+          focusTurn={historyTarget?.scope === navigationScope ? historyTarget : null}
+          viewport={() => scrollRef.current} onBeforeRead={releaseNavigationFollow} onNavigate={navigateNode}
+          onWindow={(active, showLive, liveStart) => {
+            setHistoryDisplay({ active, showLive, liveStart });
+            if (!active) setActiveHistoryTurn(null);
+          }}
+          onReadingTurn={id => setActiveHistoryTurn(previous => previous === id ? previous : id)}
+          renderTurn={turn => {
+            const [user, assistant] = historyMessages(turn);
+            return <>
+              <UserMessageView msg={user} timeLabel={formatMsgTime(user.ts)} search={search} isActiveSearchMatch={false} />
+              <AssistantMessageView msg={assistant} isLast={false} busy={false} lastIdx={-1} isLastInTurn={true}
+                turnText={messageFullText(assistant)} artifacts={[]} sessionId={sessionId}
+                timeLabel={formatMsgTime(assistant.ts)} search={search} isActiveSearchMatch={false} />
+            </>;
+          }}
         />}
         {messages.length === 0 && !historyHint && !restoring && loading && (
           <div class="messages-empty">
@@ -3674,7 +3910,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
             const isLast = idx === lastVisibleIdx;
             const setMatchRef = (el: HTMLElement | null) => { matchRefs.current[origIdx] = el; };
             const timeLabel = formatMsgTime(msg.ts);
-            const isActiveSearchMatch = searchOpen && searchTrim ? (origIdx === matchPositions[matchIdx]) : false;
+            const isActiveSearchMatch = origIdx === navHighlight || (searchOpen && searchTrim ? (origIdx === matchPositions[matchIdx]) : false);
 
             if (msg.role === 'user') {
               return (
@@ -3728,7 +3964,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         })()}
 
         {/* 排队中的消息：执行中输入、待当前回合结束后自动发送，可点 × 撤回。 */}
-        {queued.map((q) => (
+        {historyDisplay.showLive && queued.map((q) => (
           <div
             key={`q-${q.id}`}
             class="user-message-wrapper queued"
@@ -3759,7 +3995,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
           </div>
         ))}
 
-        {pendingSteers.some((item) => item.confirmed) && (
+        {historyDisplay.showLive && pendingSteers.some((item) => item.confirmed) && (
           <div class="steer-pending-status" role="status">
             {t('chat.steerPending', {
               count: pendingSteers.filter((item) => item.confirmed).length,
@@ -3767,7 +4003,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
           </div>
         )}
 
-        <div ref={bottomRef} />
+        <div />
         </div>
         {/* Zero-height sticky seat, following Harness: the control belongs to the
             conversation scroller and is centered on the same content lane. */}
@@ -3784,6 +4020,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
           </div>
         )}
       </div>
+
+      <TurnNavRail key={`${activeSession?.project_hash ?? ''}/${sessionId ?? ''}`}
+        items={navTurns} activeIndex={activeNavIndex} activeHistoryTurn={activeHistoryTurn}
+        projectHash={activeSession?.id === sessionId ? activeSession.project_hash : undefined}
+        sessionId={sessionId ?? undefined} streaming={busy}
+        onNavigate={navigateTurn} onHistory={navigateHistoricalTurn} />
 
       {/* 浮动搜索框:默认隐藏,Cmd/Ctrl+F 呼出,Esc/× 关闭。仿浏览器 Find-in-page 样式:
           长条胶囊、无图标、右侧依次 ↑ ↓ ×。position:absolute 钉在容器右上角,不占布局空间。

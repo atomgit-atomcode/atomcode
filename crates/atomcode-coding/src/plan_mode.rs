@@ -91,7 +91,14 @@ pub fn plan_verdict(
         }
         return PlanVerdict::AskMcp;
     }
-    if tool.risk(&call.arguments) == RiskLevel::Risky {
+    // Automation writes own mandatory consent and therefore skip the generic
+    // risk prompt. That must not turn persistent mutations into read-only work:
+    // plan mode blocks them before their internal approval can be reached.
+    let persistent_automation = matches!(
+        call.name.as_str(),
+        "schedule_create" | "schedule_update" | "schedule_delete"
+    );
+    if persistent_automation || tool.risk(&call.arguments) == RiskLevel::Risky {
         return PlanVerdict::Blocked(format!(
             "plan mode is active — `{}` would modify the workspace and is blocked. Only \
              read-only tools are allowed: explore and present a plan for the user to approve \
@@ -245,6 +252,43 @@ mod tests {
                 content: String::new(),
                 is_error: false,
                 images: vec![],
+            }
+        }
+    }
+
+    #[test]
+    fn internally_approved_automation_still_cannot_mutate_in_plan_mode() {
+        struct Backend;
+        impl atomcode_capabilities::tools::automation::AutomationService for Backend {
+            fn call(
+                &self,
+                _: &str,
+                _: serde_json::Value,
+                _: &std::path::Path,
+                _: &tokio_util::sync::CancellationToken,
+            ) -> Result<serde_json::Value, String> {
+                panic!("plan verdict must not execute automation");
+            }
+        }
+        for tool in atomcode_capabilities::tools::automation::automation_tools(Arc::new(Backend)) {
+            let call = ToolCall {
+                id: "plan-automation".into(),
+                name: tool.name().into(),
+                arguments: "{}".into(),
+            };
+            assert_eq!(
+                plan_verdict(false, &call, &tool, grants().as_ref()),
+                PlanVerdict::Proceed
+            );
+            let verdict = plan_verdict(true, &call, &tool, grants().as_ref());
+            if tool.read_only_hint() {
+                assert_eq!(verdict, PlanVerdict::Proceed);
+            } else {
+                assert!(
+                    matches!(verdict, PlanVerdict::Blocked(_)),
+                    "{}: {verdict:?}",
+                    call.name
+                );
             }
         }
     }

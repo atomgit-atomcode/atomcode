@@ -32,6 +32,8 @@ use atomcode_daemon::live_hub::LiveBinding;
 /// 而共享要的正是它——hub 拿着它才能把网页发来的话派进来。会话 id 要**每次现问**,
 /// 不能记下来:`/clear`、`/resume` 都会换会话,记住的那个共享出去就是另一段对话。
 pub trait Live: Send + Sync {
+    fn runtime_id(&self) -> usize;
+    fn provider_info(&self) -> Result<(String, String), String>;
     fn handle(&self) -> CodingRuntimeHandle;
     fn session(&self) -> String;
     fn working_dir(&self) -> std::path::PathBuf;
@@ -45,6 +47,40 @@ fn live() -> &'static Mutex<Option<Arc<dyn Live>>> {
 /// 接上时把它交过来。
 pub fn remember(what: Arc<dyn Live>) {
     *live().lock().expect("live poisoned") = Some(what);
+}
+
+/// Called under the background owner's slot-operation lock, before changing
+/// slots. Publication shares this lock: events after the captured watermark
+/// cannot be lost or attributed to the previous runtime.
+pub fn follow_with<T>(next: Arc<dyn Live>, commit: impl FnOnce() -> T) -> Result<T, String> {
+    let mut guard = bound().lock().expect("binding poisoned");
+    if let Some(previous) = guard.as_ref() {
+        let handle = next.handle();
+        let view = handle.live_view().map_err(|error| error.to_string())?;
+        let mode = view.mode;
+        let (provider, fingerprint) = next.provider_info()?;
+        let mut committed = None;
+        let binding = atomcode_daemon::native_live::replace_embedded_live_view(
+            previous,
+            view,
+            provider,
+            fingerprint,
+            Arc::new(handle),
+            || {
+                committed = Some(commit());
+                remember(next);
+                SESSION_EPOCH.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .map_err(|error| format!("{error:?}"))?;
+        *guard = Some(binding);
+        atomcode_daemon::live_set_mode(mode);
+        Ok(committed.expect("successful handover committed the driver"))
+    } else {
+        let committed = commit();
+        remember(next);
+        Ok(committed)
+    }
 }
 
 /// 当前挂着的那个绑定。
@@ -64,12 +100,6 @@ pub async fn attach(config_path: &std::path::Path) -> Result<(), String> {
     if sharing() {
         return Ok(());
     }
-    let live = live()
-        .lock()
-        .expect("live poisoned")
-        .clone()
-        .ok_or_else(|| tr(SMsg::HostUnavailable).into_owned())?;
-    let handle = live.handle();
     let config =
         atomcode_config::config::Config::load(config_path).map_err(|error| error.to_string())?;
     let (selection, _model) = resolved_selection(&config);
@@ -85,6 +115,14 @@ pub async fn attach(config_path: &std::path::Path) -> Result<(), String> {
         if bound.is_some() {
             return Ok(());
         }
+        // A foreground transition may have happened while configuration was
+        // being read. Capture the current runtime under the handover lock.
+        let live = live()
+            .lock()
+            .expect("live poisoned")
+            .clone()
+            .ok_or_else(|| tr(SMsg::HostUnavailable).into_owned())?;
+        let handle = live.handle();
         let view = handle.live_view().map_err(|error| error.to_string())?;
         let mode = view.mode;
         let binding = atomcode_daemon::native_live::register_embedded_live_view(
@@ -187,15 +225,35 @@ impl atomcode_tui::remote::Remote for FarEnd {
 /// 迟到的事件(hub 已经换了绑定)按「过期」丢掉,不当错误:那是另一个 runtime 的
 /// 事了,而这趟循环还在收着上一个的尾巴。
 pub fn publish(event: &SequencedRuntimeEvent) {
+    publish_inner(None, event);
+}
+
+pub fn publish_from(runtime_id: usize, event: &SequencedRuntimeEvent) {
+    publish_inner(Some(runtime_id), event);
+}
+
+fn publish_inner(runtime_id: Option<usize>, event: &SequencedRuntimeEvent) {
     let guard = bound().lock().expect("binding poisoned");
     let Some(binding) = guard.as_ref() else {
         return;
     };
+    if runtime_id.is_some_and(|id| {
+        live()
+            .lock()
+            .expect("live poisoned")
+            .as_ref()
+            .is_none_or(|live| live.runtime_id() != id)
+    }) {
+        return;
+    }
     if atomcode_daemon::native_live::publish(binding, event.clone()).is_err() {
         // Bootstrap already includes these delayed events. Their side effects
         // must be deduplicated too: an old SessionChanged must not schedule a
         // snapshot handover using the replacement session's live handle.
         return;
+    }
+    if let CodingRuntimeEvent::ModeChanged { mode } = &event.event {
+        atomcode_daemon::live_set_mode(*mode);
     }
     // 换了会话(`/clear`、`/resume`、`/cd`):hub 收到这条就把手上的快照作废,等
     // 新会话的快照交上来 —— 在那之前网页端连不上、发的话一律被拒。经典界面换完
@@ -652,14 +710,16 @@ fn webui_options(args: &str) -> Result<WebuiOptions, String> {
     let mut host = None;
     let mut port = None;
     let mut open_browser = true;
-    let mut remote = true;
+    let mut remote = false;
+    let mut local = false;
     let mut tokens = args.split_whitespace();
     let invalid = |argument: &str| tr(SMsg::WebuiInvalidArguments { argument }).into_owned();
     while let Some(token) = tokens.next() {
         match token {
             "lan" | "0.0.0.0" if host.is_none() => host = Some("0.0.0.0".to_string()),
             "--no-open" => open_browser = false,
-            "--local" => remote = false,
+            "--local" => local = true,
+            "remote" | "--remote" if !remote => remote = true,
             _ if token == "--host" || token.starts_with("--host=") => {
                 let value = token
                     .strip_prefix("--host=")
@@ -683,7 +743,10 @@ fn webui_options(args: &str) -> Result<WebuiOptions, String> {
             _ => return Err(invalid(token)),
         }
     }
-    remote &= host.is_none();
+    if remote && (local || host.is_some()) {
+        return Err(invalid(args));
+    }
+    open_browser &= !remote && host.is_none();
     Ok(WebuiOptions {
         remote,
         host: host.unwrap_or_else(|| "127.0.0.1".to_string()),
@@ -879,9 +942,24 @@ mod tests {
     }
 
     #[test]
-    fn webui_uses_relay_by_default_but_explicit_local_and_lan_do_not() {
-        assert!(webui_options("").unwrap().remote);
-        assert!(webui_options("--no-open").unwrap().remote);
+    fn webui_sharing_is_explicit_and_does_not_open_a_local_browser() {
+        assert!(webui_options("").unwrap().open_browser);
+        assert!(!webui_options("").unwrap().remote);
+        assert!(!webui_options("--no-open").unwrap().remote);
+        for args in ["remote", "--remote", "remote --no-open"] {
+            let options = webui_options(args).unwrap();
+            assert!(options.remote);
+            assert!(!options.open_browser);
+        }
+        assert!(!webui_options("lan").unwrap().open_browser);
+        for args in [
+            "remote lan",
+            "remote --local",
+            "remote --host localhost",
+            "remote remote",
+        ] {
+            assert!(webui_options(args).is_err(), "{args}");
+        }
         for args in ["--local", "lan", "--host 127.0.0.1", "--host 192.168.1.9"] {
             assert!(!webui_options(args).unwrap().remote, "{args}");
         }

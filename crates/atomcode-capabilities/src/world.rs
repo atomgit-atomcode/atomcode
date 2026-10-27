@@ -1258,7 +1258,6 @@ impl FileSystem for LocalFs {
 struct ScanBudget {
     options: WalkOptions,
     started: std::time::Instant,
-    last_notice: std::time::Instant,
     scan: ScanReport,
 }
 #[cfg(feature = "tools")]
@@ -1267,7 +1266,6 @@ impl ScanBudget {
         Self {
             options,
             started: std::time::Instant::now(),
-            last_notice: std::time::Instant::now(),
             scan: Default::default(),
         }
     }
@@ -1284,13 +1282,6 @@ impl ScanBudget {
             return false;
         }
         self.scan.entries_scanned += 1;
-        if self.last_notice.elapsed() >= std::time::Duration::from_millis(500) {
-            self.options.progress.emit(format!(
-                "Searching: {} entries visited",
-                self.scan.entries_scanned
-            ));
-            self.last_notice = std::time::Instant::now();
-        }
         true
     }
 }

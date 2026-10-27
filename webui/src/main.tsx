@@ -1,4 +1,4 @@
-import { apiFetch } from './lib/transport';
+import { apiFetch, hasRelayPairing } from './lib/transport';
 import { render } from 'preact';
 import { App } from './app';
 import { SettingsProvider } from './settings';
@@ -13,10 +13,11 @@ import './index.css';
 
 import { AuthRequired } from './components/AuthRequired';
 import { CompatNotice } from './components/CompatNotice';
-import { signedIn } from './lib/compat';
+import { signedIn, probeWebuiAccess } from './lib/compat';
+import { createAccessRecovery } from './lib/accessRecovery';
 import { getToken } from './api';
 
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import { UNAUTHORIZED_EVENT } from './components/LoginButton';
 
 /**
@@ -25,18 +26,52 @@ import { UNAUTHORIZED_EVENT } from './components/LoginButton';
  *
  * Asked once before the app mounts (opened without the link the terminal
  * printed) and again whenever the app hears a 401 (the webui restarted under
- * an open page, with a new token): from then on every request would be
- * refused, signing in included, and what the app would show is a button that
- * does nothing.
+ * an open page). Revalidate on a protected endpoint and retry without
+ * unmounting an already-open App: one failed relay request is not permanent
+ * evidence of a missing link.
  */
 function Root({ signedIn: initially }: { signedIn: boolean }) {
   const [ok, setOk] = useState(initially);
+  const [mounted, setMounted] = useState(initially);
+  const [checking, setChecking] = useState(false);
+  const recoveryRef = useRef<ReturnType<typeof createAccessRecovery> | null>(null);
   useEffect(() => {
-    const lost = () => setOk(false);
-    window.addEventListener(UNAUTHORIZED_EVENT, lost);
-    return () => window.removeEventListener(UNAUTHORIZED_EVENT, lost);
+    const recovery = createAccessRecovery({
+      probe: () => probeWebuiAccess(apiFetch, getToken()),
+      onChecking: setChecking,
+      onResult: (result) => {
+        if (result === 'allowed') { setMounted(true); setOk(true); }
+        else if (result === 'denied') setOk(false);
+        // An offline relay is not evidence that the browser lost authorization.
+      },
+    });
+    recoveryRef.current = recovery;
+    const check = () => { void recovery.check(); };
+    const visible = () => { if (document.visibilityState === 'visible') check(); };
+    window.addEventListener(UNAUTHORIZED_EVENT, check);
+    window.addEventListener('online', check);
+    window.addEventListener('pageshow', check);
+    document.addEventListener('visibilitychange', visible);
+    if (!initially) check();
+    return () => {
+      recovery.dispose();
+      recoveryRef.current = null;
+      window.removeEventListener(UNAUTHORIZED_EVENT, check);
+      window.removeEventListener('online', check);
+      window.removeEventListener('pageshow', check);
+      document.removeEventListener('visibilitychange', visible);
+    };
   }, []);
-  return ok ? <App /> : <AuthRequired />;
+  return <>
+    {/* Preserve drafts, subscriptions and scroll intent during access recovery.
+        Protected requests still require the existing server-side credentials. */}
+    {mounted && <div style={{ display: 'contents', visibility: ok ? 'visible' : 'hidden' }} aria-hidden={!ok}><App /></div>}
+    {!ok && <div class="auth-required-overlay"><AuthRequired
+      recovering={mounted || hasRelayPairing()}
+      checking={checking}
+      onRetry={() => { void recoveryRef.current?.check(); }}
+    /></div>}
+  </>;
 }
 
 // The installed app's answer for when the webui is not running (`public/sw.js`):

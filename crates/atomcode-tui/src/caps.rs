@@ -138,7 +138,8 @@ pub struct Caps {
     /// Windows ships, Consolas — have the box set but not the decorative one,
     /// so with full Unicode the prompt, the notice flag and every mode icon
     /// arrived as `□`; with plain ASCII the panels became `+--+`. This is the
-    /// third answer between the two.
+    /// third answer between the two. PuTTY and unidentified SSH clients also
+    /// use this conservative set because the server cannot inspect their font.
     pub basic_glyphs: bool,
     pub colors: Colors,
     /// The colours the terminal actually renders: its background, and its
@@ -323,6 +324,72 @@ fn mouse_reported_for(ohos: bool, env: impl Fn(&str) -> Option<String>) -> bool 
         Some(forced) => forced == "1" || forced.eq_ignore_ascii_case("true"),
         None => !ohos,
     }
+}
+
+/// Prefer client-owned copy/paste for SSH (which may identify only as xterm),
+/// explicit PuTTY terminals, and local browser terminal servers. This is a
+/// startup preference, not a capability gate: Ctrl+G can take the mouse later.
+pub(crate) fn take_mouse_at_start() -> bool {
+    take_mouse_at_start_with_browser(
+        |key| std::env::var_os(key).map(|v| v.to_string_lossy().into_owned()),
+        crate::browser_terminal::detected(),
+    )
+}
+
+#[cfg(test)]
+fn take_mouse_at_start_for(env: impl Fn(&str) -> Option<String>) -> bool {
+    take_mouse_at_start_with_browser(env, false)
+}
+
+fn take_mouse_at_start_with_browser(env: impl Fn(&str) -> Option<String>, browser: bool) -> bool {
+    if let Some(forced) = env("ATOMCODE_MOUSE").filter(|v| !v.is_empty()) {
+        return forced == "1" || forced.eq_ignore_ascii_case("true");
+    }
+    !browser && !remote_session_for(&env) && !putty_for(&env)
+}
+
+fn putty_for(env: &dyn Fn(&str) -> Option<String>) -> bool {
+    ["TERM", "TERM_PROGRAM"]
+        .into_iter()
+        .any(|key| env(key).is_some_and(|value| value.to_ascii_lowercase().starts_with("putty")))
+}
+
+/// An anonymous SSH xterm says nothing about the client's font. Prefer the
+/// existing basic decorations unless a known capable client identifies itself.
+fn remote_basic_glyphs_for(env: &dyn Fn(&str) -> Option<String>) -> bool {
+    if putty_for(env) {
+        return true;
+    }
+    if !remote_session_for(&|key| env(key)) {
+        return false;
+    }
+    let modern = env("WT_SESSION").is_some()
+        || env("VTE_VERSION").is_some()
+        || env("TERM_PROGRAM").is_some_and(|v| {
+            matches!(
+                v.as_str(),
+                "iTerm.app" | "WezTerm" | "Apple_Terminal" | "vscode" | "mintty" | "ghostty"
+            )
+        })
+        || env("TERMINAL_EMULATOR").as_deref() == Some("JetBrains-JediTerm")
+        || env("TERM").is_some_and(|v| matches!(v.as_str(), "xterm-kitty" | "xterm-ghostty"));
+    !modern
+}
+
+/// Shared boundary for startup policy and clipboard access: a server clipboard
+/// must never stand in for the SSH/browser client's clipboard, even with X11
+/// forwarding.
+pub(crate) fn remote_session() -> bool {
+    crate::browser_terminal::detected()
+        || remote_session_for(&|key| {
+            std::env::var_os(key).map(|value| value.to_string_lossy().into_owned())
+        })
+}
+
+fn remote_session_for(env: &impl Fn(&str) -> Option<String>) -> bool {
+    ["SSH_CONNECTION", "SSH_TTY", "SSH_CLIENT"]
+        .into_iter()
+        .any(|key| env(key).is_some())
 }
 
 impl Caps {
@@ -568,16 +635,18 @@ pub fn unicode_for(env: &dyn Fn(&str) -> Option<String>) -> bool {
 }
 
 /// Whether this is a console whose font has only the basic glyph set
-/// ([`Caps::basic_glyphs`]): Windows, no terminal that announces itself — not
+/// ([`Caps::basic_glyphs`]): PuTTY or an unidentified SSH client, or Windows
+/// with no terminal that announces itself — not
 /// Windows Terminal (`WT_SESSION`), not mintty or VS Code (`TERM_PROGRAM`), not
 /// a JetBrains terminal — and nobody saying the font has them
 /// (`ATOMCODE_UNICODE`) or that it has none (`ATOMCODE_ASCII`, plain ASCII).
 pub fn basic_glyphs_for(env: &dyn Fn(&str) -> Option<String>, windows: bool) -> bool {
-    windows
-        && env("WT_SESSION").is_none()
-        && env("TERM_PROGRAM").is_none()
-        && !env("TERM").is_some_and(|t| t.contains("jediterm"))
-        && env("TERMINAL_EMULATOR").as_deref() != Some("JetBrains-JediTerm")
+    ((remote_basic_glyphs_for(env) && unicode_for(env))
+        || (windows
+            && env("WT_SESSION").is_none()
+            && env("TERM_PROGRAM").is_none()
+            && !env("TERM").is_some_and(|t| t.contains("jediterm"))
+            && env("TERMINAL_EMULATOR").as_deref() != Some("JetBrains-JediTerm")))
         && !env("ATOMCODE_UNICODE").is_some_and(|v| v != "0")
         && !env("ATOMCODE_ASCII").is_some_and(|v| v != "0")
 }
@@ -852,7 +921,9 @@ pub fn glyph(unicode: bool, glyph: Glyph) -> &'static str {
 mod tests {
     use super::*;
 
-    fn env_of(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+    fn env_of<'a>(
+        pairs: &'a [(&'static str, &'static str)],
+    ) -> impl Fn(&str) -> Option<String> + 'a {
         move |k: &str| {
             pairs
                 .iter()
@@ -939,9 +1010,114 @@ mod tests {
         assert!(!mouse_reported_for(false, |k| (k == "ATOMCODE_MOUSE").then(|| "0".into())));
     }
 
+    #[test]
+    fn ssh_and_putty_do_not_disable_application_mouse_support() {
+        for vars in [
+            vec![("SSH_CONNECTION", "client server"), ("TERM", "xterm")],
+            vec![("SSH_TTY", "/dev/pts/0")],
+            vec![("SSH_CLIENT", "client 123 22")],
+            vec![("TERM", "putty-256color")],
+            vec![("TERM_PROGRAM", "PuTTY")],
+        ] {
+            let env = env_of(&vars);
+            assert!(!take_mouse_at_start_for(&env), "{vars:?}");
+            assert!(mouse_reported_for(false, &env), "{vars:?}");
+        }
+    }
+
+    #[test]
+    fn local_mouse_defaults_and_explicit_overrides_are_preserved() {
+        assert!(take_mouse_at_start_for(env_of(&[])));
+        assert!(take_mouse_at_start_for(env_of(&[("TERM", "xterm")])));
+        for value in ["1", "true", "TRUE"] {
+            assert!(take_mouse_at_start_for(env_of(&[
+                ("SSH_TTY", "/dev/pts/0"),
+                ("ATOMCODE_MOUSE", value)
+            ])));
+        }
+        for value in ["0", "false"] {
+            assert!(!take_mouse_at_start_for(env_of(&[(
+                "ATOMCODE_MOUSE",
+                value
+            )])));
+        }
+    }
+
+    #[test]
+    fn browser_terminals_hand_back_the_mouse_without_ssh_and_allow_an_override() {
+        let env = env_of(&[("TERM", "xterm-256color")]);
+        assert!(!take_mouse_at_start_with_browser(&env, true));
+        assert!(take_mouse_at_start_with_browser(&env, false));
+        assert!(mouse_reported_for(false, &env));
+        for value in ["1", "true", "TRUE"] {
+            assert!(take_mouse_at_start_with_browser(
+                env_of(&[("ATOMCODE_MOUSE", value)]),
+                true
+            ));
+        }
+        assert!(!take_mouse_at_start_with_browser(
+            env_of(&[("ATOMCODE_MOUSE", "0")]),
+            true
+        ));
+    }
+
+    #[test]
+    fn every_ssh_indicator_keeps_clipboard_access_remote() {
+        assert!(!remote_session_for(&env_of(&[])));
+        for key in ["SSH_CONNECTION", "SSH_TTY", "SSH_CLIENT"] {
+            assert!(remote_session_for(&env_of(&[(key, "")])));
+        }
+    }
+
+    #[test]
+    fn anonymous_ssh_and_putty_automatically_use_existing_basic_glyphs() {
+        for vars in [
+            vec![("TERM", "putty-256color")],
+            vec![("TERM", "xterm"), ("TERM_PROGRAM", "PuTTY")],
+            vec![("TERM", "xterm"), ("SSH_CONNECTION", "client server")],
+            vec![("TERM", "xterm-256color"), ("SSH_TTY", "/dev/pts/0")],
+            vec![("SSH_CLIENT", "client 123 22")],
+        ] {
+            assert!(basic_glyphs_for(&env_of(&vars), false), "{vars:?}");
+        }
+        // Reuse the shared rewrite instead of adding another render path.
+        let text = downgrade_keeping("❯ 你好 ⎿ ✓", false, true);
+        assert!(text.contains("你好"));
+        assert!(text.contains('└'));
+        assert!(!text.contains(['❯', '⎿', '✓']));
+    }
+
+    #[test]
+    fn known_modern_clients_and_local_unix_keep_their_existing_glyphs() {
+        assert!(!basic_glyphs_for(&env_of(&[("TERM", "xterm")]), false));
+        for (key, value) in [
+            ("TERM_PROGRAM", "iTerm.app"),
+            ("TERM_PROGRAM", "WezTerm"),
+            ("WT_SESSION", "window"),
+            ("VTE_VERSION", "7600"),
+            ("TERM", "xterm-kitty"),
+            ("TERMINAL_EMULATOR", "JetBrains-JediTerm"),
+        ] {
+            assert!(!basic_glyphs_for(
+                &env_of(&[("SSH_CONNECTION", "remote"), (key, value)]),
+                false
+            ));
+        }
+        for (key, value) in [
+            ("ATOMCODE_ASCII", "1"),
+            ("ATOMCODE_UNICODE", "1"),
+            ("LANG", "C"),
+        ] {
+            assert!(!basic_glyphs_for(
+                &env_of(&[("SSH_TTY", "/dev/pts/0"), (key, value)]),
+                false
+            ));
+        }
+    }
+
     /// A classic Windows console window is the basic one; a terminal that
     /// announces itself, a JetBrains terminal, a person's stated answer, and
-    /// anything not on Windows are not.
+    /// local Unix are not. Remote clients have their own conservative policy.
     #[test]
     fn only_a_classic_windows_console_is_basic() {
         assert!(basic_glyphs_for(&env_of(&[]), true));

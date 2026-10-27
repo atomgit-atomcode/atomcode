@@ -351,6 +351,8 @@ Select provider:
 
 ### 2. Configuration
 
+Provider presets are ordered by priority and show their API host; you can also search by host. In the TUI, open `/provider`, search for a vendor such as DeepSeek, and paste your API key. AtomCode fetches the models automatically; pick one and confirm **connect and use**. Vision, reasoning levels, context size and output limits are filled from the endpoint's metadata. Use `Ctrl+O` for advanced settings or `Ctrl+S` to save the model without switching. If discovery fails, retry with `Ctrl+F` or enter a model ID manually. Undeclared capabilities remain unknown.
+
 Config is stored at `~/.atomcode/config.toml`. A minimal single-provider
 setup looks like this:
 

@@ -608,6 +608,9 @@ name = "chat-options"
 [[insert]]
 name = "tool-intent"
 
+[[insert]]
+name = "context-maintenance"
+
 # The driver protocol: this is what `CodingRuntimeHandle` drives.
 [[insert]]
 name = "ui-handle"
@@ -799,6 +802,8 @@ struct RepeatFusePatch {
 #[derive(serde::Serialize)]
 struct CompactionTailPatch {
     threshold: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token_limit: Option<u32>,
     /// Carried because a patch replaces the whole config and base sets it. Only
     /// the model-free row reads it: `compaction-coding`, which the product swaps
     /// in, keeps recent turns by token budget.
@@ -847,6 +852,11 @@ pub fn config_rows(cfg: &crate::CodingAgentConfig) -> Result<Layer, String> {
         .with_project_file(&cfg.dirs.project(&cfg.working_dir).join("search.toml"))
         .map_err(|e| e.to_string())?;
     let mut out = model_rows(cfg)?
+        .patch(
+            "builtin-tool-search",
+            serde_json::json!({"enabled": cfg.atomgit_tool_search}),
+        )
+        .map_err(|e| e.to_string())?
         .patch("tool-search-world", search)
         .map_err(|e| e.to_string())?
         .patch(
@@ -930,6 +940,7 @@ pub fn config_rows(cfg: &crate::CodingAgentConfig) -> Result<Layer, String> {
             "compaction-tail",
             CompactionTailPatch {
                 threshold: cfg.compact_threshold,
+                token_limit: cfg.compact_token_limit,
                 keep_turns: 2,
             },
         )
@@ -1479,6 +1490,7 @@ pub fn plugins() -> Vec<Arc<dyn Plugin>> {
         // call should say about itself is a presentation decision
         // (`docs/adr/0024`, and `tool_intent`'s own module doc).
         Arc::new(crate::tool_intent::ToolIntentPlugin),
+        Arc::new(crate::context_maintenance::ContextMaintenancePlugin),
         // The review specialization's rows. Here, not in the harness: which
         // reviewer and which reviewer prompt is this product's answer, and the
         // mechanism must not depend on a specialization to offer `/review`.
@@ -1985,6 +1997,7 @@ fn compose_hosted(
         // Unconditional, unlike the recap: writing the instruction file needs a
         // repository and a model, which any assembly that gets this far has.
         .insert(Entry::named("init"))
+        .insert(Entry::named("builtin-tool-search"))
         .when(host.mcp.is_some(), |layer| {
             layer.swap("mcp", "mcp-host").enable("mcp")
         })
@@ -2104,6 +2117,7 @@ fn compose_hosted(
             crate::host_rows::NativeCompactionCheckpointPlugin(hook),
         ));
     }
+    registry.register(Arc::new(crate::mcp_tool_search::BuiltinSearchPlugin));
     if let Some(publication) = host.mcp {
         registry.register(Arc::new(crate::host_rows::McpHostPlugin::new(publication)));
     }

@@ -1593,7 +1593,9 @@ mod tests {
         ]);
         manager.append_events(&lease, &facts).unwrap();
 
-        let records = turn_records("s1", &manager.load_events("s1").unwrap());
+        // Exercise the shared history reader used by the WebUI as well as recall's
+        // projection: an event header must never be parsed as a legacy TurnRecord.
+        let records = manager.load_transcript_records("s1").unwrap();
         assert_eq!(
             records
                 .iter()

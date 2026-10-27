@@ -24,6 +24,8 @@ use tokio::io::AsyncReadExt;
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
 const MAX_TIMEOUT_SECS: u64 = 300;
 
+mod exit_diagnostic;
+
 /// How long a process can be silent (no new stdout/stderr) AFTER having emitted
 /// something, before we kill it. Bumped from 30→90 to tolerate legitimate silent
 /// phases (file lock waits, dependency downloads, linker blocking, large file
@@ -108,7 +110,9 @@ unsafe fn detach_child_from_controlling_tty() {
 /// it can reuse the private spawn/reaper primitives (`build_command`, `PgroupChild`,
 /// `detach_child_from_controlling_tty`) without widening their visibility.
 pub(crate) mod background;
-pub use background::{BashKillTool, BashPollTool, BashStartTool};
+pub use background::{
+    observe_completion, BackgroundCompletion, BashKillTool, BashPollTool, BashStartTool,
+};
 
 /// `bash`, run in whichever execution world it was handed.
 ///
@@ -118,6 +122,7 @@ pub use background::{BashKillTool, BashPollTool, BashStartTool};
 /// how to present the result.
 pub struct BashTool {
     world: Arc<dyn crate::world::Shell>,
+    output_preview: Option<super::output_artifact::ArtifactStoreProvider>,
     /// What counts as a sensitive target (the "allow all" floor and the grant scope).
     sensitive: SensitivePaths,
 }
@@ -137,7 +142,24 @@ impl BashTool {
 
     /// Run commands through `world` instead of this machine.
     pub fn with_world(world: Arc<dyn crate::world::Shell>, sensitive: SensitivePaths) -> Self {
-        Self { world, sensitive }
+        Self {
+            world,
+            sensitive,
+            output_preview: None,
+        }
+    }
+
+    /// Use the host's existing artifact store for optional per-call previews.
+    pub fn with_output_preview(self, store: Arc<super::ArtifactStore>) -> Self {
+        self.with_output_preview_provider(Arc::new(move || Some(store.clone())))
+    }
+
+    pub fn with_output_preview_provider(
+        mut self,
+        provider: super::output_artifact::ArtifactStoreProvider,
+    ) -> Self {
+        self.output_preview = Some(provider);
+        self
     }
 }
 
@@ -146,6 +168,8 @@ struct Args {
     command: String,
     #[serde(default)]
     timeout: Option<u64>,
+    #[serde(default)]
+    output_tail_lines: Option<u64>,
 }
 
 #[async_trait]
@@ -165,17 +189,30 @@ impl Tool for BashTool {
             cfg!(target_os = "windows"),
             windows_bash_active(),
             askpass_active,
+            self.output_preview
+                .as_ref()
+                .and_then(|provider| provider())
+                .is_some(),
         )
     }
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
+        let mut schema = json!({
             "type": "object",
             "properties": {
                 "command": { "type": "string", "description": "The shell command to run" },
                 "timeout": { "type": "integer", "description": "Max seconds to wait (default 60, max 300)" }
             },
             "required": ["command"]
-        })
+        });
+        if self
+            .output_preview
+            .as_ref()
+            .and_then(|provider| provider())
+            .is_some()
+        {
+            super::output_artifact::add_shell_preview_schema(&mut schema);
+        }
+        schema
     }
     fn risk(&self, args: &str) -> RiskLevel {
         // Parse the command out of args; a parse failure is conservatively Risky.
@@ -254,6 +291,18 @@ impl Tool for BashTool {
                 ))
             }
         };
+        let output_preview = self
+            .output_preview
+            .as_ref()
+            .and_then(|provider| provider())
+            .map(super::ArtifactMiddleware::new);
+        let preview_lines = match super::output_artifact::shell_preview_lines(
+            a.output_tail_lines,
+            output_preview.is_some(),
+        ) {
+            Ok(lines) => lines,
+            Err(error) => return err(format!("bash: {error}")),
+        };
         // Keep the RAW request so we can (a) avoid telling a caller that already asked for
         // more than the ceiling to "pass a larger timeout", and (b) surface the clamp up
         // front — the model otherwise believes its larger request was honored and only
@@ -299,11 +348,22 @@ impl Tool for BashTool {
             // behind: a timeout landing in the post-exit drain would kill what the
             // command had just started and call a finished command a timeout.
             res = process.collect_within(Some(dur)) => match res {
-                Ok(Some(collected)) => format_output(
-                    &self.world.decode(&collected.stdout),
-                    &self.world.decode(&collected.stderr),
-                    collected.exit.code,
-                ),
+                Ok(Some(collected)) => {
+                    let mut result = format_output(
+                        &self.world.decode(&collected.stdout),
+                        &self.world.decode(&collected.stderr),
+                        collected.exit.code,
+                    );
+                    if let (Some(lines), Some(preview)) = (preview_lines, &output_preview) {
+                        let status = collected.exit.code.map(|code| format!("[exit code {code}]"))
+                            .unwrap_or_else(|| "[process terminated by signal]".into());
+                        preview.shell_tail(&mut result, lines, &status, collected.exit.code != Some(0), "");
+                    }
+                    if collected.exit.code == Some(0) && exit_diagnostic::may_mask_status(&a.command) {
+                        exit_diagnostic::append_note(&mut result, output_preview.is_some());
+                    }
+                    result
+                },
                 Err(e) => err(format!("bash: error running command: {e}")),
                 // Don't echo the command (see the cancel arm); point at the actionable knob —
                 // a larger `timeout` — BUT only while that knob still has room. Once the run
@@ -373,6 +433,7 @@ fn shell_tool_description(
     is_windows: bool,
     bash_present: bool,
     askpass_active: bool,
+    output_preview: bool,
 ) -> &'static str {
     // Single-source the base paragraph so a Windows/Unix edit can't drift. A
     // macro (not a `const`) because `concat!` only splices literals.
@@ -393,7 +454,9 @@ fn shell_tool_description(
              text, or rewrite the whole file with write_file — do not fall back to sed. \
              Reserve bash for real shell work — git, builds, package managers, running \
              commands — and for pipelines / aggregation (wc, sort, uniq, awk, git log) \
-             the dedicated tools can't do.\n\
+             the dedicated tools can't do. For long builds/tests use `bash_start`, then \
+             `bash_poll` with wait_ms (up to 60000); it returns early on output or exit. \
+             Do not use shell sleep to wait or duplicate a running build.\n\
              This shell is NON-INTERACTIVE: stdin is not connected to a terminal, so a \
              program cannot be driven with typed input once started. Do NOT launch REPLs (python/node/irb), \
              editors (vim/nano), pagers (less/more), or full-screen/monitor programs \
@@ -459,16 +522,36 @@ fn shell_tool_description(
              larger `timeout` (e.g. 300) to leave them time to type."
         };
     }
+    // Tool-owned guidance must disappear along with the optional capability.
+    macro_rules! describe {
+        ($suffix:expr) => {
+            if output_preview {
+                concat!(
+                    "For builds, installs and tests, run the original command directly. Do not \
+                     append `| head`, `| tail` or `| tee` merely to shorten output, or end with \
+                     `echo $?`: these can hide failures. Instead pass `output_tail_lines: 12` \
+                     to this tool for a short preview with the real process status; retrieve \
+                     omitted captured output with `fetch_output` when saved. For long work use \
+                     `bash_start` with the original command, then set `output_tail_lines` on \
+                     `bash_poll`. Pipelines needed for actual data processing remain valid.\n\n",
+                    base!(),
+                    $suffix
+                )
+            } else {
+                concat!(base!(), $suffix)
+            }
+        };
+    }
     if is_windows {
         if bash_present {
-            concat!(base!(), bash_suffix!())
+            describe!(bash_suffix!())
         } else {
-            concat!(base!(), cmd_suffix!())
+            describe!(cmd_suffix!())
         }
     } else if askpass_active {
-        concat!(base!(), askpass_suffix!())
+        describe!(askpass_suffix!())
     } else {
-        base!()
+        describe!("")
     }
 }
 
@@ -4385,7 +4468,7 @@ mod tests {
             (true, false, false),
             (true, true, false),
         ] {
-            let d = shell_tool_description(win, bash, askpass);
+            let d = shell_tool_description(win, bash, askpass, false);
             let lc = d.to_lowercase();
             assert!(
                 lc.contains("non-interactive") || lc.contains("not interactive"),
@@ -4404,7 +4487,7 @@ mod tests {
     // quoting that cmd.exe can't parse, then thrashes into temp-file workarounds.
     #[test]
     fn windows_description_steers_to_cmd_not_bash() {
-        let win = shell_tool_description(true, false, false);
+        let win = shell_tool_description(true, false, false, false);
         assert!(win.contains("cmd.exe"), "windows desc must name cmd.exe");
         let lc = win.to_lowercase();
         assert!(
@@ -4420,7 +4503,7 @@ mod tests {
             "windows desc must warn off command substitution"
         );
 
-        let unix = shell_tool_description(false, false, false);
+        let unix = shell_tool_description(false, false, false, false);
         assert!(
             !unix.contains("cmd.exe"),
             "unix desc must not mention cmd.exe"
@@ -4434,7 +4517,7 @@ mod tests {
     // and (c) steer file ops to the native read_file/grep/glob tools.
     #[test]
     fn windows_description_discourages_shell_mixing_and_steers_to_native_tools() {
-        let win = shell_tool_description(true, false, false);
+        let win = shell_tool_description(true, false, false, false);
         let lc = win.to_lowercase();
         // Don't switch shells: cmd.exe only, no PowerShell, no git-bash `cmd //c`.
         assert!(
@@ -4455,7 +4538,7 @@ mod tests {
         assert!(win.contains("grep"), "must steer to grep: {win}");
         assert!(win.contains("read_file"), "must steer to read_file: {win}");
         // The unix description stays lean (no Windows shell noise).
-        let unix = shell_tool_description(false, false, false);
+        let unix = shell_tool_description(false, false, false, false);
         assert!(
             !unix.contains("PowerShell") && !unix.contains("//c"),
             "unix desc unchanged: {unix}"
@@ -4468,7 +4551,7 @@ mod tests {
     // cmd.exe, emits `dir C:\Windows` / `%VAR%` / `type` which then run in bash and break.
     #[test]
     fn windows_with_bash_present_tells_model_bash_not_cmd() {
-        let d = shell_tool_description(true, true, false);
+        let d = shell_tool_description(true, true, false, false);
         let lc = d.to_lowercase();
         // Must NOT claim cmd.exe / demand cmd-only syntax when bash is what runs.
         assert!(
@@ -4511,7 +4594,7 @@ mod tests {
     // guidance (unchanged from before the fix).
     #[test]
     fn windows_without_bash_keeps_cmd_guidance() {
-        let d = shell_tool_description(true, false, false);
+        let d = shell_tool_description(true, false, false, false);
         assert!(d.contains("cmd.exe"), "no bash → cmd.exe guidance: {d}");
         assert!(
             d.contains("$("),
@@ -4542,7 +4625,7 @@ mod tests {
     // audit-style pipelines (wc/sort/uniq/git log) still legitimately use bash.
     #[test]
     fn unix_description_steers_file_ops_to_native_tools() {
-        let unix = shell_tool_description(false, false, false);
+        let unix = shell_tool_description(false, false, false, false);
         for tool in ["read_file", "grep", "glob", "list_directory"] {
             assert!(
                 unix.contains(tool),
@@ -4564,17 +4647,17 @@ mod tests {
     fn askpass_active_advertises_interactive_password_support() {
         // With askpass wired (Unix TUI) the model is told ssh/sudo password
         // prompts work, so it runs them instead of assuming non-interactive.
-        let with = shell_tool_description(false, false, true);
+        let with = shell_tool_description(false, false, true, false);
         assert!(with.contains("Interactive password prompts ARE supported"));
         assert!(with.contains("ssh user@host"));
         assert!(with.contains("BatchMode"));
         // Interactive commands block on the prompt → steer toward a larger timeout.
         assert!(with.contains("timeout"));
         // Off (webui/headless) it must NOT advertise a prompt that can't appear.
-        let without = shell_tool_description(false, false, false);
+        let without = shell_tool_description(false, false, false, false);
         assert!(!without.contains("Interactive password prompts ARE supported"));
         // Windows never advertises it (askpass is Unix-only) even if asked to.
-        let win = shell_tool_description(true, false, true);
+        let win = shell_tool_description(true, false, true, false);
         assert!(!win.contains("Interactive password prompts ARE supported"));
     }
 
@@ -4966,6 +5049,134 @@ mod tests {
             .await;
         assert!(!r.is_error, "{}", r.content);
         assert!(r.content.contains("hello"), "{}", r.content);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wrapped_status_note_keeps_the_real_shell_result_and_does_not_rerun() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let script = d.path().join("make");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf 'run\\n' >> runs\nprintf 'failure\\nlast\\n'\nexit 23\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = Arc::new(super::super::ArtifactStore::new(d.path().join("artifacts")));
+        let tool = BashTool::default().with_output_preview(store);
+        for (i, command) in [
+            "./make | tail -1",
+            "./make > build.log 2>&1; echo \"EXIT:$?\"",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let result = tool
+                .execute(
+                    &json!({"command":command,"output_tail_lines":1}).to_string(),
+                    &ctx(d.path()),
+                )
+                .await;
+            assert!(!result.is_error);
+            assert!(
+                result.content.contains("[exit code 0]"),
+                "{}",
+                result.content
+            );
+            assert!(result.content.contains(exit_diagnostic::MARKER));
+            assert!(result.content.contains("output_tail_lines"));
+            assert_eq!(
+                std::fs::read_to_string(d.path().join("runs"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                i + 1
+            );
+        }
+        let preserved = tool
+            .execute(
+                r#"{"command":"./make > build.log 2>&1; rc=$?; tail -1 build.log; exit \"$rc\""}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(preserved.content.ends_with("[exit code 23]"));
+        assert!(!preserved.content.contains(exit_diagnostic::MARKER));
+        let unsupported = BashTool::default()
+            .execute(r#"{"command":"./make | tail -1"}"#, &ctx(d.path()))
+            .await;
+        assert!(unsupported.content.contains(exit_diagnostic::MARKER));
+        assert!(!unsupported.content.contains("output_tail_lines"));
+        assert!(!unsupported.content.contains("fetch_output"));
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("runs"))
+                .unwrap()
+                .lines()
+                .count(),
+            4
+        );
+        let query = tool
+            .execute(
+                r#"{"command":"printf 'x\\ny\\n' | tail -1"}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert_eq!(query.content, "y\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_tail_preserves_failure_without_a_pipeline() {
+        let d = tempfile::tempdir().unwrap();
+        let store = Arc::new(super::super::ArtifactStore::new(d.path().join("artifacts")));
+        let tool = BashTool::default().with_output_preview(store.clone());
+        assert!(tool.parameters_schema()["properties"]
+            .get("output_tail_lines")
+            .is_some());
+        let args =
+            json!({"command":"echo first; echo second; echo last; exit 23", "output_tail_lines":2})
+                .to_string();
+        let result = tool.execute(&args, &ctx(d.path())).await;
+        assert!(!result.is_error);
+        assert!(!result.content.contains("first"));
+        assert!(
+            result.content.ends_with("last\n[exit code 23]"),
+            "{}",
+            result.content
+        );
+        let full = "first\nsecond\nlast\n[exit code 23]";
+        let id = super::super::artifact_id(full.as_bytes());
+        assert_eq!(store.get(&id, 0, 1024).unwrap().unwrap(), full.as_bytes());
+
+        for lines in [0, 2001] {
+            let args = json!({"command":"echo ran > should-not-exist", "output_tail_lines":lines})
+                .to_string();
+            assert!(tool.execute(&args, &ctx(d.path())).await.is_error);
+        }
+        assert!(!d.path().join("should-not-exist").exists());
+        assert!(
+            BashTool::default()
+                .execute(&args, &ctx(d.path()))
+                .await
+                .is_error
+        );
+        let success = tool
+            .execute(
+                r#"{"command":"echo ok","output_tail_lines":1}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert_eq!(success.content, "ok\n[exit code 0]");
+        let piped = tool
+            .execute(
+                r#"{"command":"(exit 23) | cat","output_tail_lines":1}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(
+            piped.content.ends_with("[exit code 0]"),
+            "explicit pipelines keep their own status"
+        );
     }
 
     #[tokio::test]

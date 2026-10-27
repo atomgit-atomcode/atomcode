@@ -44,6 +44,7 @@ pub mod tui_proxy;
 pub mod tui_resume;
 pub mod tui_rewind;
 pub mod tui_schedule;
+mod tui_schedule_ui;
 pub mod tui_settings;
 pub mod tui_setup;
 pub mod tui_share;
@@ -453,7 +454,7 @@ pub mod tui_front {
                 true,
             );
             // As the interactive runtime's is built at start.
-            let mut agent = runtime.agent_config();
+            let mut agent = crate::automation_agent_config(&runtime);
             agent.round_cap_checkpoint = true;
             Ok(agent)
         }
@@ -1183,4 +1184,17 @@ mod exit_output_tests {
         assert!(redirected.ends_with('\n'));
         assert!(super::exit_resume_output(&[], true).is_empty());
     }
+}
+
+/// Host-owned automation is offered only where a person can approve changes.
+pub fn automation_agent_config(
+    cfg: &atomcode_coding::CodingRuntimeConfig,
+) -> atomcode_coding::CodingAgentConfig {
+    let mut agent = cfg.agent_config();
+    if cfg.interactive {
+        agent.automation = Some(std::sync::Arc::new(
+            atomcode_schedule::service::Service::system(cfg.dirs.user().join("schedules")),
+        ));
+    }
+    agent
 }

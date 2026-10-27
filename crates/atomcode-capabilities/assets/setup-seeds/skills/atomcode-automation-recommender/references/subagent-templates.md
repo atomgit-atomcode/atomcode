@@ -16,8 +16,9 @@ Subagents are specialized AtomCode instances that run in parallel, each with the
 | Team wants consistent review | Quality focus |
 
 **Value**: Runs code review in parallel while you continue working
-**Model**: sonnet (balanced quality/speed)
-**Tools**: Read, Grep, Glob, Bash
+**Permission**: explore
+**Difficulty**: hard
+**Tools**: `read_file`, `grep`, `glob`
 
 ---
 
@@ -32,8 +33,9 @@ Subagents are specialized AtomCode instances that run in parallel, each with the
 | API keys in code | Environment variable patterns |
 
 **Value**: Catches OWASP vulnerabilities, auth issues, data exposure
-**Model**: sonnet
-**Tools**: Read, Grep, Glob (read-only for safety)
+**Permission**: explore
+**Difficulty**: hard
+**Tools**: `read_file`, `grep`, `glob` (read-only for safety)
 
 ---
 
@@ -47,8 +49,9 @@ Subagents are specialized AtomCode instances that run in parallel, each with the
 | Testing framework configured | jest, pytest, vitest in deps |
 
 **Value**: Generates tests matching project conventions
-**Model**: sonnet
-**Tools**: Read, Write, Grep, Glob
+**Permission**: worker
+**Difficulty**: hard
+**Tools**: `read_file`, `write_file`, `edit_file`, `grep`, `glob`
 
 ---
 
@@ -65,8 +68,9 @@ Subagents are specialized AtomCode instances that run in parallel, each with the
 | Undocumented APIs | Routes without docs |
 
 **Value**: Generates OpenAPI specs, endpoint documentation
-**Model**: sonnet
-**Tools**: Read, Write, Grep, Glob
+**Permission**: worker
+**Difficulty**: hard
+**Tools**: `read_file`, `write_file`, `edit_file`, `grep`, `glob`
 
 ---
 
@@ -81,8 +85,9 @@ Subagents are specialized AtomCode instances that run in parallel, each with the
 | Complex algorithms | Nested loops, recursion |
 
 **Value**: Finds N+1 queries, O(n^2) algorithms, memory leaks
-**Model**: sonnet
-**Tools**: Read, Grep, Glob, Bash
+**Permission**: explore
+**Difficulty**: hard
+**Tools**: `read_file`, `grep`, `glob`
 
 ---
 
@@ -96,8 +101,9 @@ Subagents are specialized AtomCode instances that run in parallel, each with the
 | User-facing UI | Not just API project |
 
 **Value**: Catches accessibility issues, UX problems, responsive design gaps
-**Model**: sonnet
-**Tools**: Read, Grep, Glob
+**Permission**: explore
+**Difficulty**: hard
+**Tools**: `read_file`, `grep`, `glob`
 
 ---
 
@@ -112,9 +118,10 @@ Subagents are specialized AtomCode instances that run in parallel, each with the
 | Security advisories | `npm audit` warnings |
 | Major version behind | Significant version gaps |
 
-**Value**: Updates dependencies incrementally with testing
-**Model**: sonnet
-**Tools**: Read, Write, Bash, Grep
+**Value**: Prepares incremental dependency edits; the lead runs package commands and tests
+**Permission**: worker
+**Difficulty**: hard
+**Tools**: `read_file`, `write_file`, `edit_file`, `grep`
 
 ---
 
@@ -127,9 +134,10 @@ Subagents are specialized AtomCode instances that run in parallel, each with the
 | Breaking changes coming | Deprecation warnings |
 | Refactoring planned | Architectural changes |
 
-**Value**: Plans and executes migrations incrementally
-**Model**: opus (complex reasoning needed)
-**Tools**: Read, Write, Grep, Glob, Bash
+**Value**: Plans and prepares incremental migration edits; the lead runs builds and tests
+**Permission**: worker
+**Difficulty**: hard
+**Tools**: `read_file`, `write_file`, `edit_file`, `grep`, `glob`
 
 ---
 
@@ -150,25 +158,49 @@ Subagents are specialized AtomCode instances that run in parallel, each with the
 
 ## Subagent Placement
 
-Subagents go in `.atomcode/agents/`:
+A **team role** goes in `.atomcode/agents/` (this project) or
+`~/.atomcode/agents/` (every project). The file name without `.md` is the
+role's name, and the `team` tool offers it by that name.
+
+The file is a header of fields between `---` fences, then the role's
+instructions:
 
 ```
-.atomcode/
-  agents/
-    code-reviewer.md
-    security-reviewer.md
-    test-writer.md
+---
+permission: explore      # required: explore (reads, changes nothing) | worker (may edit files)
+difficulty: hard         # required: simple (the fast model) | hard (the strong one)
+when: reviewing auth     # optional: one line on when to hand it work
+---
+You review code for security risks. You report each finding with the file
+and why it matters.
 ```
+
+**`permission` and `difficulty` are required.** A file without them is left
+out and the person is told so — the role is then simply not on offer, which
+reads as "the agent has no reviewer" rather than "the file is malformed".
+
+`permission` decides the tools, and a member never gets a shell:
+- `explore` — read-only: read, grep, glob, list symbols, web search
+- `worker` — the above plus `write_file`, `edit_file`, `search_replace`
+
+The Claude Code agent-file fields (`name`, `description`, `allowed_tools`,
+`user_invocable`) are **not** read here: the role's name is the file's name,
+and the tools come from `permission` (or a `tools:` line naming a subset of
+what `permission` allows).
+
+UTF-8 files with a Windows byte-order mark (BOM) are accepted too.
 
 ---
 
 ## Model Selection Guide
 
-| Model | Best For | Trade-off |
-|-------|----------|-----------|
-| **haiku** | Simple, repetitive checks | Fast, cheap, less thorough |
-| **sonnet** | Most review/analysis tasks | Balanced (recommended default) |
-| **opus** | Complex migrations, architecture | Thorough, slower, more expensive |
+| Difficulty | Best For | Model |
+|------------|----------|-------|
+| `simple` | Small, focused reading or documentation tasks | Configured utility model when available |
+| `hard` | Reviews, implementation, migrations, architecture | Conversation model |
+
+In a role file, the model tier is `difficulty` (`simple` or `hard`); a
+`model:` line names a selection id outright and overrides it.
 
 ---
 
@@ -176,6 +208,8 @@ Subagents go in `.atomcode/agents/`:
 
 | Access Level | Tools | Use Case |
 |--------------|-------|----------|
-| Read-only | Read, Grep, Glob | Reviews, analysis |
-| Writing | + Write | Code generation, docs |
-| Full | + Bash | Migrations, testing |
+| `explore` | `read_file`, `list_directory`, `grep`, `glob`, `list_symbols`, `read_symbol`, available web tools | Reviews, analysis |
+| `worker` | The above plus `write_file`, `edit_file`, `search_replace` | Scoped code and documentation edits |
+
+A team member never gets a shell, whatever the role says: `permission:
+worker` means scoped file edits, not command execution.

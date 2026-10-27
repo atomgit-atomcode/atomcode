@@ -8,7 +8,9 @@
 //! server needed (see the tests below).
 
 use super::jsonrpc;
+use super::options::PreparedOptions;
 use super::registry::LspServerConfig;
+use super::trace::Trace;
 use super::types::{Diagnostic, DiagnosticSeverity, Location};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -46,6 +48,8 @@ async fn handle_server_request(
     root_uri: &str,
     writer: &SharedWrite,
     supports_pull_diagnostics: &AtomicBool,
+    settings: &Value,
+    dynamic: &Mutex<HashMap<String, String>>,
 ) {
     let Some(id) = message.get("id").cloned() else {
         return;
@@ -57,13 +61,40 @@ async fn handle_server_request(
                 .pointer("/params/items")
                 .and_then(Value::as_array)
                 .map_or(0, Vec::len);
-            Value::Array(vec![Value::Null; count])
+            let items = message.pointer("/params/items").and_then(Value::as_array);
+            Value::Array(
+                (0..count)
+                    .map(|index| {
+                        let section = items
+                            .and_then(|v| v.get(index))
+                            .and_then(|v| v.get("section"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        configuration_section(settings, section)
+                    })
+                    .collect(),
+            )
         }
         "workspace/workspaceFolders" => json!([{
             "uri": root_uri,
             "name": "workspace"
         }]),
         "client/registerCapability" => {
+            if let Some(registrations) = message
+                .pointer("/params/registrations")
+                .and_then(Value::as_array)
+            {
+                for registration in registrations {
+                    if let (Some(id), Some(method)) =
+                        (registration["id"].as_str(), registration["method"].as_str())
+                    {
+                        dynamic
+                            .lock()
+                            .unwrap()
+                            .insert(id.to_owned(), method.to_owned());
+                    }
+                }
+            }
             if message
                 .pointer("/params/registrations")
                 .and_then(Value::as_array)
@@ -83,6 +114,13 @@ async fn handle_server_request(
                 .pointer("/params/unregisterations")
                 .or_else(|| message.pointer("/params/unregistrations"))
                 .and_then(Value::as_array);
+            if let Some(registrations) = registrations {
+                for registration in registrations {
+                    if let Some(id) = registration["id"].as_str() {
+                        dynamic.lock().unwrap().remove(id);
+                    }
+                }
+            }
             if registrations.is_some_and(|registrations| {
                 registrations.iter().any(|registration| {
                     registration.get("method").and_then(Value::as_str)
@@ -138,7 +176,35 @@ impl PositionEncoding {
     }
 }
 
+fn configuration_section(settings: &Value, section: &str) -> Value {
+    if section.is_empty() {
+        return settings.clone();
+    }
+    if let Some(value) = settings.get(section) {
+        return value.clone();
+    }
+    section
+        .split('.')
+        .try_fold(settings, |value, part| value.get(part))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+struct StderrTask(Option<JoinHandle<()>>);
+impl Drop for StderrTask {
+    fn drop(&mut self) {
+        if let Some(task) = &self.0 {
+            task.abort();
+        }
+    }
+}
+
 pub struct LspClient {
+    trace: Trace,
+    capabilities: Value,
+    dynamic: Arc<Mutex<HashMap<String, String>>>,
+    init_source: String,
+    stderr_task: StderrTask,
     next_id: AtomicU64,
     pending: Pending,
     closed: Arc<AtomicBool>,
@@ -163,6 +229,25 @@ impl LspClient {
         writer: BoxWrite,
         root_uri: String,
     ) -> Result<Self, String> {
+        Self::connect_with_options(
+            reader,
+            writer,
+            root_uri,
+            PreparedOptions::default(),
+            Trace::default(),
+            true,
+        )
+        .await
+    }
+
+    pub async fn connect_with_options(
+        reader: BoxRead,
+        writer: BoxWrite,
+        root_uri: String,
+        options: PreparedOptions,
+        trace: Trace,
+        diagnostics_enabled: bool,
+    ) -> Result<Self, String> {
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let closed = Arc::new(AtomicBool::new(false));
         let diagnostics: DiagMap = Arc::new(Mutex::new(HashMap::new()));
@@ -178,16 +263,24 @@ impl LspClient {
             supports_pull_diagnostics.clone(),
         );
         let request_root_uri = root_uri.clone();
+        let settings = options.settings.clone();
+        let reader_trace = trace.clone();
+        let dynamic = Arc::new(Mutex::new(HashMap::new()));
+        let reader_dynamic = dynamic.clone();
         let reader_handle = tokio::spawn(async move {
             let mut r = BufReader::new(reader);
             loop {
                 let body = match jsonrpc::read_message(&mut r).await {
                     Ok(b) => b,
-                    Err(_) => break, // stream closed
+                    Err(error) => {
+                        reader_trace.record("transport_error", &json!({"error":error.to_string()}));
+                        break;
+                    }
                 };
                 let Ok(msg) = serde_json::from_slice::<Value>(&body) else {
                     continue;
                 };
+                reader_trace.record("receive", &msg);
                 // A response has an id and no method.
                 if let Some(id) = msg.get("id").and_then(Value::as_u64) {
                     if msg.get("method").is_none() {
@@ -207,6 +300,8 @@ impl LspClient {
                         &request_root_uri,
                         &response_writer,
                         &pull_diagnostics,
+                        &settings,
+                        &reader_dynamic,
                     )
                     .await;
                     continue;
@@ -214,8 +309,10 @@ impl LspClient {
                 if msg.get("method").and_then(Value::as_str)
                     == Some("textDocument/publishDiagnostics")
                 {
-                    if let Some(params) = msg.get("params") {
-                        handle_publish(params, &rd);
+                    if diagnostics_enabled {
+                        if let Some(params) = msg.get("params") {
+                            handle_publish(params, &rd);
+                        }
                     }
                 }
             }
@@ -229,7 +326,12 @@ impl LspClient {
             }
         });
 
-        let client = Self {
+        let mut client = Self {
+            trace,
+            capabilities: json!({}),
+            dynamic,
+            init_source: options.source,
+            stderr_task: StderrTask(None),
             next_id: AtomicU64::new(1),
             pending,
             closed,
@@ -245,9 +347,10 @@ impl LspClient {
         };
 
         // initialize → await result → initialized.
-        let init = json!({
+        let mut init = json!({
             "processId": Value::Null,
             "rootUri": client.root_uri,
+            "workspaceFolders": [{"uri":client.root_uri,"name":"workspace"}],
             "capabilities": {
                 "general": { "positionEncodings": ["utf-8", "utf-16", "utf-32"] },
                 "workspace": {
@@ -266,7 +369,15 @@ impl LspClient {
             },
             "clientInfo": { "name": "atomcode-capabilities", "version": env!("CARGO_PKG_VERSION") }
         });
+        if let Some(initialization) = options.initialization {
+            init["initializationOptions"] = initialization;
+        }
         let initialize = client.send_request("initialize", init).await?;
+        client.capabilities = initialize
+            .get("capabilities")
+            .cloned()
+            .filter(Value::is_object)
+            .ok_or("LSP initialize response is missing capabilities")?;
         *client.position_encoding.lock().unwrap() = PositionEncoding::from_initialize(&initialize);
         if initialize
             .pointer("/capabilities/diagnosticProvider")
@@ -277,11 +388,38 @@ impl LspClient {
                 .store(true, Ordering::Release);
         }
         client.send_notification("initialized", json!({})).await?;
+        if options.settings.is_object()
+            && options.settings.as_object().is_some_and(|v| !v.is_empty())
+        {
+            client
+                .send_notification(
+                    "workspace/didChangeConfiguration",
+                    json!({"settings":options.settings}),
+                )
+                .await?;
+        }
         Ok(client)
     }
 
     /// Spawn a language server process and connect over its stdio.
     pub async fn spawn(config: &LspServerConfig, root: &Path) -> Result<Self, String> {
+        Self::spawn_prepared(
+            config,
+            root,
+            PreparedOptions::default(),
+            Trace::default(),
+            true,
+        )
+        .await
+    }
+
+    pub async fn spawn_prepared(
+        config: &LspServerConfig,
+        root: &Path,
+        options: PreparedOptions,
+        trace: Trace,
+        diagnostics_enabled: bool,
+    ) -> Result<Self, String> {
         let root_uri = url::Url::from_file_path(root)
             .map(|u| u.to_string())
             .map_err(|_| format!("invalid project root for LSP: {}", root.display()))?;
@@ -290,7 +428,7 @@ impl LspClient {
             .current_dir(root)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
         // No console-window flash for the language server (mirrors core's lsp client);
         // no-op off Windows.
@@ -300,12 +438,82 @@ impl LspClient {
             .map_err(|e| format!("failed to spawn {}: {e}", config.command))?;
         let stdout = child.stdout.take().ok_or("no stdout from LSP server")?;
         let stdin = child.stdin.take().ok_or("no stdin to LSP server")?;
-        let client = Self::connect(Box::new(stdout), Box::new(stdin), root_uri).await?;
+        let tail = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let stderr = child.stderr.take().ok_or("no stderr from LSP server")?;
+        let collected = tail.clone();
+        let stderr_trace = trace.clone();
+        let task = StderrTask(Some(tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut stderr = stderr;
+            let mut bytes = [0; 2048];
+            while let Ok(count) = stderr.read(&mut bytes).await {
+                if count == 0 {
+                    break;
+                }
+                stderr_trace.record(
+                    "stderr",
+                    &json!({"text": String::from_utf8_lossy(&bytes[..count])}),
+                );
+                let mut tail = collected.lock().unwrap();
+                tail.extend_from_slice(&bytes[..count]);
+                let excess = tail.len().saturating_sub(8192);
+                tail.drain(..excess);
+            }
+        })));
+        let connected = Self::connect_with_options(
+            Box::new(stdout),
+            Box::new(stdin),
+            root_uri,
+            options,
+            trace.clone(),
+            diagnostics_enabled,
+        )
+        .await;
+        let mut client = match connected {
+            Ok(client) => client,
+            Err(error) => {
+                let status = child
+                    .try_wait()
+                    .ok()
+                    .flatten()
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "still running".into());
+                let stderr = String::from_utf8_lossy(&tail.lock().unwrap()).into_owned();
+                // Raw server diagnostics belong only in the explicit trace, where environment values are redacted.
+                return Err(format!("initialize failed: {error}; process: {status}; stderr retained: {} bytes (enable lsp.trace for details)", stderr.len()));
+            }
+        };
+        client.stderr_task = task;
         *client.child.lock().unwrap() = Some(child);
         Ok(client)
     }
 
+    pub fn status(&self) -> Value {
+        json!({"status": if self.closed.load(Ordering::Acquire) { "closed" } else { "ready" }, "root_uri":self.root_uri,"initialization_source":self.init_source,"capabilities":self.capabilities,"dynamic_methods": self.dynamic.lock().unwrap().values().cloned().collect::<Vec<_>>()})
+    }
+
+    pub fn supports(&self, operation: &str) -> bool {
+        let (capability, method) = match operation {
+            "definition" => ("definitionProvider", "textDocument/definition"),
+            "references" => ("referencesProvider", "textDocument/references"),
+            "hover" => ("hoverProvider", "textDocument/hover"),
+            "document_symbols" => ("documentSymbolProvider", "textDocument/documentSymbol"),
+            "diagnostics" => return true, // push diagnostics need no provider declaration
+            _ => return false,
+        };
+        self.capabilities
+            .get(capability)
+            .is_some_and(|v| !v.is_null() && v != &Value::Bool(false))
+            || self
+                .dynamic
+                .lock()
+                .unwrap()
+                .values()
+                .any(|value| value == method)
+    }
+
     async fn write_msg(&self, value: Value) -> Result<(), String> {
+        self.trace.record("send", &value);
         write_value(&self.writer, value).await
     }
 
@@ -328,6 +536,7 @@ impl LspClient {
         params: Value,
         cancel: Option<&CancellationToken>,
     ) -> Result<Value, String> {
+        let started = tokio::time::Instant::now();
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         {
@@ -371,6 +580,7 @@ impl LspClient {
         if result.is_err() {
             self.pending.lock().unwrap().remove(&id);
         }
+        self.trace.record("request_complete", &json!({"id":id,"method":method,"elapsed_ms":started.elapsed().as_millis(),"ok":result.is_ok()}));
         result
     }
 
@@ -570,12 +780,15 @@ impl LspClient {
 
     /// Graceful shutdown: shutdown request + exit notification, then kill the child.
     pub async fn shutdown(&self) {
-        let _ = tokio::time::timeout(
-            Duration::from_secs(5),
-            self.send_request("shutdown", Value::Null),
-        )
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            let _ = self.send_request("shutdown", Value::Null).await;
+            let _ = self.send_notification("exit", Value::Null).await;
+        })
         .await;
-        let _ = self.send_notification("exit", Value::Null).await;
+        self.closed.store(true, Ordering::Release);
+        for (_, waiter) in std::mem::take(&mut *self.pending.lock().unwrap()) {
+            let _ = waiter.send(Err(json!({"message":"language server shutdown"})));
+        }
         if let Some(mut child) = self.child.lock().unwrap().take() {
             let _ = child.start_kill();
         }
@@ -797,6 +1010,86 @@ mod tests {
         }
         // keep the reader's split half alive so `r` isn't dropped early
         let _ = &mut r;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn configured_handshake_and_settings_use_the_real_protocol_flow() {
+        let (client_end, server_end) = tokio::io::duplex(16 * 1024);
+        let (cr, cw) = tokio::io::split(client_end);
+        let (sr, mut sw) = tokio::io::split(server_end);
+        let server = tokio::spawn(async move {
+            let mut reader = BufReader::new(sr);
+            let init: Value =
+                serde_json::from_slice(&jsonrpc::read_message(&mut reader).await.unwrap()).unwrap();
+            assert_eq!(
+                init["params"]["initializationOptions"]["multiModuleOption"]["file:///proj"]
+                    ["name"],
+                "test_project"
+            );
+            assert_eq!(init["params"]["workspaceFolders"][0]["uri"], "file:///proj");
+            let response = json!({"jsonrpc":"2.0","id":init["id"],"result":{"capabilities":{"hoverProvider":true}}});
+            sw.write_all(&jsonrpc::encode(&serde_json::to_vec(&response).unwrap()))
+                .await
+                .unwrap();
+            let initialized: Value =
+                serde_json::from_slice(&jsonrpc::read_message(&mut reader).await.unwrap()).unwrap();
+            assert_eq!(initialized["method"], "initialized");
+            let changed: Value =
+                serde_json::from_slice(&jsonrpc::read_message(&mut reader).await.unwrap()).unwrap();
+            assert_eq!(changed["method"], "workspace/didChangeConfiguration");
+            let pull = json!({"jsonrpc":"2.0","id":"pull-settings","method":"workspace/configuration","params":{"items":[{"section":"python.analysis"},{"section":"missing"},{}]}});
+            sw.write_all(&jsonrpc::encode(&serde_json::to_vec(&pull).unwrap()))
+                .await
+                .unwrap();
+            let answer: Value =
+                serde_json::from_slice(&jsonrpc::read_message(&mut reader).await.unwrap()).unwrap();
+            assert_eq!(answer["result"][0], json!({"mode":"basic"}));
+            assert_eq!(answer["result"][1], Value::Null);
+            assert_eq!(answer["result"][2], changed["params"]["settings"]);
+        });
+        let options = PreparedOptions {
+            initialization: Some(
+                json!({"multiModuleOption":{"file:///proj":{"name":"test_project"}}}),
+            ),
+            settings: json!({"python":{"analysis":{"mode":"basic"}}}),
+            source: "inline".into(),
+            redactions: vec![],
+        };
+        let client = LspClient::connect_with_options(
+            Box::new(cr),
+            Box::new(cw),
+            "file:///proj".into(),
+            options,
+            Trace::default(),
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(client.supports("hover"));
+        assert!(!client.supports("definition"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn absent_initialization_options_are_omitted_not_sent_as_null() {
+        let (client_end, server_end) = tokio::io::duplex(4096);
+        let (cr, cw) = tokio::io::split(client_end);
+        let (sr, mut sw) = tokio::io::split(server_end);
+        let server = tokio::spawn(async move {
+            let mut reader = BufReader::new(sr);
+            let init: Value =
+                serde_json::from_slice(&jsonrpc::read_message(&mut reader).await.unwrap()).unwrap();
+            assert!(init["params"].get("initializationOptions").is_none());
+            let response = json!({"jsonrpc":"2.0","id":init["id"],"result":{"capabilities":{}}});
+            sw.write_all(&jsonrpc::encode(&serde_json::to_vec(&response).unwrap()))
+                .await
+                .unwrap();
+            jsonrpc::read_message(&mut reader).await.unwrap();
+        });
+        let _client = LspClient::connect(Box::new(cr), Box::new(cw), "file:///proj".into())
+            .await
+            .unwrap();
+        server.await.unwrap();
     }
 
     async fn wait_for_diags(client: &LspClient, path: &Path) -> Vec<Diagnostic> {

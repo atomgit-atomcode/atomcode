@@ -56,6 +56,8 @@ enum Operation {
     DocumentSymbols,
     Inspect,
     Status,
+    Probe,
+    Reload,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -100,7 +102,7 @@ impl Tool for LspTool {
         if self.has_ide() {
             "Read-only semantic queries through the configured IDE bridge: status (list live windows; select with window_id when ambiguous), hover, definition, references, diagnostics, document_symbols, or inspect (hover+definition+references in one request). Uses current editor buffers; positions are one-based UTF-16 columns, or line+symbol with occurrence for ambiguous matches. Reports document version/dirty state; diagnostics are editor snapshots, not build verification. Empty results do not prove lack of support. Explicit connection-file bindings take precedence over directory discovery. No writes. If unavailable, do not retry blindly; explicitly choose a configured local backend or text/AST tools (not semantic equivalents)."
         } else {
-            "Query a locally installed Language Server for semantic definition, references, hover, or diagnostics. Starts the matching server lazily. Read-only; if unavailable, fall back to read_symbol/find_references/search instead of retrying."
+            "Read-only local Language Server queries: definition, references, hover, diagnostics. Use status to inspect current connections, probe with file_path to inspect initialization and capabilities, and reload to close connections and reread initialization/settings files on next query. Probe does not send arbitrary RPC or apply edits. Query positions are one-based Unicode character columns. Starts only configured local servers; never installs them. Disabled and unsupported capabilities are reported explicitly."
         }
     }
 
@@ -114,9 +116,19 @@ impl Tool for LspTool {
                 "document_symbols",
                 "inspect",
                 "status",
+                "probe",
+                "reload",
             ]
         } else {
-            vec!["definition", "references", "hover", "diagnostics"]
+            vec![
+                "definition",
+                "references",
+                "hover",
+                "diagnostics",
+                "status",
+                "probe",
+                "reload",
+            ]
         };
         json!({
             "type": "object",
@@ -127,12 +139,12 @@ impl Tool for LspTool {
                 "symbol": { "type": "string", "description": "IDE only: literal symbol on line instead of character. Uses the editor buffer." },
                 "occurrence": { "type": "integer", "minimum": 1, "description": "IDE only: one-based match number, required for ambiguous symbols." },
                 "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 120, "description": "IDE request deadline (default 20 seconds)." },
-                "file_path": { "type": "string", "description": "Required except for status: file path relative to the workspace or absolute within it" },
+                "file_path": { "type": "string", "description": "Required except for status/reload: file path relative to the workspace or absolute within it" },
                 "line": { "type": "integer", "minimum": 1, "description": "One-based line for position queries; omit for diagnostics/document_symbols" },
                 "character": { "type": "integer", "minimum": 1, "description": "One-based character (UTF-16 for IDE); or use symbol in IDE mode" },
                 "severity": { "type": "string", "enum": ["error", "warning", "all"], "description": "Diagnostics filter (default: error)" }
             },
-            "required": if self.has_ide() { vec!["operation"] } else { vec!["operation", "file_path"] }
+            "required": ["operation"]
         })
     }
 
@@ -141,15 +153,47 @@ impl Tool for LspTool {
             Ok(args) => args,
             Err(error) => return err(format!("lsp: invalid arguments: {error}")),
         };
+        if matches!(args.operation, Operation::Reload) {
+            if matches!(args.backend, Backend::Ide) {
+                return err("lsp: reload only manages local servers");
+            }
+            return match self.manager.reload(&ctx.cancel).await {
+                Ok(status) => ok(status.to_string()),
+                Err(error) => err(error),
+            };
+        }
         if !matches!(args.operation, Operation::Status) && args.file_path.trim().is_empty() {
             return err("lsp: file_path must not be empty");
         }
-        if matches!(args.operation, Operation::Status) && matches!(args.backend, Backend::Local) {
-            return err("lsp: status inspects IDE connections; use backend ide or auto");
+        let feature_path = resolve_path(&args.file_path, &ctx.working_dir);
+        // Policies follow the actual source language even when a symlink alias has
+        // another extension. Keep missing IDE buffers queryable through their path.
+        let feature_path = feature_path.canonicalize().unwrap_or(feature_path);
+        let operation = serde_json::to_value(args.operation).unwrap_or_default();
+        let operations = if matches!(args.operation, Operation::Inspect) {
+            vec!["hover", "definition", "references"]
+        } else {
+            vec![operation.as_str().unwrap_or("")]
+        };
+        for operation in operations {
+            if let Err(message) = self.manager.check_feature(&feature_path, operation) {
+                return ok(
+                    json!({"status":"configured_disabled","operation":operation,"message":message})
+                        .to_string(),
+                );
+            }
         }
-        let use_ide = matches!(args.operation, Operation::Status)
-            || matches!(args.backend, Backend::Ide)
-            || (matches!(args.backend, Backend::Auto) && self.has_ide());
+        let use_ide = !matches!(args.operation, Operation::Probe)
+            && (matches!(args.backend, Backend::Ide)
+                || (matches!(args.backend, Backend::Auto) && self.has_ide()));
+        if matches!(args.operation, Operation::Probe) && matches!(args.backend, Backend::Ide) {
+            return err(
+                "lsp: probe inspects the local LSP connection; use status for IDE discovery",
+            );
+        }
+        if matches!(args.operation, Operation::Status) && !use_ide {
+            return ok(self.manager.status().await.to_string());
+        }
         if use_ide {
             let timeout = args.timeout_secs.unwrap_or(20);
             if !(1..=120).contains(&timeout)
@@ -227,7 +271,7 @@ impl Tool for LspTool {
         }
         if matches!(
             args.operation,
-            Operation::DocumentSymbols | Operation::Inspect | Operation::Status
+            Operation::DocumentSymbols | Operation::Inspect | Operation::Status | Operation::Reload
         ) {
             return ok(json!({"source":"local", "status":"unsupported", "message":"This operation requires an explicitly bound IDE backend."}).to_string());
         }
@@ -247,8 +291,11 @@ impl Tool for LspTool {
                     Err(error) => return err(error),
                 }
             }
-            Operation::Diagnostics => None,
-            Operation::DocumentSymbols | Operation::Inspect | Operation::Status => {
+            Operation::Diagnostics | Operation::Probe => None,
+            Operation::DocumentSymbols
+            | Operation::Inspect
+            | Operation::Status
+            | Operation::Reload => {
                 unreachable!("IDE-only operations handled above")
             }
         };
@@ -280,6 +327,15 @@ impl Tool for LspTool {
                 "lsp: file must be inside the workspace: {}",
                 path.display()
             ));
+        }
+        if matches!(args.operation, Operation::Probe) {
+            if !path.is_file() {
+                return err("lsp: probe file must be a regular file");
+            }
+            return match self.manager.probe(&root, &path, &ctx.cancel).await {
+                Ok(status) => ok(status.to_string()),
+                Err(error) => err(format!("LSP probe: {error}")),
+            };
         }
         let content = match tokio::fs::read_to_string(&path).await {
             Ok(content) => content,
@@ -317,7 +373,9 @@ impl Tool for LspTool {
                     Operation::Diagnostics
                     | Operation::DocumentSymbols
                     | Operation::Inspect
-                    | Operation::Status => {
+                    | Operation::Status
+                    | Operation::Probe
+                    | Operation::Reload => {
                         unreachable!()
                     }
                 };
@@ -326,7 +384,11 @@ impl Tool for LspTool {
                 }
                 degradable(result)
             }
-            Operation::DocumentSymbols | Operation::Inspect | Operation::Status => {
+            Operation::DocumentSymbols
+            | Operation::Inspect
+            | Operation::Status
+            | Operation::Reload
+            | Operation::Probe => {
                 unreachable!("IDE-only operations handled above")
             }
             Operation::Diagnostics => {
@@ -415,13 +477,16 @@ fn one_based_position(args: &Args) -> Result<(u32, u32), String> {
 fn degradable(result: Result<String, String>) -> ToolResult {
     match result {
         Ok(content) => ok(content),
+        Err(error) if error.starts_with("LSP server does not advertise support") => {
+            ok(json!({"status":"unsupported","message":error}).to_string())
+        }
         Err(error) => unavailable(error),
     }
 }
 
 fn unavailable(error: String) -> ToolResult {
     ok(format!(
-        "LSP unavailable: {error}. Fall back to read_symbol, find_references, grep, or read_file; do not retry this LSP call in the current runtime."
+        "LSP unavailable: {error}. Fall back to read_symbol, find_references, grep, or read_file; do not retry blindly. After fixing initialization/settings files, use operation=reload once; command/policy changes require a new runtime."
     ))
 }
 
@@ -514,6 +579,71 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn configured_disabled_is_explicit_and_does_not_spawn() {
+        use super::super::lsp_policy::{LspFeatures, LspMode};
+        let root = tempfile::tempdir().unwrap();
+        let mut policy = super::super::LspSettings::default();
+        policy.features = LspFeatures {
+            hover: Some(LspMode::Off),
+            ..Default::default()
+        };
+        let manager =
+            Arc::new(LspManager::with_registry(LspServerRegistry::empty()).with_policy(policy));
+        let tool = LspTool::new(manager.clone());
+        let result = tool
+            .execute(
+                r#"{"operation":"hover","file_path":"not-even-present.rs","line":1,"character":1}"#,
+                &ctx(root.path()),
+            )
+            .await;
+        let value: Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(value["status"], "configured_disabled");
+        assert!(!manager.has_servers().await);
+        let reloaded = tool
+            .execute(
+                r#"{"operation":"reload","backend":"local"}"#,
+                &ctx(root.path()),
+            )
+            .await;
+        assert!(!reloaded.is_error);
+        assert_eq!(
+            serde_json::from_str::<Value>(&reloaded.content).unwrap()["status"],
+            "reloaded"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ide_feature_policy_follows_symlink_target_language() {
+        use super::super::lsp_policy::{LspFeatures, LspMode, LspOptions};
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("source.rs"), "fn main() {}").unwrap();
+        std::os::unix::fs::symlink("source.rs", root.path().join("alias.txt")).unwrap();
+        let mut registry = LspServerRegistry::empty();
+        registry.insert(
+            "rs",
+            LspServerConfig {
+                command: "never-start-this-server".into(),
+                args: vec![],
+                root_markers: vec![],
+                options: LspOptions {
+                    features: LspFeatures {
+                        hover: Some(LspMode::Off),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            },
+        );
+        let tool = LspTool::new(Arc::new(LspManager::with_registry(registry)));
+        let response=tool.execute(r#"{"operation":"hover","backend":"ide","file_path":"alias.txt","line":1,"character":1}"#,&ctx(root.path())).await;
+        assert_eq!(
+            serde_json::from_str::<Value>(&response.content).unwrap()["status"],
+            "configured_disabled"
+        );
+    }
+
     fn unavailable_tool() -> LspTool {
         let mut registry = LspServerRegistry::empty();
         registry.insert(
@@ -522,6 +652,7 @@ mod tests {
                 command: "atomcode-no-such-lsp-binary-xyz".into(),
                 args: Vec::new(),
                 root_markers: Vec::new(),
+                options: Default::default(),
             },
         );
         LspTool::new(Arc::new(LspManager::with_registry(registry)))
@@ -536,10 +667,9 @@ mod tests {
             .execute(r#"{"operation":"status"}"#, &ctx(root.path()))
             .await;
         assert!(!result.is_error);
-        assert_eq!(
-            serde_json::from_str::<Value>(&result.content).unwrap()["status"],
-            "not_enabled"
-        );
+        let status: Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(status["source"], "local");
+        assert_eq!(status["connections"], json!([]));
         let tool = tool.with_ide_discovery(Some(root.path().join("missing")));
         let result = tool
             .execute(r#"{"operation":"status"}"#, &ctx(root.path()))

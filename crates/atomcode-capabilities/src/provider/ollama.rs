@@ -119,7 +119,7 @@ impl OllamaConfig {
 
 pub struct OllamaProvider {
     cfg: OllamaConfig,
-    client: reqwest::Client,
+    client: std::sync::Arc<super::openai_compat::SwappableClient>,
     url: String,
     /// Stable per-conversation id bound ONCE by the kernel; see the field on
     /// `OpenAiCompatProvider`. `OnceLock` — constant for the provider's life.
@@ -129,29 +129,37 @@ pub struct OllamaProvider {
 
 impl OllamaProvider {
     pub fn new(cfg: OllamaConfig) -> Result<Self, ProviderError> {
-        let mut builder = crate::proxy::apply_async_proxy_policy(reqwest::Client::builder())
-            .redirect(if !cfg.headers.is_empty() {
-                reqwest::redirect::Policy::none()
-            } else {
-                reqwest::redirect::Policy::default()
-            })
-            .connect_timeout(cfg.connect_timeout)
-            // Reap idle keep-alives before the server does (see POOL_IDLE_TIMEOUT).
-            .pool_idle_timeout(retry::POOL_IDLE_TIMEOUT)
-            // Product UA for gateway attribution (parity with core's build_http_client).
-            .user_agent(
-                cfg.user_agent
-                    .as_deref()
-                    .unwrap_or(super::DEFAULT_USER_AGENT),
-            );
-        if cfg.skip_tls_verify {
-            builder = builder.danger_accept_invalid_certs(true);
-        }
-        let client = builder.build().map_err(|e| ProviderError {
-            retryable: false,
-            message: format!("http client build failed: {e}"),
-            ..Default::default()
-        })?;
+        let custom_headers = !cfg.headers.is_empty();
+        let connect_timeout = cfg.connect_timeout;
+        let user_agent = cfg.user_agent.clone();
+        let skip_tls_verify = cfg.skip_tls_verify;
+        let client = std::sync::Arc::new(super::openai_compat::SwappableClient::new_with_proxy(
+            false,
+            move |_, proxy| {
+                let mut builder = super::auto_proxy::apply(
+                    crate::proxy::apply_async_proxy_policy(reqwest::Client::builder()),
+                    proxy,
+                )?
+                .redirect(if custom_headers {
+                    reqwest::redirect::Policy::none()
+                } else {
+                    reqwest::redirect::Policy::default()
+                })
+                .connect_timeout(connect_timeout)
+                // Reap idle keep-alives before the server does (see POOL_IDLE_TIMEOUT).
+                .pool_idle_timeout(retry::POOL_IDLE_TIMEOUT)
+                // Product UA for gateway attribution (parity with core's build_http_client).
+                .user_agent(user_agent.as_deref().unwrap_or(super::DEFAULT_USER_AGENT));
+                if skip_tls_verify {
+                    builder = builder.danger_accept_invalid_certs(true);
+                }
+                builder.build().map_err(|e| ProviderError {
+                    retryable: false,
+                    message: format!("http client build failed: {e}"),
+                    ..Default::default()
+                })
+            },
+        )?);
         let url = format!("{}/api/chat", cfg.base_url.trim_end_matches('/'));
         Ok(Self {
             cfg,
@@ -251,7 +259,7 @@ impl LlmProvider for OllamaProvider {
                     .await
                     {
                         Err(_elapsed) => {
-                            let mut error = retry::stream_idle_error();
+                            let mut error = retry::stream_idle_error(&watchdog);
                             error.retryable = caller_recovers && !emitted_replay_sensitive;
                             yield StreamEvent::Error(error);
                             return;
@@ -339,7 +347,7 @@ impl LlmProvider for OllamaProvider {
 /// Open one `/api/chat` stream, retrying the OPEN (transient status / transport)
 /// per `policy`. Shared by the initial open and the mid-stream re-open.
 async fn open_stream(
-    client: &reqwest::Client,
+    client: &super::openai_compat::SwappableClient,
     url: &str,
     body: &Value,
     api_key: &str,
@@ -350,7 +358,8 @@ async fn open_stream(
 ) -> Result<reqwest::Response, ProviderError> {
     let mut attempt = 1u32;
     loop {
-        let mut req = client.post(url).json(body);
+        let http = client.for_request().await?;
+        let mut req = http.post(url).json(body);
         if !api_key.is_empty() {
             req = req.bearer_auth(api_key);
         }

@@ -317,7 +317,7 @@ fn build_v1_agent(state: SharedState) -> impl ConnectTo<Client> + 'static {
                     // v1 resume: silent restore (MUST NOT replay). The response
                     // echoes the initial mode/config state, mirroring
                     // `session/new`.
-                    let mut resp = ResumeSessionResponse::new().modes(session_mode_state());
+                    let mut resp = ResumeSessionResponse::new().modes(session_mode_state(engine_ref.initial_mode()));
                     if !config_options.is_empty() {
                         resp = resp.config_options(config_options.to_vec());
                     }
@@ -380,7 +380,7 @@ fn build_v1_agent(state: SharedState) -> impl ConnectTo<Client> + 'static {
                         cx.send_notification(SessionNotification::new(id.clone(), update))?;
                     }
                     // Echo initial mode/config state, mirroring `session/resume`.
-                    let mut resp = LoadSessionResponse::new().modes(session_mode_state());
+                    let mut resp = LoadSessionResponse::new().modes(session_mode_state(engine_ref.initial_mode()));
                     if !config_options.is_empty() {
                         resp = resp.config_options(config_options.to_vec());
                     }

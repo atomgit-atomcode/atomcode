@@ -74,7 +74,11 @@ impl LlmProvider for Model {
         let slow = !tools.is_empty() && said.last().is_some_and(|text| text.contains("slow"));
         // `ask me`: a question for the person, through the tool that asks one.
         let last = messages.iter().rev().find(|m| !m.synthetic);
-        if !tools.is_empty() && last.is_some_and(|m| m.role == Role::User && m.text == "ask me") {
+        if !tools.is_empty()
+            && last.is_some_and(|m| {
+                m.role == Role::User && matches!(m.text.as_str(), "ask me" | "ask me slow")
+            })
+        {
             return Ok(Box::pin(futures::stream::iter(vec![
                 StreamEvent::ToolCall(ToolCall {
                     id: "call-ask".into(),
@@ -116,9 +120,32 @@ impl LlmProvider for Model {
                 }),
             ])));
         }
+        // A history long enough to cross the painter's ordinary coalescing
+        // boundary. File reads are real, local and require no subprocess.
+        if !tools.is_empty()
+            && last.is_some_and(|message| {
+                message.role == Role::User && message.text == "older replay tool history"
+            })
+        {
+            let mut events = (0..180)
+                .map(|index| {
+                    StreamEvent::ToolCall(ToolCall {
+                        id: format!("history-{index}"),
+                        name: "read_file".into(),
+                        arguments: serde_json::json!({"file_path":format!("history-{index}.txt")})
+                            .to_string(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            events.push(StreamEvent::Done { truncated: false });
+            return Ok(Box::pin(futures::stream::iter(events)));
+        }
         // `review it`: the model reaches for `code_review` on its own, the way a
         // person's "审查下代码改动" makes it.
-        if !tools.is_empty() && last.is_some_and(|m| m.role == Role::User && m.text == "review it")
+        if !tools.is_empty()
+            && last.is_some_and(|m| {
+                m.role == Role::User && matches!(m.text.as_str(), "review it" | "review it slow")
+            })
         {
             return Ok(Box::pin(futures::stream::iter(vec![
                 StreamEvent::ToolCall(ToolCall {
@@ -737,6 +764,64 @@ async fn a_history_and_fresh_foreground() -> (Rig, String) {
     })
     .await;
     (rig, history)
+}
+
+/// Opening a long session from the actual /bg list must paint its tail, not
+/// animate its old tool output through multiple frames.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+async fn opening_bg_list_paints_the_latest_history_without_intermediate_replay() {
+    let rig = Rig::new().await;
+    for index in 0..180 {
+        std::fs::write(
+            rig.project.path().join(format!("history-{index}.txt")),
+            format!("historical tool payload {index}"),
+        )
+        .unwrap();
+    }
+    rig.term.type_line("older replay tool history");
+    rig.until_screen("answer 1").await;
+    rig.until("history idle", |rig| rig.client.root_settled())
+        .await;
+    assert!(
+        rig.client.events().len() > 256,
+        "the replay must cross a normal repaint boundary"
+    );
+    let target = rig.client.root();
+    rig.term.type_line("/background");
+    rig.until("fresh foreground", |rig| rig.client.root() != target)
+        .await;
+    rig.term.type_line("/bg list");
+    rig.until_screen(&t(Msg::BgPlaceholder)).await;
+    let before = rig.term.frame_count();
+    rig.term.press(KeyPress {
+        key: Key::Enter,
+        mods: Mods::default(),
+    });
+    rig.until("latest reply on the opened session", |rig| {
+        let text = rig.term.text();
+        rig.client.root() == target
+            && text.contains("answer 1")
+            && !text.contains(&*t(Msg::BgPlaceholder))
+    })
+    .await;
+    let frames = rig.term.frames();
+    let opened = &frames[before..];
+    assert!(opened
+        .iter()
+        .any(|frame| frame.rows().join("\n").contains("answer 1")));
+    for frame in opened {
+        let text = frame.rows().join("\n");
+        assert!(
+            !text.contains("history-") || text.contains("answer 1"),
+            "history was painted before its latest reply:\n{text}"
+        );
+    }
+    assert!(
+        rig.client.events().len() > 256,
+        "history remains available for scrolling"
+    );
+    rig.quit().await;
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -1378,6 +1463,300 @@ async fn a_review_brought_to_the_front_is_offered_again() {
     rig.until("the review is in front", |rig| rig.client.root() == review)
         .await;
     until_listed(&rig, &review, true).await;
+    rig.quit().await;
+}
+
+async fn shared_question_id() -> u64 {
+    for _ in 0..400 {
+        if let Ok(join) = atomcode_daemon::native_live::join() {
+            if let Some(id) = join.replay.iter().find_map(|event| match &event.event {
+                atomcode_daemon::live_hub::LiveViewEvent::Runtime(
+                    atomcode_coding::CodingRuntimeEvent::Request(request),
+                ) => Some(request.id),
+                _ => None,
+            }) {
+                return id;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("shared question never published");
+}
+
+async fn share(rig: &Rig) {
+    let path = rig._home.path().join("config.toml");
+    std::fs::write(
+        &path,
+        r#"
+default_model = "custom/a"
+[provider_accounts.custom]
+provider = "openai-compatible"
+base_url = "https://example.invalid/v1"
+api_key = "k"
+[models."custom/a"]
+account = "custom"
+model = "scripted"
+"#,
+    )
+    .unwrap();
+    atomcode::tui_share::attach(&path).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(atomcode_home)]
+async fn an_unopened_running_review_is_hidden_but_its_disk_record_remains_recoverable() {
+    let rig = Rig::new().await;
+    changed_repo(rig.project.path());
+    rig.term.type_line("review it slow");
+    rig.until_background("review started", |list| {
+        list.iter().any(|s| s.state == BackgroundState::Running)
+    })
+    .await;
+    // Both the parent and its delegated review wait on the script gate. A
+    // Running status alone can precede the first committed user-message fact.
+    rig.until("review reached the model", |rig| {
+        rig.script.started.load(Ordering::SeqCst) >= 2
+    })
+    .await;
+    let review = rig.background().await[0].session.clone();
+    until_listed(&rig, &review, false).await;
+    assert!(atomcode_daemon::native_live::background_session_hidden(
+        &review
+    ));
+    let store = atomcode_capabilities::session::SessionManager::for_project(
+        rig.project.path(),
+        &atomcode_coding::config::product_dirs_from_env(),
+    );
+    assert_eq!(
+        store.read_meta(&review).unwrap().origin,
+        atomcode_capabilities::session::manager::SessionOrigin::Manual
+    );
+    rig.running.abort();
+    rig.host.shutdown_all().await;
+    assert!(!atomcode_daemon::native_live::background_session_hidden(
+        &review
+    ));
+    until_listed(&rig, &review, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(atomcode_home)]
+async fn a_shared_background_runtime_can_be_opened_from_tui_and_webui_without_a_fork() {
+    let rig = Rig::new().await;
+    rig.term.type_line("hello");
+    rig.until_screen("answer 1").await;
+    let first = rig.client.root();
+    rig.term.type_line("/background slow job");
+    rig.until_background("task started", |list| {
+        list.iter().any(|s| s.state == BackgroundState::Running)
+    })
+    .await;
+    let target = rig.background().await[0].session.clone();
+    share(&rig).await;
+    let mut peer = atomcode_daemon::native_live::join().unwrap().receiver;
+    rig.term.type_line("/bg 1");
+    rig.until("TUI opened background while sharing", |rig| {
+        rig.client.root() == target
+    })
+    .await;
+    assert!(atomcode::tui_share::sharing());
+    assert_eq!(
+        atomcode_daemon::native_live::binding().unwrap().session_id,
+        target
+    );
+    // The WebUI endpoint calls this exact navigation entry point. The original
+    // foreground is now in a slot, still held by its original runtime/lease.
+    let switched = atomcode_daemon::native_live::resume_or_fork_session(first.clone())
+        .await
+        .unwrap();
+    assert!(switched.forked_from.is_none());
+    assert_eq!(switched.changed.session_id.as_deref(), Some(first.as_str()));
+    rig.until("WebUI navigation also moves TUI", |rig| {
+        rig.client.root() == first
+    })
+    .await;
+    assert_eq!(
+        atomcode_daemon::native_live::binding().unwrap().session_id,
+        first
+    );
+    assert!(
+        peer.try_recv().is_ok(),
+        "old viewers receive the switch announcement"
+    );
+    // Let the old runtime finish: its late events must not replace the new view.
+    rig.release();
+    rig.until_background("task finished", |list| {
+        list.iter().any(|s| s.state == BackgroundState::Done)
+    })
+    .await;
+    assert_eq!(
+        atomcode_daemon::native_live::join()
+            .unwrap()
+            .binding
+            .session_id,
+        first
+    );
+    atomcode::tui_share::detach().unwrap();
+    rig.quit().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(atomcode_home)]
+async fn a_shared_review_is_promoted_only_when_the_person_opens_it() {
+    let rig = Rig::new().await;
+    let review = review_came_home(&rig).await;
+    until_listed(&rig, &review, false).await;
+    share(&rig).await;
+    let result = atomcode_daemon::native_live::resume_or_fork_session(review.clone())
+        .await
+        .unwrap();
+    assert!(result.forked_from.is_none());
+    rig.until("shared review in front", |rig| rig.client.root() == review)
+        .await;
+    until_listed(&rig, &review, true).await;
+    assert!(!atomcode_daemon::native_live::background_session_hidden(
+        &review
+    ));
+    assert_eq!(
+        atomcode_daemon::native_live::binding().unwrap().session_id,
+        review
+    );
+    atomcode::tui_share::detach().unwrap();
+    rig.quit().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(atomcode_home)]
+async fn a_shared_switch_rejected_by_approval_keeps_the_binding_and_task() {
+    let rig = Rig::new().await;
+    let first = rig.client.root();
+    rig.term.type_line("/background slow job");
+    rig.until_background("task started", |list| !list.is_empty())
+        .await;
+    let target = rig.background().await[0].session.clone();
+    share(&rig).await;
+    rig.term.type_line("ask me");
+    rig.until_screen("Which one?").await;
+    let _ = shared_question_id().await;
+    let old = atomcode_daemon::native_live::binding().unwrap();
+    let refused = atomcode_daemon::native_live::resume_or_fork_session(target.clone()).await;
+    assert!(refused.is_err());
+    assert_eq!(rig.client.root(), first);
+    assert_eq!(atomcode_daemon::native_live::binding().unwrap(), old);
+    assert_eq!(rig.background().await[0].session, target);
+    atomcode::tui_share::detach().unwrap();
+    rig.quit().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(atomcode_home)]
+async fn answering_in_webui_releases_the_switch_guard_before_the_turn_finishes() {
+    let rig = Rig::new().await;
+    rig.term.type_line("/background slow job");
+    rig.until_background("task started", |list| !list.is_empty())
+        .await;
+    let target = rig.background().await[0].session.clone();
+    share(&rig).await;
+    rig.term.type_line("ask me slow");
+    rig.until_screen("Which one?").await;
+    let id = shared_question_id().await;
+    atomcode_daemon::native_live::respond_confirmed(id, serde_json::Value::Null)
+        .await
+        .unwrap();
+    rig.until("answer accepted, next model call still running", |rig| {
+        rig.script.started.load(Ordering::SeqCst) >= 2
+    })
+    .await;
+    let switched = atomcode_daemon::native_live::resume_or_fork_session(target.clone())
+        .await
+        .unwrap();
+    assert!(switched.forked_from.is_none());
+    rig.until("switch follows the resolved request", |rig| {
+        rig.client.root() == target
+    })
+    .await;
+    atomcode::tui_share::detach().unwrap();
+    rig.release();
+    rig.quit().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+async fn disconnecting_webui_does_not_abandon_a_preparing_session_switch() {
+    let (rig, history) = a_history_and_fresh_foreground().await;
+    share(&rig).await;
+    rig.spawn_gate.send(false).unwrap();
+    let target = history.clone();
+    let browser =
+        tokio::spawn(
+            async move { atomcode_daemon::native_live::resume_or_fork_session(target).await },
+        );
+    rig.until("switch preparation began", |rig| {
+        rig.spawn_started.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    browser.abort();
+    let _ = browser.await;
+    rig.spawn_gate.send(true).unwrap();
+    rig.until("accepted switch finishes after browser disconnect", |rig| {
+        rig.client.root() == history
+    })
+    .await;
+    assert_eq!(
+        atomcode_daemon::native_live::binding().unwrap().session_id,
+        history
+    );
+    atomcode::tui_share::detach().unwrap();
+    rig.quit().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+async fn shared_history_navigation_keeps_an_idle_parent_until_its_result_comes_home() {
+    let (rig, history) = a_history_and_fresh_foreground().await;
+    rig.term.type_line("hello");
+    rig.until_screen("answer 2").await;
+    rig.until("parent idle", |rig| rig.client.root_settled())
+        .await;
+    let parent = rig.client.root();
+    rig.term.type_line("/background slow job");
+    rig.until_background("task started", |list| !list.is_empty())
+        .await;
+    let task = rig.background().await[0].session.clone();
+    let store = atomcode_capabilities::session::SessionManager::for_project(
+        rig.project.path(),
+        &atomcode_coding::config::product_dirs_from_env(),
+    );
+    share(&rig).await;
+    atomcode_daemon::native_live::resume_or_fork_session(history.clone())
+        .await
+        .unwrap();
+    rig.until("history opened", |rig| rig.client.root() == history)
+        .await;
+    assert!(
+        rig.background().await.iter().any(|s| s.session == parent),
+        "the idle result recipient is retained"
+    );
+    rig.release();
+    let mut received = false;
+    for _ in 0..400 {
+        if store.load_events(&parent).is_ok_and(|events| {
+            events.iter().any(|logged| {
+                matches!(&logged.event, atomcode_kernel::session::SessionEvent::Injected {
+                text, origin: atomcode_kernel::session::InjectionOrigin::Peer { from, .. }, ..
+            } if from == &task && text.contains("slow done"))
+            })
+        }) {
+            received = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        received,
+        "the background result reaches its original conversation"
+    );
+    atomcode::tui_share::detach().unwrap();
     rig.quit().await;
 }
 

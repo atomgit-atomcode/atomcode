@@ -298,6 +298,7 @@ pub(crate) fn chat_runtime_config(
     atomcode_coding::CodingRuntimeConfig {
         startup_warnings,
         extra_skill_dirs: config.skills.extra_dirs.clone(),
+        compact_token_limit: config.compaction.token_limit.map(|limit| limit.get()),
         dirs: atomcode_coding::config::product_dirs_from_env(),
         api_key: p.and_then(|p| p.api_key.clone()).unwrap_or_default(),
         base_url: p.and_then(|p| p.base_url.clone()).unwrap_or_default(),
@@ -308,6 +309,7 @@ pub(crate) fn chat_runtime_config(
             config.language,
         )),
         todo: config.tools.todo.clone(),
+        atomgit_tool_search: config.tools.atomgit.tool_search,
         atomgit_enabled: atomcode_config::config::atomgit_enabled_from_env(
             std::env::var("ATOMCODE_ATOMGIT").ok().as_deref(),
             config.tools.atomgit.enabled,
@@ -342,6 +344,11 @@ pub(crate) fn chat_runtime_config(
             config.coding.shell_guard_policy,
         ),
         permission_rules: std::sync::Arc::new(permission_rules),
+        initial_mode: config
+            .permissions
+            .default_mode
+            .map(Into::into)
+            .unwrap_or_default(),
         user_agent: p.and_then(|p| p.user_agent.clone()),
         headers: p.map(|p| p.headers.clone()).unwrap_or_default(),
         skip_tls_verify: p.map(|p| p.skip_tls_verify).unwrap_or(false),
@@ -694,6 +701,7 @@ pub(crate) enum LiveWireEvent {
         session_name: String,
         project_hash: String,
         provider: String,
+        model: Option<String>,
         /// 当前审批模式（build / accept_edits / bypass / plan），
         /// 让新连上的 tab 立刻显示正确的模式 pill。
         mode: String,
@@ -705,7 +713,12 @@ pub(crate) enum LiveWireEvent {
         goal: Option<LiveGoalSnapshot>,
     },
     #[serde(rename = "provider")]
-    Provider { provider: String },
+    Provider {
+        provider: String,
+        model: Option<String>,
+    },
+    #[serde(rename = "model")]
+    Model { model: Option<String> },
     #[serde(rename = "reasoning_effort")]
     ReasoningEffort {
         provider: String,
@@ -1011,6 +1024,11 @@ impl NativeLiveWireProjector {
                     auto_resuming,
                     server_message,
                 },
+                Kernel::Described { description } if description.session == self.session_id => {
+                    LiveWireEvent::Model {
+                        model: description.model,
+                    }
+                }
                 Kernel::ToolCallStreaming { .. }
                 | Kernel::ToolBatchStarted { .. }
                 | Kernel::ToolBatchCompleted { .. }
@@ -1136,8 +1154,12 @@ impl NativeLiveWireProjector {
                 }
             }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::ProviderChanged {
-                provider, ..
-            }) => LiveWireEvent::Provider { provider },
+                provider,
+                model,
+            }) => LiveWireEvent::Provider {
+                provider,
+                model: Some(model),
+            },
             crate::live_hub::LiveViewEvent::Runtime(Runtime::ReasoningEffortChanged {
                 provider,
                 effort,
@@ -1538,6 +1560,7 @@ pub(crate) async fn live_stream(
             session_name,
             project_hash,
             provider: join.binding.provider.clone(),
+            model: join.model.clone(),
             mode: live_current_mode_wire(),
             working_dir: snapshot_wd.to_string_lossy().to_string(),
             goal: initial_goal.as_ref().map(goal_snapshot),
@@ -2775,6 +2798,44 @@ pub(crate) async fn live_mcp_trust(State(state): State<AppState>) -> impl IntoRe
 #[cfg(test)]
 mod tests {
     #[test]
+    fn model_wire_uses_runtime_names_and_ignores_member_descriptions() {
+        use atomcode_coding::CodingRuntimeEvent;
+        use atomcode_kernel::{agent::AgentDescription, event::AgentEvent};
+        let mut projector = super::NativeLiveWireProjector {
+            session_id: "lead".into(),
+            ..Default::default()
+        };
+        let change = projector
+            .project(crate::live_hub::LiveViewEvent::Runtime(
+                CodingRuntimeEvent::ProviderChanged {
+                    provider: "alias".into(),
+                    model: "lumen-alpha".into(),
+                },
+            ))
+            .unwrap();
+        let wire = serde_json::to_value(change).unwrap();
+        assert_eq!(wire["type"], "provider");
+        assert_eq!(wire["provider"], "alias");
+        assert_eq!(wire["model"], "lumen-alpha");
+        let described = |session: &str| {
+            crate::live_hub::LiveViewEvent::Runtime(CodingRuntimeEvent::Agent(
+                AgentEvent::Described {
+                    description: AgentDescription {
+                        session: session.into(),
+                        model: Some("actual-model".into()),
+                        ..Default::default()
+                    }
+                    .into(),
+                },
+            ))
+        };
+        assert!(projector.project(described("member")).is_none());
+        let wire = serde_json::to_value(projector.project(described("lead")).unwrap()).unwrap();
+        assert_eq!(wire["type"], "model");
+        assert_eq!(wire["model"], "actual-model");
+    }
+
+    #[test]
     fn live_effort_parser_accepts_canonical_levels_without_loosening_endpoint_limits() {
         for level in atomcode_config::config::REASONING_EFFORT_LEVELS {
             let parsed =
@@ -3280,13 +3341,19 @@ mod tests {
             },
             "test".into(),
         );
+        let mut config = atomcode_config::Config::default();
+        config.permissions.default_mode = Some(atomcode_config::config::DefaultExecutionMode::Plan);
         let runtime = live_runtime_config(
-            &atomcode_config::config::Config::default(),
+            &config,
             "missing-test-provider",
             &std::env::temp_dir(),
             telemetry,
         );
         assert!(runtime.interactive);
+        assert_eq!(
+            runtime.agent_config().initial_mode,
+            atomcode_coding::RuntimeMode::Plan
+        );
         assert_eq!(
             crate::kernel_runtime::coding_config_from_runtime(&runtime).request_timeout,
             None

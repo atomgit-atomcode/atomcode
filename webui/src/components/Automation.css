@@ -1,0 +1,84 @@
+/* Automation uses AtomCode's model-settings modal and expandable account-card pattern. */
+.modal-card.automation-modal { width: min(880px, 100%); height: min(820px, 85dvh); }
+.automation-modal .modal-header > svg { color: var(--app-brand); flex: none; }
+.automation-body { gap: 18px; scroll-padding-top: 16px; }
+.automation-intro { display: flex; align-items: center; justify-content: space-between; gap: 20px; }
+.automation-intro h4 { margin: 0 0 6px; font-size: .9375rem; }
+.automation-intro p { margin: 0; max-width: 440px; }
+.automation-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.automation-actions .btn { min-height: 34px; }
+.automation-toolbar { display: flex; align-items: center; gap: 12px; }
+.automation-toolbar .segmented { flex: none; }
+.automation-search { flex: 1; min-width: 0; }
+.automation-feedback { padding: 10px 12px; border: 1px solid var(--app-border-strong); border-left: 3px solid var(--app-brand); border-radius: var(--corner-radius-small); background: var(--app-layer-1-background); font-size: .8125rem; line-height: 1.6; overflow-wrap: anywhere; }
+.automation-feedback p { margin: 0 0 10px; }
+.automation-catalog { display: flex; flex-direction: column; gap: 10px; }
+.automation-card { border: 1px solid var(--app-menu-border); border-radius: var(--corner-radius-medium); background: var(--app-primary-background); min-width: 0; }
+.automation-card.is-open { border-color: var(--app-input-active-border); }
+.automation-card-heading { width: 100%; border: 0; background: transparent; color: inherit; text-align: left; display: flex; align-items: center; gap: 12px; padding: 14px 16px; cursor: pointer; font: inherit; border-radius: var(--corner-radius-medium); }
+.automation-card-heading:hover { background: var(--app-ghost-button-hover-background); }
+.automation-card-heading:disabled { cursor: default; opacity: .65; }
+.automation-card-heading > svg { flex: none; color: var(--app-tertiary-foreground); }
+.automation-card-content { flex: 1; display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.automation-card-content strong { font-size: .875rem; font-weight: 600; overflow-wrap: anywhere; }
+.automation-card-content span { font-size: .75rem; color: var(--app-tertiary-foreground); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.automation-card-content small { font-size: .75rem; color: var(--app-caption-foreground); }
+.automation-badge { font-size: .6875rem; color: var(--app-secondary-foreground); background: var(--app-layer-1-background); border: 1px solid var(--app-border-subtle); padding: 3px 7px; border-radius: var(--corner-radius-small); white-space: nowrap; }
+.automation-badge.status-running { color: var(--app-brand); }
+.automation-badge.status-error,.automation-badge.status-rejected,.automation-danger { color: var(--app-error-foreground); }
+.automation-badge.status-ok { color: var(--app-success-foreground); }
+.automation-registration-warning { color: var(--app-warning-accent); font-weight: 700; }
+.automation-chevron { color: var(--app-caption-foreground); font-size: 18px; }
+.automation-editor { padding: 0 18px 18px; border-top: 1px solid var(--app-border-subtle); }
+.automation-editor-heading { display: flex; align-items: center; justify-content: space-between; min-height: 42px; gap: 12px; color: var(--app-tertiary-foreground); font-size: .75rem; }
+.automation-tabs { display: flex; gap: 18px; margin-bottom: 18px; border-bottom: 1px solid var(--app-menu-border); }
+.automation-tabs button { padding: 8px 0; background: transparent; color: var(--app-tertiary-foreground); border: 0; border-bottom: 2px solid transparent; font: inherit; font-size: .8125rem; cursor: pointer; }
+.automation-tabs button[aria-selected=true] { color: var(--app-primary-foreground); border-bottom-color: var(--app-brand); }
+.automation-tabs button:disabled { opacity: .5; cursor: default; }
+.automation-editor fieldset { padding: 0; margin: 0; border: 0; display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.automation-editor .field-group { margin: 0; display: flex; flex-direction: column; gap: 7px; }
+.automation-editor :is(input,textarea,select) { font-family: var(--app-sans-font-family); }
+.automation-editor textarea { resize: vertical; min-height: 100px; line-height: 1.6; }
+.automation-section-title { color: var(--app-secondary-foreground); font-size: .75rem; font-weight: 600; padding-top: 8px; }
+.automation-field-row { display: flex; gap: 14px; }
+.automation-field-row > label { flex: 1; min-width: 0; }
+.automation-time-hint { margin: -6px 0 0; }
+.automation-context { display: flex; flex-direction: column; gap: 6px; }
+.automation-context code { font-size: .75rem; color: var(--app-secondary-foreground); overflow-wrap: anywhere; font-family: var(--app-monospace-font-family); }
+.automation-context p { margin: 0; }
+.automation-savebar { position: sticky; bottom: -16px; z-index: 1; background: var(--app-menu-background); border: 1px solid var(--app-menu-border); border-radius: var(--corner-radius-small); padding: 12px; display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.automation-savebar .modal-error { flex-basis: 100%; margin: 0; }
+.automation-task-actions { display: flex; flex-wrap: wrap; gap: 8px; padding-top: 18px; margin-top: 18px; border-top: 1px solid var(--app-border-subtle); }
+.automation-task-actions .automation-danger { margin-left: auto; }
+.automation-empty { display: flex; align-items: center; flex-direction: column; text-align: center; padding: 32px 16px; gap: 10px; color: var(--app-tertiary-foreground); }
+.automation-empty p { margin: 0; font-size: .875rem; color: var(--app-secondary-foreground); }
+.automation-empty > svg { width: 26px; height: 26px; color: var(--app-caption-foreground); }
+.automation-history { display: flex; flex-direction: column; gap: 12px; }
+.automation-run { padding: 12px 0; border-top: 1px solid var(--app-border-subtle); min-width: 0; }
+.automation-run-summary { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: .75rem; }
+.automation-run-summary > svg { width: 15px; height: 15px; color: var(--app-tertiary-foreground); }
+.automation-run-summary .btn { margin-left: auto; }
+.automation-run details { margin-top: 10px; font-size: .8125rem; line-height: 1.6; }
+.automation-run summary { color: var(--app-secondary-foreground); cursor: pointer; overflow-wrap: anywhere; }
+.automation-run p { white-space: pre-wrap; overflow-wrap: anywhere; font-size: .8125rem; line-height: 1.6; }
+.automation-history .modal-error { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; overflow-wrap: anywhere; }
+.automation-modal :is(button,input,textarea,select):focus-visible { outline: 2px solid var(--app-input-active-border); outline-offset: 2px; }
+@media(max-width:640px) {
+  .automation-overlay { padding: 10px; }
+  .modal-card.automation-modal { width: 100%; height: 92dvh; max-height: 92dvh; }
+  .automation-body { padding: 14px; }
+  .automation-intro { align-items: flex-start; flex-direction: column; gap: 12px; }
+  .automation-toolbar { flex-wrap: wrap; gap: 10px; }
+  .automation-toolbar .automation-search { order: 3; flex-basis: 100%; }
+  .automation-toolbar > .ghost-btn { margin-left: auto; }
+  .automation-card-heading { padding: 12px; gap: 8px; }
+  .automation-card-heading > svg { display: none; }
+  .automation-editor :is(input,select) { min-height: 44px; }
+  .automation-editor { padding: 0 12px 14px; }
+  .automation-field-row { flex-wrap: wrap; }
+  .automation-field-row > label { flex-basis: 40%; }
+  .automation-modal :is(.btn,.ghost-btn,.segmented-btn,.automation-tabs button) { min-height: 44px; }
+  .automation-savebar { bottom: -14px; }
+  .automation-savebar .automation-actions { margin-left: auto; }
+  .automation-task-actions .automation-danger { margin-left: 0; }
+}
