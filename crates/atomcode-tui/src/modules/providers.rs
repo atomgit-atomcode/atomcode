@@ -134,7 +134,9 @@ enum Row {
     FormHead,
     Legend,
     Capabilities(usize),
-    SelectedModels,
+    BatchCount,
+    BatchModel(usize),
+    BatchCapabilities(usize, usize),
     DiscoveryError,
     AccountSection(bool),
     /// The model picker over the add form: the listing is on its way.
@@ -187,6 +189,28 @@ fn layout(view: &ProvidersView, panel: &Panel, h: usize) -> Vec<Row> {
         rows.push(Row::Legend);
         return rows;
     }
+    if let Some(Form::Model(form)) = &panel.form {
+        if form.is_batch() {
+            rows.extend([Row::FormHead, Row::Blank, Row::BatchCount]);
+            let room = (h.saturating_sub(8) / 3).clamp(1, MOST / 3);
+            let (from, to) = window(form.selected.len(), form.batch_cursor, room);
+            if from > 0 || to < form.selected.len() {
+                rows.push(Row::Scroll {
+                    above: from,
+                    below: form.selected.len() - to,
+                });
+            }
+            for at in from..to {
+                rows.extend([
+                    Row::BatchModel(at),
+                    Row::BatchCapabilities(at, 0),
+                    Row::BatchCapabilities(at, 1),
+                ]);
+            }
+            rows.extend([Row::Blank, Row::Legend]);
+            return rows;
+        }
+    }
     match &panel.form {
         Some(form) => {
             rows.push(Row::FormHead);
@@ -201,9 +225,6 @@ fn layout(view: &ProvidersView, panel: &Panel, h: usize) -> Vec<Row> {
             if let Form::Model(form) = form {
                 if !form.model.is_empty() {
                     rows.extend((0..3).map(Row::Capabilities));
-                    if !form.selected.is_empty() {
-                        rows.push(Row::SelectedModels);
-                    }
                 }
                 if form.discovery_error.is_some() {
                     rows.push(Row::DiscoveryError);
@@ -348,20 +369,91 @@ fn draw(view: &ProvidersView, panel: &Panel, row: Row, w: usize, caps: crate::ca
             };
             Line::styled(format!("  {text}"), theme::fg(Role::Muted)).truncate(w)
         }
-        Row::SelectedModels => {
-            let text = match &panel.form {
-                Some(Form::Model(form)) => format!(
-                    "{}: {}",
-                    t(Msg::ProviderAdditionalModels),
-                    form.selected
-                        .iter()
-                        .map(|row| row.id.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-                _ => String::new(),
+        Row::BatchCount => {
+            let n = match &panel.form {
+                Some(Form::Model(form)) => form.selected.len(),
+                _ => 0,
             };
-            Line::styled(format!("  {text}"), theme::fg(Role::Secondary)).truncate(w)
+            Line::styled(
+                format!("  {}", t(Msg::ProviderBatchCount { n })),
+                theme::fg(Role::Secondary),
+            )
+            .truncate(w)
+        }
+        Row::BatchModel(at) => {
+            let Some(Form::Model(form)) = &panel.form else {
+                return Line::empty();
+            };
+            let Some(item) = form.selected.get(at) else {
+                return Line::empty();
+            };
+            let focused = at == form.batch_cursor;
+            let using = item.id == form.model;
+            let label = t(if using {
+                Msg::ProviderWillUse
+            } else {
+                Msg::ProviderSetUse
+            });
+            let mark = if focused {
+                caps.g(crate::caps::Glyph::Pointer)
+            } else {
+                " "
+            };
+            let style = theme::fg(if focused {
+                Role::Accent
+            } else {
+                Role::Secondary
+            });
+            let suffix = format!("  [{label}]");
+            let name = width::take_width(
+                &item.id,
+                w.saturating_sub(width::str_width(&suffix) + width::str_width(mark) + 1),
+            );
+            Line::styled(format!("{mark} {name}{suffix}"), style).truncate(w)
+        }
+        Row::BatchCapabilities(at, line) => {
+            let Some(Form::Model(form)) = &panel.form else {
+                return Line::empty();
+            };
+            let Some(item) = form.selected.get(at) else {
+                return Line::empty();
+            };
+            let unknown = t(Msg::ProviderNotProvided);
+            let text = if line == 0 {
+                let number = |n: Option<usize>| {
+                    n.map(|n| crate::content::token_count(n as u32))
+                        .unwrap_or_else(|| unknown.to_string())
+                };
+                format!(
+                    "{} {} · {} {}",
+                    t(Msg::FieldWindow),
+                    number(item.window),
+                    t(Msg::ProviderOutputLimit),
+                    number(item.max_tokens)
+                )
+            } else {
+                let vision = item
+                    .vision
+                    .map(|yes| t(if yes { Msg::VisionYes } else { Msg::VisionNo }).into_owned())
+                    .unwrap_or_else(|| unknown.to_string());
+                let levels = item
+                    .levels
+                    .as_ref()
+                    .filter(|levels| !levels.is_empty())
+                    .map(|levels| levels.join("/"))
+                    .unwrap_or_else(|| unknown.to_string());
+                let effort = item.effort.as_deref().unwrap_or(&unknown);
+                format!(
+                    "{} {} · {} {} · {} {}",
+                    t(Msg::FieldVision),
+                    vision,
+                    t(Msg::FieldEffort),
+                    levels,
+                    t(Msg::StatusEffortDefault),
+                    effort
+                )
+            };
+            Line::styled(format!("  {text}"), theme::fg(Role::Muted)).truncate(w)
         }
         Row::DiscoveryError => {
             let text = match &panel.form {
@@ -1051,6 +1143,20 @@ fn legend(panel: &Panel) -> Vec<(String, String)> {
                 ]
             }
         },
+        Some(Form::Model(form)) if form.is_batch() => vec![
+            key("↑↓", Msg::LegendSelect),
+            key("space", Msg::ProviderBatchChoose),
+            key(
+                "⏎",
+                if form.connecting {
+                    Msg::ProviderConnectUse
+                } else {
+                    Msg::LegendSave
+                },
+            ),
+            key("^s", Msg::ProviderSaveOnly),
+            key("esc", Msg::LegendBack),
+        ],
         Some(Form::Account(form)) if form.preset.is_some() => vec![
             key("⏎", Msg::ProviderContinue),
             key("^o", Msg::ProviderAdvanced),
@@ -1291,7 +1397,7 @@ pub fn geometry(moment: &Moment, vp: &Viewport<'_>) -> Geometry {
             .into_iter()
             .map(|row| match row {
                 Row::Listed(at) if listed.get(at).is_some_and(|row| row.selectable()) => Some(at),
-                Row::Pick(at) => Some(at),
+                Row::Pick(at) | Row::BatchModel(at) => Some(at),
                 _ => None,
             })
             .collect(),
@@ -1647,6 +1753,82 @@ mod tests {
             screen.contains("^f") && screen.contains("从服务端拉取"),
             "{screen}"
         );
+    }
+
+    fn batch_panel(count: usize) -> Panel {
+        let view = view();
+        let mut form = ModelForm::add(&view, Some("deepseek")).unwrap();
+        form.connecting = true;
+        form.selected = (0..count)
+            .map(|at| crate::providers::Discovered {
+                id: format!("model-{at}"),
+                window: Some((at + 1) * 100_000),
+                vision: Some(at % 2 == 0),
+                ..Default::default()
+            })
+            .collect();
+        let first = form.selected[0].clone();
+        form.take_discovered(&view, &first);
+        Panel {
+            form: Some(Form::Model(form)),
+            ..Panel::new()
+        }
+    }
+
+    #[test]
+    fn batch_models_show_individual_capabilities_and_explicit_unknown_values() {
+        let m = moment(Some(batch_panel(2)));
+        let text = drawn(&m, 120, 24);
+        assert!(
+            text.contains(&t(Msg::ProviderBatchCount { n: 2 }).into_owned()),
+            "{text}"
+        );
+        let first = text.find("model-0").unwrap();
+        let second = text.find("model-1").unwrap();
+        let a = &text[first..second];
+        let b = &text[second..];
+        assert!(
+            a.contains("100.0K") && a.contains(&t(Msg::ProviderWillUse).into_owned()),
+            "{a}"
+        );
+        assert!(
+            b.contains("200.0K") && b.contains(&t(Msg::ProviderSetUse).into_owned()),
+            "{b}"
+        );
+        assert!(a.contains(&t(Msg::VisionYes).into_owned()), "{a}");
+        assert!(b.contains(&t(Msg::VisionNo).into_owned()), "{b}");
+        assert!(
+            a.contains(&t(Msg::ProviderNotProvided).into_owned())
+                && b.contains(&t(Msg::ProviderNotProvided).into_owned())
+        );
+    }
+
+    #[test]
+    fn a_large_batch_scrolls_with_focus_and_hit_tests_the_visible_model() {
+        let mut panel = batch_panel(20);
+        let Some(Form::Model(form)) = &mut panel.form else {
+            unreachable!()
+        };
+        form.batch_cursor = 19;
+        let m = moment(Some(panel));
+        for width in [20, 40, 80, 120] {
+            let vp = Viewport::new(Rect::sized(width, 18), &m);
+            let rows = layout(&m.providers, m.providers_panel.as_ref().unwrap(), 18);
+            assert!(rows.len() <= 18);
+            let at = rows
+                .iter()
+                .position(|row| *row == Row::BatchModel(19))
+                .unwrap();
+            assert_eq!(geometry(&m, &vp).listed_at(at), Some(19));
+            assert_eq!(
+                geometry(&m, &vp).listed_at(at + 1),
+                None,
+                "parameters do not switch models"
+            );
+            for line in lines(&m, width, 18) {
+                assert!(crate::width::str_width(&line.plain()) <= width as usize);
+            }
+        }
     }
 
     #[test]

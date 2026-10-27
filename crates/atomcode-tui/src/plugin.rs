@@ -13397,6 +13397,9 @@ mod provider_probe_tests {
         for key in [Key::Char(' '), Key::Down, Key::Char(' '), Key::Enter] {
             tui.run_providers_key(KeyPress::plain(key));
         }
+        assert!(host.point_providers_at(1));
+        assert_eq!(host.provider_row_key(), KeyPress::plain(Key::Char(' ')));
+        tui.run_providers_key(host.provider_row_key());
         port.fail.store(true, std::sync::atomic::Ordering::SeqCst);
         tui.run_providers_key(KeyPress::plain(Key::Enter));
         assert!(port.models.lock().unwrap().is_empty());
@@ -13407,7 +13410,8 @@ mod provider_probe_tests {
             else {
                 panic!("restored");
             };
-            assert_eq!(form.selected.len(), 1);
+            assert_eq!(form.selected.len(), 2);
+            assert_eq!(form.batch_cursor, 1);
             assert_eq!(form.model, "pro");
         }
         port.fail.store(false, std::sync::atomic::Ordering::SeqCst);

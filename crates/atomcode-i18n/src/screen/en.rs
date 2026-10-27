@@ -357,7 +357,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "This protocol has no model listing; type the model id by hand.".into()
         }
         Msg::ProviderDiscovering => "Fetching the model list from the endpoint… (Esc to cancel)".into(),
-        Msg::ProviderAdditionalModels => "Also add".into(),
+        Msg::ProviderBatchCount { n } => format!("{n} models selected").into(),
+        Msg::ProviderWillUse => "Will use".into(),
+        Msg::ProviderSetUse => "Use this model".into(),
+        Msg::ProviderBatchChoose => "Use focused model".into(),
+        Msg::ProviderNotProvided => "Not provided".into(),
         Msg::ProviderManualAdd => "Manual add".into(),
         Msg::ProviderEdit => crate::product::t_with(crate::Locale::En, crate::product::Msg::ProviderMenuEdit),
         Msg::ProviderAdvanced => "advanced settings".into(),

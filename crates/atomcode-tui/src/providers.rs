@@ -863,8 +863,10 @@ pub struct ModelForm {
     pub discovery_error: Option<String>,
     pub known_levels: Option<Vec<String>>,
     pub discovered_model: Option<String>,
-    /// Additional checked models, saved atomically with the displayed model.
+    /// Checked rows in selection order. A confirmed batch keeps every row;
+    /// the displayed model identifies the one to use after saving.
     pub selected: Vec<Discovered>,
+    pub batch_cursor: usize,
     pub name: Option<String>,
     pub max_tokens: Option<usize>,
 }
@@ -945,9 +947,20 @@ impl ModelForm {
             known_levels: None,
             discovered_model: None,
             selected: Vec::new(),
+            batch_cursor: 0,
             name: None,
             max_tokens: None,
         })
+    }
+
+    pub fn is_batch(&self) -> bool {
+        self.picking.is_none() && self.selected.len() > 1
+    }
+
+    pub fn use_batch_model(&mut self, view: &ProvidersView) {
+        if let Some(item) = self.selected.get(self.batch_cursor).cloned() {
+            self.take_discovered(view, &item);
+        }
     }
 
     pub fn start_discovery(&mut self) {
@@ -992,6 +1005,7 @@ impl ModelForm {
             known_levels: None,
             discovered_model: None,
             selected: Vec::new(),
+            batch_cursor: 0,
             name: None,
             max_tokens: None,
         })
@@ -1892,6 +1906,27 @@ fn model_key(
         panel.form = Some(Form::Model(form));
         return Step::Stay;
     }
+    if form.is_batch() {
+        match (press.key, press.mods) {
+            (Key::Up | Key::BackTab, _) => form.batch_cursor = form.batch_cursor.saturating_sub(1),
+            (Key::Down | Key::Tab, _) => {
+                form.batch_cursor = (form.batch_cursor + 1).min(form.selected.len() - 1)
+            }
+            (Key::Char(' '), Mods::NONE) => form.use_batch_model(view),
+            (Key::Enter, _) => return save_model(view, panel, &form, secret),
+            (Key::Char('s'), Mods::CTRL) => {
+                form.connecting = false;
+                return save_model(view, panel, &form, secret);
+            }
+            (Key::Esc, _) | (Key::Char('c'), Mods::CTRL) => {
+                leave_form(panel, secret);
+                return Step::Stay;
+            }
+            _ => {}
+        }
+        panel.form = Some(Form::Model(form));
+        return Step::Stay;
+    }
     let previous = (form.account_id().to_string(), form.model.clone());
     match (press.key, press.mods) {
         (Key::Esc, _) | (Key::Char('c'), Mods::CTRL) => {
@@ -2061,17 +2096,18 @@ fn picker_key(view: &ProvidersView, form: &mut ModelForm, press: KeyPress) {
             let highlighted = picked_rows(items, query)
                 .get(*cursor)
                 .map(|row| (*row).clone());
-            let active = if form.selected.is_empty() {
+            let active = if let Some(first) = form.selected.first() {
+                first.clone()
+            } else {
                 let Some(item) = highlighted else {
                     return;
                 };
                 item
-            } else {
-                highlighted
-                    .filter(|item| form.selected.iter().any(|row| row.id == item.id))
-                    .unwrap_or_else(|| form.selected[0].clone())
             };
-            form.selected.retain(|row| row.id != active.id);
+            if form.selected.len() <= 1 {
+                form.selected.clear();
+            }
+            form.batch_cursor = 0;
             form.take_discovered(view, &active);
         }
         _ => {}
@@ -2176,6 +2212,9 @@ fn save_model(
     let id = form.editing.clone();
     let mut drafts = vec![draft];
     for item in &form.selected {
+        if item.id == form.model {
+            continue;
+        }
         drafts.push(ModelDraft {
             account: form.account_id().into(),
             model: item.id.clone(),
@@ -2246,6 +2285,9 @@ pub fn paste(panel: &mut Panel, secret: &mut String, text: &str) -> bool {
                 }
                 Some(Picking::Loading { .. }) => return false,
                 None => {}
+            }
+            if form.is_batch() {
+                return false;
             }
             if form.focus == ModelField::Key {
                 secret.push_str(&line);
@@ -3380,6 +3422,24 @@ mod tests {
         key(&view, &mut panel, &mut secret, press(Key::Down));
         key(&view, &mut panel, &mut secret, press(Key::Char(' ')));
         key(&view, &mut panel, &mut secret, press(Key::Enter));
+        let Some(Form::Model(form)) = &panel.form else {
+            panic!("batch");
+        };
+        assert_eq!(
+            form.model, "flash",
+            "first checked, regardless of highlight"
+        );
+        key(&view, &mut panel, &mut secret, press(Key::Down));
+        let Some(Form::Model(form)) = &panel.form else {
+            panic!("batch");
+        };
+        assert_eq!(
+            form.model, "flash",
+            "moving focus must not switch the model"
+        );
+        assert_eq!(form.batch_cursor, 1);
+        assert!(!paste(&mut panel, &mut secret, "hidden edit"));
+        key(&view, &mut panel, &mut secret, press(Key::Char(' ')));
         let mut save_only = panel.clone();
         let Step::SaveModels { drafts } = key(&view, &mut save_only, &mut secret, ctrl('s')) else {
             panic!("save only");

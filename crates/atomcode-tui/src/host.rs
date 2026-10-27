@@ -3664,16 +3664,9 @@ impl Host {
     /// Clicking a discovered model checks it; list rows keep their Enter action.
     pub(crate) fn provider_row_key(&self) -> crate::surface::KeyPress {
         let m = self.moment.read().expect("moment poisoned");
-        let picking = matches!(
-            m.providers_panel
-                .as_ref()
-                .and_then(|panel| panel.form.as_ref()),
-            Some(crate::providers::Form::Model(crate::providers::ModelForm {
-                picking: Some(crate::providers::Picking::Ready { .. }),
-                ..
-            }))
-        );
-        crate::surface::KeyPress::plain(if picking {
+        let select = matches!(m.providers_panel.as_ref().and_then(|panel| panel.form.as_ref()),
+            Some(crate::providers::Form::Model(form)) if form.is_batch() || matches!(form.picking, Some(crate::providers::Picking::Ready { .. })));
+        crate::surface::KeyPress::plain(if select {
             crate::surface::Key::Char(' ')
         } else {
             crate::surface::Key::Enter
@@ -3688,6 +3681,12 @@ impl Host {
             .as_mut()
             .and_then(|panel| panel.form.as_mut())
         {
+            if form.is_batch() {
+                let want = row.min(form.selected.len() - 1);
+                let changed = form.batch_cursor != want;
+                form.batch_cursor = want;
+                return changed;
+            }
             if let Some(crate::providers::Picking::Ready {
                 items,
                 query,
