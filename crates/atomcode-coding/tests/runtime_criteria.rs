@@ -6712,3 +6712,65 @@ async fn a_live_view_is_available_before_the_running_turn_finishes() {
     assert_eq!(view.model.as_deref(), Some("recorder"));
     runtime.handle.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_model_only_runtime_keeps_an_empty_catalog_across_rebuilds() {
+    let project = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let recorder = Arc::new(Recorder::default());
+    let mut setup = start(project.path(), &recorder, SessionMode::Disabled);
+    setup.prepare.tools = false;
+    // Opting out of tools is stronger than a host asking to include a tool.
+    setup.prepare.host_plugins = atomcode_coding::host::HostPlugins::new().with_layer(
+        atomcode_coding::host::Layer::new()
+            .patch(
+                "tools",
+                serde_json::json!({ "include": ["bash"], "exclude": [] }),
+            )
+            .unwrap(),
+    );
+    let provider_config = setup.agent.clone();
+    let mut runtime = CodingRuntime::start(setup).await.unwrap();
+    for stage in [
+        "initial",
+        "provider swap",
+        "capability reload",
+        "config rebuild",
+        "directory change",
+    ] {
+        match stage {
+            "provider swap" => {
+                runtime
+                    .handle
+                    .reassemble_provider(provider_config.clone())
+                    .await
+                    .unwrap();
+            }
+            "capability reload" => {
+                runtime.handle.reload_capabilities().await.unwrap();
+            }
+            "config rebuild" => {
+                runtime
+                    .handle
+                    .reprepare_config(provider_config.clone())
+                    .await
+                    .unwrap();
+            }
+            "directory change" => {
+                runtime
+                    .handle
+                    .change_directory(other.path().to_path_buf())
+                    .await
+                    .unwrap();
+            }
+            _ => {}
+        }
+        turn(&mut runtime, stage).await;
+        let names = recorder.tools.lock().unwrap().last().cloned().unwrap();
+        assert!(
+            names.is_empty(),
+            "{stage}: no tools requested, but published {names:?}"
+        );
+    }
+    runtime.handle.shutdown().await.unwrap();
+}

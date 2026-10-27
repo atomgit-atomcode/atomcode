@@ -1044,7 +1044,7 @@ impl LlmProvider for OpenAiCompatProvider {
                                 request_span.in_scope(|| tracing::debug!(request_id, phase = "first_body_chunk", stream_attempt, elapsed_ms = request_started.elapsed().as_millis() as u64, "provider request timing"));
                                 logged_first_byte = true;
                             }
-                            let mut saw_done = false;
+                            let mut saw_terminal = false;
                             for ev in request_span.in_scope(|| dec.feed(chunk.as_ref())) {
                                 if !emitted_replay_sensitive && retry::is_attempt_metadata_event(&ev) {
                                     pending_metadata.push(ev);
@@ -1057,12 +1057,12 @@ impl LlmProvider for OpenAiCompatProvider {
                                 }
                                 watchdog.observe(&ev);
                                 emitted_replay_sensitive |= retry::is_replay_sensitive_event(&ev);
-                                if matches!(ev, StreamEvent::Done { .. }) {
-                                    saw_done = true;
+                                if matches!(ev, StreamEvent::Done { .. } | StreamEvent::Error(_)) {
+                                    saw_terminal = true;
                                 }
                                 yield ev;
                             }
-                            if saw_done { return; }
+                            if saw_terminal { return; }
                         }
                     }
                 }
@@ -2239,9 +2239,67 @@ impl SseDecoder {
         self.seen_finish
     }
 
-    /// Stream ended WITHOUT a `[DONE]` sentinel: flush buffered tool calls + usage,
-    /// then emit `Done`.
+    fn fail_incomplete(&mut self, code: &str, message: &str) -> Vec<StreamEvent> {
+        self.done = true;
+        self.tool_calls.clear();
+        tracing::warn!(error_origin = code, "provider stream diagnostic");
+        let mut out = Vec::new();
+        // A failed response still consumed the usage the provider reported.
+        // Deliver it before the terminal error, since consumers stop at Error.
+        if let Some(usage) = self.last_usage.take() {
+            out.push(StreamEvent::Usage(usage));
+        }
+        out.push(StreamEvent::Error(ProviderError {
+            code: Some(code.into()),
+            message: message.into(),
+            retryable: false,
+            ..Default::default()
+        }));
+        out
+    }
+
+    /// HTTP EOF is success only after a terminal signal. A complete HTTP body
+    /// can still contain an incomplete SSE response; never flush its pending
+    /// tool arguments into an executable call or claim its text is complete.
     fn finish(&mut self) -> Vec<StreamEvent> {
+        if self.done {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        // Some gateways omit the final newline as well as [DONE]. Parse the
+        // last line before deciding whether its finish_reason completed us.
+        if !self.buf.is_empty() {
+            let pending = String::from_utf8_lossy(&std::mem::take(&mut self.buf)).into_owned();
+            self.process_line(pending.trim_end_matches('\r'), &mut out);
+        }
+        if self.done {
+            return out;
+        }
+        // Preserve empty-response recovery and non-SSE/JSON error diagnostics.
+        if self.seen_finish || !self.saw_data {
+            out.extend(self.finish_completed());
+            return out;
+        }
+        self.done = true;
+        tracing::warn!(
+            error_origin = "missing_stream_terminal",
+            "provider stream diagnostic"
+        );
+        if let Some(usage) = self.last_usage.take() {
+            out.push(StreamEvent::Usage(usage));
+        }
+        out.push(StreamEvent::Error(ProviderError {
+            message: "模型响应流在完成前结束（缺少 finish_reason 或 [DONE]），已保留收到的内容。"
+                .into(),
+            code: Some(atomcode_kernel::stream::STREAM_TRANSPORT_INTERRUPTED_CODE.into()),
+            retryable: false,
+            ..Default::default()
+        }));
+        out
+    }
+
+    /// Finalize an explicit completion, flushing buffered tool calls and usage.
+    fn finish_completed(&mut self) -> Vec<StreamEvent> {
         let mut out = Vec::new();
         if self.done {
             return out;
@@ -2369,14 +2427,15 @@ impl SseDecoder {
         self.saw_data = true;
         let data = data.trim();
         if data == "[DONE]" {
-            // Same finalization as a stream EOF: flush any accumulated tool
-            // calls, then usage + Done. `finish()` does exactly this (and is a
+            // An explicit [DONE] is a completion signal even when the gateway
+            // omitted finish_reason. Flush accumulated calls, usage, then Done.
+            // `finish_completed()` does exactly this (and is a
             // no-op if already done). Calling it here — instead of emitting
             // only usage + Done — closes the gap where a gateway that reports
             // ONLY `finish_reason:""` (never a real non-empty reason) and ends
             // with `[DONE]` would otherwise drop its buffered tool call, since
             // "" is treated as non-terminal and never triggers the flush above.
-            out.extend(self.finish());
+            out.extend(self.finish_completed());
             return;
         }
         if data.is_empty() {
@@ -2443,6 +2502,29 @@ impl SseDecoder {
         let Some(choice) = chunk.choices.into_iter().next() else {
             return;
         };
+        // A refusal or an unknown terminal is not a complete response. Reject
+        // before flushing pending calls, including calls carried in this chunk.
+        if let Some(reason) = choice
+            .finish_reason
+            .as_deref()
+            .filter(|reason| !reason.is_empty())
+        {
+            let failure = match reason {
+                "stop" | "tool_calls" | "function_call" | "length" => None,
+                "content_filter" => Some((
+                    "content_filter",
+                    "模型输出被内容过滤中断，未将不完整响应标记为完成。",
+                )),
+                _ => Some((
+                    "unsupported_finish_reason",
+                    "模型返回了无法确认成功的结束原因，未将不完整响应标记为完成。",
+                )),
+            };
+            if let Some((code, message)) = failure {
+                out.extend(self.fail_incomplete(code, message));
+                return;
+            }
+        }
         if let Some(c) = choice.delta.content {
             if !c.is_empty() {
                 // A `<think>` block here is reasoning that came down the wrong
@@ -2477,11 +2559,18 @@ impl SseDecoder {
             out.push(StreamEvent::Reasoning(r));
         }
         if let Some(tcs) = choice.delta.tool_calls {
-            if self.seen_finish || self.tool_call_delta_count >= MAX_TOOL_CALL_DELTAS {
-                out.extend(self.finish());
+            if self.seen_finish {
+                out.extend(self.finish_completed());
                 return;
             }
             for tc in tcs {
+                if self.tool_call_delta_count >= MAX_TOOL_CALL_DELTAS {
+                    out.extend(self.fail_incomplete(
+                        "tool_call_delta_limit",
+                        "工具调用片段超过保护上限，已中止响应，未执行不完整的工具调用。",
+                    ));
+                    return;
+                }
                 self.tool_call_delta_count += 1;
                 // Which call this delta belongs to. `index` is authoritative when
                 // present. When it is absent — some OpenAI-compatible gateways omit
@@ -2563,6 +2652,11 @@ impl SseDecoder {
         // dropped and the model shows "0 工具". Treat "" as non-terminal.
         if let Some(fr) = choice.finish_reason.filter(|s| !s.is_empty()) {
             self.seen_finish = true;
+            if fr == "length" {
+                self.truncated = true;
+                self.tool_calls.clear();
+                return;
+            }
             for (id, name, args) in std::mem::take(&mut self.tool_calls) {
                 // Same rule as `finish()`: a nameless tool call cannot be dispatched, so
                 // dropping it beats emitting a call that is certain to fail.
@@ -2574,9 +2668,6 @@ impl SseDecoder {
                     name,
                     arguments: args,
                 }));
-            }
-            if fr == "length" {
-                self.truncated = true;
             }
         }
     }
@@ -5623,10 +5714,66 @@ mod tests {
     }
 
     #[test]
+    fn clean_eof_without_terminal_signal_is_an_interruption() {
+        for delta in [
+            json!({"content": "partial answer"}),
+            json!({"reasoning_content": "partial reasoning"}),
+            json!({"tool_calls": [{"index": 0, "id": "c1", "function": {"name": "bash", "arguments": "{\"command\":\"echo"}}]}),
+        ] {
+            let mut decoder = SseDecoder::new();
+            let mut events = decoder
+                .feed(line(json!({"choices": [{"delta": delta, "finish_reason": ""}]})).as_bytes());
+            events.extend(decoder.finish());
+            assert!(events.iter().any(|event| matches!(event, StreamEvent::Error(error)
+                if error.code.as_deref() == Some(atomcode_kernel::stream::STREAM_TRANSPORT_INTERRUPTED_CODE)
+                    && !error.retryable)), "{events:?}");
+            assert!(
+                !events.iter().any(|event| matches!(
+                    event,
+                    StreamEvent::Done { .. } | StreamEvent::ToolCall(_)
+                )),
+                "{events:?}"
+            );
+            assert!(
+                decoder.finish().is_empty(),
+                "terminal errors must not repeat"
+            );
+        }
+    }
+
+    #[test]
+    fn eof_accepts_a_terminal_line_without_a_trailing_newline() {
+        for (terminal, truncated) in [
+            (
+                line(json!({"choices": [{"delta": {}, "finish_reason": "stop"}]})),
+                false,
+            ),
+            ("data: [DONE]\n".to_string(), false),
+            (
+                line(json!({"choices": [{"delta": {}, "finish_reason": "length"}]})),
+                true,
+            ),
+        ] {
+            let mut decoder = SseDecoder::new();
+            let mut events = decoder
+                .feed(line(json!({"choices": [{"delta": {"content": "complete"}}]})).as_bytes());
+            events.extend(decoder.feed(terminal.trim_end().as_bytes()));
+            events.extend(decoder.finish());
+            assert!(
+                matches!(events.last(), Some(StreamEvent::Done { truncated: actual }) if *actual == truncated),
+                "{events:?}"
+            );
+        }
+    }
+
+    #[test]
     fn sse_finish_without_done_flushes() {
         let mut d = SseDecoder::new();
         let mut ev = d.feed(line(json!({"choices":[{"delta":{"content":"x"}}]})).as_bytes());
-        // no [DONE]; the network loop calls finish() on EOF
+        ev.extend(
+            d.feed(line(json!({"choices":[{"delta":{},"finish_reason":"stop"}]})).as_bytes()),
+        );
+        // A valid finish_reason makes EOF benign even without [DONE].
         ev.extend(d.finish());
         assert!(matches!(
             ev.last().unwrap(),
@@ -5656,6 +5803,116 @@ mod tests {
     }
 
     #[test]
+    fn failed_terminals_preserve_received_usage_without_executing_calls() {
+        for mode in ["content_filter", "unknown", "limit", "eof"] {
+            let mut decoder = SseDecoder::new();
+            let mut events = decoder.feed(line(json!({"choices": [{"delta": {"content": "partial", "tool_calls": [{"index": 0, "id": "c1", "function": {"name": "bash", "arguments": "{}"}}]}}]})).as_bytes());
+            events.extend(decoder.feed(line(json!({"choices": [], "usage": {"prompt_tokens": 11, "completion_tokens": 5}})).as_bytes()));
+            match mode {
+                "eof" => events.extend(decoder.finish()),
+                "limit" => {
+                    decoder.tool_call_delta_count = MAX_TOOL_CALL_DELTAS;
+                    events.extend(decoder.feed(line(json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": " "}}]}}]})).as_bytes()));
+                }
+                reason => events.extend(decoder.feed(
+                    line(json!({"choices": [{"delta": {}, "finish_reason": reason}]})).as_bytes(),
+                )),
+            }
+            let usages: Vec<_> = events
+                .iter()
+                .enumerate()
+                .filter_map(|(index, event)| match event {
+                    StreamEvent::Usage(usage) => Some((index, *usage)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                usages.len(),
+                1,
+                "{mode}: paid tokens must not disappear on failure: {events:?}"
+            );
+            assert_eq!(
+                usages[0].1,
+                TokenUsage {
+                    prompt: 11,
+                    completion: 5,
+                    cached: 0
+                }
+            );
+            let error = events
+                .iter()
+                .position(|event| matches!(event, StreamEvent::Error(_)))
+                .unwrap();
+            assert!(usages[0].0 < error);
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::Done { .. } | StreamEvent::ToolCall(_))));
+        }
+    }
+
+    #[test]
+    fn unsuccessful_finish_reasons_do_not_commit_partial_text_or_calls() {
+        for reason in ["content_filter", "unknown", "error", "unexpected_reason"] {
+            let mut decoder = SseDecoder::new();
+            let mut events = decoder.feed(line(json!({"choices": [{"delta": {
+                "content": "partial design", "tool_calls": [{"index": 0, "id": "c1", "function": {"name": "bash", "arguments": "{}"}}]
+            }}]})).as_bytes());
+            events.extend(decoder.feed(
+                line(json!({"choices": [{"delta": {}, "finish_reason": reason}]})).as_bytes(),
+            ));
+            events.extend(decoder.feed(b"data: [DONE]\n"));
+            events.extend(decoder.finish());
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, StreamEvent::Error(error) if !error.retryable)),
+                "{reason}: {events:?}"
+            );
+            assert!(
+                !events.iter().any(|event| matches!(
+                    event,
+                    StreamEvent::Done { .. } | StreamEvent::ToolCall(_)
+                )),
+                "{reason}: {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn token_limit_does_not_flush_pending_tool_calls() {
+        let mut decoder = SseDecoder::new();
+        let mut events = decoder.feed(line(json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c1", "function": {"name": "bash", "arguments": "{}"}}]}}]})).as_bytes());
+        events.extend(
+            decoder.feed(
+                line(json!({"choices": [{"delta": {}, "finish_reason": "length"}]})).as_bytes(),
+            ),
+        );
+        events.extend(decoder.feed(b"data: [DONE]\n"));
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Done { truncated: true })
+        ));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::ToolCall(_))));
+    }
+
+    #[test]
+    fn tool_fragment_limit_is_enforced_within_one_chunk() {
+        let mut decoder = SseDecoder::new();
+        let fragment =
+            json!({"index": 0, "id": "c1", "function": {"name": "bash", "arguments": " "}});
+        let events = decoder.feed(line(json!({"choices": [{"delta": {"tool_calls": vec![fragment; MAX_TOOL_CALL_DELTAS + 1]}}]})).as_bytes());
+        assert_eq!(decoder.tool_call_delta_count, MAX_TOOL_CALL_DELTAS);
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::Error(_))));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::ToolCall(_) | StreamEvent::Done { .. })));
+    }
+
+    #[test]
     fn sse_degenerate_stream_exceeding_hard_limit() {
         let mut d = SseDecoder::new();
         let mut ev = Vec::new();
@@ -5677,7 +5934,10 @@ mod tests {
         // The 20001-st chunk should trigger early termination.
         ev.extend(d.feed(delta_bytes));
         assert!(d.done);
-        assert!(matches!(ev.last().unwrap(), StreamEvent::Done { .. }));
+        assert!(matches!(ev.last().unwrap(), StreamEvent::Error(_)));
+        assert!(!ev
+            .iter()
+            .any(|event| matches!(event, StreamEvent::ToolCall(_) | StreamEvent::Done { .. })));
     }
 
     // ---- mid-stream re-open (v1 parity: retry a body that dies before any event) ----

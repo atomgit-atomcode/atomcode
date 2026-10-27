@@ -496,3 +496,85 @@ async fn a_cut_never_leaves_a_result_whose_call_it_removed() {
         "the call and its result are kept together"
     );
 }
+
+/// Protect agreed assistant-side decisions through the actual native log projection,
+/// not merely the strategy's returned plan.
+struct UnavailableSummary {
+    partial: bool,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl LlmProvider for UnavailableSummary {
+    fn model_name(&self) -> &str {
+        "unavailable-summary"
+    }
+    async fn chat_stream(
+        &self,
+        _: &[Message],
+        _: &[ToolDef],
+        _: &ChatOptions,
+    ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let error = ProviderError {
+            http_status: Some(403),
+            message: "summary unavailable".into(),
+            ..Default::default()
+        };
+        if !self.partial {
+            return Err(error);
+        }
+        Ok(Box::pin(futures::stream::iter(vec![
+            StreamEvent::TextDelta("incomplete checkpoint".into()),
+            StreamEvent::Error(error),
+        ])))
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn failed_summaries_keep_agreed_design_in_the_native_session_projection() {
+    const DECISION: &str = "DeviceNo and PipingNo remain separate columns. TubeSeq is the pipe-local test tube sequence, never a device sequence.";
+    for partial in [false, true] {
+        for automatic in [false, true] {
+            let mut writer = Writer::new();
+            writer.ask("Design two tables; preserve confirmed decisions.");
+            writer.answer(&format!("{DECISION}\n{}", bulk("archive", 20_000)));
+            writer.call("grep", &bulk("old result", 2_000));
+            writer.ask("Rename only the two time columns.");
+            writer.answer(&bulk("second archive", 20_000));
+            writer.ask("Keep other facts unchanged.");
+            writer.answer(&bulk("third archive", 20_000));
+            writer.ask("Return the final tables.");
+            let provider = Arc::new(UnavailableSummary {
+                partial,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let strategy =
+                OverflowCompaction::new(StubCompaction::new(1, true), Some(provider.clone()));
+            let request = if automatic {
+                pressure(16_000, 13_000)
+            } else {
+                ask(CompactTrigger::Manual { focus: None }, 16_000, 13_000)
+            };
+            assert!(strategy_would_summarize(&strategy, &writer.log, &request));
+            if let Some(decision) = decide_with_strategy(&strategy, &writer.log, &request).await {
+                assert_eq!(
+                    decision.through, 0,
+                    "failure must not replace conversation history"
+                );
+                writer.apply(decision);
+            }
+            assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let visible = writer.seen();
+            assert!(visible.iter().any(
+                |message| message.role == Role::Assistant && message.text.starts_with(DECISION)
+            ));
+            assert!(!writer
+                .log
+                .events()
+                .iter()
+                .any(|fact| matches!(fact.event, SessionEvent::Compacted { .. })));
+            no_orphan_results(&visible).unwrap();
+        }
+    }
+}

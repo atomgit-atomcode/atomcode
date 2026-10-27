@@ -3,8 +3,9 @@
 //!
 //! **Open by mechanism.** A host hands [`crate::CodingRuntime`] any [`Plugin`]
 //! and any [`Layer`] through [`HostPlugins`] (`PrepareOptions.host_plugins`).
-//! Its layers go last, so it may insert rows of its own and patch, swap or
-//! disable any row of coding's — not only the ones listed here.
+//! Its layers go last (except an explicit model-only catalog closure), so it may
+//! insert rows of its own and patch, swap or disable any row of coding's — not
+//! only the ones listed here.
 //!
 //! **Stable by promise, for what is listed here.** The rows in
 //! [`PUBLISHED_ROWS`], the config shapes documented on them, and the items in
@@ -37,7 +38,7 @@ pub use atomcode_plexus::{Context, Entry, Layer, Plugin};
 /// | row | what a host does with it |
 /// |---|---|
 /// | `persona-atomcode` | swap in its own persona: `[[patch]] id = "persona-atomcode"` `name = "<its plugin>"`. The row's config is [`PersonaConfig`]. To change only who the agent says it is, keep the row and set `PrepareOptions.identity` ([`ProductIdentity`]) instead. |
-/// | `tools` | narrow the catalog: `config = { exclude = [..], include = [..] }`, patterns with `*`, `row:tool` to name one row's tool (`docs/tool-catalog-policy.md`). The runtime never writes this row's config, so a host's patch is the whole of it. |
+/// | `tools` | narrow the catalog: `config = { exclude = [..], include = [..] }`, patterns with `*`, `row:tool` to name one row's tool (`docs/tool-catalog-policy.md`). A host's patch is the whole policy unless `PrepareOptions.tools` is false: that explicit model-only contract closes the catalog after all layers. |
 /// | `codeintel` | disable: `list_symbols`, `read_symbol`, `find_references` and their prompt fragment |
 /// | `code-graph` | disable: `trace_callers`, `trace_callees`, `trace_chain`, `blast_radius`, `file_dependencies` and their prompt fragment |
 /// | `tool-ast-grep` | disable: `ast_grep` and its prompt fragment |

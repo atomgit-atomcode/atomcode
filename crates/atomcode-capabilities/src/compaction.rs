@@ -181,9 +181,10 @@ fn recent_keep_budget(ctx_window: u32) -> usize {
 
 /// Hard ceiling on a generated summary. A runaway model could emit an enormous summary that
 /// still passes `apply_plan`'s net-loss guard (it's smaller than the drained span) yet bloats
-/// the wire on every subsequent turn (#747). We truncate the accumulated summary at this many
+/// the wire on every subsequent turn (#747). Reject accumulated output beyond this many
 /// bytes — the HARD guarantee, independent of whether the provider honors `max_tokens`. A real
 /// span summary is a paragraph, far under this; 64 KiB only catches pathological runaways.
+/// Exceeding the limit rejects the summary rather than committing a partial anchor.
 const MAX_SUMMARY_BYTES: usize = 64 * 1024;
 /// Soft cap forwarded to the summary provider (≈ `MAX_SUMMARY_BYTES`/4). Stops a runaway
 /// generation early; the byte cap above is the backstop if the gateway ignores it.
@@ -201,6 +202,9 @@ pub const SUMMARY_TIMEOUT: Duration = Duration::from_secs(180);
 /// fall back to stub compaction, so the user understands why they got a lighter compaction.
 const SUMMARY_TIMEOUT_NOTE: &str =
     "[系统] 本次 /compact 的 AI 摘要超时（>180s，模型可能在大上下文下长时间推理），已改用快速压缩：对话全部保留，仅折叠了较大的工具输出。如需更彻底的压缩，可稍后再次 /compact，或切换更快的模型。";
+
+const SUMMARY_FAILURE_NOTE: &str =
+    "[系统] 本次 AI 摘要失败或未返回有效内容，已保留对话，仅精简较大的工具输出。可稍后重试 /compact 或检查模型访问权限。";
 
 /// System prompt for the anchored compaction summary LLM call.
 const SUMMARY_SYSTEM_PROMPT: &str =
@@ -447,8 +451,8 @@ impl OverflowCompaction {
             // to the gentle stub policy.
             return self.inner.plan(view).await;
         }
-        // Wall-clock cap on the summary LLM call (see `SUMMARY_TIMEOUT`). On timeout, fall
-        // back to the gentle in-place stub policy (`self.inner`) — the same fallback used above
+        // Failed, empty, or timed-out summaries must not authorize draining history.
+        // Fall back to the gentle in-place stub policy (`self.inner`) — the same fallback used above
         // when there's nothing drainable — so a hung thinking model degrades `/compact` to a
         // lighter compaction instead of freezing it. A note tells the user what happened.
         let summary = match tokio::time::timeout(
@@ -457,15 +461,29 @@ impl OverflowCompaction {
         )
         .await
         {
-            Ok(s) => s,
-            Err(_) => {
+            Ok(Some(summary)) => Some(summary),
+            // An explicitly model-free strategy keeps its historical fallback. A
+            // configured provider failing is different: a request-only list cannot
+            // preserve the assistant's design decisions in the drained history.
+            Ok(None) if self.summary_provider.is_none() => None,
+            unavailable => {
+                let timed_out = unavailable.is_err();
+                tracing::warn!(
+                    timed_out,
+                    "compaction summary unavailable; retaining conversation history"
+                );
+                let note = if timed_out {
+                    SUMMARY_TIMEOUT_NOTE
+                } else {
+                    SUMMARY_FAILURE_NOTE
+                };
                 let mut plan = self.inner.plan(view).await;
                 // Only annotate a plan that actually shrinks; adding a note to a noop plan
                 // would grow it and get (correctly) refused by the net-loss guard for nothing.
                 if !plan.rewrites.is_empty() {
                     plan.resume_note = Some(match plan.resume_note.take() {
-                        Some(n) => format!("{n}\n{SUMMARY_TIMEOUT_NOTE}"),
-                        None => SUMMARY_TIMEOUT_NOTE.to_string(),
+                        Some(n) => format!("{n}\n{note}"),
+                        None => note.to_string(),
                     });
                 }
                 return plan;
@@ -481,7 +499,8 @@ impl OverflowCompaction {
     }
 
     /// Summarize a drained span into one paragraph via the configured provider. `None` if
-    /// no provider, the call errors, or the result is empty (caller then plain-drains).
+    /// no provider, the call fails, or the result is empty/incomplete. Manual and
+    /// automatic compaction retain conversation history on a configured provider's failure.
     /// One-shot, no tools; operates on the already-stubbed span so its input is small.
     /// `focus` (from `/compact <focus>`) steers the summary toward a topic when present.
     async fn summarize(&self, span: &[Message], focus: Option<&str>) -> Option<String> {
@@ -496,7 +515,8 @@ impl OverflowCompaction {
 /// compaction recognizes it. `None` when the call fails or says nothing.
 ///
 /// No timeout of its own — callers bound it with [`SUMMARY_TIMEOUT`] and fall
-/// back to something model-free.
+/// back to something model-free. Only a normally completed, non-truncated answer
+/// within the byte limit can become an anchor.
 pub async fn summarize_span(
     provider: &dyn LlmProvider,
     span: &[Message],
@@ -523,24 +543,31 @@ pub async fn summarize_span(
         };
         let mut stream = provider.chat_stream(&prompt, &[], &opts).await.ok()?;
         let mut out = String::new();
+        let mut completed = false;
         // Reserve room for the sentinel + framing + their newlines prepended below, so the FINAL
         // summary still respects MAX_SUMMARY_BYTES (the #747 hard guarantee).
         let body_budget =
             MAX_SUMMARY_BYTES.saturating_sub(ANCHOR_SENTINEL.len() + SUMMARY_FRAMING.len() + 2);
         while let Some(ev) = stream.next().await {
+            // Never commit a partial summary after a transport/provider failure.
+            match ev {
+                StreamEvent::Error(_) | StreamEvent::Done { truncated: true } => return None,
+                StreamEvent::Done { truncated: false } => completed = true,
+                _ => {}
+            }
             if let StreamEvent::TextDelta(t) = ev {
                 let remaining = body_budget.saturating_sub(out.len());
                 if t.len() <= remaining {
                     out.push_str(&t);
                 } else {
-                    let mut cut = remaining;
-                    while !t.is_char_boundary(cut) {
-                        cut -= 1; // is_char_boundary(0) == true, so this terminates
-                    }
-                    out.push_str(&t[..cut]);
-                    break;
+                    // A locally cut summary is incomplete too: never use its prefix
+                    // to replace the full design history.
+                    return None;
                 }
             }
+        }
+        if !completed {
+            return None;
         }
         // Strip any leading sentinel/framing the model may have echoed, then stamp exactly ONE
         // sentinel + the framing so the NEXT compaction recognizes the anchor and the model that
@@ -1459,8 +1486,7 @@ mod tests {
     }
 
     /// Streams ~96 KiB of a 3-byte CJK char so the summary blows past `MAX_SUMMARY_BYTES`,
-    /// exercising BOTH the byte ceiling and char-boundary-safe truncation (96 KiB is not a
-    /// multiple of 3, so the cut lands mid-char and must be walked back).
+    /// exercising the byte ceiling with multibyte output; no incomplete prefix may be committed.
     struct HugeSummaryProvider {
         /// Records the `max_tokens` the summarizer forwarded, so the test can assert the SOFT
         /// cap is actually sent (the byte hard-cap would otherwise mask a dropped max_tokens).
@@ -1492,6 +1518,106 @@ mod tests {
                 StreamEvent::TextDelta(chunk),
                 StreamEvent::Done { truncated: false },
             ])))
+        }
+    }
+
+    /// A failed open, empty answer, or stream failure after partial text must never
+    /// authorize replacing design decisions with the harness's request-only list.
+    struct FailedSummaryProvider(u8);
+    #[async_trait]
+    impl LlmProvider for FailedSummaryProvider {
+        fn model_name(&self) -> &str {
+            "failed-summary"
+        }
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[atomcode_kernel::tool::ToolDef],
+            _: &ChatOptions,
+        ) -> Result<
+            futures::stream::BoxStream<'static, StreamEvent>,
+            atomcode_kernel::stream::ProviderError,
+        > {
+            let error = atomcode_kernel::stream::ProviderError {
+                http_status: Some(403),
+                message: "forbidden".into(),
+                ..Default::default()
+            };
+            let events = match self.0 {
+                0 => return Err(error),
+                1 => vec![StreamEvent::Done { truncated: false }],
+                2 => vec![
+                    StreamEvent::TextDelta("incomplete design".into()),
+                    StreamEvent::Error(error),
+                ],
+                3 => vec![
+                    StreamEvent::TextDelta("incomplete design".into()),
+                    StreamEvent::Done { truncated: true },
+                ],
+                4 => vec![StreamEvent::TextDelta("incomplete design".into())],
+                5 => vec![
+                    StreamEvent::TextDelta("你".repeat(MAX_SUMMARY_BYTES)),
+                    StreamEvent::Done { truncated: false },
+                ],
+                _ => unreachable!(),
+            };
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn failed_summary_preserves_design_history_in_manual_and_auto_compaction() {
+        let messages = vec![
+            Message::system("persona"),
+            Message::user("design two tables"),
+            Message::assistant(
+                "DeviceNo and PipingNo are separate; TubeSeq is the test tube sequence.",
+                vec![],
+            ),
+            asst_call("b1", "bash"),
+            Message::tool_result("b1", &big("old output"), false),
+            Message::user("rename only"),
+            asst_call("g1", "grep"),
+            Message::tool_result("g1", &big("recent output"), false),
+            Message::user("continue"),
+        ];
+        let mut conversation = Conversation::new();
+        conversation.messages = messages.clone();
+        let floor = conversation.sacred_floor();
+        for failure in 0..6 {
+            for automatic in [false, true] {
+                let strategy = OverflowCompaction::new(
+                    StubCompaction::default(),
+                    Some(Arc::new(FailedSummaryProvider(failure))),
+                )
+                .with_auto_token_limit(Some(1));
+                let mut view = manual_view(&messages, floor, None);
+                if automatic {
+                    view.trigger = CompactTrigger::Auto { utilization: 1.0 };
+                    view.utilization = 1.0;
+                    view.used_tokens = 0;
+                }
+                let plan = strategy.plan(&view).await;
+                assert_eq!(
+                    plan.drain_to, 0,
+                    "failure={failure}, auto={automatic}: must retain history"
+                );
+                assert!(plan.summary.is_none());
+                assert!(plan
+                    .rewrites
+                    .iter()
+                    .all(|(index, _)| messages[*index].role == Role::Tool));
+                let mut retained = Conversation::new();
+                retained.messages = messages.clone();
+                retained.apply_plan(plan, floor);
+                assert!(
+                    retained
+                        .messages
+                        .iter()
+                        .any(|message| message.text == messages[2].text),
+                    "the assistant's agreed field definitions must survive"
+                );
+            }
         }
     }
 
@@ -1558,7 +1684,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn summary_is_capped_at_max_bytes() {
+    async fn oversized_summary_is_rejected_and_soft_limit_is_forwarded() {
         let msgs = vec![
             Message::system("p"),
             Message::user("u1"),
@@ -1580,39 +1706,12 @@ mod tests {
         let plan = strat
             .plan(&overflow_view(&conv.messages, floor, 2, 8000))
             .await;
-        let summary = plan.summary.expect("tier 2 produces a summary");
-        // Hard byte ceiling enforced (provider streamed ~96 KiB). The total is
-        // sentinel + "\n" + body, all ≤ MAX_SUMMARY_BYTES.
         assert!(
-            summary.len() <= MAX_SUMMARY_BYTES,
-            "summary {} bytes exceeds cap {MAX_SUMMARY_BYTES}",
-            summary.len()
+            plan.summary.is_none(),
+            "an oversized answer must not become a partial anchor"
         );
-        // The body budget is MAX_SUMMARY_BYTES - (sentinel + framing + 2 newlines). The total
-        // fills essentially to MAX_SUMMARY_BYTES (body truncated at a char boundary at the
-        // budget, then sentinel + framing are prepended). The lower bound stays near the cap.
-        assert!(
-            summary.len() > MAX_SUMMARY_BYTES - 4,
-            "should truncate near the cap, got {}",
-            summary.len()
-        );
-        // Output is anchor-prefixed + framed.
-        assert!(
-            summary.starts_with(ANCHOR_SENTINEL),
-            "summary must carry the sentinel"
-        );
-        // Char-boundary-safe: the body (after sentinel + framing) is intact and all 你.
-        let body_part = summary
-            .strip_prefix(ANCHOR_SENTINEL)
-            .unwrap()
-            .trim_start_matches('\n')
-            .strip_prefix(SUMMARY_FRAMING)
-            .expect("framing present")
-            .trim_start_matches('\n');
-        assert!(
-            body_part.chars().all(|c| c == '你'),
-            "truncation must not corrupt multibyte chars"
-        );
+        // True overflow still uses its model-free emergency fallback.
+        assert!(plan.drain_to > floor);
         // SOFT cap was actually forwarded (not masked by the byte hard-cap / dropped like the
         // historical v2 max_tokens regression).
         assert_eq!(

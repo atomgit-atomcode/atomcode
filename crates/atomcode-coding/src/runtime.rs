@@ -10994,9 +10994,22 @@ fn tree_inputs(
     };
     // What the person wrote in `config.toml`, as a layer of its own; then what
     // the host brought, in its order and after everything else, so a host's
-    // patch is the last word on any row — coding's own and the person's alike.
+    // patch is the last word on any row — except the explicit model-only catalog
+    // closure below, which no layer may reopen.
     let mut extra = vec![crate::on_harness::config_rows(config)?];
     extra.extend(prepare.host_plugins.layers.iter().cloned());
+    // `tools = false` is an explicit model-only contract, not just a request
+    // to skip prepare-time registrations. Native rows mount their own tools;
+    // close their shared catalog after both user and host layers, including on
+    // provider/capability/session/directory rebuilds. The existing catalog policy
+    // also fences execution of a tool the model calls without a definition.
+    if !prepare.tools {
+        extra.push(
+            atomcode_plexus::Layer::new()
+                .patch("tools", serde_json::json!({ "exclude": ["*"] }))
+                .map_err(|error| error.to_string())?,
+        );
+    }
     // The model catalog, when this host has one. Both halves come from what
     // `install_subagent_tiers` already put on the config, so the tree and the
     // chain resolve a selection through the same resolver — including its reset

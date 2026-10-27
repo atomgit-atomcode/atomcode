@@ -3173,7 +3173,7 @@ pub(crate) async fn spawn_native_cli_runtime(
     };
     // Build the driver-neutral half from the runtime config (external-agent
     // subagents, MCP, full-capability defaults), then overlay what makes THIS
-    // driver different. `no_tools` strips every tool beyond the core; the
+    // driver different. `no_tools` closes the entire model tool catalog; the
     // CLI serves both interactive and headless spawns, which is why
     // `prepare_from_config` resolves bypass-downgrade from `cfg.interactive`.
     let mut prepare = atomcode_coding::prepare_from_config(cfg);
