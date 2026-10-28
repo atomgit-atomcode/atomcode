@@ -10892,12 +10892,14 @@ where
                     _ => break,
                 }
             }
-            // Every arrow, one or many, while the pointer is the terminal's: a
-            // slow swipe arrives as lone arrows, which timing cannot tell from
-            // a keypress. The loop decides what they do (scroll the
-            // conversation where they would reach the composer, the keys they
-            // were anywhere else); the history is on ctrl-p/ctrl-n meanwhile.
-            let sent = wake.send(Wake::Input(Input::ArrowBurst { up, n })).is_ok();
+            // A lone arrow has exactly the same bytes as a keyboard press.
+            // Preserve normal caret/history navigation, including over SSH.
+            // Only a confirmed multi-arrow burst takes the wheel path.
+            let sent = if n == 1 {
+                forward(event)
+            } else {
+                wake.send(Wake::Input(Input::ArrowBurst { up, n })).is_ok()
+            };
             if !sent {
                 break;
             }
@@ -13040,9 +13042,8 @@ mod paste_burst_tests {
 
     /// **The wheel, turned into arrows by the terminal.** With the pointer
     /// handed back, a notch is the same arrow several times in one write —
-    /// gathered into one burst — or, swiped slowly, one at a time; either way
-    /// it reaches the loop as a burst, so the screen can scroll instead of
-    /// stepping the input history. And only then: with the pointer ours an
+    /// gathered into one burst. Lone arrows retain keyboard semantics, so
+    /// input history remains reachable with native mouse mode. With the pointer ours an
     /// arrow is a key and nothing waits for a second one.
     #[tokio::test]
     async fn arrows_the_wheel_sent_are_one_burst_only_while_the_pointer_is_handed_back() {
@@ -13056,14 +13057,15 @@ mod paste_burst_tests {
             vec![Input::Key(KeyPress::plain(Key::Up)); 3],
             "the pointer is ours: the wheel is a mouse event, and these are keys"
         );
-        // Lone arrows too — a slow swipe, or a person's key repeat, which are
-        // the same bytes: while the pointer is handed back each one is a burst
-        // of one, and the loop decides what it does (scroll where it would
-        // reach the composer; the key it was anywhere else).
-        assert_eq!(
-            pumped_with(vec![(0, arrow(false)), (35, arrow(false))], true).await,
-            vec![Input::ArrowBurst { up: false, n: 1 }; 2]
-        );
+        // A keyboard press (including ordinary key repeat) must remain a key
+        // over SSH/native mouse mode. A lone wheel arrow is indistinguishable:
+        // prioritize composer navigation rather than disabling input history.
+        for up in [true, false] {
+            assert_eq!(
+                pumped_with(vec![(0, arrow(up)), (35, arrow(up))], true).await,
+                vec![Input::Key(KeyPress::plain(if up { Key::Up } else { Key::Down })); 2]
+            );
+        }
         // The wheel reversed: the first arrow of the other way ends the burst,
         // and is itself looked at again — the start of the next burst, not one
         // lone ↑ let through to the composer.

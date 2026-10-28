@@ -167,10 +167,9 @@ pub enum Action {
     /// The mirror: down a row, or forward through the history and out the far
     /// side to the draft that was set aside.
     CaretDown,
-    /// Back through what was said, wherever the caret is. `ctrl-p`: the way to
-    /// the history while the mouse is handed back, when ↑ scrolls instead —
-    /// the terminal sends the wheel as ↑/↓ then, and a notch and a keypress
-    /// are the same bytes.
+    /// Back through what was said, wherever the caret is. `ctrl-p` bypasses
+    /// vertical movement within a multiline draft; bare Up recalls history
+    /// only at the top of the composer, including native mouse mode.
     HistoryBack,
     /// Forward through it, and out to the draft. `ctrl-n`.
     HistoryForward,
