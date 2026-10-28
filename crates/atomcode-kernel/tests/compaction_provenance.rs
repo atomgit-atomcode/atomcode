@@ -2,7 +2,8 @@ use atomcode_kernel::message::{
     Role, COMPACTION_RETAINED_FRAMING, COMPACTION_RETAINED_MODEL_ORIGIN,
 };
 use atomcode_kernel::session::{
-    derive_messages, derive_messages_with_meta, LoggedEvent, RewindScope, SessionEvent,
+    derive_messages, derive_messages_with_meta, visible_turns, InjectionOrigin, LoggedEvent,
+    RewindScope, SessionEvent,
 };
 
 fn log(events: Vec<SessionEvent>) -> Vec<LoggedEvent> {
@@ -21,6 +22,17 @@ fn user(turn: u64, text: &str) -> SessionEvent {
         turn,
         text: text.into(),
         images: vec![],
+    }
+}
+fn assistant(turn: u64, text: &str) -> SessionEvent {
+    SessionEvent::AssistantMessage {
+        turn,
+        round: 1,
+        text: text.into(),
+        reasoning: String::new(),
+        tool_calls: vec![],
+        reasoning_blocks: vec![],
+        meta: None,
     }
 }
 fn compact() -> SessionEvent {
@@ -96,4 +108,112 @@ fn a_conversation_without_compaction_has_no_history_framing() {
     assert!(derive_messages(&events)
         .iter()
         .all(|m| m.internal_origin.is_none() && !m.text.contains(COMPACTION_RETAINED_FRAMING)));
+}
+
+#[test]
+fn a_retained_turn_stays_visible_when_the_cut_lands_on_its_turn_start() {
+    let events = log(vec![
+        SessionEvent::TurnStart { turn: 1 },
+        user(1, "one"),
+        assistant(1, "ok1"),
+        SessionEvent::TurnStart { turn: 2 },
+        user(2, "two"),
+        assistant(2, "ok2"),
+        SessionEvent::Compacted {
+            turn: 2,
+            from: 3,
+            through: 4,
+            summary: "Summary of an old task".into(),
+        },
+    ]);
+    let visible = visible_turns(&events);
+    assert!(visible.contains(&1));
+    assert!(
+        visible.contains(&2),
+        "a retained turn with surviving messages is still shown"
+    );
+    assert!(derive_messages(&events).iter().any(|m| m.text == "two"));
+}
+
+#[test]
+fn an_interruption_that_survives_the_cut_keeps_its_turn_visible() {
+    let events = log(vec![
+        SessionEvent::TurnStart { turn: 1 },
+        user(1, "one"),
+        SessionEvent::Interrupted {
+            turn: 1,
+            undone: false,
+        },
+        SessionEvent::Compacted {
+            turn: 1,
+            from: 0,
+            through: 2,
+            summary: "Summary of an old task".into(),
+        },
+    ]);
+    // The cut folds the prompt but leaves the interruption, which still projects
+    // a model-visible message; the turn cannot be treated as gone.
+    assert!(derive_messages(&events)
+        .iter()
+        .any(|m| m.is_user_interruption()));
+    assert!(visible_turns(&events).contains(&1));
+}
+
+#[test]
+fn memory_survives_a_compaction_that_folds_its_turn() {
+    let events = log(vec![
+        SessionEvent::TurnStart { turn: 1 },
+        SessionEvent::Injected {
+            turn: 1,
+            text: "=== MEMORY ===\n- prefers tabs".into(),
+            origin: InjectionOrigin::Memory,
+        },
+        user(1, "one"),
+        assistant(1, "ok1"),
+        SessionEvent::TurnStart { turn: 2 },
+        user(2, "two"),
+        assistant(2, "ok2"),
+        SessionEvent::Compacted {
+            turn: 2,
+            from: 0,
+            through: 5,
+            summary: "Summary of an old task".into(),
+        },
+    ]);
+    let messages = derive_messages(&events);
+    assert!(
+        messages.iter().any(|m| m.text.contains("prefers tabs")),
+        "memory stands for the session, not for the folded history"
+    );
+    let visible = visible_turns(&events);
+    assert!(!visible.contains(&1), "turn 1's own work is folded");
+    assert!(visible.contains(&2), "turn 2's messages survive");
+}
+
+#[test]
+fn only_the_latest_memory_injection_reaches_the_projection() {
+    let events = log(vec![
+        SessionEvent::TurnStart { turn: 1 },
+        SessionEvent::Injected {
+            turn: 1,
+            text: "=== MEMORY ===\n- prefers tabs".into(),
+            origin: InjectionOrigin::Memory,
+        },
+        user(1, "one"),
+        assistant(1, "ok1"),
+        SessionEvent::TurnStart { turn: 2 },
+        SessionEvent::Injected {
+            turn: 2,
+            text: "=== MEMORY ===\n- prefers spaces".into(),
+            origin: InjectionOrigin::Memory,
+        },
+        user(2, "two"),
+        assistant(2, "ok2"),
+    ]);
+    let messages = derive_messages(&events);
+    assert!(messages.iter().any(|m| m.text.contains("prefers spaces")));
+    assert!(
+        !messages.iter().any(|m| m.text.contains("prefers tabs")),
+        "a refreshed memory replaces the earlier injection"
+    );
 }

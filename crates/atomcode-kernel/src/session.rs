@@ -833,8 +833,13 @@ fn folded_ranges(
         .collect()
 }
 
-/// Which turns the conversation still shows: opened after the compaction that
-/// stands, not taken back by an undo, not undone after an interruption.
+/// Which turns the conversation still shows: a turn is visible when any of its
+/// model-visible facts survives, is not taken back by an undo, and is not undone
+/// after an interruption.
+///
+/// A compaction cut can land on a retained turn's `TurnStart` while its prompt
+/// and reply stay in the projection; keying only on `TurnStart` would hide that
+/// turn from statistics and display entries that are still in the conversation.
 ///
 /// What is kept beside a log per turn — statistics, display entries — follows
 /// this rather than counting messages, so it agrees with [`derive_messages`]
@@ -849,19 +854,40 @@ pub fn visible_turns(events: &[LoggedEvent]) -> std::collections::BTreeSet<u64> 
             _ => None,
         })
         .collect();
-    events
-        .iter()
-        .filter(|logged| {
-            !taken_back(logged.seq)
-                && !folded
-                    .iter()
-                    .any(|(from, through)| logged.seq > *from && logged.seq <= *through)
-        })
-        .filter_map(|logged| match logged.event {
-            SessionEvent::TurnStart { turn } if !undone.contains(&turn) => Some(turn),
-            _ => None,
-        })
-        .collect()
+    let mut visible = std::collections::BTreeSet::new();
+    for logged in events.iter().filter(|logged| !taken_back(logged.seq)) {
+        if folded
+            .iter()
+            .any(|(from, through)| logged.seq > *from && logged.seq <= *through)
+        {
+            continue;
+        }
+        let turn = match &logged.event {
+            SessionEvent::TurnStart { turn } => *turn,
+            SessionEvent::UserMessage { turn, .. }
+            | SessionEvent::AssistantMessage { turn, .. }
+            | SessionEvent::ToolResultLogged { turn, .. }
+            | SessionEvent::PartialReply { turn, .. } => *turn,
+            // An interruption that survives the cut still projects a model-visible
+            // message, so its turn is not gone.
+            SessionEvent::Interrupted { turn, .. } => *turn,
+            // Memory and a compaction summary stand for the session, not for the
+            // turn they landed in.
+            SessionEvent::Injected { turn, origin, .. }
+                if !matches!(
+                    origin,
+                    InjectionOrigin::Memory | InjectionOrigin::CompactionSummary
+                ) =>
+            {
+                *turn
+            }
+            _ => continue,
+        };
+        if !undone.contains(&turn) {
+            visible.insert(turn);
+        }
+    }
+    visible
 }
 
 /// Which turns were taken back — by an undo, a rewind of the conversation, or a
@@ -1086,11 +1112,39 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<TracedMessage> {
         message.synthetic = true;
         projection.push(message, Provenance::Summary(seq));
     }
+    // Memory is a session-level view: a later injection (a refresh after the
+    // person edited memory.md) replaces the one before it, never joins it.
+    let latest_memory = events
+        .iter()
+        .filter(|logged| {
+            matches!(
+                &logged.event,
+                SessionEvent::Injected {
+                    origin: InjectionOrigin::Memory,
+                    ..
+                }
+            )
+        })
+        .map(|logged| logged.seq)
+        .max();
 
     for logged in events.iter().filter(|e| {
-        !folded
-            .iter()
-            .any(|(from, through)| e.seq > *from && e.seq <= *through)
+        // Memory stands for the session, not for the history a compaction
+        // replaces; folding it away would silently drop first-turn memory.
+        let is_memory = matches!(
+            &e.event,
+            SessionEvent::Injected {
+                origin: InjectionOrigin::Memory,
+                ..
+            }
+        );
+        if is_memory && Some(e.seq) != latest_memory {
+            return false;
+        }
+        is_memory
+            || !folded
+                .iter()
+                .any(|(from, through)| e.seq > *from && e.seq <= *through)
     }) {
         let seq = logged.seq;
         let text_of = |own: &str| rewritten.get(&seq).copied().unwrap_or(own).to_string();
