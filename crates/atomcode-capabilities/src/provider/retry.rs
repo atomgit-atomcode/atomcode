@@ -373,10 +373,16 @@ pub(crate) fn stream_read_error_message(
                     .to_string()
             }
         };
+        let detail = err_chain(err);
         format!(
-            "{lead}{}详情: {}",
+            "{lead}{}{}详情: {}",
+            if detail.contains("without sending TLS close_notify") {
+                "TLS 连接未正常关闭;请检查网络、代理或服务端连接。"
+            } else {
+                ""
+            },
             connection_reset_hint(err),
-            err_chain(err)
+            detail
         )
     } else {
         format!("stream read error: {}", err_chain(err))
@@ -838,6 +844,31 @@ mod tests {
             ErrorKind::BrokenPipe,
             "bp"
         )));
+    }
+
+    #[test]
+    fn tls_close_notify_eof_keeps_transport_recovery_and_partial_reply_guidance() {
+        let error = Wrap(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "peer closed connection without sending TLS close_notify",
+        ));
+        assert!(chain_has_transient_io(&error));
+        assert!(!chain_has_tls_corruption(&error));
+        assert!(stream_read_error_code(&error).is_some());
+        let partial = stream_read_error_message(&error, StreamReadRecovery::PartialResponse);
+        assert!(partial.contains("TLS 连接未正常关闭"));
+        assert!(partial.contains("未自动重放"));
+        assert!(partial.contains("继续"));
+        let exhausted =
+            stream_read_error_message(&error, StreamReadRecovery::RetryExhausted { attempts: 2 });
+        assert!(exhausted.contains("自动重连 2 次后仍失败"));
+        assert!(exhausted.contains("TLS 连接未正常关闭"));
+        // A generic timeout must not be diagnosed as a TLS shutdown error.
+        let timeout = Wrap(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        assert!(
+            !stream_read_error_message(&timeout, StreamReadRecovery::PartialResponse)
+                .contains("TLS 连接未正常关闭")
+        );
     }
 
     #[test]

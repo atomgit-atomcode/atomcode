@@ -1449,6 +1449,12 @@ async fn open_stream_attempts(
                     );
                     if fallback || retry::is_stale_connection_error(&e) || corruption {
                         client.rebuild(was_capped || fallback)?;
+                        tracing::info!(
+                            phase = "request_open",
+                            tls12 = was_capped || fallback,
+                            tls12_fallback = fallback,
+                            "provider connection pool rebuilt before caller recovery"
+                        );
                     }
                 }
                 if retry::is_retryable_reqwest_error(&e) && attempt < policy.max_attempts {
@@ -1496,6 +1502,13 @@ async fn open_stream_attempts(
                         // latch the working downgrade for future clients.
                         let capped = try_tls12 || was_capped;
                         client.rebuild(capped)?;
+                        tracing::info!(
+                            phase = "request_open",
+                            attempt,
+                            tls12 = capped,
+                            tls12_fallback = try_tls12,
+                            "provider connection pool rebuilt before retry"
+                        );
                         tls12_probe = capped;
                     }
                     attempt += 1;
