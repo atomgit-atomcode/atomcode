@@ -3437,7 +3437,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   // 输入框只渲染一份，按落地/常规两处择一挂载（避免两个 textarea 抢同一 ref）。
   const canStop = busy || recoveryPolicy.allowStop || Boolean(goalProgress?.recovery);
   const inputBox = (
-    <div class={'input-box' + (canStop ? ' is-running' : '') + (pendingImages.length || attachError ? ' has-input-detail' : '')}>
+    <div class={'input-box' + (messages.length > 0 ? ' can-collapse' : '') + (canStop ? ' is-running' : '') + (pendingImages.length || attachError ? ' has-input-detail' : '')}>
       {attachError && (
         <div class="input-attach-error" role="alert">
           <span>{attachError}</span>
