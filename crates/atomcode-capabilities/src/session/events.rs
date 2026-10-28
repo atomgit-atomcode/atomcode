@@ -2830,18 +2830,82 @@ mod tests {
             Some("hello".to_string())
         );
         assert!(
+            loaded
+                .snapshot
+                .messages
+                .iter()
+                .any(|message| message.text == "hello"),
+            "loading must not retract a prompt the runtime has not been given"
+        );
+        assert!(!manager
+            .load_events(id)
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event.event, SessionEvent::Rewound { .. })));
+
+        manager.prepare_resume_replay(&lease).unwrap();
+
+        let (loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
+        assert_eq!(
+            pending.map(|message| message.text),
+            Some("hello".to_string())
+        );
+        assert!(
             !loaded
                 .snapshot
                 .messages
                 .iter()
                 .any(|message| message.text == "hello"),
-            "the unanswered turn is retracted before it is replayed"
+            "the unanswered turn is retracted once the replay is prepared"
         );
         assert!(manager
             .load_events(id)
             .unwrap()
             .iter()
             .any(|event| matches!(event.event, SessionEvent::Rewound { .. })));
+    }
+
+    #[test]
+    fn loading_for_resume_does_not_retract_or_mark() {
+        let (_dir, manager) = store();
+        let id = "resume-preview";
+        let lease = created(&manager, id);
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "hello".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+
+        for _ in 0..2 {
+            let (loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
+            assert_eq!(
+                pending.map(|message| message.text),
+                Some("hello".to_string())
+            );
+            assert!(loaded
+                .snapshot
+                .messages
+                .iter()
+                .any(|message| message.text == "hello"));
+            assert!(manager.read_resume_replay(id).unwrap().is_none());
+            assert!(!manager
+                .load_events(id)
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event.event, SessionEvent::Rewound { .. })));
+        }
     }
 
     #[test]
@@ -2931,13 +2995,26 @@ mod tests {
             pending.map(|message| message.text),
             Some("hello".to_string())
         );
+        assert!(loaded
+            .snapshot
+            .messages
+            .iter()
+            .any(|message| message.text == "hello"));
+        assert!(manager.read_resume_replay(id).unwrap().is_none());
+        manager.prepare_resume_replay(&lease).unwrap();
+
+        let (loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
+        assert_eq!(
+            pending.map(|message| message.text),
+            Some("hello".to_string())
+        );
         assert!(
             !loaded
                 .snapshot
                 .messages
                 .iter()
                 .any(|message| message.text == "hello"),
-            "the unanswered turn is retracted before it is replayed"
+            "the unanswered turn is retracted once the replay is prepared"
         );
         assert_eq!(
             manager.read_resume_replay(id).unwrap(),
@@ -2961,6 +3038,8 @@ mod tests {
             Some("hello".to_string())
         );
         assert_eq!(rewinds(), 1, "a retry must not append another rewind");
+        manager.prepare_resume_replay(&lease).unwrap();
+        assert_eq!(rewinds(), 1, "preparing an already-prepared replay is a no-op");
 
         // A complete turn after the rewind means the replay was accepted.
         manager
@@ -3032,6 +3111,25 @@ mod tests {
         manager
             .write_resume_replay(id, &ResumeReplay { to: 1, turn: 1 })
             .unwrap();
+
+        let (loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
+        assert_eq!(
+            pending.map(|message| message.text),
+            Some("hello".to_string())
+        );
+        assert!(loaded
+            .snapshot
+            .messages
+            .iter()
+            .any(|message| message.text == "hello"));
+        assert!(manager.read_resume_replay(id).unwrap().is_none());
+        assert!(!manager
+            .load_events(id)
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event.event, SessionEvent::Rewound { .. })));
+
+        manager.prepare_resume_replay(&lease).unwrap();
 
         let (_loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
         assert_eq!(
