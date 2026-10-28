@@ -1527,7 +1527,7 @@ fn header_line(header: &SessionHeader) -> SessionResult<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::manager::StorageOwner;
+    use crate::session::manager::{ResumeReplay, StorageOwner};
     use atomcode_kernel::event::StopReason;
     use atomcode_kernel::message::Message;
 
@@ -2901,6 +2901,257 @@ mod tests {
             .unwrap()
             .iter()
             .any(|event| matches!(event.event, SessionEvent::Rewound { .. })));
+    }
+
+    #[test]
+    fn resume_keeps_an_unreplayed_prompt_recoverable() {
+        let (_dir, manager) = store();
+        let id = "resume-replay";
+        let lease = created(&manager, id);
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "hello".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+
+        let (loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
+        assert_eq!(
+            pending.map(|message| message.text),
+            Some("hello".to_string())
+        );
+        assert!(
+            !loaded
+                .snapshot
+                .messages
+                .iter()
+                .any(|message| message.text == "hello"),
+            "the unanswered turn is retracted before it is replayed"
+        );
+        assert_eq!(
+            manager.read_resume_replay(id).unwrap(),
+            Some(ResumeReplay { to: 1, turn: 1 })
+        );
+        let rewinds = || {
+            manager
+                .load_events(id)
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(event.event, SessionEvent::Rewound { .. }))
+                .count()
+        };
+        assert_eq!(rewinds(), 1);
+
+        // The replayed turn never landed: a second death must hand the prompt
+        // back again, not leave it hidden behind the first retraction.
+        let (_loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
+        assert_eq!(
+            pending.map(|message| message.text),
+            Some("hello".to_string())
+        );
+        assert_eq!(rewinds(), 1, "a retry must not append another rewind");
+
+        // A complete turn after the rewind means the replay was accepted.
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(4, 0, SessionEvent::TurnStart { turn: 2 }),
+                    logged(
+                        5,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 2,
+                            text: "hello".into(),
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        6,
+                        0,
+                        SessionEvent::AssistantMessage {
+                            turn: 2,
+                            round: 1,
+                            text: "ok".into(),
+                            reasoning: String::new(),
+                            tool_calls: vec![],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    logged(
+                        7,
+                        0,
+                        SessionEvent::TurnEnd {
+                            turn: 2,
+                            stop: StopReason::Stopped,
+                            error: None,
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        let (_loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
+        assert!(pending.is_none());
+        assert!(manager.read_resume_replay(id).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_marker_without_its_rewind_is_retried() {
+        let (_dir, manager) = store();
+        let id = "resume-replay-ghost";
+        let lease = created(&manager, id);
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "hello".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        manager
+            .write_resume_replay(id, &ResumeReplay { to: 1, turn: 1 })
+            .unwrap();
+
+        let (_loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
+        assert_eq!(
+            pending.map(|message| message.text),
+            Some("hello".to_string())
+        );
+        assert_eq!(
+            manager.read_resume_replay(id).unwrap(),
+            Some(ResumeReplay { to: 1, turn: 1 })
+        );
+        assert_eq!(
+            manager
+                .load_events(id)
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(event.event, SessionEvent::Rewound { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_user_rewind_without_a_marker_is_not_replayed() {
+        let (_dir, manager) = store();
+        let id = "resume-user-rewind";
+        let lease = created(&manager, id);
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "hello".into(),
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        3,
+                        0,
+                        SessionEvent::Rewound {
+                            turn: 1,
+                            to: 1,
+                            scope: RewindScope::Conversation,
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+
+        let (_loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
+        assert!(pending.is_none());
+        assert!(manager.read_resume_replay(id).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_replay_turn_lost_before_its_answer_is_replayed_again() {
+        let (_dir, manager) = store();
+        let id = "resume-replay-chain";
+        let lease = created(&manager, id);
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "hello".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        let (_loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
+        assert!(pending.is_some());
+
+        // The replay's turn was accepted, then the process died before answering.
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(4, 0, SessionEvent::TurnStart { turn: 2 }),
+                    logged(
+                        5,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 2,
+                            text: "hello".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+
+        let (_loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
+        assert_eq!(
+            pending.map(|message| message.text),
+            Some("hello".to_string())
+        );
+        assert_eq!(
+            manager.read_resume_replay(id).unwrap(),
+            Some(ResumeReplay { to: 4, turn: 2 })
+        );
+        assert_eq!(
+            manager
+                .load_events(id)
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(event.event, SessionEvent::Rewound { .. }))
+                .count(),
+            2
+        );
     }
 
     #[cfg(feature = "memory")]

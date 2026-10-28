@@ -18,9 +18,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::ProductDirs;
 use atomcode_kernel::message::{Message, Role, SessionSnapshot, SNAPSHOT_VERSION};
-use atomcode_kernel::session::{
-    LoggedEvent, RewindScope, SeqNo, SessionEvent,
-};
+use atomcode_kernel::session::{LoggedEvent, RewindScope, SeqNo, SessionEvent};
 use serde::{de::IgnoredAny, Deserialize, Serialize};
 
 use super::presentation::{
@@ -711,7 +709,7 @@ pub(crate) struct ResumeReplay {
 enum PendingReplay {
     /// The rewind is in the log, no later turn exists, and the prompt is still
     /// there to hand back.
-    StillWaiting(Message),
+    StillWaiting(Box<Message>),
     /// A turn after the rewind exists: the replay was accepted (or the person
     /// moved on), so the marker has done its job.
     Started,
@@ -735,10 +733,9 @@ fn pending_replay_prompt(events: &[LoggedEvent], replay: &ResumeReplay) -> Pendi
     else {
         return PendingReplay::Stale;
     };
-    if events
-        .iter()
-        .any(|logged| logged.seq > rewound_at && matches!(logged.event, SessionEvent::TurnStart { .. }))
-    {
+    if events.iter().any(|logged| {
+        logged.seq > rewound_at && matches!(logged.event, SessionEvent::TurnStart { .. })
+    }) {
         return PendingReplay::Started;
     }
     let mut prompt = None;
@@ -746,12 +743,7 @@ fn pending_replay_prompt(events: &[LoggedEvent], replay: &ResumeReplay) -> Pendi
         .iter()
         .filter(|logged| logged.seq > replay.to && logged.seq < rewound_at)
     {
-        let SessionEvent::UserMessage {
-            turn,
-            text,
-            images,
-        } = &logged.event
-        else {
+        let SessionEvent::UserMessage { turn, text, images } = &logged.event else {
             continue;
         };
         if *turn != replay.turn {
@@ -766,7 +758,9 @@ fn pending_replay_prompt(events: &[LoggedEvent], replay: &ResumeReplay) -> Pendi
             Message::user_with_images(text, images.clone())
         });
     }
-    prompt.map_or(PendingReplay::Stale, PendingReplay::StillWaiting)
+    prompt.map_or(PendingReplay::Stale, |prompt| {
+        PendingReplay::StillWaiting(Box::new(prompt))
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1448,11 +1442,7 @@ impl SessionManager {
         self.path_for(id, "replay")
     }
 
-    pub(crate) fn write_resume_replay(
-        &self,
-        id: &str,
-        replay: &ResumeReplay,
-    ) -> SessionResult<()> {
+    pub(crate) fn write_resume_replay(&self, id: &str, replay: &ResumeReplay) -> SessionResult<()> {
         let bytes = serialize_bounded(replay, "resume replay", MAX_RESUME_REPLAY_BYTES)?;
         atomic_write(&self.resume_replay_path(id)?, &bytes)
     }
@@ -1803,7 +1793,7 @@ impl SessionManager {
 
         match self.read_resume_replay(id) {
             Ok(Some(replay)) => match pending_replay_prompt(&events, &replay) {
-                PendingReplay::StillWaiting(prompt) => return Ok((loaded, Some(prompt))),
+                PendingReplay::StillWaiting(prompt) => return Ok((loaded, Some(*prompt))),
                 PendingReplay::Started | PendingReplay::Stale => {
                     let _ = self.clear_resume_replay(id);
                 }
@@ -1844,7 +1834,7 @@ impl SessionManager {
                 scope: RewindScope::Conversation,
             },
         };
-        match self.append_events(lease, &[rewound.clone()]) {
+        match self.append_events(lease, std::slice::from_ref(&rewound)) {
             Ok(()) => {
                 events.push(rewound);
                 loaded.snapshot = super::events::snapshot_of(&events);
