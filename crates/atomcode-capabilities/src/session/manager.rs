@@ -1531,6 +1531,54 @@ impl SessionManager {
             Err(error) => Err(io_at(&path, error)),
         }
     }
+
+    /// Carry a source session's todo sidecar into a fork.
+    ///
+    /// The sidecar may be the only copy of a plan compaction took out of the
+    /// transcript. Its `through` is a position in the **source** log; when it
+    /// points past the fork's last turn the sidecar was written after the
+    /// aggregate this fork copied, so the items travel without a position rather
+    /// than anchoring the panel to a call the fork does not have.
+    #[cfg(feature = "tools")]
+    pub(super) fn carry_todo_sidecar(&self, source_id: &str, destination_id: &str, last_turn: u64) {
+        let sidecar = match self.read_todo_sidecar(source_id) {
+            Ok(Some(sidecar)) => sidecar,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    source = source_id,
+                    "could not read the source todo sidecar for a fork"
+                );
+                return;
+            }
+        };
+        let through = match sidecar.through {
+            Some(through) if through.turn > last_turn => {
+                tracing::warn!(
+                    source = source_id,
+                    through = through.turn,
+                    last_turn,
+                    "source todo sidecar points past the fork's turns; carrying its items without a position"
+                );
+                None
+            }
+            other => other,
+        };
+        if let Err(error) = self.write_todo_sidecar(
+            destination_id,
+            &sidecar.todos,
+            sidecar.message_count,
+            through,
+        ) {
+            tracing::warn!(
+                %error,
+                source = source_id,
+                destination = destination_id,
+                "could not carry the todo sidecar into the fork"
+            );
+        }
+    }
     fn meta_lock_path(&self, id: &str) -> SessionResult<PathBuf> {
         self.path_for(id, "meta.lock")
     }
@@ -2819,16 +2867,8 @@ impl SessionManager {
             Some(&forked.presentation),
             &forked.meta,
         )?;
-        if let Ok(Some(sidecar)) = self.read_todo_sidecar(source_id) {
-            // A compacted plan lives only in the sidecar; a fork without it
-            // would start with an empty task list.
-            let _ = self.write_todo_sidecar(
-                destination_id,
-                &sidecar.todos,
-                sidecar.message_count,
-                sidecar.through,
-            );
-        }
+        #[cfg(feature = "tools")]
+        self.carry_todo_sidecar(source_id, destination_id, u64::from(forked.meta.turn_count));
         Ok((forked, destination_lease))
     }
 
