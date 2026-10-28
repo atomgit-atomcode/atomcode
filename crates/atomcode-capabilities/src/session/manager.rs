@@ -1800,19 +1800,29 @@ impl SessionManager {
             },
             Ok(None) => {}
             Err(error) => {
+                // The marker may be the only record of a retracted prompt. Keep it
+                // for a build that can read it; detection below still handles the
+                // visible case (and overwrites a new marker when it finds one).
                 notes.push(format!(
-                    "the pending replay of session {id} could not be read and was dropped: {error}"
+                    "the pending replay of session {id} could not be read and was left in place: {error}"
                 ));
-                let _ = self.clear_resume_replay(id);
             }
         }
 
-        let Some((_, _, prompt)) = super::events::unanswered_prompt(&events) else {
+        let Some((to, turn, prompt)) = super::events::unanswered_prompt(&events) else {
             return Ok((loaded, None));
         };
         // Loading does not retract: the prompt stays visible until the runtime is
-        // actually about to send it (`prepare_resume_replay`). A caller that only
-        // previews the session must not lose a line the person wrote.
+        // actually about to send it (`prepare_resume_replay`). Record the exact
+        // target so prepare retracts what was handed back, not whatever the log
+        // says later.
+        let replay = ResumeReplay { to, turn };
+        if let Err(error) = self.write_resume_replay(id, &replay) {
+            notes.push(format!(
+                "the prompt session {id} accepted before its turn was answered \
+                 could not be marked for replay: {error}"
+            ));
+        }
         Ok((loaded, Some(prompt)))
     }
 
@@ -1830,19 +1840,55 @@ impl SessionManager {
             return Ok(());
         }
         let events = self.load_events(id)?;
-        if let Some(replay) = self.read_resume_replay(id)? {
+        let replay = match self.read_resume_replay(id) {
+            Ok(Some(replay)) => Some(replay),
+            Ok(None) => None,
+            // A marker that cannot be read is not a licence to pick another
+            // target out of a log that may have moved.
+            Err(error) => return Err(error),
+        };
+        let target = if let Some(replay) = replay {
             match pending_replay_prompt(&events, &replay) {
                 PendingReplay::StillWaiting(_) => return Ok(()),
-                PendingReplay::Started | PendingReplay::Stale => {
-                    self.clear_resume_replay(id)?;
+                PendingReplay::Started => {
+                    // The rewind is in the log and a later turn exists: the
+                    // replay started, or the person moved on. Retracting anything
+                    // else here would undo work that is still theirs.
+                    let _ = self.clear_resume_replay(id);
+                    return Err(SessionStoreError::Corrupt {
+                        kind: "resume replay",
+                        message: format!(
+                            "session {id}: the pending prompt was already replayed \
+                             or the conversation moved on"
+                        ),
+                    });
+                }
+                PendingReplay::Stale => {
+                    // The marker has no rewind yet. Retract its exact target, not
+                    // a freshly chosen last turn.
+                    if super::events::unanswered_at(&events, replay.to, replay.turn).is_none() {
+                        let _ = self.clear_resume_replay(id);
+                        return Err(SessionStoreError::Corrupt {
+                            kind: "resume replay",
+                            message: format!(
+                                "session {id}: the prompt marked for replay is no \
+                                 longer unanswered"
+                            ),
+                        });
+                    }
+                    replay
                 }
             }
-        }
-        let Some((to, turn, _)) = super::events::unanswered_prompt(&events) else {
-            return Ok(());
+        } else {
+            // No marker (a load whose best-effort marker write failed, or an
+            // older caller): fall back to the last unanswered turn.
+            let Some((to, turn, _)) = super::events::unanswered_prompt(&events) else {
+                return Ok(());
+            };
+            let replay = ResumeReplay { to, turn };
+            self.write_resume_replay(id, &replay)?;
+            replay
         };
-        let replay = ResumeReplay { to, turn };
-        self.write_resume_replay(id, &replay)?;
         let seq = events
             .iter()
             .map(|logged| logged.seq)
@@ -1853,8 +1899,8 @@ impl SessionManager {
             seq,
             at: u64::try_from(super::now_ms()).unwrap_or(0),
             event: SessionEvent::Rewound {
-                turn,
-                to,
+                turn: target.turn,
+                to: target.to,
                 scope: RewindScope::Conversation,
             },
         };
@@ -2435,21 +2481,25 @@ impl SessionManager {
         &self,
         id: &str,
     ) -> SessionResult<(LoadedSession, Vec<LoggedEvent>)> {
-        let meta = self.read_native_meta(id)?;
-        let (_, events) = self.read_event_log_bounded(id, false, usize::MAX)?;
-        let snapshot = super::events::snapshot_of(&events);
-        let presentation = match self.read_presentation_bounded(id, usize::MAX) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => PresentationFile::default(),
-            other => other?,
-        };
-        Ok((
-            LoadedSession {
-                meta,
-                snapshot,
-                presentation,
-            },
-            events,
-        ))
+        self.with_meta_lock(id, || {
+            let meta = self.read_native_meta(id)?;
+            let (_, events) = self.read_event_log_bounded(id, false, usize::MAX)?;
+            let snapshot = super::events::snapshot_of(&events);
+            let presentation = match self.read_presentation_bounded(id, usize::MAX) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    PresentationFile::default()
+                }
+                other => other?,
+            };
+            Ok((
+                LoadedSession {
+                    meta,
+                    snapshot,
+                    presentation,
+                },
+                events,
+            ))
+        })
     }
 
     /// Inspect or explicitly repair the one safe incomplete-native state: valid

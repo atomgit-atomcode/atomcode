@@ -1069,6 +1069,13 @@ pub(crate) fn unanswered_prompt(events: &[LoggedEvent]) -> Option<(SeqNo, u64, M
         SessionEvent::TurnStart { turn } => Some((logged.seq, *turn)),
         _ => None,
     })?;
+    unanswered_at(events, start, turn).map(|prompt| (start, turn, prompt))
+}
+
+/// The prompt of the turn at `start` when that turn is still accepted and
+/// unanswered. A resume marker names this position, so `prepare` can retract
+/// exactly what it handed back instead of re-deciding against a log that moved.
+pub(crate) fn unanswered_at(events: &[LoggedEvent], start: SeqNo, turn: u64) -> Option<Message> {
     let mut prompt = None;
     for logged in events.iter().filter(|logged| logged.seq > start) {
         match &logged.event {
@@ -1102,7 +1109,7 @@ pub(crate) fn unanswered_prompt(events: &[LoggedEvent]) -> Option<(SeqNo, u64, M
             _ => return None,
         }
     }
-    prompt.map(|prompt| (start, turn, prompt))
+    prompt
 }
 
 /// Move a reseeded fact's turn past the turns the log already used.
@@ -2866,7 +2873,7 @@ mod tests {
     }
 
     #[test]
-    fn loading_for_resume_does_not_retract_or_mark() {
+    fn loading_for_resume_does_not_retract_the_prompt() {
         let (_dir, manager) = store();
         let id = "resume-preview";
         let lease = created(&manager, id);
@@ -2899,7 +2906,10 @@ mod tests {
                 .messages
                 .iter()
                 .any(|message| message.text == "hello"));
-            assert!(manager.read_resume_replay(id).unwrap().is_none());
+            assert_eq!(
+                manager.read_resume_replay(id).unwrap(),
+                Some(ResumeReplay { to: 1, turn: 1 })
+            );
             assert!(!manager
                 .load_events(id)
                 .unwrap()
@@ -3000,7 +3010,10 @@ mod tests {
             .messages
             .iter()
             .any(|message| message.text == "hello"));
-        assert!(manager.read_resume_replay(id).unwrap().is_none());
+        assert_eq!(
+            manager.read_resume_replay(id).unwrap(),
+            Some(ResumeReplay { to: 1, turn: 1 })
+        );
         manager.prepare_resume_replay(&lease).unwrap();
 
         let (loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
@@ -3126,7 +3139,10 @@ mod tests {
             .messages
             .iter()
             .any(|message| message.text == "hello"));
-        assert!(manager.read_resume_replay(id).unwrap().is_none());
+        assert_eq!(
+            manager.read_resume_replay(id).unwrap(),
+            Some(ResumeReplay { to: 1, turn: 1 })
+        );
         assert!(!manager
             .load_events(id)
             .unwrap()
@@ -3262,6 +3278,204 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn prepare_does_not_retract_a_newer_turn_the_resume_did_not_name() {
+        let (_dir, manager) = store();
+        let id = "resume-replay-moved";
+        let lease = created(&manager, id);
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "hello".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        let (_loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
+        assert!(pending.is_some());
+
+        // The person typed a new message before the replay was sent.
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(3, 0, SessionEvent::TurnStart { turn: 2 }),
+                    logged(
+                        4,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 2,
+                            text: "new message".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+
+        assert!(
+            manager.prepare_resume_replay(&lease).is_err(),
+            "the marker names turn 1; a newer turn must not be retracted"
+        );
+        assert!(!manager
+            .load_events(id)
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event.event, SessionEvent::Rewound { .. })));
+    }
+
+    #[test]
+    fn prepare_after_the_replay_started_does_not_retract_again() {
+        let (_dir, manager) = store();
+        let id = "resume-replay-started";
+        let lease = created(&manager, id);
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "hello".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        let (_loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
+        assert!(pending.is_some());
+        manager.prepare_resume_replay(&lease).unwrap();
+
+        // The replay's turn was accepted; a retry must not rewind it.
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(4, 0, SessionEvent::TurnStart { turn: 2 }),
+                    logged(
+                        5,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 2,
+                            text: "hello".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        assert!(manager.prepare_resume_replay(&lease).is_err());
+        assert_eq!(
+            manager
+                .load_events(id)
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(event.event, SessionEvent::Rewound { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_corrupt_replay_marker_does_not_hide_the_still_visible_prompt() {
+        let (dir, manager) = store();
+        let id = "resume-replay-corrupt";
+        let lease = created(&manager, id);
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "hello".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        // A first load writes a marker; corrupt it before the next load.
+        let (_loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
+        assert!(pending.is_some());
+        std::fs::write(
+            dir.path().join(BUCKET).join(format!("{id}.replay")),
+            b"not a marker",
+        )
+        .unwrap();
+
+        let (loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
+        assert_eq!(
+            pending.map(|message| message.text),
+            Some("hello".to_string())
+        );
+        assert!(loaded
+            .snapshot
+            .messages
+            .iter()
+            .any(|message| message.text == "hello"));
+        assert_eq!(
+            manager.read_resume_replay(id).unwrap(),
+            Some(ResumeReplay { to: 1, turn: 1 })
+        );
+        assert!(!manager
+            .load_events(id)
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event.event, SessionEvent::Rewound { .. })));
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
+    fn a_fork_drops_a_sidecar_position_past_its_own_turns() {
+        use crate::session::manager::{TodoCallPosition, TodoSidecarItem};
+
+        let (_dir, manager) = store();
+        let lease = created(&manager, "s1");
+        manager.append_events(&lease, &a_turn()).unwrap();
+        manager
+            .write_todo_sidecar(
+                "s1",
+                &[TodoSidecarItem {
+                    content: "a".into(),
+                    status: "in_progress".into(),
+                }],
+                4,
+                Some(TodoCallPosition {
+                    turn: 9,
+                    round: 1,
+                    index: 0,
+                }),
+            )
+            .unwrap();
+
+        let (_forked, _fork_lease) = manager.fork_native_session("s1", "s2", 2_000).unwrap();
+
+        let sidecar = manager
+            .read_todo_sidecar("s2")
+            .unwrap()
+            .expect("the items still travel");
+        assert_eq!(sidecar.todos.len(), 1);
+        assert_eq!(sidecar.todos[0].content, "a");
+        assert_eq!(sidecar.through, None);
     }
 
     #[cfg(feature = "memory")]

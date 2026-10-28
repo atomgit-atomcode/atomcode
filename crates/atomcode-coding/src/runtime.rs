@@ -10822,8 +10822,8 @@ fn replay_pending_resume_prompt(
     if send_agent_command(
         agent,
         AgentCommand::SendMessage {
-            text: prompt.text.clone(),
-            images: prompt.images.clone(),
+            text: prompt.text,
+            images: prompt.images,
         },
     ) {
         binding.pending_resume_prompt = None;
