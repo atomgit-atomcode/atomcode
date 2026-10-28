@@ -1679,6 +1679,161 @@ model = "scripted"
     atomcode::tui_share::attach(&path).await.unwrap();
 }
 
+/// A stored conversation belonging to another project: its own working
+/// directory and its own storage bucket, leased while it is written and
+/// released before the caller navigates to it. Shared WebUI/App navigation is
+/// the only path allowed to prepare such a target — an ordinary `/resume` stays
+/// project-scoped (`2026-10-27-resume-project-scope.md`).
+async fn a_foreign_project_session() -> (tempfile::TempDir, &'static str) {
+    use atomcode_capabilities::session::{SessionManager, SessionMeta, StorageOwner};
+    use atomcode_kernel::session::{LoggedEvent, SessionEvent, SessionHeader};
+    let project = tempfile::tempdir().unwrap();
+    let dirs = atomcode_coding::config::product_dirs_from_env();
+    let manager = SessionManager::for_project(project.path(), &dirs);
+    let target = "foreign-webui-session";
+    let lease = manager.acquire_lease(target).unwrap();
+    let mut header = SessionHeader::new(target);
+    header.cwd = Some(project.path().to_string_lossy().into_owned());
+    let mut meta = SessionMeta::new(
+        target,
+        project.path().to_string_lossy(),
+        atomcode_capabilities::session::now_ms(),
+    );
+    meta.owner = StorageOwner::Native;
+    meta.message_count = 1;
+    meta.turn_count = 1;
+    manager
+        .create_event_session(&lease, &header, &meta)
+        .unwrap();
+    manager
+        .append_events(
+            &lease,
+            &[
+                LoggedEvent {
+                    seq: 1,
+                    at: 0,
+                    event: SessionEvent::TurnStart { turn: 1 },
+                },
+                LoggedEvent {
+                    seq: 2,
+                    at: 0,
+                    event: SessionEvent::UserMessage {
+                        turn: 1,
+                        text: "FOREIGN PROJECT HISTORY".into(),
+                        images: vec![],
+                    },
+                },
+            ],
+        )
+        .unwrap();
+    drop(lease);
+    (project, target)
+}
+
+/// Navigating back is the same navigation in reverse: the destination project
+/// is prepared, the foreground follows it, and neither bucket is rewritten.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+async fn shared_navigation_returns_to_the_original_project() {
+    use atomcode_capabilities::session::SessionManager;
+    let (rig, original) = a_history_and_fresh_foreground().await;
+    let (project, target) = a_foreign_project_session().await;
+    let dirs = atomcode_coding::config::product_dirs_from_env();
+    let old_bucket = SessionManager::project_hash(rig.project.path(), &dirs);
+    let target_bucket = SessionManager::project_hash(project.path(), &dirs);
+    share(&rig).await;
+    let changed = atomcode_daemon::native_live::resume_or_fork_session(target.into())
+        .await
+        .unwrap();
+    assert_eq!(changed.changed.session_id.as_deref(), Some(target));
+    assert_eq!(
+        changed.changed.working_dir.canonicalize().unwrap(),
+        project.path().canonicalize().unwrap()
+    );
+    rig.until("foreign session visible in TUI", |rig| {
+        rig.client.root() == target
+    })
+    .await;
+    rig.until_screen("FOREIGN PROJECT HISTORY").await;
+    let changed = atomcode_daemon::native_live::resume_or_fork_session(original.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        changed.changed.session_id.as_deref(),
+        Some(original.as_str())
+    );
+    // Coming home restores the project the session was stored in, not the one
+    // the person just left.
+    assert_eq!(
+        changed.changed.working_dir.canonicalize().unwrap(),
+        rig.project.path().canonicalize().unwrap()
+    );
+    rig.until("returned to the original project", |rig| {
+        rig.client.root() == original
+    })
+    .await;
+    assert_eq!(
+        atomcode_daemon::native_live::binding().unwrap().session_id,
+        original
+    );
+    assert_eq!(
+        SessionManager::project_hash(rig.project.path(), &dirs),
+        old_bucket
+    );
+    assert_eq!(
+        SessionManager::project_hash(project.path(), &dirs),
+        target_bucket
+    );
+    atomcode::tui_share::detach().unwrap();
+    rig.quit().await;
+}
+
+/// A target whose project directory is gone fails before anything is prepared:
+/// no candidate runtime, no foreground change, no new binding.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+async fn shared_navigation_to_a_missing_project_keeps_the_old_foreground() {
+    let (rig, original) = a_history_and_fresh_foreground().await;
+    let (project, target) = a_foreign_project_session().await;
+    share(&rig).await;
+    // Visit the project first, so the missing directory is the target of a real
+    // navigation and not an unknown id.
+    atomcode_daemon::native_live::resume_or_fork_session(target.into())
+        .await
+        .unwrap();
+    rig.until("foreign session visible in TUI", |rig| {
+        rig.client.root() == target
+    })
+    .await;
+    atomcode_daemon::native_live::resume_or_fork_session(original.clone())
+        .await
+        .unwrap();
+    rig.until("returned to the original project", |rig| {
+        rig.client.root() == original
+    })
+    .await;
+    std::fs::remove_dir_all(project.path()).unwrap();
+    let before = rig.spawn_started.load(Ordering::SeqCst);
+    assert!(
+        atomcode_daemon::native_live::resume_or_fork_session(target.into())
+            .await
+            .is_err(),
+        "a target project directory that is gone must be refused"
+    );
+    assert_eq!(
+        rig.spawn_started.load(Ordering::SeqCst),
+        before,
+        "nothing may be prepared for an unusable target"
+    );
+    assert_eq!(rig.client.root(), original);
+    assert_eq!(
+        atomcode_daemon::native_live::binding().unwrap().session_id,
+        original
+    );
+    atomcode::tui_share::detach().unwrap();
+    rig.quit().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial(atomcode_home)]
 async fn an_unopened_running_review_is_hidden_but_its_disk_record_remains_recoverable() {
