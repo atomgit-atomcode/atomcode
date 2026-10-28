@@ -10,7 +10,6 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-const MAX_MEMORY_FILE_SIZE: u64 = 64 * 1024;
 /// Full memory source for a driver, without prompt truncation or presentation parsing.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct MemorySection {
@@ -110,13 +109,10 @@ impl MemoryStore {
         &self.path
     }
 
-    /// Full source for a person reviewing memory, independent of prompt budgets.
+    /// Full source for review, independent of prompt budgets. Files above 1 MiB
+    /// are refused before parsing; callers must never write a truncated preview.
     pub fn full_text(&self) -> io::Result<String> {
-        match fs::read_to_string(&self.path) {
-            Ok(text) => Ok(text),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(String::new()),
-            Err(error) => Err(error),
-        }
+        document::read(&self.path)
     }
 
     pub fn for_display(stores: &[(&str, &MemoryStore)]) -> io::Result<String> {
@@ -136,24 +132,7 @@ impl MemoryStore {
     }
 
     pub fn load(&self) -> Vec<String> {
-        let content = match fs::metadata(&self.path) {
-            Ok(meta) => {
-                if meta.len() > MAX_MEMORY_FILE_SIZE {
-                    let bytes = fs::read(&self.path).unwrap_or_default();
-                    let start = bytes.len().saturating_sub(MAX_MEMORY_FILE_SIZE as usize);
-                    // Scan forward to the next newline to avoid splitting UTF-8 chars
-                    let safe_start = bytes[start..]
-                        .iter()
-                        .position(|&b| b == b'\n')
-                        .map(|pos| start + pos + 1)
-                        .unwrap_or(start);
-                    String::from_utf8_lossy(&bytes[safe_start..]).to_string()
-                } else {
-                    fs::read_to_string(&self.path).unwrap_or_default()
-                }
-            }
-            Err(_) => return Vec::new(),
-        };
+        let content = super::context::read_tail(&self.path).unwrap_or_default();
         Document::parse(&content)
             .map(|doc| {
                 doc.entries()

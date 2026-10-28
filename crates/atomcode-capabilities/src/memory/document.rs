@@ -1,7 +1,7 @@
 //! Lossless surrounding Markdown and one serialized transaction for all writers.
 use super::entry::{invalid, parse_line, MemoryEntry, MARKER};
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::Path;
 
 pub(crate) struct Line {
@@ -70,12 +70,32 @@ impl Document {
         Ok(())
     }
 }
-fn read(path: &Path) -> io::Result<String> {
-    match fs::read_to_string(path) {
-        Ok(text) => Ok(text),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(String::new()),
-        Err(e) => Err(e),
+const MAX_DOCUMENT_BYTES: u64 = 1024 * 1024;
+
+pub(super) fn read(path: &Path) -> io::Result<String> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(e) => return Err(e),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::other("memory source is not a regular file"));
     }
+    let too_large = || {
+        io::Error::new(io::ErrorKind::InvalidData,
+        "memory file exceeds the 1 MiB review/edit limit; reduce it with an external editor before retrying")
+    };
+    if metadata.len() > MAX_DOCUMENT_BYTES {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::new();
+    // The file may grow after metadata was read. Never read an unbounded stream.
+    file.take(MAX_DOCUMENT_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_DOCUMENT_BYTES {
+        return Err(too_large());
+    }
+    String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 pub(crate) fn edit<R>(
     path: &Path,
@@ -126,6 +146,12 @@ pub(crate) fn edit<R>(
     let mut document = Document::parse(&before)?;
     let result = change(&mut document)?;
     let after = document.text();
+    if after.len() as u64 > MAX_DOCUMENT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "memory edit would exceed the 1 MiB review/edit limit; reduce the file before retrying",
+        ));
+    }
     if after == before {
         return Ok(result);
     }

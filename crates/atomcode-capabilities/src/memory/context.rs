@@ -48,6 +48,14 @@ struct Source {
     limited: bool,
     error: Option<String>,
 }
+pub(super) fn read_tail(path: &Path) -> std::io::Result<String> {
+    let source = read_source(path, true);
+    match source.error {
+        Some(error) => Err(std::io::Error::other(error)),
+        None => Ok(source.text),
+    }
+}
+
 fn read_source(path: &Path, tail: bool) -> Source {
     let read = || -> std::io::Result<Source> {
         let meta = match std::fs::metadata(path) {

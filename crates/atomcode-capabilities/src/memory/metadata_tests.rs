@@ -367,3 +367,47 @@ fn malformed_expiry_is_not_treated_as_permanent_and_cannot_be_overwritten() {
         .is_err());
     assert_eq!(store.full_text().unwrap(), broken);
 }
+
+#[test]
+fn oversized_memory_loads_only_tail_and_refuses_lossy_review_or_edit() {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("memory.md");
+    let mut file = fs::File::create(&path).unwrap();
+    file.write_all(b"- original decision\n").unwrap();
+    // Sparse allocation: a large logical file without allocating it in the test.
+    file.set_len(256 * 1024 * 1024).unwrap();
+    file.seek(SeekFrom::End(0)).unwrap();
+    file.write_all("\n- 尾部确认事项\n".as_bytes()).unwrap();
+    drop(file);
+    let store = super::MemoryStore::new(path.clone());
+    assert_eq!(store.load(), ["尾部确认事项"]);
+    assert_eq!(store.find_matching("确认"), ["尾部确认事项"]);
+    let size = fs::metadata(&path).unwrap().len();
+    assert!(store.full_text().unwrap_err().to_string().contains("1 MiB"));
+    assert!(store.append("must not overwrite original history").is_err());
+    assert_eq!(fs::metadata(&path).unwrap().len(), size);
+    let mut opening = vec![0; b"- original decision\n".len()];
+    fs::File::open(&path)
+        .unwrap()
+        .read_exact(&mut opening)
+        .unwrap();
+    assert_eq!(opening, b"- original decision\n");
+    assert_eq!(store.load(), ["尾部确认事项"]);
+}
+
+#[test]
+fn managed_edits_cannot_grow_memory_past_the_review_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("memory.md");
+    let original = "#".repeat(1024 * 1024);
+    fs::write(&path, &original).unwrap();
+    let store = super::MemoryStore::new(path.clone());
+    assert_eq!(store.full_text().unwrap(), original);
+    assert!(store
+        .append("new entry")
+        .unwrap_err()
+        .to_string()
+        .contains("1 MiB"));
+    assert_eq!(fs::read_to_string(path).unwrap(), original);
+}
