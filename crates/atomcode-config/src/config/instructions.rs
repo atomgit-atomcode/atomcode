@@ -86,13 +86,13 @@ impl LayeredInstructions {
     }
 
     fn try_load(path: &Path, level: InstructionLevel) -> Option<InstructionFile> {
-        let content = std::fs::read_to_string(path).ok()?;
+        let (content, truncated) =
+            crate::util::read_bounded_utf8_file(path, MAX_INSTRUCTION_SIZE).ok()?;
         if content.trim().is_empty() {
             return None;
         }
-        let content = if content.len() > MAX_INSTRUCTION_SIZE {
-            let truncated: String = content.chars().take(MAX_INSTRUCTION_SIZE).collect();
-            format!("{}\n\n[Truncated — file exceeds 1MB]", truncated)
+        let content = if truncated {
+            format!("{}\n\n[Truncated — file exceeds 1MB]", content)
         } else {
             content
         };
@@ -389,6 +389,21 @@ mod tests {
         assert_eq!(lines[2].level, InstructionLevel::User);
         assert!(lines[2].found);
         assert!(lines[2].path.ends_with("u.md"));
+    }
+
+    #[test]
+    fn oversized_unicode_file_is_capped_in_bytes_without_broken_utf8() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("AGENTS.md");
+        fs::write(&path, "界".repeat(MAX_INSTRUCTION_SIZE / 3 + 10)).unwrap();
+        let content = LayeredInstructions::try_load(&path, InstructionLevel::Project)
+            .unwrap()
+            .content;
+        assert!(content.len() <= MAX_INSTRUCTION_SIZE + 100);
+        assert!(content.to_lowercase().contains("truncated"));
+        let prefix = content.split('\n').next().unwrap();
+        assert!(prefix.len() <= MAX_INSTRUCTION_SIZE);
+        assert!(prefix.chars().all(|c| c == '界'));
     }
 
     #[test]

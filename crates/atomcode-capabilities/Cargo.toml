@@ -219,9 +219,9 @@ mcp = [
 # never-compacted <id>.jsonl transcript for RECALL — plus the SnapshotHook /
 # TranscriptHook / recall tool / current-date hook that drive it. Opt-in (NOT default).
 # The project-instructions loader alone (AGENTS.md / CLAUDE.md / .atomcode.md).
-# Zero dependencies — the module is pure path-in/string-out — so any stack can
-# read a repository's standing instructions without the session subsystem.
-instructions = []
+# Uses the config leaf for bounded file reads; callers do not need the session
+# subsystem to read a repository's standing instructions.
+instructions = ["dep:atomcode-config"]
 # Keyword ranking only (tokenizer + scoring). Zero dependencies; `session` needs
 # it because `recall` ranks with it.
 search = []
