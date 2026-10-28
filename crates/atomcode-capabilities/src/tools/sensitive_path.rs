@@ -169,7 +169,13 @@ impl SensitivePaths {
         // relative credential spelling is classified like the absolute one.
         if let Some(command) = value.get("command").and_then(|v| v.as_str()) {
             let mut cwd = working_dir.to_path_buf();
-            for invocation in super::bash_invocations(command).unwrap_or_default() {
+            let Some(invocations) = super::bash_invocations(command) else {
+                // A partial parse can hide a path operand; the invocation parser
+                // returns None for exactly this reason, so do not read it as
+                // "no operands" the way an empty list would.
+                return true;
+            };
+            for invocation in invocations {
                 if shell_command_name(&invocation.command) == "cd" {
                     if let Some(target) = invocation
                         .arguments
@@ -742,6 +748,16 @@ mod tests {
                 )
                 .await,
             "an incomplete parse with a redirect must fail closed"
+        );
+        assert!(
+            guard
+                .references_in(
+                    r#"{"command":"cd .ours && cat config.toml &&"}"#,
+                    temp.path(),
+                    &world
+                )
+                .await,
+            "an incomplete parse must fail closed for operands too, not just redirects"
         );
         assert!(
             !guard
