@@ -25,6 +25,7 @@ distro-pm = ["atomcode-updater/distro-pm"]
 codingplan-crypto = ["atomcode-auth/codingplan-crypto"]
 
 [dependencies]
+atomcode-schedule = { path = "../atomcode-schedule", features = ["model-tools"] }
 async-trait = "0.1"
 atomcode-codingplan = { path = "../atomcode-codingplan" }
 # Config system used directly by the final binary.

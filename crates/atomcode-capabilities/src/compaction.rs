@@ -181,9 +181,10 @@ fn recent_keep_budget(ctx_window: u32) -> usize {
 
 /// Hard ceiling on a generated summary. A runaway model could emit an enormous summary that
 /// still passes `apply_plan`'s net-loss guard (it's smaller than the drained span) yet bloats
-/// the wire on every subsequent turn (#747). We truncate the accumulated summary at this many
+/// the wire on every subsequent turn (#747). Reject accumulated output beyond this many
 /// bytes — the HARD guarantee, independent of whether the provider honors `max_tokens`. A real
 /// span summary is a paragraph, far under this; 64 KiB only catches pathological runaways.
+/// Exceeding the limit rejects the summary rather than committing a partial anchor.
 const MAX_SUMMARY_BYTES: usize = 64 * 1024;
 /// Soft cap forwarded to the summary provider (≈ `MAX_SUMMARY_BYTES`/4). Stops a runaway
 /// generation early; the byte cap above is the backstop if the gateway ignores it.
@@ -200,7 +201,10 @@ pub const SUMMARY_TIMEOUT: Duration = Duration::from_secs(180);
 /// Surfaced (as a `resume_note` → synthetic user message) when the summary times out and we
 /// fall back to stub compaction, so the user understands why they got a lighter compaction.
 const SUMMARY_TIMEOUT_NOTE: &str =
-    "[系统] 本次 /compact 的 AI 摘要超时（>180s，模型可能在大上下文下长时间推理），已改用快速压缩：对话全部保留，仅折叠了较大的工具输出。如需更彻底的压缩，可稍后再次 /compact，或切换更快的模型。";
+    "[系统] 本次上下文压缩的 AI 摘要超时（模型可能在大上下文下长时间推理），已改用快速压缩：对话全部保留，仅折叠了较大的工具输出。如需更彻底的压缩，可稍后手动压缩（/compact），或切换更快的模型。";
+
+const SUMMARY_FAILURE_NOTE: &str =
+    "[系统] 本次 AI 摘要失败或未返回有效内容，已保留对话，仅精简较大的工具输出。可稍后重试 /compact 或检查模型访问权限。";
 
 /// System prompt for the anchored compaction summary LLM call.
 const SUMMARY_SYSTEM_PROMPT: &str =
@@ -224,6 +228,7 @@ pub struct OverflowCompaction {
     inner: StubCompaction,
     /// Provider used ONLY by tier 2 to summarize the drained span. `None` ⇒ tier 2 plain-drains.
     summary_provider: Option<Arc<dyn LlmProvider>>,
+    auto_token_limit: Option<u32>,
 }
 
 impl OverflowCompaction {
@@ -231,7 +236,35 @@ impl OverflowCompaction {
         Self {
             inner,
             summary_provider,
+            auto_token_limit: None,
         }
+    }
+
+    /// Optional earlier auto-summary budget, independent of the physical model window.
+    pub fn with_auto_token_limit(mut self, limit: Option<u32>) -> Self {
+        self.auto_token_limit = limit.filter(|limit| *limit > 0);
+        self
+    }
+
+    fn recent_budget(&self, view: &CompactionView<'_>) -> usize {
+        self.auto_token_limit
+            .map_or(recent_keep_budget(view.ctx_window), |limit| {
+                recent_keep_budget(view.ctx_window).min(limit as usize / 4)
+            })
+    }
+
+    fn auto_mark(&self, view: &CompactionView<'_>) -> u64 {
+        let ratio = (view.ctx_window as f32 * AUTO_DRAIN_UTILIZATION) as u64;
+        self.auto_token_limit
+            .map_or(ratio, |limit| ratio.min(u64::from(limit)))
+    }
+
+    fn auto_due(&self, view: &CompactionView<'_>) -> bool {
+        (view.utilization >= AUTO_DRAIN_UTILIZATION
+            || self
+                .auto_token_limit
+                .is_some_and(|limit| view.used_tokens >= limit))
+            && auto_drain_would_help(view, self.recent_budget(view), self.auto_mark(view))
     }
 
     /// Aggressive stub of every tool result in `[from, to)` over `AGGRESSIVE_STUB_MIN`.
@@ -244,8 +277,9 @@ impl OverflowCompaction {
     /// folded to first line, so I switched to node scripts" report). OLD reads (below the
     /// boundary) still stub — they are stale. Pass `usize::MAX` to disable the exemption
     /// (stub every read). Convergence is owned by tier 2, whose SPLITTING boundary caps the
-    /// kept span at `recent_keep_budget` (`<= window/2`), so draining everything older
-    /// always fits regardless of which reads are exempt. Tier 0 uses the NON-splitting
+    /// kept span at `recent_keep_budget` (`<= window/2`). A successful summary sheds
+    /// the older dialogue; an unavailable summary leaves it intact and recovery
+    /// may explicitly fail. Tier 0 uses the NON-splitting
     /// `recent_keep_boundary` (it may keep a whole oversized active turn, so its exempt span
     /// is not bounded by `window/2`) — its exemption is therefore best-effort: if it sheds
     /// too little it simply escalates to tier 1/2, which do the fitting.
@@ -276,14 +310,20 @@ impl OverflowCompaction {
     }
 
     /// Hard-truncate any single message in `[from, len)` whose text exceeds `budget_chars`.
-    /// Idempotent via `TRUNCATE_MARKER`. Char-based (CJK-safe).
+    /// Idempotent via `TRUNCATE_MARKER`. Char-based (CJK-safe). With a summary
+    /// provider, dialogue must reach the summarizer intact, so only tool results
+    /// may be truncated by this tier.
     fn truncate_rewrites(
         msgs: &[Message],
         from: usize,
         budget_chars: usize,
+        tool_results_only: bool,
     ) -> Vec<(usize, String)> {
         let mut out = Vec::new();
         for (i, m) in msgs.iter().enumerate().skip(from) {
+            if tool_results_only && m.role != Role::Tool {
+                continue;
+            }
             if m.text.contains(TRUNCATE_MARKER) {
                 continue; // already truncated
             }
@@ -307,8 +347,7 @@ impl OverflowCompaction {
             0 => {
                 // Exempt RECENT reads (within the recent-keep span) from the aggressive
                 // stub so the model keeps the files it just read; older reads still stub.
-                let read_exempt_from =
-                    recent_keep_boundary(msgs, recent_keep_budget(view.ctx_window), floor);
+                let read_exempt_from = recent_keep_boundary(msgs, self.recent_budget(view), floor);
                 let mut rewrites =
                     Self::aggressive_stub_rewrites(msgs, floor, msgs.len(), read_exempt_from);
                 if rewrites.is_empty() {
@@ -334,7 +373,8 @@ impl OverflowCompaction {
             1 => {
                 // ~2 chars/token lower bound; min floor so tiny windows don't over-truncate.
                 let budget = (view.ctx_window as usize).saturating_mul(2).max(8_000);
-                let rewrites = Self::truncate_rewrites(msgs, floor, budget);
+                let rewrites =
+                    Self::truncate_rewrites(msgs, floor, budget, self.summary_provider.is_some());
                 if rewrites.is_empty() {
                     return CompactionPlan::noop();
                 }
@@ -347,18 +387,15 @@ impl OverflowCompaction {
                 }
             }
             _ => {
-                // Emergency recovery (the provider ALREADY rejected the request as too
-                // long) must fit NOW. Drain everything older than the recent keep-budget
+                // Emergency recovery (preflight or a provider rejection) summarizes
+                // everything older than the recent keep-budget
                 // — and, crucially, SPLIT the active turn when it alone exceeds the budget
                 // (a single long agentic loop's accumulated assistant messages + tool
                 // calls, which stubbing tool results alone can't reduce). Without the
                 // split, `active_turn_start` returns the turn start → noop on a one-turn
                 // overflow → the doomed request fires anyway.
-                let drain_to = recent_keep_boundary_splitting(
-                    msgs,
-                    recent_keep_budget(view.ctx_window),
-                    floor,
-                );
+                let drain_to =
+                    recent_keep_boundary_splitting(msgs, self.recent_budget(view), floor);
                 if drain_to <= floor {
                     return CompactionPlan::noop(); // nothing older than the kept window
                 }
@@ -380,15 +417,40 @@ impl OverflowCompaction {
                         resume_note: None,
                     };
                 }
-                // Same wall-clock cap as `/compact` (a thinking model can hang the summary
-                // for many minutes). On timeout, degrade to plain drain (summary=None) — which
-                // this tier already handles — rather than freezing emergency overflow recovery.
-                let summary = tokio::time::timeout(
+                // A configured summarizer failing cannot authorize losing dialogue,
+                // even in emergency recovery. Keep any tool-result savings; the
+                // bounded overflow ladder reports failure if that still cannot fit.
+                let summary = match tokio::time::timeout(
                     SUMMARY_TIMEOUT,
                     self.summarize(&msgs[floor..drain_to], None),
                 )
                 .await
-                .unwrap_or(None);
+                {
+                    Ok(Some(summary)) => Some(summary),
+                    Ok(None) if self.summary_provider.is_none() => None,
+                    unavailable => {
+                        let timed_out = unavailable.is_err();
+                        tracing::warn!(
+                            timed_out,
+                            "overflow summary unavailable; retaining conversation history"
+                        );
+                        let resume_note = (!rewrites.is_empty()).then(|| {
+                            if timed_out {
+                                SUMMARY_TIMEOUT_NOTE
+                            } else {
+                                SUMMARY_FAILURE_NOTE
+                            }
+                            .to_string()
+                        });
+                        return CompactionPlan {
+                            drain_from: 0,
+                            drain_to: 0,
+                            summary: None,
+                            rewrites,
+                            resume_note,
+                        };
+                    }
+                };
                 CompactionPlan {
                     drain_from: floor,
                     drain_to,
@@ -415,16 +477,15 @@ impl OverflowCompaction {
         // Splitting variant: when the active turn ALONE exceeds the keep-budget (a single
         // long turn), drain its older prefix rather than falling back to the gentle stub
         // (which noops on one turn → the misleading "conversation is short").
-        let drain_to =
-            recent_keep_boundary_splitting(msgs, recent_keep_budget(view.ctx_window), floor);
+        let drain_to = recent_keep_boundary_splitting(msgs, self.recent_budget(view), floor);
         if drain_to <= floor || !span_has_non_anchor(&msgs[floor..drain_to]) {
             // Nothing older than the active turn, OR the only drainable content is a prior
             // anchor (re-summarizing it alone is wasteful and only degrades it) — fall back
             // to the gentle stub policy.
             return self.inner.plan(view).await;
         }
-        // Wall-clock cap on the summary LLM call (see `SUMMARY_TIMEOUT`). On timeout, fall
-        // back to the gentle in-place stub policy (`self.inner`) — the same fallback used above
+        // Failed, empty, or timed-out summaries must not authorize draining history.
+        // Fall back to the gentle in-place stub policy (`self.inner`) — the same fallback used above
         // when there's nothing drainable — so a hung thinking model degrades `/compact` to a
         // lighter compaction instead of freezing it. A note tells the user what happened.
         let summary = match tokio::time::timeout(
@@ -433,15 +494,29 @@ impl OverflowCompaction {
         )
         .await
         {
-            Ok(s) => s,
-            Err(_) => {
+            Ok(Some(summary)) => Some(summary),
+            // An explicitly model-free strategy keeps its historical fallback. A
+            // configured provider failing is different: a request-only list cannot
+            // preserve the assistant's design decisions in the drained history.
+            Ok(None) if self.summary_provider.is_none() => None,
+            unavailable => {
+                let timed_out = unavailable.is_err();
+                tracing::warn!(
+                    timed_out,
+                    "compaction summary unavailable; retaining conversation history"
+                );
+                let note = if timed_out {
+                    SUMMARY_TIMEOUT_NOTE
+                } else {
+                    SUMMARY_FAILURE_NOTE
+                };
                 let mut plan = self.inner.plan(view).await;
                 // Only annotate a plan that actually shrinks; adding a note to a noop plan
                 // would grow it and get (correctly) refused by the net-loss guard for nothing.
                 if !plan.rewrites.is_empty() {
                     plan.resume_note = Some(match plan.resume_note.take() {
-                        Some(n) => format!("{n}\n{SUMMARY_TIMEOUT_NOTE}"),
-                        None => SUMMARY_TIMEOUT_NOTE.to_string(),
+                        Some(n) => format!("{n}\n{note}"),
+                        None => note.to_string(),
                     });
                 }
                 return plan;
@@ -457,7 +532,8 @@ impl OverflowCompaction {
     }
 
     /// Summarize a drained span into one paragraph via the configured provider. `None` if
-    /// no provider, the call errors, or the result is empty (caller then plain-drains).
+    /// no provider, the call fails, or the result is empty/incomplete. Manual and
+    /// automatic compaction retain conversation history on a configured provider's failure.
     /// One-shot, no tools; operates on the already-stubbed span so its input is small.
     /// `focus` (from `/compact <focus>`) steers the summary toward a topic when present.
     async fn summarize(&self, span: &[Message], focus: Option<&str>) -> Option<String> {
@@ -472,7 +548,8 @@ impl OverflowCompaction {
 /// compaction recognizes it. `None` when the call fails or says nothing.
 ///
 /// No timeout of its own — callers bound it with [`SUMMARY_TIMEOUT`] and fall
-/// back to something model-free.
+/// back to something model-free. Only a normally completed, non-truncated answer
+/// within the byte limit can become an anchor.
 pub async fn summarize_span(
     provider: &dyn LlmProvider,
     span: &[Message],
@@ -499,24 +576,31 @@ pub async fn summarize_span(
         };
         let mut stream = provider.chat_stream(&prompt, &[], &opts).await.ok()?;
         let mut out = String::new();
+        let mut completed = false;
         // Reserve room for the sentinel + framing + their newlines prepended below, so the FINAL
         // summary still respects MAX_SUMMARY_BYTES (the #747 hard guarantee).
         let body_budget =
             MAX_SUMMARY_BYTES.saturating_sub(ANCHOR_SENTINEL.len() + SUMMARY_FRAMING.len() + 2);
         while let Some(ev) = stream.next().await {
+            // Never commit a partial summary after a transport/provider failure.
+            match ev {
+                StreamEvent::Error(_) | StreamEvent::Done { truncated: true } => return None,
+                StreamEvent::Done { truncated: false } => completed = true,
+                _ => {}
+            }
             if let StreamEvent::TextDelta(t) = ev {
                 let remaining = body_budget.saturating_sub(out.len());
                 if t.len() <= remaining {
                     out.push_str(&t);
                 } else {
-                    let mut cut = remaining;
-                    while !t.is_char_boundary(cut) {
-                        cut -= 1; // is_char_boundary(0) == true, so this terminates
-                    }
-                    out.push_str(&t[..cut]);
-                    break;
+                    // A locally cut summary is incomplete too: never use its prefix
+                    // to replace the full design history.
+                    return None;
                 }
             }
+        }
+        if !completed {
+            return None;
         }
         // Strip any leading sentinel/framing the model may have echoed, then stamp exactly ONE
         // sentinel + the framing so the NEXT compaction recognizes the anchor and the model that
@@ -790,9 +874,7 @@ impl CompactionStrategy for OverflowCompaction {
             // sacred-floor-protected first message / active turn (e.g. one over-window
             // paste), summarizing the small drainable remainder can't cut pressure, so
             // an LLM summary + cache-bust every turn would be pure waste — stay on stub.
-            CompactTrigger::Auto { .. }
-                if view.utilization >= AUTO_DRAIN_UTILIZATION && auto_drain_would_help(view) =>
-            {
+            CompactTrigger::Auto { .. } if self.auto_due(view) => {
                 self.manual_plan(view, None).await
             }
             _ => self.inner.plan(view).await,
@@ -804,9 +886,8 @@ impl CompactionStrategy for OverflowCompaction {
     /// `AUTO_DRAIN_UTILIZATION` AND whose drain would actually reduce pressure
     /// (`auto_drain_would_help`). When there is nothing older than the kept window to
     /// drain it falls back to the fast inner stub (drain ≤ floor) and is NOT announced.
-    /// Must predict with the SAME boundary each path actually uses: the proactive
-    /// (auto/manual) drain keeps ~25% recent (`recent_keep_boundary`); the emergency
-    /// overflow ladder keeps only the active turn (`active_turn_start(1)`).
+    /// Predict with the same recent-budget split as the actual plans. In particular,
+    /// a long active turn has a drainable prefix even before another user turn starts.
     fn will_summarize(&self, view: &CompactionView<'_>) -> bool {
         let floor = view.sacred_floor;
         // Mirror the plans' guard exactly: a summarize happens only when the drained span
@@ -816,21 +897,16 @@ impl CompactionStrategy for OverflowCompaction {
             drain_to > floor && span_has_non_anchor(&view.messages[floor..drain_to])
         };
         let proactive_drains = || {
-            drains(recent_keep_boundary(
+            drains(recent_keep_boundary_splitting(
                 view.messages,
-                recent_keep_budget(view.ctx_window),
+                self.recent_budget(view),
                 floor,
             ))
         };
-        let overflow_drains = || drains(active_turn_start(view.messages, 1).max(floor));
         match &view.trigger {
             CompactTrigger::Manual { .. } => proactive_drains(),
-            CompactTrigger::Overflow { attempt } => *attempt >= 2 && overflow_drains(),
-            CompactTrigger::Auto { .. } => {
-                view.utilization >= AUTO_DRAIN_UTILIZATION
-                    && proactive_drains()
-                    && auto_drain_would_help(view)
-            }
+            CompactTrigger::Overflow { attempt } => *attempt >= 2 && proactive_drains(),
+            CompactTrigger::Auto { .. } => self.auto_due(view) && proactive_drains(),
         }
     }
 }
@@ -844,54 +920,37 @@ impl CompactionStrategy for OverflowCompaction {
 /// floor) does NOT trigger a futile LLM summary + cache-bust on every turn. Returns
 /// `true` (allow escalation) when there is no basis to estimate (window/usage unknown),
 /// matching the pre-guard behavior for the normal long-session case.
-fn auto_drain_would_help(view: &CompactionView<'_>) -> bool {
+fn auto_drain_would_help(view: &CompactionView<'_>, recent_budget: usize, mark: u64) -> bool {
     let floor = view.sacred_floor;
     // Estimate against the ACTUAL drain boundary the AUTO path (manual_plan) will use —
     // it keeps ~25% recent verbatim, so the surviving remainder is larger than a
     // keep-only-the-active-turn estimate. Using the wrong (wider) drain span here would
     // green-light a drain that can't cut pressure → re-summarize + cache-bust every turn.
-    let drain_to = recent_keep_boundary(view.messages, recent_keep_budget(view.ctx_window), floor);
+    let drain_to = recent_keep_boundary_splitting(view.messages, recent_budget, floor);
     if drain_to <= floor {
         return false; // nothing drainable
     }
     if view.ctx_window == 0 || view.used_tokens == 0 {
         return true; // no basis to estimate — allow (long-session default)
     }
-    let total_bytes: usize = view.messages.iter().map(|m| m.text.len()).sum();
-    if total_bytes == 0 {
+    let total_estimate: usize = view
+        .messages
+        .iter()
+        .map(|m| m.estimate_tokens() as usize)
+        .sum();
+    if total_estimate == 0 {
         return false;
     }
-    let drainable_bytes: usize = view.messages[floor..drain_to]
+    let drainable_estimate: usize = view.messages[floor..drain_to]
         .iter()
-        .map(|m| m.text.len())
+        .map(|m| m.estimate_tokens() as usize)
         .sum();
-    let remaining_bytes = total_bytes.saturating_sub(drainable_bytes);
-    // Token estimate of what survives the drain, by byte share of the recorded usage.
+    let remaining_estimate = total_estimate.saturating_sub(drainable_estimate);
+    // Attribute recorded usage by local message estimates, including tool arguments
+    // and images; text alone misses large write/edit arguments.
     let remaining_tokens =
-        (remaining_bytes as u64).saturating_mul(view.used_tokens as u64) / total_bytes as u64;
-    let mark = (view.ctx_window as f32 * AUTO_DRAIN_UTILIZATION) as u64;
+        (remaining_estimate as u64).saturating_mul(view.used_tokens as u64) / total_estimate as u64;
     remaining_tokens < mark
-}
-
-/// Index at which the kept window (the `keep_recent_turns` most-recent turns) begins;
-/// everything before it is "old" and eligible to stub. A turn starts at a NON-synthetic
-/// [`Role::User`] message (synthetic users are kernel-injected summaries / resume notes,
-/// not real turns). Returns `0` when there are not strictly MORE than `keep_recent_turns`
-/// real turns — i.e. nothing is old yet (mirrors core's `turns.len() <= keep_recent_turns`).
-fn active_turn_start(msgs: &[Message], keep_recent_turns: usize) -> usize {
-    if keep_recent_turns == 0 {
-        return msgs.len();
-    }
-    let starts: Vec<usize> = msgs
-        .iter()
-        .enumerate()
-        .filter(|(_, m)| m.role == Role::User && !m.synthetic)
-        .map(|(i, _)| i)
-        .collect();
-    if starts.len() <= keep_recent_turns {
-        return 0; // not enough turns to have anything older than the kept window
-    }
-    starts[starts.len() - keep_recent_turns]
 }
 
 /// Drain boundary that keeps the most-recent WHOLE turns whose combined token
@@ -899,7 +958,7 @@ fn active_turn_start(msgs: &[Message], keep_recent_turns: usize) -> usize {
 /// turn. Turn-aligned (a turn starts at a non-synthetic [`Role::User`] message)
 /// so a drain never splits a turn / orphans a tool call from its result.
 /// `msgs[..boundary]` is drained+summarized; `msgs[boundary..]` is kept verbatim.
-/// Clamped to `>= floor`. Replaces the old `active_turn_start(msgs, 1)` so a big
+/// Clamped to `>= floor`, so a big
 /// context window retains proportionally more recent history (see
 /// `recent_keep_budget`); a single turn larger than the budget degrades to
 /// keeping just that active turn.
@@ -1363,6 +1422,38 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn overflow_preserves_oversized_dialogue_when_the_summary_fails() {
+        let messages = vec![
+            Message::system("persona"),
+            Message::user("keep confirmed decisions"),
+            Message::assistant("confirmed design: ".to_owned() + &"x".repeat(50000), vec![]),
+            Message::user("change only the requested field: ".to_owned() + &"y".repeat(50000)),
+        ];
+        let mut conversation = Conversation::new();
+        conversation.messages = messages.clone();
+        let floor = conversation.sacred_floor();
+        let strategy = OverflowCompaction::new(
+            StubCompaction::default(),
+            Some(Arc::new(FailedSummaryProvider(0))),
+        );
+        for attempt in 0..3 {
+            let plan = strategy
+                .plan(&overflow_view(&conversation.messages, floor, attempt, 8000))
+                .await;
+            conversation.apply_plan(plan, floor);
+        }
+        assert_eq!(
+            conversation
+                .messages
+                .iter()
+                .map(|m| &m.text)
+                .collect::<Vec<_>>(),
+            messages.iter().map(|m| &m.text).collect::<Vec<_>>(),
+            "earlier recovery tiers must not truncate dialogue before the summary fails"
+        );
+    }
+
     #[tokio::test]
     async fn overflow_tier1_is_noop_when_nothing_oversized() {
         let msgs = vec![
@@ -1437,8 +1528,7 @@ mod tests {
     }
 
     /// Streams ~96 KiB of a 3-byte CJK char so the summary blows past `MAX_SUMMARY_BYTES`,
-    /// exercising BOTH the byte ceiling and char-boundary-safe truncation (96 KiB is not a
-    /// multiple of 3, so the cut lands mid-char and must be walked back).
+    /// exercising the byte ceiling with multibyte output; no incomplete prefix may be committed.
     struct HugeSummaryProvider {
         /// Records the `max_tokens` the summarizer forwarded, so the test can assert the SOFT
         /// cap is actually sent (the byte hard-cap would otherwise mask a dropped max_tokens).
@@ -1470,6 +1560,109 @@ mod tests {
                 StreamEvent::TextDelta(chunk),
                 StreamEvent::Done { truncated: false },
             ])))
+        }
+    }
+
+    /// A failed open, empty answer, or stream failure after partial text must never
+    /// authorize replacing design decisions with the harness's request-only list.
+    struct FailedSummaryProvider(u8);
+    #[async_trait]
+    impl LlmProvider for FailedSummaryProvider {
+        fn model_name(&self) -> &str {
+            "failed-summary"
+        }
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[atomcode_kernel::tool::ToolDef],
+            _: &ChatOptions,
+        ) -> Result<
+            futures::stream::BoxStream<'static, StreamEvent>,
+            atomcode_kernel::stream::ProviderError,
+        > {
+            let error = atomcode_kernel::stream::ProviderError {
+                http_status: Some(403),
+                message: "forbidden".into(),
+                ..Default::default()
+            };
+            let events = match self.0 {
+                0 => return Err(error),
+                1 => vec![StreamEvent::Done { truncated: false }],
+                2 => vec![
+                    StreamEvent::TextDelta("incomplete design".into()),
+                    StreamEvent::Error(error),
+                ],
+                3 => vec![
+                    StreamEvent::TextDelta("incomplete design".into()),
+                    StreamEvent::Done { truncated: true },
+                ],
+                4 => vec![StreamEvent::TextDelta("incomplete design".into())],
+                5 => vec![
+                    StreamEvent::TextDelta("你".repeat(MAX_SUMMARY_BYTES)),
+                    StreamEvent::Done { truncated: false },
+                ],
+                _ => unreachable!(),
+            };
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn failed_summary_preserves_design_history_in_every_compaction_mode() {
+        let messages = vec![
+            Message::system("persona"),
+            Message::user("design two tables"),
+            Message::assistant(
+                "DeviceNo and PipingNo are separate; TubeSeq is the test tube sequence.",
+                vec![],
+            ),
+            asst_call("b1", "bash"),
+            Message::tool_result("b1", &big("old output"), false),
+            Message::user("rename only"),
+            asst_call("g1", "grep"),
+            Message::tool_result("g1", &big("recent output"), false),
+            Message::user("continue"),
+        ];
+        let mut conversation = Conversation::new();
+        conversation.messages = messages.clone();
+        let floor = conversation.sacred_floor();
+        for failure in 0..6 {
+            for mode in 0..3 {
+                let strategy = OverflowCompaction::new(
+                    StubCompaction::default(),
+                    Some(Arc::new(FailedSummaryProvider(failure))),
+                )
+                .with_auto_token_limit(Some(1));
+                let mut view = manual_view(&messages, floor, None);
+                if mode == 1 {
+                    view.trigger = CompactTrigger::Auto { utilization: 1.0 };
+                    view.utilization = 1.0;
+                    view.used_tokens = 0;
+                }
+                if mode == 2 {
+                    view.trigger = CompactTrigger::Overflow { attempt: 2 };
+                }
+                let plan = strategy.plan(&view).await;
+                assert_eq!(
+                    plan.drain_to, 0,
+                    "failure={failure}, mode={mode}: must retain history"
+                );
+                assert!(plan.summary.is_none());
+                assert!(plan
+                    .rewrites
+                    .iter()
+                    .all(|(index, _)| messages[*index].role == Role::Tool));
+                let mut retained = Conversation::new();
+                retained.messages = messages.clone();
+                retained.apply_plan(plan, floor);
+                assert!(
+                    retained
+                        .messages
+                        .iter()
+                        .any(|message| message.text == messages[2].text),
+                    "the assistant's agreed field definitions must survive"
+                );
+            }
         }
     }
 
@@ -1536,7 +1729,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn summary_is_capped_at_max_bytes() {
+    async fn oversized_summary_is_rejected_and_soft_limit_is_forwarded() {
         let msgs = vec![
             Message::system("p"),
             Message::user("u1"),
@@ -1558,38 +1751,13 @@ mod tests {
         let plan = strat
             .plan(&overflow_view(&conv.messages, floor, 2, 8000))
             .await;
-        let summary = plan.summary.expect("tier 2 produces a summary");
-        // Hard byte ceiling enforced (provider streamed ~96 KiB). The total is
-        // sentinel + "\n" + body, all ≤ MAX_SUMMARY_BYTES.
         assert!(
-            summary.len() <= MAX_SUMMARY_BYTES,
-            "summary {} bytes exceeds cap {MAX_SUMMARY_BYTES}",
-            summary.len()
+            plan.summary.is_none(),
+            "an oversized answer must not become a partial anchor"
         );
-        // The body budget is MAX_SUMMARY_BYTES - (sentinel + framing + 2 newlines). The total
-        // fills essentially to MAX_SUMMARY_BYTES (body truncated at a char boundary at the
-        // budget, then sentinel + framing are prepended). The lower bound stays near the cap.
-        assert!(
-            summary.len() > MAX_SUMMARY_BYTES - 4,
-            "should truncate near the cap, got {}",
-            summary.len()
-        );
-        // Output is anchor-prefixed + framed.
-        assert!(
-            summary.starts_with(ANCHOR_SENTINEL),
-            "summary must carry the sentinel"
-        );
-        // Char-boundary-safe: the body (after sentinel + framing) is intact and all 你.
-        let body_part = summary
-            .strip_prefix(ANCHOR_SENTINEL)
-            .unwrap()
-            .trim_start_matches('\n')
-            .strip_prefix(SUMMARY_FRAMING)
-            .expect("framing present")
-            .trim_start_matches('\n');
-        assert!(
-            body_part.chars().all(|c| c == '你'),
-            "truncation must not corrupt multibyte chars"
+        assert_eq!(
+            plan.drain_to, 0,
+            "a rejected summary must not drain history"
         );
         // SOFT cap was actually forwarded (not masked by the byte hard-cap / dropped like the
         // historical v2 max_tokens regression).
@@ -1912,6 +2080,50 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn absolute_auto_budget_summarizes_below_the_physical_window_threshold() {
+        let mut conv = Conversation::new();
+        conv.messages = vec![
+            Message::system("policy"),
+            Message::user("original goal"),
+            Message::assistant("old work ".repeat(20_000), vec![]),
+            Message::user("second request"),
+            Message::assistant("more old work ".repeat(20_000), vec![]),
+            Message::user("current request"),
+            Message::assistant("current work", vec![]),
+        ];
+        let v = CompactionView {
+            messages: &conv.messages,
+            trigger: CompactTrigger::Auto { utilization: 0.2 },
+            ctx_window: 1_000_000,
+            used_tokens: 200_000,
+            utilization: 0.2,
+            sacred_floor: conv.sacred_floor(),
+        };
+        let default = OverflowCompaction::new(
+            StubCompaction::default(),
+            Some(Arc::new(CannedSummaryProvider)),
+        );
+        assert!(!default.will_summarize(&v));
+        let bounded = OverflowCompaction::new(
+            StubCompaction::default(),
+            Some(Arc::new(CannedSummaryProvider)),
+        )
+        .with_auto_token_limit(Some(100_000));
+        assert!(bounded.will_summarize(&v));
+        assert_eq!(bounded.recent_budget(&v), 25_000);
+        let plan = bounded.plan(&v).await;
+        assert!(plan.summary.is_some());
+        assert_eq!(plan.drain_from, v.sacred_floor);
+        assert!(plan.drain_to > plan.drain_from);
+        assert!(plan.drain_to < conv.messages.len());
+        let below = CompactionView {
+            used_tokens: 99_999,
+            ..v
+        };
+        assert!(!bounded.will_summarize(&below));
+    }
+
     /// The user's core ask: auto-compaction must ACTUALLY reduce context (like
     /// `/compact`) once pressure is high, not just nibble old tool results.
     #[tokio::test]
@@ -1977,8 +2189,56 @@ mod tests {
         assert_eq!(plan.drain_to, 0, "moderate auto = no drain (stub only)");
     }
 
+    /// A long active turn must expose its old prefix to automatic summarization.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn auto_summarizes_a_single_long_turn_at_ninety_percent() {
+        let mut conversation = Conversation::new();
+        conversation.messages = vec![Message::system("persona"), Message::user("keep working")];
+        for round in 0..12 {
+            conversation.messages.push(Message::assistant(
+                format!("round {round}: {}", "x".repeat(180_000)),
+                vec![],
+            ));
+        }
+        let floor = conversation.sacred_floor();
+        let strategy = OverflowCompaction::new(
+            StubCompaction::default(),
+            Some(Arc::new(CannedSummaryProvider)),
+        );
+        let view = CompactionView {
+            messages: &conversation.messages,
+            trigger: CompactTrigger::Auto { utilization: 0.9 },
+            ctx_window: 512_000,
+            used_tokens: 460_800,
+            utilization: 0.9,
+            sacred_floor: floor,
+        };
+        assert!(
+            strategy.will_summarize(&view),
+            "the active turn itself can have an old drainable prefix"
+        );
+        let plan = strategy.plan(&view).await;
+        assert!(
+            plan.summary.is_some(),
+            "90% must not silently remain a no-op for one long turn"
+        );
+        assert!(plan.drain_to > floor);
+        conversation.apply_plan(plan, floor);
+        assert!(conversation
+            .messages
+            .iter()
+            .any(|message| message.text.starts_with(ANCHOR_SENTINEL)));
+        assert!(
+            conversation
+                .messages
+                .iter()
+                .any(|message| message.text.starts_with("round 11:")),
+            "latest work must survive"
+        );
+    }
+
     /// At ~80% — the zone where models start nagging to "start a new conversation" —
-    /// Auto must ESCALATE to a real drain+summary (AUTO_DRAIN_UTILIZATION < 0.80),
+    /// auto must ESCALATE to a real drain+summary (AUTO_DRAIN_UTILIZATION < 0.80),
     /// so context is reduced before the model panics. Regression guard for lowering
     /// the drain gate below 0.80.
     #[tokio::test]
@@ -2059,11 +2319,9 @@ mod tests {
         assert!(plan.drain_to > floor);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn overflow_tier2_summary_timeout_plain_drains() {
-        // A hanging (thinking) provider must NOT freeze emergency overflow recovery: the
-        // wall-clock cap fires (virtual time under start_paused) → plain drain, same as no
-        // provider. Proves the tier-2 summarize call is bounded, not just `/compact`.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn overflow_tier2_summary_timeout_preserves_history() {
+        // The cap must bound emergency recovery without authorizing a lossy drain.
         let msgs = vec![
             Message::system("p"),
             Message::user("u1"),
@@ -2079,8 +2337,8 @@ mod tests {
         )
         .plan(&overflow_view(&conv.messages, floor, 2, 8000))
         .await;
-        assert!(plan.summary.is_none(), "summary timeout → plain drain");
-        assert!(plan.drain_to > floor, "still drains old turns");
+        assert!(plan.summary.is_none());
+        assert_eq!(plan.drain_to, 0, "timeout must preserve history");
     }
 
     #[test]
@@ -2373,24 +2631,22 @@ mod tests {
     }
 
     #[test]
-    fn emergency_boundary_keeps_less_than_proactive() {
-        // Small old turns that FIT the proactive 25% keep budget. The proactive drain
-        // (auto/manual) keeps them (boundary back at the floor); the emergency overflow
-        // ladder keeps ONLY the active turn (boundary at the active user) — it drains more.
+    fn summary_prediction_keeps_recent_history_for_manual_and_overflow() {
         let msgs = vec![
             Message::system("p"),
             Message::user(big("u1")),
             Message::assistant(big("a1"), vec![]),
-            Message::user("active"), // index 3 — the active turn
+            Message::user("active"),
         ];
-        let floor = 1;
-        let proactive = recent_keep_boundary(&msgs, recent_keep_budget(128_000), floor);
-        let emergency = active_turn_start(&msgs, 1).max(floor);
-        assert_eq!(emergency, 3, "emergency keeps only the active turn");
-        assert!(
-            proactive < emergency,
-            "emergency drains more (keeps less) than proactive: {proactive} vs {emergency}"
+        let strategy = OverflowCompaction::new(
+            StubCompaction::default(),
+            Some(Arc::new(CannedSummaryProvider)),
         );
+        let mut view = manual_view(&msgs, 1, None);
+        view.ctx_window = 128_000;
+        assert!(!strategy.will_summarize(&view));
+        view.trigger = CompactTrigger::Overflow { attempt: 2 };
+        assert!(!strategy.will_summarize(&view));
     }
 
     #[test]

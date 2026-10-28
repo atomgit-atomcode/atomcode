@@ -15,10 +15,12 @@
 `crates/atomcode-coding/tests/tool_policy.rs`（经过 coding 产品装配之后仍然成立）、
 `crates/atomcode-coding/tests/host_plugins.rs`（经过 `CodingRuntime` 之后仍然成立，包括重建）。
 
+`PrepareOptions.tools = false` 是显式的无工具运行契约（CLI 的 `--no-tools` 使用它）：运行时在用户和宿主层之后，用同一个目录策略排除所有工具。即使其他行自行挂工具、宿主层显式 include，或发生模型/能力/目录重建，也不能重新开放。普通 `tools = true` 时，仍按下文的宿主层策略组合。
+
 ## 经 `CodingRuntime` 交进来
 
 `HostPlugins` 里的插件只是「有这个名字」，挂哪几行由层决定。宿主的层排在**最后**，
-在产品自己的行和人写在 `config.toml` 里的设置之后，所以它对任何一行都说了算。
+在产品自己的行和人写在 `config.toml` 里的设置之后，所以它对任何一行都说了算；唯一例外是显式 `PrepareOptions.tools=false`，此时目录最终保持关闭。
 `PrepareOptions` 跟着运行时走，撤销、恢复快照、换模型、重新 prepare 重建的每一棵树都会再读它，
 宿主不用在重建后补交。同一进程里每个运行时各拿各的，不经过环境变量或全局状态。
 

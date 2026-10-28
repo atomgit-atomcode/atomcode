@@ -67,6 +67,7 @@ httpdate = { version = "1", optional = true }
 # we can downcast to it. provider-only.
 hyper = { version = "1", optional = true }
 getrandom = { version = "0.2", optional = true }
+# Structured diagnostics shared by provider/setup and tools-only shell hosts.
 tracing = { version = "0.1", optional = true }
 async-stream = { version = "0.3", optional = true }
 # `tools` capability deps. gitignore-aware file walking (grep/glob), regex (grep),
@@ -155,7 +156,7 @@ default = ["provider", "tools"]
 provider = ["dep:reqwest", "dep:rustls-native-certs", "dep:rustls", "dep:async-stream", "dep:dirs", "dep:httpdate", "dep:atomcode-auth", "dep:atomcode-config", "dep:getrandom", "dep:tracing", "dep:fs2", "dep:hyper"]
 # Real neutral coding Tools (fs read/write/edit/list + bash + grep/glob) + a generic
 # approval middleware. Pulls fs/process/io tokio features + the search stack.
-tools = ["dep:ignore", "dep:regex", "dep:grep", "dep:globset", "dep:encoding_rs", "dep:chardetng", "dep:tokio-util", "dep:similar", "dep:tree-sitter", "dep:tree-sitter-bash", "dep:sha2", "dep:dirs", "dep:image", "tokio/fs", "tokio/process", "tokio/io-util"]
+tools = ["dep:tempfile", "dep:ignore", "dep:regex", "dep:grep", "dep:globset", "dep:encoding_rs", "dep:chardetng", "dep:tokio-util", "dep:similar", "dep:tree-sitter", "dep:tree-sitter-bash", "dep:sha2", "dep:dirs", "dep:image", "dep:tracing", "tokio/fs", "tokio/process", "tokio/io-util"]
 # Network tools (web_fetch / web_search). Opt-in on top of `tools` — pulls the HTTP stack
 # (reqwest + url + tokio/net for SSRF DNS checks). NOT in default: a tools-only embedder
 # that wants no network egress skips it.
@@ -218,9 +219,9 @@ mcp = [
 # never-compacted <id>.jsonl transcript for RECALL — plus the SnapshotHook /
 # TranscriptHook / recall tool / current-date hook that drive it. Opt-in (NOT default).
 # The project-instructions loader alone (AGENTS.md / CLAUDE.md / .atomcode.md).
-# Zero dependencies — the module is pure path-in/string-out — so any stack can
-# read a repository's standing instructions without the session subsystem.
-instructions = []
+# Uses the config leaf for bounded file reads; callers do not need the session
+# subsystem to read a repository's standing instructions.
+instructions = ["dep:atomcode-config"]
 # Keyword ranking only (tokenizer + scoring). Zero dependencies; `session` needs
 # it because `recall` ranks with it.
 search = []

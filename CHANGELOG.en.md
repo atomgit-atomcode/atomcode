@@ -24,6 +24,27 @@ For whoever edits this file; this block is never shown.
 - Compiled into the binary; rebuild to see a change.
 -->
 
+## v5.2.5 (2026-10-28)
+
+### Overview
+
+This release improves context management and reliability for long-running tasks, including automatic compaction, protection against failed summaries, background completion notifications, and session recovery. It also adds shared automation management, configurable default execution modes, and improvements to model setup, history navigation, remote access, and terminal interaction.
+
+### Changes
+
+- **More reliable automatic compaction**: Long active turns can summarize their older content, and compaction can run again in the same turn after usage falls and rises. Reduce redundant tool output and schema overhead, with on-demand discovery for AtomGit tools.
+- **Preserve dialogue when summaries fail**: With a summary model configured, failed, empty, truncated, interrupted, oversized, or timed-out summaries no longer authorize dropping old dialogue. Emergency recovery also preserves user input and assistant conclusions. If safe compaction cannot make the input fit, the turn stops with an explicit error and can resume after recovery. Explicit model-free behavior is unchanged.
+- **Shared automation management**: TUI and WebUI share task management, schedules, execution history, and access to task results.
+- **Configurable default execution mode**: Set `[permissions].default_mode` to `build`, `plan`, `accept-edits`, or `auto`, including through `/config`. New sessions use the configured mode, in-session switching remains available, and explicit permission-bypass startup flags take precedence.
+- **Background completion and waiting**: Improve completion notifications and waiting for builds and downloads, reduce repetitive polling, and correct background checks, exit-status handling, and native tail previews.
+- **Model setup and connections**: Simplify Provider connections with model capability discovery, batch additions, and per-model editing. Clarify batch review versus active model selection. WebUI follows the runtime model identity; expired-login errors retain sign-in guidance, and connections can recover after a local VPN proxy stops.
+- **History and session navigation**: Read full history from native event logs, load archived WebUI turns inline in their original assistant/tool order, and provide history navigation. Keep interactive resume within the current project, hide unavailable workspaces, and show the latest content after background session switches.
+- **Mobile and remote access**: Enable phone relay access from the browser and improve pairing links, explicit sharing, mobile resume, compatible links, and QR-code presentation.
+- **Terminal interaction**: Accept visible history completion with Tab; improve SSH, PuTTY, and browser-terminal clipboard, mouse, and glyph handling. Hide unnecessary todo disclosure hints, reduce routine progress notices, reposition restart and history-loading notices, and avoid temporary allocations during panel changes.
+- **Custom command arguments**: Declare command arguments and validate them consistently across user skill invocation paths.
+- **Language services and diagnostics**: Configure LSP initialization options and expose read-only diagnostics. Add schema-size, background-job timing, and stream-idle phase diagnostics.
+- **Streaming and execution boundaries**: Improve incomplete stream handling, tool-call fragments, output limits, and preservation of usage/error facts. Honor tool opt-out, and refine requirement review, team role precedence, and todo completion behavior.
+
 ## v5.2.4 (2026-10-21)
 
 ### Overview

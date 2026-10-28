@@ -199,3 +199,96 @@ mod tests {
         );
     }
 }
+
+/// Read at most `limit + 1` bytes from a regular UTF-8 file. The extra byte
+/// detects truncation without trusting metadata (the file may grow after stat).
+/// Only an incomplete final UTF-8 character at a truncated boundary is dropped;
+/// invalid UTF-8 in the retained content remains an error.
+pub fn read_bounded_utf8_file(path: &Path, limit: usize) -> std::io::Result<(String, bool)> {
+    use std::io::{self, Read};
+    let regular = |metadata: std::fs::Metadata| {
+        if metadata.is_file() {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a regular file",
+            ))
+        }
+    };
+    regular(std::fs::metadata(path)?)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    // A path replaced with a FIFO between stat and open must not hang startup.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    regular(file.metadata()?)?;
+    let mut bytes = Vec::new();
+    file.take(limit.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)?;
+    let truncated = bytes.len() > limit;
+    if truncated {
+        bytes.truncate(limit);
+    }
+    match std::str::from_utf8(&bytes) {
+        Ok(_) => {}
+        Err(error) if truncated && error.error_len().is_none() => {
+            bytes.truncate(error.valid_up_to())
+        }
+        Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
+    }
+    let text = String::from_utf8(bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok((text, truncated))
+}
+
+#[cfg(test)]
+mod bounded_file_tests {
+    use super::read_bounded_utf8_file;
+    #[test]
+    fn exact_limit_utf8_boundary_and_invalid_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("instructions");
+        std::fs::write(&path, "abcd").unwrap();
+        assert_eq!(
+            read_bounded_utf8_file(&path, 4).unwrap(),
+            ("abcd".into(), false)
+        );
+        std::fs::write(&path, "abc中文").unwrap();
+        assert_eq!(
+            read_bounded_utf8_file(&path, 4).unwrap(),
+            ("abc".into(), true)
+        );
+        std::fs::write(&path, [0xff, b'a', b'b', b'c', b'd']).unwrap();
+        assert!(read_bounded_utf8_file(&path, 4).is_err());
+        assert!(read_bounded_utf8_file(dir.path(), 4).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn huge_sparse_file_does_not_require_reading_the_whole_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(8 * 1024 * 1024 * 1024).unwrap();
+        let (text, truncated) = read_bounded_utf8_file(&path, 1024).unwrap();
+        assert!(truncated);
+        assert_eq!(text.len(), 1024);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_is_rejected_without_opening_it() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pipe");
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: name is NUL terminated and lives through the call.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(read_bounded_utf8_file(&path, 1024).is_err());
+    }
+}

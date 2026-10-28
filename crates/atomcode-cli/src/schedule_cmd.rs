@@ -1,17 +1,25 @@
 //! `atomcode schedule` subcommand — add / list / remove / enable / disable / sync.
 //!
-//! Task 4 will fill in the `Run` arm; for now it returns a non-zero exit
-//! code with an informational message so callers can detect the stub.
+//! Executions use the shared run ledger and the native headless runtime.
 
 use anyhow::{Context, Result};
 use clap::Subcommand;
 
-use crate::schedule_os::{InstallState, OsScheduler};
 use atomcode_config::schedule::{self, Schedule, ScheduleTask};
+#[cfg(test)]
+use atomcode_schedule::os::OsScheduler;
+
+fn task_store() -> atomcode_schedule::Store {
+    atomcode_schedule::Store::new(schedule::schedules_root())
+}
+
+fn task_service() -> atomcode_schedule::service::Service {
+    atomcode_schedule::service::Service::system(schedule::schedules_root())
+}
 
 // ── CLI enum ──────────────────────────────────────────────────────────────────
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 pub enum ScheduleCli {
     /// Add a new scheduled task.
     Add {
@@ -56,6 +64,39 @@ pub enum ScheduleCli {
         notify: String,
     },
 
+    /// Edit a task, preserving fields whose flags are omitted.
+    Edit {
+        id: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(long)]
+        cwd: Option<String>,
+        #[arg(long, group = "edit_freq")]
+        daily: Option<String>,
+        #[arg(long, group = "edit_freq")]
+        weekly: Option<String>,
+        #[arg(long, group = "edit_freq")]
+        every: Option<String>,
+        #[arg(long, group = "edit_freq")]
+        hourly: bool,
+        #[arg(long)]
+        mode: Option<String>,
+        #[arg(long)]
+        notify: Option<String>,
+        /// Reject the edit if the task no longer has this observed revision.
+        #[arg(long)]
+        expected: Option<String>,
+    },
+    /// Show saved run facts, including failures and execution session ids.
+    History {
+        id: String,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long)]
+        cursor: Option<usize>,
+    },
     /// List all scheduled tasks.
     List,
 
@@ -77,11 +118,18 @@ pub enum ScheduleCli {
         id: String,
     },
 
-    /// Run a scheduled task immediately (implemented in Task 4).
-    #[command(hide = true)]
+    /// Run a scheduled task immediately.
     Run {
         /// Task id.
         id: String,
+        /// Deduplicate remote/manual retries.
+        #[arg(long)]
+        request_id: Option<String>,
+        #[arg(long)]
+        expected_revision: Option<String>,
+        /// Explicit task store used by OS registrations and remote launches.
+        #[arg(long, hide = true)]
+        store: Option<std::path::PathBuf>,
     },
 
     /// Sync OS scheduler registrations with the stored task list.
@@ -230,6 +278,7 @@ fn slug(s: &str) -> String {
 ///
 /// Installs the task into the OS scheduler.  If install fails the task is
 /// **not** deleted — the caller should log the error and suggest `sync`.
+#[cfg(test)]
 fn handle_add_with(os: &dyn OsScheduler, task: &ScheduleTask) -> Result<()> {
     if let Err(e) = os.install(task) {
         eprintln!(
@@ -242,18 +291,27 @@ fn handle_add_with(os: &dyn OsScheduler, task: &ScheduleTask) -> Result<()> {
 }
 
 /// Core logic for `schedule remove`: uninstall (best-effort) then delete.
+#[cfg(test)]
 fn handle_remove_with(os: &dyn OsScheduler, id: &str) -> Result<()> {
     // best-effort — don't abort if already absent
     let _ = os.uninstall(id);
-    schedule::remove(id).with_context(|| format!("failed to remove task {:?}", id))?;
+    let store = task_store();
+    if let Ok(definition) = store.get(id) {
+        store.remove(id, &definition.revision)?;
+    } else if store.list()?.iter().any(|d| d.task.id == id) {
+        anyhow::bail!("cannot read task");
+    }
     Ok(())
 }
 
 /// Core logic for `schedule enable`.
+#[cfg(test)]
 fn handle_enable_with(os: &dyn OsScheduler, id: &str) -> Result<()> {
-    let mut task = schedule::load(id).with_context(|| format!("task {:?} not found", id))?;
+    let store = task_store();
+    let definition = store.get(id)?;
+    let mut task = definition.task;
     task.enabled = true;
-    schedule::save(&task).with_context(|| format!("failed to save task {:?}", id))?;
+    store.put(&task, Some(&definition.revision))?;
     if let Err(e) = os.install(&task) {
         eprintln!(
             "[schedule] warning: OS scheduler registration failed for {id}: {e}\n\
@@ -264,10 +322,13 @@ fn handle_enable_with(os: &dyn OsScheduler, id: &str) -> Result<()> {
 }
 
 /// Core logic for `schedule disable`.
+#[cfg(test)]
 fn handle_disable_with(os: &dyn OsScheduler, id: &str) -> Result<()> {
-    let mut task = schedule::load(id).with_context(|| format!("task {:?} not found", id))?;
+    let store = task_store();
+    let definition = store.get(id)?;
+    let mut task = definition.task;
     task.enabled = false;
-    schedule::save(&task).with_context(|| format!("failed to save task {:?}", id))?;
+    store.put(&task, Some(&definition.revision))?;
     // best-effort
     let _ = os.uninstall(id);
     Ok(())
@@ -281,8 +342,13 @@ fn handle_disable_with(os: &dyn OsScheduler, id: &str) -> Result<()> {
 /// files), so repeated sync runs are always safe.
 ///
 /// Returns the number of errors so the caller can set a non-zero exit code.
+#[cfg(test)]
 fn handle_sync_with(os: &dyn OsScheduler) -> Result<usize> {
-    let tasks = schedule::list();
+    let tasks = task_store()
+        .list()?
+        .into_iter()
+        .map(|d| d.task)
+        .collect::<Vec<_>>();
     let mut installed = 0usize;
     let mut uninstalled = 0usize;
     let mut errors = 0usize;
@@ -351,77 +417,154 @@ pub async fn handle_schedule(cli: ScheduleCli) -> Result<i32> {
                     .into_owned()
             });
             let task = build_task(&title, &prompt, &cwd, sched, &mode, &notify);
-            schedule::save(&task)
-                .with_context(|| format!("failed to save scheduled task {:?}", task.id))?;
-            let os = crate::schedule_os::current()?;
-            handle_add_with(os.as_ref(), &task)?;
+            let entry = task_service().save(&task, None)?;
             println!("  Added task {} ({})", task.id, task.title);
+            if let Some(error) = entry.registration_error {
+                eprintln!("[schedule] saved but registration failed: {error}");
+                return Ok(1);
+            }
             Ok(0)
         }
 
-        ScheduleCli::List => {
-            let tasks = schedule::list();
-            if tasks.is_empty() {
-                println!("  No scheduled tasks. Use `atomcode schedule add` to create one.");
-                return Ok(0);
+        ScheduleCli::Edit {
+            id,
+            title,
+            prompt,
+            cwd,
+            daily,
+            weekly,
+            every,
+            hourly,
+            mode,
+            notify,
+            expected,
+        } => {
+            let service = task_service();
+            let definition = service.store.get(&id)?;
+            let observed = expected.unwrap_or(definition.revision);
+            let mut task = definition.task;
+            if let Some(value) = title {
+                task.title = value;
             }
-            // Degrade gracefully: if the OS scheduler is not available (e.g.
-            // no home directory), still print the task list with an unknown
-            // registration status rather than failing the whole command.
-            let os = crate::schedule_os::current().ok();
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-
-            for t in &tasks {
-                let next = schedule::next_run(&t.schedule, now)
-                    .map(|ts| format_epoch(ts))
-                    .unwrap_or_else(|| "-".to_string());
-                let last = t.last_status.as_deref().unwrap_or("-");
-                let state = if t.enabled { "on" } else { "off" };
-                let reg = match os.as_ref().map(|s| s.status(&t.id)) {
-                    Some(InstallState::Installed) => "registered",
-                    Some(InstallState::Missing) => "missing",
-                    None => "unknown",
+            if let Some(value) = prompt {
+                task.prompt = value;
+            }
+            if let Some(value) = cwd {
+                task.cwd = value;
+            }
+            if let Some(value) = mode {
+                task.permission_mode = value;
+            }
+            if let Some(value) = notify {
+                task.notify = value;
+            }
+            if daily.is_some() || weekly.is_some() || every.is_some() || hourly {
+                task.schedule = parse_schedule(
+                    daily.as_deref(),
+                    weekly.as_deref(),
+                    every.as_deref(),
+                    hourly,
+                    None,
+                )?;
+            }
+            let entry = service.save(&task, Some(&observed))?;
+            println!("  Updated task {} ({})", task.id, entry.definition.revision);
+            if let Some(error) = entry.registration_error {
+                eprintln!("[schedule] saved but registration failed: {error}");
+                return Ok(1);
+            }
+            Ok(0)
+        }
+        ScheduleCli::History { id, limit, cursor } => {
+            let page = task_store().history_page(&id, cursor, limit)?;
+            println!("{}", serde_json::to_string_pretty(&page)?);
+            Ok(0)
+        }
+        ScheduleCli::List => {
+            let entries = task_service().catalog()?;
+            if entries.is_empty() {
+                println!("  No scheduled tasks. Use `atomcode schedule add` to create one.");
+            }
+            for entry in entries {
+                let next = entry
+                    .next_run
+                    .as_ref()
+                    .map(|n| format!("~{} ({})", format_epoch(n.at), n.time_zone))
+                    .unwrap_or_else(|| "-".into());
+                let last = match &entry.last_run {
+                    Some(atomcode_schedule::RunEvent::Finished { status, .. }) => status.as_str(),
+                    _ if entry.running => "running",
+                    _ => entry.definition.task.last_status.as_deref().unwrap_or("-"),
                 };
                 println!(
                     "  {} | {} | next:{} | last:{} | {} | {}",
-                    t.id, t.title, next, last, state, reg
+                    entry.definition.task.id,
+                    entry.definition.task.title,
+                    next,
+                    last,
+                    if entry.definition.task.enabled {
+                        "on"
+                    } else {
+                        "off"
+                    },
+                    entry.registration
                 );
+                if let Some(error) = entry.registration_error {
+                    eprintln!("  registration: {error}");
+                }
             }
             Ok(0)
         }
-
         ScheduleCli::Remove { id } => {
-            let os = crate::schedule_os::current()?;
-            handle_remove_with(os.as_ref(), &id)?;
-            println!("  Removed task {}", id);
+            let service = task_service();
+            let definition = service.store.get(&id)?;
+            if let Some(warning) = service.remove(&id, &definition.revision)? {
+                eprintln!("[schedule] {warning}");
+            }
+            println!("  Removed task {id}");
             Ok(0)
         }
-
-        ScheduleCli::Enable { id } => {
-            let os = crate::schedule_os::current()?;
-            handle_enable_with(os.as_ref(), &id)?;
-            println!("  Enabled task {}", id);
-            Ok(0)
-        }
-
-        ScheduleCli::Disable { id } => {
-            let os = crate::schedule_os::current()?;
-            handle_disable_with(os.as_ref(), &id)?;
-            println!("  Disabled task {}", id);
-            Ok(0)
-        }
-
-        ScheduleCli::Run { id } => run_task(&id).await,
+        ScheduleCli::Enable { id } => set_enabled(&id, true),
+        ScheduleCli::Disable { id } => set_enabled(&id, false),
+        ScheduleCli::Run {
+            id,
+            request_id,
+            expected_revision,
+            store: _,
+        } => run_task(&id, request_id.as_deref(), expected_revision.as_deref()).await,
 
         ScheduleCli::Sync => {
-            let os = crate::schedule_os::current()?;
-            let errors = handle_sync_with(os.as_ref())?;
-            Ok(if errors > 0 { 1 } else { 0 })
+            let service = task_service();
+            let mut errors = 0;
+            for entry in service.catalog()? {
+                match service.reconcile(&entry.definition.task.id) {
+                    Ok(entry) if entry.registration_error.is_none() => {}
+                    result => {
+                        errors += 1;
+                        eprintln!("[schedule] registration not confirmed: {result:?}");
+                    }
+                }
+            }
+            Ok(if errors == 0 { 0 } else { 1 })
         }
     }
+}
+
+fn set_enabled(id: &str, enabled: bool) -> Result<i32> {
+    let service = task_service();
+    let definition = service.store.get(id)?;
+    let mut task = definition.task;
+    task.enabled = enabled;
+    let entry = service.save(&task, Some(&definition.revision))?;
+    if let Some(error) = entry.registration_error {
+        eprintln!("[schedule] registration failed: {error}");
+        return Ok(1);
+    }
+    println!(
+        "  {} task {id}",
+        if enabled { "Enabled" } else { "Disabled" }
+    );
+    Ok(0)
 }
 
 // ── Pure helpers (also tested below) ──────────────────────────────────────────
@@ -437,7 +580,7 @@ pub(crate) fn mode_from_str(s: &str) -> atomcode_coding::RuntimeMode {
     }
 }
 
-/// Map a headless exit code to the `last_status` string stored in the task record.
+/// Map a headless exit code to the status appended to the run ledger.
 pub(crate) fn last_status_for(exit_code: i32) -> &'static str {
     match exit_code {
         0 => "ok",
@@ -452,27 +595,47 @@ pub(crate) fn last_status_for(exit_code: i32) -> &'static str {
 ///
 /// Returns an exit code:  0 = ok, 130 = cancelled (SIGINT), other non-zero = error.
 /// If the task is disabled this returns 0 immediately.  If the task's working
-/// directory does not exist the task's `last_status` is set to "error" and the
-/// function returns non-zero.
-async fn run_task(id: &str) -> Result<i32> {
+/// directory does not exist an error terminal is appended to the run ledger and
+/// the function returns non-zero.
+async fn run_task(id: &str, request_id: Option<&str>, expected: Option<&str>) -> Result<i32> {
+    let store = task_store();
+    if request_id.is_none() && !store.get(id)?.task.enabled {
+        println!("  schedule run: task {id} is disabled, skipping");
+        return Ok(0);
+    }
+    let lease = match store.begin_revision(id, request_id, expected) {
+        Ok(lease) => lease,
+        Err(error) => {
+            if let Some(request_id) = request_id {
+                store.record_rejected(id, request_id, format!("{error:#}"))?;
+            }
+            return Err(error);
+        }
+    };
+    let result = execute_task(&lease).await;
+    match result {
+        Ok((code, diagnostic)) => {
+            lease.finish(last_status_for(code), diagnostic)?;
+            Ok(code)
+        }
+        Err(error) => {
+            lease.finish("error", Some(format!("{error:#}")))?;
+            Err(error)
+        }
+    }
+}
+
+async fn execute_task(lease: &atomcode_schedule::RunLease) -> Result<(i32, Option<String>)> {
     use atomcode_capabilities::session::manager::SessionOrigin;
     use atomcode_capabilities::session::SessionManager;
     use atomcode_coding::ProviderBootstrap;
     use atomcode_config::config::Config;
-
-    // 1. Load task record.
-    let mut task = schedule::load(id).with_context(|| format!("task {:?} not found", id))?;
-
-    // 2. Skip if disabled.
-    if !task.enabled {
-        println!("  schedule run: task {} is disabled, skipping", task.id);
-        return Ok(0);
-    }
+    let task = &lease.definition.task;
 
     // 3. Load user config from default path.
     let config_path = Config::default_path();
     let config = if config_path.exists() {
-        Config::load(&config_path).unwrap_or_default()
+        Config::load(&config_path).context("cannot load scheduled task configuration")?
     } else {
         Config::default()
     };
@@ -484,14 +647,7 @@ async fn run_task(id: &str) -> Result<i32> {
             "[schedule] working directory {:?} does not exist for task {}",
             cwd, task.id
         );
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        task.last_run_at = Some(now);
-        task.last_status = Some("error".to_string());
-        let _ = schedule::save(&task);
-        return Ok(1);
+        anyhow::bail!("working directory does not exist: {:?}", cwd);
     }
 
     // 5. Build runtime config.
@@ -524,6 +680,7 @@ async fn run_task(id: &str) -> Result<i32> {
     // 7. Mark session origin = Scheduled.
     if let Some(ref session_info) = runtime.session {
         let sid = session_info.id.clone();
+        lease.session(&sid)?;
         let manager = SessionManager::for_project(
             &agent.working_dir,
             &atomcode_coding::config::product_dirs_from_env(),
@@ -567,7 +724,7 @@ async fn run_task(id: &str) -> Result<i32> {
     //    auto permission_mode is equivalent to accept-edits + strict bash gating.
     let provider_name = runtime_cfg.provider_name.clone();
     let model_name = runtime_cfg.model.clone();
-    let (exit_code, _captured) = crate::run_native_headless(
+    let (exit_code, _captured, diagnostic) = crate::run_native_headless_detailed(
         notifications_cfg,
         runtime,
         task.prompt.clone(),
@@ -583,16 +740,8 @@ async fn run_task(id: &str) -> Result<i32> {
     )
     .await?;
 
-    // 11. Write back last_run_at and last_status.
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    task.last_run_at = Some(now);
-    task.last_status = Some(last_status_for(exit_code).to_string());
-    let _ = schedule::save(&task);
-
-    Ok(exit_code)
+    // Completion is recorded in the run ledger, never written over the task.
+    Ok((exit_code, diagnostic))
 }
 
 /// Format an epoch-seconds timestamp as a human-readable UTC string.
@@ -827,8 +976,9 @@ mod tests {
 
     // ── FakeScheduler — records install/uninstall calls ───────────────────────
 
-    use crate::schedule_os::{InstallState, OsScheduler};
     use atomcode_config::schedule::ScheduleTask;
+    #[cfg(test)]
+    use atomcode_schedule::os::{InstallState, OsScheduler};
     use std::sync::{Mutex, OnceLock};
 
     /// Global lock to serialize tests that mutate ATOMCODE_HOME / the schedule store.
@@ -875,7 +1025,7 @@ mod tests {
             id: id.into(),
             title: "Test".into(),
             prompt: "do it".into(),
-            cwd: "/tmp".into(),
+            cwd: std::env::temp_dir().to_string_lossy().into_owned(),
             schedule: Schedule::Daily {
                 time: "09:00".into(),
             },
@@ -1048,6 +1198,7 @@ mod tests {
         let reg = match state {
             Some(InstallState::Installed) => "registered",
             Some(InstallState::Missing) => "missing",
+            Some(InstallState::Unknown(_)) => "unknown",
             None => "unknown",
         };
         assert_eq!(reg, "unknown");

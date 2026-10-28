@@ -62,15 +62,19 @@ impl ResponsesProvider {
         let initial_tls12 = atomcode_config::tls::should_cap_url(&url);
         let custom_headers = !cfg.headers.is_empty();
         let client = std::sync::Arc::new(
-            super::openai_compat::SwappableClient::new(initial_tls12, move |tls12| {
-                super::openai_compat::build_account_http_client(
-                    connect_timeout,
-                    skip_tls_verify,
-                    user_agent.clone(),
-                    tls12,
-                    custom_headers,
-                )
-            })?
+            super::openai_compat::SwappableClient::new_with_proxy(
+                initial_tls12,
+                move |tls12, proxy| {
+                    super::openai_compat::build_account_http_client_with_proxy(
+                        connect_timeout,
+                        skip_tls_verify,
+                        user_agent.clone(),
+                        tls12,
+                        custom_headers,
+                        proxy,
+                    )
+                },
+            )?
             .with_headers(cfg.headers.clone()),
         );
         Ok(Self {
@@ -740,16 +744,7 @@ impl LlmProvider for ResponsesProvider {
             &self.cfg.model,
             &body,
         );
-        let body_bytes = match serde_json::to_vec(&body) {
-            Ok(b) => b,
-            Err(e) => {
-                return Err(ProviderError {
-                    retryable: false,
-                    message: format!("request body serialization failed: {e}"),
-                    ..Default::default()
-                })
-            }
-        };
+        let body_bytes = super::request_size::serialize(&self.url, &body)?;
 
         let policy = retry::policy_for_call(&self.cfg.retry, options);
         let caller_recovers = options.request_recovery.is_some();
@@ -811,7 +806,7 @@ impl LlmProvider for ResponsesProvider {
                     .await
                     {
                         Err(_elapsed) => {
-                            let mut error = retry::stream_idle_error();
+                            let mut error = retry::stream_idle_error(&watchdog);
                             error.retryable = caller_recovers && !emitted_replay_sensitive;
                             yield StreamEvent::Error(error);
                             return;

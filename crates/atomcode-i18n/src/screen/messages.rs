@@ -7,6 +7,44 @@
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Msg<'a> {
+    AutomationOlder,
+    AutomationTitle,
+    AutomationEmpty,
+    AutomationManage,
+    AutomationFinish,
+    AutomationNew,
+    AutomationNewName,
+    AutomationEnabled,
+    AutomationPaused,
+    AutomationUpdated,
+    AutomationAdmitted,
+    AutomationRegistrationChecked,
+    AutomationHistory,
+    AutomationEdit,
+    AutomationPause,
+    AutomationEnable,
+    AutomationRun,
+    AutomationRepair,
+    AutomationDelete,
+    AutomationName,
+    AutomationKeep,
+    AutomationInstructions,
+    AutomationRepeat,
+    AutomationDaily,
+    AutomationWeekly,
+    AutomationHourly,
+    AutomationInterval,
+    AutomationTime,
+    AutomationTimeHint,
+    AutomationPermissions,
+    AutomationReadOnly,
+    AutomationAllowEdits,
+    AutomationDeleteConfirm,
+    AutomationConfirm,
+    AutomationModelHint,
+    AutomationDeleteHint,
+    AutomationConfirmHint,
+    AutomationSaved,
     InjectedFromSession {
         from: &'a str,
     },
@@ -459,6 +497,34 @@ pub enum Msg<'a> {
     ProviderDiscovering,
     /// …beside an empty model field: the key that opens it.
     ProviderDiscoverHint,
+    ProviderAdvanced,
+    ProviderManualAdd,
+    ProviderBatchCount {
+        n: usize,
+    },
+    ProviderWillUse,
+    ProviderSetUse,
+    ProviderBatchChoose,
+    ProviderNotProvided,
+    ProviderEdit,
+    ProviderContinue,
+    ProviderConnectUse,
+    ProviderSaveOnly,
+    ProviderConnected,
+    ProviderAvailable,
+    ProviderCapabilitiesUnknown,
+    ProviderOutputLimit,
+    ProviderSavedSwitchFailed {
+        id: &'a str,
+        error: &'a str,
+    },
+    ProviderSavedSwitching {
+        id: &'a str,
+    },
+    ProviderConnectTitle {
+        id: &'a str,
+    },
+
     /// …its keys.
     ProviderPickKeys,
     /// …its filter line.
@@ -1649,6 +1715,10 @@ pub enum Msg<'a> {
     ProviderAuthenticationFailed,
     ProviderRateLimitError,
     ProviderConnectionError,
+    ProviderConnectionTimeout,
+    ProviderTlsInterrupted,
+    ProviderPartialReply,
+    ProviderContinueReply,
     ProviderUnknownError,
     ProviderErrorStatus {
         reason: &'a str,
@@ -1736,7 +1806,6 @@ pub enum Msg<'a> {
         rate: u64,
     },
     /// Older transcript layout is loaded progressively by scrolling upwards.
-    HistoryLoadsOnScroll,
     FoldedLines {
         hidden: usize,
     },

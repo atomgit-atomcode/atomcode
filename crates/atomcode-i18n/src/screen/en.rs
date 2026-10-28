@@ -21,6 +21,44 @@ use std::borrow::Cow;
 
 pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
     match msg {
+        Msg::AutomationOlder => "Load earlier runs".into(),
+        Msg::AutomationTitle => "Automations".into(),
+        Msg::AutomationEmpty => "No scheduled tasks".into(),
+        Msg::AutomationManage => "Manage automated tasks".into(),
+        Msg::AutomationFinish => "Finish task editor".into(),
+        Msg::AutomationNew => "+ New task".into(),
+        Msg::AutomationNewName => "New task".into(),
+        Msg::AutomationEnabled => "enabled".into(),
+        Msg::AutomationPaused => "paused".into(),
+        Msg::AutomationUpdated => "Task updated".into(),
+        Msg::AutomationAdmitted => "Run admitted; open task history to view the result".into(),
+        Msg::AutomationRegistrationChecked => "Registration checked".into(),
+        Msg::AutomationHistory => "Run history".into(),
+        Msg::AutomationEdit => "Edit task".into(),
+        Msg::AutomationPause => "Pause schedule".into(),
+        Msg::AutomationEnable => "Enable schedule".into(),
+        Msg::AutomationRun => "Run now".into(),
+        Msg::AutomationRepair => "Repair registration".into(),
+        Msg::AutomationDelete => "Delete task".into(),
+        Msg::AutomationName => "Task name".into(),
+        Msg::AutomationKeep => "Enter keeps the current value when editing".into(),
+        Msg::AutomationInstructions => "Task instructions".into(),
+        Msg::AutomationRepeat => "Repeat".into(),
+        Msg::AutomationDaily => "Daily".into(),
+        Msg::AutomationWeekly => "Weekly".into(),
+        Msg::AutomationHourly => "Hourly".into(),
+        Msg::AutomationInterval => "Interval".into(),
+        Msg::AutomationTime => "Time / interval".into(),
+        Msg::AutomationTimeHint => "Daily HH:MM · weekly 1@HH:MM (Mon=1) · interval minutes".into(),
+        Msg::AutomationPermissions => "Unattended permissions".into(),
+        Msg::AutomationReadOnly => "Read-only analysis".into(),
+        Msg::AutomationAllowEdits => "Allow edits; risky commands remain denied".into(),
+        Msg::AutomationDeleteConfirm => "Delete task?".into(),
+        Msg::AutomationConfirm => "Confirm automation".into(),
+        Msg::AutomationModelHint => "Uses the host's local time and current default model.".into(),
+        Msg::AutomationDeleteHint => "Future triggers stop. Existing runs and history are retained.".into(),
+        Msg::AutomationConfirmHint => "A new session runs each occurrence. Enter confirms; Esc cancels.".into(),
+        Msg::AutomationSaved => "Task saved".into(),
         Msg::InjectedFromSession { from } => format!("from another session {from}").into(),
         Msg::MemoryEmpty => Cow::Borrowed("No memory in this scope yet."),
 
@@ -319,8 +357,26 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "This protocol has no model listing; type the model id by hand.".into()
         }
         Msg::ProviderDiscovering => "Fetching the model list from the endpoint… (Esc to cancel)".into(),
+        Msg::ProviderBatchCount { n } => format!("{n} models selected").into(),
+        Msg::ProviderWillUse => "Will use".into(),
+        Msg::ProviderSetUse => "Use this model".into(),
+        Msg::ProviderBatchChoose => "Use focused model".into(),
+        Msg::ProviderNotProvided => "Not provided".into(),
+        Msg::ProviderManualAdd => "Manual add".into(),
+        Msg::ProviderEdit => crate::product::t_with(crate::Locale::En, crate::product::Msg::ProviderMenuEdit),
+        Msg::ProviderAdvanced => "advanced settings".into(),
+        Msg::ProviderContinue => "continue".into(),
+        Msg::ProviderConnectUse => "connect and use".into(),
+        Msg::ProviderSaveOnly => "save only".into(),
+        Msg::ProviderConnected => crate::product::t_with(crate::Locale::En, crate::product::Msg::McpStatusConnected),
+        Msg::ProviderAvailable => "add a connection".into(),
+        Msg::ProviderCapabilitiesUnknown => "capabilities not declared".into(),
+        Msg::ProviderOutputLimit => "max output".into(),
+        Msg::ProviderSavedSwitchFailed { id, error } => format!("Saved {id}, but could not start switching: {error}. Retry from the model list.").into(),
+        Msg::ProviderSavedSwitching { id } => format!("Saved {id}; switching…").into(),
+        Msg::ProviderConnectTitle { id } => format!("connect {id}").into(),
         Msg::ProviderDiscoverHint => "fetch from the endpoint".into(),
-        Msg::ProviderPickKeys => "↑↓ pick · Enter fill in · Esc back · type to filter".into(),
+        Msg::ProviderPickKeys => "↑↓ pick · Space select · Enter confirm (current first) · Esc back · type to filter".into(),
         Msg::ProviderPickFilter { query } => format!("filter: {query}").into(),
         Msg::DiscoverNotAListing => "the endpoint did not answer with a model list".into(),
         Msg::DiscoverTimedOut => "the endpoint did not answer within 10 seconds".into(),
@@ -490,21 +546,19 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SavedTo { path } => format!("saved to {path}").into(),
         Msg::SaveWouldOverwrite { path } => format!("{path} already exists and is not a .md — pick another name, or remove it first").into(),
         Msg::SaveFailed { error } => format!("could not save: {error}").into(),
-        // The same sentence the other front end says (`atomcode-tuix`'s
-        // `usage_monitor`): one person on two screens reads one number, one
-        // window and one reset time.
-        Msg::AllowanceNear { label, percent } =>
-            format!("{percent}% of the {label} window used").into(),
+        // Keep the footer compact; window explanations belong in /usage.
+        Msg::AllowanceNear { label: _, percent } =>
+            format!("Quota used {percent}%").into(),
         Msg::AllowanceNearWithReset {
-            label,
+            label: _,
             percent,
             resets_at,
-        } => format!("{percent}% of the {label} window used  resets at {resets_at}").into(),
+        } => format!("Quota used {percent}% · resets {resets_at}").into(),
         Msg::AllowanceNearWithCountdown {
-            label,
+            label: _,
             percent,
             duration,
-        } => format!("{percent}% of the {label} window used  resets in {duration}").into(),
+        } => format!("Quota used {percent}% · resets in {duration}").into(),
         Msg::AllowanceExhaustedOpenRouter { label } => {
             format!("{label} allowance used up — type /openrouter to connect OpenRouter's free models").into()
         }
@@ -664,7 +718,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::RefusedStaleQuestion => "that question is no longer waiting for an answer".into(),
         Msg::RefusedNotRunning => "there is no turn running to act on".into(),
         Msg::RefusedUnavailable => {
-            "it cannot be taken now — no usable provider, or one is being swapped".into()
+            "this session cannot accept the message; check the error details before retrying".into()
         }
         Msg::RefusedUnsupported => "this host has no answer for that command".into(),
         Msg::CostNothingYet => "this conversation has not spent any tokens yet".into(),
@@ -959,10 +1013,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::MouseTaken => "mouse taken back · ctrl+g hands it to the terminal".into(),
         Msg::RawTop => "── atomcode · the whole conversation ──".into(),
         Msg::RawBottom => "── the whole conversation, above: select, scroll and search it with the terminal · any key returns to atomcode ──".into(),
-        Msg::MouseHandedBack => "mouse handed back · ctrl+g take it · /raw select across screens · wheel/↑↓ scroll · ctrl+p/n history · ctrl+t open · ctrl+o thinking".into(),
+        Msg::MouseHandedBack => "mouse handed back · ctrl+g take it · /raw select across screens · wheel scroll · ↑↓/ctrl+p/n history · ctrl+t open · ctrl+o thinking".into(),
         Msg::MouseUnreportedAtStart => "this terminal reports no mouse · drag to select · wheel or Fn+Up/Down scroll · /raw select across screens · Up/Down history · ctrl+t open · ctrl+o thinking".into(),
         Msg::MouseUnreported => "this terminal reports no mouse, so it keeps it · drag to select · wheel or Fn+Up/Down scroll".into(),
-        Msg::MouseHandedBackAtStart => "the terminal has the mouse · ctrl+g take it · /raw select across screens · wheel/↑↓ scroll · ctrl+p/n history · ctrl+t open · ctrl+o thinking".into(),
+        Msg::MouseHandedBackAtStart => "Mouse handed to terminal · drag to copy, right-click to paste · Ctrl+T expands/collapses tool output".into(),
         Msg::ReasoningNotReceived => "No reasoning received yet; incoming content will appear live.".into(),
         Msg::ReasoningHiddenHint => "reasoning is hidden · ctrl-o shows/hides it · tool output: ctrl-t".into(),
         Msg::NoProviderPanel => "this screen has no provider panel: the launcher provided no `tui-panel-providers`".into(),
@@ -1054,6 +1108,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderAuthenticationFailed => "Model service authentication failed".into(),
         Msg::ProviderRateLimitError => "Model service rate limit reached".into(),
         Msg::ProviderConnectionError => "Cannot connect to the model service".into(),
+        Msg::ProviderConnectionTimeout => "Connection to the model service timed out".into(),
+        Msg::ProviderTlsInterrupted => "The TLS connection was interrupted".into(),
+        Msg::ProviderPartialReply => "Response interrupted; partial reply preserved".into(),
+        Msg::ProviderContinueReply => "Reply “continue” in this conversation. Check completed file changes or tool actions before repeating them.".into(),
         Msg::ProviderUnknownError => "Model request failed".into(),
         Msg::ProviderTryAgain => "Try again later with “continue”, or switch models before continuing.".into(),
         Msg::ProviderCheckAccess => "Check access to this model or contact the service provider.".into(),
@@ -1110,7 +1168,6 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::LiveOut { tokens } => format!("↓ {tokens}").into(),
         Msg::LiveCached { hit } => format!("cached {hit}").into(),
         Msg::LiveSpeed { rate } => format!("{rate} tok/s").into(),
-        Msg::HistoryLoadsOnScroll => "Earlier history loads as you scroll up".into(),
         Msg::FoldedLines { hidden } => format!("⋯ {hidden} lines folded — click to open").into(),
         Msg::MoreBelow { arrow, lines } => format!(" {arrow} {lines} more lines · click to go back to the bottom ").into(),
 
@@ -1322,9 +1379,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         )
         .into(),
         Msg::ShareNoModel => "no model is configured yet — run /login or /model first".into(),
-        Msg::CmdAboutWebui => "share in a browser; scan for phone relay access (--local for local only; stop to end)".into(),
-        Msg::WebuiTakes => "[--local | lan | --host <addr>] [--port <port>] [--no-open] | stop".into(),
-        Msg::WebuiInvalidArguments { argument } => format!("Invalid /webui argument near `{argument}`. Usage: /webui [lan | --host <addr>] [--port <0-65535>] [--no-open], or /webui stop.").into(),
+        Msg::CmdAboutWebui => "open locally; remote for phone relay access, lan for LAN access; stop to end".into(),
+        Msg::WebuiTakes => "[remote | lan | --host <addr>] [--port <port>] [--no-open] | stop".into(),
+        Msg::WebuiInvalidArguments { argument } => format!("Invalid /webui argument near `{argument}`. Usage: /webui [remote | lan | --host <addr>] [--port <0-65535>] [--no-open], or /webui stop.").into(),
         Msg::CmdAboutSync => "share this session without opening anything (off to stop)".into(),
         Msg::SyncTakes => "[off]".into(),
         Msg::CmdAboutDesktop => "open the desktop app".into(),
@@ -1455,7 +1512,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProxyTakes => "[follow_system | default_proxy | no_proxy]".into(),
         Msg::ProxyPickerTitle { current } => format!("Outbound proxy (now: {current})").into(),
         Msg::ProxyFollowSystemAbout => {
-            "the launch environment's proxy, with the system proxy filling gaps (default)".into()
+            "follow environment/system proxies; model requests go direct if a local proxy stops, and reconnect when it returns (default)".into()
         }
         Msg::ProxyDefaultProxyAbout { captured } => {
             format!("pin the proxy this launch started with into the config: {captured}").into()
@@ -1488,9 +1545,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::BackgroundPolls { job, count } => format!("Waiting for background task {job} · checked {count} times · click to expand").into(),
         Msg::CopySendFailed => "Copy request could not be sent. Press Ctrl+G, select again, and copy through the terminal.".into(),
         Msg::CopyTooLarge => "Selection exceeds the terminal copy limit (100,000 bytes); nothing sent. Select less text or use Ctrl+G to copy through the terminal.".into(),
-        Msg::CopyRemoteHandedOver => "SSH copy is unconfirmed. If paste fails, press Ctrl+G, select again, and copy in the terminal (Mac: Cmd+C).".into(),
-        Msg::ClipboardRemoteText => "SSH cannot read your local clipboard. Paste through the terminal (Mac: Cmd+V).".into(),
-        Msg::ClipboardRemoteImage => "SSH cannot read your local image clipboard. Upload the image and use /paste <path>.".into(),
+        Msg::CopyRemoteHandedOver => "Remote copy is unconfirmed. If paste fails, press Ctrl+G, select again, and copy in the terminal (Mac: Cmd+C).".into(),
+        Msg::ClipboardRemoteText => "Cannot directly read your computer's clipboard. Use the paste action provided by your terminal or browser terminal.".into(),
+        Msg::ClipboardRemoteImage => "The remote app cannot read your computer's image clipboard. Upload the image and use /paste <path>.".into(),
         Msg::CopyHandedOver => "Copy request sent. Paste to confirm.".into(),
         Msg::CopyCouldNotStart => "Copy could not start. Please retry after the current copy finishes.".into(),
         Msg::CopyLocalUnavailable => "Could not confirm copying. On Ubuntu Wayland, install wl-clipboard (sudo apt install wl-clipboard), then retry; or use Ctrl+G to release the mouse and copy through the terminal.".into(),

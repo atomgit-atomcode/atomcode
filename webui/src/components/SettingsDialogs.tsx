@@ -3,8 +3,8 @@
 // Each is opened on its own from the sidebar settings menu.
 
 import { ComponentChildren } from 'preact';
-import { useEffect, useState } from 'preact/hooks';
-import { getTunnelStatus, TunnelStatus } from '../api';
+import { useEffect, useState, useRef } from 'preact/hooks';
+import { getTunnelStatus, startTunnelRelay, TunnelStatus } from '../api';
 import { useSettings, Theme, FontScale } from '../settings';
 import { Lang } from '../i18n';
 import {
@@ -238,6 +238,9 @@ export function RemoteAccessDialog({ onClose }: { onClose: () => void }) {
   const [status, setStatus] = useState<TunnelStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [copied, setCopied] = useState(false);
+  const [starting, setStarting] = useState(false);
+  const [startError, setStartError] = useState('');
+  const request = useRef<AbortController | null>(null);
 
   const reload = () => {
     setLoading(true);
@@ -247,6 +250,25 @@ export function RemoteAccessDialog({ onClose }: { onClose: () => void }) {
       .finally(() => setLoading(false));
   };
   useEffect(() => { reload(); }, []);
+
+  useEffect(() => () => { request.current?.abort(); }, []);
+
+  async function enableRelay() {
+    if (request.current) return;
+    const controller = new AbortController();
+    request.current = controller;
+    setStarting(true);
+    setStartError('');
+    try {
+      const next = await startTunnelRelay(controller.signal);
+      if (!controller.signal.aborted) setStatus(next);
+    } catch (error) {
+      if (!controller.signal.aborted) setStartError(error instanceof Error ? error.message : String(error));
+    } finally {
+      if (!controller.signal.aborted) setStarting(false);
+      if (request.current === controller) request.current = null;
+    }
+  }
 
   function copy() {
     const url = status?.remote_url;
@@ -267,9 +289,9 @@ export function RemoteAccessDialog({ onClose }: { onClose: () => void }) {
         {!loading && status && (
           <>
             {status.mode === 'relay' && status.relay_error && <p>{status.relay_error}</p>}
-            {status.mode !== 'relay' && !status.remote_url && (
+            {!status.remote_url && (
               <div class="remote-state">
-                <p>{t('remote.startRelay')}</p>
+                <p>{t(status.relay_start_supported ? 'remote.enableHint' : 'remote.startRelay')}</p>
               </div>
             )}
 
@@ -296,8 +318,14 @@ export function RemoteAccessDialog({ onClose }: { onClose: () => void }) {
           </>
         )}
 
+        {startError && <p class="field-hint" role="alert">{startError}</p>}
         <div class="remote-actions">
-          <button class="btn" onClick={reload} disabled={loading}>
+          {status?.relay_start_supported && (status.mode !== 'relay' || !status.remote_url) && (
+            <button class="btn" onClick={enableRelay} disabled={loading || starting}>
+              {t(starting ? 'remote.enabling' : 'remote.enable')}
+            </button>
+          )}
+          <button class="btn" onClick={reload} disabled={loading || starting}>
             {t('remote.refresh')}
           </button>
           {/* 使用引导：跳官网对应语言的说明页，新标签打开。 */}

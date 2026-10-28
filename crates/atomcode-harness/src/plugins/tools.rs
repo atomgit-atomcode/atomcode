@@ -151,6 +151,13 @@ impl Plugin for FsToolsPlugin {
 
 pub struct BashToolPlugin;
 
+pub(super) fn shell_output_provider(
+    ctx: &Context,
+) -> atomcode_capabilities::tools::output_artifact::ArtifactStoreProvider {
+    let ctx = ctx.clone();
+    Arc::new(move || ctx.service::<crate::seams::OutputArtifactsSvc>())
+}
+
 #[async_trait]
 impl Plugin for BashToolPlugin {
     fn name(&self) -> &'static str {
@@ -159,22 +166,42 @@ impl Plugin for BashToolPlugin {
     fn inject(&self) -> &'static [&'static str] {
         &["product-dirs", "tools"]
     }
+    fn uses(&self) -> &'static [&'static str] {
+        &["output-artifacts"]
+    }
     fn description(&self) -> &'static str {
         "shell execution"
     }
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
         let sensitive =
             atomcode_capabilities::tools::SensitivePaths::of(&*crate::product_dirs(ctx)?);
+        let provider = shell_output_provider(ctx);
+        mount(
+            ctx,
+            atomcode_capabilities::tools::powershell::PowerShellTool::tools(
+                Arc::new(atomcode_capabilities::world::LocalShell),
+                sensitive.clone(),
+                provider.clone(),
+            )
+            .await,
+        )?;
+        let bash = BashTool::new(sensitive.clone()).with_output_preview_provider(provider.clone());
+        let poll = Arc::new(
+            atomcode_capabilities::tools::bash::BashPollTool::with_output_preview_provider(
+                provider.clone(),
+            ),
+        );
         // The background trio beside it: a dev server, a watcher or anything
         // else meant to keep running goes through `bash_start`, not `bash`.
         mount(
             ctx,
             vec![
-                Arc::new(BashTool::new(sensitive.clone())),
-                Arc::new(atomcode_capabilities::tools::bash::BashStartTool::new(
-                    sensitive,
-                )),
-                Arc::new(atomcode_capabilities::tools::bash::BashPollTool),
+                Arc::new(bash),
+                Arc::new(
+                    atomcode_capabilities::tools::bash::BashStartTool::new(sensitive)
+                        .with_output_preview_provider(provider),
+                ),
+                poll,
                 Arc::new(atomcode_capabilities::tools::bash::BashKillTool),
             ],
         )?;
@@ -184,9 +211,12 @@ impl Plugin for BashToolPlugin {
             51,
             "Use `bash` for builds, tests, and git. Quote paths that contain spaces. \
              Anything meant to keep running — a dev server, a watcher, `npm run dev` — goes through \
-             `bash_start`: read its output with `bash_poll` and stop it with `bash_kill`. Do not \
+             `bash_start`: read its output with `bash_poll` and stop it with `bash_kill`. \
+             Long builds/tests also use `bash_start`, then `bash_poll` with wait_ms up to 60000 \
+             (returns early on output or exit), instead of shell sleep or duplicate builds. Do not \
              background it inside `bash` (`&`, `nohup`, `start`); a `bash` call is for a command that \
-             finishes.",
+             finishes. Preserve the original build/test exit status; output-filtering or \
+             status-printing wrappers can hide failures.",
         );
         Ok(())
     }

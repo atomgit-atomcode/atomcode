@@ -49,6 +49,7 @@ fn _isolate_atomcode_home() {
     atomcode_kernel::test_support::isolate_home();
 }
 
+mod background_jobs;
 pub mod config;
 mod controllers;
 pub mod discipline;
@@ -72,6 +73,7 @@ pub mod telemetry;
 mod told;
 pub mod vision;
 
+mod context_maintenance;
 mod execution_policy;
 pub mod host_rows;
 mod init_prompt;
@@ -142,3 +144,5 @@ pub use atomcode_capabilities::cc_hooks;
 /// same crate this one was built against. What a host can count on about
 /// coding's own rows is in [`host`].
 pub use atomcode_plexus as plexus;
+
+mod session_reference;

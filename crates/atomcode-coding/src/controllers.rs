@@ -8,6 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 
+use crate::discipline::background_exit_code as goal_background_exit_code;
+
 use async_trait::async_trait;
 use atomcode_kernel::message::{Message, Role};
 use atomcode_kernel::provider::{ChatOptions, LlmProvider, ToolChoice};
@@ -28,7 +30,7 @@ use recovery::RetryBudget;
 pub use recovery::{GoalRecoveryKind, GoalRecoveryProgress};
 
 /// Stop the loop after this many CONSECUTIVE "not met" rounds that made no forward
-/// progress (zero tool calls). A round that only emits text without touching a tool
+/// progress (no fresh tool evidence). A round that only emits text without touching a tool
 /// did nothing but talk; when the evaluator also judges the goal unmet, re-injecting
 /// "keep working" just spins. This most often means the goal isn't a concrete,
 /// verifiable objective (e.g. an empty/vague goal like "需要"), which otherwise burned
@@ -159,7 +161,7 @@ pub(crate) struct GoalState {
     pub tokens_used: u64,
     pub max_rounds: Option<u32>,
     deadline: Option<Instant>,
-    /// Consecutive "not met" rounds that made no forward progress (zero tool calls).
+    /// Consecutive "not met" rounds without fresh tool evidence.
     /// This survives across evaluated rounds so an
     /// unpursuable goal trips [`MAX_STALLED_ROUNDS`] instead of spinning to `max_rounds`.
     pub no_progress: u32,
@@ -494,8 +496,9 @@ impl GoalState {
         self.no_progress = 0;
     }
 
-    /// Record a "not met" round and whether it made forward progress (any tool call
-    /// in the just-finished round). Returns `true` once the goal has STALLED —
+    /// Record a "not met" round and whether it supplied fresh tool evidence.
+    /// Repeated identical observational results do not
+    /// count as progress. Returns `true` once the goal has STALLED —
     /// [`MAX_STALLED_ROUNDS`] consecutive no-progress rounds — so the caller stops the
     /// loop instead of re-injecting "keep working". Any progress round resets the tally.
     pub fn note_not_met(&mut self, made_progress: bool) -> bool {
@@ -552,6 +555,10 @@ impl GoalState {
         context.push_str(&recap);
         context.push_str("\n</goal-recovery-data>");
         Some(context)
+    }
+
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
     }
 
     pub fn cap_reached(&self) -> Option<&'static str> {
@@ -1440,17 +1447,6 @@ fn goal_execution_call(call: &atomcode_kernel::tool::ToolCall) -> bool {
 
 // Raw tool-reported status is evidence to inspect, never automatic success:
 // for example `program | tee file` may exit zero while program printed an error.
-fn goal_background_exit_code(output: &str) -> Option<i32> {
-    output
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())?
-        .trim()
-        .strip_prefix("status: exited (code ")?
-        .strip_suffix(')')?
-        .parse()
-        .ok()
-}
 
 fn goal_verification_candidate(call: &atomcode_kernel::tool::ToolCall, output: &str) -> bool {
     if !goal_execution_call(call) {

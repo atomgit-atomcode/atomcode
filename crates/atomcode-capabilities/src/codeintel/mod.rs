@@ -97,6 +97,8 @@ pub fn register_codeintel_tools(reg: &mut ToolRegistry, dirs: &crate::ProductDir
     reg.register(Arc::new(FileDependenciesTool::new(index)));
 }
 
+pub mod lsp_policy;
+
 /// A neutral language-server entry supplied by an L2 assembly. Capabilities cannot
 /// depend on a product config type, so the coding layer maps `[lsp.servers]` once.
 #[derive(Debug, Clone)]
@@ -104,6 +106,7 @@ pub struct LspServerSetting {
     pub command: String,
     pub args: Vec<String>,
     pub root_markers: Vec<String>,
+    pub options: lsp_policy::LspOptions,
 }
 
 /// Runtime policy for the optional LSP tool. Disabled by default and never downloads
@@ -118,6 +121,11 @@ pub struct LspSettings {
     pub auto_detect: bool,
     pub servers: HashMap<String, LspServerSetting>,
     pub settle_delay_ms: u64,
+    pub features: lsp_policy::LspFeatures,
+    pub trace: lsp_policy::LspTrace,
+    pub config_dir: Option<PathBuf>,
+    pub trace_file: Option<PathBuf>,
+    pub init_options_off: bool,
 }
 
 impl Default for LspSettings {
@@ -129,6 +137,11 @@ impl Default for LspSettings {
             auto_detect: false,
             servers: HashMap::new(),
             settle_delay_ms: 150,
+            features: Default::default(),
+            trace: Default::default(),
+            config_dir: None,
+            trace_file: None,
+            init_options_off: false,
         }
     }
 }
@@ -155,10 +168,12 @@ pub fn register_lsp_tool(reg: &mut ToolRegistry, settings: &LspSettings) -> bool
                 command: server.command.clone(),
                 args: server.args.clone(),
                 root_markers: server.root_markers.clone(),
+                options: server.options.clone(),
             },
         );
     }
-    let manager = LspManager::with_registry_and_delay(servers, settings.settle_delay_ms);
+    let manager = LspManager::with_registry_and_delay(servers, settings.settle_delay_ms)
+        .with_policy(settings.clone());
     reg.register(Arc::new(
         LspTool::new(Arc::new(manager))
             .with_ide_discovery(settings.ide_discovery_dir.clone())

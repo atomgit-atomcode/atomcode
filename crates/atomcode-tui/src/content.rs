@@ -398,8 +398,9 @@ impl Content for WelcomeBlock {
         }
         // Under them, dim and without a bullet: an aside about the screen, not
         // a fact about the session.
-        // One line each: the keys line and the release's news are two asides.
+        // Separate the asides from the session facts with one blank row.
         if let Some(note) = self.note.as_deref().filter(|n| !n.trim().is_empty()) {
+            below.push(Line::default());
             for line in note.lines().filter(|line| !line.trim().is_empty()) {
                 below.extend(wrapped(line, content_w as u16, muted(), ""));
             }
@@ -4475,6 +4476,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn native_mouse_startup_notice_is_below_the_directory_and_model() {
+        let mut block = welcome();
+        block.note = Some("鼠标已交还终端 · 拖选复制、右键粘贴 · Ctrl+T 展开/收起工具输出".into());
+        let rows: Vec<_> = block
+            .lines(&crate::block::RenderCtx::bare(120))
+            .iter()
+            .map(Line::plain)
+            .collect();
+        let cwd = rows.iter().position(|r| r.contains("~/proj")).unwrap();
+        let model = rows.iter().position(|r| r.contains("a-model")).unwrap();
+        let hint = rows
+            .iter()
+            .position(|r| r.contains("鼠标已交还终端"))
+            .unwrap();
+        assert!(hint > cwd && hint > model, "{rows:#?}");
+        assert!(rows[hint - 1].trim().is_empty(), "{rows:#?}");
+        assert!(rows[hint].contains("Ctrl+T"));
+        assert!(!rows[hint].contains("Ctrl+G"));
+    }
+
     /// The welcome's foot can carry two asides — the keys line and the
     /// release's news — one per line.
     #[test]
@@ -4492,6 +4514,8 @@ mod tests {
             .position(|r| r.contains("已更新到"))
             .expect("news");
         assert_eq!(news, keys + 1, "{rows:#?}");
+        assert!(rows[keys - 1].trim().is_empty(), "{rows:#?}");
+        assert!(!rows[keys - 2].trim().is_empty(), "{rows:#?}");
         assert!(rows.iter().all(|r| !r.contains('\n')));
     }
 

@@ -573,6 +573,16 @@ pub fn credential_shell_verdict(
     if !super::is_command_shell_tool(tool_name) {
         return CredentialShellVerdict::NotOurs;
     }
+    // Strict credential analysis currently understands Bash only. PowerShell
+    // aliases, expressions and script blocks cannot safely inherit that verdict.
+    if super::powershell::is_powershell_tool(tool_name) {
+        match policy {
+            CredentialShellPolicy::Strict => return CredentialShellVerdict::Deny,
+            // An opaque dialect cannot be safely auto-approved by a child agent.
+            CredentialShellPolicy::Prompt if !has_human => return CredentialShellVerdict::Deny,
+            _ => {}
+        }
+    }
     let Ok(args) = serde_json::from_str::<BashArgs>(arguments) else {
         return CredentialShellVerdict::NotOurs;
     };
@@ -615,7 +625,15 @@ impl ToolMiddleware for CredentialBashGate {
                 PolicyIntervention::credential_shell_blocked(),
             ),
             // Never terminates the turn — a reject ends only this call.
-            CredentialShellVerdict::Deny => BeforeOutcome::deny(CREDENTIAL_BASH_DENIAL_REASON),
+            CredentialShellVerdict::Deny => BeforeOutcome::deny(
+                if super::powershell::is_powershell_tool(tool.name())
+                    && self.policy == CredentialShellPolicy::Strict
+                {
+                    super::powershell::STRICT_POLICY_REASON
+                } else {
+                    CREDENTIAL_BASH_DENIAL_REASON
+                },
+            ),
             CredentialShellVerdict::Ask => match &self.approval_store {
                 Some(store) => self.request_approval(call, tool, rt, store).await,
                 None => BeforeOutcome::deny(CREDENTIAL_BASH_DENIAL_REASON),

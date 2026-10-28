@@ -1,0 +1,12 @@
+{
+  "document": "# 已确认的门店收款流水方案\n\n## 收款事件流水\n- EventId：本地入库行号，每次上报独立新增。\n- StoreId：门店编号。\n- TerminalId：门店内部收款终端编号，与StoreId分开存储。\n- ReceiptSeq：同一终端的小票序号，不同终端可重号。\n- EventType：收款或退款事件类型。\n- AmountCents：本次事件金额，整数分。\n- EventTimeMs：终端上报的事件毫秒值。\n- ReceivedAt：接收时刻，仅审计。\n\n## 小票明细\n- StoreId：门店编号。\n- TerminalId：门店内部收款终端编号。\n- ReceiptSeq：同一终端的小票序号。\n- ChargedCents：该小票累计收款金额，整数分。\n- RefundedCents：该小票累计退款金额，整数分。\n- LegacyNote：旧版备注，仅供兼容，不参与业务计算。\n\n## 已确认规则\n- 关联键为(StoreId, TerminalId, ReceiptSeq)。\n- 事件流水只追加，重复上报也独立保留。\n- 币种固定CNY，不自行增加币种或汇率字段。\n- 净收款查询时计算，不落列。\n- 明细LegacyNote保留旧备注。\n\n## 尚未确认\n- EventTimeMs是否UTC时间戳：未确认，不能当作已知事实。\n\n## 维护者补充\n- TerminalId只在StoreId范围内唯一，禁止跨门店仅按TerminalId关联。\n",
+  "tasks": {
+    "rename-payment": "只将design.md中ChargedCents更名为PaidCents；字段含义不变，其他内容包括维护者补充逐字保持。",
+    "revoke-note": "现在明确撤销此前保留LegacyNote的决定：从小票明细删除LegacyNote字段，并删除已确认规则中保留旧备注的那一条。其余字段、规则、未确认事项及维护者补充逐字保持，不用再确认。"
+  },
+  "expected_documents": {
+    "rename-payment": "# 已确认的门店收款流水方案\n\n## 收款事件流水\n- EventId：本地入库行号，每次上报独立新增。\n- StoreId：门店编号。\n- TerminalId：门店内部收款终端编号，与StoreId分开存储。\n- ReceiptSeq：同一终端的小票序号，不同终端可重号。\n- EventType：收款或退款事件类型。\n- AmountCents：本次事件金额，整数分。\n- EventTimeMs：终端上报的事件毫秒值。\n- ReceivedAt：接收时刻，仅审计。\n\n## 小票明细\n- StoreId：门店编号。\n- TerminalId：门店内部收款终端编号。\n- ReceiptSeq：同一终端的小票序号。\n- PaidCents：该小票累计收款金额，整数分。\n- RefundedCents：该小票累计退款金额，整数分。\n- LegacyNote：旧版备注，仅供兼容，不参与业务计算。\n\n## 已确认规则\n- 关联键为(StoreId, TerminalId, ReceiptSeq)。\n- 事件流水只追加，重复上报也独立保留。\n- 币种固定CNY，不自行增加币种或汇率字段。\n- 净收款查询时计算，不落列。\n- 明细LegacyNote保留旧备注。\n\n## 尚未确认\n- EventTimeMs是否UTC时间戳：未确认，不能当作已知事实。\n\n## 维护者补充\n- TerminalId只在StoreId范围内唯一，禁止跨门店仅按TerminalId关联。\n",
+    "revoke-note": "# 已确认的门店收款流水方案\n\n## 收款事件流水\n- EventId：本地入库行号，每次上报独立新增。\n- StoreId：门店编号。\n- TerminalId：门店内部收款终端编号，与StoreId分开存储。\n- ReceiptSeq：同一终端的小票序号，不同终端可重号。\n- EventType：收款或退款事件类型。\n- AmountCents：本次事件金额，整数分。\n- EventTimeMs：终端上报的事件毫秒值。\n- ReceivedAt：接收时刻，仅审计。\n\n## 小票明细\n- StoreId：门店编号。\n- TerminalId：门店内部收款终端编号。\n- ReceiptSeq：同一终端的小票序号。\n- ChargedCents：该小票累计收款金额，整数分。\n- RefundedCents：该小票累计退款金额，整数分。\n\n## 已确认规则\n- 关联键为(StoreId, TerminalId, ReceiptSeq)。\n- 事件流水只追加，重复上报也独立保留。\n- 币种固定CNY，不自行增加币种或汇率字段。\n- 净收款查询时计算，不落列。\n\n## 尚未确认\n- EventTimeMs是否UTC时间戳：未确认，不能当作已知事实。\n\n## 维护者补充\n- TerminalId只在StoreId范围内唯一，禁止跨门店仅按TerminalId关联。\n"
+  },
+  "limits": "synthetic new-domain fixture; maintainer content exists before model starts, not a concurrent-write test"
+}

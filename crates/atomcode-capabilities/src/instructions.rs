@@ -168,14 +168,13 @@ fn read_source(path: &Path) -> (InstructionState, Option<String>) {
     if !path.is_file() {
         return (InstructionState::Missing, None);
     }
-    match std::fs::read_to_string(path) {
+    match atomcode_config::util::read_bounded_utf8_file(path, MAX_INSTRUCTIONS_BYTES) {
         Err(_) => (InstructionState::Unreadable, None),
-        Ok(body) if body.trim().is_empty() => (InstructionState::Empty, Some(body)),
-        Ok(body) => {
+        Ok((body, _)) if body.trim().is_empty() => (InstructionState::Empty, Some(body)),
+        Ok((body, truncated)) => {
             let body = body.trim();
-            let body = if body.len() > MAX_INSTRUCTIONS_BYTES {
-                let cut: String = body.chars().take(MAX_INSTRUCTIONS_BYTES).collect();
-                format!("{cut}\n[truncated: instructions file exceeds 1 MiB]")
+            let body = if truncated {
+                format!("{body}\n[truncated: instructions file exceeds 1 MiB]")
             } else {
                 body.to_string()
             };
@@ -360,6 +359,19 @@ mod tests {
         fs::write(proj.join("AGENTS.md"), "   \n  ").unwrap(); // whitespace-only → empty
         let out = render_instructions(&d.path().join("nohome"), &proj);
         assert!(out.is_empty(), "no non-empty tiers → empty: {out:?}");
+    }
+
+    #[test]
+    fn oversized_unicode_file_is_capped_in_bytes_without_broken_utf8() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("AGENTS.md");
+        fs::write(&path, "界".repeat(MAX_INSTRUCTIONS_BYTES / 3 + 10)).unwrap();
+        let content = read_source(&path).1.unwrap();
+        assert!(content.len() <= MAX_INSTRUCTIONS_BYTES + 100);
+        assert!(content.to_lowercase().contains("truncated"));
+        let prefix = content.split('\n').next().unwrap();
+        assert!(prefix.len() <= MAX_INSTRUCTIONS_BYTES);
+        assert!(prefix.chars().all(|c| c == '界'));
     }
 
     #[test]

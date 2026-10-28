@@ -176,7 +176,7 @@ pub fn connect(
     config: CodingAgentConfig,
     host_config: Option<Arc<dyn HostConfig>>,
 ) -> Result<HostConnection, String> {
-    let (connection, control) = attach(runtime, front_end, config, host_config, None, false)?;
+    let (connection, control) = attach(runtime, front_end, config, host_config, false)?;
     // 共享(`/webui` / `/sync` / `/app`)要的是这个 runtime 的句柄,而句柄不在
     // 宿主契约里——它是产品的东西。接上时交给那一层,它自己判断现在共享没有。
     crate::tui_share::remember(control);
@@ -197,22 +197,19 @@ pub fn connect_screen(
     config: CodingAgentConfig,
     host_config: Option<Arc<dyn HostConfig>>,
 ) -> Result<HostConnection, String> {
-    let (connection, control) = attach(runtime, front_end, config, host_config, None, true)?;
+    let (connection, control) = attach(runtime, front_end, config, host_config, true)?;
     crate::tui_share::remember(control);
     Ok(connection)
 }
 
 /// [`connect`], for a host that holds more than one runtime
-/// (`crate::background`): the control comes back as itself, and `shown` says
-/// whether this runtime is the one on screen now — only that one's events are
-/// published to a share. `None` is "always", which is what a host with one
-/// runtime means.
+/// (`crate::background`): the control comes back as itself. Shared event
+/// publication checks the foreground runtime identity under the sharing lock.
 pub(crate) fn attach(
     runtime: CodingRuntime,
     front_end: Arc<FrontEnd>,
     config: CodingAgentConfig,
     host_config: Option<Arc<dyn HostConfig>>,
-    shown: Option<Arc<std::sync::atomic::AtomicBool>>,
     // The screen asks `Readiness` as it starts (see [`connect_screen`]).
     asks_readiness: bool,
 ) -> Result<(HostConnection, Arc<RuntimeControl>), String> {
@@ -251,16 +248,12 @@ pub(crate) fn attach(
             //
             // 只有屏幕上的那个 runtime 的事件才算:后台会话(`crate::background`)
             // 的回合不是共享出去的那段对话。
-            let on_screen = shown.as_ref().map_or(true, |shown| {
-                shown.load(std::sync::atomic::Ordering::SeqCst)
-            });
-            if on_screen {
-                crate::tui_share::publish(&sequenced);
-                // 模式换了也要单独说一声,理由同 attach:远端的徽标读的是那个全局值。
-                if let CodingRuntimeEvent::ModeChanged { mode } = &sequenced.event {
-                    crate::tui_share::mode_changed(*mode);
-                }
-            }
+            // Check runtime identity under the sharing lock, not a flag read
+            // before it: a foreground handover may happen between those reads.
+            crate::tui_share::publish_from(
+                crate::tui_share::Live::runtime_id(watched.as_ref()),
+                &sequenced,
+            );
             // A provider serving again, by either road back: a model switch
             // (`ProviderChanged`) or a reload — `/login`, onboarding — which
             // reprepares and reports `Reconfigured`. Losing it after that is
@@ -530,6 +523,20 @@ pub(crate) fn attach(
 }
 
 impl crate::tui_share::Live for RuntimeControl {
+    fn runtime_id(&self) -> usize {
+        self as *const Self as usize
+    }
+    fn provider_info(&self) -> Result<(String, String), String> {
+        let config = self.config.lock().expect("config poisoned");
+        let provider = config.provider_name.clone();
+        let fingerprint = config
+            .subagent_config
+            .as_ref()
+            .map(|source| atomcode_daemon::native_live::provider_fingerprint(source, &provider))
+            .transpose()?
+            .unwrap_or_default();
+        Ok((provider, fingerprint))
+    }
     fn handle(&self) -> atomcode_coding::CodingRuntimeHandle {
         self.handle.clone()
     }
@@ -637,16 +644,16 @@ mod scope_tests {
     }
 
     #[test]
-    fn a_renamed_folder_with_none_of_its_own_falls_back_to_all() {
-        // The reported bug: after a rename the new path has no sessions, so a
-        // filter would show an empty picker. Fall back to every folder's.
+    fn an_empty_project_does_not_offer_other_projects() {
         let all = vec![at("/old-name"), at("/other")];
         let scoped = scope_sessions(all, Some("/new-name"), Some("bucket-of/new-name"));
-        assert_eq!(
-            scoped.len(),
-            2,
-            "renamed folder sees all, not nothing: {scoped:?}"
-        );
+        assert!(scoped.is_empty());
+    }
+
+    #[test]
+    fn a_matching_recorded_directory_does_not_override_the_storage_bucket() {
+        let all = vec![in_bucket("/a", "foreign"), in_bucket("/a", "here")];
+        assert_eq!(scope_sessions(all, Some("/a"), Some("here")).len(), 1);
     }
 
     #[test]
@@ -671,83 +678,6 @@ mod scope_tests {
             .filter_map(|s| s.working_dir.as_deref())
             .collect();
         assert_eq!(dirs, ["/old-name", "/new-name"]);
-    }
-}
-
-#[cfg(test)]
-mod pin_tests {
-    use super::bucket_to_pin_on_resume;
-    use atomcode_capabilities::session::{CatalogEntry, CatalogPresence};
-
-    fn entry(id: &str, bucket: &str) -> CatalogEntry {
-        entry_with(id, bucket, 1)
-    }
-
-    fn entry_with(id: &str, bucket: &str, message_count: usize) -> CatalogEntry {
-        CatalogEntry {
-            id: id.into(),
-            name: String::new(),
-            fork_root_id: None,
-            project_bucket: bucket.into(),
-            working_dir: "/w".into(),
-            created_at_ms: 0,
-            updated_at_ms: 0,
-            message_count,
-            turn_count: 1,
-            presence: CatalogPresence::NativeOnly,
-            needs_newer_version: false,
-            origin: Default::default(),
-        }
-    }
-
-    #[test]
-    fn renamed_folder_pins_to_the_sessions_bucket() {
-        // The folder resolves to an empty bucket ("new") — nothing of its own on
-        // disk — and the resumed session lives under "old". Pin to "old".
-        let entries = vec![entry("s1", "old")];
-        assert_eq!(
-            bucket_to_pin_on_resume(&entries, "s1", "new"),
-            Some("old".to_string()),
-        );
-    }
-
-    #[test]
-    fn same_bucket_resume_pins_nothing() {
-        let entries = vec![entry("s1", "here")];
-        assert_eq!(bucket_to_pin_on_resume(&entries, "s1", "here"), None);
-    }
-
-    #[test]
-    fn a_folder_that_owns_sessions_is_never_repinned() {
-        // The anti-hijack: the current bucket already holds a session, so even a
-        // manual `/resume` of a foreign session must not freeze this folder onto
-        // the foreign bucket and orphan its own.
-        let entries = vec![entry("mine", "here"), entry("foreign", "elsewhere")];
-        assert_eq!(bucket_to_pin_on_resume(&entries, "foreign", "here"), None);
-    }
-
-    #[test]
-    fn an_unknown_session_pins_nothing() {
-        let entries = vec![entry("s1", "old")];
-        assert_eq!(bucket_to_pin_on_resume(&entries, "missing", "new"), None);
-    }
-
-    #[test]
-    fn a_zero_message_phantom_in_the_folder_does_not_block_the_repair() {
-        // The renamed folder's bucket ("new") holds only a fresh-but-unused
-        // session. The picker treats the folder as owning nothing, so the pin
-        // must still fire — a phantom is not a real session.
-        let entries = vec![entry("s1", "old"), entry_with("phantom", "new", 0)];
-        assert_eq!(
-            bucket_to_pin_on_resume(&entries, "s1", "new"),
-            Some("old".to_string()),
-        );
-    }
-
-    #[test]
-    fn a_zero_message_target_is_not_resumable() {
-        let entries = vec![entry_with("s1", "old", 0)];
-        assert_eq!(bucket_to_pin_on_resume(&entries, "s1", "new"), None);
     }
 }
 
@@ -1674,7 +1604,9 @@ impl RuntimeControl {
         let all: Vec<(String, StoredSession)> = scan
             .entries
             .into_iter()
-            .filter(|entry| entry.message_count > 0 && !entry.delegated())
+            .filter(|entry| {
+                entry.message_count > 0 && !entry.delegated() && entry.working_directory_available()
+            })
             .map(|entry| {
                 (
                     entry.project_bucket,
@@ -1702,77 +1634,21 @@ impl RuntimeControl {
     }
 }
 
-/// Which sessions a `/resume` in `working_dir` should offer: this folder's own
-/// when it has any, otherwise EVERY folder's (each labelled with its own dir in
-/// the picker). The fallback is the whole point — a RENAMED folder's sessions
-/// still live under the OLD path's bucket, so filtering to the new path shows an
-/// empty picker (the "sessions lost after rename" report). Falling back to all,
-/// newest-first, puts the just-used renamed session at the top for the person to
-/// pick by its dir. `None` (no cwd given) already means "everything".
-///
-/// "This folder's own" is the folder's session BUCKET (`here_bucket`, what
-/// `SessionManager::project_hash` resolves — the marker when there is one), or
-/// failing that its recorded dir. By dir alone, a folder pinned back to its old
-/// bucket after a rename lost those sessions again the moment it got one of its
-/// own: they still carry the OLD dir, so the new one's session made `has_local`
-/// true and filtered every one of them out.
+/// Scope the picker by the same storage bucket used to acquire the resume lease.
+/// A project marker preserves identity across directory renames. An empty project
+/// stays empty; it must never silently expose or adopt another project's bucket.
 fn scope_sessions(
     all: Vec<(String, StoredSession)>,
     working_dir: Option<&str>,
     here_bucket: Option<&str>,
 ) -> Vec<StoredSession> {
-    let Some(dir) = working_dir else {
-        return all.into_iter().map(|(_, session)| session).collect();
-    };
-    let local = |(bucket, session): &(String, StoredSession)| {
-        here_bucket == Some(bucket.as_str()) || session.working_dir.as_deref() == Some(dir)
-    };
-    let has_local = all.iter().any(local);
     all.into_iter()
-        .filter(|entry| !has_local || local(entry))
+        .filter(|(bucket, session)| match here_bucket {
+            Some(here) => bucket == here,
+            None => working_dir.is_none() || session.working_dir.as_deref() == working_dir,
+        })
         .map(|(_, session)| session)
         .collect()
-}
-
-/// Whether resuming `target` from a folder resolving to `current_bucket` should
-/// pin the folder to the session's own bucket — and to which. `None` leaves the
-/// folder as it is.
-///
-/// The folder-rename repair: a renamed folder resolves to an empty bucket, so a
-/// resume would look there and miss the session, which still lives under the old
-/// path's bucket. Pinning first makes the load succeed and future resumes here
-/// find it. Pins only when ALL hold:
-///   - the target session is on disk (its bucket is knowable);
-///   - that bucket differs from the folder's current one (the cross-bucket
-///     signal — a same-bucket resume needs nothing);
-///   - the folder's current bucket holds NO real sessions of its own.
-/// The last guard is the anti-hijack: a marker's mere absence is not enough,
-/// because a folder can own unmarked path-hash sessions (created before markers,
-/// with no fresh session started since). A manual `/resume <foreign-id>` from
-/// such a folder must not freeze it onto the foreign bucket and orphan its own —
-/// so a folder that still owns sessions is never repinned.
-///
-/// "Real" everywhere means `message_count > 0`, matching what `list`/the picker
-/// (`scope_sessions`) count as a session: a 0-message phantom (a fresh session
-/// created but never used) neither identifies its target nor makes a folder
-/// "own" sessions, so a stray one in the renamed folder's bucket cannot block
-/// the repair.
-fn bucket_to_pin_on_resume(
-    entries: &[atomcode_capabilities::session::CatalogEntry],
-    target: &str,
-    current_bucket: &str,
-) -> Option<String> {
-    let session_bucket = entries
-        .iter()
-        .find(|entry| entry.id == target && entry.message_count > 0)
-        .map(|entry| entry.project_bucket.clone())?;
-    if session_bucket == current_bucket {
-        return None;
-    }
-    let folder_owns_sessions = entries
-        .iter()
-        .any(|entry| entry.project_bucket == current_bucket && entry.message_count > 0);
-    (!folder_owns_sessions).then_some(session_bucket)
 }
 
 /// What this person has typed into this project before, newest first.
@@ -2168,36 +2044,23 @@ impl HostControl for RuntimeControl {
                         ),
                     });
                 }
-                // A resume that crosses buckets is the folder-RENAME signal: the
-                // renamed folder resolves to an empty bucket, so without a pin the
-                // load below would look there and fail. Pin the folder to the
-                // session's actual bucket first — see `bucket_to_pin_on_resume`
-                // for the exact (anti-hijack) conditions. Best-effort throughout:
-                // a runtime hiccup reading the working dir must NOT fail an
-                // otherwise-fine resume, so this never uses `?`. The runtime's own
-                // working dir, not the process's: `/cd` moves where sessions
-                // resolve, and the resume follows it.
+                // Resolve the runtime's current project before any fork or disk
+                // mutation. A foreign lease cannot be mounted in this project;
+                // adopting its bucket would also redirect future persistence.
                 let here = self
                     .handle
                     .context_stats()
                     .await
-                    .ok()
-                    .map(|stats| stats.working_dir);
-                if let Some(here) = here.as_ref() {
-                    if let Some(bucket) = bucket_to_pin_on_resume(
-                        &scan.entries,
-                        &target,
-                        &SessionManager::project_hash(
-                            here,
-                            &atomcode_coding::config::product_dirs_from_env(),
-                        ),
-                    ) {
-                        SessionManager::pin_project_bucket(
-                            here,
-                            &atomcode_coding::config::product_dirs_from_env(),
-                            &bucket,
-                        );
-                    }
+                    .map_err(refused)?
+                    .working_dir;
+                let current_bucket = SessionManager::project_hash(
+                    &here,
+                    &atomcode_coding::config::product_dirs_from_env(),
+                );
+                if entry.project_bucket != current_bucket {
+                    return Err(HostError::Failed {
+                        message: "Cannot resume a session from another project.".into(),
+                    });
                 }
                 // Interactive resume has the same busy-session semantics as
                 // `atomcode-tuix`: the original runtime keeps its lease and we
@@ -2213,8 +2076,7 @@ impl HostControl for RuntimeControl {
                 })?
                 .ok_or(HostError::NotFound)?;
                 let resumed_id = prepared.view.meta.id.clone();
-                let working_dir =
-                    here.unwrap_or_else(|| prepared.view.meta.working_dir.clone().into());
+                let working_dir = here;
                 let forked_from = prepared.forked_from;
                 let changed = self
                     .handle

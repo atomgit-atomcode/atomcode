@@ -43,10 +43,21 @@ where
 
 /// Preserve a typed idle failure for the owner's progress-aware recovery.
 /// The adapter must not replay a request after deltas reached its consumer.
-pub(crate) fn stream_idle_error() -> atomcode_kernel::stream::ProviderError {
+pub(crate) fn stream_idle_error(
+    watchdog: &super::StreamWatchdog,
+) -> atomcode_kernel::stream::ProviderError {
+    let limit = watchdog
+        .budget()
+        .map(|budget| format!("; limit {}ms", budget.as_millis()))
+        .unwrap_or_default();
     atomcode_kernel::stream::ProviderError {
         code: Some(atomcode_kernel::stream::STREAM_IDLE_TIMEOUT_CODE.into()),
-        message: "stream idle timeout".into(),
+        message: format!(
+            "stream idle timeout ({}): no content for {}ms{}",
+            watchdog.phase(),
+            watchdog.silent_for().as_millis(),
+            limit
+        ),
         retryable: false,
         ..Default::default()
     }
@@ -362,10 +373,16 @@ pub(crate) fn stream_read_error_message(
                     .to_string()
             }
         };
+        let detail = err_chain(err);
         format!(
-            "{lead}{}详情: {}",
+            "{lead}{}{}详情: {}",
+            if detail.contains("without sending TLS close_notify") {
+                "TLS 连接未正常关闭;请检查网络、代理或服务端连接。"
+            } else {
+                ""
+            },
             connection_reset_hint(err),
-            err_chain(err)
+            detail
         )
     } else {
         format!("stream read error: {}", err_chain(err))
@@ -547,13 +564,41 @@ mod tests {
 
     #[test]
     fn idle_failure_is_typed_for_continuation_not_blind_replay() {
-        let error = stream_idle_error();
+        let watchdog = super::super::StreamWatchdog::new(
+            Some(Duration::from_secs(600)),
+            Some(Duration::from_secs(300)),
+        );
+        let error = stream_idle_error(&watchdog);
         assert_eq!(
             error.code.as_deref(),
             Some(atomcode_kernel::stream::STREAM_IDLE_TIMEOUT_CODE)
         );
         assert!(!error.retryable);
         assert_eq!(error.http_status, None);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn idle_failure_reports_the_actual_content_phase_and_budget() {
+        let mut watchdog = super::super::StreamWatchdog::new(
+            Some(Duration::from_secs(600)),
+            Some(Duration::from_secs(300)),
+        );
+        tokio::time::advance(Duration::from_secs(600)).await;
+        watchdog.observe(&StreamEvent::Usage(Default::default()));
+        let first = stream_idle_error(&watchdog);
+        assert_eq!(
+            first.message,
+            "stream idle timeout (first_content): no content for 600000ms; limit 600000ms"
+        );
+        watchdog.observe(&StreamEvent::Reasoning("thinking".into()));
+        tokio::time::advance(Duration::from_secs(300)).await;
+        let idle = stream_idle_error(&watchdog);
+        assert_eq!(
+            idle.message,
+            "stream idle timeout (stream_idle): no content for 300000ms; limit 300000ms"
+        );
+        assert_eq!(first.code, idle.code);
+        assert!(!idle.retryable);
     }
 
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
@@ -574,7 +619,7 @@ mod tests {
         for c in [408, 425, 429, 500, 502, 503, 504, 529] {
             assert!(is_retryable_status(c), "{c} should be retryable");
         }
-        for c in [400, 401, 403, 404, 422] {
+        for c in [400, 401, 403, 404, 413, 422] {
             assert!(!is_retryable_status(c), "{c} should be fatal");
         }
     }
@@ -799,6 +844,31 @@ mod tests {
             ErrorKind::BrokenPipe,
             "bp"
         )));
+    }
+
+    #[test]
+    fn tls_close_notify_eof_keeps_transport_recovery_and_partial_reply_guidance() {
+        let error = Wrap(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "peer closed connection without sending TLS close_notify",
+        ));
+        assert!(chain_has_transient_io(&error));
+        assert!(!chain_has_tls_corruption(&error));
+        assert!(stream_read_error_code(&error).is_some());
+        let partial = stream_read_error_message(&error, StreamReadRecovery::PartialResponse);
+        assert!(partial.contains("TLS 连接未正常关闭"));
+        assert!(partial.contains("未自动重放"));
+        assert!(partial.contains("继续"));
+        let exhausted =
+            stream_read_error_message(&error, StreamReadRecovery::RetryExhausted { attempts: 2 });
+        assert!(exhausted.contains("自动重连 2 次后仍失败"));
+        assert!(exhausted.contains("TLS 连接未正常关闭"));
+        // A generic timeout must not be diagnosed as a TLS shutdown error.
+        let timeout = Wrap(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        assert!(
+            !stream_read_error_message(&timeout, StreamReadRecovery::PartialResponse)
+                .contains("TLS 连接未正常关闭")
+        );
     }
 
     #[test]

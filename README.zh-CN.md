@@ -27,7 +27,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-5.2.4-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-5.2.5-blue" alt="version">
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS%20PC%20%7C%20Windows-lightgrey" alt="platform">
@@ -332,6 +332,8 @@ Select provider:
 ```
 
 ### 2. 配置
+
+预设供应商按常用顺序排列，名称旁显示实际 API 域名，也可以按域名搜索。在 TUI 中输入 `/provider`，搜索并选择 DeepSeek 等供应商，粘贴 API Key 后即可自动获取模型列表。选择模型，确认“连接并使用”；接口返回的视觉、推理档位、上下文和输出上限会自动填入，无需手动配置。`Ctrl+O` 展开高级设置，`Ctrl+S` 仅保存模型；获取失败时可用 `Ctrl+F` 重试，或直接输入模型 ID。接口未声明的能力保留为未知。
 
 配置文件位于 `~/.atomcode/config.toml`，最小单 provider 样例：
 

@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'preact/hooks';
 import { getModels, ModelInfo, postLiveReasoningEffort, ReasoningEffortError } from '../api';
 import { useT } from '../settings';
+import { displayedModel, type RuntimeModelIdentity } from '../lib/modelIdentity';
 import { MsgKey } from '../i18n';
 
 // Endpoint-declared reasoning effort levels. `null` returns to the model's
@@ -35,6 +36,7 @@ function areModelsEqual(a: ModelInfo[], b: ModelInfo[]): boolean {
 
 export function ModelSelector({
   value,
+  runtime,
   liveEffort,
   busy = false,
   onError,
@@ -42,6 +44,7 @@ export function ModelSelector({
   onDefaultChange,
 }: {
   value: string | null;
+  runtime?: RuntimeModelIdentity | null;
   liveEffort?: string | null;
   busy?: boolean;
   onError?: (message: string) => void;
@@ -103,13 +106,13 @@ export function ModelSelector({
     document.addEventListener('mousedown', h);
     return () => document.removeEventListener('mousedown', h);
   }, [open, effortOpen]);
-  const current = models.find((m) => m.provider === value) ?? models.find((m) => m.is_default) ?? models[0];
+  const current = displayedModel(models, value, runtime);
   const currentProvider = useRef(current?.provider);
   currentProvider.current = current?.provider;
   useEffect(() => { if (busy) setEffortOpen(false); }, [busy]);
   // Switching models resets the effort display back to the new model's
   // persisted value; capability declarations decide whether the selector appears.
-  useEffect(() => { setEffortOverride(undefined); }, [current?.provider]);
+  useEffect(() => { setEffortOverride(undefined); }, [current?.provider, current?.model]);
   useEffect(() => {
     if (liveEffort !== undefined) setEffortOverride(liveEffort);
   }, [liveEffort]);
@@ -200,7 +203,7 @@ export function ModelSelector({
             {models.map((m) => (
               <button
                 key={m.provider}
-                class={'model-item' + (m.provider === (value ?? current?.provider) ? ' active' : '')}
+                class={'model-item' + (m.provider === current?.provider && m.model === current?.model ? ' active' : '')}
                 type="button"
                 title={m.provider}
                 onClick={() => { onChange(m.provider); setOpen(false); }}

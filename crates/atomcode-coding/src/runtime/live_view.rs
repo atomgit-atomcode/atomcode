@@ -6,6 +6,8 @@ use super::*;
 pub struct RuntimeLiveView {
     pub generation: u64,
     pub mode: RuntimeMode,
+    /// Display metadata from the lead agent, retained across transcript rebases.
+    pub model: Option<String>,
     pub session_id: String,
     pub working_dir: std::path::PathBuf,
     pub snapshot: Arc<SessionSnapshot>,
@@ -19,6 +21,15 @@ pub struct RuntimeLiveView {
 }
 
 impl RuntimeLiveView {
+    pub(super) fn has_pending_blocking_request(&self) -> bool {
+        self.pending.values().any(|event| {
+            matches!(&event.event,
+            CodingRuntimeEvent::Request(request)
+                if !atomcode_capabilities::tools::request_user_input::is_continued_question(
+                    &request.kind, &request.payload))
+        })
+    }
+
     pub fn from_snapshot(
         generation: u64,
         session_id: String,
@@ -28,6 +39,7 @@ impl RuntimeLiveView {
         Self {
             generation,
             mode: RuntimeMode::Build,
+            model: None,
             session_id,
             working_dir,
             snapshot: Arc::new(snapshot),
@@ -44,6 +56,7 @@ impl RuntimeLiveView {
     /// A harness provider patch keeps the same running conversation and requests.
     pub(super) fn carry_generation(&mut self, generation: u64) {
         self.generation = generation;
+        self.model = None;
         for event in &mut self.events {
             event.generation = generation;
         }
@@ -63,19 +76,21 @@ impl RuntimeLiveView {
     pub(super) fn observe(
         &mut self,
         envelope: &SequencedRuntimeEvent,
-        seed: Option<(SessionSnapshot, RuntimeMode)>,
+        seed: Option<(SessionSnapshot, RuntimeMode, Option<String>)>,
     ) {
         if let CodingRuntimeEvent::SessionChanged(changed) = &envelope.event {
             self.generation = envelope.generation;
             self.session_id = changed.session_id.clone().unwrap_or_default();
             self.working_dir = changed.working_dir.clone();
+            self.model = None;
             self.events.clear();
             self.pending.clear();
             self.goal = None;
             self.policy = None;
             self.turn = None;
             self.valid = seed.is_some();
-            if let Some((snapshot, mode)) = seed {
+            if let Some((snapshot, mode, model)) = seed {
+                self.model = model;
                 self.snapshot = Arc::new(snapshot);
                 self.mode = mode;
             }
@@ -84,6 +99,17 @@ impl RuntimeLiveView {
         } else {
             if let CodingRuntimeEvent::ModeChanged { mode } = &envelope.event {
                 self.mode = *mode;
+            }
+            match &envelope.event {
+                CodingRuntimeEvent::ProviderChanged { model, .. } => {
+                    self.model = Some(model.clone())
+                }
+                CodingRuntimeEvent::Agent(AgentEvent::Described { description })
+                    if description.session == self.session_id =>
+                {
+                    self.model = description.model.clone()
+                }
+                _ => {}
             }
             // Cards remain small control state even if transcript replay hits
             // its bound. A later complete snapshot can then safely recover.
@@ -224,6 +250,52 @@ mod tests {
     }
 
     #[test]
+    fn lead_model_survives_completed_turn_rebase_and_ignores_members_and_stale_events() {
+        let mut view = view();
+        let description = |session: &str, model: &str| {
+            CodingRuntimeEvent::Agent(AgentEvent::Described {
+                description: atomcode_kernel::agent::AgentDescription {
+                    session: session.into(),
+                    model: Some(model.into()),
+                    ..Default::default()
+                }
+                .into(),
+            })
+        };
+        view.observe(&event(1, description("old", "lumen-alpha")), None);
+        view.observe(&event(2, description("old/member", "member-model")), None);
+        view.observe(
+            &event(
+                3,
+                CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
+                    turn_id: 1,
+                    reason: StopReason::Stopped,
+                    snapshot: Arc::new(SessionSnapshot::new(vec![Message::user("new base")])),
+                    stats: Default::default(),
+                }),
+            ),
+            None,
+        );
+        assert!(view.events.is_empty());
+        assert_eq!(view.model.as_deref(), Some("lumen-alpha"));
+        view.carry_generation(1);
+        assert!(view.model.is_none());
+        view.observe(
+            &SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 4,
+                event: CodingRuntimeEvent::ProviderChanged {
+                    provider: "same".into(),
+                    model: "new-model".into(),
+                },
+            },
+            None,
+        );
+        view.observe(&event(5, description("old", "stale-model")), None);
+        assert_eq!(view.model.as_deref(), Some("new-model"));
+    }
+
+    #[test]
     fn a_replacement_without_a_seed_never_exposes_the_previous_session() {
         let mut view = view();
         let change = event(
@@ -242,6 +314,7 @@ mod tests {
             Some((
                 SessionSnapshot::new(vec![Message::user("new history")]),
                 RuntimeMode::Plan,
+                None,
             )),
         );
         assert!(view.valid);
@@ -297,6 +370,37 @@ mod tests {
         );
         assert_eq!(view.sequence, Some(4));
         assert_eq!(view.snapshot.messages[0].text, "new base");
+    }
+
+    #[test]
+    fn blocking_request_state_tracks_resolution_even_without_transcript_replay() {
+        let mut view = view();
+        view.valid = false;
+        view.observe(
+            &event(
+                1,
+                CodingRuntimeEvent::Request(RuntimeRequest {
+                    id: 42,
+                    kind: "approval".into(),
+                    payload: serde_json::json!({}),
+                    snapshot: None,
+                }),
+            ),
+            None,
+        );
+        assert!(view.has_pending_blocking_request());
+        view.observe(
+            &event(
+                2,
+                CodingRuntimeEvent::RequestResolved {
+                    id: 42,
+                    kind: "approval".into(),
+                },
+            ),
+            None,
+        );
+        assert!(!view.has_pending_blocking_request());
+        assert!(!view.valid);
     }
 
     #[test]

@@ -1406,7 +1406,10 @@ impl CommandSet for SessionCommands {
                     // types `/cd` — after which this listed another project's
                     // sessions and called them this one's. Asked of the host,
                     // the way `/cd` asks.
-                    let here = working_dir(Some(control.clone()), client.root()).await.ok();
+                    let here = match working_dir(Some(control.clone()), client.root()).await {
+                        Ok(here) => Some(here),
+                        Err(error) => return Outcome::Refused(error),
+                    };
                     return match control
                         .call(HostCommand::ListSessions { working_dir: here })
                         .await
@@ -3127,9 +3130,18 @@ impl CommandSet for AgentCatalogCommands {
                     },
                     // Picking `/skills` enters that second level. With no skills
                     // installed it remains a bare command and can say so itself.
+                    // `require_arg` here stays about the front end's own
+                    // judgement (goal, skills with a populated sub-menu). A
+                    // command's disk `args: required` declaration is a
+                    // separate signal — it decides whether the *dispatch*
+                    // refuses a bare run (see `dispatch`), not whether the
+                    // *pick* stops on the line. Folding it in would take two
+                    // Enters to refuse, which is not what the person meant
+                    // by pressing one.
                     require_arg: edit_goal || (is_skills && !skill_options.is_empty()),
                     // The agent's commands are described, not typed with keys.
                     secret_args: false,
+                    args_requirement: c.args_requirement,
                 }
             })
             .collect()
@@ -3149,6 +3161,7 @@ impl CommandSet for AgentCatalogCommands {
                 options: Vec::new(),
                 require_arg: false,
                 secret_args: false,
+                args_requirement: c.args_requirement,
             })
             .collect()
     }
@@ -3612,6 +3625,7 @@ mod tests {
                     .into_owned(),
                 ),
                 target: atomcode_kernel::agent::CommandTarget::Session,
+                ..Default::default()
             }],
             ..Default::default()
         });
@@ -3639,6 +3653,7 @@ mod tests {
                 summary: summary.into(),
                 usage: Some(crate::i18n::product::t(usage).into_owned()),
                 target: atomcode_kernel::agent::CommandTarget::Session,
+                ..Default::default()
             };
         client.describe(&atomcode_kernel::agent::AgentDescription {
             session: "lead".into(),
@@ -3687,6 +3702,7 @@ mod tests {
                 usage: Some("[condition]".into()),
                 summary: "Work toward a goal".into(),
                 target: atomcode_kernel::agent::CommandTarget::Session,
+                ..Default::default()
             }],
             ..Default::default()
         });
@@ -3723,24 +3739,28 @@ mod tests {
                     usage: Some("[名字… [给它们的话]]".into()),
                     summary: "浏览技能".into(),
                     target: atomcode_kernel::agent::CommandTarget::Session,
+                    ..Default::default()
                 },
                 atomcode_kernel::agent::CommandDescription {
                     name: "brainstorming".into(),
                     usage: Some(skill_usage.clone()),
                     summary: "先梳理需求".into(),
                     target: atomcode_kernel::agent::CommandTarget::Session,
+                    ..Default::default()
                 },
                 atomcode_kernel::agent::CommandDescription {
                     name: "code".into(),
                     usage: Some(skill_usage),
                     summary: "实现代码".into(),
                     target: atomcode_kernel::agent::CommandTarget::Session,
+                    ..Default::default()
                 },
                 atomcode_kernel::agent::CommandDescription {
                     name: "stop-member".into(),
                     usage: Some("<name>".into()),
                     summary: "停止成员".into(),
                     target: atomcode_kernel::agent::CommandTarget::Session,
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -3780,6 +3800,7 @@ mod tests {
                     usage: Some("[名字… [给它们的话]]".into()),
                     summary: "浏览技能".into(),
                     target: atomcode_kernel::agent::CommandTarget::Session,
+                    ..Default::default()
                 }],
                 ..Default::default()
             });

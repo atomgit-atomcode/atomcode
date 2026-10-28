@@ -588,7 +588,7 @@ impl View for Input {
             // is one atomic unit" behaviour the editing keys already enforce.
             row.extend(image_chip_segments(piece));
             // The rest of something already said, dim, on the last row of what
-            // is typed — pressing right takes it. Only there, because that is
+            // is typed — pressing right or Tab takes it. Only there, because that is
             // where the caret is when a completion means anything. Never while
             // a password is being asked: what is on the line is not the draft,
             // and a completion of the draft drawn after the mask would offer to

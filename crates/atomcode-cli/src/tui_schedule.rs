@@ -1,23 +1,16 @@
 //! `/schedule`:排好的定时任务,以及它们下一次什么时候跑。
 //!
-//! 只读。增删走命令行(`atomcode schedule add` / `remove`),真正到点执行的是操作
-//! 系统的调度器(launchd / systemd / 计划任务),它回调 `atomcode schedule run <id>`
-//! ——屏幕在不在都一样。所以这块屏幕欠的只有「现在都排了什么」这一问,这也正是
-//! 经典界面的 `/schedule` 做的事。
-//!
-//! **为什么是启动器的行**:任务存在配置目录下的 `schedules/`,是这个二进制的事;
-//! 屏幕不认识磁盘(`docs/adr/0022` §3)。
-//!
-//! **为什么不报「已注册 / 缺失」**:那要问操作系统的调度器,而经典界面在那一问
-//! 失败时整条命令就没了输出。这里宁可少说一栏:`atomcode schedule list` 仍然说。
+//! Task management uses a shared host service; actual jobs remain OS-triggered.
+//! The keyboard picker and editor are in `tui_schedule_ui`.
 
+#[cfg(test)]
 use atomcode_i18n::screen::{t as tr, Msg as SMsg};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+#[cfg(test)]
 use atomcode_config::schedule::{self, ScheduleTask};
 use atomcode_plexus::{Context, Plugin};
-use atomcode_tui::command::{Command, CommandSet, Outcome};
 use atomcode_tui::plugin::CommandsSvc;
 use serde_json::Value;
 
@@ -43,37 +36,17 @@ impl Plugin for ScheduleRow {
         &["tui-commands"]
     }
     fn description(&self) -> &'static str {
-        "the scheduled tasks on this machine, and when each runs next"
+        "create, edit, pause and inspect OS-scheduled tasks and their execution sessions"
     }
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
         let commands = ctx.require::<CommandsSvc>().map_err(|e| e.to_string())?;
-        commands.add(Arc::new(ScheduleCommands))?;
+        commands.add(Arc::new(super::tui_schedule_ui::ScheduleCommands::default()))?;
         Ok(())
     }
 }
 
-struct ScheduleCommands;
-
-#[async_trait]
-impl CommandSet for ScheduleCommands {
-    fn id(&self) -> &'static str {
-        ROW
-    }
-
-    fn commands(&self) -> Vec<Command> {
-        vec![Command::said(COMMAND, tr(SMsg::CmdAboutSchedule))]
-    }
-
-    async fn run(&self, _name: &str, _args: &str, _ctx: &Context) -> Outcome {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|since| since.as_secs() as i64)
-            .unwrap_or(0);
-        Outcome::Said(listing(&schedule::list(), now))
-    }
-}
-
 /// 排了什么,一行一条。纯函数,所以判据不必在磁盘上摆任务。
+#[cfg(test)]
 pub(crate) fn listing(tasks: &[ScheduleTask], now: i64) -> String {
     if tasks.is_empty() {
         return tr(SMsg::ScheduleNone).into_owned();
@@ -106,7 +79,7 @@ pub(crate) fn listing(tasks: &[ScheduleTask], now: i64) -> String {
 
 /// 一个时间点,写成人看的样子。与 CLI 的 `schedule list` 同一种写法(UTC),
 /// 因为下一次触发时间本来就是按 UTC 算出来的。
-fn when(epoch_secs: i64) -> String {
+pub(crate) fn when(epoch_secs: i64) -> String {
     let days = epoch_secs.div_euclid(86_400);
     let rest = epoch_secs.rem_euclid(86_400);
     let (year, month, day) = civil_from_days(days);

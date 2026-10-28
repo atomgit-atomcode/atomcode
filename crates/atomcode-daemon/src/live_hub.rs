@@ -87,6 +87,7 @@ pub struct LiveObservation {
 pub struct LiveJoin {
     pub binding: LiveBinding,
     pub snapshot: Arc<SessionSnapshot>,
+    pub model: Option<String>,
     /// Latest Goal controller state. Unlike turn replay, this must survive a
     /// completed turn so late `/live` subscribers can restore the Goal UI.
     pub goal_progress: Option<atomcode_coding::GoalProgress>,
@@ -136,6 +137,7 @@ struct HubState {
     next_cursor: u64,
     binding: Option<BoundRuntime>,
     snapshot: Option<Arc<SessionSnapshot>>,
+    model: Option<String>,
     snapshot_error: Option<String>,
     replay: Vec<LiveObservation>,
     goal_progress: Option<atomcode_coding::GoalProgress>,
@@ -285,6 +287,59 @@ impl LiveViewHub {
         provider_fingerprint: String,
         control: Arc<dyn LiveRuntimeControl>,
     ) -> Result<LiveBinding, HubError> {
+        self.install_live_view(None, view, provider, provider_fingerprint, control, || {})
+    }
+
+    /// A terminal host moves its shared view between runtimes it still owns.
+    /// Replacing a running view does not stop that runtime or answer its requests.
+    pub fn replace_live_view(
+        &self,
+        expected: &LiveBinding,
+        view: atomcode_coding::runtime::RuntimeLiveView,
+        provider: String,
+        provider_fingerprint: String,
+        control: Arc<dyn LiveRuntimeControl>,
+    ) -> Result<LiveBinding, HubError> {
+        self.install_live_view(
+            Some(expected),
+            view,
+            provider,
+            provider_fingerprint,
+            control,
+            || {},
+        )
+    }
+
+    /// The infallible driver commit runs under the hub lock, before any
+    /// remote reader or command can observe the replacement binding.
+    pub fn replace_live_view_and(
+        &self,
+        expected: &LiveBinding,
+        view: atomcode_coding::runtime::RuntimeLiveView,
+        provider: String,
+        provider_fingerprint: String,
+        control: Arc<dyn LiveRuntimeControl>,
+        commit: impl FnOnce(),
+    ) -> Result<LiveBinding, HubError> {
+        self.install_live_view(
+            Some(expected),
+            view,
+            provider,
+            provider_fingerprint,
+            control,
+            commit,
+        )
+    }
+
+    fn install_live_view(
+        &self,
+        expected: Option<&LiveBinding>,
+        view: atomcode_coding::runtime::RuntimeLiveView,
+        provider: String,
+        provider_fingerprint: String,
+        control: Arc<dyn LiveRuntimeControl>,
+        commit: impl FnOnce(),
+    ) -> Result<LiveBinding, HubError> {
         let status = control.status();
         if status.generation != view.generation {
             return Err(HubError::StaleBinding);
@@ -299,11 +354,32 @@ impl LiveViewHub {
             control.clone(),
             true,
         )?;
+        staged
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .model = view.model;
         for event in view.events {
             staged.publish(&binding, event)?;
         }
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if state.turn_active
+        if let Some(expected) = expected {
+            let current = state.binding.as_ref().ok_or(HubError::Unbound)?;
+            if current.identity.id != expected.id {
+                return Err(HubError::StaleBinding);
+            }
+            if matches!(
+                current.control.status().phase,
+                RuntimePhase::WaitingApproval | RuntimePhase::Reconfiguring
+            ) || state.pending_requests.values().any(|request| {
+                !atomcode_capabilities::tools::request_user_input::is_continued_question(
+                    &request.kind,
+                    &request.payload,
+                )
+            }) {
+                return Err(HubError::ActiveTurn);
+            }
+        } else if state.turn_active
             || state.binding.as_ref().is_some_and(|bound| {
                 matches!(
                     bound.control.status().phase,
@@ -352,6 +428,24 @@ impl LiveViewHub {
             .identity
             .clone();
         *state = next;
+        commit();
+        if let Some(previous) = expected {
+            // Existing subscribers are scoped to the OLD binding. Tell them
+            // where to reconnect; a new subscriber gets only the new baseline.
+            state.next_cursor += 1;
+            let _ = self.events.send(LiveObservation {
+                binding_id: previous.id,
+                generation: previous.generation,
+                cursor: state.next_cursor,
+                event: LiveViewEvent::Runtime(CodingRuntimeEvent::SessionChanged(
+                    atomcode_coding::SessionChanged {
+                        generation: atomcode_coding::RuntimeGeneration(binding.generation),
+                        session_id: Some(binding.session_id.clone()),
+                        working_dir: binding.working_dir.clone(),
+                    },
+                )),
+            });
+        }
         Ok(binding)
     }
 
@@ -396,6 +490,7 @@ impl LiveViewHub {
             control,
         });
         state.snapshot = Some(Arc::new(snapshot));
+        state.model = None;
         state.snapshot_error = None;
         state.replay.clear();
         state.goal_progress = None;
@@ -432,6 +527,7 @@ impl LiveViewHub {
         Ok(LiveJoin {
             binding,
             snapshot,
+            model: state.model.clone(),
             goal_progress: state.goal_progress.clone(),
             replay: state.replay.clone(),
             receiver,
@@ -463,6 +559,7 @@ impl LiveViewHub {
         }
         state.binding = None;
         state.snapshot = None;
+        state.model = None;
         state.snapshot_error = None;
         state.replay.clear();
         state.goal_progress = None;
@@ -500,6 +597,7 @@ impl LiveViewHub {
         }
         state.binding = None;
         state.snapshot = None;
+        state.model = None;
         state.snapshot_error = None;
         state.replay.clear();
         state.goal_progress = None;
@@ -543,10 +641,15 @@ impl LiveViewHub {
         if current.identity.id != binding.id {
             return Err(HubError::StaleBinding);
         }
+        let clear_model = current.identity.session_id != session_id
+            || current.identity.generation != current.control.status().generation;
         current.identity.generation = current.control.status().generation;
         current.identity.session_id = session_id;
         current.identity.working_dir = working_dir;
         let identity = current.identity.clone();
+        if clear_model {
+            state.model = None;
+        }
         state.snapshot = Some(Arc::new(snapshot));
         state.snapshot_error = None;
         state.replay.clear();
@@ -1049,6 +1152,7 @@ impl LiveViewHub {
             let current = state.binding.as_mut().expect("binding checked above");
             current.identity.generation = envelope.generation;
             state.replay.clear();
+            state.model = None;
             state.goal_progress = None;
             state.pending_requests.clear();
             state.pending_web_steers.clear();
@@ -1074,11 +1178,12 @@ impl LiveViewHub {
         // from the TUI's successful reload acknowledgement.  Treat an identical
         // projection as idempotent so the explicit acknowledgement path can make
         // delivery reliable without producing duplicate SSE events.
-        if let CodingRuntimeEvent::ProviderChanged { provider, .. } = &event {
+        if let CodingRuntimeEvent::ProviderChanged { provider, model } = &event {
             if state
                 .binding
                 .as_ref()
                 .is_some_and(|current| current.identity.provider == *provider)
+                && state.model.as_ref() == Some(model)
             {
                 return Ok(());
             }
@@ -1218,6 +1323,7 @@ impl LiveViewHub {
                     // The identity changes before the owner can asynchronously fetch
                     // the replacement snapshot. Never pair it with the previous
                     // session's snapshot during that window.
+                    state.model = None;
                     state.snapshot_error = Some("session snapshot pending".into());
                     state.replay.clear();
                     state.goal_progress = None;
@@ -1226,11 +1332,20 @@ impl LiveViewHub {
                     state.turn_active = false;
                 }
             }
+            CodingRuntimeEvent::Agent(AgentEvent::Described { description })
+                if state
+                    .binding
+                    .as_ref()
+                    .is_some_and(|current| current.identity.session_id == description.session) =>
+            {
+                state.model = description.model.clone();
+            }
             CodingRuntimeEvent::WorkingDirectoryChanged(working_dir) => {
                 let current = state.binding.as_mut().expect("binding checked above");
                 current.identity.working_dir = working_dir.clone();
             }
-            CodingRuntimeEvent::ProviderChanged { provider, .. } => {
+            CodingRuntimeEvent::ProviderChanged { provider, model } => {
+                state.model = Some(model.clone());
                 let current = state.binding.as_mut().expect("binding checked above");
                 if current.identity.provider != *provider {
                     current.identity.provider_fingerprint.clear();
@@ -1394,6 +1509,7 @@ impl LiveViewHub {
         if current.identity.generation < generation.0 {
             current.identity.generation = generation.0;
             state.replay.clear();
+            state.model = None;
             state.goal_progress = None;
             state.pending_requests.clear();
             state.pending_web_steers.clear();
@@ -1527,6 +1643,110 @@ mod tests {
         session_change_is_noop, HubError, HubState, LiveBinding, LiveRuntimeControl, LiveViewEvent,
         LiveViewHub, PendingWebSteer,
     };
+
+    #[test]
+    fn replacing_a_running_view_notifies_old_peers_and_rejects_old_events() {
+        let hub = LiveViewHub::new();
+        let (old, _) = control();
+        let previous = hub
+            .bind("old", "/old".into(), snapshot("old"), old.clone())
+            .unwrap();
+        let mut peer = hub.join().unwrap().receiver;
+        old.status.lock().unwrap().phase = RuntimePhase::InTurn;
+        let (incoming, _) = control();
+        let view = atomcode_coding::runtime::RuntimeLiveView::from_snapshot(
+            1,
+            "review".into(),
+            "/review".into(),
+            snapshot("review"),
+        );
+        let next = hub
+            .replace_live_view(&previous, view, "p".into(), "f".into(), incoming)
+            .unwrap();
+        assert_ne!(next.id, previous.id);
+        let notice = peer.try_recv().unwrap();
+        assert_eq!(notice.binding_id, previous.id);
+        assert!(
+            matches!(notice.event, LiveViewEvent::Runtime(CodingRuntimeEvent::SessionChanged(changed))
+            if changed.session_id.as_deref() == Some("review"))
+        );
+        assert_eq!(hub.join().unwrap().snapshot.messages[0].text, "review");
+        assert_eq!(
+            hub.publish(
+                &previous,
+                SequencedRuntimeEvent {
+                    generation: 1,
+                    sequence: 999,
+                    event: CodingRuntimeEvent::Agent(AgentEvent::TextDelta("late old text".into())),
+                }
+            ),
+            Err(HubError::StaleBinding)
+        );
+    }
+
+    #[test]
+    fn replacing_a_waiting_or_reconfiguring_view_leaves_it_intact() {
+        for phase in [RuntimePhase::WaitingApproval, RuntimePhase::Reconfiguring] {
+            let hub = LiveViewHub::new();
+            let (old, _) = control();
+            let previous = hub
+                .bind("old", "/old".into(), snapshot("old"), old.clone())
+                .unwrap();
+            old.status.lock().unwrap().phase = phase;
+            let (incoming, _) = control();
+            let view = atomcode_coding::runtime::RuntimeLiveView::from_snapshot(
+                1,
+                "review".into(),
+                "/review".into(),
+                snapshot("review"),
+            );
+            assert_eq!(
+                hub.replace_live_view(&previous, view, "p".into(), "f".into(), incoming),
+                Err(HubError::ActiveTurn)
+            );
+            assert_eq!(hub.binding().unwrap(), previous);
+            assert_eq!(hub.join().unwrap().snapshot.messages[0].text, "old");
+        }
+    }
+
+    #[test]
+    fn a_published_request_blocks_handover_before_the_status_watch_catches_up() {
+        let hub = LiveViewHub::new();
+        let (old, _) = control();
+        let previous = hub
+            .bind("old", "/old".into(), snapshot("old"), old)
+            .unwrap();
+        hub.publish(
+            &previous,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 1,
+                event: CodingRuntimeEvent::Request(atomcode_coding::RuntimeRequest {
+                    id: 42,
+                    kind: "approval".into(),
+                    payload: serde_json::json!({}),
+                    snapshot: None,
+                }),
+            },
+        )
+        .unwrap();
+        let (incoming, _) = control();
+        let view = atomcode_coding::runtime::RuntimeLiveView::from_snapshot(
+            1,
+            "review".into(),
+            "/review".into(),
+            snapshot("review"),
+        );
+        let mut committed = false;
+        assert_eq!(
+            hub.replace_live_view_and(&previous, view, "p".into(), "f".into(), incoming, || {
+                committed = true
+            }),
+            Err(HubError::ActiveTurn)
+        );
+        assert!(!committed, "a refused handover never commits the driver");
+        assert_eq!(hub.binding().unwrap(), previous);
+    }
 
     #[test]
     fn a_live_view_binds_during_a_turn_and_keeps_requests_and_sequence_watermark() {
@@ -3165,6 +3385,89 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error, HubError::StaleEvent);
+    }
+
+    #[test]
+    fn same_provider_model_changes_are_delivered_and_late_joins_keep_the_live_name() {
+        let hub = LiveViewHub::new();
+        let (control, _) = control();
+        let mut view = atomcode_coding::runtime::RuntimeLiveView::from_snapshot(
+            1,
+            "session-1".into(),
+            PathBuf::from("/one"),
+            snapshot("done"),
+        );
+        view.model = Some("lumen-alpha".into());
+        let binding = hub
+            .bind_live_view(view, "provider-a".into(), "fingerprint".into(), control)
+            .unwrap();
+        let mut receiver = hub.join().unwrap().receiver;
+        assert_eq!(hub.join().unwrap().model.as_deref(), Some("lumen-alpha"));
+        let changed = CodingRuntimeEvent::ProviderChanged {
+            provider: "provider-a".into(),
+            model: "second-model".into(),
+        };
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 1,
+                event: changed.clone(),
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(receiver.try_recv().unwrap().event, LiveViewEvent::Runtime(CodingRuntimeEvent::ProviderChanged { model, .. }) if model == "second-model")
+        );
+        assert_eq!(hub.join().unwrap().model.as_deref(), Some("second-model"));
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 2,
+                event: changed,
+            },
+        )
+        .unwrap();
+        assert!(
+            receiver.try_recv().is_err(),
+            "identical acknowledgement is still deduplicated"
+        );
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 3,
+                event: CodingRuntimeEvent::Agent(AgentEvent::Described {
+                    description: atomcode_kernel::agent::AgentDescription {
+                        session: "member".into(),
+                        model: Some("member-model".into()),
+                        ..Default::default()
+                    }
+                    .into(),
+                }),
+            },
+        )
+        .unwrap();
+        assert_eq!(hub.join().unwrap().model.as_deref(), Some("second-model"));
+        hub.replace_snapshot(
+            &binding,
+            "session-1".into(),
+            PathBuf::from("/one"),
+            snapshot("new base"),
+        )
+        .unwrap();
+        assert_eq!(hub.join().unwrap().model.as_deref(), Some("second-model"));
+        hub.detach(&hub.binding().unwrap()).unwrap();
+        let (control, _) = self::control();
+        hub.bind(
+            "different",
+            PathBuf::from("/two"),
+            snapshot("empty"),
+            control,
+        )
+        .unwrap();
+        assert!(hub.join().unwrap().model.is_none());
     }
 
     #[test]

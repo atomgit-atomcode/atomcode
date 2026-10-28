@@ -267,7 +267,16 @@ fn says_it_is(system: &str, name: &str, provider: &str, model: &str, when: &str)
 async fn the_agent_says_it_is_the_product_that_started_it() {
     let env = env();
     let recorder = Arc::new(Recorder::default());
-    let mut runtime = env.started(&recorder, other_product()).await;
+    // This criterion forbids provider branding, not the names of optional
+    // third-party API tools. Keep those out even with the atomgit feature on.
+    let mut start = env.start(
+        &recorder,
+        SessionMode::Fresh,
+        other_product(),
+        HostPlugins::new(),
+    );
+    start.agent.atomgit_enabled = false;
+    let mut runtime = CodingRuntime::start(start).await.expect("runtime starts");
     turn(&mut runtime, "hello").await;
     let system = recorder.system();
 

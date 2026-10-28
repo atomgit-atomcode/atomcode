@@ -4008,11 +4008,7 @@ body {
   cursor: pointer;
 }
 
-.retained-history-badge, .compaction-history { color: var(--app-secondary-foreground); font-size: .85rem; margin-block: .5rem; }
-.compaction-history button { cursor: pointer; text-decoration: underline; }
-.compaction-history-records { max-height: 60vh; overflow: auto; padding: 1rem; border: 1px solid var(--app-border-subtle); border-radius: .5rem; }
-.compaction-history-records pre { white-space: pre-wrap; overflow-wrap: anywhere; font-family: inherit; }
-.compaction-history-records article { border-bottom: 1px solid var(--app-border-subtle); padding-block: .75rem; }
+.retained-history-badge { color: var(--app-secondary-foreground); font-size: .85rem; margin-block: .5rem; }
 
 .goal-recovery-status {
   padding: 8px 12px;
@@ -4030,3 +4026,109 @@ body {
 .session-reference-chips { display: flex; flex-wrap: wrap; gap: 6px; padding: 4px 0; }
 .session-reference-chip { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--app-input-border); border-radius: 8px; padding: 3px 8px; font-size: 12px; }
 .session-reference-chip button { border: 0; background: transparent; color: inherit; cursor: pointer; }
+
+/* Access recovery covers the mounted app without discarding draft or layout. */
+.auth-required-overlay { position: fixed; inset: 0; z-index: 1000; overflow: auto; background: var(--app-primary-background, #fff); }
+.btn-auth-retry { min-height: 44px; padding: 8px 16px; border: 1px solid var(--app-input-border); border-radius: 8px; background: var(--app-input-background); color: inherit; cursor: pointer; }
+.btn-auth-retry:disabled { opacity: .6; cursor: wait; }
+
+@media (max-width: 768px) {
+  /* Focus inside reveals the existing toolbar. Attachments/errors stay visible. */
+  .input-box:not(:focus-within):not(.has-input-detail) {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 6px;
+  }
+  .input-box:not(:focus-within):not(.has-input-detail) .message-input {
+    grid-column: 1;
+    grid-row: 1;
+    height: 44px !important; /* overrides a previous multiline inline height */
+    min-height: 44px;
+    max-height: 44px;
+    padding: 10px 4px;
+    overflow: hidden;
+  }
+  .input-box:not(:focus-within):not(.has-input-detail) .input-footer,
+  .input-box:not(:focus-within):not(.has-input-detail) .input-footer-actions {
+    display: contents;
+  }
+  .input-box:not(:focus-within):not(.has-input-detail) .input-footer-primary,
+  .input-box:not(:focus-within):not(.has-input-detail) .mode-selector,
+  .input-box:not(:focus-within):not(.has-input-detail) .model-controls,
+  .input-box:not(:focus-within):not(.has-input-detail) .session-reference-chips,
+  .input-box:not(:focus-within):not(.has-input-detail) .input-turn-controls > .btn-send {
+    display: none;
+  }
+  .input-box:not(:focus-within):not(.has-input-detail) .input-turn-controls {
+    grid-column: 2;
+    grid-row: 1;
+  }
+  .input-box:not(:focus-within):not(.has-input-detail):not(.is-running) .input-turn-controls {
+    display: none;
+  }
+  .input-box:not(:focus-within):not(.has-input-detail) ~ .input-subbar,
+  .input-box:not(:focus-within):not(.has-input-detail) ~ .turn-stats {
+    display: none;
+  }
+}
+
+/* Turn navigation floats over the outer gutter; it never resizes the reading lane. */
+.turn-nav-rail {
+  position: absolute; right: 8px; top: 20%; z-index: 22;
+  width: 32px; max-height: 52%; display: flex; flex-direction: column;
+  border-radius: 12px; color: var(--app-secondary-foreground);
+  background: var(--app-primary-background);
+  background: color-mix(in srgb, var(--app-primary-background) 94%, transparent);
+  border: 1px solid var(--app-border-subtle); box-shadow: 0 3px 14px #0000000b;
+}
+.turn-nav-rail.is-expanded { background: var(--app-primary-background); width: min(300px, calc(100% - 32px)); box-shadow: 0 8px 32px #00000018; }
+.turn-nav-toggle { width: 100%; min-height: 36px; display: flex; align-items: center; justify-content: center; gap: 10px; border: 0; background: transparent; color: inherit; cursor: pointer; border-radius: 10px; }
+.turn-nav-rail.is-expanded .turn-nav-toggle { padding-inline: 12px; }
+.turn-nav-toggle span { flex: 1; text-align: left; font-size: 12px; font-weight: 600; }
+.turn-nav-toggle small { margin-left: 8px; font-weight: normal; opacity: .7; }
+.turn-nav-tabs { display: flex; gap: 4px; padding: 0 8px 7px; border-bottom: 1px solid var(--app-border-subtle); }
+.turn-nav-tabs button { flex: 1; font-size: 11px; padding: 5px; border-radius: 5px; color: inherit; border: 0; background: transparent; cursor: pointer; }
+.turn-nav-tabs .is-active { color: var(--app-primary-foreground); background: var(--app-secondary-background); }
+.turn-nav-list { overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; height: min(340px, 38vh); height: min(340px, 38dvh); min-height: 0; scrollbar-width: thin; }
+.turn-nav-track { position: relative; }
+.turn-nav-node { position: absolute; left: 0; width: 100%; display: flex; align-items: center; gap: 10px; padding: 0 8px; border: 0; background: transparent; color: inherit; cursor: pointer; text-align: left; }
+.turn-nav-mark { width: 14px; height: 2px; flex-shrink: 0; border-radius: 2px; background: currentColor; opacity: .35; transition: opacity .15s, height .15s; }
+.turn-nav-node:hover, .turn-nav-node:focus-visible { background: var(--app-secondary-background); color: var(--app-primary-foreground); }
+.turn-nav-node.is-active .turn-nav-mark { opacity: 1; height: 4px; background: var(--app-accent-color); }
+.turn-nav-node.is-undone .turn-nav-mark { opacity: .3; background: transparent; border-top: 2px dashed currentColor; }
+.turn-nav-summary { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 3px; }
+.turn-nav-summary > span, .turn-nav-summary small { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.turn-nav-summary > span { font-size: 12px; color: var(--app-primary-foreground); }
+.turn-nav-summary b { font-size: 10px; font-weight: normal; opacity: .6; margin-right: 4px; }
+.turn-nav-summary small { font-size: 10px; opacity: .75; }
+.turn-nav-summary em { font-style: normal; }
+.turn-nav-status, .turn-nav-footnote { padding: 8px 10px; font-size: 11px; margin: 0; }
+.turn-nav-status button { color: inherit; text-decoration: underline; border: 0; background: none; cursor: pointer; }
+.turn-nav-footnote { border-top: 1px solid var(--app-border-subtle); opacity: .7; line-height: 1.5; }
+.turn-nav-rail button:focus-visible { outline: 2px solid var(--app-accent-color); outline-offset: -2px; }
+.turn-nav-history-target { scroll-margin-top: 20px; animation: turn-nav-flash 1.8s ease-out; }
+@keyframes turn-nav-flash { from { background: #8294ee30; } to { background: transparent; } }
+@media (max-width: 768px) {
+  .turn-nav-rail { right: 6px; top: 64px; max-height: 46%; }
+  .turn-nav-rail:not(.is-expanded) .turn-nav-list { display: none; }
+  .turn-nav-toggle { min-height: 44px; }
+  .turn-nav-rail.is-expanded { width: min(300px, calc(100% - 24px)); }
+  .turn-nav-tabs button { min-height: 36px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .turn-nav-mark { transition: none; }
+  .turn-nav-history-target { animation: none; outline: 2px solid var(--app-accent-color); }
+}
+
+
+
+/* Archived turns share the normal timeline lane and its single scrollbar. */
+.timeline-history-turn { display: flex; flex-direction: column; min-width: 0; }
+.timeline-history-turn.is-undone { opacity: .65; }
+.timeline-history-status { padding: 12px 0; color: var(--app-secondary-foreground); font-size: .85rem; text-align: center; }
+.timeline-history-status button { cursor: pointer; color: inherit; text-decoration: underline; }
+
+.timeline-history-status.is-loading { position: sticky; top: 0; z-index: 4; height: 0; min-height: 0; flex: 0 0 0; padding: 0; pointer-events: none; }
+.timeline-history-status.is-loading > span { display: inline-block; padding: 4px 10px; border-radius: 8px; background: var(--app-primary-background); }

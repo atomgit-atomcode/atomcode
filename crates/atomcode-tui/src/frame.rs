@@ -519,6 +519,21 @@ impl Frame {
         self.highlight_with_colors(sel, true);
     }
 
+    /// A 16-colour palette can quantize the selection's grey back to the
+    /// terminal background (PuTTY TERM=xterm). Reverse remains visible there.
+    pub(crate) fn highlight_for_caps(
+        &mut self,
+        sel: &crate::moment::Selection,
+        caps: crate::caps::Caps,
+    ) {
+        let background = caps.cell_background
+            && matches!(
+                caps.colors,
+                crate::caps::Colors::Ansi256 | crate::caps::Colors::True
+            );
+        self.highlight_with_colors(sel, background);
+    }
+
     pub(crate) fn highlight_with_colors(&mut self, sel: &crate::moment::Selection, colors: bool) {
         if sel.is_empty() {
             return;
@@ -838,6 +853,47 @@ mod tests {
         // One for the line count, one for each over-wide line.
         assert_eq!(v.len(), 3, "{v:?}");
         assert!(v.iter().all(|m| m.contains("greedy")));
+    }
+
+    #[test]
+    fn limited_colour_selections_reverse_while_rich_terminals_keep_the_band() {
+        use crate::caps::{Caps, Colors};
+        for (colors, backgrounds, reverse) in [
+            (Colors::Ansi16, true, true),
+            (Colors::None, true, true),
+            (Colors::Ansi256, false, true),
+            (Colors::Ansi256, true, false),
+            (Colors::True, true, false),
+        ] {
+            let mut frame = Frame::new(10, 1);
+            frame.place(
+                "text",
+                Rect::new(0, 0, 10, 1),
+                vec![Line::raw("abcdefghij")],
+            );
+            frame.highlight_for_caps(
+                &crate::moment::Selection {
+                    anchor: (2, 0),
+                    head: (4, 0),
+                },
+                Caps {
+                    colors,
+                    cell_background: backgrounds,
+                    ..Caps::default()
+                },
+            );
+            let spans = &frame.parts[0].lines[0].spans;
+            let marked = spans.iter().find(|s| s.text == "cde").unwrap();
+            assert_eq!(marked.style.reverse, reverse);
+            assert_eq!(marked.style.bg.is_some(), !reverse);
+            assert_eq!(
+                frame.selected_text(&crate::moment::Selection {
+                    anchor: (2, 0),
+                    head: (4, 0)
+                }),
+                "cde"
+            );
+        }
     }
 
     #[test]

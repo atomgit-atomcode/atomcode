@@ -8,6 +8,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use atomcode_kernel::agent::ArgsRequirement;
+
 #[derive(Clone, Debug)]
 pub struct Skill {
     pub name: String,
@@ -20,6 +22,11 @@ pub struct Skill {
     /// If false (`user-invocable: false` in frontmatter), hidden from the `/` menu;
     /// the model can still auto-invoke it. Absent → true.
     pub user_invocable: bool,
+    /// Whether the disk declared an argument requirement for this skill. The
+    /// default is `Unspecified`, which preserves legacy command behaviour
+    /// exactly: a front matter without `args:` neither routes a front end to a
+    /// completion path nor forces one onto a required path.
+    pub args_requirement: ArgsRequirement,
     /// Directory containing the skill file (for `${CLAUDE_SKILL_DIR}`).
     pub skill_dir: PathBuf,
     pub source_path: PathBuf,
@@ -221,6 +228,13 @@ struct Frontmatter {
     /// If false (`user-invocable: false`), hidden from the `/` menu — the model can
     /// still auto-invoke. Absent → true.
     user_invocable: bool,
+    /// Whether the front matter declared `args: required|optional|none`. The
+    /// default `Unspecified` keeps a legacy skill's behaviour unchanged.
+    args_requirement: ArgsRequirement,
+    /// When present, a diagnostic about a malformed `args:` value — reported
+    /// through the same `tools_error` slot as a bad `allowed-tools` list, so
+    /// the loader's single diagnostic path carries it out.
+    args_error: Option<String>,
 }
 
 impl Default for Frontmatter {
@@ -231,6 +245,8 @@ impl Default for Frontmatter {
             allowed_tools: Vec::new(),
             tools_error: None,
             user_invocable: true,
+            args_requirement: ArgsRequirement::Unspecified,
+            args_error: None,
         }
     }
 }
@@ -410,6 +426,26 @@ fn parse_frontmatter(content: &str) -> (Frontmatter, String) {
         } else if let Some(v) = line.strip_prefix("user-invocable:") {
             // Mirror core: only the literal `false` hides it; anything else stays true.
             fm.user_invocable = v.trim() != "false";
+        } else if let Some(v) = line.strip_prefix("args:") {
+            // Three declared values, matched case-insensitively so a person who
+            // writes `args: Required` is not punished; anything else is a
+            // diagnostic rather than a silent fallback to `optional` (which
+            // would change the command's behaviour in a way the person did
+            // not ask for).
+            let value = fm_value(without_yaml_comment(v))
+                .trim()
+                .to_ascii_lowercase();
+            match value.as_str() {
+                "required" => fm.args_requirement = ArgsRequirement::Required,
+                "optional" => fm.args_requirement = ArgsRequirement::Optional,
+                "none" => fm.args_requirement = ArgsRequirement::None,
+                "" => {}
+                _ => {
+                    fm.args_error = Some(format!(
+                        "invalid args value `{value}` (expected `required`, `optional`, or `none`)"
+                    ))
+                }
+            }
         }
     }
     (fm, body.to_string())
@@ -486,7 +522,7 @@ fn make_name(base: &str, namespace: Option<&str>) -> String {
 }
 
 /// Parse a flat `name.md` skill (name = file stem unless overridden in frontmatter).
-pub(crate) fn parse_skill_file(path: &Path, namespace: Option<&str>) -> Result<Skill, String> {
+pub(crate) fn parse_skill_file(path: &Path, namespace: Option<&str>) -> Result<Parsed, String> {
     let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     let stem = path
         .file_stem()
@@ -526,7 +562,7 @@ pub(crate) fn parse_skill_dir(
     skill_dir: &Path,
     skill_md: &Path,
     namespace: Option<&str>,
-) -> Result<Skill, String> {
+) -> Result<Parsed, String> {
     let content = std::fs::read_to_string(skill_md).map_err(|e| e.to_string())?;
     let dir_name = skill_dir
         .file_name()
@@ -542,6 +578,18 @@ pub(crate) fn parse_skill_dir(
     )
 }
 
+/// A parsed skill plus any non-fatal diagnostic the loader should surface.
+/// Fatal problems — an unreadable file, an invalid name, a malformed
+/// `allowed-tools` declaration — are an `Err`. A bad `args:` value is a
+/// warning instead: the skill still loads with its default (`Unspecified`,
+/// which keeps a legacy command's behaviour exactly), so a typo must not drop
+/// the command from the menu.
+#[derive(Debug)]
+pub(crate) struct Parsed {
+    pub(crate) skill: Skill,
+    pub(crate) warnings: Vec<String>,
+}
+
 fn build_skill(
     content: &str,
     default_name: &str,
@@ -549,10 +597,18 @@ fn build_skill(
     source: &Path,
     namespace: Option<&str>,
     directory_style: bool,
-) -> Result<Skill, String> {
+) -> Result<Parsed, String> {
     let (fm, template) = parse_frontmatter(content);
     if let Some(error) = fm.tools_error {
         return Err(error);
+    }
+    // `allowed-tools` errors stay fatal: a malformed grant would otherwise
+    // widen what the skill is allowed to touch, so it must refuse to load. An
+    // unknown `args:` value degrades to the default instead, and is reported
+    // here so the person can fix the typo without losing the command.
+    let mut warnings = Vec::new();
+    if let Some(error) = fm.args_error {
+        warnings.push(error);
     }
     let declared_name = fm.name.as_deref().unwrap_or(default_name);
     // Some catalogs use `name` as a human-readable title. The install name
@@ -575,15 +631,17 @@ fn build_skill(
     } else {
         fm.description
     };
-    Ok(Skill {
+    let skill = Skill {
         name,
         description,
         template,
         allowed_tools: fm.allowed_tools,
         user_invocable: fm.user_invocable,
+        args_requirement: fm.args_requirement,
         skill_dir: skill_dir.to_path_buf(),
         source_path: source.to_path_buf(),
-    })
+    };
+    Ok(Parsed { skill, warnings })
 }
 
 #[cfg(test)]
@@ -674,7 +732,7 @@ mod tests {
             content.to_owned(),
             content.replace("allowed-tools:", "allowed_tools:"),
         ] {
-            let skill = build_skill(
+            let parsed = build_skill(
                 &content,
                 "automation-recommender",
                 Path::new("."),
@@ -683,6 +741,8 @@ mod tests {
                 true,
             )
             .unwrap();
+            let skill = parsed.skill;
+            assert!(parsed.warnings.is_empty());
             assert_eq!(skill.name, "setup");
             assert_eq!(
                 skill.allowed_tools,
@@ -698,6 +758,7 @@ mod tests {
             template: template.into(),
             allowed_tools: vec![],
             user_invocable: true,
+            args_requirement: ArgsRequirement::Unspecified,
             skill_dir: PathBuf::from("/sk"),
             source_path: PathBuf::from("/sk/SKILL.md"),
         }
@@ -711,6 +772,130 @@ mod tests {
         assert!(!fm.user_invocable);
         let (fm2, _) = parse_frontmatter("---\nname: x\n---\nbody");
         assert!(fm2.user_invocable, "absent → default true");
+    }
+
+    #[test]
+    fn frontmatter_parses_args_requirement() {
+        // `args:` is optional; the three declared values each map to their
+        // own `ArgsRequirement` variant.
+        let (fm, _) = parse_frontmatter("---\nname: x\nargs: required\n---\nbody");
+        assert_eq!(fm.args_requirement, ArgsRequirement::Required);
+        assert!(fm.args_error.is_none(), "no error: {:?}", fm.args_error);
+
+        let (fm, _) = parse_frontmatter("---\nname: x\nargs: optional\n---\nbody");
+        assert_eq!(fm.args_requirement, ArgsRequirement::Optional);
+
+        let (fm, _) = parse_frontmatter("---\nname: x\nargs: none\n---\nbody");
+        assert_eq!(fm.args_requirement, ArgsRequirement::None);
+    }
+
+    #[test]
+    fn quoted_args_requirements_preserve_the_declared_policy() {
+        for (declaration, expected) in [
+            ("\"required\"", ArgsRequirement::Required),
+            ("'ReQuIrEd' # explanation", ArgsRequirement::Required),
+            ("\"optional\" # explanation", ArgsRequirement::Optional),
+            ("'none'", ArgsRequirement::None),
+        ] {
+            let parsed = build_skill(
+                &format!("---\nargs: {declaration}\n---\nTask: $ARGUMENTS"),
+                "needs",
+                Path::new("."),
+                Path::new("needs.md"),
+                None,
+                false,
+            )
+            .unwrap();
+            assert_eq!(parsed.skill.args_requirement, expected, "{declaration}");
+            assert!(
+                parsed.warnings.is_empty(),
+                "{declaration}: {:?}",
+                parsed.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn frontmatter_absent_args_stays_unspecified() {
+        // Absent `args:` reads as `Unspecified`, not `Optional`. The two states
+        // diverge in the front end's routing: `Optional` opts a command into
+        // the completion path; `Unspecified` keeps a legacy command's
+        // dispatch exactly as it was.
+        let (fm, _) = parse_frontmatter("---\nname: x\n---\nbody");
+        assert_eq!(fm.args_requirement, ArgsRequirement::Unspecified);
+        assert!(fm.args_error.is_none());
+
+        // Also for a completely empty frontmatter block.
+        let (fm, _) = parse_frontmatter("---\n---\nbody");
+        assert_eq!(fm.args_requirement, ArgsRequirement::Unspecified);
+    }
+
+    #[test]
+    fn frontmatter_rejects_unknown_args_value() {
+        // An unknown value is a diagnostic rather than a silent fallback to
+        // `optional`, which would change the command's behaviour without the
+        // person asking for it. The loader surfaces the diagnostic through
+        // `args_error`; `args_requirement` stays at the safe default.
+        let (fm, _) = parse_frontmatter("---\nname: x\nargs: bogus\n---\nbody");
+        assert_eq!(fm.args_requirement, ArgsRequirement::Unspecified);
+        let err = fm.args_error.expect("unknown args value must be reported");
+        assert!(
+            err.contains("bogus"),
+            "diagnostic names the bad value: {err}"
+        );
+        assert!(
+            err.contains("required") && err.contains("optional") && err.contains("none"),
+            "diagnostic names the accepted forms: {err}"
+        );
+    }
+
+    #[test]
+    fn frontmatter_args_value_is_case_insensitive() {
+        // `Args: Required` is not punished: the loader accepts the three
+        // values case-insensitively so a person's capitalisation does not
+        // matter.
+        for (spelling, variant) in [
+            ("Required", ArgsRequirement::Required),
+            ("REQUIRED", ArgsRequirement::Required),
+            ("Optional", ArgsRequirement::Optional),
+            ("NONE", ArgsRequirement::None),
+        ] {
+            let (fm, _) = parse_frontmatter(&format!("---\nname: x\nargs: {spelling}\n---\nbody"));
+            assert_eq!(fm.args_requirement, variant, "spelling `{spelling}`");
+            assert!(fm.args_error.is_none(), "no error: {:?}", fm.args_error);
+        }
+    }
+
+    #[test]
+    fn build_skill_loads_and_warns_on_unknown_args_value() {
+        // An unknown `args:` value degrades to the default rather than failing
+        // to load. The command keeps its legacy behaviour and the typo is
+        // reported as a warning, so one misspelling does not drop the command
+        // from the menu — unlike a malformed `allowed-tools` grant, which must
+        // refuse to load.
+        let parsed = build_skill(
+            "---\nname: x\nargs: bogus\n---\nbody",
+            "x",
+            Path::new("/sk"),
+            Path::new("/sk/SKILL.md"),
+            None,
+            true,
+        )
+        .expect("an unknown args value must not fail the load");
+        assert_eq!(
+            parsed.skill.args_requirement,
+            ArgsRequirement::Unspecified,
+            "the declaration falls back to the default"
+        );
+        let warning = parsed
+            .warnings
+            .iter()
+            .next()
+            .expect("the typo must be reported");
+        assert!(
+            warning.contains("bogus"),
+            "diagnostic names the bad value: {warning}"
+        );
     }
 
     #[test]

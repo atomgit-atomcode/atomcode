@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import {
   parseTokens,
+  providerHost,
   formatTokens,
   apiKeyProblem,
   validAccountId,
@@ -184,4 +185,28 @@ test('a discovery pick adds new rows with what the endpoint reported, never twic
   assert.equal(rows[1].window, '1M');
   assert.equal(rows[1].maxTokens, '32K');
   assert.equal(rows[2].displayName, '', 'a name equal to the id adds nothing');
+});
+
+test('discovery carries declared vision, reasoning and capacities into the saved model', () => {
+  const [row] = adoptPicked([emptyModelDraft()], [{
+    id: 'flash', name: 'Flash', context_window: 1048576, max_tokens: 393216,
+    supports_vision: true, reasoning_effort_levels: ['low', 'high', 'max'], reasoning_effort: 'high',
+  }]);
+  assert.equal(row.vision, true);
+  assert.deepEqual(row.reasoning, { enabled: true, levels: ['low', 'high', 'max'], effort: 'high' });
+  const body = modelBody(row);
+  assert.equal(body.context_window, 1048576);
+  assert.equal(body.max_tokens, 393216);
+  assert.equal(body.supports_vision, true);
+  assert.deepEqual(body.reasoning_effort_levels, ['low', 'high', 'max']);
+  const [unknown] = adoptPicked([], [{ id: 'unknown' }]);
+  assert.equal(unknown.vision, null);
+  assert.equal(unknown.reasoning.enabled, false);
+});
+
+test('provider labels show the actual host without paths or credentials', () => {
+  assert.equal(providerHost('https://api.deepseek.com/v1'), 'api.deepseek.com');
+  assert.equal(providerHost('https://user:secret@proxy.example:8443/path?key=hidden'), 'proxy.example:8443');
+  assert.equal(providerHost(''), '');
+  assert.equal(providerHost('invalid'), '');
 });

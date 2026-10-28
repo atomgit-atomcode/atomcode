@@ -551,13 +551,8 @@ impl Producer for Transcript {
 
             // ---- things the harness did that change what the model sees -----
             //
-            // All four are what `NoticeBlock` is for — "something the harness
-            // did that a person should know and the model must not" — and all
-            // four were in the log and off the screen
-            // (`docs/plans/2026-09-18-tui-panels-and-commands-inventory.md`
-            // A5, A6, A8, A9). A person reading a conversation where the middle
-            // silently left, or where a tool's output is not what the model was
-            // handed, needs it said.
+            // Summary folds and dropped history warrant a notice; routine
+            // tool-output rewrites stay in the event log without UI noise.
             SessionEvent::Compacted { through, .. } => {
                 out.emit(
                     at,
@@ -566,14 +561,9 @@ impl Producer for Transcript {
                     }),
                 );
             }
-            SessionEvent::MessagesRewritten { texts, .. } => {
-                out.emit(
-                    at,
-                    Arc::new(NoticeBlock {
-                        detail: t(Msg::TranscriptShortened { count: texts.len() }).into_owned(),
-                    }),
-                );
-            }
+            // Tool-output cleanup is bookkeeping, not a summary of the conversation.
+            // Keep the fact in the log without adding a transcript notice.
+            SessionEvent::MessagesRewritten { .. } => {}
             SessionEvent::ToolResultsStubbed { through, .. } => {
                 out.emit(
                     at,
@@ -1129,14 +1119,10 @@ mod tests {
             .join("\n")
     }
 
-    /// What the harness did to what the model sees is on the screen too
-    /// (`docs/plans/2026-09-18-tui-panels-and-commands-inventory.md` A5, A6,
-    /// A9): a conversation whose middle was compacted away, whose tool output
-    /// the model was handed shorter than it is here, or whose results stopped
-    /// being sent, reads as a conversation that makes no sense — unless it says
-    /// so.
+    /// Summary folds and dropped results remain visible; routine tool-output
+    /// rewrites do not add bookkeeping notices to the conversation.
     #[test]
-    fn what_the_model_was_handed_instead_is_said_on_screen() {
+    fn summary_folds_are_visible_but_tool_output_cleanup_is_silent() {
         use atomcode_harness::session::RewrittenText;
         // Asserts the Chinese wording, so it must not race a parallel test
         // flipping the process-global locale — same class as the conformance
@@ -1174,8 +1160,8 @@ mod tests {
             "the compaction says how far it reached:\n{drawn}"
         );
         assert!(
-            drawn.contains("2 处工具输出被就地换短"),
-            "and how much the model was handed differently:\n{drawn}"
+            !drawn.contains("工具输出被就地换短"),
+            "routine cleanup stays silent:\n{drawn}"
         );
         assert!(
             drawn.contains("#9") && drawn.contains("没有再发给模型"),

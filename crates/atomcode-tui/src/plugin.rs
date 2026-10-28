@@ -213,6 +213,9 @@ struct Link {
 /// person has looked at (`docs/adr/0023` §3).
 #[derive(Default)]
 struct Views {
+    /// Receipt after a switched session's initial history, on the same event
+    /// stream as its facts. Until it arrives, intermediate backfill is not painted.
+    replay_receipt: Option<CommandId>,
     /// The session the host gave: the lead, when there is a team.
     root: String,
     /// The one on screen — the root, or a member of its team.
@@ -593,12 +596,44 @@ impl AgentClient {
     /// Draw `session` from its first fact. Whatever was followed before — the
     /// session and any member looked at — is let go.
     pub(crate) fn follow(&self, session: &str) {
+        self.follow_inner(session, false);
+    }
+
+    fn follow_switched(&self, session: &str) {
+        self.follow_inner(session, true);
+    }
+
+    fn replaying(&self) -> bool {
+        self.view
+            .lock()
+            .expect("client poisoned")
+            .replay_receipt
+            .is_some()
+    }
+
+    fn finish_replay(&self, command: &str) -> bool {
+        let mut views = self.view.lock().expect("client poisoned");
+        if views.replay_receipt.as_deref() != Some(command) {
+            return false;
+        }
+        views.replay_receipt = None;
+        true
+    }
+
+    fn follow_inner(&self, session: &str, switched: bool) {
+        let receipt = switched.then(|| {
+            format!(
+                "tui-replay-{}",
+                self.receipts.fetch_add(1, Ordering::SeqCst)
+            )
+        });
         let previous = {
             let mut views = self.view.lock().expect("client poisoned");
             let previous: Vec<String> = views.sessions.keys().cloned().collect();
             *views = Views {
                 root: session.to_string(),
                 on_screen: session.to_string(),
+                replay_receipt: receipt.clone(),
                 ..Views::default()
             };
             views
@@ -609,9 +644,16 @@ impl AgentClient {
         for old in previous.into_iter().filter(|old| old != session) {
             self.command(AgentCommand::Unsubscribe { session: old });
         }
-        self.command(AgentCommand::Subscribe {
+        let subscribe = AgentCommand::Subscribe {
             session: session.to_string(),
             from: 0,
+        };
+        self.command(match receipt {
+            Some(id) => AgentCommand::Tagged {
+                id,
+                command: Box::new(subscribe),
+            },
+            None => subscribe,
         });
     }
 
@@ -1644,6 +1686,23 @@ impl UserInterface for Tui {
         let mut welcome_note = ctx
             .service::<OpeningNoticesSvc>()
             .and_then(|notices| notices.welcome_note.clone());
+        let launcher_note_pending = welcome_note.is_some();
+        let native_mouse_notice = (!self.surface.mouse()).then(|| {
+            t(if crate::caps::mouse_reported() {
+                Msg::MouseHandedBackAtStart
+            } else {
+                Msg::MouseUnreportedAtStart
+            })
+            .into_owned()
+        });
+        // Part of the welcome's foot, below cwd/model. Never emit a standalone
+        // startup mouse message that could race ahead of the product header.
+        if let Some(notice) = native_mouse_notice.as_deref() {
+            welcome_note = Some(match welcome_note {
+                Some(note) if !note.trim().is_empty() => format!("{notice}\n{note}"),
+                _ => notice.to_string(),
+            });
+        }
         //
         // Held until the welcome has been drawn, and said right under it: drawn
         // the moment the screen came up, they stood above the welcome — the
@@ -1663,8 +1722,9 @@ impl UserInterface for Tui {
                     .collect()
             })
             .unwrap_or_default();
-        let notices_held_since = std::time::Instant::now();
-        if !opening_notices.is_empty() {
+        let notices_held_since = tokio::time::Instant::now();
+        let mut opening_events = Vec::new();
+        {
             let wake = wake_tx.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(OPENING_NOTICE_WAIT).await;
@@ -1719,20 +1779,10 @@ impl UserInterface for Tui {
                 tokio::spawn(async move { read_input(keys_tx, move || !surface.mouse()).await })
             }
         };
-        // `[ui] mouse = false`: the pointer is the terminal's from the first
-        // frame, so ↑/↓ scroll and the history is on ctrl-p/ctrl-n — said once,
-        // on the tip row, where nobody has to have pressed ctrl-g to learn it.
-        if !self.surface.mouse() {
-            // A terminal that reports no mouse is told what does work there —
-            // not about a ctrl-g that would take nothing, or a wheel that sends
-            // nothing.
-            let tip = if crate::caps::mouse_reported() {
-                Msg::MouseHandedBackAtStart
-            } else {
-                Msg::MouseUnreportedAtStart
-            };
-            self.host
-                .say_for(t(tip).into_owned(), false, MOUSE_NOTICE_MS * 2);
+        // Keep the existing transient hint too; the welcome carries the durable
+        // startup explanation even when another tip replaces this one.
+        if let Some(tip) = native_mouse_notice {
+            self.host.say_for(tip, false, MOUSE_NOTICE_MS * 2);
         }
 
         // Before anything is typed: would a turn be taken at all?
@@ -1773,17 +1823,40 @@ impl UserInterface for Tui {
             });
         }
 
-        // Whether a newer build is out: asked once, off the loop, and only said
+        // Remote availability is asked once; local replacement is watched thereafter.
+        // The hint is only said
         // if there is one. The launcher decides the words (a package manager
         // upgrades some installs, not `/upgrade`); the row draws them.
         if let Some(check) = ctx.service::<UpdateCheckSvc>() {
             let host = self.host.clone();
             let keys = wake_tx.clone();
             tokio::spawn(async move {
-                if let Some(hint) = check.available().await {
-                    host.moment.write().expect("moment poisoned").update = Some(hint);
-                    let _ = keys.send(Wake::Fact);
-                }
+                crate::update::watch(
+                    check,
+                    |notice| {
+                        match notice {
+                            crate::update::UpdateNotice::Available(hint) => {
+                                host.moment.write().expect("moment poisoned").update = Some(hint);
+                                let _ = keys.send(Wake::Fact);
+                            }
+                            crate::update::UpdateNotice::Installed(change) => {
+                                {
+                                    let mut moment = host.moment.write().expect("moment poisoned");
+                                    moment.update = None;
+                                    moment.restart_hint = Some(change.hint);
+                                }
+                                // Also retain the one-time explanation in the conversation.
+                                deliver(
+                                    &host,
+                                    &keys,
+                                    crate::command::Outcome::Said(change.message),
+                                );
+                            }
+                        }
+                    },
+                    keys.closed(),
+                )
+                .await;
             });
         }
 
@@ -1945,7 +2018,7 @@ impl UserInterface for Tui {
                         let opened = self
                             .host
                             .open_conversation(crate::block::Coord::default(), &open);
-                        if opened && welcome_note.take().is_some() {
+                        if opened && welcome_note.take().is_some() && launcher_note_pending {
                             // Drawn: only now is it spent on the launcher's side.
                             if let Some(seen) = self
                                 .ctx
@@ -1978,7 +2051,12 @@ impl UserInterface for Tui {
                     stale |= say_opening_notices(&mut opening_notices);
                 }
             }
-            if stale && (coalesced >= COALESCE_LIMIT || wake.is_empty()) {
+            if !owes_opening || notices_held_since.elapsed() >= OPENING_NOTICE_WAIT {
+                for event in opening_events.drain(..) {
+                    stale |= self.on_event(event);
+                }
+            }
+            if stale && !client.replaying() && (coalesced >= COALESCE_LIMIT || wake.is_empty()) {
                 // The reading the frame about to be painted is drawn from. Facts
                 // absorb against whatever the last one was — a frame at most out
                 // of date, and the only reading available between commits.
@@ -2160,6 +2238,16 @@ impl UserInterface for Tui {
                 // streamed delta is already in the transcript by the time it is
                 // projected into this event, and this is the same news again.
                 // `on_event` says which arrivals did move it.
+                // Runtime startup warnings use the event channel, rather than
+                // OpeningNoticesSvc. Give both paths the same welcome ordering.
+                // Terminal errors still take effect immediately.
+                Wake::Event(
+                    event @ AgentEvent::Error {
+                        ends_turn: false, ..
+                    },
+                ) if owes_opening && notices_held_since.elapsed() < OPENING_NOTICE_WAIT => {
+                    opening_events.push(event);
+                }
                 Wake::Event(event) => stale |= self.on_event(event),
                 // The host put another session in place of this one: draw that
                 // one, from its first fact, in a stream of its own.
@@ -2187,7 +2275,7 @@ impl UserInterface for Tui {
                         if let Some(dir) = session_dir_of(&client, &session).await {
                             self.host.set_session_dir(&dir);
                         }
-                        client.follow(&session);
+                        client.follow_switched(&session);
                         {
                             let mut m = self.host.moment.write().expect("moment poisoned");
                             m.lead = session.clone();
@@ -2362,6 +2450,10 @@ impl UserInterface for Tui {
                     }
                     stale = true;
                 }
+                // Reports already in flight may outlive a handoff. They cannot
+                // open our menu or read a clipboard while the terminal owns
+                // selection and paste (notably PuTTY over SSH).
+                Wake::Input(Input::Mouse(..)) if !self.surface.mouse() => {}
                 // A late motion packet can outlive the menu that requested it.
                 // Reassert the intended mode, but motion alone does not prove
                 // that the terminal reclaimed the mouse. Do not announce that.
@@ -2759,6 +2851,11 @@ impl UserInterface for Tui {
                             // cannot answer a press aimed at a tab.
                             if self.host.providers_open() {
                                 if let Some(key) = self.host.providers_action_at(x, y) {
+                                    if key == crate::surface::KeyPress::ctrl('e') {
+                                        if let Some(row) = self.host.providers_row_at(x, y) {
+                                            self.host.point_providers_at(row);
+                                        }
+                                    }
                                     self.run_providers_key(key);
                                     stale = true;
                                     continue;
@@ -2768,15 +2865,11 @@ impl UserInterface for Tui {
                                     stale = true;
                                     continue;
                                 }
-                                // And a press on one of its rows takes that row,
-                                // through the return key's own path — so a click
-                                // that walks into an account and a keypress that
-                                // does cannot come to mean different things.
+                                // Discovery rows toggle their checkboxes; other
+                                // rows use the same Enter path as the keyboard.
                                 if let Some(row) = self.host.providers_row_at(x, y) {
                                     let _ = self.host.point_providers_at(row);
-                                    self.run_providers_key(crate::surface::KeyPress::plain(
-                                        crate::surface::Key::Enter,
-                                    ));
+                                    self.run_providers_key(self.host.provider_row_key());
                                     stale = true;
                                     continue;
                                 }
@@ -3237,13 +3330,10 @@ impl UserInterface for Tui {
                 {
                     stale = true;
                 }
-                // Plain Tab takes the guess at what to say next — the gesture the
-                // hint row names, and the reference front end's. Above the mode
-                // key and below the arms before it, which is that order ported:
-                // the menu and the team panel own Tab while they are up, and a
-                // guess on an empty line owns it ahead of the mode, so Tab always
-                // means what the row advertising it says.
-                Wake::Input(Input::Key(press)) if self.take_the_guess(press) => {
+                // Plain Tab accepts the visible inline suggestion/history suffix.
+                // Menus and team navigation keep precedence; completion beats the
+                // optional plain-Tab mode shortcut only when text is accepted.
+                Wake::Input(Input::Key(press)) if self.complete_with_tab(press) => {
                     stale = true;
                 }
                 // Shift+Tab steps the execution mode on, and plain Tab too where
@@ -3750,14 +3840,47 @@ impl Tui {
     ///
     /// **True when a frame is owed.**
     fn run_providers_key(&self, press: crate::surface::KeyPress) -> bool {
+        let before = if press.key == crate::surface::Key::Enter
+            || press == crate::surface::KeyPress::ctrl('s')
+        {
+            self.host
+                .moment
+                .read()
+                .expect("moment poisoned")
+                .providers_panel
+                .clone()
+        } else {
+            None
+        };
         let (changed, asked) = self.host.providers_key(press);
         let Some(step) = asked else {
             return changed;
         };
+        let key = match &step {
+            crate::providers::Step::SaveAccount { draft, .. } => draft.key.clone(),
+            crate::providers::Step::SaveModel { draft, .. } => draft.key.clone(),
+            crate::providers::Step::SaveModels { drafts } => {
+                drafts.first().and_then(|draft| draft.key.clone())
+            }
+            _ => None,
+        };
+        let is_write = matches!(
+            &step,
+            crate::providers::Step::SaveAccount { .. }
+                | crate::providers::Step::SaveModel { .. }
+                | crate::providers::Step::SaveModels { .. }
+        );
         match self.apply_provider_step(step) {
             Ok(Some(said)) => self.host.say(&said, false),
             Ok(None) => {}
-            Err(why) => self.host.say(&why, true),
+            Err(why) => {
+                if is_write {
+                    if let Some(panel) = before {
+                        self.host.restore_provider_form(panel, key);
+                    }
+                }
+                self.host.say(&why, true);
+            }
         }
         self.refresh_providers();
         true
@@ -3770,13 +3893,10 @@ impl Tui {
     /// screen has no idea what the configuration accepts, which is the whole
     /// reason the port exists.
     ///
-    /// **Writing the file is not making it so.** Every write here changes what
-    /// the agent would be built from, so each one is followed by
-    /// `HostCommand::Reload`, which reads the configuration again and rebuilds
-    /// what changed — the same road the settings panel takes
-    /// (`Tui::reload_if_a_change_needs_it`), and for the same reason: "the file
-    /// changed but the session did not" is the state a person must not be left
-    /// in silently.
+    /// Existing configuration edits request `HostCommand::Reload`. A new
+    /// connection first saves its account without touching the live model;
+    /// selecting a model then uses the existing `/model` command, whose runtime
+    /// result reports activation separately from persistence.
     fn apply_provider_step(&self, step: crate::providers::Step) -> Result<Option<String>, String> {
         use crate::providers::Step;
         // Switching model is not a write at all: it is the gesture `/model <id>`
@@ -3785,17 +3905,18 @@ impl Tui {
         // one layer down rides the same road, as `/effort <level>` — the same
         // line a person would type, in the order they would type them.
         if let Step::Use { id, effort } = &step {
-            let keys = self.wake.lock().expect("wake poisoned").clone();
-            if let Some(keys) = keys {
-                // 一条命令把两件事说完。分两条派发是不行的:换模型那条自己会
-                // 把档位再问一遍(`Action::PickEffort`),面板刚被这一挑选关上
-                // 就又弹回来,永远收不了尾。
-                let line = match effort {
-                    Some(level) => format!("/model {id} {level}"),
-                    None => format!("/model {id}"),
-                };
-                let _ = keys.send(Wake::Chose(Some(line)));
-            }
+            let keys = self
+                .wake
+                .lock()
+                .expect("wake poisoned")
+                .clone()
+                .ok_or_else(|| t(Msg::ScreenNotConnectedProviders).into_owned())?;
+            let line = match effort {
+                Some(level) => format!("/model {id} {level}"),
+                None => format!("/model {id}"),
+            };
+            keys.send(Wake::Chose(Some(line)))
+                .map_err(|_| t(Msg::ScreenNotConnectedProviders).into_owned())?;
             self.host.close_providers();
             return Ok(None);
         }
@@ -3808,9 +3929,13 @@ impl Tui {
         // Listing an endpoint's models writes nothing, so it is not followed by
         // a reload: the answer fills the picker the form put up, off the frame.
         if let Step::Discover { account } = step {
+            let Some(request) = self.host.provider_discovery_id() else {
+                return Ok(None);
+            };
             let Some(listing) = port.discover(&account) else {
                 let said = self.host.providers_discovered(
                     &account,
+                    request,
                     Err(t(Msg::ProviderDiscoverUnsupported).into_owned()),
                 );
                 return said.map_or(Ok(None), Err);
@@ -3819,7 +3944,7 @@ impl Tui {
             let keys = self.wake.lock().expect("wake poisoned").clone();
             tokio::spawn(async move {
                 let listed = listing.await;
-                if let Some(said) = host.providers_discovered(&account, listed) {
+                if let Some(said) = host.providers_discovered(&account, request, listed) {
                     host.say(&said, true);
                 }
                 if let Some(keys) = keys {
@@ -3849,6 +3974,16 @@ impl Tui {
                 // the one thing left to do.
                 self.host.show_providers(port.rows());
                 self.host.walk_into_provider(&id);
+                if self.host.connect_provider_models(&id) {
+                    if let Err(why) = self.apply_provider_step(Step::Discover {
+                        account: id.clone(),
+                    }) {
+                        self.host.say(&why, true);
+                    }
+                    // Saving a new credential does not change the live model.
+                    // The selected model is activated through /model below.
+                    return Ok(Some(t(Msg::ProviderAddedAddModel { id: &id }).into_owned()));
+                }
                 Some(t(Msg::ProviderAddedAddModel { id: &id }).into_owned())
             }
             Step::SaveModel {
@@ -3861,8 +3996,56 @@ impl Tui {
             }
             Step::SaveModel { id: None, draft } => {
                 let id = port.add_model(&draft)?;
+                if draft.use_now {
+                    self.refresh_providers();
+                    // Supply an explicit effort (or default) so /model does not
+                    // ask the person to choose a second time.
+                    if let Err(error) = self.apply_provider_step(Step::Use {
+                        id: id.clone(),
+                        effort: Some(draft.effort.clone().unwrap_or_else(|| "default".into())),
+                    }) {
+                        // The model is already saved. Keep it available to pick
+                        // again instead of restoring an add form that would duplicate it.
+                        self.host.say(
+                            t(Msg::ProviderSavedSwitchFailed {
+                                id: &id,
+                                error: &error,
+                            })
+                            .into_owned(),
+                            true,
+                        );
+                        return Ok(None);
+                    }
+                    return Ok(Some(
+                        t(Msg::ProviderSavedSwitching { id: &id }).into_owned(),
+                    ));
+                }
                 check = Some((draft.account.clone(), Some(id.clone())));
                 Some(t(Msg::ProviderAdded { id: &id }).into_owned())
+            }
+            Step::SaveModels { drafts } => {
+                let ids = port.add_models(&drafts)?;
+                self.refresh_providers();
+                if let Some((draft, id)) = drafts.iter().zip(&ids).find(|(draft, _)| draft.use_now)
+                {
+                    if let Err(error) = self.apply_provider_step(Step::Use {
+                        id: id.clone(),
+                        effort: Some(draft.effort.clone().unwrap_or_else(|| "default".into())),
+                    }) {
+                        self.host.say(
+                            t(Msg::ProviderSavedSwitchFailed { id, error: &error }).into_owned(),
+                            true,
+                        );
+                        return Ok(None);
+                    }
+                    return Ok(Some(t(Msg::ProviderSavedSwitching { id }).into_owned()));
+                }
+                Some(
+                    t(Msg::ProviderAdded {
+                        id: &ids.join(", "),
+                    })
+                    .into_owned(),
+                )
             }
             Step::DeleteAccount { id } => {
                 port.delete_account(&id)?;
@@ -6282,8 +6465,19 @@ impl Tui {
     fn on_event(&self, event: AgentEvent) -> bool {
         // Before anything else, and whoever is on screen: the arms below drop
         // the lead's turn events while a member is looked at.
+        let replay_ended = match &event {
+            AgentEvent::Accepted { command, .. } | AgentEvent::Rejected { command, .. } => {
+                self.client.finish_replay(command)
+            }
+            _ => false,
+        };
         let settled = self.settle_asks(&event);
-        self.on_event_drawn(event) || settled
+        let changed = self.on_event_drawn(event);
+        if replay_ended {
+            self.host.moment.write().expect("moment poisoned").scroll =
+                crate::moment::ScrollPos::BOTTOM;
+        }
+        changed || settled || replay_ended
     }
 
     fn on_event_drawn(&self, event: AgentEvent) -> bool {
@@ -6918,6 +7112,7 @@ impl Tui {
                 true
             }
             AgentEvent::Compacted {
+                trigger,
                 committed,
                 bytes_before,
                 bytes_after,
@@ -6935,8 +7130,18 @@ impl Tui {
                         .write()
                         .expect("moment poisoned")
                         .note_fold(bytes_before, bytes_after);
-                    self.say(&t(Msg::Compacted));
-                } else {
+                    // Automatic cleanup also arrives as Compacted. Genuine
+                    // summary folds already have their own transcript notice.
+                    if matches!(
+                        trigger,
+                        atomcode_kernel::message::CompactTrigger::Manual { .. }
+                    ) {
+                        self.say(&t(Msg::Compacted));
+                    }
+                } else if matches!(
+                    trigger,
+                    atomcode_kernel::message::CompactTrigger::Manual { .. }
+                ) {
                     self.say(&t(Msg::NothingWorthCompacting));
                 }
                 true
@@ -7196,29 +7401,15 @@ impl Tui {
         Ok(path)
     }
 
-    /// Plain `Tab` takes the guess at what to say next, when there is one and
-    /// the line is empty. `true` when it took something, which is the arm's
-    /// whole condition — nothing to take and the press goes on to be whatever it
-    /// was, the mode key included.
-    ///
-    /// The reference front end's gesture, kept: its hint row said `Tab: …` and
-    /// either key took it. Which press this is depends on the field's state
-    /// rather than on the keymap table, the same reason [`Self::is_mode_cycle_key`]
-    /// is a method — and it sits **above** that key and **below** the menu and
-    /// the team panel, which is the order the reference used: a list that is up
-    /// and a panel somebody opened both own Tab, and a guess on an empty line is
-    /// the completion this key is otherwise for.
-    ///
-    /// [`take_suggestion`] and not [`accept_ghost`], deliberately: the latter
-    /// would also complete from history on a *non-empty* line, which the hint
-    /// row does not advertise and which would take the mode key's job away
-    /// wherever `ui.mode_switch_key = "tab"`.
-    fn take_the_guess(&self, press: crate::surface::KeyPress) -> bool {
+    /// Accept visible inline completion with plain Tab, before the optional
+    /// plain-Tab mode shortcut. With nothing to complete the key falls through.
+    /// Menus and team navigation are handled first by the input loop.
+    fn complete_with_tab(&self, press: crate::surface::KeyPress) -> bool {
         use crate::surface::{Key, Mods};
         if press.key != Key::Tab || press.mods != Mods::NONE {
             return false;
         }
-        take_suggestion(&mut self.host.moment.write().expect("moment poisoned"))
+        accept_ghost(&mut self.host.moment.write().expect("moment poisoned"))
     }
 
     /// Whether this press steps the execution mode on.
@@ -7924,6 +8115,13 @@ impl Tui {
                 return false;
             }
             Action::AttachImage => {
+                // Ctrl+V is a paste attempt, not evidence of an image. SSH has
+                // no access to the client's clipboard; keep this guidance on
+                // the replaceable tip row instead of appending red errors.
+                if self.surface.remote_clipboard() {
+                    drop(m);
+                    return self.paste_clipboard_text(client);
+                }
                 // Read first, mutate second: a clipboard with no image in it
                 // must leave the composer exactly as it was, and "exactly as it
                 // was" is easier to keep true when nothing was touched yet.
@@ -9279,7 +9477,53 @@ impl Tui {
         let option_owner = name
             .split_once(char::is_whitespace)
             .and_then(|(base, _)| self.host.commands.find(base));
-        if command.is_some_and(|c| !c.options.is_empty() || c.require_arg)
+        // A command the person declared as `args: optional` or `args:
+        // required` also completes onto the line when the line holds only its
+        // name — the person picked it to type an argument, not to run it bare.
+        // Distinct from `require_arg`: that flag is about commands the *front
+        // end* decides need an argument, this one is about commands the
+        // *person* declared do. `Unspecified` (disk silent) and `None` (the
+        // command does not take an argument) keep the legacy shape — dispatch
+        // bare on the one Enter — which is why the check is on
+        // `args_requirement`, not on `require_arg`.
+        //
+        // "The line holds only the name" means the person picked this command
+        // without having typed an argument — the input is a single token, so
+        // it may be a prefix (`/ren`) or the full name (`/rename`), but it
+        // has nothing after it. If the person has already typed arguments
+        // (`/rename hello`), the tokens are two or more and the pick is a
+        // dispatch, not a completion.
+        let line_is_bare_pick = {
+            let line = self
+                .host
+                .moment
+                .read()
+                .expect("moment poisoned")
+                .input
+                .clone();
+            line.trim_start_matches('/').split_whitespace().count() <= 1
+        };
+        // `Required` is routed here the same as `Optional`: the person's
+        // first Enter on a required command asks for the argument's slot, and
+        // the *dispatch* answers "give me an argument first" only when they
+        // submit it still bare (see `Commands::dispatch`'s refusal). Routing
+        // Required straight into a bare dispatch would refuse on the first
+        // Enter, which is not what a single Enter on the lit row means.
+        //
+        // The `options.is_empty()` guard keeps the args_requirement branch
+        // from hijacking a command with a closed options set — that flow is
+        // owned by the existing `!c.options.is_empty()` check below.
+        let argument_completion_bare_pick = command.as_ref().is_some_and(|c| {
+            c.options.is_empty()
+                && line_is_bare_pick
+                && matches!(
+                    c.args_requirement,
+                    atomcode_kernel::agent::ArgsRequirement::Optional
+                        | atomcode_kernel::agent::ArgsRequirement::Required
+                )
+        });
+        if argument_completion_bare_pick
+            || command.is_some_and(|c| !c.options.is_empty() || c.require_arg)
             || option_owner.is_some_and(|c| c.require_arg)
         {
             self.complete_command(name);
@@ -9319,8 +9563,20 @@ impl Tui {
         let option_owner = name
             .split_once(char::is_whitespace)
             .and_then(|(base, _)| self.host.commands.find(base));
-        let takes = command.as_ref().is_some_and(|c| c.takes.is_some())
-            || option_owner.as_ref().is_some_and(|c| c.require_arg);
+        // A command whose disk declaration says it wants an argument also gets
+        // the trailing space — `optional` and `required` both mean something
+        // goes after the name, same as the front end's `takes`. Folding them
+        // in keeps the caret where the person expects it after a completion.
+        // `None` (the command takes no argument) and `Unspecified` get no
+        // trailing space.
+        let takes = command.as_ref().is_some_and(|c| {
+            c.takes.is_some()
+                || matches!(
+                    c.args_requirement,
+                    atomcode_kernel::agent::ArgsRequirement::Optional
+                        | atomcode_kernel::agent::ArgsRequirement::Required
+                )
+        }) || option_owner.as_ref().is_some_and(|c| c.require_arg);
         let text = if takes {
             format!("/{name} ")
         } else {
@@ -9500,18 +9756,18 @@ impl Tui {
     /// middle button, and Ctrl+V with no picture to attach. Returns `true` to
     /// quit, as `act` does.
     fn paste_clipboard_text(&self, client: &AgentClient) -> bool {
+        // Every paste gesture has the same SSH boundary. Do not read the
+        // server clipboard or turn ordinary client-paste guidance into an error.
+        if self.surface.remote_clipboard() {
+            self.host
+                .say(t(Msg::ClipboardRemoteText).into_owned(), false);
+            return false;
+        }
         let Some(text) = self.surface.clipboard_text().filter(|t| !t.is_empty()) else {
             // A refusal of the gesture, so it belongs on the tip row with the
             // rest of them rather than in the conversation.
-            self.host.say(
-                t(if self.surface.remote_clipboard() {
-                    Msg::ClipboardRemoteText
-                } else {
-                    Msg::ClipboardHasNoTextShort
-                })
-                .into_owned(),
-                true,
-            );
+            self.host
+                .say(t(Msg::ClipboardHasNoTextShort).into_owned(), true);
             return false;
         };
         self.act(Action::Paste(text), client)
@@ -10295,7 +10551,7 @@ fn pages_the_conversation(press: crate::surface::KeyPress) -> bool {
 
 /// Whether this action puts a pending guess away: every gesture on the field
 /// but the ones that take it. → takes it (`accept_ghost`), Tab takes it
-/// (`take_the_guess`), and a submit clears it on its own — what is left here is
+/// (`complete_with_tab`), and a submit clears it on its own — what is left here is
 /// editing, moving the caret, and Esc. Scrolling, selecting and folding are
 /// about the conversation, not the field, and leave it where it is.
 fn dismisses_suggestion(action: &Action) -> bool {
@@ -10321,12 +10577,8 @@ fn dismisses_suggestion(action: &Action) -> bool {
 
 /// Take the guess at what to say next into an empty field, if there is one.
 ///
-/// **Only** the guess, and only there. A non-empty line belongs to the
-/// completion ([`crate::text::ghost`]), which is a different gesture — so this is
-/// not [`accept_ghost`], whose other branch also answers with the rest of a
-/// history entry. Tab shares this, and Tab sits ahead of the mode key when the
-/// setting makes it the mode key: a key that silently completed from history
-/// there would be a key nobody advertised, ahead of one somebody did.
+/// This handles only the empty-line guess. Non-empty input is completed by
+/// `accept_ghost`, which both right-arrow and plain Tab use.
 ///
 /// The one place that writes it, so `→` and Tab cannot come to mean two
 /// different things.
@@ -10352,6 +10604,9 @@ fn take_suggestion(m: &mut crate::moment::Moment) -> bool {
 /// `true` when it took something, which is the caller's cue that right meant
 /// "accept" rather than "move".
 fn accept_ghost(m: &mut crate::moment::Moment) -> bool {
+    if m.secret.is_some() {
+        return false;
+    }
     // An empty field with a guess on it: right takes the guess. The history
     // ghost below never fires here — it answers with the rest of a line that
     // starts with what is typed, and nothing is typed — so the two cannot both
@@ -10637,12 +10892,14 @@ where
                     _ => break,
                 }
             }
-            // Every arrow, one or many, while the pointer is the terminal's: a
-            // slow swipe arrives as lone arrows, which timing cannot tell from
-            // a keypress. The loop decides what they do (scroll the
-            // conversation where they would reach the composer, the keys they
-            // were anywhere else); the history is on ctrl-p/ctrl-n meanwhile.
-            let sent = wake.send(Wake::Input(Input::ArrowBurst { up, n })).is_ok();
+            // A lone arrow has exactly the same bytes as a keyboard press.
+            // Preserve normal caret/history navigation, including over SSH.
+            // Only a confirmed multi-arrow burst takes the wheel path.
+            let sent = if n == 1 {
+                forward(event)
+            } else {
+                wake.send(Wake::Input(Input::ArrowBurst { up, n })).is_ok()
+            };
             if !sent {
                 break;
             }
@@ -11093,6 +11350,21 @@ mod history_tests {
         let mut m = said(&["cargo nextest run"], "cargo ");
         m.history_at = Some(0);
         assert!(!accept_ghost(&mut m));
+    }
+
+    #[test]
+    fn hidden_or_dismissed_history_cannot_be_inserted_by_a_completion_key() {
+        let mut m = said(&["你好"], "你");
+        m.secret = Some(crate::secret::Asking::default());
+        assert!(!accept_ghost(&mut m));
+        assert_eq!(m.input, "你");
+        m.secret = None;
+        m.completion_held = true;
+        assert!(!accept_ghost(&mut m));
+        m.completion_held = false;
+        assert!(accept_ghost(&mut m));
+        assert_eq!(m.input, "你好");
+        assert_eq!(m.caret, "你好".len());
     }
 
     #[test]
@@ -12623,6 +12895,34 @@ mod paste_burst_tests {
         seen
     }
 
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn native_terminal_pastes_preserve_unicode_and_newlines_without_submitting() {
+        let text = "中文粘贴🙂\n第二行 e\u{301}\n第三行内容\n";
+        for script in [
+            vec![(0, Event::Paste(text.replace('\n', "\r\n")))],
+            text.chars()
+                .map(|c| (0, if c == '\n' { enter() } else { press(c) }))
+                .collect(),
+        ] {
+            let seen = pumped_with(script, true).await;
+            assert_eq!(seen.len(), 1, "a paste must not leak Enter key events");
+            let (host, tui) = assemble(Headless::new(80, 24));
+            for input in seen {
+                let Input::Paste(pasted) = input else {
+                    panic!("paste became keystrokes")
+                };
+                tui.act(Action::Paste(pasted), &tui.client);
+            }
+            let moment = host.moment.read().unwrap();
+            assert_eq!(
+                crate::moment::expand_pastes(&moment.input, &moment.pastes),
+                text
+            );
+            assert!(!moment.pending_working);
+            assert!(!moment.turn_open);
+        }
+    }
+
     /// Zero-gap scripts check event ordering, not a wall-clock threshold.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn chinese_first_character_can_be_erased_after_burst_with_shift_and_repeat() {
@@ -12742,9 +13042,8 @@ mod paste_burst_tests {
 
     /// **The wheel, turned into arrows by the terminal.** With the pointer
     /// handed back, a notch is the same arrow several times in one write —
-    /// gathered into one burst — or, swiped slowly, one at a time; either way
-    /// it reaches the loop as a burst, so the screen can scroll instead of
-    /// stepping the input history. And only then: with the pointer ours an
+    /// gathered into one burst. Lone arrows retain keyboard semantics, so
+    /// input history remains reachable with native mouse mode. With the pointer ours an
     /// arrow is a key and nothing waits for a second one.
     #[tokio::test]
     async fn arrows_the_wheel_sent_are_one_burst_only_while_the_pointer_is_handed_back() {
@@ -12758,14 +13057,15 @@ mod paste_burst_tests {
             vec![Input::Key(KeyPress::plain(Key::Up)); 3],
             "the pointer is ours: the wheel is a mouse event, and these are keys"
         );
-        // Lone arrows too — a slow swipe, or a person's key repeat, which are
-        // the same bytes: while the pointer is handed back each one is a burst
-        // of one, and the loop decides what it does (scroll where it would
-        // reach the composer; the key it was anywhere else).
-        assert_eq!(
-            pumped_with(vec![(0, arrow(false)), (35, arrow(false))], true).await,
-            vec![Input::ArrowBurst { up: false, n: 1 }; 2]
-        );
+        // A keyboard press (including ordinary key repeat) must remain a key
+        // over SSH/native mouse mode. A lone wheel arrow is indistinguishable:
+        // prioritize composer navigation rather than disabling input history.
+        for up in [true, false] {
+            assert_eq!(
+                pumped_with(vec![(0, arrow(up)), (35, arrow(up))], true).await,
+                vec![Input::Key(KeyPress::plain(if up { Key::Up } else { Key::Down })); 2]
+            );
+        }
         // The wheel reversed: the first arrow of the other way ends the burst,
         // and is itself looked at again — the start of the next burst, not one
         // lone ↑ let through to the composer.
@@ -12955,7 +13255,310 @@ mod paste_burst_tests {
 mod provider_probe_tests {
     use super::*;
     use crate::providers::{AccountDraft, ModelDraft, ProbeFuture, Providers, ProvidersView, Step};
+    use crate::surface::{Key, KeyPress};
     use atomcode_plexus::{App, ConfigTree, PluginRegistry};
+
+    #[derive(Default)]
+    struct Connects {
+        saved: std::sync::atomic::AtomicBool,
+        fail: std::sync::atomic::AtomicBool,
+        models: std::sync::Mutex<Vec<ModelDraft>>,
+    }
+
+    impl Providers for Connects {
+        fn rows(&self) -> ProvidersView {
+            use crate::providers::{AccountRow, Protocol};
+            let configured = self.saved.load(std::sync::atomic::Ordering::SeqCst);
+            ProvidersView::new(
+                vec![AccountRow {
+                    id: "deepseek".into(),
+                    label: "DeepSeek".into(),
+                    protocol: "OpenAI".into(),
+                    endpoint: "https://api.deepseek.com/v1".into(),
+                    models: 0,
+                    configured,
+                    has_key: configured,
+                    managed: false,
+                }],
+                vec![],
+                vec![Protocol {
+                    id: "openai-compatible".into(),
+                    label: "OpenAI".into(),
+                    endpoint: None,
+                    needs_key: true,
+                }],
+                vec!["low".into(), "high".into(), "max".into()],
+            )
+        }
+        fn add_account(&self, draft: &AccountDraft) -> Result<String, String> {
+            assert_eq!(draft.key.as_deref(), Some("sk-private"));
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("write failed".into());
+            }
+            self.saved.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok("deepseek".into())
+        }
+        fn edit_account(&self, _: &str, _: &AccountDraft) -> Result<(), String> {
+            Ok(())
+        }
+        fn delete_account(&self, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn add_model(&self, draft: &ModelDraft) -> Result<String, String> {
+            self.models.lock().unwrap().push(draft.clone());
+            Ok(format!("deepseek/{}", draft.model))
+        }
+        fn add_models(&self, drafts: &[ModelDraft]) -> Result<Vec<String>, String> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("write failed".into());
+            }
+            self.models.lock().unwrap().extend_from_slice(drafts);
+            Ok(drafts
+                .iter()
+                .map(|draft| format!("deepseek/{}", draft.model))
+                .collect())
+        }
+        fn edit_model(&self, _: &str, _: &ModelDraft) -> Result<(), String> {
+            Ok(())
+        }
+        fn delete_model(&self, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn discover(&self, _: &str) -> Option<crate::providers::DiscoverFuture> {
+            Some(Box::pin(async {
+                Ok(vec![crate::providers::Discovered {
+                    id: "flash".into(),
+                    window: Some(1048576),
+                    max_tokens: Some(393216),
+                    vision: Some(true),
+                    effort: Some("high".into()),
+                    levels: Some(vec!["low".into(), "high".into(), "max".into()]),
+                    ..Default::default()
+                }])
+            }))
+        }
+    }
+
+    fn open_connect(host: &Host, port: &Connects) {
+        let mut m = host.moment.write().unwrap();
+        m.providers = port.rows();
+        m.providers_panel = Some(crate::providers::Panel::new());
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_connection_only_needs_a_key_and_a_model_and_sends_one_switch() {
+        let port = Arc::new(Connects::default());
+        let (host, tui, mut woken) = screen_with(port.clone());
+        open_connect(&host, &port);
+        tui.run_providers_key(KeyPress::plain(Key::Enter));
+        assert!(host.providers_paste("sk-private"));
+        tui.run_providers_key(KeyPress::plain(Key::Enter));
+        checked(&mut woken).await;
+        tui.run_providers_key(KeyPress::plain(Key::Enter)); // pick
+        tui.run_providers_key(KeyPress::plain(Key::Enter)); // connect and use
+        let Some(Wake::Chose(Some(line))) = woken.recv().await else {
+            panic!("switch");
+        };
+        assert_eq!(line, "/model deepseek/flash high");
+        assert!(!host.providers_open());
+        let models = port.models.lock().unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].vision, Some(true));
+        assert_eq!(models[0].window, Some(1048576));
+        assert_eq!(models[0].max_tokens, Some(393216));
+        assert_eq!(
+            models[0].levels.as_deref(),
+            Some(["low".into(), "high".into(), "max".into()].as_slice())
+        );
+        assert!(woken.try_recv().is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_batch_can_be_retried_without_partial_writes_and_switches_once() {
+        let port = Arc::new(Connects::default());
+        port.saved.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (host, tui, mut woken) = screen_with(port.clone());
+        open_connect(&host, &port);
+        host.connect_provider_models("deepseek");
+        let request = host.provider_discovery_id().unwrap();
+        host.providers_discovered(
+            "deepseek",
+            request,
+            Ok(vec![
+                crate::providers::Discovered {
+                    id: "flash".into(),
+                    ..Default::default()
+                },
+                crate::providers::Discovered {
+                    id: "pro".into(),
+                    effort: Some("high".into()),
+                    ..Default::default()
+                },
+            ]),
+        );
+        for key in [Key::Char(' '), Key::Down, Key::Char(' '), Key::Enter] {
+            tui.run_providers_key(KeyPress::plain(key));
+        }
+        assert!(host.point_providers_at(1));
+        assert_eq!(host.provider_row_key(), KeyPress::plain(Key::Char(' ')));
+        tui.run_providers_key(host.provider_row_key());
+        port.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        tui.run_providers_key(KeyPress::plain(Key::Enter));
+        assert!(port.models.lock().unwrap().is_empty());
+        {
+            let m = host.moment.read().unwrap();
+            let Some(crate::providers::Form::Model(form)) =
+                &m.providers_panel.as_ref().unwrap().form
+            else {
+                panic!("restored");
+            };
+            assert_eq!(form.selected.len(), 2);
+            assert_eq!(form.batch_cursor, 1);
+            assert_eq!(form.model, "pro");
+        }
+        port.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        tui.run_providers_key(KeyPress::plain(Key::Enter));
+        let Some(Wake::Chose(Some(line))) = woken.recv().await else {
+            panic!("switch");
+        };
+        assert_eq!(line, "/model deepseek/pro high");
+        assert_eq!(port.models.lock().unwrap().len(), 2);
+        assert!(woken.try_recv().is_err());
+        assert!(!host.providers_open());
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_failed_connection_write_keeps_the_key_for_retry() {
+        let port = Arc::new(Connects::default());
+        port.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (host, tui, mut woken) = screen_with(port.clone());
+        open_connect(&host, &port);
+        tui.run_providers_key(KeyPress::plain(Key::Enter));
+        host.providers_paste("sk-private");
+        tui.run_providers_key(KeyPress::plain(Key::Enter));
+        assert!(!port.saved.load(std::sync::atomic::Ordering::SeqCst));
+        {
+            let m = host.moment.read().unwrap();
+            let Some(crate::providers::Form::Account(form)) =
+                &m.providers_panel.as_ref().unwrap().form
+            else {
+                panic!("retains form");
+            };
+            assert_eq!(form.key_len, 10);
+            assert!(!format!("{form:?}").contains("sk-private"));
+        }
+        port.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        tui.run_providers_key(KeyPress::plain(Key::Enter));
+        checked(&mut woken).await;
+        assert!(port.saved.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn an_old_listing_cannot_fill_a_new_picker_for_the_same_account() {
+        let port = Arc::new(Connects::default());
+        port.saved.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (host, _, _) = screen_with(port.clone());
+        open_connect(&host, &port);
+        assert!(host.connect_provider_models("deepseek"));
+        let old = host.provider_discovery_id().unwrap();
+        assert!(host.connect_provider_models("deepseek"));
+        let new = host.provider_discovery_id().unwrap();
+        assert_ne!(old, new);
+        host.providers_discovered("deepseek", old, Err("stale".into()));
+        let m = host.moment.read().unwrap();
+        let Some(crate::providers::Form::Model(form)) = &m.providers_panel.as_ref().unwrap().form
+        else {
+            panic!("model");
+        };
+        assert!(matches!(
+            form.picking,
+            Some(crate::providers::Picking::Loading { .. })
+        ));
+        assert_eq!(form.discovery_error, None);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_saved_model_is_kept_when_the_switch_cannot_be_dispatched() {
+        let port = Arc::new(Connects::default());
+        let (host, tui, woken) = screen_with(port.clone());
+        open_connect(&host, &port);
+        drop(woken);
+        assert_eq!(
+            tui.apply_provider_step(Step::SaveModel {
+                id: None,
+                draft: ModelDraft {
+                    account: "deepseek".into(),
+                    model: "flash".into(),
+                    use_now: true,
+                    ..Default::default()
+                }
+            })
+            .unwrap(),
+            None
+        );
+        assert_eq!(port.models.lock().unwrap().len(), 1);
+        assert!(host.providers_open());
+        let m = host.moment.read().unwrap();
+        assert!(m.providers_panel.as_ref().unwrap().form.is_none());
+        assert!(m.notice.as_ref().unwrap().refused);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn clicking_a_discovered_model_picks_that_row_and_changing_tabs_cancels_discovery() {
+        let port = Arc::new(Connects::default());
+        port.saved.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (host, _, _) = screen_with(port.clone());
+        open_connect(&host, &port);
+        assert!(!host.connect_provider_models("missing"));
+        host.connect_provider_models("deepseek");
+        let request = host.provider_discovery_id().unwrap();
+        host.providers_discovered(
+            "deepseek",
+            request,
+            Ok(vec![
+                crate::providers::Discovered {
+                    id: "first".into(),
+                    ..Default::default()
+                },
+                crate::providers::Discovered {
+                    id: "second".into(),
+                    ..Default::default()
+                },
+            ]),
+        );
+        assert!(host.point_providers_at(1));
+        assert_eq!(host.provider_row_key(), KeyPress::plain(Key::Char(' ')));
+        host.providers_key(host.provider_row_key());
+        {
+            let m = host.moment.read().unwrap();
+            let Some(crate::providers::Form::Model(form)) =
+                &m.providers_panel.as_ref().unwrap().form
+            else {
+                panic!("picker");
+            };
+            assert_eq!(form.selected[0].id, "second");
+            assert!(
+                form.picking.is_some(),
+                "clicks leave the list available for more checks"
+            );
+        }
+        host.providers_key(KeyPress::plain(Key::Enter));
+        {
+            let m = host.moment.read().unwrap();
+            let Some(crate::providers::Form::Model(form)) =
+                &m.providers_panel.as_ref().unwrap().form
+            else {
+                panic!("model");
+            };
+            assert_eq!(form.model, "second");
+        }
+        host.connect_provider_models("deepseek");
+        let request = host.provider_discovery_id().unwrap();
+        host.show_providers_tab(crate::providers::Tab::Accounts);
+        host.providers_discovered("deepseek", request, Err("cancelled".into()));
+        let m = host.moment.read().unwrap();
+        assert!(m.providers_panel.as_ref().unwrap().form.is_none());
+    }
 
     /// A port that takes every write and answers every check with what it was
     /// asked about — so the test can see which account, and which model, the
@@ -13231,6 +13834,7 @@ mod provider_probe_tests {
                 levels: None,
                 default: false,
                 key: None,
+                ..Default::default()
             },
         })
         .expect("the write lands");
@@ -14529,6 +15133,53 @@ mod paste_habit_tests {
         assert!(m.asking.is_some());
     }
 
+    struct RemotePasteSurface;
+    impl Surface for RemotePasteSurface {
+        fn describe(&self) -> String {
+            "remote paste".into()
+        }
+        fn size(&self) -> (u16, u16) {
+            (60, 24)
+        }
+        fn present(&self, _: &crate::frame::Frame) {}
+        fn remote_clipboard(&self) -> bool {
+            true
+        }
+        fn clipboard_text(&self) -> Option<String> {
+            panic!("must not read server clipboard")
+        }
+        fn clipboard_image(&self) -> Option<atomcode_kernel::message::ImageContent> {
+            panic!("must not read server clipboard")
+        }
+    }
+
+    #[test]
+    fn every_paste_gesture_over_ssh_gives_one_plain_hint_without_reading_a_clipboard() {
+        let (host, tui) = assemble(Arc::new(RemotePasteSurface));
+        {
+            let mut moment = host.moment.write().unwrap();
+            moment.input = "draft 中文".into();
+            moment.caret = moment.input.len();
+        }
+        let before = host.stream.read().unwrap().len();
+        for _ in 0..3 {
+            assert!(!tui.act(Action::AttachImage, &tui.client));
+            assert!(!tui.run_menu_item("paste", &tui.client));
+            assert!(!tui.paste_clipboard_text(&tui.client));
+            assert!(!host.moment.read().unwrap().notice.as_ref().unwrap().refused);
+        }
+        assert_eq!(host.moment.read().unwrap().input, "draft 中文");
+        // Receiving actual pasted text still edits the composer normally.
+        assert!(!tui.act(Action::Paste("远端粘贴".into()), &tui.client));
+        assert_eq!(host.stream.read().unwrap().len(), before);
+        let moment = host.moment.read().unwrap();
+        assert!(moment.input.contains("draft 中文"));
+        assert!(moment.input.contains("远端粘贴"));
+        let notice = moment.notice.as_ref().unwrap();
+        assert_eq!(notice.text, t(Msg::ClipboardRemoteText));
+        assert!(!notice.refused);
+    }
+
     /// What people who copy with a drag paste with: the middle button, the
     /// menu's 粘贴, and Ctrl+V with text on the clipboard — all into the
     /// composer. Ctrl+V said 「剪贴板里没有图片」 where the terminal passes the
@@ -14633,30 +15284,35 @@ mod skills_menu_tests {
                     usage: Some("[名字… [给它们的话]]".into()),
                     summary: "浏览技能".into(),
                     target: atomcode_kernel::agent::CommandTarget::Session,
+                    ..Default::default()
                 },
                 atomcode_kernel::agent::CommandDescription {
                     name: "brainstorming".into(),
                     usage: Some(skill_usage.clone()),
                     summary: "先梳理需求".into(),
                     target: atomcode_kernel::agent::CommandTarget::Session,
+                    ..Default::default()
                 },
                 atomcode_kernel::agent::CommandDescription {
                     name: "code".into(),
                     usage: Some(skill_usage),
                     summary: "实现代码".into(),
                     target: atomcode_kernel::agent::CommandTarget::Session,
+                    ..Default::default()
                 },
                 atomcode_kernel::agent::CommandDescription {
                     name: "init".into(),
                     usage: None,
                     summary: "生成项目说明".into(),
                     target: atomcode_kernel::agent::CommandTarget::Session,
+                    ..Default::default()
                 },
                 atomcode_kernel::agent::CommandDescription {
                     name: "worklog".into(),
                     usage: Some("[日期]".into()),
                     summary: "生成工作复盘".into(),
                     target: atomcode_kernel::agent::CommandTarget::Session,
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -14873,6 +15529,199 @@ mod skills_menu_tests {
         assert!(host.commands.starts_turn("/init"));
         assert!(host.commands.starts_turn("/worklog"));
         assert!(host.commands.starts_turn("/worklog yesterday"));
+    }
+}
+
+/// The four disk `args:` states as the slash menu routes them on Enter.
+/// One test per state, so a routing regression names itself. The
+/// assertion is always on the routing *decision*: whether the pick
+/// completes onto the line (the person still needs to type an argument
+/// and press Enter again) or dispatches as-is (the person's one Enter
+/// runs the command, and the dispatch itself decides whether to refuse).
+///
+/// `Required` and `Optional` both complete onto the line: the person picked
+/// the command to type an argument, so the first Enter opens the argument's
+/// slot and the dispatch refuses only when they submit it still bare. `None`
+/// and `Unspecified` dispatch as-is — neither one takes an argument.
+///
+/// The `Required` refusal (bare submission after completion) is asserted in
+/// [`crate::command::tests`] against `Commands::dispatch` directly; here we
+/// only verify the routing that puts the command on the line first.
+#[cfg(test)]
+mod args_requirement_menu_tests {
+    use super::*;
+    use crate::command::{Command, CommandSet, Outcome};
+    use atomcode_kernel::agent::ArgsRequirement;
+
+    /// The owning set these picks route into. A completion never reaches it;
+    /// a dispatch does (and the dispatch is what may then refuse). It records
+    /// nothing — the routing is observed through the moment's history, which
+    /// `remember_command` writes synchronously before the dispatch is spawned.
+    struct Owned(&'static [Command]);
+    #[async_trait]
+    impl CommandSet for Owned {
+        fn id(&self) -> &'static str {
+            "owned"
+        }
+        fn commands(&self) -> Vec<Command> {
+            self.0.to_vec()
+        }
+        async fn run(&self, _name: &str, _args: &str, _ctx: &Context) -> Outcome {
+            Outcome::Said("ok".into())
+        }
+    }
+
+    /// Assemble a screen with a single command carrying the given disk
+    /// declaration. `require_arg` stays `false` — that flag is about the
+    /// front end's own judgement (`goal`, `skills` with a populated
+    /// sub-menu), and this test module only exercises the disk signal.
+    fn screen_with(requirement: ArgsRequirement) -> (Arc<Host>, Tui) {
+        let (host, tui) = assemble(Headless::new(80, 24));
+        let cmd = Command::new("cmd", "does a thing").with_args_requirement(requirement);
+        host.commands
+            .add(Arc::new(Owned(
+                Box::leak(Box::new([cmd])) as &'static [Command]
+            )))
+            .unwrap();
+        (host, tui)
+    }
+
+    fn type_line(host: &Host, line: &str) {
+        let mut m = host.moment.write().expect("moment poisoned");
+        m.input = line.into();
+        m.caret = line.len();
+        m.history.clear();
+        m.history_at = None;
+    }
+
+    #[tokio::test]
+    async fn optional_bare_pick_completes_onto_the_line() {
+        let (host, tui) = screen_with(ArgsRequirement::Optional);
+        type_line(&host, "/cmd");
+        assert!(
+            !tui.take_command("cmd", &tui.client),
+            "the pick does not report a dispatch"
+        );
+        let m = host.moment.read().expect("moment poisoned");
+        assert_eq!(
+            m.input, "/cmd ",
+            "Optional + bare → line completed onto the trailing space"
+        );
+        assert_eq!(
+            m.caret,
+            m.input.len(),
+            "caret past the space, ready to type"
+        );
+        assert!(
+            m.history.is_empty(),
+            "completing must not dispatch — the argument is still to be typed"
+        );
+    }
+
+    #[tokio::test]
+    async fn none_bare_pick_dispatches_onto_the_line() {
+        // `None` is the declaration that the command takes no argument at all,
+        // so a bare pick runs it immediately — completing it onto the line
+        // would leave the person staring at an argument slot that cannot be
+        // filled. `Unspecified` shares the route: the disk is silent there
+        // too, and legacy commands must keep dispatching on one Enter.
+        for requirement in [ArgsRequirement::None, ArgsRequirement::Unspecified] {
+            let (host, tui) = screen_with(requirement);
+            type_line(&host, "/cmd");
+            assert!(!tui.take_command("cmd", &tui.client));
+            let m = host.moment.read().expect("moment poisoned");
+            assert_eq!(
+                m.input, "",
+                "{requirement:?} + bare → dispatch path clears the line"
+            );
+            assert!(
+                !m.history.is_empty(),
+                "{requirement:?} + bare → dispatches on one Enter, does not complete"
+            );
+        }
+    }
+
+    /// The guard that decides between the two routes: a line holding only the
+    /// command's name completes, a line with something after it dispatches and
+    /// must not overwrite what the person already typed.
+    #[tokio::test]
+    async fn optional_pick_with_typed_arguments_dispatches() {
+        let (host, tui) = screen_with(ArgsRequirement::Optional);
+        type_line(&host, "/cmd hello world");
+        assert!(!tui.take_command("cmd", &tui.client));
+        let m = host.moment.read().expect("moment poisoned");
+        assert!(
+            !m.history.is_empty(),
+            "typed arguments must dispatch, not re-complete onto the line"
+        );
+    }
+
+    #[tokio::test]
+    async fn required_bare_pick_completes_onto_the_line() {
+        // The person picked a required command to type its argument, so the
+        // first Enter opens the argument's slot rather than refusing — the
+        // refusal comes when they submit it still bare (see
+        // `crate::command::tests` against `Commands::dispatch`).
+        let (host, tui) = screen_with(ArgsRequirement::Required);
+        type_line(&host, "/cmd");
+        assert!(
+            !tui.take_command("cmd", &tui.client),
+            "the pick does not report a dispatch — the argument is still to be typed"
+        );
+        let m = host.moment.read().expect("moment poisoned");
+        assert_eq!(
+            m.input, "/cmd ",
+            "Required + bare → line completed onto the trailing space"
+        );
+        assert_eq!(
+            m.caret,
+            m.input.len(),
+            "caret past the space, ready to type"
+        );
+        assert!(
+            m.history.is_empty(),
+            "completing must not dispatch — the argument is still to be typed"
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_trailing_space_follows_the_declaration() {
+        // A name completed onto the line gets a trailing space only when
+        // something belongs after it: the disk's `optional` / `required` and
+        // the front end's own `takes` do, `None` and `Unspecified` do not.
+        for (requirement, expects_space) in [
+            (ArgsRequirement::Optional, true),
+            (ArgsRequirement::Required, true),
+            (ArgsRequirement::None, false),
+            (ArgsRequirement::Unspecified, false),
+        ] {
+            let (host, tui) = screen_with(requirement);
+            type_line(&host, "/cmd");
+            tui.complete_command("cmd");
+            let m = host.moment.read().expect("moment poisoned");
+            assert_eq!(
+                m.input,
+                if expects_space { "/cmd " } else { "/cmd" },
+                "{requirement:?} → trailing space {expects_space}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unspecified_bare_pick_dispatches_as_before() {
+        // The legacy shape. Every command that predates the `args:`
+        // declaration lands here, and this is the path that must not
+        // change under this feature — a person's Enter on a legacy
+        // command runs the command, exactly as before.
+        let (host, tui) = screen_with(ArgsRequirement::Unspecified);
+        type_line(&host, "/cmd");
+        assert!(!tui.take_command("cmd", &tui.client));
+        let m = host.moment.read().expect("moment poisoned");
+        assert!(m.input.is_empty(), "Unspecified + bare → dispatch path");
+        assert!(
+            !m.history.is_empty(),
+            "a legacy command still dispatches on one Enter — the load-bearing path"
+        );
     }
 }
 
@@ -15321,5 +16170,47 @@ mod memory_transport_tests {
                 listing
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod switched_replay_tests {
+    use super::*;
+    #[test]
+    fn only_the_current_subscription_receipt_finishes_replay() {
+        let client = AgentClient::default();
+        client.follow_switched("first");
+        let first = client.view.lock().unwrap().replay_receipt.clone().unwrap();
+        client.follow_switched("second");
+        let second = client.view.lock().unwrap().replay_receipt.clone().unwrap();
+        assert!(!client.finish_replay(&first));
+        assert!(client.replaying());
+        assert!(client.finish_replay(&second));
+        assert!(!client.replaying());
+    }
+    #[test]
+    fn a_rejected_subscription_releases_the_frame_and_old_facts_stay_out() {
+        let (host, tui) = assemble(crate::surface::Headless::new(80, 24));
+        tui.client.follow_switched("current");
+        let receipt = tui
+            .client
+            .view
+            .lock()
+            .unwrap()
+            .replay_receipt
+            .clone()
+            .unwrap();
+        assert!(tui.on_event(AgentEvent::Rejected {
+            command: receipt,
+            error: atomcode_kernel::event::CommandError::Unavailable
+        }));
+        assert!(!tui.client.replaying());
+        assert!(host.moment.read().unwrap().scroll.is_at_bottom());
+        assert!(!tui.client.keep(&Committed {
+            session: "old".into(),
+            seq: 1,
+            at: 0,
+            event: atomcode_kernel::session::SessionEvent::TurnStart { turn: 1 }
+        }));
     }
 }

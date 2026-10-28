@@ -17,6 +17,7 @@ default = []
 codingplan-crypto = ["atomcode-auth/codingplan-crypto"]
 
 [dependencies]
+atomcode-schedule = { path = "../atomcode-schedule", features = ["model-tools"] }
 atomcode-codingplan = { path = "../atomcode-codingplan" }
 # Config system used directly by the daemon.
 atomcode-config = { path = "../atomcode-config" }
@@ -67,6 +68,7 @@ sha2 = "0.10"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 
 [dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
 atomcode-telemetry = { path = "../atomcode-telemetry", features = ["test-util"] }
 # Redirect ATOMCODE_HOME to a throwaway temp dir before any test runs (via a
 # #[ctor] in the lib's #[cfg(test)] module) so tests never persist into the

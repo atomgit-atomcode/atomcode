@@ -801,6 +801,13 @@ async fn inter_token_gap_uses_idle_budget_not_first_token() {
         "after the first byte, an inter-token gap past `idle` must idle-timeout even with \
          a large first-token budget; got {events:?}"
     );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::Error(error)
+        if error.message.contains("(stream_idle)") && error.message.contains("limit 100ms"))),
+        "the actual HTTP stall must expose its phase and configured limit: {events:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

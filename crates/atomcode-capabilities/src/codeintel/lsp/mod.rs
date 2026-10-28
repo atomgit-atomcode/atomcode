@@ -14,7 +14,9 @@
 pub mod client;
 pub mod jsonrpc;
 pub mod manager;
+pub mod options;
 pub mod registry;
+pub mod trace;
 pub mod types;
 
 pub use client::LspClient;

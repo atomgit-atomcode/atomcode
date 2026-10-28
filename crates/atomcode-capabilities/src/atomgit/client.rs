@@ -50,12 +50,21 @@ impl AtomgitClient {
     /// Attach auth + Accept, send, and turn transport / non-2xx into `Err(String)`.
     async fn send(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response, String> {
         let token = self.token.token()?;
-        let resp = req
-            .bearer_auth(token)
+        let request = req
+            .bearer_auth(&token)
             .header("Accept", "application/json")
-            .send()
-            .await
-            .map_err(|e| format!("AtomGit request failed: {e}"))?;
+            .build()
+            .map_err(|e| format!("AtomGit request could not be built: {}", e.without_url()))?;
+        let writing =
+            request.method() != reqwest::Method::GET && request.method() != reqwest::Method::HEAD;
+        let resp = self.http.execute(request).await.map_err(|e| {
+            let message = format!("AtomGit request failed: {}", e.without_url());
+            if writing {
+                uncertain(message)
+            } else {
+                message
+            }
+        })?;
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
             return Err(format!(
@@ -69,17 +78,52 @@ impl AtomgitClient {
         if status == reqwest::StatusCode::NOT_FOUND {
             return Err("AtomGit returned 404 Not Found: the target may not exist, may be inaccessible to this account, or may not be supported by this API. Verify the API path, account access and target type. For repository lookups, check the exact owner/repo; this error alone does not establish whether issues are supported.".into());
         }
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let details = response_details(resp.headers());
+            let body = resp.text().await.unwrap_or_default();
+            let body = if token.is_empty() {
+                body
+            } else {
+                body.replace(&token, "[redacted]")
+            };
+            return Err(format!(
+                "AtomGit platform API rate limited (HTTP 429), not model rate limiting. \
+                 Do not immediately retry, switch comment types, or bypass with curl. \
+                 Recovery time and quota scope are unknown unless supplied by the platform. \
+                 {details} Platform response: {}",
+                safe_detail(&body)
+            ));
+        }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!("AtomGit returned {status}: {body}"));
+            let message = format!("AtomGit returned {status}: {body}");
+            return Err(if writing && status.is_server_error() {
+                uncertain(message)
+            } else {
+                message
+            });
         }
         Ok(resp)
     }
 
-    async fn parse<T: DeserializeOwned>(resp: reqwest::Response) -> Result<T, String> {
-        resp.json::<T>()
-            .await
-            .map_err(|e| format!("failed to parse AtomGit response: {e}"))
+    async fn parse<T: DeserializeOwned>(
+        resp: reqwest::Response,
+        writing: bool,
+    ) -> Result<T, String> {
+        let status = resp.status();
+        let details = response_details(resp.headers());
+        resp.json::<T>().await.map_err(|e| {
+            let message = format!(
+                "failed to parse AtomGit response (HTTP {}): {}; {details}",
+                status.as_u16(),
+                e.without_url()
+            );
+            if writing {
+                uncertain(message)
+            } else {
+                message
+            }
+        })
     }
 
     pub(crate) async fn get_json<T: DeserializeOwned>(
@@ -90,7 +134,7 @@ impl AtomgitClient {
         let resp = self
             .send(self.http.get(self.url(path)).query(query))
             .await?;
-        Self::parse(resp).await
+        Self::parse(resp, false).await
     }
 
     pub(crate) async fn post_json<T: DeserializeOwned, B: Serialize>(
@@ -99,7 +143,7 @@ impl AtomgitClient {
         body: &B,
     ) -> Result<T, String> {
         let resp = self.send(self.http.post(self.url(path)).json(body)).await?;
-        Self::parse(resp).await
+        Self::parse(resp, true).await
     }
 
     pub(crate) async fn post_no_content<B: Serialize>(
@@ -119,7 +163,7 @@ impl AtomgitClient {
         let resp = self
             .send(self.http.patch(self.url(path)).json(body))
             .await?;
-        Self::parse(resp).await
+        Self::parse(resp, true).await
     }
 
     pub(crate) async fn delete(&self, path: &str) -> Result<(), String> {
@@ -149,6 +193,7 @@ impl AtomgitClient {
         query: &[(String, String)],
         body: Option<&serde_json::Value>,
     ) -> Result<String, String> {
+        let writing = method != reqwest::Method::GET && method != reqwest::Method::HEAD;
         let mut req = self.http.request(method, self.url(path));
         if !query.is_empty() {
             req = req.query(query);
@@ -157,9 +202,47 @@ impl AtomgitClient {
             req = req.json(body);
         }
         let resp = self.send(req).await?;
-        resp.text()
-            .await
-            .map_err(|e| format!("failed to read AtomGit response: {e}"))
+        resp.text().await.map_err(|e| {
+            let message = format!("failed to read AtomGit response: {}", e.without_url());
+            if writing {
+                uncertain(message)
+            } else {
+                message
+            }
+        })
+    }
+}
+
+fn uncertain(message: String) -> String {
+    format!("{message}. AtomGit write outcome is unconfirmed; it may already have succeeded. Query the target first; do not resend or switch comment types until confirmed, to avoid duplicate writes.")
+}
+
+fn safe_detail(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(2048)
+        .collect()
+}
+
+fn response_details(headers: &reqwest::header::HeaderMap) -> String {
+    let mut details = Vec::new();
+    for name in [
+        "retry-after",
+        "x-ratelimit-limit",
+        "x-ratelimit-remaining",
+        "x-ratelimit-reset",
+        "x-request-id",
+        "x-gitcode-request-id",
+    ] {
+        if let Some(value) = headers.get(name).and_then(|v| v.to_str().ok()) {
+            details.push(format!("{name}={}", safe_detail(value)));
+        }
+    }
+    if details.is_empty() {
+        "No retry timing or request ID supplied.".into()
+    } else {
+        details.join("; ")
     }
 }
 
@@ -184,6 +267,99 @@ mod tests {
             token: Arc::new(StaticToken("tok-123")),
         })
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn platform_rate_limit_retains_evidence_without_retrying_or_guessing_quota() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "120")
+                    .insert_header("X-RateLimit-Remaining", "0")
+                    .insert_header("X-Request-ID", "request-42")
+                    .set_body_string("limited tok-123"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let error = client(&server)
+            .post_json::<Thing, _>("/comments", &json!({"body":"hello"}))
+            .await
+            .unwrap_err();
+        for evidence in [
+            "platform API",
+            "429",
+            "not model",
+            "retry-after=120",
+            "x-ratelimit-remaining=0",
+            "request-42",
+            "unknown",
+            "[redacted]",
+        ] {
+            assert!(error.contains(evidence), "{error}");
+        }
+        assert!(!error.contains("tok-123"));
+        assert!(!error.contains("unconfirmed"));
+    }
+
+    #[tokio::test]
+    async fn malformed_success_is_uncertain_for_writes_but_not_reads() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(201).set_body_string("not json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let c = client(&server);
+        let error = c
+            .post_json::<Thing, _>("/comments", &json!({}))
+            .await
+            .unwrap_err();
+        assert!(error.contains("201"));
+        assert!(error.contains("unconfirmed"));
+        assert!(error.contains("Query the target first"));
+        let error = c.get_json::<Thing>("/comments", &[]).await.unwrap_err();
+        assert!(error.contains("200"));
+        assert!(!error.contains("unconfirmed"));
+    }
+
+    #[tokio::test]
+    async fn server_error_on_write_is_uncertain_but_rejection_is_not() {
+        for status in [500, 422] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(status))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let error = client(&server)
+                .post_json::<Thing, _>("/comments", &json!({}))
+                .await
+                .unwrap_err();
+            assert_eq!(error.contains("unconfirmed"), status == 500);
+        }
+    }
+
+    #[tokio::test]
+    async fn platform_rate_limit_without_headers_reports_unknown_recovery() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(429))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let error = client(&server)
+            .get_json::<Thing>("/comments", &[])
+            .await
+            .unwrap_err();
+        assert!(error.contains("unknown"));
+        assert!(error.contains("No retry timing"));
     }
 
     #[tokio::test]

@@ -58,7 +58,13 @@ fn daemon_image_preprocessor(
 
 /// Convert the shared runtime configuration into the native coding-agent config.
 pub fn coding_config_from_runtime(cfg: &CodingRuntimeConfig) -> CodingAgentConfig {
-    cfg.agent_config()
+    let mut agent = cfg.agent_config();
+    if cfg.interactive {
+        agent.automation = Some(std::sync::Arc::new(
+            atomcode_schedule::service::Service::system(cfg.dirs.user().join("schedules")),
+        ));
+    }
+    agent
 }
 
 pub async fn start_native_runtime(

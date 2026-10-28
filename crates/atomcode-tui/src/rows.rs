@@ -406,7 +406,7 @@ impl Plugin for MascotPanel {
         let id = <status::Mascot as crate::module::View>::id();
         mods.add_view(view)?;
 
-        let known: Vec<String> = mods.view_ids().into_iter().map(str::to_string).collect();
+        let known = mods.view_ids();
         layout
             .apply(
                 &LayoutOp::Show {
@@ -421,12 +421,11 @@ impl Plugin for MascotPanel {
         let m: Arc<Modules> = mods.clone();
         let l = layout.clone();
         let _ = ctx.effect(move || {
-            let known: Vec<String> = m.view_ids().into_iter().map(str::to_string).collect();
             let _ = l.apply(
                 &LayoutOp::Hide {
                     module: id.to_string(),
                 },
-                &known,
+                &[],
             );
             m.remove_view(id);
         });
@@ -462,7 +461,7 @@ impl Plugin for TeamPanel {
         let id = <team::Team as crate::module::View>::id();
         mods.add_view(view)?;
 
-        let known: Vec<String> = mods.view_ids().into_iter().map(str::to_string).collect();
+        let known = mods.view_ids();
         layout
             .apply(
                 &LayoutOp::Show {
@@ -477,12 +476,11 @@ impl Plugin for TeamPanel {
         let m: Arc<Modules> = mods.clone();
         let l = layout.clone();
         let _ = ctx.effect(move || {
-            let known: Vec<String> = m.view_ids().into_iter().map(str::to_string).collect();
             let _ = l.apply(
                 &LayoutOp::Hide {
                     module: id.to_string(),
                 },
-                &known,
+                &[],
             );
             m.remove_view(id);
         });

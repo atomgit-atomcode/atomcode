@@ -990,6 +990,9 @@ pub struct Moment {
     pub unready: Option<String>,
     /// 有更新的版本时状态行那一句(启动器给的原话,`None` 是没有或没问到)。
     pub update: Option<String>,
+    /// The installation changed while this process stayed alive. Shown above the
+    /// composer, independently of the remote-version nudge on the status row.
+    pub restart_hint: Option<String>,
     /// 底部那张单子(`/agents`、`/cd`、`/diff`、`/view`),`None` 是没升着。
     pub sheet: Option<crate::sheet::Sheet>,
     /// 一个多步的流程(引导、配对的向导),这一帧画出来的样子。宿主合成每一帧时
@@ -1243,7 +1246,7 @@ impl Moment {
     /// turn is very much in flight. `pending_working` closes that gap, so a stop
     /// gesture the instant after a send still stops.
     /// The rest of an earlier line that starts with what is typed, as drawn
-    /// dim after the caret and taken by →. `None` while it is held back after a
+    /// dim after the caret and taken by → or Tab. `None` while it is held back after a
     /// deletion ([`Moment::completion_held`]). The one question both the
     /// drawing and the key ask, so the key never takes a completion nobody can
     /// see.

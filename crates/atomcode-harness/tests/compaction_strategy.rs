@@ -17,6 +17,7 @@ use atomcode_kernel::message::{
     CompactTrigger, CompactionPlan, CompactionStrategy, CompactionView, Message, Role,
 };
 use atomcode_kernel::provider::{ChatOptions, LlmProvider};
+use atomcode_kernel::session::InjectionOrigin;
 use atomcode_kernel::stream::{ProviderError, StreamEvent};
 use atomcode_kernel::tool::{ToolCall, ToolDef};
 use futures::stream::BoxStream;
@@ -421,7 +422,7 @@ async fn an_overflow_climbs_stub_truncate_and_a_summary_that_splits_the_turn() {
     for n in 0..8 {
         outputs.push(w.call("bash", &bulk(&format!("run {n}"), 3_000)));
     }
-    let monster = w.answer(&bulk("think", 40_000));
+    w.answer(&bulk("think", 40_000));
     for n in 8..12 {
         outputs.push(w.call("bash", &bulk(&format!("run {n}"), 3_000)));
     }
@@ -436,16 +437,16 @@ async fn an_overflow_climbs_stub_truncate_and_a_summary_that_splits_the_turn() {
     assert_eq!(seqs, outputs, "every long output, the running turn's too");
     w.apply(stubbed);
 
-    let truncated = decide_with_strategy(&strategy, &w.log, &overflow(1, 16_000))
-        .await
-        .expect("a message too large to send");
-    assert_eq!(truncated.through, 0);
-    assert_eq!(
-        truncated.rewrites.iter().map(|r| r.seq).collect::<Vec<_>>(),
-        vec![monster]
+    assert!(
+        decide_with_strategy(&strategy, &w.log, &overflow(1, 16_000))
+            .await
+            .is_none(),
+        "dialogue must reach the summarizer intact"
     );
-    assert!(truncated.rewrites[0].text.contains("[truncated: showing "));
-    w.apply(truncated);
+    assert!(w
+        .seen()
+        .iter()
+        .any(|m| m.text.starts_with("think") && m.text.len() > 40000));
 
     let split = decide_with_strategy(&strategy, &w.log, &overflow(2, 16_000))
         .await
@@ -494,5 +495,144 @@ async fn a_cut_never_leaves_a_result_whose_call_it_removed() {
     assert!(
         seen.iter().any(|m| m.text.contains("out line")),
         "the call and its result are kept together"
+    );
+}
+
+/// Protect agreed assistant-side decisions through the actual native log projection,
+/// not merely the strategy's returned plan.
+struct UnavailableSummary {
+    partial: bool,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl LlmProvider for UnavailableSummary {
+    fn model_name(&self) -> &str {
+        "unavailable-summary"
+    }
+    async fn chat_stream(
+        &self,
+        _: &[Message],
+        _: &[ToolDef],
+        _: &ChatOptions,
+    ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let error = ProviderError {
+            http_status: Some(403),
+            message: "summary unavailable".into(),
+            ..Default::default()
+        };
+        if !self.partial {
+            return Err(error);
+        }
+        Ok(Box::pin(futures::stream::iter(vec![
+            StreamEvent::TextDelta("incomplete checkpoint".into()),
+            StreamEvent::Error(error),
+        ])))
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn failed_summaries_keep_agreed_design_in_the_native_session_projection() {
+    const DECISION: &str = "DeviceNo and PipingNo remain separate columns. TubeSeq is the pipe-local test tube sequence, never a device sequence.";
+    for partial in [false, true] {
+        for mode in 0..3 {
+            let mut writer = Writer::new();
+            writer.ask("Design two tables; preserve confirmed decisions.");
+            writer.answer(&format!("{DECISION}\n{}", bulk("archive", 20_000)));
+            writer.call("grep", &bulk("old result", 2_000));
+            writer.ask("Rename only the two time columns.");
+            writer.answer(&bulk("second archive", 20_000));
+            writer.ask("Keep other facts unchanged.");
+            writer.answer(&bulk("third archive", 20_000));
+            writer.ask("Return the final tables.");
+            let provider = Arc::new(UnavailableSummary {
+                partial,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let strategy =
+                OverflowCompaction::new(StubCompaction::new(1, true), Some(provider.clone()));
+            let request = match mode {
+                0 => ask(CompactTrigger::Manual { focus: None }, 16_000, 13_000),
+                1 => pressure(16_000, 13_000),
+                _ => overflow(2, 16_000),
+            };
+            assert!(strategy_would_summarize(&strategy, &writer.log, &request));
+            if let Some(decision) = decide_with_strategy(&strategy, &writer.log, &request).await {
+                assert_eq!(
+                    decision.through, 0,
+                    "failure must not replace conversation history"
+                );
+                writer.apply(decision);
+            }
+            assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let visible = writer.seen();
+            assert!(visible.iter().any(
+                |message| message.role == Role::Assistant && message.text.starts_with(DECISION)
+            ));
+            assert!(!writer
+                .log
+                .events()
+                .iter()
+                .any(|fact| matches!(fact.event, SessionEvent::Compacted { .. })));
+            no_orphan_results(&visible).unwrap();
+        }
+    }
+}
+
+/// The default coding strategy keeps a first-turn memory injection across the
+/// summary: memory stands for the session, not for the history it folds.
+#[tokio::test]
+async fn a_memory_injection_survives_the_summary() {
+    let mut w = Writer::new();
+    w.turn = 1;
+    w.log.append(SessionEvent::TurnStart { turn: 1 });
+    let memory_seq = w.log.append(SessionEvent::Injected {
+        turn: 1,
+        text: "=== MEMORY ===\n- prefers tabs".into(),
+        origin: InjectionOrigin::Memory,
+    });
+    w.log.append(SessionEvent::UserMessage {
+        turn: 1,
+        text: "first".into(),
+        images: vec![],
+    });
+    w.answer(&bulk("one", 20_000));
+
+    w.turn = 2;
+    w.round = 0;
+    w.log.append(SessionEvent::TurnStart { turn: 2 });
+    w.log.append(SessionEvent::UserMessage {
+        turn: 2,
+        text: "second".into(),
+        images: vec![],
+    });
+    w.answer(&bulk("two", 20_000));
+
+    w.turn = 3;
+    w.round = 0;
+    w.log.append(SessionEvent::TurnStart { turn: 3 });
+    w.log.append(SessionEvent::UserMessage {
+        turn: 3,
+        text: "third".into(),
+        images: vec![],
+    });
+    w.answer(&bulk("three", 20_000));
+
+    let strategy = strategy(Some(Summarizer::new()));
+    let decision = decide_with_strategy(&strategy, &w.log, &pressure(16_000, 13_000))
+        .await
+        .expect("a summary");
+    assert_ne!(decision.through, 0, "the plan must actually fold history");
+    assert!(
+        decision.through >= memory_seq,
+        "the fold must cover the memory turn: {} < {}",
+        decision.through,
+        memory_seq
+    );
+    w.apply(decision);
+    assert!(
+        w.seen().iter().any(|m| m.text.contains("prefers tabs")),
+        "memory must survive the summary"
     );
 }

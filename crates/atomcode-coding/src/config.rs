@@ -15,6 +15,8 @@ use atomcode_kernel::agent::ToolLoopPolicy;
 /// stalled provider or silent driver can never park a turn forever.
 #[derive(Clone)]
 pub struct CodingAgentConfig {
+    /// Host-injected persistent automation service; absent in generic library agents.
+    pub automation: Option<Arc<dyn atomcode_capabilities::tools::automation::AutomationService>>,
     /// What the configuration asked for that was left out or changed — a
     /// malformed permission rule, an external agent with an unknown kind — said
     /// in one line each. The runtime tells the person when it starts
@@ -56,6 +58,8 @@ pub struct CodingAgentConfig {
     /// See `atomcode_config::config::AtomGitToolConfig` for the excluded paths
     /// (`GitPushLabelMiddleware`, raw REST via `bash`).
     pub atomgit_enabled: bool,
+    /// Request-only AtomGit schema discovery.
+    pub atomgit_tool_search: bool,
     /// `[tools.output] threshold_bytes`: spill a tool result above this many
     /// bytes instead of the default. `None` leaves the row as the tree mounts it.
     pub tool_output_threshold_bytes: Option<usize>,
@@ -171,6 +175,10 @@ pub struct CodingAgentConfig {
     ///
     /// [`StubCompaction`]: atomcode_capabilities::compaction::StubCompaction
     pub compact_threshold: f32,
+    /// Optional absolute prompt-token budget for earlier automatic compaction.
+    /// None preserves window-relative behavior. Read from `[compaction].token_limit`
+    /// in config.toml; the mounted `compaction-coding` row carries the same value.
+    pub compact_token_limit: Option<u32>,
     /// `web_search` backend: `"exa"` (default, globally reachable, keyless) or
     /// `"duckduckgo"`/`"ddg"` (legacy HTML scraping, blocked in some regions). `None`/empty
     /// /unknown ⇒ Exa. Mirrors v1's `[web_search] provider` config knob — without this the
@@ -193,6 +201,8 @@ pub struct CodingAgentConfig {
     /// convenience gates so a matched rule skips (or blocks) the prompt. Shared, so a
     /// `/model` swap re-assembling the agent keeps the same parsed rules.
     pub permission_rules: std::sync::Arc<atomcode_capabilities::tools::PermissionRules>,
+    /// Initial mode only; runtime rebuilds preserve the live flags instead.
+    pub initial_mode: crate::runtime::RuntimeMode,
     /// Per-provider User-Agent override (`ProviderConfig::user_agent`). `None` ⇒
     /// `build_provider` falls back to the product `atomcode/<version>` so the gateway
     /// can attribute/slice traffic by version. Restores parity with v1's
@@ -262,6 +272,8 @@ pub fn settle_dir_names(dirs: &atomcode_capabilities::ProductDirs) {
 pub struct CodingRuntimeConfig {
     /// See [`CodingAgentConfig::startup_warnings`].
     pub startup_warnings: Vec<String>,
+    /// Optional absolute prompt budget from `[compaction].token_limit`.
+    pub compact_token_limit: Option<u32>,
     /// Explicit trusted skill roots from `[skills].extra_dirs`.
     pub extra_skill_dirs: Vec<String>,
     /// See [`CodingAgentConfig::dirs`].
@@ -273,6 +285,8 @@ pub struct CodingRuntimeConfig {
     pub todo: atomcode_config::config::TodoToolConfig,
     /// Resolved `[tools.atomgit]` switch — see `CodingAgentConfig::atomgit_enabled`.
     pub atomgit_enabled: bool,
+    /// Request-only AtomGit schema discovery.
+    pub atomgit_tool_search: bool,
     /// See `CodingAgentConfig::tool_output_threshold_bytes`.
     pub tool_output_threshold_bytes: Option<usize>,
     /// `[tools.mcp] tool_search`: model-facing schema projection, not permissions.
@@ -302,6 +316,8 @@ pub struct CodingRuntimeConfig {
     pub credential_shell_policy: atomcode_capabilities::tools::CredentialShellPolicy,
     /// Parsed `[permissions]` allow/deny rules (see `CodingAgentConfig::permission_rules`).
     pub permission_rules: std::sync::Arc<atomcode_capabilities::tools::PermissionRules>,
+    /// Initial mode only; runtime rebuilds preserve the live flags instead.
+    pub initial_mode: crate::runtime::RuntimeMode,
     pub user_agent: Option<String>,
     pub headers: atomcode_config::provider_headers::ProviderHeaders,
     pub skip_tls_verify: bool,
@@ -332,6 +348,29 @@ pub struct CodingRuntimeConfig {
     pub web_search_api_key: Option<String>,
 }
 
+fn lsp_mode(
+    mode: atomcode_config::lsp_registry::LspMode,
+) -> atomcode_capabilities::codeintel::lsp_policy::LspMode {
+    use atomcode_capabilities::codeintel::lsp_policy::LspMode as R;
+    use atomcode_config::lsp_registry::LspMode as C;
+    match mode {
+        C::On => R::On,
+        C::Auto => R::Auto,
+        C::Off => R::Off,
+    }
+}
+fn lsp_features(
+    features: &atomcode_config::lsp_registry::LspFeatures,
+) -> atomcode_capabilities::codeintel::lsp_policy::LspFeatures {
+    atomcode_capabilities::codeintel::lsp_policy::LspFeatures {
+        definition: features.definition.map(lsp_mode),
+        references: features.references.map(lsp_mode),
+        hover: features.hover.map(lsp_mode),
+        diagnostics: features.diagnostics.map(lsp_mode),
+        document_symbols: features.document_symbols.map(lsp_mode),
+    }
+}
+
 pub fn lsp_settings_from_config(
     config: &atomcode_config::config::LspConfig,
 ) -> atomcode_capabilities::codeintel::LspSettings {
@@ -341,6 +380,18 @@ pub fn lsp_settings_from_config(
         enabled: config.enabled,
         auto_detect: config.auto_detect,
         settle_delay_ms: config.diagnostics_settle_delay_ms,
+        features: lsp_features(&config.features),
+        trace: match config.trace {
+            atomcode_config::lsp_registry::LspTrace::Off => {
+                atomcode_capabilities::codeintel::lsp_policy::LspTrace::Off
+            }
+            atomcode_config::lsp_registry::LspTrace::Messages => {
+                atomcode_capabilities::codeintel::lsp_policy::LspTrace::Messages
+            }
+            atomcode_config::lsp_registry::LspTrace::Verbose => {
+                atomcode_capabilities::codeintel::lsp_policy::LspTrace::Verbose
+            }
+        },
         servers: config
             .servers
             .iter()
@@ -351,10 +402,20 @@ pub fn lsp_settings_from_config(
                         command: server.command.clone(),
                         args: server.args.clone(),
                         root_markers: server.root_markers.clone(),
+                        options: atomcode_capabilities::codeintel::lsp_policy::LspOptions {
+                            disabled: server.options.disabled,
+                            init_options_mode: lsp_mode(server.options.init_options_mode),
+                            init_options_file: server.options.init_options_file.clone(),
+                            init_options: server.options.init_options.clone(),
+                            settings_file: server.options.settings_file.clone(),
+                            settings: server.options.settings.clone(),
+                            features: lsp_features(&server.options.features),
+                        },
                     },
                 )
             })
             .collect(),
+        ..Default::default()
     }
 }
 
@@ -431,7 +492,10 @@ pub fn describe_config_file_for(
          Omit the table to disable long waits; zero short attempts disables both stages. \
          Existing goal caps and permissions still apply. Automatic retries stop on process exit; \
          native persistent sessions restore unfinished goals paused for review.\n\
-         - `[permissions]` `allow` / `deny`: rules such as `Bash(git *)`, `Read(<path>)` or \
+         - `[compaction]` `token_limit`: optional positive prompt-token budget for earlier \
+         automatic history summarization; omit to keep the window-relative policy. \
+         Applied when the agent is rebuilt; the model's physical context window is unchanged.\n\
+         - `[permissions]` `default_mode`: startup mode (`build`, `plan`, `accept-edits`, `auto`); explicit -y overrides it; temporary mode switches do not save it. `allow` / `deny`: rules such as `Bash(git *)`, `Read(<path>)` or \
          `mcp__<server>__<tool>`. `deny` wins, and `allow` never opens a sensitive path.\n\
          - `[coding]` `max_rounds` (per turn; 0 = no cap; `ATOMCODE_TURN_MAX_ROUNDS` wins), \
          `repeat_stop_rounds` (stop a turn after this many rounds of the very same tool \
@@ -448,6 +512,7 @@ pub fn describe_config_file_for(
          `claude-code`, `model`, `permission`, `timeout_secs`, `enabled`), add the Codex \
          or Claude Code CLI as a delegate where the front end allows it.\n\
          - `[tools.todo]` `enabled`, and `eager` = `auto` | `preferred` | `always`.\n\
+         - `[tools.atomgit]` `tool_search` (default true): discover AtomGit schemas via `builtin_search`; false sends them eagerly.\n\
          - `[tools.mcp]` `tool_search`: `on` (default), `auto`, or `off`; \
          lazily expose large MCP schemas through `mcp_search`, without changing approvals.\n\
          - `[tools.search]` `respect_gitignore`, `include_hidden`, `follow_symlinks`, `timeout_secs`, `max_entries`: Glob/Grep discovery defaults; per-project search.toml under the product settings directory overrides individual keys; permissions still apply.\n\
@@ -456,7 +521,10 @@ pub fn describe_config_file_for(
          preview that `fetch_output` reads past; `ATOMCODE_TOOL_OUTPUT_THRESHOLD_BYTES` \
          wins.\n\
          - `[lsp]` `enabled`, `auto_detect`, `ide_discovery_dir` (opt-in private window discovery), `ide_connection_file` (private IDE window binding path), and `[lsp.servers.<extension>]` = \
-         `{{ command, args, root_markers }}`.\n\
+         `{{ command, args, root_markers, disabled, init_options_file or init_options, init_options_mode = on|auto|off, settings_file or settings }}`. \
+         `[lsp.features]` and service `features` select definition/references/hover/diagnostics/document_symbols with on|auto|off. \
+         `[lsp] trace = off|messages|verbose` enables bounded, redacted protocol logging. Relative LSP JSON files use the user config directory. \
+         Use the lsp tool probe/status/reload operations to diagnose initialization and reread JSON files; command/policy changes require a new runtime.\n\
          - `[web_search]` `provider` = `exa` | `duckduckgo`, and `api_key` for Exa; the \
          `ATOMCODE_WEB_SEARCH_PROVIDER` and `EXA_API_KEY` environment variables win.\n\
          - `keep_interrupted_context` (keep a cancelled turn's partial work; default \
@@ -544,8 +612,9 @@ impl CodingRuntimeConfig {
             .extend(crate::parts::resolve_external_subagents(&config.subagent, interactive).1);
         Self {
             startup_warnings,
+            compact_token_limit: config.compaction.token_limit.map(|limit| limit.get()),
             extra_skill_dirs: config.skills.extra_dirs.clone(),
-            dirs,
+            dirs: dirs.clone(),
             api_key: r.and_then(|r| r.api_key.clone()).unwrap_or_default(),
             base_url: r.and_then(|r| r.base_url.clone()).unwrap_or_default(),
             model: r.map(|r| r.model.clone()).unwrap_or_default(),
@@ -560,6 +629,7 @@ impl CodingRuntimeConfig {
                 config.tools.atomgit.enabled,
             ),
             tool_output_threshold_bytes: config.tools.output.threshold_bytes,
+            atomgit_tool_search: config.tools.atomgit.tool_search,
             mcp_tool_search: config.tools.mcp.tool_search,
             tool_search: config.tools.search.clone(),
             provider_name: r.map(|r| r.selection_id.clone()).unwrap_or_default(),
@@ -578,6 +648,15 @@ impl CodingRuntimeConfig {
             thinking_enabled: r.and_then(|r| r.thinking_enabled),
             thinking_type: r.and_then(|r| r.thinking_type.clone()),
             thinking_keep: r.and_then(|r| r.thinking_keep.clone()),
+            initial_mode: if dangerously_skip_permissions {
+                crate::runtime::RuntimeMode::Auto
+            } else {
+                config
+                    .permissions
+                    .default_mode
+                    .map(Into::into)
+                    .unwrap_or_default()
+            },
             dangerously_skip_permissions,
             interactive,
             keep_interrupted_context: config.keep_interrupted_context,
@@ -604,7 +683,14 @@ impl CodingRuntimeConfig {
             // TUI spawn sites and `event_loop::reload_runtime_provider_from`).
             round_cap_checkpoint: false,
             next_prompt_suggestions: false,
-            lsp: lsp_settings_from_config(&config.lsp),
+            lsp: {
+                let mut lsp = lsp_settings_from_config(&config.lsp);
+                lsp.config_dir = Some(dirs.user().to_path_buf());
+                lsp.trace_file = Some(dirs.user().join("logs").join("lsp.log"));
+                lsp.init_options_off = std::env::var("ATOMCODE_LSP_INIT_OPTIONS")
+                    .is_ok_and(|v| v.eq_ignore_ascii_case("off"));
+                lsp
+            },
             web_search_provider: web_search_from_config(&config.web_search).0,
             web_search_api_key: web_search_from_config(&config.web_search).1,
         }
@@ -618,8 +704,10 @@ impl CodingRuntimeConfig {
             &self.working_dir,
             self.dirs.clone(),
         );
+        config.initial_mode = self.initial_mode;
         config.startup_warnings = self.startup_warnings.clone();
         config.extra_skill_dirs = self.extra_skill_dirs.clone();
+        config.compact_token_limit = self.compact_token_limit;
         config.context_window = self.context_window;
         config.supports_vision = self.supports_vision;
         config.supports_reasoning_effort =
@@ -634,6 +722,7 @@ impl CodingRuntimeConfig {
         config.preferred_language = self.preferred_language;
         config.todo = self.todo.clone();
         config.atomgit_enabled = self.atomgit_enabled;
+        config.atomgit_tool_search = self.atomgit_tool_search;
         config.tool_output_threshold_bytes = self.tool_output_threshold_bytes;
         config.mcp_tool_search = self.mcp_tool_search;
         config.tool_search = self.tool_search.clone();
@@ -1105,6 +1194,7 @@ impl CodingAgentConfig {
     ) -> Self {
         let model = model.into();
         Self {
+            automation: None,
             startup_warnings: Vec::new(),
             extra_skill_dirs: Vec::new(),
             dirs,
@@ -1118,6 +1208,7 @@ impl CodingAgentConfig {
             preferred_language: None,
             todo: Default::default(),
             atomgit_enabled: true,
+            atomgit_tool_search: true,
             tool_output_threshold_bytes: None,
             mcp_tool_search: Default::default(),
             tool_search: Default::default(),
@@ -1145,12 +1236,14 @@ impl CodingAgentConfig {
             thinking_type: None,
             thinking_keep: None,
             compact_threshold: 0.7,
+            compact_token_limit: None,
             web_search_provider: None,
             web_search_api_key: None,
             lsp: Default::default(),
             keep_interrupted_context: false,
             credential_shell_policy: Default::default(),
             permission_rules: Default::default(),
+            initial_mode: Default::default(),
             user_agent: None,
             headers: Default::default(),
             skip_tls_verify: false,
@@ -1166,6 +1259,48 @@ impl CodingAgentConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn configured_initial_mode_and_explicit_skip_reach_agent_config() {
+        use crate::runtime::RuntimeMode;
+        for (name, expected) in [
+            ("build", RuntimeMode::Build),
+            ("plan", RuntimeMode::Plan),
+            ("accept-edits", RuntimeMode::AcceptEdits),
+            ("auto", RuntimeMode::Auto),
+        ] {
+            let config = toml::from_str::<atomcode_config::Config>(&format!(
+                "[permissions]\ndefault_mode = {name:?}\n"
+            ))
+            .unwrap();
+            for skip in [false, true] {
+                let runtime = super::CodingRuntimeConfig::from_config(
+                    &config,
+                    std::path::Path::new("/work"),
+                    super::product_dirs_from_env(),
+                    None,
+                    None,
+                    skip,
+                    false,
+                );
+                assert_eq!(
+                    runtime.agent_config().initial_mode,
+                    if skip { RuntimeMode::Auto } else { expected }
+                );
+            }
+        }
+        let config = atomcode_config::Config::default();
+        let runtime = super::CodingRuntimeConfig::from_config(
+            &config,
+            std::path::Path::new("/work"),
+            super::product_dirs_from_env(),
+            None,
+            None,
+            false,
+            false,
+        );
+        assert_eq!(runtime.agent_config().initial_mode, RuntimeMode::Build);
+    }
+
     use super::*;
 
     #[test]
@@ -1306,6 +1441,7 @@ mod tests {
                 command: "custom-ra".into(),
                 args: vec!["--stdio".into()],
                 root_markers: vec!["Cargo.toml".into()],
+                options: Default::default(),
             },
         );
         let runtime = CodingRuntimeConfig::from_config(

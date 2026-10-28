@@ -749,6 +749,12 @@ impl std::error::Error for SpawnError {}
 pub trait Shell: Send + Sync {
     fn describe(&self) -> String;
 
+    /// Optional PowerShell executor in THIS world. Remote worlds must opt in;
+    /// absence must never cause execution on the local host instead.
+    async fn powershell(&self) -> Option<Arc<dyn Shell>> {
+        None
+    }
+
     /// Start `command`. Returns once the process exists, not once it is done.
     async fn spawn(
         &self,
@@ -1258,7 +1264,6 @@ impl FileSystem for LocalFs {
 struct ScanBudget {
     options: WalkOptions,
     started: std::time::Instant,
-    last_notice: std::time::Instant,
     scan: ScanReport,
 }
 #[cfg(feature = "tools")]
@@ -1267,7 +1272,6 @@ impl ScanBudget {
         Self {
             options,
             started: std::time::Instant::now(),
-            last_notice: std::time::Instant::now(),
             scan: Default::default(),
         }
     }
@@ -1284,13 +1288,6 @@ impl ScanBudget {
             return false;
         }
         self.scan.entries_scanned += 1;
-        if self.last_notice.elapsed() >= std::time::Duration::from_millis(500) {
-            self.options.progress.emit(format!(
-                "Searching: {} entries visited",
-                self.scan.entries_scanned
-            ));
-            self.last_notice = std::time::Instant::now();
-        }
         true
     }
 }

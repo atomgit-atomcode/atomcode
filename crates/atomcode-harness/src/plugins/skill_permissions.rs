@@ -45,6 +45,9 @@ struct SkillPermissions {
 
 impl SkillPermissions {
     fn may_preauthorize(&self, exec: &ToolExec) -> bool {
+        if atomcode_capabilities::tools::powershell::is_powershell_tool(&exec.call.name) {
+            return false;
+        }
         if matches!(exec.call.name.as_str(), "bash" | "bash_start") {
             if let Ok(args) = serde_json::from_str::<Value>(&exec.call.arguments) {
                 if args

@@ -16,6 +16,34 @@ static HEADLESS: OnceLock<Mutex<Option<HeadlessRuntime>>> = OnceLock::new();
 static REMOTE_COMMAND: StdMutex<Option<tokio::sync::mpsc::UnboundedSender<String>>> =
     StdMutex::new(None);
 
+/// The embedded driver's existing session owner, never another runtime owner.
+/// Weak registration lets undelivered work reappear in history after it exits.
+#[async_trait::async_trait]
+pub trait EmbeddedSessions: Send + Sync {
+    fn owns(&self, session: &str) -> bool;
+    fn hidden(&self, session: &str) -> bool;
+    async fn switch(&self, expected: String, session: String) -> Result<Resumed, String>;
+}
+
+static EMBEDDED_SESSIONS: StdMutex<Option<std::sync::Weak<dyn EmbeddedSessions>>> =
+    StdMutex::new(None);
+
+pub fn register_embedded_sessions(owner: std::sync::Weak<dyn EmbeddedSessions>) {
+    *EMBEDDED_SESSIONS.lock().unwrap_or_else(|e| e.into_inner()) = Some(owner);
+}
+
+fn embedded_sessions() -> Option<Arc<dyn EmbeddedSessions>> {
+    EMBEDDED_SESSIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()?
+        .upgrade()
+}
+
+pub fn background_session_hidden(session: &str) -> bool {
+    embedded_sessions().is_some_and(|owner| owner.hidden(session))
+}
+
 struct HeadlessRuntime {
     binding: LiveBinding,
     handle: atomcode_coding::CodingRuntimeHandle,
@@ -89,6 +117,28 @@ pub fn embedded_binding() -> Option<LiveBinding> {
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .clone()
+}
+
+pub fn replace_embedded_live_view(
+    expected: &LiveBinding,
+    view: atomcode_coding::runtime::RuntimeLiveView,
+    provider: String,
+    fingerprint: String,
+    control: Arc<dyn LiveRuntimeControl>,
+    commit: impl FnOnce(),
+) -> Result<LiveBinding, HubError> {
+    let mut embedded = EMBEDDED_BINDING.lock().unwrap_or_else(|e| e.into_inner());
+    if embedded
+        .as_ref()
+        .is_none_or(|current| current.id != expected.id)
+    {
+        return Err(HubError::StaleBinding);
+    }
+    let next =
+        hub().replace_live_view_and(expected, view, provider, fingerprint, control, commit)?;
+    *embedded = Some(next.clone());
+    crate::live_set_working_dir(next.working_dir.clone());
+    Ok(next)
 }
 
 pub fn unregister_embedded_runtime(binding: &LiveBinding) -> Result<(), HubError> {
@@ -362,6 +412,18 @@ async fn resume(session_id: String, fork_on_busy: bool) -> Result<Resumed, HubEr
             },
             forked_from: None,
         });
+    }
+    if fork_on_busy && embedded_binding().is_some() {
+        if let Some(owner) = embedded_sessions().filter(|owner| owner.owns(&binding.session_id)) {
+            // A disconnected browser must not drop the driver's candidate
+            // runtime or abandon an accepted handover halfway through.
+            return tokio::spawn(async move { owner.switch(binding.session_id, session_id).await })
+                .await
+                .map_err(|error| {
+                    HubError::RuntimeRejected(format!("session navigation failed: {error}"))
+                })?
+                .map_err(HubError::RuntimeRejected);
+        }
     }
     let project_bucket = atomcode_capabilities::session::SessionManager::project_hash(
         &binding.working_dir,

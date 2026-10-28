@@ -145,11 +145,16 @@ impl Default for TodoToolConfig {
 #[serde(default)]
 pub struct AtomGitToolConfig {
     pub enabled: bool,
+    /// Offer AtomGit schemas through builtin_search; false restores eager loading.
+    pub tool_search: bool,
 }
 
 impl Default for AtomGitToolConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            tool_search: true,
+        }
     }
 }
 
@@ -297,6 +302,27 @@ impl OutputToolConfig {
     }
 }
 
+/// Default execution mode for newly constructed coding runtimes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DefaultExecutionMode {
+    Build,
+    Plan,
+    AcceptEdits,
+    Auto,
+}
+
+impl DefaultExecutionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Build => "build",
+            Self::Plan => "plan",
+            Self::AcceptEdits => "accept-edits",
+            Self::Auto => "auto",
+        }
+    }
+}
+
 /// `[permissions]` — user-declared pre-authorization for tool calls, so the common
 /// commands in a project stop prompting without reaching for the all-or-nothing
 /// `--dangerously-skip-permissions`.
@@ -308,12 +334,16 @@ impl OutputToolConfig {
 ///
 /// ```toml
 /// [permissions]
+/// default_mode = "build" # plan / accept-edits / auto
 /// allow = ["Bash(git *)", "Bash(cargo test*)", "Read(src/**)"]
 /// deny  = ["Bash(rm -rf *)"]
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PermissionsConfig {
+    /// Startup mode; temporary mode changes never write this value back.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_mode: Option<DefaultExecutionMode>,
     /// Calls matching any of these run WITHOUT an approval prompt.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow: Vec<String>,
@@ -323,9 +353,9 @@ pub struct PermissionsConfig {
 }
 
 impl PermissionsConfig {
-    /// No rules declared — the table carries nothing and is omitted on save.
+    /// No startup mode or rules declared — omit the empty table on save.
     pub fn is_empty(&self) -> bool {
-        self.allow.is_empty() && self.deny.is_empty()
+        self.default_mode.is_none() && self.allow.is_empty() && self.deny.is_empty()
     }
 }
 
@@ -511,8 +541,23 @@ pub struct SkillsConfig {
     pub extra_dirs: Vec<String>,
 }
 
+/// Optional absolute prompt budget. Omission preserves window-relative compaction.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CompactionConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_limit: Option<std::num::NonZeroU32>,
+}
+impl CompactionConfig {
+    fn is_default(&self) -> bool {
+        self.token_limit.is_none()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default, skip_serializing_if = "CompactionConfig::is_default")]
+    pub compaction: CompactionConfig,
     #[serde(default)]
     pub skills: SkillsConfig,
     /// Legacy default selection (a `[providers.*]` key). `#[serde(default)]` so a
@@ -786,8 +831,10 @@ pub struct UiConfig {
     /// PageUp/PageDown). Most people are better off leaving this ON and holding
     /// Shift to drag-select natively when they want to. Read once at startup (like
     /// `theme`); `--no-mouse` overrides it off for one launch, Ctrl+G toggles it
-    /// live. Default on — except on HarmonyOS, whose terminal reports no mouse at
-    /// all (see [`default_mouse`]).
+    /// live. Default on locally — except on HarmonyOS, whose terminal reports no
+    /// mouse at all (see [`default_mouse`]). SSH/PuTTY start with native terminal
+    /// copy/paste even when enabled here. Ctrl+G toggles application mouse live;
+    /// ATOMCODE_MOUSE=1 explicitly opts in at startup.
     #[serde(default = "default_mouse")]
     pub mouse: bool,
     /// Conversation scrollbar visibility in the full-screen UI; read at startup.
@@ -1061,6 +1108,7 @@ impl Default for Config {
             default_provider: String::new(),
             evaluator_provider: None,
             goal: GoalConfig::default(),
+            compaction: CompactionConfig::default(),
             default_workdir: None,
             providers: HashMap::new(),
             provider_accounts: HashMap::new(),
@@ -2043,6 +2091,10 @@ pub struct LspConfig {
     /// avoid surprising the user with binary spawns.
     #[serde(default)]
     pub auto_detect: bool,
+    #[serde(default)]
+    pub features: crate::lsp_registry::LspFeatures,
+    #[serde(default)]
+    pub trace: crate::lsp_registry::LspTrace,
     /// Custom server configurations keyed by file extension.
     #[serde(default)]
     pub servers: std::collections::HashMap<String, crate::lsp_registry::LspServerConfig>,
@@ -2064,6 +2116,8 @@ impl Default for LspConfig {
             ide_connection_file: None,
             enabled: false,
             auto_detect: false,
+            features: Default::default(),
+            trace: Default::default(),
             servers: Default::default(),
             diagnostics_settle_delay_ms: default_diagnostics_settle_delay_ms(),
         }
@@ -2097,7 +2151,9 @@ fn migrate_legacy_lsp_default(cfg: &mut Config) {
         && cfg.lsp.diagnostics_settle_delay_ms == 150
         && cfg.lsp.servers.is_empty()
         && cfg.lsp.ide_connection_file.is_none()
-        && cfg.lsp.ide_discovery_dir.is_none();
+        && cfg.lsp.ide_discovery_dir.is_none()
+        && cfg.lsp.features == crate::lsp_registry::LspFeatures::default()
+        && cfg.lsp.trace == crate::lsp_registry::LspTrace::Off;
     if looks_auto_written {
         cfg.lsp = LspConfig::default();
     }
@@ -2345,6 +2401,7 @@ fn render_network_section(cfg: &NetworkConfig) -> String {
     out.push_str(
         "# - follow_system  -> follow the launch environment / system proxy state (default)\n",
     );
+    out.push_str("#   Model requests refresh this state; a refused loopback proxy temporarily goes direct.\n");
     out.push_str(
         "# - default_proxy  -> pin the proxy values below and reuse them on future launches\n",
     );
@@ -2975,6 +3032,32 @@ kind = "claude-code"
         );
     }
 
+    #[test]
+    fn default_execution_mode_round_trips_without_losing_rules() {
+        for mode in ["build", "plan", "accept-edits", "auto"] {
+            let input = format!("[permissions]\ndefault_mode = {mode:?}\nallow = [\"Read(src/**)\"]\ndeny = [\"Bash(rm *)\"]\n");
+            let config: Config = toml::from_str(&input).unwrap();
+            assert_eq!(config.permissions.default_mode.unwrap().as_str(), mode);
+            let text = toml::to_string(&config).unwrap();
+            let restored: Config = toml::from_str(&text).unwrap();
+            assert_eq!(
+                restored.permissions.default_mode,
+                config.permissions.default_mode
+            );
+            assert_eq!(restored.permissions.allow, config.permissions.allow);
+            assert_eq!(restored.permissions.deny, config.permissions.deny);
+        }
+        let config: Config = toml::from_str("[permissions]\ndefault_mode = \"auto\"\n").unwrap();
+        assert!(!config.permissions.is_empty());
+        assert!(toml::to_string(&config).unwrap().contains("[permissions]"));
+        for value in ["typo", "bypass", "accept_edits", ""] {
+            assert!(toml::from_str::<Config>(&format!(
+                "[permissions]\ndefault_mode = {value:?}\n"
+            ))
+            .is_err());
+        }
+    }
+
     /// `[permissions]` must parse from TOML and default to empty when absent — an older
     /// config file has to keep behaving exactly as it did.
     #[test]
@@ -3575,6 +3658,8 @@ model = "missing-type"
             ide_connection_file: None,
             enabled: true,
             auto_detect: true,
+            features: Default::default(),
+            trace: Default::default(),
             servers: Default::default(),
             diagnostics_settle_delay_ms: 150,
         });
@@ -3599,6 +3684,7 @@ model = "missing-type"
                 command: "my-custom-rust-ls".to_string(),
                 args: vec![],
                 root_markers: vec![],
+                options: Default::default(),
             },
         );
         let mut cfg = blank_config_with_lsp(LspConfig {
@@ -3606,6 +3692,8 @@ model = "missing-type"
             ide_connection_file: None,
             enabled: true,
             auto_detect: true,
+            features: Default::default(),
+            trace: Default::default(),
             servers,
             diagnostics_settle_delay_ms: 150,
         });
@@ -3618,6 +3706,8 @@ model = "missing-type"
             ide_connection_file: None,
             enabled: true,
             auto_detect: true,
+            features: Default::default(),
+            trace: Default::default(),
             servers: Default::default(),
             diagnostics_settle_delay_ms: 500,
         });
@@ -3631,6 +3721,8 @@ model = "missing-type"
             ide_connection_file: None,
             enabled: true,
             auto_detect: false,
+            features: Default::default(),
+            trace: Default::default(),
             servers: Default::default(),
             diagnostics_settle_delay_ms: 150,
         });
@@ -3842,6 +3934,7 @@ model = "missing-type"
             default_provider: "p".to_string(),
             evaluator_provider: None,
             goal: GoalConfig::default(),
+            compaction: CompactionConfig::default(),
             default_workdir: None,
             providers: HashMap::new(),
             provider_accounts: HashMap::new(),

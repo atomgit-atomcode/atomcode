@@ -80,7 +80,7 @@ pub async fn handle_new_session(
         CodingSessionMode::Fresh,
     )
     .await?;
-    let mut resp = NewSessionResponse::new(id).modes(session_mode_state());
+    let mut resp = NewSessionResponse::new(id).modes(session_mode_state(engine.initial_mode()));
     if !config_options.is_empty() {
         resp = resp.config_options(config_options.to_vec());
     }

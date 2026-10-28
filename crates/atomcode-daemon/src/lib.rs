@@ -30,6 +30,7 @@ mod api_codingplan;
 mod api_config;
 mod api_provider;
 mod api_provider_accounts;
+mod api_schedule;
 pub mod approval_mode;
 mod commands;
 pub(crate) mod kernel_runtime;
@@ -40,6 +41,7 @@ mod login_state;
 mod login_state_tests;
 pub mod native_live;
 mod runtime_host;
+mod transcript_view;
 /// File-sink diagnostic trace (`ctrace!` macro), enabled via `ATOMCODE_TUIX_LOG`.
 /// Daemon owns this sink; the historical environment name is retained for
 /// existing diagnostic scripts.
@@ -386,6 +388,8 @@ pub struct ChangeDirResponse {
 pub struct SearchQuery {
     /// Search keyword for session name
     pub q: String,
+    #[serde(default)]
+    pub include_unavailable: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1479,32 +1483,6 @@ fn response_project_hash(path: &std::path::Path) -> String {
     hash_path(path)
 }
 
-/// System temp directory prefixes to exclude from the project list.
-/// These are directories that are not meaningful as user projects.
-fn is_system_temp_dir(path: &std::path::Path) -> bool {
-    let path_str = path.to_string_lossy();
-    // Unix/Linux/macOS temp dirs
-    if path_str.starts_with("/tmp/") || path_str == "/tmp" {
-        return true;
-    }
-    if path_str.starts_with("/var/tmp/") || path_str == "/var/tmp" {
-        return true;
-    }
-    // Windows temp dirs
-    if path_str.contains("\\Temp\\")
-        || path_str.contains("\\TEMP\\")
-        || path_str.ends_with("\\Temp")
-        || path_str.ends_with("\\TEMP")
-    {
-        return true;
-    }
-    // /private/tmp (macOS symlink target for /tmp)
-    if path_str.starts_with("/private/tmp/") || path_str == "/private/tmp" {
-        return true;
-    }
-    false
-}
-
 /// List all projects (scans sessions directory)
 fn list_projects() -> std::io::Result<Vec<ProjectInfo>> {
     let root = NativeSessionManager::sessions_root(
@@ -1524,9 +1502,6 @@ fn projects_from_catalog(
     let mut by_project = std::collections::BTreeMap::<String, ProjectInfo>::new();
     for entry in entries {
         // A project is counted by what its session list shows.
-        if is_system_temp_dir(&entry.working_dir) {
-            continue;
-        }
         let created_at = u64::try_from(entry.created_at_ms.max(0)).unwrap_or(0) / 1_000;
         let updated_at = u64::try_from(entry.updated_at_ms.max(0)).unwrap_or(0) / 1_000;
         let project = by_project
@@ -1573,6 +1548,7 @@ pub struct SessionSummary {
     pub message_count: usize,
     #[serde(default)]
     pub file_size: u64,
+    pub working_directory_available: bool,
 }
 
 fn catalog_scan_in_root(
@@ -1680,6 +1656,7 @@ fn catalog_entry_to_session_summary(
         updated_at: u64::try_from(entry.updated_at_ms.max(0)).unwrap_or(0) / 1_000,
         message_count: entry.message_count,
         file_size: 0,
+        working_directory_available: entry.working_directory_available(),
     }
 }
 
@@ -1746,6 +1723,12 @@ fn catalog_entry_is_visible(
     // Background work done for another conversation (a review): its result
     // went back there, and it is not listed beside it.
     if entry.delegated() {
+        return false;
+    }
+    if crate::native_live::background_session_hidden(&entry.id) {
+        return false;
+    }
+    if !entry.working_directory_available() {
         return false;
     }
     if entry.message_count > 0 {
@@ -2344,14 +2327,88 @@ async fn get_session_detail(Path((hash, id)): Path<(String, String)>) -> impl In
 #[derive(serde::Serialize)]
 struct SessionTranscript {
     session_id: String,
-    turns: Vec<atomcode_capabilities::session::TurnRecord>,
+    turns: Vec<transcript_view::TranscriptTurn>,
 }
 
 /// GET /projects/:hash/sessions/:id/transcript - Full never-compacted per-turn
 /// trajectory. READ-ONLY: it does not touch the runtime snapshot, compaction, or
 /// what the model sees — it only exposes the transcript that is already written on
-/// every turn. Serves the UI's "view compacted history" affordance.
-async fn get_session_transcript(Path((hash, id)): Path<(String, String)>) -> impl IntoResponse {
+/// every turn. Serves the inline timeline detail and lightweight navigation index.
+#[derive(Default, serde::Deserialize)]
+struct TranscriptQuery {
+    turn_id: Option<u64>,
+    turn_ids: Option<String>,
+    #[serde(default)]
+    summary: bool,
+    #[serde(default)]
+    detail: bool,
+}
+
+impl TranscriptQuery {
+    fn selected_turns(&self) -> Result<Vec<u64>, &'static str> {
+        match (&self.turn_ids, self.turn_id) {
+            (Some(_), Some(_)) => Err("Use turn_id or turn_ids, not both"),
+            (None, one) => Ok(one.into_iter().collect()),
+            (Some(ids), None) => {
+                let parsed = ids
+                    .split(',')
+                    .take(7)
+                    .map(str::parse::<u64>)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| "Invalid turn_ids")?;
+                if parsed.is_empty() || parsed.len() > 6 {
+                    return Err("Select between one and six turns");
+                }
+                Ok(parsed)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod transcript_query_tests {
+    use super::TranscriptQuery;
+
+    #[test]
+    fn batches_are_bounded_and_do_not_silently_become_all_history() {
+        let query = |ids: &str| TranscriptQuery {
+            turn_ids: Some(ids.into()),
+            ..Default::default()
+        };
+        assert_eq!(query("1,4,9").selected_turns().unwrap(), vec![1, 4, 9]);
+        for invalid in ["", "1,", "oops", "1,2,3,4,5,6,7"] {
+            assert!(query(invalid).selected_turns().is_err());
+        }
+        assert!(TranscriptQuery {
+            turn_id: Some(1),
+            ..query("2")
+        }
+        .selected_turns()
+        .is_err());
+        assert_eq!(
+            TranscriptQuery {
+                turn_id: Some(8),
+                ..Default::default()
+            }
+            .selected_turns()
+            .unwrap(),
+            vec![8]
+        );
+        assert!(TranscriptQuery::default()
+            .selected_turns()
+            .unwrap()
+            .is_empty());
+    }
+}
+
+async fn get_session_transcript(
+    Path((hash, id)): Path<(String, String)>,
+    Query(query): Query<TranscriptQuery>,
+) -> impl IntoResponse {
+    let selected = match query.selected_turns() {
+        Ok(selected) => selected,
+        Err(error) => return (StatusCode::BAD_REQUEST, Json(error)).into_response(),
+    };
     // Gate on the session resolving, mirroring `get_session_detail`'s 404 semantics.
     match crate::legacy_convert::load_catalog_session_view_in_project(&hash, &id) {
         Ok(Some(_)) => {}
@@ -2373,7 +2430,11 @@ async fn get_session_transcript(Path((hash, id)): Path<(String, String)>) -> imp
             )
             .join(&task_hash),
         );
-        manager.load_transcript_records(&task_id)
+        let mut turns = transcript_view::load(&manager, &task_id, &selected, query.detail)?;
+        if query.summary {
+            transcript_view::summarize(&mut turns);
+        }
+        Ok::<_, atomcode_capabilities::session::SessionStoreError>(turns)
     })
     .await;
     match loaded {
@@ -2876,24 +2937,34 @@ async fn append_session_messages(
 }
 
 /// Search sessions by name across all projects
-fn search_sessions_by_name(keyword: &str) -> std::io::Result<Vec<SessionMetaWithProject>> {
+fn search_sessions_by_name(
+    keyword: &str,
+    include_unavailable: bool,
+) -> std::io::Result<Vec<SessionMetaWithProject>> {
     search_sessions_by_name_in_root(
         &NativeSessionManager::sessions_root(
             atomcode_coding::config::product_dirs_from_env().user(),
         ),
         keyword,
+        include_unavailable,
     )
 }
 
 fn search_sessions_by_name_in_root(
     sessions_root: &std::path::Path,
     keyword: &str,
+    include_unavailable: bool,
 ) -> std::io::Result<Vec<SessionMetaWithProject>> {
     let keyword_lower = keyword.to_lowercase();
     let mut entries: Vec<_> = catalog_scan_in_root(sessions_root)?
         .entries
         .into_iter()
-        .filter(|entry| entry.message_count > 0 && !entry.delegated())
+        .filter(|entry| {
+            entry.message_count > 0
+                && !entry.delegated()
+                && !crate::native_live::background_session_hidden(&entry.id)
+        })
+        .filter(|entry| include_unavailable || entry.working_directory_available())
         .collect();
     crate::legacy_convert::repair_catalog_names_for_display_in_root(sessions_root, &mut entries);
     Ok(entries
@@ -2965,7 +3036,7 @@ async fn session_reference_candidates(
 
 /// GET /sessions/search?q=keyword - Search sessions by name
 async fn search_sessions(Query(query): Query<SearchQuery>) -> impl IntoResponse {
-    if query.q.trim().is_empty() {
+    if query.q.trim().is_empty() && !query.include_unavailable {
         return (
             StatusCode::BAD_REQUEST,
             Json("Search keyword cannot be empty"),
@@ -2974,7 +3045,11 @@ async fn search_sessions(Query(query): Query<SearchQuery>) -> impl IntoResponse 
     }
 
     let keyword = query.q;
-    match run_session_catalog_io(move || search_sessions_by_name(&keyword)).await {
+    match run_session_catalog_io(move || {
+        search_sessions_by_name(&keyword, query.include_unavailable)
+    })
+    .await
+    {
         Ok(sessions) => Json(sessions).into_response(),
         Err(e) => {
             let msg = format!("Failed to search sessions: {}", e);
@@ -5945,6 +6020,7 @@ struct WebuiHandle {
     shutdown: watch::Sender<bool>,
     relay_url: Option<String>,
     relay_error: Option<String>,
+    relay_starter: Option<WebuiRelayStarter>,
 }
 
 static WEBUI: std::sync::Mutex<Option<WebuiHandle>> = std::sync::Mutex::new(None);
@@ -5960,6 +6036,23 @@ pub fn webui_port() -> Option<u16> {
         .as_ref()
         .filter(|handle| !handle.abort.is_finished())
         .map(|handle| handle.port)
+}
+
+/// Host-owned side effect; credentials remain in memory, outside runtime config.
+pub type WebuiRelayStarter = Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+pub fn set_webui_relay_starter(target: &WebuiRelayTarget, starter: WebuiRelayStarter) {
+    let mut guard = WEBUI.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(handle) = guard
+        .as_mut()
+        .filter(|h| h.port == target.port && h.tokens.is_valid(&target.token))
+    {
+        handle.relay_starter = Some(starter);
+    }
 }
 
 /// Host-owned tunnel presentation; never used as an authentication bypass.
@@ -6094,6 +6187,7 @@ pub struct WebuiLaunch {
     pub relay_target: Option<WebuiRelayTarget>,
 }
 
+#[derive(Clone)]
 pub struct WebuiRelayTarget {
     pub port: u16,
     pub endpoint: String,
@@ -6206,6 +6300,7 @@ pub async fn launch_webui(host: &str, port: u16, sync: bool, open_browser: bool)
                 shutdown,
                 relay_url: None,
                 relay_error: None,
+                relay_starter: None,
             });
         }
         (tokens, actual_port, host.to_string())
@@ -6261,8 +6356,10 @@ pub async fn launch_webui(host: &str, port: u16, sync: bool, open_browser: bool)
     // 绑定了非回环地址：给出访问 URL + 安全/作用域提示。
     if !is_loopback_authority(&bound_host) {
         if is_wildcard {
-            // 主 URL（local_url）已是局域网 IP（若探测到），它在本机自身也可访问
-            // （0.0.0.0 监听所有接口，含回环），故无需再单列 127.0.0.1 那条冗余链接。
+            // The LAN address is primary; retain loopback as a local fallback.
+            msg.push_str(&format!(
+                "\n本机备用：http://127.0.0.1:{actual_port}/?token={token}{sync_suffix}"
+            ));
             msg.push_str(
                 "\n⚠️ 主地址为局域网 IP，仅同一网络内的设备可访问；公网访问请用隧道（如 cloudflared / Tailscale）。无 TLS，凡能访问者凭 token 即可进入。",
             );
@@ -6428,6 +6525,7 @@ struct PgyInfo {
 
 #[derive(serde::Serialize)]
 struct TunnelStatus {
+    relay_start_supported: bool,
     mode: &'static str,
     relay_error: Option<String>,
     /// server 绑定地址（127.0.0.1=仅本机；0.0.0.0/具体 IP=可被其它设备访问）。
@@ -6557,6 +6655,84 @@ fn pgy_probe() -> PgyInfo {
     PgyInfo { installed, ipv4 }
 }
 
+fn relay_tunnel_status(
+    bind_host: String,
+    port: u16,
+    url: Option<String>,
+    error: Option<String>,
+) -> TunnelStatus {
+    let qr_svg = url
+        .as_ref()
+        .and_then(|url| qrcode::QrCode::new(url.as_bytes()).ok())
+        .map(|code| {
+            code.render::<qrcode::render::svg::Color>()
+                .min_dimensions(200, 200)
+                .quiet_zone(true)
+                .build()
+        });
+    TunnelStatus {
+        relay_start_supported: true,
+        mode: "relay",
+        relay_error: error,
+        bind_host,
+        port,
+        reachable: url.is_some(),
+        pgy: PgyInfo {
+            installed: false,
+            ipv4: None,
+        },
+        remote_url: url,
+        qr_svg,
+    }
+}
+
+#[cfg(test)]
+mod relay_presentation_tests {
+    use super::*;
+
+    #[test]
+    fn phone_dialog_keeps_the_exact_host_published_url() {
+        let url = "https://relay.example/webui/?sync=1#relay=route-0123456789012345&token=token-0123456789012345";
+        let status = relay_tunnel_status("127.0.0.1".into(), 13457, Some(url.into()), None);
+        assert_eq!(status.remote_url.as_deref(), Some(url));
+        assert!(status.reachable);
+        assert!(status.qr_svg.is_some());
+        let failed = relay_tunnel_status("127.0.0.1".into(), 13457, None, Some("offline".into()));
+        assert!(failed.remote_url.is_none());
+        assert!(failed.qr_svg.is_none());
+        assert!(!failed.reachable);
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StartWebuiRelayRequest {}
+
+/// Explicit, authenticated action; GET status never enables sharing.
+async fn start_webui_relay(
+    State(state): State<AppState>,
+    Json(_): Json<StartWebuiRelayRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let starter = {
+        let guard = WEBUI.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .as_ref()
+            .filter(|h| h.port == state.bind_port && !h.abort.is_finished())
+            .and_then(|h| h.relay_starter.clone())
+    };
+    let error = |status, message: String| (status, Json(serde_json::json!({"error": message})));
+    let starter = starter.ok_or_else(|| {
+        error(
+            StatusCode::NOT_IMPLEMENTED,
+            "当前宿主不支持从网页开启中继".into(),
+        )
+    })?;
+    let url = starter()
+        .await
+        .map_err(|message| error(StatusCode::BAD_GATEWAY, message))?;
+    Ok(Json(serde_json::json!({"url": url})))
+}
+
 /// GET /tunnel/status - 远程访问探测：绑定地址、蒲公英状态、远程 URL + 二维码。
 async fn get_tunnel_status(
     State(state): State<AppState>,
@@ -6567,31 +6743,23 @@ async fn get_tunnel_status(
         guard
             .as_ref()
             .filter(|h| h.port == state.bind_port)
-            .map(|h| (h.relay_url.clone(), h.relay_error.clone()))
+            .map(|h| {
+                (
+                    h.relay_url.clone(),
+                    h.relay_error.clone(),
+                    h.relay_starter.is_some(),
+                )
+            })
     };
-    if let Some((url, error)) = relay.filter(|(url, error)| url.is_some() || error.is_some()) {
-        let qr_svg = url
-            .as_ref()
-            .and_then(|url| qrcode::QrCode::new(url.as_bytes()).ok())
-            .map(|code| {
-                code.render::<qrcode::render::svg::Color>()
-                    .min_dimensions(200, 200)
-                    .quiet_zone(true)
-                    .build()
-            });
-        return Json(TunnelStatus {
-            mode: "relay",
-            relay_error: error,
-            bind_host: state.bind_host.clone(),
-            port: state.bind_port,
-            reachable: url.is_some(),
-            pgy: PgyInfo {
-                installed: false,
-                ipv4: None,
-            },
-            remote_url: url,
-            qr_svg,
-        });
+    let relay_start_supported = relay.as_ref().is_some_and(|(_, _, available)| *available);
+    if let Some((url, error, _)) = relay.filter(|(url, error, _)| url.is_some() || error.is_some())
+    {
+        return Json(relay_tunnel_status(
+            state.bind_host.clone(),
+            state.bind_port,
+            url,
+            error,
+        ));
     }
     let pgy = tokio::task::spawn_blocking(pgy_probe)
         .await
@@ -6623,8 +6791,17 @@ async fn get_tunnel_status(
         )
     });
 
-    let (remote_url, qr_svg) = match (&pgy.ipv4, &token) {
-        (Some(ip), Some(tok)) if pgy_reachable => {
+    // Match the address selected by launch_webui for wildcard LAN binding.
+    // A phone on the LAN does not require the optional Pgy VPN.
+    let remote_ip = if matches!(state.bind_host.as_str(), "0.0.0.0" | "::") {
+        primary_lan_ipv4().or_else(|| pgy.ipv4.clone())
+    } else if reachable {
+        Some(state.bind_host.clone())
+    } else {
+        None
+    };
+    let (remote_url, qr_svg) = match (&remote_ip, &token) {
+        (Some(ip), Some(tok)) if reachable || pgy_reachable => {
             // sync=1：手机端扫码/打开后接入与 TUI 的实时同步会话（与本机
             // 自动打开浏览器的 URL 一致）。二维码由该 url 生成，故一并带上。
             let url = format!("http://{}:{}/?token={}&sync=1", ip, state.bind_port, tok);
@@ -6640,6 +6817,7 @@ async fn get_tunnel_status(
     };
 
     Json(TunnelStatus {
+        relay_start_supported,
         mode: "lan",
         relay_error: None,
         bind_host: state.bind_host.clone(),
@@ -7086,6 +7264,17 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
             None
         }
     };
+    // An embedded TUI has already published its live mode. A standalone daemon
+    // seeds the same default before accepting chat/live requests.
+    if native_live::binding().is_err() {
+        live_api::live_set_mode(
+            startup_config
+                .as_ref()
+                .and_then(|config| config.permissions.default_mode)
+                .map(Into::into)
+                .unwrap_or_default(),
+        );
+    }
     let cfg_telemetry = startup_config
         .as_ref()
         .map(|c| c.telemetry.clone())
@@ -7194,6 +7383,10 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     // Bearer 携带）；只有 `--no-auth` 或 App 中继路径（webui_tokens=None）才
     // enforce_token=false，此时 auth_token.rs 的中间件直接放行。
     let protected = Router::new()
+        .merge(api_schedule::routes(
+            state.project.clone(),
+            api_schedule::system_service(),
+        ))
         // Shutdown endpoint (R7.1)
         .route("/shutdown", post(shutdown_handler))
         // Session APIs
@@ -7236,6 +7429,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         )
         // 远程访问状态（Tailscale 探测 + 绑定可达性 + 二维码）
         .route("/tunnel/status", get(get_tunnel_status))
+        .route("/tunnel/start", post(start_webui_relay))
         // Live session API (阶段②)
         .route("/live", get(live_api::live_stream))
         .route("/live/message", post(live_api::live_message))
@@ -8279,6 +8473,156 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn automation_http_requires_auth_and_preserves_revision_and_replay_semantics() {
+        use tower::ServiceExt;
+        let home = ScopedChatHome::new();
+        let mut state = chat_test_state(&home);
+        state.enforce_token = true;
+        state.webui_tokens.insert("automation-test-token".into());
+        let service = atomcode_schedule::service::Service::new(
+            atomcode_schedule::Store::new(home._dir.path().join("schedules")),
+            None,
+        );
+        let app = api_schedule::routes::<AppState>(state.project.clone(), service.clone())
+            .route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                auth_token::require_webui_token,
+            ))
+            .with_state(state);
+        let request = |method: &str, path: &str, body: serde_json::Value, authorized: bool| {
+            let mut builder = axum::http::Request::builder()
+                .method(method)
+                .uri(path)
+                .header("content-type", "application/json");
+            if authorized {
+                builder = builder.header("authorization", "Bearer automation-test-token");
+            }
+            builder
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap()
+        };
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    "GET",
+                    "/schedules/events",
+                    serde_json::Value::Null,
+                    false
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let unauthorized = app
+            .clone()
+            .oneshot(request("GET", "/schedules", serde_json::Value::Null, false))
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        let task = serde_json::json!({"id":"http-task","title":"Review","prompt":"Review changes","cwd":home._dir.path(),"schedule":{"kind":"daily","time":"09:00"}});
+        let create = serde_json::json!({"request_id":"create-http","action":"create","task":task});
+        assert_eq!(
+            app.clone()
+                .oneshot(request("POST", "/schedules", create.clone(), false))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let other = tempfile::tempdir().unwrap();
+        let mut outside = task.clone();
+        outside["id"] = serde_json::json!("other-project");
+        outside["cwd"] = serde_json::json!(other.path());
+        let denied =
+            serde_json::json!({"request_id":"outside-http","action":"create","task":outside});
+        assert_eq!(
+            app.clone()
+                .oneshot(request("POST", "/schedules", denied, true))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(service.catalog().unwrap().is_empty());
+        let response = app
+            .clone()
+            .oneshot(request("POST", "/schedules", create.clone(), true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let first: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let revision = first["entry"]["revision"].as_str().unwrap();
+        assert_eq!(first["entry"]["registration"], "error");
+        let replay = app
+            .clone()
+            .oneshot(request("POST", "/schedules", create.clone(), true))
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(service.catalog().unwrap().len(), 1);
+        let conflict = serde_json::json!({"request_id":"conflict-http","action":"update","task":task,"expected":"outdated"});
+        assert_eq!(
+            app.clone()
+                .oneshot(request("POST", "/schedules", conflict, true))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        let lease = service.store.begin("http-task").unwrap();
+        lease.session("native-recorded-session").unwrap();
+        lease
+            .finish("error", Some("provider unavailable".into()))
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(request(
+                "GET",
+                "/schedules/http-task/history",
+                serde_json::Value::Null,
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let events: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(events["events"].as_array().unwrap().len(), 3);
+        assert_eq!(events["events"][1]["session_id"], "native-recorded-session");
+        let remove = serde_json::json!({"request_id":"delete-http","action":"delete","id":"http-task","expected":revision});
+        for _ in 0..2 {
+            assert_eq!(
+                app.clone()
+                    .oneshot(request("POST", "/schedules", remove.clone(), true))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::OK
+            );
+        }
+        // A late create acknowledgement must not recreate a task deleted later.
+        assert_eq!(
+            app.oneshot(request("POST", "/schedules", create, true))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert!(service.catalog().unwrap().is_empty());
+        assert_eq!(service.store.history("http-task").unwrap().len(), 3);
+    }
+
     #[test]
     fn new_chat_assignment_is_sent_only_after_the_native_aggregate_is_durable() {
         let home = ScopedChatHome::new();
@@ -8957,7 +9301,7 @@ mod tests {
         let snapshot = atomcode_kernel::message::SessionSnapshot::new(vec![
             atomcode_kernel::message::Message::user("修复 VS Code 历史标题"),
         ]);
-        let mut meta = SessionMeta::new(session_id, "/project", 1);
+        let mut meta = SessionMeta::new(session_id, tmp.path().to_string_lossy(), 1);
         meta.owner = StorageOwner::Native;
         meta.message_count = 1;
         manager
@@ -8994,7 +9338,7 @@ mod tests {
         let manager =
             std::sync::Arc::new(SessionManager::with_root(tmp.path().join(project_bucket)));
         let lease = manager.acquire_lease(session_id).unwrap();
-        let mut meta = SessionMeta::new(session_id, "/project", 1);
+        let mut meta = SessionMeta::new(session_id, tmp.path().to_string_lossy(), 1);
         meta.owner = StorageOwner::Native;
         manager
             .commit_native_import(
@@ -9008,7 +9352,7 @@ mod tests {
         let hook = SnapshotHook::new(
             manager.clone(),
             session_id,
-            "/project",
+            tmp.path().to_string_lossy(),
             &atomcode_coding::config::product_dirs_from_env(),
         )
         .with_lease(lease);
@@ -9046,7 +9390,7 @@ mod tests {
             ("conversation", 1, false),
             ("fork", 1, true),
         ] {
-            let mut meta = SessionMeta::new(id, "/project", 1);
+            let mut meta = SessionMeta::new(id, tmp.path().to_string_lossy(), 1);
             meta.owner = StorageOwner::Native;
             meta.message_count = messages;
             if fork {
@@ -9097,7 +9441,7 @@ mod tests {
         let manager = SessionManager::with_root(tmp.path().join(project_bucket));
         for id in ["active-empty", "unused-empty"] {
             manager
-                .write_meta(&SessionMeta::new(id, "/project", 1))
+                .write_meta(&SessionMeta::new(id, tmp.path().to_string_lossy(), 1))
                 .unwrap();
         }
         let active = CatalogLocation {
@@ -9179,7 +9523,7 @@ mod tests {
         let snapshot = atomcode_kernel::message::SessionSnapshot::new(vec![
             atomcode_kernel::message::Message::user("可搜索的历史标题"),
         ]);
-        let mut meta = SessionMeta::new(session_id, "/project", 1);
+        let mut meta = SessionMeta::new(session_id, tmp.path().to_string_lossy(), 1);
         meta.owner = StorageOwner::Native;
         meta.message_count = 1;
         manager
@@ -9193,7 +9537,7 @@ mod tests {
         drop(lease);
 
         let global = list_all_sessions_in_root(tmp.path(), None).unwrap();
-        let search = search_sessions_by_name_in_root(tmp.path(), "可搜索").unwrap();
+        let search = search_sessions_by_name_in_root(tmp.path(), "可搜索", false).unwrap();
 
         assert_eq!(global.len(), 1);
         assert_eq!(global[0].meta.name, "可搜索的历史标题");
@@ -9211,6 +9555,7 @@ mod tests {
             serde_json::from_slice(include_bytes!("../tests/fixtures/session/legacy_full.json"))
                 .unwrap();
         let session_id = legacy["id"].as_str().unwrap().to_string();
+        legacy["working_dir"] = serde_json::json!(tmp.path());
         legacy["name"] = serde_json::Value::String(format!("session-{session_id}"));
         legacy["user_renamed"] = serde_json::Value::Bool(false);
         legacy["ai_named"] = serde_json::Value::Bool(false);
@@ -9229,6 +9574,76 @@ mod tests {
         assert!(!project.join(format!("{session_id}.ui.json")).exists());
     }
 
+    #[tokio::test]
+    async fn unavailable_workspaces_leave_default_catalogs_but_keep_readable_history() {
+        use atomcode_capabilities::session::{PresentationFile, SessionManager, SessionMeta};
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let bucket = "0123456789abcdef";
+        let manager = SessionManager::with_root(root.path().join(bucket));
+        let lease = manager.acquire_lease("history").unwrap();
+        let mut meta = SessionMeta::new("history", workspace.path().to_string_lossy(), 1);
+        meta.owner = atomcode_capabilities::session::StorageOwner::Native;
+        meta.name = "saved automation".into();
+        meta.message_count = 1;
+        let snapshot = atomcode_kernel::message::SessionSnapshot::new(vec![
+            atomcode_kernel::message::Message::user("keep this history"),
+        ]);
+        manager
+            .commit_native_import(
+                &lease,
+                Some(&snapshot),
+                Some(&PresentationFile::default()),
+                &meta,
+            )
+            .unwrap();
+        drop(lease);
+        assert_eq!(
+            list_all_sessions_in_root(root.path(), None).unwrap().len(),
+            1
+        );
+        workspace.close().unwrap();
+        assert!(list_all_sessions_in_root(root.path(), None)
+            .unwrap()
+            .is_empty());
+        assert!(list_sessions_in_root(root.path(), bucket, None)
+            .unwrap()
+            .is_empty());
+        assert!(projects_from_catalog(
+            root.path(),
+            catalog_scan_in_root(root.path()).unwrap().entries,
+            None
+        )
+        .is_empty());
+        assert!(search_sessions_by_name_in_root(root.path(), "saved", false)
+            .unwrap()
+            .is_empty());
+        let history = search_sessions_by_name_in_root(root.path(), "", true).unwrap();
+        assert_eq!(history.len(), 1);
+        assert!(!history[0].meta.working_directory_available);
+        assert_eq!(
+            resolve_session_in_root(root.path(), "history")
+                .unwrap()
+                .unwrap()
+                .meta
+                .id,
+            "history"
+        );
+        let loaded = manager.load_native_session("history").unwrap();
+        assert_eq!(loaded.snapshot.messages[0].text, "keep this history");
+        // The active conversation must not disappear if its directory is removed.
+        let active = atomcode_capabilities::session::CatalogLocation {
+            id: "history".into(),
+            project_bucket: bucket.into(),
+        };
+        assert_eq!(
+            list_all_sessions_in_root(root.path(), Some(&active))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
     #[test]
     fn daemon_global_listing_keeps_latest_fifty_sessions() {
         use atomcode_capabilities::session::{SessionManager, SessionMeta};
@@ -9237,7 +9652,7 @@ mod tests {
         let manager = SessionManager::with_root(tmp.path().join("0123456789abcdef"));
         for index in 0..51 {
             let id = format!("history-{index:02}");
-            let mut meta = SessionMeta::new(&id, "/project", index);
+            let mut meta = SessionMeta::new(&id, tmp.path().to_string_lossy(), index);
             meta.name = format!("history title {index:02}");
             meta.message_count = 1;
             manager.write_meta(&meta).unwrap();
@@ -9588,6 +10003,18 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn chat_offers_the_mcp_tools_on_its_first_turn() {
+        // Pin eager offering: the default deliberately defers schemas to mcp_search.
+        check_chat_first_turn_mcp(Some(atomcode_config::config::McpToolSearchMode::Off)).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn chat_defers_mcp_schemas_to_discovery_by_default() {
+        check_chat_first_turn_mcp(None).await;
+    }
+
+    #[cfg(unix)]
+    async fn check_chat_first_turn_mcp(mode: Option<atomcode_config::config::McpToolSearchMode>) {
         let home = ScopedChatHome::new();
         let dir = home._dir.path().to_path_buf();
         let script = dir.join("mcp-server.sh");
@@ -9621,6 +10048,9 @@ done
 
         let (main_url, main_request, main_task) = spawn_openai_sse("done").await;
         let mut config = Config::with_default_provider("main");
+        if let Some(mode) = mode {
+            config.tools.mcp.tool_search = mode;
+        }
         config
             .providers
             .insert("main".into(), test_provider("deepseek-v4-flash", main_url));
@@ -9664,11 +10094,129 @@ done
             .await
             .expect("the provider must be called")
             .expect("request captured");
-        assert!(
-            request.contains("mcp__t__echo"),
-            "the first /chat turn went out without the MCP tool"
-        );
+        let (_, body) = request.split_once("\r\n\r\n").expect("HTTP request body");
+        let body: serde_json::Value = serde_json::from_str(body).expect("provider JSON");
+        let names = body["tools"]
+            .as_array()
+            .expect("offered tools")
+            .iter()
+            .filter_map(|tool| {
+                tool.pointer("/function/name")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .collect::<Vec<_>>();
+        if mode.is_some() {
+            assert!(
+                names.contains(&"mcp__t__echo"),
+                "first eager /chat turn missing MCP tool: {names:?}"
+            );
+        } else {
+            assert!(
+                names.contains(&"mcp_search"),
+                "first /chat turn missing MCP discovery: {names:?}"
+            );
+            assert!(
+                !names.contains(&"mcp__t__echo"),
+                "default mode must defer MCP schemas: {names:?}"
+            );
+        }
         main_task.await.expect("provider task");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn webui_relay_start_requires_auth_and_json_before_calling_the_host() {
+        use tower::ServiceExt;
+        let home = ScopedChatHome::new();
+        let mut state = chat_test_state(&home);
+        state.enforce_token = true;
+        let token = state.webui_tokens.mint();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = calls.clone();
+        let task = tokio::spawn(std::future::pending::<()>());
+        let (shutdown, _) = watch::channel(false);
+        *WEBUI.lock().unwrap() = Some(WebuiHandle {
+            tokens: state.webui_tokens.clone(),
+            port: state.bind_port,
+            host: state.bind_host.clone(),
+            abort: task.abort_handle(),
+            shutdown,
+            relay_url: None,
+            relay_error: None,
+            relay_starter: Some(Arc::new(move || {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async {
+                    Ok("https://relay.example/webui/#relay=dummy&token=dummy".into())
+                })
+            })),
+        });
+        let cookie = format!("{}={token}", state.webui_cookie_name);
+        let app = axum::Router::new()
+            .route("/tunnel/start", post(start_webui_relay))
+            .route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                auth_token::require_webui_token,
+            ))
+            .with_state(state);
+        for (authorization, content_type, body, expected) in [
+            (false, "application/json", "{}", StatusCode::UNAUTHORIZED),
+            (true, "text/plain", "{}", StatusCode::UNSUPPORTED_MEDIA_TYPE),
+            (
+                true,
+                "application/json",
+                r#"{"endpoint":"https://attacker.example"}"#,
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+        ] {
+            let mut request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/tunnel/start")
+                .header("content-type", content_type);
+            if authorization {
+                request = request.header("authorization", format!("Bearer {token}"));
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(axum::body::Body::from(body)).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/tunnel/start")
+                    .header("content-type", "application/json")
+                    .header("cookie", cookie)
+                    .body(axum::body::Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["url"],
+            "https://relay.example/webui/#relay=dummy&token=dummy"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        WEBUI.lock().unwrap().take();
+        task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn webui_relay_start_reports_an_unsupported_host() {
+        let home = ScopedChatHome::new();
+        let result = start_webui_relay(
+            State(chat_test_state(&home)),
+            Json(StartWebuiRelayRequest {}),
+        )
+        .await;
+        assert_eq!(result.unwrap_err().0, StatusCode::NOT_IMPLEMENTED);
     }
 
     // 回归：限流事件必须作为独立的 `rate_limited` ChatEvent 下发（非 error/warning），

@@ -56,6 +56,74 @@ pub fn storage_id(session_id: &str) -> String {
     session_id.replace('/', "~")
 }
 
+// Only presentation payloads are shortened. Sequence numbers and structural
+// facts remain intact so the canonical projector still decides what is visible.
+fn reference_hit(text: &str, query: &str) -> Option<usize> {
+    if query.is_empty() {
+        return None;
+    }
+    // Prefer the latest mention inside a long answer: an earlier proposal may
+    // have been corrected near its end. The result still reports a partial window.
+    let target = text.to_lowercase().rfind(&query.to_lowercase())?;
+    let mut lowered = 0;
+    for (offset, ch) in text.char_indices() {
+        let width: usize = ch.to_lowercase().map(char::len_utf8).sum();
+        if target < lowered + width {
+            return Some(offset);
+        }
+        lowered += width;
+    }
+    None
+}
+
+fn trim_reference_payload(value: &mut serde_json::Value, clipped: &mut bool, query: &str) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            for (key, value) in fields.iter_mut() {
+                if matches!(key.as_str(), "reasoning" | "reasoning_blocks" | "images") {
+                    *value = if value.is_array() {
+                        serde_json::json!([])
+                    } else {
+                        serde_json::json!("")
+                    };
+                } else if key == "arguments" && value.is_string() {
+                    // Calls remain paired by id, but their inputs are never quoted.
+                    *value = serde_json::json!("{}");
+                } else if matches!(key.as_str(), "text" | "content" | "summary") {
+                    if let Some(text) = value.as_str() {
+                        let count = text.chars().count();
+                        if count > 8000 {
+                            let hit = reference_hit(text, query);
+                            let excerpt: String = if let Some(hit) = hit {
+                                let start = text[..hit].chars().count().saturating_sub(2000);
+                                text.chars().skip(start).take(8000).collect()
+                            } else if key == "summary"
+                                || text.starts_with(crate::compaction::ANCHOR_SENTINEL)
+                            {
+                                text.chars().take(8000).collect()
+                            } else {
+                                text.chars().skip(count - 8000).collect()
+                            };
+                            *clipped = true;
+                            *value = serde_json::json!(excerpt);
+                        }
+                    } else {
+                        trim_reference_payload(value, clipped, query);
+                    }
+                } else {
+                    trim_reference_payload(value, clipped, query);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                trim_reference_payload(item, clipped, query);
+            }
+        }
+        _ => {}
+    }
+}
+
 impl SessionManager {
     /// Whether `id` is stored as an event log. The index is the commit point of
     /// such a session, so it is what decides.
@@ -225,6 +293,173 @@ impl SessionManager {
         Ok(snapshot_of(
             &self.read_event_log_bounded(id, false, limit)?.1,
         ))
+    }
+
+    /// Read-only reference projection. Scan with the store's line/file guards,
+    /// retain bounded text, and use the canonical projector for rewind/compaction.
+    pub(super) fn reference_projection(
+        &self,
+        id: &str,
+        retained_limit: usize,
+    ) -> SessionResult<(SessionMeta, Vec<(Message, bool)>, bool, Option<u64>)> {
+        self.reference_projection_query(id, retained_limit, "", false)
+    }
+
+    pub(super) fn reference_projection_query(
+        &self,
+        id: &str,
+        retained_limit: usize,
+        query: &str,
+        historical: bool,
+    ) -> SessionResult<(SessionMeta, Vec<(Message, bool)>, bool, Option<u64>)> {
+        let meta = self.read_meta(id)?;
+        if meta.needs_newer_version() {
+            return Err(SessionStoreError::FutureSchema {
+                kind: "session events",
+                found: meta.format_version,
+                supported: SESSION_FORMAT_VERSION,
+            });
+        }
+        if meta.owner != StorageOwner::Native {
+            return Err(SessionStoreError::OwnershipConflict {
+                id: id.into(),
+                owner: meta.owner,
+                operation: "reference session",
+            });
+        }
+        if !self.is_event_session(id) {
+            if historical {
+                return Err(SessionStoreError::Corrupt {
+                    kind: "session reference",
+                    message: "raw history is unavailable for an unmigrated snapshot".into(),
+                });
+            }
+            let loaded = self.load_native_session_bounded(id, retained_limit)?;
+            return Ok((
+                loaded.meta,
+                loaded
+                    .snapshot
+                    .messages
+                    .into_iter()
+                    .map(|m| (m, false))
+                    .collect(),
+                false,
+                None,
+            ));
+        }
+        let path = self.events_path(id)?;
+        let mut header = None;
+        let mut events = Vec::new();
+        let mut retained = 0usize;
+        let mut clipped = false;
+        let mut index = 0usize;
+        super::manager::for_each_jsonl_line_limited(&path, 64 * 1024 * 1024, true, |raw| {
+            index += 1;
+            if raw.iter().all(u8::is_ascii_whitespace) {
+                return Ok(());
+            }
+            let line: Line =
+                serde_json::from_slice(raw).map_err(|e| SessionStoreError::Corrupt {
+                    kind: "session events",
+                    message: format!("{}:{index}: {e}", path.display()),
+                })?;
+            if let Some(found) = line.header {
+                if header.is_some() || !events.is_empty() || storage_id(&found.id) != id {
+                    return Err(SessionStoreError::Corrupt {
+                        kind: "session events",
+                        message: "invalid reference session header".into(),
+                    });
+                }
+                if found.version > SESSION_FORMAT_VERSION {
+                    return Err(SessionStoreError::FutureSchema {
+                        kind: "session events",
+                        found: found.version,
+                        supported: SESSION_FORMAT_VERSION,
+                    });
+                }
+                header = Some(found);
+                return Ok(());
+            }
+            let (Some(seq), Some(value)) = (line.seq, line.event) else {
+                return Err(SessionStoreError::Corrupt {
+                    kind: "session events",
+                    message: "not an event record".into(),
+                });
+            };
+            if header.is_none()
+                || events
+                    .last()
+                    .is_some_and(|last: &LoggedEvent| last.seq >= seq)
+            {
+                return Err(SessionStoreError::Corrupt {
+                    kind: "session events",
+                    message: "missing header or non-increasing sequence".into(),
+                });
+            }
+            // Validate the original event before dropping any non-reference payload.
+            let event = event_of(value, &path, index - 1, header.as_ref())?;
+            let mut value =
+                serde_json::to_value(event).map_err(|e| SessionStoreError::Corrupt {
+                    kind: "session events",
+                    message: e.to_string(),
+                })?;
+            trim_reference_payload(&mut value, &mut clipped, query);
+            retained = retained
+                .saturating_add(
+                    serde_json::to_vec(&value)
+                        .map_err(|e| SessionStoreError::Corrupt {
+                            kind: "session events",
+                            message: e.to_string(),
+                        })?
+                        .len(),
+                )
+                .saturating_add(64);
+            if retained > retained_limit {
+                return Err(SessionStoreError::TooLarge {
+                    kind: "reference projection",
+                    limit: retained_limit,
+                    actual: retained,
+                });
+            }
+            let event = event_of(value, &path, index - 1, header.as_ref())?;
+            events.push(LoggedEvent {
+                seq,
+                at: line.at,
+                event,
+            });
+            Ok(())
+        })?;
+        if header.is_none() {
+            return Err(SessionStoreError::Corrupt {
+                kind: "session events",
+                message: "missing session header".into(),
+            });
+        }
+        let captured_through_seq = events.last().map(|e| e.seq);
+        if historical {
+            let messages = events
+                .iter()
+                .filter_map(|logged| match &logged.event {
+                    SessionEvent::UserMessage { text, .. } => Some((Message::user(text), false)),
+                    SessionEvent::AssistantMessage { text, .. } => {
+                        Some((Message::assistant(text, vec![]), false))
+                    }
+                    _ => None,
+                })
+                .collect();
+            return Ok((meta, messages, clipped, captured_through_seq));
+        }
+        let messages = atomcode_kernel::session::derive_traced(&events)
+            .into_iter()
+            .map(|traced| {
+                let summary = matches!(
+                    traced.source,
+                    atomcode_kernel::session::Provenance::Summary(_)
+                );
+                (traced.message, summary)
+            })
+            .collect();
+        Ok((meta, messages, clipped, captured_through_seq))
     }
 
     fn read_event_log(
@@ -767,6 +1002,10 @@ pub fn events_to_become(events: &[LoggedEvent], target: &[Message]) -> Vec<Sessi
     if let Some(summary) = target
         .first()
         .filter(|m| m.role == Role::System && m.synthetic)
+        // A synthetic system block is a compaction summary only when it is not
+        // the memory block; memory is reseeded below as an `Injected` fact of its
+        // own, so the log keeps its provenance instead of hiding it in a summary.
+        .filter(|m| !m.text.starts_with(MEMORY_INJECTION_HEADER))
     {
         for to in starts.iter().rev() {
             let compacted = SessionEvent::Compacted {
@@ -887,6 +1126,10 @@ fn last_turn(events: &[LoggedEvent]) -> u64 {
         .unwrap_or(0)
 }
 
+/// First line of the memory block `MemoryContext` injects. A synthetic system
+/// message carrying it is memory, not a compaction summary.
+const MEMORY_INJECTION_HEADER: &str = "=== MEMORY ===";
+
 /// The facts a stored conversation is made of, numbered from `first_seq`.
 ///
 /// The one crossing from a snapshot into a log: converting a session stored as
@@ -915,10 +1158,15 @@ pub fn events_from_snapshot(snapshot: &SessionSnapshot, first_seq: SeqNo) -> Vec
         match message.role {
             Role::System => {
                 if message.synthetic {
+                    let origin = if message.text.starts_with(MEMORY_INJECTION_HEADER) {
+                        InjectionOrigin::Memory
+                    } else {
+                        InjectionOrigin::CompactionSummary
+                    };
                     events.push(SessionEvent::Injected {
                         turn,
                         text: message.text.clone(),
-                        origin: InjectionOrigin::CompactionSummary,
+                        origin,
                     });
                 }
             }
@@ -1593,7 +1841,9 @@ mod tests {
         ]);
         manager.append_events(&lease, &facts).unwrap();
 
-        let records = turn_records("s1", &manager.load_events("s1").unwrap());
+        // Exercise the shared history reader used by the WebUI as well as recall's
+        // projection: an event header must never be parsed as a legacy TurnRecord.
+        let records = manager.load_transcript_records("s1").unwrap();
         assert_eq!(
             records
                 .iter()
@@ -2204,5 +2454,210 @@ mod tests {
         assert!(!manager.index_path("s2").unwrap().exists());
         assert!(!manager.events_path("s2").unwrap().exists());
         assert!(manager.load_native_session("s1").is_ok());
+    }
+
+    #[test]
+    fn snapshot_memory_is_replayed_as_memory_not_as_a_compaction_summary() {
+        let mut memory = Message::system("=== MEMORY ===\n- prefers tabs");
+        memory.synthetic = true;
+        let snapshot = SessionSnapshot::new(vec![
+            Message::system("You are AtomCode"),
+            memory,
+            Message::user("hello"),
+        ]);
+        let events = events_from_snapshot(&snapshot, 1);
+        let origin = events.iter().find_map(|logged| match &logged.event {
+            SessionEvent::Injected { text, origin, .. } if text.contains("prefers tabs") => {
+                Some(origin)
+            }
+            _ => None,
+        });
+        assert_eq!(origin, Some(&InjectionOrigin::Memory));
+        assert!(!events.iter().any(|logged| matches!(
+            &logged.event,
+            SessionEvent::Injected {
+                origin: InjectionOrigin::CompactionSummary,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn events_to_become_keeps_memory_out_of_a_summary() {
+        let events = vec![
+            logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+            logged(
+                2,
+                0,
+                SessionEvent::Injected {
+                    turn: 1,
+                    text: "=== MEMORY ===\n- prefers tabs".into(),
+                    origin: InjectionOrigin::Memory,
+                },
+            ),
+            logged(
+                3,
+                0,
+                SessionEvent::UserMessage {
+                    turn: 1,
+                    text: "one".into(),
+                    images: vec![],
+                },
+            ),
+            logged(
+                4,
+                0,
+                SessionEvent::AssistantMessage {
+                    turn: 1,
+                    round: 1,
+                    text: "ok1".into(),
+                    reasoning: String::new(),
+                    tool_calls: vec![],
+                    reasoning_blocks: vec![],
+                    meta: None,
+                },
+            ),
+            logged(5, 0, SessionEvent::TurnStart { turn: 2 }),
+            logged(
+                6,
+                0,
+                SessionEvent::UserMessage {
+                    turn: 2,
+                    text: "two".into(),
+                    images: vec![],
+                },
+            ),
+            logged(
+                7,
+                0,
+                SessionEvent::AssistantMessage {
+                    turn: 2,
+                    round: 1,
+                    text: "ok2".into(),
+                    reasoning: String::new(),
+                    tool_calls: vec![],
+                    reasoning_blocks: vec![],
+                    meta: None,
+                },
+            ),
+        ];
+        let mut memory = Message::system("=== MEMORY ===\n- prefers tabs");
+        memory.synthetic = true;
+        let target = vec![
+            memory,
+            Message::user("two"),
+            Message::assistant("ok2", vec![]),
+        ];
+        let change = events_to_become(&events, &target);
+        assert!(!change.iter().any(|event| matches!(
+            event,
+            SessionEvent::Compacted { summary, .. } if summary.contains("prefers tabs")
+        )));
+        assert!(change.iter().any(|event| matches!(
+            event,
+            SessionEvent::Injected {
+                origin: InjectionOrigin::Memory,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn events_to_become_reseeds_a_memory_snapshot_instead_of_summarizing_it() {
+        // The log holds no memory fact; the snapshot's leading synthetic system
+        // message is a memory block. It must be reseeded as `Injected` memory, not
+        // recorded as a `Compacted` summary that a later compaction could drop.
+        let events = vec![
+            logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+            logged(
+                3,
+                0,
+                SessionEvent::UserMessage {
+                    turn: 1,
+                    text: "one".into(),
+                    images: vec![],
+                },
+            ),
+            logged(
+                4,
+                0,
+                SessionEvent::AssistantMessage {
+                    turn: 1,
+                    round: 1,
+                    text: "ok1".into(),
+                    reasoning: String::new(),
+                    tool_calls: vec![],
+                    reasoning_blocks: vec![],
+                    meta: None,
+                },
+            ),
+            logged(5, 0, SessionEvent::TurnStart { turn: 2 }),
+            logged(
+                6,
+                0,
+                SessionEvent::UserMessage {
+                    turn: 2,
+                    text: "two".into(),
+                    images: vec![],
+                },
+            ),
+            logged(
+                7,
+                0,
+                SessionEvent::AssistantMessage {
+                    turn: 2,
+                    round: 1,
+                    text: "ok2".into(),
+                    reasoning: String::new(),
+                    tool_calls: vec![],
+                    reasoning_blocks: vec![],
+                    meta: None,
+                },
+            ),
+        ];
+        let mut memory = Message::system("=== MEMORY ===\n- prefers tabs");
+        memory.synthetic = true;
+        let target = vec![
+            memory,
+            Message::user("two"),
+            Message::assistant("ok2", vec![]),
+        ];
+        let change = events_to_become(&events, &target);
+        assert!(
+            !change.iter().any(|event| matches!(
+                event,
+                SessionEvent::Compacted { summary, .. } if summary.contains("prefers tabs")
+            )),
+            "memory must not become a compaction summary: {change:?}"
+        );
+        assert!(
+            change.iter().any(|event| matches!(
+                event,
+                SessionEvent::Injected {
+                    origin: InjectionOrigin::Memory,
+                    ..
+                }
+            )),
+            "memory is reseeded as its own fact: {change:?}"
+        );
+    }
+
+    #[cfg(feature = "memory")]
+    #[test]
+    fn memory_injection_header_matches_the_real_block() {
+        use crate::memory::context::MemoryContext;
+        use crate::memory::store::MemoryStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::new(dir.path().join("memory.md"));
+        store.append("prefers tabs").unwrap();
+        let context = MemoryContext::load(
+            &store,
+            &store,
+            &store,
+            "project",
+            &dir.path().join("knowledge/INDEX.md"),
+        );
+        assert!(context.prompt.starts_with(MEMORY_INJECTION_HEADER));
     }
 }

@@ -371,13 +371,14 @@ impl OpenAiCompatProvider {
         let initial_tls12 = atomcode_config::tls::should_cap_url(&url);
         let custom_headers = !cfg.headers.is_empty();
         let client = std::sync::Arc::new(
-            SwappableClient::new(initial_tls12, move |tls12| {
-                build_account_http_client(
+            SwappableClient::new_with_proxy(initial_tls12, move |tls12, proxy| {
+                build_account_http_client_with_proxy(
                     connect_timeout,
                     skip_tls_verify,
                     user_agent.clone(),
                     tls12,
                     custom_headers,
+                    proxy,
                 )
             })?
             .with_headers(cfg.headers.clone()),
@@ -414,12 +415,31 @@ pub(crate) fn build_http_client(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn build_account_http_client(
     connect_timeout: std::time::Duration,
     skip_tls_verify: bool,
     user_agent: Option<String>,
     force_tls12: bool,
     custom_headers: bool,
+) -> Result<reqwest::Client, ProviderError> {
+    build_account_http_client_with_proxy(
+        connect_timeout,
+        skip_tls_verify,
+        user_agent,
+        force_tls12,
+        custom_headers,
+        None,
+    )
+}
+
+pub(crate) fn build_account_http_client_with_proxy(
+    connect_timeout: std::time::Duration,
+    skip_tls_verify: bool,
+    user_agent: Option<String>,
+    force_tls12: bool,
+    custom_headers: bool,
+    proxy: Option<&atomcode_config::proxy::ProxyConfig>,
 ) -> Result<reqwest::Client, ProviderError> {
     // First attempt: webpki base + OS native store + SSL_CERT_FILE (add_trusted_roots).
     match build_http_client_inner(
@@ -429,6 +449,7 @@ pub(crate) fn build_account_http_client(
         force_tls12,
         true,
         custom_headers,
+        proxy,
     ) {
         Ok(client) => Ok(client),
         Err(first) => {
@@ -451,6 +472,7 @@ pub(crate) fn build_account_http_client(
                 force_tls12,
                 false,
                 custom_headers,
+                proxy,
             )
         }
     }
@@ -466,22 +488,26 @@ fn build_http_client_inner(
     force_tls12: bool,
     trust_os_roots: bool,
     custom_headers: bool,
+    proxy: Option<&atomcode_config::proxy::ProxyConfig>,
 ) -> Result<reqwest::Client, ProviderError> {
-    let mut builder = crate::proxy::apply_async_proxy_policy(reqwest::Client::builder())
-        .redirect(if custom_headers {
-            reqwest::redirect::Policy::none()
-        } else {
-            reqwest::redirect::Policy::default()
-        })
-        .connect_timeout(connect_timeout)
-        // Drop idle keep-alive connections before the gateway LB does, so
-        // we don't reuse a server-closed socket (the "error sending
-        // request" / ConnectionReset class). See POOL_IDLE_TIMEOUT.
-        .pool_idle_timeout(retry::POOL_IDLE_TIMEOUT)
-        // Product UA so the gateway can attribute/slice traffic by version
-        // (parity with core's `build_http_client`). Driver injects the real
-        // `atomcode/<version>`; bare fallback when unset.
-        .user_agent(user_agent.as_deref().unwrap_or(super::DEFAULT_USER_AGENT));
+    let mut builder = super::auto_proxy::apply(
+        crate::proxy::apply_async_proxy_policy(reqwest::Client::builder()),
+        proxy,
+    )?
+    .redirect(if custom_headers {
+        reqwest::redirect::Policy::none()
+    } else {
+        reqwest::redirect::Policy::default()
+    })
+    .connect_timeout(connect_timeout)
+    // Drop idle keep-alive connections before the gateway LB does, so
+    // we don't reuse a server-closed socket (the "error sending
+    // request" / ConnectionReset class). See POOL_IDLE_TIMEOUT.
+    .pool_idle_timeout(retry::POOL_IDLE_TIMEOUT)
+    // Product UA so the gateway can attribute/slice traffic by version
+    // (parity with core's `build_http_client`). Driver injects the real
+    // `atomcode/<version>`; bare fallback when unset.
+    .user_agent(user_agent.as_deref().unwrap_or(super::DEFAULT_USER_AGENT));
     if force_tls12 {
         builder = builder.max_tls_version(reqwest::tls::Version::TLS_1_2);
     }
@@ -579,17 +605,29 @@ pub(crate) fn add_trusted_roots(mut builder: reqwest::ClientBuilder) -> reqwest:
     builder
 }
 
-/// An HTTP client held behind a rebuild seam. `get()` hands out the current client
-/// (cheap: `reqwest::Client` is `Arc` inside); `rebuild()` constructs a fresh client
+/// An HTTP client held behind a rebuild seam. `for_request()` refreshes automatic
+/// proxy routing; `rebuild()` constructs a fresh client with that same route
 /// — hence a brand-new, EMPTY connection pool — and atomically swaps it in. This is
 /// the automatic form of the manual `/login` remedy for the "poisoned pool" failure:
 /// once a keep-alive connection is silently half-closed, only a fresh pool recovers,
 /// because every reuse of the old pool re-hands-out the dead socket.
 pub(crate) struct SwappableClient {
     pub(crate) headers: atomcode_config::provider_headers::ProviderHeaders,
-    current: std::sync::RwLock<(reqwest::Client, bool)>,
+    current: std::sync::RwLock<(
+        reqwest::Client,
+        bool,
+        Option<atomcode_config::proxy::ProxyConfig>,
+    )>,
+    refresh: tokio::sync::Mutex<()>,
     #[allow(clippy::type_complexity)]
-    build: Box<dyn Fn(bool) -> Result<reqwest::Client, ProviderError> + Send + Sync>,
+    build: Box<
+        dyn Fn(
+                bool,
+                Option<&atomcode_config::proxy::ProxyConfig>,
+            ) -> Result<reqwest::Client, ProviderError>
+            + Send
+            + Sync,
+    >,
 }
 
 impl SwappableClient {
@@ -601,14 +639,29 @@ impl SwappableClient {
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn new(
         force_tls12: bool,
         build: impl Fn(bool) -> Result<reqwest::Client, ProviderError> + Send + Sync + 'static,
     ) -> Result<Self, ProviderError> {
-        let initial = build(force_tls12)?;
+        Self::new_with_proxy(force_tls12, move |tls12, _| build(tls12))
+    }
+
+    pub(crate) fn new_with_proxy(
+        force_tls12: bool,
+        build: impl Fn(
+                bool,
+                Option<&atomcode_config::proxy::ProxyConfig>,
+            ) -> Result<reqwest::Client, ProviderError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Result<Self, ProviderError> {
+        let initial = build(force_tls12, None)?;
         Ok(Self {
             headers: Default::default(),
-            current: std::sync::RwLock::new((initial, force_tls12)),
+            current: std::sync::RwLock::new((initial, force_tls12, None)),
+            refresh: tokio::sync::Mutex::new(()),
             build: Box::new(build),
         })
     }
@@ -617,12 +670,52 @@ impl SwappableClient {
     /// the guarded `reqwest::Client` is ALWAYS a valid client, so a lock poisoned by an
     /// unrelated panic must not turn every subsequent request into a hard panic — that would
     /// re-create the exact "wedged until restart" failure this seam exists to prevent.
+    #[cfg(test)]
     pub(crate) fn get(&self) -> reqwest::Client {
         self.current
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .0
             .clone()
+    }
+
+    /// Refresh before an existing OPEN attempt, never by replaying the turn or
+    /// allocating another retry. Cancellation drops this future; the blocking
+    /// resolver only returns data and cannot later mutate this client.
+    pub(crate) async fn for_request(&self) -> Result<reqwest::Client, ProviderError> {
+        self.for_request_with(super::auto_proxy::for_request())
+            .await
+    }
+
+    async fn for_request_with(
+        &self,
+        refresh: impl std::future::Future<
+            Output = Result<Option<atomcode_config::proxy::ProxyConfig>, ProviderError>,
+        >,
+    ) -> Result<reqwest::Client, ProviderError> {
+        let _refresh = self.refresh.lock().await;
+        let proxy = refresh.await?;
+        self.with_proxy(proxy)
+    }
+
+    fn with_proxy(
+        &self,
+        proxy: Option<atomcode_config::proxy::ProxyConfig>,
+    ) -> Result<reqwest::Client, ProviderError> {
+        let mut current = self.current.write().unwrap_or_else(|p| p.into_inner());
+        if current.2 != proxy {
+            let fresh = (self.build)(current.1, proxy.as_ref())?;
+            if proxy
+                .as_ref()
+                .is_some_and(|cfg| cfg.http.is_none() && cfg.https.is_none())
+            {
+                tracing::info!("代理路由已更新，正在直连（本地代理恢复后会自动重新使用）");
+            } else {
+                tracing::info!("network proxy route refreshed; connection pool rebuilt");
+            }
+            *current = (fresh, current.1, proxy);
+        }
+        Ok(current.0.clone())
     }
 
     pub(crate) fn is_tls12(&self) -> bool {
@@ -632,8 +725,10 @@ impl SwappableClient {
     /// Rebuild with a fresh (empty) pool and swap it in. On failure the old
     /// client remains valid, but the caller receives the build error explicitly.
     pub(crate) fn rebuild(&self, force_tls12: bool) -> Result<reqwest::Client, ProviderError> {
-        let fresh = (self.build)(force_tls12)?;
-        *self.current.write().unwrap_or_else(|p| p.into_inner()) = (fresh.clone(), force_tls12);
+        let mut current = self.current.write().unwrap_or_else(|p| p.into_inner());
+        let fresh = (self.build)(force_tls12, current.2.as_ref())?;
+        current.0 = fresh.clone();
+        current.1 = force_tls12;
         Ok(fresh)
     }
 }
@@ -701,16 +796,7 @@ impl LlmProvider for OpenAiCompatProvider {
         );
         // Serialize once and reuse the exact bytes across retries (hence `.body()`
         // with an explicit content-type rather than re-serializing via `.json()`).
-        let body_bytes = match serde_json::to_vec(&body) {
-            Ok(b) => b,
-            Err(e) => {
-                return Err(ProviderError {
-                    retryable: false,
-                    message: format!("request body serialization failed: {e}"),
-                    ..Default::default()
-                })
-            }
-        };
+        let body_bytes = super::request_size::serialize(&self.url, &body)?;
 
         let mut timing = super::latency::Latency::new();
         timing.mark("request_start");
@@ -825,7 +911,7 @@ impl LlmProvider for OpenAiCompatProvider {
                             // Do not replay here: partial deltas may already be visible.
                             // The owner can continue from preserved safe progress.
                             request_span.in_scope(|| tracing::warn!(error_origin = "stream_watchdog", stream_attempt, had_replay_sensitive_output = emitted_replay_sensitive, "provider stream diagnostic"));
-                            let mut error = retry::stream_idle_error();
+                            let mut error = retry::stream_idle_error(&watchdog);
                             error.retryable = caller_recovers && !emitted_replay_sensitive;
                             yield StreamEvent::Error(error);
                             return;
@@ -949,7 +1035,7 @@ impl LlmProvider for OpenAiCompatProvider {
                                 request_span.in_scope(|| tracing::debug!(request_id, phase = "first_body_chunk", stream_attempt, elapsed_ms = request_started.elapsed().as_millis() as u64, "provider request timing"));
                                 logged_first_byte = true;
                             }
-                            let mut saw_done = false;
+                            let mut saw_terminal = false;
                             for ev in request_span.in_scope(|| dec.feed(chunk.as_ref())) {
                                 if !emitted_replay_sensitive && retry::is_attempt_metadata_event(&ev) {
                                     pending_metadata.push(ev);
@@ -962,12 +1048,12 @@ impl LlmProvider for OpenAiCompatProvider {
                                 }
                                 watchdog.observe(&ev);
                                 emitted_replay_sensitive |= retry::is_replay_sensitive_event(&ev);
-                                if matches!(ev, StreamEvent::Done { .. }) {
-                                    saw_done = true;
+                                if matches!(ev, StreamEvent::Done { .. } | StreamEvent::Error(_)) {
+                                    saw_terminal = true;
                                 }
                                 yield ev;
                             }
-                            if saw_done { return; }
+                            if saw_terminal { return; }
                         }
                     }
                 }
@@ -1171,7 +1257,7 @@ async fn open_stream_attempts(
         first_wire_attempt = false;
         // Take the CURRENT client each attempt: a transport-error retry below
         // rebuilds it, so the retried attempt gets a fresh (empty) pool.
-        let http = client.get();
+        let http = client.for_request().await?;
         let mut req = http
             .post(url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -1363,6 +1449,12 @@ async fn open_stream_attempts(
                     );
                     if fallback || retry::is_stale_connection_error(&e) || corruption {
                         client.rebuild(was_capped || fallback)?;
+                        tracing::info!(
+                            phase = "request_open",
+                            tls12 = was_capped || fallback,
+                            tls12_fallback = fallback,
+                            "provider connection pool rebuilt before caller recovery"
+                        );
                     }
                 }
                 if retry::is_retryable_reqwest_error(&e) && attempt < policy.max_attempts {
@@ -1410,6 +1502,13 @@ async fn open_stream_attempts(
                         // latch the working downgrade for future clients.
                         let capped = try_tls12 || was_capped;
                         client.rebuild(capped)?;
+                        tracing::info!(
+                            phase = "request_open",
+                            attempt,
+                            tls12 = capped,
+                            tls12_fallback = try_tls12,
+                            "provider connection pool rebuilt before retry"
+                        );
                         tls12_probe = capped;
                     }
                     attempt += 1;
@@ -2144,9 +2243,67 @@ impl SseDecoder {
         self.seen_finish
     }
 
-    /// Stream ended WITHOUT a `[DONE]` sentinel: flush buffered tool calls + usage,
-    /// then emit `Done`.
+    fn fail_incomplete(&mut self, code: &str, message: &str) -> Vec<StreamEvent> {
+        self.done = true;
+        self.tool_calls.clear();
+        tracing::warn!(error_origin = code, "provider stream diagnostic");
+        let mut out = Vec::new();
+        // A failed response still consumed the usage the provider reported.
+        // Deliver it before the terminal error, since consumers stop at Error.
+        if let Some(usage) = self.last_usage.take() {
+            out.push(StreamEvent::Usage(usage));
+        }
+        out.push(StreamEvent::Error(ProviderError {
+            code: Some(code.into()),
+            message: message.into(),
+            retryable: false,
+            ..Default::default()
+        }));
+        out
+    }
+
+    /// HTTP EOF is success only after a terminal signal. A complete HTTP body
+    /// can still contain an incomplete SSE response; never flush its pending
+    /// tool arguments into an executable call or claim its text is complete.
     fn finish(&mut self) -> Vec<StreamEvent> {
+        if self.done {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        // Some gateways omit the final newline as well as [DONE]. Parse the
+        // last line before deciding whether its finish_reason completed us.
+        if !self.buf.is_empty() {
+            let pending = String::from_utf8_lossy(&std::mem::take(&mut self.buf)).into_owned();
+            self.process_line(pending.trim_end_matches('\r'), &mut out);
+        }
+        if self.done {
+            return out;
+        }
+        // Preserve empty-response recovery and non-SSE/JSON error diagnostics.
+        if self.seen_finish || !self.saw_data {
+            out.extend(self.finish_completed());
+            return out;
+        }
+        self.done = true;
+        tracing::warn!(
+            error_origin = "missing_stream_terminal",
+            "provider stream diagnostic"
+        );
+        if let Some(usage) = self.last_usage.take() {
+            out.push(StreamEvent::Usage(usage));
+        }
+        out.push(StreamEvent::Error(ProviderError {
+            message: "模型响应流在完成前结束（缺少 finish_reason 或 [DONE]），已保留收到的内容。"
+                .into(),
+            code: Some(atomcode_kernel::stream::STREAM_TRANSPORT_INTERRUPTED_CODE.into()),
+            retryable: false,
+            ..Default::default()
+        }));
+        out
+    }
+
+    /// Finalize an explicit completion, flushing buffered tool calls and usage.
+    fn finish_completed(&mut self) -> Vec<StreamEvent> {
         let mut out = Vec::new();
         if self.done {
             return out;
@@ -2274,14 +2431,15 @@ impl SseDecoder {
         self.saw_data = true;
         let data = data.trim();
         if data == "[DONE]" {
-            // Same finalization as a stream EOF: flush any accumulated tool
-            // calls, then usage + Done. `finish()` does exactly this (and is a
+            // An explicit [DONE] is a completion signal even when the gateway
+            // omitted finish_reason. Flush accumulated calls, usage, then Done.
+            // `finish_completed()` does exactly this (and is a
             // no-op if already done). Calling it here — instead of emitting
             // only usage + Done — closes the gap where a gateway that reports
             // ONLY `finish_reason:""` (never a real non-empty reason) and ends
             // with `[DONE]` would otherwise drop its buffered tool call, since
             // "" is treated as non-terminal and never triggers the flush above.
-            out.extend(self.finish());
+            out.extend(self.finish_completed());
             return;
         }
         if data.is_empty() {
@@ -2348,6 +2506,29 @@ impl SseDecoder {
         let Some(choice) = chunk.choices.into_iter().next() else {
             return;
         };
+        // A refusal or an unknown terminal is not a complete response. Reject
+        // before flushing pending calls, including calls carried in this chunk.
+        if let Some(reason) = choice
+            .finish_reason
+            .as_deref()
+            .filter(|reason| !reason.is_empty())
+        {
+            let failure = match reason {
+                "stop" | "tool_calls" | "function_call" | "length" => None,
+                "content_filter" => Some((
+                    "content_filter",
+                    "模型输出被内容过滤中断，未将不完整响应标记为完成。",
+                )),
+                _ => Some((
+                    "unsupported_finish_reason",
+                    "模型返回了无法确认成功的结束原因，未将不完整响应标记为完成。",
+                )),
+            };
+            if let Some((code, message)) = failure {
+                out.extend(self.fail_incomplete(code, message));
+                return;
+            }
+        }
         if let Some(c) = choice.delta.content {
             if !c.is_empty() {
                 // A `<think>` block here is reasoning that came down the wrong
@@ -2382,11 +2563,18 @@ impl SseDecoder {
             out.push(StreamEvent::Reasoning(r));
         }
         if let Some(tcs) = choice.delta.tool_calls {
-            if self.seen_finish || self.tool_call_delta_count >= MAX_TOOL_CALL_DELTAS {
-                out.extend(self.finish());
+            if self.seen_finish {
+                out.extend(self.finish_completed());
                 return;
             }
             for tc in tcs {
+                if self.tool_call_delta_count >= MAX_TOOL_CALL_DELTAS {
+                    out.extend(self.fail_incomplete(
+                        "tool_call_delta_limit",
+                        "工具调用片段超过保护上限，已中止响应，未执行不完整的工具调用。",
+                    ));
+                    return;
+                }
                 self.tool_call_delta_count += 1;
                 // Which call this delta belongs to. `index` is authoritative when
                 // present. When it is absent — some OpenAI-compatible gateways omit
@@ -2468,6 +2656,11 @@ impl SseDecoder {
         // dropped and the model shows "0 工具". Treat "" as non-terminal.
         if let Some(fr) = choice.finish_reason.filter(|s| !s.is_empty()) {
             self.seen_finish = true;
+            if fr == "length" {
+                self.truncated = true;
+                self.tool_calls.clear();
+                return;
+            }
             for (id, name, args) in std::mem::take(&mut self.tool_calls) {
                 // Same rule as `finish()`: a nameless tool call cannot be dispatched, so
                 // dropping it beats emitting a call that is certain to fail.
@@ -2479,9 +2672,6 @@ impl SseDecoder {
                     name,
                     arguments: args,
                 }));
-            }
-            if fr == "length" {
-                self.truncated = true;
             }
         }
     }
@@ -3318,6 +3508,142 @@ mod tests {
     }
 
     // ---- request building ----
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn auto_proxy_cancelled_refresh_cannot_replace_client_later() {
+        let client = std::sync::Arc::new(
+            SwappableClient::new_with_proxy(false, |_, _| {
+                Ok(reqwest::Client::builder().no_proxy().build().unwrap())
+            })
+            .unwrap(),
+        );
+        let (started, waiting) = tokio::sync::oneshot::channel();
+        let (complete, result) = tokio::sync::oneshot::channel();
+        let pending_client = client.clone();
+        let request = tokio::spawn(async move {
+            pending_client
+                .for_request_with(async move {
+                    started.send(()).unwrap();
+                    result.await.unwrap()
+                })
+                .await
+        });
+        waiting.await.unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert!(complete.send(Ok(Some(Default::default()))).is_err());
+        assert!(client.current.read().unwrap().2.is_none());
+        // The cancelled request must also release the refresh lock.
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            client.for_request_with(async { Ok(Some(Default::default())) }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(client.current.read().unwrap().2.is_some());
+    }
+
+    #[test]
+    fn auto_proxy_route_changes_rebuild_once_and_transport_rebuild_keeps_route() {
+        use atomcode_config::proxy::ProxyConfig;
+        let builds = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = builds.clone();
+        let client = SwappableClient::new_with_proxy(true, move |tls12, cfg| {
+            captured.lock().unwrap().push((tls12, cfg.cloned()));
+            Ok(reqwest::Client::builder().no_proxy().build().unwrap())
+        })
+        .unwrap();
+        let cfg = Some(ProxyConfig::default());
+        client.with_proxy(cfg.clone()).unwrap();
+        client.with_proxy(cfg.clone()).unwrap();
+        assert_eq!(
+            builds.lock().unwrap().len(),
+            2,
+            "same route keeps the connection pool"
+        );
+        client.rebuild(true).unwrap();
+        assert_eq!(builds.lock().unwrap().last(), Some(&(true, cfg.clone())));
+        assert!(client.is_tls12());
+        client.with_proxy(None).unwrap();
+        assert_eq!(builds.lock().unwrap().last(), Some(&(true, None)));
+    }
+
+    #[test]
+    fn auto_proxy_failed_refresh_keeps_old_client_and_route() {
+        let client = SwappableClient::new_with_proxy(false, |_, cfg| {
+            if cfg.is_some() {
+                Err(ProviderError {
+                    message: "route build failed".into(),
+                    ..Default::default()
+                })
+            } else {
+                Ok(reqwest::Client::builder().no_proxy().build().unwrap())
+            }
+        })
+        .unwrap();
+        let error = client.with_proxy(Some(Default::default())).unwrap_err();
+        assert_eq!(error.message, "route build failed");
+        assert!(client.current.read().unwrap().2.is_none());
+        client.rebuild(false).unwrap();
+    }
+
+    // Real sockets are required to prove route selection (not a virtual-clock test).
+    #[tokio::test]
+    async fn auto_proxy_requests_switch_to_direct_then_back_and_honor_no_proxy() {
+        use atomcode_config::proxy::ProxyConfig;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let origin = MockServer::start().await;
+        let proxy = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200).set_body_string("direct"))
+            .mount(&origin)
+            .await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200).set_body_string("proxied"))
+            .mount(&proxy)
+            .await;
+        let client = SwappableClient::new_with_proxy(false, |_, cfg| {
+            super::super::auto_proxy::apply(reqwest::Client::builder().no_proxy(), cfg)?
+                .build()
+                .map_err(|_| ProviderError {
+                    message: "build failed".into(),
+                    ..Default::default()
+                })
+        })
+        .unwrap();
+        let configured = ProxyConfig {
+            http: Some(proxy.uri()),
+            https: Some(proxy.uri()),
+            ..Default::default()
+        };
+        for (cfg, expected) in [
+            (configured.clone(), "proxied"),
+            (ProxyConfig::default(), "direct"),
+            (configured.clone(), "proxied"),
+            (
+                ProxyConfig {
+                    no_proxy: Some("127.0.0.1".into()),
+                    ..configured
+                },
+                "direct",
+            ),
+        ] {
+            let http = client.with_proxy(Some(cfg)).unwrap();
+            assert_eq!(
+                http.get(origin.uri())
+                    .send()
+                    .await
+                    .unwrap()
+                    .text()
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
+        assert_eq!(proxy.received_requests().await.unwrap().len(), 2);
+        assert_eq!(origin.received_requests().await.unwrap().len(), 2);
+    }
 
     #[test]
     fn format_messages_maps_roles_and_tool_result() {
@@ -5392,10 +5718,66 @@ mod tests {
     }
 
     #[test]
+    fn clean_eof_without_terminal_signal_is_an_interruption() {
+        for delta in [
+            json!({"content": "partial answer"}),
+            json!({"reasoning_content": "partial reasoning"}),
+            json!({"tool_calls": [{"index": 0, "id": "c1", "function": {"name": "bash", "arguments": "{\"command\":\"echo"}}]}),
+        ] {
+            let mut decoder = SseDecoder::new();
+            let mut events = decoder
+                .feed(line(json!({"choices": [{"delta": delta, "finish_reason": ""}]})).as_bytes());
+            events.extend(decoder.finish());
+            assert!(events.iter().any(|event| matches!(event, StreamEvent::Error(error)
+                if error.code.as_deref() == Some(atomcode_kernel::stream::STREAM_TRANSPORT_INTERRUPTED_CODE)
+                    && !error.retryable)), "{events:?}");
+            assert!(
+                !events.iter().any(|event| matches!(
+                    event,
+                    StreamEvent::Done { .. } | StreamEvent::ToolCall(_)
+                )),
+                "{events:?}"
+            );
+            assert!(
+                decoder.finish().is_empty(),
+                "terminal errors must not repeat"
+            );
+        }
+    }
+
+    #[test]
+    fn eof_accepts_a_terminal_line_without_a_trailing_newline() {
+        for (terminal, truncated) in [
+            (
+                line(json!({"choices": [{"delta": {}, "finish_reason": "stop"}]})),
+                false,
+            ),
+            ("data: [DONE]\n".to_string(), false),
+            (
+                line(json!({"choices": [{"delta": {}, "finish_reason": "length"}]})),
+                true,
+            ),
+        ] {
+            let mut decoder = SseDecoder::new();
+            let mut events = decoder
+                .feed(line(json!({"choices": [{"delta": {"content": "complete"}}]})).as_bytes());
+            events.extend(decoder.feed(terminal.trim_end().as_bytes()));
+            events.extend(decoder.finish());
+            assert!(
+                matches!(events.last(), Some(StreamEvent::Done { truncated: actual }) if *actual == truncated),
+                "{events:?}"
+            );
+        }
+    }
+
+    #[test]
     fn sse_finish_without_done_flushes() {
         let mut d = SseDecoder::new();
         let mut ev = d.feed(line(json!({"choices":[{"delta":{"content":"x"}}]})).as_bytes());
-        // no [DONE]; the network loop calls finish() on EOF
+        ev.extend(
+            d.feed(line(json!({"choices":[{"delta":{},"finish_reason":"stop"}]})).as_bytes()),
+        );
+        // A valid finish_reason makes EOF benign even without [DONE].
         ev.extend(d.finish());
         assert!(matches!(
             ev.last().unwrap(),
@@ -5425,6 +5807,116 @@ mod tests {
     }
 
     #[test]
+    fn failed_terminals_preserve_received_usage_without_executing_calls() {
+        for mode in ["content_filter", "unknown", "limit", "eof"] {
+            let mut decoder = SseDecoder::new();
+            let mut events = decoder.feed(line(json!({"choices": [{"delta": {"content": "partial", "tool_calls": [{"index": 0, "id": "c1", "function": {"name": "bash", "arguments": "{}"}}]}}]})).as_bytes());
+            events.extend(decoder.feed(line(json!({"choices": [], "usage": {"prompt_tokens": 11, "completion_tokens": 5}})).as_bytes()));
+            match mode {
+                "eof" => events.extend(decoder.finish()),
+                "limit" => {
+                    decoder.tool_call_delta_count = MAX_TOOL_CALL_DELTAS;
+                    events.extend(decoder.feed(line(json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": " "}}]}}]})).as_bytes()));
+                }
+                reason => events.extend(decoder.feed(
+                    line(json!({"choices": [{"delta": {}, "finish_reason": reason}]})).as_bytes(),
+                )),
+            }
+            let usages: Vec<_> = events
+                .iter()
+                .enumerate()
+                .filter_map(|(index, event)| match event {
+                    StreamEvent::Usage(usage) => Some((index, *usage)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                usages.len(),
+                1,
+                "{mode}: paid tokens must not disappear on failure: {events:?}"
+            );
+            assert_eq!(
+                usages[0].1,
+                TokenUsage {
+                    prompt: 11,
+                    completion: 5,
+                    cached: 0
+                }
+            );
+            let error = events
+                .iter()
+                .position(|event| matches!(event, StreamEvent::Error(_)))
+                .unwrap();
+            assert!(usages[0].0 < error);
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::Done { .. } | StreamEvent::ToolCall(_))));
+        }
+    }
+
+    #[test]
+    fn unsuccessful_finish_reasons_do_not_commit_partial_text_or_calls() {
+        for reason in ["content_filter", "unknown", "error", "unexpected_reason"] {
+            let mut decoder = SseDecoder::new();
+            let mut events = decoder.feed(line(json!({"choices": [{"delta": {
+                "content": "partial design", "tool_calls": [{"index": 0, "id": "c1", "function": {"name": "bash", "arguments": "{}"}}]
+            }}]})).as_bytes());
+            events.extend(decoder.feed(
+                line(json!({"choices": [{"delta": {}, "finish_reason": reason}]})).as_bytes(),
+            ));
+            events.extend(decoder.feed(b"data: [DONE]\n"));
+            events.extend(decoder.finish());
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, StreamEvent::Error(error) if !error.retryable)),
+                "{reason}: {events:?}"
+            );
+            assert!(
+                !events.iter().any(|event| matches!(
+                    event,
+                    StreamEvent::Done { .. } | StreamEvent::ToolCall(_)
+                )),
+                "{reason}: {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn token_limit_does_not_flush_pending_tool_calls() {
+        let mut decoder = SseDecoder::new();
+        let mut events = decoder.feed(line(json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c1", "function": {"name": "bash", "arguments": "{}"}}]}}]})).as_bytes());
+        events.extend(
+            decoder.feed(
+                line(json!({"choices": [{"delta": {}, "finish_reason": "length"}]})).as_bytes(),
+            ),
+        );
+        events.extend(decoder.feed(b"data: [DONE]\n"));
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Done { truncated: true })
+        ));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::ToolCall(_))));
+    }
+
+    #[test]
+    fn tool_fragment_limit_is_enforced_within_one_chunk() {
+        let mut decoder = SseDecoder::new();
+        let fragment =
+            json!({"index": 0, "id": "c1", "function": {"name": "bash", "arguments": " "}});
+        let events = decoder.feed(line(json!({"choices": [{"delta": {"tool_calls": vec![fragment; MAX_TOOL_CALL_DELTAS + 1]}}]})).as_bytes());
+        assert_eq!(decoder.tool_call_delta_count, MAX_TOOL_CALL_DELTAS);
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::Error(_))));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::ToolCall(_) | StreamEvent::Done { .. })));
+    }
+
+    #[test]
     fn sse_degenerate_stream_exceeding_hard_limit() {
         let mut d = SseDecoder::new();
         let mut ev = Vec::new();
@@ -5446,7 +5938,10 @@ mod tests {
         // The 20001-st chunk should trigger early termination.
         ev.extend(d.feed(delta_bytes));
         assert!(d.done);
-        assert!(matches!(ev.last().unwrap(), StreamEvent::Done { .. }));
+        assert!(matches!(ev.last().unwrap(), StreamEvent::Error(_)));
+        assert!(!ev
+            .iter()
+            .any(|event| matches!(event, StreamEvent::ToolCall(_) | StreamEvent::Done { .. })));
     }
 
     // ---- mid-stream re-open (v1 parity: retry a body that dies before any event) ----

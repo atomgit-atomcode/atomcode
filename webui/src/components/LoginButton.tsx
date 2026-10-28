@@ -87,21 +87,28 @@ export function useAuth() {
   const busyRef = useRef(false);
   const pollTimer = useRef<number | null>(null);
   const loginGeneration = useRef(0);
+  const refreshing = useRef(false);
 
   async function refresh(shouldApply: () => boolean = () => true) {
+    if (refreshing.current) return;
+    refreshing.current = true;
     try {
       const r = await apiFetch('/auth/status', { headers: authHeaders() });
+      if (!shouldApply()) return;
       if (r.status === 401) {
         window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
         return;
       }
+      if (!r.ok) return;
       const s = await r.json();
       if (!shouldApply()) return;
       setLoggedIn(!!s.logged_in);
       setExpired(!!s.expired);
       setUser(s.user ?? null);
     } catch {
-      /* ignore */
+      /* A transport failure does not change account or WebUI authorization. */
+    } finally {
+      refreshing.current = false;
     }
   }
 

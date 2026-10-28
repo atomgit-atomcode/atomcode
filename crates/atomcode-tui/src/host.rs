@@ -3386,18 +3386,73 @@ impl Host {
         true
     }
 
-    /// What an endpoint listed for the providers panel's picker — see
-    /// [`crate::providers::discovered`]. Answers what to tell the person when
-    /// there is nothing to pick.
+    /// Start model selection immediately after saving a new connection.
+    pub fn connect_provider_models(&self, account: &str) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let view = m.providers.clone();
+        if !view
+            .account(account)
+            .is_some_and(|row| row.configured && !row.managed)
+        {
+            return false;
+        }
+        let Some(panel) = m.providers_panel.as_mut() else {
+            return false;
+        };
+        let Some(mut form) = crate::providers::ModelForm::add(&view, Some(account)) else {
+            return false;
+        };
+        form.connecting = true;
+        form.advanced = false;
+        form.focus = crate::providers::ModelField::Model;
+        form.start_discovery();
+        panel.form = Some(crate::providers::Form::Model(form));
+        true
+    }
+
+    pub fn provider_discovery_id(&self) -> Option<u64> {
+        let m = self.moment.read().expect("moment poisoned");
+        match m.providers_panel.as_ref()?.form.as_ref()? {
+            crate::providers::Form::Model(form) if form.picking.is_some() => {
+                Some(form.discovery_id)
+            }
+            _ => None,
+        }
+    }
+
+    /// A cancelled request cannot fill a replacement picker, even for the same account.
     pub fn providers_discovered(
         &self,
         account: &str,
+        request: u64,
         listed: Result<Vec<crate::providers::Discovered>, String>,
     ) -> Option<String> {
         let mut m = self.moment.write().expect("moment poisoned");
         let view = m.providers.clone();
         let panel = m.providers_panel.as_mut()?;
+        if !matches!(&panel.form, Some(crate::providers::Form::Model(form)) if form.discovery_id == request)
+        {
+            return None;
+        }
         crate::providers::discovered(&view, panel, account, listed)
+    }
+
+    /// Restore an unsuccessful write without asking the person to type again.
+    pub fn restore_provider_form(&self, mut panel: crate::providers::Panel, key: Option<String>) {
+        let count = key.as_deref().unwrap_or_default().chars().count();
+        match panel.form.as_mut() {
+            Some(crate::providers::Form::Account(form)) => form.key_len = count,
+            Some(crate::providers::Form::Model(form)) => form.key_len = count,
+            None => {}
+        }
+        let mut m = self.moment.write().expect("moment poisoned");
+        if m.providers_panel.is_some() {
+            m.providers_panel = Some(panel);
+            *self
+                .providers_secret
+                .lock()
+                .expect("provider secret poisoned") = key.unwrap_or_default();
+        }
     }
 
     /// Run one key against the providers panel: the panel it writes back, and
@@ -3454,6 +3509,27 @@ impl Host {
             return false;
         }
         let mut m = self.moment.write().expect("moment poisoned");
+        if let Some(crate::providers::Form::Model(form)) = m
+            .providers_panel
+            .as_mut()
+            .and_then(|panel| panel.form.as_mut())
+        {
+            if let Some(crate::providers::Picking::Ready {
+                items,
+                query,
+                cursor,
+            }) = form.picking.as_mut()
+            {
+                let rows = crate::providers::picked_rows(items, query).len();
+                *cursor = if by < 0 {
+                    cursor.saturating_sub(by.unsigned_abs() as usize)
+                } else {
+                    cursor.saturating_add(by as usize)
+                }
+                .min(rows.saturating_sub(1));
+                return true;
+            }
+        }
         let rows = match m.providers_panel.as_ref() {
             // A form has no list to walk, and a wheel over it must not scroll
             // the conversation behind it either — it is still the panel's.
@@ -3514,7 +3590,14 @@ impl Host {
         let view = m.providers.clone();
         match m.providers_panel.as_mut() {
             Some(panel) => {
-                let moved = panel.show(tab);
+                let closed_form = panel.form.take().is_some();
+                if closed_form {
+                    self.providers_secret
+                        .lock()
+                        .expect("provider secret poisoned")
+                        .clear();
+                }
+                let moved = panel.show(tab) || closed_form;
                 view.settle_cursor(panel);
                 moved
             }
@@ -3578,9 +3661,48 @@ impl Host {
         crate::modules::providers::geometry(&m, &vp).listed_at((y - rect.y) as usize)
     }
 
+    /// Clicking a discovered model checks it; list rows keep their Enter action.
+    pub(crate) fn provider_row_key(&self) -> crate::surface::KeyPress {
+        let m = self.moment.read().expect("moment poisoned");
+        let select = matches!(m.providers_panel.as_ref().and_then(|panel| panel.form.as_ref()),
+            Some(crate::providers::Form::Model(form)) if form.is_batch() || matches!(form.picking, Some(crate::providers::Picking::Ready { .. })));
+        crate::surface::KeyPress::plain(if select {
+            crate::surface::Key::Char(' ')
+        } else {
+            crate::surface::Key::Enter
+        })
+    }
+
     /// Point the panel at a listed row. True when it moved.
     pub fn point_providers_at(&self, row: usize) -> bool {
         let mut m = self.moment.write().expect("moment poisoned");
+        if let Some(crate::providers::Form::Model(form)) = m
+            .providers_panel
+            .as_mut()
+            .and_then(|panel| panel.form.as_mut())
+        {
+            if form.is_batch() {
+                let want = row.min(form.selected.len() - 1);
+                let changed = form.batch_cursor != want;
+                form.batch_cursor = want;
+                return changed;
+            }
+            if let Some(crate::providers::Picking::Ready {
+                items,
+                query,
+                cursor,
+            }) = form.picking.as_mut()
+            {
+                let want = row.min(
+                    crate::providers::picked_rows(items, query)
+                        .len()
+                        .saturating_sub(1),
+                );
+                let changed = *cursor != want;
+                *cursor = want;
+                return changed;
+            }
+        }
         let rows = match m.providers_panel.as_ref() {
             Some(panel) => m.providers.listed(panel).len(),
             None => return false,
@@ -6102,18 +6224,6 @@ impl Host {
             },
             moment.scroll.0 > 0 || moment.stream_selection.is_some(),
         );
-        let history_notice = || {
-            (index.loaded_start > 0 && index.loaded_start < stream.slots().len()).then(|| {
-                Line::from_spans(vec![crate::frame::Span::styled(
-                    crate::i18n::t(crate::i18n::Msg::HistoryLoadsOnScroll).into_owned(),
-                    crate::theme::fg(crate::theme::Role::Muted),
-                )])
-                .truncate(rect.w as usize)
-            })
-        };
-        if pane.block_scroll == 0 && index.loaded_start > 0 {
-            return history_notice();
-        }
         let distance = pane
             .block_scroll
             .saturating_add(rect.h as usize)
@@ -6124,7 +6234,7 @@ impl Host {
         let first =
             (first..index.rows.len()).find(|i| index.rows[*i].is_some_and(|row| row.rows > 0))?;
         if stream.slots()[first].block().kind() == "user" {
-            return history_notice();
+            return None;
         }
         // A reserved row must not push the reading position into the next
         // prompt while still labeling it with the preceding turn.
@@ -6134,17 +6244,14 @@ impl Host {
             .find(|i| index.rows[*i].is_some_and(|row| row.rows > 0))
             .is_some_and(|i| stream.slots()[i].block().kind() == "user")
         {
-            return history_notice();
+            return None;
         }
-        (0..first)
-            .rev()
-            .find_map(|i| {
-                let block = stream.slots()[i].block();
-                (block.kind() == "user" && index.rows[i].is_some_and(|row| row.rows > 0))
-                    .then(|| block.content.prompt_header(rect.w))
-                    .flatten()
-            })
-            .or_else(history_notice)
+        (0..first).rev().find_map(|i| {
+            let block = stream.slots()[i].block();
+            (block.kind() == "user" && !pres.is_hidden("user"))
+                .then(|| block.content.prompt_header(rect.w))
+                .flatten()
+        })
     }
 
     fn reserve_prompt_header(&self, pane: &mut Pane, moment: &Moment) -> Option<Line> {
@@ -6866,7 +6973,7 @@ impl Host {
         // Last, over everything, including a modal: the selection is a
         // rectangle on the screen, and the screen is what was pointed at.
         if let Some(sel) = moment.selection {
-            frame.highlight_with_colors(&sel, moment.caps.colors != crate::caps::Colors::None);
+            frame.highlight_for_caps(&sel, moment.caps);
         }
 
         // Last of all, and after the selection on purpose: the context menu is
@@ -11174,8 +11281,8 @@ mod tests {
         );
         assert_eq!(h.stream.read().unwrap().slots().len(), 2_000);
         assert!(
-            h.compose(size).part("stream.prompt").is_some(),
-            "bounded history must be visible to the reader"
+            h.compose(size).part("stream.prompt").is_none(),
+            "a history loading notice must not occupy the prompt header"
         );
         let first = h.row_index.lock().unwrap().loaded_start;
         assert!(first > 0);
@@ -14125,6 +14232,7 @@ mod tests {
     #[test]
     fn prompt_header_follows_the_visible_turn_and_is_not_transcript_content() {
         let h = host();
+        h.set_history_layout_rows(Some(10));
         let say = |turn, text: &str| {
             h.absorb(&SessionEvent::UserMessage {
                 turn,
@@ -14153,6 +14261,10 @@ mod tests {
             .expect("long turn pins its prompt");
         assert_eq!(header.lines.len(), 1);
         assert!(header.lines[0].plain().contains("Second question"));
+        assert!(
+            h.row_index.lock().unwrap().loaded_start > 0,
+            "the input header remains available even outside the measured history tail"
+        );
         assert!(h.compose((15, 15)).part("stream.prompt").is_none());
         assert!(h.compose((40, 3)).part("stream.prompt").is_none());
         let moment = h.moment.read().unwrap().clone();

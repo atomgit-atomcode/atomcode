@@ -3911,6 +3911,12 @@ async fn catalogs(key: &str, dir: &std::path::Path) -> (Vec<String>, Vec<String>
 /// it. What is left are four things somebody has to decide, not fix.
 const KNOWN_TOOL_DIFFERENCES: &[(&str, &str)] = &[
     (
+        "session_reference",
+        "coding-row-only feature added after the recorded chain retired: bounded \
+         queries over sources explicitly referenced by the current human request. \
+         It does not replace project recall. Keep the historical golden unchanged.",
+    ),
+    (
         "request_user_input",
         "chain-only NAME for the same capability the tree mounts as `ask_user`.          One of them has to win, and whichever does, the persona and the prompts          that name it have to move with it.",
     ),
@@ -3940,13 +3946,36 @@ const KNOWN_TOOL_DIFFERENCES: &[(&str, &str)] = &[
     ),
 ];
 
+/// Differences that exist only where the HOST provides the capability — mounted
+/// by detection at assembly time, not by a build constant.
+///
+/// They cannot join [`KNOWN_TOOL_DIFFERENCES`]: that list requires the difference
+/// to exist on every platform, and a host without a PowerShell mounts `pwsh`
+/// nowhere, so both engines would agree and the entry would read as stale. Here
+/// the requirement is weaker and still real: wherever the tool is mounted at all,
+/// exactly one engine may mount it.
+const HOST_GATED_TOOL_DIFFERENCES: &[(&str, &str)] = &[
+    (
+        "pwsh",
+        "tree-only where a PowerShell is detected: the row set mounts it with          conservative approval, while the recorded chain has no shell-family          row to bring it. Absent on hosts that provide no PowerShell, where          both engines then agree by mounting nothing.",
+    ),
+    (
+        "pwsh_start",
+        "tree-only, one decision with `pwsh`: starts a background PowerShell job.          See above.",
+    ),
+];
+
 #[tokio::test]
+#[serial_test::serial(offline_verdict)]
 async fn both_engines_offer_the_model_the_same_tools() {
     let dir = scratch("tool-catalog");
     seed(&dir);
     let (chain, rows) = catalogs("catalog", &dir).await;
 
-    let known = |name: &String| KNOWN_TOOL_DIFFERENCES.iter().any(|(n, _)| n == name);
+    let known = |name: &String| {
+        KNOWN_TOOL_DIFFERENCES.iter().any(|(n, _)| n == name)
+            || HOST_GATED_TOOL_DIFFERENCES.iter().any(|(n, _)| n == name)
+    };
     let missing: Vec<&String> = chain
         .iter()
         .filter(|n| !rows.contains(n) && !known(n))
@@ -3973,6 +4002,21 @@ async fn both_engines_offer_the_model_the_same_tools() {
             "`{name}` is recorded as a known difference ({why}) but both engines \
              now agree about it — drop the entry rather than leaving a stale reason"
         );
+    }
+
+    // A host-gated entry is exempt from the "must differ here" rule only while
+    // this host mounts the tool nowhere: then there is no difference to observe.
+    // The moment either engine mounts it, the engines must still disagree.
+    for (name, why) in HOST_GATED_TOOL_DIFFERENCES {
+        let on_chain = chain.iter().any(|n| n == name);
+        let on_rows = rows.iter().any(|n| n == name);
+        if on_chain || on_rows {
+            assert_ne!(
+                on_chain, on_rows,
+                "`{name}` is recorded as a host-gated difference ({why}) but both \
+                 engines now mount it — drop the entry rather than leaving a stale reason"
+            );
+        }
     }
 }
 

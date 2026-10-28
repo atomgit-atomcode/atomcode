@@ -4,13 +4,14 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { Chat } from './components/Chat';
 import { Sidebar } from './components/Sidebar';
+import { Automation } from './components/Automation';
 import { ThemeDialog, LanguageDialog, RemoteAccessDialog, NotificationsDialog } from './components/SettingsDialogs';
 import { ModelConfigDialog } from './components/ModelProviders';
 import { RenameDialog, DeleteDialog } from './components/SessionDialogs';
 import { CwdPicker } from './components/CwdPicker';
 import { resolvePendingAfterDecision } from './lib/pendingPermission';
 import { getProject, getConfig, changeDir, resolveSession, createSession, getSession, SessionMetaWithProject } from './api';
-import { useT, SettingsSection } from './settings';
+import { useT, useSettings, SettingsSection } from './settings';
 import { applyConfigDefaults, initNotificationPermissionPrompt } from './lib/notifications';
 import { sessionMessagesToMarkdownLines } from './lib/historyMessages';
 
@@ -30,6 +31,7 @@ function shortSessionId(id: string): string {
 
 export function App() {
   const t = useT();
+  const { lang } = useSettings();
   // URL 里是短 id，不能直接当完整 id 用（后端需要完整 id）；先置空，挂载后再还原。
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [activeSession, setActiveSession] = useState<SessionMetaWithProject | null>(null);
@@ -45,6 +47,10 @@ export function App() {
   const [projectHash, setProjectHash] = useState('');
   const [pending, setPending] = useState<any | null>(null);
   const [showCwd, setShowCwd] = useState(false);
+  const [showAutomation, setShowAutomation] = useState(false);
+  const automationNavigation = useRef(0);
+  const composerSequence = useRef(0);
+  const [composerInsert, setComposerInsert] = useState<{text: string; seq: number; sessionId: string} | null>(null);
   const [settingsSection, setSettingsSection] = useState<SettingsSection | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -384,6 +390,7 @@ export function App() {
         activeSessionId={sessionId}
         onSelect={handleSelectSession}
         onNew={handleNewSession}
+        onOpenAutomation={() => { automationNavigation.current++; setSidebarOpen(false); setShowAutomation(true); }}
         onNewInProject={handleNewInProject}
         open={sidebarOpen}
         collapsed={sidebarCollapsed}
@@ -505,12 +512,32 @@ export function App() {
             onCwdChanged={handleCwdChanged}
             onLanding={setIsLanding}
             skillInsert={skillInsert}
+            composerInsert={composerInsert}
             onSessionRenamed={(name) => setActiveSession((prev) => prev ? { ...prev, name } : prev)}
           />
         </div>
       </div>
 
       {/* ===== Modals ===== */}
+      {showAutomation && <Automation cwd={cwd} onCreateInChat={async () => {
+        const generation = automationNavigation.current;
+        let sync = false;
+        try { sync = new URLSearchParams(location.search).get('sync') === '1'; } catch { /* no URL context */ }
+        const data = await createSession(cwd || undefined, undefined, sync);
+        if (generation !== automationNavigation.current) return;
+        handleSelectSession({ id: data.id, name: data.name, working_dir: data.working_dir, project_hash: data.project_hash, created_at: data.created_at, updated_at: data.created_at, message_count: 0 });
+        setComposerInsert({ seq: ++composerSequence.current, sessionId: data.id, text: lang === 'zh'
+          ? '帮我创建一个自动化任务：\n任务内容：\n执行频率与时间（主机本地时区）：\n默认只读分析，每次在独立会话中运行。'
+          : 'Help me create an automation:\nInstructions:\nRepeat and time (execution host local zone):\nUse read-only analysis by default, with a fresh session for each run.' });
+        setSessionListVersion(version => version + 1);
+        automationNavigation.current++; setShowAutomation(false);
+      }} onClose={() => { automationNavigation.current++; setShowAutomation(false); }} onSession={async (id, isCurrent) => {
+        const generation = automationNavigation.current;
+        const session = await resolveSession(id);
+        if (generation !== automationNavigation.current || isCurrent?.() === false) return;
+        if (!session) throw new Error('Execution session is unavailable');
+        handleSelectSession(session); setShowAutomation(false);
+      }} />}
       {showCwd && (
         <CwdPicker
           current={cwd}

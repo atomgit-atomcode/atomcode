@@ -761,16 +761,15 @@ fn truncate(text: &str, max: usize) -> String {
 struct CompactBeforeRequest {
     ctx: Context,
     threshold: f32,
-    /// The turn each session last tried a quick and a slow compaction in.
+    token_limit: Option<u32>,
+    /// Attempts in each session’s current turn and context-pressure cycle.
     tried: Mutex<HashMap<String, (u64, [bool; 2])>>,
 }
 
 impl CompactBeforeRequest {
-    /// At most one attempt per stage — a quick one, one that calls a model — per
-    /// turn. The trigger runs before every request and pressure does not fall
-    /// between two rounds of one turn; a strategy that found nothing worth doing
-    /// at the first would be asked again at every round after it, and one that
-    /// calls a model would bill for it each time.
+    /// At most one attempt per stage per turn or pressure cycle. A no-op or
+    /// failed summary must not bill again on every request while pressure stays
+    /// high. A later provider report below the trigger rearms both stages.
     fn first_try(&self, session: &str, turn: u64, slow: bool) -> bool {
         let mut tried = self.tried.lock().expect("compaction attempts poisoned");
         let entry = tried
@@ -806,7 +805,19 @@ impl Waterfall<AgentRequest> for CompactBeforeRequest {
             .map(|p| p.context_window())
             .unwrap_or(0);
         let used = last_prompt_tokens(&session);
-        if window == 0 || used == 0 || (used as f32) < (window as f32 * self.threshold) {
+        let trigger_tokens = self
+            .token_limit
+            .map_or(window as f32 * self.threshold, |limit| {
+                (window as f32 * self.threshold).min(limit as f32)
+            });
+        if window == 0 || used == 0 {
+            return next.run(req).await;
+        }
+        if (used as f32) < trigger_tokens {
+            self.tried
+                .lock()
+                .expect("compaction attempts poisoned")
+                .remove(session.id());
             return next.run(req).await;
         }
 
@@ -907,10 +918,21 @@ impl Plugin for CompactionPlugin {
 /// wants compaction to fire at the same pressure. Both rows call this, and a
 /// replacement strategy that forgot to would be a strategy that never runs.
 pub fn mount_compaction_trigger(ctx: &Context, threshold: f32) {
+    mount_compaction_trigger_with_limit(ctx, threshold, None);
+}
+
+/// Use the same bounded trigger with an optional earlier absolute token budget.
+/// The provider's physical context window remains unchanged.
+pub fn mount_compaction_trigger_with_limit(
+    ctx: &Context,
+    threshold: f32,
+    token_limit: Option<u32>,
+) {
     let _ = ctx.on_waterfall::<AgentRequest>(
         Arc::new(CompactBeforeRequest {
             ctx: ctx.clone(),
             threshold,
+            token_limit,
             tried: Mutex::new(HashMap::new()),
         }),
         false,
@@ -957,6 +979,32 @@ struct ToolLoopGuard {
     state: Arc<Mutex<LoopState>>,
     warn_after: u32,
     stop_after: u32,
+}
+
+/// A bounded wait on a live background job can legitimately return the same
+/// status for many rounds. Its last line is the tool's status, after stdout.
+/// Sub-second checks, missing jobs, errors and terminal results keep the normal
+/// loop protection. No process state or lifecycle is owned by this policy.
+fn pending_background_wait(call: &atomcode_kernel::tool::ToolCall, result: &ToolResult) -> bool {
+    if call.name != "bash_poll" || result.is_error {
+        return false;
+    }
+    let Ok(args) = serde_json::from_str::<Value>(&call.arguments) else {
+        return false;
+    };
+    if args
+        .get("wait_ms")
+        .filter(|wait| !wait.is_null())
+        .is_some_and(|wait| !wait.as_u64().is_some_and(|ms| ms >= 1000))
+    {
+        return false;
+    }
+    let status = result.content.lines().last().unwrap_or_default();
+    status == "status: running"
+        || (status.starts_with("status: exited (code ")
+            && status.ends_with(
+                "; what it started is still running and writing here — keep polling, or stop it with bash_kill",
+            ))
 }
 
 /// The exact-repeat guard has stronger evidence than a generic "you repeated
@@ -1015,6 +1063,14 @@ impl Waterfall<ToolsExecute> for ToolLoopGuard {
     async fn handle(&self, exec: &mut ToolExec, next: Next<'_, ToolsExecute>) -> ToolResult {
         let signature = format!("{}::{}", exec.call.name, exec.call.arguments);
         let mut result = next.run(exec).await;
+        if pending_background_wait(&exec.call, &result) {
+            self.state
+                .lock()
+                .expect("loop guard poisoned")
+                .counts
+                .clear();
+            return result;
+        }
         let key = format!("{signature}=>{}", result.content);
 
         let mut state = self.state.lock().expect("loop guard poisoned");
@@ -1073,6 +1129,8 @@ impl Listener<TurnStopping> for ToolLoopGuard {
 /// in seconds; one that spends minutes per round is spending neither tokens nor
 /// the budget fast, and still meets every other stop (round cap, runaway fuse,
 /// a person).
+/// Successful bounded background waits are also excluded even when they return
+/// sooner: output or exit can wake one before `poll_after`.
 struct RepeatFuse {
     ctx: Context,
     nudge_at: u32,
@@ -1145,6 +1203,11 @@ impl Waterfall<ToolsExecuteBatch> for RepeatFuse {
         if self
             .poll_after
             .is_some_and(|after| started.elapsed() >= after)
+            || batch.calls.iter().any(|call| {
+                results.iter().any(|result| {
+                    result.call_id == call.id && pending_background_wait(call, result)
+                })
+            })
         {
             let mut state = self.state.lock().expect("repeat fuse poisoned");
             if state.signature == round_signature(&batch.calls) {
@@ -1239,7 +1302,8 @@ impl Plugin for RepeatFusePlugin {
             #[serde(default = "default_stop_at")]
             stop_at: u32,
             /// A round that ran this long is a wait, not a repeat; `0`
-            /// counts every round.
+            /// disables this elapsed-time exemption. Live bounded background
+            /// waits remain exempt independently of their duration.
             #[serde(default = "default_poll_after_secs")]
             poll_after_secs: u64,
         }
@@ -1316,7 +1380,7 @@ impl Plugin for ToolLoopGuardPlugin {
 
 #[cfg(test)]
 mod focused_policy_tests {
-    use super::{exact_repeat_warning, retry_backoff};
+    use super::{exact_repeat_warning, pending_background_wait, retry_backoff};
     use crate::events::{Authorization, ToolExec};
     use atomcode_kernel::tool::{ToolCall, ToolResult};
     use std::time::Duration;
@@ -1368,6 +1432,36 @@ mod focused_policy_tests {
             round: 3,
             authorization: Authorization::default(),
             working_dir: std::path::PathBuf::from("."),
+        }
+    }
+
+    #[test]
+    fn only_successful_bounded_waits_on_live_jobs_are_polling() {
+        for (name, args, content, is_error, pending) in [
+            ("bash_poll", r#"{"job_id":"bg-1"}"#, "status: running", false, true),
+            ("bash_poll", r#"{"job_id":"bg-1","wait_ms":null}"#, "status: running", false, true),
+            ("bash_poll", r#"{"job_id":"bg-1","wait_ms":60000}"#, "status: running", false, true),
+            ("bash_poll", r#"{"job_id":"bg-1","wait_ms":0}"#, "status: running", false, false),
+            ("bash_poll", r#"{"job_id":"bg-1","wait_ms":1}"#, "status: running", false, false),
+            ("bash_poll", r#"{"job_id":"bg-1","wait_ms":999}"#, "status: running", false, false),
+            ("bash_poll", r#"{"job_id":"bg-1","wait_ms":1000}"#, "status: running", false, true),
+            ("bash_poll", r#"{"job_id":"bg-1"}"#, "no background job", true, false),
+            ("bash_poll", r#"{"job_id":"bg-1"}"#, "status: running", true, false),
+            ("bash_poll", r#"{"job_id":"bg-1"}"#, "status: exited (code 0)", false, false),
+            ("bash_poll", r#"{"job_id":"bg-1"}"#, "status: killed", false, false),
+            ("read_file", r#"{"file_path":"log"}"#, "status: running", false, false),
+            ("bash_poll", r#"{"job_id":"bg-1","wait_ms":-1}"#, "status: running", false, false),
+            ("bash_poll", "invalid", "status: running", false, false),
+            ("bash_poll", r#"{"job_id":"bg-1"}"#, "status: exited (code 0); what it started is still running and writing here — keep polling, or stop it with bash_kill", false, true),
+        ] {
+            let exec = exec(name, args);
+            let result = ToolResult {
+                call_id: exec.call.id.clone(),
+                content: content.into(),
+                is_error,
+                images: Vec::new(),
+            };
+            assert_eq!(pending_background_wait(&exec.call, &result), pending, "{name} {args} {content}");
         }
     }
 

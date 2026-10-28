@@ -188,6 +188,10 @@ impl LlmProvider for RecordingProvider {
             ])));
         }
         let first = match last {
+            Some(m) if m.role == Role::User && m.text.starts_with("retrieve referenced definition") => {
+                StreamEvent::ToolCall(ToolCall { id: format!("call-{n}"), name: "session_reference".into(),
+                    arguments: serde_json::json!({"source": "0123456789abcdef/source", "query": "TubeSeq"}).to_string() })
+            }
             Some(m) if m.role == Role::User && m.text.starts_with("read ") => {
                 StreamEvent::ToolCall(ToolCall {
                     id: format!("call-{n}"),
@@ -2632,6 +2636,29 @@ async fn the_ui_language_does_not_reach_the_persona() {
     runtime.handle.shutdown().await.unwrap();
 }
 
+/// Defaults seed the live flags before mount; rebuilding keeps the person's
+/// temporary override rather than applying the startup default again.
+async fn startup_modes_seed_the_owner_and_reload_preserves_a_temporary_switch() {
+    for mode in [
+        RuntimeMode::Build,
+        RuntimeMode::Plan,
+        RuntimeMode::AcceptEdits,
+        RuntimeMode::Auto,
+    ] {
+        let env = env();
+        let recorder = Arc::new(Recorder::default());
+        let mut input = start(env.project.path(), &recorder, SessionMode::Fresh);
+        input.agent.initial_mode = mode;
+        let runtime = CodingRuntime::start(input).await.unwrap();
+        assert_eq!(runtime.handle.mode().await.unwrap(), mode);
+        assert_eq!(runtime.handle.live_view().unwrap().mode, mode);
+        runtime.handle.set_mode(mode.next()).await.unwrap();
+        runtime.handle.reload_capabilities().await.unwrap();
+        assert_eq!(runtime.handle.mode().await.unwrap(), mode.next());
+        runtime.handle.shutdown().await.unwrap();
+    }
+}
+
 /// A `[permissions]` deny rule refuses the call it names, without asking.
 async fn a_permission_rule_refuses_what_it_denies() {
     let env = env();
@@ -2641,6 +2668,7 @@ async fn a_permission_rule_refuses_what_it_denies() {
         atomcode_capabilities::tools::PermissionRules::parse(&[], &["write_file".to_string()]);
     assert!(invalid.is_empty());
     start.agent.permission_rules = Arc::new(rules);
+    start.agent.initial_mode = RuntimeMode::Auto;
     let mut runtime = CodingRuntime::start(start).await.unwrap();
 
     turn(&mut runtime, "write denied.txt").await;
@@ -6525,6 +6553,7 @@ mod criteria {
         an_undo_is_told_that_the_files_stayed,
         the_ui_language_does_not_reach_the_persona,
         a_permission_rule_refuses_what_it_denies,
+        startup_modes_seed_the_owner_and_reload_preserves_a_temporary_switch,
         a_round_budget_ends_the_turn,
         #[cfg(unix)]
         what_the_model_is_told_about_mcp_only_names_ways_this_build_has,
@@ -6596,10 +6625,10 @@ mod criteria {
 async fn a_live_view_is_available_before_the_running_turn_finishes() {
     let env = env();
     let recorder = Arc::new(Recorder::default());
-    let mut runtime =
-        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
-            .await
-            .unwrap();
+    let mut initial = start(env.project.path(), &recorder, SessionMode::Fresh);
+    // A configured alias is not the model reported by the mounted provider.
+    initial.agent.model = "configured-alias".into();
+    let mut runtime = CodingRuntime::start(initial).await.unwrap();
     turn(&mut runtime, "history").await;
     recorder.answer_delay_ms.store(60_000, Ordering::SeqCst);
     runtime
@@ -6617,6 +6646,7 @@ async fn a_live_view_is_available_before_the_running_turn_finishes() {
         }
     }
     let view = runtime.handle.live_view().unwrap();
+    assert_eq!(view.model.as_deref(), Some("recorder"));
     assert!(view
         .snapshot
         .messages
@@ -6632,9 +6662,11 @@ async fn a_live_view_is_available_before_the_running_turn_finishes() {
     )
     .await
     .is_err());
+    let mut replacement = start(env.project.path(), &recorder, SessionMode::Fresh).agent;
+    replacement.model = "reconfigured-alias".into();
     let generation = runtime
         .handle
-        .reassemble_provider(start(env.project.path(), &recorder, SessionMode::Fresh).agent)
+        .reassemble_provider(replacement)
         .await
         .unwrap();
     loop {
@@ -6646,6 +6678,7 @@ async fn a_live_view_is_available_before_the_running_turn_finishes() {
         }
     }
     let view = runtime.handle.live_view().unwrap();
+    assert_eq!(view.model.as_deref(), Some("recorder"));
     assert_eq!(view.generation, generation.0);
     assert!(view
         .events
@@ -6680,5 +6713,138 @@ async fn a_live_view_is_available_before_the_running_turn_finishes() {
     let view = runtime.handle.live_view().unwrap();
     assert_eq!(Some(view.session_id), changed.session_id);
     assert!(view.snapshot.messages.is_empty());
+    assert_eq!(view.model.as_deref(), Some("recorder"));
+    runtime.handle.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_model_only_runtime_keeps_an_empty_catalog_across_rebuilds() {
+    let project = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let recorder = Arc::new(Recorder::default());
+    let mut setup = start(project.path(), &recorder, SessionMode::Disabled);
+    setup.prepare.tools = false;
+    // Opting out of tools is stronger than a host asking to include a tool.
+    setup.prepare.host_plugins = atomcode_coding::host::HostPlugins::new().with_layer(
+        atomcode_coding::host::Layer::new()
+            .patch(
+                "tools",
+                serde_json::json!({ "include": ["bash"], "exclude": [] }),
+            )
+            .unwrap(),
+    );
+    let provider_config = setup.agent.clone();
+    let mut runtime = CodingRuntime::start(setup).await.unwrap();
+    for stage in [
+        "initial",
+        "provider swap",
+        "capability reload",
+        "config rebuild",
+        "directory change",
+    ] {
+        match stage {
+            "provider swap" => {
+                runtime
+                    .handle
+                    .reassemble_provider(provider_config.clone())
+                    .await
+                    .unwrap();
+            }
+            "capability reload" => {
+                runtime.handle.reload_capabilities().await.unwrap();
+            }
+            "config rebuild" => {
+                runtime
+                    .handle
+                    .reprepare_config(provider_config.clone())
+                    .await
+                    .unwrap();
+            }
+            "directory change" => {
+                runtime
+                    .handle
+                    .change_directory(other.path().to_path_buf())
+                    .await
+                    .unwrap();
+            }
+            _ => {}
+        }
+        turn(&mut runtime, stage).await;
+        let names = recorder.tools.lock().unwrap().last().cloned().unwrap();
+        assert!(
+            names.is_empty(),
+            "{stage}: no tools requested, but published {names:?}"
+        );
+    }
+    runtime.handle.shutdown().await.unwrap();
+}
+
+// Real filesystem work in the tool runs on spawn_blocking; keep a real clock.
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(engine)]
+async fn referenced_details_are_queried_by_the_mounted_tool_without_inheriting_grants() {
+    use atomcode_capabilities::session::{SessionMeta, StorageOwner};
+    use atomcode_kernel::session::{LoggedEvent, SessionEvent, SessionHeader};
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let setup = start(env.project.path(), &recorder, SessionMode::Fresh);
+    let reference = atomcode_capabilities::session::reference::SessionReference {
+        bucket: "0123456789abcdef".into(),
+        id: "source".into(),
+    };
+    let source = SessionManager::with_root(
+        SessionManager::sessions_root(setup.agent.dirs.user()).join(&reference.bucket),
+    );
+    let lease = source.acquire_lease(&reference.id).unwrap();
+    let mut meta = SessionMeta::new(&reference.id, "/source", 1);
+    meta.owner = StorageOwner::Native;
+    source
+        .create_event_session(&lease, &SessionHeader::new(&reference.id), &meta)
+        .unwrap();
+    source
+        .append_events(
+            &lease,
+            &[LoggedEvent {
+                seq: 1,
+                at: 0,
+                event: SessionEvent::UserMessage {
+                    turn: 1,
+                    text: "TubeSeq is the test tube sequence".into(),
+                    images: vec![],
+                },
+            }],
+        )
+        .unwrap();
+    let path = source.events_path(&reference.id).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let mut runtime = CodingRuntime::start(setup).await.unwrap();
+    turn(
+        &mut runtime,
+        &format!(
+            "retrieve referenced definition {}",
+            reference.spelling("definition")
+        ),
+    )
+    .await;
+    let request = recorder.last_turn_request();
+    assert!(
+        request
+            .iter()
+            .any(|m| m.role == Role::Tool && !m.is_error && m.text.contains("test tube sequence")),
+        "{request:?}"
+    );
+    turn(
+        &mut runtime,
+        "retrieve referenced definition without a source link",
+    )
+    .await;
+    let request = recorder.last_turn_request();
+    assert!(
+        request.iter().any(|m| m.role == Role::Tool
+            && m.is_error
+            && m.text.contains("explicitly referenced")),
+        "{request:?}"
+    );
+    assert_eq!(std::fs::read(path).unwrap(), before);
     runtime.handle.shutdown().await.unwrap();
 }

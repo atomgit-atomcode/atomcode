@@ -143,6 +143,52 @@ pub fn rehydrate_record(
     out
 }
 
+/// Request composition in UTF-8 bytes; token figures remain explicitly heuristic.
+/// Images are measured as base64 bytes, never presented as vision token counts.
+fn context_breakdown(messages: &[Message], tools: &[ToolDef]) -> serde_json::Value {
+    use atomcode_kernel::message::Role;
+    let names: HashMap<_, _> = messages
+        .iter()
+        .flat_map(|m| &m.tool_calls)
+        .map(|call| (call.id.as_str(), call.name.as_str()))
+        .collect();
+    let mut bytes = std::collections::BTreeMap::<&str, usize>::new();
+    let mut estimated = std::collections::BTreeMap::<&str, u64>::new();
+    for m in messages {
+        let category = match m.role {
+            Role::System => "system",
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::Tool => match m
+                .tool_call_id
+                .as_deref()
+                .and_then(|id| names.get(id))
+                .copied()
+            {
+                Some("read_file") => "file_reads",
+                Some("edit_file") => "edit_results",
+                _ => "other_tool_results",
+            },
+        };
+        *bytes.entry(category).or_default() += m.text.len();
+        *estimated.entry(category).or_default() += u64::from(m.estimate_tokens());
+        *bytes.entry("tool_arguments").or_default() += m
+            .tool_calls
+            .iter()
+            .map(|c| c.arguments.len())
+            .sum::<usize>();
+        *bytes.entry("reasoning").or_default() += m.reasoning.as_ref().map_or(0, String::len);
+        *bytes.entry("images_base64").or_default() +=
+            m.images.iter().map(|i| i.data.len()).sum::<usize>();
+    }
+    let tool_schema_bytes = serde_json::to_vec(tools).map_or(0, |json| json.len());
+    serde_json::json!({
+        "text_bytes": bytes,
+        "estimated_message_tokens": estimated,
+        "tool_schema_json_bytes": tool_schema_bytes,
+    })
+}
+
 /// Native-runtime datalog writer. All filesystem failures are deliberately ignored:
 /// observability must never change a turn's behavior or terminal.
 pub struct DatalogHook {
@@ -179,6 +225,8 @@ struct TurnLog {
     /// Wall-clock start of the CURRENT round's request (set in `on_request`, read in
     /// `on_model_response` to record per-round latency the aggregate turn stats lose).
     round_started: Option<Instant>,
+    previous_message_refs: Vec<Option<u32>>,
+    previous_estimated_tokens: Option<u64>,
     rounds: u32,
     tool_calls: usize,
     total_tokens: u64,
@@ -290,6 +338,8 @@ impl DatalogHook {
         state.cas_path = None;
         state.blob_ids.clear();
         state.next_blob_id = 0;
+        state.previous_message_refs.clear();
+        state.previous_estimated_tokens = None;
         state.initialization_attempted = false;
         state.started = Some(Instant::now());
         state.round_started = None;
@@ -443,6 +493,20 @@ impl DatalogHook {
             tools,
             &mut cas_lines,
         );
+        let common_prefix_messages = state
+            .previous_message_refs
+            .iter()
+            .zip(&message_refs)
+            .take_while(|(a, b)| a.is_some() && a == b)
+            .count();
+        let request_delta = serde_json::json!({
+            "previous_estimated_tokens": state.previous_estimated_tokens,
+            "estimated_token_change": state.previous_estimated_tokens.map(|previous| estimated_tokens as i128 - previous as i128),
+            "common_prefix_messages": common_prefix_messages,
+            "suffix_estimated_tokens": messages[common_prefix_messages..].iter().map(|m| u64::from(m.estimate_tokens())).sum::<u64>(),
+        });
+        state.previous_message_refs = message_refs.clone();
+        state.previous_estimated_tokens = Some(estimated_tokens);
         let record = serde_json::json!({
             "v": RECORD_FORMAT_VERSION,
             "step": ctx.round,
@@ -453,6 +517,8 @@ impl DatalogHook {
             "context_window": self.context_window,
             "message_count": messages.len(),
             "estimated_tokens": estimated_tokens,
+            "context_breakdown": context_breakdown(messages, tools),
+            "request_delta": request_delta,
             "tool_count": tools.len(),
             "message_refs": message_refs,
             "tool_refs": tool_refs,
@@ -1128,6 +1194,13 @@ mod tests {
         let record: serde_json::Value =
             serde_json::from_str(jsonl.lines().next().unwrap()).unwrap();
         assert_eq!(record["v"], RECORD_FORMAT_VERSION);
+        let second: serde_json::Value =
+            serde_json::from_str(jsonl.lines().nth(1).unwrap()).unwrap();
+        assert!(record["request_delta"]["previous_estimated_tokens"].is_null());
+        assert_eq!(second["request_delta"]["common_prefix_messages"], 1);
+        assert_eq!(second["request_delta"]["estimated_token_change"], 0);
+        assert_eq!(second["request_delta"]["suffix_estimated_tokens"], 0);
+        assert!(record["context_breakdown"]["estimated_message_tokens"].is_object());
         assert!(record.get("messages").is_none());
         assert_eq!(record["message_refs"].as_array().unwrap().len(), 1);
 
@@ -1140,6 +1213,52 @@ mod tests {
         let full = rehydrate_record(&record, &build_cas_index(&cas));
         assert!(full.get("message_refs").is_none());
         assert!(full["messages"].to_string().contains("inspect this"));
+        hook.start_turn("a new turn has a different CAS id namespace");
+        assert!(hook.lock().previous_message_refs.is_empty());
+        assert!(hook.lock().previous_estimated_tokens.is_none());
+    }
+
+    #[test]
+    fn context_breakdown_separates_arguments_reads_and_images() {
+        let call = ToolCall {
+            id: "r".into(),
+            name: "read_file".into(),
+            arguments: "{}".into(),
+        };
+        let mut image = Message::user("你好");
+        image.images.push(atomcode_kernel::message::ImageContent {
+            media_type: "image/png".into(),
+            data: "AAAA".into(),
+        });
+        let messages = vec![
+            Message::system("policy"),
+            Message::assistant("", vec![call]),
+            Message::tool_result("r", "1\tcontent\n", false),
+            image,
+        ];
+        let original = serde_json::to_value(&messages).unwrap();
+        let report = context_breakdown(&messages, &[]);
+        assert_eq!(report["text_bytes"]["user"], 6);
+        assert_eq!(report["text_bytes"]["tool_arguments"], 2);
+        assert_eq!(report["text_bytes"]["file_reads"], 10);
+        assert_eq!(report["text_bytes"]["images_base64"], 4);
+        assert_eq!(
+            report["estimated_message_tokens"]
+                .as_object()
+                .unwrap()
+                .values()
+                .map(|v| v.as_u64().unwrap())
+                .sum::<u64>(),
+            messages
+                .iter()
+                .map(|m| u64::from(m.estimate_tokens()))
+                .sum::<u64>()
+        );
+        assert_eq!(
+            serde_json::to_value(&messages).unwrap(),
+            original,
+            "diagnostics never rewrite requests"
+        );
     }
 
     #[test]

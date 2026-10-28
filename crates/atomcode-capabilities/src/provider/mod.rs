@@ -17,6 +17,7 @@
 
 mod anthropic;
 mod atomgit_sign;
+mod auto_proxy;
 pub mod discovery;
 mod input_profile;
 mod latency;
@@ -24,6 +25,7 @@ mod ollama;
 mod openai_compat;
 pub mod probe;
 mod reasoning;
+mod request_size;
 mod responses;
 mod retry;
 mod sign;

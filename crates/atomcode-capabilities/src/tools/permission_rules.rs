@@ -93,6 +93,7 @@ fn canonical_tool(name: &str) -> String {
         "ls" | "list" => "listdirectory".to_string(),
         "multiedit" | "paralleledit" => "paralleleditfiles".to_string(),
         "shell" | "terminal" => "bash".to_string(),
+        "powershell" => "pwsh".to_string(),
         "todo" => "todowrite".to_string(),
         _ => squashed,
     }
@@ -261,13 +262,18 @@ impl PermissionRules {
             return RuleDecision::NoMatch;
         }
         let targets = match_targets(tool, args, cwd);
-        if self.deny.iter().any(|r| r.matches(tool, &targets)) {
+        if self.deny.iter().any(|r| {
+            r.matches(tool, &targets)
+                || (super::powershell::is_powershell_tool(tool)
+                    && (r.matches("bash", &targets)
+                        || (tool == "pwsh_start" && r.matches("bash_start", &targets))))
+        }) {
             return RuleDecision::Deny;
         }
         if self.allow.iter().any(|r| r.matches(tool, &targets)) {
             // HARD FLOOR: a user allow-rule pre-authorizes convenience, never a secret. A
             // sensitive target falls through so the normal gates still prompt.
-            if sensitive.references(args) {
+            if sensitive.references(args) || super::powershell::is_powershell_tool(tool) {
                 return RuleDecision::NoMatch;
             }
             return RuleDecision::Allow;
@@ -288,11 +294,20 @@ fn match_targets(tool: &str, args: &str, cwd: &Path) -> Vec<String> {
     // that is exactly as dangerous as a foreground one, so a rule must reach it too —
     // `command` is not a path key, so without this arm a `BashStart(rm *)` pattern silently
     // matched NOTHING, and a deny rule that never fires is worse than no rule at all.
-    if matches!(canonical_tool(tool).as_str(), "bash" | "bashstart") {
+    if matches!(
+        canonical_tool(tool).as_str(),
+        "bash" | "bashstart" | "pwsh" | "pwshstart"
+    ) {
         return value
             .get("command")
             .and_then(|v| v.as_str())
-            .map(|c| vec![normalize_command_for_grant(c)])
+            .map(|c| {
+                if super::powershell::is_powershell_tool(tool) {
+                    vec![c.trim().to_string()]
+                } else {
+                    vec![normalize_command_for_grant(c)]
+                }
+            })
             .unwrap_or_default();
     }
     let mut targets = Vec::new();
@@ -390,6 +405,36 @@ impl ToolMiddleware for PermissionRuleGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn powershell_deny_patterns_match_commands_and_bash_allows_never_cross_dialects() {
+        let guard = crate::tools::sensitive_path::test_guard();
+        let args = r#"{"command":"Remove-Item 'C:\\temp\\data'"}"#;
+        for tool in ["pwsh", "pwsh_start"] {
+            assert_eq!(
+                rules(&[], &["Bash(*)"]).decide(&guard, tool, args, &cwd()),
+                RuleDecision::Deny
+            );
+            assert_eq!(
+                rules(&[], &["Pwsh(Remove-Item*)", "PwshStart(Remove-Item*)"]).decide(
+                    &guard,
+                    tool,
+                    args,
+                    &cwd()
+                ),
+                RuleDecision::Deny
+            );
+            assert_eq!(
+                rules(&["Bash(*)", "Pwsh(*)", "PwshStart(*)"], &[]).decide(
+                    &guard,
+                    tool,
+                    args,
+                    &cwd()
+                ),
+                RuleDecision::NoMatch
+            );
+        }
+    }
 
     fn cwd() -> PathBuf {
         PathBuf::from("/work")

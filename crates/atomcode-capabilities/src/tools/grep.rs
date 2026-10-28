@@ -125,10 +125,6 @@ impl Tool for GrepTool {
         let raw = a.path.clone().unwrap_or_else(|| ".".to_string());
         let root = resolve_path(&raw, &ctx.working_dir);
         let scope = crate::pathnorm::to_display(&root);
-        ctx.progress.emit(format!(
-            "Searching {scope} (up to {}s / {} entries)",
-            options.timeout_secs, options.max_entries
-        ));
         let timeout_secs = options.timeout_secs;
         let timeout_hint = options.filter_hint();
         let scan_cancel = ctx.cancel.child_token();

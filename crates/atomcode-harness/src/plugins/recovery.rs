@@ -27,7 +27,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::events::{AgentRequest, ModelRequest, ModelResponse, RequestError};
-use crate::seams::{CompactionAsk, CompactionSvc, SessionSvc};
+use crate::seams::{CompactionAsk, CompactionSvc, LlmSvc, SessionSvc};
 use crate::session::{NoticeKind, SessionEvent};
 
 fn parse<T: for<'de> Deserialize<'de> + Default>(config: &Value) -> Result<T, String> {
@@ -346,12 +346,18 @@ impl Waterfall<AgentRequest> for OverflowLadder {
                 atomcode_kernel::agent::effective_input_limit(window, req.options.max_tokens);
             let mut attempt = 0;
             while estimate(&req.messages) >= u64::from(limit) {
-                if self
+                if let Err(why) = self
                     .shrink(req, &mut attempt, "the request would not fit")
                     .await
-                    .is_err()
                 {
-                    break;
+                    return Err(RequestError {
+                        context_overflow: true,
+                        code: Some("context_length_exceeded".into()),
+                        ..RequestError::message(format!(
+                            "The request still exceeds the usable context window after safe compaction ({why}). \
+                             Conversation history was retained; restore the summary provider or use a model with a larger context window before retrying."
+                        ))
+                    });
                 }
             }
         }
@@ -640,7 +646,10 @@ impl Waterfall<AgentRequest> for StreamRecovery {
             let turn = session.current_turn();
             // Each failed attempt is preserved once, including the final failure.
             if let Some(partial) = &error.partial {
-                if !partial.text.is_empty() || !partial.reasoning.is_empty() {
+                if !partial.text.is_empty()
+                    || !partial.reasoning.is_empty()
+                    || !partial.reasoning_blocks.is_empty()
+                {
                     crate::session::commit(
                         &self.ctx,
                         &session,
@@ -650,8 +659,21 @@ impl Waterfall<AgentRequest> for StreamRecovery {
                             text: partial.text.clone(),
                             reasoning: partial.reasoning.clone(),
                             tool_calls: Vec::new(),
-                            reasoning_blocks: Vec::new(),
-                            meta: None,
+                            reasoning_blocks: partial.reasoning_blocks.clone(),
+                            meta: crate::agent::scoped(&self.ctx).service::<LlmSvc>().map(
+                                |provider| {
+                                    let mut meta = super::agent_loop::response_meta(
+                                        &session,
+                                        provider.as_ref(),
+                                        partial,
+                                        turn,
+                                        req.round,
+                                        Duration::ZERO,
+                                    );
+                                    meta.finish_reason = "error".into();
+                                    meta
+                                },
+                            ),
                         },
                     );
                 }

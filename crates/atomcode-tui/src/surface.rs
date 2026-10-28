@@ -1256,7 +1256,10 @@ impl Terminal {
         // used to keep the *asked-for* value while the terminal was told off,
         // so the first re-statement took the mouse back and selection died.
         let link_terminal = link_pointer::detect();
-        let (_, mouse) = starting_pointer(mouse, crate::caps::mouse_reported());
+        let (_, mouse) = starting_pointer(
+            mouse && crate::caps::take_mouse_at_start(),
+            crate::caps::mouse_reported(),
+        );
         let pointer = ansi::Pointer::from_intents(
             mouse,
             link_terminal != link_pointer::TerminalKind::Unsupported,
@@ -2034,7 +2037,7 @@ fn read_clipboard_text() -> Option<String> {
 /// is not the one anybody is looking at. There OSC 52 is the only thing that
 /// can work, and it is already on its way — and nothing can be confirmed.
 fn local_clipboard(text: &str) -> bool {
-    if std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some() {
+    if crate::caps::remote_session() {
         return false;
     }
     #[cfg(windows)]
@@ -2688,7 +2691,7 @@ impl Surface for Terminal {
         // text to the same clipboard twice costs nothing.
         let terminal_result = send_clipboard(std::io::stdout().lock(), text);
         #[cfg(target_os = "linux")]
-        if std::env::var_os("SSH_CONNECTION").is_none() && std::env::var_os("SSH_TTY").is_none() {
+        if !crate::caps::remote_session() {
             // GNOME does not expose the data-control protocol used by native
             // Wayland clipboard libraries. wl-copy also supports its regular
             // data-device protocol; prefer it over the XWayland bridge.
@@ -2723,7 +2726,7 @@ impl Surface for Terminal {
         }
     }
     fn remote_clipboard(&self) -> bool {
-        std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some()
+        crate::caps::remote_session()
     }
     fn clipboard_image(&self) -> Option<atomcode_kernel::message::ImageContent> {
         if self.remote_clipboard() {
@@ -3322,7 +3325,8 @@ mod tests {
     fn remote_copy_explains_the_native_selection_fallback() {
         let message = Copied::RemoteHandedOver.words("已复制");
         assert!(!message.starts_with("已复制"));
-        assert!(message.contains("SSH"));
+        // Browser terminals share this path without an SSH connection.
+        assert!(!message.contains("SSH"));
         assert!(message.contains("Ctrl+G"));
         assert!(message.contains("Cmd+C"));
     }

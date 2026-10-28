@@ -288,6 +288,7 @@ export interface SessionMeta {
   updated_at: number;
   message_count: number;
   file_size?: number;
+  working_directory_available?: boolean;
 }
 
 export interface SessionMetaWithProject extends SessionMeta {
@@ -366,8 +367,8 @@ export async function listProjectSessions(projectHash: string): Promise<SessionM
 
 // Cross-project session search by name, UNCAPPED. Backs the search modal so it
 // can find a session in ANY project (the sidebar list itself is per-project).
-export async function searchSessions(q: string): Promise<SessionMetaWithProject[]> {
-  const resp = await apiFetch(`/sessions/search?q=${encodeURIComponent(q)}`, {
+export async function searchSessions(q: string, includeUnavailable = false): Promise<SessionMetaWithProject[]> {
+  const resp = await apiFetch(`/sessions/search?q=${encodeURIComponent(q)}${includeUnavailable ? "&include_unavailable=true" : ""}`, {
     headers: authHeaders(),
   });
   if (!resp.ok) throw new Error(`search sessions failed: ${resp.status}`);
@@ -536,6 +537,9 @@ export interface ProviderPresetInfo {
 
 export interface DiscoveredModelInfo {
   id: string;
+  supports_vision?: boolean;
+  reasoning_effort_levels?: string[];
+  reasoning_effort?: string;
   name?: string;
   context_window?: number;
   max_tokens?: number;
@@ -677,6 +681,7 @@ export interface PgyInfo {
 }
 
 export interface TunnelStatus {
+  relay_start_supported?: boolean;
   mode?: 'relay' | 'lan';
   relay_error?: string | null;
   bind_host: string;
@@ -694,6 +699,19 @@ export async function getTunnelStatus(): Promise<TunnelStatus> {
   const resp = await apiFetch('/tunnel/status', { headers: authHeaders() });
   if (!resp.ok) throw new Error(`tunnel status failed: ${resp.status}`);
   return resp.json();
+}
+
+/** Explicitly enable remote access through the current terminal host. */
+export async function startTunnelRelay(signal?: AbortSignal): Promise<TunnelStatus> {
+  const resp = await apiFetch('/tunnel/start', {
+    method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+    body: '{}', signal,
+  });
+  if (!resp.ok) {
+    const body = await resp.json().catch(() => null);
+    throw new Error(body?.error ?? `relay start failed: ${resp.status}`);
+  }
+  return getTunnelStatus();
 }
 
 // --- Provider CRUD ---
@@ -958,9 +976,11 @@ export async function deleteProject(hash: string): Promise<void> {
 export async function getSession(
   projectHash: string,
   sessionId: string,
+  signal?: AbortSignal,
 ): Promise<SessionDetail> {
   const resp = await apiFetch(`/projects/${projectHash}/sessions/${sessionId}`, {
     headers: authHeaders(),
+    signal,
   });
   if (!resp.ok) {
     throw new Error(`getSession failed with status ${resp.status}`);
@@ -968,7 +988,16 @@ export async function getSession(
   return resp.json();
 }
 
+export interface TranscriptStep {
+  text: string;
+  reasoning: string;
+  tools: { id: string; name: string; args: string; result: string | null; is_error: boolean | null }[];
+}
 export interface TranscriptTurn {
+  user_truncated?: boolean;
+  started_at?: number;
+  ts?: number;
+  steps?: TranscriptStep[];
   turn_id: number;
   user: string;
   assistant: string;
@@ -977,8 +1006,15 @@ export interface TranscriptTurn {
   undone: boolean;
 }
 
-export async function getSessionTranscript(projectHash: string, sessionId: string, signal?: AbortSignal): Promise<{ session_id: string; turns: TranscriptTurn[] }> {
-  const resp = await apiFetch(`/projects/${encodeURIComponent(projectHash)}/sessions/${encodeURIComponent(sessionId)}/transcript`, { headers: authHeaders(), signal });
+export async function getSessionTranscript(projectHash: string, sessionId: string, signal?: AbortSignal, detail?: { turnId?: number; turnIds?: number[]; all?: boolean; index?: boolean }): Promise<{ session_id: string; turns: TranscriptTurn[] }> {
+  const query = new URLSearchParams();
+  if (detail?.turnId != null) query.set('turn_id', String(detail.turnId));
+  if (detail?.turnIds) query.set('turn_ids', detail.turnIds.join(','));
+  if (detail?.all) query.set('detail', 'true');
+  if (detail?.index) query.set('summary', 'true');
+  const params = query.toString();
+  const suffix = params ? `?${params}` : '';
+  const resp = await apiFetch(`/projects/${encodeURIComponent(projectHash)}/sessions/${encodeURIComponent(sessionId)}/transcript${suffix}`, { headers: authHeaders(), signal });
   if (!resp.ok) throw new Error(`history request failed: ${resp.status}`);
   return resp.json();
 }
@@ -1031,9 +1067,10 @@ export interface LiveGoalProgress {
 }
 
 export type LiveWireEvent =
-  | { type: 'snapshot'; messages: SessionMessage[]; session_id: string; project_hash: string; provider: string; mode: ApprovalMode; goal?: LiveGoalProgress | null }
+  | { type: 'snapshot'; messages: SessionMessage[]; session_id: string; project_hash: string; provider: string; model?: string | null; mode: ApprovalMode; goal?: LiveGoalProgress | null }
   | ({ type: 'goal_changed' } & LiveGoalProgress)
-  | { type: 'provider'; provider: string }
+  | { type: 'provider'; provider: string; model?: string | null }
+  | { type: 'model'; model: string | null }
   | { type: 'reasoning_effort'; provider: string; effort: string | null; applicable: boolean }
   | { type: 'mode'; mode: ApprovalMode }
   | { type: 'user'; text: string; images?: ImageData[]; client_input_id?: string }

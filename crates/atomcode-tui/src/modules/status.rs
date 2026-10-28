@@ -977,7 +977,7 @@ mod tests {
     fn the_allowance_is_only_said_once_it_is_worth_saying() {
         let now = crate::moment::Timestamp::millis(0);
         let left = |percent, resets_at: &str| crate::moment::Allowance {
-            label: "5 小时".into(),
+            label: "当前窗口结束即重置额度（每 5 小时一个窗口）".into(),
             percent,
             resets_at: resets_at.into(),
             resets_by: None,
@@ -995,11 +995,7 @@ mod tests {
 
         let near = allowance_badge(&left(ALLOWANCE_NEAR, ""), now).expect("at the step it speaks");
         assert!(near.contains("80"), "it says how much: {near}");
-        assert!(near.contains("5 小时"), "and which window: {near}");
-        assert_eq!(
-            near, "Token使用量 80%，5 小时滚动窗口",
-            "the same sentence the classic screen says, word for word"
-        );
+        assert_eq!(near, "额度已用 80%", "window explanations stay in /usage");
 
         // With a reset to report it says when it comes back; without one it must
         // not, or it reads as "back in 0 seconds".
@@ -1029,7 +1025,25 @@ mod tests {
 
         // Spent is still said — it is the one figure that changes what happens
         // next. The colour is the row's business; the words are the same.
-        assert!(allowance_badge(&left(100, "19:41"), now).is_some());
+        assert_eq!(
+            allowance_badge(&left(100, "01:45"), now).as_deref(),
+            Some("额度已用 100% · 01:45 重置")
+        );
+        let moment = Moment {
+            model: "deepseek-flash".into(),
+            cwd: "~/work/demo".into(),
+            allowance: Some(left(100, "01:45")),
+            ..Moment::default()
+        };
+        let row = draw::<Status>(&State::default(), 100, &moment);
+        assert!(
+            row.contains("deepseek-flash") && row.contains("demo") && row.contains("01:45"),
+            "quota must leave room for the model and directory: {row}"
+        );
+        assert!(
+            !row.contains("滚动窗口") && !row.contains("窗口结束"),
+            "{row}"
+        );
     }
 
     /// A countdown is counted from when the host said it, not frozen at it: the

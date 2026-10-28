@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.2.4</span>
+    <span class="dhdr-ver">v5.2.5</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -81,9 +81,20 @@
 <ol><li>电脑保持 AtomCode 运行，执行 <code>/webui</code>。本机浏览器会打开，终端同时显示手机链接和二维码。</li><li>用手机浏览器扫码，或在电脑 WebUI 的“远程访问”面板复制中继链接。手机和电脑可使用不同网络。</li><li>TUI 与手机同步查看和回答同一会话。执行 <code>/webui stop</code>、退出 AtomCode 或在终端登出会停止中继共享。</li></ol>
 <p>独立启动可用 <code>atomcode webui</code>；仅本机访问用 <code>/webui --local</code> 或 <code>atomcode webui --local</code>。显式指定 <code>/webui lan</code> 或 <code>--host &lt;地址&gt;</code> 时使用局域网地址，不自动连接中继。</p>
 <h2 id="连接失败">连接失败</h2>
-<p>中继连接失败时本机 WebUI 仍可使用，终端和远程访问面板会说明原因。若提示中继未启用 WebUI，需升级中继服务端并部署当前版本的 WebUI 资源，再执行 <code>/webui</code> 重试。可通过 <code>ATOMCODE_APP_RELAY</code> 指定自建中继，<code>ATOMCODE_ENABLE_RELAY=0</code> 禁用中继。</p>
+<p>中继连接失败时本机 WebUI 仍可使用，终端和远程访问面板会说明原因。若提示中继未启用 WebUI，需升级中继服务端并部署当前版本的 WebUI 资源，再执行 <code>/webui</code> 重试。已有兼容服务端时，可通过 <code>ATOMCODE_APP_RELAY</code> 指定中继地址（见下方部署要求），<code>ATOMCODE_ENABLE_RELAY=0</code> 禁用中继。</p>
 <h2 id="中继地址">中继地址</h2>
 <p>默认使用线上 HTTPS 中继 <code>https://relay-atomcode.atomgit.com</code>，无需额外配置。手机请打开 AtomCode 生成的配对链接或扫描二维码。</p>
+<h2 id="自建中继的部署要求">自建中继的部署要求</h2>
+<p><code>ATOMCODE_APP_RELAY</code> 只是地址覆盖项，不会安装服务端。relay-client 是本机隧道客户端，不能作为公网中继服务端使用。服务端由独立的 atomcode-relay 项目维护；本指南不提供服务端源码或公开下载地址。需要自部署的用户请通过项目 Issue 联系维护者，确认兼容服务端产物的获取方式、支持平台和版本；尚未取得产物时，不能仅凭此配置完成部署。</p>
+<p>自部署可以使用单二进制或容器；以下是取得兼容服务端后的配置要求，不代表已有公开 Docker 镜像或安装包。</p>
+<ol>
+<li>在自有 VPS 部署 <code>atomcode-relay-server</code>，监听 <code>127.0.0.1:18880</code>，前置 HTTPS 反向代理（容器部署时，监听容器内网地址，且仅向反代网络暴露，不能把容器内的回环地址当作其他容器可访问的地址）；代理必须支持 WebSocket 升级和 SSE 实时转发，关闭响应缓冲。</li>
+<li>服务端设置 <code>ATOM_RELAY_ADMIN_SECRET</code> 为随机接入口令，禁止开放匿名注册。按容量设置 <code>ATOM_RELAY_MAX_TUNNELS</code>（例如个人使用设为 10）和 <code>ATOM_RELAY_MAX_CONCURRENT</code>，并在反向代理限制注册速率和连接数。接入口令与每台设备的路由 token、WebUI 访问令牌用途不同，不可互相替代。</li>
+<li>使用 WebUI 时还必须部署兼容的已构建静态资源：单版本可通过 <code>ATOM_RELAY_WEBUI_DIR</code> 指向含 <code>index.html</code> 的目录；多版本使用 <code>ATOM_RELAY_WEBUI_BUNDLES_DIR</code> 和配套发布目录。应向维护者同时取得匹配的 WebUI 资源及安装说明，不能只部署隧道服务或使用源码目录代替构建产物。</li>
+<li>启动本机 AtomCode 前，设置 <code>ATOMCODE_APP_RELAY=https://relay.example.com</code> 和 <code>ATOMCODE_APP_RELAY_SECRET</code>（与服务端接入口令相同）。现有 <code>/app</code>、<code>/webui</code> 复用官方 relay-client，无需更换客户端；服务端须兼容该客户端的注册、握手和转发协议，普通 HTTP 代理不能直接替代。</li>
+<li>验收时检查 <code>/health</code>，再分别验证客户端注册、手机配对、流式回复及断线重连；健康检查成功不代表 WebUI 资源和整条隧道均可用。</li>
+</ol>
+<p>暂未取得服务端产物时，可继续使用已有的 SSH 反向隧道或 VPN。自建中继由部署者管理 TLS、接入口令、流量和升级，不消耗官方中继带宽；中继不提供模型推理额度。</p>
 <h2 id="安全与生命周期">安全与生命周期</h2>
 <p>链接等同于访问密码，请勿外传。请求经 HTTPS 中继到本机，继续校验 WebUI 令牌；中继可以处理传输内容，不提供端到端加密。浏览器把配对凭据保存在当前标签页的 sessionStorage，用于刷新重连，关闭标签页后清除。网络中断时客户端自动重连；电脑休眠、离线或 AtomCode 退出后不可访问。</p>
 <h2 id="局域网备选">局域网备选</h2>

@@ -43,6 +43,38 @@ async fn the_runtime_mounts_distinct_first_content_and_idle_budgets() {
     assert!(dump.contains("\"stream_idle_ms\": 120000"), "{dump}");
 }
 
+#[tokio::test]
+async fn the_configured_absolute_compaction_budget_reaches_the_existing_strategy_row() {
+    let project = tempfile::tempdir().unwrap();
+    let mut file: atomcode_config::config::Config =
+        toml::from_str("[compaction]\ntoken_limit=200000").unwrap();
+    let runtime = atomcode_coding::CodingRuntimeConfig::from_config(
+        &file,
+        project.path(),
+        atomcode_coding::config::product_dirs_from_env(),
+        None,
+        None,
+        false,
+        false,
+    );
+    let cfg = runtime.agent_config();
+    assert_eq!(cfg.compact_token_limit, Some(200_000));
+    let mounted = support::mount(&cfg, quiet_options(), Arc::new(CannedProvider)).await;
+    assert!(mounted.dump().contains("\"token_limit\": 200000"));
+    mounted.shutdown().await;
+    file.compaction.token_limit = None;
+    let runtime = atomcode_coding::CodingRuntimeConfig::from_config(
+        &file,
+        project.path(),
+        atomcode_coding::config::product_dirs_from_env(),
+        None,
+        None,
+        false,
+        false,
+    );
+    assert!(runtime.agent_config().compact_token_limit.is_none());
+}
+
 /// Answers with a little text and a usage report — enough for a metering
 /// decorator to fold a `TokenUsage` and emit one `LlmChat`.
 struct CannedProvider;
@@ -346,6 +378,19 @@ async fn a_configured_credential_never_enters_the_config_tree() {
     let project = tempfile::tempdir().unwrap();
     let mut file = atomcode_config::config::Config::default();
     file.web_search.api_key = Some(SENTINEL.into());
+    file.lsp.enabled = true;
+    file.lsp.servers.insert(
+        "rs".into(),
+        atomcode_config::lsp_registry::LspServerConfig {
+            command: "unused-lsp-credential-test".into(),
+            args: vec![],
+            root_markers: vec![],
+            options: atomcode_config::lsp_registry::LspOptions {
+                init_options: Some(serde_json::json!({"token":SENTINEL})),
+                ..Default::default()
+            },
+        },
+    );
     let cfg = atomcode_coding::CodingRuntimeConfig::from_config(
         &file,
         project.path(),
@@ -367,6 +412,15 @@ async fn a_configured_credential_never_enters_the_config_tree() {
         ..quiet_options()
     };
     let mounted = support::mount(&cfg, opts, Arc::new(CannedProvider)).await;
+    assert!(
+        mounted
+            .context()
+            .service::<atomcode_harness::seams::ToolsSvc>()
+            .unwrap()
+            .get("lsp")
+            .is_some(),
+        "the credential-bearing LSP instance really mounted"
+    );
     let dump = mounted.dump();
     assert!(
         dump.contains("tool-web-keyed"),
@@ -658,4 +712,365 @@ async fn search_defaults_reach_the_shipping_tools_and_project_overrides_are_scop
         }
         mounted.shutdown().await;
     }
+}
+
+/// A real edit retains the driver's diff while the next request and replay use
+/// the same short receipt; repeated whole-file reads retire the stale version.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn recent_context_cleanup_keeps_the_ui_diff_and_replays_the_model_view() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    };
+    struct Editor {
+        step: AtomicUsize,
+        seen: Mutex<Vec<Vec<Message>>>,
+    }
+    #[async_trait::async_trait]
+    impl LlmProvider for Editor {
+        fn model_name(&self) -> &str {
+            "context-cleanup"
+        }
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            _: &[atomcode_kernel::tool::ToolDef],
+            _: &atomcode_kernel::provider::ChatOptions,
+        ) -> Result<
+            futures::stream::BoxStream<'static, atomcode_kernel::stream::StreamEvent>,
+            atomcode_kernel::stream::ProviderError,
+        > {
+            use atomcode_kernel::{stream::StreamEvent, tool::ToolCall};
+            self.seen.lock().unwrap().push(messages.to_vec());
+            let step = self.step.fetch_add(1, Ordering::SeqCst);
+            let call = match step {
+                0 | 2 => Some(("read_file", serde_json::json!({"file_path":"a.txt"}))),
+                1 => Some((
+                    "edit_file",
+                    serde_json::json!({"file_path":"a.txt","old_string":"original","new_string":"updated"}),
+                )),
+                _ => None,
+            };
+            let mut events = Vec::new();
+            if let Some((name, args)) = call {
+                events.push(StreamEvent::ToolCall(ToolCall {
+                    id: format!("cleanup-{step}"),
+                    name: name.into(),
+                    arguments: args.to_string(),
+                }));
+            } else {
+                events.push(StreamEvent::TextDelta("done".into()));
+            }
+            events.push(StreamEvent::Done { truncated: false });
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join("a.txt"),
+        format!("original {}\n", "kept ".repeat(30)),
+    )
+    .unwrap();
+    let cfg = CodingAgentConfig::new(
+        "k",
+        "http://localhost",
+        "context-cleanup",
+        project.path(),
+        atomcode_coding::config::product_dirs_from_env(),
+    );
+    let provider = Arc::new(Editor {
+        step: AtomicUsize::new(0),
+        seen: Mutex::new(Vec::new()),
+    });
+    let mut mounted = support::mount(
+        &cfg,
+        PrepareOptions {
+            tools: true,
+            ..quiet_options()
+        },
+        provider.clone(),
+    )
+    .await;
+    let turn = support::turn(&mut mounted.handle, "edit then read", support::allow()).await;
+    assert!(turn.error.is_none(), "{turn:?}");
+    let edit = turn
+        .tool_results
+        .iter()
+        .find(|r| r.call_id == "cleanup-1")
+        .expect("edit result");
+    assert!(!edit.is_error, "{}", edit.content);
+    assert!(
+        edit.content.contains("@@ "),
+        "the driver keeps the actual diff"
+    );
+    let seen = provider.seen.lock().unwrap();
+    let last = seen.last().unwrap();
+    let receipt = last
+        .iter()
+        .find(|m| m.tool_call_id.as_deref() == Some("cleanup-1"))
+        .unwrap();
+    assert!(
+        receipt.text.starts_with("Edited ") && !receipt.text.contains("@@ "),
+        "{}",
+        receipt.text
+    );
+    assert!(last
+        .iter()
+        .find(|m| m.tool_call_id.as_deref() == Some("cleanup-0"))
+        .unwrap()
+        .text
+        .contains("Superseded"));
+    let receipt_text = receipt.text.clone();
+    drop(seen);
+    let log = mounted
+        .context()
+        .service::<atomcode_harness::seams::AgentsSvc>()
+        .unwrap()
+        .list()[0]
+        .session();
+    let events = log.events();
+    let decoded: Vec<_> = events
+        .iter()
+        .map(|logged| atomcode_kernel::session::LoggedEvent {
+            seq: logged.seq,
+            at: logged.at,
+            event: serde_json::from_str(&serde_json::to_string(&logged.event).unwrap()).unwrap(),
+        })
+        .collect();
+    let records = atomcode_capabilities::session::events::turn_records(log.id(), &decoded);
+    assert!(
+        records
+            .iter()
+            .flat_map(|turn| &turn.tools)
+            .any(|tool| tool.name == "edit_file" && tool.result.contains("@@ ")),
+        "presentation readers retain the original diff after replay"
+    );
+    let replay = atomcode_kernel::session::derive_messages(&decoded);
+    assert_eq!(
+        replay
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("cleanup-1"))
+            .unwrap()
+            .text,
+        receipt_text
+    );
+    mounted.shutdown().await;
+}
+
+/// The production mount must project schemas, rather than merely test a helper.
+#[cfg(feature = "atomgit")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomgit_env)]
+async fn atomgit_discovery_loads_full_schemas_without_changing_the_executable_catalog() {
+    use atomcode_kernel::{
+        stream::StreamEvent,
+        tool::{ToolCall, ToolDef},
+    };
+    use std::sync::Mutex;
+    struct Recorder(Mutex<Vec<Vec<ToolDef>>>);
+    #[async_trait::async_trait]
+    impl LlmProvider for Recorder {
+        fn model_name(&self) -> &str {
+            "discovery-test"
+        }
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            tools: &[ToolDef],
+            _: &atomcode_kernel::provider::ChatOptions,
+        ) -> Result<
+            futures::stream::BoxStream<'static, StreamEvent>,
+            atomcode_kernel::stream::ProviderError,
+        > {
+            let mut requests = self.0.lock().unwrap();
+            requests.push(tools.to_vec());
+            let event = if requests.len() == 1 && tools.iter().any(|t| t.name == "builtin_search") {
+                StreamEvent::ToolCall(ToolCall {
+                    id: "discover".into(),
+                    name: "builtin_search".into(),
+                    arguments: r#"{"query":"atomgit_issue","limit":1}"#.into(),
+                })
+            } else {
+                StreamEvent::TextDelta("done".into())
+            };
+            Ok(Box::pin(futures::stream::iter(vec![
+                event,
+                StreamEvent::Done { truncated: false },
+            ])))
+        }
+    }
+    let project = tempfile::tempdir().unwrap();
+    let mut cfg = CodingAgentConfig::new(
+        "k",
+        "http://localhost",
+        "discovery-test",
+        project.path(),
+        atomcode_coding::config::product_dirs_from_env(),
+    );
+    let mut eager: Vec<ToolDef> = Vec::new();
+    let mut lazy: Vec<ToolDef> = Vec::new();
+    for enabled in [false, true] {
+        let mut file = atomcode_config::config::Config::default();
+        file.tools.atomgit.tool_search = enabled;
+        let runtime = atomcode_coding::CodingRuntimeConfig::from_config(
+            &file,
+            project.path(),
+            cfg.dirs.clone(),
+            None,
+            None,
+            false,
+            false,
+        );
+        assert_eq!(runtime.agent_config().atomgit_tool_search, enabled);
+        cfg.atomgit_tool_search = enabled;
+        let recorder = Arc::new(Recorder(Mutex::new(Vec::new())));
+        let mut mounted = support::mount(&cfg, quiet_options(), recorder.clone()).await;
+        let catalog = mounted
+            .context()
+            .service::<atomcode_harness::seams::ToolsSvc>()
+            .unwrap()
+            .defs();
+        for name in ["atomgit_repo", "atomgit_issue", "atomgit_pr", "atomgit_api"] {
+            assert!(catalog.iter().any(|t| t.name == name));
+        }
+        turn(&mut mounted.handle, "inspect issue capabilities", allow()).await;
+        let requests = recorder.0.lock().unwrap().clone();
+        if enabled {
+            assert!(requests.len() >= 2);
+            assert!(!requests[0].iter().any(|t| t.name.starts_with("atomgit_")));
+            assert!(requests[0]
+                .iter()
+                .any(|t| t.name == "builtin_search" && t.description.contains("atomgit_issue")));
+            let original = eager.iter().find(|t| t.name == "atomgit_issue").unwrap();
+            assert!(
+                requests[1].contains(original),
+                "search must expose the same complete schema as eager loading"
+            );
+            assert_eq!(
+                requests[1]
+                    .iter()
+                    .filter(|t| t.name.starts_with("atomgit_"))
+                    .count(),
+                1
+            );
+            lazy = requests[0].clone();
+        } else {
+            assert!(!requests[0].iter().any(|t| t.name == "builtin_search"));
+            assert_eq!(
+                requests[0]
+                    .iter()
+                    .filter(|t| t.name.starts_with("atomgit_"))
+                    .count(),
+                4
+            );
+            eager = requests[0].clone();
+        }
+        mounted.shutdown().await;
+    }
+    let eager_bytes = serde_json::to_vec(&eager).unwrap().len();
+    let lazy_bytes = serde_json::to_vec(&lazy).unwrap().len();
+    eprintln!(
+        "production builtin tool JSON bytes: eager={eager_bytes}, lazy={lazy_bytes}, saved={}",
+        eager_bytes - lazy_bytes
+    );
+    assert!(lazy_bytes < eager_bytes);
+    let unaffected = |tools: Vec<ToolDef>| {
+        tools
+            .into_iter()
+            .filter(|t| !t.name.starts_with("atomgit_") && t.name != "builtin_search")
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(unaffected(eager), unaffected(lazy));
+}
+
+#[cfg(feature = "atomgit")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomgit_env)]
+async fn atomgit_discovery_follows_the_admitted_catalog_when_env_overrides_disabled_config() {
+    struct RestoreEnv(Option<std::ffi::OsString>);
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var("ATOMCODE_ATOMGIT", value),
+                None => std::env::remove_var("ATOMCODE_ATOMGIT"),
+            }
+        }
+    }
+    let _restore = RestoreEnv(std::env::var_os("ATOMCODE_ATOMGIT"));
+    std::env::set_var("ATOMCODE_ATOMGIT", "1");
+    let project = tempfile::tempdir().unwrap();
+    let mut cfg = CodingAgentConfig::new(
+        "k",
+        "http://localhost",
+        "canned",
+        project.path(),
+        atomcode_coding::config::product_dirs_from_env(),
+    );
+    cfg.atomgit_enabled = false;
+    let mounted = support::mount(&cfg, quiet_options(), Arc::new(CannedProvider)).await;
+    let catalog = mounted
+        .context()
+        .service::<atomcode_harness::seams::ToolsSvc>()
+        .unwrap()
+        .defs();
+    assert!(
+        catalog.iter().any(|tool| tool.name == "atomgit_repo"),
+        "the environment enables registration"
+    );
+    assert!(
+        catalog.iter().any(|tool| tool.name == "builtin_search"),
+        "discovery must follow the actually admitted tools, not a stale configuration flag"
+    );
+    mounted.shutdown().await;
+}
+
+#[tokio::test]
+async fn host_automation_tools_mount_on_the_lead_without_widening_delegation() {
+    struct AutomationBackend;
+    impl atomcode_capabilities::tools::automation::AutomationService for AutomationBackend {
+        fn call(
+            &self,
+            _: &str,
+            _: serde_json::Value,
+            _: &Path,
+            _: &tokio_util::sync::CancellationToken,
+        ) -> Result<serde_json::Value, String> {
+            Ok(serde_json::json!({"tasks":[]}))
+        }
+    }
+    let project = tempfile::tempdir().unwrap();
+    let mut cfg = CodingAgentConfig::new(
+        "placeholder",
+        "http://localhost",
+        "test",
+        project.path(),
+        atomcode_coding::config::product_dirs_from_env(),
+    );
+    cfg.automation = Some(Arc::new(AutomationBackend));
+    let mut options = quiet_options();
+    options.tools = true;
+    options.subagents = atomcode_coding::SubagentPolicy::Enabled;
+    let mounted = support::mount(&cfg, options, Arc::new(CannedProvider)).await;
+    let tools = mounted
+        .context()
+        .service::<atomcode_harness::seams::ToolsSvc>()
+        .unwrap();
+    for name in [
+        "schedule_create",
+        "schedule_list",
+        "schedule_update",
+        "schedule_delete",
+    ] {
+        assert!(tools.get(name).is_some(), "lead tool {name} is missing");
+    }
+    let delegated = mounted
+        .context()
+        .service::<atomcode_harness::seams::SubagentsSvc>()
+        .unwrap();
+    assert!(
+        !delegated.describe().contains("schedule_"),
+        "{}",
+        delegated.describe()
+    );
+    mounted.shutdown().await;
 }

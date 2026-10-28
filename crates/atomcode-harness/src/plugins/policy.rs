@@ -689,6 +689,9 @@ impl Plugin for OutputArtifactPlugin {
     fn name(&self) -> &'static str {
         "tool-output-artifact"
     }
+    fn provides(&self) -> &'static [&'static str] {
+        &["output-artifacts"]
+    }
     fn uses(&self) -> &'static [&'static str] {
         &["tools"]
     }
@@ -718,6 +721,9 @@ impl Plugin for OutputArtifactPlugin {
                 atomcode_capabilities::tools::FetchOutputTool::new(store.clone()),
             )],
         )?;
+        let _ = ctx
+            .provide::<crate::seams::OutputArtifactsSvc>(store.clone())
+            .map_err(|e| e.to_string())?;
         let spill = Arc::new(
             atomcode_capabilities::tools::ArtifactMiddleware::new(store)
                 .with_threshold(row.threshold_bytes),

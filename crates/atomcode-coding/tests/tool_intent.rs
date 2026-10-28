@@ -33,6 +33,7 @@ fn _isolate_atomcode_home() {
 struct Seen {
     /// `(tool name, whether its schema offered `intent`)`, in request order.
     offered: Vec<(String, bool)>,
+    system: String,
 }
 
 /// A scripted model that answers its first step with the given calls — exactly
@@ -52,12 +53,18 @@ impl LlmProvider for ScriptedModel {
     }
     async fn chat_stream(
         &self,
-        _: &[Message],
+        messages: &[Message],
         tools: &[ToolDef],
         _: &ChatOptions,
     ) -> Result<futures::stream::BoxStream<'static, StreamEvent>, ProviderError> {
         {
             let mut seen = self.seen.lock().expect("seen poisoned");
+            seen.system = messages
+                .iter()
+                .filter(|message| message.role == atomcode_kernel::message::Role::System)
+                .map(|message| message.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
             seen.offered = tools
                 .iter()
                 .map(|t| {
@@ -144,8 +151,8 @@ async fn one_annotated_write(
         .expect("the turn's session")
         .events();
     mounted.shutdown().await;
-    let offered = std::mem::take(&mut seen.lock().expect("seen poisoned").offered);
-    (Seen { offered }, events, file)
+    let seen = std::mem::take(&mut *seen.lock().expect("seen poisoned"));
+    (seen, events, file)
 }
 
 /// **Half one.** Every tool the model may call is offered the `intent` argument.
@@ -161,6 +168,20 @@ async fn every_tool_is_offered_somewhere_to_say_why() {
     assert!(
         !seen.offered.is_empty(),
         "no tools were advertised, so this would pass for the wrong reason"
+    );
+    assert!(
+        seen.system.contains("do not repeat that action in prose"),
+        "phase-level progress rules must not require duplicate tool announcements"
+    );
+    assert!(
+        seen.system
+            .contains("do not repeat its purpose in assistant prose"),
+        "the mounted tool-intent rule must explain that its title already announces the action"
+    );
+    assert!(
+        seen.system
+            .contains("new findings, meaningful outcomes, blockers, changed plans"),
+        "reducing repetition must preserve useful updates"
     );
     let missing: Vec<&String> = seen
         .offered

@@ -129,6 +129,7 @@ mod tests {
                 command: "atomcode-no-such-lsp-binary-xyz".into(),
                 args: vec![],
                 root_markers: vec![],
+                options: Default::default(),
             },
         );
         let tool = DiagnosticsTool::new(Arc::new(LspManager::with_registry(registry)));

@@ -352,8 +352,11 @@ EOF
 
 - `parts_json_bytes` 按系统消息、用户消息、助手消息、工具结果、核心工具 schema、MCP schema 和封装字段划分；各项之和等于 `request_json_bytes`。
 - `tagged_text_bytes` 是另一个视角：按文本标记识别项目/用户指令、技能目录、记忆和 SessionStart hook，记录原始 UTF-8 字节数。标记分类只用于诊断，不影响权限或请求内容，也不能与 JSON 分类相加。
-- 日志只记录分类、数量和大小，不记录提示正文、工具参数或凭据。完整 wire dump 仍需显式开启。
+- `largest_core_tools` 列出当前最终请求里最大的十个非 MCP 工具（工具名及单个定义的 wire JSON 字节数），用于定位剩余常驻开销。它是 `tools_core` 的子集视图，不能再加到分类总和中。
+- 日志只记录分类、工具名、数量和大小，不记录提示正文、工具描述、参数内容或凭据。完整 wire dump 仍需显式开启。
 
 `MCP schema projection decision` 同时记录模式、模型上下文、schema 预算、MCP 大小和是否启用按需加载。默认 `on` 不依赖目录大小触发；显式选择 `auto` 时预算随上下文增大：1M 上下文对应约 400KB，42KB 的 MCP 目录不会触发。用 `off` 恢复全量发送，或选择 `auto` 使用比例阈值策略。设置按现有配置加载机制生效，已运行会话不会因编辑文件自动改变。
+
+`Tool schema projection result` 记录投影前的 `admitted_tools` / `admitted_schema_bytes`、实际保留的 `retained_tools` / `retained_schema_bytes` 和被隐藏的 `hidden_tools` / `hidden_schema_bytes`，用 `catalog` 区分 `builtin_search` 与 `mcp_search`。已挂载的 `auto` 投影无需延迟加载、或搜索入口被策略禁用时，保留全部、隐藏为零。显式关闭搜索时沿用原先不挂投影处理的行为，此时查看 provider 输入统计。这里统计中立 ToolDef JSON，不含 provider 封装与后续参数装饰，应与最终 wire 统计分开比较。
 
 这些是字节计量，不是分词器或计费 token 数。比较时应保持同一模型和工具配置，分别检查新会话首轮与搜索加载后的请求；真实 token 以 provider 返回的 usage 为准。

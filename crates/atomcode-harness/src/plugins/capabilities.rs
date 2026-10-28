@@ -402,6 +402,7 @@ impl crate::commands::CatalogCommand for ReviewCommand {
             usage: Some("[staged | <base>]".into()),
             summary: t(Msg::CmdCatalogReview).into_owned(),
             target: atomcode_kernel::agent::CommandTarget::Session,
+            ..Default::default()
         }
     }
 
@@ -613,10 +614,17 @@ impl crate::commands::CatalogCommand for RunSkill {
             ),
             summary: self.skill.description.clone(),
             target: atomcode_kernel::agent::CommandTarget::Session,
+            args_requirement: self.skill.args_requirement,
         }
     }
 
     async fn run(&self, agent: Arc<crate::agent::Agent>, args: &str) -> Result<String, String> {
+        // Validate user invocations before expanding templates or queuing context.
+        // Both custom commands and user-invocable skills reach this owner through
+        // the command catalog. Model-side `use_skill` has its own loading path.
+        if let Some(error) = missing_required_arg(&self.name, args, self.skill.args_requirement) {
+            return Err(error);
+        }
         super::skill_permissions::rules(&self.skill)?;
         let text = self.skill.expand(args.trim(), agent.session_id());
         if text.trim().is_empty() {
@@ -648,6 +656,23 @@ impl crate::commands::CatalogCommand for RunSkill {
 
     fn skill_registry(&self) -> Option<&Arc<SkillRegistry>> {
         Some(&self.registry)
+    }
+}
+
+/// Whether running `/name` with `args` as typed must be refused: the command
+/// declared `args: required` and nothing was supplied. Shared by every entry
+/// point that runs a disk skill as a slash command — the composer dispatches
+/// into [`RunSkill::run`] and a driver sends `Invoke` straight at it, so the
+/// check lives on the command itself, not on one front end.
+fn missing_required_arg(
+    name: &str,
+    args: &str,
+    requirement: atomcode_kernel::agent::ArgsRequirement,
+) -> Option<String> {
+    if requirement == atomcode_kernel::agent::ArgsRequirement::Required && args.trim().is_empty() {
+        Some(t(Msg::CmdCustomArgRequired { name }).into_owned())
+    } else {
+        None
     }
 }
 
@@ -719,6 +744,7 @@ impl crate::commands::CatalogCommand for ListSkills {
             usage: Some(t(Msg::CmdCatalogSkillsUsage).into_owned()),
             summary: t(Msg::CmdCatalogSkills).into_owned(),
             target: atomcode_kernel::agent::CommandTarget::Session,
+            ..Default::default()
         }
     }
 
@@ -795,7 +821,11 @@ impl ListSkills {
         // Each gets the same task: they are several ways of looking at one
         // thing, not a pipeline.
         let skills: Vec<_> = names.iter().filter_map(|name| self.0.get(name)).collect();
+        let invocation = format!("skills {}", names.join(" "));
         for skill in &skills {
+            if let Some(error) = missing_required_arg(&invocation, task, skill.args_requirement) {
+                return Err(error);
+            }
             super::skill_permissions::rules(skill)?;
         }
         let blocks: Vec<(String, String)> = skills
@@ -883,6 +913,7 @@ impl crate::commands::CatalogCommand for MemoryCommand {
             usage: self.usage.map(|msg| t(msg).into_owned()),
             summary: t(self.summary).into_owned(),
             target: atomcode_kernel::agent::CommandTarget::Session,
+            ..Default::default()
         }
     }
 
@@ -1330,6 +1361,125 @@ impl Plugin for McpPlugin {
 #[cfg(test)]
 mod tests {
     use super::skills_and_task;
+    use super::RunSkill;
+    use crate::commands::CatalogCommand;
+
+    /// A `RunSkill` built from a disk skill carries the skill's declared
+    /// `args_requirement` on its `CommandDescription`. This is the row's
+    /// only duty: the front end reads `args_requirement` off the catalog
+    /// description to route its Enter key, and this row is the only one that
+    /// knows a skill's own declaration.
+    fn runskill_with_requirement(requirement: atomcode_kernel::agent::ArgsRequirement) -> RunSkill {
+        use atomcode_capabilities::skills::{Skill, SkillRegistry};
+        use std::path::PathBuf;
+        let skill = std::sync::Arc::new(Skill {
+            name: "cmd".into(),
+            description: "a command".into(),
+            template: "body".into(),
+            allowed_tools: vec![],
+            user_invocable: true,
+            args_requirement: requirement,
+            skill_dir: PathBuf::from("/sk"),
+            source_path: PathBuf::from("/sk/SKILL.md"),
+        });
+        RunSkill {
+            skill,
+            name: "cmd".into(),
+            command: true,
+            registry: std::sync::Arc::new(SkillRegistry::new()),
+        }
+    }
+
+    #[test]
+    fn runskill_describe_surfaces_required() {
+        let desc =
+            runskill_with_requirement(atomcode_kernel::agent::ArgsRequirement::Required).describe();
+        assert_eq!(
+            desc.args_requirement,
+            atomcode_kernel::agent::ArgsRequirement::Required,
+        );
+    }
+
+    #[test]
+    fn runskill_describe_surfaces_optional() {
+        let desc =
+            runskill_with_requirement(atomcode_kernel::agent::ArgsRequirement::Optional).describe();
+        assert_eq!(
+            desc.args_requirement,
+            atomcode_kernel::agent::ArgsRequirement::Optional,
+        );
+    }
+
+    #[test]
+    fn runskill_describe_surfaces_none() {
+        let desc =
+            runskill_with_requirement(atomcode_kernel::agent::ArgsRequirement::None).describe();
+        assert_eq!(
+            desc.args_requirement,
+            atomcode_kernel::agent::ArgsRequirement::None,
+        );
+    }
+
+    #[test]
+    fn runskill_describe_surfaces_unspecified_for_legacy() {
+        // A skill whose frontmatter has no `args:` field comes back as
+        // `Unspecified` — the state that keeps legacy command behaviour
+        // unchanged. Folding it into `Optional` would route every
+        // pre-existing command to the completion path on the next front end
+        // update, which is exactly the behaviour change the disk declaration
+        // exists to avoid.
+        let desc = runskill_with_requirement(atomcode_kernel::agent::ArgsRequirement::Unspecified)
+            .describe();
+        assert_eq!(
+            desc.args_requirement,
+            atomcode_kernel::agent::ArgsRequirement::Unspecified,
+        );
+    }
+
+    #[test]
+    fn missing_required_arg_refuses_only_required_bare() {
+        use atomcode_kernel::agent::ArgsRequirement;
+        let _locale = atomcode_config::i18n::test_lock();
+        atomcode_config::i18n::set_locale(atomcode_config::i18n::Locale::En);
+        // The matrix every entry point shares: only `Required` + a bare
+        // argument refuses. `optional` / `none` / `unspecified` keep the
+        // legacy dispatch, and a `required` command with an argument runs.
+        let bare = [
+            ArgsRequirement::Optional,
+            ArgsRequirement::None,
+            ArgsRequirement::Unspecified,
+        ];
+        for requirement in bare {
+            assert_eq!(
+                super::missing_required_arg("cmd", "", requirement),
+                None,
+                "{requirement:?} + bare must not refuse"
+            );
+            assert_eq!(
+                super::missing_required_arg("cmd", "   ", requirement),
+                None,
+                "{requirement:?} + whitespace must not refuse"
+            );
+        }
+        let err = super::missing_required_arg("cmd", "", ArgsRequirement::Required)
+            .expect("required + bare must refuse");
+        assert_eq!(err, "/cmd requires an argument. Usage: /cmd <your-input>");
+        assert_eq!(
+            super::missing_required_arg("cmd", "   ", ArgsRequirement::Required),
+            Some("/cmd requires an argument. Usage: /cmd <your-input>".into()),
+            "required + whitespace-only is still a bare dispatch"
+        );
+        assert_eq!(
+            super::missing_required_arg("cmd", "hello", ArgsRequirement::Required),
+            None,
+            "required + a real argument runs"
+        );
+        assert_eq!(
+            super::missing_required_arg("cmd", "hello world", ArgsRequirement::Required),
+            None,
+            "required + several arguments runs"
+        );
+    }
 
     #[test]
     fn skill_listing_keeps_loaded_paths_and_failures_even_without_loaded_skills() {

@@ -341,6 +341,9 @@ pub async fn register_session(
     // The same `connect()` the full-screen UI goes through. ACP stops reading
     // the product's own event enum here: what it sees from now on is what the
     // contract says, which is what every other front end sees.
+    let current_mode = runtime.handle.mode().await.map_err(|error| {
+        agent_client_protocol::util::internal_error(format!("cannot read runtime mode: {error}"))
+    })?;
     let host: Arc<dyn crate::host::HostConfig> = Arc::new(AcpHost {
         resolve_model,
         current: config.clone(),
@@ -395,7 +398,7 @@ pub async fn register_session(
             goal_ended,
             native_id,
             cwd,
-            current_mode: RuntimeMode::Build,
+            current_mode,
             config_options: config_options.to_vec(),
             usage: (0, 0),
             todo_calls: Vec::new(),
