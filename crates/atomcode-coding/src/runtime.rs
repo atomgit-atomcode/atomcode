@@ -10802,7 +10802,11 @@ fn replay_pending_resume_prompt(
     // Loading a session only hands the prompt back; the retraction happens here,
     // immediately before the replay is actually sent. A preview that dropped the
     // prompt therefore leaves the conversation unchanged.
-    if binding.manager.prepare_resume_replay(&binding.lease).is_err() {
+    if binding
+        .manager
+        .prepare_resume_replay(&binding.lease)
+        .is_err()
+    {
         // The prompt is still visible in the log; do not keep an in-memory replay
         // that could fire after the person has moved on.
         binding.pending_resume_prompt = None;
