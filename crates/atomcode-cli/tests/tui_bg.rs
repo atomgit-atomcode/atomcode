@@ -1536,6 +1536,130 @@ async fn shared_question_id() -> u64 {
     panic!("shared question never published");
 }
 
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+async fn shared_navigation_prepares_the_target_project_before_resuming() {
+    use atomcode_capabilities::session::{SessionManager, SessionMeta, StorageOwner};
+    use atomcode_kernel::session::{LoggedEvent, SessionEvent, SessionHeader};
+    let (rig, original) = a_history_and_fresh_foreground().await;
+    let old = rig.client.root();
+    let project = tempfile::tempdir().unwrap();
+    let dirs = atomcode_coding::config::product_dirs_from_env();
+    let manager = SessionManager::for_project(project.path(), &dirs);
+    let target = "foreign-webui-session";
+    let lease = manager.acquire_lease(target).unwrap();
+    let mut header = SessionHeader::new(target);
+    header.cwd = Some(project.path().to_string_lossy().into_owned());
+    let mut meta = SessionMeta::new(
+        target,
+        project.path().to_string_lossy(),
+        atomcode_capabilities::session::now_ms(),
+    );
+    meta.owner = StorageOwner::Native;
+    meta.message_count = 1;
+    meta.turn_count = 1;
+    manager
+        .create_event_session(&lease, &header, &meta)
+        .unwrap();
+    manager
+        .append_events(
+            &lease,
+            &[
+                LoggedEvent {
+                    seq: 1,
+                    at: 0,
+                    event: SessionEvent::TurnStart { turn: 1 },
+                },
+                LoggedEvent {
+                    seq: 2,
+                    at: 0,
+                    event: SessionEvent::UserMessage {
+                        turn: 1,
+                        text: "FOREIGN PROJECT HISTORY".into(),
+                        images: vec![],
+                    },
+                },
+            ],
+        )
+        .unwrap();
+    drop(lease);
+    let old_bucket = SessionManager::project_hash(rig.project.path(), &dirs);
+    let target_bucket = SessionManager::project_hash(project.path(), &dirs);
+    share(&rig).await;
+    let changed = atomcode_daemon::native_live::resume_or_fork_session(target.into())
+        .await
+        .unwrap();
+    assert_eq!(changed.changed.session_id.as_deref(), Some(target));
+    assert_eq!(
+        changed.changed.working_dir.canonicalize().unwrap(),
+        project.path().canonicalize().unwrap()
+    );
+    rig.until("foreign session visible in TUI", |rig| {
+        rig.client.root() == target
+    })
+    .await;
+    assert_eq!(
+        atomcode_daemon::native_live::binding().unwrap().session_id,
+        target
+    );
+    assert_eq!(
+        SessionManager::project_hash(rig.project.path(), &dirs),
+        old_bucket
+    );
+    assert_eq!(
+        SessionManager::project_hash(project.path(), &dirs),
+        target_bucket
+    );
+    rig.until_screen("FOREIGN PROJECT HISTORY").await;
+    let changed = atomcode_daemon::native_live::resume_or_fork_session(original.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        changed.changed.session_id.as_deref(),
+        Some(original.as_str())
+    );
+    rig.until("returned to original project", |rig| {
+        rig.client.root() == original
+    })
+    .await;
+    // A foreign session held elsewhere opens a copy in the destination project.
+    let held = manager.acquire_lease(target).unwrap();
+    let forked = atomcode_daemon::native_live::resume_or_fork_session(target.into())
+        .await
+        .unwrap();
+    assert_eq!(forked.forked_from.as_deref(), Some(target));
+    assert_ne!(forked.changed.session_id.as_deref(), Some(target));
+    assert_eq!(
+        forked.changed.working_dir.canonicalize().unwrap(),
+        project.path().canonicalize().unwrap()
+    );
+    atomcode_daemon::native_live::resume_or_fork_session(original.clone())
+        .await
+        .unwrap();
+    drop(held);
+    rig.until("returned after foreign copy", |rig| {
+        rig.client.root() == original
+    })
+    .await;
+    // Missing destination: fail before preparing or changing the foreground/binding.
+    std::fs::remove_dir_all(project.path()).unwrap();
+    let before = rig.spawn_started.load(Ordering::SeqCst);
+    assert!(
+        atomcode_daemon::native_live::resume_or_fork_session(target.into())
+            .await
+            .is_err()
+    );
+    assert_eq!(rig.spawn_started.load(Ordering::SeqCst), before);
+    assert_eq!(rig.client.root(), original);
+    assert_eq!(
+        atomcode_daemon::native_live::binding().unwrap().session_id,
+        original
+    );
+    assert_ne!(old, target);
+    atomcode::tui_share::detach().unwrap();
+    rig.quit().await;
+}
+
 async fn share(rig: &Rig) {
     let path = rig._home.path().join("config.toml");
     std::fs::write(

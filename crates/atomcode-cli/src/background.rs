@@ -1459,10 +1459,15 @@ impl Background {
     /// is prepared privately. Failed preparation never changes the slot table.
     async fn resume(&self, session: String, target: String) -> Result<HostReply, HostError> {
         let _op = self.op.lock().await;
-        self.resume_locked(session, target).await
+        self.resume_locked(session, target, false).await
     }
 
-    async fn resume_locked(&self, session: String, target: String) -> Result<HostReply, HostError> {
+    async fn resume_locked(
+        &self,
+        session: String,
+        target: String,
+        project_navigation: bool,
+    ) -> Result<HostReply, HostError> {
         let front = {
             let state = self.state.lock().expect("background poisoned");
             if state.front.control.session_id() != session {
@@ -1475,7 +1480,8 @@ impl Background {
             return self.foreground_locked(session, target).await;
         }
         if target == session
-            || (!crate::tui_share::sharing()
+            || (!project_navigation
+                && !crate::tui_share::sharing()
                 && !in_turn(&self.state.lock().expect("background poisoned").front))
         {
             return front.call(HostCommand::Resume { session, target }).await;
@@ -1486,7 +1492,34 @@ impl Background {
                 return Err(Self::full());
             }
         }
-        let working_dir = front.working_dir_now().await;
+        let mut working_dir = front.working_dir_now().await;
+        if project_navigation {
+            use atomcode_capabilities::session::SessionManager;
+            let dirs = atomcode_coding::config::product_dirs_from_env();
+            let scan = SessionManager::scan_all(dirs.user());
+            let entry = scan
+                .entries
+                .iter()
+                .find(|entry| entry.id == target && entry.message_count > 0)
+                .ok_or(HostError::NotFound)?;
+            if entry.needs_newer_version {
+                return Err(HostError::Failed {
+                    message: "Update AtomCode before opening this session.".into(),
+                });
+            }
+            if entry.project_bucket != SessionManager::project_hash(&working_dir, &dirs) {
+                // Shared project navigation prepares the destination first. The
+                // ordinary /resume guard then validates its lease in that project.
+                // Never repin the old directory to another storage bucket.
+                if !entry.working_directory_available()
+                    || SessionManager::project_hash(&entry.working_dir, &dirs)
+                        != entry.project_bucket
+                {
+                    return Err(HostError::Failed { message: "The session's project directory is unavailable or belongs to another storage bucket.".into() });
+                }
+                working_dir = entry.working_dir.clone();
+            }
+        }
         let (mut incoming, mut pumps) = self.prepare_at(working_dir).await?;
         let reply = match incoming
             .control
@@ -1868,7 +1901,7 @@ impl atomcode_daemon::native_live::EmbeddedSessions for Background {
     ) -> Result<atomcode_daemon::native_live::Resumed, String> {
         let _op = self.op.lock().await;
         let reply = self
-            .resume_locked(expected, target.clone())
+            .resume_locked(expected, target.clone(), true)
             .await
             .map_err(|error| format!("{error:?}"))?;
         // The operation already committed. Do not ask for another full replay:
