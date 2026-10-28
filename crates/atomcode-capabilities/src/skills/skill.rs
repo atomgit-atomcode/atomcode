@@ -428,11 +428,13 @@ fn parse_frontmatter(content: &str) -> (Frontmatter, String) {
             fm.user_invocable = v.trim() != "false";
         } else if let Some(v) = line.strip_prefix("args:") {
             // Three declared values, matched case-insensitively so a person who
-            // writes `Args: Required` is not punished; anything else is a
+            // writes `args: Required` is not punished; anything else is a
             // diagnostic rather than a silent fallback to `optional` (which
             // would change the command's behaviour in a way the person did
             // not ask for).
-            let value = without_yaml_comment(v).trim().to_ascii_lowercase();
+            let value = fm_value(without_yaml_comment(v))
+                .trim()
+                .to_ascii_lowercase();
             match value.as_str() {
                 "required" => fm.args_requirement = ArgsRequirement::Required,
                 "optional" => fm.args_requirement = ArgsRequirement::Optional,
@@ -785,6 +787,32 @@ mod tests {
 
         let (fm, _) = parse_frontmatter("---\nname: x\nargs: none\n---\nbody");
         assert_eq!(fm.args_requirement, ArgsRequirement::None);
+    }
+
+    #[test]
+    fn quoted_args_requirements_preserve_the_declared_policy() {
+        for (declaration, expected) in [
+            ("\"required\"", ArgsRequirement::Required),
+            ("'ReQuIrEd' # explanation", ArgsRequirement::Required),
+            ("\"optional\" # explanation", ArgsRequirement::Optional),
+            ("'none'", ArgsRequirement::None),
+        ] {
+            let parsed = build_skill(
+                &format!("---\nargs: {declaration}\n---\nTask: $ARGUMENTS"),
+                "needs",
+                Path::new("."),
+                Path::new("needs.md"),
+                None,
+                false,
+            )
+            .unwrap();
+            assert_eq!(parsed.skill.args_requirement, expected, "{declaration}");
+            assert!(
+                parsed.warnings.is_empty(),
+                "{declaration}: {:?}",
+                parsed.warnings
+            );
+        }
     }
 
     #[test]

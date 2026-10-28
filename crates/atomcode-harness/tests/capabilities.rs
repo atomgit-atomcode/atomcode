@@ -1595,3 +1595,156 @@ async fn memory_expiry_filters_and_renewal_use_the_store_without_rewriting_sessi
     assert_eq!(agent.session().events(), original);
     assert!(transcript(&app).contains("EXPIRY_HISTORY_FACT"));
 }
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn required_user_templates_reject_empty_input_before_queuing_context() {
+    use atomcode_capabilities::skills::TemplateKind;
+    use atomcode_kernel::agent::ArgsRequirement;
+    for kind in [TemplateKind::Command, TemplateKind::Skill] {
+        for declaration in ["required", "\"required\"", "'Required' # note"] {
+            let dir = scratch("required-template");
+            let templates = dir.join("templates");
+            std::fs::create_dir_all(&templates).unwrap();
+            std::fs::write(
+                templates.join("needs.md"),
+                format!("---\nargs: {declaration}\n---\nTask: $ARGUMENTS\n"),
+            )
+            .unwrap();
+            let app = start(tree(&dir, STOP, &[])).await;
+            let ctx = app.context();
+            let registry = ctx.service::<SkillsSvc>().unwrap();
+            registry.load_template_dir(&templates, None, kind);
+            plugins::capabilities::register_skill_commands(&ctx, &registry).unwrap();
+            let agent = atomcode_harness::create_agent(&app).await.unwrap();
+            let catalog = ctx
+                .service::<atomcode_harness::seams::CommandsSvc>()
+                .unwrap();
+            let command = catalog.find("needs", &agent).unwrap();
+            assert_eq!(
+                command.describe().args_requirement,
+                ArgsRequirement::Required
+            );
+            for args in ["", " \t\n "] {
+                assert!(
+                    command.run(agent.clone(), args).await.is_err(),
+                    "{kind:?}: {declaration}"
+                );
+                assert!(agent.inbox().claim().is_empty(), "refusal queued a message");
+                assert!(agent.claim_injections().is_empty(), "refusal left context");
+            }
+            assert!(command.run(agent.clone(), "real task").await.is_ok());
+            let claimed = agent.inbox().claim();
+            assert_eq!(claimed.injections[0].0, "Task: real task\n");
+            assert!(claimed.message.is_some());
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn skills_gateway_validates_all_requirements_before_any_template_expansion() {
+    let dir = scratch("required-batch");
+    let templates = dir.join("templates");
+    std::fs::create_dir_all(&templates).unwrap();
+    let marker = dir.join("expanded");
+    let quoted_marker = marker.to_string_lossy().replace('\'', "'\\''");
+    std::fs::write(
+        templates.join("first.md"),
+        format!(
+            "---\nargs: optional\n---\n!`printf expanded > '{quoted_marker}'`\nFirst: $ARGUMENTS"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        templates.join("needs.md"),
+        "---\nargs: required\n---\nRequired: $ARGUMENTS",
+    )
+    .unwrap();
+    let app = start(tree(&dir, STOP, &[])).await;
+    let ctx = app.context();
+    let registry = ctx.service::<SkillsSvc>().unwrap();
+    registry.load_dir(&templates, None);
+    plugins::capabilities::register_skill_commands(&ctx, &registry).unwrap();
+    let agent = atomcode_harness::create_agent(&app).await.unwrap();
+    let catalog = ctx
+        .service::<atomcode_harness::seams::CommandsSvc>()
+        .unwrap();
+    let gateway = catalog.find("skills", &agent).unwrap();
+    assert!(gateway.run(agent.clone(), "first needs").await.is_err());
+    assert!(
+        !marker.exists(),
+        "an earlier template ran before the batch was validated"
+    );
+    assert!(agent.inbox().claim().is_empty());
+    assert!(agent.claim_injections().is_empty());
+    gateway
+        .run(agent.clone(), "first needs actual task")
+        .await
+        .unwrap();
+    assert!(
+        marker.exists(),
+        "the valid invocation really expands the template"
+    );
+    let claimed = agent.inbox().claim();
+    assert!(claimed.injections[0].0.contains("Required: actual task"));
+    assert!(claimed.message.is_some());
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn optional_and_legacy_templates_keep_empty_input_and_model_loading_is_unchanged() {
+    use atomcode_capabilities::skills::TemplateKind;
+    use atomcode_kernel::tool::{Tool, ToolContext};
+    for kind in [TemplateKind::Skill, TemplateKind::Command] {
+        for declaration in ["", "args: none\n", "args: optional\n"] {
+            let dir = scratch("optional-template");
+            let templates = dir.join("templates");
+            std::fs::create_dir_all(&templates).unwrap();
+            std::fs::write(
+                templates.join("maybe.md"),
+                format!("---\n{declaration}---\nTask: $ARGUMENTS"),
+            )
+            .unwrap();
+            let app = start(tree(&dir, STOP, &[])).await;
+            let ctx = app.context();
+            let registry = ctx.service::<SkillsSvc>().unwrap();
+            registry.load_template_dir(&templates, None, kind);
+            plugins::capabilities::register_skill_commands(&ctx, &registry).unwrap();
+            let agent = atomcode_harness::create_agent(&app).await.unwrap();
+            let catalog = ctx
+                .service::<atomcode_harness::seams::CommandsSvc>()
+                .unwrap();
+            assert!(catalog
+                .find("maybe", &agent)
+                .unwrap()
+                .run(agent.clone(), "")
+                .await
+                .is_ok());
+            assert!(agent.inbox().claim().message.is_some());
+        }
+    }
+    let dir = scratch("model-required-skill");
+    std::fs::write(
+        dir.join("needs.md"),
+        "---\nargs: required\n---\nTask: $ARGUMENTS",
+    )
+    .unwrap();
+    let registry = std::sync::Arc::new(atomcode_capabilities::skills::SkillRegistry::new());
+    registry.load_dir(&dir, None);
+    let tool = atomcode_capabilities::skills::UseSkillTool::new(registry);
+    let result = tool
+        .execute(
+            r#"{"name":"needs"}"#,
+            &ToolContext {
+                working_dir: dir,
+                cancel: Default::default(),
+                progress: Default::default(),
+                requester: None,
+            },
+        )
+        .await;
+    assert!(
+        !result.is_error,
+        "model loading behavior changed: {}",
+        result.content
+    );
+}

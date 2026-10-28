@@ -619,21 +619,11 @@ impl crate::commands::CatalogCommand for RunSkill {
     }
 
     async fn run(&self, agent: Arc<crate::agent::Agent>, args: &str) -> Result<String, String> {
-        // A slash command that declared `args: required` and was run with
-        // nothing after its name is refused here, before it queues anything.
-        // The owning check rather than a front end's: this is where every
-        // entry point lands — the composer dispatches into it, and a driver
-        // (an ACP client, a headless run, the daemon) sends `Invoke` straight
-        // to it without any composer in between. Refusing in the front end
-        // only would leave those drivers running the command with an empty
-        // argument. `self.command` is what says it was run as `/name`; the
-        // same skill reached through `use_skill` is not a typed command and
-        // does not get the gate.
-        if self.command {
-            if let Some(error) = missing_required_arg(&self.name, args, self.skill.args_requirement)
-            {
-                return Err(error);
-            }
+        // Validate user invocations before expanding templates or queuing context.
+        // Both custom commands and user-invocable skills reach this owner through
+        // the command catalog. Model-side `use_skill` has its own loading path.
+        if let Some(error) = missing_required_arg(&self.name, args, self.skill.args_requirement) {
+            return Err(error);
         }
         super::skill_permissions::rules(&self.skill)?;
         let text = self.skill.expand(args.trim(), agent.session_id());
@@ -831,7 +821,11 @@ impl ListSkills {
         // Each gets the same task: they are several ways of looking at one
         // thing, not a pipeline.
         let skills: Vec<_> = names.iter().filter_map(|name| self.0.get(name)).collect();
+        let invocation = format!("skills {}", names.join(" "));
         for skill in &skills {
+            if let Some(error) = missing_required_arg(&invocation, task, skill.args_requirement) {
+                return Err(error);
+            }
             super::skill_permissions::rules(skill)?;
         }
         let blocks: Vec<(String, String)> = skills
