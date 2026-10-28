@@ -2819,6 +2819,16 @@ impl SessionManager {
             Some(&forked.presentation),
             &forked.meta,
         )?;
+        if let Ok(Some(sidecar)) = self.read_todo_sidecar(source_id) {
+            // A compacted plan lives only in the sidecar; a fork without it
+            // would start with an empty task list.
+            let _ = self.write_todo_sidecar(
+                destination_id,
+                &sidecar.todos,
+                sidecar.message_count,
+                sidecar.through,
+            );
+        }
         Ok((forked, destination_lease))
     }
 
@@ -6334,6 +6344,21 @@ mod tests {
             &source_meta,
         )
         .unwrap();
+        let todo_through = TodoCallPosition {
+            turn: 1,
+            round: 1,
+            index: 0,
+        };
+        mgr.write_todo_sidecar(
+            "source",
+            &[TodoSidecarItem {
+                content: "a".into(),
+                status: "in_progress".into(),
+            }],
+            2,
+            Some(todo_through),
+        )
+        .unwrap();
 
         let (forked, fork_lease) = mgr
             .fork_native_session("source", "destination", 20)
@@ -6360,6 +6385,14 @@ mod tests {
                 base_turn_count: 2,
             })
         );
+        let sidecar = mgr
+            .read_todo_sidecar("destination")
+            .unwrap()
+            .expect("the fork carries the plan");
+        assert_eq!(sidecar.todos.len(), 1);
+        assert_eq!(sidecar.todos[0].content, "a");
+        assert_eq!(sidecar.todos[0].status, "in_progress");
+        assert_eq!(sidecar.through, Some(todo_through));
         assert_eq!(mgr.load_native_session("source").unwrap().meta, source_meta);
         assert!(matches!(
             mgr.acquire_lease("source"),
