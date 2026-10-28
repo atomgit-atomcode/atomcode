@@ -406,7 +406,7 @@ impl Tool for AtomgitIssueTool {
         "atomgit_issue"
     }
     fn description(&self) -> &str {
-        "Operate on AtomGit issues. action: \"list\" (owner+repo; optional \
+        "Operate on AtomGit issues. On platform HTTP 429, stop repeated calls and do not bypass with curl. For unconfirmed writes, query first before resending. action: \"list\" (owner+repo; optional \
          state=open|closed|all, limit), \"view\" (owner+repo+number), \"create\" \
          (owner+repo+title; optional body), \"update\" (owner+repo+number+title; \
          optional body, state=reopen|close), \"close\" (owner+repo+number), \
@@ -821,7 +821,7 @@ impl Tool for AtomgitPrTool {
         "atomgit_pr"
     }
     fn description(&self) -> &str {
-        "Operate on AtomGit pull requests. action: \"list\" (owner+repo; optional \
+        "Operate on AtomGit pull requests. On platform HTTP 429, stop repeated calls and do not bypass with curl. For unconfirmed writes, query first before resending. Never replace an unsupported review reply with an ordinary comment without user approval. action: \"list\" (owner+repo; optional \
          state=open|closed|all, limit), \"list_mine\" (the authenticated user's PRs \
          across all repos; optional scope=created_by_me|assigned_to_me|need_my_review|\
          need_my_approve, state, sort, direction, labels, source_branch, target_branch, \
