@@ -121,6 +121,7 @@ pub use background::{
 /// the same wherever it runs: what counts as destructive, how long to wait, and
 /// how to present the result.
 pub struct BashTool {
+    label: &'static str,
     world: Arc<dyn crate::world::Shell>,
     output_preview: Option<super::output_artifact::ArtifactStoreProvider>,
     /// What counts as a sensitive target (the "allow all" floor and the grant scope).
@@ -144,9 +145,15 @@ impl BashTool {
     pub fn with_world(world: Arc<dyn crate::world::Shell>, sensitive: SensitivePaths) -> Self {
         Self {
             world,
+            label: "bash",
             sensitive,
             output_preview: None,
         }
+    }
+
+    pub(crate) fn with_label(mut self, label: &'static str) -> Self {
+        self.label = label;
+        self
     }
 
     /// Use the host's existing artifact store for optional per-call previews.
@@ -175,7 +182,7 @@ struct Args {
 #[async_trait]
 impl Tool for BashTool {
     fn name(&self) -> &str {
-        "bash"
+        self.label
     }
     fn description(&self) -> &str {
         // Only advertise interactive password support when the askpass helper is
@@ -287,7 +294,8 @@ impl Tool for BashTool {
             Ok(a) => a,
             Err(e) => {
                 return err(format!(
-                    "bash: invalid arguments: {e}. Expected {{\"command\":\"<shell command>\"}}."
+                    "{}: invalid arguments: {e}. Expected {{\"command\":\"<shell command>\"}}.",
+                    self.label
                 ))
             }
         };
@@ -301,7 +309,7 @@ impl Tool for BashTool {
             output_preview.is_some(),
         ) {
             Ok(lines) => lines,
-            Err(error) => return err(format!("bash: {error}")),
+            Err(error) => return err(format!("{}: {error}", self.label)),
         };
         // Keep the RAW request so we can (a) avoid telling a caller that already asked for
         // more than the ceiling to "pass a larger timeout", and (b) surface the clamp up
@@ -328,7 +336,9 @@ impl Tool for BashTool {
             // The world's rewrite directive goes back as-is; a failure to start is
             // this tool's to report.
             Err(crate::world::SpawnError::Unsupported(reason)) => return err(reason),
-            Err(crate::world::SpawnError::Failed(reason)) => return err(format!("bash: {reason}")),
+            Err(crate::world::SpawnError::Failed(reason)) => {
+                return err(format!("{}: {reason}", self.label))
+            }
         };
 
         let result = tokio::select! {
@@ -342,7 +352,7 @@ impl Tool for BashTool {
                 // header above (for the user) and in the tool-call record
                 // (for the model), so don't echo it back — a long command
                 // just wraps into several redundant error lines.
-                err("bash: cancelled before completion.".to_string())
+                err(format!("{}: cancelled before completion.", self.label))
             }
             // The limit is on the command running, not on reading what it left
             // behind: a timeout landing in the post-exit drain would kill what the
@@ -359,12 +369,12 @@ impl Tool for BashTool {
                             .unwrap_or_else(|| "[process terminated by signal]".into());
                         preview.shell_tail(&mut result, lines, &status, collected.exit.code != Some(0), "");
                     }
-                    if collected.exit.code == Some(0) && exit_diagnostic::may_mask_status(&a.command) {
+                    if self.label == "bash" && collected.exit.code == Some(0) && exit_diagnostic::may_mask_status(&a.command) {
                         exit_diagnostic::append_note(&mut result, output_preview.is_some());
                     }
                     result
                 },
-                Err(e) => err(format!("bash: error running command: {e}")),
+                Err(e) => err(format!("{}: error running command: {e}", self.label)),
                 // Don't echo the command (see the cancel arm); point at the actionable knob —
                 // a larger `timeout` — BUT only while that knob still has room. Once the run
                 // was already at MAX_TIMEOUT_SECS, "pass a larger timeout" is advice that
@@ -373,7 +383,7 @@ impl Tool for BashTool {
                 // `bash_start`, the background path every platform has.
                 Ok(None) => {
                     process.kill().await;
-                    err(timeout_message(secs))
+                    err(if self.label == "pwsh" { timeout_message(secs).replace("bash_start", "pwsh_start").replacen("bash:", "pwsh:", 1) } else { timeout_message(secs) })
                 }
             }
         };
@@ -473,9 +483,10 @@ fn shell_tool_description(
              printf '\\n'. Chain steps with &&. For multi-line text (e.g. a multi-line commit \
              message) write it to a temp file and pass the file (e.g. git commit -F msg.txt).\n\
              Default to ONE shell — cmd.exe — and do NOT randomly switch between shells mid-task. \
-             Do NOT use git-bash forms like `cmd //c`. Use PowerShell (`pwsh -Command ...`) ONLY \
-             when a task genuinely needs a PowerShell-only feature, never as a substitute for a \
-             cmd.exe builtin. Always quote paths \
+             Do NOT use git-bash forms like `cmd //c`. For PowerShell-only operations, prefer \
+             the independent `pwsh` tool when available; its description names the actual version. \
+             Do not assume the pwsh.exe executable is installed or nest shells unnecessarily. \
+             Always quote paths \
              containing spaces, e.g. `if exist \"C:\\Program Files\"` — an unquoted spaced path \
              splits into two tokens and reports a false \"not found\".\n\
              The dedicated file tools above (read_file / grep / glob / list_directory) also \
@@ -491,6 +502,8 @@ fn shell_tool_description(
              PATHS: bash treats `\\` as an escape, so a Windows path like `C:\\Windows` is \
              mangled — use forward slashes (`C:/Windows`) or POSIX form (`/c/Windows`). \
              Relative paths work (the working directory is already set).\n\
+             If the independent `pwsh` tool is available, use it for registry, services, and \
+             PowerShell-native Windows operations instead of nesting PowerShell inside bash.\n\
              GNU tools in /usr/bin and /bin take priority over Windows names such as \
              find/sort. To run a Windows version, use its explicit path \
              (e.g. C:/Windows/System32/find.exe).\n\
@@ -2910,6 +2923,13 @@ impl crate::world::Shell for LocalShell {
         }
     }
 
+    async fn powershell(&self) -> Option<Arc<dyn crate::world::Shell>> {
+        tokio::task::spawn_blocking(super::powershell::detected_shell)
+            .await
+            .ok()
+            .flatten()
+    }
+
     fn decode(&self, bytes: &[u8]) -> String {
         decode_output(bytes)
     }
@@ -2934,130 +2954,138 @@ impl crate::world::Shell for LocalShell {
         // On Windows without a POSIX bash this is where a construct cmd.exe would
         // silently corrupt is refused with a rewrite directive; that refusal is
         // the model's to act on, hence `Unsupported`.
-        let mut cmd =
+        let cmd =
             build_command(&effective_command).map_err(crate::world::SpawnError::Unsupported)?;
-        #[cfg(unix)]
-        crate::process_utils::apply_utf8_locale_env(&mut cmd);
-        // Coax interactive programs (REPLs, pagers, git prompts) into non-interactive
-        // behavior so they can't block on our closed stdin or paint the TUI. Both
-        // platforms (git honors GIT_TERMINAL_PROMPT; Git Bash honors TERM).
-        apply_non_interactive_env(&mut cmd);
-        // Windows GBK locale (CP936): a Python child the model runs (python -c, scripts)
-        // defaults its `subprocess` text pipes AND stdio to the console code page, so reading
-        // UTF-8 output with the GBK codec dies with UnicodeDecodeError (#876). `PYTHONUTF8=1`
-        // (PEP 540) flips `locale.getpreferredencoding()` to utf-8 — which is what `subprocess`
-        // text pipes use — so that case stops crashing; `PYTHONIOENCODING` only covers Python's
-        // OWN stdio (not child pipes), kept as belt-and-suspenders. Set HERE (not in
-        // build_command) so it covers BOTH the cmd.exe and the Git Bash shells. Mirrors
-        // AtomCode's own decode_output UTF-8-first policy.
-        //
-        // KNOWN TRADEOFFS (this is a mitigation, not a complete fix — env vars can't do better):
-        //   1. NOT fixed: TRULY binary output. `0x80` is invalid in utf-8 too, so a text-mode
-        //      pipe over real binary still crashes — just with a utf-8 codec error. The real
-        //      fix there is the model using bytes mode / `errors=` (its code, not ours).
-        //   2. MIRROR REGRESSION: the SAME locale flip changes `open()`'s default encoding from
-        //      GBK to utf-8, so `open('gbk_file.txt')` WITHOUT an explicit `encoding=` now fails
-        //      on a GBK-encoded file (it worked before). `open()` and `subprocess` share
-        //      `locale.getpreferredencoding()`, so no env can fix the pipe case without moving
-        //      this one — they cannot be decoupled. Accepted because modern files/output are
-        //      predominantly utf-8; the model can pass `encoding='gbk'` for legacy files.
-        #[cfg(windows)]
-        {
-            cmd.env("PYTHONUTF8", "1");
-            cmd.env("PYTHONIOENCODING", "utf-8");
-        }
-        // No console-window flash per command on Windows: in headless/daemon mode (e.g.
-        // the WeChat clawbot bridge) there's no console to inherit, so each cmd.exe would
-        // otherwise allocate a NEW console window on the desktop. No-op off Windows.
-        super::suppress_console_window(&mut cmd);
-        if let Some(cwd) = &options.cwd {
-            cmd.current_dir(cwd);
-        }
-        for (key, value) in &options.env {
-            cmd.env(key, value);
-        }
-        cmd.stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true); // dropping the handle SIGKILLs the child
-
-        // Unix only: detach from the controlling tty so neither the child nor a
-        // grandchild (ssh, git hooks) can grab /dev/tty and fight the TUI, and inject
-        // the askpass env vars so password prompts use our secure modal. Full detach
-        // (setsid + TIOCNOTTY) shared with run_shell via `detach_child_from_controlling_tty`.
-        #[cfg(unix)]
-        {
-            if let Some(env) = crate::askpass::current_env() {
-                apply_askpass_env(&mut cmd, env);
-            }
-            unsafe {
-                cmd.pre_exec(|| {
-                    detach_child_from_controlling_tty();
-                    Ok(())
-                });
-            }
-        }
-
-        // `mut` is consumed on Windows, where the child is not rebound below.
-        #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| crate::world::SpawnError::Failed(format!("failed to spawn shell: {e}")))?;
-
-        // Reap the WHOLE shell process tree (mvn → java, pipeline sub-shells,
-        // busybox applets) on kill — not just the direct child, which is all
-        // `kill_on_drop` covers.
-        //
-        // Windows: a kill-on-close Job Object, held by the handle. An explicit
-        // `kill()` terminates the job; if that never happens (or atomcode dies)
-        // dropping the handle closes it → KILL_ON_JOB_CLOSE reaps the tree anyway.
-        //
-        // Unix: the setsid pre_exec made the shell its own pgroup leader
-        // (pgid == pid), so `killpg(pgid)` reaches the grandchildren that
-        // `kill_on_drop` (direct child only) would otherwise orphan.
-        #[cfg(target_os = "windows")]
-        let job = crate::process_utils::assign_child_to_kill_on_close_job(&child);
-        #[cfg(target_os = "windows")]
-        let pid = child.id();
-        #[cfg(not(target_os = "windows"))]
-        let mut child = PgroupChild::new(child);
-        #[cfg(not(target_os = "windows"))]
-        let pgid = child.pgid();
-
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut pumps = Vec::with_capacity(2);
-        if let Some(out) = child.stdout.take() {
-            pumps.push(tokio::spawn(pump(
-                out,
-                tx.clone(),
-                crate::world::Chunk::Stdout,
-            )));
-        }
-        if let Some(errs) = child.stderr.take() {
-            pumps.push(tokio::spawn(pump(
-                errs,
-                tx.clone(),
-                crate::world::Chunk::Stderr,
-            )));
-        }
-        drop(tx); // so the receiver sees EOF once both pumps are done
-
-        Ok(std::sync::Arc::new(LocalProcess {
-            chunks: tokio::sync::Mutex::new(rx),
-            pumps,
-            exited: std::sync::atomic::AtomicBool::new(false),
-            state: tokio::sync::Mutex::new(ChildState {
-                child: Some(child),
-                exit: None,
-            }),
-            #[cfg(not(target_os = "windows"))]
-            pgid,
-            #[cfg(target_os = "windows")]
-            job,
-            #[cfg(target_os = "windows")]
-            pid,
-        }))
+        spawn_local_command(cmd, options).await
     }
+}
+
+/// Shared process ownership, output pumps and tree cancellation for local shells.
+pub(crate) async fn spawn_local_command(
+    mut cmd: tokio::process::Command,
+    options: &crate::world::SpawnOptions,
+) -> Result<Arc<dyn crate::world::Process>, crate::world::SpawnError> {
+    #[cfg(unix)]
+    crate::process_utils::apply_utf8_locale_env(&mut cmd);
+    // Coax interactive programs (REPLs, pagers, git prompts) into non-interactive
+    // behavior so they can't block on our closed stdin or paint the TUI. Both
+    // platforms (git honors GIT_TERMINAL_PROMPT; Git Bash honors TERM).
+    apply_non_interactive_env(&mut cmd);
+    // Windows GBK locale (CP936): a Python child the model runs (python -c, scripts)
+    // defaults its `subprocess` text pipes AND stdio to the console code page, so reading
+    // UTF-8 output with the GBK codec dies with UnicodeDecodeError (#876). `PYTHONUTF8=1`
+    // (PEP 540) flips `locale.getpreferredencoding()` to utf-8 — which is what `subprocess`
+    // text pipes use — so that case stops crashing; `PYTHONIOENCODING` only covers Python's
+    // OWN stdio (not child pipes), kept as belt-and-suspenders. Set HERE (not in
+    // build_command) so it covers BOTH the cmd.exe and the Git Bash shells. Mirrors
+    // AtomCode's own decode_output UTF-8-first policy.
+    //
+    // KNOWN TRADEOFFS (this is a mitigation, not a complete fix — env vars can't do better):
+    //   1. NOT fixed: TRULY binary output. `0x80` is invalid in utf-8 too, so a text-mode
+    //      pipe over real binary still crashes — just with a utf-8 codec error. The real
+    //      fix there is the model using bytes mode / `errors=` (its code, not ours).
+    //   2. MIRROR REGRESSION: the SAME locale flip changes `open()`'s default encoding from
+    //      GBK to utf-8, so `open('gbk_file.txt')` WITHOUT an explicit `encoding=` now fails
+    //      on a GBK-encoded file (it worked before). `open()` and `subprocess` share
+    //      `locale.getpreferredencoding()`, so no env can fix the pipe case without moving
+    //      this one — they cannot be decoupled. Accepted because modern files/output are
+    //      predominantly utf-8; the model can pass `encoding='gbk'` for legacy files.
+    #[cfg(windows)]
+    {
+        cmd.env("PYTHONUTF8", "1");
+        cmd.env("PYTHONIOENCODING", "utf-8");
+    }
+    // No console-window flash per command on Windows: in headless/daemon mode (e.g.
+    // the WeChat clawbot bridge) there's no console to inherit, so each cmd.exe would
+    // otherwise allocate a NEW console window on the desktop. No-op off Windows.
+    super::suppress_console_window(&mut cmd);
+    if let Some(cwd) = &options.cwd {
+        cmd.current_dir(cwd);
+    }
+    for (key, value) in &options.env {
+        cmd.env(key, value);
+    }
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true); // dropping the handle SIGKILLs the child
+
+    // Unix only: detach from the controlling tty so neither the child nor a
+    // grandchild (ssh, git hooks) can grab /dev/tty and fight the TUI, and inject
+    // the askpass env vars so password prompts use our secure modal. Full detach
+    // (setsid + TIOCNOTTY) shared with run_shell via `detach_child_from_controlling_tty`.
+    #[cfg(unix)]
+    {
+        if let Some(env) = crate::askpass::current_env() {
+            apply_askpass_env(&mut cmd, env);
+        }
+        unsafe {
+            cmd.pre_exec(|| {
+                detach_child_from_controlling_tty();
+                Ok(())
+            });
+        }
+    }
+
+    // `mut` is consumed on Windows, where the child is not rebound below.
+    #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| crate::world::SpawnError::Failed(format!("failed to spawn shell: {e}")))?;
+
+    // Reap the WHOLE shell process tree (mvn → java, pipeline sub-shells,
+    // busybox applets) on kill — not just the direct child, which is all
+    // `kill_on_drop` covers.
+    //
+    // Windows: a kill-on-close Job Object, held by the handle. An explicit
+    // `kill()` terminates the job; if that never happens (or atomcode dies)
+    // dropping the handle closes it → KILL_ON_JOB_CLOSE reaps the tree anyway.
+    //
+    // Unix: the setsid pre_exec made the shell its own pgroup leader
+    // (pgid == pid), so `killpg(pgid)` reaches the grandchildren that
+    // `kill_on_drop` (direct child only) would otherwise orphan.
+    #[cfg(target_os = "windows")]
+    let job = crate::process_utils::assign_child_to_kill_on_close_job(&child);
+    #[cfg(target_os = "windows")]
+    let pid = child.id();
+    #[cfg(not(target_os = "windows"))]
+    let mut child = PgroupChild::new(child);
+    #[cfg(not(target_os = "windows"))]
+    let pgid = child.pgid();
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut pumps = Vec::with_capacity(2);
+    if let Some(out) = child.stdout.take() {
+        pumps.push(tokio::spawn(pump(
+            out,
+            tx.clone(),
+            crate::world::Chunk::Stdout,
+        )));
+    }
+    if let Some(errs) = child.stderr.take() {
+        pumps.push(tokio::spawn(pump(
+            errs,
+            tx.clone(),
+            crate::world::Chunk::Stderr,
+        )));
+    }
+    drop(tx); // so the receiver sees EOF once both pumps are done
+
+    Ok(std::sync::Arc::new(LocalProcess {
+        chunks: tokio::sync::Mutex::new(rx),
+        pumps,
+        exited: std::sync::atomic::AtomicBool::new(false),
+        state: tokio::sync::Mutex::new(ChildState {
+            child: Some(child),
+            exit: None,
+        }),
+        #[cfg(not(target_os = "windows"))]
+        pgid,
+        #[cfg(target_os = "windows")]
+        job,
+        #[cfg(target_os = "windows")]
+        pid,
+    }))
 }
 
 impl Drop for LocalProcess {

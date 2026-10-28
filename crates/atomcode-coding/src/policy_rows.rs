@@ -93,7 +93,18 @@ impl Waterfall<ToolsExecute> for CredentialShell {
                 }
                 return refuse(CREDENTIAL_BASH_DENIAL_REASON);
             }
-            CredentialShellVerdict::Deny => return refuse(CREDENTIAL_BASH_DENIAL_REASON),
+            CredentialShellVerdict::Deny => {
+                return refuse(
+                    if atomcode_capabilities::tools::powershell::is_powershell_tool(&exec.call.name)
+                        && self.policy
+                            == atomcode_capabilities::tools::CredentialShellPolicy::Strict
+                    {
+                        atomcode_capabilities::tools::powershell::STRICT_POLICY_REASON
+                    } else {
+                        CREDENTIAL_BASH_DENIAL_REASON
+                    },
+                )
+            }
             CredentialShellVerdict::Ask => {}
         }
         let (Some(policy), Some(toolbox)) = (policy, self.ctx.service::<ToolsSvc>()) else {

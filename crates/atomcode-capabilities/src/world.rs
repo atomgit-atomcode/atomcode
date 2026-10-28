@@ -749,6 +749,12 @@ impl std::error::Error for SpawnError {}
 pub trait Shell: Send + Sync {
     fn describe(&self) -> String;
 
+    /// Optional PowerShell executor in THIS world. Remote worlds must opt in;
+    /// absence must never cause execution on the local host instead.
+    async fn powershell(&self) -> Option<Arc<dyn Shell>> {
+        None
+    }
+
     /// Start `command`. Returns once the process exists, not once it is done.
     async fn spawn(
         &self,

@@ -26,7 +26,7 @@ impl BackgroundJobs {
         }
     }
     pub fn started(&mut self, call: &ToolCall) {
-        if call.name == "bash_start"
+        if matches!(call.name.as_str(), "bash_start" | "pwsh_start")
             && serde_json::from_str::<serde_json::Value>(&call.arguments)
                 .ok()
                 .is_some_and(|args| {
@@ -197,6 +197,15 @@ pub(crate) mod tests {
         jobs.started(&opted);
         jobs.result(&result);
         assert!(jobs.pending());
+        let mut powershell = opted.clone();
+        powershell.name = "pwsh_start".into();
+        let mut powershell_jobs = BackgroundJobs::default();
+        powershell_jobs.started(&powershell);
+        powershell_jobs.result(&result);
+        assert!(
+            powershell_jobs.pending(),
+            "PowerShell jobs share completion notifications"
+        );
         jobs.retain_generation(1);
         assert!(!jobs.pending());
         jobs.started(&opted);

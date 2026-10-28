@@ -313,7 +313,7 @@ impl ToolMiddleware for ApprovalMiddleware {
         }
         // Shared allow-all short-circuit: if the user has granted "allow all Bash" this
         // session, skip the round-trip entirely for any command-shell tool (bash / bash_start).
-        if crate::tools::is_command_shell_tool(&call.name)
+        if matches!(call.name.as_str(), "bash" | "bash_start")
             && self.allow_all.is_granted(BASH_ALLOW_ALL_KEY)
         {
             return BeforeOutcome::Proceed;

@@ -80,7 +80,7 @@ pub mod write_approval;
 /// caught `bash_start` bypassing all three when they hard-coded the literal `"bash"`).
 /// Public because a driver's approval policy keys on the same thing (the CLI's `-p`).
 pub fn is_command_shell_tool(name: &str) -> bool {
-    matches!(name, "bash" | "bash_start")
+    matches!(name, "bash" | "bash_start" | "pwsh" | "pwsh_start")
 }
 
 #[cfg(feature = "memory")]
@@ -101,6 +101,7 @@ pub use ast_grep::AstGrepTool;
 pub use atomgit::{
     atomgit_tool_names, register_atomgit_tools, AtomgitIssueTool, AtomgitPrTool, AtomgitRepoTool,
 };
+pub mod powershell;
 pub use bash::{
     bash_invocations, normalize_command_for_grant, run_shell, shell_always_grant_scope,
     BashInvocation, BashTool, ShellExit, ShellOutcome,

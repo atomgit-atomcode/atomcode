@@ -3258,7 +3258,7 @@ pub(crate) fn headless_auto_approve(
     }
     // -p approves an escalated shell command — backgrounded through `bash_start` as
     // much as run through `bash`, since it is the same command.
-    skip_permissions || atomcode_capabilities::tools::is_command_shell_tool(tool)
+    skip_permissions || matches!(tool, "bash" | "bash_start")
 }
 
 fn write_headless_json_event(event: &headless_json::HeadlessEvent) -> io::Result<()> {
@@ -4993,6 +4993,17 @@ fn install_panic_hook(telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>) 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn powershell_headless_authorization_is_not_inherited_from_bash() {
+        for tool in ["pwsh", "pwsh_start"] {
+            assert!(!super::headless_auto_approve(false, false, tool));
+            assert!(super::headless_auto_approve(false, true, tool));
+            assert!(!super::headless_auto_approve(true, true, tool));
+        }
+        assert!(super::headless_auto_approve(false, false, "bash"));
+        assert!(super::headless_auto_approve(false, false, "bash_start"));
+    }
+
     #[test]
     fn lsp_probe_cli_has_bounded_read_only_methods_and_complete_positions() {
         assert!(Cli::try_parse_from([

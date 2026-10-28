@@ -176,6 +176,15 @@ impl Plugin for BashToolPlugin {
         let sensitive =
             atomcode_capabilities::tools::SensitivePaths::of(&*crate::product_dirs(ctx)?);
         let provider = shell_output_provider(ctx);
+        mount(
+            ctx,
+            atomcode_capabilities::tools::powershell::PowerShellTool::tools(
+                Arc::new(atomcode_capabilities::world::LocalShell),
+                sensitive.clone(),
+                provider.clone(),
+            )
+            .await,
+        )?;
         let bash = BashTool::new(sensitive.clone()).with_output_preview_provider(provider.clone());
         let poll = Arc::new(
             atomcode_capabilities::tools::bash::BashPollTool::with_output_preview_provider(

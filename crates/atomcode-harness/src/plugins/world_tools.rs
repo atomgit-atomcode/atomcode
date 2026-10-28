@@ -173,6 +173,15 @@ impl Plugin for BashWorldToolPlugin {
         let sensitive =
             atomcode_capabilities::tools::SensitivePaths::of(&*crate::product_dirs(ctx)?);
         let provider = super::tools::shell_output_provider(ctx);
+        super::tools::mount(
+            ctx,
+            atomcode_capabilities::tools::powershell::PowerShellTool::tools(
+                shell.clone(),
+                sensitive.clone(),
+                provider.clone(),
+            )
+            .await,
+        )?;
         let bash = BashTool::with_world(shell.clone(), sensitive.clone())
             .with_output_preview_provider(provider.clone());
         let poll = Arc::new(

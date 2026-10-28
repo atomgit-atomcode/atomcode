@@ -620,6 +620,7 @@ struct PollArgs {
 
 /// `bash_start` — spawn a command in the background and return its job id.
 pub struct BashStartTool {
+    label: &'static str,
     world: Arc<dyn Shell>,
     output_preview: Option<crate::tools::output_artifact::ArtifactStoreProvider>,
     /// What counts as a sensitive target — the same grant floor `bash` uses.
@@ -646,9 +647,15 @@ impl BashStartTool {
     ) -> Self {
         Self {
             world,
+            label: "bash_start",
             sensitive,
             output_preview: None,
         }
+    }
+
+    pub(crate) fn with_label(mut self, label: &'static str) -> Self {
+        self.label = label;
+        self
     }
 
     pub fn with_output_preview_provider(
@@ -663,7 +670,7 @@ impl BashStartTool {
 #[async_trait]
 impl Tool for BashStartTool {
     fn name(&self) -> &str {
-        "bash_start"
+        self.label
     }
     fn description(&self) -> &str {
         macro_rules! base { () => {
@@ -727,8 +734,9 @@ impl Tool for BashStartTool {
             Ok(a) => a,
             Err(e) => {
                 return err(format!(
-                    "bash_start: invalid arguments: {e}. \
-                     Expected {{\"command\":\"<shell command>\"}}."
+                    "{}: invalid arguments: {e}. \
+                     Expected {{\"command\":\"<shell command>\"}}.",
+                    self.label
                 ))
             }
         };

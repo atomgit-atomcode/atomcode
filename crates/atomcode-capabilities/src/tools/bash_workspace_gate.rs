@@ -949,6 +949,9 @@ pub async fn bash_workspace_verdict(
     if !super::is_command_shell_tool(tool_name) {
         return BashWorkspaceVerdict::Defer;
     }
+    if super::powershell::is_powershell_tool(tool_name) {
+        return ungrantable;
+    }
     let Some(command) = bash_command(arguments) else {
         return BashWorkspaceVerdict::Defer; // unparseable — the bash tool / risk flow handles it
     };
@@ -1040,6 +1043,11 @@ impl ToolMiddleware for BashWorkspaceGate {
     ) -> BeforeOutcome {
         if !super::is_command_shell_tool(tool.name()) {
             return BeforeOutcome::Proceed; // not a command-running shell tool (bash / bash_start)
+        }
+        if super::powershell::is_powershell_tool(tool.name()) {
+            // PowerShell is opaque to the Bash scanner. Never let an alias,
+            // script block or variable expansion inherit a workspace grant.
+            return self.prompt_unremembered(call, tool, rt).await;
         }
         let Some(command) = bash_command(&call.arguments) else {
             return BeforeOutcome::Proceed; // unparseable args — bash tool / risk flow handles it
