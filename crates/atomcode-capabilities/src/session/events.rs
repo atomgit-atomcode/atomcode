@@ -767,6 +767,10 @@ pub fn events_to_become(events: &[LoggedEvent], target: &[Message]) -> Vec<Sessi
     if let Some(summary) = target
         .first()
         .filter(|m| m.role == Role::System && m.synthetic)
+        // A synthetic system block is a compaction summary only when it is not
+        // the memory block; memory is reseeded below as an `Injected` fact of its
+        // own, so the log keeps its provenance instead of hiding it in a summary.
+        .filter(|m| !m.text.starts_with(MEMORY_INJECTION_HEADER))
     {
         for to in starts.iter().rev() {
             let compacted = SessionEvent::Compacted {
@@ -2321,6 +2325,86 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn events_to_become_reseeds_a_memory_snapshot_instead_of_summarizing_it() {
+        // The log holds no memory fact; the snapshot's leading synthetic system
+        // message is a memory block. It must be reseeded as `Injected` memory, not
+        // recorded as a `Compacted` summary that a later compaction could drop.
+        let events = vec![
+            logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+            logged(
+                3,
+                0,
+                SessionEvent::UserMessage {
+                    turn: 1,
+                    text: "one".into(),
+                    images: vec![],
+                },
+            ),
+            logged(
+                4,
+                0,
+                SessionEvent::AssistantMessage {
+                    turn: 1,
+                    round: 1,
+                    text: "ok1".into(),
+                    reasoning: String::new(),
+                    tool_calls: vec![],
+                    reasoning_blocks: vec![],
+                    meta: None,
+                },
+            ),
+            logged(5, 0, SessionEvent::TurnStart { turn: 2 }),
+            logged(
+                6,
+                0,
+                SessionEvent::UserMessage {
+                    turn: 2,
+                    text: "two".into(),
+                    images: vec![],
+                },
+            ),
+            logged(
+                7,
+                0,
+                SessionEvent::AssistantMessage {
+                    turn: 2,
+                    round: 1,
+                    text: "ok2".into(),
+                    reasoning: String::new(),
+                    tool_calls: vec![],
+                    reasoning_blocks: vec![],
+                    meta: None,
+                },
+            ),
+        ];
+        let mut memory = Message::system("=== MEMORY ===\n- prefers tabs");
+        memory.synthetic = true;
+        let target = vec![
+            memory,
+            Message::user("two"),
+            Message::assistant("ok2", vec![]),
+        ];
+        let change = events_to_become(&events, &target);
+        assert!(
+            !change.iter().any(|event| matches!(
+                event,
+                SessionEvent::Compacted { summary, .. } if summary.contains("prefers tabs")
+            )),
+            "memory must not become a compaction summary: {change:?}"
+        );
+        assert!(
+            change.iter().any(|event| matches!(
+                event,
+                SessionEvent::Injected {
+                    origin: InjectionOrigin::Memory,
+                    ..
+                }
+            )),
+            "memory is reseeded as its own fact: {change:?}"
+        );
     }
 
     #[cfg(feature = "memory")]
