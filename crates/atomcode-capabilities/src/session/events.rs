@@ -237,6 +237,17 @@ impl SessionManager {
         file.write_all(&buffer).map_err(|e| io_at(&path, e))?;
         drop(file);
         self.index_the_chosen_name(id, events);
+        #[cfg(feature = "tools")]
+        if events.iter().any(|logged| match &logged.event {
+            SessionEvent::Rewound { scope, .. } => scope.takes_back_conversation(),
+            SessionEvent::Interrupted { undone, .. } => *undone,
+            _ => false,
+        }) {
+            // A rewind or a cancelled-and-undone turn takes its todo calls out
+            // of the projection; the list the model reads is the log's standing
+            // turns, rebuilt so the sidecar cannot keep offering undone work.
+            let _ = self.rebuild_todo_sidecar_after_undo(id);
+        }
         Ok(())
     }
 
@@ -424,6 +435,109 @@ impl SessionManager {
             None => return Err(corrupt()),
         };
         parse(line)
+    }
+
+    /// Rebuild the todo sidecar from the log after a rewind or a cancelled-and-
+    /// undone turn.
+    ///
+    /// The sidecar is the model's list once compaction has drained the
+    /// transcript's calls. An undo takes those calls out of the projection but
+    /// leaves the facts in the log, so folding the standing turns here is the
+    /// only way the cache can agree with what the model is about to be shown.
+    #[cfg(feature = "tools")]
+    fn rebuild_todo_sidecar_after_undo(&self, id: &str) -> SessionResult<()> {
+        use crate::tools::todo::{is_todo_call, reduce_todos, TodoStatus};
+
+        let events = self.load_events(id)?;
+        let undone = atomcode_kernel::session::undone_turns(&events);
+        let retained: Vec<LoggedEvent> = events
+            .iter()
+            .filter(|logged| {
+                // Memory and a compaction summary stand for the session, not the
+                // turn they landed in; everything else a taken-back turn wrote
+                // is no longer part of the conversation.
+                let stands_for_the_session = matches!(
+                    &logged.event,
+                    SessionEvent::Injected {
+                        origin: InjectionOrigin::Memory | InjectionOrigin::CompactionSummary,
+                        ..
+                    }
+                );
+                stands_for_the_session || !undone.contains(&logged.event.turn())
+            })
+            .cloned()
+            .collect();
+
+        let failed: std::collections::HashSet<(u64, u32, String)> = retained
+            .iter()
+            .filter_map(|logged| match &logged.event {
+                SessionEvent::ToolResultLogged {
+                    turn,
+                    round,
+                    call_id,
+                    is_error: true,
+                    ..
+                } => Some((*turn, *round, call_id.clone())),
+                _ => None,
+            })
+            .collect();
+
+        let mut calls: Vec<(u64, u32, u32, &str, &str)> = Vec::new();
+        for logged in &retained {
+            let SessionEvent::AssistantMessage {
+                turn,
+                round,
+                tool_calls,
+                ..
+            } = &logged.event
+            else {
+                continue;
+            };
+            for (index, call) in tool_calls.iter().enumerate() {
+                if !is_todo_call(&call.name) || failed.contains(&(*turn, *round, call.id.clone())) {
+                    continue;
+                }
+                calls.push((
+                    *turn,
+                    *round,
+                    u32::try_from(index).unwrap_or(u32::MAX),
+                    call.name.as_str(),
+                    call.arguments.as_str(),
+                ));
+            }
+        }
+
+        let items = reduce_todos(
+            calls
+                .iter()
+                .map(|(_, _, _, name, arguments)| (*name, *arguments)),
+        );
+        let through =
+            calls.last().map(
+                |(turn, round, index, _, _)| super::manager::TodoCallPosition {
+                    turn: *turn,
+                    round: *round,
+                    index: *index,
+                },
+            );
+        let had_sidecar = self.read_todo_sidecar(id).ok().flatten().is_some();
+        if calls.is_empty() && !had_sidecar {
+            return Ok(());
+        }
+        let todos: Vec<super::manager::TodoSidecarItem> = items
+            .into_iter()
+            .map(|item| super::manager::TodoSidecarItem {
+                content: item.content,
+                status: match item.status {
+                    TodoStatus::Pending => "pending",
+                    TodoStatus::InProgress => "in_progress",
+                    TodoStatus::Completed => "completed",
+                }
+                .to_string(),
+            })
+            .collect();
+        let message_count = atomcode_kernel::session::derive_messages(&retained).len();
+        self.write_todo_sidecar(id, &todos, message_count, through)
     }
 
     /// Keep the index's name with the log's when the person names the session.
@@ -764,6 +878,15 @@ impl SessionManager {
             // Only remove a destination we created, never an existing session
             // rejected by create_event_session. A failed copy is not offered.
             self.delete(destination)?;
+        } else if let Ok(Some(sidecar)) = self.read_todo_sidecar(source_id) {
+            // A plan compaction took out of the transcript lives only in the
+            // sidecar; a fork without it would start with an empty task list.
+            let _ = self.write_todo_sidecar(
+                destination.id(),
+                &sidecar.todos,
+                sidecar.message_count,
+                sidecar.through,
+            );
         }
         copied
     }
@@ -837,7 +960,15 @@ impl SessionManager {
                 ),
             });
         }
-        file.set_len(mark).map_err(|error| io_at(&path, error))
+        file.set_len(mark).map_err(|error| io_at(&path, error))?;
+        drop(file);
+        #[cfg(feature = "tools")]
+        {
+            // A rolled-back append may have carried the rewind that rebuilt the
+            // todo sidecar; the sidecar follows the log back.
+            let _ = self.rebuild_todo_sidecar_after_undo(lease.id());
+        }
+        Ok(())
     }
 
     /// What making this session's conversation `target` would append, stamped
@@ -3882,6 +4013,107 @@ mod tests {
             .any(|event| matches!(event.event, SessionEvent::Rewound { .. })));
     }
 
+    /// A session whose turn 1 plans two tasks and turn 2 completes the second,
+    /// with the sidecar already reflecting that completion.
+    #[cfg(feature = "tools")]
+    fn todo_session(manager: &SessionManager, id: &str) -> SessionLease {
+        use crate::session::manager::{TodoCallPosition, TodoSidecarItem};
+        use atomcode_kernel::tool::ToolCall;
+
+        let lease = created(manager, id);
+        let plan = ToolCall {
+            id: "p".into(),
+            name: "todowrite".into(),
+            arguments: r#"{"todos":[{"content":"a","status":"pending"},{"content":"b","status":"in_progress"}]}"#.into(),
+        };
+        let update = ToolCall {
+            id: "u".into(),
+            name: "todowrite".into(),
+            arguments: r#"{"action":"update","id":2,"status":"completed"}"#.into(),
+        };
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::AssistantMessage {
+                            turn: 1,
+                            round: 1,
+                            text: String::new(),
+                            reasoning: String::new(),
+                            tool_calls: vec![plan],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    logged(
+                        3,
+                        0,
+                        SessionEvent::ToolResultLogged {
+                            turn: 1,
+                            round: 1,
+                            call_id: "p".into(),
+                            content: "#1 [ ] a\n#2 [~] b".into(),
+                            is_error: false,
+                            images: vec![],
+                        },
+                    ),
+                    logged(4, 0, SessionEvent::TurnStart { turn: 2 }),
+                    logged(
+                        5,
+                        0,
+                        SessionEvent::AssistantMessage {
+                            turn: 2,
+                            round: 1,
+                            text: String::new(),
+                            reasoning: String::new(),
+                            tool_calls: vec![update],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    logged(
+                        6,
+                        0,
+                        SessionEvent::ToolResultLogged {
+                            turn: 2,
+                            round: 1,
+                            call_id: "u".into(),
+                            content: "#2 [x] b".into(),
+                            is_error: false,
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        manager
+            .write_todo_sidecar(
+                id,
+                &[
+                    TodoSidecarItem {
+                        content: "a".into(),
+                        status: "pending".into(),
+                    },
+                    TodoSidecarItem {
+                        content: "b".into(),
+                        status: "completed".into(),
+                    },
+                ],
+                6,
+                Some(TodoCallPosition {
+                    turn: 2,
+                    round: 1,
+                    index: 0,
+                }),
+            )
+            .unwrap();
+        lease
+    }
+
     #[test]
     fn resume_keeps_an_unreplayed_prompt_recoverable() {
         let (_dir, manager) = store();
@@ -4109,6 +4341,53 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[cfg(feature = "tools")]
+    fn assert_todo_reverted(manager: &SessionManager, id: &str) {
+        use crate::session::manager::TodoCallPosition;
+
+        let sidecar = manager
+            .read_todo_sidecar(id)
+            .unwrap()
+            .expect("a list survives the undo");
+        let shown: Vec<(&str, &str)> = sidecar
+            .todos
+            .iter()
+            .map(|todo| (todo.content.as_str(), todo.status.as_str()))
+            .collect();
+        assert_eq!(shown, vec![("a", "pending"), ("b", "in_progress")]);
+        assert_eq!(
+            sidecar.through,
+            Some(TodoCallPosition {
+                turn: 1,
+                round: 1,
+                index: 0,
+            })
+        );
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
+    fn a_rewind_rebuilds_the_todo_sidecar() {
+        let (_dir, manager) = store();
+        let lease = todo_session(&manager, "rewind-todos");
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    7,
+                    0,
+                    SessionEvent::Rewound {
+                        turn: 2,
+                        to: 4,
+                        scope: RewindScope::Conversation,
+                    },
+                )],
+            )
+            .unwrap();
+
+        assert_todo_reverted(&manager, "rewind-todos");
     }
 
     #[test]
@@ -4894,6 +5173,67 @@ mod tests {
                 SessionEvent::UserMessage { text, .. } if text == "=== RESUME ==="
             )
         }));
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
+    fn a_rewind_before_the_plan_clears_the_todo_sidecar() {
+        let (_dir, manager) = store();
+        let lease = todo_session(&manager, "rewind-clear-todos");
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    7,
+                    0,
+                    SessionEvent::Rewound {
+                        turn: 2,
+                        to: 1,
+                        scope: RewindScope::Conversation,
+                    },
+                )],
+            )
+            .unwrap();
+
+        let sidecar = manager
+            .read_todo_sidecar("rewind-clear-todos")
+            .unwrap()
+            .expect("the sidecar is rewritten, not left stale");
+        assert!(sidecar.todos.is_empty());
+        assert_eq!(sidecar.through, None);
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
+    fn forking_an_event_session_copies_its_todo_sidecar() {
+        use crate::session::manager::{TodoCallPosition, TodoSidecarItem};
+
+        let (_dir, manager) = store();
+        let lease = created(&manager, "s1");
+        manager.append_events(&lease, &a_turn()).unwrap();
+        let items = vec![TodoSidecarItem {
+            content: "a".into(),
+            status: "in_progress".into(),
+        }];
+        let through = Some(TodoCallPosition {
+            turn: 1,
+            round: 1,
+            index: 0,
+        });
+        manager
+            .write_todo_sidecar("s1", &items, 4, through)
+            .unwrap();
+
+        let (_forked, _fork_lease) = manager.fork_native_session("s1", "s2", 2_000).unwrap();
+
+        let sidecar = manager
+            .read_todo_sidecar("s2")
+            .unwrap()
+            .expect("the fork carries the plan");
+        assert_eq!(sidecar.todos.len(), 1);
+        assert_eq!(sidecar.todos[0].content, "a");
+        assert_eq!(sidecar.todos[0].status, "in_progress");
+        assert_eq!(sidecar.through, through);
     }
 
     #[cfg(feature = "memory")]
