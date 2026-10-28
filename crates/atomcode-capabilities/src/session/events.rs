@@ -2322,4 +2322,23 @@ mod tests {
             }
         )));
     }
+
+    #[cfg(feature = "memory")]
+    #[test]
+    fn memory_injection_header_matches_the_real_block() {
+        use crate::memory::context::MemoryContext;
+        use crate::memory::store::MemoryStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::new(dir.path().join("memory.md"));
+        store.append("prefers tabs").unwrap();
+        let context = MemoryContext::load(
+            &store,
+            &store,
+            &store,
+            "project",
+            &dir.path().join("knowledge/INDEX.md"),
+        );
+        assert!(context.prompt.starts_with(MEMORY_INJECTION_HEADER));
+    }
 }

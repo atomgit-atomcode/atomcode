@@ -1109,6 +1109,21 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<TracedMessage> {
         message.synthetic = true;
         projection.push(message, Provenance::Summary(seq));
     }
+    // Memory is a session-level view: a later injection (a refresh after the
+    // person edited memory.md) replaces the one before it, never joins it.
+    let latest_memory = events
+        .iter()
+        .filter(|logged| {
+            matches!(
+                &logged.event,
+                SessionEvent::Injected {
+                    origin: InjectionOrigin::Memory,
+                    ..
+                }
+            )
+        })
+        .map(|logged| logged.seq)
+        .max();
 
     for logged in events.iter().filter(|e| {
         // Memory stands for the session, not for the history a compaction
@@ -1120,6 +1135,9 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<TracedMessage> {
                 ..
             }
         );
+        if is_memory && Some(e.seq) != latest_memory {
+            return false;
+        }
         is_memory
             || !folded
                 .iter()

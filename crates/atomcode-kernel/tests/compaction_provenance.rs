@@ -165,3 +165,31 @@ fn memory_survives_a_compaction_that_folds_its_turn() {
     assert!(!visible.contains(&1), "turn 1's own work is folded");
     assert!(visible.contains(&2), "turn 2's messages survive");
 }
+
+#[test]
+fn only_the_latest_memory_injection_reaches_the_projection() {
+    let events = log(vec![
+        SessionEvent::TurnStart { turn: 1 },
+        SessionEvent::Injected {
+            turn: 1,
+            text: "=== MEMORY ===\n- prefers tabs".into(),
+            origin: InjectionOrigin::Memory,
+        },
+        user(1, "one"),
+        assistant(1, "ok1"),
+        SessionEvent::TurnStart { turn: 2 },
+        SessionEvent::Injected {
+            turn: 2,
+            text: "=== MEMORY ===\n- prefers spaces".into(),
+            origin: InjectionOrigin::Memory,
+        },
+        user(2, "two"),
+        assistant(2, "ok2"),
+    ]);
+    let messages = derive_messages(&events);
+    assert!(messages.iter().any(|m| m.text.contains("prefers spaces")));
+    assert!(
+        !messages.iter().any(|m| m.text.contains("prefers tabs")),
+        "a refreshed memory replaces the earlier injection"
+    );
+}

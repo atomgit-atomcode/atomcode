@@ -592,7 +592,7 @@ async fn a_memory_injection_survives_the_summary() {
     let mut w = Writer::new();
     w.turn = 1;
     w.log.append(SessionEvent::TurnStart { turn: 1 });
-    w.log.append(SessionEvent::Injected {
+    let memory_seq = w.log.append(SessionEvent::Injected {
         turn: 1,
         text: "=== MEMORY ===\n- prefers tabs".into(),
         origin: InjectionOrigin::Memory,
@@ -628,6 +628,13 @@ async fn a_memory_injection_survives_the_summary() {
     let decision = decide_with_strategy(&strategy, &w.log, &pressure(16_000, 13_000))
         .await
         .expect("a summary");
+    assert_ne!(decision.through, 0, "the plan must actually fold history");
+    assert!(
+        decision.through >= memory_seq,
+        "the fold must cover the memory turn: {} < {}",
+        decision.through,
+        memory_seq
+    );
     w.apply(decision);
     assert!(
         w.seen().iter().any(|m| m.text.contains("prefers tabs")),
