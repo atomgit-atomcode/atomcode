@@ -56,6 +56,74 @@ pub fn storage_id(session_id: &str) -> String {
     session_id.replace('/', "~")
 }
 
+// Only presentation payloads are shortened. Sequence numbers and structural
+// facts remain intact so the canonical projector still decides what is visible.
+fn reference_hit(text: &str, query: &str) -> Option<usize> {
+    if query.is_empty() {
+        return None;
+    }
+    // Prefer the latest mention inside a long answer: an earlier proposal may
+    // have been corrected near its end. The result still reports a partial window.
+    let target = text.to_lowercase().rfind(&query.to_lowercase())?;
+    let mut lowered = 0;
+    for (offset, ch) in text.char_indices() {
+        let width: usize = ch.to_lowercase().map(char::len_utf8).sum();
+        if target < lowered + width {
+            return Some(offset);
+        }
+        lowered += width;
+    }
+    None
+}
+
+fn trim_reference_payload(value: &mut serde_json::Value, clipped: &mut bool, query: &str) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            for (key, value) in fields.iter_mut() {
+                if matches!(key.as_str(), "reasoning" | "reasoning_blocks" | "images") {
+                    *value = if value.is_array() {
+                        serde_json::json!([])
+                    } else {
+                        serde_json::json!("")
+                    };
+                } else if key == "arguments" && value.is_string() {
+                    // Calls remain paired by id, but their inputs are never quoted.
+                    *value = serde_json::json!("{}");
+                } else if matches!(key.as_str(), "text" | "content" | "summary") {
+                    if let Some(text) = value.as_str() {
+                        let count = text.chars().count();
+                        if count > 8000 {
+                            let hit = reference_hit(text, query);
+                            let excerpt: String = if let Some(hit) = hit {
+                                let start = text[..hit].chars().count().saturating_sub(2000);
+                                text.chars().skip(start).take(8000).collect()
+                            } else if key == "summary"
+                                || text.starts_with(crate::compaction::ANCHOR_SENTINEL)
+                            {
+                                text.chars().take(8000).collect()
+                            } else {
+                                text.chars().skip(count - 8000).collect()
+                            };
+                            *clipped = true;
+                            *value = serde_json::json!(excerpt);
+                        }
+                    } else {
+                        trim_reference_payload(value, clipped, query);
+                    }
+                } else {
+                    trim_reference_payload(value, clipped, query);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                trim_reference_payload(item, clipped, query);
+            }
+        }
+        _ => {}
+    }
+}
+
 impl SessionManager {
     /// Whether `id` is stored as an event log. The index is the commit point of
     /// such a session, so it is what decides.
@@ -225,6 +293,173 @@ impl SessionManager {
         Ok(snapshot_of(
             &self.read_event_log_bounded(id, false, limit)?.1,
         ))
+    }
+
+    /// Read-only reference projection. Scan with the store's line/file guards,
+    /// retain bounded text, and use the canonical projector for rewind/compaction.
+    pub(super) fn reference_projection(
+        &self,
+        id: &str,
+        retained_limit: usize,
+    ) -> SessionResult<(SessionMeta, Vec<(Message, bool)>, bool, Option<u64>)> {
+        self.reference_projection_query(id, retained_limit, "", false)
+    }
+
+    pub(super) fn reference_projection_query(
+        &self,
+        id: &str,
+        retained_limit: usize,
+        query: &str,
+        historical: bool,
+    ) -> SessionResult<(SessionMeta, Vec<(Message, bool)>, bool, Option<u64>)> {
+        let meta = self.read_meta(id)?;
+        if meta.needs_newer_version() {
+            return Err(SessionStoreError::FutureSchema {
+                kind: "session events",
+                found: meta.format_version,
+                supported: SESSION_FORMAT_VERSION,
+            });
+        }
+        if meta.owner != StorageOwner::Native {
+            return Err(SessionStoreError::OwnershipConflict {
+                id: id.into(),
+                owner: meta.owner,
+                operation: "reference session",
+            });
+        }
+        if !self.is_event_session(id) {
+            if historical {
+                return Err(SessionStoreError::Corrupt {
+                    kind: "session reference",
+                    message: "raw history is unavailable for an unmigrated snapshot".into(),
+                });
+            }
+            let loaded = self.load_native_session_bounded(id, retained_limit)?;
+            return Ok((
+                loaded.meta,
+                loaded
+                    .snapshot
+                    .messages
+                    .into_iter()
+                    .map(|m| (m, false))
+                    .collect(),
+                false,
+                None,
+            ));
+        }
+        let path = self.events_path(id)?;
+        let mut header = None;
+        let mut events = Vec::new();
+        let mut retained = 0usize;
+        let mut clipped = false;
+        let mut index = 0usize;
+        super::manager::for_each_jsonl_line_limited(&path, 64 * 1024 * 1024, true, |raw| {
+            index += 1;
+            if raw.iter().all(u8::is_ascii_whitespace) {
+                return Ok(());
+            }
+            let line: Line =
+                serde_json::from_slice(raw).map_err(|e| SessionStoreError::Corrupt {
+                    kind: "session events",
+                    message: format!("{}:{index}: {e}", path.display()),
+                })?;
+            if let Some(found) = line.header {
+                if header.is_some() || !events.is_empty() || storage_id(&found.id) != id {
+                    return Err(SessionStoreError::Corrupt {
+                        kind: "session events",
+                        message: "invalid reference session header".into(),
+                    });
+                }
+                if found.version > SESSION_FORMAT_VERSION {
+                    return Err(SessionStoreError::FutureSchema {
+                        kind: "session events",
+                        found: found.version,
+                        supported: SESSION_FORMAT_VERSION,
+                    });
+                }
+                header = Some(found);
+                return Ok(());
+            }
+            let (Some(seq), Some(value)) = (line.seq, line.event) else {
+                return Err(SessionStoreError::Corrupt {
+                    kind: "session events",
+                    message: "not an event record".into(),
+                });
+            };
+            if header.is_none()
+                || events
+                    .last()
+                    .is_some_and(|last: &LoggedEvent| last.seq >= seq)
+            {
+                return Err(SessionStoreError::Corrupt {
+                    kind: "session events",
+                    message: "missing header or non-increasing sequence".into(),
+                });
+            }
+            // Validate the original event before dropping any non-reference payload.
+            let event = event_of(value, &path, index - 1, header.as_ref())?;
+            let mut value =
+                serde_json::to_value(event).map_err(|e| SessionStoreError::Corrupt {
+                    kind: "session events",
+                    message: e.to_string(),
+                })?;
+            trim_reference_payload(&mut value, &mut clipped, query);
+            retained = retained
+                .saturating_add(
+                    serde_json::to_vec(&value)
+                        .map_err(|e| SessionStoreError::Corrupt {
+                            kind: "session events",
+                            message: e.to_string(),
+                        })?
+                        .len(),
+                )
+                .saturating_add(64);
+            if retained > retained_limit {
+                return Err(SessionStoreError::TooLarge {
+                    kind: "reference projection",
+                    limit: retained_limit,
+                    actual: retained,
+                });
+            }
+            let event = event_of(value, &path, index - 1, header.as_ref())?;
+            events.push(LoggedEvent {
+                seq,
+                at: line.at,
+                event,
+            });
+            Ok(())
+        })?;
+        if header.is_none() {
+            return Err(SessionStoreError::Corrupt {
+                kind: "session events",
+                message: "missing session header".into(),
+            });
+        }
+        let captured_through_seq = events.last().map(|e| e.seq);
+        if historical {
+            let messages = events
+                .iter()
+                .filter_map(|logged| match &logged.event {
+                    SessionEvent::UserMessage { text, .. } => Some((Message::user(text), false)),
+                    SessionEvent::AssistantMessage { text, .. } => {
+                        Some((Message::assistant(text, vec![]), false))
+                    }
+                    _ => None,
+                })
+                .collect();
+            return Ok((meta, messages, clipped, captured_through_seq));
+        }
+        let messages = atomcode_kernel::session::derive_traced(&events)
+            .into_iter()
+            .map(|traced| {
+                let summary = matches!(
+                    traced.source,
+                    atomcode_kernel::session::Provenance::Summary(_)
+                );
+                (traced.message, summary)
+            })
+            .collect();
+        Ok((meta, messages, clipped, captured_through_seq))
     }
 
     fn read_event_log(

@@ -665,7 +665,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ModelNotKept { error } => format!("但没存下来,重启后还是旧的那个:{error}").into(),
         Msg::RefusedStaleQuestion => "那个问题已经不等回答了".into(),
         Msg::RefusedNotRunning => "没有正在跑的回合可停".into(),
-        Msg::RefusedUnavailable => "现在接不了 —— 没有可用的 provider,或者正在换".into(),
+        Msg::RefusedUnavailable => "当前会话无法接收消息，请查看错误详情后重试".into(),
         Msg::RefusedUnsupported => "这个宿主答不了这条命令".into(),
         Msg::CostNothingYet => "这段对话还没花过 token".into(),
         Msg::CostTokens { prompt, completion, cached, rate, total } => format!(

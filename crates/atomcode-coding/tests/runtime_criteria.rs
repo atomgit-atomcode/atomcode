@@ -188,6 +188,10 @@ impl LlmProvider for RecordingProvider {
             ])));
         }
         let first = match last {
+            Some(m) if m.role == Role::User && m.text.starts_with("retrieve referenced definition") => {
+                StreamEvent::ToolCall(ToolCall { id: format!("call-{n}"), name: "session_reference".into(),
+                    arguments: serde_json::json!({"source": "0123456789abcdef/source", "query": "TubeSeq"}).to_string() })
+            }
             Some(m) if m.role == Role::User && m.text.starts_with("read ") => {
                 StreamEvent::ToolCall(ToolCall {
                     id: format!("call-{n}"),
@@ -6772,5 +6776,75 @@ async fn a_model_only_runtime_keeps_an_empty_catalog_across_rebuilds() {
             "{stage}: no tools requested, but published {names:?}"
         );
     }
+    runtime.handle.shutdown().await.unwrap();
+}
+
+// Real filesystem work in the tool runs on spawn_blocking; keep a real clock.
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(engine)]
+async fn referenced_details_are_queried_by_the_mounted_tool_without_inheriting_grants() {
+    use atomcode_capabilities::session::{SessionMeta, StorageOwner};
+    use atomcode_kernel::session::{LoggedEvent, SessionEvent, SessionHeader};
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let setup = start(env.project.path(), &recorder, SessionMode::Fresh);
+    let reference = atomcode_capabilities::session::reference::SessionReference {
+        bucket: "0123456789abcdef".into(),
+        id: "source".into(),
+    };
+    let source = SessionManager::with_root(
+        SessionManager::sessions_root(setup.agent.dirs.user()).join(&reference.bucket),
+    );
+    let lease = source.acquire_lease(&reference.id).unwrap();
+    let mut meta = SessionMeta::new(&reference.id, "/source", 1);
+    meta.owner = StorageOwner::Native;
+    source
+        .create_event_session(&lease, &SessionHeader::new(&reference.id), &meta)
+        .unwrap();
+    source
+        .append_events(
+            &lease,
+            &[LoggedEvent {
+                seq: 1,
+                at: 0,
+                event: SessionEvent::UserMessage {
+                    turn: 1,
+                    text: "TubeSeq is the test tube sequence".into(),
+                    images: vec![],
+                },
+            }],
+        )
+        .unwrap();
+    let path = source.events_path(&reference.id).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let mut runtime = CodingRuntime::start(setup).await.unwrap();
+    turn(
+        &mut runtime,
+        &format!(
+            "retrieve referenced definition {}",
+            reference.spelling("definition")
+        ),
+    )
+    .await;
+    let request = recorder.last_turn_request();
+    assert!(
+        request
+            .iter()
+            .any(|m| m.role == Role::Tool && !m.is_error && m.text.contains("test tube sequence")),
+        "{request:?}"
+    );
+    turn(
+        &mut runtime,
+        "retrieve referenced definition without a source link",
+    )
+    .await;
+    let request = recorder.last_turn_request();
+    assert!(
+        request.iter().any(|m| m.role == Role::Tool
+            && m.is_error
+            && m.text.contains("explicitly referenced")),
+        "{request:?}"
+    );
+    assert_eq!(std::fs::read(path).unwrap(), before);
     runtime.handle.shutdown().await.unwrap();
 }

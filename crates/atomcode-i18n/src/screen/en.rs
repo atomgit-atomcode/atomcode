@@ -718,7 +718,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::RefusedStaleQuestion => "that question is no longer waiting for an answer".into(),
         Msg::RefusedNotRunning => "there is no turn running to act on".into(),
         Msg::RefusedUnavailable => {
-            "it cannot be taken now — no usable provider, or one is being swapped".into()
+            "this session cannot accept the message; check the error details before retrying".into()
         }
         Msg::RefusedUnsupported => "this host has no answer for that command".into(),
         Msg::CostNothingYet => "this conversation has not spent any tokens yet".into(),

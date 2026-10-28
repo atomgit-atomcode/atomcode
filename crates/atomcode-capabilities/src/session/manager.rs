@@ -4705,11 +4705,30 @@ pub(super) fn read_regular_file_bounded(
 
 pub(crate) fn for_each_jsonl_line(
     path: &Path,
+    visit: impl FnMut(&[u8]) -> SessionResult<()>,
+) -> SessionResult<(usize, usize)> {
+    for_each_jsonl_line_limited(path, MAX_JSONL_BYTES, false, visit)
+}
+
+pub(super) fn for_each_jsonl_line_limited(
+    path: &Path,
+    limit: usize,
+    shared: bool,
     mut visit: impl FnMut(&[u8]) -> SessionResult<()>,
 ) -> SessionResult<(usize, usize)> {
+    let limit = limit.min(MAX_JSONL_BYTES);
+    let kind = if shared { "session scan" } else { "transcript" };
     let size = regular_file_len(path)?;
-    ensure_size("transcript", size, MAX_JSONL_BYTES)?;
+    ensure_size(kind, size, limit)?;
     let file = open_read_file(path)?;
+    if shared {
+        retry_transient_file_access(|| {
+            fs2::FileExt::try_lock_shared(&file).map_err(|e| io_at(path, e))
+        })?;
+    }
+    let size =
+        usize::try_from(file.metadata().map_err(|e| io_at(path, e))?.len()).unwrap_or(usize::MAX);
+    ensure_size(kind, size, limit)?;
     let mut reader = BufReader::new(file);
     let mut line = Vec::new();
     let mut total = 0usize;
@@ -4732,7 +4751,7 @@ pub(crate) fn for_each_jsonl_line(
                 limit: MAX_JSONL_BYTES,
                 actual: usize::MAX,
             })?;
-        ensure_size("transcript", total, MAX_JSONL_BYTES)?;
+        ensure_size(kind, total, limit)?;
         lines += 1;
         if lines > MAX_JSONL_LINES {
             return Err(SessionStoreError::TooLarge {

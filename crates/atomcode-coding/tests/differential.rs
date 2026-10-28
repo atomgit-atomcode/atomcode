@@ -3911,6 +3911,12 @@ async fn catalogs(key: &str, dir: &std::path::Path) -> (Vec<String>, Vec<String>
 /// it. What is left are four things somebody has to decide, not fix.
 const KNOWN_TOOL_DIFFERENCES: &[(&str, &str)] = &[
     (
+        "session_reference",
+        "coding-row-only feature added after the recorded chain retired: bounded \
+         queries over sources explicitly referenced by the current human request. \
+         It does not replace project recall. Keep the historical golden unchanged.",
+    ),
+    (
         "request_user_input",
         "chain-only NAME for the same capability the tree mounts as `ask_user`.          One of them has to win, and whichever does, the persona and the prompts          that name it have to move with it.",
     ),

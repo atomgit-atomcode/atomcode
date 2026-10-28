@@ -126,6 +126,22 @@ impl SessionLog {
         (seq, at)
     }
 
+    /// Latest durable human message for a turn, without cloning tool payloads
+    /// or the rest of the log. Peer/internal injections are deliberately absent.
+    pub fn latest_user_text(&self, turn: u64) -> Option<String> {
+        self.events
+            .read()
+            .expect("session log poisoned")
+            .iter()
+            .rev()
+            .find_map(|logged| match &logged.event {
+                SessionEvent::UserMessage {
+                    turn: found, text, ..
+                } if *found == turn => Some(text.clone()),
+                _ => None,
+            })
+    }
+
     pub fn events(&self) -> Vec<LoggedEvent> {
         self.events.read().expect("session log poisoned").clone()
     }

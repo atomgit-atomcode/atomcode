@@ -144,3 +144,5 @@ pub use atomcode_capabilities::cc_hooks;
 /// same crate this one was built against. What a host can count on about
 /// coding's own rows is in [`host`].
 pub use atomcode_plexus as plexus;
+
+mod session_reference;

@@ -241,6 +241,9 @@ name = "memory"
 name = "recall"
 
 [[insert]]
+name = "tool-session-reference"
+
+[[insert]]
 name = "tool-todo"
 
 # Off here, on purpose: coding's `TodoHook` (host-mounted beside `tool-todo`, under
@@ -1476,6 +1479,7 @@ pub fn plugins() -> Vec<Arc<dyn Plugin>> {
         Arc::new(DatalogPlugin),
         Arc::new(CcHooksPlugin),
         Arc::new(ChatOptionsPlugin),
+        Arc::new(crate::session_reference::SessionReferencePlugin),
         // This product's own gate rows. They used to live in the harness's
         // `plugins/policy.rs` while only this assembly ever mounted them —
         // judging what counts as out of bounds is the product's call, and the
