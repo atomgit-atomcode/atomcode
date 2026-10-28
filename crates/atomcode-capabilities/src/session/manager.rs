@@ -18,7 +18,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::ProductDirs;
 use atomcode_kernel::message::{Message, Role, SessionSnapshot, SNAPSHOT_VERSION};
-use atomcode_kernel::session::{LoggedEvent, RewindScope, SessionEvent};
+use atomcode_kernel::session::{
+    LoggedEvent, RewindScope, SeqNo, SessionEvent,
+};
 use serde::{de::IgnoredAny, Deserialize, Serialize};
 
 use super::presentation::{
@@ -100,6 +102,7 @@ pub const MAX_SNAPSHOT_MESSAGES: usize = 100_000;
 pub const MAX_META_TURN_STATS: usize = 100_000;
 pub const MAX_STORED_STRING_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_IMAGE_BASE64_BYTES: usize = 32 * 1024 * 1024;
+const MAX_RESUME_REPLAY_BYTES: usize = 4096;
 
 pub type SessionResult<T> = Result<T, SessionStoreError>;
 
@@ -687,6 +690,83 @@ pub(crate) struct InflightSnapshot {
     version: u32,
     replay_safe: bool,
     pub(super) snapshot: SessionSnapshot,
+}
+
+/// A resume retracted an accepted-but-unanswered prompt and handed it to the
+/// runtime; this marker says the replayed turn may not have landed yet.
+///
+/// The prompt itself stays in the event log (a rewind is a projection fact, not
+/// a deletion). The marker only makes the *retraction* retryable: without it a
+/// second death before the replay started would leave the prompt hidden from
+/// the projection with nothing left to hand back.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ResumeReplay {
+    /// The `TurnStart` the resume rewind took back.
+    pub to: SeqNo,
+    /// The turn whose accepted prompt is waiting to be replayed.
+    pub turn: u64,
+}
+
+/// What a [`ResumeReplay`] marker means against the log that holds it.
+enum PendingReplay {
+    /// The rewind is in the log, no later turn exists, and the prompt is still
+    /// there to hand back.
+    StillWaiting(Message),
+    /// A turn after the rewind exists: the replay was accepted (or the person
+    /// moved on), so the marker has done its job.
+    Started,
+    /// The marker no longer matches the log (its rewind was rolled back, or the
+    /// prompt is gone); the normal resume path decides what to do.
+    Stale,
+}
+
+fn pending_replay_prompt(events: &[LoggedEvent], replay: &ResumeReplay) -> PendingReplay {
+    let Some(rewound_at) = events
+        .iter()
+        .find(|logged| {
+            logged.seq > replay.to
+                && matches!(
+                    &logged.event,
+                    SessionEvent::Rewound { to, scope, .. }
+                        if *to == replay.to && scope.takes_back_conversation()
+                )
+        })
+        .map(|logged| logged.seq)
+    else {
+        return PendingReplay::Stale;
+    };
+    if events
+        .iter()
+        .any(|logged| logged.seq > rewound_at && matches!(logged.event, SessionEvent::TurnStart { .. }))
+    {
+        return PendingReplay::Started;
+    }
+    let mut prompt = None;
+    for logged in events
+        .iter()
+        .filter(|logged| logged.seq > replay.to && logged.seq < rewound_at)
+    {
+        let SessionEvent::UserMessage {
+            turn,
+            text,
+            images,
+        } = &logged.event
+        else {
+            continue;
+        };
+        if *turn != replay.turn {
+            continue;
+        }
+        if prompt.is_some() {
+            return PendingReplay::Stale;
+        }
+        prompt = Some(if images.is_empty() {
+            Message::user(text)
+        } else {
+            Message::user_with_images(text, images.clone())
+        });
+    }
+    prompt.map_or(PendingReplay::Stale, PendingReplay::StillWaiting)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1363,6 +1443,37 @@ impl SessionManager {
         let sidecar: TodoSidecar = deserialize(&bytes, "todo sidecar")?;
         Ok(Some(sidecar))
     }
+
+    fn resume_replay_path(&self, id: &str) -> SessionResult<PathBuf> {
+        self.path_for(id, "replay")
+    }
+
+    pub(crate) fn write_resume_replay(
+        &self,
+        id: &str,
+        replay: &ResumeReplay,
+    ) -> SessionResult<()> {
+        let bytes = serialize_bounded(replay, "resume replay", MAX_RESUME_REPLAY_BYTES)?;
+        atomic_write(&self.resume_replay_path(id)?, &bytes)
+    }
+
+    pub(crate) fn read_resume_replay(&self, id: &str) -> SessionResult<Option<ResumeReplay>> {
+        let path = self.resume_replay_path(id)?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = read_regular_file_bounded(&path, "resume replay", MAX_RESUME_REPLAY_BYTES)?;
+        deserialize(&bytes, "resume replay").map(Some)
+    }
+
+    pub(crate) fn clear_resume_replay(&self, id: &str) -> SessionResult<()> {
+        let path = self.resume_replay_path(id)?;
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(io_at(&path, error)),
+        }
+    }
     fn meta_lock_path(&self, id: &str) -> SessionResult<PathBuf> {
         self.path_for(id, "meta.lock")
     }
@@ -1632,45 +1743,10 @@ impl SessionManager {
         notes: &mut Vec<String>,
     ) -> SessionResult<(LoadedSession, Option<Message>)> {
         self.validate_active_lease(lease)?;
-        let mut loaded = self.load_native_session(lease.id())?;
-        // An event session's accepted prompt is already a fact in its log. A
-        // turn that never got past that prompt is the exception the runtime
-        // still needs handed back: rewind the unanswered turn and let the
-        // normal replay start it again, the way a converted snapshot's
-        // inflight prompt is handed back.
         if self.is_event_session(lease.id()) {
-            let events = self.load_events(lease.id())?;
-            if let Some((to, turn, prompt)) = super::events::unanswered_prompt(&events) {
-                let seq = events
-                    .iter()
-                    .map(|logged| logged.seq)
-                    .max()
-                    .unwrap_or(0)
-                    .saturating_add(1);
-                let rewound = LoggedEvent {
-                    seq,
-                    at: u64::try_from(super::now_ms()).unwrap_or(0),
-                    event: SessionEvent::Rewound {
-                        turn,
-                        to,
-                        scope: RewindScope::Conversation,
-                    },
-                };
-                match self.append_events(lease, &[rewound]) {
-                    Ok(()) => {
-                        loaded = self.load_native_session(lease.id())?;
-                        return Ok((loaded, Some(prompt)));
-                    }
-                    // Resume still loads; only the automatic replay is lost.
-                    Err(error) => notes.push(format!(
-                        "the prompt session {} accepted before its turn was answered \
-                         could not be rewound for replay: {error}",
-                        lease.id()
-                    )),
-                }
-            }
-            return Ok((loaded, None));
+            return self.resume_event_session(lease, notes);
         }
+        let mut loaded = self.load_native_session(lease.id())?;
         let inflight = match self.load_inflight_snapshot(lease.id()) {
             Ok(Some(checkpoint)) => checkpoint,
             Ok(None) => return Ok((loaded, None)),
@@ -1705,6 +1781,83 @@ impl SessionManager {
             // state on future resumes.
             self.clear_inflight_snapshot(lease.id());
             Ok((loaded, None))
+        }
+    }
+
+    /// Resume an event session: continue a replay a previous resume retracted but
+    /// did not finish, otherwise retract a newly found accepted-but-unanswered
+    /// prompt and hand it back.
+    ///
+    /// The prompt is never deleted: the rewind only changes the projection, and
+    /// the marker written before it makes that retraction retryable. A death
+    /// between the marker and the rewind leaves the prompt visible; a death
+    /// between the rewind and the replay hands the same prompt back on the next
+    /// resume.
+    fn resume_event_session(
+        &self,
+        lease: &SessionLease,
+        notes: &mut Vec<String>,
+    ) -> SessionResult<(LoadedSession, Option<Message>)> {
+        let id = lease.id();
+        let (mut loaded, mut events) = self.load_event_session_with_events(id)?;
+
+        match self.read_resume_replay(id) {
+            Ok(Some(replay)) => match pending_replay_prompt(&events, &replay) {
+                PendingReplay::StillWaiting(prompt) => return Ok((loaded, Some(prompt))),
+                PendingReplay::Started | PendingReplay::Stale => {
+                    let _ = self.clear_resume_replay(id);
+                }
+            },
+            Ok(None) => {}
+            Err(error) => {
+                notes.push(format!(
+                    "the pending replay of session {id} could not be read and was dropped: {error}"
+                ));
+                let _ = self.clear_resume_replay(id);
+            }
+        }
+
+        let Some((to, turn, prompt)) = super::events::unanswered_prompt(&events) else {
+            return Ok((loaded, None));
+        };
+        let replay = ResumeReplay { to, turn };
+        if let Err(error) = self.write_resume_replay(id, &replay) {
+            // The prompt stays visible in the log; a later resume can try again.
+            notes.push(format!(
+                "the prompt session {id} accepted before its turn was answered \
+                 could not be marked for replay: {error}"
+            ));
+            return Ok((loaded, None));
+        }
+        let seq = events
+            .iter()
+            .map(|logged| logged.seq)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let rewound = LoggedEvent {
+            seq,
+            at: u64::try_from(super::now_ms()).unwrap_or(0),
+            event: SessionEvent::Rewound {
+                turn,
+                to,
+                scope: RewindScope::Conversation,
+            },
+        };
+        match self.append_events(lease, &[rewound.clone()]) {
+            Ok(()) => {
+                events.push(rewound);
+                loaded.snapshot = super::events::snapshot_of(&events);
+                Ok((loaded, Some(prompt)))
+            }
+            Err(error) => {
+                let _ = self.clear_resume_replay(id);
+                notes.push(format!(
+                    "the prompt session {id} accepted before its turn was answered \
+                     could not be rewound for replay: {error}"
+                ));
+                Ok((loaded, None))
+            }
         }
     }
 
@@ -2233,6 +2386,24 @@ impl SessionManager {
         id: &str,
         limit: usize,
     ) -> SessionResult<LoadedSession> {
+        let meta = self.read_native_meta(id)?;
+        let snapshot = self.load_snapshot_bounded(id, limit)?;
+        let presentation = match self.read_presentation_bounded(id, limit) {
+            // An event session has display-only entries only if something added
+            // them.
+            Err(error) if self.is_event_session(id) && error.kind() == io::ErrorKind::NotFound => {
+                PresentationFile::default()
+            }
+            other => other?,
+        };
+        Ok(LoadedSession {
+            meta,
+            snapshot,
+            presentation,
+        })
+    }
+
+    fn read_native_meta(&self, id: &str) -> SessionResult<SessionMeta> {
         let meta = self.read_meta(id)?;
         if meta.needs_newer_version() {
             return Err(SessionStoreError::FutureSchema {
@@ -2248,20 +2419,31 @@ impl SessionManager {
                 operation: "load native session",
             });
         }
-        let snapshot = self.load_snapshot_bounded(id, limit)?;
-        let presentation = match self.read_presentation_bounded(id, limit) {
-            // An event session has display-only entries only if something added
-            // them.
-            Err(error) if self.is_event_session(id) && error.kind() == io::ErrorKind::NotFound => {
-                PresentationFile::default()
-            }
+        Ok(meta)
+    }
+
+    /// An event session's strict aggregate and the facts its projection was made
+    /// from, in one log read. Resume both decides whether a prompt is pending and
+    /// returns the projected conversation; reading the same log twice is not free.
+    fn load_event_session_with_events(
+        &self,
+        id: &str,
+    ) -> SessionResult<(LoadedSession, Vec<LoggedEvent>)> {
+        let meta = self.read_native_meta(id)?;
+        let (_, events) = self.read_event_log_bounded(id, false, usize::MAX)?;
+        let snapshot = super::events::snapshot_of(&events);
+        let presentation = match self.read_presentation_bounded(id, usize::MAX) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => PresentationFile::default(),
             other => other?,
         };
-        Ok(LoadedSession {
-            meta,
-            snapshot,
-            presentation,
-        })
+        Ok((
+            LoadedSession {
+                meta,
+                snapshot,
+                presentation,
+            },
+            events,
+        ))
     }
 
     /// Inspect or explicitly repair the one safe incomplete-native state: valid
@@ -3417,6 +3599,7 @@ impl SessionManager {
             self.path_for(id, "rewind")?,
             self.path_for(id, "rewind.txn")?,
             self.path_for(id, "todos")?,
+            self.path_for(id, "replay")?,
             self.path_for(id, "controller")?,
             self.path_for(id, "index")?,
         ];

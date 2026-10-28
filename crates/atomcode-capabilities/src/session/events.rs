@@ -24,8 +24,8 @@ use std::path::PathBuf;
 
 use atomcode_kernel::message::{Message, Role, SessionSnapshot};
 use atomcode_kernel::session::{
-    derive_messages_with_meta, InjectionOrigin, LoggedEvent, RewindScope, SeqNo, SessionEvent,
-    SessionHeader, SESSION_FORMAT_VERSION,
+    derive_messages_with_meta, InjectionOrigin, LoggedEvent, NoticeKind, RewindScope, SeqNo,
+    SessionEvent, SessionHeader, SESSION_FORMAT_VERSION,
 };
 
 use super::manager::{
@@ -230,6 +230,14 @@ impl SessionManager {
         file.write_all(&buffer).map_err(|e| io_at(&path, e))?;
         drop(file);
         self.index_the_chosen_name(id, events);
+        if events
+            .iter()
+            .any(|logged| matches!(logged.event, SessionEvent::TurnStart { .. }))
+        {
+            // A replayed prompt opens its turn here; the resume marker has done
+            // its job. A later turn the person starts instead retires it too.
+            let _ = self.clear_resume_replay(id);
+        }
         Ok(())
     }
 
@@ -470,7 +478,7 @@ impl SessionManager {
         self.read_event_log_bounded(id, header_only, MAX_JSONL_BYTES)
     }
 
-    fn read_event_log_bounded(
+    pub(super) fn read_event_log_bounded(
         &self,
         id: &str,
         header_only: bool,
@@ -1081,6 +1089,16 @@ pub(crate) fn unanswered_prompt(events: &[LoggedEvent]) -> Option<(SeqNo, u64, M
             | SessionEvent::Compacted { .. }
             | SessionEvent::ToolResultsStubbed { .. }
             | SessionEvent::MessagesRewritten { .. } => {}
+            // Notices that only describe the session or its setup do not mean
+            // the model ran. A retry, a truncated answer or a recovered stream
+            // does, so those stay on the refusal side.
+            SessionEvent::Notice {
+                notice:
+                    NoticeKind::CompactionDegraded
+                    | NoticeKind::ConfigSkipped
+                    | NoticeKind::MemberNotRestored,
+                ..
+            } => {}
             _ => return None,
         }
     }
@@ -2709,6 +2727,28 @@ mod tests {
             unanswered_prompt(&accepted).expect("the accepted prompt is replayable");
         assert_eq!((to, turn, prompt.text.as_str()), (1, 1, "hello"));
 
+        for notice in [
+            NoticeKind::CompactionDegraded,
+            NoticeKind::ConfigSkipped,
+            NoticeKind::MemberNotRestored,
+        ] {
+            let mut events = accepted.clone();
+            events.push(logged(
+                4,
+                0,
+                SessionEvent::Notice {
+                    turn: 1,
+                    notice,
+                    detail: String::new(),
+                    retry: None,
+                },
+            ));
+            assert!(
+                unanswered_prompt(&events).is_some(),
+                "a notice about the session is not model progress"
+            );
+        }
+
         for progress in [
             SessionEvent::AssistantMessage {
                 turn: 1,
@@ -2733,6 +2773,12 @@ mod tests {
                 turn: 1,
                 to: 1,
                 scope: RewindScope::Conversation,
+            },
+            SessionEvent::Notice {
+                turn: 1,
+                notice: NoticeKind::ProviderRetry,
+                detail: String::new(),
+                retry: None,
             },
         ] {
             let mut events = accepted.clone();
