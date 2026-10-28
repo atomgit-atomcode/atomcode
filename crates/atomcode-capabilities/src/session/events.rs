@@ -3039,7 +3039,11 @@ mod tests {
         );
         assert_eq!(rewinds(), 1, "a retry must not append another rewind");
         manager.prepare_resume_replay(&lease).unwrap();
-        assert_eq!(rewinds(), 1, "preparing an already-prepared replay is a no-op");
+        assert_eq!(
+            rewinds(),
+            1,
+            "preparing an already-prepared replay is a no-op"
+        );
 
         // A complete turn after the rewind means the replay was accepted.
         manager
@@ -3212,6 +3216,7 @@ mod tests {
             .unwrap();
         let (_loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
         assert!(pending.is_some());
+        manager.prepare_resume_replay(&lease).unwrap();
 
         // The replay's turn was accepted, then the process died before answering.
         manager
@@ -3231,6 +3236,13 @@ mod tests {
                 ],
             )
             .unwrap();
+
+        let (_loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
+        assert_eq!(
+            pending.map(|message| message.text),
+            Some("hello".to_string())
+        );
+        manager.prepare_resume_replay(&lease).unwrap();
 
         let (_loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
         assert_eq!(
