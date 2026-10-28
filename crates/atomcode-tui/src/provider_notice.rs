@@ -56,6 +56,11 @@ pub(crate) fn reason(error: &str) -> String {
                 Msg::ProviderUnavailable
             }
         }
+        None if partial_reply_preserved(error) => Msg::ProviderPartialReply,
+        None if lower.contains("without sending tls close_notify") => Msg::ProviderTlsInterrupted,
+        None if lower.contains("connection timed out") || error.contains("等待首字节超过") => {
+            Msg::ProviderConnectionTimeout
+        }
         None if lower.contains("overloaded") => Msg::ProviderBusy,
         None if [
             "connection refused",
@@ -82,6 +87,14 @@ pub(crate) fn reason(error: &str) -> String {
     }
 }
 
+fn partial_reply_preserved(error: &str) -> bool {
+    let error = error
+        .trim()
+        .strip_prefix("provider error: ")
+        .unwrap_or(error.trim());
+    error.starts_with("响应中断:为避免重复输出或工具执行,未自动重放;已保留可安全保存的部分回复。")
+}
+
 pub(crate) fn advice(error: &str) -> String {
     if authentication_expired(error) {
         return reason(error);
@@ -89,6 +102,12 @@ pub(crate) fn advice(error: &str) -> String {
     let action = match status(error) {
         Some(401) => Msg::ProviderCheckCredentials,
         Some(403) => Msg::ProviderCheckAccess,
+        None if partial_reply_preserved(error) => Msg::ProviderContinueReply,
+        None if reason(error) == t(Msg::ProviderConnectionTimeout)
+            || reason(error) == t(Msg::ProviderTlsInterrupted) =>
+        {
+            Msg::ProviderCheckConnection
+        }
         _ if reason(error) == t(Msg::ProviderConnectionError) => Msg::ProviderCheckConnection,
         Some(429 | 500 | 502 | 503 | 504) => Msg::ProviderTryAgain,
         None if error.to_ascii_lowercase().contains("overloaded") => Msg::ProviderTryAgain,
@@ -151,6 +170,35 @@ mod tests {
 
     fn plain(lines: Vec<Line>) -> String {
         lines.iter().map(Line::plain).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn transport_summaries_preserve_the_phase_and_recovery_action() {
+        let tls = "open failed: peer closed connection without sending TLS close_notify";
+        assert_eq!(reason(tls), t(Msg::ProviderTlsInterrupted));
+        let timeout = "open failed: Connection timed out (os error 110)";
+        assert_eq!(reason(timeout), t(Msg::ProviderConnectionTimeout));
+        let partial = "响应中断:为避免重复输出或工具执行,未自动重放;已保留可安全保存的部分回复。详情: connection timed out; without sending TLS close_notify";
+        assert_eq!(reason(partial), t(Msg::ProviderPartialReply));
+        assert!(advice(partial).contains(&*t(Msg::ProviderContinueReply)));
+        assert!(!advice(tls).contains(&*t(Msg::ProviderContinueReply)));
+        assert!(!advice(timeout).contains("/login"));
+        assert_eq!(
+            reason("HTTP 401: without sending TLS close_notify"),
+            t(Msg::ProviderErrorStatus {
+                reason: &t(Msg::ProviderAuthenticationFailed),
+                status: 401
+            })
+        );
+        let block = DiagnosticBlock {
+            summary: Arc::new(NoticeBlock {
+                detail: advice(partial),
+            }),
+            detail: partial.into(),
+        };
+        assert!(plain(block.summary_lines(&RenderCtx::bare(100)))
+            .contains(&*t(Msg::ProviderContinueReply)));
+        assert_eq!(block.detail, partial);
     }
 
     #[test]

@@ -1715,6 +1715,10 @@ pub enum Msg<'a> {
     ProviderAuthenticationFailed,
     ProviderRateLimitError,
     ProviderConnectionError,
+    ProviderConnectionTimeout,
+    ProviderTlsInterrupted,
+    ProviderPartialReply,
+    ProviderContinueReply,
     ProviderUnknownError,
     ProviderErrorStatus {
         reason: &'a str,
