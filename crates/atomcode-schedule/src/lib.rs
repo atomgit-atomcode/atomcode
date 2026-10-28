@@ -314,8 +314,18 @@ impl Store {
     }
     fn append(&self, id: &str, event: &RunEvent) -> Result<()> {
         let path = self.run_dir(id)?.join("events.jsonl");
-        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        // Opened for read AND write rather than append-only. `LockFileEx` — what
+        // `lock_exclusive` becomes on Windows — refuses a handle that carries only
+        // FILE_APPEND_DATA with ERROR_ACCESS_DENIED, which made every run fact
+        // unwritable there. Appending at the end is therefore reached by seeking
+        // under the lock, so the offset is read after any other appender is done.
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(path)?;
         file.lock_exclusive()?;
+        file.seek(SeekFrom::End(0))?;
         let mut bytes = serde_json::to_vec(event)?;
         if bytes.len() > 1024 * 1024 {
             bail!("run metadata event exceeds one MiB");
