@@ -494,6 +494,7 @@ async fn open_stream_attempts(
     caller_recovers: bool,
     open_timeout: Duration,
 ) -> Result<reqwest::Response, ProviderError> {
+    let body_bytes = super::request_size::serialize(url, body)?;
     let mut attempt = 1u32;
     let mut timeout_pool_refreshed = false;
     loop {
@@ -501,7 +502,8 @@ async fn open_stream_attempts(
         let mut req = http
             .post(url)
             .header("anthropic-version", anthropic_version)
-            .json(body);
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body_bytes.clone());
         if !api_key.is_empty() {
             req = req.header("x-api-key", api_key);
         }

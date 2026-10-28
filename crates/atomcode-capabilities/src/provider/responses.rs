@@ -744,16 +744,7 @@ impl LlmProvider for ResponsesProvider {
             &self.cfg.model,
             &body,
         );
-        let body_bytes = match serde_json::to_vec(&body) {
-            Ok(b) => b,
-            Err(e) => {
-                return Err(ProviderError {
-                    retryable: false,
-                    message: format!("request body serialization failed: {e}"),
-                    ..Default::default()
-                })
-            }
-        };
+        let body_bytes = super::request_size::serialize(&self.url, &body)?;
 
         let policy = retry::policy_for_call(&self.cfg.retry, options);
         let caller_recovers = options.request_recovery.is_some();

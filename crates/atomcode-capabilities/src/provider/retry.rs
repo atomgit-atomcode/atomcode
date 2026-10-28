@@ -613,7 +613,7 @@ mod tests {
         for c in [408, 425, 429, 500, 502, 503, 504, 529] {
             assert!(is_retryable_status(c), "{c} should be retryable");
         }
-        for c in [400, 401, 403, 404, 422] {
+        for c in [400, 401, 403, 404, 413, 422] {
             assert!(!is_retryable_status(c), "{c} should be fatal");
         }
     }

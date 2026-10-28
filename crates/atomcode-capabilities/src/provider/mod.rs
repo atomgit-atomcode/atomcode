@@ -25,6 +25,7 @@ mod ollama;
 mod openai_compat;
 pub mod probe;
 mod reasoning;
+mod request_size;
 mod responses;
 mod retry;
 mod sign;
