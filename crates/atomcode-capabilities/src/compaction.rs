@@ -277,8 +277,9 @@ impl OverflowCompaction {
     /// folded to first line, so I switched to node scripts" report). OLD reads (below the
     /// boundary) still stub — they are stale. Pass `usize::MAX` to disable the exemption
     /// (stub every read). Convergence is owned by tier 2, whose SPLITTING boundary caps the
-    /// kept span at `recent_keep_budget` (`<= window/2`), so draining everything older
-    /// always fits regardless of which reads are exempt. Tier 0 uses the NON-splitting
+    /// kept span at `recent_keep_budget` (`<= window/2`). A successful summary sheds
+    /// the older dialogue; an unavailable summary leaves it intact and recovery
+    /// may explicitly fail. Tier 0 uses the NON-splitting
     /// `recent_keep_boundary` (it may keep a whole oversized active turn, so its exempt span
     /// is not bounded by `window/2`) — its exemption is therefore best-effort: if it sheds
     /// too little it simply escalates to tier 1/2, which do the fitting.
@@ -309,14 +310,20 @@ impl OverflowCompaction {
     }
 
     /// Hard-truncate any single message in `[from, len)` whose text exceeds `budget_chars`.
-    /// Idempotent via `TRUNCATE_MARKER`. Char-based (CJK-safe).
+    /// Idempotent via `TRUNCATE_MARKER`. Char-based (CJK-safe). With a summary
+    /// provider, dialogue must reach the summarizer intact, so only tool results
+    /// may be truncated by this tier.
     fn truncate_rewrites(
         msgs: &[Message],
         from: usize,
         budget_chars: usize,
+        tool_results_only: bool,
     ) -> Vec<(usize, String)> {
         let mut out = Vec::new();
         for (i, m) in msgs.iter().enumerate().skip(from) {
+            if tool_results_only && m.role != Role::Tool {
+                continue;
+            }
             if m.text.contains(TRUNCATE_MARKER) {
                 continue; // already truncated
             }
@@ -366,7 +373,8 @@ impl OverflowCompaction {
             1 => {
                 // ~2 chars/token lower bound; min floor so tiny windows don't over-truncate.
                 let budget = (view.ctx_window as usize).saturating_mul(2).max(8_000);
-                let rewrites = Self::truncate_rewrites(msgs, floor, budget);
+                let rewrites =
+                    Self::truncate_rewrites(msgs, floor, budget, self.summary_provider.is_some());
                 if rewrites.is_empty() {
                     return CompactionPlan::noop();
                 }
@@ -379,8 +387,8 @@ impl OverflowCompaction {
                 }
             }
             _ => {
-                // Emergency recovery (the provider ALREADY rejected the request as too
-                // long) must fit NOW. Drain everything older than the recent keep-budget
+                // Emergency recovery (preflight or a provider rejection) summarizes
+                // everything older than the recent keep-budget
                 // — and, crucially, SPLIT the active turn when it alone exceeds the budget
                 // (a single long agentic loop's accumulated assistant messages + tool
                 // calls, which stubbing tool results alone can't reduce). Without the
@@ -409,15 +417,40 @@ impl OverflowCompaction {
                         resume_note: None,
                     };
                 }
-                // Same wall-clock cap as `/compact` (a thinking model can hang the summary
-                // for many minutes). On timeout, degrade to plain drain (summary=None) — which
-                // this tier already handles — rather than freezing emergency overflow recovery.
-                let summary = tokio::time::timeout(
+                // A configured summarizer failing cannot authorize losing dialogue,
+                // even in emergency recovery. Keep any tool-result savings; the
+                // bounded overflow ladder reports failure if that still cannot fit.
+                let summary = match tokio::time::timeout(
                     SUMMARY_TIMEOUT,
                     self.summarize(&msgs[floor..drain_to], None),
                 )
                 .await
-                .unwrap_or(None);
+                {
+                    Ok(Some(summary)) => Some(summary),
+                    Ok(None) if self.summary_provider.is_none() => None,
+                    unavailable => {
+                        let timed_out = unavailable.is_err();
+                        tracing::warn!(
+                            timed_out,
+                            "overflow summary unavailable; retaining conversation history"
+                        );
+                        let resume_note = (!rewrites.is_empty()).then(|| {
+                            if timed_out {
+                                SUMMARY_TIMEOUT_NOTE
+                            } else {
+                                SUMMARY_FAILURE_NOTE
+                            }
+                            .to_string()
+                        });
+                        return CompactionPlan {
+                            drain_from: 0,
+                            drain_to: 0,
+                            summary: None,
+                            rewrites,
+                            resume_note,
+                        };
+                    }
+                };
                 CompactionPlan {
                     drain_from: floor,
                     drain_to,
@@ -1389,6 +1422,38 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn overflow_preserves_oversized_dialogue_when_the_summary_fails() {
+        let messages = vec![
+            Message::system("persona"),
+            Message::user("keep confirmed decisions"),
+            Message::assistant("confirmed design: ".to_owned() + &"x".repeat(50000), vec![]),
+            Message::user("change only the requested field: ".to_owned() + &"y".repeat(50000)),
+        ];
+        let mut conversation = Conversation::new();
+        conversation.messages = messages.clone();
+        let floor = conversation.sacred_floor();
+        let strategy = OverflowCompaction::new(
+            StubCompaction::default(),
+            Some(Arc::new(FailedSummaryProvider(0))),
+        );
+        for attempt in 0..3 {
+            let plan = strategy
+                .plan(&overflow_view(&conversation.messages, floor, attempt, 8000))
+                .await;
+            conversation.apply_plan(plan, floor);
+        }
+        assert_eq!(
+            conversation
+                .messages
+                .iter()
+                .map(|m| &m.text)
+                .collect::<Vec<_>>(),
+            messages.iter().map(|m| &m.text).collect::<Vec<_>>(),
+            "earlier recovery tiers must not truncate dialogue before the summary fails"
+        );
+    }
+
     #[tokio::test]
     async fn overflow_tier1_is_noop_when_nothing_oversized() {
         let msgs = vec![
@@ -1543,7 +1608,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn failed_summary_preserves_design_history_in_manual_and_auto_compaction() {
+    async fn failed_summary_preserves_design_history_in_every_compaction_mode() {
         let messages = vec![
             Message::system("persona"),
             Message::user("design two tables"),
@@ -1562,22 +1627,25 @@ mod tests {
         conversation.messages = messages.clone();
         let floor = conversation.sacred_floor();
         for failure in 0..6 {
-            for automatic in [false, true] {
+            for mode in 0..3 {
                 let strategy = OverflowCompaction::new(
                     StubCompaction::default(),
                     Some(Arc::new(FailedSummaryProvider(failure))),
                 )
                 .with_auto_token_limit(Some(1));
                 let mut view = manual_view(&messages, floor, None);
-                if automatic {
+                if mode == 1 {
                     view.trigger = CompactTrigger::Auto { utilization: 1.0 };
                     view.utilization = 1.0;
                     view.used_tokens = 0;
                 }
+                if mode == 2 {
+                    view.trigger = CompactTrigger::Overflow { attempt: 2 };
+                }
                 let plan = strategy.plan(&view).await;
                 assert_eq!(
                     plan.drain_to, 0,
-                    "failure={failure}, auto={automatic}: must retain history"
+                    "failure={failure}, mode={mode}: must retain history"
                 );
                 assert!(plan.summary.is_none());
                 assert!(plan
@@ -1687,8 +1755,10 @@ mod tests {
             plan.summary.is_none(),
             "an oversized answer must not become a partial anchor"
         );
-        // True overflow still uses its model-free emergency fallback.
-        assert!(plan.drain_to > floor);
+        assert_eq!(
+            plan.drain_to, 0,
+            "a rejected summary must not drain history"
+        );
         // SOFT cap was actually forwarded (not masked by the byte hard-cap / dropped like the
         // historical v2 max_tokens regression).
         assert_eq!(
@@ -2249,11 +2319,9 @@ mod tests {
         assert!(plan.drain_to > floor);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn overflow_tier2_summary_timeout_plain_drains() {
-        // A hanging (thinking) provider must NOT freeze emergency overflow recovery: the
-        // wall-clock cap fires (virtual time under start_paused) → plain drain, same as no
-        // provider. Proves the tier-2 summarize call is bounded, not just `/compact`.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn overflow_tier2_summary_timeout_preserves_history() {
+        // The cap must bound emergency recovery without authorizing a lossy drain.
         let msgs = vec![
             Message::system("p"),
             Message::user("u1"),
@@ -2269,8 +2337,8 @@ mod tests {
         )
         .plan(&overflow_view(&conv.messages, floor, 2, 8000))
         .await;
-        assert!(plan.summary.is_none(), "summary timeout → plain drain");
-        assert!(plan.drain_to > floor, "still drains old turns");
+        assert!(plan.summary.is_none());
+        assert_eq!(plan.drain_to, 0, "timeout must preserve history");
     }
 
     #[test]

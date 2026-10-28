@@ -346,12 +346,18 @@ impl Waterfall<AgentRequest> for OverflowLadder {
                 atomcode_kernel::agent::effective_input_limit(window, req.options.max_tokens);
             let mut attempt = 0;
             while estimate(&req.messages) >= u64::from(limit) {
-                if self
+                if let Err(why) = self
                     .shrink(req, &mut attempt, "the request would not fit")
                     .await
-                    .is_err()
                 {
-                    break;
+                    return Err(RequestError {
+                        context_overflow: true,
+                        code: Some("context_length_exceeded".into()),
+                        ..RequestError::message(format!(
+                            "The request still exceeds the usable context window after safe compaction ({why}). \
+                             Conversation history was retained; restore the summary provider or use a model with a larger context window before retrying."
+                        ))
+                    });
                 }
             }
         }

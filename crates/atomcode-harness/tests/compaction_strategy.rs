@@ -421,7 +421,7 @@ async fn an_overflow_climbs_stub_truncate_and_a_summary_that_splits_the_turn() {
     for n in 0..8 {
         outputs.push(w.call("bash", &bulk(&format!("run {n}"), 3_000)));
     }
-    let monster = w.answer(&bulk("think", 40_000));
+    w.answer(&bulk("think", 40_000));
     for n in 8..12 {
         outputs.push(w.call("bash", &bulk(&format!("run {n}"), 3_000)));
     }
@@ -436,16 +436,16 @@ async fn an_overflow_climbs_stub_truncate_and_a_summary_that_splits_the_turn() {
     assert_eq!(seqs, outputs, "every long output, the running turn's too");
     w.apply(stubbed);
 
-    let truncated = decide_with_strategy(&strategy, &w.log, &overflow(1, 16_000))
-        .await
-        .expect("a message too large to send");
-    assert_eq!(truncated.through, 0);
-    assert_eq!(
-        truncated.rewrites.iter().map(|r| r.seq).collect::<Vec<_>>(),
-        vec![monster]
+    assert!(
+        decide_with_strategy(&strategy, &w.log, &overflow(1, 16_000))
+            .await
+            .is_none(),
+        "dialogue must reach the summarizer intact"
     );
-    assert!(truncated.rewrites[0].text.contains("[truncated: showing "));
-    w.apply(truncated);
+    assert!(w
+        .seen()
+        .iter()
+        .any(|m| m.text.starts_with("think") && m.text.len() > 40000));
 
     let split = decide_with_strategy(&strategy, &w.log, &overflow(2, 16_000))
         .await
@@ -535,7 +535,7 @@ impl LlmProvider for UnavailableSummary {
 async fn failed_summaries_keep_agreed_design_in_the_native_session_projection() {
     const DECISION: &str = "DeviceNo and PipingNo remain separate columns. TubeSeq is the pipe-local test tube sequence, never a device sequence.";
     for partial in [false, true] {
-        for automatic in [false, true] {
+        for mode in 0..3 {
             let mut writer = Writer::new();
             writer.ask("Design two tables; preserve confirmed decisions.");
             writer.answer(&format!("{DECISION}\n{}", bulk("archive", 20_000)));
@@ -551,10 +551,10 @@ async fn failed_summaries_keep_agreed_design_in_the_native_session_projection() 
             });
             let strategy =
                 OverflowCompaction::new(StubCompaction::new(1, true), Some(provider.clone()));
-            let request = if automatic {
-                pressure(16_000, 13_000)
-            } else {
-                ask(CompactTrigger::Manual { focus: None }, 16_000, 13_000)
+            let request = match mode {
+                0 => ask(CompactTrigger::Manual { focus: None }, 16_000, 13_000),
+                1 => pressure(16_000, 13_000),
+                _ => overflow(2, 16_000),
             };
             assert!(strategy_would_summarize(&strategy, &writer.log, &request));
             if let Some(decision) = decide_with_strategy(&strategy, &writer.log, &request).await {

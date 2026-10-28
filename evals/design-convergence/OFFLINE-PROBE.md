@@ -58,3 +58,100 @@ passed: compaction before requests 5 and 9, with main request bytes falling
 640,044 → 460,352 and 1,001,426 → 460,352 respectively. Corresponding Rust
 regressions cover a long active-turn prefix and rearming after a low provider
 reading; the existing constant-pressure no-op test still limits slow attempts.
+
+### Failure and restart matrix
+
+The same probe accepts `--resume-after` to exit the first CLI process, resume its
+native event session in a second process, and send another request. Every main
+request must retain the opening instruction and contain paired tool calls/results.
+The append-only event file must still contain the original first work message.
+
+```sh
+python3 evals/design-convergence/auto_compaction_probe.py \
+  --binary target/release/atomcode --resume-after --output /tmp/compact-success.json
+python3 evals/design-convergence/auto_compaction_probe.py \
+  --binary target/release/atomcode --summary-outcome error --work-bytes 140000 \
+  --resume-after --output /tmp/compact-error.json
+```
+
+Repeat the second command with `empty`, `truncated`, `disconnected`, and
+`oversized`. Each requires two summary attempts (one per pressure cycle), no
+committed history cut, and the first work message present in every subsequent
+main request, including the request after restart. Failure fixtures use smaller
+work messages so the separate estimated-input overflow guard is not triggered.
+
+The previous emergency policy was tested separately (legacy negative control):
+
+```sh
+python3 evals/design-convergence/auto_compaction_probe.py \
+  --binary target/release/atomcode --summary-outcome error \
+  --expect-overflow-fallback --resume-after --output /tmp/compact-emergency.json
+```
+
+At the default larger message size, accumulated history eventually exceeds the
+usable input estimate (window minus output reserve and safety margin), regardless
+of synthetic low usage reports. Before the emergency-failure fix, recovery could then drain old
+context without a model summary when summarization fails. The legacy fixture requires
+that fallback, preserved tool pairing, a successful restart, and the original
+message still present in the raw event log. It **does not** claim the model still
+sees those drained details. Ordinary proactive failure and emergency fallback
+therefore have different preservation guarantees; the tests must not conflate them.
+
+2026-10-27 broader verification, before the emergency-failure fix, on compaction fix `718959a36`: all seven native
+cases above passed (success, five soft failures, emergency failure), including a
+separate CLI restart in every case. The old binary above failed the updated
+success case as expected (one compaction rather than two).
+
+Rust verification: 1,097 capabilities library tests; 216 coding tests across
+`runtime_criteria`, `session`, `recovery`, `overflow_recovery`, `loop_policy`;
+7 harness strategy tests; 38 kernel tests across `compaction`,
+`overflow_compaction`, `compaction_provenance`, `session_format`,
+`projection_order`, `cancellation`; 41 coding library tests selected by
+`test(compact) or test(cancel)`; and the harness library compaction cancellation
+test. All 1,400 passed. These cover manual compaction, overflow retry, native
+storage/resume, rewind, todo state, summary failure, pairing, cancellation and
+reported terminal outcomes. They do not establish real DeepSeek summary quality
+or Windows TUI behavior. No production policy was changed by this broader test pass.
+
+
+### Emergency summary failure now refuses lossy continuation
+
+```sh
+python3 evals/design-convergence/auto_compaction_probe.py \
+  --binary target/release/atomcode --summary-outcome error \
+  --expect-overflow-refusal --resume-after --output /tmp/compact-preserved.json
+```
+
+With a configured summary model, overflow no longer drains dialogue on a failed,
+empty, interrupted, truncated, oversized or timed-out summary. The preceding
+hard-truncation tier also leaves user/assistant messages intact for summarization;
+only tool results can be shortened there. Explicit model-free mode is unchanged.
+If the bounded recovery ladder cannot make the estimated input fit, it reports
+context overflow and stops before sending that oversized request.
+
+The refusal probe requires an explicit persisted error, no history cut before the
+error, and no main request beyond step 9. With `--resume-after`, the fake summary
+provider is repaired before the second CLI starts: the retained history must then
+successfully summarize and the resumed turn complete. The old binary must fail
+this contract; it silently continued by dropping context. The earlier
+`--expect-overflow-fallback` check is retained only as a legacy negative control.
+
+Emergency-failure fix verification (2026-10-27): patched binary SHA-256
+`35c27712161d667edfde2fbb34a8876c950f44d993c784ff1ce93bae7096ceb2` passed
+11 native cases: normal two-cycle automatic compaction, five proactive failures
+with preserved history, and the same five failures under estimated input overflow.
+Every case restarted the native CLI. All five emergency failures ended with
+exit 1 and zero initial history cuts, then resumed successfully (exit 0) after
+the simulated summary provider recovered. The previous binary
+`f84c25e530ac2f306b824281af40b7fa7645aa9c3374e9d72bc7e613c6809cd2` failed the
+refusal contract: it committed a history cut and silently continued instead.
+
+Rust regressions passed: 1,098 capabilities library tests, 217 coding integration
+tests (`runtime_criteria`, `session`, `recovery`, `overflow_recovery`,
+`loop_policy`) and 7 harness compaction strategy tests, totaling 1,322. Additional
+coverage checks that oversized user/assistant messages are not truncated before
+a configured summary fails, and that exhausted preflight recovery never sends
+an unchanged oversized request. The scope-only patch passed the full compile gate
+in an isolated worktree; unrelated skill changes in the shared worktree were
+excluded from that check. The final shared-worktree compile gate also passed. Real-model summary fidelity
+and Windows rendering remain outside these deterministic tests.

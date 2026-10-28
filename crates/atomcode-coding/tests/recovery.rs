@@ -490,6 +490,51 @@ async fn a_request_that_would_not_fit_is_compacted_before_it_is_sent() {
     );
 }
 
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn an_unshrinkable_preflight_overflow_stops_before_the_provider_and_keeps_history() {
+    let dir = scratch("overflow-preserve-history");
+    let app = start(tree(&dir, &[
+        "[[patch]]\nid = \"llm\"\nname = \"llm-replay\"\nconfig = { context_window = 30000, script = [ { text = \"ok\" } ] }",
+        "[[remove]]\nid = \"compaction-tail\"",
+    ])).await;
+    run_turn(&app, "keep all confirmed decisions")
+        .await
+        .unwrap();
+    let ctx = app.context();
+    let log = ctx.only_session().unwrap();
+    let turn = log.current_turn();
+    for round in 2..14 {
+        atomcode_harness::session::commit(
+            &ctx,
+            &log,
+            SessionEvent::AssistantMessage {
+                turn,
+                round,
+                text: format!("confirmed design {round}: {}", "x".repeat(16000)),
+                reasoning: String::new(),
+                tool_calls: vec![],
+                reasoning_blocks: vec![],
+                meta: None,
+            },
+        );
+    }
+    let before: Vec<_> = log.derive_messages().into_iter().map(|m| m.text).collect();
+    let run = run_with(&app, 0, overflowing()).await;
+    assert_eq!(run.stop, StopReason::ProviderError);
+    assert_eq!(
+        run.attempts, 0,
+        "must not send an unchanged oversized request"
+    );
+    assert!(run.error.unwrap_or_default().contains("history"));
+    let after: Vec<_> = log.derive_messages().into_iter().map(|m| m.text).collect();
+    for message in before {
+        assert!(
+            after.contains(&message),
+            "confirmed conversation must survive"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_bounded_ladder_gives_up_instead_of_spinning() {
     let dir = scratch("overflow-hopeless");
