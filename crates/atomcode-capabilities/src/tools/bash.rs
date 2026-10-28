@@ -2534,10 +2534,13 @@ pub fn bash_invocations(source: &str) -> Option<Vec<BashInvocation>> {
 
 /// Paths read through shell input redirection (`< file`). Output redirection is a
 /// write and is handled by the workspace gate; fd dups and heredocs are not files.
-pub(crate) fn bash_input_redirect_paths(source: &str) -> Vec<String> {
-    let Some(tree) = parse_bash(source) else {
-        return Vec::new();
-    };
+/// `None` when the command is not fully parsed, so callers can fail closed instead
+/// of reading a partial tree as "no redirect".
+pub(crate) fn bash_input_redirect_paths(source: &str) -> Option<Vec<String>> {
+    let tree = parse_bash(source)?;
+    if tree.root_node().has_error() {
+        return None;
+    }
     let bytes = source.as_bytes();
     let mut paths = Vec::new();
     let mut stack = vec![tree.root_node()];
@@ -2574,7 +2577,7 @@ pub(crate) fn bash_input_redirect_paths(source: &str) -> Vec<String> {
             }
         }
     }
-    paths
+    Some(paths)
 }
 
 /// Whether `command` is PROVABLY read-only, so it may run CONCURRENTLY without a
@@ -4765,10 +4768,13 @@ mod tests {
     fn input_redirect_paths_ignore_outputs_and_fd_dups() {
         assert_eq!(
             bash_input_redirect_paths("cat < .atomcode/config.toml"),
-            vec![".atomcode/config.toml"]
+            Some(vec![".atomcode/config.toml".into()])
         );
-        assert!(bash_input_redirect_paths("echo x > out.txt").is_empty());
-        assert!(bash_input_redirect_paths("echo x 2>&1").is_empty());
+        assert_eq!(
+            bash_input_redirect_paths("echo x > out.txt"),
+            Some(Vec::new())
+        );
+        assert_eq!(bash_input_redirect_paths("echo x 2>&1"), Some(Vec::new()));
     }
 
     #[test]

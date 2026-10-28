@@ -179,7 +179,7 @@ impl SensitivePaths {
                         let target = target.trim_matches(|c| c == '\'' || c == '"');
                         if !target.is_empty() && !target.contains('$') && !target.contains('`') {
                             let path = super::resolve_path(target, &cwd);
-                            if looks_like_path(target) && self.path_is_sensitive(&path) {
+                            if looks_like_path(target) && self.read_target_is_sensitive(&path) {
                                 return true;
                             }
                             cwd = path;
@@ -202,20 +202,39 @@ impl SensitivePaths {
                 }
             }
             // Input redirection targets are paths too: `cat < .atomcode/config.toml`.
-            for target in super::bash::bash_input_redirect_paths(command) {
-                if !looks_like_path(&target) {
-                    continue;
+            // A redirect may sit before or after a literal `cd`; check both the
+            // starting directory and the directory the invocations ended in.
+            if let Some(targets) = super::bash::bash_input_redirect_paths(command) {
+                for target in targets {
+                    if !looks_like_path(&target) {
+                        continue;
+                    }
+                    for base in [working_dir, cwd.as_path()] {
+                        let path = super::resolve_path(&target, base);
+                        if self
+                            .resolved_target_is_sensitive(path, world, &mut real_user)
+                            .await
+                        {
+                            return true;
+                        }
+                    }
                 }
-                let path = super::resolve_path(&target, working_dir);
-                if self
-                    .resolved_target_is_sensitive(path, world, &mut real_user)
-                    .await
-                {
-                    return true;
-                }
+            } else if command.contains('<') {
+                // A partial parse can hide the redirect target; do not treat that
+                // as "no redirect".
+                return true;
             }
         }
         false
+    }
+
+    /// True if a shell operand or redirect target names a sensitive location by
+    /// the READ-side policy. The write-side [`Self::path_is_sensitive`] includes
+    /// system prefixes and secret extensions; a plain `cat /etc/hosts` must stay
+    /// as quiet through bash as it is through `read_file`.
+    fn read_target_is_sensitive(&self, path: &Path) -> bool {
+        self.references(&serde_json::json!({ "path": path }).to_string())
+            || is_credential_path(path, &self.user_dir)
     }
 
     /// True if `path` or the real path it resolves to is sensitive for this world.
@@ -225,13 +244,13 @@ impl SensitivePaths {
         world: &dyn crate::world::FileSystem,
         real_user: &mut Option<Option<PathBuf>>,
     ) -> bool {
-        if self.path_is_sensitive(&path) {
+        if self.read_target_is_sensitive(&path) {
             return true;
         }
         let Ok(real) = world.canonicalize(&path).await else {
             return false;
         };
-        if self.path_is_sensitive(&real) {
+        if self.read_target_is_sensitive(&real) {
             return true;
         }
         let user = match &*real_user {
@@ -373,8 +392,16 @@ fn shell_command_name(command: &str) -> &str {
 }
 
 /// Shell operands are untyped. Only a path-shaped word is classified; a bare search word
-/// such as `grep credentials` must not be mistaken for a file.
+/// such as `grep credentials`, a glob (`*.key`) or an option value (`--include=*.crt`)
+/// must not be mistaken for a file.
 fn looks_like_path(raw: &str) -> bool {
+    if raw.is_empty()
+        || raw
+            .chars()
+            .any(|c| matches!(c, '*' | '?' | '[' | '{' | '=' | '$' | '`'))
+    {
+        return false;
+    }
     raw.starts_with(|c: char| matches!(c, '.' | '/' | '~' | '\\'))
         || raw.contains(|c: char| c == '/' || c == '\\')
         || Path::new(raw).extension().is_some()
@@ -697,10 +724,58 @@ mod tests {
             "a literal cd moves the base for later operands"
         );
         assert!(
+            guard
+                .references_in(
+                    r#"{"command":"cd .ours && cat < config.toml"}"#,
+                    temp.path(),
+                    &world
+                )
+                .await,
+            "a redirect after cd uses the tracked directory"
+        );
+        assert!(
+            guard
+                .references_in(
+                    r#"{"command":"cat < .ours/config.toml &&"}"#,
+                    temp.path(),
+                    &world
+                )
+                .await,
+            "an incomplete parse with a redirect must fail closed"
+        );
+        assert!(
             !guard
                 .references_in(r#"{"command":"grep credentials src"}"#, temp.path(), &world)
                 .await,
             "a bare search word is not a path"
+        );
+        assert!(
+            !guard
+                .references_in(
+                    r#"{"command":"find . -name \"*.key\""}"#,
+                    temp.path(),
+                    &world
+                )
+                .await,
+            "a glob is a search pattern, not a file"
+        );
+        assert!(
+            !guard
+                .references_in(
+                    r#"{"command":"grep --include=*.crt TODO src"}"#,
+                    temp.path(),
+                    &world
+                )
+                .await,
+            "an option value is not a path"
+        );
+        #[cfg(windows)]
+        let system_path = r#"{"command":"cat C:/Windows/win.ini"}"#;
+        #[cfg(not(windows))]
+        let system_path = r#"{"command":"cat /etc/hosts"}"#;
+        assert!(
+            !guard.references_in(system_path, temp.path(), &world).await,
+            "a plain system read must stay as quiet through bash as through read_file"
         );
         assert!(
             !guard
