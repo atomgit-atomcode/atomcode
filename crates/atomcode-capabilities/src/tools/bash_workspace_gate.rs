@@ -225,11 +225,18 @@ fn split_segments(cmd: &str) -> Vec<String> {
                 i += 2;
             }
             '&' if prev_nonspace == Some('>') && !prev_was_escaped => {
-                // `2>&1` / `>&-` are fd dups; `>&file` is stdout+stderr redirected to
-                // a file. Keep the former opaque; drop the `&` for the latter so
-                // `tokenize`/`redirect_targets` still see the file target.
-                let next = chars[i + 1..].iter().find(|c| !c.is_whitespace()).copied();
-                if next.is_some_and(|c| c.is_ascii_digit() || c == '-') {
+                // `[n]>&word` copies an fd only when the whole word is digits; a
+                // word beginning with `-` closes it. Anything else — `>&2notes.txt`
+                // — redirects both streams to that file, so drop the `&` and leave
+                // the target visible to `tokenize`/`redirect_targets`.
+                let word: String = chars[i + 1..]
+                    .iter()
+                    .skip_while(|c| c.is_whitespace())
+                    .take_while(|c| !c.is_whitespace() && !matches!(c, ';' | '&' | '|' | '<' | '>'))
+                    .collect();
+                let fd_copy = (!word.is_empty() && word.chars().all(|c| c.is_ascii_digit()))
+                    || word.starts_with('-');
+                if fd_copy {
                     cur.push(c);
                     prev_nonspace = Some(c);
                 } else {
@@ -1302,7 +1309,19 @@ mod tests {
             scan("echo pwned >& /outside/log.txt"),
             BashScan::Targets(vec!["/outside/log.txt".into()])
         );
+        // A digit-leading word is a file unless the WHOLE word is digits: bash
+        // reads `>&2notes.txt` as a write to that file, not as fd 2.
+        assert_eq!(
+            scan("echo pwned >&2notes.txt"),
+            BashScan::Targets(vec!["2notes.txt".into()])
+        );
+        assert_eq!(
+            scan("echo pwned >&1out/log.txt"),
+            BashScan::Targets(vec!["1out/log.txt".into()])
+        );
         assert_eq!(scan("echo ok 2>&1"), BashScan::NotDestructive);
+        assert_eq!(scan("echo ok >&2"), BashScan::NotDestructive);
+        assert_eq!(scan("echo ok >&-"), BashScan::NotDestructive);
     }
 
     #[tokio::test]
