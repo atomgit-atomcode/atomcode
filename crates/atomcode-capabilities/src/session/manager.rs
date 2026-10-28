@@ -1789,7 +1789,7 @@ impl SessionManager {
         notes: &mut Vec<String>,
     ) -> SessionResult<(LoadedSession, Option<Message>)> {
         let id = lease.id();
-        let (mut loaded, mut events) = self.load_event_session_with_events(id)?;
+        let (loaded, events) = self.load_event_session_with_events(id)?;
 
         match self.read_resume_replay(id) {
             Ok(Some(replay)) => match pending_replay_prompt(&events, &replay) {
@@ -1807,18 +1807,42 @@ impl SessionManager {
             }
         }
 
-        let Some((to, turn, prompt)) = super::events::unanswered_prompt(&events) else {
+        let Some((_, _, prompt)) = super::events::unanswered_prompt(&events) else {
             return Ok((loaded, None));
         };
-        let replay = ResumeReplay { to, turn };
-        if let Err(error) = self.write_resume_replay(id, &replay) {
-            // The prompt stays visible in the log; a later resume can try again.
-            notes.push(format!(
-                "the prompt session {id} accepted before its turn was answered \
-                 could not be marked for replay: {error}"
-            ));
-            return Ok((loaded, None));
+        // Loading does not retract: the prompt stays visible until the runtime is
+        // actually about to send it (`prepare_resume_replay`). A caller that only
+        // previews the session must not lose a line the person wrote.
+        Ok((loaded, Some(prompt)))
+    }
+
+    /// The runtime is about to replay a prompt `resume_event_session` handed back:
+    /// write the retry marker, then retract the unanswered turn.
+    ///
+    /// Idempotent while the marker's rewind is in the log, so a failed send can be
+    /// retried. A failure leaves the prompt visible; the marker is cleared only
+    /// after the rewind lands, and a death between the two is recovered by
+    /// [`Self::resume_event_session`].
+    pub fn prepare_resume_replay(&self, lease: &SessionLease) -> SessionResult<()> {
+        self.validate_active_lease(lease)?;
+        let id = lease.id();
+        if !self.is_event_session(id) {
+            return Ok(());
         }
+        let events = self.load_events(id)?;
+        if let Some(replay) = self.read_resume_replay(id)? {
+            match pending_replay_prompt(&events, &replay) {
+                PendingReplay::StillWaiting(_) => return Ok(()),
+                PendingReplay::Started | PendingReplay::Stale => {
+                    self.clear_resume_replay(id)?;
+                }
+            }
+        }
+        let Some((to, turn, _)) = super::events::unanswered_prompt(&events) else {
+            return Ok(());
+        };
+        let replay = ResumeReplay { to, turn };
+        self.write_resume_replay(id, &replay)?;
         let seq = events
             .iter()
             .map(|logged| logged.seq)
@@ -1835,18 +1859,10 @@ impl SessionManager {
             },
         };
         match self.append_events(lease, std::slice::from_ref(&rewound)) {
-            Ok(()) => {
-                events.push(rewound);
-                loaded.snapshot = super::events::snapshot_of(&events);
-                Ok((loaded, Some(prompt)))
-            }
+            Ok(()) => Ok(()),
             Err(error) => {
                 let _ = self.clear_resume_replay(id);
-                notes.push(format!(
-                    "the prompt session {id} accepted before its turn was answered \
-                     could not be rewound for replay: {error}"
-                ));
-                Ok((loaded, None))
+                Err(error)
             }
         }
     }
