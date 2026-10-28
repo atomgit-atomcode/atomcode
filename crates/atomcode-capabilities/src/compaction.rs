@@ -201,7 +201,7 @@ pub const SUMMARY_TIMEOUT: Duration = Duration::from_secs(180);
 /// Surfaced (as a `resume_note` → synthetic user message) when the summary times out and we
 /// fall back to stub compaction, so the user understands why they got a lighter compaction.
 const SUMMARY_TIMEOUT_NOTE: &str =
-    "[系统] 本次 /compact 的 AI 摘要超时（>180s，模型可能在大上下文下长时间推理），已改用快速压缩：对话全部保留，仅折叠了较大的工具输出。如需更彻底的压缩，可稍后再次 /compact，或切换更快的模型。";
+    "[系统] 本次上下文压缩的 AI 摘要超时（模型可能在大上下文下长时间推理），已改用快速压缩：对话全部保留，仅折叠了较大的工具输出。如需更彻底的压缩，可稍后手动压缩（/compact），或切换更快的模型。";
 
 const SUMMARY_FAILURE_NOTE: &str =
     "[系统] 本次 AI 摘要失败或未返回有效内容，已保留对话，仅精简较大的工具输出。可稍后重试 /compact 或检查模型访问权限。";

@@ -160,15 +160,18 @@ fn strip_quotes(t: &str) -> &str {
     }
 }
 
-/// Quote-aware split of a command line into pipeline/list segments on unquoted `; && || | \n`.
-/// A `|` immediately following an unquoted `>` is the noclobber-override redirect `>|`, NOT a
-/// pipeline separator — it is dropped so the redirect target stays in the same segment.
+/// Quote-aware split of a command line into pipeline/list segments on unquoted
+/// `; && || | & \n`. A single `&` backgrounds the preceding command and starts a new one;
+/// `>|` is a redirect, so its operator stays in the current segment. `>&` is a
+/// redirect for fd dups (`2>&1`) and a file write for `>&file`; the latter drops
+/// the `&` so the target remains visible to the redirect scanner.
 fn split_segments(cmd: &str) -> Vec<String> {
     let chars: Vec<char> = cmd.chars().collect();
     let mut segs = Vec::new();
     let mut cur = String::new();
     let mut quote: Option<char> = None;
     let mut prev_nonspace: Option<char> = None;
+    let mut prev_was_escaped = false;
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
@@ -180,6 +183,7 @@ fn split_segments(cmd: &str) -> Vec<String> {
             if q == '"' && c == '\\' && i + 1 < chars.len() {
                 cur.push(chars[i + 1]);
                 prev_nonspace = Some(chars[i + 1]);
+                prev_was_escaped = false;
                 i += 2;
                 continue;
             }
@@ -187,6 +191,7 @@ fn split_segments(cmd: &str) -> Vec<String> {
                 quote = None;
             }
             prev_nonspace = Some(c);
+            prev_was_escaped = false;
             i += 1;
             continue;
         }
@@ -195,6 +200,7 @@ fn split_segments(cmd: &str) -> Vec<String> {
                 cur.push(c);
                 quote = Some(c);
                 prev_nonspace = Some(c);
+                prev_was_escaped = false;
                 i += 1;
             }
             '\\' if i + 1 < chars.len() => {
@@ -203,31 +209,65 @@ fn split_segments(cmd: &str) -> Vec<String> {
                 cur.push(c);
                 cur.push(chars[i + 1]);
                 prev_nonspace = Some(chars[i + 1]);
+                prev_was_escaped = true;
                 i += 2;
             }
             ';' | '\n' => {
                 segs.push(std::mem::take(&mut cur));
                 prev_nonspace = None;
+                prev_was_escaped = false;
                 i += 1;
             }
             '&' if i + 1 < chars.len() && chars[i + 1] == '&' => {
                 segs.push(std::mem::take(&mut cur));
                 prev_nonspace = None;
+                prev_was_escaped = false;
                 i += 2;
+            }
+            '&' if prev_nonspace == Some('>') && !prev_was_escaped => {
+                // `[n]>&word` copies an fd only when the whole word is digits; a
+                // word beginning with `-` closes it. Anything else — `>&2notes.txt`
+                // — redirects both streams to that file, so drop the `&` and leave
+                // the target visible to `tokenize`/`redirect_targets`.
+                let word: String = chars[i + 1..]
+                    .iter()
+                    .skip_while(|c| c.is_whitespace())
+                    .take_while(|c| !c.is_whitespace() && !matches!(c, ';' | '&' | '|' | '<' | '>'))
+                    .collect();
+                let fd_copy = (!word.is_empty() && word.chars().all(|c| c.is_ascii_digit()))
+                    || word.starts_with('-');
+                if fd_copy {
+                    cur.push(c);
+                    prev_nonspace = Some(c);
+                } else {
+                    prev_nonspace = Some('>');
+                }
+                prev_was_escaped = false;
+                i += 1;
+            }
+            '&' => {
+                // A single `&` backgrounds the preceding command; the rest is a new command.
+                segs.push(std::mem::take(&mut cur));
+                prev_nonspace = None;
+                prev_was_escaped = false;
+                i += 1;
             }
             '|' if i + 1 < chars.len() && chars[i + 1] == '|' => {
                 segs.push(std::mem::take(&mut cur));
                 prev_nonspace = None;
+                prev_was_escaped = false;
                 i += 2;
             }
-            '|' if prev_nonspace == Some('>') => {
+            '|' if prev_nonspace == Some('>') && !prev_was_escaped => {
                 // `>|` — noclobber-override write; the `|` belongs to the redirect, not a pipe.
                 prev_nonspace = Some('|');
+                prev_was_escaped = false;
                 i += 1;
             }
             '|' => {
                 segs.push(std::mem::take(&mut cur));
                 prev_nonspace = None;
+                prev_was_escaped = false;
                 i += 1;
             }
             c if c.is_whitespace() => {
@@ -237,6 +277,7 @@ fn split_segments(cmd: &str) -> Vec<String> {
             _ => {
                 cur.push(c);
                 prev_nonspace = Some(c);
+                prev_was_escaped = false;
                 i += 1;
             }
         }
@@ -1243,6 +1284,71 @@ mod tests {
         assert_eq!(
             scan("git commit -m 'cd into dir and rm stuff'"),
             BashScan::NotDestructive
+        );
+    }
+
+    #[test]
+    fn background_operator_separates_commands() {
+        assert_eq!(
+            scan("echo ready & rm /outside/x.txt"),
+            BashScan::Targets(vec!["/outside/x.txt".into()])
+        );
+        // `&>` is a redirect; splitting it still exposes its target to the scan.
+        assert_eq!(
+            scan("echo ready &> /outside/log.txt"),
+            BashScan::Targets(vec!["/outside/log.txt".into()])
+        );
+        // `>&` belongs to the redirect, not to the background separator.
+        assert_eq!(
+            split_segments("echo ok 2>&1 & rm /outside/x.txt"),
+            vec!["echo ok 2>&1 ", " rm /outside/x.txt"]
+        );
+        // An escaped `>` is word content; the following `&` / `|` still splits.
+        assert_eq!(
+            scan("echo a\\> & rm /outside/x.txt"),
+            BashScan::Targets(vec!["/outside/x.txt".into()])
+        );
+        assert_eq!(
+            scan("echo a\\> | rm /outside/x.txt"),
+            BashScan::Targets(vec!["/outside/x.txt".into()])
+        );
+        // `>&file` redirects both streams to a file; the target must stay visible.
+        assert_eq!(
+            scan("echo pwned >& /outside/log.txt"),
+            BashScan::Targets(vec!["/outside/log.txt".into()])
+        );
+        // A digit-leading word is a file unless the WHOLE word is digits: bash
+        // reads `>&2notes.txt` as a write to that file, not as fd 2.
+        assert_eq!(
+            scan("echo pwned >&2notes.txt"),
+            BashScan::Targets(vec!["2notes.txt".into()])
+        );
+        assert_eq!(
+            scan("echo pwned >&1out/log.txt"),
+            BashScan::Targets(vec!["1out/log.txt".into()])
+        );
+        assert_eq!(scan("echo ok 2>&1"), BashScan::NotDestructive);
+        assert_eq!(scan("echo ok >&2"), BashScan::NotDestructive);
+        assert_eq!(scan("echo ok >&-"), BashScan::NotDestructive);
+    }
+
+    #[tokio::test]
+    async fn backgrounded_out_of_workspace_rm_prompts() {
+        let ws = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let target = std::path::PathBuf::from("C:/atomcode-test-outside-rm/bg.txt");
+        #[cfg(not(windows))]
+        let target = std::path::PathBuf::from("/atomcode-test-outside-rm/bg.txt");
+        let gate = BashWorkspaceGate::pinned(
+            ws.path().to_path_buf(),
+            crate::tools::sensitive_path::test_guard(),
+        );
+        let tool = bash_tool();
+        let mut call = bash_call(&format!("echo ready & rm {}", target.to_str().unwrap()));
+        let out = gate.before(&mut call, &tool, &silent_rt()).await;
+        assert!(
+            out.is_deny(),
+            "a backgrounded out-of-workspace rm must prompt (fail closed), got {out:?}"
         );
     }
 
