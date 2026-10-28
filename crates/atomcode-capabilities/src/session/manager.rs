@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::ProductDirs;
 use atomcode_kernel::message::{Message, Role, SessionSnapshot, SNAPSHOT_VERSION};
+use atomcode_kernel::session::{LoggedEvent, RewindScope, SessionEvent};
 use serde::{de::IgnoredAny, Deserialize, Serialize};
 
 use super::presentation::{
@@ -1632,8 +1633,42 @@ impl SessionManager {
     ) -> SessionResult<(LoadedSession, Option<Message>)> {
         self.validate_active_lease(lease)?;
         let mut loaded = self.load_native_session(lease.id())?;
-        // An event session's accepted prompt is already a fact in its log.
+        // An event session's accepted prompt is already a fact in its log. A
+        // turn that never got past that prompt is the exception the runtime
+        // still needs handed back: rewind the unanswered turn and let the
+        // normal replay start it again, the way a converted snapshot's
+        // inflight prompt is handed back.
         if self.is_event_session(lease.id()) {
+            let events = self.load_events(lease.id())?;
+            if let Some((to, turn, prompt)) = super::events::unanswered_prompt(&events) {
+                let seq = events
+                    .iter()
+                    .map(|logged| logged.seq)
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                let rewound = LoggedEvent {
+                    seq,
+                    at: u64::try_from(super::now_ms()).unwrap_or(0),
+                    event: SessionEvent::Rewound {
+                        turn,
+                        to,
+                        scope: RewindScope::Conversation,
+                    },
+                };
+                match self.append_events(lease, &[rewound]) {
+                    Ok(()) => {
+                        loaded = self.load_native_session(lease.id())?;
+                        return Ok((loaded, Some(prompt)));
+                    }
+                    // Resume still loads; only the automatic replay is lost.
+                    Err(error) => notes.push(format!(
+                        "the prompt session {} accepted before its turn was answered \
+                         could not be rewound for replay: {error}",
+                        lease.id()
+                    )),
+                }
+            }
             return Ok((loaded, None));
         }
         let inflight = match self.load_inflight_snapshot(lease.id()) {

@@ -1047,6 +1047,46 @@ pub fn events_to_become(events: &[LoggedEvent], target: &[Message]) -> Vec<Sessi
     change
 }
 
+/// The prompt a turn accepted but never answered: the fact a process that died
+/// mid-turn leaves behind. A turn qualifies only when nothing after its
+/// `TurnStart` shows it ran — turn-start context, titles, checkpoints and a
+/// compaction of earlier history are fine; a request, streamed or final
+/// output, a tool, usage, a question or a stop means replaying would repeat
+/// work the log cannot undo.
+///
+/// Returns the `TurnStart` sequence the caller rewinds to, the turn, and the
+/// prompt to hand back to the runtime.
+pub(crate) fn unanswered_prompt(events: &[LoggedEvent]) -> Option<(SeqNo, u64, Message)> {
+    let (start, turn) = events.iter().rev().find_map(|logged| match &logged.event {
+        SessionEvent::TurnStart { turn } => Some((logged.seq, *turn)),
+        _ => None,
+    })?;
+    let mut prompt = None;
+    for logged in events.iter().filter(|logged| logged.seq > start) {
+        match &logged.event {
+            SessionEvent::UserMessage {
+                turn: said_in,
+                text,
+                images,
+            } if *said_in == turn && prompt.is_none() => {
+                prompt = Some(if images.is_empty() {
+                    Message::user(text)
+                } else {
+                    Message::user_with_images(text, images.clone())
+                });
+            }
+            SessionEvent::Injected { .. }
+            | SessionEvent::Titled { .. }
+            | SessionEvent::Checkpointed { .. }
+            | SessionEvent::Compacted { .. }
+            | SessionEvent::ToolResultsStubbed { .. }
+            | SessionEvent::MessagesRewritten { .. } => {}
+            _ => return None,
+        }
+    }
+    prompt.map(|prompt| (start, turn, prompt))
+}
+
 /// Move a reseeded fact's turn past the turns the log already used.
 fn shift_turn(event: &mut SessionEvent, offset: u64) {
     if offset == 0 {
@@ -2640,6 +2680,181 @@ mod tests {
             )),
             "memory is reseeded as its own fact: {change:?}"
         );
+    }
+
+    #[test]
+    fn an_unanswered_prompt_is_the_one_to_replay() {
+        let accepted = vec![
+            logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+            logged(
+                2,
+                0,
+                SessionEvent::Injected {
+                    turn: 1,
+                    text: "=== MEMORY ===\n- prefers tabs".into(),
+                    origin: InjectionOrigin::Memory,
+                },
+            ),
+            logged(
+                3,
+                0,
+                SessionEvent::UserMessage {
+                    turn: 1,
+                    text: "hello".into(),
+                    images: vec![],
+                },
+            ),
+        ];
+        let (to, turn, prompt) =
+            unanswered_prompt(&accepted).expect("the accepted prompt is replayable");
+        assert_eq!((to, turn, prompt.text.as_str()), (1, 1, "hello"));
+
+        for progress in [
+            SessionEvent::AssistantMessage {
+                turn: 1,
+                round: 1,
+                text: "ok".into(),
+                reasoning: String::new(),
+                tool_calls: vec![],
+                reasoning_blocks: vec![],
+                meta: None,
+            },
+            SessionEvent::StepStart { turn: 1, step: 1 },
+            SessionEvent::TurnEnd {
+                turn: 1,
+                stop: atomcode_kernel::event::StopReason::Stopped,
+                error: None,
+            },
+            SessionEvent::Interrupted {
+                turn: 1,
+                undone: false,
+            },
+            SessionEvent::Rewound {
+                turn: 1,
+                to: 1,
+                scope: RewindScope::Conversation,
+            },
+        ] {
+            let mut events = accepted.clone();
+            events.push(logged(4, 0, progress));
+            assert!(
+                unanswered_prompt(&events).is_none(),
+                "a turn that made progress must not be replayed"
+            );
+        }
+        let mut second_prompt = accepted.clone();
+        second_prompt.push(logged(
+            4,
+            0,
+            SessionEvent::UserMessage {
+                turn: 1,
+                text: "again".into(),
+                images: vec![],
+            },
+        ));
+        assert!(unanswered_prompt(&second_prompt).is_none());
+    }
+
+    #[test]
+    fn resume_rewinds_an_unanswered_prompt_for_replay() {
+        let (_dir, manager) = store();
+        let id = "resume-unanswered";
+        let lease = created(&manager, id);
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "hello".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+
+        let (loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
+        assert_eq!(
+            pending.map(|message| message.text),
+            Some("hello".to_string())
+        );
+        assert!(
+            !loaded
+                .snapshot
+                .messages
+                .iter()
+                .any(|message| message.text == "hello"),
+            "the unanswered turn is retracted before it is replayed"
+        );
+        assert!(manager
+            .load_events(id)
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event.event, SessionEvent::Rewound { .. })));
+    }
+
+    #[test]
+    fn resume_does_not_replay_an_answered_turn() {
+        let (_dir, manager) = store();
+        let id = "resume-answered";
+        let lease = created(&manager, id);
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "hello".into(),
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        3,
+                        0,
+                        SessionEvent::AssistantMessage {
+                            turn: 1,
+                            round: 1,
+                            text: "ok".into(),
+                            reasoning: String::new(),
+                            tool_calls: vec![],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    logged(
+                        4,
+                        0,
+                        SessionEvent::TurnEnd {
+                            turn: 1,
+                            stop: atomcode_kernel::event::StopReason::Stopped,
+                            error: None,
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+
+        let (loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
+        assert!(pending.is_none());
+        assert!(loaded
+            .snapshot
+            .messages
+            .iter()
+            .any(|message| message.text == "hello"));
+        assert!(!manager
+            .load_events(id)
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event.event, SessionEvent::Rewound { .. })));
     }
 
     #[cfg(feature = "memory")]
