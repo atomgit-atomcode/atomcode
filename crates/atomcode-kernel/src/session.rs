@@ -868,6 +868,9 @@ pub fn visible_turns(events: &[LoggedEvent]) -> std::collections::BTreeSet<u64> 
             | SessionEvent::AssistantMessage { turn, .. }
             | SessionEvent::ToolResultLogged { turn, .. }
             | SessionEvent::PartialReply { turn, .. } => *turn,
+            // An interruption that survives the cut still projects a model-visible
+            // message, so its turn is not gone.
+            SessionEvent::Interrupted { turn, .. } => *turn,
             // Memory and a compaction summary stand for the session, not for the
             // turn they landed in.
             SessionEvent::Injected { turn, origin, .. }

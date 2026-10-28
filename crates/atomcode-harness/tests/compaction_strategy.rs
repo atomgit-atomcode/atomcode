@@ -17,7 +17,7 @@ use atomcode_kernel::message::{
     CompactTrigger, CompactionPlan, CompactionStrategy, CompactionView, Message, Role,
 };
 use atomcode_kernel::provider::{ChatOptions, LlmProvider};
-use atomcode_kernel::session::{visible_turns, InjectionOrigin};
+use atomcode_kernel::session::InjectionOrigin;
 use atomcode_kernel::stream::{ProviderError, StreamEvent};
 use atomcode_kernel::tool::{ToolCall, ToolDef};
 use futures::stream::BoxStream;
@@ -306,11 +306,6 @@ async fn past_the_mark_older_turns_are_summarized_under_the_first_request() {
     assert!(decision.summary.starts_with(ANCHOR_SENTINEL));
     assert!(decision.summary.contains("SUMMARY 1"));
     w.apply(decision);
-    let visible = visible_turns(&w.log.events());
-    assert!(
-        visible.contains(&4),
-        "the kept turn must stay visible: {visible:?}"
-    );
     let seen: Vec<String> = w.seen().into_iter().map(|m| m.text).collect();
     assert!(seen[0].contains("SUMMARY 1"), "{seen:?}");
     assert_eq!(

@@ -136,6 +136,30 @@ fn a_retained_turn_stays_visible_when_the_cut_lands_on_its_turn_start() {
 }
 
 #[test]
+fn an_interruption_that_survives_the_cut_keeps_its_turn_visible() {
+    let events = log(vec![
+        SessionEvent::TurnStart { turn: 1 },
+        user(1, "one"),
+        SessionEvent::Interrupted {
+            turn: 1,
+            undone: false,
+        },
+        SessionEvent::Compacted {
+            turn: 1,
+            from: 0,
+            through: 2,
+            summary: "Summary of an old task".into(),
+        },
+    ]);
+    // The cut folds the prompt but leaves the interruption, which still projects
+    // a model-visible message; the turn cannot be treated as gone.
+    assert!(derive_messages(&events)
+        .iter()
+        .any(|m| m.is_user_interruption()));
+    assert!(visible_turns(&events).contains(&1));
+}
+
+#[test]
 fn memory_survives_a_compaction_that_folds_its_turn() {
     let events = log(vec![
         SessionEvent::TurnStart { turn: 1 },
