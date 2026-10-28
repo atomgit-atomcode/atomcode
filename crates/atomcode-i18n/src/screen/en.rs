@@ -1330,6 +1330,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SignedInAgainRerunningSetup => "signed in again — running setup once more…".into(),
         Msg::ConfigNotWritten { error } => format!("the config was not written: {error}").into(),
         Msg::LoginCouldNotStart { error } => format!("the login could not be started: {error}").into(),
+        Msg::LoginAutoOpenFailed { reason } => {
+            format!("  Could not open a browser automatically: {reason}").into()
+        }
         Msg::LoginFailed { error } => format!("the login failed: {error}").into(),
         Msg::LoginNoAnswer => "the login went quiet".into(),
         Msg::TokenExchangeFailed { error } => format!("exchanging the token failed: {error}").into(),

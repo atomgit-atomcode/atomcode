@@ -1261,6 +1261,9 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SignedInAgainRerunningSetup => "重新登录成了，重跑 setup…".into(),
         Msg::ConfigNotWritten { error } => format!("配置没写成：{error}").into(),
         Msg::LoginCouldNotStart { error } => format!("登录起不来：{error}").into(),
+        Msg::LoginAutoOpenFailed { reason } => {
+            format!("  未能自动打开浏览器：{reason}").into()
+        }
         Msg::LoginFailed { error } => format!("登录没成：{error}").into(),
         Msg::LoginNoAnswer => "登录没了回音".into(),
         Msg::TokenExchangeFailed { error } => format!("换 token 没成：{error}").into(),
