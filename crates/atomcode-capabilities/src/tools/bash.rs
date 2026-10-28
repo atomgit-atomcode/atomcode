@@ -2545,6 +2545,29 @@ pub fn bash_invocations(source: &str) -> Option<Vec<BashInvocation>> {
     Some(invocations)
 }
 
+/// A flat invocation list cannot bound directories changed by loops or functions.
+/// Callers doing path resolution must ask for approval for those constructs.
+pub(crate) fn bash_has_repeated_directory_changes(source: &str) -> bool {
+    let Some(tree) = parse_bash(source) else {
+        return true;
+    };
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if matches!(
+            node.kind(),
+            "for_statement" | "c_style_for_statement" | "while_statement" | "function_definition"
+        ) {
+            return true;
+        }
+        for index in 0..node.named_child_count() as u32 {
+            if let Some(child) = node.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    false
+}
+
 /// Paths read through shell input redirection (`< file`). Output redirection is a
 /// write and is handled by the workspace gate; fd dups and heredocs are not files.
 /// `None` when the command is not fully parsed, so callers can fail closed instead

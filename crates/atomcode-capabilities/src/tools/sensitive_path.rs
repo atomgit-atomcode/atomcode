@@ -168,7 +168,10 @@ impl SensitivePaths {
         // the command's effective directory, including a preceding literal `cd`, so a
         // relative credential spelling is classified like the absolute one.
         if let Some(command) = value.get("command").and_then(|v| v.as_str()) {
-            let mut cwd = working_dir.to_path_buf();
+            // The syntax-only invocation list flattens branches and subshells.
+            // Keep every possible base instead of claiming a child `cd` moves
+            // its parent. Redirects must also see intermediate bases.
+            let mut bases = vec![working_dir.to_path_buf()];
             let Some(invocations) = super::bash_invocations(command) else {
                 // A partial parse can hide a path operand; the invocation parser
                 // returns None for exactly this reason, so do not read it as
@@ -177,18 +180,47 @@ impl SensitivePaths {
             };
             for invocation in invocations {
                 if shell_command_name(&invocation.command) == "cd" {
-                    if let Some(target) = invocation
+                    if super::bash::bash_has_repeated_directory_changes(command) {
+                        return true;
+                    }
+                    let Some(target) = invocation
                         .arguments
                         .iter()
                         .find(|argument| !argument.starts_with('-'))
+                    else {
+                        // `cd`, `cd -`, and dynamic destinations need shell state.
+                        return true;
+                    };
+                    let target = target.trim_matches(|c| c == '\'' || c == '"');
+                    if target.is_empty()
+                        || target
+                            .chars()
+                            .any(|c| matches!(c, '$' | '`' | '*' | '?' | '[' | '{'))
                     {
-                        let target = target.trim_matches(|c| c == '\'' || c == '"');
-                        if !target.is_empty() && !target.contains('$') && !target.contains('`') {
-                            let path = super::resolve_path(target, &cwd);
-                            if looks_like_path(target) && self.read_target_is_sensitive(&path) {
-                                return true;
+                        return true;
+                    }
+                    let previous = bases.clone();
+                    for base in previous {
+                        let path = super::resolve_path(target, &base);
+                        if self
+                            .resolved_target_is_sensitive(path.clone(), world, &mut real_user)
+                            .await
+                        {
+                            return true;
+                        }
+                        // A cd may fail, or be scoped to a child: retain its old base.
+                        // Canonicalize new bases so symlinked directories are followed.
+                        if !bases.contains(&path) {
+                            bases.push(path.clone());
+                        }
+                        if let Ok(real) = world.canonicalize(&path).await {
+                            if !bases.contains(&real) {
+                                bases.push(real);
                             }
-                            cwd = path;
+                        }
+                        // Complex control flow must cost approval, not unbounded work.
+                        if bases.len() > 64 {
+                            return true;
                         }
                     }
                     continue;
@@ -198,24 +230,26 @@ impl SensitivePaths {
                     if !looks_like_path(argument) {
                         continue;
                     }
-                    let path = super::resolve_path(argument, &cwd);
-                    if self
-                        .resolved_target_is_sensitive(path, world, &mut real_user)
-                        .await
-                    {
-                        return true;
+                    for base in &bases {
+                        let path = super::resolve_path(argument, base);
+                        if self
+                            .resolved_target_is_sensitive(path, world, &mut real_user)
+                            .await
+                        {
+                            return true;
+                        }
                     }
                 }
             }
             // Input redirection targets are paths too: `cat < .atomcode/config.toml`.
-            // A redirect may sit before or after a literal `cd`; check both the
-            // starting directory and the directory the invocations ended in.
+            // A redirect can occur at any intermediate base, not just the start
+            // or final directory. Checking all candidates is conservative.
             if let Some(targets) = super::bash::bash_input_redirect_paths(command) {
                 for target in targets {
                     if !looks_like_path(&target) {
                         continue;
                     }
-                    for base in [working_dir, cwd.as_path()] {
+                    for base in &bases {
                         let path = super::resolve_path(&target, base);
                         if self
                             .resolved_target_is_sensitive(path, world, &mut real_user)
@@ -397,9 +431,10 @@ fn shell_command_name(command: &str) -> &str {
         .unwrap_or(command)
 }
 
-/// Shell operands are untyped. Only a path-shaped word is classified; a bare search word
-/// such as `grep credentials`, a glob (`*.key`) or an option value (`--include=*.crt`)
-/// must not be mistaken for a file.
+/// Shell operands are untyped. A bare filename can be a symlink to credentials,
+/// so include literal words as candidates too. Ordinary search words still need
+/// to resolve to a sensitive location before they trigger approval. Options and
+/// expansion patterns are not literal file targets.
 fn looks_like_path(raw: &str) -> bool {
     if raw.is_empty()
         || raw
@@ -408,9 +443,7 @@ fn looks_like_path(raw: &str) -> bool {
     {
         return false;
     }
-    raw.starts_with(|c: char| matches!(c, '.' | '/' | '~' | '\\'))
-        || raw.contains(|c: char| c == '/' || c == '\\')
-        || Path::new(raw).extension().is_some()
+    !raw.starts_with('-')
 }
 
 /// The user's real home directory. Used to anchor `~/.ssh` / `~/.aws` / `~/.gnupg`
@@ -655,6 +688,98 @@ mod grant_scope_tests {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn uncertain_shell_directories_require_approval() {
+        let temp = tempfile::tempdir().unwrap();
+        let guard = SensitivePaths::new(temp.path().join(".ours"), ".ours");
+        let world = crate::world::LocalFs::unfenced();
+        for command in [
+            "cd && cat config.toml",
+            "cd - && cat config.toml",
+            "cd \"$DEST\" && cat config.toml",
+            "for i in 1 2; do cd ..; done; cat config.toml",
+            "while true; do cd ..; done; cat config.toml",
+            "move() { cd ..; }; move; cat config.toml",
+        ] {
+            assert!(
+                guard
+                    .references_in(
+                        &serde_json::json!({"command": command}).to_string(),
+                        temp.path(),
+                        &world
+                    )
+                    .await,
+                "{command}"
+            );
+        }
+        std::fs::create_dir(temp.path().join("src")).unwrap();
+        std::fs::write(temp.path().join("src/main.rs"), "fn main() {}").unwrap();
+        assert!(
+            !guard
+                .references_in(
+                    r#"{"command":"cd src && cat main.rs"}"#,
+                    temp.path(),
+                    &world
+                )
+                .await
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn review_redirect_uses_its_own_intermediate_directory() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let user = temp.path().join(".ours");
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::write(user.join("config.toml"), "FAKE").unwrap();
+        let stage = temp.path().join("stage");
+        std::fs::create_dir(&stage).unwrap();
+        symlink(user.join("config.toml"), stage.join("input.txt")).unwrap();
+        symlink(user.join("config.toml"), stage.join("input")).unwrap();
+        let guard = SensitivePaths::new(&user, ".ours");
+        let world = crate::world::LocalFs::unfenced();
+        assert!(
+            guard
+                .references_in(
+                    r#"{"command":"cd stage && cat input && cd .."}"#,
+                    temp.path(),
+                    &world
+                )
+                .await
+        );
+        assert!(
+            guard
+                .references_in(
+                    r#"{"command":"cd stage && cat < input.txt && cd .."}"#,
+                    temp.path(),
+                    &world
+                )
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn review_subshell_cd_does_not_move_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let user = temp.path().join(".ours");
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::create_dir(temp.path().join("public")).unwrap();
+        std::fs::write(user.join("config.toml"), "FAKE").unwrap();
+        let guard = SensitivePaths::new(&user, ".ours");
+        let world = crate::world::LocalFs::unfenced();
+        assert!(
+            guard
+                .references_in(
+                    r#"{"command":"(cd ../public); cat config.toml"}"#,
+                    &user,
+                    &world
+                )
+                .await
+        );
+    }
+
     #[tokio::test]
     async fn relative_file_targets_use_the_execution_directory() {
         let temp = tempfile::tempdir().unwrap();
