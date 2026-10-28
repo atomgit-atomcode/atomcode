@@ -22,6 +22,46 @@
   英文界面读它，某个版本没有英文节时显示这里的中文节。Issues 只写在这份里，英文界面也显示这里的。
 -->
 
+## v5.2.5 (2026-10-28)
+
+### 概览
+
+这一版重点改善长任务的上下文管理与执行可靠性：修复长回合自动压缩及摘要失败后的有损降级，增强后台任务完成通知和会话恢复。新增 TUI 与 WebUI 共享的自动化任务管理、可配置的默认执行模式，并完善模型接入、历史阅读、远程访问及终端交互。
+
+### 更新内容
+
+- **长任务自动压缩更可靠**：修复单个回合持续执行时，旧内容未进入自动摘要的问题；压缩后用量回落、再次升高时，同一回合可以再次触发压缩。减少重复工具输出与工具 schema 的上下文占用，AtomGit 工具支持按需发现。
+- **摘要失败保护已确认的对话**：配置了摘要模型时，摘要报错、为空、截断、断流、超长或超时，不再直接裁掉旧对话；应急恢复也保留用户输入和助手结论。安全精简后仍超限时明确报错停止，服务恢复后可从原会话继续；显式无模型模式保持原有行为。
+- **统一自动化任务管理**：TUI 与 WebUI 使用共享的任务服务，支持管理自动化任务、执行计划及运行历史，并统一任务操作与结果查看入口。
+- **默认执行模式可配置**：新增 `[permissions].default_mode`，支持 `build`、`plan`、`accept-edits` 和 `auto`，也可从 `/config` 调整；新会话按配置起步，会话内仍可随时切换，显式跳过审批的启动参数优先。
+- **后台任务等待与完成通知**：改善构建、下载等后台工作的等待和完成通知，减少重复轮询；修正后台检查、命令退出状态及原生尾部预览的处理，避免误判任务完成或失败。
+- **模型配置与接入体验**：简化 Provider 连接设置，支持模型能力发现、批量添加和逐个编辑模型；明确批量模型确认与当前模型选择的区别。WebUI 按运行时的实际模型显示身份，登录过期时保留重新登录指引，本地 VPN 代理关闭后可自动恢复连接。
+- **历史会话与后台切换**：从原生事件日志读取完整历史，WebUI 可在对话内加载归档回合，保持助手消息与工具结果的原始顺序，并新增历史导航。交互式恢复限定在当前项目，隐藏不可用工作区；切换后台会话后正确展示最新内容。
+- **手机与远程访问**：WebUI 支持从浏览器启用手机中继访问，改善配对链接、远程分享、手机恢复及二维码展示；分享操作更明确，并保留兼容链接。
+- **终端输入与状态展示**：支持用 Tab 接受可见的历史补全；改善 SSH、PuTTY 和浏览器终端的粘贴、鼠标与字符兼容。待办已全部显示时不再提示展开，精简常规扫描和工具输出清理提示，调整重启提醒与上下文加载提示的位置，并减少面板切换时的临时分配。
+- **自定义指令参数校验**：支持声明指令参数，并在不同用户技能调用入口统一校验，避免遗漏必填参数或传入不符合声明的参数。
+- **语言服务与诊断**：支持配置 LSP 初始化参数并提供只读诊断；补充工具 schema 大小、后台任务时序及流式响应停滞阶段的诊断信息，方便定位上下文和等待问题。
+- **流式响应与执行边界**：完善不完整流式结束、工具调用片段及输出上限的处理，保留可用的用量和错误信息；修复禁用工具后仍可能发布工具目录的问题，并改善需求复核、团队角色优先级和待办收尾行为。
+
+### Issues
+
+本节收录 [v5.2.5 里程碑](https://atomgit.com/atomgit_atomcode/atomcode/milestones/1056767?iid=48)下的全部 issue，不区分状态。
+
+- [#669 [共创大赛]-[Feature] 请求体超出 20MB 限制时，应提供更主动的防护机制而非静默失败](https://atomgit.com/atomgit_atomcode/atomcode/issues/669)
+- [#781 [共创大赛] 指令文件读取无大小检查导致OOM](https://atomgit.com/atomgit_atomcode/atomcode/issues/781)
+- [#782 [共创大赛] memory文件超限时读取整个文件导致OOM](https://atomgit.com/atomgit_atomcode/atomcode/issues/782)
+- [#1682 [共创大赛][Bug] V5.2.3 SSH 终端复制粘贴无法兼容 PuTTY，体验较 V5.2.2 退化](https://atomgit.com/atomgit_atomcode/atomcode/issues/1682)
+- [#1684 内置工具每请求全量加载：41 个工具 ≈15K token 死重，导致上下文迅速膨胀、频繁压缩](https://atomgit.com/atomgit_atomcode/atomcode/issues/1684)
+- [#1685 默认执行模式无法配置：每个新会话都从 Build 起步，缺 Claude Code permissions.defaultMode 等价物](https://atomgit.com/atomgit_atomcode/atomcode/issues/1685)
+- [#1687 perf(tui): borrow layout known module ids as &str instead of allocating Vec<String>](https://atomgit.com/atomgit_atomcode/atomcode/issues/1687)
+- [#1688 [Feature][WebUI] WebUI 增加右侧"对话节点导航轨"(Turn navigation rail),支持按回合快速定位](https://atomgit.com/atomgit_atomcode/atomcode/issues/1688)
+- [#1689 weui的二维码也太大了吧，严重影响进一步操作，希望优化下](https://atomgit.com/atomgit_atomcode/atomcode/issues/1689)
+- [#1690 建议开源或发布 atomcode relay 服务端，支持自建中继](https://atomgit.com/atomgit_atomcode/atomcode/issues/1690)
+- [#1693 [Feature][LSP] 可配置/内置 LSP 初始化消息（initializationOptions）+ 逐项功能开关 + 自调试通道](https://atomgit.com/atomgit_atomcode/atomcode/issues/1693)
+- [#1695 [Bug] 共享会话期间 TUI 侧 /resume 被拒，webui/App 侧却能切换并同步回 TUI（两端规则不一致）](https://atomgit.com/atomgit_atomcode/atomcode/issues/1695)
+- [#1696 [共创大赛][Bug] 自定义指令的参数配置和校验功能在 tuix→tui 架构迁移后丢失](https://atomgit.com/atomgit_atomcode/atomcode/issues/1696)
+- [#1697 [Bug][Linux/SSH][TUI] 输入框里按 ↑/↓ 不调输入历史，反而滚动上方对话（指针交回 + mouse_reported 时单发箭头被当成滚轮）](https://atomgit.com/atomgit_atomcode/atomcode/issues/1697)
+
 ## v5.2.4 (2026-10-21)
 
 ### 概览
