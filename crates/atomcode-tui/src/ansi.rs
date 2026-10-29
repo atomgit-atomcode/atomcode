@@ -229,7 +229,9 @@ pub fn transcript(lines: &[Line], width: u16, caps: crate::caps::Caps) -> String
     out
 }
 
-/// Ask the terminal to report the pointer: button presses (1000) with SGR
+/// Disable alternate-scroll arrow translation before taking the pointer, so
+/// wheel reports cannot also become input-history keys. Then ask for button
+/// presses with SGR
 /// coordinates (1006), so columns past 223 are reportable at all.
 ///
 /// **This takes the mouse away from the terminal**, which is a real cost, not a
@@ -245,9 +247,10 @@ pub fn transcript(lines: &[Line], width: u16, caps: crate::caps::Caps) -> String
 /// pointer crossing cells with nothing held — is a separate switch
 /// ([`MOUSE_MOTION_ON`]) because it costs a packet per cell crossed, and only
 /// something that follows the pointer is worth that.
-pub const MOUSE_ON: &str = "\x1b[?1002h\x1b[?1006h";
-/// The exact inverse of [`MOUSE_ON`], and then some: it also turns off free
-/// motion, so the pointer can be handed back from any state.
+pub const MOUSE_ON: &str = "\x1b[?1007l\x1b[?1002h\x1b[?1006h";
+/// Release mouse reporting, including free motion, so the pointer can be
+/// handed back from any state. Alternate-scroll translation is a separate
+/// terminal policy; releasing reporting does not re-enable it.
 ///
 /// That extra term is not symmetry for its own sake. `MOUSE_MOTION_ON` is
 /// turned on and off while the program runs, so "the mouse is off" can be
@@ -267,7 +270,7 @@ pub const MOUSE_OFF: &str = "\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?1002l\x1b[?1
 /// event, and the pointer crosses cells all day. Whoever turns it on owes the
 /// terminal [`Pointer::Buttons`] — [`MOUSE_OFF`] covers the case where that
 /// debt is still outstanding when the mouse is handed back.
-pub const MOUSE_MOTION_ON: &str = "\x1b[?1003h";
+pub const MOUSE_MOTION_ON: &str = "\x1b[?1007l\x1b[?1003h\x1b[?1006h";
 
 /// Which setting the terminal's mouse tracker is on.
 ///
@@ -1354,7 +1357,16 @@ mod tests {
             !MOUSE_ON.contains("?1003"),
             "free motion comes on only for the thing that follows the pointer"
         );
-        assert_eq!(MOUSE_MOTION_ON, "\x1b[?1003h");
+        for owned in [MOUSE_ON, MOUSE_MOTION_ON] {
+            assert!(
+                owned.starts_with(ALT_SCROLL_OFF),
+                "stop wheel-to-arrow translation before taking the mouse"
+            );
+            assert!(
+                owned.contains("?1006h"),
+                "every captured state requests SGR reports"
+            );
+        }
         // One tracker, three settings, and each state names its own escape —
         // never a delta. This is the pair that matters: stopping the hover is
         // `Pointer::Buttons`, whose escape asks for button reporting outright,

@@ -311,12 +311,15 @@ pub fn cell_background_for(
 /// `[ui] mouse = true` as well, since that defaults off on HarmonyOS
 /// (`atomcode_config::config::default_mouse`).
 ///
+/// A confirmed tmux mouse=off also keeps capture disabled for this launch.
 /// Read once and kept — a launch-time environment variable, and this is asked
 /// per arrow burst, not once per screen.
 pub fn mouse_reported() -> bool {
     static REPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *REPORTED
-        .get_or_init(|| mouse_reported_for(cfg!(target_env = "ohos"), |k| std::env::var(k).ok()))
+    *REPORTED.get_or_init(|| {
+        mouse_reported_for(cfg!(target_env = "ohos"), |k| std::env::var(k).ok())
+            && !crate::tmux_mouse::disabled()
+    })
 }
 
 fn mouse_reported_for(ohos: bool, env: impl Fn(&str) -> Option<String>) -> bool {
@@ -326,9 +329,10 @@ fn mouse_reported_for(ohos: bool, env: impl Fn(&str) -> Option<String>) -> bool 
     }
 }
 
-/// Prefer client-owned copy/paste for SSH (which may identify only as xterm),
-/// explicit PuTTY terminals, and local browser terminal servers. This is a
-/// startup preference, not a capability gate: Ctrl+G can take the mouse later.
+/// Prefer real wheel reports for ordinary SSH as well as local terminals:
+/// terminal-owned wheel arrows are indistinguishable from keyboard input.
+/// Explicit PuTTY/browser terminals retain native copy/paste at startup; this
+/// is a preference, not a capability gate: Ctrl+G can take the mouse later.
 pub(crate) fn take_mouse_at_start() -> bool {
     take_mouse_at_start_with_browser(
         |key| std::env::var_os(key).map(|v| v.to_string_lossy().into_owned()),
@@ -345,7 +349,7 @@ fn take_mouse_at_start_with_browser(env: impl Fn(&str) -> Option<String>, browse
     if let Some(forced) = env("ATOMCODE_MOUSE").filter(|v| !v.is_empty()) {
         return forced == "1" || forced.eq_ignore_ascii_case("true");
     }
-    !browser && !remote_session_for(&env) && !putty_for(&env)
+    !browser && !putty_for(&env)
 }
 
 fn putty_for(env: &dyn Fn(&str) -> Option<String>) -> bool {
@@ -1011,17 +1015,29 @@ mod tests {
     }
 
     #[test]
-    fn ssh_and_putty_do_not_disable_application_mouse_support() {
+    fn ssh_keeps_wheel_events_distinct_from_keyboard_arrows() {
+        // SSH normally forwards only TERM; cmd.exe and PowerShell are local
+        // shells and do not provide a reliable terminal identity on Ubuntu.
+        for key in ["SSH_CONNECTION", "SSH_TTY", "SSH_CLIENT"] {
+            let vars = [(key, "remote"), ("TERM", "xterm-256color")];
+            let env = env_of(&vars);
+            assert!(take_mouse_at_start_for(&env), "{key}");
+            assert!(mouse_reported_for(false, &env), "{key}");
+            assert!(
+                !take_mouse_at_start_with_browser(&env, true),
+                "browser override"
+            );
+        }
         for vars in [
-            vec![("SSH_CONNECTION", "client server"), ("TERM", "xterm")],
-            vec![("SSH_TTY", "/dev/pts/0")],
-            vec![("SSH_CLIENT", "client 123 22")],
             vec![("TERM", "putty-256color")],
-            vec![("TERM_PROGRAM", "PuTTY")],
+            vec![("TERM_PROGRAM", "PuTTY"), ("SSH_TTY", "/dev/pts/0")],
         ] {
             let env = env_of(&vars);
-            assert!(!take_mouse_at_start_for(&env), "{vars:?}");
-            assert!(mouse_reported_for(false, &env), "{vars:?}");
+            assert!(
+                !take_mouse_at_start_for(&env),
+                "explicit PuTTY keeps native selection"
+            );
+            assert!(mouse_reported_for(false, &env));
         }
     }
 

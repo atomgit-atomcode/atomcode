@@ -1580,6 +1580,7 @@ pub enum Msg<'a> {
     MouseHandedBackAtStart,
     /// The terminal reports no mouse (HarmonyOS): what works instead, at start.
     MouseUnreportedAtStart,
+    MouseDisabledByTmux,
     /// ctrl-g on a terminal that reports no mouse.
     MouseUnreported,
     /// Said once, after a turn whose reasoning is off the screen: the key that

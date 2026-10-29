@@ -761,6 +761,9 @@ impl Surface for Headless {
     /// that matters is derived from the pair rather than from either one.
     fn set_mouse(&self, on: bool) {
         use std::sync::atomic::Ordering;
+        // Settings updates and explicit toggles share the same effective gate:
+        // a confirmed tmux mouse=off must not be bypassed by a later refresh.
+        let on = on && crate::caps::mouse_reported();
         if self.grab.swap(on, Ordering::SeqCst) == on {
             return;
         }
@@ -2507,6 +2510,9 @@ impl Surface for Terminal {
     }
     fn set_mouse(&self, on: bool) {
         use std::sync::atomic::Ordering;
+        // Apply the same capability/tmux gate as startup and explicit Ctrl+G,
+        // including settings refreshes that call the surface directly.
+        let on = on && crate::caps::mouse_reported();
         if self.grab.swap(on, Ordering::SeqCst) == on {
             return;
         }
@@ -3212,6 +3218,50 @@ mod tests {
         assert_eq!(slots.len(), 16);
     }
     use super::*;
+
+    #[test]
+    fn real_terminal_settings_cannot_bypass_a_disabled_mouse_gate() {
+        // A child provides a cold capability cache without changing parallel tests' env.
+        const CHILD: &str = "ATOMCODE_TEST_MOUSE_GATE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "surface::tests::real_terminal_settings_cannot_bypass_a_disabled_mouse_gate",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("ATOMCODE_MOUSE", "0")
+                .env_remove("TMUX")
+                .env_remove("TMUX_PANE")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let terminal = Terminal {
+            raw: false,
+            state: std::sync::atomic::AtomicU8::new(pointer_state(ansi::Pointer::Terminal)),
+            grab: std::sync::atomic::AtomicBool::new(false),
+            hover: std::sync::atomic::AtomicBool::new(false),
+            caps: crate::caps::Caps::default(),
+            painted: LastPainted::default(),
+            startup: Mutex::new(None),
+            link_hover: Mutex::new(link_pointer::LinkHover::default()),
+            #[cfg(target_os = "linux")]
+            clipboard: Mutex::new(None),
+            // Exercise the actual terminal setter without writing to a real tty.
+            away: std::sync::atomic::AtomicBool::new(true),
+            stderr: None,
+            margin: 0,
+        };
+        terminal.set_mouse(true);
+        assert!(
+            !terminal.mouse(),
+            "settings bypassed the effective mouse gate"
+        );
+        assert_eq!(terminal.pointer_mode(), ansi::Pointer::Terminal);
+    }
 
     /// A console's own mode is the answer where there is a console: crossterm
     /// says yes whenever `TERM` is set even if turning the mode on failed, and

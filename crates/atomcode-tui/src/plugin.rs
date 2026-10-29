@@ -1688,7 +1688,9 @@ impl UserInterface for Tui {
             .and_then(|notices| notices.welcome_note.clone());
         let launcher_note_pending = welcome_note.is_some();
         let native_mouse_notice = (!self.surface.mouse()).then(|| {
-            t(if crate::caps::mouse_reported() {
+            t(if crate::tmux_mouse::disabled() {
+                Msg::MouseDisabledByTmux
+            } else if crate::caps::mouse_reported() {
                 Msg::MouseHandedBackAtStart
             } else {
                 Msg::MouseUnreportedAtStart
@@ -8456,8 +8458,13 @@ impl Tui {
                 // Nothing to take on a terminal that reports no mouse: taking it
                 // would only stop the terminal's own selection.
                 if !self.surface.mouse() && !crate::caps::mouse_reported() {
+                    let why = if crate::tmux_mouse::disabled() {
+                        Msg::MouseDisabledByTmux
+                    } else {
+                        Msg::MouseUnreported
+                    };
                     self.host
-                        .say_for(t(Msg::MouseUnreported).into_owned(), false, MOUSE_NOTICE_MS);
+                        .say_for(t(why).into_owned(), false, MOUSE_NOTICE_MS);
                     return false;
                 }
                 let on = !self.surface.mouse();

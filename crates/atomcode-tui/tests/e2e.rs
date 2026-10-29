@@ -4527,6 +4527,59 @@ async fn a_drag_held_at_the_edge_keeps_scrolling() {
     let _ = task.await;
 }
 
+/// Real mouse reports must never recall input history, including when the
+/// pointer is over the composer. This is the SSH startup path: unlike arrows
+/// synthesized by a terminal, wheel reports carry their own event identity.
+#[tokio::test]
+async fn reported_wheel_scrolls_only_the_conversation_and_arrows_recall_history() {
+    let dir = scratch("wheel-not-history");
+    let s = start(tree(&dir, &replay(&sixty_lines()), &[])).await;
+    let task = s.open().await;
+    s.term.type_line("PREVIOUS_HOURLY_PROMPT");
+    until(&s, "LINE-60").await;
+    s.term.type_text("UNSENT_DRAFT");
+    s.quiet().await;
+    assert!(s.term.mouse());
+    let input_before = part_text(&s, "input");
+    let stream_before = part_text(&s, "stream");
+    let input = s.term.last().unwrap().part("input").unwrap().rect;
+    for _ in 0..3 {
+        s.term.pointer(
+            atomcode_tui::surface::Click::WheelUp,
+            input.x + 2,
+            input.y + 1,
+        );
+    }
+    s.quiet().await;
+    assert_eq!(
+        part_text(&s, "input"),
+        input_before,
+        "wheel must not replace a draft with history"
+    );
+    assert_ne!(
+        part_text(&s, "stream"),
+        stream_before,
+        "wheel must scroll the conversation"
+    );
+    for _ in 0..3 {
+        s.term.pointer(
+            atomcode_tui::surface::Click::WheelDown,
+            input.x + 2,
+            input.y + 1,
+        );
+    }
+    s.quiet().await;
+    assert_eq!(part_text(&s, "input"), input_before);
+    s.term.press(KeyPress::plain(Key::Up));
+    s.quiet().await;
+    assert!(part_text(&s, "input").contains("PREVIOUS_HOURLY_PROMPT"));
+    s.term.press(KeyPress::plain(Key::Down));
+    s.quiet().await;
+    assert!(part_text(&s, "input").contains("UNSENT_DRAFT"));
+    task.abort();
+    let _ = task.await;
+}
+
 /// The wheel moves the view and leaves a conversation selection where it was:
 /// scrolled away and back, it is still there for the menu to copy.
 #[tokio::test]
@@ -10742,11 +10795,10 @@ async fn recalled_slash_history_waits_for_an_edit_before_opening_the_menu() {
 /// **The wheel with the mouse handed back scrolls, it does not step the input
 /// history.** With the pointer the terminal's (ctrl+g), iTerm2 and Terminal.app
 /// send the wheel as arrow keys, and ↑ in an empty composer recalls the last
-/// prompt — every notch put an old line in the box. A slow swipe arrives as
-/// lone arrows, the same bytes as a keypress, so while the pointer is handed
-/// back every ↑/↓ that would reach the composer scrolls, and the history moves
-/// to ctrl-p/ctrl-n; the tip row says so once and fades, the status row says
-/// nothing. With the mouse ours, ↑ recalls as it always did.
+/// prompt. Confirmed multi-arrow bursts scroll while handed back; lone arrows
+/// have keyboard semantics because their source is ambiguous. Real mouse
+/// reports avoid that ambiguity. The tip row names ownership; the status row
+/// says nothing. With the mouse ours, ↑ recalls as it always did.
 #[tokio::test]
 async fn the_wheel_as_arrows_scrolls_while_the_mouse_is_handed_back() {
     let dir = scratch("wheel-arrows");
@@ -10767,8 +10819,8 @@ async fn the_wheel_as_arrows_scrolls_while_the_mouse_is_handed_back() {
     let before = composer(&s);
 
     // Handed back: said once, on the tip row — not the status row — and a
-    // notch scrolls, whether it arrives as a burst or as a lone arrow (a slow
-    // swipe), because the two are the same bytes as a keypress.
+    // confirmed multi-arrow notch scrolls. Single native wheel arrows cannot
+    // be distinguished from keyboard presses and are not simulated as bursts.
     s.term.press(KeyPress::ctrl('g'));
     until(&s, &handed).await;
     // In-flight reports must not bring the app's menu back or paste the
@@ -10808,7 +10860,6 @@ async fn the_wheel_as_arrows_scrolls_while_the_mouse_is_handed_back() {
         s.screen()
     );
     s.term.arrows(true, 3);
-    s.term.arrows(true, 1);
     s.quiet().await;
     assert_eq!(
         composer(&s),

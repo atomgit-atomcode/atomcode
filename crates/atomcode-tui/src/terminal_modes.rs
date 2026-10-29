@@ -8,7 +8,21 @@ use std::io::{self, Write};
 pub(crate) fn pointer(
     writer: &mut impl Write,
     mode: crate::ansi::Pointer,
+    capture: impl FnMut(bool) -> io::Result<()>,
+) -> io::Result<()> {
+    pointer_with_alternate_scroll(
+        writer,
+        mode,
+        capture,
+        crate::ansi::alternate_scroll_enabled(),
+    )
+}
+
+fn pointer_with_alternate_scroll(
+    writer: &mut impl Write,
+    mode: crate::ansi::Pointer,
     mut capture: impl FnMut(bool) -> io::Result<()>,
+    native_alternate_scroll: bool,
 ) -> io::Result<()> {
     use crate::ansi::{Pointer, MOUSE_ON};
     let enabled = mode != Pointer::Terminal;
@@ -31,9 +45,15 @@ pub(crate) fn pointer(
         }
         result
     } else {
-        let encoded = writer
-            .write_all(mode.escape().as_bytes())
-            .and_then(|()| writer.flush());
+        let encoded = (|| {
+            writer.write_all(mode.escape().as_bytes())?;
+            // HiShell's native wheel needs 1007. Restore its existing policy
+            // when handing back after capture disabled arrow translation.
+            if native_alternate_scroll {
+                writer.write_all(crate::ansi::ALT_SCROLL_ON.as_bytes())?;
+            }
+            writer.flush()
+        })();
         native.and(encoded)
     }
 }
@@ -394,6 +414,34 @@ mod tests {
             Ok(())
         }
     }
+    #[test]
+    fn native_handoff_restores_only_the_platforms_alternate_scroll_policy() {
+        for native_scroll in [false, true] {
+            let mut bytes = Vec::new();
+            pointer_with_alternate_scroll(
+                &mut bytes,
+                crate::ansi::Pointer::Terminal,
+                |_| Ok(()),
+                native_scroll,
+            )
+            .unwrap();
+            let text = String::from_utf8(bytes).unwrap();
+            assert!(text.starts_with(crate::ansi::MOUSE_OFF));
+            assert_eq!(text.contains(crate::ansi::ALT_SCROLL_ON), native_scroll);
+            let mut captured = Vec::new();
+            pointer_with_alternate_scroll(
+                &mut captured,
+                crate::ansi::Pointer::Buttons,
+                |_| Ok(()),
+                native_scroll,
+            )
+            .unwrap();
+            let text = String::from_utf8(captured).unwrap();
+            assert!(text.starts_with(crate::ansi::ALT_SCROLL_OFF));
+            assert!(!text.contains(crate::ansi::ALT_SCROLL_ON));
+        }
+    }
+
     #[test]
     fn native_capture_precedes_sgr_and_hover_always_gets_sgr() {
         for mode in [
