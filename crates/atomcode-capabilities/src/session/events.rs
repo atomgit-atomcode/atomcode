@@ -492,27 +492,15 @@ impl SessionManager {
             })
             .next_back();
 
-        // A failed result excludes the call it answered, keyed by the position
-        // that call was made at — the same rule the transcript fold applies by
-        // message order. Ids alone would let a provider that reuses them across
-        // turns drop a later call the model still sees.
-        let failed: std::collections::HashSet<(u64, u32, &str)> = events
-            .iter()
-            .filter(|logged| !undone.contains(&logged.event.turn()))
-            .filter(|logged| boundary.is_none_or(|(seq, _)| logged.seq > seq))
-            .filter_map(|logged| match &logged.event {
-                SessionEvent::ToolResultLogged {
-                    turn,
-                    round,
-                    call_id,
-                    is_error: true,
-                    ..
-                } => Some((*turn, *round, call_id.as_str())),
-                _ => None,
-            })
-            .collect();
-
+        // A failed result excludes the call it answered — the latest earlier
+        // call with that id, the same association the transcript fold makes by
+        // message order. Keyed by id alone, one turn's failure would drop a
+        // later turn that reused the id; keyed by turn and round it could miss
+        // a result filed under another round.
         let mut calls: Vec<(u64, u32, u32, &str, &str)> = Vec::new();
+        let mut failed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut latest: std::collections::HashMap<&str, Option<usize>> =
+            std::collections::HashMap::new();
         for logged in &events {
             if undone.contains(&logged.event.turn()) {
                 continue;
@@ -520,28 +508,47 @@ impl SessionManager {
             if boundary.is_some_and(|(seq, _)| logged.seq <= seq) {
                 continue;
             }
-            let SessionEvent::AssistantMessage {
-                turn,
-                round,
-                tool_calls,
-                ..
-            } = &logged.event
-            else {
-                continue;
-            };
-            for (index, call) in tool_calls.iter().enumerate() {
-                if !is_todo_call(&call.name) || failed.contains(&(*turn, *round, call.id.as_str()))
-                {
-                    continue;
+            match &logged.event {
+                SessionEvent::AssistantMessage {
+                    turn,
+                    round,
+                    tool_calls,
+                    ..
+                } => {
+                    for (index, call) in tool_calls.iter().enumerate() {
+                        if is_todo_call(&call.name) {
+                            latest.insert(call.id.as_str(), Some(calls.len()));
+                            calls.push((
+                                *turn,
+                                *round,
+                                u32::try_from(index).unwrap_or(u32::MAX),
+                                call.name.as_str(),
+                                call.arguments.as_str(),
+                            ));
+                        } else {
+                            latest.insert(call.id.as_str(), None);
+                        }
+                    }
                 }
-                calls.push((
-                    *turn,
-                    *round,
-                    u32::try_from(index).unwrap_or(u32::MAX),
-                    call.name.as_str(),
-                    call.arguments.as_str(),
-                ));
+                SessionEvent::ToolResultLogged {
+                    call_id,
+                    is_error: true,
+                    ..
+                } => {
+                    if let Some(Some(position)) = latest.get(call_id.as_str()) {
+                        failed.insert(*position);
+                    }
+                }
+                _ => {}
             }
+        }
+        if !failed.is_empty() {
+            calls = calls
+                .into_iter()
+                .enumerate()
+                .filter(|(position, _)| !failed.contains(position))
+                .map(|(_, call)| call)
+                .collect();
         }
 
         let has_plan = calls
@@ -6300,6 +6307,97 @@ mod tests {
             .expect("the later call shapes the list");
         assert_eq!(sidecar.todos.len(), 1, "{sidecar:?}");
         assert_eq!(sidecar.todos[0].content, "later");
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
+    fn the_sidecar_fold_matches_a_result_to_the_call_it_followed() {
+        use atomcode_kernel::tool::ToolCall;
+
+        let (_dir, manager) = store();
+        let id = "failed-result-other-round";
+        let lease = created(&manager, id);
+        let plan = ToolCall {
+            id: "p".into(),
+            name: "todowrite".into(),
+            arguments: r#"{"todos":[{"content":"failed","status":"pending"}]}"#.into(),
+        };
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "hello".into(),
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        3,
+                        0,
+                        SessionEvent::AssistantMessage {
+                            turn: 1,
+                            round: 1,
+                            text: String::new(),
+                            reasoning: String::new(),
+                            tool_calls: vec![plan],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    // A rewritten transcript can file the result under another
+                    // round; the fold still binds it to the call it follows.
+                    logged(
+                        4,
+                        0,
+                        SessionEvent::ToolResultLogged {
+                            turn: 1,
+                            round: 2,
+                            call_id: "p".into(),
+                            content: "denied".into(),
+                            is_error: true,
+                            images: vec![],
+                        },
+                    ),
+                    logged(6, 0, SessionEvent::TurnStart { turn: 2 }),
+                    logged(
+                        7,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 2,
+                            text: "undo".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    8,
+                    0,
+                    SessionEvent::Rewound {
+                        turn: 2,
+                        to: 6,
+                        scope: RewindScope::Conversation,
+                    },
+                )],
+            )
+            .unwrap();
+
+        let sidecar = manager.read_todo_sidecar(id).unwrap();
+        assert!(
+            sidecar
+                .as_ref()
+                .is_none_or(|sidecar| sidecar.todos.is_empty()),
+            "the call the failed result answered is not part of the list: {sidecar:?}"
+        );
     }
 
     #[cfg(feature = "tools")]
