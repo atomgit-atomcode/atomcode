@@ -2911,7 +2911,11 @@ mod tests {
             );
             assert_eq!(
                 manager.read_resume_replay(id).unwrap(),
-                Some(ResumeReplay { to: 1, turn: 1 })
+                Some(ResumeReplay {
+                    to: 1,
+                    turn: 1,
+                    rewound: None
+                })
             );
             assert!(!manager
                 .load_events(id)
@@ -3018,7 +3022,11 @@ mod tests {
         );
         assert_eq!(
             manager.read_resume_replay(id).unwrap(),
-            Some(ResumeReplay { to: 1, turn: 1 })
+            Some(ResumeReplay {
+                to: 1,
+                turn: 1,
+                rewound: None
+            })
         );
         manager.prepare_resume_replay(&lease).unwrap();
 
@@ -3037,7 +3045,11 @@ mod tests {
         );
         assert_eq!(
             manager.read_resume_replay(id).unwrap(),
-            Some(ResumeReplay { to: 1, turn: 1 })
+            Some(ResumeReplay {
+                to: 1,
+                turn: 1,
+                rewound: Some(3),
+            })
         );
         let rewinds = || {
             manager
@@ -3132,7 +3144,14 @@ mod tests {
             )
             .unwrap();
         manager
-            .write_resume_replay(id, &ResumeReplay { to: 1, turn: 1 })
+            .write_resume_replay(
+                id,
+                &ResumeReplay {
+                    to: 1,
+                    turn: 1,
+                    rewound: None,
+                },
+            )
             .unwrap();
 
         let (loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
@@ -3150,7 +3169,11 @@ mod tests {
         );
         assert_eq!(
             manager.read_resume_replay(id).unwrap(),
-            Some(ResumeReplay { to: 1, turn: 1 })
+            Some(ResumeReplay {
+                to: 1,
+                turn: 1,
+                rewound: None
+            })
         );
         assert!(!manager
             .load_events(id)
@@ -3167,7 +3190,11 @@ mod tests {
         );
         assert_eq!(
             manager.read_resume_replay(id).unwrap(),
-            Some(ResumeReplay { to: 1, turn: 1 })
+            Some(ResumeReplay {
+                to: 1,
+                turn: 1,
+                rewound: Some(3),
+            })
         );
         assert_eq!(
             manager
@@ -3178,6 +3205,98 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn a_user_undo_with_the_same_target_before_prepare_is_not_replayed() {
+        let (_dir, manager) = store();
+        let id = "resume-user-undo-before";
+        let lease = created(&manager, id);
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "hello".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        // A load records the target but no rewind; a user's undo of that same
+        // turn must not be mistaken for the resume's own retraction.
+        let (_loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
+        assert!(pending.is_some());
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    3,
+                    0,
+                    SessionEvent::Rewound {
+                        turn: 1,
+                        to: 1,
+                        scope: RewindScope::Conversation,
+                    },
+                )],
+            )
+            .unwrap();
+
+        let (_loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
+        assert!(pending.is_none());
+        assert!(manager.read_resume_replay(id).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_user_undo_with_the_same_target_after_prepare_retires_the_replay() {
+        let (_dir, manager) = store();
+        let id = "resume-user-undo-after";
+        let lease = created(&manager, id);
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "hello".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        let (_loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
+        assert!(pending.is_some());
+        manager.prepare_resume_replay(&lease).unwrap();
+        // The person undoes the same turn after resume prepared its own rewind.
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    4,
+                    0,
+                    SessionEvent::Rewound {
+                        turn: 1,
+                        to: 1,
+                        scope: RewindScope::Conversation,
+                    },
+                )],
+            )
+            .unwrap();
+
+        let (_loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
+        assert!(pending.is_none());
+        assert!(manager.read_resume_replay(id).unwrap().is_none());
     }
 
     #[test]
@@ -3276,7 +3395,11 @@ mod tests {
         );
         assert_eq!(
             manager.read_resume_replay(id).unwrap(),
-            Some(ResumeReplay { to: 4, turn: 2 })
+            Some(ResumeReplay {
+                to: 4,
+                turn: 2,
+                rewound: Some(6),
+            })
         );
         assert_eq!(
             manager
@@ -3452,7 +3575,11 @@ mod tests {
         );
         assert_eq!(
             manager.read_resume_replay(id).unwrap(),
-            Some(ResumeReplay { to: 1, turn: 1 })
+            Some(ResumeReplay {
+                to: 1,
+                turn: 1,
+                rewound: None
+            })
         );
         assert!(!manager
             .load_events(id)

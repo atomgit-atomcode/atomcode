@@ -703,6 +703,10 @@ pub(crate) struct ResumeReplay {
     pub to: SeqNo,
     /// The turn whose accepted prompt is waiting to be replayed.
     pub turn: u64,
+    /// The exact `Rewound` this resume committed, once it has. Without it a
+    /// user's own undo with the same `to` would be mistaken for ours.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rewound: Option<SeqNo>,
 }
 
 /// What [`SessionManager::prepare_resume_replay`] decided.
@@ -734,6 +738,7 @@ fn pending_replay_prompt(events: &[LoggedEvent], replay: &ResumeReplay) -> Pendi
         .iter()
         .find(|logged| {
             logged.seq > replay.to
+                && replay.rewound == Some(logged.seq)
                 && matches!(
                     &logged.event,
                     SessionEvent::Rewound { to, scope, .. }
@@ -744,6 +749,18 @@ fn pending_replay_prompt(events: &[LoggedEvent], replay: &ResumeReplay) -> Pendi
     else {
         return PendingReplay::Stale;
     };
+    // A later user rewind that reaches the same turn retires the prompt, even
+    // though our own rewind is still in the log.
+    if events.iter().any(|logged| {
+        logged.seq > rewound_at
+            && matches!(
+                &logged.event,
+                SessionEvent::Rewound { to, scope, .. }
+                    if scope.takes_back_conversation() && *to <= replay.to
+            )
+    }) {
+        return PendingReplay::Stale;
+    }
     if events.iter().any(|logged| {
         logged.seq > rewound_at && matches!(logged.event, SessionEvent::TurnStart { .. })
     }) {
@@ -1827,7 +1844,11 @@ impl SessionManager {
         // actually about to send it (`prepare_resume_replay`). Record the exact
         // target so prepare retracts what was handed back, not whatever the log
         // says later.
-        let replay = ResumeReplay { to, turn };
+        let replay = ResumeReplay {
+            to,
+            turn,
+            rewound: None,
+        };
         if let Err(error) = self.write_resume_replay(id, &replay) {
             notes.push(format!(
                 "the prompt session {id} accepted before its turn was answered \
@@ -1909,9 +1930,11 @@ impl SessionManager {
             let Some((to, turn, _)) = super::events::unanswered_prompt(&events) else {
                 return Ok(PrepareResumeReplay::Prepared);
             };
-            let replay = ResumeReplay { to, turn };
-            self.write_resume_replay(id, &replay)?;
-            replay
+            ResumeReplay {
+                to,
+                turn,
+                rewound: None,
+            }
         };
         let seq = events
             .iter()
@@ -1919,6 +1942,17 @@ impl SessionManager {
             .max()
             .unwrap_or(0)
             .saturating_add(1);
+        // Record the exact rewind this prepare is about to append. A user undo
+        // with the same `to` has a different sequence number and must not be
+        // mistaken for it.
+        self.write_resume_replay(
+            id,
+            &ResumeReplay {
+                to: target.to,
+                turn: target.turn,
+                rewound: Some(seq),
+            },
+        )?;
         let rewound = LoggedEvent {
             seq,
             at: u64::try_from(super::now_ms()).unwrap_or(0),

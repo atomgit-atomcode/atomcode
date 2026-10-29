@@ -10832,15 +10832,22 @@ fn replay_pending_resume_prompt(
         runtime_phase_state(generation, RuntimePhase::InTurn),
         Ordering::Release,
     );
-    if send_agent_command(
-        agent,
-        AgentCommand::SendMessage {
-            text: prompt.text,
-            images: prompt.images,
-        },
-    ) {
-        binding.pending_resume_prompt = None;
-    } else {
+    let command = AgentCommand::SendMessage {
+        text: prompt.text,
+        images: prompt.images,
+    };
+    let unsent = match agent.as_ref() {
+        Some(agent) => agent.commands.send(command).err().map(|error| error.0),
+        None => Some(command),
+    };
+    if let Some(AgentCommand::SendMessage { text, images }) = unsent {
+        // The prepared rewind stands; put the prompt back so a rebuild or a
+        // provider change can retry it instead of leaving it hidden.
+        binding.pending_resume_prompt = Some(if images.is_empty() {
+            atomcode_kernel::message::Message::user(text)
+        } else {
+            atomcode_kernel::message::Message::user_with_images(text, images)
+        });
         *agent_available = false;
         *active_turn = None;
         runtime_state.store(
