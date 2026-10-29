@@ -1934,10 +1934,18 @@ impl SessionManager {
                     let _ = self.clear_resume_replay(id);
                     return Ok(PrepareResumeReplay::Obsolete);
                 }
+                PendingReplay::StillWaiting(_) => {
+                    // The marker's rewind is committed for a prompt this
+                    // runtime does not hold. Keep the marker — it is the only
+                    // record of that retracted prompt — and do not send this
+                    // copy beside it; the next resume hands the log's prompt
+                    // back and replays that.
+                    return Ok(PrepareResumeReplay::Obsolete);
+                }
                 // The marker has no retraction this prompt can use yet. Retract
                 // its exact target, not a freshly chosen last turn, and only
                 // while that target still holds the prompt being replayed.
-                PendingReplay::StillWaiting(_) | PendingReplay::Stale => {
+                PendingReplay::Stale => {
                     let Some(visible) =
                         super::events::unanswered_at(&events, replay.to, replay.turn)
                     else {

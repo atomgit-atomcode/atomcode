@@ -3703,6 +3703,90 @@ mod tests {
     }
 
     #[test]
+    fn a_mismatched_prompt_keeps_the_committed_retraction() {
+        let (_dir, manager) = store();
+        let id = "resume-replay-kept";
+        let lease = created(&manager, id);
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "hello".into(),
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        3,
+                        0,
+                        SessionEvent::Rewound {
+                            turn: 1,
+                            to: 1,
+                            scope: RewindScope::Conversation,
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        manager
+            .write_resume_replay(
+                id,
+                &ResumeReplay {
+                    to: 1,
+                    turn: 1,
+                    rewound: Some(3),
+                },
+            )
+            .unwrap();
+
+        // A copy that is not the retracted prompt must not be sent, and must
+        // not take the marker — the only record of the retracted prompt — with
+        // it.
+        assert_eq!(
+            manager
+                .prepare_resume_replay(&lease, &Message::user("other"))
+                .unwrap(),
+            PrepareResumeReplay::Obsolete
+        );
+        assert_eq!(
+            manager.read_resume_replay(id).unwrap(),
+            Some(ResumeReplay {
+                to: 1,
+                turn: 1,
+                rewound: Some(3)
+            })
+        );
+        assert_eq!(
+            manager
+                .load_events(id)
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(event.event, SessionEvent::Rewound { .. }))
+                .count(),
+            1
+        );
+
+        // The next resume hands the log's prompt back, and preparing it is a
+        // no-op on the rewind already committed.
+        let (_loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
+        assert_eq!(
+            pending.map(|message| message.text),
+            Some("hello".to_string())
+        );
+        assert_eq!(
+            manager
+                .prepare_resume_replay(&lease, &Message::user("hello"))
+                .unwrap(),
+            PrepareResumeReplay::Prepared
+        );
+    }
+
+    #[test]
     fn an_unreadable_marker_does_not_strand_the_visible_prompt() {
         let (dir, manager) = store();
         let id = "resume-replay-unreadable";
