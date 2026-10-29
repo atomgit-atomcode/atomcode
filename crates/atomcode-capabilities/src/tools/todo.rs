@@ -382,36 +382,45 @@ pub fn active_todo_calls(messages: &[Message]) -> Vec<ActiveTodoCall<'_>> {
         .iter()
         .rposition(Message::is_user_interruption)
         .map_or(messages, |index| &messages[index + 1..]);
-    let mut calls = Vec::new();
-    let mut pending = std::collections::HashMap::new();
+    // Each failed result excludes the call it answered — the nearest earlier
+    // message that made a call with that id — not every call sharing the id.
+    // A provider that reuses ids across turns must not let one turn's failure
+    // drop a later turn's call.
     let mut failed = std::collections::HashSet::new();
-    for message in active_messages {
-        for (index, call) in message.tool_calls.iter().enumerate() {
-            // IDs can be reused in a later round. A settlement belongs to this
-            // occurrence, never every historical call carrying the same ID.
-            pending.remove(call.id.as_str());
-            if is_todo_call(&call.name) {
-                pending.insert(call.id.as_str(), calls.len());
-                calls.push(ActiveTodoCall {
-                    call,
-                    meta: message.meta.as_ref(),
-                    index,
-                });
-            }
+    for (index, message) in active_messages.iter().enumerate() {
+        if !message.is_error {
+            continue;
         }
-        if let Some(call_id) = message.tool_call_id.as_deref() {
-            if let Some(index) = pending.remove(call_id) {
-                if message.is_error {
-                    failed.insert(index);
-                }
-            }
+        let Some(id) = message.tool_call_id.as_deref() else {
+            continue;
+        };
+        let answered = active_messages[..index].iter().enumerate().rev().find_map(
+            |(message_index, earlier)| {
+                earlier
+                    .tool_calls
+                    .iter()
+                    .position(|call| call.id == id)
+                    .map(|call_index| (message_index, call_index))
+            },
+        );
+        if let Some(call) = answered {
+            failed.insert(call);
         }
     }
-    calls
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, call)| (!failed.contains(&index)).then_some(call))
-        .collect()
+    let mut active = Vec::new();
+    for (message_index, message) in active_messages.iter().enumerate() {
+        for (call_index, call) in message.tool_calls.iter().enumerate() {
+            if !is_todo_call(&call.name) || failed.contains(&(message_index, call_index)) {
+                continue;
+            }
+            active.push(ActiveTodoCall {
+                call,
+                meta: message.meta.as_ref(),
+                index: call_index,
+            });
+        }
+    }
+    active
 }
 
 /// Stateless full-list-replace todo tool. No interior state — current list is derived
@@ -1018,6 +1027,21 @@ mod tests {
         let todos = derive_current_todos(&messages);
         assert_eq!(todos.len(), 3);
         assert!(todos.iter().all(|todo| todo.content != "task 4"));
+    }
+
+    #[test]
+    fn a_reused_call_id_does_not_carry_an_older_failure_forward() {
+        // Some OpenAI-compatible providers number calls per response, so the
+        // same id can name one call in each turn. A failed call in turn 1 must
+        // not drop the todo call turn 2 made under that id.
+        let messages = vec![
+            write_call("call_0", PLAN3),
+            Message::tool_result("call_0", "plan rejected", true),
+            write_call("call_0", r#"{"action":"add","content":"later"}"#),
+        ];
+        let calls = active_todo_calls(&messages);
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].call.arguments.contains("later"));
     }
 
     #[test]
