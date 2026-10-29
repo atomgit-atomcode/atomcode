@@ -6384,11 +6384,13 @@ mod tests {
             &source_meta,
         )
         .unwrap();
+        #[cfg(feature = "tools")]
         let todo_through = TodoCallPosition {
             turn: 1,
             round: 1,
             index: 0,
         };
+        #[cfg(feature = "tools")]
         mgr.write_todo_sidecar(
             "source",
             &[TodoSidecarItem {
@@ -6425,14 +6427,17 @@ mod tests {
                 base_turn_count: 2,
             })
         );
-        let sidecar = mgr
-            .read_todo_sidecar("destination")
-            .unwrap()
-            .expect("the fork carries the plan");
-        assert_eq!(sidecar.todos.len(), 1);
-        assert_eq!(sidecar.todos[0].content, "a");
-        assert_eq!(sidecar.todos[0].status, "in_progress");
-        assert_eq!(sidecar.through, Some(todo_through));
+        #[cfg(feature = "tools")]
+        {
+            let sidecar = mgr
+                .read_todo_sidecar("destination")
+                .unwrap()
+                .expect("the fork carries the plan");
+            assert_eq!(sidecar.todos.len(), 1);
+            assert_eq!(sidecar.todos[0].content, "a");
+            assert_eq!(sidecar.todos[0].status, "in_progress");
+            assert_eq!(sidecar.through, Some(todo_through));
+        }
         assert_eq!(mgr.load_native_session("source").unwrap().meta, source_meta);
         assert!(matches!(
             mgr.acquire_lease("source"),
