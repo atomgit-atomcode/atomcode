@@ -8,6 +8,32 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+/// Directories installed alongside skills by runtimes and development tools.
+/// This applies to discovered children, never an explicitly configured root.
+fn ignored_discovery_directory(path: &Path) -> bool {
+    const IGNORED: &[&str] = &[
+        ".venv",
+        "venv",
+        "node_modules",
+        ".git",
+        ".hg",
+        ".svn",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".tox",
+        ".nox",
+    ];
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            IGNORED
+                .iter()
+                .any(|ignored| name.eq_ignore_ascii_case(ignored))
+        })
+}
+
 /// The caller identifies the role of a directory, including custom plugin paths.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TemplateKind {
@@ -248,7 +274,7 @@ impl SkillRegistry {
     }
 
     pub fn load_template_dir(&self, dir: &Path, namespace: Option<&str>, kind: TemplateKind) {
-        self.scan_skill_dir(dir, namespace, 0, kind);
+        self.scan_skill_dir(dir, namespace, 0, kind, &mut BTreeSet::new());
     }
 
     /// Scan `dir` for skills, recursing into grouping subdirectories. A subdir holding a
@@ -256,19 +282,21 @@ impl SkillRegistry {
     /// subdir without one is a grouping directory whose nested skills are discovered
     /// recursively, so `skills/GROUP/SUB/SKILL.md` is still found. Flat `*.md`
     /// slash-commands are TOP-LEVEL only (depth 0) — a skill's own `*.md` are resources,
-    /// not separate commands. `depth` is bounded to guard against symlink cycles.
+    /// not separate commands. Dependency/cache trees are not groups. Ancestry
+    /// detects real symlink cycles; depth independently bounds grouping traversal.
     fn scan_skill_dir(
         &self,
         dir: &Path,
         namespace: Option<&str>,
         depth: usize,
         kind: TemplateKind,
+        ancestors: &mut BTreeSet<PathBuf>,
     ) {
         const MAX_DEPTH: usize = 8;
         if depth > MAX_DEPTH {
             self.diagnose(
                 dir,
-                "skill scan depth limit exceeded (possible symlink cycle)".into(),
+                format!("skill scan depth limit exceeded (maximum grouping depth: {MAX_DEPTH})"),
                 true,
             );
             return;
@@ -282,6 +310,21 @@ impl SkillRegistry {
                 return;
             }
         };
+        let identity = match std::fs::canonicalize(dir) {
+            Ok(path) => path,
+            Err(error) => {
+                self.diagnose(
+                    dir,
+                    format!("cannot resolve skill directory: {error}"),
+                    true,
+                );
+                return;
+            }
+        };
+        if !ancestors.insert(identity.clone()) {
+            self.diagnose(dir, "skill directory symlink cycle detected".into(), true);
+            return;
+        }
         let mut entries = Vec::new();
         for entry in rd {
             match entry {
@@ -298,6 +341,12 @@ impl SkillRegistry {
                     self.insert_parsed(parse_skill_file(&p, namespace), &p, kind);
                 }
             } else if p.is_dir() {
+                // Explicit roots remain usable, including .system bundles and
+                // symlinked installs. Only incidental dependency/cache children
+                // are skipped; do not blanket-ignore hidden grouping directories.
+                if ignored_discovery_directory(&p) {
+                    continue;
+                }
                 let skill_md = p.join("SKILL.md");
                 if skill_md.is_file() {
                     self.insert_parsed(
@@ -306,10 +355,11 @@ impl SkillRegistry {
                         TemplateKind::Skill,
                     );
                 } else {
-                    self.scan_skill_dir(&p, namespace, depth + 1, kind);
+                    self.scan_skill_dir(&p, namespace, depth + 1, kind, ancestors);
                 }
             }
         }
+        ancestors.remove(&identity);
     }
 
     /// Resolve a skill by its registry key, falling back to bare-name lookup.
@@ -1056,6 +1106,99 @@ mod tests {
         let reg = SkillRegistry::load(&[user_skills]);
         assert_eq!(reg.len(), 1, "same-name skills must collapse to one entry");
         assert!(reg.get("dedup-skill").is_some());
+    }
+
+    #[test]
+    fn dependency_and_cache_trees_are_not_skill_groups() {
+        let root = tempfile::tempdir().unwrap();
+        for ignored in [
+            ".venv",
+            "venv",
+            "node_modules",
+            ".git",
+            "__pycache__",
+            ".pytest_cache",
+            ".tox",
+        ] {
+            let directory = root.path().join(ignored).join("dependency");
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(
+                directory.join("SKILL.md"),
+                "---\ndescription: dependency example\n---\nNot an installed skill.",
+            )
+            .unwrap();
+            // Reproduce NumPy's deep environment tree from the report.
+            std::fs::create_dir_all(
+                root.path()
+                    .join(ignored)
+                    .join("lib/python/site-packages/numpy/core/tests/examples/cython/deep"),
+            )
+            .unwrap();
+        }
+        let builtin = root.path().join(".system/real-skill");
+        std::fs::create_dir_all(&builtin).unwrap();
+        std::fs::write(
+            builtin.join("SKILL.md"),
+            "---\ndescription: built-in skill\n---\nReal skill.",
+        )
+        .unwrap();
+        let registry = SkillRegistry::load(&[root.path().to_path_buf()]);
+        assert_eq!(
+            registry.len(),
+            1,
+            "dependency examples must not become skills"
+        );
+        assert!(
+            registry.get("real-skill").is_some(),
+            "do not skip all dot-directories"
+        );
+        assert!(
+            registry.diagnostics().is_empty(),
+            "{:?}",
+            registry.diagnostics()
+        );
+        // A caller can still explicitly select a custom root under an environment.
+        let explicit = SkillRegistry::load(&[root.path().join(".venv")]);
+        assert!(explicit.get("dependency").is_some());
+    }
+
+    #[test]
+    fn a_deep_group_is_not_reported_as_a_symlink_cycle() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("a/b/c/d/e/f/g/h/i/j")).unwrap();
+        let registry = SkillRegistry::load(&[root.path().to_path_buf()]);
+        let warnings = registry.take_new_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("depth limit"));
+        assert!(!warnings[0].contains("symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_cycle_is_detected_before_the_depth_limit_without_hiding_valid_links() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(external.path().join("linked-skill")).unwrap();
+        std::fs::write(
+            external.path().join("linked-skill/SKILL.md"),
+            "---\ndescription: linked\n---\nLinked skill.",
+        )
+        .unwrap();
+        symlink(external.path(), root.path().join("group-link")).unwrap();
+        symlink(root.path(), root.path().join("loop")).unwrap();
+        let registry = SkillRegistry::load(&[root.path().to_path_buf()]);
+        assert!(registry.get("linked-skill").is_some());
+        let warnings = registry.take_new_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("symlink cycle detected"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("loop:"),
+            "diagnose the first cycle, not depth-nine descendants: {warnings:?}"
+        );
     }
 
     #[test]
