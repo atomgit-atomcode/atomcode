@@ -575,19 +575,25 @@ impl SessionManager {
         } else {
             if sidecar_is_current {
                 if let Some(sidecar) = existing.as_ref() {
-                    items = sidecar
-                        .todos
-                        .iter()
-                        .map(|item| TodoItem {
-                            content: item.content.clone(),
-                            status: match item.status.as_str() {
-                                "in_progress" => TodoStatus::InProgress,
-                                "completed" => TodoStatus::Completed,
-                                _ => TodoStatus::Pending,
-                            },
-                        })
-                        .collect();
-                    through = sidecar.through;
+                    // A legacy sidecar written before positions existed cannot
+                    // say which calls it already reflects. Laying the log's calls
+                    // over it would append an `add` twice; the log is authoritative
+                    // when it has calls.
+                    if !(sidecar.through.is_none() && !calls.is_empty()) {
+                        items = sidecar
+                            .todos
+                            .iter()
+                            .map(|item| TodoItem {
+                                content: item.content.clone(),
+                                status: match item.status.as_str() {
+                                    "in_progress" => TodoStatus::InProgress,
+                                    "completed" => TodoStatus::Completed,
+                                    _ => TodoStatus::Pending,
+                                },
+                            })
+                            .collect();
+                        through = sidecar.through;
+                    }
                 }
             }
             for (turn, round, index, _, arguments) in &calls {
@@ -630,21 +636,10 @@ impl SessionManager {
                 .to_string(),
             })
             .collect();
-        // The sidecar's `message_count` is an unused stale marker; projecting the
-        // whole log just to fill it is pure cost. Count the message-bearing facts
-        // without a projection.
-        let message_count = events
-            .iter()
-            .filter(|logged| {
-                matches!(
-                    logged.event,
-                    SessionEvent::UserMessage { .. }
-                        | SessionEvent::AssistantMessage { .. }
-                        | SessionEvent::ToolResultLogged { .. }
-                        | SessionEvent::PartialReply { .. }
-                )
-            })
-            .count();
+        // `message_count` is the conversation size this list was written against,
+        // so it must be the projection, not a raw event count. Rewinds are rare;
+        // one projection here is cheaper than a marker with the wrong meaning.
+        let message_count = atomcode_kernel::session::derive_messages(&events).len();
         self.write_todo_sidecar(id, &todos, message_count, through)
     }
 
@@ -1050,14 +1045,26 @@ impl SessionManager {
         let Ok(path) = self.events_path(id) else {
             return true;
         };
-        let Ok(bytes) = read_regular_file_bounded(&path, "session events", MAX_JSONL_BYTES) else {
+        let Ok(mut file) = fs::File::open(&path) else {
             return true;
         };
-        let start = usize::try_from(mark).unwrap_or(usize::MAX);
-        let Some(tail) = bytes.get(start..) else {
+        let Ok(len) = file.metadata().map(|meta| meta.len()) else {
             return true;
         };
-        for line in tail
+        if mark > len || file.seek(SeekFrom::Start(mark)).is_err() {
+            return true;
+        }
+        // Only the rolled-back tail is read; the prefix is already validated and
+        // the whole-log parse belongs to the rebuild, not this predicate.
+        let mut bytes = Vec::new();
+        if file
+            .take(MAX_JSONL_BYTES as u64)
+            .read_to_end(&mut bytes)
+            .is_err()
+        {
+            return true;
+        }
+        for line in bytes
             .split(|byte| *byte == b'\n')
             .filter(|line| !line.is_empty())
         {
@@ -1078,14 +1085,13 @@ impl SessionManager {
                         return true;
                     }
                 }
-                Some("interrupted") => {
+                Some("interrupted")
                     if event
                         .get("undone")
                         .and_then(|undone| undone.as_bool())
-                        .unwrap_or(false)
-                    {
-                        return true;
-                    }
+                        .unwrap_or(false) =>
+                {
+                    return true;
                 }
                 _ => {}
             }
@@ -4660,6 +4666,108 @@ mod tests {
                 index: 0,
             })
         );
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
+    fn a_legacy_sidecar_without_a_position_does_not_double_apply_a_log_add() {
+        use crate::session::manager::TodoSidecarItem;
+        use atomcode_kernel::tool::ToolCall;
+
+        let (_dir, manager) = store();
+        let id = "legacy-sidecar-add";
+        let lease = created(&manager, id);
+        let add = ToolCall {
+            id: "a".into(),
+            name: "todowrite".into(),
+            arguments: r#"{"action":"add","content":"new"}"#.into(),
+        };
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::AssistantMessage {
+                            turn: 1,
+                            round: 1,
+                            text: String::new(),
+                            reasoning: String::new(),
+                            tool_calls: vec![add],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    logged(
+                        3,
+                        0,
+                        SessionEvent::ToolResultLogged {
+                            turn: 1,
+                            round: 1,
+                            call_id: "a".into(),
+                            content: "#1 [ ] new".into(),
+                            is_error: false,
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        4,
+                        0,
+                        SessionEvent::TurnEnd {
+                            turn: 1,
+                            stop: StopReason::Stopped,
+                            error: None,
+                        },
+                    ),
+                    logged(5, 0, SessionEvent::TurnStart { turn: 2 }),
+                    logged(
+                        6,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 2,
+                            text: "later".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        manager
+            .write_todo_sidecar(
+                id,
+                &[TodoSidecarItem {
+                    content: "new".into(),
+                    status: "pending".into(),
+                }],
+                2,
+                None,
+            )
+            .unwrap();
+
+        // Rewinding turn 2 triggers a rebuild; the legacy sidecar cannot say
+        // which calls it already reflects, so the log's add must not append a
+        // second copy on top of it.
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    7,
+                    0,
+                    SessionEvent::Rewound {
+                        turn: 2,
+                        to: 5,
+                        scope: RewindScope::Conversation,
+                    },
+                )],
+            )
+            .unwrap();
+
+        let sidecar = manager.read_todo_sidecar(id).unwrap().unwrap();
+        assert_eq!(sidecar.todos.len(), 1);
+        assert_eq!(sidecar.todos[0].content, "new");
+        assert!(sidecar.through.is_some());
     }
 
     #[cfg(feature = "tools")]
