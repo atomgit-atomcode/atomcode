@@ -21388,7 +21388,10 @@ type = "openai"
             &original,
             id,
             project.path(),
-            &SessionSnapshot::new(vec![Message::user("original history")]),
+            &SessionSnapshot::new(vec![
+                Message::user("original history"),
+                Message::assistant("done", Vec::new()),
+            ]),
         );
         persist_native_session(
             &elsewhere,
@@ -21473,7 +21476,10 @@ type = "openai"
             &original,
             id,
             project.path(),
-            &SessionSnapshot::new(vec![Message::user("before marker change")]),
+            &SessionSnapshot::new(vec![
+                Message::user("before marker change"),
+                Message::assistant("done", Vec::new()),
+            ]),
         );
         let mut start = native_start(false);
         start.agent.working_dir = project.path().to_path_buf();
@@ -21827,9 +21833,7 @@ type = "openai"
         ]);
         persist_native_session(&manager, "session-b", project.path(), &source);
         let mut inflight = source.clone();
-        inflight
-            .messages
-            .push(Message::user("replay after switch"));
+        inflight.messages.push(Message::user("replay after switch"));
         std::fs::write(
             manager.root().join("session-b.snapshot.inflight"),
             serde_json::to_vec(&serde_json::json!({
