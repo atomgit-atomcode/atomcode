@@ -246,7 +246,15 @@ impl SessionManager {
             // A rewind or a cancelled-and-undone turn takes its todo calls out
             // of the projection; the list the model reads is the log's standing
             // turns, rebuilt so the sidecar cannot keep offering undone work.
-            let _ = self.rebuild_todo_sidecar_after_undo(id);
+            if let Err(error) = self.rebuild_todo_sidecar_after_undo(id) {
+                // The append itself stands: a stale sidecar is a cache problem,
+                // not a reason to report the committed fact as failed.
+                tracing::warn!(
+                    %error,
+                    session = id,
+                    "todo sidecar could not follow a rewind; the log append stands"
+                );
+            }
         }
         Ok(())
     }
@@ -1041,10 +1049,18 @@ impl SessionManager {
         drop(file);
         #[cfg(feature = "tools")]
         {
-            // A rolled-back append may have carried the rewind that rebuilt the
-            // todo sidecar; the sidecar follows the log back. A failure here is
-            // a real half-rollback, so it reaches the caller.
-            self.rebuild_todo_sidecar_after_undo(lease.id())?;
+            // Only a session that keeps a todo sidecar has a cache to follow.
+            // The log rollback already landed; a cache write failure is reported
+            // but cannot veto it.
+            if self.read_todo_sidecar(lease.id()).ok().flatten().is_some() {
+                if let Err(error) = self.rebuild_todo_sidecar_after_undo(lease.id()) {
+                    tracing::warn!(
+                        %error,
+                        session = lease.id(),
+                        "todo sidecar could not follow the truncated log; the log rollback stands"
+                    );
+                }
+            }
         }
         Ok(())
     }
