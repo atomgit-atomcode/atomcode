@@ -146,6 +146,7 @@ const zh = {
 
   // Chat
   'chat.startHint': '发送消息开始对话…',
+  'chat.loadingHistory': '正在加载会话…',
   'chat.continueHint': '发送消息继续此会话',
   'chat.greeting': '今天想构建点什么？',
   'chat.chipReview': '/review 审查改动',
@@ -757,6 +758,7 @@ const en: Record<MsgKey, string> = {
   'effort.max': 'Max',
 
   'chat.startHint': 'Send a message to start a conversation…',
+  'chat.loadingHistory': 'Loading conversation…',
   'chat.continueHint': 'Send a message to continue this session',
   'chat.greeting': 'What would you like to build today?',
   'chat.chipReview': '/review the changes',

@@ -3406,6 +3406,17 @@ body {
   .input-footer-actions > .mode-selector {
     max-width: 100%;
   }
+  /* Mode is the leftmost control: right anchoring would put its menu off-screen. */
+  .model-selector-up.mode-selector .mode-dropdown {
+    left: 0;
+    right: auto;
+    width: min(320px, calc(100vw - 48px));
+    min-width: 0;
+    box-sizing: border-box;
+    max-height: min(280px, 50vh);
+    max-height: min(280px, 50dvh);
+    overflow-wrap: anywhere;
+  }
   .input-footer-actions > .model-controls {
     width: 100%;
   }

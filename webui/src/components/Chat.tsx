@@ -562,7 +562,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   // failures for the same session/path.
   const [persistenceWarning, setPersistenceWarning] = useState<string | null>(null);
   // 正在拉取某会话历史：用于抑制落地页，避免切到「有内容的会话」时先闪一下落地页。
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(sessionId != null);
   const [provider, setProvider] = useState<string | null>(null);
   const [reasoningEffort, setReasoningEffort] = useState<{
     provider: string;
@@ -622,6 +622,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   const [sync, setSync] = useState<boolean>(() => {
     try { return new URLSearchParams(location.search).get('sync') === '1'; } catch { return false; }
   });
+  // A live connection has no conversation verdict until its first snapshot.
+  // Retain this across reconnects so an already rendered conversation stays put.
+  const [liveSnapshotReady, setLiveSnapshotReady] = useState(false);
   useEffect(() => { if (!sync) setGoalProgress(null); }, [sync]);
   const syncRef = useRef(sync);
   syncRef.current = sync;
@@ -1637,6 +1640,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     }
     // snapshot：确立实时会话 id 并把视图切到它（连上即对齐）。
     if (e.type === 'snapshot') {
+      setLiveSnapshotReady(true);
+      setLoading(false);
       setGoalProgress(e.goal ?? null);
       liveSessionIdRef.current = e.session_id || null;
       // Historical timestamps come from the daemon's native transcript projection.
@@ -1753,6 +1758,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         todoTitlesRef.current.clear();
         resetTodoBatch(true, false);
         setMessages([]);
+        setLoading(true);
         // bot review P2: 切换会话时重置搜索状态,避免残留关键词过滤新会话、matchIdx 超界致计数错乱。
         setSearch('');
         setMatchIdx(0);
@@ -1957,6 +1963,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         }
       }
       if (next) {
+        setLiveSnapshotReady(false);
         // 重新开启同步：先让已绑定的 Coding Runtime 恢复当前会话，再读取 live hub 快照。
         const sid = activeIdRef.current;
         if (sid) {
@@ -3398,7 +3405,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   // 新建会话、空的同步会话、空的历史会话都适用）。
   // 抑制条件：正在拉历史（loading，避免切到有内容会话时闪屏）、restoring（刷新还原中）、
   // 已有 historyHint（无法加载、提示去 TUI/磁盘续聊）。
-  const landing = messages.length === 0 && !historyHint && !restoring && !loading;
+  // Cover the render before the session-loading effect runs as well as the
+  // relay's first snapshot, which may arrive well after the page has painted.
+  const awaitingConversation = Boolean(restoring) || loading
+    || (sessionId !== null && activeIdRef.current !== sessionId)
+    || (sync && !liveSnapshotReady);
+  const landing = messages.length === 0 && !historyHint && !awaitingConversation;
 
   // 上报落地态给 App（决定是否显示会话标题头）。
   useEffect(() => {
@@ -3852,10 +3864,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
             </>;
           }}
         />}
-        {messages.length === 0 && !historyHint && !restoring && loading && (
+        {messages.length === 0 && !historyHint && awaitingConversation && (
           <div class="messages-empty">
             <div>
-              {t('chat.startHint')}
+              {t('chat.loadingHistory')}
             </div>
           </div>
         )}
