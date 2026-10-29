@@ -198,6 +198,20 @@ impl SessionManager {
     /// write, which is safe only while that lease keeps a single writer; a
     /// second writer would need the allocation moved inside the append lock.
     pub fn append_events(&self, lease: &SessionLease, events: &[LoggedEvent]) -> SessionResult<()> {
+        self.append_events_inner(lease, events, true)
+    }
+
+    /// [`Self::append_events`], optionally leaving the todo cache untouched: a
+    /// fork copies the source log and then carries the source's sidecar, so a
+    /// rebuild from the copied facts would only be overwritten — and on a
+    /// source with no sidecar it could resurrect calls compaction drained.
+    #[cfg_attr(not(feature = "tools"), allow(unused_variables))]
+    fn append_events_inner(
+        &self,
+        lease: &SessionLease,
+        events: &[LoggedEvent],
+        follow_sidecar: bool,
+    ) -> SessionResult<()> {
         self.validate_active_lease(lease)?;
         let id = lease.id();
         if !self.is_event_session(id) {
@@ -238,11 +252,13 @@ impl SessionManager {
         drop(file);
         self.index_the_chosen_name(id, events);
         #[cfg(feature = "tools")]
-        if events.iter().any(|logged| match &logged.event {
-            SessionEvent::Rewound { scope, .. } => scope.takes_back_conversation(),
-            SessionEvent::Interrupted { undone, .. } => *undone,
-            _ => false,
-        }) {
+        if follow_sidecar
+            && events.iter().any(|logged| match &logged.event {
+                SessionEvent::Rewound { scope, .. } => scope.takes_back_conversation(),
+                SessionEvent::Interrupted { undone, .. } => *undone,
+                _ => false,
+            })
+        {
             // A rewind or a cancelled-and-undone turn takes its todo calls out
             // of the projection; the list the model reads is the log's standing
             // turns, rebuilt so the sidecar cannot keep offering undone work.
@@ -476,17 +492,19 @@ impl SessionManager {
             })
             .next_back();
 
-        let failed: std::collections::HashSet<(u64, u32, String)> = events
+        // The transcript fold excludes a failed call by its id inside the same
+        // active window (`active_todo_calls`); keying by turn and round too
+        // would keep a call the model's view already dropped.
+        let failed: std::collections::HashSet<&str> = events
             .iter()
             .filter(|logged| !undone.contains(&logged.event.turn()))
+            .filter(|logged| boundary.is_none_or(|(seq, _)| logged.seq > seq))
             .filter_map(|logged| match &logged.event {
                 SessionEvent::ToolResultLogged {
-                    turn,
-                    round,
                     call_id,
                     is_error: true,
                     ..
-                } => Some((*turn, *round, call_id.clone())),
+                } => Some(call_id.as_str()),
                 _ => None,
             })
             .collect();
@@ -509,7 +527,7 @@ impl SessionManager {
                 continue;
             };
             for (index, call) in tool_calls.iter().enumerate() {
-                if !is_todo_call(&call.name) || failed.contains(&(*turn, *round, call.id.clone())) {
+                if !is_todo_call(&call.name) || failed.contains(call.id.as_str()) {
                     continue;
                 }
                 calls.push((
@@ -614,12 +632,18 @@ impl SessionManager {
             let Some(sidecar) = existing.as_ref() else {
                 return Ok(());
             };
-            let retired_by_undo = sidecar
-                .through
-                .is_some_and(|through| undone.contains(&through.turn));
-            if !retired_by_undo && !boundary.is_some_and(|_| !sidecar_is_current) {
-                // The sidecar is the only copy of the plan (a converted or
-                // compacted session); nothing here says it was taken back.
+            // Only a plan the log holds can be retired by the log: an undone
+            // turn whose calls it still carries, or a cancel boundary that cuts
+            // event-sourced calls. A list that lives only in the sidecar — a
+            // converted or compacted session — is its only copy, and a cancel
+            // the log cannot tie to that plan must not erase it.
+            let retired_by_undo = had_plan_in_log
+                && sidecar
+                    .through
+                    .is_some_and(|through| undone.contains(&through.turn));
+            let retired_by_boundary =
+                had_plan_in_log && boundary.is_some_and(|_| !sidecar_is_current);
+            if !retired_by_undo && !retired_by_boundary {
                 return Ok(());
             }
         }
@@ -975,7 +999,7 @@ impl SessionManager {
         header.created_at = u64::try_from(now_ms).unwrap_or(0);
         self.create_event_session(destination, &header, meta)?;
         let copied = self
-            .append_events(destination, &events)
+            .append_events_inner(destination, &events, false)
             .and_then(|()| self.write_presentation(destination.id(), presentation));
         if copied.is_err() {
             // Only remove a destination we created, never an existing session
@@ -1054,45 +1078,50 @@ impl SessionManager {
         if mark > len || file.seek(SeekFrom::Start(mark)).is_err() {
             return true;
         }
-        // Only the rolled-back tail is read; the prefix is already validated and
-        // the whole-log parse belongs to the rebuild, not this predicate.
-        let mut bytes = Vec::new();
-        if file
-            .take(MAX_JSONL_BYTES as u64)
-            .read_to_end(&mut bytes)
-            .is_err()
-        {
-            return true;
+        // Only the rolled-back tail is read, one line at a time, and only the
+        // few fields this predicate asks about are deserialized: the prefix is
+        // already validated, and a tool-call-heavy line need not become a JSON
+        // tree just to read its `kind`.
+        #[derive(serde::Deserialize)]
+        struct TailEvent {
+            #[serde(default)]
+            kind: Option<String>,
+            #[serde(default)]
+            scope: Option<String>,
+            #[serde(default)]
+            undone: Option<bool>,
         }
-        for line in bytes
-            .split(|byte| *byte == b'\n')
-            .filter(|line| !line.is_empty())
-        {
-            let Ok(record) = serde_json::from_slice::<serde_json::Value>(line) else {
+        #[derive(serde::Deserialize)]
+        struct TailRecord {
+            #[serde(default)]
+            event: Option<TailEvent>,
+        }
+
+        use std::io::{BufRead, BufReader};
+        for line in BufReader::new(file).take(MAX_JSONL_BYTES as u64).lines() {
+            let Ok(line) = line else {
                 // An unreadable tail is not evidence that no undo was cut.
                 return true;
             };
-            let Some(event) = record.get("event") else {
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(record) = serde_json::from_str::<TailRecord>(&line) else {
+                return true;
+            };
+            let Some(event) = record.event else {
                 continue;
             };
-            match event.get("kind").and_then(|kind| kind.as_str()) {
+            match event.kind.as_deref() {
                 Some("rewound") => {
-                    let scope = event.get("scope").and_then(|scope| scope.as_str());
                     if matches!(
-                        scope,
+                        event.scope.as_deref(),
                         Some("Conversation" | "conversation" | "Both" | "both")
                     ) {
                         return true;
                     }
                 }
-                Some("interrupted")
-                    if event
-                        .get("undone")
-                        .and_then(|undone| undone.as_bool())
-                        .unwrap_or(false) =>
-                {
-                    return true;
-                }
+                Some("interrupted") if event.undone.unwrap_or(false) => return true,
                 _ => {}
             }
         }
@@ -5702,6 +5731,222 @@ mod tests {
         assert_eq!(sidecar.todos.len(), 1);
         assert_eq!(sidecar.todos[0].content, "keep me");
         assert_eq!(sidecar.through, through);
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
+    fn a_cancel_boundary_does_not_erase_a_sidecar_only_plan() {
+        use crate::session::manager::{TodoCallPosition, TodoSidecarItem};
+
+        let (_dir, manager) = store();
+        let id = "sidecar-only-cancel";
+        let lease = created(&manager, id);
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "first".into(),
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        3,
+                        0,
+                        SessionEvent::AssistantMessage {
+                            turn: 1,
+                            round: 1,
+                            text: "ok".into(),
+                            reasoning: String::new(),
+                            tool_calls: vec![],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    logged(
+                        4,
+                        0,
+                        SessionEvent::TurnEnd {
+                            turn: 1,
+                            stop: StopReason::Stopped,
+                            error: None,
+                        },
+                    ),
+                    logged(5, 0, SessionEvent::TurnStart { turn: 2 }),
+                    logged(
+                        6,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 2,
+                            text: "second".into(),
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        7,
+                        0,
+                        SessionEvent::Interrupted {
+                            turn: 2,
+                            undone: false,
+                        },
+                    ),
+                    logged(8, 0, SessionEvent::TurnStart { turn: 3 }),
+                    logged(
+                        9,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 3,
+                            text: "third".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        let through = Some(TodoCallPosition {
+            turn: 1,
+            round: 1,
+            index: 0,
+        });
+        manager
+            .write_todo_sidecar(
+                id,
+                &[TodoSidecarItem {
+                    content: "keep me".into(),
+                    status: "in_progress".into(),
+                }],
+                4,
+                through,
+            )
+            .unwrap();
+
+        // The undo takes back turn 3. The cancel at turn 2 must not retire a
+        // plan the log never held: the sidecar is its only copy.
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    10,
+                    0,
+                    SessionEvent::Rewound {
+                        turn: 3,
+                        to: 8,
+                        scope: RewindScope::Conversation,
+                    },
+                )],
+            )
+            .unwrap();
+
+        let sidecar = manager
+            .read_todo_sidecar(id)
+            .unwrap()
+            .expect("the sidecar is the only copy of the plan");
+        assert_eq!(sidecar.todos.len(), 1, "{sidecar:?}");
+        assert_eq!(sidecar.todos[0].content, "keep me");
+        assert_eq!(sidecar.through, through);
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
+    fn the_sidecar_fold_excludes_a_failed_call_by_id_like_the_transcript() {
+        use atomcode_kernel::tool::ToolCall;
+
+        let (_dir, manager) = store();
+        let id = "failed-call-id";
+        let lease = created(&manager, id);
+        let plan = ToolCall {
+            id: "p".into(),
+            name: "todowrite".into(),
+            arguments: r#"{"todos":[{"content":"failed","status":"pending"}]}"#.into(),
+        };
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "hello".into(),
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        3,
+                        0,
+                        SessionEvent::AssistantMessage {
+                            turn: 1,
+                            round: 1,
+                            text: String::new(),
+                            reasoning: String::new(),
+                            tool_calls: vec![plan],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    // Filed under a later round than the call, as a rewritten
+                    // transcript can be: the fold drops the call by id alone.
+                    logged(
+                        4,
+                        0,
+                        SessionEvent::ToolResultLogged {
+                            turn: 1,
+                            round: 2,
+                            call_id: "p".into(),
+                            content: "denied".into(),
+                            is_error: true,
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        5,
+                        0,
+                        SessionEvent::TurnEnd {
+                            turn: 1,
+                            stop: StopReason::Stopped,
+                            error: None,
+                        },
+                    ),
+                    logged(6, 0, SessionEvent::TurnStart { turn: 2 }),
+                    logged(
+                        7,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 2,
+                            text: "undo".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    8,
+                    0,
+                    SessionEvent::Rewound {
+                        turn: 2,
+                        to: 6,
+                        scope: RewindScope::Conversation,
+                    },
+                )],
+            )
+            .unwrap();
+
+        let sidecar = manager.read_todo_sidecar(id).unwrap();
+        assert!(
+            sidecar.is_none_or(|sidecar| sidecar.todos.is_empty()),
+            "a call whose result failed is not part of the list: {sidecar:?}"
+        );
     }
 
     #[cfg(feature = "tools")]
