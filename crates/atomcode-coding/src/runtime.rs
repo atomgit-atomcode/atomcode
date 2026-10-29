@@ -4731,6 +4731,7 @@ fn spawn_runtime_owner_with_optional_agent(
                 &mut active_turn,
                 &mut turn_stats,
                 &mut agent_available,
+                &runtime_event_tx,
             );
         }
         if let Some(reason) = provider_unavailable_reason {
@@ -7794,6 +7795,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                     &mut active_turn,
                                     &mut turn_stats,
                                     &mut agent_available,
+                                    &runtime_event_tx,
                                 );
                                 resources = Some(runtime);
                                 if active_turn.is_none() {
@@ -10789,6 +10791,7 @@ fn replay_pending_resume_prompt(
     active_turn: &mut Option<u64>,
     turn_stats: &mut RuntimeTurnStats,
     agent_available: &mut bool,
+    event_tx: &RuntimeEventEmitter,
 ) {
     let Some(runtime) = resources else {
         return;
@@ -10802,15 +10805,24 @@ fn replay_pending_resume_prompt(
     // Loading a session only hands the prompt back; the retraction happens here,
     // immediately before the replay is actually sent. A preview that dropped the
     // prompt therefore leaves the conversation unchanged.
-    if binding
-        .manager
-        .prepare_resume_replay(&binding.lease)
-        .is_err()
-    {
-        // The prompt is still visible in the log; do not keep an in-memory replay
-        // that could fire after the person has moved on.
-        binding.pending_resume_prompt = None;
-        return;
+    match binding.manager.prepare_resume_replay(&binding.lease) {
+        Ok(atomcode_capabilities::session::manager::PrepareResumeReplay::Prepared) => {}
+        Ok(atomcode_capabilities::session::manager::PrepareResumeReplay::Obsolete) => {
+            binding.pending_resume_prompt = None;
+            let _ = event_tx.send(CodingRuntimeEvent::ControllerWarning(
+                "the resumed prompt was not replayed because the conversation moved on".into(),
+            ));
+            return;
+        }
+        Err(error) => {
+            // Transient IO/marker failures are retryable: keep the prompt pending
+            // for the next rebuild/provider change, and say why nothing started.
+            let _ = event_tx.send(CodingRuntimeEvent::ControllerWarning(format!(
+                "could not prepare the resumed prompt for replay: {error}; \
+                 it is still in the session history and will be retried"
+            )));
+            return;
+        }
     }
     *next_turn_id = next_turn_id.wrapping_add(1);
     *active_turn = Some(*next_turn_id);

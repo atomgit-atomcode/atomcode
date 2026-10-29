@@ -1534,7 +1534,7 @@ fn header_line(header: &SessionHeader) -> SessionResult<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::manager::{ResumeReplay, StorageOwner};
+    use crate::session::manager::{PrepareResumeReplay, ResumeReplay, StorageOwner};
     use atomcode_kernel::event::StopReason;
     use atomcode_kernel::message::Message;
 
@@ -2837,12 +2837,12 @@ mod tests {
             Some("hello".to_string())
         );
         assert!(
-            loaded
+            !loaded
                 .snapshot
                 .messages
                 .iter()
                 .any(|message| message.text == "hello"),
-            "loading must not retract a prompt the runtime has not been given"
+            "the pending view excludes the prompt it will replay"
         );
         assert!(!manager
             .load_events(id)
@@ -2901,11 +2901,14 @@ mod tests {
                 pending.map(|message| message.text),
                 Some("hello".to_string())
             );
-            assert!(loaded
-                .snapshot
-                .messages
-                .iter()
-                .any(|message| message.text == "hello"));
+            assert!(
+                !loaded
+                    .snapshot
+                    .messages
+                    .iter()
+                    .any(|message| message.text == "hello"),
+                "the pending view excludes the prompt it will replay"
+            );
             assert_eq!(
                 manager.read_resume_replay(id).unwrap(),
                 Some(ResumeReplay { to: 1, turn: 1 })
@@ -3005,11 +3008,14 @@ mod tests {
             pending.map(|message| message.text),
             Some("hello".to_string())
         );
-        assert!(loaded
-            .snapshot
-            .messages
-            .iter()
-            .any(|message| message.text == "hello"));
+        assert!(
+            !loaded
+                .snapshot
+                .messages
+                .iter()
+                .any(|message| message.text == "hello"),
+            "the pending view excludes the prompt it will replay"
+        );
         assert_eq!(
             manager.read_resume_replay(id).unwrap(),
             Some(ResumeReplay { to: 1, turn: 1 })
@@ -3134,11 +3140,14 @@ mod tests {
             pending.map(|message| message.text),
             Some("hello".to_string())
         );
-        assert!(loaded
-            .snapshot
-            .messages
-            .iter()
-            .any(|message| message.text == "hello"));
+        assert!(
+            !loaded
+                .snapshot
+                .messages
+                .iter()
+                .any(|message| message.text == "hello"),
+            "the pending view excludes the prompt it will replay"
+        );
         assert_eq!(
             manager.read_resume_replay(id).unwrap(),
             Some(ResumeReplay { to: 1, turn: 1 })
@@ -3325,7 +3334,10 @@ mod tests {
             .unwrap();
 
         assert!(
-            manager.prepare_resume_replay(&lease).is_err(),
+            matches!(
+                manager.prepare_resume_replay(&lease),
+                Ok(PrepareResumeReplay::Obsolete)
+            ),
             "the marker names turn 1; a newer turn must not be retracted"
         );
         assert!(!manager
@@ -3379,7 +3391,10 @@ mod tests {
                 ],
             )
             .unwrap();
-        assert!(manager.prepare_resume_replay(&lease).is_err());
+        assert!(matches!(
+            manager.prepare_resume_replay(&lease),
+            Ok(PrepareResumeReplay::Obsolete)
+        ));
         assert_eq!(
             manager
                 .load_events(id)
@@ -3427,11 +3442,14 @@ mod tests {
             pending.map(|message| message.text),
             Some("hello".to_string())
         );
-        assert!(loaded
-            .snapshot
-            .messages
-            .iter()
-            .any(|message| message.text == "hello"));
+        assert!(
+            !loaded
+                .snapshot
+                .messages
+                .iter()
+                .any(|message| message.text == "hello"),
+            "the pending view excludes the prompt it will replay"
+        );
         assert_eq!(
             manager.read_resume_replay(id).unwrap(),
             Some(ResumeReplay { to: 1, turn: 1 })
