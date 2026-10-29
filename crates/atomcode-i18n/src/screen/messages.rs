@@ -2071,6 +2071,12 @@ pub enum Msg<'a> {
     LoginCouldNotStart {
         error: &'a str,
     },
+    /// Said when the automatic browser launch at the top of the login flow
+    /// failed. `{reason}` is the opener's own explanation, which already
+    /// carries the URL for manual access.
+    LoginAutoOpenFailed {
+        reason: &'a str,
+    },
     LoginFailed {
         error: &'a str,
     },
