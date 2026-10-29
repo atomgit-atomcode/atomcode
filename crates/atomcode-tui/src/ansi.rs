@@ -349,7 +349,10 @@ impl Pointer {
     }
 }
 
-/// Name the window (OSC 2).
+/// Name both the window and tab/icon (OSC 0).
+///
+/// iTerm2 uses the icon title for its session/tab name; OSC 2 alone leaves
+/// that name unchanged even when the window title carries the status dot.
 ///
 /// Which session a window is looking at is the one thing a person needs from
 /// across the room, and the terminal already has somewhere to put it: the tab
@@ -361,16 +364,16 @@ impl Pointer {
 /// onto the screen as commands.
 pub fn set_title(title: &str) -> String {
     let clean: String = title.chars().filter(|c| !c.is_control()).collect();
-    format!("\x1b]2;{clean}\x07")
+    format!("\x1b]0;{clean}\x07")
 }
 
-/// Ask the terminal to remember the title it has (XTWINOPS 22;2), so leaving
+/// Ask the terminal to remember both titles (XTWINOPS 22;0), so leaving
 /// can put it back. Terminals that do not know it ignore it, and then
 /// [`RESTORE_TITLE`] is ignored too — the window keeps the name this session
 /// gave it, which is the same thing that happened before any of this existed.
-pub const SAVE_TITLE: &str = "\x1b[22;2t";
-/// Put back the title saved on the way in (XTWINOPS 23;2).
-pub const RESTORE_TITLE: &str = "\x1b[23;2t";
+pub const SAVE_TITLE: &str = "\x1b[22;0t";
+/// Put back both titles saved on the way in (XTWINOPS 23;0).
+pub const RESTORE_TITLE: &str = "\x1b[23;0t";
 
 /// Put text on the system clipboard, through the terminal (OSC 52).
 ///
@@ -947,11 +950,18 @@ mod tests {
     #[test]
     fn a_title_cannot_carry_control_characters_out_of_its_escape() {
         use super::set_title;
-        assert_eq!(set_title("fix the parser"), "\x1b]2;fix the parser\x07");
+        assert_eq!(set_title("fix the parser"), "\x1b]0;fix the parser\x07");
         let sneaky = set_title("a\x1b]2;b\x07c\nd");
-        assert_eq!(sneaky, "\x1b]2;a]2;bcd\x07");
+        assert_eq!(sneaky, "\x1b]0;a]2;bcd\x07");
         assert_eq!(sneaky.matches('\x1b').count(), 1, "one escape: {sneaky:?}");
         assert_eq!(sneaky.matches('\x07').count(), 1, "one terminator");
+    }
+
+    #[test]
+    fn status_titles_update_and_preserve_both_window_and_tab() {
+        assert_eq!(super::set_title("🟡 Working"), "\x1b]0;🟡 Working\x07");
+        assert_eq!(super::SAVE_TITLE, "\x1b[22;0t");
+        assert_eq!(super::RESTORE_TITLE, "\x1b[23;0t");
     }
 
     use super::*;
