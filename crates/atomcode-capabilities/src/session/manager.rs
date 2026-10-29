@@ -1861,7 +1861,8 @@ impl SessionManager {
     /// write the retry marker, then retract the unanswered turn.
     ///
     /// Idempotent while the marker's rewind is in the log, so a failed send can be
-    /// retried. A transient failure leaves the prompt visible; [`PrepareResumeReplay::Obsolete`]
+    /// retried. A transient failure is reported and leaves the retryable state in
+    /// place — the prompt visible before a rewind, the marker after one. [`PrepareResumeReplay::Obsolete`]
     /// means the conversation moved on and the runtime must not send it.
     pub fn prepare_resume_replay(
         &self,

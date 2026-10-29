@@ -10799,7 +10799,7 @@ fn replay_pending_resume_prompt(
     let Some(binding) = runtime.parts.session.as_mut() else {
         return;
     };
-    let Some(prompt) = binding.pending_resume_prompt.clone() else {
+    let Some(prompt) = binding.pending_resume_prompt.take() else {
         return;
     };
     // Loading a session only hands the prompt back; the retraction happens here,
@@ -10808,15 +10808,16 @@ fn replay_pending_resume_prompt(
     match binding.manager.prepare_resume_replay(&binding.lease) {
         Ok(atomcode_capabilities::session::manager::PrepareResumeReplay::Prepared) => {}
         Ok(atomcode_capabilities::session::manager::PrepareResumeReplay::Obsolete) => {
-            binding.pending_resume_prompt = None;
             let _ = event_tx.send(CodingRuntimeEvent::ControllerWarning(
                 "the resumed prompt was not replayed because the conversation moved on".into(),
             ));
             return;
         }
         Err(error) => {
-            // Transient IO/marker failures are retryable: keep the prompt pending
-            // for the next rebuild/provider change, and say why nothing started.
+            // Transient IO/marker failures are retryable: put the prompt back so
+            // the next rebuild/provider change can try again, and say why nothing
+            // started.
+            binding.pending_resume_prompt = Some(prompt);
             let _ = event_tx.send(CodingRuntimeEvent::ControllerWarning(format!(
                 "could not prepare the resumed prompt for replay: {error}; \
                  it is still in the session history and will be retried"
