@@ -154,38 +154,99 @@ fn ohos_aa_argv(url: &str) -> Vec<String> {
     ]
 }
 
-/// Spawn like a person's shell would: on `ENOEXEC`, rerun the command through
-/// `sh -c 'exec "$0" "$@"'`. HarmonyOS PC ships `aa` as a two-line shell wrapper
-/// (`#!/usr/bin/zsh` + `exec /bin/aa`) whose interpreter the sandbox image does
-/// not carry — an interactive shell reruns the file as a script when execve says
-/// ENOEXEC, while a bare `Command::spawn` dies with "Exec format error"
-/// (os error 8). Arguments stay in argv (`"$@"`), so nothing is re-parsed by a
-/// shell and the URL cannot grow metacharacters.
-fn spawn_shell_fallback(cmd: &mut Command) -> std::io::Result<std::process::Child> {
-    match cmd.spawn() {
-        Ok(child) => Ok(child),
-        // 8 = ENOEXEC：内核认不得这个文件本身（壳脚本、解释器缺失）。
-        Err(e) if e.raw_os_error() == Some(8) => {
-            let mut sh = shell_fallback_command(cmd);
-            sh.stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
-            sh.spawn()
+/// Resolve an existing script before interpreting it: ENOENT may mean the
+/// interpreter is missing, but must never turn a missing command into success.
+fn script_path(cmd: &Command) -> Option<PathBuf> {
+    use std::io::Read;
+    let program = Path::new(cmd.get_program());
+    let paths: Vec<PathBuf> = if program.components().count() > 1 || program.is_absolute() {
+        vec![program.into()]
+    } else {
+        std::env::split_paths(&std::env::var_os("PATH")?)
+            .map(|dir| dir.join(program))
+            .collect()
+    };
+    paths.into_iter().find(|path| {
+        if !path.is_file() {
+            return false;
         }
-        Err(e) => Err(e),
-    }
+        let mut prefix = [0; 2];
+        std::fs::File::open(path)
+            .and_then(|mut file| file.read_exact(&mut prefix))
+            .is_ok()
+            && prefix == *b"#!"
+    })
 }
 
-/// The `sh` command that reruns `cmd` the way a shell reruns an ENOEXEC file.
-/// Split from the spawn so the shape is unit-testable without executing anything.
-fn shell_fallback_command(cmd: &Command) -> Command {
+/// Interpret the verified wrapper itself, rather than exec'ing it again and
+/// consulting the same broken shebang. URL arguments are never shell source.
+fn shell_fallback_command(cmd: &Command, path: &Path) -> Command {
     let mut sh = Command::new("sh");
-    sh.arg("-c").arg("exec \"$0\" \"$@\"");
-    sh.arg(cmd.get_program());
-    for arg in cmd.get_args() {
-        sh.arg(arg);
+    sh.arg(path).args(cmd.get_args());
+    for (key, value) in cmd.get_envs() {
+        if let Some(value) = value {
+            sh.env(key, value);
+        } else {
+            sh.env_remove(key);
+        }
+    }
+    if let Some(cwd) = cmd.get_current_dir() {
+        sh.current_dir(cwd);
     }
     sh
+}
+
+/// aa is a short-lived request dispatcher. Check its exit status, not just
+/// process creation. File-backed diagnostics avoid pipe-fill and inherited-pipe
+/// hangs; only a bounded prefix is read back into memory.
+fn run_aa(mut cmd: Command, timeout: std::time::Duration) -> Result<(), String> {
+    use std::io::Read;
+    let output = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
+    let diagnostics = output.reopen().map_err(|e| e.to_string())?;
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(diagnostics.try_clone().map_err(|e| e.to_string())?)
+        .stderr(diagnostics);
+    // The fallback needs the same output destination and argv; construct it here
+    // so stream configuration is not lost when the wrapper interpreter is absent.
+    let spawn = cmd.spawn();
+    let mut child = match spawn {
+        Ok(child) => child,
+        Err(error) if matches!(error.raw_os_error(), Some(2 | 8)) => {
+            let path = script_path(&cmd).ok_or_else(|| error.to_string())?;
+            let diagnostics = output.reopen().map_err(|e| e.to_string())?;
+            shell_fallback_command(&cmd, &path)
+                .stdin(std::process::Stdio::null())
+                .stdout(diagnostics.try_clone().map_err(|e| e.to_string())?)
+                .stderr(diagnostics)
+                .spawn()
+                .map_err(|e| e.to_string())?
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => {
+                let mut text = String::new();
+                let _ = output
+                    .reopen()
+                    .and_then(|file| file.take(4096).read_to_string(&mut text));
+                return Err(format!("aa exited with {status}: {}", text.trim()));
+            }
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20))
+            }
+            result => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(match result {
+                    Err(error) => error.to_string(),
+                    _ => "aa timed out while submitting the browser request".into(),
+                });
+            }
+        }
+    }
 }
 
 /// Pick a strategy from OS + env. Pure (reads env / `/proc/version`, no GUI side effects).
@@ -229,7 +290,7 @@ fn pick_open_strategy() -> OpenStrategy {
 /// The Unix opener, split from the env reads above so the HarmonyOS branch is
 /// unit-testable on any host: `ohos` is `cfg!(target_env = "ohos")` at the call site,
 /// `has_display` the `$DISPLAY` / `$WAYLAND_DISPLAY` check.
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
 fn pick_unix_strategy(ohos: bool, has_display: bool) -> OpenStrategy {
     // HarmonyOS PC: the system image has no `xdg-open`, and the app sandbox atomcode
     // runs in exports no `$DISPLAY` — so the display check would refuse a URL on a
@@ -437,7 +498,10 @@ pub fn open_local_url_sync(url: &str) -> Result<String, String> {
 
 /// Open a URL in this machine's default browser. Skips file-path resolution entirely.
 pub async fn open_local_url(url: &str) -> Result<String, String> {
-    open_local_url_impl(url)
+    let url = url.to_string();
+    tokio::task::spawn_blocking(move || open_local_url_impl(&url))
+        .await
+        .map_err(|e| format!("URL opener failed: {e}"))?
 }
 
 fn open_local_url_impl(url: &str) -> Result<String, String> {
@@ -483,11 +547,16 @@ fn open_local_url_impl(url: &str) -> Result<String, String> {
             ));
         }
     };
+    if matches!(strategy, OpenStrategy::OhosAa) {
+        return run_aa(cmd, std::time::Duration::from_secs(5))
+            .map(|()| format!("Submitted browser-open request for `{url}` via `aa`; the page may appear after a few seconds."))
+            .map_err(|error| format!("open_file: {error}.\n\nURL for manual access:\n  {url}"));
+    }
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     crate::process_utils::suppress_console_window_sync(&mut cmd);
-    match spawn_shell_fallback(&mut cmd) {
+    match cmd.spawn() {
         Ok(_child) => {
             let mut message = format!(
                 "Opened URL `{url}` via `{}`.",
@@ -672,7 +741,6 @@ mod tests {
     /// HarmonyOS PC is where the sandbox hides the display, so `aa` is the opener there
     /// whether or not a display is reported; every other Unix keeps today's behaviour —
     /// refuse without a display, `xdg-open` with one.
-    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn unix_picks_aa_for_harmonyos_and_xdg_open_elsewhere() {
         assert_eq!(pick_unix_strategy(true, false), OpenStrategy::OhosAa);
@@ -708,32 +776,34 @@ mod tests {
     /// The ENOEXEC fallback must rerun exactly the same program and argv through
     /// `sh`, with the URL still one argv entry — nothing handed to a shell for
     /// re-parsing, so a URL with `&` in it cannot turn into a background job.
+    #[cfg(unix)]
     #[test]
-    fn enoexec_fallback_reruns_the_same_argv_through_sh() {
-        let mut cmd = Command::new("aa");
-        cmd.arg("start")
-            .arg("-U")
-            .arg("https://acs.atomgit.com/s/1");
-        let sh = shell_fallback_command(&cmd);
-        assert_eq!(sh.get_program().to_string_lossy(), "sh");
-        let args: Vec<String> = sh
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(args[0], "-c");
-        assert_eq!(args[1], "exec \"$0\" \"$@\"");
-        assert_eq!(args[2], "aa");
-        assert_eq!(
-            args.len(),
-            6,
-            "program + 3 shell args + 2 aa args: {args:?}"
+    fn aa_checks_failures_missing_interpreters_and_literal_arguments() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aa");
+        std::fs::write(&path, "#!/missing/aa-interpreter\n[ \"$1\" = 'https://example.test/?a=1&b=$(bad)' ] || exit 9\necho rejected >&2\nexit 42\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut command = Command::new(&path);
+        command.arg("https://example.test/?a=1&b=$(bad)");
+        let error = run_aa(command, std::time::Duration::from_secs(1)).unwrap_err();
+        assert!(
+            error.contains("42") && error.contains("rejected"),
+            "{error}"
         );
-        for (got, want) in args[3..]
-            .iter()
-            .zip(["start", "-U", "https://acs.atomgit.com/s/1"])
-        {
-            assert_eq!(got, want);
-        }
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        assert!(run_aa(Command::new(&path), std::time::Duration::from_secs(1)).is_ok());
+        std::fs::write(&path, "#!/bin/sh\nexec sleep 10\n").unwrap();
+        assert!(
+            run_aa(Command::new(&path), std::time::Duration::from_millis(40))
+                .unwrap_err()
+                .contains("timed out")
+        );
+        assert!(run_aa(
+            Command::new(dir.path().join("missing")),
+            std::time::Duration::from_secs(1)
+        )
+        .is_err());
     }
 
     #[test]
