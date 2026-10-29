@@ -1618,6 +1618,8 @@ impl RuntimeControl {
                         updated_at: u64::try_from(entry.updated_at_ms).unwrap_or(0),
                         turns: u32::try_from(entry.turn_count).unwrap_or(u32::MAX),
                         needs_newer_version: entry.needs_newer_version,
+                        scheduled: entry.origin
+                            == atomcode_capabilities::session::manager::SessionOrigin::Scheduled,
                     },
                 )
             })

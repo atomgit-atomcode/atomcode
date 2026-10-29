@@ -1431,6 +1431,7 @@ impl CommandSet for SessionCommands {
                                     updated_at: stored.updated_at,
                                     turns: stored.turns,
                                     needs_newer_version: stored.needs_newer_version,
+                                    scheduled: stored.scheduled,
                                 })
                                 .collect();
                             if sessions.is_empty() {
@@ -6985,6 +6986,7 @@ mod tests {
                         updated_at: 2,
                         turns: 1,
                         needs_newer_version: false,
+                        scheduled: false,
                     },
                     atomcode_host_api::StoredSession {
                         id: "two".into(),
@@ -6994,6 +6996,7 @@ mod tests {
                         updated_at: 1,
                         turns: 1,
                         needs_newer_version: false,
+                        scheduled: false,
                     },
                 ],
             }));

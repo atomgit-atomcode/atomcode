@@ -289,6 +289,7 @@ export interface SessionMeta {
   message_count: number;
   file_size?: number;
   working_directory_available?: boolean;
+  scheduled?: boolean;
 }
 
 export interface SessionMetaWithProject extends SessionMeta {

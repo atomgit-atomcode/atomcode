@@ -1254,7 +1254,7 @@ export function Sidebar({
         }
       >
         <button class="session-item-main" onClick={() => onSelect(s)} title={dir}>
-          <span class="session-item-name">{label}</span>
+          <span class="session-item-name">{s.scheduled && <span class="session-automation-mark" title={t('sidebar.automation')} aria-label={t('sidebar.automation')}>◷</span>}{label}</span>
           <span class="session-item-meta">
             {formatTime(s.updated_at || s.created_at, t, timeNow)}
           </span>

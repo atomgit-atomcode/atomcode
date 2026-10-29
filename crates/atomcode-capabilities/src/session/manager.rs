@@ -418,7 +418,7 @@ pub struct ForkInfo {
 }
 
 /// How a session was created. Stored in [`SessionMeta`] so that automated
-/// scheduled-task sessions can be excluded from user-facing history pickers.
+/// task conversations can be marked in user-facing history pickers.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SessionOrigin {
@@ -426,8 +426,8 @@ pub enum SessionOrigin {
     /// sessions that predate this field (`#[serde(default)]`).
     #[default]
     Manual,
-    /// Started by the scheduled-tasks runner. Hidden from normal `/resume`
-    /// and sidebar pickers; visible in a dedicated scheduled-tasks view.
+    /// Persistent conversation for a scheduled task. Listed with an automation
+    /// marker in ordinary pickers and linked from the task's run history.
     Scheduled,
     /// Started in the background to do something for another conversation
     /// (a review, `/bg <task>`), whose result goes back to that conversation.
@@ -3288,14 +3288,13 @@ impl SessionManager {
         out
     }
 
-    /// Sessions for normal pickers (/resume, webui sidebar): excludes scheduled-run
-    /// sessions so recurring tasks don't flood the user's manual history, and
+    /// Sessions for normal pickers: includes automation conversations, excludes
     /// background work done for another conversation. Use `list()` for the full
     /// set (e.g. a scheduled-tasks view).
     pub fn list_visible(&self) -> Vec<SessionMeta> {
         self.list()
             .into_iter()
-            .filter(|m| m.origin == SessionOrigin::Manual)
+            .filter(|m| m.origin != SessionOrigin::Delegated)
             .collect()
     }
 
@@ -8430,7 +8429,12 @@ mod tests {
         assert_eq!(delegated("review"), Some(true));
         assert_eq!(delegated("mine"), Some(false));
 
+        let mut scheduled = SessionMeta::new("hourly", "/project", 3);
+        scheduled.origin = SessionOrigin::Scheduled;
+        manager.write_meta(&scheduled).unwrap();
         let offered: Vec<String> = manager.list_visible().into_iter().map(|m| m.id).collect();
-        assert_eq!(offered, ["mine"]);
+        assert!(offered.contains(&"mine".to_string()));
+        assert!(offered.contains(&"hourly".to_string()));
+        assert!(!offered.contains(&"review".to_string()));
     }
 }

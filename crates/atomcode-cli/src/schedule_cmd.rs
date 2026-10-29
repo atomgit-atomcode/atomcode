@@ -661,12 +661,24 @@ async fn execute_task(lease: &atomcode_schedule::RunLease) -> Result<(i32, Optio
         false, // headless: fail-closed approval timeout
     );
 
-    // 6. Spawn runtime (Fresh session — no resume).
+    // The run lease protects this binding across OS/manual launches. Never fork
+    // a busy conversation or silently start over after deletion/resume failure.
+    let resume_id = match lease.bound_session()? {
+        Some((id, previous_cwd)) => {
+            if std::fs::canonicalize(&previous_cwd)? != std::fs::canonicalize(&cwd)? {
+                anyhow::bail!("automation conversation belongs to {previous_cwd}; create a new task to change its working directory");
+            }
+            Some(id)
+        }
+        None => None,
+    };
+
+    // 6. First run is fresh; subsequent runs restore the same native log.
     // Headless path always uses ProviderBootstrap::Required so it fails fast
     // when no provider is configured, mirroring the `-p` / `--prompt` flow.
     let (runtime, agent, _cont) = crate::spawn_native_cli_runtime(
         &runtime_cfg,
-        None,
+        resume_id,
         ProviderBootstrap::Required,
         false,
         false,
@@ -678,17 +690,22 @@ async fn execute_task(lease: &atomcode_schedule::RunLease) -> Result<(i32, Optio
     .await?;
 
     // 7. Mark session origin = Scheduled.
-    if let Some(ref session_info) = runtime.session {
+    {
+        let session_info = runtime
+            .session
+            .as_ref()
+            .context("automation runtime has no persistent session")?;
         let sid = session_info.id.clone();
         lease.session(&sid)?;
         let manager = SessionManager::for_project(
             &agent.working_dir,
             &atomcode_coding::config::product_dirs_from_env(),
         );
-        // Best-effort — don't abort the run if meta update fails.
-        let _ = manager.update_meta(&sid, |m| {
+        // The visible automation marker is part of admitting this run. Do not
+        // execute model/tool work if its metadata cannot be committed.
+        manager.update_meta(&sid, |m| {
             m.origin = SessionOrigin::Scheduled;
-        });
+        })?;
     }
 
     // 8. Set the runtime mode after spawn.

@@ -1685,6 +1685,7 @@ body {
 }
 
 .session-item-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.875rem; line-height: 1.25rem; }
+.session-automation-mark { margin-inline-end: 6px; color: var(--app-secondary-foreground); }
 .session-item.active .session-item-name { font-weight: 600; }
 .session-item-meta { flex-shrink: 0; font-size: 0.75rem; line-height: 1.25rem; color: var(--app-caption-foreground); white-space: nowrap; }
 

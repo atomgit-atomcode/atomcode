@@ -26,6 +26,7 @@ pub struct Session {
     pub turns: u32,
     /// 这个会话是更新版本写的,当前构建读不了——列表说出来,选中也不恢复。
     pub needs_newer_version: bool,
+    pub scheduled: bool,
 }
 
 impl Session {
@@ -234,6 +235,7 @@ mod delete_tests {
                 updated_at: 0,
                 turns: 2,
                 needs_newer_version: false,
+                scheduled: false,
             },
             Session {
                 id: "bbb".into(),
@@ -242,6 +244,7 @@ mod delete_tests {
                 updated_at: 0,
                 turns: 1,
                 needs_newer_version: false,
+                scheduled: false,
             },
         ])
     }
@@ -295,6 +298,7 @@ mod tests {
             updated_at: 0,
             turns: 3,
             needs_newer_version: false,
+            scheduled: false,
         }
     }
 

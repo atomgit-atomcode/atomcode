@@ -303,9 +303,14 @@ fn session_line(
     } else {
         base.under(theme::fg(Role::PanelFg))
     };
+    let heading = if session.scheduled {
+        format!("◷ {} · {}", t(Msg::AutomationTitle), session.heading())
+    } else {
+        session.heading().to_string()
+    };
     let spans = vec![
         crate::frame::Span::styled(pointer, base),
-        crate::frame::Span::styled(session.heading().to_string(), heading_style),
+        crate::frame::Span::styled(heading, heading_style),
         crate::frame::Span::styled(format!("  {meta}"), base.under(theme::fg(Role::Muted))),
     ];
     pad_to(Line::from_spans(spans).truncate(w), w, base)
@@ -357,7 +362,19 @@ mod tests {
             updated_at: 0,
             turns: 3,
             needs_newer_version: false,
+            scheduled: false,
         }
+    }
+
+    #[test]
+    fn automation_conversations_are_marked_without_changing_their_identity() {
+        let mut scheduled = session("hourly", Some("Check trending"));
+        scheduled.scheduled = true;
+        let view = ResumeView::new(vec![scheduled]);
+        let rendered = text_with(&view, &Panel::new(), None, 120).join("\n");
+        assert!(rendered.contains("◷"), "{rendered}");
+        assert!(rendered.contains("Check trending"), "{rendered}");
+        assert_eq!(view.sessions()[0].id, "hourly");
     }
 
     fn view() -> ResumeView {

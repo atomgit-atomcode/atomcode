@@ -1261,6 +1261,9 @@ pub struct StoredSession {
     /// there, refused if they try to resume it (`docs/adr/0024` §16).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub needs_newer_version: bool,
+    /// A persistent conversation used by an automation task.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub scheduled: bool,
 }
 
 /// Something that happened on the host, whoever caused it.
@@ -1788,6 +1791,7 @@ mod tests {
                     updated_at: 2,
                     turns: 3,
                     needs_newer_version: true,
+                    scheduled: true,
                 }],
             },
             HostReply::Undone {

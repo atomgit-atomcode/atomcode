@@ -1549,6 +1549,7 @@ pub struct SessionSummary {
     #[serde(default)]
     pub file_size: u64,
     pub working_directory_available: bool,
+    pub scheduled: bool,
 }
 
 fn catalog_scan_in_root(
@@ -1657,6 +1658,8 @@ fn catalog_entry_to_session_summary(
         message_count: entry.message_count,
         file_size: 0,
         working_directory_available: entry.working_directory_available(),
+        scheduled: entry.origin
+            == atomcode_capabilities::session::manager::SessionOrigin::Scheduled,
     }
 }
 
@@ -9526,6 +9529,7 @@ mod tests {
         let mut meta = SessionMeta::new(session_id, tmp.path().to_string_lossy(), 1);
         meta.owner = StorageOwner::Native;
         meta.message_count = 1;
+        meta.origin = atomcode_capabilities::session::manager::SessionOrigin::Scheduled;
         manager
             .commit_native_import(
                 &lease,
@@ -9540,6 +9544,8 @@ mod tests {
         let search = search_sessions_by_name_in_root(tmp.path(), "可搜索", false).unwrap();
 
         assert_eq!(global.len(), 1);
+        assert!(global[0].meta.scheduled);
+        assert!(search[0].meta.scheduled);
         assert_eq!(global[0].meta.name, "可搜索的历史标题");
         assert_eq!(search.len(), 1);
         assert_eq!(search[0].meta.id, session_id);
