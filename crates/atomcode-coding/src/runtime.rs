@@ -7798,7 +7798,9 @@ fn spawn_runtime_owner_with_optional_agent(
                                     &runtime_event_tx,
                                 );
                                 resources = Some(runtime);
-                                if active_turn.is_none() {
+                                // A replay whose send failed already set the
+                                // failure phase; a ready store here would hide it.
+                                if active_turn.is_none() && agent_available {
                                     controls.state.store(
                                         runtime_phase_state(generation, RuntimePhase::Ready),
                                         Ordering::Release,
@@ -8630,7 +8632,9 @@ fn spawn_runtime_owner_with_optional_agent(
                         let cwd = runtime.config.working_dir.clone();
                         if changes_session { mode_model_return = None; }
                         resources = Some(runtime);
-                        if active_turn.is_none() {
+                        // A replay whose send failed already set the failure
+                        // phase; a ready store here would hide it.
+                        if active_turn.is_none() && agent_available {
                             controls.state.store(
                                 runtime_phase_state(generation, RuntimePhase::Ready),
                                 Ordering::Release,
@@ -10853,21 +10857,19 @@ fn replay_pending_resume_prompt(
         Ordering::Release,
     );
     let command = AgentCommand::SendMessage {
-        text: prompt.text,
-        images: prompt.images,
+        text: prompt.text.clone(),
+        images: prompt.images.clone(),
     };
     let unsent = match agent.as_ref() {
         Some(agent) => agent.commands.send(command).err().map(|error| error.0),
         None => Some(command),
     };
-    if let Some(AgentCommand::SendMessage { text, images }) = unsent {
-        // The prepared rewind stands; put the prompt back so a rebuild or a
-        // provider change can retry it instead of leaving it hidden.
-        binding.pending_resume_prompt = Some(if images.is_empty() {
-            atomcode_kernel::message::Message::user(text)
-        } else {
-            atomcode_kernel::message::Message::user_with_images(text, images)
-        });
+    if unsent.is_some() {
+        // The prepared rewind stands; put the prompt back as it came back from
+        // the log so a rebuild or a provider change can retry it instead of
+        // leaving it hidden. A rebuilt `Message::user` would drop any other
+        // field the pending prompt carries.
+        binding.pending_resume_prompt = Some(prompt);
         let _ = event_tx.send(CodingRuntimeEvent::ControllerWarning(
             "the resumed prompt could not be handed to the agent; \
              it will be replayed when the runtime is rebuilt"
