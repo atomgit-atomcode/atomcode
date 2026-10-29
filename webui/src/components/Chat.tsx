@@ -68,6 +68,7 @@ import {
   splitAtToken,
 } from '../lib/atMention';
 import { toolResultStatus, updateToolProgress, upsertToolPart, type ToolRow, type MsgPart } from '../lib/toolRows';
+import { backgroundPresentation, groupEmptyPolls, type PollGroups } from '../lib/backgroundTools';
 import { commitTodoCall, todoToolDetail, type TodoTitles } from '../lib/todoToolDetail';
 import {
   applyTodoCall,
@@ -3289,6 +3290,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   // 不过滤时间线，而是展示完整消息流
   const visibleMessages = useMemo(() => !historyDisplay.showLive ? [] : messages.map((m, origIdx) => ({ msg: m, origIdx }))
     .filter(({ origIdx }) => !historyDisplay.active || origIdx >= historyDisplay.liveStart), [messages, historyDisplay]);
+  const pollGroups = useMemo(() => groupEmptyPolls(searchTrim ? [] : visibleMessages.map(({ msg }) => msg)), [visibleMessages, searchTrim]);
   const lastVisibleIdx = visibleMessages.length - 1;
   // 计算匹配的原始消息索引列表
   const matchPositions = useMemo(() => {
@@ -3970,6 +3972,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
                 timeLabel={timeLabel}
                 search={search}
                 isActiveSearchMatch={isActiveSearchMatch}
+                pollGroups={pollGroups}
               />
             );
           });
@@ -4237,6 +4240,7 @@ function AssistantMessageView({
   timeLabel,
   search,
   isActiveSearchMatch,
+  pollGroups,
 }: {
   msg: Message;
   isLast: boolean;
@@ -4250,6 +4254,7 @@ function AssistantMessageView({
   timeLabel?: string;
   search: string;
   isActiveSearchMatch: boolean;
+  pollGroups?: PollGroups;
 }) {
   const t = useT();
   const text = messageText(msg);
@@ -4306,6 +4311,11 @@ function AssistantMessageView({
 
   const showTimestamp = Boolean(timeLabel) && shouldShowAssistantTimestamp(isLastInTurn, streaming, text, isError);
 
+  const groups = pollGroups ?? groupEmptyPolls(search.trim() ? [] : [msg]);
+  const onlyHiddenPolls = msg.parts.every(part => part.kind === 'tool'
+    ? groups.hidden.has(part.tool.id) : part.kind === 'text' && !part.text.trim());
+  if (onlyHiddenPolls && !streaming && !copyBtn && !showTimestamp && artifacts.length === 0) return null;
+
   return (
     <div class={cls} ref={searchRef}>
       {/* Error turns are pure injected text — render flat. */}
@@ -4324,7 +4334,7 @@ function AssistantMessageView({
         <>
           {/* Segments in chronological order: text→tool→text→tool,
               matching the TUI. Consecutive tools share one tool-list. */}
-          {renderAssistantParts(msg.parts, search)}
+          {renderAssistantParts(msg.parts, search, groups)}
           {streaming && (
             <span class="waiting-dots" role="status" aria-label={t('chat.waiting')}>
               <span class="waiting-dot" />
@@ -4373,7 +4383,7 @@ function AssistantMessageView({
   );
 }
 
-function renderAssistantParts(parts: MsgPart[], search: string): VNode[] {
+function renderAssistantParts(parts: MsgPart[], search: string, pollGroups: PollGroups): VNode[] {
   const out: VNode[] = [];
   let i = 0;
   while (i < parts.length) {
@@ -4387,12 +4397,12 @@ function renderAssistantParts(parts: MsgPart[], search: string): VNode[] {
         tools.push(q.tool);
         i++;
       }
-      const visibleTools = tools.filter(shouldShowToolRow);
+      const visibleTools = tools.filter(tool => shouldShowToolRow(tool) && !pollGroups.hidden.has(tool.id));
       if (visibleTools.length > 0) {
         out.push(
           <div class="tool-list" key={`tg-${groupKey}`}>
             {visibleTools.map((tool) => (
-              <ToolRowView key={tool.id} tool={tool} />
+              <ToolRowView key={tool.id} tool={tool} polls={pollGroups.byFirstId.get(tool.id)} />
             ))}
           </div>,
         );
@@ -4687,10 +4697,12 @@ function ToolStatusIcon({ cls }: { cls: string }) {
       stroke-linejoin="round"
       aria-hidden="true"
     >
-      {cls === 'success' ? (
+      {cls === 'success' || cls === 'neutral' ? (
         <path d="M3.5 8.5 6.5 11.5 12.5 4.5" />
       ) : cls === 'error' ? (
         <path d="M4 4l8 8M12 4l-8 8" />
+      ) : cls === 'background' ? (
+        <><circle cx="8" cy="8" r="5.5" /><path d="M8 4.5V8l2.5 1.5" /></>
       ) : cls === 'warning' ? (
         <path d="M8 2.5 14 13H2L8 2.5ZM8 6v3.5M8 11.5h.01" />
       ) : (
@@ -4704,8 +4716,11 @@ function shouldShowToolRow(tool: ToolRow): boolean {
   return !isTodoTool(tool.name) || tool.status === 'error' || tool.status === 'incomplete';
 }
 
-function ToolRowView({ tool }: { tool: ToolRow }) {
+function ToolRowView({ tool: original, polls }: { tool: ToolRow; polls?: ToolRow[] }) {
   const t = useT();
+  const calls = polls ?? [original];
+  const tool = calls[calls.length - 1];
+  const background = backgroundPresentation(tool);
   const [expanded, setExpanded] = useState(false);
 
   // Successful TodoWrite calls are represented by the persistent composer
@@ -4725,14 +4740,16 @@ function ToolRowView({ tool }: { tool: ToolRow }) {
     annotation = { cls: 'warning', label: t('tool.incomplete') };
   }
 
-  const hasDetail = !!(tool.args || tool.output);
+  if (background) annotation = { cls: background.cls, label: t(background.label, background.params) };
+  const hasDetail = calls.some(call => Boolean(call.args || call.output));
 
   return (
     <div class="tool-body">
-      <div class="tool-header" onClick={() => setExpanded((e) => !e)}>
+      <button type="button" class="tool-header" aria-expanded={expanded} onClick={() => setExpanded((e) => !e)}>
         <ToolTypeIcon name={tool.name} />
-        <span class="tool-name">{displayToolName(tool.name)}</span>
-        <span class="tool-name-secondary">{abbreviateArgs(tool.detail ?? formatToolDetail(tool.name, tool.args))}</span>
+        <span class="tool-name">{background?.title ? t(background.title) : displayToolName(tool.name)}</span>
+        <span class="tool-name-secondary">{abbreviateArgs(background?.detail ?? tool.detail ?? formatToolDetail(tool.name, tool.args))}</span>
+        {calls.length > 1 && <span class="tool-poll-count">{t('tool.pollCount', { n: calls.length })}</span>}
         {annotation && (
           <span class={'tool-annotation ' + annotation.cls}>
             <ToolStatusIcon cls={annotation.cls} />
@@ -4742,24 +4759,27 @@ function ToolRowView({ tool }: { tool: ToolRow }) {
         {hasDetail && (
           <span class={'tool-chevron' + (expanded ? ' expanded' : '')}>▾</span>
         )}
-      </div>
+      </button>
       {tool.status === 'pending' && tool.progress && (
         <div class="tool-progress" title={tool.progress}>{tool.progress}</div>
       )}
       {expanded && hasDetail && (
         <div class="tool-body-grid">
-          {tool.args && (
-            <div class="tool-body-row">
-              <div class="tool-body-row-label">{t('tool.args')}</div>
-              <div class="tool-body-row-content">{tool.args}</div>
-            </div>
-          )}
-          {tool.output && (
-            <div class="tool-body-row">
-              <div class="tool-body-row-label">{t('tool.output')}</div>
-              <div class="tool-body-row-content">{tool.output}</div>
-            </div>
-          )}
+          {calls.flatMap((call, index) => [
+            calls.length > 1 && <div key={`${call.id}-attempt`} class="tool-poll-attempt">{t('tool.pollAttempt', { n: index + 1 })}</div>,
+            call.args && (
+              <div key={`${call.id}-args`} class="tool-body-row">
+                <div class="tool-body-row-label">{t('tool.args')}</div>
+                <div class="tool-body-row-content">{call.args}</div>
+              </div>
+            ),
+            call.output && (
+              <div key={`${call.id}-output`} class="tool-body-row">
+                <div class="tool-body-row-label">{t('tool.output')}</div>
+                <div class="tool-body-row-content">{call.output}</div>
+              </div>
+            ),
+          ])}
         </div>
       )}
     </div>

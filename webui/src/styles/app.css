@@ -697,6 +697,12 @@ body {
 }
 
 .tool-header {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  font: inherit;
   display: flex;
   align-items: center;
   padding: 5px 6px;
@@ -766,6 +772,10 @@ body {
 @keyframes tool-spin { to { transform: rotate(360deg); } }
 
 .tool-annotation.success { color: var(--app-success-foreground); }
+.tool-annotation.background, .tool-annotation.neutral { color: var(--app-secondary-foreground); }
+.tool-poll-count { flex-shrink: 0; color: var(--app-secondary-foreground); font-size: .75rem; }
+.tool-poll-attempt { grid-column: 1 / -1; padding: 6px 10px; border-top: 1px solid var(--app-input-border); color: var(--app-secondary-foreground); font-size: .75rem; }
+
 .tool-annotation.error { color: var(--app-error-foreground); }
 .tool-annotation.warning { color: var(--app-warning-accent); }
 .tool-annotation.pending { color: var(--app-tertiary-foreground); }
