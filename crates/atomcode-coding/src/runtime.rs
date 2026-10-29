@@ -48,7 +48,9 @@ use crate::controllers::{
     EvalOutcome, GoalPhase, GoalProgress, GoalRecoveryKind, GoalResult, GoalState, GoalTerminal,
     LoopProgress, LoopState, ScheduleWakeupTool, WakeupRequest,
 };
-use crate::parts::{prepare_with_plugin_hook_source_reusing_lease, SessionLeaseSource};
+use crate::parts::{
+    prepare_with_plugin_hook_source_reusing_lease, SessionBinding, SessionLeaseSource,
+};
 #[cfg(test)]
 use crate::prepare_with_plugin_hook_source;
 use crate::{CodingAgentConfig, CodingProviderFactory, PluginHookSource, PrepareOptions};
@@ -4724,7 +4726,9 @@ fn spawn_runtime_owner_with_optional_agent(
         if agent_available {
             replay_pending_resume_prompt(
                 &agent,
-                resources.as_mut(),
+                resources
+                    .as_mut()
+                    .and_then(|runtime| runtime.parts.session.as_mut()),
                 controls.state.as_ref(),
                 generation,
                 &mut next_turn_id,
@@ -7788,7 +7792,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 runtime_event_tx.seed_live_view(generation, &runtime);
                                 replay_pending_resume_prompt(
                                     &agent,
-                                    Some(&mut runtime),
+                                    runtime.parts.session.as_mut(),
                                     controls.state.as_ref(),
                                     generation,
                                     &mut next_turn_id,
@@ -8619,7 +8623,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         // step of this path replays it.
                         replay_pending_resume_prompt(
                             &agent,
-                            Some(&mut runtime),
+                            runtime.parts.session.as_mut(),
                             controls.state.as_ref(),
                             generation,
                             &mut next_turn_id,
@@ -10805,7 +10809,7 @@ fn request_cancel_snapshot(agent: &Option<AgentHandle>) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn replay_pending_resume_prompt(
     agent: &Option<AgentHandle>,
-    resources: Option<&mut RuntimeResources>,
+    session: Option<&mut SessionBinding>,
     runtime_state: &AtomicU64,
     generation: u64,
     next_turn_id: &mut u64,
@@ -10814,10 +10818,7 @@ fn replay_pending_resume_prompt(
     agent_available: &mut bool,
     event_tx: &RuntimeEventEmitter,
 ) {
-    let Some(runtime) = resources else {
-        return;
-    };
-    let Some(binding) = runtime.parts.session.as_mut() else {
+    let Some(binding) = session else {
         return;
     };
     let Some(prompt) = binding.pending_resume_prompt.take() else {
@@ -21869,6 +21870,127 @@ type = "openai"
             .filter(|message| message.text == "replay after switch")
             .count();
         assert_eq!(replayed, 1, "{:?}", loaded.snapshot.messages);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn a_failed_replay_send_keeps_the_prompt_for_a_retry() {
+        use atomcode_kernel::session::SessionEvent;
+
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let manager = Arc::new(atomcode_capabilities::session::SessionManager::for_project(
+            project.path(),
+            &crate::config::product_dirs_from_env(),
+        ));
+        let id = "replay-send-failure";
+        let source = SessionSnapshot::new(vec![
+            Message::user("old question"),
+            Message::assistant("old answer", Vec::new()),
+        ]);
+        persist_native_session(&manager, id, project.path(), &source);
+        let mut inflight = source.clone();
+        inflight.messages.push(Message::user("replay me"));
+        std::fs::write(
+            manager.root().join(format!("{id}.snapshot.inflight")),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "replay_safe": true,
+                "snapshot": inflight,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let lease = manager.acquire_lease(id).unwrap();
+        let (_loaded, pending) = manager
+            .open_for_resume_noting(&lease, &mut Vec::new())
+            .unwrap();
+        let mut pending = pending.expect("the checkpoint's prompt is handed back");
+        // A field a rebuilt `Message::user` would drop.
+        pending.meta = Some(MessageMeta {
+            turn_id: 7,
+            round: 2,
+            request_id: 9,
+            ..Default::default()
+        });
+        let mut binding = SessionBinding::test_binding(id, manager.clone(), lease, Some(pending));
+
+        // An agent whose command channel is already closed: the prepared replay
+        // cannot be handed over.
+        let (commands, commands_rx) = tokio::sync::mpsc::unbounded_channel::<AgentCommand>();
+        drop(commands_rx);
+        let (_events_tx, events) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        let agent = Some(AgentHandle {
+            commands,
+            events,
+            task: tokio::spawn(async {}),
+        });
+        let (raw_tx, mut raw_rx) = tokio::sync::mpsc::unbounded_channel::<CodingRuntimeEvent>();
+        let emitter = RuntimeEventEmitter::new(raw_tx, None, Arc::new(AtomicU64::new(0)));
+        let state = AtomicU64::new(runtime_phase_state(0, RuntimePhase::Reconfiguring));
+        let mut next_turn_id = 0;
+        let mut active_turn = None;
+        let mut turn_stats = RuntimeTurnStats::default();
+        let mut agent_available = true;
+
+        replay_pending_resume_prompt(
+            &agent,
+            Some(&mut binding),
+            &state,
+            0,
+            &mut next_turn_id,
+            &mut active_turn,
+            &mut turn_stats,
+            &mut agent_available,
+            &emitter,
+        );
+
+        let restored = binding
+            .pending_resume_prompt
+            .as_ref()
+            .expect("the prompt is kept for the next rebuild");
+        assert_eq!(restored.text, "replay me");
+        assert!(
+            restored.meta.is_some(),
+            "the original message is kept, not one rebuilt from text and images"
+        );
+        assert!(!agent_available, "the dead agent must not be reused");
+        assert!(active_turn.is_none());
+        assert_eq!(
+            runtime_status(state.load(Ordering::Acquire)).phase,
+            RuntimePhase::Failed,
+            "the failure phase must survive the caller's ready store"
+        );
+        assert!(matches!(
+            raw_rx.try_recv(),
+            Ok(CodingRuntimeEvent::ControllerWarning(_))
+        ));
+
+        // The prepared rewind stands; a retry after a rebuild adds no second one.
+        let rewinds = || {
+            manager
+                .load_events(id)
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(event.event, SessionEvent::Rewound { .. }))
+                .count()
+        };
+        assert_eq!(rewinds(), 1);
+        agent_available = true;
+        replay_pending_resume_prompt(
+            &agent,
+            Some(&mut binding),
+            &state,
+            0,
+            &mut next_turn_id,
+            &mut active_turn,
+            &mut turn_stats,
+            &mut agent_available,
+            &emitter,
+        );
+        assert!(binding.pending_resume_prompt.is_some());
+        assert_eq!(rewinds(), 1);
     }
 
     #[tokio::test]
