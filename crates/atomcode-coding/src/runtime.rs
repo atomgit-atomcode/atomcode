@@ -8611,14 +8611,31 @@ fn spawn_runtime_owner_with_optional_agent(
                             }
                             None => {}
                         }
+                        // A resumed session may carry a prompt its previous
+                        // process accepted but never answered. This binding is
+                        // the switch's only chance to hand it back; no other
+                        // step of this path replays it.
+                        replay_pending_resume_prompt(
+                            &agent,
+                            Some(&mut runtime),
+                            controls.state.as_ref(),
+                            generation,
+                            &mut next_turn_id,
+                            &mut active_turn,
+                            &mut turn_stats,
+                            &mut agent_available,
+                            &runtime_event_tx,
+                        );
                         let changed = session_changed(generation, &runtime);
                         let cwd = runtime.config.working_dir.clone();
                         if changes_session { mode_model_return = None; }
                         resources = Some(runtime);
-                        controls.state.store(
-                            runtime_phase_state(generation, RuntimePhase::Ready),
-                            Ordering::Release,
-                        );
+                        if active_turn.is_none() {
+                            controls.state.store(
+                                runtime_phase_state(generation, RuntimePhase::Ready),
+                                Ordering::Release,
+                            );
+                        }
                         runtime_event_tx.session_changed(changed.clone(), resources.as_ref());
                         if changes_session {
                             if let Some(intervention) = pending_policy_intervention.take() {
@@ -10805,7 +10822,10 @@ fn replay_pending_resume_prompt(
     // Loading a session only hands the prompt back; the retraction happens here,
     // immediately before the replay is actually sent. A preview that dropped the
     // prompt therefore leaves the conversation unchanged.
-    match binding.manager.prepare_resume_replay(&binding.lease) {
+    match binding
+        .manager
+        .prepare_resume_replay(&binding.lease, &prompt)
+    {
         Ok(atomcode_capabilities::session::manager::PrepareResumeReplay::Prepared) => {}
         Ok(atomcode_capabilities::session::manager::PrepareResumeReplay::Obsolete) => {
             let _ = event_tx.send(CodingRuntimeEvent::ControllerWarning(
@@ -10848,6 +10868,11 @@ fn replay_pending_resume_prompt(
         } else {
             atomcode_kernel::message::Message::user_with_images(text, images)
         });
+        let _ = event_tx.send(CodingRuntimeEvent::ControllerWarning(
+            "the resumed prompt could not be handed to the agent; \
+             it will be replayed when the runtime is rebuilt"
+                .into(),
+        ));
         *agent_available = false;
         *active_turn = None;
         runtime_state.store(
@@ -21775,6 +21800,69 @@ type = "openai"
 
         runtime.handle.shutdown().await.unwrap();
         manager.acquire_lease("session-b").unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn session_switch_replays_an_unanswered_prompt() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let manager = atomcode_capabilities::session::SessionManager::for_project(
+            project.path(),
+            &crate::config::product_dirs_from_env(),
+        );
+        persist_native_session(
+            &manager,
+            "session-a",
+            project.path(),
+            &SessionSnapshot::new(vec![
+                Message::user("complete"),
+                Message::assistant("answer", Vec::new()),
+            ]),
+        );
+        let source = SessionSnapshot::new(vec![
+            Message::user("old question"),
+            Message::assistant("old answer", Vec::new()),
+        ]);
+        persist_native_session(&manager, "session-b", project.path(), &source);
+        let mut inflight = source.clone();
+        inflight
+            .messages
+            .push(Message::user("replay after switch"));
+        std::fs::write(
+            manager.root().join("session-b.snapshot.inflight"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "replay_safe": true,
+                "snapshot": inflight,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.prepare.session = crate::SessionMode::Resume("session-a".into());
+        let mut runtime = CodingRuntime::start(start).await.unwrap();
+        runtime.handle.resume_session("session-b").await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            wait_for_turn_finished(&mut runtime),
+        )
+        .await
+        .expect("the switched-to session replays its recovered prompt");
+        runtime.handle.shutdown().await.unwrap();
+        runtime.task.await.unwrap();
+
+        let loaded = manager.load_native_session("session-b").unwrap();
+        let replayed = loaded
+            .snapshot
+            .messages
+            .iter()
+            .filter(|message| message.text == "replay after switch")
+            .count();
+        assert_eq!(replayed, 1, "{:?}", loaded.snapshot.messages);
     }
 
     #[tokio::test]

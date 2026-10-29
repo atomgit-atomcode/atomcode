@@ -733,6 +733,12 @@ enum PendingReplay {
     Stale,
 }
 
+/// Whether a prompt found in the log is the one the runtime holds. The two are
+/// built from the same `UserMessage` fact, so text and images decide it.
+fn same_accepted_prompt(pending: &Message, logged: &Message) -> bool {
+    pending.text == logged.text && pending.images == logged.images
+}
+
 fn pending_replay_prompt(events: &[LoggedEvent], replay: &ResumeReplay) -> PendingReplay {
     let Some(rewound_at) = events
         .iter()
@@ -1878,8 +1884,13 @@ impl SessionManager {
         Ok((loaded, Some(prompt)))
     }
 
-    /// The runtime is about to replay a prompt `resume_event_session` handed back:
+    /// The runtime is about to replay the prompt `resume_event_session` handed back:
     /// write the retry marker, then retract the unanswered turn.
+    ///
+    /// `pending` is the prompt the runtime holds. When the marker cannot name a
+    /// retraction (never written, or unreadable), the log decides — but only a
+    /// still-visible copy of `pending` may be retracted, so a conversation that
+    /// moved on is never rewound on the replay's behalf.
     ///
     /// Idempotent while the marker's rewind is in the log, so a failed send can be
     /// retried. A transient failure is reported and leaves the retryable state in
@@ -1888,6 +1899,7 @@ impl SessionManager {
     pub fn prepare_resume_replay(
         &self,
         lease: &SessionLease,
+        pending: &Message,
     ) -> SessionResult<PrepareResumeReplay> {
         self.validate_active_lease(lease)?;
         let id = lease.id();
@@ -1898,13 +1910,21 @@ impl SessionManager {
         let replay = match self.read_resume_replay(id) {
             Ok(Some(replay)) => Some(replay),
             Ok(None) => None,
-            // A marker that cannot be read is not a licence to pick another
-            // target out of a log that may have moved.
-            Err(error) => return Err(error),
+            Err(error) => {
+                // A retry aid that cannot be read must not strand the prompt.
+                // The marker is left in place for a build that can read it, but
+                // this attempt decides from the log alone.
+                tracing::warn!(
+                    session = id,
+                    %error,
+                    "resume replay marker could not be read; deciding from the log"
+                );
+                None
+            }
         };
         let target = if let Some(replay) = replay {
             match pending_replay_prompt(&events, &replay) {
-                PendingReplay::StillWaiting(_) => {
+                PendingReplay::StillWaiting(logged) if same_accepted_prompt(pending, &logged) => {
                     return Ok(PrepareResumeReplay::Prepared);
                 }
                 PendingReplay::Started => {
@@ -1914,10 +1934,17 @@ impl SessionManager {
                     let _ = self.clear_resume_replay(id);
                     return Ok(PrepareResumeReplay::Obsolete);
                 }
-                PendingReplay::Stale => {
-                    // The marker has no rewind yet. Retract its exact target, not
-                    // a freshly chosen last turn.
-                    if super::events::unanswered_at(&events, replay.to, replay.turn).is_none() {
+                // The marker has no retraction this prompt can use yet. Retract
+                // its exact target, not a freshly chosen last turn, and only
+                // while that target still holds the prompt being replayed.
+                PendingReplay::StillWaiting(_) | PendingReplay::Stale => {
+                    let Some(visible) =
+                        super::events::unanswered_at(&events, replay.to, replay.turn)
+                    else {
+                        let _ = self.clear_resume_replay(id);
+                        return Ok(PrepareResumeReplay::Obsolete);
+                    };
+                    if !same_accepted_prompt(pending, &visible) {
                         let _ = self.clear_resume_replay(id);
                         return Ok(PrepareResumeReplay::Obsolete);
                     }
@@ -1925,11 +1952,17 @@ impl SessionManager {
                 }
             }
         } else {
-            // No marker (a load whose best-effort marker write failed, or an
-            // older caller): fall back to the last unanswered turn.
-            let Some((to, turn, _)) = super::events::unanswered_prompt(&events) else {
-                return Ok(PrepareResumeReplay::Prepared);
+            // No usable marker (its write failed at load, or it could not be
+            // read): fall back to the last unanswered turn, which must still be
+            // this prompt. With no such turn the replay was answered or the
+            // conversation moved on; sending it would show the prompt again
+            // without retracting anything.
+            let Some((to, turn, visible)) = super::events::unanswered_prompt(&events) else {
+                return Ok(PrepareResumeReplay::Obsolete);
             };
+            if !same_accepted_prompt(pending, &visible) {
+                return Ok(PrepareResumeReplay::Obsolete);
+            }
             ResumeReplay {
                 to,
                 turn,

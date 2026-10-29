@@ -701,7 +701,7 @@ impl SessionManager {
             self.record_chosen_name(lease);
             return Ok(false);
         }
-        self.convert(lease, self.load_native_session(id)?)?;
+        self.convert(lease, self.load_native_session(id)?, None)?;
         Ok(true)
     }
 
@@ -733,14 +733,21 @@ impl SessionManager {
             return self.load_native_session_for_resume_noting(lease, notes);
         }
         let (loaded, pending) = self.load_native_session_for_resume_noting(lease, notes)?;
-        self.convert(lease, loaded)?;
-        Ok((self.load_native_session(id)?, pending))
+        self.convert(lease, loaded, pending.as_ref())?;
+        if pending.is_some() {
+            // The accepted turn is now a fact of the log; the log's own resume
+            // hands it back, with the marker and pending view every replay of a
+            // log fact has.
+            return self.load_native_session_for_resume_noting(lease, notes);
+        }
+        Ok((self.load_native_session(id)?, None))
     }
 
     fn convert(
         &self,
         lease: &SessionLease,
         loaded: super::manager::LoadedSession,
+        accepted: Option<&Message>,
     ) -> SessionResult<()> {
         let id = lease.id();
         let times = self.load_transcript_timestamps(id).unwrap_or_default();
@@ -759,6 +766,29 @@ impl SessionManager {
                 seq,
                 at,
                 event: titled,
+            });
+        }
+        if let Some(prompt) = accepted {
+            // The snapshot's in-flight prompt was accepted before the process
+            // died but never entered a log. It becomes the turn the log would
+            // have held, so its replay retracts a log fact like any other
+            // instead of being sent beside a conversation that lacks it.
+            let turn = last_turn(&events) + 1;
+            let at = u64::try_from(super::now_ms()).unwrap_or(0);
+            let seq = events.last().map_or(1, |last| last.seq + 1);
+            events.push(LoggedEvent {
+                seq,
+                at,
+                event: SessionEvent::TurnStart { turn },
+            });
+            events.push(LoggedEvent {
+                seq: seq + 1,
+                at,
+                event: SessionEvent::UserMessage {
+                    turn,
+                    text: prompt.text.clone(),
+                    images: prompt.images.clone(),
+                },
             });
         }
         let mut header = SessionHeader::new(id);
@@ -2850,7 +2880,9 @@ mod tests {
             .iter()
             .any(|event| matches!(event.event, SessionEvent::Rewound { .. })));
 
-        manager.prepare_resume_replay(&lease).unwrap();
+        manager
+            .prepare_resume_replay(&lease, &Message::user("hello"))
+            .unwrap();
 
         let (loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
         assert_eq!(
@@ -3028,7 +3060,9 @@ mod tests {
                 rewound: None
             })
         );
-        manager.prepare_resume_replay(&lease).unwrap();
+        manager
+            .prepare_resume_replay(&lease, &Message::user("hello"))
+            .unwrap();
 
         let (loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
         assert_eq!(
@@ -3069,7 +3103,9 @@ mod tests {
             Some("hello".to_string())
         );
         assert_eq!(rewinds(), 1, "a retry must not append another rewind");
-        manager.prepare_resume_replay(&lease).unwrap();
+        manager
+            .prepare_resume_replay(&lease, &Message::user("hello"))
+            .unwrap();
         assert_eq!(
             rewinds(),
             1,
@@ -3181,7 +3217,9 @@ mod tests {
             .iter()
             .any(|event| matches!(event.event, SessionEvent::Rewound { .. })));
 
-        manager.prepare_resume_replay(&lease).unwrap();
+        manager
+            .prepare_resume_replay(&lease, &Message::user("hello"))
+            .unwrap();
 
         let (_loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
         assert_eq!(
@@ -3277,7 +3315,9 @@ mod tests {
             .unwrap();
         let (_loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
         assert!(pending.is_some());
-        manager.prepare_resume_replay(&lease).unwrap();
+        manager
+            .prepare_resume_replay(&lease, &Message::user("hello"))
+            .unwrap();
         // The person undoes the same turn after resume prepared its own rewind.
         manager
             .append_events(
@@ -3360,7 +3400,9 @@ mod tests {
             .unwrap();
         let (_loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
         assert!(pending.is_some());
-        manager.prepare_resume_replay(&lease).unwrap();
+        manager
+            .prepare_resume_replay(&lease, &Message::user("hello"))
+            .unwrap();
 
         // The replay's turn was accepted, then the process died before answering.
         manager
@@ -3386,7 +3428,9 @@ mod tests {
             pending.map(|message| message.text),
             Some("hello".to_string())
         );
-        manager.prepare_resume_replay(&lease).unwrap();
+        manager
+            .prepare_resume_replay(&lease, &Message::user("hello"))
+            .unwrap();
 
         let (_loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
         assert_eq!(
@@ -3458,7 +3502,7 @@ mod tests {
 
         assert!(
             matches!(
-                manager.prepare_resume_replay(&lease),
+                manager.prepare_resume_replay(&lease, &Message::user("hello")),
                 Ok(PrepareResumeReplay::Obsolete)
             ),
             "the marker names turn 1; a newer turn must not be retracted"
@@ -3494,7 +3538,9 @@ mod tests {
             .unwrap();
         let (_loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
         assert!(pending.is_some());
-        manager.prepare_resume_replay(&lease).unwrap();
+        manager
+            .prepare_resume_replay(&lease, &Message::user("hello"))
+            .unwrap();
 
         // The replay's turn was accepted; a retry must not rewind it.
         manager
@@ -3515,7 +3561,7 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(
-            manager.prepare_resume_replay(&lease),
+            manager.prepare_resume_replay(&lease, &Message::user("hello")),
             Ok(PrepareResumeReplay::Obsolete)
         ));
         assert_eq!(
@@ -3586,6 +3632,247 @@ mod tests {
             .unwrap()
             .iter()
             .any(|event| matches!(event.event, SessionEvent::Rewound { .. })));
+    }
+
+    #[test]
+    fn prepare_without_a_marker_does_not_replay_an_answered_prompt() {
+        let (_dir, manager) = store();
+        let id = "resume-replay-no-marker";
+        let lease = created(&manager, id);
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "hello".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        let (_loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
+        assert!(pending.is_some());
+        // The marker is a retry aid. Without it, a prompt the log no longer
+        // shows unanswered must not be sent again unretracted.
+        manager.clear_resume_replay(id).unwrap();
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(
+                        3,
+                        0,
+                        SessionEvent::AssistantMessage {
+                            turn: 1,
+                            round: 1,
+                            text: "ok".into(),
+                            reasoning: String::new(),
+                            tool_calls: vec![],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    logged(
+                        4,
+                        0,
+                        SessionEvent::TurnEnd {
+                            turn: 1,
+                            stop: StopReason::Stopped,
+                            error: None,
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            manager.prepare_resume_replay(&lease, &Message::user("hello")),
+            Ok(PrepareResumeReplay::Obsolete)
+        ));
+        assert!(!manager
+            .load_events(id)
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event.event, SessionEvent::Rewound { .. })));
+    }
+
+    #[test]
+    fn an_unreadable_marker_does_not_strand_the_visible_prompt() {
+        let (dir, manager) = store();
+        let id = "resume-replay-unreadable";
+        let lease = created(&manager, id);
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "hello".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        let (_loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
+        assert!(pending.is_some());
+        std::fs::write(
+            dir.path().join(BUCKET).join(format!("{id}.replay")),
+            b"not a marker",
+        )
+        .unwrap();
+
+        // A marker that cannot be read must not block a prompt the log still
+        // shows unanswered: the log decides and a fresh marker replaces it.
+        assert_eq!(
+            manager
+                .prepare_resume_replay(&lease, &Message::user("hello"))
+                .unwrap(),
+            PrepareResumeReplay::Prepared
+        );
+        assert_eq!(
+            manager.read_resume_replay(id).unwrap(),
+            Some(ResumeReplay {
+                to: 1,
+                turn: 1,
+                rewound: Some(3)
+            })
+        );
+        assert_eq!(
+            manager
+                .load_events(id)
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(event.event, SessionEvent::Rewound { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn an_unreadable_marker_does_not_retract_a_different_prompt() {
+        let (dir, manager) = store();
+        let id = "resume-replay-unreadable-moved";
+        let lease = created(&manager, id);
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "hello".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        let (_loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
+        assert!(pending.is_some());
+        std::fs::write(
+            dir.path().join(BUCKET).join(format!("{id}.replay")),
+            b"not a marker",
+        )
+        .unwrap();
+        // The person typed a new message before the replay was sent.
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(3, 0, SessionEvent::TurnStart { turn: 2 }),
+                    logged(
+                        4,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 2,
+                            text: "new message".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            manager.prepare_resume_replay(&lease, &Message::user("hello")),
+            Ok(PrepareResumeReplay::Obsolete)
+        ));
+        assert!(!manager
+            .load_events(id)
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event.event, SessionEvent::Rewound { .. })));
+    }
+
+    #[test]
+    fn a_converted_sessions_inflight_prompt_becomes_a_log_turn() {
+        let (_dir, manager) = store();
+        let (lease, snapshot) = snapshot_session(&manager, "s1");
+        let mut inflight = snapshot.clone();
+        inflight
+            .messages
+            .push(Message::user("continue after crash"));
+        manager
+            .save_inflight_snapshot("s1", &inflight, true)
+            .unwrap();
+
+        let (loaded, pending) = manager.open_for_resume(&lease).unwrap();
+        assert_eq!(
+            pending.map(|message| message.text),
+            Some("continue after crash".to_string())
+        );
+        assert!(
+            !loaded
+                .snapshot
+                .messages
+                .iter()
+                .any(|message| message.text == "continue after crash"),
+            "the pending view excludes the prompt it will replay"
+        );
+
+        let events = manager.load_events("s1").unwrap();
+        assert!(
+            events.iter().any(|logged| matches!(
+                &logged.event,
+                SessionEvent::UserMessage { text, .. } if text == "continue after crash"
+            )),
+            "the accepted prompt is a fact of the log, not only of the checkpoint"
+        );
+        assert!(
+            events.iter().any(|logged| matches!(
+                &logged.event,
+                SessionEvent::TurnStart { turn } if *turn == 4
+            )),
+            "the prompt continues the session's turn numbering"
+        );
+
+        assert_eq!(
+            manager
+                .prepare_resume_replay(&lease, &Message::user("continue after crash"))
+                .unwrap(),
+            PrepareResumeReplay::Prepared
+        );
+        // The retraction is a fact now: a second resume hands the same prompt
+        // back without depending on the checkpoint, which conversion moved aside.
+        let (_loaded, pending) = manager.open_for_resume(&lease).unwrap();
+        assert_eq!(
+            pending.map(|message| message.text),
+            Some("continue after crash".to_string())
+        );
     }
 
     #[cfg(feature = "tools")]
