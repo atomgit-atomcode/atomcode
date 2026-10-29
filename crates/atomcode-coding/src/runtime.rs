@@ -10823,10 +10823,6 @@ fn replay_pending_resume_prompt(
     };
     let Some(prompt) = binding.pending_resume_prompt.take() else {
         return;
-    let Some(prompt) = binding.pending_resume_prompt.clone() else {
-        return;
-    };
-        return;
     };
     // Loading a session only hands the prompt back; the retraction happens here,
     // immediately before the replay is actually sent. A preview that dropped the
