@@ -1222,8 +1222,17 @@ pub(crate) fn unanswered_prompt(events: &[LoggedEvent]) -> Option<(SeqNo, u64, M
 /// unanswered. A resume marker names this position, so `prepare` can retract
 /// exactly what it handed back instead of re-deciding against a log that moved.
 pub(crate) fn unanswered_at(events: &[LoggedEvent], start: SeqNo, turn: u64) -> Option<Message> {
+    // Read in file order from the turn's own record, the order the log projects
+    // in: a `Rewound` written after the turn answers it however the records
+    // were numbered. Filtering by `seq > start` would mix the two orders —
+    // skipping a record written after the turn but numbered below it, and
+    // reading one written before it but numbered above.
+    let position = events.iter().position(|logged| {
+        logged.seq == start
+            && matches!(logged.event, SessionEvent::TurnStart { turn: found } if found == turn)
+    })?;
     let mut prompt = None;
-    for logged in events.iter().filter(|logged| logged.seq > start) {
+    for logged in &events[position + 1..] {
         match &logged.event {
             SessionEvent::UserMessage {
                 turn: said_in,
@@ -2965,6 +2974,43 @@ mod tests {
             },
         ));
         assert!(unanswered_prompt(&second_prompt).is_none());
+    }
+
+    #[test]
+    fn a_withdrawal_answers_a_turn_whatever_its_sequence_says() {
+        // File order is the order the log projects in; the sequence only names
+        // positions. A record written after the turn but numbered below it still
+        // answers it, and one written before but numbered above it still does not
+        // belong to it.
+        let events = vec![
+            logged(5, 0, SessionEvent::TurnStart { turn: 1 }),
+            logged(
+                6,
+                0,
+                SessionEvent::UserMessage {
+                    turn: 1,
+                    text: "hello".into(),
+                    images: vec![],
+                },
+            ),
+            logged(
+                2,
+                0,
+                SessionEvent::Rewound {
+                    turn: 1,
+                    to: 5,
+                    scope: RewindScope::Conversation,
+                },
+            ),
+        ];
+        assert!(unanswered_at(&events, 5, 1).is_none());
+        assert!(unanswered_prompt(&events).is_none());
+
+        let before_the_withdrawal = &events[..2];
+        assert_eq!(
+            unanswered_at(before_the_withdrawal, 5, 1).map(|prompt| prompt.text),
+            Some("hello".to_string())
+        );
     }
 
     #[test]

@@ -7833,6 +7833,12 @@ fn spawn_runtime_owner_with_optional_agent(
                                         operation: ReconfigureKind::Provider,
                                     },
                                 );
+                                // The swap committed: the daemon commits this
+                                // generation as the binding's provider identity,
+                                // so an `Err` here would leave it pointed at the
+                                // old one. A deferred replay is reported through
+                                // the failed phase and the warning above, and the
+                                // next rebuild retries it.
                                 let _ = done.send(Ok(RuntimeGeneration(generation)));
                             }
                             Err(candidate_error) => {
@@ -10894,15 +10900,13 @@ fn replay_pending_resume_prompt(
         runtime_phase_state(generation, RuntimePhase::InTurn),
         Ordering::Release,
     );
-    let delivered = agent.as_ref().is_some_and(|agent| {
-        agent
-            .commands
-            .send(AgentCommand::SendMessage {
-                text: prompt.text.clone(),
-                images: prompt.images.clone(),
-            })
-            .is_ok()
-    });
+    let delivered = send_agent_command(
+        agent,
+        AgentCommand::SendMessage {
+            text: prompt.text.clone(),
+            images: prompt.images.clone(),
+        },
+    );
     if !delivered {
         // The prepared rewind stands; put the prompt back as it came back from
         // the log so a rebuild or a provider change can retry it instead of

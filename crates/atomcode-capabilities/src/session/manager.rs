@@ -2025,13 +2025,34 @@ impl SessionManager {
         match appended {
             Ok(()) => Ok(PrepareResumeReplay::Prepared),
             Err(error) => {
-                // The marker was written, but the log did not take the rewind:
-                // it must not be trusted on the next resume.
-                if marked {
+                // A failed append is not proof the rewind is absent: a write
+                // that failed after the bytes reached the file has already
+                // retracted the turn, and clearing the marker then would lose
+                // the prompt for good — no marker hands it back, and the rewind
+                // hides it from `unanswered_prompt`. Clear only a marker the
+                // log provably does not need; one naming an absent rewind is
+                // `Stale` on the next resume and is dealt with there.
+                if marked && self.resume_retraction_is_absent(id, target.to, target.turn) {
                     let _ = self.clear_resume_replay(id);
                 }
                 Err(error)
             }
+        }
+    }
+
+    /// Whether the log can be read and does not hold the retraction a failed
+    /// append was asked to write. A read that fails proves nothing and answers
+    /// `false`, so the marker survives an uncertain commit.
+    fn resume_retraction_is_absent(&self, id: &str, to: SeqNo, turn: u64) -> bool {
+        match self.load_events(id) {
+            Ok(events) => !events.iter().any(|logged| {
+                matches!(
+                    &logged.event,
+                    SessionEvent::Rewound { to: found, turn: found_turn, scope }
+                        if *found == to && *found_turn == turn && scope.takes_back_conversation()
+                )
+            }),
+            Err(_) => false,
         }
     }
 
@@ -4097,7 +4118,9 @@ fn scan_bucket_into(bucket: &str, bucket_path: &Path, out: &mut BucketPartial) {
             .or_else(|| name.strip_suffix(".rewind.txn"))
             .or_else(|| name.strip_suffix(".rewind"))
             .or_else(|| name.strip_suffix(".ui"))
-            .or_else(|| name.strip_suffix(".todos"));
+            .or_else(|| name.strip_suffix(".todos"))
+            .or_else(|| name.strip_suffix(".replay"))
+            .or_else(|| name.strip_suffix(".controller"));
         if let Some(id) = direct_sidecar_id {
             match file_entry.file_type() {
                 Ok(file_type) if file_type.is_file() => {}
@@ -7409,15 +7432,80 @@ mod tests {
         let bucket = root.path().join("0123456789abcdef");
         let mgr = SessionManager::with_root(&bucket);
         mgr.save_snapshot("orphan", &snap(&["x"])).unwrap();
+        // A resume marker is a native sidecar like any other: without its index
+        // it is an orphan, not an unknown file.
+        std::fs::write(bucket.join("orphan-replay.replay"), b"{}").unwrap();
         let lock_only = mgr.acquire_lease("deleted").unwrap();
         drop(lock_only);
 
         let scan = SessionManager::scan_catalog(root.path());
 
         assert!(scan.entries.is_empty());
-        assert_eq!(scan.diagnostics.len(), 1);
-        assert!(scan.diagnostics[0].path.ends_with("orphan.snapshot"));
-        assert_eq!(scan.diagnostics[0].kind, CatalogDiagnosticKind::Corrupt);
+        assert_eq!(scan.diagnostics.len(), 2);
+        assert!(scan
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.path.ends_with("orphan.snapshot")));
+        assert!(scan
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.path.ends_with("orphan-replay.replay")));
+        assert!(scan
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.kind == CatalogDiagnosticKind::Corrupt));
+    }
+
+    #[test]
+    fn an_uncertain_retraction_keeps_the_replay_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(root.path().join("0123456789abcdef"));
+        let lease = mgr.acquire_lease("replay").unwrap();
+        let mut meta = SessionMeta::new("replay", "/p", 1);
+        meta.owner = StorageOwner::Native;
+        mgr.create_event_session(
+            &lease,
+            &atomcode_kernel::session::SessionHeader::new("replay"),
+            &meta,
+        )
+        .unwrap();
+        let logged = |seq: u64, event: SessionEvent| LoggedEvent { seq, at: 0, event };
+        mgr.append_events(
+            &lease,
+            &[
+                logged(1, SessionEvent::TurnStart { turn: 1 }),
+                logged(
+                    2,
+                    SessionEvent::UserMessage {
+                        turn: 1,
+                        text: "hello".into(),
+                        images: vec![],
+                    },
+                ),
+            ],
+        )
+        .unwrap();
+        assert!(mgr.resume_retraction_is_absent("replay", 1, 1));
+
+        mgr.append_events(
+            &lease,
+            &[logged(
+                3,
+                SessionEvent::Rewound {
+                    turn: 1,
+                    to: 1,
+                    scope: RewindScope::Conversation,
+                },
+            )],
+        )
+        .unwrap();
+        assert!(!mgr.resume_retraction_is_absent("replay", 1, 1));
+        assert!(mgr.resume_retraction_is_absent("replay", 1, 2));
+
+        // A log that cannot be read proves nothing about the retraction, so the
+        // marker has to survive instead of being cleared on the failed append.
+        std::fs::write(mgr.events_path("replay").unwrap(), b"not a record\n").unwrap();
+        assert!(!mgr.resume_retraction_is_absent("replay", 1, 1));
     }
 
     #[test]
