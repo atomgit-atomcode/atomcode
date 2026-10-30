@@ -128,6 +128,25 @@ internal class ApprovalModeRuntimeState(initialMode: ApprovalMode = ApprovalMode
     fun modeForRequest(): ApprovalMode? =
         if (!userChoseMode) null else (pendingMode ?: confirmedMode)
 
+    /// Forget a mode a person picked earlier, so the conversation that is starting
+    /// now falls back to the daemon's mode (`[permissions] default_mode`). A switch
+    /// still in flight is left alone — it is the answer the person is waiting for.
+    @Synchronized
+    fun resetChoice() {
+        if (pendingMode != null) return
+        userChoseMode = false
+    }
+
+    /// Adopt the mode the daemon reports for a conversation that starts fresh:
+    /// the previous conversation's pick is dropped and the daemon's mode — config
+    /// `[permissions] default_mode`, or `Build` when the file does not set one —
+    /// becomes what the label shows and what later requests defer to.
+    @Synchronized
+    fun adoptDaemonDefault(responseMode: String): ApprovalMode {
+        resetChoice()
+        return refreshFromDaemon(responseMode)
+    }
+
     private fun parseApprovalMode(wire: String, fallback: ApprovalMode): ApprovalMode =
         when (wire) {
             ApprovalMode.AcceptEdits.wire -> ApprovalMode.AcceptEdits
@@ -701,6 +720,21 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
             return CompletableFuture.completedFuture(approvalMode)
         }
         return refreshApprovalMode(client).thenApply { approvalMode }
+    }
+
+    /// A conversation that starts fresh (new session, or an old one opened again)
+    /// takes its mode from the daemon — `[permissions] default_mode` in
+    /// config.toml, or `Build` when the file sets none — rather than whatever the
+    /// previous conversation ended with.
+    ///
+    /// The daemon's mode is read FIRST: a failed read (daemon down, stale token)
+    /// keeps the conversation's own choice, because dropping it would leave the
+    /// label showing one mode while requests defer to another.
+    fun adoptDaemonApprovalMode(): CompletableFuture<ApprovalMode> {
+        val client = activeClient ?: return CompletableFuture.completedFuture(approvalMode)
+        return client.getApprovalMode().handle { response, _ ->
+            if (response == null) approvalMode else approvalModeState.adoptDaemonDefault(response.mode)
+        }
     }
 
     private fun sendPromptWhenReady(

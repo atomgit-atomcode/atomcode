@@ -466,10 +466,27 @@ class AtomCodeChatPanel(
         }
     }
 
+    /// 新建会话或重新打开旧会话时，模式回到 daemon 当前持有的值——也就是
+    /// config.toml 的 `[permissions] default_mode`——而不是上一个会话结束时留下的
+    /// 模式。否则人一旦选过 Build/Plan，之后每个新会话都会带着它跑。
+    private fun syncApprovalModeForNewConversation() {
+        service.adoptDaemonApprovalMode().thenAccept { mode ->
+            SwingUtilities.invokeLater {
+                if (disposed) return@invokeLater
+                inputPanel.setApprovalMode(mode)
+                inputPanel.setApprovalModeEnabled(!service.approvalModePending)
+            }
+        }
+    }
+
     private fun refreshAfterConnect() {
         service.ensureConnected().thenAccept { state ->
             if (state is ConnectionState.Ready) {
                 SwingUtilities.invokeLater {
+                    // A panel built after the connection went Ready never sees the
+                    // connection listener fire, so it would keep the client-side
+                    // Build initial value instead of `[permissions] default_mode`.
+                    refreshApprovalModeLabel()
                     refreshSetupSnapshot()
                     refreshSessionList()
                 }
@@ -749,6 +766,7 @@ class AtomCodeChatPanel(
                 messageView.clear()
                 dismissPersistenceWarning()
                 addSystemMessage("Started new session ${session.name.ifBlank { session.id.take(8) }}.")
+                syncApprovalModeForNewConversation()
                 refreshSessionList()
                 inputPanel.focusInput()
             }
@@ -993,6 +1011,8 @@ class AtomCodeChatPanel(
                 updateAtomCodeChatTabTitle(project, this@AtomCodeChatPanel, detail.name.ifBlank { detail.id.take(8) })
                 persistRuntimeSession()
                 replaceSelectedSession(detail.id); renderSession(detail); inputPanel.focusInput()
+                // 打开旧会话同样从 config.toml 的 default_mode 起步，不沿用上一个会话的模式。
+                syncApprovalModeForNewConversation()
             }
         }
     }

@@ -70,6 +70,76 @@ class ApprovalModeRuntimeStateTest {
     }
 
     @Test
+    fun `a new conversation drops the previous pick and follows the daemon again`() {
+        val state = ApprovalModeRuntimeState()
+        state.refreshFromDaemon(ApprovalMode.Auto.wire)
+
+        // The person switches to Build in one conversation …
+        assertTrue(state.beginSwitch(ApprovalMode.Build))
+        state.completeSwitch(ApprovalMode.Build, ApprovalMode.Build.wire)
+        assertEquals(ApprovalMode.Build, state.modeForRequest())
+
+        // … then starts / opens a conversation: config.toml's default_mode rules again.
+        state.resetChoice()
+        assertFalse(state.userChoseMode)
+        assertNull(state.modeForRequest())
+
+        assertEquals(ApprovalMode.Auto, state.refreshFromDaemon(ApprovalMode.Auto.wire))
+        assertEquals(ApprovalMode.Auto, state.displayMode)
+    }
+
+    @Test
+    fun `a new conversation leaves a switch still in flight alone`() {
+        val state = ApprovalModeRuntimeState()
+
+        assertTrue(state.beginSwitch(ApprovalMode.Plan))
+        state.resetChoice()
+
+        // The in-flight answer is still what the person asked for.
+        assertTrue(state.userChoseMode)
+        assertEquals(ApprovalMode.Plan, state.modeForRequest())
+    }
+
+    @Test
+    fun `adopting the daemon default clears the previous pick`() {
+        val state = ApprovalModeRuntimeState()
+        assertTrue(state.beginSwitch(ApprovalMode.Plan))
+        state.completeSwitch(ApprovalMode.Plan, ApprovalMode.Plan.wire)
+
+        // A conversation that starts fresh adopts what the daemon holds.
+        assertEquals(ApprovalMode.Auto, state.adoptDaemonDefault(ApprovalMode.Auto.wire))
+        assertEquals(ApprovalMode.Auto, state.displayMode)
+        assertFalse(state.userChoseMode)
+        assertNull(state.modeForRequest())
+    }
+
+    @Test
+    fun `an unset default_mode falls back to build on both sides`() {
+        // config.toml without `[permissions] default_mode`: the daemon seeds its
+        // live mode with `ApprovalMode::default()` (build) and reports "build", so
+        // the adopted label is build — not a stale mode from the last conversation.
+        val state = ApprovalModeRuntimeState()
+        assertTrue(state.beginSwitch(ApprovalMode.Plan))
+        state.completeSwitch(ApprovalMode.Plan, ApprovalMode.Plan.wire)
+
+        assertEquals(ApprovalMode.Build, state.adoptDaemonDefault(ApprovalMode.Build.wire))
+        assertEquals(ApprovalMode.Build, state.displayMode)
+        assertFalse(state.userChoseMode)
+        assertNull(state.modeForRequest())
+    }
+
+    @Test
+    fun `adopting the daemon default leaves an in-flight switch alone`() {
+        val state = ApprovalModeRuntimeState()
+
+        assertTrue(state.beginSwitch(ApprovalMode.Plan))
+        assertEquals(ApprovalMode.Plan, state.adoptDaemonDefault(ApprovalMode.Auto.wire))
+
+        assertTrue(state.userChoseMode)
+        assertEquals(ApprovalMode.Plan, state.modeForRequest())
+    }
+
+    @Test
     fun `auto travels as the daemon's bypass wire name`() {
         // config.toml says "auto"; the wire says "bypass". A mismatch here would
         // fall back silently to the previous mode (parseApprovalMode's else arm).
