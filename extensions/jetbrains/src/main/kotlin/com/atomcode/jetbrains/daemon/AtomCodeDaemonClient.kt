@@ -184,6 +184,9 @@ class AtomCodeDaemonClient(
                     model = it.jsonString("model").orEmpty(),
                     providerType = it.jsonString("provider_type").orEmpty(),
                     isDefault = it.jsonBoolean("is_default") ?: false,
+                    effortApplicable = it.jsonBoolean("effort_applicable") ?: false,
+                    effortLevels = it.jsonStringArray("effort_levels"),
+                    reasoningEffort = it.jsonString("reasoning_effort"),
                 )
             }.filter { it.provider.isNotBlank() }
         }
@@ -365,6 +368,20 @@ class AtomCodeDaemonClient(
                 ok = it.jsonBoolean("ok") ?: false,
                 mode = it.jsonString("mode").orEmpty(),
             )
+        }
+    }
+
+    /// Set the reasoning effort for one endpoint. `null` restores the API default
+    /// (the "Default" entry). The daemon persists it and rejects a level this
+    /// endpoint does not declare.
+    fun setReasoningEffort(provider: String, effort: String?): CompletableFuture<Boolean> {
+        val body = buildString {
+            append("{\"provider\":").append(provider.jsonQuoted())
+            append(",\"reasoning_effort\":").append(effort?.jsonQuoted() ?: "null")
+            append('}')
+        }
+        return send("POST", "/live/reasoning_effort", body).thenApply {
+            it.jsonBoolean("ok") ?: false
         }
     }
 

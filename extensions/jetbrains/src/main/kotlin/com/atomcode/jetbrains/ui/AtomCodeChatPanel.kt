@@ -26,6 +26,7 @@ import com.atomcode.jetbrains.settings.AtomCodeContextLevel
 import com.atomcode.jetbrains.settings.AtomCodeSettingsState
 import com.atomcode.jetbrains.ui.header.HeaderPanel
 import com.atomcode.jetbrains.ui.input.InputPanel
+import com.atomcode.jetbrains.ui.input.EffortChoices
 import com.atomcode.jetbrains.ui.input.QueuedPromptView
 import com.atomcode.jetbrains.ui.message.JBCefMessageView
 import com.atomcode.jetbrains.ui.message.MessageAttachmentView
@@ -239,6 +240,7 @@ class AtomCodeChatPanel(
         onRemoveContext = { item -> removePendingAttachment(item) },
         onModelSelect = { showModelPickerPopup() },
         onApprovalModeSelect = { mode -> setApprovalMode(mode) },
+        onEffortSelect = { effort -> setReasoningEffort(effort) },
         onPasteFromClipboard = { transferable -> pasteClipboardImage(transferable) },
     )
 
@@ -507,6 +509,14 @@ class AtomCodeChatPanel(
             ?: snapshot.currentModel.ifBlank { null }
             ?: "No model"
         inputPanel.setModelName(currentModel)
+        // The effort menu belongs to the selected model: a model declaring
+        // low/medium/high must not offer max (the wire would clamp it).
+        val selectedModel = modelPicker.selectedItem as? ModelInfo
+        inputPanel.setEffortChoices(
+            EffortChoices.forModel(selectedModel),
+            selectedModel?.reasoningEffort,
+        )
+        inputPanel.setEffortEnabled(!generating)
         if (currentSession == null && !generating) {
             showWelcomePage()
         }
@@ -562,6 +572,24 @@ class AtomCodeChatPanel(
                 }
                 inputPanel.setApprovalMode(applied)
                 startNextQueuedPromptIfReady()
+            }
+        }
+    }
+
+    private fun setReasoningEffort(effort: String?) {
+        val model = modelPicker.selectedItem as? ModelInfo ?: return
+        inputPanel.setEffortEnabled(false)
+        service.setReasoningEffort(model.provider, effort).whenComplete { ok, error ->
+            SwingUtilities.invokeLater {
+                inputPanel.setEffortEnabled(true)
+                if (error != null) {
+                    addErrorMessage(error.cause?.message ?: error.message ?: "failed to set reasoning effort")
+                } else if (ok != true) {
+                    addErrorMessage("The daemon rejected that reasoning effort.")
+                }
+                // Re-read either way: the label must show what the daemon holds,
+                // not what was clicked.
+                refreshSetupSnapshot(silent = true)
             }
         }
     }

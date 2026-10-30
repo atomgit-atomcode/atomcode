@@ -7,6 +7,7 @@ interface AtomCodeApiClient {
     fun listSessions(): CompletableFuture<List<SessionMeta>>
     fun listSessionsForWorkingDir(workingDir: String): CompletableFuture<List<SessionMeta>>
     fun searchSessions(query: String): CompletableFuture<List<SessionMeta>>
+    fun setReasoningEffort(provider: String, effort: String?): CompletableFuture<Boolean>
     fun getSession(projectHash: String, sessionId: String): CompletableFuture<SessionDetail>
     fun createSession(title: String?, workingDir: String): CompletableFuture<SessionRef>
     fun streamChat(request: ChatRequest, onEvent: (ChatEvent) -> Unit): CompletableFuture<Void>
@@ -28,6 +29,9 @@ class ExistingDaemonApiClient(
         delegate.listSessionsForWorkingDir(workingDir)
 
     override fun searchSessions(query: String): CompletableFuture<List<SessionMeta>> = delegate.searchSessions(query)
+
+    override fun setReasoningEffort(provider: String, effort: String?): CompletableFuture<Boolean> =
+        delegate.setReasoningEffort(provider, effort)
 
     override fun getSession(projectHash: String, sessionId: String): CompletableFuture<SessionDetail> =
         delegate.getSession(projectHash, sessionId)

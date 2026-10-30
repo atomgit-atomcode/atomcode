@@ -60,6 +60,7 @@ class InputPanel(
     private val onRemoveContext: (ChatContextItem) -> Unit,
     private val onModelSelect: () -> Unit,
     private val onApprovalModeSelect: (ApprovalMode) -> Unit = {},
+    private val onEffortSelect: (String?) -> Unit = {},
     private val onPasteFromClipboard: (Transferable?) -> Boolean,
 ) : JPanel(BorderLayout()), DataProvider, PasteProvider {
 
@@ -135,6 +136,25 @@ class InputPanel(
         })
     }
 
+    /// Sits between the mode and the model, the way the VS Code client orders them.
+    /// Hidden whenever the selected model exposes no effort levels.
+    private val effortLabel = JLabel("${EffortChoices.DEFAULT_LABEL} ▾").apply {
+        font = font.deriveFont(java.awt.Font.BOLD, font.size2D - 2f)
+        isOpaque = false
+        cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+        toolTipText = "推理强度"
+        accessibleContext.accessibleName = "Reasoning effort"
+        border = BorderFactory.createEmptyBorder(5, 8, 5, 8)
+        isVisible = false
+        addMouseListener(object : MouseAdapter() {
+            override fun mouseClicked(e: MouseEvent) {
+                if (isEnabled && isVisible) showEffortMenu()
+            }
+        })
+    }
+
+    private var effortChoices: List<EffortChoice> = emptyList()
+
     private val actionCards = CardLayout()
     private val actionPanel = JPanel(actionCards).apply {
         isOpaque = false
@@ -175,6 +195,7 @@ class InputPanel(
                     commandButton,
                     tokenLabel,
                     approvalModeLabel,
+                    effortLabel,
                     modelLabel,
                     actionPanel,
                 )
@@ -188,6 +209,7 @@ class InputPanel(
             add(commandButton)
             add(tokenLabel)
             add(approvalModeLabel)
+            add(effortLabel)
             add(modelLabel)
             add(actionPanel)
         }
@@ -381,6 +403,30 @@ class InputPanel(
         modelLabel.parent?.revalidate()
     }
 
+    /// Refresh the effort selector for the selected model. An empty list hides it
+/// entirely — a model without declared levels has nothing to choose.
+    internal fun setEffortChoices(choices: List<EffortChoice>, current: String?) {
+        effortChoices = choices
+        effortLabel.isVisible = choices.isNotEmpty()
+        effortLabel.text = "${EffortChoices.labelFor(choices, current)} ▾"
+        effortLabel.parent?.revalidate()
+        effortLabel.parent?.repaint()
+    }
+
+    fun setEffortEnabled(enabled: Boolean) {
+        effortLabel.isEnabled = enabled
+        effortLabel.foreground = if (enabled) MODEL_FG else DISABLED_FG
+        effortLabel.repaint()
+    }
+
+    internal fun effortDisplayTextForTest(): String = effortLabel.text
+
+    internal fun effortVisibleForTest(): Boolean = effortLabel.isVisible
+
+    internal fun effortOptionsForTest(): List<String> = effortChoices.map { it.label }
+
+    internal fun selectEffortForTest(value: String?) = onEffortSelect(value)
+
     fun setApprovalMode(mode: ApprovalMode) {
         approvalModeLabel.text = "$mode ▾"
         approvalModeLabel.parent?.revalidate()
@@ -542,6 +588,16 @@ class InputPanel(
         menu.show(approvalModeLabel, 0, -menu.preferredSize.height)
     }
 
+    private fun showEffortMenu() {
+        val menu = JPopupMenu()
+        effortChoices.forEach { choice ->
+            menu.add(JMenuItem(choice.label).apply {
+                addActionListener { onEffortSelect(choice.value) }
+            })
+        }
+        menu.show(effortLabel, 0, -menu.preferredSize.height)
+    }
+
     private fun fireSend() {
         val text = inputArea.text.trim()
         if (text.isNotEmpty()) {
@@ -662,6 +718,7 @@ class InputPanel(
         command: Component,
         token: Component,
         mode: Component,
+        effort: Component,
         model: Component,
         action: Component,
     ) {
@@ -673,7 +730,7 @@ class InputPanel(
         val height = (toolbar.height - insets.top - insets.bottom).coerceAtLeast(0)
         val gap = 8
 
-        listOf(attach, command, token, mode, model, action).forEach { it.isVisible = false }
+        listOf(attach, command, token, mode, effort, model, action).forEach { it.isVisible = false }
 
         val actionSize = action.preferredSize
         val actionWidth = actionSize.width.coerceAtMost((right - left).coerceAtLeast(0))
@@ -705,6 +762,7 @@ class InputPanel(
             rightX = x - gap
         }
         placeRight(model)
+        placeRight(effort)
         placeRight(mode)
         placeRight(token)
     }
@@ -762,6 +820,8 @@ class InputPanel(
         modelLabel.border = BorderFactory.createEmptyBorder(5, 8, 5, 8)
         approvalModeLabel.foreground = if (approvalModeLabel.isEnabled) MODEL_FG else DISABLED_FG
         approvalModeLabel.border = BorderFactory.createEmptyBorder(5, 8, 5, 8)
+        effortLabel.foreground = if (effortLabel.isEnabled) MODEL_FG else DISABLED_FG
+        effortLabel.border = BorderFactory.createEmptyBorder(5, 8, 5, 8)
         stopButton.foreground = STOP_FG
         stopButton.background = STOP_BG
         stopButton.border = clickableBorder(horizontal = 12)

@@ -684,6 +684,12 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
         }
     }
 
+    /// Persist the reasoning effort for one endpoint. `null` restores the API
+    /// default (the menu's "Default"); the daemon rejects a level this endpoint
+    /// does not declare.
+    fun setReasoningEffort(provider: String, effort: String?): CompletableFuture<Boolean> =
+        getOrCreateClient().setReasoningEffort(provider, effort)
+
     /// Ask the daemon which mode it holds and adopt it — what the panel does when
     /// it opens, so a `[permissions] default_mode` edited in config.toml shows up
     /// without a reconnect (the VS Code client re-reads on every panel open too).

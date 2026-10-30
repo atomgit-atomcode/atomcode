@@ -104,6 +104,12 @@ data class ModelInfo(
     val model: String,
     val providerType: String,
     val isDefault: Boolean,
+    /** Whether this endpoint exposes a reasoning-effort choice at all. */
+    val effortApplicable: Boolean = false,
+    /** Levels it exposes (`low|medium|high|xhigh|max`), in the daemon's order. */
+    val effortLevels: List<String> = emptyList(),
+    /** The effort in force; `null` means the API default. */
+    val reasoningEffort: String? = null,
 ) {
     override fun toString(): String {
         val marker = if (isDefault) " *" else ""
