@@ -1986,40 +1986,39 @@ impl SessionManager {
                 rewound: None,
             }
         };
-        // Allocated outside the append's file lock: the session lease is an
-        // exclusive OS lock, and prepare only runs at startup or after the old
-        // agent was stopped, so no append can interleave here. A second writer
-        // would have to allocate inside the append lock instead.
-        let seq = events
-            .iter()
-            .map(|logged| logged.seq)
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1);
-        // Record the exact rewind this prepare is about to append. A user undo
-        // with the same `to` has a different sequence number and must not be
-        // mistaken for it.
-        self.write_resume_replay(
-            id,
-            &ResumeReplay {
-                to: target.to,
-                turn: target.turn,
-                rewound: Some(seq),
-            },
-        )?;
-        let rewound = LoggedEvent {
-            seq,
-            at: u64::try_from(super::now_ms()).unwrap_or(0),
-            event: SessionEvent::Rewound {
-                turn: target.turn,
-                to: target.to,
-                scope: RewindScope::Conversation,
-            },
-        };
-        match self.append_events(lease, std::slice::from_ref(&rewound)) {
+        // The marker must name the exact `Rewound` this prepare is about to
+        // append, so the sequence is allocated under the log's write lock. A
+        // user undo with the same `to` takes a different sequence and must not
+        // be mistaken for it.
+        let mut marked = false;
+        let appended = self.append_event_allocating(lease, |seq| {
+            self.write_resume_replay(
+                id,
+                &ResumeReplay {
+                    to: target.to,
+                    turn: target.turn,
+                    rewound: Some(seq),
+                },
+            )?;
+            marked = true;
+            Ok(LoggedEvent {
+                seq,
+                at: u64::try_from(super::now_ms()).unwrap_or(0),
+                event: SessionEvent::Rewound {
+                    turn: target.turn,
+                    to: target.to,
+                    scope: RewindScope::Conversation,
+                },
+            })
+        });
+        match appended {
             Ok(()) => Ok(PrepareResumeReplay::Prepared),
             Err(error) => {
-                let _ = self.clear_resume_replay(id);
+                // The marker was written, but the log did not take the rewind:
+                // it must not be trusted on the next resume.
+                if marked {
+                    let _ = self.clear_resume_replay(id);
+                }
                 Err(error)
             }
         }

@@ -4724,7 +4724,7 @@ fn spawn_runtime_owner_with_optional_agent(
         // rebuild replaces the parts and the person's switches outlive it.
         let mut mcp_disable_holds: BTreeMap<String, McpDisableHold> = BTreeMap::new();
         if agent_available {
-            replay_pending_resume_prompt(
+            kernel_turn_open = replay_pending_resume_prompt(
                 &agent,
                 resources
                     .as_mut()
@@ -7790,7 +7790,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 let reasoning_effort_applicable =
                                     runtime.config.supports_reasoning_effort;
                                 runtime_event_tx.seed_live_view(generation, &runtime);
-                                replay_pending_resume_prompt(
+                                kernel_turn_open |= replay_pending_resume_prompt(
                                     &agent,
                                     runtime.parts.session.as_mut(),
                                     controls.state.as_ref(),
@@ -8621,7 +8621,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         // process accepted but never answered. This binding is
                         // the switch's only chance to hand it back; no other
                         // step of this path replays it.
-                        replay_pending_resume_prompt(
+                        kernel_turn_open |= replay_pending_resume_prompt(
                             &agent,
                             runtime.parts.session.as_mut(),
                             controls.state.as_ref(),
@@ -10817,12 +10817,12 @@ fn replay_pending_resume_prompt(
     turn_stats: &mut RuntimeTurnStats,
     agent_available: &mut bool,
     event_tx: &RuntimeEventEmitter,
-) {
+) -> bool {
     let Some(binding) = session else {
-        return;
+        return false;
     };
     let Some(prompt) = binding.pending_resume_prompt.take() else {
-        return;
+        return false;
     };
     // Loading a session only hands the prompt back; the retraction happens here,
     // immediately before the replay is actually sent. A preview that dropped the
@@ -10836,7 +10836,7 @@ fn replay_pending_resume_prompt(
             let _ = event_tx.send(CodingRuntimeEvent::ControllerWarning(
                 "the resumed prompt was not replayed because the conversation moved on".into(),
             ));
-            return;
+            return false;
         }
         Err(error) => {
             // Transient IO/marker failures are retryable: put the prompt back so
@@ -10847,7 +10847,7 @@ fn replay_pending_resume_prompt(
                 "could not prepare the resumed prompt for replay: {error}; \
                  it is still in the session history and will be retried"
             )));
-            return;
+            return false;
         }
     }
     *next_turn_id = next_turn_id.wrapping_add(1);
@@ -10883,7 +10883,9 @@ fn replay_pending_resume_prompt(
             runtime_phase_state(generation, RuntimePhase::Failed),
             Ordering::Release,
         );
+        return false;
     }
+    true
 }
 
 async fn receive_agent_event(agent: &mut Option<AgentHandle>) -> Option<AgentEvent> {
@@ -21935,7 +21937,7 @@ type = "openai"
         let mut turn_stats = RuntimeTurnStats::default();
         let mut agent_available = true;
 
-        replay_pending_resume_prompt(
+        let delivered = replay_pending_resume_prompt(
             &agent,
             Some(&mut binding),
             &state,
@@ -21946,6 +21948,7 @@ type = "openai"
             &mut agent_available,
             &emitter,
         );
+        assert!(!delivered, "a dead agent must not report the turn open");
 
         let restored = binding
             .pending_resume_prompt
@@ -21979,7 +21982,7 @@ type = "openai"
         };
         assert_eq!(rewinds(), 1);
         agent_available = true;
-        replay_pending_resume_prompt(
+        let delivered = replay_pending_resume_prompt(
             &agent,
             Some(&mut binding),
             &state,
@@ -21990,8 +21993,83 @@ type = "openai"
             &mut agent_available,
             &emitter,
         );
+        assert!(!delivered);
         assert!(binding.pending_resume_prompt.is_some());
         assert_eq!(rewinds(), 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn a_delivered_replay_reports_the_turn_open() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let manager = Arc::new(atomcode_capabilities::session::SessionManager::for_project(
+            project.path(),
+            &crate::config::product_dirs_from_env(),
+        ));
+        let id = "replay-delivered";
+        let source = SessionSnapshot::new(vec![
+            Message::user("old question"),
+            Message::assistant("old answer", Vec::new()),
+        ]);
+        persist_native_session(&manager, id, project.path(), &source);
+        let mut inflight = source.clone();
+        inflight.messages.push(Message::user("replay me"));
+        std::fs::write(
+            manager.root().join(format!("{id}.snapshot.inflight")),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "replay_safe": true,
+                "snapshot": inflight,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let lease = manager.acquire_lease(id).unwrap();
+        let (_loaded, pending) = manager
+            .open_for_resume_noting(&lease, &mut Vec::new())
+            .unwrap();
+        let mut binding = SessionBinding::test_binding(id, manager.clone(), lease, pending);
+
+        let (commands, mut commands_rx) = tokio::sync::mpsc::unbounded_channel::<AgentCommand>();
+        let (_events_tx, events) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        let agent = Some(AgentHandle {
+            commands,
+            events,
+            task: tokio::spawn(async {}),
+        });
+        let (raw_tx, _raw_rx) = tokio::sync::mpsc::unbounded_channel::<CodingRuntimeEvent>();
+        let emitter = RuntimeEventEmitter::new(raw_tx, None, Arc::new(AtomicU64::new(0)));
+        let state = AtomicU64::new(runtime_phase_state(0, RuntimePhase::Reconfiguring));
+        let mut next_turn_id = 0;
+        let mut active_turn = None;
+        let mut turn_stats = RuntimeTurnStats::default();
+        let mut agent_available = true;
+
+        let delivered = replay_pending_resume_prompt(
+            &agent,
+            Some(&mut binding),
+            &state,
+            0,
+            &mut next_turn_id,
+            &mut active_turn,
+            &mut turn_stats,
+            &mut agent_available,
+            &emitter,
+        );
+
+        assert!(delivered, "a handed-over replay opens the agent's turn");
+        assert!(active_turn.is_some());
+        assert_eq!(
+            runtime_status(state.load(Ordering::Acquire)).phase,
+            RuntimePhase::InTurn
+        );
+        assert!(binding.pending_resume_prompt.is_none());
+        match commands_rx.try_recv() {
+            Ok(AgentCommand::SendMessage { text, .. }) => assert_eq!(text, "replay me"),
+            _ => panic!("the replay must reach the agent"),
+        }
     }
 
     #[tokio::test]

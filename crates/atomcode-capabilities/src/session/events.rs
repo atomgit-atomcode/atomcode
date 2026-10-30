@@ -19,8 +19,8 @@
 //! (`docs/adr/0024` §7) — so the numbering on disk has gaps.
 
 use std::fs;
-use std::io::Write;
-use std::path::PathBuf;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 
 use atomcode_kernel::message::{Message, Role, SessionSnapshot};
 use atomcode_kernel::session::{
@@ -234,6 +234,97 @@ impl SessionManager {
         drop(file);
         self.index_the_chosen_name(id, events);
         Ok(())
+    }
+
+    /// Append one fact whose sequence number is allocated under the log's write
+    /// lock.
+    ///
+    /// `build` runs while the lock is held so it can record the exact sequence
+    /// — a resume marker must name the `Rewound` it is about to write — and a
+    /// failure there leaves the log untouched.
+    pub(super) fn append_event_allocating<F>(
+        &self,
+        lease: &SessionLease,
+        build: F,
+    ) -> SessionResult<()>
+    where
+        F: FnOnce(SeqNo) -> SessionResult<LoggedEvent>,
+    {
+        self.validate_active_lease(lease)?;
+        let id = lease.id();
+        if !self.is_event_session(id) {
+            return Err(SessionStoreError::NotFound {
+                path: self.index_path(id)?,
+            });
+        }
+        let path = self.events_path(id)?;
+        let mut file = retry_transient_file_access(|| open_append_file(&path))?;
+        retry_transient_file_access(|| {
+            fs2::FileExt::lock_exclusive(&file).map_err(|e| io_at(&path, e))
+        })?;
+        // The same handle reads and writes: Windows locks are mandatory, so a
+        // second handle could not read the region this one has locked.
+        let next =
+            Self::last_recorded_seq(&mut file, &path)?.map_or(1, |seq| seq.saturating_add(1));
+        let event = build(next)?;
+        let buffer = record_line(&event)?;
+        let current = usize::try_from(file.metadata().map_err(|e| io_at(&path, e))?.len())
+            .unwrap_or(usize::MAX);
+        let next_len = current.saturating_add(buffer.len());
+        if next_len > MAX_JSONL_BYTES {
+            return Err(SessionStoreError::TooLarge {
+                kind: "session events",
+                limit: MAX_JSONL_BYTES,
+                actual: next_len,
+            });
+        }
+        file.write_all(&buffer).map_err(|e| io_at(&path, e))?;
+        drop(file);
+        self.index_the_chosen_name(id, std::slice::from_ref(&event));
+        Ok(())
+    }
+
+    /// The last fact's sequence in the log, read from its tail through the
+    /// locked append handle. `None` for a log with only its header (or nothing).
+    fn last_recorded_seq(file: &mut fs::File, path: &Path) -> SessionResult<Option<SeqNo>> {
+        #[derive(serde::Deserialize)]
+        struct SeqRecord {
+            #[serde(default)]
+            seq: Option<SeqNo>,
+        }
+
+        let len = file.metadata().map_err(|error| io_at(path, error))?.len();
+        if len == 0 {
+            return Ok(None);
+        }
+        let mut window = 8 * 1024u64;
+        loop {
+            let start = len.saturating_sub(window);
+            file.seek(SeekFrom::Start(start))
+                .map_err(|error| io_at(path, error))?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)
+                .map_err(|error| io_at(path, error))?;
+            let mut end = bytes.len();
+            while end > 0 && matches!(bytes[end - 1], b'\n' | b'\r') {
+                end -= 1;
+            }
+            let tail = &bytes[..end];
+            let last = match tail.iter().rposition(|byte| *byte == b'\n') {
+                Some(position) => &tail[position + 1..],
+                None if start == 0 => tail,
+                None => {
+                    window = window.saturating_mul(2);
+                    continue;
+                }
+            };
+            return serde_json::from_slice::<SeqRecord>(last)
+                .map(|record| record.seq)
+                .map_err(|_| SessionStoreError::Corrupt {
+                    kind: "session events",
+                    message: format!("{}: unreadable last record", path.display()),
+                });
+        }
     }
 
     /// Keep the index's name with the log's when the person names the session.
@@ -2921,6 +3012,59 @@ mod tests {
                 .iter()
                 .any(|message| message.text == "hello"),
             "the retraction removes the prompt from the projection"
+        );
+    }
+
+    #[test]
+    fn a_prepare_allocates_the_sequence_after_a_large_tail() {
+        let (_dir, manager) = store();
+        let id = "resume-large-tail";
+        let lease = created(&manager, id);
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "hello".into(),
+                            images: vec![],
+                        },
+                    ),
+                    // Larger than the tail window the allocator scans, and a
+                    // fact the replayable-turn rule tolerates.
+                    logged(
+                        3,
+                        0,
+                        SessionEvent::Injected {
+                            turn: 1,
+                            text: "x".repeat(10 * 1024),
+                            origin: atomcode_kernel::session::InjectionOrigin::Continuation,
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+
+        let (_loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
+        assert!(pending.is_some());
+        assert_eq!(
+            manager
+                .prepare_resume_replay(&lease, &Message::user("hello"))
+                .unwrap(),
+            PrepareResumeReplay::Prepared
+        );
+        assert_eq!(
+            manager.read_resume_replay(id).unwrap(),
+            Some(ResumeReplay {
+                to: 1,
+                turn: 1,
+                rewound: Some(4)
+            }),
+            "the rewind takes the sequence after the log's actual last record"
         );
     }
 
