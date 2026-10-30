@@ -46,6 +46,10 @@ pub struct LspFeatures {
 #[serde(default, deny_unknown_fields)]
 pub struct LspOptions {
     pub disabled: bool,
+    /// Total semantic query attempts, including the first (1..=5; default 1).
+    pub retry_attempts: Option<u32>,
+    /// Delay between successful empty responses (0..=10000; default 5000 ms).
+    pub retry_interval_ms: Option<u64>,
     pub init_options_mode: LspMode,
     pub init_options_file: Option<std::path::PathBuf>,
     pub init_options: Option<serde_json::Value>,
@@ -67,6 +71,8 @@ mod tests {
             hover = "off"
             [servers.cj]
             command = "LSPServer.exe"
+            retry_attempts = 3
+            retry_interval_ms = 5000
             root_markers = ["cjpm.toml"]
             init_options_file = "LSP_config/cangjie.json"
             init_options_mode = "auto"
@@ -77,6 +83,8 @@ mod tests {
         .unwrap();
         assert_eq!(config.trace, LspTrace::Messages);
         let server = &config.servers["cj"];
+        assert_eq!(server.options.retry_attempts, Some(3));
+        assert_eq!(server.options.retry_interval_ms, Some(5000));
         assert_eq!(
             server.options.init_options_file.as_deref(),
             Some(std::path::Path::new("LSP_config/cangjie.json"))

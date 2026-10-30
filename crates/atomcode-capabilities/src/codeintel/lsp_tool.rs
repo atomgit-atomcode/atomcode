@@ -102,7 +102,7 @@ impl Tool for LspTool {
         if self.has_ide() {
             "Read-only semantic queries through the configured IDE bridge: status (list live windows; select with window_id when ambiguous), hover, definition, references, diagnostics, document_symbols, or inspect (hover+definition+references in one request). Uses current editor buffers; positions are one-based UTF-16 columns, or line+symbol with occurrence for ambiguous matches. Reports document version/dirty state; diagnostics are editor snapshots, not build verification. Empty results do not prove lack of support. Explicit connection-file bindings take precedence over directory discovery. No writes. If unavailable, do not retry blindly; explicitly choose a configured local backend or text/AST tools (not semantic equivalents)."
         } else {
-            "Read-only local Language Server queries: definition, references, hover, diagnostics. Use status to inspect current connections, probe with file_path to inspect initialization and capabilities, and reload to close connections and reread initialization/settings files on next query. Probe does not send arbitrary RPC or apply edits. Query positions are one-based Unicode character columns. Starts only configured local servers; never installs them. Disabled and unsupported capabilities are reported explicitly."
+            "Read-only local Language Server queries: definition, references, hover, diagnostics, document_symbols (file outline; no position required). Use status to inspect current connections, probe with file_path to inspect initialization and capabilities, and reload to close connections and reread initialization/settings files on next query. Probe does not send arbitrary RPC or apply edits. Query positions are one-based Unicode character columns. Starts only configured local servers; never installs them. Disabled and unsupported capabilities are reported explicitly."
         }
     }
 
@@ -125,6 +125,7 @@ impl Tool for LspTool {
                 "references",
                 "hover",
                 "diagnostics",
+                "document_symbols",
                 "status",
                 "probe",
                 "reload",
@@ -271,7 +272,7 @@ impl Tool for LspTool {
         }
         if matches!(
             args.operation,
-            Operation::DocumentSymbols | Operation::Inspect | Operation::Status | Operation::Reload
+            Operation::Inspect | Operation::Status | Operation::Reload
         ) {
             return ok(json!({"source":"local", "status":"unsupported", "message":"This operation requires an explicitly bound IDE backend."}).to_string());
         }
@@ -291,11 +292,8 @@ impl Tool for LspTool {
                     Err(error) => return err(error),
                 }
             }
-            Operation::Diagnostics | Operation::Probe => None,
-            Operation::DocumentSymbols
-            | Operation::Inspect
-            | Operation::Status
-            | Operation::Reload => {
+            Operation::Diagnostics | Operation::Probe | Operation::DocumentSymbols => None,
+            Operation::Inspect | Operation::Status | Operation::Reload => {
                 unreachable!("IDE-only operations handled above")
             }
         };
@@ -352,6 +350,17 @@ impl Tool for LspTool {
         }
 
         match args.operation {
+            Operation::DocumentSymbols => {
+                let result = self
+                    .manager
+                    .document_symbols(&root, &path, &content, &ctx.cancel)
+                    .await
+                    .map(render_document_symbols);
+                if ctx.cancel.is_cancelled() {
+                    return ok("LSP query cancelled.");
+                }
+                degradable(result)
+            }
             Operation::Definition | Operation::References | Operation::Hover => {
                 let (line, character) = semantic_position.expect("validated semantic position");
                 let result = match args.operation {
@@ -384,11 +393,7 @@ impl Tool for LspTool {
                 }
                 degradable(result)
             }
-            Operation::DocumentSymbols
-            | Operation::Inspect
-            | Operation::Status
-            | Operation::Reload
-            | Operation::Probe => {
+            Operation::Inspect | Operation::Status | Operation::Reload | Operation::Probe => {
                 unreachable!("IDE-only operations handled above")
             }
             Operation::Diagnostics => {
@@ -524,6 +529,60 @@ fn render_locations(kind: &str, locations: Vec<Location>, root: &Path) -> String
     format!("Found {total} semantic {kind}:\n{}", lines.join("\n"))
 }
 
+fn render_document_symbols(value: serde_json::Value) -> String {
+    let Some(symbols) = value.as_array() else {
+        return if value.is_null() {
+            "No document symbols found.".into()
+        } else {
+            "LSP returned an unexpected document symbol response.".into()
+        };
+    };
+    if symbols.is_empty() {
+        return "No document symbols found.".into();
+    }
+    let mut output = Vec::new();
+    let mut stack: Vec<_> = symbols
+        .iter()
+        .rev()
+        .map(|symbol| (symbol, 0usize))
+        .collect();
+    while let Some((symbol, depth)) = stack.pop() {
+        if output.len() == 500 {
+            output.push("… additional symbols omitted".into());
+            break;
+        }
+        let position = symbol
+            .get("selectionRange")
+            .or_else(|| symbol.get("range"))
+            .or_else(|| symbol.get("location").and_then(|v| v.get("range")))
+            .and_then(|range| range.get("start"));
+        let line = position
+            .and_then(|p| p["line"].as_u64())
+            .unwrap_or(0)
+            .saturating_add(1);
+        let col = position
+            .and_then(|p| p["character"].as_u64())
+            .unwrap_or(0)
+            .saturating_add(1);
+        output.push(format!(
+            "{}{} (kind {}) [{}:{}]{}",
+            "  ".repeat(depth.min(20)),
+            symbol["name"].as_str().unwrap_or("?"),
+            symbol["kind"],
+            line,
+            col,
+            symbol["detail"]
+                .as_str()
+                .map(|detail| format!(" — {detail}"))
+                .unwrap_or_default()
+        ));
+        if let Some(children) = symbol["children"].as_array() {
+            stack.extend(children.iter().rev().map(|child| (child, depth + 1)));
+        }
+    }
+    output.join("\n")
+}
+
 fn render_hover(value: Value) -> String {
     let contents = value.get("contents").unwrap_or(&value);
     let rendered = match contents {
@@ -565,6 +624,27 @@ fn display_path(path: &Path, root: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn outlines_keep_hierarchical_and_flat_chinese_symbols_and_positions() {
+        let nested = render_document_symbols(
+            serde_json::json!([{"name":"模块","kind":2,"range":{"start":{"line":0,"character":0}},"children":[{"name":"启动","kind":12,"detail":"Unit","selectionRange":{"start":{"line":30,"character":2}}}]}]),
+        );
+        assert!(nested.contains("模块 (kind 2) [1:1]"));
+        assert!(nested.contains("  启动 (kind 12) [31:3] — Unit"));
+        let flat = render_document_symbols(
+            serde_json::json!([{"name":"测试","kind":12,"location":{"uri":"file:///main.cj","range":{"start":{"line":100,"character":0}}}}]),
+        );
+        assert!(flat.contains("测试 (kind 12) [101:1]"));
+        assert_eq!(
+            render_document_symbols(serde_json::Value::Null),
+            "No document symbols found."
+        );
+        assert_eq!(
+            render_document_symbols(serde_json::json!([])),
+            "No document symbols found."
+        );
+    }
+
     use super::*;
     use crate::codeintel::lsp::{LspServerConfig, LspServerRegistry};
     use atomcode_kernel::tool::ProgressSink;

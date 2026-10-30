@@ -404,6 +404,8 @@ pub fn lsp_settings_from_config(
                         root_markers: server.root_markers.clone(),
                         options: atomcode_capabilities::codeintel::lsp_policy::LspOptions {
                             disabled: server.options.disabled,
+                            retry_attempts: server.options.retry_attempts,
+                            retry_interval_ms: server.options.retry_interval_ms,
                             init_options_mode: lsp_mode(server.options.init_options_mode),
                             init_options_file: server.options.init_options_file.clone(),
                             init_options: server.options.init_options.clone(),

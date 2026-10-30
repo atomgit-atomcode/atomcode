@@ -54,6 +54,66 @@ pub struct LspManager {
     settle_delay_ms: u64,
 }
 
+// Query budget covers all attempts and waits, not server initialization.
+async fn retry_empty_query<T, F, Fut>(
+    attempts: u32,
+    interval: Duration,
+    cancel: &CancellationToken,
+    mut query: F,
+    empty: impl Fn(&T) -> bool,
+) -> Result<T, String>
+where
+    F: FnMut(CancellationToken) -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    for attempt in 0..attempts {
+        if cancel.is_cancelled() {
+            return Err("LSP query cancelled".into());
+        }
+        let token = cancel.child_token();
+        let request = query(token.clone());
+        tokio::pin!(request);
+        let value = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                token.cancel();
+                let _ = request.await;
+                return Err("LSP query cancelled".into());
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                token.cancel();
+                let _ = request.await;
+                return Err("LSP query timed out (shared 30-second budget)".into());
+            }
+            result = &mut request => result?,
+        };
+        if !empty(&value) || attempt + 1 == attempts {
+            return Ok(value);
+        }
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err("LSP query cancelled".into()),
+            _ = tokio::time::sleep_until(deadline) => return Err("LSP query timed out (shared 30-second budget)".into()),
+            _ = tokio::time::sleep(interval) => {}
+        }
+    }
+    Err("LSP query requires at least one attempt".into())
+}
+
+fn hover_empty(value: &Value) -> bool {
+    fn contents_empty(value: &Value) -> bool {
+        match value {
+            Value::Null => true,
+            Value::String(text) => text.trim().is_empty(),
+            Value::Array(items) => items.iter().all(contents_empty),
+            Value::Object(obj) => obj.get("value").is_some_and(contents_empty),
+            _ => false,
+        }
+    }
+    value.is_null() || value.get("contents").is_some_and(contents_empty)
+}
+
 impl LspManager {
     pub fn new() -> Self {
         Self::with_registry(LspServerRegistry::with_defaults())
@@ -94,6 +154,23 @@ impl LspManager {
         }
         if self.feature_mode(path, operation) == LspMode::Off {
             return Err(format!("LSP {operation} is disabled by configuration"));
+        }
+        Ok(())
+    }
+
+    fn check_query(&self, path: &Path, operation: &str) -> Result<(), String> {
+        self.check_feature(path, operation)?;
+        if let Some(server) = Self::ext_of(path).and_then(|ext| self.registry.get(&ext)) {
+            if server
+                .options
+                .retry_attempts
+                .is_some_and(|n| !(1..=5).contains(&n))
+                || server.options.retry_interval_ms.is_some_and(|n| n > 10000)
+            {
+                return Err(
+                    "LSP retry_attempts must be 1..=5 and retry_interval_ms 0..=10000".into(),
+                );
+            }
         }
         Ok(())
     }
@@ -348,7 +425,7 @@ impl LspManager {
         character: u32,
         cancel: &CancellationToken,
     ) -> Result<Vec<Location>, String> {
-        self.check_feature(path, "definition")?;
+        self.check_query(path, "definition")?;
         let client = self.sync_document(root, path, content, cancel).await?;
         if self.feature_mode(path, "definition") == LspMode::Auto && !client.supports("definition")
         {
@@ -358,7 +435,16 @@ impl LspManager {
             ));
         }
         let (line, character) = client.wire_position(content, line, character)?;
-        client.definition(path, line, character, cancel).await
+        self.retry_query(
+            path,
+            cancel,
+            |token| {
+                let client = client.clone();
+                async move { client.definition(path, line, character, &token).await }
+            },
+            |values: &Vec<Location>| values.is_empty(),
+        )
+        .await
     }
 
     pub async fn references(
@@ -370,7 +456,7 @@ impl LspManager {
         character: u32,
         cancel: &CancellationToken,
     ) -> Result<Vec<Location>, String> {
-        self.check_feature(path, "references")?;
+        self.check_query(path, "references")?;
         let client = self.sync_document(root, path, content, cancel).await?;
         if self.feature_mode(path, "references") == LspMode::Auto && !client.supports("references")
         {
@@ -380,7 +466,16 @@ impl LspManager {
             ));
         }
         let (line, character) = client.wire_position(content, line, character)?;
-        client.references(path, line, character, cancel).await
+        self.retry_query(
+            path,
+            cancel,
+            |token| {
+                let client = client.clone();
+                async move { client.references(path, line, character, &token).await }
+            },
+            |values: &Vec<Location>| values.is_empty(),
+        )
+        .await
     }
 
     pub async fn hover(
@@ -392,7 +487,7 @@ impl LspManager {
         character: u32,
         cancel: &CancellationToken,
     ) -> Result<serde_json::Value, String> {
-        self.check_feature(path, "hover")?;
+        self.check_query(path, "hover")?;
         let client = self.sync_document(root, path, content, cancel).await?;
         if self.feature_mode(path, "hover") == LspMode::Auto && !client.supports("hover") {
             return Err(format!(
@@ -401,7 +496,69 @@ impl LspManager {
             ));
         }
         let (line, character) = client.wire_position(content, line, character)?;
-        client.hover(path, line, character, cancel).await
+        self.retry_query(
+            path,
+            cancel,
+            |token| {
+                let client = client.clone();
+                async move { client.hover(path, line, character, &token).await }
+            },
+            hover_empty,
+        )
+        .await
+    }
+
+    pub async fn document_symbols(
+        &self,
+        root: &Path,
+        path: &Path,
+        content: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Value, String> {
+        self.check_query(path, "document_symbols")?;
+        let client = self.sync_document(root, path, content, cancel).await?;
+        if self.feature_mode(path, "document_symbols") == LspMode::Auto
+            && !client.supports("document_symbols")
+        {
+            return Err(
+                "LSP server does not advertise document_symbols (use mode=on to explicitly try)"
+                    .into(),
+            );
+        }
+        self.retry_query(
+            path,
+            cancel,
+            |token| {
+                let client = client.clone();
+                async move { client.document_symbols(path, &token).await }
+            },
+            |value| value.is_null() || value.as_array().is_some_and(Vec::is_empty),
+        )
+        .await
+    }
+
+    async fn retry_query<T, F, Fut>(
+        &self,
+        path: &Path,
+        cancel: &CancellationToken,
+        query: F,
+        empty: impl Fn(&T) -> bool,
+    ) -> Result<T, String>
+    where
+        F: FnMut(CancellationToken) -> Fut,
+        Fut: std::future::Future<Output = Result<T, String>>,
+    {
+        let options = Self::ext_of(path)
+            .and_then(|ext| self.registry.get(&ext))
+            .map(|s| &s.options);
+        retry_empty_query(
+            options.and_then(|o| o.retry_attempts).unwrap_or(1),
+            Duration::from_millis(options.and_then(|o| o.retry_interval_ms).unwrap_or(5000)),
+            cancel,
+            query,
+            empty,
+        )
+        .await
     }
 
     pub async fn refresh_pull_diagnostics(
@@ -461,6 +618,220 @@ impl Default for LspManager {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn document_symbols_open_once_and_retry_on_the_same_client() {
+        use super::super::jsonrpc;
+        use tokio::io::{AsyncWriteExt, BufReader};
+        let workspace = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(workspace.path()).unwrap();
+        let file = root.join("main.cj");
+        let mut registry = LspServerRegistry::empty();
+        registry.insert(
+            "cj",
+            super::super::registry::LspServerConfig {
+                command: "mock-no-spawn".into(),
+                args: vec![],
+                root_markers: vec![],
+                options: super::super::super::lsp_policy::LspOptions {
+                    retry_attempts: Some(3),
+                    retry_interval_ms: Some(5000),
+                    ..Default::default()
+                },
+            },
+        );
+        let manager = LspManager::with_registry(registry);
+        let (client_end, server_end) = tokio::io::duplex(8192);
+        let (cr, cw) = tokio::io::split(client_end);
+        let (sr, mut sw) = tokio::io::split(server_end);
+        let server = tokio::spawn(async move {
+            let mut reader = BufReader::new(sr);
+            let mut opened = 0;
+            let mut queries = 0;
+            while let Ok(body) = jsonrpc::read_message(&mut reader).await {
+                let message: Value = serde_json::from_slice(&body).unwrap();
+                let result = match message["method"].as_str() {
+                    Some("initialize") => {
+                        assert_eq!(message.pointer("/params/capabilities/textDocument/documentSymbol/hierarchicalDocumentSymbolSupport"), Some(&json!(true)));
+                        json!({"capabilities":{"documentSymbolProvider":true}})
+                    }
+                    Some("textDocument/didOpen") => {
+                        opened += 1;
+                        continue;
+                    }
+                    Some("textDocument/documentSymbol") => {
+                        assert_eq!(opened, 1);
+                        assert!(message["params"].get("position").is_none());
+                        queries += 1;
+                        if queries == 1 {
+                            json!([])
+                        } else {
+                            json!([{"name":"启动","kind":12,"range":{"start":{"line":30,"character":0},"end":{"line":31,"character":0}},"selectionRange":{"start":{"line":30,"character":0},"end":{"line":30,"character":2}}}])
+                        }
+                    }
+                    Some("shutdown") => Value::Null,
+                    Some("exit") => break,
+                    _ => continue,
+                };
+                sw.write_all(&jsonrpc::encode(
+                    &serde_json::to_vec(
+                        &json!({"jsonrpc":"2.0","id":message["id"],"result":result}),
+                    )
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+            }
+            (opened, queries)
+        });
+        let client = LspClient::connect(
+            Box::new(cr),
+            Box::new(cw),
+            url::Url::from_file_path(&root).unwrap().to_string(),
+        )
+        .await
+        .unwrap();
+        let mut key = LspManager::client_key(root.clone(), manager.registry.get("cj").unwrap());
+        key.identity = json!([Value::Null, json!({}), true]).to_string();
+        manager.clients.lock().await.insert(key, Arc::new(client));
+        let result = manager
+            .document_symbols(&root, &file, "func 启动() {}", &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(result[0]["name"], "启动");
+        manager.shutdown().await;
+        assert_eq!(server.await.unwrap(), (1, 2));
+    }
+
+    #[test]
+    fn invalid_retry_configuration_and_disabled_symbols_fail_before_startup() {
+        let mut registry = missing_binary_registry();
+        let mut config = registry.get("rs").unwrap().clone();
+        config.options.retry_attempts = Some(0);
+        registry.insert("rs", config.clone());
+        let manager = LspManager::with_registry(registry);
+        assert!(manager
+            .check_query(Path::new("main.rs"), "hover")
+            .unwrap_err()
+            .contains("retry_attempts"));
+        config.options.retry_attempts = Some(3);
+        config.options.features.document_symbols = Some(LspMode::Off);
+        let mut registry = LspServerRegistry::empty();
+        registry.insert("rs", config);
+        assert!(LspManager::with_registry(registry)
+            .check_feature(Path::new("main.rs"), "document_symbols")
+            .unwrap_err()
+            .contains("disabled"));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn empty_query_retries_hit_and_retains_last_empty_result() {
+        for (attempts, hit, expected) in [(1, 2, 1), (3, 2, 2), (3, 9, 3)] {
+            let calls = std::cell::Cell::new(0);
+            let start = tokio::time::Instant::now();
+            let result = retry_empty_query(
+                attempts,
+                Duration::from_secs(5),
+                &CancellationToken::new(),
+                |_| {
+                    calls.set(calls.get() + 1);
+                    let value = if calls.get() == hit { vec![42] } else { vec![] };
+                    async move { Ok(value) }
+                },
+                Vec::is_empty,
+            )
+            .await
+            .unwrap();
+            assert_eq!(calls.get(), expected);
+            assert_eq!(!result.is_empty(), expected == hit);
+            assert_eq!(
+                start.elapsed(),
+                Duration::from_secs(5 * (expected - 1) as u64)
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn empty_query_errors_cancel_and_budget_do_not_retry_forever() {
+        let calls = std::cell::Cell::new(0);
+        let result = retry_empty_query(
+            3,
+            Duration::ZERO,
+            &CancellationToken::new(),
+            |_| {
+                calls.set(calls.get() + 1);
+                async { Err::<Vec<u8>, _>("protocol failure".into()) }
+            },
+            Vec::is_empty,
+        )
+        .await;
+        assert_eq!(result.unwrap_err(), "protocol failure");
+        assert_eq!(calls.get(), 1);
+        let cancel = CancellationToken::new();
+        let cancelling = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            cancelling.cancel();
+        });
+        let result = retry_empty_query(
+            3,
+            Duration::from_secs(5),
+            &cancel,
+            |_| async { Ok(Vec::<u8>::new()) },
+            Vec::is_empty,
+        )
+        .await;
+        assert!(result.unwrap_err().contains("cancelled"));
+        let start = tokio::time::Instant::now();
+        let result = retry_empty_query(
+            5,
+            Duration::from_secs(10),
+            &CancellationToken::new(),
+            |_| async { Ok(Vec::<u8>::new()) },
+            Vec::is_empty,
+        )
+        .await;
+        assert!(result.unwrap_err().contains("shared 30-second budget"));
+        assert_eq!(start.elapsed(), Duration::from_secs(30));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn budget_cancels_the_in_flight_request_before_returning() {
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let finished_query = finished.clone();
+        let result = retry_empty_query(
+            3,
+            Duration::ZERO,
+            &CancellationToken::new(),
+            |token| {
+                let finished = finished_query.clone();
+                async move {
+                    token.cancelled().await;
+                    finished.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Err::<Vec<u8>, _>("cancelled".into())
+                }
+            },
+            Vec::is_empty,
+        )
+        .await;
+        assert!(result.unwrap_err().contains("timed out"));
+        assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn hover_empty_checks_contents_not_the_presence_of_a_range() {
+        for value in [
+            Value::Null,
+            json!({"contents": ""}),
+            json!({"contents":{"kind":"markdown","value":" "},"range":{}}),
+            json!({"contents":[]}),
+        ] {
+            assert!(hover_empty(&value));
+        }
+        assert!(!hover_empty(
+            &json!({"contents":[{"language":"cj","value":"中文签名"}]})
+        ));
+    }
+
     use super::*;
     use crate::codeintel::lsp::registry::{LspServerConfig, LspServerRegistry};
 

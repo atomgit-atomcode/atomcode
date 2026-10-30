@@ -33,6 +33,10 @@ pub struct LspFeatures {
 #[serde(default, deny_unknown_fields)]
 pub struct LspOptions {
     pub disabled: bool,
+    /// Total semantic query attempts, including the first (1..=5; default 1).
+    pub retry_attempts: Option<u32>,
+    /// Delay between successful empty responses (0..=10000; default 5000 ms).
+    pub retry_interval_ms: Option<u64>,
     pub init_options_mode: LspMode,
     pub init_options_file: Option<std::path::PathBuf>,
     pub init_options: Option<serde_json::Value>,

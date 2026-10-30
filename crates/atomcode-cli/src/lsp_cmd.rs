@@ -9,13 +9,13 @@ pub enum LspCli {
     Probe {
         #[arg(long)]
         file: std::path::PathBuf,
-        /// One-based line. Required with --method.
-        #[arg(long, requires = "method", requires = "col", value_parser = clap::value_parser!(u32).range(1..))]
+        /// One-based line. Required for position queries.
+        #[arg(long, requires = "method", requires = "col", required_if_eq_any = [("method", "hover"), ("method", "definition"), ("method", "references")], value_parser = clap::value_parser!(u32).range(1..))]
         line: Option<u32>,
         /// One-based Unicode character column (not byte or UTF-16 offset).
         #[arg(long, requires = "line", value_parser = clap::value_parser!(u32).range(1..))]
         col: Option<u32>,
-        #[arg(long, requires = "line")]
+        #[arg(long)]
         method: Option<ProbeMethod>,
         /// Ignore initialization options for this probe only.
         #[arg(long)]
@@ -35,6 +35,7 @@ pub enum ProbeMethod {
     Definition,
     References,
     Hover,
+    DocumentSymbols,
 }
 
 pub async fn run(
@@ -51,6 +52,11 @@ pub async fn run(
         no_lsp_init_options,
         trace,
     } = command;
+    if method.is_some_and(|m| !matches!(m, ProbeMethod::DocumentSymbols))
+        && (line.is_none() || col.is_none())
+    {
+        bail!("Position queries require --line and --col");
+    }
     let config =
         atomcode_config::Config::load_strict(config_path).context("load LSP configuration")?;
     if !config.lsp.enabled {
@@ -108,6 +114,7 @@ pub async fn run(
                 ProbeMethod::Definition => "definition",
                 ProbeMethod::References => "references",
                 ProbeMethod::Hover => "hover",
+                ProbeMethod::DocumentSymbols => "document_symbols",
             };
             let result = tool.execute(&json!({"operation":operation,"backend":"local","file_path":file,"line":line,"character":col}).to_string(), &ctx).await;
             failed = result.is_error
@@ -131,5 +138,45 @@ pub async fn run(
     tokio::select! {
         result = work => result,
         _ = tokio::signal::ctrl_c() => { cancel.cancel(); bail!("LSP probe cancelled"); }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+    #[derive(Parser)]
+    struct Args {
+        #[command(subcommand)]
+        command: LspCli,
+    }
+    #[test]
+    fn outline_probe_needs_no_position_and_positional_queries_accept_coordinates() {
+        let args = Args::try_parse_from([
+            "lsp",
+            "probe",
+            "--file",
+            "main.cj",
+            "--method",
+            "document-symbols",
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.command,
+            LspCli::Probe {
+                method: Some(ProbeMethod::DocumentSymbols),
+                line: None,
+                col: None,
+                ..
+            }
+        ));
+        assert!(
+            Args::try_parse_from(["lsp", "probe", "--file", "main.cj", "--method", "hover"])
+                .is_err()
+        );
+        assert!(Args::try_parse_from([
+            "lsp", "probe", "--file", "main.cj", "--method", "hover", "--line", "1", "--col", "2"
+        ])
+        .is_ok());
     }
 }
