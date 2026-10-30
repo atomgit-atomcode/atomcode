@@ -889,6 +889,21 @@ impl CompactBeforeRequest {
         }
         !std::mem::replace(&mut entry.1[usize::from(slow)], true)
     }
+
+    /// Whether both stages were already attempted for this turn/cycle. Checked
+    /// before `calls_model`, which projects the whole log: a long turn that stays
+    /// above the threshold must not pay that projection on every request after
+    /// both attempts are spent.
+    fn both_tried(&self, session: &str, turn: u64) -> bool {
+        let mut tried = self.tried.lock().expect("compaction attempts poisoned");
+        let entry = tried
+            .entry(session.to_string())
+            .or_insert((turn, [false; 2]));
+        if entry.0 != turn {
+            *entry = (turn, [false; 2]);
+        }
+        entry.1[0] && entry.1[1]
+    }
 }
 
 #[async_trait]
@@ -927,6 +942,9 @@ impl Waterfall<AgentRequest> for CompactBeforeRequest {
                 .lock()
                 .expect("compaction attempts poisoned")
                 .remove(session.id());
+            return next.run(req).await;
+        }
+        if self.both_tried(session.id(), session.current_turn()) {
             return next.run(req).await;
         }
 
@@ -975,18 +993,7 @@ pub(crate) fn reproject(req: &mut ModelRequest, session: &crate::session::Sessio
 /// for a session seeded from a stored conversation, which carries no usage
 /// facts — what the stored answer recorded.
 pub(crate) fn last_prompt_tokens(session: &crate::session::SessionLog) -> u32 {
-    session
-        .events()
-        .iter()
-        .rev()
-        .find_map(|e| match &e.event {
-            SessionEvent::Usage { usage, .. } => Some(usage.prompt),
-            SessionEvent::AssistantMessage {
-                meta: Some(meta), ..
-            } if meta.used_tokens > 0 => Some(meta.used_tokens),
-            _ => None,
-        })
-        .unwrap_or(0)
+    session.last_prompt_tokens()
 }
 
 pub struct CompactionPlugin;
