@@ -51,12 +51,19 @@ class EffortChoicesTest {
     }
 
     @Test
-    fun `a model that declares no levels keeps every level the wire accepts`() {
-        val choices = EffortChoices.forModel(model(levels = emptyList()))
-
-        assertEquals(
-            listOf(null, "low", "medium", "high", "xhigh", "max"),
-            choices.map { it.value },
+    fun `a model that declares no levels gets no menu at all`() {
+        // The daemon derives both fields from the endpoint's declared levels
+        // (`declared_effort_levels`: unset ⇒ empty), so "applicable but no levels"
+        // describes an endpoint with nothing to switch — offering a lone "Default"
+        // row was the reported bug.
+        assertTrue(EffortChoices.forModel(model(levels = emptyList())).isEmpty())
+        assertTrue(
+            EffortChoices.forModel(model(levels = listOf("  "))).isEmpty(),
+            "blank levels are not choices",
+        )
+        assertTrue(
+            EffortChoices.forModel(model(levels = listOf("auto"))).isEmpty(),
+            "auto alone leaves nothing switchable",
         )
     }
 

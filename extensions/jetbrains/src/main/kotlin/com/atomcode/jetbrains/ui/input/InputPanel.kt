@@ -155,6 +155,9 @@ class InputPanel(
 
     private var effortChoices: List<EffortChoice> = emptyList()
 
+    /// The composer toolbar; kept only so tests can drive [layoutToolbar].
+    private var toolbarRef: JPanel? = null
+
     private val actionCards = CardLayout()
     private val actionPanel = JPanel(actionCards).apply {
         isOpaque = false
@@ -213,6 +216,7 @@ class InputPanel(
             add(modelLabel)
             add(actionPanel)
         }
+        toolbarRef = toolbar
 
         val composer = JPanel(BorderLayout()).apply {
             isOpaque = true
@@ -407,11 +411,15 @@ class InputPanel(
 /// entirely — a model without declared levels has nothing to choose.
     internal fun setEffortChoices(choices: List<EffortChoice>, current: String?) {
         effortChoices = choices
-        effortLabel.isVisible = choices.isNotEmpty()
+        effortLabel.isVisible = effortChipHasContent()
         effortLabel.text = "${EffortChoices.labelFor(choices, current)} ▾"
         effortLabel.parent?.revalidate()
         effortLabel.parent?.repaint()
     }
+
+    /// The chip only exists when the selected model exposes switchable levels; an
+    /// endpoint declaring none must not leave a lone "Default" chip in the toolbar.
+    private fun effortChipHasContent(): Boolean = effortChoices.isNotEmpty()
 
     fun setEffortEnabled(enabled: Boolean) {
         effortLabel.isEnabled = enabled
@@ -426,6 +434,14 @@ class InputPanel(
     internal fun effortOptionsForTest(): List<String> = effortChoices.map { it.label }
 
     internal fun selectEffortForTest(value: String?) = onEffortSelect(value)
+
+    /// Test hook: run the toolbar layout as a real layout pass would, so tests can
+    /// prove the chip stays hidden after `setEffortChoices` hides it.
+    internal fun layoutToolbarForTest(width: Int) {
+        val toolbar = toolbarRef ?: return
+        toolbar.setSize(width, toolbar.height.coerceAtLeast(36))
+        toolbar.doLayout()
+    }
 
     fun setApprovalMode(mode: ApprovalMode) {
         approvalModeLabel.text = "$mode ▾"
@@ -762,7 +778,10 @@ class InputPanel(
             rightX = x - gap
         }
         placeRight(model)
-        placeRight(effort)
+        // A layout pass runs after setEffortChoices, so re-showing the chip here
+        // unconditionally resurrected it (as a lone "Default") for models that
+        // expose no levels. Only place it when there is something to pick.
+        if (effortChipHasContent()) placeRight(effort)
         placeRight(mode)
         placeRight(token)
     }
