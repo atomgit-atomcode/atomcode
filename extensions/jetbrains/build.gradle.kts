@@ -240,6 +240,16 @@ tasks {
     processResources {
         dependsOn(verifyBundledDaemon)
         from(bundledDaemonDir)
+        // macOS writes an AppleDouble `._*` sidecar next to every file it creates
+        // on a network/external volume — including the bundled daemons. They are
+        // not plugin content and must not reach the jar or the distribution zip.
+        exclude("**/._*")
+    }
+
+    // Belt and braces: whatever ends up in an archive, the sidecars stay out, so
+    // a signed plugin cannot carry them either.
+    withType<org.gradle.api.tasks.bundling.Zip>().configureEach {
+        exclude("**/._*")
     }
 
     named("runIde") {
