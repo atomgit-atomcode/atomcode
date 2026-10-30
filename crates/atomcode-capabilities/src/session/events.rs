@@ -921,6 +921,10 @@ impl SessionManager {
                 // ran has none, while turn ids are read from the log, not the index.
                 let turn = last_turn(&events) + 1;
                 let at = u64::try_from(super::now_ms()).unwrap_or(0);
+                // `events_from_snapshot` numbered these consecutively in
+                // memory and this log is written whole, so the last record is
+                // also the highest sequence; unlike an appended log, there is
+                // no stored tail that could disagree with it.
                 let seq = events.last().map_or(1, |last| last.seq + 1);
                 events.push(LoggedEvent {
                     seq,

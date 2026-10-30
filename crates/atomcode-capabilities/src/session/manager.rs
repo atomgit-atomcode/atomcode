@@ -767,16 +767,41 @@ fn pending_replay_prompt(events: &[LoggedEvent], replay: &ResumeReplay) -> Pendi
     // carry a smaller number, and comparing numbers would call that rewind an
     // earlier one. A rewind whose turn is not in the log cannot be shown to spare
     // the prompt, so it retires it too.
-    if after.iter().any(|logged| {
-        let SessionEvent::Rewound { to, scope, .. } = &logged.event else {
-            return false;
+    let later_rewinds: BTreeSet<SeqNo> = after
+        .iter()
+        .filter_map(|logged| match &logged.event {
+            SessionEvent::Rewound { to, scope, .. } if scope.takes_back_conversation() => Some(*to),
+            _ => None,
+        })
+        .collect();
+    if !later_rewinds.is_empty() {
+        // `turn_start_at` resolves a sequence to the first record that carries
+        // it; looking each later rewind up from the front of the log would make
+        // this quadratic on a log with many rewinds. Resolve them all in one
+        // pass. A sequence whose first record is not a `TurnStart` still
+        // resolves to none, exactly as `turn_start_at` does.
+        let mut first_position: HashMap<SeqNo, usize> = HashMap::new();
+        for (position, logged) in events.iter().enumerate() {
+            if later_rewinds.contains(&logged.seq) {
+                first_position.entry(logged.seq).or_insert(position);
+            }
+        }
+        let turn_start = |seq: SeqNo| {
+            first_position.get(&seq).and_then(|&position| {
+                matches!(events[position].event, SessionEvent::TurnStart { .. }).then_some(position)
+            })
         };
-        scope.takes_back_conversation()
-            && super::events::turn_start_at(events, *to)
-                .is_none_or(|(position, _)| position <= start)
-    }) {
-        return PendingReplay::Stale;
+        if later_rewinds
+            .iter()
+            .any(|to| turn_start(*to).is_none_or(|position| position <= start))
+        {
+            return PendingReplay::Stale;
+        }
     }
+    // Wider than `unanswered_prompt` on purpose: the question here is not
+    // whether the prompt still waits for an answer, but whether anything
+    // happened after the retraction. Any later turn means the replay was
+    // accepted or the person moved on, and the marker has done its job.
     if after
         .iter()
         .any(|logged| matches!(logged.event, SessionEvent::TurnStart { .. }))
