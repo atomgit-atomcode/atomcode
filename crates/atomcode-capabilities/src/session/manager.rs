@@ -1795,12 +1795,11 @@ impl SessionManager {
         let canonical_len = loaded.snapshot.messages.len();
         let recoverable = inflight.snapshot.messages.len() == canonical_len.saturating_add(1)
             && inflight.snapshot.messages[..canonical_len] == loaded.snapshot.messages
-            && inflight.snapshot.messages.last().is_some_and(|message| {
-                message.role == atomcode_kernel::message::Role::User
-                    && !message.synthetic
-                    && message.internal_origin.is_none()
-                    && message.tool_calls.is_empty()
-            });
+            && inflight
+                .snapshot
+                .messages
+                .last()
+                .is_some_and(super::events::is_resumable_prompt);
         if recoverable {
             if inflight.replay_safe {
                 Ok((loaded, inflight.snapshot.messages.last().cloned()))
@@ -1846,16 +1845,23 @@ impl SessionManager {
                 // retraction and the person's undo write the same `Rewound`,
                 // and an unreadable marker names neither; handing a prompt back
                 // on the strength of a rewind alone would replay what the person
-                // withdrew. So nothing is replayed, and the marker is removed
-                // instead of failing every later resume. Naming the rewind's
-                // author would take a new fact or a field on `Rewound` — a log
-                // format change of its own — so this stays conservative until
-                // that exists.
+                // withdrew. So nothing is replayed from it, and the log below
+                // decides instead.
+                //
+                // The marker stays. It may be unreadable only for this read (a
+                // sharing violation, a partial write that later completes), and
+                // the retraction it names may already be committed: removing it
+                // would throw away the only record that could hand that prompt
+                // back. `prepare_resume_replay` treats an unreadable marker the
+                // same way — it decides from the log and replaces the marker with
+                // one it can use when it retracts — so leaving it here is what
+                // keeps that replacement possible. Naming the rewind's author
+                // would take a new fact or a field on `Rewound` — a log format
+                // change of its own.
                 notes.push(format!(
                     "the pending replay of session {id} could not be read; its retraction, \
                      if any, will not be replayed: {error}"
                 ));
-                let _ = self.clear_resume_replay(id);
             }
         }
 
@@ -2648,7 +2654,12 @@ impl SessionManager {
             let (_, events) = self.read_event_log_bounded(id, false, usize::MAX)?;
             let snapshot = super::events::snapshot_of(&events);
             let presentation = match self.read_presentation_bounded(id, usize::MAX) {
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                // An event session has display-only entries only if something
+                // added them. Any other session needs the file, the same way
+                // the strict aggregate does.
+                Err(error)
+                    if self.is_event_session(id) && error.kind() == io::ErrorKind::NotFound =>
+                {
                     PresentationFile::default()
                 }
                 other => other?,
@@ -7695,9 +7706,16 @@ mod tests {
                 .any(|note| note.contains("will not be replayed")),
             "{notes:?}"
         );
+        // The marker may name a retraction that is already committed, and it can
+        // be unreadable for one resume only. Removing it would throw away the
+        // only record that could hand that prompt back.
+        assert_eq!(
+            std::fs::read(mgr.resume_replay_path("replay").unwrap()).unwrap(),
+            b"\xffnot a marker"
+        );
         assert!(
-            !mgr.resume_replay_path("replay").unwrap().exists(),
-            "the unreadable marker is not kept as an error for every later resume"
+            mgr.read_resume_replay("replay").is_err(),
+            "still unreadable, and still kept"
         );
         assert!(matches!(
             mgr.prepare_resume_replay(&lease, &Message::user("hello")),
@@ -7769,7 +7787,10 @@ mod tests {
                 .any(|note| note.contains("will not be replayed")),
             "{notes:?}"
         );
-        assert!(!mgr.resume_replay_path("replay").unwrap().exists());
+        assert_eq!(
+            std::fs::read(mgr.resume_replay_path("replay").unwrap()).unwrap(),
+            b"\xffnot a marker"
+        );
     }
 
     #[test]

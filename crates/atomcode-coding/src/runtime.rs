@@ -5177,6 +5177,15 @@ fn spawn_runtime_owner_with_optional_agent(
                                 );
                             }
                         }
+                        // `done` reports the replacement, which is installed
+                        // whether or not the replay ran: the caller has no other
+                        // agent to fall back to, and this channel only carries
+                        // `()`. A deferred replay is not silent — it left the
+                        // failed phase and a `ControllerWarning` carrying the
+                        // reason on the event stream, the surfaces every replay
+                        // site reports through. An outcome that could also say
+                        // "installed, replay pending" would change `manage`'s
+                        // signature for every control.
                         let _ = done.send(());
                     }
                     Some(OwnerControl::Shutdown { done }) => {
@@ -7709,13 +7718,17 @@ fn spawn_runtime_owner_with_optional_agent(
                                 // went out under the new generation, so the
                                 // caller is told it happened. A replay the new
                                 // provider deferred already left the failure
-                                // phase and warning above; reporting that as a
-                                // failed reconfiguration would send the caller
-                                // back to the old provider while this runtime
-                                // runs the new one. The next resume or provider
-                                // rebuild retries the replay. A distinct
-                                // "swapped, replay pending" outcome would take a
-                                // result type the callers do not read yet.
+                                // phase and a `ControllerWarning` carrying the
+                                // reason, and callers read the phase off this
+                                // runtime's status: the pending replay is visible
+                                // there, not only in this value. Reporting the
+                                // swap as failed would send the caller back to
+                                // the old provider while this runtime runs the
+                                // new one. A distinct "swapped, replay pending"
+                                // outcome would take a result type the daemon's
+                                // snapshot commit and the CLI's config write both
+                                // understand — a caller contract change this path
+                                // cannot decide.
                                 let _ = done.send(Ok(RuntimeGeneration(generation)));
                                 continue;
                             }
@@ -8743,8 +8756,9 @@ fn spawn_runtime_owner_with_optional_agent(
                             .send(CodingRuntimeEvent::Reconfigured { operation });
                         // The switch itself committed, so the caller is told it
                         // happened. A replay this candidate could not prepare is
-                        // not a failed switch: its failed phase and warning say
-                        // the conversation cannot continue, and the next rebuild
+                        // not a failed switch: its failed phase and the
+                        // `ControllerWarning` naming the reason are what the
+                        // caller's status read reports, and the next rebuild
                         // retries it — an `Err` here would send the caller back
                         // to a session this generation no longer holds. A distinct
                         // "switched, replay pending" outcome would take a result
@@ -10949,6 +10963,13 @@ fn replay_pending_resume_prompt(
             // continuing would let a new turn run past a prompt the log still
             // holds. Keep the prompt so a rebuild retries it, and stop this
             // generation: reporting ready would let exactly that happen.
+            //
+            // No timer retries this. The prepare failed against the candidate
+            // this generation just built, and nothing about that candidate
+            // changes on its own, so an immediate retry would repeat the same
+            // read. The prompt and its marker are the log's: the next rebuild
+            // (`/model`, a provider reload, a resume) retries the prepare when it
+            // builds a new generation.
             binding.pending_resume_prompt = Some(prompt);
             let _ = event_tx.send(CodingRuntimeEvent::ControllerWarning(format!(
                 "the resumed prompt could not be prepared for replay: {error}; \

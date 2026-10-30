@@ -314,11 +314,14 @@ impl SessionManager {
     /// with the record above it, and treating that blank line as the record
     /// would refuse to allocate for a log that reads back fine.
     ///
-    /// The lock is held for the whole scan, so it reads one fixed window at a
-    /// time into a buffer it reuses: a record that fits is parsed where it was
-    /// read, only a wider one collects the windows before it, and no byte is
-    /// read from disk twice. A tail without a line boundary within
-    /// [`MAX_JSONL_LINE_BYTES`] is not a line this store wrote.
+    /// The lock is held for the whole scan, into one buffer that is reused: the
+    /// tail window holds every record an append writes, so a normal log pays one
+    /// read and parses the line where it was read. A record wider than the
+    /// window — or a tail buried under more blank bytes than one — takes a
+    /// second read, of the widest line this store writes
+    /// ([`MAX_JSONL_LINE_BYTES`]), which covers it without keeping every window
+    /// alive or joining copies. A tail without a line boundary within that
+    /// bound is not a line this store wrote.
     fn last_recorded_seq(file: &mut fs::File, path: &Path) -> SessionResult<Option<SeqNo>> {
         #[derive(serde::Deserialize)]
         struct SeqRecord {
@@ -340,68 +343,38 @@ impl SessionManager {
                 .map_err(|_| corrupt())
         };
 
-        // The last window first: it holds the end of every record a normal
-        // append writes, trailing blank bytes included, and the buffer below is
-        // reused for each earlier one the walk needs.
-        let mut window = Vec::new();
-        let mut end = len;
-        let mut start = loop {
-            let next = end.saturating_sub(TAIL_WINDOW);
-            read_log_window(file, path, next, end, &mut window)?;
-            if let Some(position) = window.iter().rposition(|byte| !byte.is_ascii_whitespace()) {
-                end = next + position as u64 + 1;
-                window.truncate(position + 1);
-                break next;
-            }
-            if next == 0 {
-                return Ok(None);
-            }
-            if len - next > MAX_JSONL_LINE_BYTES as u64 {
-                return Err(corrupt());
-            }
-            end = next;
-        };
-        // The line after the last newline is the record. Windows read so far are
-        // kept newest first; a line wider than one window is joined once, from
-        // the window that holds its newline to the one that holds its end.
-        let mut earlier: Vec<Vec<u8>> = Vec::new();
-        loop {
-            if let Some(position) = window.iter().rposition(|byte| *byte == b'\n') {
-                let line = &window[position + 1..];
-                if earlier.is_empty() {
-                    return parse(line);
-                }
-                let mut joined =
-                    Vec::with_capacity(earlier.iter().map(Vec::len).sum::<usize>() + line.len());
-                joined.extend_from_slice(line);
-                for part in earlier.iter().rev() {
-                    joined.extend_from_slice(part);
-                }
-                return parse(&joined);
-            }
-            if start == 0 {
-                // The log's first line is a header, not a record: `seq` stays
-                // `None`, and the caller allocates from its own floor.
-                if earlier.is_empty() {
-                    return parse(&window);
-                }
-                let mut joined =
-                    Vec::with_capacity(earlier.iter().map(Vec::len).sum::<usize>() + window.len());
-                joined.extend_from_slice(&window);
-                for part in earlier.iter().rev() {
-                    joined.extend_from_slice(part);
-                }
-                return parse(&joined);
-            }
-            let next = start.saturating_sub(TAIL_WINDOW);
-            if end.saturating_sub(next) > MAX_JSONL_LINE_BYTES as u64 {
-                return Err(corrupt());
-            }
-            let mut part = Vec::new();
-            read_log_window(file, path, next, start, &mut part)?;
-            earlier.push(std::mem::replace(&mut window, part));
-            start = next;
+        // `end` is the position just past the last non-blank byte. Only blanks
+        // leave it at the window's start.
+        let mut buffer = Vec::new();
+        let mut start = len.saturating_sub(TAIL_WINDOW);
+        read_log_window(file, path, start, len, &mut buffer)?;
+        let mut end = start + trimmed_len(&buffer) as u64;
+        if end == 0 {
+            return Ok(None);
         }
+        if !buffer[..(end - start) as usize].contains(&b'\n') && start > 0 {
+            // No line boundary in the window: the last record is wider than it,
+            // or the window is all blanks and the record ends before it. Either
+            // way the boundary it follows is within one widest line of the end.
+            start = len.saturating_sub((MAX_JSONL_LINE_BYTES as u64).saturating_add(1));
+            read_log_window(file, path, start, len, &mut buffer)?;
+            end = start + trimmed_len(&buffer) as u64;
+        }
+        if end == start {
+            // Blanks all the way back to the start of the file: no record, like
+            // an empty log. Anywhere else, the tail is wider than this store
+            // writes.
+            return if start == 0 { Ok(None) } else { Err(corrupt()) };
+        }
+        let used = (end - start) as usize;
+        let line = match buffer[..used].iter().rposition(|byte| *byte == b'\n') {
+            Some(position) => &buffer[position + 1..used],
+            // The log's first line is a header, not a record: `seq` stays
+            // `None`, and the caller allocates from its own floor.
+            None if start == 0 => &buffer[..used],
+            None => return Err(corrupt()),
+        };
+        parse(line)
     }
 
     /// Keep the index's name with the log's when the person names the session.
@@ -936,15 +909,9 @@ impl SessionManager {
             // is one becomes a turn: the checkpoint's tail can also be a tool
             // result, an injected continuation or a synthetic note, and writing
             // one of those as a `UserMessage` would replay it as the person's
-            // next prompt. The resume loader already refuses them; the write
-            // states the condition again because this is where the fact is
-            // born, and every later resume reads it back from here.
-            let is_prompt = prompt.role == Role::User
-                && prompt.tool_call_id.is_none()
-                && !prompt.synthetic
-                && prompt.internal_origin.is_none()
-                && prompt.tool_calls.is_empty();
-            if is_prompt {
+            // next prompt. The resume loader asks the same predicate, so a
+            // prompt it hands back is always one this write accepts.
+            if is_resumable_prompt(prompt) {
                 // The snapshot's in-flight prompt was accepted before the process
                 // died but never entered a log. It becomes the turn the log would
                 // have held, so its replay retracts a log fact like any other
@@ -1082,16 +1049,41 @@ impl SessionManager {
     }
 }
 
-/// How much of the log's tail one step of [`SessionManager::last_recorded_seq`]
-/// reads. Fixed so the scan holds one window at a time, never the file.
+/// Whether a message the resume paths hand back is one the person said, and so
+/// one the log can hold as this turn's `UserMessage`.
+///
+/// The resume loader and the snapshot conversion both ask here because they
+/// must agree: a message the loader hands back but the conversion refuses
+/// leaves no turn in the log, and the next resume then finds nothing to hand
+/// back — the prompt the person lost their turn to disappears without a trace.
+pub(super) fn is_resumable_prompt(message: &Message) -> bool {
+    message.role == Role::User
+        && message.tool_call_id.is_none()
+        && !message.synthetic
+        && message.internal_origin.is_none()
+        && message.tool_calls.is_empty()
+}
+
+/// How much of the log's tail the first read of
+/// [`SessionManager::last_recorded_seq`] covers. Fixed so the normal scan holds
+/// one window at a time, never the file.
 const TAIL_WINDOW: u64 = 64 * 1024;
+
+/// Where the last non-blank byte of `buffer` ends, or zero when it holds only
+/// blanks. Trailing blank lines are skipped the way the reader skips them.
+fn trimmed_len(buffer: &[u8]) -> usize {
+    buffer
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map_or(0, |position| position + 1)
+}
 
 /// Fill `buffer` with bytes `start..end` of the locked append handle.
 ///
 /// Seeking on an append handle is safe: the handle's writes go to the end of the
 /// file whatever its position (append semantics), and Windows locks cover the
-/// same handle that holds them. The buffer is reused across the steps of a tail
-/// scan, so the normal one-window scan allocates nothing beyond it.
+/// same handle that holds them. The buffer is reused across both tail reads, so
+/// the normal one-window scan allocates nothing beyond it.
 fn read_log_window(
     file: &mut fs::File,
     path: &Path,
@@ -1304,11 +1296,19 @@ pub fn events_to_become(events: &[LoggedEvent], target: &[Message]) -> Vec<Sessi
 /// Returns the `TurnStart` sequence the caller rewinds to, the turn, and the
 /// prompt to hand back to the runtime.
 pub(crate) fn unanswered_prompt(events: &[LoggedEvent]) -> Option<(SeqNo, u64, Message)> {
-    let (start, turn) = events.iter().rev().find_map(|logged| match &logged.event {
-        SessionEvent::TurnStart { turn } => Some((logged.seq, *turn)),
-        _ => None,
-    })?;
-    unanswered_at(events, start, turn).map(|prompt| (start, turn, prompt))
+    // The position is what decides the turn; re-finding it later by sequence
+    // would pick the first record carrying that number, which a log read after
+    // a truncation can have written twice.
+    let (position, seq, turn) =
+        events
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(position, logged)| match logged.event {
+                SessionEvent::TurnStart { turn } => Some((position, logged.seq, turn)),
+                _ => None,
+            })?;
+    unanswered_from(events, position, turn).map(|prompt| (seq, turn, prompt))
 }
 
 /// The prompt of the turn at `start` when that turn is still accepted and
@@ -1324,6 +1324,11 @@ pub(crate) fn unanswered_at(events: &[LoggedEvent], start: SeqNo, turn: u64) -> 
     if found != turn {
         return None;
     }
+    unanswered_from(events, position, turn)
+}
+
+/// [`unanswered_at`] for a caller that already holds the `TurnStart`'s position.
+fn unanswered_from(events: &[LoggedEvent], position: usize, turn: u64) -> Option<Message> {
     let mut prompt = None;
     for logged in &events[position + 1..] {
         match &logged.event {
@@ -3377,6 +3382,59 @@ mod tests {
             .unwrap();
         assert_eq!(allocated, Some(7));
         assert_eq!(manager.load_events(id).unwrap().last().unwrap().seq, 7);
+    }
+
+    #[test]
+    fn a_blank_tail_wider_than_the_scan_window_does_not_hide_the_last_record() {
+        let (_dir, manager) = store();
+        let id = "resume-wide-blank-tail";
+        let lease = created(&manager, id);
+        manager.append_events(&lease, &a_turn()).unwrap();
+        // More blank bytes than the tail window holds: the first read sees only
+        // blanks, so the allocator has to widen its read to reach the record.
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(manager.events_path(id).unwrap())
+            .unwrap();
+        log.write_all(&vec![b'\n'; 100 * 1024]).unwrap();
+        drop(log);
+
+        let mut allocated = None;
+        manager
+            .append_event_allocating(
+                &lease,
+                5,
+                |seq| {
+                    allocated = Some(seq);
+                    Ok(logged(seq, 0, SessionEvent::TurnStart { turn: 2 }))
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(allocated, Some(6));
+        assert_eq!(manager.load_events(id).unwrap().last().unwrap().seq, 6);
+    }
+
+    #[test]
+    fn a_resumable_prompt_is_exactly_a_message_the_log_would_hold() {
+        assert!(is_resumable_prompt(&Message::user("hello")));
+        assert!(is_resumable_prompt(&Message::user_with_images(
+            "hello",
+            vec![]
+        )));
+        // Every other shape the loader can meet at the checkpoint's tail is not
+        // a turn the log can hold as the person's prompt.
+        assert!(!is_resumable_prompt(&Message::synthetic_user("note")));
+        assert!(!is_resumable_prompt(&Message::tool_result(
+            "call-1", "out", false
+        )));
+        assert!(!is_resumable_prompt(&Message::assistant("answer", vec![])));
+        let mut tool_call_id = Message::user("hello");
+        tool_call_id.tool_call_id = Some("call-1".into());
+        assert!(!is_resumable_prompt(&tool_call_id));
+        let mut injected = Message::user("hello");
+        injected.internal_origin = Some("continuation".into());
+        assert!(!is_resumable_prompt(&injected));
     }
 
     #[test]
