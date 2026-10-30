@@ -1904,6 +1904,8 @@ impl SessionManager {
         self.validate_active_lease(lease)?;
         let id = lease.id();
         if !self.is_event_session(id) {
+            // A snapshot session has no log to retract. Its prompt came from
+            // the in-flight checkpoint and simply starts a new turn.
             return Ok(PrepareResumeReplay::Prepared);
         }
         let events = self.load_events(id)?;
@@ -1946,6 +1948,13 @@ impl SessionManager {
                 // its exact target, not a freshly chosen last turn, and only
                 // while that target still holds the prompt being replayed.
                 PendingReplay::Stale => {
+                    // The marker names a `TurnStart` at `to`. A truncated and
+                    // rewritten log can reuse that sequence for another turn;
+                    // retracting it there would take back the new turn instead.
+                    if super::events::turn_started_at(&events, replay.to) != Some(replay.turn) {
+                        let _ = self.clear_resume_replay(id);
+                        return Ok(PrepareResumeReplay::Obsolete);
+                    }
                     let Some(visible) =
                         super::events::unanswered_at(&events, replay.to, replay.turn)
                     else {
@@ -1977,6 +1986,10 @@ impl SessionManager {
                 rewound: None,
             }
         };
+        // Allocated outside the append's file lock: the session lease is an
+        // exclusive OS lock, and prepare only runs at startup or after the old
+        // agent was stopped, so no append can interleave here. A second writer
+        // would have to allocate inside the append lock instead.
         let seq = events
             .iter()
             .map(|logged| logged.seq)

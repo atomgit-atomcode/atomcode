@@ -194,6 +194,9 @@ impl SessionManager {
     ///
     /// One write, under the file's exclusive lock, so records from two writers
     /// can never interleave; the lease is what keeps there being one writer.
+    /// Callers allocate sequence numbers from the log they read before the
+    /// write, which is safe only while that lease keeps a single writer; a
+    /// second writer would need the allocation moved inside the append lock.
     pub fn append_events(&self, lease: &SessionLease, events: &[LoggedEvent]) -> SessionResult<()> {
         self.validate_active_lease(lease)?;
         let id = lease.id();
@@ -230,14 +233,6 @@ impl SessionManager {
         file.write_all(&buffer).map_err(|e| io_at(&path, e))?;
         drop(file);
         self.index_the_chosen_name(id, events);
-        if events
-            .iter()
-            .any(|logged| matches!(logged.event, SessionEvent::TurnStart { .. }))
-        {
-            // A replayed prompt opens its turn here; the resume marker has done
-            // its job. A later turn the person starts instead retires it too.
-            let _ = self.clear_resume_replay(id);
-        }
         Ok(())
     }
 
@@ -1140,6 +1135,19 @@ pub(crate) fn unanswered_at(events: &[LoggedEvent], start: SeqNo, turn: u64) -> 
         }
     }
     prompt
+}
+
+/// The turn whose `TurnStart` still sits at `seq`, when the log still has one
+/// there. A marker records a position; a log that was truncated and rewritten
+/// can reuse it for another turn, and a retraction must not follow it there.
+pub(crate) fn turn_started_at(events: &[LoggedEvent], seq: SeqNo) -> Option<u64> {
+    events
+        .iter()
+        .find(|logged| logged.seq == seq)
+        .and_then(|logged| match logged.event {
+            SessionEvent::TurnStart { turn } => Some(turn),
+            _ => None,
+        })
 }
 
 /// Move a reseeded fact's turn past the turns the log already used.
@@ -2897,11 +2905,23 @@ mod tests {
                 .any(|message| message.text == "hello"),
             "the unanswered turn is retracted once the replay is prepared"
         );
-        assert!(manager
-            .load_events(id)
-            .unwrap()
+        let events = manager.load_events(id).unwrap();
+        let (turn, to, scope) = events
             .iter()
-            .any(|event| matches!(event.event, SessionEvent::Rewound { .. })));
+            .find_map(|logged| match &logged.event {
+                SessionEvent::Rewound { turn, to, scope } => Some((*turn, *to, *scope)),
+                _ => None,
+            })
+            .expect("the prepared replay records a retraction");
+        assert_eq!(turn, 1, "the retraction names the unanswered turn");
+        assert_eq!(to, 1, "the retraction rewinds to that turn's TurnStart");
+        assert!(matches!(scope, RewindScope::Conversation));
+        assert!(
+            !atomcode_kernel::session::derive_messages(&events)
+                .iter()
+                .any(|message| message.text == "hello"),
+            "the retraction removes the prompt from the projection"
+        );
     }
 
     #[test]
@@ -3572,6 +3592,59 @@ mod tests {
                 .filter(|event| matches!(event.event, SessionEvent::Rewound { .. }))
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn a_marker_pointing_at_another_turns_start_is_not_retracted() {
+        let (_dir, manager) = store();
+        let id = "resume-replay-retargeted";
+        let lease = created(&manager, id);
+        // A truncated and rewritten log can reuse the sequence a marker names.
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 2 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "hello".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        manager
+            .write_resume_replay(
+                id,
+                &ResumeReplay {
+                    to: 1,
+                    turn: 1,
+                    rewound: None,
+                },
+            )
+            .unwrap();
+
+        assert!(
+            matches!(
+                manager.prepare_resume_replay(&lease, &Message::user("hello")),
+                Ok(PrepareResumeReplay::Obsolete)
+            ),
+            "the marker no longer names this turn's TurnStart"
+        );
+        assert!(manager.read_resume_replay(id).unwrap().is_none());
+        assert_eq!(
+            manager
+                .load_events(id)
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(event.event, SessionEvent::Rewound { .. }))
+                .count(),
+            0
         );
     }
 

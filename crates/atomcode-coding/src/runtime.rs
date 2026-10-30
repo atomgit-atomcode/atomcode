@@ -10857,15 +10857,16 @@ fn replay_pending_resume_prompt(
         runtime_phase_state(generation, RuntimePhase::InTurn),
         Ordering::Release,
     );
-    let command = AgentCommand::SendMessage {
-        text: prompt.text.clone(),
-        images: prompt.images.clone(),
-    };
-    let unsent = match agent.as_ref() {
-        Some(agent) => agent.commands.send(command).err().map(|error| error.0),
-        None => Some(command),
-    };
-    if unsent.is_some() {
+    let delivered = agent.as_ref().is_some_and(|agent| {
+        agent
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: prompt.text.clone(),
+                images: prompt.images.clone(),
+            })
+            .is_ok()
+    });
+    if !delivered {
         // The prepared rewind stands; put the prompt back as it came back from
         // the log so a rebuild or a provider change can retry it instead of
         // leaving it hidden. A rebuilt `Message::user` would drop any other
