@@ -1847,6 +1847,11 @@ impl SessionManager {
             }
         }
 
+        // A retired marker does not end the resume: what the log holds now is
+        // the authority. A prompt the person withdrew is followed there by its
+        // own `Rewound`, and `unanswered_prompt` hands back only a turn no
+        // rewind follows, so this finds a later prompt still waiting — never
+        // the withdrawn one.
         let Some((to, turn, prompt)) = super::events::unanswered_prompt(&events) else {
             return Ok((loaded, None));
         };
@@ -1993,9 +1998,11 @@ impl SessionManager {
         // The marker must name the exact `Rewound` this prepare is about to
         // append, so the sequence is allocated under the log's write lock. A
         // user undo with the same `to` takes a different sequence and must not
-        // be mistaken for it.
+        // be mistaken for it. The log read above is the floor: an allocation is
+        // never a sequence this prepare has already seen in the log.
+        let floor = events.iter().map(|logged| logged.seq).max().unwrap_or(0);
         let mut marked = false;
-        let appended = self.append_event_allocating(lease, |seq| {
+        let appended = self.append_event_allocating(lease, floor, |seq| {
             self.write_resume_replay(
                 id,
                 &ResumeReplay {

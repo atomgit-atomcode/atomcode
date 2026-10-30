@@ -242,9 +242,17 @@ impl SessionManager {
     /// `build` runs while the lock is held so it can record the exact sequence
     /// — a resume marker must name the `Rewound` it is about to write — and a
     /// failure there leaves the log untouched.
+    ///
+    /// `floor` is the highest sequence the caller's read of this log already
+    /// saw. The allocation is one past the later of it and the file's last
+    /// record, so a log whose tail is not its maximum — one an earlier build
+    /// appended out of order — is still never given a sequence it already
+    /// holds. The two agree for every log written in increasing order, which is
+    /// every log this store writes.
     pub(super) fn append_event_allocating<F>(
         &self,
         lease: &SessionLease,
+        floor: SeqNo,
         build: F,
     ) -> SessionResult<()>
     where
@@ -264,8 +272,10 @@ impl SessionManager {
         })?;
         // The same handle reads and writes: Windows locks are mandatory, so a
         // second handle could not read the region this one has locked.
-        let next =
-            Self::last_recorded_seq(&mut file, &path)?.map_or(1, |seq| seq.saturating_add(1));
+        let next = Self::last_recorded_seq(&mut file, &path)?
+            .unwrap_or(0)
+            .max(floor)
+            .saturating_add(1);
         let event = build(next)?;
         let buffer = record_line(&event)?;
         let current = usize::try_from(file.metadata().map_err(|e| io_at(&path, e))?.len())
@@ -286,6 +296,10 @@ impl SessionManager {
 
     /// The last fact's sequence in the log, read from its tail through the
     /// locked append handle. `None` for a log with only its header (or nothing).
+    ///
+    /// The last record, not the maximum: [`Self::append_event_allocating`]
+    /// raises it to the caller's floor, which is what covers a log an earlier
+    /// build appended out of order.
     ///
     /// Trailing blank lines are skipped the way the reader skips them
     /// ([`Self::read_event_log_bounded`]): a log that ends with one still ends
@@ -871,7 +885,10 @@ impl SessionManager {
             // The snapshot's in-flight prompt was accepted before the process
             // died but never entered a log. It becomes the turn the log would
             // have held, so its replay retracts a log fact like any other
-            // instead of being sent beside a conversation that lacks it.
+            // instead of being sent beside a conversation that lacks it. The
+            // index is not advanced for it: `turn_count` is the number of turn
+            // stats (a runtime commit sets exactly that) and a turn that never
+            // ran has none, while turn ids are read from the log, not the index.
             let turn = last_turn(&events) + 1;
             let at = u64::try_from(super::now_ms()).unwrap_or(0);
             let seq = events.last().map_or(1, |last| last.seq + 1);
@@ -3130,6 +3147,39 @@ mod tests {
             }),
             "the rewind takes the sequence after the log's actual last record"
         );
+    }
+
+    #[test]
+    fn an_allocation_never_reuses_a_sequence_the_log_already_holds() {
+        let (_dir, manager) = store();
+        let id = "resume-out-of-order-tail";
+        let lease = created(&manager, id);
+        manager.append_events(&lease, &a_turn()).unwrap();
+        // The last record is not the file's maximum: an earlier build wrote the
+        // tail out of order. Allocating after the tail alone would reuse a
+        // sequence the log already holds, so the caller's read of the log is
+        // the floor.
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(manager.events_path(id).unwrap())
+            .unwrap();
+        log.write_all(b"{\"seq\":3,\"at\":0,\"event\":{\"kind\":\"user_message\",\"turn\":1,\"text\":\"late\",\"images\":[]}}\n")
+            .unwrap();
+        drop(log);
+
+        let mut allocated = None;
+        manager
+            .append_event_allocating(&lease, 5, |seq| {
+                allocated = Some(seq);
+                Ok(logged(seq, 0, SessionEvent::TurnStart { turn: 2 }))
+            })
+            .unwrap();
+        assert_eq!(
+            allocated,
+            Some(6),
+            "the allocation is one past the log's maximum, not its tail"
+        );
+        assert_eq!(manager.load_events(id).unwrap().last().unwrap().seq, 6);
     }
 
     #[test]

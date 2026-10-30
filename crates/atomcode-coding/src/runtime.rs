@@ -8670,6 +8670,12 @@ fn spawn_runtime_owner_with_optional_agent(
                         }
                         let _ = runtime_event_tx
                             .send(CodingRuntimeEvent::Reconfigured { operation });
+                        // The switch itself committed, so the caller is told it
+                        // happened. A replay this candidate could not prepare is
+                        // not a failed switch: its failed phase and warning say
+                        // the conversation cannot continue, and the next rebuild
+                        // retries it — an `Err` here would send the caller back
+                        // to a session this generation no longer holds.
                         let _ = done.send(Ok(changed));
                     }
                     Some(CodingRuntimeControl::ApplyUndo {
