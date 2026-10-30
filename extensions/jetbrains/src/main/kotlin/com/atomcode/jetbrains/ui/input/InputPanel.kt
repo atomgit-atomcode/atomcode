@@ -1,6 +1,7 @@
 package com.atomcode.jetbrains.ui.input
 
 import com.atomcode.jetbrains.daemon.ApprovalMode
+import com.atomcode.jetbrains.daemon.ModelInfo
 import com.atomcode.jetbrains.ui.ChatContextItem
 import com.intellij.ide.PasteProvider
 import com.intellij.openapi.actionSystem.DataContext
@@ -70,6 +71,10 @@ class InputPanel(
     /// 输入框外框，选择器左沿与它对齐（而不是文字区那一点内缩）。
     private lateinit var composerPanel: JPanel
 
+    /// 模型选择器：可滚动、两行展示（模型名 + provider），默认模型带 default 徽标。
+    private val modelPopup = ModelPickerPopup(anchor = { modelLabel })
+
+
     private val commandPopup = SlashCommandPopup(
         anchor = { inputArea },
         onInsert = { name ->
@@ -130,7 +135,7 @@ class InputPanel(
         font = font.deriveFont(java.awt.Font.BOLD, font.size2D - 2f)
         isOpaque = false
         cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
-        border = BorderFactory.createEmptyBorder(5, 8, 5, 8)
+        border = RoundedLineBorder()
         addMouseListener(object : MouseAdapter() {
             override fun mouseClicked(e: MouseEvent) = onModelSelect()
         })
@@ -142,7 +147,7 @@ class InputPanel(
         cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
         toolTipText = "模式"
         accessibleContext.accessibleName = "Approval mode"
-        border = BorderFactory.createEmptyBorder(5, 8, 5, 8)
+        border = RoundedLineBorder()
         addMouseListener(object : MouseAdapter() {
             override fun mouseClicked(e: MouseEvent) {
                 if (isEnabled) showApprovalModeMenu()
@@ -158,7 +163,7 @@ class InputPanel(
         cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
         toolTipText = "推理强度"
         accessibleContext.accessibleName = "Reasoning effort"
-        border = BorderFactory.createEmptyBorder(5, 8, 5, 8)
+        border = RoundedLineBorder()
         isVisible = false
         addMouseListener(object : MouseAdapter() {
             override fun mouseClicked(e: MouseEvent) {
@@ -407,6 +412,13 @@ class InputPanel(
         commandPopup.updateCommands(commands, commandPrefix().orEmpty())
     }
 
+    /// 打开模型选择器（点模型标签触发）。列表由调用方给出，选中后回调回写默认模型。
+    internal fun showModelPickerPopup(models: List<ModelInfo>, onPick: (ModelInfo) -> Unit) {
+        modelPopup.onPick = onPick
+        modelPopup.toggle(models)
+        inputArea.requestFocusInWindow()
+    }
+
     fun setGenerating(generating: Boolean) {
         actionCards.show(actionPanel, if (generating) STOP_CARD else SEND_CARD)
     }
@@ -526,6 +538,7 @@ class InputPanel(
         inputArea.inputMap.put(KeyStroke.getKeyStroke("UP"), "atomcode-command-up")
         inputArea.actionMap.put("atomcode-command-up", object : AbstractAction() {
             override fun actionPerformed(e: java.awt.event.ActionEvent?) {
+                if (modelPopup.isVisible && modelPopup.move(-1)) return
                 if (!commandPopup.move(-1)) {
                     inputArea.transferFocusBackward()
                 }
@@ -535,6 +548,7 @@ class InputPanel(
         inputArea.inputMap.put(KeyStroke.getKeyStroke("DOWN"), "atomcode-command-down")
         inputArea.actionMap.put("atomcode-command-down", object : AbstractAction() {
             override fun actionPerformed(e: java.awt.event.ActionEvent?) {
+                if (modelPopup.isVisible && modelPopup.move(1)) return
                 if (!commandPopup.move(1)) {
                     inputArea.transferFocus()
                 }
@@ -560,6 +574,7 @@ class InputPanel(
         inputArea.inputMap.put(KeyStroke.getKeyStroke("ENTER"), enterAction)
         inputArea.actionMap.put(enterAction, object : AbstractAction() {
             override fun actionPerformed(e: java.awt.event.ActionEvent?) {
+                if (modelPopup.isVisible && modelPopup.activate()) return
                 if (commandPopup.activate()) return
                 if (sendWithCtrlEnter) {
                     insertNewline()
@@ -627,7 +642,9 @@ class InputPanel(
                 addActionListener { onApprovalModeSelect(mode) }
             })
         }
-        menu.show(approvalModeLabel, 0, -menu.preferredSize.height)
+        // 弹框右沿与控件（圆角边框右侧）对齐
+        val width = menu.preferredSize.width
+        menu.show(approvalModeLabel, approvalModeLabel.width - width, -menu.preferredSize.height)
     }
 
     private fun showEffortMenu() {
@@ -637,7 +654,8 @@ class InputPanel(
                 addActionListener { onEffortSelect(choice.value) }
             })
         }
-        menu.show(effortLabel, 0, -menu.preferredSize.height)
+        val width = menu.preferredSize.width
+        menu.show(effortLabel, effortLabel.width - width, -menu.preferredSize.height)
     }
 
     private fun fireSend() {
@@ -651,6 +669,7 @@ class InputPanel(
     }
 
     private fun hideCommandPopup() {
+        modelPopup.hide()
         commandPopup.hide()
         inputArea.requestFocusInWindow()
     }
@@ -797,11 +816,11 @@ class InputPanel(
 
         tokenLabel.foreground = TOKEN_FG
         modelLabel.foreground = MODEL_FG
-        modelLabel.border = BorderFactory.createEmptyBorder(5, 8, 5, 8)
+        modelLabel.border = RoundedLineBorder()
         approvalModeLabel.foreground = if (approvalModeLabel.isEnabled) MODEL_FG else DISABLED_FG
-        approvalModeLabel.border = BorderFactory.createEmptyBorder(5, 8, 5, 8)
+        approvalModeLabel.border = RoundedLineBorder()
         effortLabel.foreground = if (effortLabel.isEnabled) MODEL_FG else DISABLED_FG
-        effortLabel.border = BorderFactory.createEmptyBorder(5, 8, 5, 8)
+        effortLabel.border = RoundedLineBorder()
         stopButton.foreground = STOP_FG
         stopButton.background = STOP_BG
         stopButton.border = clickableBorder(horizontal = 12)
