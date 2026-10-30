@@ -740,43 +740,46 @@ fn same_accepted_prompt(pending: &Message, logged: &Message) -> bool {
 }
 
 fn pending_replay_prompt(events: &[LoggedEvent], replay: &ResumeReplay) -> PendingReplay {
-    let Some(rewound_at) = events
-        .iter()
-        .find(|logged| {
-            logged.seq > replay.to
-                && replay.rewound == Some(logged.seq)
-                && matches!(
-                    &logged.event,
-                    SessionEvent::Rewound { to, scope, .. }
-                        if *to == replay.to && scope.takes_back_conversation()
-                )
-        })
-        .map(|logged| logged.seq)
-    else {
-        return PendingReplay::Stale;
-    };
-    // A later user rewind that reaches the same turn retires the prompt, even
-    // though our own rewind is still in the log.
-    if events.iter().any(|logged| {
-        logged.seq > rewound_at
+    // The marker names positions in the log, and the log projects in file order;
+    // a sequence number only names one. Walk that order here for the same reason
+    // `unanswered_at` does, so the two cannot disagree about where the retracted
+    // turn starts and ends when records are not numbered in file order.
+    let Some(rewound_at) = events.iter().position(|logged| {
+        replay.rewound == Some(logged.seq)
             && matches!(
                 &logged.event,
                 SessionEvent::Rewound { to, scope, .. }
-                    if scope.takes_back_conversation() && *to <= replay.to
+                    if *to == replay.to && scope.takes_back_conversation()
             )
+    }) else {
+        return PendingReplay::Stale;
+    };
+    let after = &events[rewound_at + 1..];
+    // A later user rewind that reaches the same turn retires the prompt, even
+    // though our own rewind is still in the log.
+    if after.iter().any(|logged| {
+        matches!(
+            &logged.event,
+            SessionEvent::Rewound { to, scope, .. }
+                if scope.takes_back_conversation() && *to <= replay.to
+        )
     }) {
         return PendingReplay::Stale;
     }
-    if events.iter().any(|logged| {
-        logged.seq > rewound_at && matches!(logged.event, SessionEvent::TurnStart { .. })
-    }) {
+    if after
+        .iter()
+        .any(|logged| matches!(logged.event, SessionEvent::TurnStart { .. }))
+    {
         return PendingReplay::Started;
     }
+    let Some((start, turn)) = super::events::turn_start_at(events, replay.to) else {
+        return PendingReplay::Stale;
+    };
+    if turn != replay.turn || start >= rewound_at {
+        return PendingReplay::Stale;
+    }
     let mut prompt = None;
-    for logged in events
-        .iter()
-        .filter(|logged| logged.seq > replay.to && logged.seq < rewound_at)
-    {
+    for logged in &events[start + 1..rewound_at] {
         let SessionEvent::UserMessage { turn, text, images } = &logged.event else {
             continue;
         };
@@ -2002,26 +2005,33 @@ impl SessionManager {
         // never a sequence this prepare has already seen in the log.
         let floor = events.iter().map(|logged| logged.seq).max().unwrap_or(0);
         let mut marked = false;
-        let appended = self.append_event_allocating(lease, floor, |seq| {
-            self.write_resume_replay(
-                id,
-                &ResumeReplay {
-                    to: target.to,
-                    turn: target.turn,
-                    rewound: Some(seq),
-                },
-            )?;
-            marked = true;
-            Ok(LoggedEvent {
-                seq,
-                at: u64::try_from(super::now_ms()).unwrap_or(0),
-                event: SessionEvent::Rewound {
-                    turn: target.turn,
-                    to: target.to,
-                    scope: RewindScope::Conversation,
-                },
-            })
-        });
+        let appended = self.append_event_allocating(
+            lease,
+            floor,
+            |seq| {
+                Ok(LoggedEvent {
+                    seq,
+                    at: u64::try_from(super::now_ms()).unwrap_or(0),
+                    event: SessionEvent::Rewound {
+                        turn: target.turn,
+                        to: target.to,
+                        scope: RewindScope::Conversation,
+                    },
+                })
+            },
+            |seq| {
+                self.write_resume_replay(
+                    id,
+                    &ResumeReplay {
+                        to: target.to,
+                        turn: target.turn,
+                        rewound: Some(seq),
+                    },
+                )?;
+                marked = true;
+                Ok(())
+            },
+        );
         match appended {
             Ok(()) => Ok(PrepareResumeReplay::Prepared),
             Err(error) => {
@@ -4119,8 +4129,7 @@ fn scan_bucket_into(bucket: &str, bucket_path: &Path, out: &mut BucketPartial) {
             .or_else(|| name.strip_suffix(".rewind"))
             .or_else(|| name.strip_suffix(".ui"))
             .or_else(|| name.strip_suffix(".todos"))
-            .or_else(|| name.strip_suffix(".replay"))
-            .or_else(|| name.strip_suffix(".controller"));
+            .or_else(|| name.strip_suffix(".replay"));
         if let Some(id) = direct_sidecar_id {
             match file_entry.file_type() {
                 Ok(file_type) if file_type.is_file() => {}
@@ -7506,6 +7515,58 @@ mod tests {
         // marker has to survive instead of being cleared on the failed append.
         std::fs::write(mgr.events_path("replay").unwrap(), b"not a record\n").unwrap();
         assert!(!mgr.resume_retraction_is_absent("replay", 1, 1));
+    }
+
+    #[test]
+    fn a_marker_and_a_retraction_meet_in_file_order() {
+        let root = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(root.path().join("0123456789abcdef"));
+        let lease = mgr.acquire_lease("replay").unwrap();
+        let mut meta = SessionMeta::new("replay", "/p", 1);
+        meta.owner = StorageOwner::Native;
+        mgr.create_event_session(
+            &lease,
+            &atomcode_kernel::session::SessionHeader::new("replay"),
+            &meta,
+        )
+        .unwrap();
+        let logged = |seq: u64, event: SessionEvent| LoggedEvent { seq, at: 0, event };
+        // The retraction was appended with a sequence below the turn it retracts,
+        // as an allocation from that log's own tail can be. File order still puts
+        // it after the prompt, and that is what the marker decides against.
+        mgr.append_events(
+            &lease,
+            &[
+                logged(5, SessionEvent::TurnStart { turn: 1 }),
+                logged(
+                    6,
+                    SessionEvent::UserMessage {
+                        turn: 1,
+                        text: "hello".into(),
+                        images: vec![],
+                    },
+                ),
+                logged(
+                    2,
+                    SessionEvent::Rewound {
+                        turn: 1,
+                        to: 5,
+                        scope: RewindScope::Conversation,
+                    },
+                ),
+            ],
+        )
+        .unwrap();
+
+        let marker = ResumeReplay {
+            to: 5,
+            turn: 1,
+            rewound: Some(2),
+        };
+        match pending_replay_prompt(&mgr.load_events("replay").unwrap(), &marker) {
+            PendingReplay::StillWaiting(prompt) => assert_eq!(prompt.text, "hello"),
+            _ => panic!("the retraction written after the prompt still leaves it waiting"),
+        }
     }
 
     #[test]

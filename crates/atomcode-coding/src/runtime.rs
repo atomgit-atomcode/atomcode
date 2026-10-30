@@ -5146,14 +5146,36 @@ fn spawn_runtime_owner_with_optional_agent(
                         if let Some(runtime) = resources.as_ref() {
                             runtime.parts.team_manager.begin_generation(generation);
                         }
+                        // The replacement is the only live agent this binding
+                        // has before the next rebuild, so a resume replay the
+                        // previous one could not deliver is retried here rather
+                        // than reported over.
+                        let replay = replay_pending_resume_prompt(
+                            &agent,
+                            resources
+                                .as_mut()
+                                .and_then(|runtime| runtime.parts.session.as_mut()),
+                            controls.state.as_ref(),
+                            generation,
+                            &mut next_turn_id,
+                            &mut active_turn,
+                            &mut turn_stats,
+                            &mut agent_available,
+                            &runtime_event_tx,
+                        );
+                        kernel_turn_open |= replay == ResumeReplayOutcome::Sent;
                         if resume_after_replace {
                             compaction_suspended = false;
-                            controls
-                                .state
-                                .store(
+                            // A deferred replay already stored the failed phase;
+                            // a sent one stored the turn it opened.
+                            if replay == ResumeReplayOutcome::Idle
+                                || replay == ResumeReplayOutcome::Obsolete
+                            {
+                                controls.state.store(
                                     runtime_phase_state(generation, RuntimePhase::Ready),
                                     Ordering::Release,
                                 );
+                            }
                         }
                         let _ = done.send(());
                     }
@@ -7624,10 +7646,36 @@ fn spawn_runtime_owner_with_optional_agent(
                                     pending_steer_acknowledgements.clear();
                                 }
                                 event_generation.store(generation, Ordering::Release);
-                                controls.state.store(
-                                    runtime_phase_state(generation, resumed),
-                                    Ordering::Release,
+                                pending_steer_acknowledgements.clear();
+                                // A resume whose replay the previous generation
+                                // could not deliver is retried here: the patch
+                                // changed the provider behind the agent, and the
+                                // prompt and its retraction are still the log's.
+                                // Reporting `resumed` instead would claim a
+                                // readiness that lets a new turn run past a
+                                // prompt the log still hides.
+                                let replay = replay_pending_resume_prompt(
+                                    &agent,
+                                    resources
+                                        .as_mut()
+                                        .and_then(|runtime| runtime.parts.session.as_mut()),
+                                    controls.state.as_ref(),
+                                    generation,
+                                    &mut next_turn_id,
+                                    &mut active_turn,
+                                    &mut turn_stats,
+                                    &mut agent_available,
+                                    &runtime_event_tx,
                                 );
+                                kernel_turn_open |= replay == ResumeReplayOutcome::Sent;
+                                if replay == ResumeReplayOutcome::Idle
+                                    || replay == ResumeReplayOutcome::Obsolete
+                                {
+                                    controls.state.store(
+                                        runtime_phase_state(generation, resumed),
+                                        Ordering::Release,
+                                    );
+                                }
                                 runtime_event_tx.carry_live_view(generation);
                                 if let (Some(turn), Some(current)) = (active_turn, running_model) {
                                     turn_model_before_selection = Some((generation, turn, current.clone()));
@@ -7836,9 +7884,13 @@ fn spawn_runtime_owner_with_optional_agent(
                                 // The swap committed: the daemon commits this
                                 // generation as the binding's provider identity,
                                 // so an `Err` here would leave it pointed at the
-                                // old one. A deferred replay is reported through
+                                // old one and route later requests by the wrong
+                                // provider. A deferred replay is reported through
                                 // the failed phase and the warning above, and the
-                                // next rebuild retries it.
+                                // next rebuild retries it. Reporting "committed,
+                                // replay pending" separately would take a result
+                                // type the daemon and CLI commit on; that is a
+                                // caller contract change this path cannot decide.
                                 let _ = done.send(Ok(RuntimeGeneration(generation)));
                             }
                             Err(candidate_error) => {
@@ -8681,7 +8733,11 @@ fn spawn_runtime_owner_with_optional_agent(
                         // not a failed switch: its failed phase and warning say
                         // the conversation cannot continue, and the next rebuild
                         // retries it — an `Err` here would send the caller back
-                        // to a session this generation no longer holds.
+                        // to a session this generation no longer holds. A distinct
+                        // "switched, replay pending" outcome would take a result
+                        // type the daemon's snapshot commit and the CLI's config
+                        // write both understand; that is a caller contract change
+                        // this path cannot decide.
                         let _ = done.send(Ok(changed));
                     }
                     Some(CodingRuntimeControl::ApplyUndo {

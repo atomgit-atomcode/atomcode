@@ -239,9 +239,14 @@ impl SessionManager {
     /// Append one fact whose sequence number is allocated under the log's write
     /// lock.
     ///
-    /// `build` runs while the lock is held so it can record the exact sequence
-    /// — a resume marker must name the `Rewound` it is about to write — and a
-    /// failure there leaves the log untouched.
+    /// `build` runs while the lock is held so it can record the exact sequence,
+    /// and `commit` runs under the same lock once the record is serialized and
+    /// the log has room for it, immediately before the bytes are written. A
+    /// failed `build`, a record that cannot be serialized or a full log thus
+    /// writes nothing before `commit`: a caller persisting a retry marker there
+    /// never leaves one naming a fact this call decided not to write. A `commit`
+    /// that fails leaves the log untouched; a write that fails after it leaves
+    /// the caller's marker to be reconciled against the log.
     ///
     /// `floor` is the highest sequence the caller's read of this log already
     /// saw. The allocation is one past the later of it and the file's last
@@ -249,14 +254,16 @@ impl SessionManager {
     /// appended out of order — is still never given a sequence it already
     /// holds. The two agree for every log written in increasing order, which is
     /// every log this store writes.
-    pub(super) fn append_event_allocating<F>(
+    pub(super) fn append_event_allocating<F, C>(
         &self,
         lease: &SessionLease,
         floor: SeqNo,
         build: F,
+        commit: C,
     ) -> SessionResult<()>
     where
         F: FnOnce(SeqNo) -> SessionResult<LoggedEvent>,
+        C: FnOnce(SeqNo) -> SessionResult<()>,
     {
         self.validate_active_lease(lease)?;
         let id = lease.id();
@@ -288,6 +295,7 @@ impl SessionManager {
                 actual: next_len,
             });
         }
+        commit(next)?;
         file.write_all(&buffer).map_err(|e| io_at(&path, e))?;
         drop(file);
         self.index_the_chosen_name(id, std::slice::from_ref(&event));
@@ -1222,15 +1230,15 @@ pub(crate) fn unanswered_prompt(events: &[LoggedEvent]) -> Option<(SeqNo, u64, M
 /// unanswered. A resume marker names this position, so `prepare` can retract
 /// exactly what it handed back instead of re-deciding against a log that moved.
 pub(crate) fn unanswered_at(events: &[LoggedEvent], start: SeqNo, turn: u64) -> Option<Message> {
-    // Read in file order from the turn's own record, the order the log projects
+    // Read from the turn's own record in file order, the order the log projects
     // in: a `Rewound` written after the turn answers it however the records
     // were numbered. Filtering by `seq > start` would mix the two orders —
     // skipping a record written after the turn but numbered below it, and
     // reading one written before it but numbered above.
-    let position = events.iter().position(|logged| {
-        logged.seq == start
-            && matches!(logged.event, SessionEvent::TurnStart { turn: found } if found == turn)
-    })?;
+    let (position, found) = turn_start_at(events, start)?;
+    if found != turn {
+        return None;
+    }
     let mut prompt = None;
     for logged in &events[position + 1..] {
         match &logged.event {
@@ -1267,17 +1275,22 @@ pub(crate) fn unanswered_at(events: &[LoggedEvent], start: SeqNo, turn: u64) -> 
     prompt
 }
 
+/// The position and turn of the `TurnStart` at `seq`, read in file order — the
+/// order the log projects in. Sequence numbers name positions; they do not order
+/// records, so every walk that starts from a turn locates it through here.
+pub(crate) fn turn_start_at(events: &[LoggedEvent], seq: SeqNo) -> Option<(usize, u64)> {
+    let position = events.iter().position(|logged| logged.seq == seq)?;
+    match events[position].event {
+        SessionEvent::TurnStart { turn } => Some((position, turn)),
+        _ => None,
+    }
+}
+
 /// The turn whose `TurnStart` still sits at `seq`, when the log still has one
 /// there. A marker records a position; a log that was truncated and rewritten
 /// can reuse it for another turn, and a retraction must not follow it there.
 pub(crate) fn turn_started_at(events: &[LoggedEvent], seq: SeqNo) -> Option<u64> {
-    events
-        .iter()
-        .find(|logged| logged.seq == seq)
-        .and_then(|logged| match logged.event {
-            SessionEvent::TurnStart { turn } => Some(turn),
-            _ => None,
-        })
+    turn_start_at(events, seq).map(|(_, turn)| turn)
 }
 
 /// Move a reseeded fact's turn past the turns the log already used.
@@ -3005,6 +3018,8 @@ mod tests {
         ];
         assert!(unanswered_at(&events, 5, 1).is_none());
         assert!(unanswered_prompt(&events).is_none());
+        assert_eq!(turn_started_at(&events, 5), Some(1));
+        assert_eq!(turn_started_at(&events, 2), None);
 
         let before_the_withdrawal = &events[..2];
         assert_eq!(
@@ -3215,10 +3230,15 @@ mod tests {
 
         let mut allocated = None;
         manager
-            .append_event_allocating(&lease, 5, |seq| {
-                allocated = Some(seq);
-                Ok(logged(seq, 0, SessionEvent::TurnStart { turn: 2 }))
-            })
+            .append_event_allocating(
+                &lease,
+                5,
+                |seq| {
+                    allocated = Some(seq);
+                    Ok(logged(seq, 0, SessionEvent::TurnStart { turn: 2 }))
+                },
+                |_| Ok(()),
+            )
             .unwrap();
         assert_eq!(
             allocated,
