@@ -63,6 +63,8 @@ import java.awt.Toolkit
 import java.awt.datatransfer.DataFlavor
 import java.awt.datatransfer.StringSelection
 import java.awt.datatransfer.Transferable
+import java.awt.event.ComponentAdapter
+import java.awt.event.ComponentEvent
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import java.io.ByteArrayInputStream
@@ -277,6 +279,7 @@ class AtomCodeChatPanel(
                 if (event.newValue is ConnectionState.Ready) {
                     inputPanel.setApprovalMode(service.approvalMode)
                     inputPanel.setApprovalModeEnabled(!service.approvalModePending)
+                    refreshApprovalModeLabel()
                     refreshSetupSnapshot()
                     refreshSessionList()
                 }
@@ -314,6 +317,14 @@ class AtomCodeChatPanel(
         installInputKeyBindings()
 
         service.addConnectionListener(connectionListener)
+        // 面板每次重新显示时向 daemon 要一次模式：改完 config.toml 的
+        // `[permissions] default_mode` 不必重连就能看到生效值（与 VS Code 每次
+        // 打开面板都重读一次对齐）。
+        addComponentListener(object : ComponentAdapter() {
+            override fun componentShown(event: ComponentEvent) {
+                if (service.connectionState is ConnectionState.Ready) refreshApprovalModeLabel()
+            }
+        })
         setupRefreshTimer.start()
         renderConnectionState(service.connectionState)
         applyChatSettings()
@@ -439,6 +450,18 @@ class AtomCodeChatPanel(
     private fun connect() {
         header.updateConnectionState(ConnectionState.CheckingDaemon)
         refreshAfterConnect()
+    }
+
+    /// 向 daemon 索取当前模式并刷新标签。请求层同样只在人真的选过模式时才带
+    /// `approval_mode`，所以这里刷新的是"daemon 认为的模式"，而不是本地初值。
+    private fun refreshApprovalModeLabel() {
+        service.refreshApprovalModeNow().thenAccept { mode ->
+            SwingUtilities.invokeLater {
+                if (disposed) return@invokeLater
+                inputPanel.setApprovalMode(mode)
+                inputPanel.setApprovalModeEnabled(!service.approvalModePending)
+            }
+        }
     }
 
     private fun refreshAfterConnect() {
@@ -1067,7 +1090,9 @@ class AtomCodeChatPanel(
         val attachments = contextForSend.map { MessageAttachmentView(displayName = it.displayName, path = it.path) } +
             pendingImagesForSend.map { it.toMessageAttachmentView() }
         val images = pendingImagesForSend.map { it.toImageInput() }
-        val approvalModeForSend = service.confirmedApprovalMode
+        // 只在人真的选过模式时才把它带上；否则留空，让 daemon 用它自己的模式
+        // （= config.toml 的 `[permissions] default_mode`）。
+        val approvalModeForSend = service.approvalModeForRequest
 
         if (generating) {
             val queued = QueuedPrompt(
@@ -1096,7 +1121,7 @@ class AtomCodeChatPanel(
         contextNames: List<String>,
         attachments: List<MessageAttachmentView>,
         images: List<ImageInput>,
-        approvalMode: ApprovalMode,
+        approvalMode: ApprovalMode?,
     ) {
         val generationId = ++generationSequence
         activeGenerationId = generationId
@@ -1947,7 +1972,7 @@ private data class QueuedPrompt(
     val contextNames: List<String>,
     val attachments: List<MessageAttachmentView>,
     val images: List<ImageInput>,
-    val approvalMode: ApprovalMode,
+    val approvalMode: ApprovalMode?,
 )
 
 private data class PendingImageAttachment(

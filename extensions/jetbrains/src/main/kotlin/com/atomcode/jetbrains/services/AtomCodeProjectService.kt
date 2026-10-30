@@ -78,11 +78,19 @@ internal class ApprovalModeRuntimeState(initialMode: ApprovalMode = ApprovalMode
     var pendingMode: ApprovalMode? = null
         private set
 
+    /// True once a person picked a mode here. Until then the mode belongs to the
+    /// daemon — it is `[permissions] default_mode` from config.toml — and
+    /// requests leave `approval_mode` unset so that value is what applies.
+    @Volatile
+    var userChoseMode: Boolean = false
+        private set
+
     @Synchronized
     fun beginSwitch(mode: ApprovalMode): Boolean {
         if (pendingMode != null || displayMode == mode) return false
         displayMode = mode
         pendingMode = mode
+        userChoseMode = true
         return true
     }
 
@@ -112,6 +120,13 @@ internal class ApprovalModeRuntimeState(initialMode: ApprovalMode = ApprovalMode
         displayMode = applied
         return displayMode
     }
+
+    /// What a chat request should carry: the mode only once a person picked one in
+    /// this session. Until then the field stays unset, so the mode the daemon
+    /// already holds — `[permissions] default_mode` from config.toml — is what
+    /// applies, instead of a client-side default overriding it.
+    fun modeForRequest(): ApprovalMode? =
+        if (!userChoseMode) null else (pendingMode ?: confirmedMode)
 
     private fun parseApprovalMode(wire: String, fallback: ApprovalMode): ApprovalMode =
         when (wire) {
@@ -151,6 +166,15 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
 
     val confirmedApprovalMode: ApprovalMode
         get() = approvalModeState.confirmedMode
+
+    /// Whether a person picked the mode here rather than the daemon's configured
+    /// default applying. Requests carry `approval_mode` only after they have.
+    val approvalModeChosenByUser: Boolean
+        get() = approvalModeState.userChoseMode
+
+    /// The `approval_mode` a chat request carries: unset until a person picks one.
+    val approvalModeForRequest: ApprovalMode?
+        get() = approvalModeState.modeForRequest()
 
     val approvalModePending: Boolean
         get() = approvalModeState.pendingMode != null
@@ -658,6 +682,19 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
             approvalModeState.refreshFromDaemon(response.mode)
             Unit
         }
+    }
+
+    /// Ask the daemon which mode it holds and adopt it — what the panel does when
+    /// it opens, so a `[permissions] default_mode` edited in config.toml shows up
+    /// without a reconnect (the VS Code client re-reads on every panel open too).
+    /// A mode the person picked here outranks the file, and an in-flight switch is
+    /// left alone by `refreshFromDaemon`.
+    fun refreshApprovalModeNow(): CompletableFuture<ApprovalMode> {
+        val client = activeClient
+        if (client == null || approvalModeState.userChoseMode) {
+            return CompletableFuture.completedFuture(approvalMode)
+        }
+        return refreshApprovalMode(client).thenApply { approvalMode }
     }
 
     private fun sendPromptWhenReady(
