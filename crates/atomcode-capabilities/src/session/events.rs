@@ -286,6 +286,11 @@ impl SessionManager {
 
     /// The last fact's sequence in the log, read from its tail through the
     /// locked append handle. `None` for a log with only its header (or nothing).
+    ///
+    /// Trailing blank lines are skipped the way the reader skips them
+    /// ([`Self::read_event_log_bounded`]): a log that ends with one still ends
+    /// with the record above it, and treating that blank line as the record
+    /// would refuse to allocate for a log that reads back fine.
     fn last_recorded_seq(file: &mut fs::File, path: &Path) -> SessionResult<Option<SeqNo>> {
         #[derive(serde::Deserialize)]
         struct SeqRecord {
@@ -306,8 +311,16 @@ impl SessionManager {
             file.read_to_end(&mut bytes)
                 .map_err(|error| io_at(path, error))?;
             let mut end = bytes.len();
-            while end > 0 && matches!(bytes[end - 1], b'\n' | b'\r') {
+            while end > 0 && bytes[end - 1].is_ascii_whitespace() {
                 end -= 1;
+            }
+            if end == 0 {
+                // Only blank lines so far; the record is above them.
+                if start == 0 {
+                    return Ok(None);
+                }
+                window = window.saturating_mul(2);
+                continue;
             }
             let tail = &bytes[..end];
             let last = match tail.iter().rposition(|byte| *byte == b'\n') {
@@ -3016,6 +3029,57 @@ mod tests {
     }
 
     #[test]
+    fn a_blank_tail_does_not_hide_the_last_record() {
+        let (_dir, manager) = store();
+        let id = "resume-blank-tail";
+        let lease = created(&manager, id);
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "hello".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        // A crash after a partial line, or an editor, can leave blank lines
+        // after the last record. The reader skips them, so the allocator must
+        // not mistake one for a record and refuse a log that reads back fine.
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(manager.events_path(id).unwrap())
+            .unwrap();
+        log.write_all(b"\n   \n\t\n").unwrap();
+        drop(log);
+
+        let (_loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
+        assert!(pending.is_some());
+        assert_eq!(
+            manager
+                .prepare_resume_replay(&lease, &Message::user("hello"))
+                .unwrap(),
+            PrepareResumeReplay::Prepared
+        );
+        assert_eq!(
+            manager.read_resume_replay(id).unwrap(),
+            Some(ResumeReplay {
+                to: 1,
+                turn: 1,
+                rewound: Some(3)
+            }),
+            "the rewind still takes the sequence after the last record"
+        );
+    }
+
+    #[test]
     fn a_prepare_allocates_the_sequence_after_a_large_tail() {
         let (_dir, manager) = store();
         let id = "resume-large-tail";
@@ -3119,6 +3183,68 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event.event, SessionEvent::Rewound { .. })));
         }
+    }
+
+    #[test]
+    fn an_unreadable_replay_marker_is_replaced_by_a_readable_one() {
+        let (_dir, manager) = store();
+        let id = "resume-unreadable-marker";
+        let lease = created(&manager, id);
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "hello".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        // Another build's marker, or a damaged one: this build cannot read it,
+        // so it cannot be left to anchor a retry.
+        std::fs::write(manager.root().join(format!("{id}.replay")), b"not a replay").unwrap();
+
+        let mut notes = Vec::new();
+        let (_loaded, pending) = manager.open_for_resume_noting(&lease, &mut notes).unwrap();
+        assert_eq!(
+            pending.map(|message| message.text),
+            Some("hello".to_string())
+        );
+        assert!(
+            notes.iter().any(|note| note.contains("could not be read")),
+            "the unreadable marker is reported: {notes:?}"
+        );
+        // The prompt is still in the log, and the replacement names this load's
+        // target, so the replay it enables retracts exactly that turn.
+        assert_eq!(
+            manager.read_resume_replay(id).unwrap(),
+            Some(ResumeReplay {
+                to: 1,
+                turn: 1,
+                rewound: None
+            })
+        );
+        assert_eq!(
+            manager
+                .prepare_resume_replay(&lease, &Message::user("hello"))
+                .unwrap(),
+            PrepareResumeReplay::Prepared
+        );
+        assert_eq!(
+            manager.read_resume_replay(id).unwrap(),
+            Some(ResumeReplay {
+                to: 1,
+                turn: 1,
+                rewound: Some(3)
+            })
+        );
     }
 
     #[test]

@@ -1834,11 +1834,15 @@ impl SessionManager {
             },
             Ok(None) => {}
             Err(error) => {
-                // The marker may be the only record of a retracted prompt. Keep it
-                // for a build that can read it; detection below still handles the
-                // visible case (and overwrites a new marker when it finds one).
+                // An unreadable marker cannot anchor a retry, so it is replaced
+                // rather than kept: the write below substitutes a readable one
+                // whenever this load finds a prompt to replay. The log stays the
+                // authority — it is what decides whether a prompt is still
+                // waiting — and the replacement names this load's exact target,
+                // so the bytes that could not be read are never acted on.
                 notes.push(format!(
-                    "the pending replay of session {id} could not be read and was left in place: {error}"
+                    "the pending replay of session {id} could not be read; \
+                     a new marker will replace it if this load finds a prompt to replay: {error}"
                 ));
             }
         }
@@ -1913,9 +1917,9 @@ impl SessionManager {
             Ok(Some(replay)) => Some(replay),
             Ok(None) => None,
             Err(error) => {
-                // A retry aid that cannot be read must not strand the prompt.
-                // The marker is left in place for a build that can read it, but
-                // this attempt decides from the log alone.
+                // A retry aid that cannot be read must not strand the prompt:
+                // this attempt decides from the log, and any marker it writes
+                // replaces the unreadable one with a marker this build can use.
                 tracing::warn!(
                     session = id,
                     %error,
