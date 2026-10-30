@@ -672,10 +672,6 @@ const SUMMARY_TRANSCRIPT_TAIL_CHARS: usize = 40_000;
 /// `tail_chars` must not exceed `max_chars` (checked in debug builds): the head
 /// shrinks to nothing and the tail alone would then spend more than the cap.
 fn bounded_body<'a>(text: &'a str, max_chars: usize, tail_chars: usize) -> Cow<'a, str> {
-    debug_assert!(
-        tail_chars <= max_chars,
-        "a tail wider than the cap would overflow the budget"
-    );
     if text.len() <= max_chars {
         return Cow::Borrowed(text);
     }
@@ -683,6 +679,19 @@ fn bounded_body<'a>(text: &'a str, max_chars: usize, tail_chars: usize) -> Cow<'
     if total <= max_chars {
         return Cow::Borrowed(text);
     }
+    Cow::Owned(truncated_body(text, total, max_chars, tail_chars))
+}
+
+/// The cut itself, for a caller that already counted `total` characters.
+///
+/// `total` must exceed `max_chars`, and `tail_chars` must not exceed it
+/// (both checked in debug builds): a wider tail spends more than the cap.
+fn truncated_body(text: &str, total: usize, max_chars: usize, tail_chars: usize) -> String {
+    debug_assert!(total > max_chars, "nothing to cut");
+    debug_assert!(
+        tail_chars <= max_chars,
+        "a tail wider than the cap would overflow the budget"
+    );
     let head_chars = max_chars.saturating_sub(tail_chars);
     let head: String = text.chars().take(head_chars).collect();
     let tail: String = text
@@ -690,7 +699,7 @@ fn bounded_body<'a>(text: &'a str, max_chars: usize, tail_chars: usize) -> Cow<'
         .skip(total.saturating_sub(tail_chars))
         .collect();
     let cut = total - max_chars;
-    Cow::Owned(format!("{head}\n[truncated {cut} chars]\n{tail}"))
+    format!("{head}\n[truncated {cut} chars]\n{tail}")
 }
 
 fn render_tool_body(text: &str) -> Cow<'_, str> {
@@ -750,18 +759,21 @@ fn render_transcript(span: &[Message]) -> String {
     }
     // A byte length at or under the cap proves the char count is too, so the
     // common case returns the built string untouched. Multibyte text can
-    // exceed the cap in bytes while fitting in chars, so count before handing
-    // it to `bounded_body`, which would clone the same text to hand it back.
-    if s.len() <= SUMMARY_TRANSCRIPT_MAX_CHARS || s.chars().count() <= SUMMARY_TRANSCRIPT_MAX_CHARS
-    {
+    // exceed the cap in bytes while fitting in chars, so count before the cut;
+    // that count is handed to the cut, which then scans the string only once.
+    if s.len() <= SUMMARY_TRANSCRIPT_MAX_CHARS {
         return s;
     }
-    bounded_body(
+    let total = s.chars().count();
+    if total <= SUMMARY_TRANSCRIPT_MAX_CHARS {
+        return s;
+    }
+    truncated_body(
         &s,
+        total,
         SUMMARY_TRANSCRIPT_MAX_CHARS,
         SUMMARY_TRANSCRIPT_TAIL_CHARS,
     )
-    .into_owned()
 }
 
 /// Sentinel first line stamped on every anchored compaction summary. Used to find the
@@ -2852,6 +2864,20 @@ mod tests {
         let long = "字".repeat(3_000);
         assert!(matches!(
             bounded_body(&long, 2_000, 500),
+            std::borrow::Cow::Owned(_)
+        ));
+    }
+
+    #[test]
+    fn bounded_body_keeps_a_body_that_lands_on_the_cap() {
+        let exact = "a".repeat(2_000);
+        assert!(matches!(
+            bounded_body(&exact, 2_000, 500),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        let over = "a".repeat(2_001);
+        assert!(matches!(
+            bounded_body(&over, 2_000, 500),
             std::borrow::Cow::Owned(_)
         ));
     }
