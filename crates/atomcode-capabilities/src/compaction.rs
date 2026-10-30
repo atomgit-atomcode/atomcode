@@ -651,22 +651,43 @@ const SUMMARY_TOOL_OUTPUT_MAX_CHARS: usize = 2_000;
 /// trace, bash failure banner) usually sits at the END of a long output; head-only would
 /// drop it and the summary would miss the failure.
 const SUMMARY_TOOL_OUTPUT_TAIL_CHARS: usize = 500;
+/// Per-message cap for non-tool text in the summary input. A pasted log or a long
+/// assistant dump is still summarized from its head and tail; unbounded text made the
+/// summary call grow with whatever the person happened to paste.
+const SUMMARY_MESSAGE_MAX_CHARS: usize = 8_000;
+const SUMMARY_MESSAGE_TAIL_CHARS: usize = 2_000;
+/// Tool-call arguments are part of "what happened" even when the result is short
+/// (`write_file`'s content, `edit_file`'s patch). Keep a bounded head+tail so the
+/// summary can name the action without re-reading a whole file.
+const SUMMARY_TOOL_CALL_MAX_CHARS: usize = 600;
+const SUMMARY_TOOL_CALL_TAIL_CHARS: usize = 200;
+/// Whole-input ceiling for the summary transcript. Per-message caps still leave a
+/// long session able to produce an arbitrarily large call; the head keeps the
+/// early decisions, the tail keeps what led into the retained turns.
+const SUMMARY_TRANSCRIPT_MAX_CHARS: usize = 120_000;
+const SUMMARY_TRANSCRIPT_TAIL_CHARS: usize = 40_000;
 
-/// Bound a TOOL result body for the summary input: keep the head + tail (so a trailing
-/// error survives) with a `[truncated N chars]` marker between. Full text when it fits.
-fn render_tool_body(text: &str) -> String {
+/// Bound a text body for the summary input: full text when it fits, otherwise a
+/// head + tail around a `[truncated N chars]` marker. Idempotent marker text is
+/// not needed here (the summary input is built afresh for every call).
+fn bounded_body(text: &str, max_chars: usize, tail_chars: usize) -> String {
     let total = text.chars().count();
-    if total <= SUMMARY_TOOL_OUTPUT_MAX_CHARS {
+    if total <= max_chars {
         return text.to_string();
     }
-    let head_chars = SUMMARY_TOOL_OUTPUT_MAX_CHARS - SUMMARY_TOOL_OUTPUT_TAIL_CHARS;
+    let head_chars = max_chars.saturating_sub(tail_chars);
     let head: String = text.chars().take(head_chars).collect();
-    let tail: String = text
-        .chars()
-        .skip(total - SUMMARY_TOOL_OUTPUT_TAIL_CHARS)
-        .collect();
-    let cut = total - SUMMARY_TOOL_OUTPUT_MAX_CHARS;
+    let tail: String = text.chars().skip(total - tail_chars).collect();
+    let cut = total - max_chars;
     format!("{head}\n[truncated {cut} chars]\n{tail}")
+}
+
+fn render_tool_body(text: &str) -> String {
+    bounded_body(
+        text,
+        SUMMARY_TOOL_OUTPUT_MAX_CHARS,
+        SUMMARY_TOOL_OUTPUT_TAIL_CHARS,
+    )
 }
 
 /// Render a message span as a compact role-tagged transcript for the summarizer.
@@ -689,7 +710,22 @@ fn render_transcript(span: &[Message]) -> String {
             }
             s.push_str(&render_tool_body(&m.text));
         } else {
-            s.push_str(&m.text);
+            s.push_str(&bounded_body(
+                &m.text,
+                SUMMARY_MESSAGE_MAX_CHARS,
+                SUMMARY_MESSAGE_TAIL_CHARS,
+            ));
+        }
+        // The call names and their (bounded) arguments say what the assistant ran
+        // or wrote; the result alone often says only "ok".
+        for call in &m.tool_calls {
+            let arguments = bounded_body(
+                &call.arguments,
+                SUMMARY_TOOL_CALL_MAX_CHARS,
+                SUMMARY_TOOL_CALL_TAIL_CHARS,
+            )
+            .replace('\n', " ");
+            s.push_str(&format!("\n[tool call: {} {arguments}]", call.name));
         }
         // Record image attachments so a drained vision turn is not summarized as if it had no
         // visual content (the raw bytes can't be transcribed here, but their PRESENCE must
@@ -702,7 +738,11 @@ fn render_transcript(span: &[Message]) -> String {
         }
         s.push('\n');
     }
-    s
+    bounded_body(
+        &s,
+        SUMMARY_TRANSCRIPT_MAX_CHARS,
+        SUMMARY_TRANSCRIPT_TAIL_CHARS,
+    )
 }
 
 /// Sentinel first line stamped on every anchored compaction summary. Used to find the
@@ -2745,12 +2785,54 @@ mod tests {
             out.contains("TOOL: [error] "),
             "error tool result is marked"
         );
-        // A small TOOL output is untouched (no spurious marker); user text never truncated.
+        // A small TOOL output is untouched (no spurious marker); user text within
+        // the per-message cap is kept.
         assert!(
             out.contains("TOOL: small\n"),
             "small tool output kept verbatim"
         );
-        assert!(out.contains(&big_user), "user text is never truncated");
+        assert!(out.contains(&big_user), "user text under the cap is kept");
+    }
+
+    #[test]
+    fn render_transcript_bounds_a_large_user_message() {
+        let big = "u".repeat(SUMMARY_MESSAGE_MAX_CHARS + 1_000);
+        let out = render_transcript(&[Message::user(big.clone())]);
+        assert!(!out.contains(&big), "the full user message must not appear");
+        assert!(out.contains("[truncated "), "the message is bounded");
+    }
+
+    #[test]
+    fn render_transcript_names_tool_calls_with_bounded_arguments() {
+        let call = ToolCall {
+            id: "c1".into(),
+            name: "write_file".into(),
+            arguments: format!(r#"{{"path":"x","content":"{}"}}"#, "y".repeat(2_000)),
+        };
+        let out = render_transcript(&[Message::assistant("writing", vec![call])]);
+        assert!(out.contains("ASSISTANT: writing"), "{out:.120}");
+        assert!(
+            out.contains("[tool call: write_file "),
+            "the call name is part of the summary input"
+        );
+        assert!(
+            out.contains("[truncated "),
+            "a large argument list is bounded"
+        );
+    }
+
+    #[test]
+    fn render_transcript_caps_the_whole_input() {
+        let span: Vec<Message> = (0..20)
+            .map(|i| Message::user(format!("{i}{}", "z".repeat(SUMMARY_MESSAGE_MAX_CHARS))))
+            .collect();
+        let out = render_transcript(&span);
+        assert!(
+            out.chars().count() < SUMMARY_TRANSCRIPT_MAX_CHARS + 200,
+            "the whole summary input is bounded: {} chars",
+            out.chars().count()
+        );
+        assert!(out.contains("[truncated "), "the cap leaves a marker");
     }
 
     #[test]
