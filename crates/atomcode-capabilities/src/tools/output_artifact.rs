@@ -3,7 +3,7 @@
 //! full outputs live on disk, deduplicated by content.
 
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// 16 lowercase hex chars of sha256 — deterministic content id (dedup + cache-safe).
@@ -21,6 +21,19 @@ fn is_valid_id(id: &str) -> bool {
         && id
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Drop a wildcard-only `.gitignore` next to the store so the tool outputs
+/// never reach version control — even in a repo where no root rule covers
+/// the artifact directory. Never clobbers an existing `.gitignore`. A
+/// genuine write failure propagates: an unprotected artifact dir is exactly
+/// the failure this sentinel exists to prevent, so it must not be swallowed.
+fn ensure_gitignore_sentinel(dir: &Path) -> std::io::Result<()> {
+    let sentinel = dir.join(".gitignore");
+    if !sentinel.exists() {
+        std::fs::write(sentinel, "*\n")?;
+    }
+    Ok(())
 }
 
 /// Content-addressed store for full tool outputs, one directory per session.
@@ -41,6 +54,13 @@ impl ArtifactStore {
         let path = self.dir.join(&id);
         if !path.exists() {
             std::fs::create_dir_all(&self.dir)?;
+            // Keep tool outputs out of version control on the directory's own
+            // terms, not only on the repo-root `.gitignore` the operator
+            // happened to set: drop a wildcard-only sentinel beside the store
+            // on first write. Never clobbers an existing `.gitignore`, and a
+            // genuine write failure surfaces to the caller — an unprotected
+            // artifact dir is the failure we are defending against.
+            ensure_gitignore_sentinel(&self.dir)?;
             // Write to a temp sibling then rename → readers never see a partial file.
             let tmp = self.dir.join(format!("{id}.tmp"));
             std::fs::write(&tmp, bytes)?;
@@ -522,9 +542,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = super::ArtifactStore::new(dir.path());
         let id = store.put(b"0123456789abcdef").unwrap();
-        // dedup: same bytes → same id, one file
+        // dedup: same bytes → same id, one file (the wildcard `.gitignore`
+        // sentinel guards the dir and is not an artifact).
         assert_eq!(store.put(b"0123456789abcdef").unwrap(), id);
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        let artifact_files = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().file_name() != ".gitignore")
+            .count();
+        assert_eq!(artifact_files, 1);
         // slice
         assert_eq!(store.get(&id, 2, 4).unwrap().unwrap(), b"2345");
         // offset past end → empty
