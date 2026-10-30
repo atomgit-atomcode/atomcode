@@ -364,24 +364,51 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
         }
     }
 
+    /// Sessions of the project that is open right now, and only those.
+    ///
+    /// The global `/sessions` mixes every project's sessions and truncates to 50,
+    /// so another project's traffic can push this project's older sessions out of
+    /// it — and loading a foreign session would silently move the agent's working
+    /// directory into that other project.
     fun refreshSessions(): CompletableFuture<List<SessionMeta>> =
         ensureConnected().thenCompose { state ->
             if (state !is ConnectionState.Ready) {
                 CompletableFuture.completedFuture(emptyList())
             } else {
-                val client = getOrCreateClient()
-                client.listSessions()
+                val workingDir = projectWorkingDir(state)
+                if (workingDir.isBlank()) {
+                    // No project directory: there is no current project to show.
+                    CompletableFuture.completedFuture(emptyList())
+                } else {
+                    getOrCreateClient().listSessionsForWorkingDir(workingDir)
+                }
             }
         }
 
-    fun searchSessions(query: String): CompletableFuture<List<SessionMeta>> =
-        ensureConnected().thenCompose { state ->
-            if (state !is ConnectionState.Ready) {
-                CompletableFuture.completedFuture(emptyList())
+    /// Search stays inside the project for the same reason. The daemon's
+    /// `/sessions/search` matches session names across every project, so filtering
+    /// this project's own sessions keeps the same semantics and the right scope.
+    fun searchSessions(query: String): CompletableFuture<List<SessionMeta>> {
+        val needle = query.trim()
+        return refreshSessions().thenApply { sessions ->
+            if (needle.isEmpty()) {
+                sessions
             } else {
-                val client = getOrCreateClient()
-                client.searchSessions(query)
+                sessions.filter {
+                    it.displayName.contains(needle, ignoreCase = true) ||
+                        it.id.contains(needle, ignoreCase = true)
+                }
             }
+        }
+    }
+
+    /// The directory a session would start in — one expression, shared by
+    /// `createSession` and the history, so the history lists exactly the sessions
+    /// this project can resume.
+    private fun projectWorkingDir(state: ConnectionState): String =
+        when (state) {
+            is ConnectionState.Ready -> state.projectPath.ifBlank { project.basePath.orEmpty() }
+            else -> project.basePath.orEmpty()
         }
 
     fun loadSession(meta: SessionMeta): CompletableFuture<SessionDetail> {
@@ -447,10 +474,7 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
 
     fun createSession(): CompletableFuture<SessionRefView> =
         ensureConnected().thenCompose { state ->
-            val path = when (state) {
-                is ConnectionState.Ready -> state.projectPath.ifBlank { project.basePath.orEmpty() }
-                else -> project.basePath.orEmpty()
-            }
+            val path = projectWorkingDir(state)
             val client = getOrCreateClient()
             client.createSession("AtomCode Chat", path).thenApply {
                 SessionRefView(it.id, it.name, it.projectHash, it.workingDir)

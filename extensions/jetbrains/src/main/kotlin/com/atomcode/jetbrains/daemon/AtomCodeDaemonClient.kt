@@ -219,6 +219,13 @@ class AtomCodeDaemonClient(
     fun listSessions(): CompletableFuture<List<SessionMeta>> =
         send("GET", "/sessions").thenApply(::parseSessionMetaList)
 
+    /// Sessions of one working directory only. `/sessions` lists every project's
+    /// sessions and truncates to 50, so a project's own older sessions can be
+    /// pushed out of it by other projects' activity.
+    fun listSessionsForWorkingDir(workingDir: String): CompletableFuture<List<SessionMeta>> =
+        send("GET", "/sessions/by-working-dir?working_dir=${workingDir.urlQueryEncoded()}")
+            .thenApply(::parseSessionMetaList)
+
     fun searchSessions(query: String): CompletableFuture<List<SessionMeta>> {
         val trimmed = query.trim()
         if (trimmed.isEmpty()) return listSessions()
