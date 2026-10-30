@@ -280,6 +280,13 @@ class AtomCodeChatPanel(
     /// 面板自己报的错（建会话、切模型、改模式等失败的路径），和流里的错误一样要
     /// 挡住欢迎页与历史重渲染——否则消息区被整块重画，错误同样一闪而过。
     private var lastPanelError: String? = null
+
+    /// 上次渲染过的模型列表：每 2s 的 setup 轮询若数据没变就不重建下拉（重建会闪）。
+    private var lastRenderedModels: List<ModelInfo> = emptyList()
+
+    /// 当前欢迎页的内容签名（语言 + 登录态）。相同就不重画——欢迎页渲染会 clearMessages，
+    /// 每轮刷新都重画就是用户看到的闪屏。
+    private var welcomeSignature: String? = null
     private var disposed = false
     private val connectionListener = java.beans.PropertyChangeListener { event: PropertyChangeEvent ->
         if (disposed) return@PropertyChangeListener
@@ -389,7 +396,15 @@ class AtomCodeChatPanel(
     }
 
     fun showWelcomePage() {
+        welcomeSignature = welcomeSignatureOf()
         messageView.showWelcomePage(welcomeLanguage, loggedIn)
+    }
+
+    private fun welcomeSignatureOf(): String = "$welcomeLanguage|$loggedIn"
+
+    /// 消息区一旦有了别的内容，欢迎页签名就失效（下次需要时会重画）。
+    private fun invalidateWelcomePage() {
+        welcomeSignature = null
     }
 
     fun submitPrompt(prompt: String) {
@@ -522,14 +537,17 @@ class AtomCodeChatPanel(
         setupSnapshot = snapshot
         loggedIn = snapshot.auth?.let { it.loggedIn && !it.expired } == true
 
-        loadingModels = true
-        modelPicker.removeAllItems()
-        snapshot.models.forEach(modelPicker::addItem)
-        snapshot.models.firstOrNull { it.isDefault }?.let {
-            modelPicker.selectedItem = it
+        if (snapshot.models != lastRenderedModels) {
+            lastRenderedModels = snapshot.models
+            loadingModels = true
+            modelPicker.removeAllItems()
+            snapshot.models.forEach(modelPicker::addItem)
+            snapshot.models.firstOrNull { it.isDefault }?.let {
+                modelPicker.selectedItem = it
+            }
+            modelPicker.isEnabled = snapshot.models.isNotEmpty()
+            loadingModels = false
         }
-        modelPicker.isEnabled = snapshot.models.isNotEmpty()
-        loadingModels = false
 
         // Update input panel model name
         val currentModel = snapshot.models.firstOrNull { it.isDefault }?.model
@@ -544,8 +562,10 @@ class AtomCodeChatPanel(
             selectedModel?.reasoningEffort,
         )
         inputPanel.setEffortEnabled(!generating)
-        // 欢迎页渲染会清空消息区；错误还挂着就先不换，否则刚显示的错误会一闪而过。
-        if (WelcomePagePolicy.shouldRenderAutomatically(
+        // 欢迎页渲染会 clearMessages：错误还挂着时不能换，且内容签名没变时不必重画
+        // （每轮轮询都重画 = 闪屏）。
+        if (welcomeSignature != welcomeSignatureOf() &&
+            WelcomePagePolicy.shouldRenderAutomatically(
                 hasSession = currentSession != null,
                 generating = generating,
                 lastError = liveError(),
@@ -780,6 +800,7 @@ class AtomCodeChatPanel(
                 currentSession = session
                 persistRuntimeSession()
                 messageView.clear()
+                invalidateWelcomePage()
                 dismissPersistenceWarning()
                 addSystemMessage("Started new session ${session.name.ifBlank { session.id.take(8) }}.")
                 syncApprovalModeForNewConversation()
@@ -1035,6 +1056,7 @@ class AtomCodeChatPanel(
 
     private fun renderSession(detail: SessionDetail) {
         messageView.clear()
+        invalidateWelcomePage()
         dismissPersistenceWarning()
         var assistantGroupOpen = false
         detail.messages.forEach { message ->
@@ -1456,10 +1478,12 @@ class AtomCodeChatPanel(
     // ── Message helpers ──
 
     private fun addSystemMessage(text: String) {
+        invalidateWelcomePage()
         messageView.addSystemMessage(text)
     }
 
     private fun addErrorMessage(text: String) {
+        invalidateWelcomePage()
         lastPanelError = text
         messageView.addError(text)
     }

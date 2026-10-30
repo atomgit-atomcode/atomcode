@@ -854,6 +854,9 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
 
     private fun setConnectionState(next: ConnectionState) {
         val previous = connectionState
+        // 状态没变就不要通知：健康检查每 30s 跑一轮，无条件 fire 会让面板整轮重刷
+        // （重取快照、重建会话列表、重画欢迎页），表现就是"停留期间反复闪屏"。
+        if (previous == next) return
         connectionState = next
         ApplicationManager.getApplication().invokeLater {
             changes.firePropertyChange("connectionState", previous, next)
