@@ -749,8 +749,11 @@ fn render_transcript(span: &[Message]) -> String {
         s.push('\n');
     }
     // A byte length at or under the cap proves the char count is too, so the
-    // common case returns the built string untouched.
-    if s.len() <= SUMMARY_TRANSCRIPT_MAX_CHARS {
+    // common case returns the built string untouched. Multibyte text can
+    // exceed the cap in bytes while fitting in chars, so count before handing
+    // it to `bounded_body`, which would clone the same text to hand it back.
+    if s.len() <= SUMMARY_TRANSCRIPT_MAX_CHARS || s.chars().count() <= SUMMARY_TRANSCRIPT_MAX_CHARS
+    {
         return s;
     }
     bounded_body(
@@ -2801,13 +2804,13 @@ mod tests {
             out.contains("TOOL: [error] "),
             "error tool result is marked"
         );
-        // A small TOOL output is untouched (no spurious marker); user text within
-        // the per-message cap is kept.
+        // A small TOOL output is untouched (no spurious marker); dialogue has
+        // no per-message cap, so this user text is kept whole.
         assert!(
             out.contains("TOOL: small\n"),
             "small tool output kept verbatim"
         );
-        assert!(out.contains(&big_user), "user text under the cap is kept");
+        assert!(out.contains(&big_user), "user text is kept whole");
     }
 
     #[test]
@@ -2818,6 +2821,39 @@ mod tests {
         let out = render_transcript(&[Message::user(text.clone())]);
         assert!(out.contains(&text), "the message must not be cut");
         assert!(!out.contains("[truncated "), "nothing was cut");
+    }
+
+    #[test]
+    fn render_transcript_counts_the_cap_in_chars_not_bytes() {
+        // Three bytes per char: this body exceeds the cap in bytes and fits in
+        // chars, so it must be kept whole.
+        let under = "字".repeat(SUMMARY_TRANSCRIPT_MAX_CHARS - 1_000);
+        let out = render_transcript(&[Message::user(under.clone())]);
+        assert!(out.contains(&under), "the cap counts chars, not bytes");
+        assert!(!out.contains("[truncated "), "nothing was cut");
+
+        // The same unit decides the cut: over the cap in chars is cut.
+        let over = "字".repeat(SUMMARY_TRANSCRIPT_MAX_CHARS + 1_000);
+        let out = render_transcript(&[Message::user(over.clone())]);
+        assert!(!out.contains(&over), "an over-cap body is cut");
+        assert!(out.contains("[truncated "), "and says so");
+    }
+
+    #[test]
+    fn bounded_body_borrows_multibyte_text_that_fits_in_chars() {
+        // 3,000 bytes, 1,000 chars: the byte check fails, the char check holds,
+        // so the body is borrowed rather than cloned and cut.
+        let text = "字".repeat(1_000);
+        assert!(matches!(
+            bounded_body(&text, 2_000, 500),
+            std::borrow::Cow::Borrowed(_)
+        ));
+
+        let long = "字".repeat(3_000);
+        assert!(matches!(
+            bounded_body(&long, 2_000, 500),
+            std::borrow::Cow::Owned(_)
+        ));
     }
 
     #[test]
