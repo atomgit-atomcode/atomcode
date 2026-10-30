@@ -63,6 +63,8 @@ import java.awt.Toolkit
 import java.awt.datatransfer.DataFlavor
 import java.awt.datatransfer.StringSelection
 import java.awt.datatransfer.Transferable
+import java.awt.event.MouseAdapter
+import java.awt.event.MouseEvent
 import java.io.ByteArrayInputStream
 import java.awt.image.BufferedImage
 import java.io.ByteArrayOutputStream
@@ -769,7 +771,25 @@ class AtomCodeChatPanel(
         val dialog = JDialog(SwingUtilities.getWindowAncestor(this), "AtomCode Session History", Dialog.ModalityType.APPLICATION_MODAL).apply {
             contentPane = panel; pack(); setLocationRelativeTo(this@AtomCodeChatPanel)
         }
-        load.addActionListener { val selected = list.selectedValue ?: return@addActionListener; dialog.dispose(); loadSession(selected) }
+        // Enter and double-click are how a list in an IDE says "open this one".
+        // Both take the same path as `Load`, and both stay inert unless exactly
+        // one row is selected — the same state that enables the button — so a
+        // multi-selection can never quietly load its lead row.
+        fun loadSelectedSession() {
+            if (list.selectedValuesList.size != 1) return
+            val selected = list.selectedValue ?: return
+            dialog.dispose()
+            loadSession(selected)
+        }
+        load.addActionListener { loadSelectedSession() }
+        list.addMouseListener(object : MouseAdapter() {
+            override fun mouseClicked(event: MouseEvent) {
+                if (event.clickCount >= 2) loadSelectedSession()
+            }
+        })
+        // Enter reaches the button from anywhere in the dialog — including the
+        // search field, where the filter has already run as the person typed.
+        dialog.rootPane.defaultButton = load
         rename.addActionListener {
             val selected = list.selectedValue ?: return@addActionListener
             val nextName = JOptionPane.showInputDialog(dialog, "Session name", selected.displayName)?.trim() ?: return@addActionListener

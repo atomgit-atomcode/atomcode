@@ -12,6 +12,9 @@ packages/npm/*.tgz
 
 # OS
 .DS_Store
+# macOS AppleDouble sidecars: a workspace on a network/external volume gets a
+# `._*` file next to everything the OS writes, at any depth.
+._*
 Thumbs.db
 Desktop.ini
 $RECYCLE.BIN/
