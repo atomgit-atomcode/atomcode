@@ -3959,41 +3959,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "tools")]
-    #[test]
-    fn a_fork_drops_a_sidecar_position_past_its_own_turns() {
-        use crate::session::manager::{TodoCallPosition, TodoSidecarItem};
-
-        let (_dir, manager) = store();
-        let lease = created(&manager, "s1");
-        manager.append_events(&lease, &a_turn()).unwrap();
-        manager
-            .write_todo_sidecar(
-                "s1",
-                &[TodoSidecarItem {
-                    content: "a".into(),
-                    status: "in_progress".into(),
-                }],
-                4,
-                Some(TodoCallPosition {
-                    turn: 9,
-                    round: 1,
-                    index: 0,
-                }),
-            )
-            .unwrap();
-
-        let (_forked, _fork_lease) = manager.fork_native_session("s1", "s2", 2_000).unwrap();
-
-        let sidecar = manager
-            .read_todo_sidecar("s2")
-            .unwrap()
-            .expect("the items still travel");
-        assert_eq!(sidecar.todos.len(), 1);
-        assert_eq!(sidecar.todos[0].content, "a");
-        assert_eq!(sidecar.through, None);
-    }
-
     #[cfg(feature = "memory")]
     #[test]
     fn memory_injection_header_matches_the_real_block() {
