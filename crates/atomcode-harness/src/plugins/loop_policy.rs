@@ -912,7 +912,9 @@ impl CompactBeforeRequest {
     /// This deliberately does not cache `calls_model`'s last verdict: a verdict
     /// that flips — overflow starts needing the stub, or enough turns settle —
     /// is the signal to spend the other stage, and skipping it could send a
-    /// request the stub was about to shrink.
+    /// request the stub was about to shrink. A verdict that never flips is
+    /// therefore still asked for on every request; the projection is skipped
+    /// only after both stages have been spent.
     fn both_tried(&self, session: &str, turn: u64) -> bool {
         let mut tried = self.tried.lock().expect("compaction attempts poisoned");
         let entry = Self::attempts(&mut tried, session, turn);

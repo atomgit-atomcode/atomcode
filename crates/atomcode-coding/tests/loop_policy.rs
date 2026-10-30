@@ -1182,47 +1182,54 @@ id = "tool-loop-guard"
     );
 }
 
-/// A strategy whose model verdict flips after the first ask: one turn spends the
-/// slow stage and then the fast one, which is when the trigger may stop asking.
-struct Flip {
+/// A strategy that counts what the trigger asks and can stop claiming a model
+/// after `true_for` asks: `1` flips the verdict inside one turn, `u32::MAX`
+/// keeps it stable.
+struct CountingVerdict {
     asked: Arc<AtomicU32>,
-    committed: Arc<AtomicU32>,
+    attempts: Arc<AtomicU32>,
+    true_for: u32,
 }
 
 #[async_trait]
-impl atomcode_harness::seams::Compaction for Flip {
+impl atomcode_harness::seams::Compaction for CountingVerdict {
     fn describe(&self) -> String {
-        "calls a model once, then claims not to".into()
+        format!("claims a model for its first {} ask(s)", self.true_for)
     }
     fn calls_model(
         &self,
         _: &atomcode_harness::session::SessionLog,
         _: &atomcode_harness::seams::CompactionAsk,
     ) -> bool {
-        self.asked.fetch_add(1, Ordering::SeqCst) == 0
+        self.asked.fetch_add(1, Ordering::SeqCst) < self.true_for
     }
     async fn compact(
         &self,
         _: &atomcode_harness::session::SessionLog,
         _: &atomcode_harness::seams::CompactionAsk,
     ) -> Option<atomcode_harness::seams::CompactionDecision> {
-        self.committed.fetch_add(1, Ordering::SeqCst);
+        self.attempts.fetch_add(1, Ordering::SeqCst);
         None
     }
 }
 
-struct FlipRow(Arc<AtomicU32>, Arc<AtomicU32>, f32);
+struct VerdictRow {
+    asked: Arc<AtomicU32>,
+    attempts: Arc<AtomicU32>,
+    true_for: u32,
+    threshold: f32,
+}
 
 #[async_trait]
-impl atomcode_plexus::Plugin for FlipRow {
+impl atomcode_plexus::Plugin for VerdictRow {
     fn name(&self) -> &'static str {
-        "compaction-flip"
+        "compaction-verdict"
     }
     fn provides(&self) -> &'static [&'static str] {
         &["compaction"]
     }
     fn description(&self) -> &'static str {
-        "a model verdict that flips once"
+        "a counted model verdict"
     }
     async fn apply(
         &self,
@@ -1230,25 +1237,25 @@ impl atomcode_plexus::Plugin for FlipRow {
         _: &serde_json::Value,
     ) -> Result<(), String> {
         let _ = ctx
-            .provide::<CompactionSvc>(Arc::new(Flip {
-                asked: self.0.clone(),
-                committed: self.1.clone(),
+            .provide::<CompactionSvc>(Arc::new(CountingVerdict {
+                asked: self.asked.clone(),
+                attempts: self.attempts.clone(),
+                true_for: self.true_for,
             }))
             .map_err(|e| e.to_string())?;
-        plugins::loop_policy::mount_compaction_trigger(ctx, self.2);
+        plugins::loop_policy::mount_compaction_trigger(ctx, self.threshold);
         Ok(())
     }
 }
 
-/// Pressure does not fall between the rounds of a turn. Once both stages have
-/// been spent, the trigger must stop asking the strategy — `calls_model`
-/// projects the whole log — and only a new turn (or a pressure drop) may rearm
-/// it. The strategy's verdict flips after the first ask, so this is the only
-/// way both stage slots get marked inside one turn.
-#[tokio::test]
-async fn a_spent_turn_stops_asking_the_strategy_until_the_next_turn() {
-    let dir = scratch("fast-path");
-    std::fs::write(dir.join("a.txt"), "x").unwrap();
+/// Four tool rounds, a closing answer and one more turn's answer: the first
+/// request has no usage, the four after it do.
+async fn verdict_app(
+    dir: &std::path::Path,
+    asked: &Arc<AtomicU32>,
+    attempts: &Arc<AtomicU32>,
+    true_for: u32,
+) -> App {
     let call =
         r#"{ text = "again", calls = [ { name = "read_file", args = { file_path = "a.txt" } } ] }"#;
     let script = format!(
@@ -1256,18 +1263,32 @@ async fn a_spent_turn_stops_asking_the_strategy_until_the_next_turn() {
          {call},\n  {call},\n  {call},\n  {call},\n  {{ text = \"done\" }},\n  {{ text = \"next\" }}\n] }}\n"
     );
     let swap = "[[remove]]\nid = \"compaction-tail\"\n\n\
-                [[insert]]\nid = \"compaction-flip\"\nname = \"compaction-flip\"\n\n\
+                [[insert]]\nid = \"compaction-verdict\"\nname = \"compaction-verdict\"\n\n\
                 [[remove]]\nid = \"repeat-fuse\"\n\n[[remove]]\nid = \"tool-loop-guard\"";
-    let asked = Arc::new(AtomicU32::new(0));
-    let committed = Arc::new(AtomicU32::new(0));
     let mut registry = atomcode_coding::on_harness::catalog();
-    registry.register(Arc::new(FlipRow(
-        asked.clone(),
-        committed.clone(),
-        0.0000001,
-    )));
-    let mut app = App::new(registry, tree(&dir, &script, &[swap]));
+    registry.register(Arc::new(VerdictRow {
+        asked: asked.clone(),
+        attempts: attempts.clone(),
+        true_for,
+        threshold: 0.0000001,
+    }));
+    let mut app = App::new(registry, tree(dir, &script, &[swap]));
     app.start().await.expect("must mount");
+    app
+}
+
+/// Pressure does not fall between the rounds of a turn. Once both stages have
+/// been spent, the trigger must stop asking the strategy — `calls_model`
+/// projects the whole log — and only a new turn (or a pressure drop) may rearm
+/// it. The verdict flips after the first ask so both stage slots get marked
+/// inside one turn; the stable-verdict case is pinned separately below.
+#[tokio::test]
+async fn a_spent_turn_stops_asking_the_strategy_until_the_next_turn() {
+    let dir = scratch("fast-path");
+    std::fs::write(dir.join("a.txt"), "x").unwrap();
+    let asked = Arc::new(AtomicU32::new(0));
+    let attempts = Arc::new(AtomicU32::new(0));
+    let mut app = verdict_app(&dir, &asked, &attempts, 1).await;
 
     run_turn(&app, "first").await.unwrap();
     assert_eq!(
@@ -1276,7 +1297,7 @@ async fn a_spent_turn_stops_asking_the_strategy_until_the_next_turn() {
         "the two stages spend one ask each inside the turn"
     );
     assert_eq!(
-        committed.load(Ordering::SeqCst),
+        attempts.load(Ordering::SeqCst),
         2,
         "and each attempt reaches the strategy once"
     );
@@ -1287,5 +1308,32 @@ async fn a_spent_turn_stops_asking_the_strategy_until_the_next_turn() {
         3,
         "a new turn rearms the trigger instead of leaving it silent"
     );
-    assert_eq!(committed.load(Ordering::SeqCst), 3);
+    assert_eq!(attempts.load(Ordering::SeqCst), 3);
+}
+
+/// A verdict that never flips is still asked for on every request: the trigger
+/// cannot know it changed without asking, and caching the last answer would
+/// skip a flip that may be the stub a shrinking request depends on. The fast
+/// path only stops asking once both stages are spent, which a stable verdict
+/// never reaches — this pins that cost so a future "optimization" cannot make
+/// the trigger deaf to the stub.
+#[tokio::test]
+async fn a_stable_verdict_is_still_asked_each_request() {
+    let dir = scratch("stable-verdict");
+    std::fs::write(dir.join("a.txt"), "x").unwrap();
+    let asked = Arc::new(AtomicU32::new(0));
+    let attempts = Arc::new(AtomicU32::new(0));
+    let mut app = verdict_app(&dir, &asked, &attempts, u32::MAX).await;
+
+    run_turn(&app, "first").await.unwrap();
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        4,
+        "one ask per request after the first, whether or not the stage is spent"
+    );
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "the slow stage is still attempted only once"
+    );
 }
