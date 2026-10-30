@@ -112,10 +112,9 @@ extensions/vscode/resources/bin/
 # AtomCode local-scope configs (machine-specific)
 .atomcode/local/
 crates/atomcode-codingplan-crypto/
-scripts/build-official.sh
-build-official.sh
-build-official-vscode.sh
-build-official-jetbrains.sh
+# build-official* 是本地发布机用的脚本与说明，只留在本地磁盘、不入库。
+# 无斜杠的前缀通配在任意层级都生效，因此同时覆盖根目录与 scripts/ 下的同名文件。
+build-official*
 
 # git worktrees
 .worktrees/
