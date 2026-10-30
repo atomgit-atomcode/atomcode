@@ -220,6 +220,7 @@ impl SessionManager {
         retry_transient_file_access(|| {
             fs2::FileExt::lock_exclusive(&file).map_err(|e| io_at(&path, e))
         })?;
+        Self::drop_unterminated_tail(&mut file, &path)?;
         let current = usize::try_from(file.metadata().map_err(|e| io_at(&path, e))?.len())
             .unwrap_or(usize::MAX);
         let next = current.saturating_add(buffer.len());
@@ -230,6 +231,9 @@ impl SessionManager {
                 actual: next,
             });
         }
+        // The handle also carries plain write access so a torn tail can be cut
+        // off; anchor the record at the end instead of trusting the cursor.
+        file.seek(SeekFrom::End(0)).map_err(|e| io_at(&path, e))?;
         file.write_all(&buffer).map_err(|e| io_at(&path, e))?;
         drop(file);
         self.index_the_chosen_name(id, events);
@@ -278,7 +282,10 @@ impl SessionManager {
             fs2::FileExt::lock_exclusive(&file).map_err(|e| io_at(&path, e))
         })?;
         // The same handle reads and writes: Windows locks are mandatory, so a
-        // second handle could not read the region this one has locked.
+        // second handle could not read the region this one has locked. An
+        // append that never completed is cut off first, so the allocation and
+        // the write both see the log a reader would.
+        Self::drop_unterminated_tail(&mut file, &path)?;
         let next = Self::last_recorded_seq(&mut file, &path)?
             .unwrap_or(0)
             .max(floor)
@@ -296,9 +303,51 @@ impl SessionManager {
             });
         }
         commit(next)?;
+        // The handle also carries plain write access so a torn tail can be cut
+        // off; anchor the record at the end instead of trusting the cursor.
+        file.seek(SeekFrom::End(0)).map_err(|e| io_at(&path, e))?;
         file.write_all(&buffer).map_err(|e| io_at(&path, e))?;
         drop(file);
         self.index_the_chosen_name(id, std::slice::from_ref(&event));
+        Ok(())
+    }
+
+    /// Cut off a final line that no write completed.
+    ///
+    /// Every record this store appends ends with a newline, written in the same
+    /// buffer, so a last line without one is the prefix a failed `write_all`
+    /// left behind — not a fact. Readers skip it (see `read_event_log_bounded`);
+    /// appends remove it here, under the log's exclusive lock, so the next
+    /// record is not glued onto its prefix. A file with no complete line at all
+    /// (a torn header) is refused: there is nothing sound to append behind.
+    fn drop_unterminated_tail(file: &mut fs::File, path: &Path) -> SessionResult<()> {
+        let len = file.metadata().map_err(|error| io_at(path, error))?.len();
+        if len == 0 {
+            return Ok(());
+        }
+        let mut buffer = Vec::new();
+        read_log_window(file, path, len - 1, len, &mut buffer)?;
+        if buffer.first() == Some(&b'\n') {
+            return Ok(());
+        }
+        // The newline that ends the last complete line is within one widest
+        // record of the end: the residue is the prefix of a single record, and
+        // a record this store writes never exceeds `MAX_JSONL_LINE_BYTES`.
+        let start = len.saturating_sub((MAX_JSONL_LINE_BYTES as u64).saturating_add(1));
+        read_log_window(file, path, start, len, &mut buffer)?;
+        let Some(position) = buffer.iter().rposition(|byte| *byte == b'\n') else {
+            return Err(SessionStoreError::Corrupt {
+                kind: "session events",
+                message: format!("{}: unreadable last record", path.display()),
+            });
+        };
+        let keep = start + position as u64 + 1;
+        file.set_len(keep).map_err(|error| io_at(path, error))?;
+        // `set_len` leaves the cursor where it was; on Windows the handle now
+        // also carries plain write access, so the next write follows the cursor
+        // instead of always appending. Put it back at the new end.
+        file.seek(SeekFrom::Start(keep))
+            .map_err(|error| io_at(path, error))?;
         Ok(())
     }
 
@@ -622,9 +671,22 @@ impl SessionManager {
     ) -> SessionResult<(Option<SessionHeader>, Vec<LoggedEvent>)> {
         let path = self.events_path(id)?;
         let bytes = read_regular_file_bounded(&path, "session events", limit.min(MAX_JSONL_BYTES))?;
+        // A failed append can leave the prefix of a record at the end, without
+        // the newline that terminates every line this store writes. It is not a
+        // fact: reading it as one would turn a single failed write into a
+        // session that can never be opened or resumed. The next append cuts it
+        // off (see `drop_unterminated_tail`).
+        let complete = if bytes.last().is_none_or(|byte| *byte == b'\n') {
+            &bytes[..]
+        } else {
+            bytes
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map_or(&bytes[..0], |position| &bytes[..=position])
+        };
         let mut header = None;
         let mut events = Vec::new();
-        for (index, raw) in bytes.split(|b| *b == b'\n').enumerate() {
+        for (index, raw) in complete.split(|b| *b == b'\n').enumerate() {
             if raw.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
@@ -896,7 +958,7 @@ impl SessionManager {
         // session renamed before the log existed came back nameless, its `/rename`
         // gone from the composer until it was renamed again.
         if let Some(titled) = name_from_meta(&meta, &events) {
-            let seq = events.last().map_or(1, |last| last.seq + 1);
+            let seq = next_seq(&events);
             let at = events.last().map_or(0, |last| last.at);
             events.push(LoggedEvent {
                 seq,
@@ -921,11 +983,7 @@ impl SessionManager {
                 // ran has none, while turn ids are read from the log, not the index.
                 let turn = last_turn(&events) + 1;
                 let at = u64::try_from(super::now_ms()).unwrap_or(0);
-                // `events_from_snapshot` numbered these consecutively in
-                // memory and this log is written whole, so the last record is
-                // also the highest sequence; unlike an appended log, there is
-                // no stored tail that could disagree with it.
-                let seq = events.last().map_or(1, |last| last.seq + 1);
+                let seq = next_seq(&events);
                 events.push(LoggedEvent {
                     seq,
                     at,
@@ -1464,6 +1522,19 @@ fn last_turn(events: &[LoggedEvent]) -> u64 {
         .map(|logged| logged.event.turn())
         .max()
         .unwrap_or(0)
+}
+
+/// One past the highest sequence the built log holds.
+///
+/// The append path allocates from the log's maximum, not its last record; a
+/// whole-file conversion keeps the same shape so the two cannot disagree if a
+/// builder ever stops numbering consecutively.
+fn next_seq(events: &[LoggedEvent]) -> SeqNo {
+    events
+        .iter()
+        .map(|logged| logged.seq)
+        .max()
+        .map_or(1, |highest| highest.saturating_add(1))
 }
 
 /// First line of the memory block `MemoryContext` injects. A synthetic system
@@ -3417,6 +3488,65 @@ mod tests {
             .unwrap();
         assert_eq!(allocated, Some(6));
         assert_eq!(manager.load_events(id).unwrap().last().unwrap().seq, 6);
+    }
+
+    #[test]
+    fn a_tail_a_failed_write_left_behind_is_ignored_and_cut_off() {
+        let (_dir, manager) = store();
+        let id = "resume-torn-tail";
+        let lease = created(&manager, id);
+        manager.append_events(&lease, &a_turn()).unwrap();
+        let path = manager.events_path(id).unwrap();
+        let tear = || {
+            let mut log = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            // The prefix a write cut short leaves behind: no newline, so not a
+            // line this store completed.
+            log.write_all(
+                b"{\"seq\":6,\"at\":16,\"event\":{\"kind\":\"user_message\",\"turn\":3,\"text\":\"TORN-RESIDUE",
+            )
+            .unwrap();
+        };
+
+        tear();
+        // One failed write must not strand the log: the reader ignores the
+        // prefix and still hands back every completed record.
+        assert_eq!(manager.load_events(id).unwrap().last().unwrap().seq, 5);
+
+        let mut allocated = None;
+        manager
+            .append_event_allocating(
+                &lease,
+                5,
+                |seq| {
+                    allocated = Some(seq);
+                    Ok(logged(seq, 17, SessionEvent::TurnStart { turn: 3 }))
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(allocated, Some(6));
+        let raw = std::fs::read(&path).unwrap();
+        assert!(
+            !raw.windows(12).any(|window| window == b"TORN-RESIDUE"),
+            "the prefix is cut off instead of being glued to the new record"
+        );
+        assert_eq!(raw.last(), Some(&b'\n'));
+        assert_eq!(manager.load_events(id).unwrap().last().unwrap().seq, 6);
+
+        // The ordinary append path repairs it the same way.
+        tear();
+        manager
+            .append_events(
+                &lease,
+                &[logged(7, 18, SessionEvent::TurnStart { turn: 4 })],
+            )
+            .unwrap();
+        let raw = std::fs::read(&path).unwrap();
+        assert!(!raw.windows(12).any(|window| window == b"TORN-RESIDUE"));
+        assert_eq!(manager.load_events(id).unwrap().last().unwrap().seq, 7);
     }
 
     #[test]

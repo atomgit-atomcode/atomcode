@@ -5032,6 +5032,15 @@ pub(super) fn open_append_file(path: &Path) -> SessionResult<File> {
     // GENERIC_READ via `read(true)` is what satisfies LockFileEx here. Append
     // semantics are unchanged.
     options.create(true).append(true).read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // `append(true)` alone grants only FILE_APPEND_DATA, which can write at
+        // the end of the file but cannot truncate it; cutting off a torn tail
+        // (`set_len`) needs write access as well. FILE_APPEND_DATA is still set
+        // by the append flag, so writes keep landing at the end of the file.
+        options.access_mode(0x8000_0000 | 0x4000_0000); // GENERIC_READ | GENERIC_WRITE
+    }
     set_private_create_mode(&mut options);
     no_follow(&mut options);
     let file = options.open(path).map_err(|e| io_at(path, e))?;
