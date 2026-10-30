@@ -13,6 +13,7 @@ import com.atomcode.jetbrains.daemon.PatchThinkingRequest
 import com.atomcode.jetbrains.daemon.ProviderInfo
 import com.atomcode.jetbrains.daemon.SessionDetail
 import com.atomcode.jetbrains.daemon.SessionMeta
+import com.atomcode.jetbrains.daemon.SkillInfo
 import com.atomcode.jetbrains.daemon.SetupSnapshot
 import com.atomcode.jetbrains.diagnostics.AtomCodeDiagnostics
 import com.atomcode.jetbrains.actions.openAtomCodeSettings
@@ -28,6 +29,8 @@ import com.atomcode.jetbrains.ui.header.HeaderPanel
 import com.atomcode.jetbrains.ui.input.InputPanel
 import com.atomcode.jetbrains.ui.input.EffortChoices
 import com.atomcode.jetbrains.ui.input.QueuedPromptView
+import com.atomcode.jetbrains.ui.input.SlashCommand
+import com.atomcode.jetbrains.ui.input.SlashCommands
 import com.atomcode.jetbrains.ui.message.JBCefMessageView
 import com.atomcode.jetbrains.ui.message.MessageAttachmentView
 import com.intellij.diff.DiffContentFactory
@@ -272,6 +275,8 @@ class AtomCodeChatPanel(
     private val pendingContext = mutableListOf<ChatContextItem>()
     private val pendingImages = mutableListOf<PendingImageAttachment>()
     private val queuedPrompts = ArrayDeque<QueuedPrompt>()
+    /// Skills the daemon exposes as slash commands; refreshed when the link is ready.
+    private var slashSkills: List<SkillInfo> = emptyList()
     private var disposed = false
     private val connectionListener = java.beans.PropertyChangeListener { event: PropertyChangeEvent ->
         if (disposed) return@PropertyChangeListener
@@ -282,6 +287,7 @@ class AtomCodeChatPanel(
                     inputPanel.setApprovalMode(service.approvalMode)
                     inputPanel.setApprovalModeEnabled(!service.approvalModePending)
                     refreshApprovalModeLabel()
+                    refreshSkills()
                     refreshSetupSnapshot()
                     refreshSessionList()
                 }
@@ -483,6 +489,7 @@ class AtomCodeChatPanel(
         service.ensureConnected().thenAccept { state ->
             if (state is ConnectionState.Ready) {
                 SwingUtilities.invokeLater {
+                    refreshSkills()
                     // A panel built after the connection went Ready never sees the
                     // connection listener fire, so it would keep the client-side
                     // Build initial value instead of `[permissions] default_mode`.
@@ -1940,11 +1947,119 @@ class AtomCodeChatPanel(
 
     // ── Slash commands ──
 
-    private fun handleLocalInputCommand(prompt: String): Boolean {
-        val command = prompt.split(Regex("\\s+"), limit = 2).firstOrNull()?.lowercase() ?: return false
-        return when (command) {
+    /// Commands this client answers itself. `/review` is deliberately absent: it is
+    /// a prompt the daemon runs, so it travels through the normal send path.
+    private fun handleLocalInputCommand(prompt: String): Boolean =
+        when (SlashCommands.commandWord(prompt)) {
             "/login" -> { login(); true }
+            "/logout" -> { logout(); true }
+            "/whoami" -> { showWhoAmI(); true }
+            "/status" -> { showStatus(); true }
+            "/config" -> { showConfigPath(); true }
+            "/reload" -> { reloadDaemonConfig(); true }
             else -> false
+        }
+
+    private fun logout() {
+        service.logout().whenComplete { auth, error ->
+            SwingUtilities.invokeLater {
+                if (error != null) {
+                    addErrorMessage("退出登录失败：${error.cause?.message ?: error.message}")
+                    return@invokeLater
+                }
+                addSystemMessage(
+                    if (auth?.loggedIn == true) "退出登录未生效，请稍后再试。" else "已退出 AtomGit 登录。",
+                )
+                refreshSetupSnapshot(silent = true)
+            }
+        }
+    }
+
+    private fun showWhoAmI() {
+        service.authStatusNow().whenComplete { auth, error ->
+            SwingUtilities.invokeLater {
+                if (error != null) {
+                    addErrorMessage("读取登录状态失败：${error.cause?.message ?: error.message}")
+                    return@invokeLater
+                }
+                val text = when {
+                    auth == null -> "未登录。"
+                    auth.expired -> "AtomGit 登录已过期，请重新 /login。"
+                    !auth.loggedIn -> "未登录。"
+                    else -> buildString {
+                        appendLine("用户：${auth.userName ?: "（未提供）"}")
+                        appendLine("认证方式：${auth.authPath}")
+                        append("User ID：${auth.userName ?: "—"}")
+                    }
+                }
+                addSystemMessage(text)
+            }
+        }
+    }
+
+    private fun showStatus() {
+        service.healthNow().whenComplete { health, healthError ->
+            service.authStatusNow().whenComplete { auth, _ ->
+                SwingUtilities.invokeLater {
+                    val authLabel = when {
+                        auth == null -> "未登录"
+                        auth.expired -> "已过期"
+                        auth.loggedIn -> "已登录（${auth.userName ?: "?"}）"
+                        else -> "未登录"
+                    }
+                    val model = modelPicker.selectedItem as? ModelInfo
+                    addSystemMessage(
+                        listOf(
+                            if (healthError != null || health == null) "Daemon：不可用" else "Daemon：${health.service} ${health.version}",
+                            "登录：$authLabel",
+                            "模型：" + (model?.let { "${it.provider} (${it.model})" } ?: "未配置"),
+                        ).joinToString("\n"),
+                    )
+                }
+            }
+        }
+    }
+
+    private fun showConfigPath() {
+        service.configInfo().whenComplete { config, error ->
+            SwingUtilities.invokeLater {
+                if (error != null || config == null) {
+                    addErrorMessage("读取配置失败：${error?.cause?.message ?: error?.message ?: "未知错误"}")
+                    return@invokeLater
+                }
+                addSystemMessage(
+                    listOf(
+                        "默认模型：${config.defaultProvider ?: "未配置"}",
+                        "配置文件：${config.path}",
+                        "改完文件后执行 /reload，无需重启。",
+                    ).joinToString("\n"),
+                )
+            }
+        }
+    }
+
+    private fun reloadDaemonConfig() {
+        service.reloadConfig().whenComplete { config, error ->
+            SwingUtilities.invokeLater {
+                if (error != null || config == null) {
+                    addErrorMessage("重新读取配置失败：${error?.cause?.message ?: error?.message ?: "未知错误"}")
+                    return@invokeLater
+                }
+                addSystemMessage("已重新读取配置。默认模型：${config.defaultProvider ?: "未配置"}。")
+                refreshSetupSnapshot(silent = true)
+            }
+        }
+    }
+
+    /// Skills the daemon exposes, refreshed when the connection becomes ready so the
+    /// `/` menu lists what is actually installed.
+    private fun refreshSkills() {
+        if (service.connectionState !is ConnectionState.Ready) return
+        service.listSkills().whenComplete { skills, error ->
+            if (error != null || skills == null) return@whenComplete
+            SwingUtilities.invokeLater {
+                if (!disposed) slashSkills = skills
+            }
         }
     }
 
@@ -1978,11 +2093,7 @@ class AtomCodeChatPanel(
 
     private fun showCommandMenu() {
         val menu = JPopupMenu()
-        val items = listOf(
-            SlashCommand("/login", "登录 AtomGit"),
-            SlashCommand("/review", "审查代码"),
-        )
-        items.forEach { command ->
+        SlashCommands.items(slashSkills).forEach { command ->
             menu.add(JMenuItem("${command.name} - ${command.description}").apply {
                 addActionListener { inputPanel.setInputText("${command.name} "); inputPanel.focusInput() }
             })
@@ -2018,7 +2129,6 @@ class AtomCodeChatPanel(
         com.atomcode.jetbrains.ui.extractLastCodeBlock(text)
 }
 
-private data class SlashCommand(val name: String, val description: String)
 private data class QueuedPrompt(
     val id: String,
     val prompt: String,

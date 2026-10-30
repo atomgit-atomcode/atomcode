@@ -6,11 +6,13 @@ import com.atomcode.jetbrains.daemon.AuthStatusResponse
 import com.atomcode.jetbrains.daemon.ChatEvent
 import com.atomcode.jetbrains.daemon.ChatRequest
 import com.atomcode.jetbrains.daemon.ChatStreamListener
+import com.atomcode.jetbrains.daemon.ConfigResponse
 import com.atomcode.jetbrains.daemon.ConnectionErrorKind
 import com.atomcode.jetbrains.daemon.ConnectionState
 import com.atomcode.jetbrains.daemon.CreateProviderRequest
 import com.atomcode.jetbrains.daemon.DaemonAuth
 import com.atomcode.jetbrains.daemon.DaemonTokenFile
+import com.atomcode.jetbrains.daemon.HealthResponse
 import com.atomcode.jetbrains.daemon.ImageInput
 import com.atomcode.jetbrains.daemon.MessageInfo
 import com.atomcode.jetbrains.daemon.ModelInfo
@@ -19,6 +21,7 @@ import com.atomcode.jetbrains.daemon.PatchThinkingRequest
 import com.atomcode.jetbrains.daemon.ProviderInfo
 import com.atomcode.jetbrains.daemon.SessionDetail
 import com.atomcode.jetbrains.daemon.SessionMeta
+import com.atomcode.jetbrains.daemon.SkillInfo
 import com.atomcode.jetbrains.daemon.SetupSnapshot
 import com.atomcode.jetbrains.files.FileChangeService
 import com.atomcode.jetbrains.settings.AtomCodeSettings
@@ -708,6 +711,28 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
     /// does not declare.
     fun setReasoningEffort(provider: String, effort: String?): CompletableFuture<Boolean> =
         getOrCreateClient().setReasoningEffort(provider, effort)
+
+    /// Skills the daemon exposes as slash commands, so the command menu lists what
+    /// is actually installed instead of a hardcoded pair.
+    fun listSkills(): CompletableFuture<List<SkillInfo>> =
+        getOrCreateClient().skills()
+
+    fun logout(): CompletableFuture<AuthStatusResponse> =
+        getOrCreateClient().logout()
+
+    fun reloadConfig(): CompletableFuture<ConfigResponse> =
+        getOrCreateClient().reloadConfig()
+
+    /// Live reads used by the `/whoami`, `/status` and `/config` commands: those
+    /// report what the daemon holds right now, not the last cached snapshot.
+    fun authStatusNow(): CompletableFuture<AuthStatusResponse> =
+        getOrCreateClient().authStatus()
+
+    fun healthNow(): CompletableFuture<HealthResponse> =
+        getOrCreateClient().health()
+
+    fun configInfo(): CompletableFuture<ConfigResponse> =
+        getOrCreateClient().config()
 
     /// Ask the daemon which mode it holds and adopt it — what the panel does when
     /// it opens, so a `[permissions] default_mode` edited in config.toml shows up

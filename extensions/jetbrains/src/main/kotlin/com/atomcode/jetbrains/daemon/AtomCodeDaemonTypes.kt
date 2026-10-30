@@ -33,6 +33,12 @@ data class AuthStatusResponse(
     val userName: String?,
 )
 
+/** A user-invocable skill the daemon exposes as a slash command (`/skills`). */
+data class SkillInfo(
+    val name: String,
+    val description: String = "",
+)
+
 data class LoginStartResponse(
     val loginId: String,
     val url: String,

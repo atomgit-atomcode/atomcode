@@ -65,15 +65,33 @@ class AtomCodeDaemonClient(
             )
         }
 
+    /// Skills the daemon exposes as slash commands, so the command menu lists what
+    /// is actually installed (`user_invocable` only — same set the VS Code client
+    /// shows).
+    fun skills(): CompletableFuture<List<SkillInfo>> =
+        send("GET", "/skills").thenApply { raw ->
+            raw.jsonObjects().mapNotNull {
+                val name = it.jsonString("name").orEmpty()
+                if (name.isBlank()) null else SkillInfo(name, it.jsonString("description").orEmpty())
+            }
+        }
+
     fun authStatus(): CompletableFuture<AuthStatusResponse> =
-        send("GET", "/auth/status").thenApply { raw ->
-            AuthStatusResponse(
-                loggedIn = raw.jsonBoolean("logged_in") ?: false,
-                expired = raw.jsonBoolean("expired") ?: false,
-                authPath = raw.jsonString("auth_path").orEmpty(),
-                userName = raw.jsonNestedObject("user")?.let {
-                    it.jsonString("name") ?: it.jsonString("username") ?: it.jsonString("email")
-                },
+        send("GET", "/auth/status").thenApply { it.toAuthStatus() }
+
+    /// `POST /auth/logout` answers with the auth status after logging out.
+    fun logout(): CompletableFuture<AuthStatusResponse> =
+        send("POST", "/auth/logout").thenApply { it.toAuthStatus() }
+
+    /// Re-read config.toml on the daemon side. The answer nests the same body
+    /// `GET /config` returns under `config`.
+    fun reloadConfig(): CompletableFuture<ConfigResponse> =
+        send("POST", "/config/reload").thenApply { raw ->
+            val config = raw.jsonNestedObject("config") ?: raw
+            ConfigResponse(
+                path = config.jsonString("path").orEmpty(),
+                defaultProvider = config.jsonString("default_provider"),
+                providerCount = config.jsonArrayObjects("providers").size,
             )
         }
 
@@ -451,6 +469,17 @@ internal fun String.jsonQuoted(): String = buildString(length + 2) {
     }
     append('"')
 }
+
+/// `GET /auth/status` and `POST /auth/logout` answer with the same body shape.
+private fun String.toAuthStatus(): AuthStatusResponse =
+    AuthStatusResponse(
+        loggedIn = jsonBoolean("logged_in") ?: false,
+        expired = jsonBoolean("expired") ?: false,
+        authPath = jsonString("auth_path").orEmpty(),
+        userName = jsonNestedObject("user")?.let {
+            it.jsonString("name") ?: it.jsonString("username") ?: it.jsonString("email")
+        },
+    )
 
 internal fun formatDaemonHttpError(statusCode: Int, body: String): String {
     val prefix = "Daemon request failed: HTTP $statusCode"
