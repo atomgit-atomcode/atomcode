@@ -4356,6 +4356,10 @@ function AssistantMessageView({
                 title={artifact.path}
                 onClick={() => {
                   setArtifactError('');
+                  if (sessionId) {
+                    window.dispatchEvent(new CustomEvent('workbench-open-file', { detail: { session: sessionId, path: artifact.path } }));
+                    return;
+                  }
                   void openWorkspaceFile(artifact.path, sessionId ?? undefined).catch((error) => {
                     setArtifactError(t('chat.artifactOpenFailed', { msg: String(error) }));
                   });

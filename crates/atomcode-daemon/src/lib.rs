@@ -42,6 +42,7 @@ mod login_state_tests;
 pub mod native_live;
 mod runtime_host;
 mod transcript_view;
+mod workbench;
 /// File-sink diagnostic trace (`ctrace!` macro), enabled via `ATOMCODE_TUIX_LOG`.
 /// Daemon owns this sink; the historical environment name is retained for
 /// existing diagnostic scripts.
@@ -685,6 +686,7 @@ impl Drop for SseConnectionGuard {
 #[derive(Clone)]
 pub struct AppState {
     pub project: ProjectStateStore,
+    pub(crate) terminals: workbench::Terminals,
     /// Admitted background chat operations and their session/request aliases.
     active_chats: ActiveChatRegistry,
     /// In-flight OAuth login sessions (login_id -> entry)
@@ -7345,8 +7347,11 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     let project_store = Arc::new(RwLock::new(project_state));
     *DAEMON_PROJECT.lock().unwrap() = Some(project_store.clone());
 
+    let terminals = workbench::Terminals::default();
+    terminals.maintain(shutdown_tx.subscribe());
     let state = AppState {
         project: project_store,
+        terminals,
         active_chats: ActiveChatRegistry::default(),
         login_sessions: Arc::new(RwLock::new(HashMap::new())),
         login_start_lock: Arc::new(Mutex::new(())),
@@ -7469,6 +7474,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/fs/search", get(fs_search))
         .route("/fs/mkdir", post(fs_mkdir))
         .route("/fs/open", post(fs_open))
+        .merge(workbench::routes())
         // MCP API
         .route("/mcp/status", get(mcp_status))
         .route("/mcp/reload", post(mcp_reload))
@@ -8456,6 +8462,7 @@ mod tests {
                 recent_dirs: Vec::new(),
                 name: "chat-test".into(),
             })),
+            terminals: workbench::Terminals::default(),
             active_chats: ActiveChatRegistry::default(),
             login_sessions: Arc::new(RwLock::new(HashMap::new())),
             login_start_lock: Arc::new(Mutex::new(())),

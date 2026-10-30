@@ -3,6 +3,7 @@
 
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { Chat } from './components/Chat';
+import { Workbench, hasUnsavedWorkbenchDrafts, persistWorkbenchState } from './components/Workbench';
 import { Sidebar } from './components/Sidebar';
 import { Automation } from './components/Automation';
 import { ThemeDialog, LanguageDialog, RemoteAccessDialog, NotificationsDialog } from './components/SettingsDialogs';
@@ -30,10 +31,27 @@ function shortSessionId(id: string): string {
 }
 
 export function App() {
+  const [workbenchOpen, setWorkbenchOpen] = useState(false);
+  useEffect(()=>{
+    const warn=(event:BeforeUnloadEvent)=>{persistWorkbenchState();if(hasUnsavedWorkbenchDrafts()){event.preventDefault();event.returnValue='';}};
+    window.addEventListener('beforeunload',warn);
+    return()=>window.removeEventListener('beforeunload',warn);
+  },[]);
   const t = useT();
   const { lang } = useSettings();
   // URL 里是短 id，不能直接当完整 id 用（后端需要完整 id）；先置空，挂载后再还原。
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [workbenchFile, setWorkbenchFile] = useState<{session:string;path:string;seq:number}|null>(null);
+  useEffect(() => {
+    const open = (event: Event) => {
+      const detail = (event as CustomEvent<{session:string;path:string}>).detail;
+      if (detail?.session !== sessionId || typeof detail.path !== 'string') return;
+      setWorkbenchFile({ ...detail, seq: Date.now() });
+      setWorkbenchOpen(true);
+    };
+    window.addEventListener('workbench-open-file', open);
+    return () => window.removeEventListener('workbench-open-file', open);
+  }, [sessionId]);
   const [activeSession, setActiveSession] = useState<SessionMetaWithProject | null>(null);
   // 首条消息发出瞬间插入的「乐观会话」：让新会话即时出现在侧栏（后端空会话不入列表，
   // 真实标题也要等回合落盘后自动命名）。其 id 与真实会话对齐后，列表刷新会用真实条目
@@ -414,6 +432,7 @@ export function App() {
 
       {/* ===== Main column: sticky session-title header + chat (no top bar) ===== */}
       <div class="main-column">
+        {(!workbenchOpen || !sessionId) && <button class="workbench-toggle" disabled={restoring} onClick={() => { if (!sessionId) openNewSession(cwd || undefined); setWorkbenchOpen(true); }} aria-expanded={workbenchOpen && !!sessionId}>{lang === 'zh' ? '工作区' : 'Workspace'}</button>}
         {/* Mobile-only floating menu button (the old top bar carried the ☰; the
             redesign has no top bar, so a fixed button gives mobile drawer access). */}
         <button
@@ -515,6 +534,7 @@ export function App() {
             composerInsert={composerInsert}
             onSessionRenamed={(name) => setActiveSession((prev) => prev ? { ...prev, name } : prev)}
           />
+          {workbenchOpen && sessionId && <Workbench key={sessionId} session={sessionId} cwd={activeSession?.working_dir || cwd} requestedFile={workbenchFile} onFileOpened={() => setWorkbenchFile(null)} onClose={() => setWorkbenchOpen(false)} />}
         </div>
       </div>
 

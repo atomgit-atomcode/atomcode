@@ -58,7 +58,11 @@ mime_guess = "2"
 # Async trait support
 async-trait = "0.1"
 
+# Interactive browser terminals (portable Unix PTY / Windows ConPTY).
+portable-pty = "0.9"
+
 # Utils
+tempfile = "3"
 anyhow = "1"
 uuid = { version = "1", features = ["v4"] }
 tokio-util = "0.7"
@@ -79,7 +83,9 @@ atomcode-kernel = { path = "../atomcode-kernel", features = ["test-support"] }
 atomcode-config = { path = "../atomcode-config", features = ["test-util"] }
 serial_test = "3"
 ctor = "0.2"
-tempfile = "3"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

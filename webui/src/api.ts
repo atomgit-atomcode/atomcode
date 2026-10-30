@@ -1475,3 +1475,19 @@ export function postUserInputAnswer(
   }
   return postLiveUserInput(body);
 }
+
+// User-driven workspace pane. These calls never invoke an agent.
+export async function workbenchRequest<T>(path: string, body?: unknown, method?: string): Promise<T> {
+  const response = await apiFetch('/workbench/' + path, {
+    method: method || (body === undefined ? 'GET' : 'POST'),
+    headers: { ...authHeaders(), ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+  if (response.status === 204) return undefined as T;
+  return readJson<T>(response);
+}
+export async function workbenchPreview(session: string, path: string): Promise<Blob> {
+  const response = await apiFetch('/workbench/preview?' + new URLSearchParams({ session_id: session, path }), { headers: authHeaders() });
+  if (!response.ok) throw await failure(response);
+  return response.blob();
+}

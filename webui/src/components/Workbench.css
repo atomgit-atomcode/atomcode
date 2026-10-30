@@ -1,0 +1,359 @@
+.workbench-toggle {
+  position: absolute;
+  right: 18px;
+  top: 12px;
+  z-index: 20;
+  border: 1px solid var(--app-border-subtle, rgba(128, 128, 128, 0.2));
+  border-radius: 7px;
+  padding: 6px 10px;
+  background: var(--app-primary-background, #151517);
+  color: inherit;
+  font-size: 12px;
+}
+.workbench {
+  position: relative;
+  width: 420px;
+  min-width: 300px;
+  max-width: 48vw;
+  flex-shrink: 0;
+  border-left: 1px solid var(--app-border-subtle, rgba(128, 128, 128, 0.2));
+  background: var(--app-primary-background, #151517);
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+  color: var(--app-primary-foreground, #eee);
+}
+.workbench header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 16px;
+  border-bottom: 1px solid var(--app-border-subtle, rgba(128, 128, 128, 0.2));
+}
+.workbench header div {
+  min-width: 0;
+}
+.workbench header small {
+  display: block;
+  font: 11px monospace;
+  opacity: 0.6;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-top: 5px;
+  max-width: 340px;
+}
+.workbench button {
+  cursor: pointer;
+  background: transparent;
+  color: inherit;
+  border: 0;
+  padding: 7px 10px;
+  text-align: left;
+}
+.workbench button:focus-visible {
+  outline: 2px solid #7c6be8;
+  outline-offset: -2px;
+}
+.workbench button:hover {
+  background: rgba(128, 128, 128, 0.1);
+}
+.workbench button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.workbench nav {
+  display: flex;
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--app-border-subtle, rgba(128, 128, 128, 0.2));
+  font-size: 13px;
+}
+.workbench nav span {
+  flex: 1;
+}
+.workbench .active {
+  background: color-mix(in srgb, var(--app-brand, #d97757) 10%, transparent);
+  color: var(--app-brand, #d97757);
+}
+.workbench-path {
+  display: flex;
+  align-items: center;
+  font-size: 12px;
+  padding: 3px 8px;
+  overflow: hidden;
+}
+.workbench-path code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.workbench-tree {
+  height: 210px;
+  min-height: 80px;
+  overflow: auto;
+  resize: vertical;
+  border-bottom: 1px solid var(--app-border-subtle, rgba(128, 128, 128, 0.2));
+  padding: 5px;
+}
+.workbench-tree button {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  font-size: 12px;
+  padding: 5px 10px;
+}
+.workbench-folder {
+  opacity: 0.4;
+}
+.workbench-tabs {
+  display: flex;
+  overflow: auto;
+  flex-shrink: 0;
+  min-height: 30px;
+  border-bottom: 1px solid var(--app-border-subtle, rgba(128, 128, 128, 0.2));
+  font-size: 11px;
+}
+.workbench-tabs > div {
+  display: flex;
+  border-right: 1px solid var(--app-border-subtle, rgba(128, 128, 128, 0.2));
+  white-space: nowrap;
+}
+.workbench-tabs button {
+  padding: 6px;
+}
+.workbench-preview {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px;
+  background: rgba(128, 128, 128, 0.025);
+}
+.workbench-preview pre {
+  font:
+    12px/1.65 ui-monospace,
+    monospace;
+  white-space: pre;
+  margin: 0;
+  tab-size: 2;
+}
+.workbench-preview img {
+  max-width: 100%;
+  height: auto;
+}
+.workbench-empty {
+  margin: auto;
+  padding: 30px;
+  text-align: center;
+  font-size: 13px;
+}
+.workbench-empty p {
+  opacity: 0.6;
+  line-height: 1.7;
+  margin-top: 10px;
+}
+.workbench-error {
+  color: #c44;
+  background: rgba(200, 60, 60, 0.06);
+  padding: 10px;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.workbench-terminal-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  padding: 8px;
+  font-size: 12px;
+  gap: 4px;
+}
+.workbench-terminal-actions small {
+  opacity: 0.55;
+  padding-left: 10px;
+}
+.workbench-terminal {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+  background: #16181d;
+  padding: 7px;
+}
+.workbench-terminal-host {
+  flex: 1;
+  min-height: 0;
+}
+.main-column {
+  position: relative;
+}
+.session-body:has(.workbench) {
+  display: flex;
+  flex-direction: row;
+  min-height: 0;
+}
+.session-body:has(.workbench) > :first-child {
+  flex: 1;
+  min-width: 0;
+}
+@media (max-width: 850px) {
+  .workbench {
+    position: fixed;
+    inset: 0 0 0 auto;
+    width: min(100%, 480px);
+    max-width: 100%;
+    z-index: 70;
+    box-shadow: -10px 0 40px #0002;
+  }
+  .workbench-toggle {
+    right: 60px;
+    top: 9px;
+  }
+}
+.workbench {
+  max-width: 60vw;
+}
+.workbench-resizer {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 5px;
+  cursor: col-resize;
+  z-index: 4;
+  touch-action: none;
+}
+.workbench-resizer:hover,
+.workbench-resizer:focus-visible {
+  background: var(--app-accent-color, #d97757);
+  outline: none;
+}
+.workbench-file-mode,
+.workbench-editor-actions,
+.workbench-diff-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--app-border-subtle, #ddd);
+  padding: 5px 8px;
+  font-size: 0.75rem;
+}
+.workbench-file-mode code {
+  margin-left: auto;
+  max-width: 55%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  opacity: 0.6;
+}
+.workbench-editor {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+.workbench-editor-actions > span {
+  flex: 1;
+  opacity: 0.65;
+}
+.workbench-editor .workbench-save {
+  background: var(--app-brand, #d97757);
+  color: var(--app-brand-ivory, #fff);
+  border-radius: 5px;
+}
+.workbench-editor textarea {
+  flex: 1;
+  min-height: 160px;
+  width: 100%;
+  border: 0;
+  outline: none;
+  resize: none;
+  padding: 14px;
+  background: var(--app-primary-background);
+  color: var(--app-primary-foreground);
+  font:
+    12px/1.65 ui-monospace,
+    monospace;
+  white-space: pre;
+  tab-size: 2;
+  overflow: auto;
+}
+.workbench-git {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+.workbench-git-caption {
+  padding: 12px;
+  font-size: 0.7rem;
+  opacity: 0.6;
+}
+.workbench-changes {
+  max-height: 230px;
+  overflow: auto;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--app-border-subtle, #ddd);
+}
+.workbench-changes button {
+  display: flex;
+  gap: 10px;
+  width: 100%;
+  font-size: 0.75rem;
+}
+.workbench-changes code {
+  min-width: 20px;
+  white-space: pre;
+  color: var(--app-accent-color, #d97757);
+}
+.workbench-changes span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.workbench-diff-actions > span {
+  flex: 1;
+}
+.workbench-diff {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px;
+  font:
+    12px/1.7 ui-monospace,
+    monospace;
+  white-space: pre;
+}
+.workbench-diff > span {
+  display: block;
+  min-height: 1.7em;
+}
+.workbench-diff .diff-added {
+  background: rgba(40, 140, 80, 0.09);
+  color: var(--workbench-diff-addition, #298650);
+}
+.workbench-diff .diff-removed {
+  background: rgba(190, 60, 70, 0.09);
+  color: var(--app-diff-deletion-foreground, #bd4a51);
+}
+.workbench-diff .diff-hunk {
+  color: var(--app-accent-color, #d97757);
+}
+@media (max-width: 850px) {
+  .workbench {
+    max-width: 100%;
+  }
+  .workbench-resizer {
+    display: none;
+  }
+}
+
+html[data-theme="dark"] .workbench {
+  --workbench-diff-addition: #74c991;
+}
+@media (prefers-color-scheme: dark) {
+  html:not([data-theme="light"]) .workbench {
+    --workbench-diff-addition: #74c991;
+  }
+}
