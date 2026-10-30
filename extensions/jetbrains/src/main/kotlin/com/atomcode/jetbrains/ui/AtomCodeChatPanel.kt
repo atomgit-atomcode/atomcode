@@ -534,7 +534,13 @@ class AtomCodeChatPanel(
             selectedModel?.reasoningEffort,
         )
         inputPanel.setEffortEnabled(!generating)
-        if (currentSession == null && !generating) {
+        // 欢迎页渲染会清空消息区；错误还挂着就先不换，否则刚显示的错误会一闪而过。
+        if (WelcomePagePolicy.shouldRenderAutomatically(
+                hasSession = currentSession != null,
+                generating = generating,
+                lastError = streamHandler.lastError,
+            )
+        ) {
             showWelcomePage()
         }
     }

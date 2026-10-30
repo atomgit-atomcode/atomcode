@@ -1,6 +1,7 @@
 package com.atomcode.jetbrains.ui
 
 import com.atomcode.jetbrains.daemon.ChatEvent
+import com.atomcode.jetbrains.i18n.RuntimeErrorMessages
 import com.atomcode.jetbrains.ui.message.JBCefMessageView
 import com.google.gson.JsonParser
 
@@ -28,6 +29,16 @@ class StreamEventHandler(
 
     /** AI 文本输出累积 */
     var assistantText: String = ""
+        private set
+
+    /**
+     * 最近一次展示给用户的错误；在下一次提问（[reset]）时清空。
+     *
+     * 欢迎页渲染会 `clearMessages()` 整块清屏，自动刷新（会话还没建起来时每轮
+     * 都可能触发）会把刚显示的错误一起抹掉——界面上就是"一闪而过"。面板据此
+     * 在错误仍待处理时不重渲染欢迎页。
+     */
+    var lastError: String? = null
         private set
 
     /** 当前工具事件之间的文本段；用于保持“文本 → 工具 → 文本”的展示顺序。 */
@@ -149,7 +160,11 @@ class StreamEventHandler(
     fun onError(message: String) {
         flushAssistantSegment()
         messageView.finishAssistantTurn()
-        messageView.addError(message)
+        // A session held by another runtime is the one error a person can fix by
+        // acting elsewhere; everything else keeps the runtime's own wording.
+        val friendly = RuntimeErrorMessages.friendly(message)
+        lastError = friendly
+        messageView.addError(friendly)
         addTurnSummary("Error", tokens = 0, toolCalls = 0, failed = true)
         hasOutput = true
     }
@@ -183,6 +198,7 @@ class StreamEventHandler(
     /** 重置状态，准备新一轮对话 */
     fun reset() {
         hasOutput = false
+        lastError = null
         assistantText = ""
         assistantSegmentText = ""
         activeArtifactId = null
