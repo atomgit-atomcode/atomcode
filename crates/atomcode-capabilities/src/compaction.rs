@@ -18,6 +18,7 @@
 //! prefix repeatedly. Below the trigger threshold nothing is stubbed at all → short
 //! sessions stay full-fidelity and purely append-only (perfect cache).
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -656,31 +657,31 @@ const SUMMARY_TOOL_OUTPUT_TAIL_CHARS: usize = 500;
 /// summary can name the action without re-reading a whole file.
 const SUMMARY_TOOL_CALL_MAX_CHARS: usize = 600;
 const SUMMARY_TOOL_CALL_TAIL_CHARS: usize = 200;
-/// Whole-input ceiling for the summary transcript. A long session can still hand
-/// the summarizer an arbitrarily large span; the head keeps the early decisions,
-/// the tail keeps what led into the retained turns.
+/// Whole-input ceiling for the summary transcript. Dialogue reaches the
+/// summarizer whole and is cut only here, once, so the marker reports what was
+/// actually dropped; tool results and tool-call arguments keep their own
+/// smaller caps (tier1 already allows truncating those).
 const SUMMARY_TRANSCRIPT_MAX_CHARS: usize = 120_000;
 const SUMMARY_TRANSCRIPT_TAIL_CHARS: usize = 40_000;
-/// Cap for one non-tool message. Dialogue must reach the summarizer intact (the
-/// tier1 rule in `truncate_rewrites`), so a message is only cut when it alone
-/// would spend the whole transcript budget; that ceiling is the real boundary.
-const SUMMARY_MESSAGE_MAX_CHARS: usize = SUMMARY_TRANSCRIPT_MAX_CHARS;
-const SUMMARY_MESSAGE_TAIL_CHARS: usize = SUMMARY_TRANSCRIPT_TAIL_CHARS;
 
-/// Bound a text body for the summary input: full text when it fits, otherwise a
-/// head + tail around a `[truncated N chars]` marker. Idempotent marker text is
-/// not needed here (the summary input is built afresh for every call).
+/// Bound a text body for the summary input: the full body when it fits,
+/// otherwise a head + tail around a `[truncated N chars]` marker. The common
+/// case borrows the caller's text: a byte length at or under the cap proves the
+/// char count is too, so neither the count nor a copy is needed.
 ///
 /// `tail_chars` must not exceed `max_chars` (checked in debug builds): the head
 /// shrinks to nothing and the tail alone would then spend more than the cap.
-fn bounded_body(text: &str, max_chars: usize, tail_chars: usize) -> String {
+fn bounded_body<'a>(text: &'a str, max_chars: usize, tail_chars: usize) -> Cow<'a, str> {
     debug_assert!(
         tail_chars <= max_chars,
         "a tail wider than the cap would overflow the budget"
     );
+    if text.len() <= max_chars {
+        return Cow::Borrowed(text);
+    }
     let total = text.chars().count();
     if total <= max_chars {
-        return text.to_string();
+        return Cow::Borrowed(text);
     }
     let head_chars = max_chars.saturating_sub(tail_chars);
     let head: String = text.chars().take(head_chars).collect();
@@ -689,10 +690,10 @@ fn bounded_body(text: &str, max_chars: usize, tail_chars: usize) -> String {
         .skip(total.saturating_sub(tail_chars))
         .collect();
     let cut = total - max_chars;
-    format!("{head}\n[truncated {cut} chars]\n{tail}")
+    Cow::Owned(format!("{head}\n[truncated {cut} chars]\n{tail}"))
 }
 
-fn render_tool_body(text: &str) -> String {
+fn render_tool_body(text: &str) -> Cow<'_, str> {
     bounded_body(
         text,
         SUMMARY_TOOL_OUTPUT_MAX_CHARS,
@@ -720,11 +721,10 @@ fn render_transcript(span: &[Message]) -> String {
             }
             s.push_str(&render_tool_body(&m.text));
         } else {
-            s.push_str(&bounded_body(
-                &m.text,
-                SUMMARY_MESSAGE_MAX_CHARS,
-                SUMMARY_MESSAGE_TAIL_CHARS,
-            ));
+            // Dialogue reaches the summarizer whole: the whole-input ceiling is
+            // the only bound, so a long message is cut once and its marker
+            // reports what was actually dropped.
+            s.push_str(&m.text);
         }
         // The call names and their (bounded) arguments say what the assistant ran
         // or wrote; the result alone often says only "ok".
@@ -749,7 +749,7 @@ fn render_transcript(span: &[Message]) -> String {
         s.push('\n');
     }
     // A byte length at or under the cap proves the char count is too, so the
-    // common case skips the full scan and copy `bounded_body` would make.
+    // common case returns the built string untouched.
     if s.len() <= SUMMARY_TRANSCRIPT_MAX_CHARS {
         return s;
     }
@@ -758,6 +758,7 @@ fn render_transcript(span: &[Message]) -> String {
         SUMMARY_TRANSCRIPT_MAX_CHARS,
         SUMMARY_TRANSCRIPT_TAIL_CHARS,
     )
+    .into_owned()
 }
 
 /// Sentinel first line stamped on every anchored compaction summary. Used to find the
@@ -2812,8 +2813,7 @@ mod tests {
     #[test]
     fn render_transcript_keeps_dialogue_intact_under_the_budget() {
         // A pasted spec larger than a tool result must still reach the summarizer
-        // whole: the whole-input ceiling, not a smaller per-message cap, decides
-        // when dialogue is cut.
+        // whole: only the whole-input ceiling may cut dialogue.
         let text = "u".repeat(20_000);
         let out = render_transcript(&[Message::user(text.clone())]);
         assert!(out.contains(&text), "the message must not be cut");
@@ -2822,10 +2822,14 @@ mod tests {
 
     #[test]
     fn render_transcript_bounds_a_message_that_alone_exceeds_the_budget() {
-        let big = "u".repeat(SUMMARY_MESSAGE_MAX_CHARS + 1_000);
+        let big = "u".repeat(SUMMARY_TRANSCRIPT_MAX_CHARS + 1_000);
         let out = render_transcript(&[Message::user(big.clone())]);
         assert!(!out.contains(&big), "the full user message must not appear");
-        assert!(out.contains("[truncated "), "the message is bounded");
+        assert_eq!(
+            out.matches("[truncated ").count(),
+            1,
+            "one message is cut once, so the marker reports the whole drop"
+        );
     }
 
     #[test]
@@ -2849,9 +2853,14 @@ mod tests {
 
     #[test]
     fn render_transcript_caps_the_whole_input() {
-        let span: Vec<Message> = (0..20)
+        let mut span: Vec<Message> = (0..20)
             .map(|i| Message::user(format!("{i}{}", "z".repeat(20_000))))
             .collect();
+        // Distinct ends: the cut keeps a head and a tail, so both must survive.
+        // A head-only cut, or head and tail swapped, would drop the other mark.
+        span[0] = Message::user(format!("HEADMARK{}", "z".repeat(20_000)));
+        let last = span.len() - 1;
+        span[last] = Message::user(format!("{}TAILMARK", "z".repeat(20_000)));
         let out = render_transcript(&span);
         assert!(
             out.chars().count() < SUMMARY_TRANSCRIPT_MAX_CHARS + 200,
@@ -2859,6 +2868,8 @@ mod tests {
             out.chars().count()
         );
         assert!(out.contains("[truncated "), "the cap leaves a marker");
+        assert!(out.contains("HEADMARK"), "the head is kept");
+        assert!(out.contains("TAILMARK"), "the tail is kept");
     }
 
     #[test]
