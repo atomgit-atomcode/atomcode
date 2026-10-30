@@ -51,7 +51,7 @@ JSON 的对象键和字符串值均支持以下变量，数值和布尔值保持
 | `${HOME}` | 用户 home 目录 |
 | `${env:VAR}` | 已定义的环境变量 VAR；未定义时报错 |
 
-不能把本机路径直接当作 file URI。未知变量、替换后的重复对象键、坏 JSON 和不可读文件均报错，不静默发送空对象。每个 JSON 文件最大 1 MiB。配置文件路径本身支持 `~`，不展开上述 JSON 模板。
+不能把本机路径直接当作 file URI。未知变量、替换后的重复对象键、坏 JSON 和不可读文件均报错，不静默发送空对象。每个 JSON 文件最大 1 MiB。`init_options_file` 和 `settings_file` 的路径也支持以上变量；模板先展开，再按本机路径或 `file://` URI 解析。相对路径仍以用户配置目录为基准，`~` 仍可使用。非文件协议 URI、URI 查询参数和 fragment 会被拒绝，不进行网络读取。
 
 ## 工作区设置
 
@@ -173,3 +173,37 @@ retry_interval_ms = 5000
   重试复用同一客户端和已打开文档，不重复启动进程或 didOpen。
 - 次数用尽返回最后一次空结果；空结果不代表服务端不支持该能力。
   diagnostics 保持原有 settle-delay 行为，IDE bridge 不使用这些重试设置。
+
+
+## 多项目初始化文件
+
+全局配置可显式指向每个项目自己的 JSON，无需切换项目时改模块名：
+
+```toml
+[lsp.servers.cj]
+command = "C:/CangJie_HOME/cangjie/tools/bin/LSPServer.exe"
+root_markers = ["cjpm.toml"]
+init_options_mode = "on"
+init_options_file = "${workspaceFolder}/.atomcode/lsp_init.json"
+# 可选：settings_file = "${workspaceFolder}/.atomcode/lsp_settings.json"
+```
+
+项目中的 `.atomcode/lsp_init.json` 使用自己的包名：
+
+```json
+{
+  "multiModuleOption": {
+    "${workspaceUri}": {
+      "name": "该项目 cjpm.toml 中的 package.name",
+      "src_path": "${workspaceUri}/src"
+    }
+  }
+}
+```
+
+优先使用 `${workspaceFolder}` 表达文件路径；也支持
+`init_options_file = "${workspaceUri}/.atomcode/lsp_init.json"`，file URI 会解码为本机路径。
+变量里的项目根由 `root_markers` 决定，不一定是启动目录。
+文件内容修改后运行 LSP `reload`，下一次查询会重读；服务命令或声明本身改变仍需重载 runtime。
+这是全局配置显式授权读取项目 JSON，不会自动加载或合并项目 `.atomcode/config.toml`。
+仓库中的初始化选项会交给本地语言服务器处理，使用前应审查其内容。

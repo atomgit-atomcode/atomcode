@@ -37,18 +37,68 @@ pub async fn read_json(path: &Path) -> Result<Value, String> {
     })
 }
 
-fn file_path(path: &Path, policy: &LspSettings) -> Result<PathBuf, String> {
-    if let Some(path) = crate::pathutil::expand_tilde(&path.to_string_lossy()) {
+fn file_path(
+    path: &Path,
+    policy: &LspSettings,
+    root: &Path,
+    file: &Path,
+    redactions: &mut Vec<String>,
+) -> Result<PathBuf, String> {
+    let previous = redactions.len();
+    let text = expand(&path.to_string_lossy(), root, file, redactions)?;
+    let path = resolve_file_path(&text, policy)?;
+    if redactions.len() > previous {
+        // URI decoding and Windows separators can change an environment value's
+        // spelling. Redact the resolved filename as well as the original value.
+        redactions.push(path.to_string_lossy().into_owned());
+    }
+    Ok(path)
+}
+
+fn resolve_file_path(text: &str, policy: &LspSettings) -> Result<PathBuf, String> {
+    if text.starts_with("file:") {
+        let url = url::Url::parse(text).map_err(|_| "invalid LSP configuration file URI")?;
+        if url.query().is_some() || url.fragment().is_some() {
+            return Err("LSP configuration file URI must not contain a query or fragment".into());
+        }
+        return url
+            .to_file_path()
+            .map_err(|_| "LSP configuration URI is not a local file path".into());
+    }
+    if text.contains("://") {
+        return Err("LSP configuration files require local paths or file URIs".into());
+    }
+    if let Some(path) = crate::pathutil::expand_tilde(text) {
         return Ok(path);
     }
+    let path = PathBuf::from(text);
     if path.is_absolute() {
-        return Ok(path.to_path_buf());
+        return Ok(path);
     }
     policy
         .config_dir
         .as_ref()
         .map(|base| base.join(path))
         .ok_or_else(|| "relative LSP configuration path requires a host config directory".into())
+}
+
+fn redact_path_message(mut message: String, redactions: &[String]) -> String {
+    // Sort here too: preparation may fail before its final redaction sorting.
+    let mut secrets: Vec<_> = redactions
+        .iter()
+        .filter(|value| !value.is_empty())
+        .collect();
+    secrets.sort_unstable_by_key(|value| std::cmp::Reverse(value.len()));
+    for secret in secrets {
+        message = message.replace(secret, "[redacted]");
+    }
+    message
+}
+
+async fn read_option_json(path: &Path, redactions: &[String]) -> Result<Value, String> {
+    read_json(path)
+        .await
+        .map_err(|message| redact_path_message(message, redactions))
 }
 
 fn uri(path: &Path) -> Result<String, String> {
@@ -171,7 +221,7 @@ pub async fn prepare(
             prepared.source = "inline".into();
             Some(inline.clone())
         } else if let Some(path) = &options.init_options_file {
-            let path = file_path(path, policy)?;
+            let path = file_path(path, policy, root, file, &mut prepared.redactions)?;
             match tokio::fs::metadata(&path).await {
                 Err(e)
                     if e.kind() == std::io::ErrorKind::NotFound
@@ -181,8 +231,11 @@ pub async fn prepare(
                     None
                 }
                 _ => {
-                    prepared.source = format!("file: {}", path.display());
-                    Some(read_json(&path).await?)
+                    prepared.source = redact_path_message(
+                        format!("file: {}", path.display()),
+                        &prepared.redactions,
+                    );
+                    Some(read_option_json(&path, &prepared.redactions).await?)
                 }
             }
         } else {
@@ -203,7 +256,8 @@ pub async fn prepare(
         return Err("use settings or settings_file, not both".into());
     }
     let settings = if let Some(path) = &options.settings_file {
-        read_json(&file_path(path, policy)?).await?
+        let path = file_path(path, policy, root, file, &mut prepared.redactions)?;
+        read_option_json(&path, &prepared.redactions).await?
     } else {
         options.settings.clone().unwrap_or_else(|| json!({}))
     };
@@ -225,6 +279,214 @@ pub async fn prepare(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn file_templates_preserve_relative_paths_and_decode_uri_escapes() {
+        let root = std::env::temp_dir().join("LSP 项目 #1");
+        let file = root.join("src/main.cj");
+        let policy = LspSettings {
+            config_dir: Some(root.join("user")),
+            ..Default::default()
+        };
+        for (template, expected) in [
+            ("init.json", root.join("user/init.json")),
+            ("${workspaceFolder}/init.json", root.join("init.json")),
+            ("${workspaceUri}/init.json", root.join("init.json")),
+            ("${fileDir}/settings.json", root.join("src/settings.json")),
+            (
+                "${fileDirUri}/settings.json",
+                root.join("src/settings.json"),
+            ),
+        ] {
+            assert_eq!(
+                file_path(Path::new(template), &policy, &root, &file, &mut vec![]).unwrap(),
+                expected
+            );
+        }
+        assert_eq!(
+            file_path(
+                &root.join("literal.json"),
+                &policy,
+                &root,
+                &file,
+                &mut vec![]
+            )
+            .unwrap(),
+            root.join("literal.json")
+        );
+        let home = crate::pathutil::expand_tilde("~/").unwrap();
+        assert_eq!(
+            file_path(Path::new("~/init.json"), &policy, &root, &file, &mut vec![]).unwrap(),
+            home.join("init.json")
+        );
+        assert_eq!(
+            file_path(
+                Path::new("${HOME}/init.json"),
+                &policy,
+                &root,
+                &file,
+                &mut vec![]
+            )
+            .unwrap(),
+            home.join("init.json")
+        );
+        for bad in [
+            "${unknown}/x",
+            "${workspaceUri}/x?query=1",
+            "${workspaceUri}/x#fragment",
+            "https://example.com/init.json",
+            "${unterminated",
+        ] {
+            assert!(
+                file_path(Path::new(bad), &policy, &root, &file, &mut vec![]).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(file_path(
+            Path::new("init.json"),
+            &Default::default(),
+            &root,
+            &file,
+            &mut vec![]
+        )
+        .is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_uri_paths_are_decoded_to_drive_paths() {
+        let root = Path::new(r"C:\项目 空格");
+        let file = root.join("main.cj");
+        assert_eq!(
+            file_path(
+                Path::new("${workspaceUri}/init.json"),
+                &Default::default(),
+                root,
+                &file,
+                &mut vec![]
+            )
+            .unwrap(),
+            root.join("init.json")
+        );
+    }
+
+    #[tokio::test]
+    async fn two_projects_read_their_own_options_and_reread_changed_files() {
+        let base = tempfile::tempdir().unwrap();
+        let mut config = LspServerConfig {
+            command: "unused".into(),
+            args: vec![],
+            root_markers: vec![],
+            options: Default::default(),
+        };
+        config.options.init_options_mode = LspMode::On;
+        config.options.init_options_file = Some("${workspaceUri}/init.json".into());
+        config.options.settings_file = Some("${fileDir}/settings.json".into());
+        for name in ["项目 A", "项目 B"] {
+            let root = base.path().join(name);
+            tokio::fs::create_dir_all(root.join("src")).await.unwrap();
+            tokio::fs::write(root.join("init.json"), serde_json::to_vec(&json!({"multiModuleOption":{"${workspaceUri}":{"name":name,"src_path":"${workspaceUri}/src"}}})).unwrap()).await.unwrap();
+            tokio::fs::write(
+                root.join("src/settings.json"),
+                r#"{"enabled":true,"limit":3}"#,
+            )
+            .await
+            .unwrap();
+            let query_file = root.join("src/main.cj");
+            let prepared = prepare(&config, &Default::default(), &root, &query_file)
+                .await
+                .unwrap();
+            assert_eq!(
+                prepared.initialization.as_ref().unwrap()["multiModuleOption"][uri(&root).unwrap()]
+                    ["name"],
+                name
+            );
+            assert_eq!(prepared.settings, json!({"enabled":true,"limit":3}));
+            tokio::fs::write(root.join("init.json"), r#"{"updated":true}"#)
+                .await
+                .unwrap();
+            let updated = prepare(&config, &Default::default(), &root, &query_file)
+                .await
+                .unwrap();
+            assert_eq!(updated.initialization, Some(json!({"updated":true})));
+        }
+    }
+
+    #[tokio::test]
+    async fn templated_missing_files_keep_auto_on_and_settings_failure_semantics() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = LspServerConfig {
+            command: "unused".into(),
+            args: vec![],
+            root_markers: vec![],
+            options: Default::default(),
+        };
+        config.options.init_options_file = Some("${workspaceFolder}/missing.json".into());
+        let file = root.path().join("main.cj");
+        assert!(prepare(&config, &Default::default(), root.path(), &file)
+            .await
+            .unwrap()
+            .initialization
+            .is_none());
+        config.options.init_options_mode = LspMode::On;
+        assert!(prepare(&config, &Default::default(), root.path(), &file)
+            .await
+            .is_err());
+        config.options.init_options_mode = LspMode::Off;
+        config.options.init_options_file = Some("${invalid}".into());
+        assert!(prepare(&config, &Default::default(), root.path(), &file)
+            .await
+            .is_ok());
+        config.options.settings_file = Some("${workspaceUri}/missing.json".into());
+        assert!(prepare(&config, &Default::default(), root.path(), &file)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn path_errors_redact_environment_values_before_preparation_succeeds() {
+        // A dedicated test-process environment key avoids touching real credentials.
+        const KEY: &str = "ATOMCODE_LSP_PATH_TEMPLATE_TEST_SECRET";
+        const SECRET: &str = "path-template-secret/segment-for-test";
+        std::env::set_var(KEY, SECRET);
+        let root = tempfile::tempdir().unwrap();
+        let mut config = LspServerConfig {
+            command: "unused".into(),
+            args: vec![],
+            root_markers: vec![],
+            options: Default::default(),
+        };
+        config.options.init_options_mode = LspMode::On;
+        config.options.init_options_file =
+            Some(format!("${{workspaceUri}}/${{env:{KEY}}}/missing.json").into());
+        let result = prepare(
+            &config,
+            &Default::default(),
+            root.path(),
+            &root.path().join("a.cj"),
+        )
+        .await;
+        let message = result.err().unwrap();
+        assert!(message.contains("[redacted]"));
+        assert!(!message.contains(SECRET));
+        tokio::fs::create_dir_all(root.path().join(SECRET))
+            .await
+            .unwrap();
+        tokio::fs::write(root.path().join(SECRET).join("missing.json"), "{}")
+            .await
+            .unwrap();
+        let prepared = prepare(
+            &config,
+            &Default::default(),
+            root.path(),
+            &root.path().join("a.cj"),
+        )
+        .await
+        .unwrap();
+        std::env::remove_var(KEY);
+        assert!(prepared.source.contains("[redacted]"));
+        assert!(!prepared.source.contains(SECRET));
+    }
+
     #[tokio::test]
     async fn server_errors_cannot_echo_credentials_from_initialization_or_settings() {
         let root = tempfile::tempdir().unwrap();
