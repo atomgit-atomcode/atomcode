@@ -7705,6 +7705,17 @@ fn spawn_runtime_owner_with_optional_agent(
                                         operation: ReconfigureKind::Provider,
                                     },
                                 );
+                                // The swap committed and its provider events
+                                // went out under the new generation, so the
+                                // caller is told it happened. A replay the new
+                                // provider deferred already left the failure
+                                // phase and warning above; reporting that as a
+                                // failed reconfiguration would send the caller
+                                // back to the old provider while this runtime
+                                // runs the new one. The next resume or provider
+                                // rebuild retries the replay. A distinct
+                                // "swapped, replay pending" outcome would take a
+                                // result type the callers do not read yet.
                                 let _ = done.send(Ok(RuntimeGeneration(generation)));
                                 continue;
                             }

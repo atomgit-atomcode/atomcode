@@ -755,14 +755,25 @@ fn pending_replay_prompt(events: &[LoggedEvent], replay: &ResumeReplay) -> Pendi
         return PendingReplay::Stale;
     };
     let after = &events[rewound_at + 1..];
-    // A later user rewind that reaches the same turn retires the prompt, even
-    // though our own rewind is still in the log.
+    let Some((start, turn)) = super::events::turn_start_at(events, replay.to) else {
+        return PendingReplay::Stale;
+    };
+    if turn != replay.turn || start >= rewound_at {
+        return PendingReplay::Stale;
+    }
+    // A later user rewind that reaches this turn retires the prompt, even though
+    // our own rewind is still in the log. The turn it reaches is the `TurnStart`
+    // at its position in the log, not the smallest sequence: a later record may
+    // carry a smaller number, and comparing numbers would call that rewind an
+    // earlier one. A rewind whose turn is not in the log cannot be shown to spare
+    // the prompt, so it retires it too.
     if after.iter().any(|logged| {
-        matches!(
-            &logged.event,
-            SessionEvent::Rewound { to, scope, .. }
-                if scope.takes_back_conversation() && *to <= replay.to
-        )
+        let SessionEvent::Rewound { to, scope, .. } = &logged.event else {
+            return false;
+        };
+        scope.takes_back_conversation()
+            && super::events::turn_start_at(events, *to)
+                .map_or(true, |(position, _)| position <= start)
     }) {
         return PendingReplay::Stale;
     }
@@ -771,12 +782,6 @@ fn pending_replay_prompt(events: &[LoggedEvent], replay: &ResumeReplay) -> Pendi
         .any(|logged| matches!(logged.event, SessionEvent::TurnStart { .. }))
     {
         return PendingReplay::Started;
-    }
-    let Some((start, turn)) = super::events::turn_start_at(events, replay.to) else {
-        return PendingReplay::Stale;
-    };
-    if turn != replay.turn || start >= rewound_at {
-        return PendingReplay::Stale;
     }
     let mut prompt = None;
     for logged in &events[start + 1..rewound_at] {
@@ -797,6 +802,33 @@ fn pending_replay_prompt(events: &[LoggedEvent], replay: &ResumeReplay) -> Pendi
     }
     prompt.map_or(PendingReplay::Stale, |prompt| {
         PendingReplay::StillWaiting(Box::new(prompt))
+    })
+}
+
+/// The marker an unreadable one cannot supply, rebuilt from the log when the
+/// log still shows the retraction it recorded.
+///
+/// A marker is written before the rewind it names, so a death after the rewind
+/// leaves that rewind as the log's last fact with nothing after it. If no turn
+/// started after it and the turn it reaches has one prompt and no answer
+/// ([`super::events::unanswered_at`] over the log up to the rewind), the log
+/// shows exactly what the marker was retrying — and without the marker that
+/// prompt would stay hidden with nothing left to hand back. Anything else is
+/// not replayed: bytes that could not be read never make a prompt be sent.
+fn recover_pending_replay(events: &[LoggedEvent]) -> Option<ResumeReplay> {
+    let rewound = events.last()?;
+    let SessionEvent::Rewound { to, turn, scope } = &rewound.event else {
+        return None;
+    };
+    if !scope.takes_back_conversation() {
+        return None;
+    }
+    let before = &events[..events.len() - 1];
+    super::events::unanswered_at(before, *to, *turn)?;
+    Some(ResumeReplay {
+        to: *to,
+        turn: *turn,
+        rewound: Some(rewound.seq),
     })
 }
 
@@ -1837,16 +1869,42 @@ impl SessionManager {
             },
             Ok(None) => {}
             Err(error) => {
-                // An unreadable marker cannot anchor a retry, so it is replaced
-                // rather than kept: the write below substitutes a readable one
-                // whenever this load finds a prompt to replay. The log stays the
-                // authority — it is what decides whether a prompt is still
-                // waiting — and the replacement names this load's exact target,
-                // so the bytes that could not be read are never acted on.
-                notes.push(format!(
-                    "the pending replay of session {id} could not be read; \
-                     a new marker will replace it if this load finds a prompt to replay: {error}"
-                ));
+                // An unreadable marker cannot name the retraction it recorded.
+                // The log can still show it, and a replay committed before the
+                // death stays retryable only if the marker is rewritten from
+                // that evidence; without it the retracted prompt would stay
+                // hidden with nothing left to hand back. When the log shows no
+                // such retraction the bytes are not acted on, and the marker is
+                // removed instead of being promised a replacement it never got.
+                match recover_pending_replay(&events) {
+                    Some(recovered) => {
+                        notes.push(format!(
+                            "the pending replay of session {id} could not be read; \
+                             its retraction is in the log and is retried: {error}"
+                        ));
+                        if let Err(error) = self.write_resume_replay(id, &recovered) {
+                            notes.push(format!(
+                                "the retry of session {id}'s pending replay could not be marked: \
+                                 {error}"
+                            ));
+                        }
+                        match pending_replay_prompt(&events, &recovered) {
+                            PendingReplay::StillWaiting(prompt) => {
+                                return Ok((loaded, Some(*prompt)));
+                            }
+                            PendingReplay::Started | PendingReplay::Stale => {
+                                let _ = self.clear_resume_replay(id);
+                            }
+                        }
+                    }
+                    None => {
+                        notes.push(format!(
+                            "the pending replay of session {id} could not be read and no prompt \
+                             it retracted is left in the log: {error}"
+                        ));
+                        let _ = self.clear_resume_replay(id);
+                    }
+                }
             }
         }
 
@@ -7567,6 +7625,211 @@ mod tests {
             PendingReplay::StillWaiting(prompt) => assert_eq!(prompt.text, "hello"),
             _ => panic!("the retraction written after the prompt still leaves it waiting"),
         }
+    }
+
+    #[test]
+    fn a_later_rewind_is_read_by_position_not_by_its_number() {
+        let root = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(root.path().join("0123456789abcdef"));
+        let lease = mgr.acquire_lease("replay").unwrap();
+        let mut meta = SessionMeta::new("replay", "/p", 1);
+        meta.owner = StorageOwner::Native;
+        mgr.create_event_session(
+            &lease,
+            &atomcode_kernel::session::SessionHeader::new("replay"),
+            &meta,
+        )
+        .unwrap();
+        let logged = |seq: u64, event: SessionEvent| LoggedEvent { seq, at: 0, event };
+        // The later rewind names turn 2, whose `TurnStart` sits after the
+        // prompt's and only carries a smaller number. It does not reach the
+        // retracted prompt, whatever the numbers say.
+        mgr.append_events(
+            &lease,
+            &[
+                logged(100, SessionEvent::TurnStart { turn: 1 }),
+                logged(
+                    101,
+                    SessionEvent::UserMessage {
+                        turn: 1,
+                        text: "hello".into(),
+                        images: vec![],
+                    },
+                ),
+                logged(50, SessionEvent::TurnStart { turn: 2 }),
+                logged(
+                    102,
+                    SessionEvent::Rewound {
+                        turn: 1,
+                        to: 100,
+                        scope: RewindScope::Conversation,
+                    },
+                ),
+                logged(
+                    103,
+                    SessionEvent::Rewound {
+                        turn: 2,
+                        to: 50,
+                        scope: RewindScope::Conversation,
+                    },
+                ),
+            ],
+        )
+        .unwrap();
+
+        let marker = ResumeReplay {
+            to: 100,
+            turn: 1,
+            rewound: Some(102),
+        };
+        match pending_replay_prompt(&mgr.load_events("replay").unwrap(), &marker) {
+            PendingReplay::StillWaiting(prompt) => assert_eq!(prompt.text, "hello"),
+            _ => panic!("a rewind to a later turn does not retire the prompt"),
+        }
+    }
+
+    #[test]
+    fn an_unreadable_marker_is_rebuilt_from_the_retraction_it_left() {
+        let root = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(root.path().join("0123456789abcdef"));
+        let lease = mgr.acquire_lease("replay").unwrap();
+        let mut meta = SessionMeta::new("replay", "/p", 1);
+        meta.owner = StorageOwner::Native;
+        mgr.create_event_session(
+            &lease,
+            &atomcode_kernel::session::SessionHeader::new("replay"),
+            &meta,
+        )
+        .unwrap();
+        let logged = |seq: u64, event: SessionEvent| LoggedEvent { seq, at: 0, event };
+        mgr.append_events(
+            &lease,
+            &[
+                logged(1, SessionEvent::TurnStart { turn: 1 }),
+                logged(
+                    2,
+                    SessionEvent::UserMessage {
+                        turn: 1,
+                        text: "hello".into(),
+                        images: vec![],
+                    },
+                ),
+                logged(
+                    3,
+                    SessionEvent::Rewound {
+                        turn: 1,
+                        to: 1,
+                        scope: RewindScope::Conversation,
+                    },
+                ),
+            ],
+        )
+        .unwrap();
+        std::fs::write(
+            mgr.resume_replay_path("replay").unwrap(),
+            b"\xffnot a marker",
+        )
+        .unwrap();
+
+        let mut notes = Vec::new();
+        let (_loaded, pending) = mgr
+            .load_native_session_for_resume_noting(&lease, &mut notes)
+            .unwrap();
+        assert_eq!(
+            pending.as_ref().map(|message| message.text.as_str()),
+            Some("hello")
+        );
+        assert!(
+            notes.iter().any(|note| note.contains("retried")),
+            "{notes:?}"
+        );
+        assert_eq!(
+            mgr.read_resume_replay("replay").unwrap(),
+            Some(ResumeReplay {
+                to: 1,
+                turn: 1,
+                rewound: Some(3)
+            }),
+            "the replacement names the rewind the log holds"
+        );
+
+        // A second death before the replay starts finds that replacement.
+        let mut notes = Vec::new();
+        let (_loaded, pending) = mgr
+            .load_native_session_for_resume_noting(&lease, &mut notes)
+            .unwrap();
+        assert_eq!(
+            pending.as_ref().map(|message| message.text.as_str()),
+            Some("hello")
+        );
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    #[test]
+    fn an_unreadable_marker_does_not_resurrect_an_answered_turn() {
+        let root = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(root.path().join("0123456789abcdef"));
+        let lease = mgr.acquire_lease("replay").unwrap();
+        let mut meta = SessionMeta::new("replay", "/p", 1);
+        meta.owner = StorageOwner::Native;
+        mgr.create_event_session(
+            &lease,
+            &atomcode_kernel::session::SessionHeader::new("replay"),
+            &meta,
+        )
+        .unwrap();
+        let logged = |seq: u64, event: SessionEvent| LoggedEvent { seq, at: 0, event };
+        // The rewind hides a turn the model answered; its prompt was not left
+        // waiting, so nothing may hand it back.
+        mgr.append_events(
+            &lease,
+            &[
+                logged(1, SessionEvent::TurnStart { turn: 1 }),
+                logged(
+                    2,
+                    SessionEvent::UserMessage {
+                        turn: 1,
+                        text: "hello".into(),
+                        images: vec![],
+                    },
+                ),
+                logged(
+                    3,
+                    SessionEvent::TurnEnd {
+                        turn: 1,
+                        stop: atomcode_kernel::event::StopReason::Stopped,
+                        error: None,
+                    },
+                ),
+                logged(
+                    4,
+                    SessionEvent::Rewound {
+                        turn: 1,
+                        to: 1,
+                        scope: RewindScope::Conversation,
+                    },
+                ),
+            ],
+        )
+        .unwrap();
+        std::fs::write(
+            mgr.resume_replay_path("replay").unwrap(),
+            b"\xffnot a marker",
+        )
+        .unwrap();
+
+        let mut notes = Vec::new();
+        let (_loaded, pending) = mgr
+            .load_native_session_for_resume_noting(&lease, &mut notes)
+            .unwrap();
+        assert!(pending.is_none());
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("no prompt it retracted")),
+            "{notes:?}"
+        );
+        assert!(!mgr.resume_replay_path("replay").unwrap().exists());
     }
 
     #[test]

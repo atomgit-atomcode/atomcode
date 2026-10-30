@@ -313,6 +313,11 @@ impl SessionManager {
     /// ([`Self::read_event_log_bounded`]): a log that ends with one still ends
     /// with the record above it, and treating that blank line as the record
     /// would refuse to allocate for a log that reads back fine.
+    ///
+    /// The lock is held for the whole scan, so it reads fixed windows from the
+    /// tail instead of growing one buffer over the file: only the last record is
+    /// held whole, and a tail without a line boundary within
+    /// [`MAX_JSONL_LINE_BYTES`] is not a line this store wrote.
     fn last_recorded_seq(file: &mut fs::File, path: &Path) -> SessionResult<Option<SeqNo>> {
         #[derive(serde::Deserialize)]
         struct SeqRecord {
@@ -324,42 +329,54 @@ impl SessionManager {
         if len == 0 {
             return Ok(None);
         }
-        let mut window = 8 * 1024u64;
+        let corrupt = || SessionStoreError::Corrupt {
+            kind: "session events",
+            message: format!("{}: unreadable last record", path.display()),
+        };
+        // The last non-blank byte, trimming a crash's trailing blank line in
+        // bounded windows rather than one window over the whole tail.
+        let mut end = len;
+        let mut blank = 0u64;
         loop {
-            let start = len.saturating_sub(window);
-            file.seek(SeekFrom::Start(start))
-                .map_err(|error| io_at(path, error))?;
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes)
-                .map_err(|error| io_at(path, error))?;
-            let mut end = bytes.len();
-            while end > 0 && bytes[end - 1].is_ascii_whitespace() {
-                end -= 1;
+            let start = end.saturating_sub(TAIL_WINDOW);
+            let window = read_log_window(file, path, start, end)?;
+            if let Some(position) = window.iter().rposition(|byte| !byte.is_ascii_whitespace()) {
+                end = start + position as u64 + 1;
+                break;
             }
-            if end == 0 {
-                // Only blank lines so far; the record is above them.
-                if start == 0 {
-                    return Ok(None);
-                }
-                window = window.saturating_mul(2);
-                continue;
+            if start == 0 {
+                return Ok(None);
             }
-            let tail = &bytes[..end];
-            let last = match tail.iter().rposition(|byte| *byte == b'\n') {
-                Some(position) => &tail[position + 1..],
-                None if start == 0 => tail,
-                None => {
-                    window = window.saturating_mul(2);
-                    continue;
-                }
-            };
-            return serde_json::from_slice::<SeqRecord>(last)
-                .map(|record| record.seq)
-                .map_err(|_| SessionStoreError::Corrupt {
-                    kind: "session events",
-                    message: format!("{}: unreadable last record", path.display()),
-                });
+            blank = blank.saturating_add(end - start);
+            if blank > MAX_JSONL_LINE_BYTES as u64 {
+                return Err(corrupt());
+            }
+            end = start;
         }
+        // The line after the previous newline is the last record. A record line
+        // is capped like every other line this store writes, so the search stops
+        // a line's length above the end.
+        let mut start = end;
+        loop {
+            let window_start = start.saturating_sub(TAIL_WINDOW);
+            let window = read_log_window(file, path, window_start, start)?;
+            if let Some(position) = window.iter().rposition(|byte| *byte == b'\n') {
+                start = window_start + position as u64 + 1;
+                break;
+            }
+            if end.saturating_sub(window_start) > MAX_JSONL_LINE_BYTES as u64 {
+                return Err(corrupt());
+            }
+            if window_start == 0 {
+                start = 0;
+                break;
+            }
+            start = window_start;
+        }
+        let line = read_log_window(file, path, start, end)?;
+        serde_json::from_slice::<SeqRecord>(&line)
+            .map(|record| record.seq)
+            .map_err(|_| corrupt())
     }
 
     /// Keep the index's name with the log's when the person names the session.
@@ -1024,6 +1041,34 @@ impl SessionManager {
         }
         Ok(())
     }
+}
+
+/// How much of the log's tail one step of [`SessionManager::last_recorded_seq`]
+/// reads. Fixed so the scan holds one window and the last record, never the file.
+const TAIL_WINDOW: u64 = 64 * 1024;
+
+/// Bytes `start..end` of the locked append handle, read in place.
+///
+/// Seeking on an append handle is safe: the handle's writes go to the end of the
+/// file whatever its position (append semantics), and Windows locks cover the
+/// same handle that holds them.
+fn read_log_window(
+    file: &mut fs::File,
+    path: &Path,
+    start: u64,
+    end: u64,
+) -> SessionResult<Vec<u8>> {
+    let len =
+        usize::try_from(end.saturating_sub(start)).map_err(|_| SessionStoreError::Corrupt {
+            kind: "session events",
+            message: format!("{}: unreadable last record", path.display()),
+        })?;
+    file.seek(SeekFrom::Start(start))
+        .map_err(|error| io_at(path, error))?;
+    let mut window = vec![0u8; len];
+    file.read_exact(&mut window)
+        .map_err(|error| io_at(path, error))?;
+    Ok(window)
 }
 
 /// A change to a session's conversation, planned against its log.
@@ -3246,6 +3291,52 @@ mod tests {
             "the allocation is one past the log's maximum, not its tail"
         );
         assert_eq!(manager.load_events(id).unwrap().last().unwrap().seq, 6);
+    }
+
+    #[test]
+    fn an_allocation_walks_back_a_last_record_larger_than_a_tail_window() {
+        let (_dir, manager) = store();
+        let id = "resume-long-tail";
+        let lease = created(&manager, id);
+        manager.append_events(&lease, &a_turn()).unwrap();
+        // A record wider than the scan window still ends the file; the scan
+        // walks back to its start instead of assuming the whole line is in view.
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    6,
+                    15,
+                    SessionEvent::UserMessage {
+                        turn: 2,
+                        text: "x".repeat(200 * 1024),
+                        images: vec![],
+                    },
+                )],
+            )
+            .unwrap();
+        // A crash's trailing blank line is skipped the way the reader skips it.
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(manager.events_path(id).unwrap())
+            .unwrap();
+        log.write_all(b"\n\n").unwrap();
+        drop(log);
+
+        let mut allocated = None;
+        manager
+            .append_event_allocating(
+                &lease,
+                5,
+                |seq| {
+                    allocated = Some(seq);
+                    Ok(logged(seq, 16, SessionEvent::TurnStart { turn: 3 }))
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(allocated, Some(7));
+        assert_eq!(manager.load_events(id).unwrap().last().unwrap().seq, 7);
     }
 
     #[test]
