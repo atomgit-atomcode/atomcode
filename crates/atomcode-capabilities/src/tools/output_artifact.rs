@@ -52,15 +52,17 @@ impl ArtifactStore {
     pub fn put(&self, bytes: &[u8]) -> std::io::Result<String> {
         let id = artifact_id(bytes);
         let path = self.dir.join(&id);
+        std::fs::create_dir_all(&self.dir)?;
+        // Keep tool outputs out of version control on the directory's own
+        // terms, not only on the repo-root `.gitignore` the operator happened
+        // to set: drop a wildcard-only sentinel beside the store. Run this on
+        // EVERY put, not just the first write — a store that predates the
+        // sentinel (upgrade) or one whose sentinel was removed would otherwise
+        // stay unprotected on every dedup hit. Never clobbers an existing
+        // `.gitignore`, and a genuine write failure surfaces to the caller —
+        // an unprotected artifact dir is the failure we are defending against.
+        ensure_gitignore_sentinel(&self.dir)?;
         if !path.exists() {
-            std::fs::create_dir_all(&self.dir)?;
-            // Keep tool outputs out of version control on the directory's own
-            // terms, not only on the repo-root `.gitignore` the operator
-            // happened to set: drop a wildcard-only sentinel beside the store
-            // on first write. Never clobbers an existing `.gitignore`, and a
-            // genuine write failure surfaces to the caller — an unprotected
-            // artifact dir is the failure we are defending against.
-            ensure_gitignore_sentinel(&self.dir)?;
             // Write to a temp sibling then rename → readers never see a partial file.
             let tmp = self.dir.join(format!("{id}.tmp"));
             std::fs::write(&tmp, bytes)?;

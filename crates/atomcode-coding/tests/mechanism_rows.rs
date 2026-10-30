@@ -794,7 +794,7 @@ async fn an_oversized_tool_result_is_shown_head_and_tail_and_saved_whole() {
         .unwrap_or_default();
     assert_eq!(saved.len(), 1, "the whole output is on disk: {saved:?}");
     // The sentinel guards the dir on its own terms: present with the wildcard
-    // body, and never clobbered across writes.
+    // body after this spill.
     assert_eq!(
         std::fs::read_to_string(artifacts.join(".gitignore")).unwrap(),
         "*\n",
