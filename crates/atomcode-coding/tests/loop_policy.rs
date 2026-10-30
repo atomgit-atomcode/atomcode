@@ -1181,3 +1181,111 @@ id = "tool-loop-guard"
         "falling below the trigger must permit the next pressure cycle in the same turn"
     );
 }
+
+/// A strategy whose model verdict flips after the first ask: one turn spends the
+/// slow stage and then the fast one, which is when the trigger may stop asking.
+struct Flip {
+    asked: Arc<AtomicU32>,
+    committed: Arc<AtomicU32>,
+}
+
+#[async_trait]
+impl atomcode_harness::seams::Compaction for Flip {
+    fn describe(&self) -> String {
+        "calls a model once, then claims not to".into()
+    }
+    fn calls_model(
+        &self,
+        _: &atomcode_harness::session::SessionLog,
+        _: &atomcode_harness::seams::CompactionAsk,
+    ) -> bool {
+        self.asked.fetch_add(1, Ordering::SeqCst) == 0
+    }
+    async fn compact(
+        &self,
+        _: &atomcode_harness::session::SessionLog,
+        _: &atomcode_harness::seams::CompactionAsk,
+    ) -> Option<atomcode_harness::seams::CompactionDecision> {
+        self.committed.fetch_add(1, Ordering::SeqCst);
+        None
+    }
+}
+
+struct FlipRow(Arc<AtomicU32>, Arc<AtomicU32>, f32);
+
+#[async_trait]
+impl atomcode_plexus::Plugin for FlipRow {
+    fn name(&self) -> &'static str {
+        "compaction-flip"
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["compaction"]
+    }
+    fn description(&self) -> &'static str {
+        "a model verdict that flips once"
+    }
+    async fn apply(
+        &self,
+        ctx: &atomcode_plexus::Context,
+        _: &serde_json::Value,
+    ) -> Result<(), String> {
+        let _ = ctx
+            .provide::<CompactionSvc>(Arc::new(Flip {
+                asked: self.0.clone(),
+                committed: self.1.clone(),
+            }))
+            .map_err(|e| e.to_string())?;
+        plugins::loop_policy::mount_compaction_trigger(ctx, self.2);
+        Ok(())
+    }
+}
+
+/// Pressure does not fall between the rounds of a turn. Once both stages have
+/// been spent, the trigger must stop asking the strategy — `calls_model`
+/// projects the whole log — and only a new turn (or a pressure drop) may rearm
+/// it. The strategy's verdict flips after the first ask, so this is the only
+/// way both stage slots get marked inside one turn.
+#[tokio::test]
+async fn a_spent_turn_stops_asking_the_strategy_until_the_next_turn() {
+    let dir = scratch("fast-path");
+    std::fs::write(dir.join("a.txt"), "x").unwrap();
+    let call =
+        r#"{ text = "again", calls = [ { name = "read_file", args = { file_path = "a.txt" } } ] }"#;
+    let script = format!(
+        "[[patch]]\nid = \"llm\"\nname = \"llm-replay\"\nconfig = {{ script = [\n  \
+         {call},\n  {call},\n  {call},\n  {call},\n  {{ text = \"done\" }},\n  {{ text = \"next\" }}\n] }}\n"
+    );
+    let swap = "[[remove]]\nid = \"compaction-tail\"\n\n\
+                [[insert]]\nid = \"compaction-flip\"\nname = \"compaction-flip\"\n\n\
+                [[remove]]\nid = \"repeat-fuse\"\n\n[[remove]]\nid = \"tool-loop-guard\"";
+    let asked = Arc::new(AtomicU32::new(0));
+    let committed = Arc::new(AtomicU32::new(0));
+    let mut registry = atomcode_coding::on_harness::catalog();
+    registry.register(Arc::new(FlipRow(
+        asked.clone(),
+        committed.clone(),
+        0.0000001,
+    )));
+    let mut app = App::new(registry, tree(&dir, &script, &[swap]));
+    app.start().await.expect("must mount");
+
+    run_turn(&app, "first").await.unwrap();
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        2,
+        "the two stages spend one ask each inside the turn"
+    );
+    assert_eq!(
+        committed.load(Ordering::SeqCst),
+        2,
+        "and each attempt reaches the strategy once"
+    );
+
+    run_turn(&app, "second").await.unwrap();
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        3,
+        "a new turn rearms the trigger instead of leaving it silent"
+    );
+    assert_eq!(committed.load(Ordering::SeqCst), 3);
+}

@@ -876,17 +876,31 @@ struct CompactBeforeRequest {
 }
 
 impl CompactBeforeRequest {
-    /// At most one attempt per stage per turn or pressure cycle. A no-op or
-    /// failed summary must not bill again on every request while pressure stays
-    /// high. A later provider report below the trigger rearms both stages.
-    fn first_try(&self, session: &str, turn: u64, slow: bool) -> bool {
-        let mut tried = self.tried.lock().expect("compaction attempts poisoned");
+    /// The attempt table for this session, reset when the turn changes.
+    ///
+    /// Both readers share it so the rearm rule has one definition: a reset
+    /// added to one but not the other would suppress automatic compaction for
+    /// the rest of the turn.
+    fn attempts<'a>(
+        tried: &'a mut HashMap<String, (u64, [bool; 2])>,
+        session: &str,
+        turn: u64,
+    ) -> &'a mut (u64, [bool; 2]) {
         let entry = tried
             .entry(session.to_string())
             .or_insert((turn, [false; 2]));
         if entry.0 != turn {
             *entry = (turn, [false; 2]);
         }
+        entry
+    }
+
+    /// At most one attempt per stage per turn or pressure cycle. A no-op or
+    /// failed summary must not bill again on every request while pressure stays
+    /// high. A later provider report below the trigger rearms both stages.
+    fn first_try(&self, session: &str, turn: u64, slow: bool) -> bool {
+        let mut tried = self.tried.lock().expect("compaction attempts poisoned");
+        let entry = Self::attempts(&mut tried, session, turn);
         !std::mem::replace(&mut entry.1[usize::from(slow)], true)
     }
 
@@ -894,14 +908,14 @@ impl CompactBeforeRequest {
     /// before `calls_model`, which projects the whole log: a long turn that stays
     /// above the threshold must not pay that projection on every request after
     /// both attempts are spent.
+    ///
+    /// This deliberately does not cache `calls_model`'s last verdict: a verdict
+    /// that flips — overflow starts needing the stub, or enough turns settle —
+    /// is the signal to spend the other stage, and skipping it could send a
+    /// request the stub was about to shrink.
     fn both_tried(&self, session: &str, turn: u64) -> bool {
         let mut tried = self.tried.lock().expect("compaction attempts poisoned");
-        let entry = tried
-            .entry(session.to_string())
-            .or_insert((turn, [false; 2]));
-        if entry.0 != turn {
-            *entry = (turn, [false; 2]);
-        }
+        let entry = Self::attempts(&mut tried, session, turn);
         entry.1[0] && entry.1[1]
     }
 }
