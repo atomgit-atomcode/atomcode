@@ -1,19 +1,20 @@
 import type { ComponentChildren } from 'preact';
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import { getSessionTranscript, type TranscriptTurn } from '../api';
-import { historyBoundary, historyWindow, HISTORY_BATCH, type HistoryMessage } from '../lib/inlineHistory';
+import { historyBoundary, historyWindow, type HistoryMessage } from '../lib/inlineHistory';
 import { useT } from '../settings';
 
 /** Display-only paging. The runtime conversation and composer are never replaced. */
 export function CompactionHistory(props: {
   projectHash: string; sessionId: string; messages: HistoryMessage[]; reset: number;
+  canLoadBefore?: boolean; compact?: boolean;
   focusTurn?: { turnId: number; request: number } | null;
   viewport: () => HTMLElement | null;
   onBeforeRead: () => void;
   onWindow: (active: boolean, showLive: boolean, liveStart: number) => void;
   onNavigate: (node: HTMLElement) => void;
   onReadingTurn?: (turnId: number | null) => void;
-  renderTurn: (turn: TranscriptTurn) => ComponentChildren;
+  renderTurn: (turn: TranscriptTurn, onEdges: (before: boolean, after: boolean) => void) => ComponentChildren;
 }) {
   const t = useT();
   const latest = useRef(props); latest.current = props;
@@ -28,6 +29,7 @@ export function CompactionHistory(props: {
   const ignoreScrollUntil = useRef(0);
   const index = useRef<TranscriptTurn[] | null>(null);
   const nodes = useRef(new Map<number, HTMLElement>());
+  const innerEdges = useRef(new Map<number, { before: boolean; after: boolean }>());
   const [bounds, setBounds] = useState<{ end: number; liveStart: number; joined: boolean } | null>(null);
 
   function cancel() { epoch.current += 1; pending.current?.abort(); pending.current = null; }
@@ -73,10 +75,10 @@ export function CompactionHistory(props: {
       // A directly selected record is reachable even if the live suffix overlaps it.
       if (found >= boundary.end || (direction !== 'target' && current && current.end > boundary.end)) { boundary.end = records.length; boundary.joined = false; }
       const range = direction === 'target' || !current
-        ? historyWindow(boundary.end, found < 0 ? undefined : found)
+        ? historyWindow(boundary.end, found < 0 ? undefined : found, p.compact ? 1 : 2)
         : direction === 'before'
-          ? { start: Math.max(0, current.start - HISTORY_BATCH), end: current.start }
-          : { start: current.end, end: Math.min(boundary.end, current.end + HISTORY_BATCH) };
+          ? { start: Math.max(0, current.start - (p.compact ? 1 : 2)), end: current.start }
+          : { start: current.end, end: Math.min(boundary.end, current.end + (p.compact ? 1 : 2)) };
       if (range.start >= range.end) return;
       p.onBeforeRead();
       const selected = records.slice(range.start, range.end);
@@ -101,9 +103,10 @@ export function CompactionHistory(props: {
           ? { start: range.start, end: current.end, turns: [...details, ...current.turns] }
           : { start: current.start, end: range.end, turns: [...current.turns, ...details] };
       // Bound mounted detail on long sessions; the opposite side remains scroll-loadable.
-      if (next.turns.length > 60) {
-        if (direction === 'before') next = { ...next, end: next.start + 60, turns: next.turns.slice(0, 60) };
-        else next = { ...next, start: next.end - 60, turns: next.turns.slice(-60) };
+      const maxTurns = p.compact ? 3 : 6;
+      if (next.turns.length > maxTurns) {
+        if (direction === 'before') next = { ...next, end: next.start + maxTurns, turns: next.turns.slice(0, maxTurns) };
+        else next = { ...next, start: next.end - maxTurns, turns: next.turns.slice(-maxTurns) };
       }
       // Compaction/snapshot replay can replace the live suffix while detail is in flight.
       // Join against its current identity/indices, never the request's captured messages.
@@ -135,7 +138,16 @@ export function CompactionHistory(props: {
     if (!viewport) return;
     let previous = viewport.scrollTop;
     const older = () => {
+      const first = windowRef.current?.turns[0];
+      if (first && innerEdges.current.get(first.turn_id)?.before) return;
+      if (latest.current.canLoadBefore === false) return;
       if (viewport.scrollTop <= 120 && (!windowRef.current || windowRef.current.start > 0)) void load('before');
+    };
+    const newer = () => {
+      const turns = windowRef.current?.turns;
+      const last = turns?.[turns.length - 1];
+      if (last && innerEdges.current.get(last.turn_id)?.after) return;
+      void load('after');
     };
     const scroll = () => {
       const top = viewport.scrollTop;
@@ -149,12 +161,12 @@ export function CompactionHistory(props: {
       latest.current.onReadingTurn?.(reading && reading.bottom > line ? reading.id : null);
       if (performance.now() < ignoreScrollUntil.current) { previous = top; return; }
       if (top < previous) older();
-      else if (top > previous && viewport.scrollHeight - top - viewport.clientHeight < 160 && windowRef.current) void load('after');
+      else if (top > previous && viewport.scrollHeight - top - viewport.clientHeight < 160 && windowRef.current) newer();
       previous = top;
     };
     const wheel = (event: WheelEvent) => {
       if (event.deltaY < 0) older();
-      else if (event.deltaY > 0 && viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight < 160 && windowRef.current) void load('after');
+      else if (event.deltaY > 0 && viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight < 160 && windowRef.current) newer();
     };
     let touchY: number | null = null;
     const touchStart = (event: TouchEvent) => { touchY = event.touches[0]?.clientY ?? null; };
@@ -175,9 +187,9 @@ export function CompactionHistory(props: {
     {error && <div class="timeline-history-status" role="alert">{t('chat.historyFailed')} {error} <button onClick={() => retry.current()}>{t('chat.historyRetry')}</button></div>}
     {window?.turns.map(turn => <div key={turn.turn_id} data-history-turn={turn.turn_id}
       class={turn.undone ? 'timeline-history-turn is-undone' : 'timeline-history-turn'}
-      ref={node => { if (node) nodes.current.set(turn.turn_id, node); else nodes.current.delete(turn.turn_id); }}>
+      ref={node => { if (node) nodes.current.set(turn.turn_id, node); else { nodes.current.delete(turn.turn_id); innerEdges.current.delete(turn.turn_id); } }}>
       {turn.undone && <div class="timeline-history-status">{t('chat.historyUndone')}</div>}
-      {props.renderTurn(turn)}
+      {props.renderTurn(turn, (before, after) => { if (before || after) innerEdges.current.set(turn.turn_id, { before, after }); else innerEdges.current.delete(turn.turn_id); })}
     </div>)}
     {window && bounds && window.end < bounds.end && !busy && <div class="timeline-history-status">
       <button onClick={() => void load('after')}>{t('chat.historyLoadNext')}</button>

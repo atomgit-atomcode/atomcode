@@ -25,9 +25,9 @@ export function historyBoundary(turns: readonly TranscriptTurn[], messages: read
   return { end: turns.length, liveStart: 0, joined: false };
 }
 
-export function historyWindow(end: number, target?: number) {
-  const start = target == null ? Math.max(0, end - HISTORY_BATCH) : Math.max(0, Math.min(target, end - 1));
-  return { start, end: Math.min(end, start + HISTORY_BATCH) };
+export function historyWindow(end: number, target?: number, batch = HISTORY_BATCH) {
+  const start = target == null ? Math.max(0, end - batch) : Math.max(0, Math.min(target, end - 1));
+  return { start, end: Math.min(end, start + batch) };
 }
 
 export function historyMessages(turn: TranscriptTurn): HistoryMessage[] {

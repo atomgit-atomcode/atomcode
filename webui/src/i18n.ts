@@ -160,6 +160,8 @@ const zh = {
   'chat.detachedStopped': '已请求停止后台回合，可以继续发送。',
   'chat.retainedHistory': "压缩保留的历史消息 · 非新指令",
   'chat.historyLoading': "正在读取历史…",
+  'chat.historyLoadPrevious': '加载更早的消息',
+  'chat.timelineLatest': '回到最新消息',
   'chat.historyLoadNext': '加载后续对话',
   'chat.historyFailed': "无法加载对话记录：",
   'chat.historyRetry': "重试",
@@ -446,6 +448,7 @@ const zh = {
   // Copy button
   'copy.copy': '复制',
   'copy.copied': '已复制',
+  'copy.failed': '复制失败，请重试',
 
   // Slash commands
   'cmd.plan.desc': '切换到 Plan 模式（只读探索）',
@@ -792,6 +795,8 @@ const en: Record<MsgKey, string> = {
   'chat.detachedStopped': 'The background turn was asked to stop; you can send again.',
   'chat.retainedHistory': "Historical message retained after compaction · not a new request",
   'chat.historyLoading': "Loading history…",
+  'chat.historyLoadPrevious': 'Load earlier messages',
+  'chat.timelineLatest': 'Back to latest messages',
   'chat.historyLoadNext': 'Load newer messages',
   'chat.historyFailed': "Could not load history:",
   'chat.historyRetry': "Retry",
@@ -1071,6 +1076,7 @@ const en: Record<MsgKey, string> = {
   // Copy button
   'copy.copy': 'Copy',
   'copy.copied': 'Copied',
+  'copy.failed': 'Could not copy. Please retry.',
 
   // Slash commands
   'cmd.plan.desc': 'Switch to Plan mode (read-only exploration)',

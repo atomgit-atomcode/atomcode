@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "test": "node --experimental-strip-types --test \"src/**/*.test.ts\"",
+    "test:timeline": "node scripts/timeline-e2e.mjs",
     "test:workbench": "node scripts/workbench-e2e.mjs"
   },
   "engines": {

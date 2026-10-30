@@ -6,6 +6,7 @@ export interface TurnArtifact {
 }
 
 interface ArtifactMessage {
+  archiveArtifacts?: TurnArtifact[];
   role: 'user' | 'assistant' | 'system';
   parts: MsgPart[];
 }
@@ -98,7 +99,7 @@ export function artifactsByAssistantIndex(messages: ArtifactMessage[]): Map<numb
       flush();
     } else if (message.role === 'assistant') {
       assistantIndexes.push(index);
-      paths.push(...successfulMutationPaths(message.parts));
+      paths.push(...(message.archiveArtifacts?.map(artifact => artifact.path) ?? successfulMutationPaths(message.parts)));
     }
   });
   flush();

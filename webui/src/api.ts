@@ -1113,20 +1113,29 @@ export async function streamLive(
   const reader = resp.body!.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    onActivity?.();
-    buffer += decoder.decode(value, { stream: true });
-    const parts = buffer.split('\n\n');
-    buffer = parts.pop() ?? '';
-    for (const part of parts) {
-      const line = part.split('\n').find((l) => l.startsWith('data:'));
-      if (!line) continue;
-      const json = line.slice('data:'.length).trim();
-      if (!json) continue;
-      try { onEvent(JSON.parse(json) as LiveWireEvent); } catch { /* ignore keepalive */ }
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      onActivity?.();
+      buffer += decoder.decode(value, { stream: true });
+      const parts = buffer.split('\n\n');
+      buffer = parts.pop() ?? '';
+      for (const part of parts) {
+        const line = part.split('\n').find((l) => l.startsWith('data:'));
+        if (!line) continue;
+        const json = line.slice('data:'.length).trim();
+        if (!json) continue;
+        let event: LiveWireEvent;
+        try { event = JSON.parse(json) as LiveWireEvent; } catch { continue; }
+        onEvent(event);
+      }
     }
+  } finally {
+    // Release the response even when parsing/dispatch or an aborted read throws.
+    // A reconnect must not leave an old body locked in the mobile browser.
+    try { await reader.cancel(); } catch { /* fetch already aborted */ }
+    reader.releaseLock();
   }
 }
 

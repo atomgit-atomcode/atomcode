@@ -666,3 +666,54 @@ test('unavailable history is opt-in and remains available for read-only retrieva
     globalThis.fetch = originalFetch;
   }
 });
+
+test('live stream unlocks its body on normal close and failed reads', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    const { streamLive } = await import('./api.ts');
+    for (const fail of [false, true]) {
+      const body = new ReadableStream<Uint8Array>({ start(controller) {
+        if (fail) controller.error(new Error('disconnected'));
+        else { controller.enqueue(new TextEncoder().encode('data: {"type":"text","content":"hello"}\n\n')); controller.close(); }
+      } });
+      globalThis.fetch = (async () => new Response(body)) as typeof fetch;
+      const events: unknown[] = [];
+      if (fail) await assert.rejects(streamLive(e => events.push(e)), /disconnected/);
+      else { await streamLive(e => events.push(e)); assert.equal(events.length, 1); }
+      assert.equal(body.locked, false);
+    }
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+
+test('live stream cancels and unlocks a still-open body when its activity observer fails', async () => {
+  const originalFetch = globalThis.fetch;
+  let cancelled = false;
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) { controller.enqueue(new TextEncoder().encode(': ping\n\n')); },
+    cancel() { cancelled = true; },
+  });
+  globalThis.fetch = (async () => new Response(body)) as typeof fetch;
+  try {
+    const { streamLive } = await import('./api.ts');
+    await assert.rejects(streamLive(() => {}, undefined, 'session', () => { throw new Error('observer failed'); }), /observer failed/);
+    assert.equal(cancelled, true);
+    assert.equal(body.locked, false);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+
+test('live dispatch failures cancel the old body instead of leaving a falsely healthy stream', async () => {
+  const originalFetch = globalThis.fetch;
+  let cancelled = false;
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) { controller.enqueue(new TextEncoder().encode('data: {"type":"text","content":"hello"}\n\n')); },
+    cancel() { cancelled = true; },
+  });
+  globalThis.fetch = (async () => new Response(body)) as typeof fetch;
+  try {
+    const { streamLive } = await import('./api.ts');
+    await assert.rejects(streamLive(() => { throw new Error('dispatch failed'); }), /dispatch failed/);
+    assert.equal(cancelled, true); assert.equal(body.locked, false);
+  } finally { globalThis.fetch = originalFetch; }
+});
