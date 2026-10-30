@@ -773,7 +773,7 @@ fn pending_replay_prompt(events: &[LoggedEvent], replay: &ResumeReplay) -> Pendi
         };
         scope.takes_back_conversation()
             && super::events::turn_start_at(events, *to)
-                .map_or(true, |(position, _)| position <= start)
+                .is_none_or(|(position, _)| position <= start)
     }) {
         return PendingReplay::Stale;
     }
@@ -802,33 +802,6 @@ fn pending_replay_prompt(events: &[LoggedEvent], replay: &ResumeReplay) -> Pendi
     }
     prompt.map_or(PendingReplay::Stale, |prompt| {
         PendingReplay::StillWaiting(Box::new(prompt))
-    })
-}
-
-/// The marker an unreadable one cannot supply, rebuilt from the log when the
-/// log still shows the retraction it recorded.
-///
-/// A marker is written before the rewind it names, so a death after the rewind
-/// leaves that rewind as the log's last fact with nothing after it. If no turn
-/// started after it and the turn it reaches has one prompt and no answer
-/// ([`super::events::unanswered_at`] over the log up to the rewind), the log
-/// shows exactly what the marker was retrying — and without the marker that
-/// prompt would stay hidden with nothing left to hand back. Anything else is
-/// not replayed: bytes that could not be read never make a prompt be sent.
-fn recover_pending_replay(events: &[LoggedEvent]) -> Option<ResumeReplay> {
-    let rewound = events.last()?;
-    let SessionEvent::Rewound { to, turn, scope } = &rewound.event else {
-        return None;
-    };
-    if !scope.takes_back_conversation() {
-        return None;
-    }
-    let before = &events[..events.len() - 1];
-    super::events::unanswered_at(before, *to, *turn)?;
-    Some(ResumeReplay {
-        to: *to,
-        turn: *turn,
-        rewound: Some(rewound.seq),
     })
 }
 
@@ -1869,42 +1842,20 @@ impl SessionManager {
             },
             Ok(None) => {}
             Err(error) => {
-                // An unreadable marker cannot name the retraction it recorded.
-                // The log can still show it, and a replay committed before the
-                // death stays retryable only if the marker is rewritten from
-                // that evidence; without it the retracted prompt would stay
-                // hidden with nothing left to hand back. When the log shows no
-                // such retraction the bytes are not acted on, and the marker is
-                // removed instead of being promised a replacement it never got.
-                match recover_pending_replay(&events) {
-                    Some(recovered) => {
-                        notes.push(format!(
-                            "the pending replay of session {id} could not be read; \
-                             its retraction is in the log and is retried: {error}"
-                        ));
-                        if let Err(error) = self.write_resume_replay(id, &recovered) {
-                            notes.push(format!(
-                                "the retry of session {id}'s pending replay could not be marked: \
-                                 {error}"
-                            ));
-                        }
-                        match pending_replay_prompt(&events, &recovered) {
-                            PendingReplay::StillWaiting(prompt) => {
-                                return Ok((loaded, Some(*prompt)));
-                            }
-                            PendingReplay::Started | PendingReplay::Stale => {
-                                let _ = self.clear_resume_replay(id);
-                            }
-                        }
-                    }
-                    None => {
-                        notes.push(format!(
-                            "the pending replay of session {id} could not be read and no prompt \
-                             it retracted is left in the log: {error}"
-                        ));
-                        let _ = self.clear_resume_replay(id);
-                    }
-                }
+                // The log cannot say whose rewind this is. A resume's own
+                // retraction and the person's undo write the same `Rewound`,
+                // and an unreadable marker names neither; handing a prompt back
+                // on the strength of a rewind alone would replay what the person
+                // withdrew. So nothing is replayed, and the marker is removed
+                // instead of failing every later resume. Naming the rewind's
+                // author would take a new fact or a field on `Rewound` — a log
+                // format change of its own — so this stays conservative until
+                // that exists.
+                notes.push(format!(
+                    "the pending replay of session {id} could not be read; its retraction, \
+                     if any, will not be replayed: {error}"
+                ));
+                let _ = self.clear_resume_replay(id);
             }
         }
 
@@ -7689,7 +7640,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_marker_is_rebuilt_from_the_retraction_it_left() {
+    fn an_unreadable_marker_does_not_replay_the_rewind_it_cannot_own() {
         let root = tempfile::tempdir().unwrap();
         let mgr = SessionManager::with_root(root.path().join("0123456789abcdef"));
         let lease = mgr.acquire_lease("replay").unwrap();
@@ -7702,6 +7653,8 @@ mod tests {
         )
         .unwrap();
         let logged = |seq: u64, event: SessionEvent| LoggedEvent { seq, at: 0, event };
+        // A committed rewind hides one unanswered prompt, but the log cannot say
+        // whether the resume wrote it or the person undid the turn themselves.
         mgr.append_events(
             &lease,
             &[
@@ -7735,34 +7688,21 @@ mod tests {
         let (_loaded, pending) = mgr
             .load_native_session_for_resume_noting(&lease, &mut notes)
             .unwrap();
-        assert_eq!(
-            pending.as_ref().map(|message| message.text.as_str()),
-            Some("hello")
-        );
+        assert!(pending.is_none(), "an unwritten prompt is not handed back");
         assert!(
-            notes.iter().any(|note| note.contains("retried")),
+            notes
+                .iter()
+                .any(|note| note.contains("will not be replayed")),
             "{notes:?}"
         );
-        assert_eq!(
-            mgr.read_resume_replay("replay").unwrap(),
-            Some(ResumeReplay {
-                to: 1,
-                turn: 1,
-                rewound: Some(3)
-            }),
-            "the replacement names the rewind the log holds"
+        assert!(
+            !mgr.resume_replay_path("replay").unwrap().exists(),
+            "the unreadable marker is not kept as an error for every later resume"
         );
-
-        // A second death before the replay starts finds that replacement.
-        let mut notes = Vec::new();
-        let (_loaded, pending) = mgr
-            .load_native_session_for_resume_noting(&lease, &mut notes)
-            .unwrap();
-        assert_eq!(
-            pending.as_ref().map(|message| message.text.as_str()),
-            Some("hello")
-        );
-        assert!(notes.is_empty(), "{notes:?}");
+        assert!(matches!(
+            mgr.prepare_resume_replay(&lease, &Message::user("hello")),
+            Ok(PrepareResumeReplay::Obsolete)
+        ));
     }
 
     #[test]
@@ -7826,7 +7766,7 @@ mod tests {
         assert!(
             notes
                 .iter()
-                .any(|note| note.contains("no prompt it retracted")),
+                .any(|note| note.contains("will not be replayed")),
             "{notes:?}"
         );
         assert!(!mgr.resume_replay_path("replay").unwrap().exists());

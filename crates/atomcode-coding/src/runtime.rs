@@ -7865,6 +7865,8 @@ fn spawn_runtime_owner_with_optional_agent(
                                 // A replay that could not run already set the
                                 // failure phase; a ready store here would hide
                                 // it and let a turn run past its pending prompt.
+                                // The caller is still told the swap happened:
+                                // see the send below for why that is the contract.
                                 if active_turn.is_none()
                                     && agent_available
                                     && replay != ResumeReplayOutcome::Deferred

@@ -314,9 +314,10 @@ impl SessionManager {
     /// with the record above it, and treating that blank line as the record
     /// would refuse to allocate for a log that reads back fine.
     ///
-    /// The lock is held for the whole scan, so it reads fixed windows from the
-    /// tail instead of growing one buffer over the file: only the last record is
-    /// held whole, and a tail without a line boundary within
+    /// The lock is held for the whole scan, so it reads one fixed window at a
+    /// time into a buffer it reuses: a record that fits is parsed where it was
+    /// read, only a wider one collects the windows before it, and no byte is
+    /// read from disk twice. A tail without a line boundary within
     /// [`MAX_JSONL_LINE_BYTES`] is not a line this store wrote.
     fn last_recorded_seq(file: &mut fs::File, path: &Path) -> SessionResult<Option<SeqNo>> {
         #[derive(serde::Deserialize)]
@@ -333,50 +334,74 @@ impl SessionManager {
             kind: "session events",
             message: format!("{}: unreadable last record", path.display()),
         };
-        // The last non-blank byte, trimming a crash's trailing blank line in
-        // bounded windows rather than one window over the whole tail.
+        let parse = |line: &[u8]| {
+            serde_json::from_slice::<SeqRecord>(line)
+                .map(|record| record.seq)
+                .map_err(|_| corrupt())
+        };
+
+        // The last window first: it holds the end of every record a normal
+        // append writes, trailing blank bytes included, and the buffer below is
+        // reused for each earlier one the walk needs.
+        let mut window = Vec::new();
         let mut end = len;
-        let mut blank = 0u64;
-        loop {
-            let start = end.saturating_sub(TAIL_WINDOW);
-            let window = read_log_window(file, path, start, end)?;
+        let mut start = loop {
+            let next = end.saturating_sub(TAIL_WINDOW);
+            read_log_window(file, path, next, end, &mut window)?;
             if let Some(position) = window.iter().rposition(|byte| !byte.is_ascii_whitespace()) {
-                end = start + position as u64 + 1;
-                break;
+                end = next + position as u64 + 1;
+                window.truncate(position + 1);
+                break next;
             }
-            if start == 0 {
+            if next == 0 {
                 return Ok(None);
             }
-            blank = blank.saturating_add(end - start);
-            if blank > MAX_JSONL_LINE_BYTES as u64 {
+            if len - next > MAX_JSONL_LINE_BYTES as u64 {
                 return Err(corrupt());
             }
-            end = start;
-        }
-        // The line after the previous newline is the last record. A record line
-        // is capped like every other line this store writes, so the search stops
-        // a line's length above the end.
-        let mut start = end;
+            end = next;
+        };
+        // The line after the last newline is the record. Windows read so far are
+        // kept newest first; a line wider than one window is joined once, from
+        // the window that holds its newline to the one that holds its end.
+        let mut earlier: Vec<Vec<u8>> = Vec::new();
         loop {
-            let window_start = start.saturating_sub(TAIL_WINDOW);
-            let window = read_log_window(file, path, window_start, start)?;
             if let Some(position) = window.iter().rposition(|byte| *byte == b'\n') {
-                start = window_start + position as u64 + 1;
-                break;
+                let line = &window[position + 1..];
+                if earlier.is_empty() {
+                    return parse(line);
+                }
+                let mut joined =
+                    Vec::with_capacity(earlier.iter().map(Vec::len).sum::<usize>() + line.len());
+                joined.extend_from_slice(line);
+                for part in earlier.iter().rev() {
+                    joined.extend_from_slice(part);
+                }
+                return parse(&joined);
             }
-            if end.saturating_sub(window_start) > MAX_JSONL_LINE_BYTES as u64 {
+            if start == 0 {
+                // The log's first line is a header, not a record: `seq` stays
+                // `None`, and the caller allocates from its own floor.
+                if earlier.is_empty() {
+                    return parse(&window);
+                }
+                let mut joined =
+                    Vec::with_capacity(earlier.iter().map(Vec::len).sum::<usize>() + window.len());
+                joined.extend_from_slice(&window);
+                for part in earlier.iter().rev() {
+                    joined.extend_from_slice(part);
+                }
+                return parse(&joined);
+            }
+            let next = start.saturating_sub(TAIL_WINDOW);
+            if end.saturating_sub(next) > MAX_JSONL_LINE_BYTES as u64 {
                 return Err(corrupt());
             }
-            if window_start == 0 {
-                start = 0;
-                break;
-            }
-            start = window_start;
+            let mut part = Vec::new();
+            read_log_window(file, path, next, start, &mut part)?;
+            earlier.push(std::mem::replace(&mut window, part));
+            start = next;
         }
-        let line = read_log_window(file, path, start, end)?;
-        serde_json::from_slice::<SeqRecord>(&line)
-            .map(|record| record.seq)
-            .map_err(|_| corrupt())
     }
 
     /// Keep the index's name with the log's when the person names the session.
@@ -907,30 +932,44 @@ impl SessionManager {
             });
         }
         if let Some(prompt) = accepted {
-            // The snapshot's in-flight prompt was accepted before the process
-            // died but never entered a log. It becomes the turn the log would
-            // have held, so its replay retracts a log fact like any other
-            // instead of being sent beside a conversation that lacks it. The
-            // index is not advanced for it: `turn_count` is the number of turn
-            // stats (a runtime commit sets exactly that) and a turn that never
-            // ran has none, while turn ids are read from the log, not the index.
-            let turn = last_turn(&events) + 1;
-            let at = u64::try_from(super::now_ms()).unwrap_or(0);
-            let seq = events.last().map_or(1, |last| last.seq + 1);
-            events.push(LoggedEvent {
-                seq,
-                at,
-                event: SessionEvent::TurnStart { turn },
-            });
-            events.push(LoggedEvent {
-                seq: seq + 1,
-                at,
-                event: SessionEvent::UserMessage {
-                    turn,
-                    text: prompt.text.clone(),
-                    images: prompt.images.clone(),
-                },
-            });
+            // A log turn means "the person said this", so only a message that
+            // is one becomes a turn: the checkpoint's tail can also be a tool
+            // result, an injected continuation or a synthetic note, and writing
+            // one of those as a `UserMessage` would replay it as the person's
+            // next prompt. The resume loader already refuses them; the write
+            // states the condition again because this is where the fact is
+            // born, and every later resume reads it back from here.
+            let is_prompt = prompt.role == Role::User
+                && prompt.tool_call_id.is_none()
+                && !prompt.synthetic
+                && prompt.internal_origin.is_none()
+                && prompt.tool_calls.is_empty();
+            if is_prompt {
+                // The snapshot's in-flight prompt was accepted before the process
+                // died but never entered a log. It becomes the turn the log would
+                // have held, so its replay retracts a log fact like any other
+                // instead of being sent beside a conversation that lacks it. The
+                // index is not advanced for it: `turn_count` is the number of turn
+                // stats (a runtime commit sets exactly that) and a turn that never
+                // ran has none, while turn ids are read from the log, not the index.
+                let turn = last_turn(&events) + 1;
+                let at = u64::try_from(super::now_ms()).unwrap_or(0);
+                let seq = events.last().map_or(1, |last| last.seq + 1);
+                events.push(LoggedEvent {
+                    seq,
+                    at,
+                    event: SessionEvent::TurnStart { turn },
+                });
+                events.push(LoggedEvent {
+                    seq: seq + 1,
+                    at,
+                    event: SessionEvent::UserMessage {
+                        turn,
+                        text: prompt.text.clone(),
+                        images: prompt.images.clone(),
+                    },
+                });
+            }
         }
         let mut header = SessionHeader::new(id);
         header.created_at = u64::try_from(meta.created_at).unwrap_or(0);
@@ -1044,20 +1083,22 @@ impl SessionManager {
 }
 
 /// How much of the log's tail one step of [`SessionManager::last_recorded_seq`]
-/// reads. Fixed so the scan holds one window and the last record, never the file.
+/// reads. Fixed so the scan holds one window at a time, never the file.
 const TAIL_WINDOW: u64 = 64 * 1024;
 
-/// Bytes `start..end` of the locked append handle, read in place.
+/// Fill `buffer` with bytes `start..end` of the locked append handle.
 ///
 /// Seeking on an append handle is safe: the handle's writes go to the end of the
 /// file whatever its position (append semantics), and Windows locks cover the
-/// same handle that holds them.
+/// same handle that holds them. The buffer is reused across the steps of a tail
+/// scan, so the normal one-window scan allocates nothing beyond it.
 fn read_log_window(
     file: &mut fs::File,
     path: &Path,
     start: u64,
     end: u64,
-) -> SessionResult<Vec<u8>> {
+    buffer: &mut Vec<u8>,
+) -> SessionResult<()> {
     let len =
         usize::try_from(end.saturating_sub(start)).map_err(|_| SessionStoreError::Corrupt {
             kind: "session events",
@@ -1065,10 +1106,9 @@ fn read_log_window(
         })?;
     file.seek(SeekFrom::Start(start))
         .map_err(|error| io_at(path, error))?;
-    let mut window = vec![0u8; len];
-    file.read_exact(&mut window)
-        .map_err(|error| io_at(path, error))?;
-    Ok(window)
+    buffer.clear();
+    buffer.resize(len, 0);
+    file.read_exact(buffer).map_err(|error| io_at(path, error))
 }
 
 /// A change to a session's conversation, planned against its log.
@@ -4507,6 +4547,24 @@ mod tests {
             pending.map(|message| message.text),
             Some("continue after crash".to_string())
         );
+    }
+
+    #[test]
+    fn a_converted_sessions_tail_that_is_not_a_prompt_is_not_a_log_turn() {
+        let (_dir, manager) = store();
+        let (lease, _snapshot) = snapshot_session(&manager, "s1");
+        let loaded = manager.load_native_session("s1").unwrap();
+        // A synthetic note is a `User`-role message, so only the prompt test
+        // keeps it from becoming a turn the model would read as the person's.
+        let note = Message::synthetic_user("=== RESUME ===");
+        manager.convert(&lease, loaded, Some(&note)).unwrap();
+
+        assert!(!manager.load_events("s1").unwrap().iter().any(|logged| {
+            matches!(
+                &logged.event,
+                SessionEvent::UserMessage { text, .. } if text == "=== RESUME ==="
+            )
+        }));
     }
 
     #[cfg(feature = "memory")]
