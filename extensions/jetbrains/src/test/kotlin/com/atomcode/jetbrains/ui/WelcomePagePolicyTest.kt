@@ -1,6 +1,7 @@
 package com.atomcode.jetbrains.ui
 
 import kotlin.test.Test
+import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
@@ -47,5 +48,19 @@ class WelcomePagePolicyTest {
                 lastError = null,
             ),
         )
+    }
+
+    @Test
+    fun `a pending error keeps the live view instead of re-rendering history`() {
+        // 失败的一轮不落历史：重渲染会按历史重画并清屏，错误就没了。
+        assertEquals(
+            false,
+            WelcomePagePolicy.shouldRenderFinishedTurnFromHistory("该会话正在终端或其他客户端中使用。"),
+        )
+    }
+
+    @Test
+    fun `a clean turn is re-rendered from history`() {
+        assertEquals(true, WelcomePagePolicy.shouldRenderFinishedTurnFromHistory(null))
     }
 }

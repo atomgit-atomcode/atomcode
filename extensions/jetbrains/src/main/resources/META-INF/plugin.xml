@@ -58,6 +58,23 @@
       <category>AtomCode</category>
     </intentionAction>
 
+    <!-- 意图的描述目录：缺了它 IDE 每次展示意图都会报
+         "Intention Description Dir URL is null ... while looking for description.html"。 -->
+    <intentionDescriptions>
+      <intentionDescription
+        dirName="ExplainSelectionIntention"
+        className="com.atomcode.jetbrains.actions.ExplainSelectionIntention" />
+      <intentionDescription
+        dirName="FixSelectionIntention"
+        className="com.atomcode.jetbrains.actions.FixSelectionIntention" />
+      <intentionDescription
+        dirName="OptimizeSelectionIntention"
+        className="com.atomcode.jetbrains.actions.OptimizeSelectionIntention" />
+      <intentionDescription
+        dirName="AddContextIntention"
+        className="com.atomcode.jetbrains.actions.AddContextIntention" />
+    </intentionDescriptions>
+
     <projectService serviceImplementation="com.atomcode.jetbrains.services.AtomCodeProjectService" />
     <projectService serviceImplementation="com.atomcode.jetbrains.session.SessionWorkspace" />
     <projectService serviceImplementation="com.atomcode.jetbrains.persistence.AtomCodeProjectWorkspaceState" />

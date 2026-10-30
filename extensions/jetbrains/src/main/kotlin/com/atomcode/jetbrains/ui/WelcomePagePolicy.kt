@@ -16,4 +16,13 @@ internal object WelcomePagePolicy {
         generating: Boolean,
         lastError: String?,
     ): Boolean = !hasSession && !generating && lastError == null
+
+    /**
+     * 回合结束后要不要用历史把消息区整块重画。
+     *
+     * 失败的那一轮不会进历史（daemon 只记成功消息），而重渲染会 `clearMessages()`
+     * 后按历史重画——刚显示的"会话被其他客户端占用"就这么被抹掉了，用户看到的只是
+     * 一闪。所以错误还挂着时保留现场视图，等下一次提问再清。
+     */
+    fun shouldRenderFinishedTurnFromHistory(lastError: String?): Boolean = lastError == null
 }

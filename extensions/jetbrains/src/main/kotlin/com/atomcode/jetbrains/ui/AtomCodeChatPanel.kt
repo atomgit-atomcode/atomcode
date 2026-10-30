@@ -277,6 +277,9 @@ class AtomCodeChatPanel(
     private val queuedPrompts = ArrayDeque<QueuedPrompt>()
     /// Skills the daemon exposes as slash commands; refreshed when the link is ready.
     private var slashSkills: List<SkillInfo> = emptyList()
+    /// 面板自己报的错（建会话、切模型、改模式等失败的路径），和流里的错误一样要
+    /// 挡住欢迎页与历史重渲染——否则消息区被整块重画，错误同样一闪而过。
+    private var lastPanelError: String? = null
     private var disposed = false
     private val connectionListener = java.beans.PropertyChangeListener { event: PropertyChangeEvent ->
         if (disposed) return@PropertyChangeListener
@@ -545,7 +548,7 @@ class AtomCodeChatPanel(
         if (WelcomePagePolicy.shouldRenderAutomatically(
                 hasSession = currentSession != null,
                 generating = generating,
-                lastError = streamHandler.lastError,
+                lastError = liveError(),
             )
         ) {
             showWelcomePage()
@@ -1102,6 +1105,8 @@ class AtomCodeChatPanel(
                 if (error != null) return@invokeLater
                 if (generating || activeGenerationId != null) return@invokeLater
                 if (currentSession?.id != session.id) return@invokeLater
+                // 失败的一轮不落历史，重渲染会把刚显示的错误连带清掉。
+                if (!WelcomePagePolicy.shouldRenderFinishedTurnFromHistory(liveError())) return@invokeLater
 
                 currentSession = SessionRefView(detail.id, detail.name, detail.projectHash, detail.workingDir)
                 updateAtomCodeChatTabTitle(project, this@AtomCodeChatPanel, detail.name.ifBlank { detail.id.take(8) })
@@ -1196,6 +1201,8 @@ class AtomCodeChatPanel(
         generating = true
         inputPanel.setGenerating(true)
         streamHandler.reset()
+        // 人重新提问才算"错误已读"：上一条错误的挡板在这里解除。
+        lastPanelError = null
 
         val provider = (modelPicker.selectedItem as? ModelInfo)?.provider
         service.sendPrompt(message, currentSession, object : ChatStreamListener {
@@ -1453,8 +1460,12 @@ class AtomCodeChatPanel(
     }
 
     private fun addErrorMessage(text: String) {
+        lastPanelError = text
         messageView.addError(text)
     }
+
+    /// 当前还挂着、尚未被下一次提问清掉的错误（流里的优先，其次是面板自己报的）。
+    private fun liveError(): String? = streamHandler.lastError ?: lastPanelError
 
     // ── Context management ──
 
@@ -2058,7 +2069,10 @@ class AtomCodeChatPanel(
         service.listSkills().whenComplete { skills, error ->
             if (error != null || skills == null) return@whenComplete
             SwingUtilities.invokeLater {
-                if (!disposed) slashSkills = skills
+                if (disposed) return@invokeLater
+                val changed = skills != slashSkills
+                slashSkills = skills
+                if (changed) inputPanel.updateCommandPopup(SlashCommands.items(skills))
             }
         }
     }
@@ -2091,14 +2105,13 @@ class AtomCodeChatPanel(
         val pointer = java.awt.MouseInfo.getPointerInfo().location; SwingUtilities.convertPointFromScreen(pointer, this); menu.show(this, pointer.x, pointer.y)
     }
 
+    /// `/` 菜单：内置命令 + daemon 的技能由 InputPanel 的选择器渲染（限高可滚动、
+    /// 模糊过滤、点击或 Enter 补进输入框），这里只负责给出清单。
     private fun showCommandMenu() {
-        val menu = JPopupMenu()
-        SlashCommands.items(slashSkills).forEach { command ->
-            menu.add(JMenuItem("${command.name} - ${command.description}").apply {
-                addActionListener { inputPanel.setInputText("${command.name} "); inputPanel.focusInput() }
-            })
-        }
-        inputPanel.showCommandPopup(menu)
+        inputPanel.showCommandPopup(SlashCommands.items(slashSkills))
+        // vscode 打开选择器时才 ensureSlashSkills：命令行里已经能用的内置项先显示，
+        // 技能到达后由 refreshSkills() 就地补上。
+        if (slashSkills.isEmpty()) refreshSkills()
     }
 
     private fun showModelPickerPopup() {

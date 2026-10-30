@@ -78,18 +78,54 @@ class SlashCommandsTest {
     fun `a bare slash lists everything and a prefix narrows it`() {
         val items = SlashCommands.BUILT_INS
 
-        assertEquals(items.size, SlashCommands.filter(items, "/").size)
-        assertEquals(items.size, SlashCommands.filter(items, "").size)
-        assertEquals(listOf("/login", "/logout"), SlashCommands.filter(items, "/log").map { it.name })
-        assertEquals(emptyList(), SlashCommands.filter(items, "/nope"))
+        assertEquals(items.size, SlashCommands.match(items, "/").size)
+        assertEquals(items.size, SlashCommands.match(items, "").size)
+        assertEquals(listOf("/login", "/logout"), SlashCommands.match(items, "/log").map { it.name })
+        assertEquals(emptyList(), SlashCommands.match(items, "/nope"))
     }
 
     @Test
-    fun `the filter is case insensitive`() {
+    fun `matching is case insensitive`() {
         assertEquals(
             listOf("/whoami"),
-            SlashCommands.filter(SlashCommands.BUILT_INS, "/Who").map { it.name },
+            SlashCommands.match(SlashCommands.BUILT_INS, "/Who").map { it.name },
         )
+    }
+
+    @Test
+    fun `a prefix hit outranks a subsequence hit`() {
+        val skills = listOf(
+            SkillInfo("karpathy-guidelines", "guidelines"),
+            SkillInfo("kag-tool", "starts with the query"),
+        )
+        val items = SlashCommands.items(skills)
+
+        // `/ka` is a prefix of `kag-tool` (a skill without the namespace prefix) and
+        // only a subsequence of `karpathy-guidelines`; the prefix one must come first.
+        val matched = SlashCommands.match(items.filter { it.name.startsWith("/k") }, "/kag")
+        // 两个都会命中（karpathy 里 k→a→g 是子序列），但前缀命中必须排在前面。
+        assertEquals("/kag-tool", matched.first().name)
+        assertTrue(matched.size >= 2, "子序列命中仍然保留，只是排在后面")
+    }
+
+    @Test
+    fun `a subsequence query still finds a skill`() {
+        val items = SlashCommands.items(
+            listOf(SkillInfo("andrej-karpathy-skills:karpathy-guidelines", "guidelines")),
+        )
+
+        // VS Code 的规则是前缀匹配；这里额外允许子序列，`/kg` 才能命中 karpathy-guidelines。
+        assertEquals(
+            listOf("/andrej-karpathy-skills:karpathy-guidelines"),
+            SlashCommands.match(items, "/kg").map { it.name },
+        )
+    }
+
+    @Test
+    fun `an unmatched subsequence disappears`() {
+        val items = SlashCommands.items(listOf(SkillInfo("silent-skill", "x")))
+
+        assertEquals(emptyList(), SlashCommands.match(items, "/zzz"))
     }
 
     @Test

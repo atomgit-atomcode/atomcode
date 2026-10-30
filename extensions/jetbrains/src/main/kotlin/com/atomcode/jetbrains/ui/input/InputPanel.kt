@@ -12,6 +12,7 @@ import java.awt.BorderLayout
 import java.awt.CardLayout
 import java.awt.Component
 import java.awt.Cursor
+import java.awt.GraphicsEnvironment
 import java.awt.Dimension
 import java.awt.Graphics
 import java.awt.Graphics2D
@@ -34,7 +35,6 @@ import javax.swing.JButton
 import javax.swing.JLabel
 import javax.swing.JMenuItem
 import javax.swing.MenuElement
-import javax.swing.MenuSelectionManager
 import javax.swing.JPanel
 import javax.swing.JPopupMenu
 import javax.swing.JScrollPane
@@ -65,7 +65,21 @@ class InputPanel(
 ) : JPanel(BorderLayout()), DataProvider, PasteProvider {
 
     private var slashTriggerConsumed = false
-    private var commandPopup: JPopupMenu? = null
+
+    /// `/` 选择器：向上弹出、限高可滚动；焦点始终留在输入框，所以打字就是过滤。
+    /// 输入框外框，选择器左沿与它对齐（而不是文字区那一点内缩）。
+    private lateinit var composerPanel: JPanel
+
+    private val commandPopup = SlashCommandPopup(
+        anchor = { inputArea },
+        onInsert = { name ->
+            setInputText("$name ")
+            focusInput()
+        },
+        horizontalAnchor = { if (::composerPanel.isInitialized) composerPanel else inputArea },
+        // 收起后复位：焦点移开导致收起，再回来继续输入时仍要重新触发匹配。
+        onHide = { slashTriggerConsumed = false },
+    )
     private var initialized = false
     private val toolButtons = mutableListOf<JButton>()
     private val compactToolButtons = mutableSetOf<JButton>()
@@ -230,6 +244,8 @@ class InputPanel(
             add(toolbar, BorderLayout.SOUTH)
         }
 
+        composerPanel = composer
+
         val composerInset = JPanel(BorderLayout()).apply {
             isOpaque = false
             border = BorderFactory.createEmptyBorder(8, 10, 10, 10)
@@ -379,15 +395,16 @@ class InputPanel(
         inputArea.requestFocusInWindow()
     }
 
-    fun showCommandPopup(menu: JPopupMenu) {
-        commandPopup?.isVisible = false
-        commandPopup = menu
-        menu.isFocusable = false
-        menu.components.forEach { it.isFocusable = false }
-        menu.show(inputArea, 0, -menu.preferredSize.height)
-        filterCommandPopup(commandPrefix())
-        selectCommandMenuItem(0)
+    /// 打开 `/` 选择器。列表由调用方给出（内置命令 + daemon 的技能），过滤与
+    /// 滚动都在 [SlashCommandPopup] 里，焦点一直留在输入框。
+    internal fun showCommandPopup(commands: List<SlashCommand>) {
         inputArea.requestFocusInWindow()
+        commandPopup.show(commands, commandPrefix().orEmpty())
+    }
+
+    /// 技能列表异步到达：选择器开着就地更新，别让人重开一次才看到。
+    internal fun updateCommandPopup(commands: List<SlashCommand>) {
+        commandPopup.updateCommands(commands, commandPrefix().orEmpty())
     }
 
     fun setGenerating(generating: Boolean) {
@@ -509,7 +526,7 @@ class InputPanel(
         inputArea.inputMap.put(KeyStroke.getKeyStroke("UP"), "atomcode-command-up")
         inputArea.actionMap.put("atomcode-command-up", object : AbstractAction() {
             override fun actionPerformed(e: java.awt.event.ActionEvent?) {
-                if (!moveCommandSelection(-1)) {
+                if (!commandPopup.move(-1)) {
                     inputArea.transferFocusBackward()
                 }
             }
@@ -518,7 +535,7 @@ class InputPanel(
         inputArea.inputMap.put(KeyStroke.getKeyStroke("DOWN"), "atomcode-command-down")
         inputArea.actionMap.put("atomcode-command-down", object : AbstractAction() {
             override fun actionPerformed(e: java.awt.event.ActionEvent?) {
-                if (!moveCommandSelection(1)) {
+                if (!commandPopup.move(1)) {
                     inputArea.transferFocus()
                 }
             }
@@ -534,7 +551,7 @@ class InputPanel(
         inputArea.inputMap.put(KeyStroke.getKeyStroke("TAB"), tabAction)
         inputArea.actionMap.put(tabAction, object : AbstractAction() {
             override fun actionPerformed(e: java.awt.event.ActionEvent?) {
-                if (!activateSelectedCommand()) {
+                if (!commandPopup.activate()) {
                     inputArea.transferFocus()
                 }
             }
@@ -543,7 +560,7 @@ class InputPanel(
         inputArea.inputMap.put(KeyStroke.getKeyStroke("ENTER"), enterAction)
         inputArea.actionMap.put(enterAction, object : AbstractAction() {
             override fun actionPerformed(e: java.awt.event.ActionEvent?) {
-                if (activateSelectedCommand()) return
+                if (commandPopup.activate()) return
                 if (sendWithCtrlEnter) {
                     insertNewline()
                 } else {
@@ -584,14 +601,23 @@ class InputPanel(
         }
     }
 
+    /// `/` 按钮是开关：选择器开着就清空输入并收起，否则补上 `/` 再打开
+    /// （与 vscode 的 handleSlashButton 一致）。
     private fun showSlashCommandsFromButton() {
+        if (commandPopup.isVisible) {
+            slashTriggerConsumed = false
+            commandPopup.hide()
+            inputArea.text = ""
+            inputArea.requestFocusInWindow()
+            return
+        }
         if (commandPrefix() == null) {
             slashTriggerConsumed = true
             inputArea.text = "/"
             inputArea.caretPosition = inputArea.document.length
         }
-        onSlashCommand()
         inputArea.requestFocusInWindow()
+        onSlashCommand()
     }
 
     private fun showApprovalModeMenu() {
@@ -615,6 +641,7 @@ class InputPanel(
     }
 
     private fun fireSend() {
+        commandPopup.hide()
         val text = inputArea.text.trim()
         if (text.isNotEmpty()) {
             if (onSend(text)) {
@@ -624,8 +651,7 @@ class InputPanel(
     }
 
     private fun hideCommandPopup() {
-        commandPopup?.isVisible = false
-        MenuSelectionManager.defaultManager().clearSelectedPath()
+        commandPopup.hide()
         inputArea.requestFocusInWindow()
     }
 
@@ -638,12 +664,12 @@ class InputPanel(
         val prefix = commandPrefix()
         if (prefix == null) {
             slashTriggerConsumed = false
-            commandPopup?.isVisible = false
+            commandPopup.hide()
             return
         }
 
-        if (commandPopup?.isVisible == true) {
-            filterCommandPopup(prefix)
+        if (commandPopup.isVisible) {
+            commandPopup.update(prefix)
             return
         }
 
@@ -654,10 +680,7 @@ class InputPanel(
             val currentPrefix = commandPrefix()
             if (currentPrefix != null) {
                 onSlashCommand()
-                SwingUtilities.invokeLater {
-                    filterCommandPopup(currentPrefix)
-                    selectCommandMenuItem(0)
-                }
+                SwingUtilities.invokeLater { commandPopup.update(currentPrefix) }
             }
         }
     }
@@ -665,68 +688,6 @@ class InputPanel(
     private fun commandPrefix(): String? {
         return slashCommandPrefix(inputArea.text)
     }
-
-    private fun commandItems(): List<JMenuItem> =
-        commandPopup
-            ?.components
-            ?.filterIsInstance<JMenuItem>()
-            .orEmpty()
-
-    private fun visibleCommandItems(): List<JMenuItem> =
-        commandItems().filter { it.isVisible }
-
-    private fun filterCommandPopup(prefix: String?) {
-        val popup = commandPopup?.takeIf { it.isVisible } ?: return
-        val normalizedPrefix = prefix.orEmpty().lowercase()
-        val items = commandItems()
-        items.forEach { item ->
-            item.isVisible = normalizedPrefix.isBlank() ||
-                item.text.lowercase().startsWith(normalizedPrefix)
-        }
-        popup.pack()
-        if (items.any { it.isVisible }) {
-            selectCommandMenuItem(0)
-        } else {
-            MenuSelectionManager.defaultManager().clearSelectedPath()
-        }
-    }
-
-    private fun selectedCommandIndex(items: List<JMenuItem>): Int {
-        val selected = MenuSelectionManager.defaultManager().selectedPath.lastOrNull() as? JMenuItem
-        val selectedIndex = items.indexOf(selected)
-        return selectedIndex.takeIf { it >= 0 } ?: 0
-    }
-
-    private fun selectCommandMenuItem(index: Int): Boolean {
-        val popup = commandPopup?.takeIf { it.isVisible } ?: return false
-        val items = visibleCommandItems()
-        if (items.isEmpty()) return false
-        val selected = index.coerceIn(items.indices)
-        MenuSelectionManager.defaultManager().selectedPath = arrayOf<MenuElement>(popup, items[selected])
-        return true
-    }
-
-    private fun moveCommandSelection(delta: Int): Boolean {
-        val popup = commandPopup?.takeIf { it.isVisible } ?: return false
-        val items = visibleCommandItems()
-        if (items.isEmpty()) return false
-        val next = (selectedCommandIndex(items) + delta).floorMod(items.size)
-        MenuSelectionManager.defaultManager().selectedPath = arrayOf<MenuElement>(popup, items[next])
-        return true
-    }
-
-    private fun activateSelectedCommand(): Boolean {
-        val popup = commandPopup?.takeIf { it.isVisible } ?: return false
-        val items = visibleCommandItems()
-        if (items.isEmpty()) return false
-        val selected = items[selectedCommandIndex(items)]
-        selected.doClick(0)
-        hideCommandPopup()
-        return true
-    }
-
-    private fun Int.floorMod(divisor: Int): Int =
-        ((this % divisor) + divisor) % divisor
 
     private fun layoutToolbar(
         toolbar: JPanel,
@@ -887,3 +848,19 @@ internal fun slashCommandPrefix(text: String): String? {
     if (text.any { it.isWhitespace() }) return null
     return text
 }
+
+internal const val MIN_COMMAND_ROWS = 6
+internal const val MAX_COMMAND_ROWS = 12
+internal const val COMMAND_POPUP_RESERVED_HEIGHT = 160
+
+/**
+ * 屏幕上最多放得下多少行命令。弹窗高过屏幕时 Swing 会把它渲染成重型窗口，那是
+ * "列表一闪而过"的起点（见 showCommandPopup 的说明），所以这里要么放得下，
+ * 要么明确截断到放得下。
+ */
+internal fun commandRowsThatFit(availableHeight: Int, rowHeight: Int): Int {
+    val usable = (availableHeight - COMMAND_POPUP_RESERVED_HEIGHT).coerceAtLeast(0)
+    val row = rowHeight.coerceAtLeast(1)
+    return (usable / row).coerceIn(MIN_COMMAND_ROWS, MAX_COMMAND_ROWS)
+}
+

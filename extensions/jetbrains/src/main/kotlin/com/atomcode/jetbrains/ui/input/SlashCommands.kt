@@ -36,14 +36,44 @@ internal object SlashCommands {
     }
 
     /**
-     * Commands whose name starts with `prefix`. A bare `/` (or an empty filter)
-     * lists everything, the way the popup opens before a second character arrives.
+     * Commands matching what the person typed after `/`.
+     *
+     * Same rule as the VS Code picker — a name that starts with the query ranks
+     * first — plus a subsequence fallback so `/kg` still finds
+     * `karpathy-guidelines`. A bare `/` lists everything, in declaration order.
      */
-    fun filter(items: List<SlashCommand>, prefix: String): List<SlashCommand> {
-        val needle = prefix.trim().lowercase()
-        if (needle.isEmpty() || needle == "/") return items
-        return items.filter { it.name.lowercase().startsWith(needle) }
+    fun match(items: List<SlashCommand>, prefix: String): List<SlashCommand> {
+        val needle = prefix.trim().removePrefix("/").lowercase()
+        if (needle.isEmpty()) return items
+        return items
+            .mapIndexedNotNull { index, item ->
+                score(item.name, needle)?.let { Triple(item, it, index) }
+            }
+            .sortedWith(compareByDescending<Triple<SlashCommand, Int, Int>> { it.second }.thenBy { it.third })
+            .map { it.first }
     }
+
+    /**
+     * Higher is better, `null` means "no match". A prefix hit beats any
+     * subsequence hit (that is the VS Code ordering); within the same kind,
+     * tighter matches (shorter name, fewer gaps) win.
+     */
+    fun score(name: String, needle: String): Int? {
+        val haystack = name.removePrefix("/").lowercase()
+        if (haystack.startsWith(needle)) return PREFIX_SCORE - haystack.length
+        var cursor = 0
+        var gaps = 0
+        for (char in needle) {
+            val hit = haystack.indexOf(char, cursor)
+            if (hit < 0) return null
+            gaps += hit - cursor
+            cursor = hit + 1
+        }
+        return SUBSEQUENCE_SCORE - gaps
+    }
+
+    private const val PREFIX_SCORE = 1_000
+    private const val SUBSEQUENCE_SCORE = 100
 
     /** The command word of an input line, lowercased, or null when it is not one. */
     fun commandWord(prompt: String): String? {
