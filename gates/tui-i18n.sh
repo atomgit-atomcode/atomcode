@@ -63,11 +63,23 @@ for root in roots:
     for p in sorted(pathlib.Path(root).rglob('*.rs')):
         if exempt.search(p.name):
             continue
+        raw = p.read_text().split('\n')
+
+        def exempt_near(number):
+            """The marker on the line, or on the line that starts or ends the
+            statement it explains. rustfmt moves a trailing comment onto its own
+            line (often the line after), so a same-line-only rule silently
+            stopped exempting what it was asked to exempt."""
+            for candidate in (number - 1, number, number + 1):
+                if 0 <= candidate < len(raw) and 'i18n-exempt:' in raw[candidate]:
+                    return True
+            return False
+
         for n, line in production(p):
             s = line.strip()
             if s.startswith('//'):
                 continue
-            if 'i18n-exempt:' in line:
+            if exempt_near(n - 1):
                 continue
             for m in LIT.finditer(line):
                 if CJK.search(m.group(1)):

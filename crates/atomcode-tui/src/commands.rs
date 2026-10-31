@@ -1625,16 +1625,16 @@ impl CommandSet for SessionCommands {
                         // parsing after `/language`. The panel never dispatches
                         // a command at all — it carries a `Scope` — so this
                         // parser exists for what a person types, and only that.
+                        // i18n-exempt: user-typed alias, not shown
                         None | Some("对话") | Some("conversation") => {
-                            // i18n-exempt: user-typed alias, not shown
                             atomcode_kernel::session::RewindScope::Conversation
                         }
+                        // i18n-exempt: user-typed alias, not shown
                         Some("代码") | Some("code") => {
-                            // i18n-exempt: user-typed alias, not shown
                             atomcode_kernel::session::RewindScope::Code
                         }
+                        // i18n-exempt: user-typed alias, not shown
                         Some("全部") | Some("both") => {
-                            // i18n-exempt: user-typed alias, not shown
                             atomcode_kernel::session::RewindScope::Both
                         }
                         Some(other) => {
