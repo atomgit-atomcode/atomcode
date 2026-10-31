@@ -32,6 +32,18 @@
 另外 `zig` 不在插件里（它是静态 `ET_EXEC`，只能放在 `nativeLibraryDir` 执行），由
 `com.atomcode.tools` helper APK 承载。
 
+### mcp-filesystem（MCP，仓库内可编，未发布）
+
+论外的第 11 个：不在上面 10 个的市场条里，因为还没发布。形态与 `mcp-example` 相同
+（命令型，`libmcp_filesystem.so` 导出 `plugin_main`），区别是它**有用**：只读的
+`list_dir` / `read_file` / `stat`，根由 `ATOMCODE_MCP_FS_ROOT` 指定，参数解析成 realpath
+后必须落在根内。手机上没有 shell 时，这是 agent 唯一能看文件的路子。
+
+- 打包：`bash scripts/build-android-mcp-filesystem.sh`（aarch64，约 6.8 KB）；
+- 自测：`bash scripts/mcp-filesystem/selftest.sh` 用主机编译器跑同一份源码，覆盖
+  initialize / tools/list / tools/call 与越界、二进制两条失败路径；
+- 待做：发布到市场仓库（权限未到），与 `mcp-example` 一起。
+
 ## 本批新增的三个
 
 ### quickjs（解释器）

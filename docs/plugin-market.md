@@ -138,6 +138,43 @@ version = "1.0.0"
 ```
 
 构建：`bash scripts/build-android-mcp-plugin.sh`（Windows/Linux 的 NDK 布局都支持）。
+
+**真实用途的那一个**：`mcp-filesystem` 同形，但工具是只读的文件访问
+（`list_dir` / `read_file` / `stat`）：
+
+```toml
+[[plugins]]
+name = "mcp-filesystem"
+title = "文件系统 MCP 服务器"
+summary = "只读文件访问：列目录、读文本、看 stat；越界路径（含符号链接）拒绝"
+category = "mcp"
+version = "1.0.0"
+```
+
+```json
+{
+  "name": "mcp-filesystem",
+  "version": "1.0.0",
+  "entry": "lib/libmcp_filesystem.so",
+  "symbol": "plugin_main",
+  "aliases": ["mcp-filesystem", "filesystem"]
+}
+```
+
+它必须知道**能读哪里**，所以 `mcp.json` 的条目带一个根：
+
+```json
+{ "mcpServers": { "filesystem": {
+  "command": "<product>/bin/mcp-filesystem", "args": [],
+  "env": { "ATOMCODE_MCP_FS_ROOT": "/storage/emulated/0" } } } }
+```
+
+参数先解析成 realpath 再与根比较，`../` 和指向根外的符号链接都返回错误结果；二进制文件
+（含 NUL）拒绝回显。构建：`bash scripts/build-android-mcp-filesystem.sh`；协议自测不需要
+设备：`bash scripts/mcp-filesystem/selftest.sh`（主机编译器跑同一份源码）。
+
+**发布状态**：两个 MCP 包（`mcp-example`、`mcp-filesystem`）都只在本仓库里可编，尚未
+发布到市场仓库——市场仓库还等组织建仓权限。
 注意 MCP 服务器是在 **live runtime 装配时**连接的，改完 `mcp.json` 要切会话或重启应用，
 `/config/reload` 只重载 provider 配置。
 

@@ -10,7 +10,7 @@
 
 ## 一、功能：待做
 
-### 1. 真正有用的 MCP 集成包（可选）
+### 1. 真正有用的 MCP 集成包（仓库内部分已完成，发布未做）
 
 **现状**：MCP 的**交付形态**已经跑通两种，都是真机验证过的：
 
@@ -19,13 +19,23 @@
   `connected, tool_count 2`，模型调用 `mcp__example-bin__now` 拿到时间。
 
 所以「MCP 服务器怎么在手机上跑」这个问题已经有答案（插件路线，`scripts/build-android-mcp-plugin.sh`
-可复现），缺的是**真实集成**：文件系统、数据库、文档检索之类。
+可复现）。
 
-**下一步**：照 `mcp-example` 的形状做一个真实用途的插件包（`mcp-filesystem` 等），
-发布到市场仓库。产物在本仓库内可编，**发布**不在。
+**已补的真实集成**：`mcp-filesystem`（`scripts/mcp-filesystem/plugin.c`）把「看文件」这件事
+补上了，这是手机上没有 shell 时最缺的能力。只读工具 `list_dir` / `read_file` / `stat`，
+根由 `ATOMCODE_MCP_FS_ROOT` 指定，参数解析到 realpath 后必须落在根内（`..` 和符号链接都
+不能越界），二进制文件拒绝回显而不是当文本丢给模型。
 
-**落点**：`crates/atomcode-capabilities/assets/setup-seeds/mcp/example_server.c`（模板）、
-`scripts/build-android-mcp-plugin.sh`、`docs/plugin-market.md`。
+- 打包：`scripts/build-android-mcp-filesystem.sh`（NDK aarch64，产物约 6.8 KB）；
+- 协议自测：`bash scripts/mcp-filesystem/selftest.sh`，同一份源码用主机编译器跑
+  initialize / tools/list / tools/call 与两条失败路径（越界、二进制），不需要真机；
+- 真机安装路径与 `mcp-example` 相同（`POST /packages/install`，再让 `mcp.json` 指向别名）。
+
+**仍未做（不在本仓库内）**：把 `mcp-filesystem` 与 `com.atomcode.tools.zig` 一样发布到
+市场仓库并加目录条目——仓库推送权限还在等。产物已经可编、可自测，发布是纯搬运。
+
+**落点**：`scripts/mcp-filesystem/`、`scripts/build-android-mcp-filesystem.sh`、
+`docs/plugin-market.md`。
 
 
 ### 2. 包的版本更新提示（已实现，此处仅备注逻辑）
