@@ -153,7 +153,18 @@ pub const HELPER_TOOLS: &[(&str, &str)] = &[
 /// the library the link is removed, so an uninstalled provider leaves nothing behind.
 /// This also covers upgrades: a device whose old helper shipped `zig` keeps that link
 /// only while a provider still has the binary.
-pub const PROVIDER_TOOLS: &[(&str, &str)] = &[("zig", "libzig.so")];
+pub const PROVIDER_TOOLS: &[(&str, &str)] = &[
+    ("zig", "libzig.so"),
+    // clang and clang++ are the same driver; which one it acts as is read from
+    // argv[0], which is the name of this link.
+    ("clang", "libclang.so"),
+    ("clang++", "libclang.so"),
+    ("lld", "liblld.so"),
+    // node is the interpreter itself. It replaces the nodejs-mobile plugin, whose
+    // last release is 18.20.4 — a program cannot run from our data directory, so
+    // the upgrade had to move to the provider shape.
+    ("node", "libnode.so"),
+];
 
 /// Point `<data>/bin` at the provider APKs' binaries.
 ///
@@ -312,6 +323,26 @@ pub fn install(
     // The helper APK's binaries are linked last: it is optional, and its absence
     // is normal rather than an error.
     let helper_tools = link_helper_tools(provider_lib_dirs, data_dir);
+    // Provider binaries share their directory with their runtime libraries
+    // (libLLVM, libicu, libc++_shared …), but the loader only searches the
+    // executable's RUNPATH — which these binaries set to the Termux prefix on a
+    // phone that does not exist here. LD_LIBRARY_PATH is inherited by every child
+    // the agent spawns, so one setting covers clang, lld and node.
+    if !provider_lib_dirs.is_empty() {
+        let mut dirs: Vec<String> = provider_lib_dirs
+            .iter()
+            .map(|dir| dir.display().to_string())
+            .collect();
+        dirs.push(native_lib_dir.display().to_string());
+        std::env::set_var("LD_LIBRARY_PATH", dirs.join(":"));
+    }
+    // clang's headers, resource directory and sysroot are a data package (they are
+    // read, not executed). The wrapper the provider ships reads this variable to
+    // build `-resource-dir` and `--sysroot`.
+    let clang_data = data_dir.join("clang");
+    if clang_data.is_dir() {
+        std::env::set_var("ATOMCODE_CLANG_DATA", &clang_data);
+    }
     // Zig 在 APK 的 nativeLibraryDir 里找 `../lib`（不存在），只认 `$ZIG_LIB_DIR`。
     // 标准库由 `zig-lib` 数据包链接到 `<data>/zig`——链接本身就是标准库目录（下面直接
     // 就是 `std/`），所以不能再拼一层 `lib`。

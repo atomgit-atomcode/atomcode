@@ -83,8 +83,8 @@ rc=126
 | lua / sqlite3 / quickjs / node 18 | B（市场插件包） | ✓ 既有 |
 | **MCP 服务器（二进制）** | **B**：`mcp-example` 插件包（纯 C，11 KB） | **✓ 已实现并实测**：`/mcp/status` `connected, tool_count 2`；模型调用 `mcp__example-bin__now` 拿到时间 |
 | Go | A（`CGO_ENABLED=0 GOOS=linux GOARCH=arm64`，静态） | **未做**：本机没有 Go 工具链，且产物必须进 APK（A 路线） |
-| node 20/22 | B（需要 libnode 的交叉构建） | **未做**：18.20.4 已 EOL，升级要重编 libnode（Linux + NDK） |
-| clang + lld | A（NDK 的 clang/lld + sysroot 放进 provider APK；`clang` 的 `-cc1` 在同进程，`ld.lld` 同目录可 exec） | **未做**：产物数百 MB，要 Linux 侧的打包流程 |
+| **node 24 LTS** | **A**：独立 APK `com.atomcode.tools.node`（Termux `nodejs-lts` 24.22.1，`libnode.so` 45 MB）；npm 树与头文件是市场包 `node-lib`，npm 用 `node <prefix>/lib/node_modules/npm/bin/npm-cli.js` 调（数据目录里的 shebang 脚本不可执行） | **已打包，未上真机**（APK 19 MB + 5.1 MB 数据包）。取代 `nodejs-mobile` 18 插件：它是最后能用的 libnode 版本（GitHub 不可达，npm 上仍指 18.20.4） |
+| **clang 21 + lld 21** | **A**：独立 APK `com.atomcode.tools.clang`（Termux LLVM 21.1.8）；头文件、sysroot、resource dir 是市场包 `clang-sysroot`；`clang` 是启动器（`scripts/termux/launcher/clang.c`），注入 `-resource-dir`/`--sysroot` 后 exec 真 driver | **已打包，未上真机**（APK 114 MB + 30 MB 数据包）。NDK 的 clang 是宿主二进制，不能上设备；产物由 `scripts/build-android-clang-provider.sh` 从 Termux 包生成 |
 | cmake / ninja / pkg-config | A | **未做**：同上（cmake 还会 exec 编译器，必须在 A 路线） |
 
 ### 结论

@@ -568,7 +568,12 @@ class AgentService : Service() {
          * forbids executing our own data directory, so an APK directory is the only
          * place a process-model tool can live. Each needs a `<queries>` entry.
          */
-        internal val HELPER_PACKAGES = listOf("com.atomcode.tools", "com.atomcode.tools.zig")
+        internal val HELPER_PACKAGES = listOf(
+            "com.atomcode.tools",
+            "com.atomcode.tools.zig",
+            "com.atomcode.tools.clang",
+            "com.atomcode.tools.node",
+        )
         /**
          * 空闲时多久问一次 daemon。
          *

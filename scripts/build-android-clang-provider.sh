@@ -77,6 +77,17 @@ rm -rf "$JNI"
 mkdir -p "$JNI"
 cp "$CACHE"/clang-split/jniLibs/arm64-v8a/* "$JNI"/
 
+# `clang` is the launcher, not the driver: it appends `-resource-dir` and
+# `--sysroot` for the data package and execs `libclang-real.so` next to it. It has
+# to be a binary because a script in the data directory cannot be executed either.
+cc="$ndk/toolchains/llvm/prebuilt/$host_tag/bin/aarch64-linux-android${API:-26}-clang"
+[ -x "$cc" ] || cc="$cc.cmd"
+[ -e "$cc" ] || { echo "error: no NDK clang at $cc" >&2; exit 1; }
+echo "→ launcher (clang $clang_dir)"
+"$cc" -O2 -DCLANG_RESOURCE="\"lib/clang/$clang_dir\"" \
+  scripts/termux/launcher/clang.c -o "$JNI/libclang.so"
+ls -lh "$JNI/libclang.so" "$JNI/libclang-real.so"
+
 mkdir -p "$DIST"
 bundle="$DIST/clang-sysroot-$version-arm64.tar.gz"
 echo "→ data package $bundle"

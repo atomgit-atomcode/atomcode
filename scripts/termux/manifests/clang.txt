@@ -9,7 +9,12 @@
 # builtins). It is only read, so it ships as data — but the wrapper has to point
 # clang at it with `-resource-dir`, because clang would otherwise look next to its
 # own binary, which lives in nativeLibraryDir.
-exec bin/clang-21 clang
+# `clang` itself is NOT in this list: it is the launcher compiled from
+# scripts/termux/launcher/clang.c, which injects `-resource-dir` and `--sysroot`
+# for the data package and then execs this driver. The driver needs those flags
+# because it would otherwise look for its resource directory next to itself — in
+# the APK's nativeLibraryDir, where the data package is not.
+exec bin/clang-21 clang-real
 exec bin/lld lld
 
 data include

@@ -38,6 +38,11 @@
              stays small. Same mechanism — a file holder whose nativeLibraryDir we
              are allowed to execute. -->
         <package android:name="com.atomcode.tools.zig" />
+        <!-- Android/bionic clang + lld (Termux build) and node 24. Same carrier,
+             same reason: these are programs, and only an APK's lib directory is
+             executable on this platform. -->
+        <package android:name="com.atomcode.tools.clang" />
+        <package android:name="com.atomcode.tools.node" />
         <!--
           The attachment picker offers "take a photo" next to "pick a file", and the
           output URI must be granted to whichever camera app answers. Since Android 11
