@@ -609,14 +609,10 @@ fn with_market_base(text: &str, base: &str) -> String {
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
 
     let mut header: Option<usize> = None;
-    let mut section_is_market = false;
     for (index, raw) in lines.iter().enumerate() {
         let trimmed = raw.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            section_is_market = trimmed == "[market]";
-            if section_is_market {
-                header = Some(index);
-            }
+        if trimmed == "[market]" {
+            header = Some(index);
         }
     }
 

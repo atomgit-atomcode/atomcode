@@ -4779,25 +4779,6 @@ fn lock_session_dir(path: &Path, deadline: std::time::Instant) -> io::Result<Ses
     }
 }
 
-fn acquire_file_lock_until(file: &File, timeout: std::time::Duration) -> io::Result<()> {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        match fs2::FileExt::try_lock_exclusive(file) {
-            Ok(()) => return Ok(()),
-            Err(error) if is_file_lock_contention(&error) => {
-                let now = std::time::Instant::now();
-                if now >= deadline {
-                    return Err(error);
-                }
-                std::thread::sleep(
-                    META_LOCK_RETRY_DELAY.min(deadline.saturating_duration_since(now)),
-                );
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
 pub(super) fn retry_transient_file_access<T>(
     mut operation: impl FnMut() -> SessionResult<T>,
 ) -> SessionResult<T> {
@@ -5190,8 +5171,6 @@ mod tests {
         DisplayAnchor, PresentationEntry, PresentationFile, PresentationRole,
         MAX_PRESENTATION_BYTES, PRESENTATION_VERSION,
     };
-    use super::*;
-
     use crate::product_dirs::test_dirs;
     use atomcode_kernel::message::Message;
     use std::collections::BTreeSet;
@@ -7710,7 +7689,8 @@ mod tests {
         let contender = super::open_lock_file(&path).unwrap();
 
         let started = Instant::now();
-        let error = super::acquire_file_lock_until(&contender, Duration::from_millis(40))
+        let error = super::lock_session_file(&contender, &path, Duration::from_millis(40))
+            .map(|_| ())
             .expect_err("contended lock must stop at its deadline");
         assert!(super::is_file_lock_contention(&error));
         assert!(started.elapsed() < Duration::from_secs(1));
@@ -8125,11 +8105,19 @@ mod tests {
             Err(SessionStoreError::SessionInUse { .. })
         ));
 
-        // A pid that is gone does not: the session is free again.
-        fs::write(lock.join("owner"), u32::MAX.to_string()).unwrap();
-        let taken = take_lock_dir("s1", &lease).expect("a dead owner's lock is taken over");
-        assert!(taken.is_dir());
-        let _ = fs::remove_dir_all(&taken);
+        // A pid that is gone does not: the session is free again. Only a
+        // platform that can ask (unix: `/proc`) can tell a dead owner from a
+        // live one; elsewhere `pid_alive` answers "alive" on purpose, because
+        // the filesystems those platforms run on support `flock` and never take
+        // this path at all. Asserting it there would test a road the platform
+        // does not drive on.
+        #[cfg(unix)]
+        {
+            fs::write(lock.join("owner"), u32::MAX.to_string()).unwrap();
+            let taken = take_lock_dir("s1", &lease).expect("a dead owner's lock is taken over");
+            assert!(taken.is_dir());
+            let _ = fs::remove_dir_all(&taken);
+        }
     }
 
     #[test]
