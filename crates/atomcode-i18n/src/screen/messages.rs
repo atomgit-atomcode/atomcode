@@ -2353,6 +2353,14 @@ pub enum Msg<'a> {
     },
     /// This build ships no notes at all.
     ChangelogEmpty,
+    /// What `/init` says as it starts reading the repository.
+    TranscriptInitAcknowledgement,
+    /// What `/worklog` says once the recap is in the conversation.
+    TranscriptWorklogAcknowledgement,
+    /// The skills a command opened the turn with, named in one line.
+    TranscriptSkillsStarted {
+        names: &'a str,
+    },
     /// The one line on the first launch after an upgrade. `from` is the release
     /// last told about, when known; `releases` how many with notes lie between;
     /// `highlights` the points to name; `more` when there are more than named.

@@ -23,6 +23,10 @@ fail=0
 #                   证明渲染器能处理 CJK 宽度、能在长中文命令上正确截断。翻译它们
 #                   等于删掉这些 fixture 要检查的性质。
 #   launch.rs       `--audit` / `--demo` 那一帧的样例输入，同上。
+#
+# 行上的 `// i18n-exempt: <理由>` 是同一件事的更细粒度形式，只给**不是给人看**的
+# 字面量用：用户能输入的别名（切到 en 之后旧输入仍要解析），以及从别处发来、被本模块
+# 用来分类的协议文本。展示文案不在此列——它在词表里，这一条就是为什么。
 EXEMPT_FILES='conformance\.rs|launch\.rs'
 
 report=$(python3 - "$SRC" "$EXEMPT_FILES" <<'PY'
@@ -62,6 +66,8 @@ for root in roots:
         for n, line in production(p):
             s = line.strip()
             if s.startswith('//'):
+                continue
+            if 'i18n-exempt:' in line:
                 continue
             for m in LIT.finditer(line):
                 if CJK.search(m.group(1)):

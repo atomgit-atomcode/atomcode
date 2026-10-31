@@ -10176,7 +10176,7 @@ fn starts_goal_turn(line: &str) -> bool {
             | "status"
             | "state"
             | "progress"
-            | "状态"
+            | "状态" // i18n-exempt: user-typed alias, not shown
             | "help"
             | "?"
             | "-h"

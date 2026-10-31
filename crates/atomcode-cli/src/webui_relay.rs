@@ -1,5 +1,6 @@
 //! Host-owned WebUI tunnel. The daemon keeps its own authentication and runtime.
 use atomcode_daemon::{WebuiLaunch, WebuiRelayTarget};
+use atomcode_i18n::product::{t as pt, Msg as PMsg};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Mutex, OnceLock,
@@ -67,14 +68,17 @@ pub async fn launch(
         if let Some(target) = &launched.relay_target {
             match start_for_webui(target, sync).await {
                 Ok(url) => {
-                    launched.message =
-                        format!("手机浏览器扫码访问（中继）：{url}\n{}", launched.message);
+                    launched.message = pt(PMsg::RelayQrHint {
+                        url: &url,
+                        detail: &launched.message,
+                    })
+                    .into_owned();
                     launched.qr_url = Some(url);
                 }
                 Err(error) => {
                     launched
                         .message
-                        .push_str(&format!("\n中继访问未启动：{error}。本机地址仍可使用。"));
+                        .push_str(&pt(PMsg::RelayNotStarted { error: &error }));
                 }
             }
         }
@@ -95,7 +99,7 @@ async fn start_for_webui(target: &WebuiRelayTarget, sync: bool) -> Result<String
 
 fn relay_base(base: &str) -> Result<(String, String), String> {
     let (ws, base) = crate::tui_share::relay_urls(base);
-    let url = reqwest::Url::parse(&base).map_err(|_| "中继地址无效".to_string())?;
+    let url = reqwest::Url::parse(&base).map_err(|_| pt(PMsg::RelayInvalidAddress).into_owned())?;
     let loopback = matches!(
         url.host_str(),
         Some("127.0.0.1" | "localhost" | "[::1]" | "::1")
@@ -106,7 +110,7 @@ fn relay_base(base: &str) -> Result<(String, String), String> {
         || url.query().is_some()
         || url.fragment().is_some()
     {
-        return Err("中继须使用 HTTPS（本机测试可用 HTTP）".into());
+        return Err(pt(PMsg::RelayHttpsRequired).into_owned());
     }
     Ok((ws, base))
 }
@@ -137,9 +141,9 @@ async fn startup_step<T>(
                 if generation.load(Ordering::SeqCst) != epoch { return; }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-        } => Err("中继启动已取消".into()),
+        } => Err(pt(PMsg::RelayStartCancelled).into_owned()),
         result = tokio::time::timeout_at(deadline, operation) =>
-            result.map_err(|_| "中继连接超时，请检查网络或接入口令".to_string())?,
+            result.map_err(|_| pt(PMsg::RelayConnectTimeout).into_owned())?,
     }
 }
 
@@ -155,12 +159,12 @@ async fn start(target: &WebuiRelayTarget, sync: bool) -> Result<String, String> 
         .timeout(Duration::from_secs(3))
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .map_err(|_| "无法初始化中继连接".to_string())?;
+        .map_err(|_| pt(PMsg::RelayInitFailed).into_owned())?;
     let response = http
         .get(format!("{base}/relay/webui"))
         .send()
         .await
-        .map_err(|_| "无法连接中继服务".to_string())?;
+        .map_err(|_| pt(PMsg::RelayUnreachable).into_owned())?;
     let supported = response.status().is_success()
         && response
             .json::<serde_json::Value>()
@@ -168,7 +172,7 @@ async fn start(target: &WebuiRelayTarget, sync: bool) -> Result<String, String> 
             .ok()
             .is_some_and(|v| v["protocol"] == 1 && v["webui"] == true);
     if !supported {
-        return Err("中继尚未启用 WebUI，请先升级中继服务并配置 WebUI 静态资源".into());
+        return Err(pt(PMsg::RelayWebuiNotEnabled).into_owned());
     }
 
     let mut previous = TUNNEL.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -217,7 +221,7 @@ async fn start(target: &WebuiRelayTarget, sync: bool) -> Result<String, String> 
             }
             let child = command
                 .spawn()
-                .map_err(|_| "中继客户端启动失败".to_string())?;
+                .map_err(|_| pt(PMsg::RelayClientStartFailed).into_owned())?;
             Tunnel {
                 child,
                 endpoint: target.endpoint.clone(),
@@ -228,10 +232,10 @@ async fn start(target: &WebuiRelayTarget, sync: bool) -> Result<String, String> 
     let ready = startup_step(&EPOCH, epoch, deadline, async {
         loop {
             if EPOCH.load(Ordering::SeqCst) != epoch {
-                return Err("中继启动已取消".to_string());
+                return Err(pt(PMsg::RelayStartCancelled).into_owned());
             }
             if !matches!(tunnel.child.try_wait(), Ok(None)) {
-                return Err("中继客户端已退出，请检查接入口令和客户端版本".to_string());
+                return Err(pt(PMsg::RelayClientExited).into_owned());
             }
             if http
                 .get(format!("{base}/api/project"))
@@ -251,7 +255,7 @@ async fn start(target: &WebuiRelayTarget, sync: bool) -> Result<String, String> 
     let url = mobile_url(&base, &tunnel.route, &target.token, sync);
     let mut slot = TUNNEL.lock().unwrap_or_else(|e| e.into_inner());
     if EPOCH.load(Ordering::SeqCst) != epoch {
-        return Err("中继启动已取消".into());
+        return Err(pt(PMsg::RelayStartCancelled).into_owned());
     }
     atomcode_daemon::set_webui_relay_access(target, Some(url.clone()), None);
     *slot = Some(tunnel);

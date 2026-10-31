@@ -1468,6 +1468,9 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("没有 {asked} 的更新说明。输入 /changelog 从列表里选。").into()
         }
         Msg::ChangelogEmpty => "这个构建没有附带更新说明。".into(),
+        Msg::TranscriptInitAcknowledgement => "正在读这个仓库,准备写它的说明文件。".into(),
+        Msg::TranscriptWorklogAcknowledgement => "把那天的工作复盘放进对话了。".into(),
+        Msg::TranscriptSkillsStarted { names } => format!("按 {names} 开始").into(),
         Msg::WhatsNewNotice {
             from,
             to,

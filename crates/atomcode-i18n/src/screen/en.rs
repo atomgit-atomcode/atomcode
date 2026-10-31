@@ -1573,6 +1573,13 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("No notes for {asked}. Type /changelog to pick from the list.").into()
         }
         Msg::ChangelogEmpty => "This build ships no release notes.".into(),
+        Msg::TranscriptInitAcknowledgement => {
+            "Reading the repository to write its instruction file.".into()
+        }
+        Msg::TranscriptWorklogAcknowledgement => {
+            "Put the recap of that day in the conversation.".into()
+        }
+        Msg::TranscriptSkillsStarted { names } => format!("Starting with {names}").into(),
         Msg::WhatsNewNotice {
             from,
             to,

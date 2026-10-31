@@ -1496,6 +1496,27 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdCatalogRememberUsage => "[--topic <topic>] [--source <source>] [--pin] [--ttl-days N] <what to remember>".into(),
         Msg::CmdCatalogForget => "Delete one of the lines you remembered".into(),
         Msg::CmdCatalogForgetUsage => "<keyword> | --id <ID>".into(),
+        Msg::RelayQrHint { url, detail } => {
+            format!("Scan with a phone browser (relay): {url}\n{detail}").into()
+        }
+        Msg::RelayNotStarted { error } => {
+            format!("\nRelay access did not start: {error}. The local address still works.").into()
+        }
+        Msg::RelayInvalidAddress => "The relay address is invalid".into(),
+        Msg::RelayHttpsRequired => "The relay requires HTTPS (HTTP is fine for local testing)".into(),
+        Msg::RelayStartCancelled => "Relay start cancelled".into(),
+        Msg::RelayConnectTimeout => {
+            "Relay connection timed out — check the network or the access phrase".into()
+        }
+        Msg::RelayInitFailed => "Could not initialize the relay connection".into(),
+        Msg::RelayUnreachable => "Could not reach the relay service".into(),
+        Msg::RelayWebuiNotEnabled => {
+            "The relay has no WebUI yet — upgrade the relay service and configure the WebUI static assets".into()
+        }
+        Msg::RelayClientStartFailed => "The relay client failed to start".into(),
+        Msg::RelayClientExited => {
+            "The relay client exited — check the access phrase and the client version".into()
+        }
         Msg::ModelNoImageSupport { model } => format!(
             "Current model \"{}\" does not support image input and no \
              vision_preprocessor_provider is configured. Use /model to \

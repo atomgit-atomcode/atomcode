@@ -2370,4 +2370,23 @@ pub enum Msg<'a> {
     CmdCatalogRememberUsage,
     CmdCatalogForget,
     CmdCatalogForgetUsage,
+    /// The QR line for WebUI access through the relay: the URL, then whatever
+    /// the launcher already said about the local address.
+    RelayQrHint {
+        url: &'a str,
+        detail: &'a str,
+    },
+    /// The relay did not come up; the local address still works.
+    RelayNotStarted {
+        error: &'a str,
+    },
+    RelayInvalidAddress,
+    RelayHttpsRequired,
+    RelayStartCancelled,
+    RelayConnectTimeout,
+    RelayInitFailed,
+    RelayUnreachable,
+    RelayWebuiNotEnabled,
+    RelayClientStartFailed,
+    RelayClientExited,
 }

@@ -1455,6 +1455,23 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdCatalogRememberUsage => "[--topic <主题>] [--source <来源>] [--pin] [--ttl-days N] <要记住的话>".into(),
         Msg::CmdCatalogForget => "把记住的某句话删掉".into(),
         Msg::CmdCatalogForgetUsage => "<关键词> | --id <ID>".into(),
+        Msg::RelayQrHint { url, detail } => {
+            format!("手机浏览器扫码访问（中继）：{url}\n{detail}").into()
+        }
+        Msg::RelayNotStarted { error } => {
+            format!("\n中继访问未启动：{error}。本机地址仍可使用。").into()
+        }
+        Msg::RelayInvalidAddress => "中继地址无效".into(),
+        Msg::RelayHttpsRequired => "中继须使用 HTTPS（本机测试可用 HTTP）".into(),
+        Msg::RelayStartCancelled => "中继启动已取消".into(),
+        Msg::RelayConnectTimeout => "中继连接超时，请检查网络或接入口令".into(),
+        Msg::RelayInitFailed => "无法初始化中继连接".into(),
+        Msg::RelayUnreachable => "无法连接中继服务".into(),
+        Msg::RelayWebuiNotEnabled => {
+            "中继尚未启用 WebUI，请先升级中继服务并配置 WebUI 静态资源".into()
+        }
+        Msg::RelayClientStartFailed => "中继客户端启动失败".into(),
+        Msg::RelayClientExited => "中继客户端已退出，请检查接入口令和客户端版本".into(),
         Msg::ModelNoImageSupport { model } => format!(
             "当前模型 \"{}\" 不支持图片输入，且未配置 vision_preprocessor_provider。\
              请用 /model 切换到支持视觉的模型，或在配置中设置 vision_preprocessor_provider。",

@@ -58,7 +58,9 @@ pub(crate) fn reason(error: &str) -> String {
         }
         None if partial_reply_preserved(error) => Msg::ProviderPartialReply,
         None if lower.contains("without sending tls close_notify") => Msg::ProviderTlsInterrupted,
-        None if lower.contains("connection timed out") || error.contains("等待首字节超过") => {
+        None if lower.contains("connection timed out") || error.contains("等待首字节超过") =>
+        {
+            // i18n-exempt: protocol marker, classified not shown
             Msg::ProviderConnectionTimeout
         }
         None if lower.contains("overloaded") => Msg::ProviderBusy,
@@ -93,6 +95,7 @@ fn partial_reply_preserved(error: &str) -> bool {
         .strip_prefix("provider error: ")
         .unwrap_or(error.trim());
     error.starts_with("响应中断:为避免重复输出或工具执行,未自动重放;已保留可安全保存的部分回复。")
+    // i18n-exempt: protocol marker, classified not shown
 }
 
 pub(crate) fn advice(error: &str) -> String {

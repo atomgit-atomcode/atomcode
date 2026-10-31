@@ -1626,12 +1626,15 @@ impl CommandSet for SessionCommands {
                         // a command at all — it carries a `Scope` — so this
                         // parser exists for what a person types, and only that.
                         None | Some("对话") | Some("conversation") => {
+                            // i18n-exempt: user-typed alias, not shown
                             atomcode_kernel::session::RewindScope::Conversation
                         }
                         Some("代码") | Some("code") => {
+                            // i18n-exempt: user-typed alias, not shown
                             atomcode_kernel::session::RewindScope::Code
                         }
                         Some("全部") | Some("both") => {
+                            // i18n-exempt: user-typed alias, not shown
                             atomcode_kernel::session::RewindScope::Both
                         }
                         Some(other) => {

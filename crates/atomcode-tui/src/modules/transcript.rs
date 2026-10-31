@@ -304,19 +304,10 @@ impl Producer for Transcript {
                     out.emit(at, Arc::new(UserSaid(text.clone())));
                 }
                 let command = text.split_whitespace().next().unwrap_or("");
-                let english = crate::i18n::current_locale() == crate::i18n::Locale::En;
                 let acknowledgement = if command.eq_ignore_ascii_case("/init") {
-                    Some(if english {
-                        "Reading the repository to write its instruction file."
-                    } else {
-                        "正在读这个仓库,准备写它的说明文件。"
-                    })
+                    Some(t(Msg::TranscriptInitAcknowledgement))
                 } else if command.eq_ignore_ascii_case("/worklog") {
-                    Some(if english {
-                        "Put the recap of that day in the conversation."
-                    } else {
-                        "把那天的工作复盘放进对话了。"
-                    })
+                    Some(t(Msg::TranscriptWorklogAcknowledgement))
                 } else {
                     None
                 };
@@ -324,7 +315,7 @@ impl Producer for Transcript {
                     out.emit(
                         at,
                         Arc::new(CommandSaid {
-                            text: text.into(),
+                            text: text.into_owned(),
                             refused: false,
                         }),
                     );
@@ -339,7 +330,7 @@ impl Producer for Transcript {
                     out.emit(
                         at,
                         Arc::new(CommandSaid {
-                            text: format!("按 {names} 开始"),
+                            text: t(Msg::TranscriptSkillsStarted { names: &names }).into_owned(),
                             refused: false,
                         }),
                     );
