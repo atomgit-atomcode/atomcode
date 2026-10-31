@@ -1617,6 +1617,7 @@ fn recorded_override(name: &str) -> Option<OverrideRecord> {
     })
 }
 
+#[cfg(unix)]
 fn remember_override(name: &str, target: &Path, owner: &str) {
     let Some(base) = target
         .file_name()

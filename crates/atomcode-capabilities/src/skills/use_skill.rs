@@ -212,7 +212,7 @@ mod tests {
             "---\ndescription: has bundled scripts\n---\nRun scripts/go.sh\n",
         )
         .unwrap();
-        let mut reg = SkillRegistry::new();
+        let reg = SkillRegistry::new();
         reg.load_dir(&skills_dir, None);
 
         let tool = UseSkillTool::new(Arc::new(reg));
@@ -353,7 +353,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut reg = SkillRegistry::load(&[base.path().to_path_buf()]);
+        let reg = SkillRegistry::load(&[base.path().to_path_buf()]);
         reg.load_dir(&skills_dir, Some(plugin_ns));
 
         let tool = UseSkillTool::new(Arc::new(reg));
@@ -381,7 +381,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut reg = SkillRegistry::new();
+        let reg = SkillRegistry::new();
         reg.load_dir(&skills_dir, Some(plugin_ns));
 
         let tool = UseSkillTool::new(Arc::new(reg));

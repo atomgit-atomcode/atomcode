@@ -251,13 +251,29 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let cfg = config(&format!("http://{addr}"));
         let probe = |addr| TcpStream::connect_timeout(&addr, Duration::from_millis(50)).map(|_| ());
+
+        // Positive control on a real listener: a proxy that is up is kept.
         assert!(without_refused_loopback(cfg.clone(), probe).https.is_some());
-        // Drain the probe before closing so the same listening port can be rebound.
         drop(listener.accept().unwrap());
         drop(listener);
-        assert!(without_refused_loopback(cfg.clone(), probe).https.is_none());
-        let _restored = TcpListener::bind(addr).unwrap();
-        assert!(without_refused_loopback(cfg.clone(), probe).https.is_some());
+
+        // A stopped proxy is dropped. The refusal is injected: on Windows a
+        // closed loopback port can keep completing connects for a while after
+        // the close (measured here — waiting two seconds did not help), so a real
+        // probe at this point would assert something about the OS rather than
+        // about this function. The socket-based reading of "refused" is what the
+        // other tests in this module use too.
+        let refused = |_addr| Err(io::ErrorKind::ConnectionRefused.into());
+        assert!(without_refused_loopback(cfg.clone(), refused)
+            .https
+            .is_none());
         assert_eq!(cfg.mode, ProxyMode::FollowSystem);
+
+        // And a proxy that comes back is used again. A fresh port, because
+        // rebinding the one above is exactly the OS behaviour this test must not
+        // depend on.
+        let restored = TcpListener::bind("127.0.0.1:0").unwrap();
+        let back = config(&format!("http://{}", restored.local_addr().unwrap()));
+        assert!(without_refused_loopback(back, probe).https.is_some());
     }
 }

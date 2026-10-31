@@ -328,7 +328,6 @@ mod tests {
         SetSessionConfigOptionRequest, SetSessionModeRequest,
     };
     use agent_client_protocol::{Agent, Channel, ConnectionTo, Responder};
-    use atomcode_coding::CodingAgentConfig;
     use std::sync::Arc;
 
     use crate::acp::sessions::test_support::sessions_with;

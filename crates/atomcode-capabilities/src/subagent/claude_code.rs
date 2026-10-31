@@ -229,7 +229,6 @@ impl SubagentBackend for ClaudeCodeBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio_util::sync::CancellationToken;
 
     #[test]
     fn argv_read_only_uses_plan_mode() {

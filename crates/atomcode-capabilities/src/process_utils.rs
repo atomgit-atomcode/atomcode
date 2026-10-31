@@ -279,13 +279,13 @@ pub fn is_running_as_admin() -> bool {
     false
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cc-hooks", unix))]
 pub(crate) struct EnvVarGuard {
     saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
     _lock: std::sync::MutexGuard<'static, ()>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cc-hooks", unix))]
 impl EnvVarGuard {
     pub(crate) fn new(keys: &[&'static str]) -> Self {
         use std::sync::{Mutex, OnceLock};
@@ -300,7 +300,7 @@ impl EnvVarGuard {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cc-hooks", unix))]
 impl Drop for EnvVarGuard {
     fn drop(&mut self) {
         for (key, value) in &self.saved {
@@ -417,7 +417,6 @@ pub(crate) fn apply_utf8_locale_env_sync(cmd: &mut std::process::Command) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
 
     // STRUCTURAL ONLY: `creation_flags` is set-only (std can't read it back), so the
     // actual CREATE_NO_WINDOW behavior is unverifiable off Windows and must be checked

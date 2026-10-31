@@ -1275,45 +1275,52 @@ impl Launchd {
     ) -> anyhow::Result<()> {
         #[cfg(not(unix))]
         {
+            // Nothing here runs launchd: the body below is unix-only, so the
+            // parameters are read only there. Silencing them here keeps one
+            // function rather than two near-identical ones.
+            let _ = (task, task_root);
             anyhow::bail!("launchd is only available on macOS/Unix");
         }
-        let trigger = launchd_calendar(&task.schedule)?;
-        let exe = execution_binary()?;
-        let exe_str = exe.to_string_lossy();
-        let mut plist_content = Self::render_plist(&task.id, &exe_str, &trigger);
-        if let Some(root) = task_root {
-            plist_content = plist_content.replacen(
-                "\t</array>",
-                &format!(
-                    "\t\t<string>--store</string>\n\t\t<string>{}</string>\n\t</array>",
-                    xml_escape(&root.to_string_lossy())
-                ),
-                1,
+        #[cfg(unix)]
+        {
+            let trigger = launchd_calendar(&task.schedule)?;
+            let exe = execution_binary()?;
+            let exe_str = exe.to_string_lossy();
+            let mut plist_content = Self::render_plist(&task.id, &exe_str, &trigger);
+            if let Some(root) = task_root {
+                plist_content = plist_content.replacen(
+                    "\t</array>",
+                    &format!(
+                        "\t\t<string>--store</string>\n\t\t<string>{}</string>\n\t</array>",
+                        xml_escape(&root.to_string_lossy())
+                    ),
+                    1,
+                );
+            }
+            std::fs::create_dir_all(&self.root)?;
+            let path = self.plist_path(&task.id);
+            std::fs::write(&path, plist_content)?;
+            let uid = get_uid();
+            let label = Self::label(&task.id);
+            // Best-effort bootout before bootstrap to make install idempotent.
+            // If the service is not currently loaded, bootout returns an error which
+            // we intentionally ignore.
+            let _ = self.runner.run(
+                "launchctl",
+                &["bootout".to_string(), format!("gui/{uid}/{label}")],
             );
+            let domain = format!("gui/{uid}");
+            run_checked(
+                self.runner.as_ref(),
+                "launchctl",
+                &[
+                    "bootstrap".to_string(),
+                    domain,
+                    path.to_string_lossy().to_string(),
+                ],
+            )?;
+            Ok(())
         }
-        std::fs::create_dir_all(&self.root)?;
-        let path = self.plist_path(&task.id);
-        std::fs::write(&path, plist_content)?;
-        let uid = get_uid();
-        let label = Self::label(&task.id);
-        // Best-effort bootout before bootstrap to make install idempotent.
-        // If the service is not currently loaded, bootout returns an error which
-        // we intentionally ignore.
-        let _ = self.runner.run(
-            "launchctl",
-            &["bootout".to_string(), format!("gui/{uid}/{label}")],
-        );
-        let domain = format!("gui/{uid}");
-        run_checked(
-            self.runner.as_ref(),
-            "launchctl",
-            &[
-                "bootstrap".to_string(),
-                domain,
-                path.to_string_lossy().to_string(),
-            ],
-        )?;
-        Ok(())
     }
 }
 

@@ -304,7 +304,6 @@ impl SubagentBackend for CodexBackend {
 mod tests {
     use super::*;
     use std::path::Path;
-    use tokio_util::sync::CancellationToken;
 
     #[test]
     fn argv_read_only_uses_sandbox_read_only() {

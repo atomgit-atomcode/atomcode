@@ -2423,7 +2423,7 @@ async fn the_mode_a_person_picks_is_the_one_the_session_runs_in() {
 #[tokio::test]
 async fn the_mode_a_session_is_in_can_be_read_back_from_the_runtime() {
     let env = env();
-    let mut connection = connected(&env).await;
+    let connection = connected(&env).await;
     let session = connection.session.clone();
 
     // A fresh session is in the contract's `Ask` — this runtime's `Build` —
@@ -2486,7 +2486,7 @@ async fn the_mode_a_session_is_in_can_be_read_back_from_the_runtime() {
 #[tokio::test]
 async fn a_mode_change_is_broadcast_to_watchers_in_the_contracts_own_words() {
     let env = env();
-    let mut connection = connected(&env).await;
+    let connection = connected(&env).await;
     let session = connection.session.clone();
     let mut watching = connection.control.subscribe();
 

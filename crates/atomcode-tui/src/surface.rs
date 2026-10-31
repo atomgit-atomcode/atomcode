@@ -1750,6 +1750,7 @@ fn give_back_stderr(_held: &StderrHeld) {}
 /// same-sized screenshots whose top and bottom chrome match, and keeps a look
 /// at a 4K picture to a couple of KB of hashing. `atomcode-tuix`'s, kept.
 #[cfg(any(not(windows), test))]
+#[cfg(not(windows))]
 fn pixel_fingerprint(width: usize, height: usize, bytes: &[u8]) -> u64 {
     use std::hash::{Hash, Hasher};
     const SAMPLES: usize = 16;

@@ -807,14 +807,14 @@ mod tests {
                                 &content.chars().take(100).collect::<String>()
                             );
                             // Try parsing just this one skill
-                            let mut tmp_reg = crate::skills::SkillRegistry::new();
+                            let tmp_reg = crate::skills::SkillRegistry::new();
                             tmp_reg.load_dir(&sd, Some("__test__"));
                         }
                     }
                 }
             }
         }
-        let mut reg = crate::skills::SkillRegistry::new();
+        let reg = crate::skills::SkillRegistry::new();
         reg.load_dir(std::path::Path::new("/tmp"), None);
         let skills = reg.list();
         eprintln!("=== DEBUG: {} skills loaded ===", skills.len());

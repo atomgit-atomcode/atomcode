@@ -5743,6 +5743,7 @@ async fn turn_reporting_compactions(
 /// The control for both scenarios below: each asserts that a specific event is
 /// MISSING, and an assertion about an absence is worthless until something
 /// present has been shown.
+#[cfg(unix)]
 async fn sink_is_live(captured: &Arc<tokio::sync::Mutex<Vec<atomcode_telemetry::Record>>>) -> bool {
     for _ in 0..200 {
         if captured
