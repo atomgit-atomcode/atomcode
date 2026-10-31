@@ -39,7 +39,17 @@ adb install -r "$apk_clang" | tail -1
 adb install -r "$apk_node" | tail -1
 
 lib_dir() { # lib_dir <package> → nativeLibraryDir (the one executable place)
-  adb shell "dumpsys package $1" 2>/dev/null |
+  # `pm path` is stable across releases; `dumpsys package` does not reliably print
+  # nativeLibraryDir, so it is only a fallback. The APK lives at
+  # `<install-dir>/base.apk` and the extracted libraries sit in `<install-dir>/lib/arm64`.
+  local pkg=$1 base
+  base=$(adb shell "pm path $pkg" 2>/dev/null |
+    sed -n 's/^package:\(.*\)\/base\.apk$/\1/p' | head -1)
+  if [ -n "$base" ] && adb shell "test -d $base/lib/arm64" 2>/dev/null; then
+    printf '%s\n' "$base/lib/arm64"
+    return
+  fi
+  adb shell "dumpsys package $pkg" 2>/dev/null |
     sed -n 's/.*nativeLibraryDir=\(.*\)/\1/p' | head -1
 }
 clang_lib=$(lib_dir com.atomcode.tools.clang)
