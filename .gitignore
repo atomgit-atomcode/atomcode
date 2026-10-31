@@ -153,6 +153,8 @@ android*/app/src/main/jniLibs/*/*.so
 # 插件构建输入：第三方源码包与合并源码由脚本按需下载，体积数 MB 且可重现，不入库。
 # 取法见 docs/plugin-ecosystem.md 的「构建输入从哪来」。
 quickjs.tar.xz
+lua.tgz
+sqlite.zip
 freetype-*.tar.gz
 lsqlite3-master.tar.gz
 sqlite-amalgamation.zip
