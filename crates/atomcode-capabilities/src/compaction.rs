@@ -673,8 +673,8 @@ const SUMMARY_TRANSCRIPT_TAIL_CHARS: usize = 40_000;
 /// case borrows the caller's text: a byte length at or under the cap proves the
 /// char count is too, so neither the count nor a copy is needed.
 ///
-/// `tail_chars` must not exceed `max_chars` (checked in debug builds): the head
-/// shrinks to nothing and the tail alone would then spend more than the cap.
+/// A `tail_chars` wider than `max_chars` is clamped to it, so head and tail
+/// never spend more than the cap between them.
 fn bounded_body<'a>(text: &'a str, max_chars: usize, tail_chars: usize) -> Cow<'a, str> {
     if text.len() <= max_chars {
         return Cow::Borrowed(text);
@@ -688,14 +688,12 @@ fn bounded_body<'a>(text: &'a str, max_chars: usize, tail_chars: usize) -> Cow<'
 
 /// The cut itself, for a caller that already counted `total` characters.
 ///
-/// `total` must exceed `max_chars`, and `tail_chars` must not exceed it
-/// (both checked in debug builds): a wider tail spends more than the cap.
+/// `total` must exceed `max_chars` (checked in debug builds). A `tail_chars`
+/// wider than `max_chars` is clamped, so head and tail never spend more than
+/// the cap between them.
 fn truncated_body(text: &str, total: usize, max_chars: usize, tail_chars: usize) -> String {
     debug_assert!(total > max_chars, "nothing to cut");
-    debug_assert!(
-        tail_chars <= max_chars,
-        "a tail wider than the cap would overflow the budget"
-    );
+    let tail_chars = tail_chars.min(max_chars);
     let head_chars = max_chars.saturating_sub(tail_chars);
     let head: String = text.chars().take(head_chars).collect();
     let tail: String = text
@@ -2922,6 +2920,20 @@ mod tests {
             bounded_body(&over, 2_000, 500),
             std::borrow::Cow::Owned(_)
         ));
+    }
+
+    #[test]
+    fn truncated_body_clamps_a_tail_wider_than_the_cap() {
+        // Only debug builds assert that the tail fits; release must still keep
+        // the body within the cap when a caller gets it wrong.
+        let text = "z".repeat(100);
+        let out = truncated_body(&text, 100, 10, 50);
+        assert_eq!(
+            out.matches('z').count(),
+            10,
+            "head and tail spend the cap between them, not the tail alone"
+        );
+        assert!(out.contains("[truncated 90 chars]"));
     }
 
     #[test]
