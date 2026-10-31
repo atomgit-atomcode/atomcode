@@ -895,6 +895,10 @@ impl CompactBeforeRequest {
     /// above the threshold must not pay that projection on every request after
     /// both attempts are spent.
     ///
+    /// Only a strategy whose `calls_model` can be true spends the slow slot, so
+    /// the built-in tail strategy never trips this gate; the optimization pays
+    /// off when a model-backed summarizer is configured.
+    ///
     /// Read-only: the turn reset belongs to `first_try`, which every request
     /// that gets past this check still reaches, so a steady turn pays one map
     /// lookup and no allocation here.

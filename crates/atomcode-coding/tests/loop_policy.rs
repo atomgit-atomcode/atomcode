@@ -1377,9 +1377,9 @@ async fn a_stable_verdict_is_still_asked_each_request() {
 /// The fast path and the pressure rearm meet: after both stages are spent, a
 /// high request is skipped without asking; a drop below the trigger then removes
 /// the entry, so the next high request asks the strategy again in the same turn.
-/// Without the gate the skipped ask would run, and without the rearm the last
-/// ask would stay silent — the final 3/3 separates both from the correct 3 asks
-/// and 3 attempts.
+/// Without the gate that skipped ask would run (4 asks); without the rearm the
+/// last ask would stay silent (2 asks). The 3/3 pinned here is the only count
+/// that needs both paths.
 #[tokio::test]
 async fn a_pressure_drop_rearms_the_fast_path_inside_one_turn() {
     let dir = scratch("fast-path-rearm");
