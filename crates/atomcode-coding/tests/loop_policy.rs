@@ -1295,7 +1295,7 @@ async fn verdict_app_with_rounds(
         r#"{ text = "again", calls = [ { name = "read_file", args = { file_path = "a.txt" } } ] }"#;
     let calls = vec![call; rounds].join(",\n  ");
     let script = format!(
-        "[[patch]]\nid = \"llm\"\nname = \"llm-replay\"\nconfig = {{ script = [\n  \
+        "[[patch]]\nid = \"llm\"\nname = \"llm-replay\"\nconfig = {{ context_window = 128000, script = [\n  \
          {calls},\n  {{ text = \"done\" }},\n  {{ text = \"next\" }}\n] }}\n"
     );
     let swap = "[[remove]]\nid = \"compaction-tail\"\n\n\

@@ -945,6 +945,9 @@ impl Waterfall<AgentRequest> for CompactBeforeRequest {
             return next.run(req).await;
         }
         if (used as f32) < trigger_tokens {
+            // This must stay ahead of both_tried: a low request is the one that
+            // rearms, and the gate would otherwise skip it with the table still
+            // spent, silencing the trigger until the next turn.
             self.tried
                 .lock()
                 .expect("compaction attempts poisoned")
