@@ -36,6 +36,17 @@ test('interaction dock is non-modal, height-capped, and scrolls only its body', 
   assert.match(css, /\.interaction-dock-body[\s\S]*?overflow-y: auto/);
 });
 
+test('mobile approval keeps decisions reachable and long arguments inside the card', () => {
+  const css = read('src/styles/app.css');
+  const mobile = css.slice(css.indexOf('@media (max-width: 768px)'));
+
+  assert.match(mobile, /\.interaction-dock-card \.permission-footer \{[\s\S]*?display: grid;/);
+  assert.match(mobile, /grid-template-columns: repeat\(2, minmax\(0, 1fr\)\)/);
+  assert.match(mobile, /\.interaction-dock-card \.permission-footer \.btn \{[\s\S]*?min-height: 48px;/);
+  assert.match(mobile, /\.interaction-dock-card \.permission-footer \.btn-danger \{[\s\S]*?grid-column: 1 \/ -1;/);
+  assert.match(mobile, /\.interaction-dock-card\.permission-card \.field-group \.tool-body-row-content \{[\s\S]*?white-space: pre-wrap;[\s\S]*?overflow-wrap: anywhere;/);
+});
+
 test('interaction dock owns focus safely and chat restores the composer afterwards', () => {
   const dock = read('src/components/InteractionDock.tsx');
   const chat = read('src/components/Chat.tsx');

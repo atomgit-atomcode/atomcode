@@ -1,8 +1,10 @@
 import { useState, useEffect, useRef } from 'preact/hooks';
+import { createPortal } from 'preact/compat';
 import { getModels, ModelInfo, postLiveReasoningEffort, ReasoningEffortError } from '../api';
 import { useT } from '../settings';
 import { displayedModel, type RuntimeModelIdentity } from '../lib/modelIdentity';
 import { MsgKey } from '../i18n';
+import { useDropdown } from '../lib/useDropdown';
 
 // Endpoint-declared reasoning effort levels. `null` returns to the model's
 // own default while retaining its configured capability.
@@ -60,8 +62,21 @@ export function ModelSelector({
   // undefined = "show the provider's persisted value"; a string/null is a
   // local override after the user picks one (config isn't re-fetched).
   const [effortOverride, setEffortOverride] = useState<string | null | undefined>(undefined);
-  const ref = useRef<HTMLDivElement>(null);
-  const effortRef = useRef<HTMLDivElement>(null);
+  // The two menus are portaled to <body> and placed against the viewport, so
+  // a wide list next to a narrow trigger stays on screen and sits flush with
+  // its trigger (see `useDropdown`).
+  const modelDropdown = useDropdown({
+    open,
+    onClose: () => setOpen(false),
+    prefer: 'above',
+    width: 260,
+  });
+  const effortDropdown = useDropdown({
+    open: effortOpen,
+    onClose: () => setEffortOpen(false),
+    prefer: 'above',
+    width: 200,
+  });
 
   const modelsRef = useRef(models);
   modelsRef.current = models;
@@ -96,16 +111,8 @@ export function ModelSelector({
       document.removeEventListener('visibilitychange', onVisibility);
     };
   }, [onDefaultChange]);
-  useEffect(() => {
-    if (!open && !effortOpen) return;
-    const h = (e: MouseEvent) => {
-      const tgt = e.target as Node;
-      if (ref.current && !ref.current.contains(tgt)) setOpen(false);
-      if (effortRef.current && !effortRef.current.contains(tgt)) setEffortOpen(false);
-    };
-    document.addEventListener('mousedown', h);
-    return () => document.removeEventListener('mousedown', h);
-  }, [open, effortOpen]);
+  // Outside-click and placement are `useDropdown`'s job here (both menus are
+  // portaled to <body>), so there is no ref/handler pair to keep in this file.
   const current = displayedModel(models, value, runtime);
   const currentProvider = useRef(current?.provider);
   currentProvider.current = current?.provider;
@@ -157,8 +164,9 @@ export function ModelSelector({
     <div class="model-controls">
       {effortError && <span role="alert">{effortError}</span>}
       {current?.effort_applicable && (
-        <div class="model-selector effort-selector model-selector-up" ref={effortRef}>
+        <div class="model-selector effort-selector model-selector-up">
           <button
+            ref={effortDropdown.triggerRef}
             class="model-selector-trigger"
             onClick={() => { setEffortOpen((o) => !o); setOpen(false); }}
             type="button"
@@ -169,8 +177,12 @@ export function ModelSelector({
             <span class="model-selector-label">{effortLabel(effort)}</span>
             <span class="model-selector-chevron">▾</span>
           </button>
-          {effortOpen && !busy && !effortSaving && (
-            <div class="model-dropdown">
+          {effortOpen && !busy && !effortSaving && createPortal(
+            <div
+              ref={effortDropdown.menuRef}
+              class="model-dropdown model-dropdown-viewport"
+              style={effortDropdown.style}
+            >
               {EFFORT_OPTIONS.filter(
                 (o) =>
                   o.val === null ||
@@ -186,20 +198,30 @@ export function ModelSelector({
                   <span class="model-item-model">{t(o.key)}</span>
                 </button>
               ))}
-            </div>
+            </div>,
+            document.body,
           )}
         </div>
       )}
-      <div class="model-selector model-selector-up" ref={ref}>
-        <button class="model-selector-trigger" onClick={() => { setOpen((o) => !o); setEffortOpen(false); }} type="button">
+      <div class="model-selector model-selector-up">
+        <button
+          ref={modelDropdown.triggerRef}
+          class="model-selector-trigger"
+          onClick={() => { setOpen((o) => !o); setEffortOpen(false); }}
+          type="button"
+        >
           <span class="model-selector-label">{current ? current.model : t('model.label')}</span>
           {current && isDup(current.model) && (
             <span class="model-selector-provider">{providerLabel(current)}</span>
           )}
           <span class="model-selector-chevron">▾</span>
         </button>
-        {open && (
-          <div class="model-dropdown">
+        {open && createPortal(
+          <div
+            ref={modelDropdown.menuRef}
+            class="model-dropdown model-dropdown-viewport"
+            style={modelDropdown.style}
+          >
             {models.map((m) => (
               <button
                 key={m.provider}
@@ -212,7 +234,8 @@ export function ModelSelector({
                 {isDup(m.model) && <span class="model-item-provider">{providerLabel(m)}</span>}
               </button>
             ))}
-          </div>
+          </div>,
+          document.body,
         )}
       </div>
     </div>

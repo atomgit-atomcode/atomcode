@@ -62,6 +62,10 @@ interface SidebarProps {
   onOpenRemote?: () => void;
   /** Open the working-directory picker (to switch to / start a project in any dir). */
   onOpenCwd?: () => void;
+  /** Open the git source-control panel for the current working directory. */
+  onOpenSourceControl?: () => void;
+  /** Open the runtime-packages panel (installable interpreters / toolchains). */
+  onOpenPackages?: () => void;
 }
 
 type Translate = (key: MsgKey, params?: Record<string, string | number>) => string;
@@ -243,6 +247,30 @@ function McpIcon() {
   );
 }
 
+/** Git branch glyph for the source-control action. */
+function BranchIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <circle cx="4.5" cy="3.5" r="1.8" stroke="currentColor" stroke-width="1.2" />
+      <circle cx="4.5" cy="12.5" r="1.8" stroke="currentColor" stroke-width="1.2" />
+      <circle cx="11.5" cy="6.5" r="1.8" stroke="currentColor" stroke-width="1.2" />
+      <path d="M4.5 5.3v5.4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
+      <path d="M11.5 8.3c0 2.2-2.2 2.4-4.2 3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
+    </svg>
+  );
+}
+
+/** Package/box glyph for the runtime-packages action. */
+function PackageIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path d="M8 1.8 14 4.9v6.2L8 14.2 2 11.1V4.9z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" />
+      <path d="M2 4.9 8 8l6-3.1" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" />
+      <path d="M8 8v6.2" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" />
+    </svg>
+  );
+}
+
 /** Search (magnifying glass) glyph. */
 function SearchIcon() {
   return (
@@ -338,6 +366,8 @@ export function Sidebar({
   onPickSkill,
   onOpenRemote,
   onOpenCwd,
+  onOpenSourceControl,
+  onOpenPackages,
 }: SidebarProps) {
   const t = useT();
   const { theme, setTheme, lang, setLang } = useSettings();
@@ -1313,6 +1343,26 @@ export function Sidebar({
           >
             <McpIcon />
           </button>
+          {onOpenSourceControl && (
+            <button
+              class="rail-btn"
+              onClick={onOpenSourceControl}
+              title={t('sidebar.sourceControl')}
+              aria-label={t('sidebar.sourceControl')}
+            >
+              <BranchIcon />
+            </button>
+          )}
+          {onOpenPackages && (
+            <button
+              class="rail-btn"
+              onClick={onOpenPackages}
+              title={t('sidebar.packages')}
+              aria-label={t('sidebar.packages')}
+            >
+              <PackageIcon />
+            </button>
+          )}
         </nav>
         <div class="sidebar-rail-bottom">
           {onOpenRemote && (
@@ -1400,6 +1450,18 @@ export function Sidebar({
           {mcpCount > 0 && <span class="sidebar-action-badge">{mcpCount}</span>}
           <span class="sidebar-action-caret"><ChevronDownIcon /></span>
         </button>
+        {onOpenSourceControl && (
+          <button class="sidebar-action" onClick={onOpenSourceControl}>
+            <span class="sidebar-action-icon"><BranchIcon /></span>
+            <span class="sidebar-action-label">{t('sidebar.sourceControl')}</span>
+          </button>
+        )}
+        {onOpenPackages && (
+          <button class="sidebar-action" onClick={onOpenPackages}>
+            <span class="sidebar-action-icon"><PackageIcon /></span>
+            <span class="sidebar-action-label">{t('sidebar.packages')}</span>
+          </button>
+        )}
       </div>
 
       <div class="session-group-header">

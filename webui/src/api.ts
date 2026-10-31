@@ -1474,3 +1474,554 @@ export function postUserInputAnswer(
   }
   return postLiveUserInput(body);
 }
+
+// --- Git panel (source control) ---
+//
+// The daemon asks git on every call and caches nothing, so a refresh is just
+// another `gitStatus()`. There is no second repository store on this side.
+
+/** One changed path. `status` is git's two-character porcelain code. */
+export interface GitChange {
+  path: string;
+  status: string;
+  staged: boolean;
+  unstaged: boolean;
+  conflicted: boolean;
+  untracked: boolean;
+  /** Source path of a rename / copy. */
+  orig_path?: string;
+}
+
+/** A configured remote. Never carries userinfo. */
+export interface GitRemote {
+  name: string;
+  url: string;
+}
+
+export interface GitStatus {
+  repo: boolean;
+  root?: string;
+  branch: string;
+  upstream: string;
+  ahead: number;
+  behind: number;
+  has_commits: boolean;
+  changes: GitChange[];
+  remotes: GitRemote[];
+  /** Present when `repo` is false: why (not a repository / git unavailable). */
+  error?: string;
+}
+
+export type GitDiffKind = 'staged' | 'worktree' | 'untracked' | 'conflict';
+
+export interface GitDiffResult {
+  path: string;
+  kind: GitDiffKind;
+  patch: string;
+  binary: boolean;
+  truncated: boolean;
+}
+
+export interface GitCommandResult {
+  output: string;
+}
+
+export interface GitInitResult extends GitCommandResult {
+  root: string;
+}
+
+export interface GitCommitResult extends GitCommandResult {
+  commit: string;
+}
+
+export interface GitPushResult extends GitCommandResult {
+  upstream: string;
+}
+
+export interface GitCloneResult extends GitCommandResult {
+  dir: string;
+  root: string;
+}
+
+/** A stored credential. The token itself is never returned. */
+export interface GitCredential {
+  host: string;
+  username: string;
+}
+
+async function postJson<T>(path: string, body?: unknown): Promise<T> {
+  const resp = await apiFetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  return readJson<T>(resp);
+}
+
+export async function gitStatus(): Promise<GitStatus> {
+  const resp = await apiFetch('/git/status', { headers: authHeaders() });
+  return readJson<GitStatus>(resp);
+}
+
+export async function gitDiff(path: string, kind: GitDiffKind): Promise<GitDiffResult> {
+  const resp = await apiFetch(`/git/diff?path=${encodeURIComponent(path)}&kind=${kind}`, {
+    headers: authHeaders(),
+  });
+  return readJson<GitDiffResult>(resp);
+}
+
+export function gitInit(): Promise<GitInitResult> {
+  return postJson<GitInitResult>('/git/init');
+}
+
+export function gitStage(paths: string[]): Promise<GitCommandResult> {
+  return postJson<GitCommandResult>('/git/stage', { paths });
+}
+
+export function gitUnstage(paths: string[]): Promise<GitCommandResult> {
+  return postJson<GitCommandResult>('/git/unstage', { paths });
+}
+
+export function gitCommit(message: string): Promise<GitCommitResult> {
+  return postJson<GitCommitResult>('/git/commit', { message });
+}
+
+export function gitPull(remote?: string, branch?: string): Promise<GitCommandResult> {
+  return postJson<GitCommandResult>('/git/pull', { remote, branch });
+}
+
+export function gitPush(remote?: string, branch?: string): Promise<GitPushResult> {
+  return postJson<GitPushResult>('/git/push', { remote, branch });
+}
+
+export function gitClone(url: string, dir?: string): Promise<GitCloneResult> {
+  return postJson<GitCloneResult>('/git/clone', { url, dir });
+}
+
+export async function listGitCredentials(): Promise<GitCredential[]> {
+  const resp = await apiFetch('/git/credentials', { headers: authHeaders() });
+  const body = await readJson<{ credentials?: GitCredential[] }>(resp);
+  return body.credentials ?? [];
+}
+
+export function storeGitCredential(
+  host: string,
+  username: string,
+  token: string,
+): Promise<{ success: boolean; host: string }> {
+  return postJson<{ success: boolean; host: string }>('/git/credentials', {
+    host,
+    username,
+    token,
+  });
+}
+
+export async function removeGitCredential(host: string): Promise<boolean> {
+  const resp = await apiFetch(`/git/credentials/${encodeURIComponent(host)}`, {
+    method: 'DELETE',
+    headers: authHeaders(),
+  });
+  const body = await readJson<{ removed?: boolean }>(resp);
+  return body.removed === true;
+}
+
+/** A runtime package installed on this device — an interpreter or toolchain
+ *  that is not in the APK. Android forbids executing such a package directly,
+ *  so it ships as a library and runs through `pluginhost`. */
+export interface PackageRecord {
+  name: string;
+  version: string;
+  description: string;
+  /** Library inside the package that the launcher loads. */
+  entry: string;
+  symbol: string;
+  /** Command names it answers to: its own name plus aliases. */
+  commands: string[];
+  /** The version kept beside this one; present means a rollback is possible. */
+  previous_version?: string;
+  size_bytes: number;
+}
+
+export async function listPackages(): Promise<PackageRecord[]> {
+  const resp = await apiFetch('/packages', { headers: authHeaders() });
+  const body = await readJson<{ packages?: PackageRecord[] }>(resp);
+  return body.packages ?? [];
+}
+
+/** Install from a URL or a local bundle path. `sha256` is verified when given. */
+export async function installPackage(source: {
+  url?: string;
+  path?: string;
+  sha256?: string;
+}): Promise<PackageRecord> {
+  const body = await postJson<{ package: PackageRecord }>('/packages/install', source);
+  return body.package;
+}
+
+export async function removePackage(name: string): Promise<boolean> {
+  const resp = await apiFetch(`/packages/${encodeURIComponent(name)}`, {
+    method: 'DELETE',
+    headers: authHeaders(),
+  });
+  const body = await readJson<{ removed?: boolean }>(resp);
+  return body.removed === true;
+}
+
+/** Whether the optional helper APK (`com.atomcode.tools`) is installed.
+ *
+ *  It is a second APK that carries tools runtime packages cannot host — `make`
+ *  spawns a compiler, and Android forbids executing anything from this app's own
+ *  data directory. The tools show up on `PATH` only when that APK is present, so
+ *  the panel surfaces it instead of leaving `make` unexplained. */
+export interface HelperStatus {
+  installed: boolean;
+  /** Command names it contributed (`make`, `cc`, `tcc`). */
+  tools: string[];
+}
+
+export async function listHelperStatus(): Promise<HelperStatus> {
+  const resp = await apiFetch('/packages/helper', { headers: authHeaders() });
+  const body = await readJson<{ installed?: boolean; tools?: string[] }>(resp);
+  return { installed: body.installed === true, tools: body.tools ?? [] };
+}
+
+/** A provider APK as the market repository publishes it.
+ *
+ *  It is **not** a plugin: it is a second app carrying binaries that have to
+ *  spawn children or run as a program (`make` runs a compiler, `zig` *is* the
+ *  program), and Android forbids executing anything from this app's own data
+ *  directory. Publishing it is what lets the panel offer a download instead of
+ *  only an `adb install` line.
+ *
+ *  There is more than one: the tools helper holds `make`/`tcc`/the CLI, and zig
+ *  alone is 141 MB and ships in its own APK. Go, clang and the rest would follow
+ *  the same route, so the market publishes a list. */
+export interface MarketHelper {
+  name: string;
+  /** Android package id (`com.atomcode.tools.zig`) — what install state is keyed on. */
+  package?: string;
+  title: string;
+  summary: string;
+  version: string;
+  size_bytes: number;
+  sha256: string;
+  download_url?: string | null;
+  download_path?: string | null;
+}
+
+/**
+ * Download one provider APK into this app's storage.
+ *
+ * The daemon fetches it from the same base the plugins come from and checks the
+ * published hash, then writes it where the app can find it. The returned path
+ * is inside the app's own storage — installing it is still the person's
+ * decision, which is why this only prepares the file.
+ *
+ * `name` is the provider's manifest id (or its Android package id). Omit it for
+ * the first one, which is what a market with a single provider means.
+ */
+export async function downloadHelperApk(
+  name?: string,
+): Promise<{ path: string; version: string; packageId: string | null }> {
+  const query = name ? `?name=${encodeURIComponent(name)}` : '';
+  const resp = await apiFetch(`/packages/market/helper${query}`, { headers: authHeaders() });
+  const body = await readJson<{ path?: string; version?: string; package?: string }>(resp);
+  if (!body.path) throw new Error('the daemon did not return a provider file');
+  return { path: body.path, version: body.version ?? '', packageId: body.package ?? null };
+}
+
+/**
+ * Swap back to the version kept beside the installed one.
+ *
+ * An upgrade can install cleanly and still be wrong to run, so the replaced
+ * version is kept for exactly this. The swap also makes the *current* version
+ * the new previous one, so a rollback can be undone by rolling back again.
+ */
+export async function rollbackPackage(name: string): Promise<PackageRecord> {
+  const body = await postJson<{ package: PackageRecord }>(
+    `/packages/${encodeURIComponent(name)}/rollback`,
+  );
+  return body.package;
+}
+
+/** Whether an installed package would actually run, and why not when it would not. */
+export interface PackageHealth {
+  name: string;
+  ok: boolean;
+  /** The version when healthy, the loader's complaint when broken. */
+  detail: string;
+}
+
+/**
+ * Probe every installed package through the launcher.
+ *
+ * An install can succeed and still be useless — a wrong-architecture `.so`, a
+ * missing symbol, a library that needs something the phone does not have. This
+ * is how the panel finds out without the person running it in a shell first.
+ */
+export async function listPackageHealth(): Promise<PackageHealth[]> {
+  const resp = await apiFetch('/packages/health', { headers: authHeaders() });
+  const body = await readJson<{ packages?: PackageHealth[] }>(resp);
+  return body.packages ?? [];
+}
+
+/** A valid package bundle found on the device's local storage. */
+export interface LocalPackage {
+  path: string;
+  name: string;
+  version: string;
+  description: string;
+  size_bytes: number;
+}
+
+export type PackageDiscoveryEvent =
+  | { type: 'progress'; directories: number; archives: number; skipped: number }
+  | { type: 'found'; package: LocalPackage }
+  | {
+      type: 'done';
+      directories: number;
+      archives: number;
+      skipped: number;
+      truncated: boolean;
+    }
+  | { type: 'error'; message: string };
+
+/**
+ * Scan local storage for valid runtime-package bundles.
+ *
+ * Results arrive one at a time because a full phone-storage scan can be slow.
+ * Aborting the signal closes the stream and stops the daemon's directory walk.
+ */
+export async function discoverLocalPackages(
+  onEvent: (event: PackageDiscoveryEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const resp = await apiFetch('/packages/discover/stream', {
+    headers: authHeaders(),
+    signal,
+  });
+  if (!resp.ok) throw await failure(resp);
+  const reader = resp.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let finished = false;
+  let streamError: string | null = null;
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const parts = buffer.split('\n\n');
+    buffer = parts.pop() ?? '';
+    for (const part of parts) {
+      const line = part.split('\n').find((candidate) => candidate.startsWith('data:'));
+      if (!line) continue;
+      const json = line.slice('data:'.length).trim();
+      if (!json) continue;
+      let event: PackageDiscoveryEvent;
+      try {
+        event = JSON.parse(json) as PackageDiscoveryEvent;
+      } catch {
+        continue;
+      }
+      onEvent(event);
+      if (event.type === 'done') finished = true;
+      if (event.type === 'error') streamError = event.message;
+    }
+  }
+
+  if (streamError) throw new Error(streamError);
+  if (!finished) throw new Error('package discovery stream ended without a result');
+}
+
+/** One event on the install progress stream. */
+export interface PackageProgress {
+  type: 'progress' | 'done' | 'error';
+  /** Which step is running: fetch the bytes, check the hash, unpack, link. */
+  stage?: 'download' | 'verify' | 'unpack' | 'link';
+  received?: number;
+  total?: number;
+  files?: number;
+  message?: string;
+  package?: PackageRecord;
+}
+
+/**
+ * Install while reporting progress.
+ *
+ * A 47 MB bundle takes long enough that a motionless button reads as a hang, so
+ * the panel subscribes to the daemon's event stream instead of awaiting one
+ * response. The stream always ends with exactly one `done` or `error`.
+ */
+export async function installPackageStreaming(
+  source: { url?: string; path?: string; sha256?: string },
+  onEvent: (event: PackageProgress) => void,
+  signal?: AbortSignal,
+): Promise<PackageRecord> {
+  const resp = await apiFetch('/packages/install/stream', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(source),
+    signal,
+  });
+  if (!resp.ok) {
+    throw await failure(resp);
+  }
+
+  const reader = resp.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let installed: PackageRecord | null = null;
+  let streamError: string | null = null;
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    // SSE frames are separated by a blank line; the tail may be incomplete.
+    const parts = buffer.split('\n\n');
+    buffer = parts.pop() ?? '';
+    for (const part of parts) {
+      const line = part.split('\n').find((candidate) => candidate.startsWith('data:'));
+      if (!line) continue;
+      const json = line.slice('data:'.length).trim();
+      if (!json) continue;
+      let event: PackageProgress;
+      try {
+        event = JSON.parse(json) as PackageProgress;
+      } catch {
+        continue; // keepalive comment or partial frame
+      }
+      onEvent(event);
+      if (event.type === 'done' && event.package) installed = event.package;
+      if (event.type === 'error') streamError = event.message ?? 'install failed';
+    }
+  }
+
+  if (streamError) throw new Error(streamError);
+  if (!installed) throw new Error('install stream ended without a result');
+  return installed;
+}
+
+/** Runtime data that outlived its package. */
+export interface RuntimeLeftover {
+  name: string;
+  path: string;
+  bytes: number;
+}
+
+export interface LeftoverReport {
+  leftovers: RuntimeLeftover[];
+  totalBytes: number;
+}
+
+/** What an uninstalled runtime left behind (`python-packages`, `.local`).
+ *
+ *  The daemon reports these only when no interpreter is installed any more —
+ *  while one is, those directories are live and worth their space. */
+export async function listLeftovers(): Promise<LeftoverReport> {
+  const resp = await apiFetch('/packages/leftovers', { headers: authHeaders() });
+  const body = await readJson<{ leftovers?: RuntimeLeftover[]; total_bytes?: number }>(resp);
+  return { leftovers: body.leftovers ?? [], totalBytes: body.total_bytes ?? 0 };
+}
+
+/** Delete those leftovers. Returns the bytes actually reclaimed. */
+export async function cleanLeftovers(): Promise<number> {
+  const resp = await apiFetch('/packages/leftovers', {
+    method: 'DELETE',
+    headers: authHeaders(),
+  });
+  const body = await readJson<{ freed_bytes?: number }>(resp);
+  return body.freed_bytes ?? 0;
+}
+
+/** One sidebar section of the plugin market. */
+export interface MarketCategory {
+  id: string;
+  title: string;
+  blurb?: string;
+}
+
+/** One plugin as the market repository describes it.
+ *
+ *  `download_url` and `download_path` are resolved by the daemon from the
+ *  entry's `artifact` field, so this page never has to know whether the bundle
+ *  lives in Git LFS, a release asset or an object store. */
+/** 市场里的一个具体版本（可装回旧版）。 */
+export interface MarketPluginVersion {
+  version: string;
+  size_bytes: number;
+  sha256: string;
+  download_url?: string | null;
+  download_path?: string | null;
+}
+
+export interface MarketPlugin {
+  name: string;
+  title: string;
+  summary: string;
+  category: string;
+  tags: string[];
+  version: string;
+  size_bytes: number;
+  sha256: string;
+  artifact_kind?: string;
+  download_url?: string | null;
+  download_path?: string | null;
+  /** 全部可装版本，最新的在最后；老仓库可能没有这一项。 */
+  versions?: MarketPluginVersion[];
+  installed: boolean;
+  installed_version?: string | null;
+}
+
+export interface MarketIndex {
+  success: boolean;
+  error?: string;
+  hint?: string;
+  base?: string;
+  storage?: string;
+  generated_at?: string;
+  from_cache?: boolean;
+  categories: MarketCategory[];
+  plugins: MarketPlugin[];
+  /** The first provider APK, when the repository publishes one (old servers). */
+  helper?: MarketHelper | null;
+  /** Every provider APK the repository publishes, in publication order. */
+  helpers?: MarketHelper[];
+}
+
+/** The market index, from the separate plugin repository.
+ *
+ *  `refresh` skips the daemon's cache — the person pressed the refresh button. */
+export async function listMarket(refresh = false): Promise<MarketIndex> {
+  const query = refresh ? '?refresh=1' : '';
+  const resp = await apiFetch(`/packages/market${query}`, { headers: authHeaders() });
+  const body = await readJson<Partial<MarketIndex>>(resp);
+  return {
+    success: body.success ?? false,
+    error: body.error,
+    hint: body.hint,
+    base: body.base,
+    storage: body.storage,
+    generated_at: body.generated_at,
+    from_cache: body.from_cache,
+    categories: body.categories ?? [],
+    plugins: body.plugins ?? [],
+    helper: body.helper ?? null,
+    helpers: body.helpers ?? (body.helper ? [body.helper] : []),
+  };
+}
+
+/** Point the market at another repository (or a local directory).
+ *
+ *  Written into `config.toml`'s `[market] base` by the daemon, so it survives a
+ *  restart — that is the whole reason this is not just frontend state. */
+export async function setMarketBase(base: string): Promise<{ success: boolean; error?: string }> {
+  const resp = await apiFetch('/packages/market/config', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ base }),
+  });
+  const body = await readJson<{ success?: boolean; error?: string }>(resp);
+  return { success: body.success ?? false, error: body.error };
+}

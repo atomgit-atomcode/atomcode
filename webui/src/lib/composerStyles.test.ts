@@ -58,7 +58,30 @@ test('mobile composer isolates selectors from the send tap target', () => {
   assert.match(css, /@media \(max-width: 768px\)[\s\S]*?\.input-footer\s*\{[^}]*flex-direction:\s*column;/);
   assert.match(css, /\.input-footer-actions\s*\{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\) auto;/);
   assert.match(css, /\.input-turn-controls\s*>\s*\.btn-send,[\s\S]*?width:\s*44px;[\s\S]*?height:\s*44px;/);
-  assert.match(css, /\.input-footer-actions \.model-controls\s*>\s*\.model-selector:not\(\.effort-selector\)\s*\{[^}]*flex:\s*1 1 0;[^}]*max-width:\s*none;/);
+  // The model pill may shrink, but not to "q…": it keeps a usable minimum.
+  assert.match(css, /\.input-footer-actions \.model-controls\s*>\s*\.model-selector:not\(\.effort-selector\)\s*\{[^}]*flex:\s*1 1 140px;[^}]*max-width:\s*none;/);
   assert.match(css, /\.input-footer-actions \.model-selector-trigger,[\s\S]*?min-height:\s*44px;/);
   assert.match(css, /padding:\s*6px 8px max\(8px, env\(safe-area-inset-bottom\)\);/);
+});
+
+test('mobile composer gives the selectors their own row above the send button', () => {
+  const css = readFileSync(join(root, 'src/styles/app.css'), 'utf8');
+
+  // Mode, effort and model do not fit on one row of a phone: the model pill
+  // was squeezed down to "q…". The selectors take row 1, the mode pill and
+  // the send button share row 2.
+  assert.match(css, /\.input-footer-actions\s*>\s*\.model-controls\s*\{[^}]*grid-column:\s*1 \/ -1;[^}]*grid-row:\s*1;/);
+  assert.match(css, /\.input-footer-actions\s*>\s*\.mode-selector\s*\{[^}]*grid-column:\s*1;[^}]*grid-row:\s*2;/);
+  assert.match(css, /\.input-footer-actions\s*>\s*\.input-turn-controls\s*\{[^}]*grid-column:\s*2 \/ -1;[^}]*grid-row:\s*2;/);
+});
+
+test('the app reserves the status bar and the drawer does too', () => {
+  const css = readFileSync(join(root, 'src/styles/app.css'), 'utf8');
+
+  // Android draws every app edge-to-edge since API 35, so the window reaches
+  // under the status bar; the WebView reports that inset through
+  // `env(safe-area-inset-top)`.
+  assert.match(css, /\.app\s*\{[^}]*padding-top:\s*env\(safe-area-inset-top, 0px\);/);
+  // The drawer is `position: fixed`, so it does not inherit `.app`'s padding.
+  assert.match(css, /\.session-list\s*\{[^}]*padding-top:\s*env\(safe-area-inset-top, 0px\);/);
 });

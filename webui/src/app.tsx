@@ -9,6 +9,8 @@ import { ThemeDialog, LanguageDialog, RemoteAccessDialog, NotificationsDialog } 
 import { ModelConfigDialog } from './components/ModelProviders';
 import { RenameDialog, DeleteDialog } from './components/SessionDialogs';
 import { CwdPicker } from './components/CwdPicker';
+import { SourceControl } from './components/SourceControl';
+import { PackageBrowser } from './components/PackageBrowser';
 import { resolvePendingAfterDecision } from './lib/pendingPermission';
 import { getProject, getConfig, changeDir, resolveSession, createSession, getSession, SessionMetaWithProject } from './api';
 import { useT, useSettings, SettingsSection } from './settings';
@@ -51,6 +53,10 @@ export function App() {
   const automationNavigation = useRef(0);
   const composerSequence = useRef(0);
   const [composerInsert, setComposerInsert] = useState<{text: string; seq: number; sessionId: string} | null>(null);
+  const [showSourceControl, setShowSourceControl] = useState(false);
+  // 插件页现在是一个真实的路由页（`#packages`），不再是叠在对话之上的遮罩层。
+  // 插件只会越来越多，它需要自己的地址、自己的返回，也要能直接从外部打开。
+  const [routeHash, setRouteHash] = useState(() => window.location.hash);
   const [settingsSection, setSettingsSection] = useState<SettingsSection | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -58,6 +64,28 @@ export function App() {
   const [headerMenuOpen, setHeaderMenuOpen] = useState(false);
   // 表头会话菜单改用 fixed 定位，避免被祖先 overflow/层叠裁剪；记录锚点坐标。
   const [headerMenuPos, setHeaderMenuPos] = useState<{ top: number; left: number } | null>(null);
+
+  useEffect(() => {
+    const sync = () => setRouteHash(window.location.hash);
+    window.addEventListener('hashchange', sync);
+    return () => window.removeEventListener('hashchange', sync);
+  }, []);
+
+  const packagesPage = routeHash === '#packages';
+
+  function openPackages() {
+    // 抽屉是“对话页”的导航；进了独立页再回来时它不该还开着。
+    setSidebarOpen(false);
+    window.location.hash = '#packages';
+  }
+
+  // 用 replaceState 而不是 back()：直接以 `#packages` 打开时，back 会退出应用。
+  function closePackages() {
+    const url = new URL(window.location.href);
+    url.hash = '';
+    window.history.replaceState(null, '', url.pathname + url.search);
+    setRouteHash('');
+  }
   const [headerDialog, setHeaderDialog] = useState<'rename' | 'delete' | null>(null);
   const [headerExporting, setHeaderExporting] = useState(false);
   const headerMenuRef = useRef<HTMLDivElement>(null);
@@ -383,6 +411,11 @@ export function App() {
     }
   }
 
+  // 独立页面：只渲染插件页。对话仍在服务端继续，返回时按会话恢复。
+  if (packagesPage) {
+    return <PackageBrowser onClose={closePackages} />;
+  }
+
   return (
     <div class="app">
       {/* ===== Full-height sidebar (通栏)：品牌 + 收起按钮在其顶部 ===== */}
@@ -406,6 +439,8 @@ export function App() {
         onPickSkill={(name) => setSkillInsert({ name, seq: Date.now() })}
         onOpenRemote={() => setSettingsSection('remote')}
         onOpenCwd={() => setShowCwd(true)}
+        onOpenSourceControl={() => setShowSourceControl(true)}
+        onOpenPackages={openPackages}
       />
       <div
         class={'sidebar-backdrop' + (sidebarOpen ? ' show' : '')}
@@ -543,6 +578,12 @@ export function App() {
           current={cwd}
           onPick={handlePickCwd}
           onClose={() => setShowCwd(false)}
+        />
+      )}
+      {showSourceControl && (
+        <SourceControl
+          onPick={handlePickCwd}
+          onClose={() => setShowSourceControl(false)}
         />
       )}
       {settingsSection === 'theme' && (

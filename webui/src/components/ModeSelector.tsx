@@ -1,7 +1,9 @@
-import { useState, useEffect, useRef } from 'preact/hooks';
+import { useState } from 'preact/hooks';
+import { createPortal } from 'preact/compat';
 import { ApprovalMode } from '../api';
 import { useT } from '../settings';
 import { MsgKey } from '../i18n';
+import { useDropdown } from '../lib/useDropdown';
 
 // Approval modes shown in the pill dropdown. Order = display order.
 // The Auto mode keeps the `bypass` wire value for protocol compatibility and
@@ -24,20 +26,21 @@ export function ModeSelector({
 }) {
   const t = useT();
   const [open, setOpen] = useState(false);
-  const ref = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (!open) return;
-    const h = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
-    };
-    document.addEventListener('mousedown', h);
-    return () => document.removeEventListener('mousedown', h);
-  }, [open]);
+  // The menu is portaled to <body> and placed against the viewport: on a
+  // narrow phone the pill is far narrower than the menu, so anchoring the
+  // menu's right edge to the pill pushed it off the left edge of the screen.
+  const dropdown = useDropdown({
+    open,
+    onClose: () => setOpen(false),
+    prefer: 'above',
+    width: 240,
+  });
   const current = MODE_OPTIONS.find((o) => o.val === value) ?? MODE_OPTIONS[0];
   const isAuto = value === 'bypass';
   return (
-    <div class="model-selector model-selector-up mode-selector" ref={ref}>
+    <div class="model-selector model-selector-up mode-selector">
       <button
+        ref={dropdown.triggerRef}
         class={'model-selector-trigger mode-selector-trigger' + (isAuto ? ' mode-bypass' : '')}
         onClick={() => {
           if (!disabled) setOpen((o) => !o);
@@ -50,8 +53,12 @@ export function ModeSelector({
         <span class="model-selector-label">{t(current.label)}</span>
         <span class="model-selector-chevron">▾</span>
       </button>
-      {open && (
-        <div class="model-dropdown mode-dropdown">
+      {open && createPortal(
+        <div
+          ref={dropdown.menuRef}
+          class="model-dropdown mode-dropdown model-dropdown-viewport"
+          style={dropdown.style}
+        >
           {MODE_OPTIONS.map((o) => (
             <button
               key={o.val}
@@ -72,7 +79,8 @@ export function ModeSelector({
               <span class="mode-item-desc">{t(o.desc)}</span>
             </button>
           ))}
-        </div>
+        </div>,
+        document.body,
       )}
     </div>
   );

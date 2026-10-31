@@ -59,6 +59,30 @@ test('searchFiles URL-encodes the dir and the raw @ token, returns matches', asy
   }
 });
 
+test('gitDiff encodes the path and requested area', async () => {
+  const calls: string[] = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: RequestInfo | URL) => {
+    calls.push(String(url));
+    return new Response(JSON.stringify({
+      path: 'src/a b.txt',
+      kind: 'worktree',
+      patch: '@@ -1 +1 @@',
+      binary: false,
+      truncated: false,
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  }) as typeof fetch;
+
+  try {
+    const { gitDiff } = await import('./api.ts');
+    const result = await gitDiff('src/a b.txt', 'worktree');
+    assert.equal(calls[0], '/git/diff?path=src%2Fa%20b.txt&kind=worktree');
+    assert.equal(result.patch, '@@ -1 +1 @@');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('postLiveMessage does not send approval_mode because live mode is global', async () => {
   const calls: Array<{ url: string; init?: RequestInit }> = [];
   const originalFetch = globalThis.fetch;
@@ -662,6 +686,29 @@ test('unavailable history is opt-in and remains available for read-only retrieva
       '/sessions/search?q=automation',
       '/sessions/search?q=&include_unavailable=true',
     ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('discoverLocalPackages streams found packages and the final scan summary', async () => {
+  const calls: string[] = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: RequestInfo | URL) => {
+    calls.push(String(url));
+    return new Response(
+      'data: {"type":"found","package":{"path":"/sdcard/Download/cpython.tar.gz","name":"cpython","version":"3.12","description":"Python","size_bytes":123}}\n\n' +
+        'data: {"type":"done","directories":4,"archives":2,"skipped":1,"truncated":false}\n\n',
+      { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+    );
+  }) as typeof fetch;
+
+  try {
+    const { discoverLocalPackages } = await import('./api.ts');
+    const events: Array<{ type: string }> = [];
+    await discoverLocalPackages((event: { type: string }) => events.push(event));
+    assert.deepEqual(calls, ['/packages/discover/stream']);
+    assert.deepEqual(events.map((event) => event.type), ['found', 'done']);
   } finally {
     globalThis.fetch = originalFetch;
   }

@@ -42,6 +42,7 @@ import {
   type SlashHandlers,
 } from '../lib/slashCommands';
 import { resolvePendingAfterDecision } from '../lib/pendingPermission';
+import { fileToImageData, MAX_RAW_BYTES } from '../lib/imageAttach';
 import { isDuplicateTrailingNotice } from '../lib/notices';
 import { beginModeSwitch, completeModeSwitch, failModeSwitch, initModeState, modeForQueuedPrompt } from '../lib/modeSwitch';
 import { Markdown } from './Markdown';
@@ -207,28 +208,11 @@ function messageHasTools(m: Message): boolean {
   return m.parts.some((p) => p.kind === 'tool');
 }
 
-/** Max attached images per message and per-image byte cap (raw file size). */
+/** Max attached images per message. */
 const MAX_IMAGES = 6;
-const MAX_IMAGE_MB = 2;
-const MAX_IMAGE_BYTES = MAX_IMAGE_MB * 1024 * 1024;
-
-/** Read a File into an ImageData (base64, no data-URL prefix). */
-function fileToImageData(file: File): Promise<ImageData | null> {
-  return new Promise((resolve) => {
-    if (!file.type.startsWith('image/') || file.size > MAX_IMAGE_BYTES) {
-      resolve(null);
-      return;
-    }
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = String(reader.result || '');
-      const comma = result.indexOf(',');
-      resolve(comma >= 0 ? { media_type: file.type, data: result.slice(comma + 1) } : null);
-    };
-    reader.onerror = () => resolve(null);
-    reader.readAsDataURL(file);
-  });
-}
+/** Raw-size cap before we even try to decode; anything below is downscaled, not
+ *  rejected (a phone photo is 3–8 MB and must still be attachable). */
+const MAX_RAW_MB = Math.round(MAX_RAW_BYTES / (1024 * 1024));
 
 /** Build a displayable data URL from an ImageData. */
 function imageDataUrl(img: ImageData): string {
@@ -3229,24 +3213,36 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     insertAtCursor((needLead ? ' ' : '') + path + ' ');
   }
 
-  // 追加图片（上传或粘贴）：过滤非图片/超限，去除解析失败的，限制总数。
+  // 追加图片（上传或粘贴）：压缩到长边 1568px 后入列，限制总数。
+  //
+  // 以前这里按 2MB 直接拒绝——手机上拍照的图通常 3–8MB，等于附件功能在
+  // Android 上永远用不了。现在浏览器先做一次降采样（与 daemon 的
+  // image_normalize 同一长边上限），只有连解码都不该尝试的超大文件才拒绝。
   async function addImageFiles(files: File[] | FileList) {
-    const arr = Array.from(files).filter((f) => f.type.startsWith('image/'));
-    if (arr.length === 0) return;
-    // 严格拦截超过 2M 的图片，并提示用户（其余正常入列）。
-    const oversized = arr.filter((f) => f.size > MAX_IMAGE_BYTES);
+    const offered = Array.from(files);
+    if (offered.length === 0) return;
+    const arr = offered.filter((f) => f.type.startsWith('image/') && f.size > 0);
+    if (arr.length === 0) {
+      // The picker handed us something we cannot read (an empty file from a camera
+      // that failed to write, or a type we do not accept). Saying so is the point:
+      // silently doing nothing looks like the attachment button is broken.
+      setAttachError(t('attach.unreadable'));
+      return;
+    }
+    const oversized = arr.filter((f) => f.size > MAX_RAW_BYTES);
+    const candidates = arr.filter((f) => f.size <= MAX_RAW_BYTES);
+    const parsed = await Promise.all(candidates.map(fileToImageData));
+    const images = parsed.filter((x): x is ImageData => x !== null);
+    const unreadable = parsed.length - images.length;
     if (oversized.length > 0) {
-      setAttachError(t('attach.tooLarge', { mb: String(MAX_IMAGE_MB) }));
+      setAttachError(t('attach.tooLarge', { mb: String(MAX_RAW_MB) }));
+    } else if (unreadable > 0) {
+      setAttachError(t('attach.unreadable'));
     } else {
       setAttachError(null);
     }
-    const allowed = arr.filter((f) => f.size <= MAX_IMAGE_BYTES);
-    if (allowed.length === 0) return;
-    const parsed = (await Promise.all(allowed.map(fileToImageData))).filter(
-      (x): x is ImageData => x !== null,
-    );
-    if (parsed.length === 0) return;
-    setPendingImages((prev) => [...prev, ...parsed].slice(0, MAX_IMAGES));
+    if (images.length === 0) return;
+    setPendingImages((prev) => [...prev, ...images].slice(0, MAX_IMAGES));
   }
 
   function removePendingImage(idx: number) {
