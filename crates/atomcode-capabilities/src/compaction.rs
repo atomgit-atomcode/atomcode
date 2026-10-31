@@ -196,9 +196,10 @@ const MAX_SUMMARY_TOKENS: u32 = 16_000;
 /// a thinking model (e.g. GLM-5.2) trickles hidden-reasoning bytes for many minutes, so the
 /// idle timer never fires and the summary could hang 20+ min. This hard cap bounds it — on
 /// expiry we fall back to the gentle in-place stub (manual/auto) or a plain drain (overflow).
-/// 180s (up from 120s): gives a slow model more room now that the summary INPUT is bounded
-/// (tool outputs truncated — see `SUMMARY_TOOL_OUTPUT_MAX_CHARS`), so a legit slow-but-
-/// progressing summary isn't cut early, while still bounding a genuinely hung call.
+/// 180s (up from 120s): gives a slow model more room now that the summary INPUT is
+/// bounded — per-item tool caps plus the whole-transcript ceiling
+/// ([`SUMMARY_TRANSCRIPT_MAX_CHARS`]) — so a legit slow-but-progressing summary
+/// isn't cut early, while still bounding a genuinely hung call.
 pub const SUMMARY_TIMEOUT: Duration = Duration::from_secs(180);
 /// Surfaced (as a `resume_note` → synthetic user message) when the summary times out and we
 /// fall back to stub compaction, so the user understands why they got a lighter compaction.
