@@ -97,6 +97,20 @@ pub(crate) mod proxy;
 /// [`pathutil`]. Free of any feature `cfg` because `codeintel` is independent of `tools`.
 pub(crate) mod pathutil;
 
+/// Example skills that ship inside the binary, for a host with no setup wizard.
+///
+/// The same `assets/setup-seeds/skills/` files the desktop wizard installs, embedded
+/// directly (no tarball, so no `zstd`/`tar` in a phone build) and seeded only when the
+/// directory is absent — an edited or deleted example stays that way.
+pub mod example_skills;
+
+/// A worked MCP server that ships inside the binary (stdlib-only Python over stdio),
+/// seeded with its `mcp.json` entry so a fresh install has a callable server instead
+/// of an empty `/mcp/status`. Opt-in `mcp` feature — it writes through the same merge
+/// the CLI's `mcp add` uses.
+#[cfg(feature = "mcp")]
+pub mod example_mcp;
+
 /// Cross-platform atomic file write (tempfile → fsync → persist → parent-dir fsync).
 /// Ported from `atomcode-core`'s `fs_atomic` for the `plugin` feature (trust store).
 /// Opt-in behind `feature = "plugin"` or `feature = "mcp"` (the mcp trust store
