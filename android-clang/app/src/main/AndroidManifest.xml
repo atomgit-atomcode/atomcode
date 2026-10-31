@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- A file holder, like `com.atomcode.tools` and `com.atomcode.tools.zig`:
+         no activity, no service, no IPC.
+
+         The main app links `<data>/bin/clang`, `<data>/bin/clang++` and
+         `<data>/bin/lld` at this package's `nativeLibraryDir`, which the platform
+         allows even though it forbids executing our own data directory. The
+         headers and the clang resource directory are NOT here — they are the
+         `clang-sysroot` market package, read through the sysroot and resource-dir
+         flags by the wrappers the app writes. -->
+    <application
+        android:allowBackup="false"
+        android:label="AtomCode Clang" />
+
+</manifest>

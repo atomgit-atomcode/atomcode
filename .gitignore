@@ -171,3 +171,6 @@ android-tools/app/src/main/jniLibs/*/*.so
 
 # 编辑器个人工作目录
 .trae/
+
+# Termux 包缓存（scripts/termux/fetch.sh 的 workdir，可重现）
+.termux-cache/

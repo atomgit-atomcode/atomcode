@@ -1,0 +1,16 @@
+# clang + lld provider: what goes into the APK (executables) and what becomes the
+# `clang-sysroot` data package (read-only headers and the resource directory).
+#
+# `bin/clang-21` is the driver; Termux links it against libLLVM.so and
+# libclang-cpp.so, so the binary itself is small and its runtime closure is pulled
+# in automatically by split.sh.
+#
+# `lib/clang/21` is clang's resource directory (builtin headers, per-target
+# builtins). It is only read, so it ships as data — but the wrapper has to point
+# clang at it with `-resource-dir`, because clang would otherwise look next to its
+# own binary, which lives in nativeLibraryDir.
+exec bin/clang-21 clang
+exec bin/lld lld
+
+data include
+data lib/clang
