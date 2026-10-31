@@ -1196,6 +1196,15 @@ fn base64_url_no_pad(bytes: &[u8]) -> String {
     out
 }
 
+#[cfg(target_os = "android")]
+fn open_browser(_url: &str) -> Result<()> {
+    // An app process cannot launch another app's activity: that needs an Intent
+    // owned by the Kotlin shell. The caller has already announced the URL through
+    // `McpOAuthStep::WaitingForBrowser`, so the person can open it from the UI —
+    // saying so is better than a spawn error for a binary that never existed.
+    anyhow::bail!("Android: open the authorization URL shown above in a browser")
+}
+
 #[cfg(target_os = "macos")]
 fn open_browser(url: &str) -> Result<()> {
     std::process::Command::new("open")

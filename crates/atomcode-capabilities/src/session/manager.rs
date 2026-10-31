@@ -25,6 +25,36 @@ use super::presentation::{
 };
 use super::transcript::{TurnRecord, TurnTimestamp, RECORD_VERSION};
 
+/// Where sessions live, when the host wants them somewhere other than
+/// `<user tree>/sessions`.
+///
+/// The default is right for a desktop. The Android build points sessions at the
+/// shared workspace so an externally started daemon and the in-app one read the
+/// *same* history — while `config.toml` and the keys in it stay in the app's
+/// private tree. Set once, before any runtime exists: `OnceLock` on purpose, so
+/// there is never a window where half the process wrote to one root.
+static SESSIONS_ROOT_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Point sessions at `path`. `false` means an override was already pinned —
+/// the first one wins, and the host logs it rather than silently moving history.
+pub fn set_sessions_root(path: impl Into<PathBuf>) -> bool {
+    SESSIONS_ROOT_OVERRIDE.set(path.into()).is_ok()
+}
+
+/// The pinned override, if a host set one.
+pub fn sessions_root_override() -> Option<&'static Path> {
+    SESSIONS_ROOT_OVERRIDE.get().map(PathBuf::as_path)
+}
+
+/// Pure decision behind [`SessionManager::sessions_root`], so it can be asserted
+/// without pinning a process-wide value.
+fn resolve_sessions_root(user_dir: &Path, override_root: Option<&Path>) -> PathBuf {
+    match override_root {
+        Some(root) => root.to_path_buf(),
+        None => user_dir.join("sessions"),
+    }
+}
+
 /// Fast-listing metadata for ONE session — read to populate a `/resume` picker WITHOUT
 /// parsing the (large) snapshot / transcript files. Persisted as `<id>.meta`.
 pub const META_VERSION: u32 = 1;
@@ -1004,15 +1034,38 @@ impl fmt::Debug for SessionLease {
     }
 }
 
+/// How an acquired lease keeps other runtimes out.
+///
+/// `flock` is the natural choice: the kernel drops it when the process dies, so
+/// a crash leaves nothing to clean up. Android's shared storage (FUSE) does not
+/// implement it and answers `ENOSYS` — and because the Android host pins the
+/// session root to the shared workspace, that made *every* session creation
+/// fail outright the moment all-files access was granted.
+///
+/// The directory fallback keeps the same guarantee using a primitive every
+/// filesystem has: `mkdir` is atomic, and the owner pid written inside lets a
+/// later runtime take over a lock whose owner is gone.
+enum LeaseLock {
+    Flock(File),
+    Dir(PathBuf),
+}
+
 struct SessionLeaseInner {
     id: String,
     path: PathBuf,
-    file: File,
+    lock: LeaseLock,
 }
 
 impl Drop for SessionLeaseInner {
     fn drop(&mut self) {
-        let _ = fs2::FileExt::unlock(&self.file);
+        match &self.lock {
+            LeaseLock::Flock(file) => {
+                let _ = fs2::FileExt::unlock(file);
+            }
+            LeaseLock::Dir(dir) => {
+                let _ = fs::remove_dir_all(dir);
+            }
+        }
     }
 }
 
@@ -1075,8 +1128,11 @@ impl SessionManager {
     }
 
     /// `<user tree>/sessions` — every project's buckets.
+    ///
+    /// A host may pin this elsewhere with [`set_sessions_root`]; that is how the
+    /// Android build shares one history with an externally started daemon.
     pub fn sessions_root(user_dir: &Path) -> PathBuf {
-        user_dir.join("sessions")
+        resolve_sessions_root(user_dir, sessions_root_override())
     }
 
     /// Copy the pre-v4.16 macOS session tree into the canonical sessions root.
@@ -1675,20 +1731,27 @@ impl SessionManager {
         let path = self.lease_path(id)?;
         reject_existing_non_regular(&path)?;
         let file = open_session_lock_file(id, &path)?;
-        match fs2::FileExt::try_lock_exclusive(&file) {
-            Ok(()) => Ok(SessionLease {
-                inner: Arc::new(SessionLeaseInner {
+        let lock = match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => LeaseLock::Flock(file),
+            Err(error) if is_file_lock_contention(&error) => {
+                return Err(SessionStoreError::SessionInUse {
                     id: id.to_string(),
                     path,
-                    file,
-                }),
-            }),
-            Err(error) if is_file_lock_contention(&error) => Err(SessionStoreError::SessionInUse {
+                })
+            }
+            // A filesystem that refuses advisory locks altogether (Android FUSE
+            // answers ENOSYS): use the atomic directory instead of failing the
+            // session outright.
+            Err(error) if lock_unsupported(&error) => LeaseLock::Dir(take_lock_dir(id, &path)?),
+            Err(error) => return Err(io_at(&path, error)),
+        };
+        Ok(SessionLease {
+            inner: Arc::new(SessionLeaseInner {
                 id: id.to_string(),
                 path,
+                lock,
             }),
-            Err(error) => Err(io_at(&path, error)),
-        }
+        })
     }
 
     /// Persist the working-set snapshot (atomic). Overwrites every turn.
@@ -1823,16 +1886,17 @@ impl SessionManager {
         let lock_path = self.meta_lock_path(id)?;
         reject_existing_non_regular(&lock_path)?;
         let lock = open_session_lock_file(id, &lock_path)?;
-        acquire_file_lock_until(&lock, META_LOCK_WAIT_TIMEOUT).map_err(|error| {
-            if is_file_lock_contention(&error) {
-                SessionStoreError::SessionInUse {
-                    id: id.to_string(),
-                    path: lock_path.clone(),
+        let _held =
+            lock_session_file(&lock, &lock_path, META_LOCK_WAIT_TIMEOUT).map_err(|error| {
+                if is_file_lock_contention(&error) {
+                    SessionStoreError::SessionInUse {
+                        id: id.to_string(),
+                        path: lock_path.clone(),
+                    }
+                } else {
+                    io_at(&lock_path, error)
                 }
-            } else {
-                io_at(&lock_path, error)
-            }
-        })?;
+            })?;
         operation()
     }
 
@@ -4548,7 +4612,7 @@ pub(super) fn open_append_file(path: &Path) -> SessionResult<File> {
 }
 
 const TRANSIENT_FILE_ACCESS_RETRY_DELAYS_MS: [u64; 3] = [10, 30, 60];
-const META_LOCK_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+pub(super) const META_LOCK_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const META_LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
 
 fn is_file_lock_contention(error: &io::Error) -> bool {
@@ -4557,6 +4621,162 @@ fn is_file_lock_contention(error: &io::Error) -> bool {
         // consistently mapping them to WouldBlock (ERROR_SHARING_VIOLATION=32,
         // ERROR_LOCK_VIOLATION=33).
         || cfg!(windows) && matches!(error.raw_os_error(), Some(32 | 33))
+}
+
+/// Whether the filesystem refused advisory locks outright, as opposed to
+/// another process holding one.
+///
+/// Android's shared storage is FUSE and answers `ENOSYS` (38) to `flock`;
+/// some network filesystems answer `EOPNOTSUPP` (95). Both mean "this
+/// filesystem has no advisory locks", not "someone else owns the session".
+fn lock_unsupported(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::Unsupported
+        || matches!(error.raw_os_error(), Some(38) | Some(95))
+}
+
+/// Take the directory-shaped lease lock, taking over one whose owner is gone.
+fn take_lock_dir(id: &str, lease: &Path) -> SessionResult<PathBuf> {
+    let dir = lease.with_extension("lease.d");
+    match create_lock_dir(&dir) {
+        Ok(()) => Ok(dir),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            if lock_dir_owner_alive(&dir) {
+                return Err(SessionStoreError::SessionInUse {
+                    id: id.to_string(),
+                    path: lease.to_path_buf(),
+                });
+            }
+            // The owner died without releasing (hard kill, or a crash that
+            // skipped `Drop`). Nothing is holding the session, so take it over.
+            let _ = fs::remove_dir_all(&dir);
+            match create_lock_dir(&dir) {
+                Ok(()) => Ok(dir),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    // Another runtime won the re-create race: it owns the lease.
+                    Err(SessionStoreError::SessionInUse {
+                        id: id.to_string(),
+                        path: lease.to_path_buf(),
+                    })
+                }
+                Err(error) => Err(io_at(&dir, error)),
+            }
+        }
+        Err(error) => Err(io_at(&dir, error)),
+    }
+}
+
+fn create_lock_dir(dir: &Path) -> io::Result<()> {
+    fs::create_dir(dir)?;
+    // Written after the directory exists: an owner file that lags the lock is
+    // read as "owner unknown", which is treated as held, never as free.
+    let _ = fs::write(dir.join("owner"), std::process::id().to_string());
+    Ok(())
+}
+
+/// Whether the pid recorded in the lock directory is still running.
+///
+/// Unknown owner (missing or unparsable) counts as held: "I cannot tell" must
+/// never be turned into "steal it".
+fn lock_dir_owner_alive(dir: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(dir.join("owner")) else {
+        return true;
+    };
+    match text.trim().parse::<u32>() {
+        Ok(pid) => pid_alive(pid),
+        Err(_) => true,
+    }
+}
+
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
+#[cfg(not(unix))]
+fn pid_alive(_pid: u32) -> bool {
+    // Only reached on a filesystem without advisory locks; other platforms take
+    // the `flock` path, which the kernel releases on its own.
+    true
+}
+
+/// A held exclusive lock over one session artifact.
+///
+/// The `Flock` case is released by the caller's `File` going out of scope, so
+/// the guard itself has nothing to do. `Dir` exists for filesystems that have no
+/// advisory locks at all — Android's shared storage is FUSE and answers ENOSYS
+/// to `flock`, which used to make every session write fail on the device.
+pub(crate) enum SessionLock {
+    Flock,
+    Dir(PathBuf),
+}
+
+impl Drop for SessionLock {
+    fn drop(&mut self) {
+        if let SessionLock::Dir(dir) = self {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// Take the artifact lock, waiting up to `timeout` for a holder to finish.
+///
+/// Falls back to an atomic directory when the filesystem refuses advisory locks
+/// outright. A directory whose owner is gone is taken over, so a killed process
+/// cannot wedge a session forever.
+pub(crate) fn lock_session_file(
+    file: &File,
+    path: &Path,
+    timeout: std::time::Duration,
+) -> io::Result<SessionLock> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match fs2::FileExt::try_lock_exclusive(file) {
+            Ok(()) => return Ok(SessionLock::Flock),
+            Err(error) if lock_unsupported(&error) => return lock_session_dir(path, deadline),
+            Err(error) if is_file_lock_contention(&error) => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return Err(error);
+                }
+                std::thread::sleep(
+                    META_LOCK_RETRY_DELAY.min(deadline.saturating_duration_since(now)),
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn lock_session_dir(path: &Path, deadline: std::time::Instant) -> io::Result<SessionLock> {
+    let mut dir = path.as_os_str().to_os_string();
+    dir.push(".d");
+    let dir = PathBuf::from(dir);
+    loop {
+        match fs::create_dir(&dir) {
+            Ok(()) => {
+                let _ = fs::write(dir.join("owner"), std::process::id().to_string());
+                return Ok(SessionLock::Dir(dir));
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if !lock_dir_owner_alive(&dir) {
+                    // Owner died without releasing: the artifact is free.
+                    let _ = fs::remove_dir_all(&dir);
+                    continue;
+                }
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "session lock is held by another runtime",
+                    ));
+                }
+                std::thread::sleep(
+                    META_LOCK_RETRY_DELAY.min(deadline.saturating_duration_since(now)),
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn acquire_file_lock_until(file: &File, timeout: std::time::Duration) -> io::Result<()> {
@@ -4946,6 +5166,26 @@ fn atomic_write_tracked(path: &Path, bytes: &[u8]) -> Result<(), AtomicWriteFail
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn the_sessions_root_follows_the_host_override_when_set() {
+        // 桌面默认是 <user tree>/sessions；宿主钉了别处就完全照它来（Android 把会话
+        // 放进共享工作目录，好让外部 daemon 与 App 读同一份历史）。
+        let user = Path::new("/data/user/0/com.atomcode.app/files/atomcode");
+        assert_eq!(
+            resolve_sessions_root(user, None),
+            PathBuf::from("/data/user/0/com.atomcode.app/files/atomcode/sessions")
+        );
+        assert_eq!(
+            resolve_sessions_root(
+                user,
+                Some(Path::new("/storage/emulated/0/AtomCode/.sessions"))
+            ),
+            PathBuf::from("/storage/emulated/0/AtomCode/.sessions")
+        );
+    }
+
     use super::super::presentation::{
         DisplayAnchor, PresentationEntry, PresentationFile, PresentationRole,
         MAX_PRESENTATION_BYTES, PRESENTATION_VERSION,
@@ -7862,6 +8102,34 @@ mod tests {
 
         drop(lease_clone);
         mgr.acquire_lease("s1").unwrap();
+    }
+
+    #[test]
+    fn the_directory_lock_rejects_a_live_owner_and_takes_over_a_dead_one() {
+        // The path filesystems without advisory locks take (Android FUSE):
+        // exclusive create for mutual exclusion, the owner pid to tell a
+        // crashed runtime's leftover from a running one.
+        let dir = tempfile::tempdir().unwrap();
+        let lease = dir.path().join("s1.lease");
+        let lock = take_lock_dir("s1", &lease).expect("the first owner takes the lock");
+        assert!(lock.is_dir(), "the fallback lock is a directory");
+        assert!(matches!(
+            take_lock_dir("s1", &lease),
+            Err(SessionStoreError::SessionInUse { ref id, .. }) if id == "s1"
+        ));
+
+        // A live owner keeps it.
+        fs::write(lock.join("owner"), std::process::id().to_string()).unwrap();
+        assert!(matches!(
+            take_lock_dir("s1", &lease),
+            Err(SessionStoreError::SessionInUse { .. })
+        ));
+
+        // A pid that is gone does not: the session is free again.
+        fs::write(lock.join("owner"), u32::MAX.to_string()).unwrap();
+        let taken = take_lock_dir("s1", &lease).expect("a dead owner's lock is taken over");
+        assert!(taken.is_dir());
+        let _ = fs::remove_dir_all(&taken);
     }
 
     #[test]

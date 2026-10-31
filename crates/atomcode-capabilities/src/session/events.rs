@@ -214,9 +214,12 @@ impl SessionManager {
         }
         let path = self.events_path(id)?;
         let mut file = retry_transient_file_access(|| open_append_file(&path))?;
-        retry_transient_file_access(|| {
-            fs2::FileExt::lock_exclusive(&file).map_err(|e| io_at(&path, e))
-        })?;
+        // Advisory locks where the filesystem has them, an atomic directory
+        // where it does not: Android's shared storage is FUSE and answers
+        // ENOSYS to `flock`, which used to fail every append.
+        let _held =
+            super::manager::lock_session_file(&file, &path, super::manager::META_LOCK_WAIT_TIMEOUT)
+                .map_err(|e| io_at(&path, e))?;
         let current = usize::try_from(file.metadata().map_err(|e| io_at(&path, e))?.len())
             .unwrap_or(usize::MAX);
         let next = current.saturating_add(buffer.len());
@@ -620,7 +623,9 @@ impl SessionManager {
                 .open(&path)
                 .map_err(|error| io_at(&path, error))
         })?;
-        fs2::FileExt::lock_exclusive(&file).map_err(|error| io_at(&path, error))?;
+        let _held =
+            super::manager::lock_session_file(&file, &path, super::manager::META_LOCK_WAIT_TIMEOUT)
+                .map_err(|error| io_at(&path, error))?;
         let len = file.metadata().map_err(|error| io_at(&path, error))?.len();
         if mark > len {
             return Err(SessionStoreError::Corrupt {

@@ -126,6 +126,17 @@ fn pick_open_strategy() -> OpenStrategy {
         return OpenStrategy::Headless(reason);
     }
 
+    // Android: a sandboxed app process has no `xdg-open`, and handing a path to
+    // another app needs an Intent the Kotlin shell owns — not something a shell
+    // tool can do. Refuse with the path so the UI (or the person) can act on it,
+    // instead of reporting a spawn failure for a binary that never existed.
+    #[cfg(target_os = "android")]
+    {
+        return OpenStrategy::Headless(
+            "Android app sandbox: this tool cannot launch a viewer — open the path from the app UI"
+                .into(),
+        );
+    }
     #[cfg(target_os = "macos")]
     {
         return OpenStrategy::MacOpen;
@@ -134,7 +145,7 @@ fn pick_open_strategy() -> OpenStrategy {
     {
         return OpenStrategy::WindowsStart;
     }
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
     {
         if is_wsl() {
             // `wslview` (wslu) is the canonical WSL opener; if it's missing the spawn
@@ -178,7 +189,7 @@ fn ci_signal() -> Option<String> {
     None
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
 fn is_wsl() -> bool {
     if std::env::var("WSL_DISTRO_NAME")
         .map(|s| !s.is_empty())

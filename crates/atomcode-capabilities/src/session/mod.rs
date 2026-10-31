@@ -26,6 +26,8 @@ pub mod context;
 pub use crate::instructions;
 pub mod events;
 pub mod manager;
+// 宿主用它把会话目录钉到别处（Android 指到共享工作目录，与外部 daemon 共用历史）。
+pub use manager::{sessions_root_override, set_sessions_root};
 pub mod presentation;
 pub mod recall;
 pub mod reference;
