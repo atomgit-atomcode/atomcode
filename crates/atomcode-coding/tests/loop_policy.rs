@@ -1143,6 +1143,27 @@ impl Waterfall<AgentRequest> for PressureCycle {
     }
 }
 
+/// Reports a scheduled prompt size for each response, so one turn can cross the
+/// trigger, spend both stages, fall below it and rise again.
+struct ScheduledPressure(AtomicU32, &'static [u32]);
+#[async_trait]
+impl Waterfall<AgentRequest> for ScheduledPressure {
+    async fn handle(
+        &self,
+        req: &mut ModelRequest,
+        next: Next<'_, AgentRequest>,
+    ) -> Result<ModelResponse, RequestError> {
+        let mut response = next.run(req).await?;
+        let index = self.0.fetch_add(1, Ordering::SeqCst) as usize;
+        response.usage = Some(atomcode_kernel::stream::TokenUsage {
+            prompt: self.1.get(index).copied().unwrap_or(100),
+            completion: 1,
+            cached: 0,
+        });
+        Ok(response)
+    }
+}
+
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn automatic_compaction_rearms_after_pressure_falls_and_grows_in_one_turn() {
     let dir = scratch("pressure-cycles");
@@ -1256,11 +1277,26 @@ async fn verdict_app(
     attempts: &Arc<AtomicU32>,
     true_for: u32,
 ) -> App {
+    verdict_app_with_rounds(dir, asked, attempts, true_for, 4, 0.0000001).await
+}
+
+/// A turn of `rounds` tool rounds plus the closing answer, followed by one more
+/// turn's answer. The first request has no usage; the responses after it drive
+/// the trigger. `threshold` sets how many prompt tokens count as pressure.
+async fn verdict_app_with_rounds(
+    dir: &std::path::Path,
+    asked: &Arc<AtomicU32>,
+    attempts: &Arc<AtomicU32>,
+    true_for: u32,
+    rounds: usize,
+    threshold: f32,
+) -> App {
     let call =
         r#"{ text = "again", calls = [ { name = "read_file", args = { file_path = "a.txt" } } ] }"#;
+    let calls = vec![call; rounds].join(",\n  ");
     let script = format!(
         "[[patch]]\nid = \"llm\"\nname = \"llm-replay\"\nconfig = {{ script = [\n  \
-         {call},\n  {call},\n  {call},\n  {call},\n  {{ text = \"done\" }},\n  {{ text = \"next\" }}\n] }}\n"
+         {calls},\n  {{ text = \"done\" }},\n  {{ text = \"next\" }}\n] }}\n"
     );
     let swap = "[[remove]]\nid = \"compaction-tail\"\n\n\
                 [[insert]]\nid = \"compaction-verdict\"\nname = \"compaction-verdict\"\n\n\
@@ -1270,7 +1306,7 @@ async fn verdict_app(
         asked: asked.clone(),
         attempts: attempts.clone(),
         true_for,
-        threshold: 0.0000001,
+        threshold,
     }));
     let mut app = App::new(registry, tree(dir, &script, &[swap]));
     app.start().await.expect("must mount");
@@ -1336,4 +1372,37 @@ async fn a_stable_verdict_is_still_asked_each_request() {
         1,
         "the slow stage is still attempted only once"
     );
+}
+
+/// The fast path and the pressure rearm meet: after both stages are spent, a
+/// high request is skipped without asking; a drop below the trigger then removes
+/// the entry, so the next high request asks the strategy again in the same turn.
+/// Without the gate the skipped ask would run, and without the rearm the last
+/// ask would stay silent — the final 3/3 separates both from the correct 3 asks
+/// and 3 attempts.
+#[tokio::test]
+async fn a_pressure_drop_rearms_the_fast_path_inside_one_turn() {
+    let dir = scratch("fast-path-rearm");
+    std::fs::write(dir.join("a.txt"), "x").unwrap();
+    let asked = Arc::new(AtomicU32::new(0));
+    let attempts = Arc::new(AtomicU32::new(0));
+    // Five tool rounds and the closing answer. The first request has no usage;
+    // each response then sets the pressure the next request sees: high, high,
+    // high (gate skips), low (entry removed), high (asks again).
+    let mut app = verdict_app_with_rounds(&dir, &asked, &attempts, 1, 5, 0.0005).await;
+    let _guard = app.context().on_waterfall::<AgentRequest>(
+        Arc::new(ScheduledPressure(
+            AtomicU32::new(0),
+            &[100, 100, 100, 10, 100],
+        )),
+        false,
+    );
+
+    run_turn(&app, "first").await.unwrap();
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        3,
+        "the gate skipped one high request, the drop rearmed, and the rise asked again"
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 3);
 }
