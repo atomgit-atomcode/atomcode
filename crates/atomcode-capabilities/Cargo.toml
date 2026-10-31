@@ -19,6 +19,7 @@ tar = "0.4"
 [dependencies]
 # L0 only. NEVER add atomcode-core or any L2/L3 crate here (layering is compile-enforced).
 atomcode-kernel = { path = "../atomcode-kernel" }
+
 # Shared leaf translations for memory diagnostics; no driver/config dependency.
 atomcode-i18n = { path = "../atomcode-i18n", optional = true }
 atomcode-auth = { path = "../atomcode-auth", optional = true }
@@ -151,6 +152,7 @@ tar = { version = "0.4", optional = true }
 
 [features]
 default = ["provider", "tools"]
+
 # Real LlmProvider adapters (OpenAI-compatible: GLM / DeepSeek / …). `dirs` resolves the
 # wire-dump output dir (config_dir()/wire-dump) for the byte-level ATOMCODE_WIRE_DUMP.
 provider = ["dep:reqwest", "dep:rustls-native-certs", "dep:rustls", "dep:async-stream", "dep:dirs", "dep:httpdate", "dep:atomcode-auth", "dep:atomcode-config", "dep:getrandom", "dep:tracing", "dep:fs2", "dep:hyper"]
