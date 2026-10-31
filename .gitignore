@@ -109,6 +109,10 @@ extensions/vscode/resources/bin/
 # AtomCode local-scope configs (machine-specific)
 .atomcode/local/
 crates/atomcode-codingplan-crypto/
+# 专有请求签名 crate 的本地 checkout。里面是网关签名算法与主密钥,
+# 绝不能进版本库——`crates/atomcode-codingplan-crypto/` 那条规则只覆盖
+# workspace 里被覆盖后的目录,覆盖不到仓库根下这份 clone。
+overlay/
 scripts/build-official.sh
 build-official.sh
 build-official-vscode.sh
@@ -131,3 +135,33 @@ extensions/jetbrains/.spec_docs
 
 # Codex 子代理在项目目录生成的运行时目录(external subagent driver)
 .codex/
+
+# Android 构建产物。`jniLibs/` 里的 .so 由 scripts/build-android.sh 生成,
+# 和 webui/dist 不同:它来自本机 NDK 的一次构建,按 ABI 数十 MB,不入库。
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/app/src/main/jniLibs/*/*.so
+
+# 本地 Android SDK/NDK 安装(scripts/build-android.sh 的查找目标之一)。
+# 只为让本机构建可复现,体积以 GB 计,不入库。
+.android-sdk/
+
+# 插件构建输入：第三方源码包与合并源码由脚本按需下载，体积数 MB 且可重现，不入库。
+# 取法见 docs/plugin-ecosystem.md 的「构建输入从哪来」。
+quickjs.tar.xz
+freetype-*.tar.gz
+lsqlite3-master.tar.gz
+sqlite-amalgamation.zip
+sqlite3.c
+sqlite3.h
+
+# helper APK 里的 zig 二进制由工具链复制而来，135 MB，不入库（同主 APK 的 jniLibs 规则）。
+android-tools/app/src/main/jniLibs/*/*.so
+
+# adb 调试用的端口/令牌暂存（有值时含设备 token），只留在本机。
+.addr
+
+# 编辑器个人工作目录
+.trae/
