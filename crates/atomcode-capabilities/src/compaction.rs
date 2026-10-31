@@ -313,8 +313,10 @@ impl OverflowCompaction {
 
     /// Hard-truncate any single message in `[from, len)` whose text exceeds `budget_chars`.
     /// Idempotent via `TRUNCATE_MARKER`. Char-based (CJK-safe). With a summary
-    /// provider, dialogue must reach the summarizer intact, so only tool results
-    /// may be truncated by this tier.
+    /// provider, this tier leaves dialogue alone (`tool_results_only`) so the span
+    /// reaches the summarizer intact; only the summarizer transcript's positional
+    /// whole-input ceiling ([`SUMMARY_TRANSCRIPT_MAX_CHARS`]) may cut dialogue
+    /// after this tier.
     fn truncate_rewrites(
         msgs: &[Message],
         from: usize,
