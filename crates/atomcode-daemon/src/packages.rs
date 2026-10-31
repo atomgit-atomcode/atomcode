@@ -2493,6 +2493,38 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_data_package_can_link_its_own_root() {
+        // `clang-sysroot` and `node-lib` declare `{"clang": ""}` / `{"node": ""}`:
+        // the package root **is** the tree the consumer walks (`usr/include` and
+        // `lib/clang/<ver>` for clang, `lib/node_modules/npm` for node), so the
+        // link target is the package directory itself rather than a child of it.
+        // If this were rejected, the launcher's `-resource-dir`/`--sysroot` and the
+        // npm command line would both point at paths that do not exist.
+        with_temp_root(|| {
+            let bundle = bundle_with(
+                r#"{"name":"clang-sysroot","version":"21","entry":"","links":{"clang":""}}"#,
+                &[
+                    ("usr/include/stdio.h", b""),
+                    ("lib/clang/21/include/stddef.h", b""),
+                ],
+            );
+            install_bytes(&bundle).expect("a data-only package installs");
+
+            let product = packages_root().parent().unwrap().to_path_buf();
+            let link = product.join("clang");
+            assert!(
+                link.join("usr/include/stdio.h").is_file(),
+                "the link resolves to the package root, so headers are under it"
+            );
+            assert!(
+                link.join("lib/clang/21/include/stddef.h").is_file(),
+                "the resource directory is reached through the same link"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_data_package_links_its_directory_and_points_zig_at_it() {
         with_temp_root(|| {
             let bundle = bundle_with(
