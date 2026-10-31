@@ -702,18 +702,27 @@ fn truncated_body(text: &str, total: usize, max_chars: usize, tail_chars: usize)
     format!("{head}\n[truncated {cut} chars]\n{tail}")
 }
 
-/// Append `text` to `into` with every line break folded to a space: a tool call
-/// is one line of the transcript. Written straight into the transcript because
-/// most argument lists are a borrowed slice of the message — `format!` and
-/// `String::replace` would each copy them just to reuse the text unchanged.
+/// Append `text` to `into` with every line break folded to one space: CRLF,
+/// lone CR, and the Unicode line/paragraph separators, so a call stays on one
+/// `\n`-delimited line of the transcript. Written straight into the transcript
+/// because most argument lists are a borrowed slice of the message — `format!`
+/// and `String::replace` would each copy them just to reuse the text unchanged.
 fn push_single_line(into: &mut String, text: &str) {
-    let mut rest = text;
-    while let Some(at) = rest.find('\n') {
-        into.push_str(&rest[..at]);
+    let mut start = 0;
+    let mut chars = text.char_indices().peekable();
+    while let Some((at, ch)) = chars.next() {
+        if !matches!(ch, '\r' | '\n' | '\u{2028}' | '\u{2029}') {
+            continue;
+        }
+        into.push_str(&text[start..at]);
         into.push(' ');
-        rest = &rest[at + 1..];
+        // CRLF is one break, not two.
+        if ch == '\r' && matches!(chars.peek(), Some((_, '\n'))) {
+            chars.next();
+        }
+        start = chars.peek().map_or(text.len(), |(next, _)| *next);
     }
-    into.push_str(rest);
+    into.push_str(&text[start..]);
 }
 
 fn render_tool_body(text: &str) -> Cow<'_, str> {
@@ -2948,6 +2957,14 @@ mod tests {
             call_line, r#"[tool call: write_file {   "path": "x" }]"#,
             "line breaks are folded to spaces, not left in the transcript"
         );
+    }
+
+    #[test]
+    fn push_single_line_folds_every_line_break_to_one_space() {
+        let mut out = String::from("head ");
+        push_single_line(&mut out, "a\r\nb\rc\nd\u{2028}e\u{2029}f");
+        assert_eq!(out, "head a b c d e f");
+        assert!(!out.contains(&['\r', '\n', '\u{2028}', '\u{2029}'][..]));
     }
 
     #[test]
