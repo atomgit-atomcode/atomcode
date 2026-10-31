@@ -1324,7 +1324,7 @@ async fn a_spent_turn_stops_asking_the_strategy_until_the_next_turn() {
     std::fs::write(dir.join("a.txt"), "x").unwrap();
     let asked = Arc::new(AtomicU32::new(0));
     let attempts = Arc::new(AtomicU32::new(0));
-    let mut app = verdict_app(&dir, &asked, &attempts, 1).await;
+    let app = verdict_app(&dir, &asked, &attempts, 1).await;
 
     run_turn(&app, "first").await.unwrap();
     assert_eq!(
@@ -1359,7 +1359,7 @@ async fn a_stable_verdict_is_still_asked_each_request() {
     std::fs::write(dir.join("a.txt"), "x").unwrap();
     let asked = Arc::new(AtomicU32::new(0));
     let attempts = Arc::new(AtomicU32::new(0));
-    let mut app = verdict_app(&dir, &asked, &attempts, u32::MAX).await;
+    let app = verdict_app(&dir, &asked, &attempts, u32::MAX).await;
 
     run_turn(&app, "first").await.unwrap();
     assert_eq!(
@@ -1389,7 +1389,7 @@ async fn a_pressure_drop_rearms_the_fast_path_inside_one_turn() {
     // Five tool rounds and the closing answer. The first request has no usage;
     // each response then sets the pressure the next request sees: high, high,
     // high (gate skips), low (entry removed), high (asks again).
-    let mut app = verdict_app_with_rounds(&dir, &asked, &attempts, 1, 5, 0.0005).await;
+    let app = verdict_app_with_rounds(&dir, &asked, &attempts, 1, 5, 0.0005).await;
     let _guard = app.context().on_waterfall::<AgentRequest>(
         Arc::new(ScheduledPressure(
             AtomicU32::new(0),
