@@ -1245,7 +1245,12 @@ impl LiveViewHub {
                 );
                 replay = true;
             }
-            CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed { snapshot, .. }) => {
+            CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
+                reason,
+                snapshot,
+                stats,
+                ..
+            }) => {
                 // A policy intervention is a terminal, driver-owned recovery
                 // contract rather than in-flight transcript. Keep only that
                 // structured event across the snapshot commit so a reconnect
@@ -1275,22 +1280,62 @@ impl LiveViewHub {
                 state.replay.extend(terminal_intervention);
                 state.pending_web_steers.clear();
                 state.turn_active = false;
+                // The host's only view of a finished turn is this hook and `/health`;
+                // record what it did while the snapshot is still at hand.
+                crate::turn_outcome::record_completed(
+                    *reason,
+                    &snapshot,
+                    state
+                        .binding
+                        .as_ref()
+                        .map(|bound| bound.identity.session_id.as_str()),
+                    stats.tool_call_count,
+                    stats.duration,
+                );
                 replay = false;
             }
             CodingRuntimeEvent::TurnFinished(TurnCompletion::SnapshotUnavailable {
-                error, ..
+                reason,
+                error,
+                stats,
+                ..
             }) => {
                 state.snapshot_error = Some(error.message.clone());
                 state.pending_requests.clear();
                 state.pending_web_steers.clear();
                 state.turn_active = false;
+                crate::turn_outcome::record_failed(
+                    *reason,
+                    Some(error.message.clone()),
+                    state
+                        .binding
+                        .as_ref()
+                        .map(|bound| bound.identity.session_id.as_str()),
+                    stats.tool_call_count,
+                    stats.duration,
+                );
                 replay = false;
             }
             CodingRuntimeEvent::RuntimeStopped(_) => {
+                // A stop with no turn in flight is not a finished turn — only report
+                // one that was actually running.
+                let was_active = state.turn_active;
                 state.snapshot_error = Some("runtime stopped".into());
                 state.pending_requests.clear();
                 state.pending_web_steers.clear();
                 state.turn_active = false;
+                if was_active {
+                    crate::turn_outcome::record_failed(
+                        atomcode_kernel::event::StopReason::InternalError,
+                        Some("runtime stopped".into()),
+                        state
+                            .binding
+                            .as_ref()
+                            .map(|bound| bound.identity.session_id.as_str()),
+                        0,
+                        std::time::Duration::ZERO,
+                    );
+                }
                 replay = false;
             }
             CodingRuntimeEvent::PolicyInterventionResolved {

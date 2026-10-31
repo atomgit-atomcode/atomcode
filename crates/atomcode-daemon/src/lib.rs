@@ -33,15 +33,21 @@ mod api_provider_accounts;
 mod api_schedule;
 pub mod approval_mode;
 mod commands;
+mod git_credentials;
+mod git_ops;
 pub(crate) mod kernel_runtime;
 pub mod legacy_convert;
 pub mod live_hub;
 mod login_state;
 #[cfg(test)]
 mod login_state_tests;
+mod market;
 pub mod native_live;
+mod package_discovery;
+mod packages;
 mod runtime_host;
 mod transcript_view;
+pub mod turn_outcome;
 /// File-sink diagnostic trace (`ctrace!` macro), enabled via `ATOMCODE_TUIX_LOG`.
 /// Daemon owns this sink; the historical environment name is retained for
 /// existing diagnostic scripts.
@@ -555,10 +561,15 @@ impl ActiveChatRegistry {
             },
         );
 
-        Ok(ActiveChatAdmission {
+        let admission = ActiveChatAdmission {
             operation_id,
             cancellation,
-        })
+        };
+        // After releasing the index: the hook is host code and must never run
+        // with this lock held.
+        drop(index);
+        fire_turn(true);
+        Ok(admission)
     }
 
     /// Bind the runtime's canonical session id after a first-turn session has
@@ -635,6 +646,11 @@ impl ActiveChatRegistry {
                 index.aliases.remove(&alias);
             }
         }
+        let idle = index.operations.is_empty();
+        drop(index);
+        if idle {
+            fire_turn(false);
+        }
         true
     }
 
@@ -654,6 +670,16 @@ impl ActiveChatRegistry {
 
     async fn has_active_operations(&self) -> bool {
         !self.inner.read().await.operations.is_empty()
+    }
+
+    /// How many `/chat` turns are running right now.
+    ///
+    /// Reported by `/health` so the Android foreground notification can say
+    /// whether the agent is working or idle instead of showing one static line
+    /// forever. It is deliberately a count, not a list: the service needs a
+    /// number, and operation details stay inside the daemon.
+    async fn operations_count(&self) -> usize {
+        self.inner.read().await.operations.len()
     }
 
     #[cfg(test)]
@@ -1884,6 +1910,17 @@ pub struct HealthResponse {
     pub instance_id: String,
     /// Feature flags let newer clients fail gracefully against older daemons.
     pub capabilities: &'static [&'static str],
+    /// `/chat` turns running right now, so a foreground notification can show
+    /// work in progress rather than a single static line.
+    pub active_chats: usize,
+    /// Turns owned by the shared native live runtime. Waiting for approval or
+    /// reconfiguration still counts as active and must keep a mobile host awake.
+    pub active_live: usize,
+    /// How the last finished turn ended, one entry per conversation, newest first
+    /// (at most [`crate::turn_outcome::RECENT_LIMIT`]). A host says so in a
+    /// notification instead of dropping straight back to "idle"; with more than one
+    /// conversation it can name each of them. Empty until a turn finishes.
+    pub last_turns: Vec<crate::turn_outcome::LastTurn>,
 }
 
 fn executable_sha256() -> &'static str {
@@ -1907,6 +1944,9 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         binary_hash: executable_sha256(),
         instance_id: state.daemon_instance_id.to_string(),
         capabilities: &["goal", "session_scoped_live"],
+        active_chats: state.active_chats.operations_count().await,
+        active_live: crate::native_live::active_count(),
+        last_turns: crate::turn_outcome::recent_turns(),
     })
 }
 
@@ -4617,13 +4657,25 @@ impl ChatRuntimeProjector {
                 message: format!("compact failed: {error}"),
             }],
             CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
-                reason, stats, ..
+                reason,
+                snapshot,
+                stats,
+                ..
             }) => {
                 if self.terminal_seen {
                     return Vec::new();
                 }
                 self.terminal_seen = true;
                 self.terminal_reason = Some(reason);
+                // A mobile host reports the last finished turn from `/health`; this
+                // is the one place that knows the reason and has the snapshot.
+                crate::turn_outcome::record_completed(
+                    reason,
+                    &snapshot,
+                    Some(permission_session_id),
+                    stats.tool_call_count,
+                    stats.duration,
+                );
                 if let Some(usage) = stats.last_usage.as_ref() {
                     self.total_tokens = (usage.tokens.prompt + usage.tokens.completion) as usize;
                 }
@@ -4652,6 +4704,7 @@ impl ChatRuntimeProjector {
             CodingRuntimeEvent::TurnFinished(TurnCompletion::SnapshotUnavailable {
                 reason,
                 error,
+                stats,
                 ..
             }) => {
                 if self.terminal_seen {
@@ -4660,6 +4713,13 @@ impl ChatRuntimeProjector {
                 self.terminal_seen = true;
                 self.terminal_reason = Some(reason);
                 self.last_error = Some(error.message.clone());
+                crate::turn_outcome::record_failed(
+                    reason,
+                    Some(error.message.clone()),
+                    Some(permission_session_id),
+                    stats.tool_call_count,
+                    stats.duration,
+                );
                 let mut events = Vec::new();
                 if let Some(event) = self.finish() {
                     events.push(event);
@@ -6056,6 +6116,25 @@ pub fn set_webui_relay_starter(target: &WebuiRelayTarget, starter: WebuiRelaySta
 }
 
 /// Host-owned tunnel presentation; never used as an authentication bypass.
+/// Fired when a chat turn starts, and again when the last one ends.
+///
+/// The phone needs exactly this: keeping the CPU awake has to follow the
+/// runtime's turn lifecycle, because a poller cannot wake an already sleeping
+/// device to discover that a turn began. Injected by the host rather than called
+/// directly, so this crate stays free of Android/JNI knowledge.
+static TURN_HOOK: std::sync::OnceLock<Box<dyn Fn(bool) + Send + Sync>> = std::sync::OnceLock::new();
+
+/// Install the turn-lifecycle hook. Only the first call has an effect.
+pub fn set_turn_hook(hook: Box<dyn Fn(bool) + Send + Sync>) {
+    let _ = TURN_HOOK.set(hook);
+}
+
+fn fire_turn(active: bool) {
+    if let Some(hook) = TURN_HOOK.get() {
+        hook(active);
+    }
+}
+
 pub fn set_webui_relay_access(
     target: &WebuiRelayTarget,
     url: Option<String>,
@@ -7228,6 +7307,12 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         ..
     } = opts;
 
+    // Packages that ship native libraries (numpy's `libopenblas.so`) are only
+    // importable if their `.libs` directory is on the loader path. Do it before
+    // anything can spawn a tool, so a restart is enough to pick up an install
+    // that happened in a previous session.
+    packages::refresh_native_library_path();
+
     // Step 0: Security guardrail — refuse to start an UNAUTHENTICATED daemon on a
     // remotely-reachable bind. `--no-auth` + `0.0.0.0` exposes the full
     // agent-control / filesystem / config(API-key) API to anyone who can reach
@@ -7466,6 +7551,57 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/fs/search", get(fs_search))
         .route("/fs/mkdir", post(fs_mkdir))
         .route("/fs/open", post(fs_open))
+        // Git credentials: a phone has no prompt to type a token into, so the
+        // caller hands one over here and git's `store` helper reads it.
+        .route(
+            "/git/credentials",
+            get(git_credentials::list_credentials).post(git_credentials::store_credential),
+        )
+        .route(
+            "/git/credentials/:host",
+            delete(git_credentials::remove_credential),
+        )
+        // Git panel: the repository on disk is the only authority, so every
+        // request asks git again. See `git_ops`.
+        .route("/git/status", get(git_ops::status))
+        .route("/git/diff", get(git_ops::diff))
+        .route("/git/init", post(git_ops::init))
+        .route("/git/stage", post(git_ops::stage))
+        .route("/git/unstage", post(git_ops::unstage))
+        .route("/git/commit", post(git_ops::commit))
+        .route("/git/pull", post(git_ops::pull))
+        .route("/git/push", post(git_ops::push))
+        .route("/git/clone", post(git_ops::clone))
+        // Runtime packages: installable toolchains that are NOT in the APK.
+        // Android forbids execve from the data dir, so a package is a `.so` the
+        // bundled `pluginhost` dlopens — see `packages`.
+        .route("/packages", get(packages::list_packages))
+        // 插件市场：清单来自独立仓库，包体位置由条目里的 artifact 决定。
+        .route("/packages/market", get(market::market_index))
+        // helper APK 的包体：插件页把它下载到本机，再交给系统安装器。
+        .route(
+            "/packages/market/helper",
+            get(market::market_helper_download),
+        )
+        // 市场源可改：写进 config.toml 的 [market] base，重启后仍生效。
+        .route("/packages/market/config", post(market::set_market_base))
+        .route("/packages/helper", get(packages::helper_status))
+        .route(
+            "/packages/leftovers",
+            get(packages::list_leftovers).delete(packages::clean_leftovers),
+        )
+        .route("/packages/health", get(packages::packages_health))
+        .route(
+            "/packages/discover/stream",
+            get(package_discovery::discover_packages_stream),
+        )
+        .route("/packages/install", post(packages::install_package))
+        .route(
+            "/packages/install/stream",
+            post(packages::install_package_stream),
+        )
+        .route("/packages/:name", delete(packages::remove_package))
+        .route("/packages/:name/rollback", post(packages::rollback_package))
         // MCP API
         .route("/mcp/status", get(mcp_status))
         .route("/mcp/reload", post(mcp_reload))

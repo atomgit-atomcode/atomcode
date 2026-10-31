@@ -209,6 +209,13 @@ pub fn binding() -> Result<LiveBinding, HubError> {
     hub().binding()
 }
 
+/// Number of live turns currently executing or parked for an interaction.
+/// This is a read-only projection for host resource management; joining the
+/// live stream would create a runtime when none exists and is not equivalent.
+pub fn active_count() -> usize {
+    usize::from(hub().turn_in_progress())
+}
+
 pub fn submit(input: UserInput) -> Result<(), HubError> {
     hub().submit(input)
 }

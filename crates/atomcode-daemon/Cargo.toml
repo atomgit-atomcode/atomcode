@@ -42,6 +42,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "1"
 
 # WebUI static embedding.
 #
@@ -64,6 +65,11 @@ uuid = { version = "1", features = ["v4"] }
 tokio-util = "0.7"
 tracing = "0.1"
 sha2 = "0.10"
+# Runtime packages ship as a `.tar.gz` bundle: one file to fetch, one file to
+# verify. Both crates are already in the workspace lock (via other deps), so
+# this adds no new download.
+tar = "0.4"
+flate2 = "1"
 # 远程访问二维码（/tunnel/status 的 SVG）
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 
