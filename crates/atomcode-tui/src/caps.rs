@@ -379,6 +379,42 @@ fn remote_basic_glyphs_for(env: &dyn Fn(&str) -> Option<String>) -> bool {
 /// Shared boundary for startup policy and clipboard access: a server clipboard
 /// must never stand in for the SSH/browser client's clipboard, even with X11
 /// forwarding.
+/// The environment facts a drawing primitive may need, read here.
+///
+/// Primitives above the shield ask for these instead of touching the
+/// environment themselves — `gates/tui-layers.sh` enforces that, and the point
+/// is not purity for its own sake: a decision made by reading `TERM` deep in a
+/// renderer is a decision a test cannot override.
+pub(crate) struct TerminalEnv {
+    pub program: String,
+    pub term: String,
+    pub kitty_window: bool,
+    pub multiplexed: bool,
+    pub cmux_workspace: bool,
+}
+
+pub(crate) fn terminal_env() -> TerminalEnv {
+    let value = |key: &str| std::env::var(key).unwrap_or_default();
+    TerminalEnv {
+        program: value("TERM_PROGRAM"),
+        term: value("TERM"),
+        kitty_window: std::env::var_os("KITTY_WINDOW_ID").is_some(),
+        multiplexed: ["TMUX", "STY", "ZELLIJ"]
+            .iter()
+            .any(|key| std::env::var_os(key).is_some()),
+        cmux_workspace: std::env::var_os("CMUX_WORKSPACE_ID").is_some(),
+    }
+}
+
+/// The terminal modes this launch was told to leave out, if anyone said.
+///
+/// `ATOMCODE_TERM_SKIP` is the explicit trade-off switch (see
+/// [`crate::ansi`]); the variable is read here so the screen primitives stay
+/// free of environment access.
+pub(crate) fn term_skip_modes() -> Option<std::ffi::OsString> {
+    std::env::var_os("ATOMCODE_TERM_SKIP")
+}
+
 pub(crate) fn remote_session() -> bool {
     crate::browser_terminal::detected()
         || remote_session_for(&|key| {

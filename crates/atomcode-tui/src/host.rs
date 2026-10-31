@@ -5907,7 +5907,7 @@ impl Host {
                         .find(name.trim_start_matches('/'))
                         .is_some_and(|c| c.secret_args) =>
             {
-                format!("{name} ••••••")
+                format!("{name} ******")
             }
             _ => line.to_string(),
         };
@@ -6964,7 +6964,7 @@ impl Host {
                 frame.place(
                     modal.id(),
                     rect,
-                    crate::overlay::framed(&modal.title(), body, rect),
+                    crate::overlay::framed(&modal.title(), body, rect, &moment.caps),
                 );
                 frame.cursor = None;
             }
@@ -8327,7 +8327,7 @@ mod tests {
         let bar = |text: &str| crate::content::UserSaid(text.into()).content_hash();
         assert_eq!(
             echoed,
-            vec![bar("/connect ••••••"), bar("/rename my session")]
+            vec![bar("/connect ******"), bar("/rename my session")]
         );
     }
 

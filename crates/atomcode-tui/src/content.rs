@@ -5,7 +5,7 @@
 //! them semantic is exactly what lets presentation stay mutable while content
 //! does not.
 
-use crate::block::{hash_of, Content, ContentHash, RenderCtx};
+use crate::block::{hash_of, Content, ContentHash, RenderCtx, ShapeCaps};
 use crate::caps::{Caps, Glyph};
 use crate::frame::{Color, Line, Span, Style};
 use crate::i18n::product::{t as pt, Msg as PMsg};
@@ -62,7 +62,7 @@ fn ok() -> Style {
 /// has already told the reader it exists, and the live line below is where "in
 /// flight" is stated.
 fn fold() -> Style {
-    Style::new().fg(Color::rgb((0xa8, 0xa8, 0xa8)))
+    Style::new().fg(Color::role(Role::Muted))
 }
 
 /// The ink a click is announced in — the tail a lid ends with (`点击展开` on a
@@ -1136,11 +1136,11 @@ impl ToolCallBlock {
                     && text.contains("The file was NOT modified."))
     }
 
-    fn mark(&self) -> (&'static str, Style) {
+    fn mark(&self, caps: &ShapeCaps) -> (&'static str, Style) {
         match &self.outcome {
-            Outcome::Pending => ("⋯", tool()),
-            Outcome::Ok(_) => ("✓", ok()),
-            Outcome::Failed(_) => ("✗", bad()),
+            Outcome::Pending => (caps.g(Glyph::Pending), tool()),
+            Outcome::Ok(_) => (caps.g(Glyph::Ok), ok()),
+            Outcome::Failed(_) => (caps.g(Glyph::Fail), bad()),
             Outcome::Interrupted => ("—", muted()),
         }
     }
@@ -1233,14 +1233,14 @@ impl ToolCallBlock {
         w: u16,
         exchange: &[(String, ReadAnswer)],
         name_style: Style,
+        caps: &ShapeCaps,
     ) -> Vec<Line> {
-        let caps = Caps::default();
         let lead = format!("{} ", caps.g(Glyph::ToolMark));
         let mut out = crate::markdown::wrap_spans(
             &[Span::styled(self.display_name(), name_style)],
             w,
             &lead,
-            self.mark().1,
+            self.mark(caps).1,
         );
         let gutter = format!("{}{} ", " ".repeat(GUTTER), caps.g(Glyph::Gutter));
         let under = " ".repeat(width::str_width(&gutter));
@@ -1972,8 +1972,8 @@ fn clip(s: &str, cells: usize) -> String {
 }
 
 impl Content for ToolCallBlock {
-    fn reading_text(&self, _ctx: &RenderCtx) -> String {
-        let (mark, _) = self.mark();
+    fn reading_text(&self, ctx: &RenderCtx) -> String {
+        let (mark, _) = self.mark(&ctx.caps);
         let body = match &self.outcome {
             Outcome::Ok(text) | Outcome::Failed(text) => text.as_str(),
             _ => "",
@@ -2025,7 +2025,7 @@ impl Content for ToolCallBlock {
             return Vec::new();
         }
         if let Some(exchange) = self.exchange() {
-            return self.exchange_lines(w, &exchange, self.name_style());
+            return self.exchange_lines(w, &exchange, self.name_style(), &ctx.caps);
         }
         let caps = Caps::default();
         let lead = format!("{} ", caps.g(Glyph::ToolMark));
@@ -2045,12 +2045,12 @@ impl Content for ToolCallBlock {
             && self.reason().is_some()
             && matches!(self.outcome, Outcome::Pending | Outcome::Ok(_))
         {
-            return self.head(w, &lead, self.mark().1, self.name_style());
+            return self.head(w, &lead, self.mark(&ctx.caps).1, self.name_style());
         }
         let mut out = self.opening_rows(
             w,
             &lead,
-            self.mark().1,
+            self.mark(&ctx.caps).1,
             self.name_style(),
             self.name_style(),
         );
@@ -2145,7 +2145,7 @@ impl Content for ToolCallBlock {
             let mut rows = self.opening_rows(
                 w,
                 &lead,
-                self.mark().1,
+                self.mark(&ctx.caps).1,
                 self.folded_reason_style(),
                 self.folded_style(),
             );
@@ -2170,7 +2170,7 @@ impl Content for ToolCallBlock {
         // note survives folding too.
         if self.is_todo() && matches!(self.outcome, Outcome::Pending | Outcome::Ok(_)) {
             return self
-                .head(w, &lead, self.mark().1, self.folded_style())
+                .head(w, &lead, self.mark(&ctx.caps).1, self.folded_style())
                 .into_iter()
                 .take(FOLDED_ROWS)
                 .collect();
@@ -2189,7 +2189,7 @@ impl Content for ToolCallBlock {
         let opening = self.opening_rows(
             w,
             &lead,
-            self.mark().1,
+            self.mark(&ctx.caps).1,
             self.folded_reason_style(),
             self.folded_style(),
         );
@@ -2308,7 +2308,7 @@ impl Content for ToolCallBlock {
         // `$ cargo test` reads; `bash {"command":…}` does not.
         let mut spans = vec![Span::styled(
             format!("{} ", Caps::default().g(Glyph::ToolMark)),
-            self.mark().1,
+            self.mark(&ctx.caps).1,
         )];
         spans.push(Span::styled(self.called(&subject), style));
         if !note.is_empty() {
@@ -2365,10 +2365,20 @@ impl Content for GoalEndedBlock {
     fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
         let condition = self.condition.as_str();
         let (text, mark, mark_style, body) = if self.met {
-            (t(Msg::GoalMet { condition }), "✓ ", ok(), Style::new())
+            (
+                t(Msg::GoalMet { condition }),
+                format!("{} ", ctx.caps.g(Glyph::Ok)),
+                ok(),
+                Style::new(),
+            )
         } else {
             let warn = Style::new().fg(Color::role(Role::Warning));
-            (t(Msg::GoalGaveUp { condition }), "⚠ ", warn, warn)
+            (
+                t(Msg::GoalGaveUp { condition }),
+                "⚠ ".to_string(),
+                warn,
+                warn,
+            )
         };
         let mut text = match self.elapsed_ms {
             Some(ms) => format!("{text} · {}", t(Msg::LiveElapsed { took: &fmt_dur(ms) })),
@@ -2380,7 +2390,7 @@ impl Content for GoalEndedBlock {
                 text.push_str(&part);
             }
         }
-        let mut out = wrapped(&text, ctx.width, body, mark);
+        let mut out = wrapped(&text, ctx.width, body, &mark);
         if let Some(lead) = out.first_mut().and_then(|line| line.spans.first_mut()) {
             lead.style = mark_style;
         }
@@ -5237,16 +5247,17 @@ mod tests {
     #[test]
     fn a_running_call_is_not_painted_the_warning_colour() {
         let warn = Some(crate::frame::Color::role(Role::Warning));
+        let caps = crate::block::ShapeCaps::of(&Caps::default());
 
         let running = ToolCallBlock::pending("c", "read_file", r#"{"file_path":"a.rs"}"#);
         assert_ne!(
-            running.mark().1.fg,
+            running.mark(&caps).1.fg,
             warn,
             "a running call is not a warning: {:?}",
-            running.mark()
+            running.mark(&caps)
         );
         assert_eq!(
-            running.mark().0,
+            running.mark(&caps).0,
             "⋯",
             "the `⋯` glyph is what marks it in flight"
         );
@@ -5269,7 +5280,7 @@ mod tests {
         ] {
             let block =
                 ToolCallBlock::pending("c", "read_file", r#"{"file_path":"a.rs"}"#).with(done);
-            assert_ne!(block.mark().1.fg, warn, "{:?}", block.mark());
+            assert_ne!(block.mark(&caps).1.fg, warn, "{:?}", block.mark(&caps));
         }
     }
 
@@ -5435,7 +5446,7 @@ mod tests {
     /// rather than the summary, and a fold must not swallow that.
     #[test]
     fn a_folded_call_recedes_to_the_muted_grey_once_done_and_keeps_its_failure_note() {
-        let receded = Some(crate::frame::Color::rgb((0xa8, 0xa8, 0xa8)));
+        let receded = Some(crate::frame::Color::role(Role::Muted));
         let pending = ToolCallBlock::pending(
             "c",
             "read_file",

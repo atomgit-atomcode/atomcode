@@ -13,6 +13,17 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
+# 这条闸门按**字符**数装饰符，而 `grep` 在 C locale 下按字节比较：同一个 `─`
+# （UTF-8 三个字节）会被算成三处命中。实测同一棵树默认环境 495、UTF-8 环境 23，
+# 于是「闸门红不红」取决于跑它的机器，棘轮也就没有意义。这里显式选一个 UTF-8
+# locale；一个都没有时宁可不改（此时数字偏大，只会更严，不会放过违规）。
+for candidate in C.UTF-8 C.utf8 en_US.UTF-8; do
+  if locale -a 2>/dev/null | grep -qix "$candidate"; then
+    export LC_ALL="$candidate"
+    break
+  fi
+done
+
 # 可被阴性对照重定向到密封的 fixture：一个只能对真实仓库运行的闸门，
 # 无法被证明它会判红。
 SRC=${TUI_SRC:-crates/atomcode-tui/src}
@@ -92,8 +103,14 @@ fi
 # 11 个框线字符写成常量——它就是画表格那个框的那一层，降级同样发生在上屏时
 # （每个字符都在 caps::ascii_for 里，table.rs 自带判据钉着 ASCII 降级），而它的
 # 渲染只处理字符串与宽度、拿不到 Caps。当时没改这里，闸门从 17 跳到 28 判红；
-# 豁免它而不是抬基线，理由与 el.rs 一样，基线仍是 17。
-UPPER=$(find "$SRC" -name '*.rs' ! -name caps.rs ! -name surface.rs ! -name el.rs ! -path '*/markdown/table.rs')
+# 豁免它而不是抬基线，理由与 el.rs 一样。
+#
+# browser_terminal.rs 是 `Caps::remote_session` 背后的探测器（读 `/proc` 判断
+# 是不是 gotty/ttyd 这类浏览器终端）。它就**是**一个能力在屏蔽层的实现，
+# `cfg!(target_os = "linux")` 是这段探测能不能存在的前提；把它算成「上层绕过
+# 屏蔽」只会诱使人把探测搬到一个更远、更说不清的地方。
+UPPER=$(find "$SRC" -name '*.rs' ! -name caps.rs ! -name surface.rs ! -name el.rs \
+  ! -name browser_terminal.rs ! -path '*/markdown/table.rs')
 
 echo "→ 屏蔽层之外不得出现字面装饰字符（应走 Caps::g(Glyph::…)）"
 n=$(code_only $UPPER | grep -oE '[┌┐└┘─│├┤┬┴┼✓✗⋯▸•]' | wc -l | tr -d ' ')

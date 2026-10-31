@@ -13,6 +13,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use crate::caps::{Caps, Glyph};
 use crate::frame::{Color, Line, Rect, Span, Style};
 use crate::moment::Viewport;
 use crate::surface::KeyPress;
@@ -227,7 +228,7 @@ pub fn frame_rect(screen: Rect, size: (u8, u8)) -> Rect {
 }
 
 /// Draw the border and title around a modal's own lines.
-pub fn framed(title: &str, body: Vec<Line>, rect: Rect) -> Vec<Line> {
+pub fn framed(title: &str, body: Vec<Line>, rect: Rect, caps: &Caps) -> Vec<Line> {
     let w = rect.w as usize;
     if w < 4 || rect.h < 3 {
         // Too small to frame. Return the body clipped to the rect rather than
@@ -240,37 +241,54 @@ pub fn framed(title: &str, body: Vec<Line>, rect: Rect) -> Vec<Line> {
             .collect();
     }
     let edge = Style::new().fg(Color::role(Role::Border));
-    let head = format!("┌─ {title} ");
+    let horizontal = caps.g(Glyph::Horizontal);
+    let vertical = caps.g(Glyph::Vertical);
+    let head = format!("{}{} {title} ", caps.g(Glyph::TopLeft), horizontal);
     let head_w = width::str_width(&head);
     let mut out = vec![Line::from_spans(vec![
         Span::styled(width::take_width(&head, w.saturating_sub(1)), edge),
         Span::styled(
-            format!("{}┐", "─".repeat(w.saturating_sub(head_w + 1))),
+            format!(
+                "{}{}",
+                horizontal.repeat(w.saturating_sub(head_w + 1)),
+                caps.g(Glyph::TopRight)
+            ),
             edge,
         ),
     ])
     .truncate(w)];
     let inner = w.saturating_sub(2);
     for line in body.into_iter().take((rect.h as usize).saturating_sub(2)) {
-        let mut spans = vec![Span::styled("│", edge)];
+        let mut spans = vec![Span::styled(vertical, edge)];
         let cut = line.truncate(inner);
         let pad = inner.saturating_sub(cut.width());
         spans.extend(cut.spans);
         spans.push(Span::styled(" ".repeat(pad), Style::new()));
-        spans.push(Span::styled("│", edge));
+        spans.push(Span::styled(vertical, edge));
         out.push(Line::from_spans(spans).truncate(w));
     }
     while out.len() + 1 < rect.h as usize {
         out.push(
             Line::from_spans(vec![
-                Span::styled("│", edge),
+                Span::styled(vertical, edge),
                 Span::styled(" ".repeat(inner), Style::new()),
-                Span::styled("│", edge),
+                Span::styled(vertical, edge),
             ])
             .truncate(w),
         );
     }
-    out.push(Line::styled(format!("└{}┘", "─".repeat(w.saturating_sub(2))), edge).truncate(w));
+    out.push(
+        Line::styled(
+            format!(
+                "{}{}{}",
+                caps.g(Glyph::BottomLeft),
+                horizontal.repeat(w.saturating_sub(2)),
+                caps.g(Glyph::BottomRight)
+            ),
+            edge,
+        )
+        .truncate(w),
+    );
     out
 }
 
@@ -384,7 +402,7 @@ mod tests {
         for w in 0..40u16 {
             for h in 0..12u16 {
                 let rect = Rect::sized(w, h);
-                let lines = framed("标题", vec![Line::raw("内容")], rect);
+                let lines = framed("标题", vec![Line::raw("内容")], rect, &Caps::default());
                 assert!(lines.len() <= (h as usize).max(1));
                 for line in lines {
                     assert!(line.width() <= w as usize, "{w}×{h}: {}", line.width());

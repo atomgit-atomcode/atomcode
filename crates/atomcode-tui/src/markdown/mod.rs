@@ -19,12 +19,13 @@ mod table;
 
 /// Markdown's horizontal decoration: the rule under a heading or table header.
 ///
-/// Named once, and for a reason beyond tidiness: `caps::downgrade` rewrites it
-/// to `-` at paint time on a terminal that cannot show it, so what matters is
-/// that every one of them is the *same* character. (The layering ratchet counts
-/// this glyph per occurrence in the source, which is the other half of the same
-/// argument — one site, one decision.)
-pub(super) const RULE: &str = "─";
+/// Taken from [`crate::caps::Glyph::Horizontal`] rather than written as the
+/// character: `caps::downgrade` rewrites it to `-` at paint time on a terminal
+/// that cannot show it, and the layering ratchet wants every decoration to come
+/// from one table, so there is one site and one decision.
+fn rule() -> &'static str {
+    crate::caps::Caps::default().g(crate::caps::Glyph::Horizontal)
+}
 
 /// The left gutter prefix for blockquotes. Code blocks have no printable
 /// decoration so terminal selection copies the source without an extra prefix.
@@ -221,7 +222,7 @@ fn ordinary_line(t: &str, indent: usize, w: u16, base: Style) -> Vec<Line> {
         return wrap_spans(&inline(title, heading()), w, "", heading());
     }
     if is_rule(t) {
-        return vec![Line::styled(RULE.repeat(w as usize), fence())];
+        return vec![Line::styled(rule().repeat(w as usize), fence())];
     }
     if let Some(b) = t.strip_prefix("> ").or_else(|| t.strip_prefix(">")) {
         // A blockquote is a CALLOUT, not a heading. Keep the Accent gutter to mark it,
@@ -268,7 +269,12 @@ fn is_rule(t: &str) -> bool {
 fn list_item(t: &str) -> Option<(String, &str)> {
     for m in ["- ", "* ", "+ "] {
         if let Some(body) = t.strip_prefix(m) {
-            return Some(("•".to_string(), body));
+            return Some((
+                crate::caps::Caps::default()
+                    .g(crate::caps::Glyph::Bullet)
+                    .to_string(),
+                body,
+            ));
         }
     }
     // `1. ` and friends.

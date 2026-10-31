@@ -134,7 +134,7 @@ pub fn transcript_out() -> String {
 /// names, and none when nobody said a thing (see [`skipped_modes_for`]).
 fn skipped_modes() -> &'static [String] {
     static SKIPPED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    SKIPPED.get_or_init(|| skipped_modes_for(std::env::var_os("ATOMCODE_TERM_SKIP")))
+    SKIPPED.get_or_init(|| skipped_modes_for(crate::caps::term_skip_modes()))
 }
 
 /// `ATOMCODE_TERM_SKIP` as the modes to leave out: the ones it names, or none

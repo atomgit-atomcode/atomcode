@@ -26,15 +26,9 @@ pub(super) fn supported(program: &str, term: &str, kitty: bool, multiplexed: boo
 }
 
 pub(super) fn detect() -> TerminalKind {
-    let terminal = supported(
-        &std::env::var("TERM_PROGRAM").unwrap_or_default(),
-        &std::env::var("TERM").unwrap_or_default(),
-        std::env::var_os("KITTY_WINDOW_ID").is_some(),
-        ["TMUX", "STY", "ZELLIJ"]
-            .iter()
-            .any(|key| std::env::var_os(key).is_some()),
-    );
-    embedded_kind(terminal, std::env::var_os("CMUX_WORKSPACE_ID").is_some())
+    let env = crate::caps::terminal_env();
+    let terminal = supported(&env.program, &env.term, env.kitty_window, env.multiplexed);
+    embedded_kind(terminal, env.cmux_workspace)
 }
 
 fn embedded_kind(terminal: TerminalKind, cmux: bool) -> TerminalKind {
