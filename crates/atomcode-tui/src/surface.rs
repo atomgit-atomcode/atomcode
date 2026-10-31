@@ -840,7 +840,7 @@ pub struct Terminal {
     // X11 owns clipboard data in the writing process. Keep its event loop alive
     // until this terminal is dropped rather than losing the selection on return.
     #[cfg(target_os = "linux")]
-    clipboard: Mutex<Option<arboard::Clipboard>>,
+    clipboard: Mutex<Option<crate::clipboard::Clipboard>>,
     /// Whether `/raw` has stepped out onto the terminal's own screen
     /// ([`Surface::show_transcript`]): while it has, nothing is written.
     away: std::sync::atomic::AtomicBool,
@@ -1840,7 +1840,11 @@ fn clipboard_diagnostic<T>(stage: &str, operation: impl FnOnce() -> T) -> T {
 fn clipboard_rgba_direct() -> Option<(usize, usize, Vec<u8>)> {
     #[cfg(windows)]
     let _guard = windows_clipboard_guard();
-    let from_arboard = clipboard_diagnostic("arboard_open", arboard::Clipboard::new)
+    // Android has no clipboard to read an image from (see `crate::clipboard`), so the
+    // whole arboard road is compiled out there rather than stubbed with an image
+    // type that module would then have to carry.
+    #[cfg(not(target_os = "android"))]
+    let from_arboard = clipboard_diagnostic("arboard_open", crate::clipboard::Clipboard::new)
         .ok()
         .and_then(|mut clipboard| {
             let image = clipboard_diagnostic("arboard_get_image", || clipboard.get_image()).ok();
@@ -1848,6 +1852,8 @@ fn clipboard_rgba_direct() -> Option<(usize, usize, Vec<u8>)> {
             image
         })
         .map(|img| (img.width, img.height, img.bytes.into_owned()));
+    #[cfg(target_os = "android")]
+    let from_arboard: Option<(usize, usize, Vec<u8>)> = None;
     #[cfg(windows)]
     {
         from_arboard.or_else(|| {
@@ -1923,7 +1929,7 @@ pub fn run_clipboard_helper_if_requested() -> bool {
             out.write_all(&rgba).ok()?;
             Some(())
         }),
-        "text" => arboard::Clipboard::new()
+        "text" => crate::clipboard::Clipboard::new()
             .ok()
             .and_then(|mut clipboard| clipboard.get_text().ok())
             .and_then(|text| std::io::stdout().lock().write_all(text.as_bytes()).ok()),
@@ -2024,7 +2030,7 @@ fn read_clipboard_text() -> Option<String> {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let mut clipboard = arboard::Clipboard::new().ok()?;
+        let mut clipboard = crate::clipboard::Clipboard::new().ok()?;
         let text = clipboard.get_text().ok()?;
         (!text.is_empty()).then_some(text)
     }
@@ -2046,7 +2052,7 @@ fn local_clipboard(text: &str) -> bool {
     // in the system's ANSI code page, so Chinese piped to it as UTF-8 arrived
     // garbled; it stays as the fallback.
     #[cfg(windows)]
-    if arboard::Clipboard::new()
+    if crate::clipboard::Clipboard::new()
         .and_then(|mut board| board.set_text(text.to_string()))
         .is_ok()
     {
@@ -2702,7 +2708,7 @@ impl Surface for Terminal {
             }
             let mut owner = self.clipboard.lock().expect("clipboard poisoned");
             if owner.is_none() {
-                *owner = arboard::Clipboard::new().ok();
+                *owner = crate::clipboard::Clipboard::new().ok();
             }
             if owner
                 .as_mut()

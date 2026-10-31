@@ -46,7 +46,10 @@ tracing = "0.1"
 # terminal, and the clipboard is the terminal's — so the platform lives here,
 # behind `Surface::clipboard_image`, and everything above it sees an
 # `ImageContent` and nothing else.
-arboard = "3"
+#
+# Not on Android: arboard has no backend there and its platform module does not
+# compile (`platform::Clear` missing). `src/clipboard.rs` substitutes a stub that
+# reports "unavailable", which is the truth on a phone anyway.
 # Anonymous input files keep clipboard helpers from blocking on a full pipe.
 tempfile = "3"
 # arboard hands back raw RGBA; every provider wants an encoded image, so the
@@ -76,6 +79,9 @@ libc = "0.2"
 # The raw `CF_DIB` behind a Windows clipboard picture, for the screenshots
 # `arboard` cannot decode (the Snipping Tool's and Qt tools' V5 headers). The
 # same crate `arboard` already uses there, so nothing new is built.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+arboard = "3"
+
 [target.'cfg(windows)'.dependencies]
 clipboard-win = "5.4"
 
