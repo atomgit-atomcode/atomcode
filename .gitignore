@@ -138,11 +138,13 @@ extensions/jetbrains/.spec_docs
 
 # Android 构建产物。`jniLibs/` 里的 .so 由 scripts/build-android.sh 生成,
 # 和 webui/dist 不同:它来自本机 NDK 的一次构建,按 ABI 数十 MB,不入库。
-android/.gradle/
-android/build/
-android/app/build/
-android/local.properties
-android/app/src/main/jniLibs/*/*.so
+# 主应用与每个 provider 工程（android-tools、android-zig）都适用:
+# Gradle 缓存、build/ 产出与 jniLibs 下的 .so 都是本机构建产物。
+android*/.gradle/
+android*/build/
+android*/app/build/
+android*/local.properties
+android*/app/src/main/jniLibs/*/*.so
 
 # 本地 Android SDK/NDK 安装(scripts/build-android.sh 的查找目标之一)。
 # 只为让本机构建可复现,体积以 GB 计,不入库。

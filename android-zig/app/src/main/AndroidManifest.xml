@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- A file holder, like `com.atomcode.tools`: no activity, no service, no IPC.
+         The main app links `<data>/bin/zig` at this package's `nativeLibraryDir`,
+         which the platform allows even though it forbids executing our own data
+         directory. The standard library is NOT here — it is the `zig-lib` market
+         package, read through `$ZIG_LIB_DIR`. -->
+    <application
+        android:allowBackup="false"
+        android:label="AtomCode Zig" />
+
+</manifest>

@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">AtomCode</string>
+    <string name="channel_agent">Agent</string>
+    <string name="notification_title">AtomCode agent</string>
+    <string name="notification_text">Running locally — the agent stops when you end this service</string>
+    <string name="notification_idle">Idle — the agent runs on this device</string>
+    <string name="notification_external">Connected to the external daemon on port %1$d</string>
+    <string name="notification_external_lost">The external daemon on port %1$d stopped answering</string>
+    <string name="notification_busy">Working on %1$d conversation(s)…</string>
+    <string name="notification_last_turn_ok">%1$s · last turn finished</string>
+    <string name="notification_last_turn_cancelled">%1$s · last turn stopped by you</string>
+    <string name="notification_last_turn_failed">%1$s · last turn failed (%2$s)</string>
+    <string name="notification_multiple_results">%1$s · %2$d conversations finished</string>
+    <string name="notification_result_ok">finished</string>
+    <string name="notification_result_failed">failed (%1$s)</string>
+    <string name="notification_result_cancelled">stopped</string>
+    <string name="notification_session_unknown">unnamed conversation</string>
+    <string name="attach_choose">Attach: take a photo or pick a file</string>
+    <string name="notification_starting">Starting the agent…</string>
+    <string name="starting">Starting the agent…</string>
+    <string name="start_failed">The agent did not start: %1$s</string>
+    <string name="external_title">External daemon found</string>
+    <string name="external_message">An `atomcode daemon` is listening on port %1$d. Switch to it? The in-app agent will be stopped.</string>
+    <string name="external_switch">Switch to it</string>
+    <string name="external_local">Keep this one</string>
+    <string name="external_connected">Connected to the external daemon on port %1$d</string>
+    <string name="external_lost">The external daemon stopped; switched back to the in-app agent</string>
+    <string name="external_token_title">This daemon needs a token</string>
+    <string name="external_token_message">The daemon on port %1$d requires a token. Paste it here, or restart the daemon with --no-auth. Tokens are never read from shared storage.</string>
+    <string name="external_token_hint">token</string>
+    <string name="external_token_connect">Connect</string>
+    <string name="storage_title">Open a real project folder</string>
+    <string name="storage_message">AtomCode needs access to shared storage so the agent can open your repositories by path — Git, shell commands and language servers cannot work with Android\'s document picker URIs. Without it the agent is limited to its private folder.</string>
+    <string name="storage_grant">Grant access</string>
+    <string name="no_browser">No app on this device can open that link.</string>
+    <string name="helper_installed">Helper installed. Restarting so make / tcc / zig become available.</string>
+    <string name="external_start_unseen">The daemon started but discovery did not find it; reopen the app to retry.</string>
+    <string name="sessions_private_on">Sessions are now app-private. Reopen the app for it to take effect.</string>
+    <string name="sessions_private_off">Sessions are shared again. Reopen the app for it to take effect.</string>
+</resources>

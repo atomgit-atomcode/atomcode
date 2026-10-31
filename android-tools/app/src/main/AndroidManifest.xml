@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Deliberately empty: this APK exists only to carry one native binary, so
+         the main app can find out whether it may execute another package's
+         nativeLibraryDir. No activity, no service, nothing to launch. -->
+    <application
+        android:allowBackup="false"
+        android:label="ToolsProbe" />
+
+</manifest>

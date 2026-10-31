@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  中文文案。webui 的界面本来就是中文，而系统对话框（存储授权、helper 安装、
+  外部 daemon 提示）此前只有英文，中文用户会在同一屏里看到两种语言。
+  占位符（%1$d / %1$s）必须与 values/strings.xml 完全一致，否则格式化会崩。
+-->
+<resources>
+    <string name="app_name">AtomCode</string>
+    <string name="channel_agent">智能体</string>
+    <string name="notification_title">AtomCode 智能体</string>
+    <string name="notification_text">本机运行中 —— 结束此服务后智能体将停止</string>
+    <string name="notification_idle">空闲 —— 智能体在本机运行</string>
+    <string name="notification_external">已连接外部守护进程（端口 %1$d）</string>
+    <string name="notification_external_lost">端口 %1$d 的外部守护进程已停止响应</string>
+    <string name="notification_busy">正在处理 %1$d 个会话……</string>
+    <string name="notification_last_turn_ok">%1$s · 上一轮已完成</string>
+    <string name="notification_last_turn_cancelled">%1$s · 上一轮被你停止</string>
+    <string name="notification_last_turn_failed">%1$s · 上一轮失败（%2$s）</string>
+    <string name="notification_multiple_results">%1$s · %2$d 个会话有结果</string>
+    <string name="notification_result_ok">已完成</string>
+    <string name="notification_result_failed">失败（%1$s）</string>
+    <string name="notification_result_cancelled">已停止</string>
+    <string name="notification_session_unknown">未命名会话</string>
+    <string name="attach_choose">添加：拍照或选文件</string>
+    <string name="notification_starting">正在启动智能体……</string>
+    <string name="starting">正在启动智能体……</string>
+    <string name="start_failed">智能体启动失败：%1$s</string>
+    <string name="external_title">发现外部守护进程</string>
+    <string name="external_message">检测到 `atomcode daemon` 正在端口 %1$d 监听。要切换过去吗？应用内智能体将被停止。</string>
+    <string name="external_switch">切换过去</string>
+    <string name="external_local">使用本机的</string>
+    <string name="external_connected">已连接端口 %1$d 的外部守护进程</string>
+    <string name="external_lost">外部守护进程已停止，已切回应用内智能体</string>
+    <string name="external_token_title">该守护进程需要令牌</string>
+    <string name="external_token_message">端口 %1$d 的守护进程需要令牌。请在此粘贴，或用 --no-auth 重启该守护进程。令牌不会从共享存储读取。</string>
+    <string name="external_token_hint">令牌</string>
+    <string name="external_token_connect">连接</string>
+    <string name="storage_title">打开真实项目目录</string>
+    <string name="storage_message">AtomCode 需要访问共享存储，智能体才能按路径打开你的仓库 —— Git、shell 命令和语言服务器无法使用 Android 文档选择器提供的 URI。不授予的话，智能体只能使用它的私有目录。</string>
+    <string name="storage_grant">授予访问</string>
+    <string name="no_browser">本机没有能打开该链接的应用。</string>
+    <string name="helper_installed">辅助程序已安装。正在重启，随后 make / tcc / zig 可用。</string>
+    <string name="external_start_unseen">守护进程已启动但未被发现，请重新打开应用再试。</string>
+    <string name="sessions_private_on">会话记录已改为应用私有。重新打开应用后生效。</string>
+    <string name="sessions_private_off">会话记录已改回共享。重新打开应用后生效。</string>
+</resources>

@@ -1867,6 +1867,14 @@ async fn run(process_start: std::time::Instant) -> Result<i32> {
                 no_auth,
             } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
+                // Same knob the Android host uses: point the daemon's sessions at the
+                // directory the app reads, so switching to it keeps one history.
+                if let Ok(dir) = std::env::var("ATOMCODE_SESSIONS_DIR") {
+                    let dir = dir.trim();
+                    if !dir.is_empty() {
+                        let _ = atomcode_capabilities::session::set_sessions_root(dir);
+                    }
+                }
                 eprintln!("Starting AtomCode daemon on port {}...", port);
                 eprintln!("Press Ctrl+C to stop.");
                 // Run the bundled server IN-PROCESS (same `run_server` the webui uses),

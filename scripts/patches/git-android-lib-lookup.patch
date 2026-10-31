@@ -1,0 +1,51 @@
+--- a/run-command.c
++++ b/run-command.c
+@@ -407,6 +407,26 @@
+ 	set_error_routine(old_errfn);
+ }
+ 
++#ifdef __ANDROID__
++/*
++ * Android only lets an app execute files that live in the APK's native library
++ * directory, and that directory cannot hold a name Gradle would not package
++ * (lib*.so). Git still looks its own programs up by bare name, so map a name
++ * that PATH did not resolve onto the packaged lib<name>.so beside the binary.
++ */
++static char *android_lib_program(const char *name)
++{
++	struct strbuf candidate = STRBUF_INIT;
++	char *resolved = NULL;
++
++	strbuf_addf(&candidate, "%s/lib%s.so", git_exec_path(), name);
++	if (access(candidate.buf, X_OK) == 0)
++		resolved = xstrdup(candidate.buf);
++	strbuf_release(&candidate);
++	return resolved;
++}
++#endif
++
+ static int prepare_cmd(struct strvec *out, const struct child_process *cmd)
+ {
+ 	if (!cmd->args.v[0])
+@@ -438,9 +458,18 @@
+ 			free((char *)out->v[1]);
+ 			out->v[1] = program;
+ 		} else {
+-			strvec_clear(out);
+-			errno = ENOENT;
+-			return -1;
++			char *packaged = NULL;
++#ifdef __ANDROID__
++			packaged = android_lib_program(out->v[1]);
++#endif
++			if (packaged) {
++				free((char *)out->v[1]);
++				out->v[1] = packaged;
++			} else {
++				strvec_clear(out);
++				errno = ENOENT;
++				return -1;
++			}
+ 		}
+ 	}
+ 

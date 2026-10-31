@@ -33,6 +33,17 @@ strip = "none"
 [profile.test]
 debug = "line-tables-only" # Smaller binaries, faster linker
 
+# Android loads `libatomcode_android.so` into the app's own process. A Rust
+# panic there must unwind to the JNI boundary and be turned into an error the
+# Kotlin side reports — with the release profile's `panic = "abort"` a single
+# panic anywhere in the agent would kill the whole app instead.
+#
+# Everything else (opt-level = "z", LTO, codegen-units = 1, strip) is inherited:
+# the phone cares about the same size the desktop release does.
+[profile.android]
+inherits = "release"
+panic = "unwind"
+
 # workspace 内自己的 crate 也只留行号表(2026-09-18)。默认的 `debug = 2` 会为
 # 这 40 万行自己的代码生成完整 DWARF —— 它进 `.rlib`、进每一个 test binary、
 # 再由链接器串进 160MB 的 debug 二进制里,是 `target/` 体积与链接时间的另一半

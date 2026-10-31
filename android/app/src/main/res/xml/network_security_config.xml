@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The webui is served by an in-process HTTP server on 127.0.0.1. Android blocks
+  cleartext traffic by default; this opens it for loopback ONLY, so a link the
+  model emits to an external http:// site still fails rather than silently
+  carrying the session cookie off-device.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+    </domain-config>
+</network-security-config>

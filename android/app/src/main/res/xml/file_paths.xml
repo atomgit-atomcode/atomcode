@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The paths the package installer may read.
+
+  The helper APK is downloaded by the daemon into the app's own storage (the
+  product directory), and Android's package installer cannot open a `file://`
+  URI from another process — it needs a `content://` one that this app vouches
+  for. This is that grant, and it covers exactly the helper directory: nothing
+  else in the app's tree is exposed.
+-->
+<paths>
+    <files-path
+        name="helper"
+        path="atomcode/helper/" />
+    <!--
+      Camera output. `ACTION_IMAGE_CAPTURE` hands the picture back through a
+      `content://` URI this app must vouch for; the file itself lives in the
+      cache dir so it is never mistaken for user data — the webui reads it
+      once and the host deletes it.
+    -->
+    <cache-path
+        name="captures"
+        path="captures/" />
+</paths>

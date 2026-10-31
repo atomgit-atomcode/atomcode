@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- The agent talks to model providers; the webui is loopback-only. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- A turn can run for many minutes with the screen off. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!--
+      A coding agent needs real POSIX paths. SAF hands out content:// URIs, which
+      no `bash`, `git` or LSP can open; the alternative is this permission, which
+      is what every on-device IDE/terminal uses. It is granted per-app in system
+      settings, never silently, and the app falls back to its private directory
+      when it is absent.
+    -->
+    <uses-permission
+        android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
+
+    <!--
+      The optional helper APK carries tools that must spawn child processes
+      (`make` runs a compiler, a compiler runs an assembler/linker) — something
+      this app cannot host, because Android forbids executing anything from its
+      own data directory. It can execute ANOTHER package's nativeLibraryDir, so
+      the helper is just a file holder: no service, no IPC. Since Android 11 an
+      app can only see packages it declares here, and without this the lookup
+      raises NameNotFoundException even when the helper is installed.
+    -->
+    <queries>
+        <package android:name="com.atomcode.tools" />
+        <!-- The zig provider: zig's 141 MB binary on its own, so the helper above
+             stays small. Same mechanism — a file holder whose nativeLibraryDir we
+             are allowed to execute. -->
+        <package android:name="com.atomcode.tools.zig" />
+        <!--
+          The attachment picker offers "take a photo" next to "pick a file", and the
+          output URI must be granted to whichever camera app answers. Since Android 11
+          a package that has not declared this intent cannot see the camera at all, so
+          the grant would silently go to nobody.
+        -->
+        <intent>
+            <action android:name="android.media.action.IMAGE_CAPTURE" />
+        </intent>
+    </queries>
+
+    <application
+        android:allowBackup="false"
+        android:label="@string/app_name"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.AtomCode">
+
+        <activity
+            android:name=".MainActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden|uiMode"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".AgentService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!--
+          The helper APK is downloaded into the app's own storage; the system
+          installer cannot read a `file://` URI from another process, so this
+          provider hands out a `content://` URI for that one directory.
+        -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.files"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+    </application>
+</manifest>

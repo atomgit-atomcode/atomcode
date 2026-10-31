@@ -1,0 +1,74 @@
+[package]
+name = "atomcode-android"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Android host: runs the coding agent's HTTP front end in-process and hands the webui URL to Kotlin. Builds as a cdylib for aarch64-linux-android; compiles to a stub on desktop so the workspace gate stays green."
+publish = false
+
+[lib]
+name = "atomcode_android"
+# `cdylib` is what Kotlin loads via System.loadLibrary. `rlib` keeps the host
+# layer reachable from tests on the build machine.
+crate-type = ["cdylib", "rlib"]
+
+# The launcher that runs an installed runtime package. It lives in
+# `nativeLibraryDir` (the only executable place on Android), `dlopen`s the
+# package's library and calls its entry point — see the module docs.
+# `pluginhost` is built for the Android target only; on the build machine it
+# compiles to a stub so `cargo check --all-targets` stays green.
+[[bin]]
+name = "pluginhost"
+path = "src/bin/pluginhost.rs"
+
+[features]
+default = []
+# The official build's request-signing overlay.
+#
+# The AtomGit gateway (`llm-api.atomgit.com`) rejects any request that carries
+# only an OAuth bearer: it answers `ATOMCODE_SIG_MISSING` (403). The signature
+# algorithm lives in the closed-source `atomcode-codingplan-crypto` crate, which
+# the official pipeline drops in over the public stub. With the public stub the
+# algorithm version is 0, `signer_available()` is false, and the provider layer
+# refuses the gateway up front with "gateway authentication is unavailable in
+# this build" — the failure a phone build hits without the overlay.
+#
+# Enabling this feature is a no-op with the public stub (the version check in
+# `atomcode-auth::gateway_crypto` still reports "unavailable"), so the same
+# build command works before and after the overlay lands.
+codingplan-crypto = ["atomcode-daemon/codingplan-crypto"]
+
+[dependencies]
+anyhow = "1"
+tracing = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros"] }
+# `pluginhost` reads a package's `package.json` (name/version/entry/symbol);
+# the daemon side already depends on these, so nothing new enters the lock.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+atomcode-config = { path = "../atomcode-config" }
+atomcode-telemetry = { path = "../atomcode-telemetry" }
+# For one thing only: reporting whether the gateway signer is available, so a
+# phone build without the official overlay says so plainly instead of failing
+# the first turn with a provider error.
+atomcode-capabilities = { path = "../atomcode-capabilities", default-features = false, features = [
+    "provider",
+    # First-start seeding writes the example MCP server's `mcp.json` entry through the
+    # same merge the CLI's `mcp add` uses. The daemon already enables this feature, so
+    # naming it here adds nothing to the APK — it only makes the dependency honest.
+    "mcp",
+] }
+# The server that serves the embedded webui; `run_server` is the same entry the
+# standalone daemon and the TUI's in-process `/webui` use.
+atomcode-daemon = { path = "../atomcode-daemon" }
+
+[target.'cfg(target_os = "android")'.dependencies]
+# JNI bindings + logcat. Both are Android-only: gating them keeps a desktop
+# `cargo check --workspace --all-targets` from needing them at all.
+jni = "0.21"
+android_logger = "0.14"
+# `android_logger::Config::with_max_level` speaks `log`'s level type.
+log = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
