@@ -662,8 +662,9 @@ const SUMMARY_TOOL_CALL_TAIL_CHARS: usize = 200;
 /// Whole-input ceiling for the transcript. It is the only bound on dialogue
 /// text (messages have no per-message cap) and is positional, not role-aware:
 /// an over-budget span can lose dialogue from its middle, which the marker
-/// reports. Tool results and call arguments are capped smaller, which keeps
-/// tool data from filling the span (tier1 already allows cutting those).
+/// reports. Tool results and call arguments have per-item caps, which keeps
+/// one item from spending the span; many items can still reach this ceiling
+/// together (tier1 already allows cutting tool data).
 const SUMMARY_TRANSCRIPT_MAX_CHARS: usize = 120_000;
 const SUMMARY_TRANSCRIPT_TAIL_CHARS: usize = 40_000;
 
@@ -763,9 +764,9 @@ fn render_transcript(span: &[Message]) -> String {
         }
         // The call names and their arguments say what the assistant ran or
         // wrote; the result alone often says only "ok". Both come from the
-        // model, so both are bounded, and their line breaks are folded: a name
-        // or argument must not start a line of the transcript and pose as a
-        // role tag.
+        // model, so both have per-item bounds, and their line breaks are
+        // folded: a name or argument must not start a line of the transcript
+        // and pose as a role tag.
         for call in &m.tool_calls {
             s.push_str("\n[tool call: ");
             push_single_line(
