@@ -698,8 +698,22 @@ fn truncated_body(text: &str, total: usize, max_chars: usize, tail_chars: usize)
         .chars()
         .skip(total.saturating_sub(tail_chars))
         .collect();
-    let cut = total - max_chars;
+    let cut = total.saturating_sub(max_chars);
     format!("{head}\n[truncated {cut} chars]\n{tail}")
+}
+
+/// Append `text` to `into` with every line break folded to a space: a tool call
+/// is one line of the transcript. Written straight into the transcript because
+/// most argument lists are a borrowed slice of the message — `format!` and
+/// `String::replace` would each copy them just to reuse the text unchanged.
+fn push_single_line(into: &mut String, text: &str) {
+    let mut rest = text;
+    while let Some(at) = rest.find('\n') {
+        into.push_str(&rest[..at]);
+        into.push(' ');
+        rest = &rest[at + 1..];
+    }
+    into.push_str(rest);
 }
 
 fn render_tool_body(text: &str) -> Cow<'_, str> {
@@ -738,13 +752,18 @@ fn render_transcript(span: &[Message]) -> String {
         // The call names and their (bounded) arguments say what the assistant ran
         // or wrote; the result alone often says only "ok".
         for call in &m.tool_calls {
-            let arguments = bounded_body(
-                &call.arguments,
-                SUMMARY_TOOL_CALL_MAX_CHARS,
-                SUMMARY_TOOL_CALL_TAIL_CHARS,
-            )
-            .replace('\n', " ");
-            s.push_str(&format!("\n[tool call: {} {arguments}]", call.name));
+            s.push_str("\n[tool call: ");
+            s.push_str(&call.name);
+            s.push(' ');
+            push_single_line(
+                &mut s,
+                &bounded_body(
+                    &call.arguments,
+                    SUMMARY_TOOL_CALL_MAX_CHARS,
+                    SUMMARY_TOOL_CALL_TAIL_CHARS,
+                ),
+            );
+            s.push(']');
         }
         // Record image attachments so a drained vision turn is not summarized as if it had no
         // visual content (the raw bytes can't be transcribed here, but their PRESENCE must
@@ -2910,6 +2929,24 @@ mod tests {
         assert!(
             out.contains("[truncated "),
             "a large argument list is bounded"
+        );
+    }
+
+    #[test]
+    fn render_transcript_folds_tool_call_arguments_onto_the_call_line() {
+        let call = ToolCall {
+            id: "c1".into(),
+            name: "write_file".into(),
+            arguments: "{\n  \"path\": \"x\"\n}".into(),
+        };
+        let out = render_transcript(&[Message::assistant("writing", vec![call])]);
+        let call_line = out
+            .lines()
+            .find(|line| line.starts_with("[tool call: "))
+            .expect("the call line is present");
+        assert_eq!(
+            call_line, r#"[tool call: write_file {   "path": "x" }]"#,
+            "line breaks are folded to spaces, not left in the transcript"
         );
     }
 
