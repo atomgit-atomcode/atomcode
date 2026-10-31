@@ -686,12 +686,22 @@ fn bounded_body<'a>(text: &'a str, max_chars: usize, tail_chars: usize) -> Cow<'
     Cow::Owned(truncated_body(text, total, max_chars, tail_chars))
 }
 
+/// Clip one body to `max_chars` with the per-item `[truncated N chars]` marker.
+fn truncated_body(text: &str, total: usize, max_chars: usize, tail_chars: usize) -> String {
+    cut_body(text, total, max_chars, tail_chars, "truncated")
+}
+
 /// The cut itself, for a caller that already counted `total` characters.
+///
+/// `marker` names what was lost: a clipped body says `[truncated N chars]`,
+/// while the whole-span cut says `[conversation truncated N chars]`, so the
+/// summarizer can tell one message's clip from a missing middle of the
+/// exchange.
 ///
 /// `total` must exceed `max_chars` (checked in debug builds). A `tail_chars`
 /// wider than `max_chars` is clamped, so head and tail never spend more than
 /// the cap between them.
-fn truncated_body(text: &str, total: usize, max_chars: usize, tail_chars: usize) -> String {
+fn cut_body(text: &str, total: usize, max_chars: usize, tail_chars: usize, marker: &str) -> String {
     debug_assert!(total > max_chars, "nothing to cut");
     let tail_chars = tail_chars.min(max_chars);
     let head_chars = max_chars.saturating_sub(tail_chars);
@@ -701,7 +711,7 @@ fn truncated_body(text: &str, total: usize, max_chars: usize, tail_chars: usize)
         .skip(total.saturating_sub(tail_chars))
         .collect();
     let cut = total.saturating_sub(max_chars);
-    format!("{head}\n[truncated {cut} chars]\n{tail}")
+    format!("{head}\n[{marker} {cut} chars]\n{tail}")
 }
 
 /// Append `text` to `into` with every line break folded to one space: CRLF,
@@ -808,11 +818,12 @@ fn render_transcript(span: &[Message]) -> String {
     if total <= SUMMARY_TRANSCRIPT_MAX_CHARS {
         return s;
     }
-    truncated_body(
+    cut_body(
         &s,
         total,
         SUMMARY_TRANSCRIPT_MAX_CHARS,
         SUMMARY_TRANSCRIPT_TAIL_CHARS,
+        "conversation truncated",
     )
 }
 
@@ -2888,7 +2899,7 @@ mod tests {
         let over = "字".repeat(SUMMARY_TRANSCRIPT_MAX_CHARS + 1_000);
         let out = render_transcript(&[Message::user(over.clone())]);
         assert!(!out.contains(&over), "an over-cap body is cut");
-        assert!(out.contains("[truncated "), "and says so");
+        assert!(out.contains("[conversation truncated "), "and says so");
     }
 
     #[test]
@@ -2942,9 +2953,35 @@ mod tests {
         let out = render_transcript(&[Message::user(big.clone())]);
         assert!(!out.contains(&big), "the full user message must not appear");
         assert_eq!(
-            out.matches("[truncated ").count(),
+            out.matches("[conversation truncated ").count(),
             1,
             "one message is cut once, so the marker reports the whole drop"
+        );
+    }
+
+    #[test]
+    fn the_two_truncation_markers_are_distinct() {
+        // A clipped item says `[truncated N chars]`; a span whose middle was
+        // dropped says `[conversation truncated N chars]`, so the summarizer
+        // can tell a clipped tool body from a lost part of the exchange.
+        let mut span = vec![Message::tool_result(
+            "c0",
+            "z".repeat(SUMMARY_TOOL_OUTPUT_MAX_CHARS + 100),
+            false,
+        )];
+        for i in 0..80 {
+            span.push(Message::tool_result(
+                format!("c{i}"),
+                "x".repeat(1_900),
+                false,
+            ));
+        }
+
+        let out = render_transcript(&span);
+        assert!(out.contains("[truncated "), "the tool body is clipped");
+        assert!(
+            out.contains("[conversation truncated "),
+            "the whole span is clipped"
         );
     }
 
@@ -3050,9 +3087,13 @@ mod tests {
             "tool data can fill the span and push middle dialogue out"
         );
         assert_eq!(
-            out.matches("[truncated ").count(),
+            out.matches("[conversation truncated ").count(),
             1,
-            "only the whole-input cut leaves a marker; each tool body fits its cap"
+            "only the whole-input cut leaves a marker"
+        );
+        assert!(
+            !out.contains("[truncated "),
+            "each tool body fits its cap, so none is clipped"
         );
         assert!(
             out.chars().count() < SUMMARY_TRANSCRIPT_MAX_CHARS + 200,
@@ -3077,7 +3118,10 @@ mod tests {
             "the whole summary input is bounded: {} chars",
             out.chars().count()
         );
-        assert!(out.contains("[truncated "), "the cap leaves a marker");
+        assert!(
+            out.contains("[conversation truncated "),
+            "the cap leaves a marker"
+        );
         assert!(out.contains("HEADMARK"), "the head is kept");
         assert!(out.contains("TAILMARK"), "the tail is kept");
     }
