@@ -64,6 +64,17 @@ mkdir -p "$JNI"
 cp "$CACHE"/node-split/jniLibs/arm64-v8a/* "$JNI"/
 
 mkdir -p "$DIST"
+# The package root is the node prefix (`include/node`, `lib/node_modules/npm`),
+# exposed as `<product>/node` — an empty link target.
+cat > "$data/manifest.json" <<EOF
+{
+  "schema": 1,
+  "name": "node-lib",
+  "version": "$version",
+  "entry": "",
+  "links": { "node": "" }
+}
+EOF
 bundle="$DIST/node-lib-$version-arm64.tar.gz"
 echo "→ data package $bundle"
 tar -czf "$bundle" -C "$data" .

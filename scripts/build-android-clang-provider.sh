@@ -89,9 +89,22 @@ echo "→ launcher (clang $clang_dir)"
 ls -lh "$JNI/libclang.so" "$JNI/libclang-real.so"
 
 mkdir -p "$DIST"
+# The installer links `<product>/<link>` at this package's directory. `clang` is
+# the name `$ATOMCODE_CLANG_DATA` points at, and the package root is exactly the
+# root the launcher expects (`usr/include`, `usr/lib`, `lib/clang/<ver>`), so the
+# link target is the package root — an empty relative path.
+cat > "$data/manifest.json" <<EOF
+{
+  "schema": 1,
+  "name": "clang-sysroot",
+  "version": "$version",
+  "entry": "",
+  "links": { "clang": "" }
+}
+EOF
 bundle="$DIST/clang-sysroot-$version-arm64.tar.gz"
 echo "→ data package $bundle"
-tar -czf "$bundle" -C "$data" usr lib
+tar -czf "$bundle" -C "$data" manifest.json usr lib
 echo "  size   $(du -h "$bundle" | cut -f1)"
 echo "  sha256 $(sha256sum "$bundle" | cut -d' ' -f1)"
 
