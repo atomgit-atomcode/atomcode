@@ -909,7 +909,7 @@ impl CompactBeforeRequest {
         let tried = self.tried.lock().expect("compaction attempts poisoned");
         tried
             .get(session)
-            .is_some_and(|entry| entry.0 == turn && entry.1[0] && entry.1[1])
+            .is_some_and(|entry| entry.0 == turn && entry.1.iter().all(|tried| *tried))
     }
 }
 
