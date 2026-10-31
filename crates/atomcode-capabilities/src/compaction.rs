@@ -3024,6 +3024,44 @@ mod tests {
     }
 
     #[test]
+    fn tool_data_without_a_total_budget_can_crowd_out_dialogue() {
+        // Known boundary: the tool caps are per item, not a total budget. Many
+        // results can reach the whole-input ceiling, and the positional cut then
+        // drops the middle of the span — dialogue included. This pins the
+        // tradeoff until an aggregate tool-data budget exists.
+        let mut span = vec![Message::user("HEAD-USER")];
+        for i in 0..100 {
+            span.push(Message::tool_result(
+                format!("c{i}"),
+                "x".repeat(1_900),
+                false,
+            ));
+            if i == 51 {
+                span.push(Message::user("MIDDLE-USER"));
+            }
+        }
+        span.push(Message::user("TAIL-USER"));
+
+        let out = render_transcript(&span);
+        assert!(out.contains("HEAD-USER"), "the head is kept");
+        assert!(out.contains("TAIL-USER"), "the tail is kept");
+        assert!(
+            !out.contains("MIDDLE-USER"),
+            "tool data can fill the span and push middle dialogue out"
+        );
+        assert_eq!(
+            out.matches("[truncated ").count(),
+            1,
+            "only the whole-input cut leaves a marker; each tool body fits its cap"
+        );
+        assert!(
+            out.chars().count() < SUMMARY_TRANSCRIPT_MAX_CHARS + 200,
+            "the whole summary input is bounded: {} chars",
+            out.chars().count()
+        );
+    }
+
+    #[test]
     fn render_transcript_caps_the_whole_input() {
         let mut span: Vec<Message> = (0..20)
             .map(|i| Message::user(format!("{i}{}", "z".repeat(20_000))))
