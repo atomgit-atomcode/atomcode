@@ -12,6 +12,9 @@ packages/npm/*.tgz
 
 # OS
 .DS_Store
+# macOS AppleDouble sidecars: a workspace on a network/external volume gets a
+# `._*` file next to everything the OS writes, at any depth.
+._*
 Thumbs.db
 Desktop.ini
 $RECYCLE.BIN/
@@ -113,10 +116,9 @@ crates/atomcode-codingplan-crypto/
 # 绝不能进版本库——`crates/atomcode-codingplan-crypto/` 那条规则只覆盖
 # workspace 里被覆盖后的目录,覆盖不到仓库根下这份 clone。
 overlay/
-scripts/build-official.sh
-build-official.sh
-build-official-vscode.sh
-build-official-jetbrains.sh
+# build-official* 是本地发布机用的脚本与说明，只留在本地磁盘、不入库。
+# 无斜杠的前缀通配在任意层级都生效，因此同时覆盖根目录与 scripts/ 下的同名文件。
+build-official*
 
 # git worktrees
 .worktrees/

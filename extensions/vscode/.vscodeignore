@@ -6,3 +6,8 @@ tsconfig.json
 node_modules/**
 webview-ui/**
 webview/**/*.ts
+# macOS AppleDouble sidecars: the workspace may live on a network/external
+# volume that recreates `._*` next to every written file, so they get packed
+# unless excluded here (they show up in out/ and resources/bin/).
+**/._*
+._*

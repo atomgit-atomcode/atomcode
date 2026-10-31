@@ -6,11 +6,13 @@ import com.atomcode.jetbrains.daemon.AuthStatusResponse
 import com.atomcode.jetbrains.daemon.ChatEvent
 import com.atomcode.jetbrains.daemon.ChatRequest
 import com.atomcode.jetbrains.daemon.ChatStreamListener
+import com.atomcode.jetbrains.daemon.ConfigResponse
 import com.atomcode.jetbrains.daemon.ConnectionErrorKind
 import com.atomcode.jetbrains.daemon.ConnectionState
 import com.atomcode.jetbrains.daemon.CreateProviderRequest
 import com.atomcode.jetbrains.daemon.DaemonAuth
 import com.atomcode.jetbrains.daemon.DaemonTokenFile
+import com.atomcode.jetbrains.daemon.HealthResponse
 import com.atomcode.jetbrains.daemon.ImageInput
 import com.atomcode.jetbrains.daemon.MessageInfo
 import com.atomcode.jetbrains.daemon.ModelInfo
@@ -19,6 +21,7 @@ import com.atomcode.jetbrains.daemon.PatchThinkingRequest
 import com.atomcode.jetbrains.daemon.ProviderInfo
 import com.atomcode.jetbrains.daemon.SessionDetail
 import com.atomcode.jetbrains.daemon.SessionMeta
+import com.atomcode.jetbrains.daemon.SkillInfo
 import com.atomcode.jetbrains.daemon.SetupSnapshot
 import com.atomcode.jetbrains.files.FileChangeService
 import com.atomcode.jetbrains.settings.AtomCodeSettings
@@ -78,11 +81,19 @@ internal class ApprovalModeRuntimeState(initialMode: ApprovalMode = ApprovalMode
     var pendingMode: ApprovalMode? = null
         private set
 
+    /// True once a person picked a mode here. Until then the mode belongs to the
+    /// daemon — it is `[permissions] default_mode` from config.toml — and
+    /// requests leave `approval_mode` unset so that value is what applies.
+    @Volatile
+    var userChoseMode: Boolean = false
+        private set
+
     @Synchronized
     fun beginSwitch(mode: ApprovalMode): Boolean {
         if (pendingMode != null || displayMode == mode) return false
         displayMode = mode
         pendingMode = mode
+        userChoseMode = true
         return true
     }
 
@@ -111,6 +122,32 @@ internal class ApprovalModeRuntimeState(initialMode: ApprovalMode = ApprovalMode
         confirmedMode = applied
         displayMode = applied
         return displayMode
+    }
+
+    /// What a chat request should carry: the mode only once a person picked one in
+    /// this session. Until then the field stays unset, so the mode the daemon
+    /// already holds — `[permissions] default_mode` from config.toml — is what
+    /// applies, instead of a client-side default overriding it.
+    fun modeForRequest(): ApprovalMode? =
+        if (!userChoseMode) null else (pendingMode ?: confirmedMode)
+
+    /// Forget a mode a person picked earlier, so the conversation that is starting
+    /// now falls back to the daemon's mode (`[permissions] default_mode`). A switch
+    /// still in flight is left alone — it is the answer the person is waiting for.
+    @Synchronized
+    fun resetChoice() {
+        if (pendingMode != null) return
+        userChoseMode = false
+    }
+
+    /// Adopt the mode the daemon reports for a conversation that starts fresh:
+    /// the previous conversation's pick is dropped and the daemon's mode — config
+    /// `[permissions] default_mode`, or `Build` when the file does not set one —
+    /// becomes what the label shows and what later requests defer to.
+    @Synchronized
+    fun adoptDaemonDefault(responseMode: String): ApprovalMode {
+        resetChoice()
+        return refreshFromDaemon(responseMode)
     }
 
     private fun parseApprovalMode(wire: String, fallback: ApprovalMode): ApprovalMode =
@@ -151,6 +188,15 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
 
     val confirmedApprovalMode: ApprovalMode
         get() = approvalModeState.confirmedMode
+
+    /// Whether a person picked the mode here rather than the daemon's configured
+    /// default applying. Requests carry `approval_mode` only after they have.
+    val approvalModeChosenByUser: Boolean
+        get() = approvalModeState.userChoseMode
+
+    /// The `approval_mode` a chat request carries: unset until a person picks one.
+    val approvalModeForRequest: ApprovalMode?
+        get() = approvalModeState.modeForRequest()
 
     val approvalModePending: Boolean
         get() = approvalModeState.pendingMode != null
@@ -364,24 +410,51 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
         }
     }
 
+    /// Sessions of the project that is open right now, and only those.
+    ///
+    /// The global `/sessions` mixes every project's sessions and truncates to 50,
+    /// so another project's traffic can push this project's older sessions out of
+    /// it — and loading a foreign session would silently move the agent's working
+    /// directory into that other project.
     fun refreshSessions(): CompletableFuture<List<SessionMeta>> =
         ensureConnected().thenCompose { state ->
             if (state !is ConnectionState.Ready) {
                 CompletableFuture.completedFuture(emptyList())
             } else {
-                val client = getOrCreateClient()
-                client.listSessions()
+                val workingDir = projectWorkingDir(state)
+                if (workingDir.isBlank()) {
+                    // No project directory: there is no current project to show.
+                    CompletableFuture.completedFuture(emptyList())
+                } else {
+                    getOrCreateClient().listSessionsForWorkingDir(workingDir)
+                }
             }
         }
 
-    fun searchSessions(query: String): CompletableFuture<List<SessionMeta>> =
-        ensureConnected().thenCompose { state ->
-            if (state !is ConnectionState.Ready) {
-                CompletableFuture.completedFuture(emptyList())
+    /// Search stays inside the project for the same reason. The daemon's
+    /// `/sessions/search` matches session names across every project, so filtering
+    /// this project's own sessions keeps the same semantics and the right scope.
+    fun searchSessions(query: String): CompletableFuture<List<SessionMeta>> {
+        val needle = query.trim()
+        return refreshSessions().thenApply { sessions ->
+            if (needle.isEmpty()) {
+                sessions
             } else {
-                val client = getOrCreateClient()
-                client.searchSessions(query)
+                sessions.filter {
+                    it.displayName.contains(needle, ignoreCase = true) ||
+                        it.id.contains(needle, ignoreCase = true)
+                }
             }
+        }
+    }
+
+    /// The directory a session would start in — one expression, shared by
+    /// `createSession` and the history, so the history lists exactly the sessions
+    /// this project can resume.
+    private fun projectWorkingDir(state: ConnectionState): String =
+        when (state) {
+            is ConnectionState.Ready -> state.projectPath.ifBlank { project.basePath.orEmpty() }
+            else -> project.basePath.orEmpty()
         }
 
     fun loadSession(meta: SessionMeta): CompletableFuture<SessionDetail> {
@@ -447,10 +520,7 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
 
     fun createSession(): CompletableFuture<SessionRefView> =
         ensureConnected().thenCompose { state ->
-            val path = when (state) {
-                is ConnectionState.Ready -> state.projectPath.ifBlank { project.basePath.orEmpty() }
-                else -> project.basePath.orEmpty()
-            }
+            val path = projectWorkingDir(state)
             val client = getOrCreateClient()
             client.createSession("AtomCode Chat", path).thenApply {
                 SessionRefView(it.id, it.name, it.projectHash, it.workingDir)
@@ -636,6 +706,62 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
         }
     }
 
+    /// Persist the reasoning effort for one endpoint. `null` restores the API
+    /// default (the menu's "Default"); the daemon rejects a level this endpoint
+    /// does not declare.
+    fun setReasoningEffort(provider: String, effort: String?): CompletableFuture<Boolean> =
+        getOrCreateClient().setReasoningEffort(provider, effort)
+
+    /// Skills the daemon exposes as slash commands, so the command menu lists what
+    /// is actually installed instead of a hardcoded pair.
+    fun listSkills(): CompletableFuture<List<SkillInfo>> =
+        getOrCreateClient().skills()
+
+    fun logout(): CompletableFuture<AuthStatusResponse> =
+        getOrCreateClient().logout()
+
+    fun reloadConfig(): CompletableFuture<ConfigResponse> =
+        getOrCreateClient().reloadConfig()
+
+    /// Live reads used by the `/whoami`, `/status` and `/config` commands: those
+    /// report what the daemon holds right now, not the last cached snapshot.
+    fun authStatusNow(): CompletableFuture<AuthStatusResponse> =
+        getOrCreateClient().authStatus()
+
+    fun healthNow(): CompletableFuture<HealthResponse> =
+        getOrCreateClient().health()
+
+    fun configInfo(): CompletableFuture<ConfigResponse> =
+        getOrCreateClient().config()
+
+    /// Ask the daemon which mode it holds and adopt it — what the panel does when
+    /// it opens, so a `[permissions] default_mode` edited in config.toml shows up
+    /// without a reconnect (the VS Code client re-reads on every panel open too).
+    /// A mode the person picked here outranks the file, and an in-flight switch is
+    /// left alone by `refreshFromDaemon`.
+    fun refreshApprovalModeNow(): CompletableFuture<ApprovalMode> {
+        val client = activeClient
+        if (client == null || approvalModeState.userChoseMode) {
+            return CompletableFuture.completedFuture(approvalMode)
+        }
+        return refreshApprovalMode(client).thenApply { approvalMode }
+    }
+
+    /// A conversation that starts fresh (new session, or an old one opened again)
+    /// takes its mode from the daemon — `[permissions] default_mode` in
+    /// config.toml, or `Build` when the file sets none — rather than whatever the
+    /// previous conversation ended with.
+    ///
+    /// The daemon's mode is read FIRST: a failed read (daemon down, stale token)
+    /// keeps the conversation's own choice, because dropping it would leave the
+    /// label showing one mode while requests defer to another.
+    fun adoptDaemonApprovalMode(): CompletableFuture<ApprovalMode> {
+        val client = activeClient ?: return CompletableFuture.completedFuture(approvalMode)
+        return client.getApprovalMode().handle { response, _ ->
+            if (response == null) approvalMode else approvalModeState.adoptDaemonDefault(response.mode)
+        }
+    }
+
     private fun sendPromptWhenReady(
         prompt: String,
         projectPath: String,
@@ -728,6 +854,9 @@ class AtomCodeProjectService(private val project: Project) : Disposable {
 
     private fun setConnectionState(next: ConnectionState) {
         val previous = connectionState
+        // 状态没变就不要通知：健康检查每 30s 跑一轮，无条件 fire 会让面板整轮重刷
+        // （重取快照、重建会话列表、重画欢迎页），表现就是"停留期间反复闪屏"。
+        if (previous == next) return
         connectionState = next
         ApplicationManager.getApplication().invokeLater {
             changes.firePropertyChange("connectionState", previous, next)

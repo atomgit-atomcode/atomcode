@@ -30,6 +30,7 @@ async function main() {
     'todo-regression.test.ts',
     'tab-title-truncation.test.ts',
     'daemon-client-token.test.ts',
+    'effort-levels.test.ts',
   ];
 
   try {

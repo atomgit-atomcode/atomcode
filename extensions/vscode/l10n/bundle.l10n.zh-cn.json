@@ -83,5 +83,6 @@
   "Trust this workspace before enabling the language bridge.": "请先信任此工作区，再启用 IDE 语言服务桥接。",
   "Open a folder in this window before enabling the language bridge.": "请先在此窗口打开一个文件夹，再启用 IDE 语言服务桥接。",
   "The language bridge needs a folder on this host's local filesystem.": "IDE 语言服务桥接需要本机文件系统上的文件夹。",
-  "This extension host has no local filesystem for the bridge connection file.": "当前扩展宿主没有可供桥接连接文件使用的本地文件系统。"
+  "This extension host has no local filesystem for the bridge connection file.": "当前扩展宿主没有可供桥接连接文件使用的本地文件系统。",
+  "This session is in use by another client (the terminal or another IDE). Close it there or switch to a different session, then open it here. (session {0})": "该会话正在终端或其他客户端中使用。请先在那边退出或切换到别的会话，再在这里打开。（会话 {0}）"
 }

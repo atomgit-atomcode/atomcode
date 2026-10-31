@@ -240,6 +240,42 @@ tasks {
     processResources {
         dependsOn(verifyBundledDaemon)
         from(bundledDaemonDir)
+        // macOS writes an AppleDouble `._*` sidecar next to every file it creates
+        // on a network/external volume — including the bundled daemons. They are
+        // not plugin content and must not reach the jar or the distribution zip.
+        exclude("**/._*")
+    }
+
+    // Belt and braces: whatever ends up in an archive, the sidecars stay out, so
+    // a signed plugin cannot carry them either.
+    withType<org.gradle.api.tasks.bundling.Zip>().configureEach {
+        exclude("**/._*")
+    }
+
+    // The archives are covered above, but bytecode instrumentation reads the
+    // compiled classes directly: on a network/external volume macOS drops a
+    // `._*` sidecar next to every `.class`, and the IntelliJ instrumenter tries
+    // to parse them as class files ("instrumentation failed for
+    // .../daemon/._ApprovalMode.class: IllegalArgumentException"). The task
+    // exposes no exclude knob, so purge the sidecars from its inputs (and from
+    // the previous run's output directory) right before it executes.
+    withType<org.jetbrains.intellij.platform.gradle.tasks.InstrumentCodeTask>().configureEach {
+        doFirst {
+            val roots = buildList {
+                addAll(classesDirs.files)
+                addAll(formsDirs.files)
+                add(outputDirectory.get().asFile)
+            }
+            var removed = 0
+            roots.filter { it.exists() }.forEach { root ->
+                root.walkTopDown()
+                    .filter { it.isFile && it.name.startsWith("._") }
+                    .forEach {
+                        if (it.delete()) removed++
+                    }
+            }
+            if (removed > 0) logger.lifecycle("[instrumentCode] removed $removed AppleDouble sidecar(s)")
+        }
     }
 
     named("runIde") {
