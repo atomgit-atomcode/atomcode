@@ -129,10 +129,18 @@ mod tests {
         }
     }
 
+    /// What the tool stores: `pathnorm::canonicalize`, which drops the Windows
+    /// `\\?\` verbatim prefix. `std::fs::canonicalize` keeps it, so building the
+    /// expectation straight from std compared two spellings of one path and made
+    /// every test here fail on Windows while passing on unix.
+    fn canonical(path: &Path) -> PathBuf {
+        crate::pathnorm::strip_verbatim_path(&std::fs::canonicalize(path).unwrap())
+    }
+
     #[tokio::test]
     async fn cd_into_subdir_updates_shared_handle() {
         let d = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(d.path()).unwrap();
+        let root = canonical(d.path());
         std::fs::create_dir(root.join("sub")).unwrap();
         let cwd = Arc::new(RwLock::new(root.clone()));
         let tool = ChangeDirTool::new(cwd.clone());
@@ -147,7 +155,7 @@ mod tests {
     #[tokio::test]
     async fn cd_absolute_path() {
         let d = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(d.path()).unwrap();
+        let root = canonical(d.path());
         let cwd = Arc::new(RwLock::new(PathBuf::from("/")));
         let tool = ChangeDirTool::new(cwd.clone());
         let r = tool
@@ -163,7 +171,7 @@ mod tests {
     #[tokio::test]
     async fn cd_relative_is_resolved_against_current_cwd() {
         let d = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(d.path()).unwrap();
+        let root = canonical(d.path());
         std::fs::create_dir_all(root.join("a/b")).unwrap();
         let cwd = Arc::new(RwLock::new(root.join("a")));
         let tool = ChangeDirTool::new(cwd.clone());
@@ -176,7 +184,7 @@ mod tests {
     #[tokio::test]
     async fn cd_missing_dir_errors_and_leaves_cwd() {
         let d = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(d.path()).unwrap();
+        let root = canonical(d.path());
         let cwd = Arc::new(RwLock::new(root.clone()));
         let tool = ChangeDirTool::new(cwd.clone());
         let r = tool.execute(r#"{"path":"nope"}"#, &ctx(&root)).await;
@@ -188,7 +196,7 @@ mod tests {
     #[tokio::test]
     async fn cd_to_a_file_errors() {
         let d = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(d.path()).unwrap();
+        let root = canonical(d.path());
         std::fs::write(root.join("f.txt"), "x").unwrap();
         let cwd = Arc::new(RwLock::new(root.clone()));
         let tool = ChangeDirTool::new(cwd.clone());

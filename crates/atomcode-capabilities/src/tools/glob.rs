@@ -282,7 +282,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     #[test]
-    fn split_absolute_base_handles_windows_and_unix_roots() {
+    fn split_absolute_base_handles_windows_roots() {
         // Windows drive, forward slashes.
         let (base, rest) = split_absolute_base("G:/VR2024/keystore/*").unwrap();
         assert_eq!(base, PathBuf::from("G:/VR2024/keystore"));
@@ -291,6 +291,17 @@ mod tests {
         let (base, rest) = split_absolute_base(r"G:\VR2024\**\*.jks").unwrap();
         assert_eq!(base, PathBuf::from(r"G:\VR2024"));
         assert_eq!(rest, "**/*.jks");
+    }
+
+    /// A bare leading `/` is a POSIX root: absolute on unix and on Android, but
+    /// not on Windows, where `Path::is_absolute` wants a drive or a UNC prefix
+    /// (a leading `/` there means "root of the current drive", a different
+    /// location than the one the pattern was written for). The tool keeps that
+    /// distinction, so this half of the contract is only assertable where the
+    /// spelling means what the pattern says.
+    #[cfg(unix)]
+    #[test]
+    fn split_absolute_base_handles_posix_roots() {
         // An absolute exact file path (no metachar) is a degenerate glob that resolves
         // to its own directory + literal name.
         let (base, rest) = split_absolute_base("/abs/dir/screenshare.jks").unwrap();
@@ -301,6 +312,10 @@ mod tests {
         let (base, rest) = split_absolute_base("/abs/dir/").unwrap();
         assert_eq!(base, PathBuf::from("/abs/dir"));
         assert_eq!(rest, "*");
+    }
+
+    #[test]
+    fn split_absolute_base_leaves_relative_patterns_alone() {
         // Relative patterns are left for base-relative matching.
         assert!(split_absolute_base("**/*.rs").is_none());
         assert!(split_absolute_base("src/**/*.ts").is_none());

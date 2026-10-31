@@ -1704,7 +1704,7 @@ mod tests {
             crate::tools::sensitive_path::test_guard(),
         );
         let tool = bash_tool();
-        let mut call = bash_call(&format!("rm {}", target.to_str().unwrap()));
+        let mut call = bash_call(&format!("rm '{}'", target.to_str().unwrap()));
         let out = gate.before(&mut call, &tool, &silent_rt()).await;
         assert!(
             out.is_deny(),
@@ -1727,8 +1727,9 @@ mod tests {
         let mut call = ToolCall {
             id: "1".into(),
             name: "bash_start".into(),
-            arguments: serde_json::json!({ "command": format!("rm {}", target.to_str().unwrap()) })
-                .to_string(),
+            arguments:
+                serde_json::json!({ "command": format!("rm '{}'", target.to_str().unwrap()) })
+                    .to_string(),
         };
         let out = gate.before(&mut call, &tool, &silent_rt()).await;
         assert!(
@@ -1755,7 +1756,7 @@ mod tests {
             crate::tools::sensitive_path::test_guard(),
         );
         let tool = bash_tool();
-        let mut call = bash_call(&format!("rm {}", secret.to_str().unwrap()));
+        let mut call = bash_call(&format!("rm '{}'", secret.to_str().unwrap()));
         let out = gate.before(&mut call, &tool, &silent_rt()).await;
         assert!(
             out.is_deny(),
@@ -1802,7 +1803,7 @@ mod tests {
         );
         let tool = bash_tool();
 
-        let mut s = bash_call(&format!("rm {}", sibling.to_str().unwrap()));
+        let mut s = bash_call(&format!("rm '{}'", sibling.to_str().unwrap()));
         assert!(
             matches!(
                 gate.before(&mut s, &tool, &silent_rt()).await,
@@ -1810,7 +1811,7 @@ mod tests {
             ),
             "a sibling delete in the granted folder must auto-approve"
         );
-        let mut o = bash_call(&format!("rm {}", other.to_str().unwrap()));
+        let mut o = bash_call(&format!("rm '{}'", other.to_str().unwrap()));
         assert!(
             gate.before(&mut o, &tool, &silent_rt()).await.is_deny(),
             "a delete in a different folder must still prompt"
@@ -1905,13 +1906,24 @@ mod tests {
     #[tokio::test]
     async fn mv_temp_to_temp_proceeds() {
         // No in-workspace source involved → the move doesn't touch the workspace → no prompt.
+        //
+        // The two ends are real directories outside the workspace, not the literal
+        // `/tmp/…` spelling: `/tmp` is absolute only on POSIX, so on Windows it
+        // resolved somewhere this assertion never meant to reason about (the gate
+        // answered Deny and the test read as a policy change).
         let ws = tempfile::tempdir().unwrap();
+        let outside_a = tempfile::tempdir().unwrap();
+        let outside_b = tempfile::tempdir().unwrap();
         let gate = BashWorkspaceGate::pinned(
             ws.path().to_path_buf(),
             crate::tools::sensitive_path::test_guard(),
         );
         let tool = bash_tool();
-        let mut call = bash_call("mv /tmp/atomcode-a /tmp/atomcode-b");
+        let mut call = bash_call(&format!(
+            "mv '{}' '{}'",
+            outside_a.path().join("a").display(),
+            outside_b.path().join("b").display()
+        ));
         assert_eq!(
             gate.before(&mut call, &tool, &silent_rt()).await,
             BeforeOutcome::Proceed
@@ -2087,7 +2099,13 @@ mod tests {
             crate::tools::sensitive_path::test_guard(),
         );
         let tool = bash_tool();
-        let mut call = bash_call(&format!("rm {}", secret.to_str().unwrap()));
+        // Single-quoted: outside quotes bash (and this gate's tokenizer, which
+        // mirrors it) treats `\` as an escape, so an unquoted Windows path such as
+        // `C:\Users\…\id_rsa` collapses into one word with the separators eaten —
+        // the basename stops matching the sensitive list, and the allow-all grant
+        // then reads as legitimate. Quoting is what a person typing this command
+        // does, and it keeps the path the path.
+        let mut call = bash_call(&format!("rm '{}'", secret.to_str().unwrap()));
         let out = gate.before(&mut call, &tool, &silent_rt()).await;
         assert!(
             out.is_deny(),
