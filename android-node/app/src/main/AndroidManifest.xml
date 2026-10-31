@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- A file holder, like com.atomcode.tools.zig and com.atomcode.tools.clang:
+         no activity, no service, no IPC.
+
+         The main app links `<data>/bin/node` at this package's
+         `nativeLibraryDir`. The npm tree and node's headers are NOT here — they are
+         the `node-lib` market package. -->
+    <application
+        android:allowBackup="false"
+        android:label="AtomCode Node" />
+
+</manifest>

@@ -1,0 +1,16 @@
+# node provider: the interpreter goes into the APK (it is executed), the parts
+# npm needs at runtime are read from the data package.
+#
+# `bin/node` is a real ET_EXEC. It cannot run from the app's data directory
+# (measured: exit 126), so it ships as `jniLibs/libnode.so` and the main app links
+# `<data>/bin/node` at it — the same shape as `com.atomcode.tools.zig`.
+#
+# `lib/node_modules/npm` is a JS tree driven by the interpreter; nothing in it is
+# executable by the kernel, so it belongs with the data. `npm` itself is invoked
+# as `node <prefix>/lib/node_modules/npm/bin/npm-cli.js` because a shebang script
+# could not be executed from the data directory either.
+exec bin/node node
+
+data include
+data lib/node_modules
+data etc
