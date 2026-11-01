@@ -1620,8 +1620,41 @@ getpid 5902
 - **ABI 模式下必须先 `ffi.cdef` 声明再访问**，否则 `libc.strlen` 抛
   `AttributeError`——这不是 cffi 坏了，是用法。
 
-`numpy` 是同类但重得多（要 meson/ninja 交叉构建整套 C 源），`lupa` 需要 Lua 头文件；
-这两者尚未做。
+`numpy` 是同类但重得多（要 meson/ninja 交叉构建整套 C 源）。
+
+#### lupa：自带 Lua 源码，一个翻译单元就够（真机验证 2026-11-02）
+
+`lupa` 走的是和 cffi 一样的交叉编译路线，但比 numpy 好办：它的 sdist **自带 Lua 源码**
+（`third-party/lua54/`）和**已生成好的 Cython C 文件**（`lupa/lua54.c`），所以既不用联网
+取 Lua，也不用 Cython——一个翻译单元加 Lua 核心一起编成 `lupa/lua54.so` 即可。33 个 Lua
+源文件清单直接解析它自己的 `Makefile`（`CORE_O`/`AUX_O`/`LIB_O`），不手抄。
+
+```sh
+bash scripts/build-android-lupa-wheel.sh <lupa-sdist.tar.gz>
+bash scripts/build-android-lupa-plugin.sh
+→ dist/lupa-2.8-cp312-cp312-linux_aarch64.whl  (250 KB)
+→ dist/lupa-2.8-arm64.tar.gz                   (244 KB，插件包)
+```
+
+真机验证（装成插件后由 agent 回合里的 bash 工具执行）：
+
+```
+lupa 2.8
+eval 3
+execute hi from lua
+call 42
+```
+
+**踩到的坑：漏 `-lm`，构建机发现不了。** 第一版链接时没写 `-lm`，构建机上照样编得过
+（宿主 glibc 把 libm 并进了 libc），到设备上就是：
+
+```
+ImportError: dlopen failed: cannot locate symbol "pow" referenced by …/lua54.cpython-312.so
+```
+
+`pow` 来自 Lua 的 `lmathlib.c`，只住在 libm 里，而 bionic 不像 glibc 那样合并。补上
+`-lm` 后 `DT_NEEDED` 里出现 `libm.so`，随即通过。教训：交叉编译的产物只核架构和符号
+不够，**必须真机 import 一次**——这类缺失符号在构建机上是隐形的。
 
 #### SQLite 与 Lua：把「编译期砍掉的能力」补回来
 

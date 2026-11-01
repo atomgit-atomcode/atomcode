@@ -87,10 +87,15 @@ echo "→ 编译 lupa/lua54 + $COUNT 个 Lua 源文件"
 
 # LUA_USE_POSIX 让 os.time/os.date 走 POSIX 实现；不定义 LUA_USE_LINUX，它会连带
 # 要求 readline（设备上没有）。
+#
+# `-lm` 不能省：Lua 的 `lmathlib.c` 用 `pow`，它只住在 libm 里。构建机上宿主把
+# libm 并进了 libc，所以漏掉这一行照样编得过；到了 bionic 上就是
+# `dlopen failed: cannot locate symbol "pow"`（真机上踩到过一次）。
 "$CC" -shared -fPIC -O2 -DLUA_USE_POSIX \
   -I"$PYINC" -I"$LUA" \
   -o lua54.cpython-312.so \
   lupa/lua54.c $(for f in $LUA_SRCS; do printf '%s/%s ' "$LUA" "$f"; done) \
+  -lm \
   -Wl,-soname,lua54.cpython-312.so
 
 echo "→ 组装 wheel"
