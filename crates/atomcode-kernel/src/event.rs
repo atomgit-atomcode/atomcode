@@ -570,6 +570,8 @@ pub enum AgentEvent {
     /// (symmetric to visible text via `on_text_delta`) — so a redaction reaches both
     /// the live channel and storage consistently.
     Reasoning(String),
+    /// Discard only the current request's unsigned reasoning preview.
+    ReasoningDiscarded,
     /// Non-fatal advisory (e.g. a truncated response). The turn still completes.
     Warning(String),
     /// A partial response timed out after replay-unsafe output had already been

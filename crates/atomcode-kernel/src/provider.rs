@@ -43,6 +43,9 @@ pub struct ChatOptions {
     pub max_tokens: Option<u32>,
     /// Sampling temperature for this call. `None` = no opinion (adapter default).
     pub temperature: Option<f32>,
+    /// Local stream policy; adapters must not send this to the model API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_loop_guard: Option<crate::reasoning_loop::ReasoningLoopConfig>,
     /// Whether/how the model must use tools this call. `Auto` (default) = no
     /// opinion — the model decides.
     pub tool_choice: ToolChoice,
@@ -260,6 +263,7 @@ mod tests {
             tool_choice: ToolChoice::Required,
             rate_limit_retry_owner: RateLimitRetryOwner::Provider,
             request_recovery: None,
+            reasoning_loop_guard: None,
         };
         let back: ChatOptions =
             serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();

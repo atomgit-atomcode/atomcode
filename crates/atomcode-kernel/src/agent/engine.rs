@@ -2230,6 +2230,7 @@ impl RunningAgent {
         // the budget is per-turn (mirrors v1's per-user-message `empty_response_retries`)
         // so a model that keeps returning empty across rounds can't spin forever.
         let mut empty_retries: u32 = 0;
+        let mut reasoning_loop_retried = false;
         // Whether the PRE-SEND over-window advisory has fired this turn. Gates it
         // to once per turn (robust to the empty-retry / provider-retry `round -= 1`
         // decrements that reset `round` to 1) AND tells the empty-exhaustion
@@ -2758,6 +2759,12 @@ impl RunningAgent {
             // Set to true by the mid-stream 429 WaitAndRetry arm so we can break
             // out of the inner stream loop and retry the round from the outer loop.
             let mut retry_this_round = false;
+            let mut reasoning_guard = crate::reasoning_loop::ReasoningLoopDetector::new(
+                request_options
+                    .reasoning_loop_guard
+                    .clone()
+                    .unwrap_or_default(),
+            );
             loop {
                 // MID-STREAM cancel checkpoint: cancellation stops stream
                 // consumption immediately. Carried from production runner.rs:420.
@@ -2936,6 +2943,63 @@ impl RunningAgent {
                         }
                     }
                     _ => {}
+                }
+                if reasoning_guard.observe(&ev) {
+                    // No answer, tool fragment or signed block has escaped.
+                    // Stop consuming before publishing the triggering chunk.
+                    self.rt.emit(AgentEvent::ReasoningDiscarded);
+                    if usage != TokenUsage::default() {
+                        self.rt.emit(AgentEvent::Usage(MessageMeta {
+                            tokens: usage,
+                            round,
+                            turn_id,
+                            request_id,
+                            ctx_window: self.provider.context_window(),
+                            used_tokens: usage.prompt,
+                            session_id: self.session_id.as_deref().map(str::to_string),
+                            ..Default::default()
+                        }));
+                    }
+                    if !reasoning_loop_retried {
+                        reasoning_loop_retried = true;
+                        if let Some(budget) = &request_options.request_recovery {
+                            if let Err(limit) = budget.try_attempt() {
+                                drop(stream);
+                                self.hooks.on_error(&limit.to_string()).await;
+                                self.rt.emit(AgentEvent::Error {
+                                    message: limit.to_string(),
+                                    http_status: None,
+                                    code: Some(crate::reasoning_loop::REASONING_LOOP_CODE.into()),
+                                    retryable: Some(false),
+                                    retry_after_secs: None,
+                                    ends_turn: true,
+                                });
+                                self.finish_turn(convo, StopReason::ProviderError, &turn_ctx)
+                                    .await;
+                                return;
+                            }
+                        }
+                        self.rt.emit(AgentEvent::Warning(
+                            crate::reasoning_loop::RETRY_NOTICE.into(),
+                        ));
+                        retry_this_round = true;
+                        break;
+                    }
+                    drop(stream);
+                    self.hooks
+                        .on_error(crate::reasoning_loop::STOP_NOTICE)
+                        .await;
+                    self.rt.emit(AgentEvent::Error {
+                        message: crate::reasoning_loop::STOP_NOTICE.into(),
+                        http_status: None,
+                        code: Some(crate::reasoning_loop::REASONING_LOOP_CODE.into()),
+                        retryable: Some(false),
+                        retry_after_secs: None,
+                        ends_turn: true,
+                    });
+                    self.finish_turn(convo, StopReason::ProviderError, &turn_ctx)
+                        .await;
+                    return;
                 }
                 match ev {
                     StreamEvent::TextDelta(mut t) => {
@@ -3237,6 +3301,7 @@ impl RunningAgent {
             // broke out. Re-issue the same logical round (round was already
             // incremented at the top of the outer loop, so decrement to neutralize).
             if retry_this_round {
+                drop(stream);
                 // A partial-output recovery is an explicit continuation and keeps
                 // its new round number. A content-free reconnect is a replay and
                 // neutralizes the round increment as before.

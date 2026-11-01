@@ -2365,7 +2365,13 @@ async fn configured_request_options_reach_the_provider_and_follow_a_model_switch
     start.agent.chat_options.temperature = Some(0.25);
     start.agent.chat_options.reasoning_effort =
         Some(atomcode_kernel::provider::ReasoningEffort::High);
+    start.agent.chat_options.reasoning_loop_guard =
+        Some(atomcode_kernel::reasoning_loop::ReasoningLoopConfig {
+            enabled: false,
+            ..Default::default()
+        });
     let mut next = start.agent.clone();
+    next.chat_options.reasoning_loop_guard = None;
     next.model = "recorder-two".into();
     next.chat_options.max_tokens = Some(99);
     next.chat_options.reasoning_effort = Some(atomcode_kernel::provider::ReasoningEffort::Low);
@@ -2373,6 +2379,10 @@ async fn configured_request_options_reach_the_provider_and_follow_a_model_switch
 
     turn(&mut runtime, "hello").await;
     let first = recorder.options.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(
+        first.reasoning_loop_guard.as_ref().map(|g| g.enabled),
+        Some(false)
+    );
     assert_eq!(first.max_tokens, Some(1234), "");
     assert_eq!(first.temperature, Some(0.25), "");
     assert_eq!(
@@ -2384,6 +2394,10 @@ async fn configured_request_options_reach_the_provider_and_follow_a_model_switch
     runtime.handle.reassemble_provider(next).await.unwrap();
     turn(&mut runtime, "again").await;
     let after = recorder.options.lock().unwrap().last().cloned().unwrap();
+    assert!(
+        after.reasoning_loop_guard.is_none(),
+        "model reload resets the local stream policy"
+    );
     assert_eq!(after.max_tokens, Some(99), "after /model");
     assert_eq!(
         after.reasoning_effort,

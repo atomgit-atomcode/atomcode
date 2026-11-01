@@ -688,6 +688,8 @@ struct RateLimitPatch<'a> {
 #[derive(serde::Serialize)]
 struct ChatOptionsPatch {
     #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_loop_guard: Option<atomcode_kernel::reasoning_loop::ReasoningLoopConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<atomcode_kernel::provider::ReasoningEffort>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
@@ -746,6 +748,7 @@ fn model_rows(cfg: &crate::CodingAgentConfig) -> Result<Layer, String> {
         .patch(
             "chat-options",
             ChatOptionsPatch {
+                reasoning_loop_guard: cfg.chat_options.reasoning_loop_guard.clone(),
                 reasoning_effort: cfg.chat_options.reasoning_effort,
                 max_tokens: cfg.chat_options.max_tokens,
                 // A non-finite temperature is dropped HERE, on purpose and where
@@ -3164,12 +3167,14 @@ struct ChatOptionsRow {
     max_tokens: Option<u32>,
     #[serde(default)]
     temperature: Option<f32>,
+    reasoning_loop_guard: Option<atomcode_kernel::reasoning_loop::ReasoningLoopConfig>,
 }
 
 struct ChatOptions {
     reasoning_effort: Option<atomcode_kernel::provider::ReasoningEffort>,
     max_tokens: Option<u32>,
     temperature: Option<f32>,
+    reasoning_loop_guard: Option<atomcode_kernel::reasoning_loop::ReasoningLoopConfig>,
 }
 
 #[async_trait]
@@ -3189,6 +3194,9 @@ impl atomcode_plexus::Waterfall<atomcode_harness::events::AgentRequest> for Chat
         }
         if options.temperature.is_none() {
             options.temperature = self.temperature;
+        }
+        if options.reasoning_loop_guard.is_none() {
+            options.reasoning_loop_guard = self.reasoning_loop_guard.clone();
         }
         next.run(req).await
     }
@@ -3214,6 +3222,7 @@ impl Plugin for ChatOptionsPlugin {
             ),
             max_tokens: row.max_tokens,
             temperature: row.temperature,
+            reasoning_loop_guard: row.reasoning_loop_guard,
         };
         // Said the way it is applied: for every agent, unless something more
         // specific — a member's role — already said otherwise.
@@ -3229,6 +3238,7 @@ impl Plugin for ChatOptionsPlugin {
         if options.reasoning_effort.is_none()
             && options.max_tokens.is_none()
             && options.temperature.is_none()
+            && options.reasoning_loop_guard.is_none()
         {
             return Ok(());
         }

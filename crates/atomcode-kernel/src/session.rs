@@ -171,6 +171,11 @@ pub enum SessionEvent {
         delta: String,
         reasoning: bool,
     },
+    /// Transient UI boundary, never written to a session file.
+    ReasoningDiscarded {
+        turn: u64,
+        round: u32,
+    },
     AssistantMessage {
         turn: u64,
         round: u32,
@@ -446,6 +451,14 @@ pub enum SessionEvent {
 }
 
 impl SessionEvent {
+    /// Live presentation only; neither chunks nor discarded previews are durable facts.
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            Self::AssistantChunk { .. } | Self::ReasoningDiscarded { .. }
+        )
+    }
+
     pub fn turn(&self) -> u64 {
         match self {
             Self::TurnStart { turn }
@@ -454,6 +467,7 @@ impl SessionEvent {
             | Self::StepEnd { turn, .. }
             | Self::RequestHeader { turn, .. }
             | Self::AssistantChunk { turn, .. }
+            | Self::ReasoningDiscarded { turn, .. }
             | Self::AssistantMessage { turn, .. }
             | Self::PartialReply { turn, .. }
             | Self::Stopped { turn }

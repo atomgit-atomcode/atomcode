@@ -199,6 +199,7 @@ impl Projector {
         event: &SessionEvent,
     ) -> Vec<AgentEvent> {
         match event {
+            SessionEvent::ReasoningDiscarded { .. } => vec![AgentEvent::ReasoningDiscarded],
             SessionEvent::TurnStart { turn } => {
                 self.terminal_error = None;
                 self.stepped_this_turn = false;

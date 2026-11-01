@@ -20,6 +20,7 @@ pub mod hook;
 pub mod message;
 pub mod middleware;
 pub mod provider;
+pub mod reasoning_loop;
 pub mod request;
 pub mod session;
 pub mod stream;

@@ -352,6 +352,15 @@ impl Producer for Transcript {
             // Chunks accumulate into one live block rather than one block per
             // token: the model said one thing, and the transcript should show
             // one thing being said.
+            SessionEvent::ReasoningDiscarded { .. } => {
+                if let Some((id, _)) = open.thought.take() {
+                    out.amend(
+                        id,
+                        Arc::new(ModelThought("[推理复读，此次推理已丢弃]".into())),
+                    );
+                    out.settle(id);
+                }
+            }
             SessionEvent::AssistantChunk {
                 delta,
                 reasoning,
@@ -2154,5 +2163,27 @@ mod tests {
             !p.is_hidden("injected:peer"),
             "a teammate's report is not the environment talking to itself"
         );
+    }
+    #[test]
+    fn discarded_reasoning_is_marked_and_not_combined_with_the_retry() {
+        let stream = fold(&[
+            SessionEvent::AssistantChunk {
+                turn: 1,
+                round: 1,
+                delta: "bad repeated prefix".into(),
+                reasoning: true,
+            },
+            SessionEvent::ReasoningDiscarded { turn: 1, round: 1 },
+            SessionEvent::AssistantChunk {
+                turn: 1,
+                round: 1,
+                delta: "fresh reasoning".into(),
+                reasoning: true,
+            },
+        ]);
+        let shown = said(&stream);
+        assert!(!shown.contains("bad repeated prefix"));
+        assert!(shown.contains("已丢弃"));
+        assert!(shown.contains("fresh reasoning"));
     }
 }
