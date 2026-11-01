@@ -57,6 +57,13 @@
         <!-- pkg-config: a `configure` script or CMake find_package looks it up by
              name; same carrier as the rest. -->
         <package android:name="com.atomcode.tools.pkgconf" />
+        <!-- A real bash: the platform shell is toybox, and repo scripts say
+             `#!/bin/bash`. Same carrier as the rest. -->
+        <package android:name="com.atomcode.tools.bash" />
+        <!-- rsync: resumable transfers on a flaky phone link. -->
+        <package android:name="com.atomcode.tools.rsync" />
+        <!-- The OpenSSH client (ssh/scp/sftp/ssh-keygen): client only. -->
+        <package android:name="com.atomcode.tools.openssh" />
         <!--
           The attachment picker offers "take a photo" next to "pick a file", and the
           output URI must be granted to whichever camera app answers. Since Android 11

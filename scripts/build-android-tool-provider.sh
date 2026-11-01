@@ -85,9 +85,11 @@ if [ -d "$data" ] && [ -n "$(ls -A "$data" 2>/dev/null)" ]; then
   # The data half is a market package of its own — the versioned `.so` files Gradle
   # refuses to package and the read-only trees (GOROOT, cmake modules) live here.
   # Its version comes from the deb that carries the primary package.
-  deb=$(ls "$CACHE/$name/debs/$primary"*.deb 2>/dev/null | head -1 || true)
-  version=$(ar p "$deb" control.tar.xz 2>/dev/null |
-    tar -xJO ./control 2>/dev/null | awk -F': *' '/^Version:/{print $2}' | head -1 || true)
+  # From the fetch index, not from the deb: `ar p` writes the member through a
+  # pipe that mangles binary on this host ("Compressed data is corrupt"), so the
+  # filename in the index is the reliable source. `bash_5.3.20_aarch64.deb` →
+  # `5.3.20`; an epoch/`-1` suffix stays part of the version string.
+  version=$(awk -F'	' -v p="$primary" '$1 == p { print $2; exit }'       "$CACHE/$name/index/db.tsv" 2>/dev/null | sed -e 's#.*/##' -e 's/_aarch64\.deb$//' -e 's/.*_//' || true)
   version=${version:-0.0.0}
   bash scripts/build-android-data-package.sh "$name-data" "$version" "$data" "$name"
 fi

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- A file holder, like com.atomcode.tools.ninja: no activity, no service,
+         no IPC. The app links `<product>/bin/{ssh,scp,sftp,ssh-keygen}` at this
+         package's `nativeLibraryDir`; the libraries travel as `openssh-data`.
+
+         Client only: no `sshd`, no service, nothing listening. -->
+    <application
+        android:allowBackup="false"
+        android:label="AtomCode OpenSSH" />
+
+</manifest>

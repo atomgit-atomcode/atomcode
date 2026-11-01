@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- A file holder, like com.atomcode.tools.ninja: no activity, no service,
+         no IPC. The app links `<product>/bin/bash` at this package's
+         `nativeLibraryDir`; bash's libraries (readline) travel as the `bash-data`
+         market package because their names carry versions Gradle will not package. -->
+    <application
+        android:allowBackup="false"
+        android:label="AtomCode bash" />
+
+</manifest>

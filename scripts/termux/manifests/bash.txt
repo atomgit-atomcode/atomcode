@@ -1,0 +1,9 @@
+# bash provider: one executable, its libraries in the data package.
+#
+# Android ships toybox's `sh`, which is enough for the agent's own `bash` tool but
+# not for the scripts people write: `[[ ]]`, arrays, `set -o pipefail` and `source`
+# are all bash-only, and a repo's `#!/bin/bash` script currently fails at the
+# shebang. Termux's bash is a bionic build; `readline` comes in as a versioned
+# soname (`libreadline.so.8`), which Gradle will not package — it lands in the data
+# package's `libs/`, which the host puts on LD_LIBRARY_PATH.
+exec bin/bash bash

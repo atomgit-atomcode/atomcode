@@ -1,0 +1,15 @@
+# openssh provider: the client half (ssh, scp, sftp, ssh-keygen).
+#
+# On a phone this is how a repository gets to a machine that is not on a Git host:
+# `ssh` to a build box, `scp`/`sftp` a directory back. Only the client is here — a
+# daemon has no business running on a phone, and `sshd` would need root anyway.
+#
+# The binaries are bionic builds from Termux. `termux-auth` is in their dependency
+# chain, which is Termux's own package: if it turns out to be required at runtime,
+# the loader error names exactly what is missing, and that is what the data
+# package's `libs/` is for.
+exec bin/ssh ssh
+exec bin/scp scp
+exec bin/sftp sftp
+exec bin/ssh-keygen ssh-keygen
+exec bin/ssh-add ssh-add

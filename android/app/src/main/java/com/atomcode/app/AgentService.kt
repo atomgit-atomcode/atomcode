@@ -686,6 +686,9 @@ class AgentService : Service() {
             "com.atomcode.tools.cmake",
             "com.atomcode.tools.go",
             "com.atomcode.tools.pkgconf",
+            "com.atomcode.tools.bash",
+            "com.atomcode.tools.rsync",
+            "com.atomcode.tools.openssh",
         )
         /**
          * 空闲时多久问一次 daemon。

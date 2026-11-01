@@ -86,6 +86,9 @@ rc=126
 | **cmake 4.4.5** | **A**：独立 APK `com.atomcode.tools.cmake`（`libcmake.so`/`libctest.so`/`libcpack.so`），模块是数据包 `cmake-data` | **✓ 已实现并实测**（2026-11-01）：`cmake --version` → `4.4.5`；`cmake -S … -B … -DCMAKE_C_COMPILER=clang` → `Configuring done`，`cmake --build` → `Built target hello`（7064 字节），见下方「六个坑」 |
 | **ninja 1.13.2** | **A**：独立 APK `com.atomcode.tools.ninja`（`libninja.so`，648 KB） | **✓ 已实现并实测**：`ninja --version` → `1.13.2` |
 | **pkg-config 0.29.2** | **A**：独立 APK `com.atomcode.tools.pkgconf`（`libpkg-config.so`），版本化依赖（`libglib-2.0.so.0`）走数据包 `pkgconf-data` | **✓ 已实现并实测**（2026-11-01）：`pkg-config --version` → `0.29.2`，`PKG_CONFIG_PATH` 下 `--modversion` / `--libs` 都对 |
+| **bash 5.3.20** | **A**：独立 APK `com.atomcode.tools.bash`（`libbash.so`），`readline` 等版本化库走数据包 `bash-data` | **✓ 已实现并实测**（2026-11-01）：`bash --version` → `5.3.20(1)-release`；`#!/bin/bash` + `set -o pipefail` 的脚本跑通——平台自带的 `/system/bin/sh` 是 toybox，跑不了这些 |
+| **rsync 3.5.1** | **A**：独立 APK `com.atomcode.tools.rsync`（`librsync.so`），`libpopt`/`libxxhash`/`libidn2` 等走 `rsync-data` | **✓ 已实现并实测**：`rsync --version` → `3.5.1`，`rsync -a src/ dst/` 同步成功。手机网络抖，`rsync --partial` 比 `git clone` 从头再来实在 |
+| **OpenSSH 10.6p1** | **A**：独立 APK `com.atomcode.tools.openssh`（`libssh.so`/`libscp.so`/`libsftp.so`/`libssh-keygen.so`/`libssh-add.so`），库走 `openssh-data`；**只有客户端，不含 sshd** | **✓ 已实现并实测**：`ssh -V` → `OpenSSH_10.6p1, OpenSSL 3.6.5`；`ssh-keygen -t ed25519` 生成密钥、`sftp` 可用。`termux-auth` 依赖没有在运行时发作 |
 | **node 24 LTS** | **A**：独立 APK `com.atomcode.tools.node`（Termux `nodejs-lts` 24.22.1，`libnode.so` 45 MB）；npm 树与头文件是市场包 `node-lib`，npm 用 `node <prefix>/lib/node_modules/npm/bin/npm-cli.js` 调（数据目录里的 shebang 脚本不可执行） | **✓ 已实现并实测**（2026-11-01，APK 37 MB + 22 MB 数据包）：`node --version` → `v26.12.1`，`node -e` 求值正常，`child_process.execSync` 也正常（补丁把 Termux 的 `$PREFIX/bin/sh` 换成 `/bin/sh`）。取代 `nodejs-mobile` 18 插件：它是最后能用的 libnode 版本（GitHub 不可达，npm 上仍指 18.20.4）。注意 deb 的 control 写 `24.22.1`，二进制实际报 `v26.12.1`——版本号以运行结果为准 |
 | **clang 21 + lld 21** | **A**：独立 APK `com.atomcode.tools.clang`（Termux LLVM 21.1.8）；头文件、sysroot、resource dir 是市场包 `clang-sysroot`；`clang` 是启动器（`scripts/termux/launcher/clang.c`），注入 `-resource-dir`/`--sysroot` 后 exec 真 driver | **✓ 已实现并实测**（2026-11-01，APK 72 MB + 30 MB 数据包）：`clang --version` → `21.1.8`，能编译、能链接（`clang main.c -o hello` → 6040 字节），cgo 的 `-buildmode=c-shared` 也通。NDK 的 clang 是宿主二进制，不能上设备；产物由 `scripts/build-android-clang-provider.sh` 从 Termux 包生成 |
 
@@ -179,6 +182,9 @@ XML / Kotlin 源文件比对，少改一处就红（加 provider 时会先撞到
 
 ## 四、已知边界（不是缺陷，但要知道）
 
+- **`adb install` 的流式安装会挂**：本机上有几个 provider APK（rsync、openssh）用默认的
+  `adb install` 会卡在 `Performing Streamed Install` 直到超时，换成
+  `adb install --no-streaming -r <apk>` 立刻成功。装不上时先换这个，不要去怀疑包本身。
 - **产物点击的"没有查看器"提示在真机上基本不可达**：`MainActivity.viewerMimeType` 在
   resolver 与扩展名都认不出时回落到 `*/*`，而设备上总有应用声明 `*/*`（文本编辑器、
   文件管理器），于是永远弹「打开方式」而不是兜底 toast。这个取舍是有意的——`.patch`

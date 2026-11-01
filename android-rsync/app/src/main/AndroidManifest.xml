@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- A file holder, like com.atomcode.tools.ninja: no activity, no service,
+         no IPC. The app links `<product>/bin/rsync` at this package's
+         `nativeLibraryDir`; rsync's libraries travel as the `rsync-data` market
+         package. -->
+    <application
+        android:allowBackup="false"
+        android:label="AtomCode rsync" />
+
+</manifest>

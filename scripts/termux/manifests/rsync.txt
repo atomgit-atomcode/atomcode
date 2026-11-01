@@ -1,0 +1,8 @@
+# rsync provider: one executable, its libraries in the data package.
+#
+# On a phone rsync is how a repository actually moves: `git clone` restarts from
+# scratch on a flaky link, while `rsync --partial` picks up where it stopped. The
+# binary is a bionic build from Termux; its libraries (libpopt, libxxhash, liblz4,
+# libidn2, openssl…) carry versioned sonames Gradle will not package, so they land
+# in the data package's `libs/`.
+exec bin/rsync rsync

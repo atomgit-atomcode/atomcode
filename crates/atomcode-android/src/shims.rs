@@ -186,6 +186,19 @@ pub const PROVIDER_TOOLS: &[(&str, &str)] = &[
     ("go", "libgo.so"),
     // `configure` scripts and CMake's find_package look this up by name.
     ("pkg-config", "libpkg-config.so"),
+    // A real bash: `#!/bin/bash` scripts and `[[ ]]`/arrays are bash-only, and the
+    // platform's `/system/bin/sh` is toybox.
+    ("bash", "libbash.so"),
+    // rsync: `git clone` restarts from zero on a flaky link; `rsync --partial` does
+    // not. The binary is the only thing here — its libraries are data.
+    ("rsync", "librsync.so"),
+    // The OpenSSH client: how a repository reaches a machine that is not a Git host.
+    // Client only — no daemon, nothing listening.
+    ("ssh", "libssh.so"),
+    ("scp", "libscp.so"),
+    ("sftp", "libsftp.so"),
+    ("ssh-keygen", "libssh-keygen.so"),
+    ("ssh-add", "libssh-add.so"),
 ];
 
 /// The tools Go's driver execs from `$GOROOT/pkg/tool/android_arm64/`.
