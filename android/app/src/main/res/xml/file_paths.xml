@@ -21,4 +21,24 @@
     <cache-path
         name="captures"
         path="captures/" />
+    <!--
+      Files the agent produced, handed to whatever app can view them.
+
+      The artifact chips in the webui call this app to open a path, and the only
+      way to hand a file to another app since Android 7 is a `content://` URI this
+      app vouches for — a `file://` one raises `FileUriExposedException`. The
+      agent works in shared storage (`/storage/emulated/0/AtomCode`), so that whole
+      tree is vouchable, and so are the product directory and the shared-file
+      cache; nothing else is. Each URI is granted one viewer, read-only, for one
+      launch — the paths here only decide what this app *can* vouch for.
+    -->
+    <external-path
+        name="workspace"
+        path="." />
+    <files-path
+        name="product"
+        path="atomcode/" />
+    <cache-path
+        name="shares"
+        path="shares/" />
 </paths>

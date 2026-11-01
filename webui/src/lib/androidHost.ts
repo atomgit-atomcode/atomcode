@@ -19,11 +19,90 @@ interface HostBridge {
   stopExternalDaemon?(): void;
   sessionsPrivate?(): boolean;
   setSessionsPrivate?(appPrivate: boolean): void;
+  /** Whether the linked native library can sign AtomGit gateway requests. */
+  gatewaySigning?(): boolean;
+  /** Files/text shared in from another app as JSON; draining on read. */
+  takeShares?(): string;
+  /** Open an absolute path with the phone's own viewer; false if it cannot. */
+  openPath?(path: string): boolean;
+}
+
+/** What another app sent us: real paths plus any text that came with them. */
+export interface SharedContent {
+  /** Absolute paths under the app's cache — real files a tool can open. */
+  paths: string[];
+  /** `EXTRA_TEXT` from the share, or an empty string. */
+  text: string;
 }
 
 declare global {
   interface Window {
     AtomCodeHost?: HostBridge;
+  }
+}
+
+/**
+ * Whether this build can sign requests for the AtomGit gateway.
+ *
+ * `null` means "not the Android app", so the page shows nothing: a desktop build
+ * with the public stub has the same limitation, but it is a build-time choice the
+ * CLI reports in its own way, not something a phone-only banner should claim.
+ *
+ * `false` is the case this exists for — the app was built without the official
+ * `codingplan-crypto` overlay, so the gateway answers every turn with
+ * `ATOMCODE_SIG_MISSING` (403). Without a banner the person reads that as a
+ * provider outage and retries a turn that can never succeed.
+ */
+export function gatewaySigningAvailable(): boolean | null {
+  const bridge = host();
+  if (!bridge?.gatewaySigning) return null;
+  try {
+    return bridge.gatewaySigning() === true;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * What another app shared into this one, or null outside the Android host.
+ *
+ * Draining on read: the host clears its queue, so calling this twice does not
+ * insert the same file twice. The page calls it on mount (a share can be what
+ * launched the app) and on the host's `atomcode:share` event.
+ */
+export function takeShares(): SharedContent | null {
+  const bridge = host();
+  if (!bridge?.takeShares) return null;
+  try {
+    const parsed: unknown = JSON.parse(bridge.takeShares());
+    if (typeof parsed !== 'object' || parsed === null) return null;
+    const record = parsed as { paths?: unknown; text?: unknown };
+    const paths = Array.isArray(record.paths)
+      ? record.paths.filter((value): value is string => typeof value === 'string')
+      : [];
+    const text = typeof record.text === 'string' ? record.text : '';
+    return { paths, text };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Open a file the agent produced with the phone's own viewer.
+ *
+ * `false` means "this page is not the Android app" — the caller then asks the
+ * daemon, which opens the file on the host that actually has a desktop. On
+ * Android that call cannot work (a sandboxed process has no opener, and the
+ * Intent belongs to the app shell), so `/fs/open` answers with the path; that is
+ * why the chip prefers this and only falls back when there is no bridge.
+ */
+export function openWithHost(path: string): boolean {
+  const bridge = host();
+  if (!bridge?.openPath) return false;
+  try {
+    return bridge.openPath(path) === true;
+  } catch {
+    return false;
   }
 }
 

@@ -13,6 +13,7 @@ import './index.css';
 
 import { AuthRequired } from './components/AuthRequired';
 import { CompatNotice } from './components/CompatNotice';
+import { GatewayNotice } from './components/GatewayNotice';
 import { signedIn, probeWebuiAccess } from './lib/compat';
 import { createAccessRecovery } from './lib/accessRecovery';
 import { getToken } from './api';
@@ -84,10 +85,48 @@ if ('serviceWorker' in navigator && window.isSecureContext) {
   });
 }
 
+/**
+ * The bars across the top, and the space they take.
+ *
+ * They are `position: fixed` so they survive every page state, which also means
+ * the app shell below does not know they are there: without this the stack covers
+ * the floating menu button and nobody can reach the session list while a banner is
+ * showing. The measured height goes into `--notice-height`, which `.app` reserves
+ * in its own padding — the safe-area part is subtracted first, because `.app`
+ * already reserves that.
+ */
+function NoticeStack() {
+  const ref = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const apply = () => {
+      const safeArea = Number.parseFloat(getComputedStyle(el).paddingTop) || 0;
+      const height = Math.max(0, el.getBoundingClientRect().height - safeArea);
+      document.documentElement.style.setProperty('--notice-height', `${height}px`);
+    };
+    apply();
+    const observer = new ResizeObserver(apply);
+    observer.observe(el);
+    return () => {
+      observer.disconnect();
+      document.documentElement.style.setProperty('--notice-height', '0px');
+    };
+  }, []);
+  return (
+    <div class="notice-stack" ref={ref}>
+      {/* Both can be true at once (an old WebView *and* an unsigned build); they
+          stack in flow so neither draws on top of the other. */}
+      <CompatNotice />
+      <GatewayNotice />
+    </div>
+  );
+}
+
 void signedIn(apiFetch, getToken()).then((ok) => {
   render(
     <SettingsProvider>
-      <CompatNotice />
+      <NoticeStack />
       <Root signedIn={ok} />
     </SettingsProvider>,
     document.getElementById('app')!,

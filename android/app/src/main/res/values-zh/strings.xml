@@ -21,6 +21,8 @@
     <string name="notification_result_failed">失败（%1$s）</string>
     <string name="notification_result_cancelled">已停止</string>
     <string name="notification_session_unknown">未命名会话</string>
+    <!-- 通知上的操作按钮，只在有回合在跑时出现。 -->
+    <string name="notification_action_stop">停止</string>
     <string name="attach_choose">添加：拍照或选文件</string>
     <string name="notification_starting">正在启动智能体……</string>
     <string name="starting">正在启动智能体……</string>
@@ -39,6 +41,7 @@
     <string name="storage_message">AtomCode 需要访问共享存储，智能体才能按路径打开你的仓库 —— Git、shell 命令和语言服务器无法使用 Android 文档选择器提供的 URI。不授予的话，智能体只能使用它的私有目录。</string>
     <string name="storage_grant">授予访问</string>
     <string name="no_browser">本机没有能打开该链接的应用。</string>
+    <string name="no_viewer">本机没有能打开 %1$s 的应用。</string>
     <string name="helper_installed">辅助程序已安装。正在重启，随后 make / tcc / zig 可用。</string>
     <string name="external_start_unseen">守护进程已启动但未被发现，请重新打开应用再试。</string>
     <string name="sessions_private_on">会话记录已改为应用私有。重新打开应用后生效。</string>

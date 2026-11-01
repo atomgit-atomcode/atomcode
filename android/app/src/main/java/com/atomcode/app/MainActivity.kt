@@ -13,9 +13,12 @@ import android.os.PowerManager
 import android.os.Environment
 import android.os.IBinder
 import android.provider.MediaStore
+import android.provider.OpenableColumns
 import android.provider.Settings
 import android.util.Log
 import java.io.File
+import org.json.JSONArray
+import org.json.JSONObject
 import android.view.ViewGroup
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
@@ -61,6 +64,16 @@ class MainActivity : ComponentActivity() {
     /** Whether all-files access was already granted when this screen opened. */
     private var storageGrantedAtStart = false
     private var askedForStorage = false
+    /**
+     * Files another app shared into this one, waiting for the page to collect them.
+     *
+     * A queue rather than a direct call: a share can launch the process, and the
+     * WebView is not loaded yet at that point. `MainActivity.HostBridge.takeShares`
+     * drains it.
+     */
+    private val pendingShares = java.util.concurrent.CopyOnWriteArrayList<String>()
+    /** Text another app shared (`EXTRA_TEXT`), drained with the files. */
+    @Volatile private var pendingShareText: String? = null
 
     /**
      * One-shot request to be excluded from Doze.
@@ -132,6 +145,14 @@ class MainActivity : ComponentActivity() {
         // supported outcome, not an error — the runtime notifies the service over
         // JNI on every turn boundary, so the wake lock still follows the work.
         requestBatteryExemptionOnce()
+
+        // A build without the official request-signing overlay cannot pass the
+        // AtomGit gateway: it answers every turn with `ATOMCODE_SIG_MISSING` (403).
+        // The page shows a banner for this; log it too, because the first thing a
+        // person does with a build that "just fails" is read logcat.
+        if (!NativeAgent.nativeGatewaySigningAvailable()) {
+            Log.w(TAG, "this build cannot sign AtomGit gateway requests (codingplan-crypto overlay absent)")
+        }
 
         // Debug builds only: lets `adb forward` + chrome://inspect drive the page
         // for on-device UI verification. Release builds keep devtools off.
@@ -241,6 +262,143 @@ class MainActivity : ComponentActivity() {
         bindService(Intent(this, AgentService::class.java), connection, Context.BIND_AUTO_CREATE)
         storageGrantedAtStart = Environment.isExternalStorageManager()
         maybeAttachExternal()
+        // A share can be what launched us. The page drains the queue when it
+        // mounts, so all that happens here is copying the bytes.
+        if (savedInstanceState == null) ingestShareIntent(intent)
+    }
+
+    /**
+     * A share that arrives while the app is already open (`singleTask`).
+     *
+     * `onCreate` only sees the launch intent, so this is the other half: copy the
+     * content, then tell the page. The page cannot discover a new share by itself,
+     * and an injected event is the only channel that reaches it without a reload.
+     */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        ingestShareIntent(intent)
+        nudgeWebForShares()
+    }
+
+    /**
+     * Take the files or text another app shared into this one.
+     *
+     * The intent carries `content://` URIs, which no `bash`, `git` or language
+     * server can open — the same reason this app asks for all-files access. So the
+     * bytes are copied into our own cache first and the page receives real paths,
+     * which is exactly what the built-in file picker produces. Images take the
+     * same route: a path the model can `read_file`, rather than a second upload
+     * channel.
+     */
+    private fun ingestShareIntent(intent: Intent?) {
+        if (intent == null) return
+        val action = intent.action
+        if (action != Intent.ACTION_SEND && action != Intent.ACTION_SEND_MULTIPLE) return
+        intent.getStringExtra(Intent.EXTRA_TEXT)?.trim()?.takeIf { it.isNotEmpty() }?.let {
+            pendingShareText = it
+        }
+        val uris = when (action) {
+            Intent.ACTION_SEND -> listOfNotNull(shareStream(intent))
+            else -> shareStreams(intent)
+        }
+        if (uris.isEmpty()) return
+        val dir = File(cacheDir, SHARES_DIR).apply { mkdirs() }
+        pruneStaleShares(dir)
+        for (uri in uris) {
+            val target = File(dir, "${System.currentTimeMillis()}-${shareName(uri)}")
+            try {
+                val input = contentResolver.openInputStream(uri) ?: continue
+                input.use { source -> target.outputStream().use { source.copyTo(it) } }
+                pendingShares.add(target.absolutePath)
+                Log.i(TAG, "accepted a shared file: ${target.name}")
+            } catch (failure: Exception) {
+                Log.w(TAG, "could not copy a shared file", failure)
+                target.delete()
+            }
+        }
+    }
+
+    /** The single stream of an `ACTION_SEND`, or null when it carries none. */
+    @Suppress("DEPRECATION")
+    private fun shareStream(intent: Intent): Uri? = intent.getParcelableExtra(Intent.EXTRA_STREAM)
+
+    /** The streams of an `ACTION_SEND_MULTIPLE`. */
+    @Suppress("DEPRECATION")
+    private fun shareStreams(intent: Intent): List<Uri> =
+        intent.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM) ?: emptyList()
+
+    /**
+     * A display name that is safe to create inside the cache directory.
+     *
+     * The name comes from another app, so it must not be able to point outside the
+     * directory (`..`, separators, a leading dot): only a conservative character
+     * set survives, and a nameless URI falls back to something that still works.
+     */
+    private fun shareName(uri: Uri): String {
+        val raw = try {
+            contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+                ?.use { cursor -> if (cursor.moveToFirst()) cursor.getString(0) else null }
+        } catch (failure: Exception) {
+            Log.w(TAG, "could not read the shared file's name", failure)
+            null
+        } ?: uri.lastPathSegment
+        return File(raw ?: "shared").name
+            .replace(Regex("[^A-Za-z0-9._-]"), "_")
+            .ifEmpty { "shared" }
+    }
+
+    /** Drop shares nobody collected, so a cache full of them cannot grow forever. */
+    private fun pruneStaleShares(dir: File) {
+        val cutoff = System.currentTimeMillis() - STALE_SHARE_MS
+        dir.listFiles()?.forEach { file ->
+            if (file.lastModified() < cutoff) file.delete()
+        }
+    }
+
+    /**
+     * Tell the page a share arrived. Harmless before it has loaded: the queue is
+     * drained on mount, so nothing is lost by the event going nowhere.
+     */
+    private fun nudgeWebForShares() {
+        runOnUiThread {
+            if (!this::web.isInitialized || loadedUrl == null) return@runOnUiThread
+            web.evaluateJavascript("window.dispatchEvent(new Event('atomcode:share'))", null)
+        }
+    }
+
+    /** Send the viewer intent, and say so when the phone has nothing that takes it. */
+    private fun launchViewer(file: File, intent: Intent) {
+        try {
+            startActivity(intent)
+        } catch (missing: android.content.ActivityNotFoundException) {
+            // A `.rs`, `.toml` or `.patch` file on a phone with no editor installed
+            // is the common case. Naming the file is more useful than a stack trace
+            // in logcat, and this is a person-visible action.
+            Log.i(TAG, "no app can open ${file.name}", missing)
+            toast(getString(R.string.no_viewer, file.name))
+        } catch (failure: Exception) {
+            Log.w(TAG, "could not hand ${file.name} to a viewer", failure)
+            toast(getString(R.string.no_viewer, file.name))
+        }
+    }
+
+    /**
+     * What to tell the viewer the bytes are.
+     *
+     * The resolver knows the extension mapping already; the explicit fallback
+     * matters for names it does not (`SKILL.md`, `.patch`), where the catch-all
+     * type at least offers every app instead of failing the intent.
+     */
+    private fun viewerMimeType(file: File, uri: Uri): String {
+        val fromResolver = try {
+            contentResolver.getType(uri)
+        } catch (failure: Exception) {
+            null
+        }
+        if (!fromResolver.isNullOrEmpty()) return fromResolver
+        return android.webkit.MimeTypeMap.getSingleton()
+            .getMimeTypeFromExtension(file.extension.lowercase()) ?: "*/*"
     }
 
     override fun onResume() {
@@ -275,6 +433,13 @@ class MainActivity : ComponentActivity() {
             if (!ExternalDaemon.isAlive(endpoint.port)) {
                 useInProcess(getString(R.string.external_lost))
             }
+        }
+        // 服务可能已经不在了（系统回收、被省电策略收掉、或它自己停掉自己）：通知、
+        // 唤醒锁与忙闲统计全都停了，页面却还开着。回到前台是重起的自然时机——
+        // `start` 幂等，已经在跑时只是再走一次 onStartCommand，不会起第二个运行时。
+        if (!bound) {
+            AgentService.start(this)
+            bindService(Intent(this, AgentService::class.java), connection, Context.BIND_AUTO_CREATE)
         }
         binder?.url()?.let { current -> load(current) }
     }
@@ -388,6 +553,74 @@ class MainActivity : ComponentActivity() {
          * Synchronous on purpose: it is a single file existence check, so the
          * page can render the toggle state without a round trip.
          */
+        /**
+         * What another app shared into this one, then forgets it.
+         *
+         * Returns `{"paths":[…],"text":"…"}`. Draining on read is deliberate: the
+         * page calls this both when it mounts (the app may have been launched BY
+         * the share) and on the `atomcode:share` event (the app was already open),
+         * and a share must be inserted once, not every time the page mounts.
+         */
+        @android.webkit.JavascriptInterface
+        fun takeShares(): String {
+            val paths = pendingShares.toList()
+            pendingShares.clear()
+            val text = pendingShareText.orEmpty()
+            pendingShareText = null
+            return JSONObject().put("paths", JSONArray(paths)).put("text", text).toString()
+        }
+
+        /**
+         * Open a file the agent produced, with whatever app the phone has for it.
+         *
+         * The daemon cannot do this, by design: a sandboxed app process has no
+         * `xdg-open`, and handing a path to another app needs an Intent, which only
+         * this shell can send. `/fs/open` therefore answers "open the path from the
+         * app UI" — the artifact chip is that UI, and without this method the chip
+         * could only ever show that refusal.
+         *
+         * The decision is synchronous so the page knows whether to fall back: a path
+         * this app cannot vouch for (`FileProvider` raises) returns `false`, and the
+         * daemon's message — which names the path — is the better answer then. The
+         * launch itself is posted to the main thread, where a missing viewer is
+         * reported as a toast instead of a crash.
+         */
+        @android.webkit.JavascriptInterface
+        fun openPath(path: String): Boolean {
+            val file = File(path)
+            if (!file.isAbsolute || !file.isFile) {
+                Log.w(TAG, "not an absolute file path: $path")
+                return false
+            }
+            val uri = try {
+                FileProvider.getUriForFile(this@MainActivity, "$packageName.files", file)
+            } catch (refused: IllegalArgumentException) {
+                Log.w(TAG, "outside the paths this app can vouch for: $path", refused)
+                return false
+            }
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, viewerMimeType(file, uri))
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                // The viewer is a different task; keeping this one out of the back
+                // stack leaves the chat exactly where it was after the viewer closes.
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            runOnUiThread { launchViewer(file, intent) }
+            return true
+        }
+
+        /**
+         * Whether this build can sign requests for the AtomGit gateway.
+         *
+         * Synchronous on purpose: the answer is a property of the linked `.so`
+         * (the signing overlay is either in the build or it is not), and the page
+         * decides on its first render whether to show the banner — an async answer
+         * would make that warning appear a frame late, or after the person has
+         * already sent a turn and been refused.
+         */
+        @android.webkit.JavascriptInterface
+        fun gatewaySigning(): Boolean = NativeAgent.nativeGatewaySigningAvailable()
+
         @android.webkit.JavascriptInterface
         fun sessionsPrivate(): Boolean = SessionsLocation.isPrivate(this@MainActivity)
 
@@ -866,6 +1099,10 @@ class MainActivity : ComponentActivity() {
         private const val CAPTURE_LINGER_MS = 60_000L
         /** Captures untouched for this long are leftovers from a cancelled camera. */
         private const val STALE_CAPTURE_MS = 10 * 60_000L
+        /** Where files shared in from other apps are copied before the page sees them. */
+        private const val SHARES_DIR = "shares"
+        /** Shared files nobody collected are cleaned up from the cache. */
+        private const val STALE_SHARE_MS = 60 * 60_000L
         /** Runtime notification prompt (Android 13+). */
         private const val NOTIFICATION_REQUEST = 0x52
         private var fileCallback: android.webkit.ValueCallback<Array<Uri>>? = null

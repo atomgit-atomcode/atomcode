@@ -80,8 +80,20 @@ test('the app reserves the status bar and the drawer does too', () => {
 
   // Android draws every app edge-to-edge since API 35, so the window reaches
   // under the status bar; the WebView reports that inset through
-  // `env(safe-area-inset-top)`.
-  assert.match(css, /\.app\s*\{[^}]*padding-top:\s*env\(safe-area-inset-top, 0px\);/);
-  // The drawer is `position: fixed`, so it does not inherit `.app`'s padding.
-  assert.match(css, /\.session-list\s*\{[^}]*padding-top:\s*env\(safe-area-inset-top, 0px\);/);
+  // `env(safe-area-inset-top)`. The notice stack is `position: fixed` on top of
+  // that, so the shell reserves its measured height too — otherwise a banner
+  // covers the floating menu button and the session list is unreachable.
+  assert.match(
+    css,
+    /\.app\s*\{[^}]*padding-top:\s*calc\(env\(safe-area-inset-top, 0px\) \+ var\(--notice-height, 0px\)\);/,
+  );
+  // Without border-box that padding would grow the box past 100dvh and the
+  // bottom rows would be clipped instead of the content shrinking.
+  assert.match(css, /\.app\s*\{[^}]*box-sizing:\s*border-box;/);
+  // The drawer is `position: fixed`, so it does not inherit `.app`'s padding and
+  // has to reserve the same two things itself.
+  assert.match(
+    css,
+    /\.session-list\s*\{[^}]*padding-top:\s*calc\(env\(safe-area-inset-top, 0px\) \+ var\(--notice-height, 0px\)\);/,
+  );
 });

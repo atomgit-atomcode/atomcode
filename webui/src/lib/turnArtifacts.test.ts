@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { artifactsByAssistantIndex } from './turnArtifacts.ts';
+import { artifactsByAssistantIndex, resolveArtifactPath } from './turnArtifacts.ts';
 
 const tool = (name: string, args: unknown, status: 'done' | 'error' = 'done') => ({
   kind: 'tool' as const,
@@ -79,4 +79,21 @@ test('does not report a hydrated call that has no authoritative tool result', ()
     }],
   }]);
   assert.deepEqual(result.get(0), []);
+});
+
+test('resolves a relative artifact against the working directory the page shows', () => {
+  assert.equal(resolveArtifactPath('notes.md', '/storage/emulated/0/AtomCode'), '/storage/emulated/0/AtomCode/notes.md');
+  assert.equal(resolveArtifactPath('notes.md', '/storage/emulated/0/AtomCode/'), '/storage/emulated/0/AtomCode/notes.md');
+});
+
+test('leaves an absolute artifact alone, and a tilde one for the daemon', () => {
+  assert.equal(resolveArtifactPath('/tmp/report.md', '/repo'), '/tmp/report.md');
+  // The page cannot know the agent's HOME (on Android it is the product
+  // directory), so a `~` path stays as it is — `/fs/open` resolves it there.
+  assert.equal(resolveArtifactPath('~/out.md', '/repo'), '~/out.md');
+});
+
+test('an artifact with no working directory and no anchor is returned unchanged', () => {
+  assert.equal(resolveArtifactPath('notes.md', ''), 'notes.md');
+  assert.equal(resolveArtifactPath('  ', '/repo'), '');
 });

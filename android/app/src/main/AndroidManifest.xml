@@ -8,7 +8,12 @@
     <!-- A turn can run for many minutes with the screen off. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!--
+      `specialUse`, not `dataSync`: see the service below. Since Android 15 a
+      `dataSync` foreground service is capped at six hours per 24 and then killed
+      out from under the turn it was keeping alive.
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
@@ -71,12 +76,43 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!--
+              Sharing INTO the agent: a diff, a screenshot, a log someone wants
+              explained. The intent carries `content://` URIs, which no shell or git
+              can open, so the activity copies the bytes into its own cache and the
+              page receives real paths — the same shape the file picker produces.
+            -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
         </activity>
 
+        <!--
+          The agent service is `specialUse`, not `dataSync`.
+
+          A `dataSync` foreground service is capped at six hours per 24 on Android
+          15+ (targetSdk 35 and up), after which the system calls `onTimeout` and
+          kills the service if it does not stop — the exact work this service
+          exists for: an overnight loop, a goal that waits, or a turn that simply
+          runs long with the screen off. `specialUse` has no such cap, and a
+          user-started coding-agent run is what the category is for.
+
+          It costs two declarations: the platform permission above, and the subtype
+          property below (the policy the type is documented with). Play
+          distribution is not a consideration for this build either way —
+          MANAGE_EXTERNAL_STORAGE already rules it out.
+        -->
         <service
             android:name=".AgentService"
             android:exported="false"
-            android:foregroundServiceType="dataSync" />
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="coding-agent-turn" />
+        </service>
 
         <!--
           The helper APK is downloaded into the app's own storage; the system

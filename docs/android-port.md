@@ -95,6 +95,14 @@ gradle assembleDebug --no-daemon
 > 在 TLS 被拦截的网络里会以 `PKIX path building failed` 失败。用本机 `gradle` 即可。
 > 只有在需要固定版本、且网络可达时，才 `gradle wrapper --offline` 生成后使用。
 
+> **改了 webui 就要重编 `.so`，只跑 `assembleDebug` 没用。** 页面是
+> `#[derive(RustEmbed)] #[folder = "webui/dist/"]` **编译期**嵌进
+> `libatomcode_android.so` 的（`crates/atomcode-daemon/src/webui.rs`），APK 里没有
+> 独立的 `dist` 目录。所以前端改动的完整顺序是
+> `webui/npm run build` → `scripts/build-android.sh` → `gradle assembleDebug`。
+> 少了中间一步，装上去的页面还是旧的：2026-10-31 就因此排查了一轮「分享进来的文本
+> 不显示」，实际是 APK 里那份 `.so` 带着旧 dist。
+
 ### 辅助程序 APK（make / tcc / zig）
 
 `make`、`tcc` 与 `zig` 需要 spawn 子进程，无法作为插件跑，所以放在单独的

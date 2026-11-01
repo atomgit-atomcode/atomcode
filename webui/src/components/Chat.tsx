@@ -60,6 +60,7 @@ import { FilePicker } from './FilePicker';
 import { PermissionCard } from './PermissionCard';
 import { UserInputCard } from './UserInputCard';
 import { PolicyInterventionCard } from './PolicyInterventionCard';
+import { takeShares, openWithHost } from '../lib/androidHost';
 import { useT } from '../settings';
 import type { MsgKey } from '../i18n';
 import {
@@ -118,7 +119,7 @@ import { hasCoarsePointer, shouldSendComposerOnEnter } from '../lib/composerKeyb
 import { randomId } from '../lib/randomId';
 import { completedTurnStats, formatTurnDuration, formatTurnTokens, turnCacheHit } from '../lib/turnStats';
 import { disposeNotifications, maybeNotifyTurnFinished } from '../lib/notifications';
-import { artifactsByAssistantIndex, type TurnArtifact } from '../lib/turnArtifacts';
+import { artifactsByAssistantIndex, resolveArtifactPath, type TurnArtifact } from '../lib/turnArtifacts';
 
 interface Message {
   retainedHistory?: boolean;
@@ -3213,6 +3214,28 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     insertAtCursor((needLead ? ' ' : '') + path + ' ');
   }
 
+  // 其它应用「分享到 AtomCode」进入的内容。
+  //
+  // 宿主先把 `content://` 拷成 cache 里的真实路径（shell / git / read_file 都只认路径），
+  // 这里取走并插进输入框——与上面文件选择器产出的形态完全一致，模型看到的都是路径。
+  // 两处都要取：首次挂载可能是分享直接启动了进程，之后新增的分享靠宿主派发的事件。
+  useEffect(() => {
+    const collect = () => {
+      const shared = takeShares();
+      if (!shared) return;
+      const parts = [...shared.paths, shared.text]
+        .map((part) => part.trim())
+        .filter(Boolean);
+      if (parts.length === 0) return;
+      insertAtCursor(parts.join(' ') + ' ');
+    };
+    collect();
+    window.addEventListener('atomcode:share', collect);
+    return () => window.removeEventListener('atomcode:share', collect);
+    // 只在挂载时装一次：insertAtCursor 读的是 ref 与 setState，事件处理里用同一份即可。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // 追加图片（上传或粘贴）：压缩到长边 1568px 后入列，限制总数。
   //
   // 以前这里按 2MB 直接拒绝——手机上拍照的图通常 3–8MB，等于附件功能在
@@ -3843,7 +3866,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
             return <>
               <UserMessageView msg={user} timeLabel={formatMsgTime(user.ts)} search={search} isActiveSearchMatch={false} />
               <AssistantMessageView msg={assistant} isLast={false} busy={false} lastIdx={-1} isLastInTurn={true}
-                turnText={messageFullText(assistant)} artifacts={[]} sessionId={sessionId}
+                turnText={messageFullText(assistant)} artifacts={[]} sessionId={sessionId} cwd={cwd}
                 timeLabel={formatMsgTime(assistant.ts)} search={search} isActiveSearchMatch={false} />
             </>;
           }}
@@ -3950,6 +3973,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
                 turnText={turnTexts.get(origIdx) ?? ''}
                 artifacts={turnArtifacts.get(origIdx) ?? []}
                 sessionId={sessionId}
+                cwd={cwd}
                 searchRef={setMatchRef}
                 timeLabel={timeLabel}
                 search={search}
@@ -4217,6 +4241,7 @@ function AssistantMessageView({
   turnText,
   artifacts,
   sessionId,
+  cwd,
   searchRef,
   timeLabel,
   search,
@@ -4230,6 +4255,8 @@ function AssistantMessageView({
   turnText: string;
   artifacts: TurnArtifact[];
   sessionId: string | null;
+  /** The working directory the turn ran in; relative artifacts resolve against it. */
+  cwd: string;
   searchRef?: (el: HTMLElement | null) => void;
   timeLabel?: string;
   search: string;
@@ -4330,6 +4357,11 @@ function AssistantMessageView({
                 title={artifact.path}
                 onClick={() => {
                   setArtifactError('');
+                  // On the phone the viewer is the app shell's job: a sandboxed
+                  // daemon process cannot launch one, so `/fs/open` answers with
+                  // "open the path from the app UI" and nothing happens. Everywhere
+                  // else there is no bridge and the daemon opens the file itself.
+                  if (openWithHost(resolveArtifactPath(artifact.path, cwd))) return;
                   void openWorkspaceFile(artifact.path, sessionId ?? undefined).catch((error) => {
                     setArtifactError(t('chat.artifactOpenFailed', { msg: String(error) }));
                   });

@@ -70,6 +70,22 @@ function successfulMutationPaths(parts: MsgPart[]): string[] {
 }
 
 /**
+ * The absolute path of an artifact, given the working directory it belongs to.
+ *
+ * Tool calls usually carry absolute paths, but a model working in the workspace
+ * may have written `notes.md`. The daemon resolves a relative path against the
+ * session's workspace itself; the phone's viewer cannot, because `FileProvider`
+ * refuses anything that is not absolute. A `~` path is left alone for the daemon:
+ * the page does not know the agent's HOME.
+ */
+export function resolveArtifactPath(path: string, cwd: string): string {
+  const trimmed = path.trim();
+  if (!trimmed || trimmed.startsWith('/') || trimmed.startsWith('~')) return trimmed;
+  if (!cwd) return trimmed;
+  return cwd.replace(/\/+$/, '') + '/' + trimmed;
+}
+
+/**
  * Associate every assistant message with the successful file mutations from its
  * complete user turn. System notices are transparent, matching Chat's turn grouping.
  */

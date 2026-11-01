@@ -132,8 +132,10 @@ helper APK：**82 MB → 33 MB**（剩下的主体是 `libatomcode.so`，即设�
 **仍未做**：把 `com.atomcode.tools.zig` 这个 APK **发布到市场**（清单里一个 `helper`
 条目），并在插件页加第二个「下载并安装」。目前它靠 `adb install` 装，代码侧全部就位。
 
-**注意**：`shims::HELPER_TOOLS` / `PROVIDER_TOOLS` 与 `packages.rs::HELPER_COMMANDS`
-是必须同步的清单。
+**注意**：`shims::HELPER_TOOLS` / `PROVIDER_TOOLS`、`packages.rs::HELPER_COMMANDS`、
+`AgentService.HELPER_PACKAGES` 与 manifest 的 `<queries>` 是必须同步的四份清单。
+现在是自动门而不是注释：`crates/atomcode-android/tests/list_sync.rs` 直接读
+XML / Kotlin 源文件比对，少改一处就红（加 provider 时会先撞到这里）。
 
 ---
 

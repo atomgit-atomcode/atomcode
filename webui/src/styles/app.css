@@ -47,12 +47,20 @@ body {
   height: 100vh; height: 100dvh;
   width: 100%;
   overflow: hidden;
+  /* Without border-box the padding below would be added *outside* the 100dvh
+     height, pushing the last rows past the bottom edge where `overflow: hidden`
+     clips them. Reserving space must shrink the content, not overflow it. */
+  box-sizing: border-box;
   /* The window can extend under the system bars (Android draws every app
      edge-to-edge since API 35, and iOS notches overlap the top). The WebView
      reports the top inset through `env(safe-area-inset-top)`, so reserve it
      here — otherwise the floating menu button and the session header sit
-     underneath the status bar and cannot be tapped. */
-  padding-top: env(safe-area-inset-top, 0px);
+     underneath the status bar and cannot be tapped.
+
+     `--notice-height` is the fixed `.notice-stack` above (measured by
+     `NoticeStack`); reserving it here is what keeps the menu button reachable
+     while a banner is showing. */
+  padding-top: calc(env(safe-area-inset-top, 0px) + var(--notice-height, 0px));
 }
 
 /* Right-hand column: sticky session-title header above the chat body (no top bar). */
@@ -3645,8 +3653,9 @@ body {
     border-right: 1px solid var(--app-primary-border-color);
     box-shadow: 2px 0 16px rgba(0, 0, 0, 0.35);
     /* The drawer is `position: fixed`, so it does NOT inherit the app's
-       top safe-area padding — its brand row would sit under the status bar. */
-    padding-top: env(safe-area-inset-top, 0px);
+       top padding — its brand row would sit under the status bar, and under the
+       notice stack when a banner is showing. Reserve the same space here. */
+    padding-top: calc(env(safe-area-inset-top, 0px) + var(--notice-height, 0px));
   }
   .session-list.open { transform: translateX(0); }
   /* 移动端用抽屉(transform)，不存在收起 rail；即便残留 .collapsed 也强制全宽抽屉。 */
@@ -4297,13 +4306,23 @@ body {
 .turn-artifact-more { align-self: center; color: var(--app-tertiary-foreground); }
 .turn-artifact-error { flex-basis: 100%; color: var(--app-error-fg, #b3261e); font-size: 0.8125rem; }
 
-/* === Old browser notice / opened without the link === */
-.compat-notice {
+/* === Old browser notice / unsigned build / opened without the link === */
+.notice-stack {
   position: fixed;
   top: 0;
   left: 0;
   right: 0;
   z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  /* This bar is `position: fixed`, so it does NOT inherit `.app`'s safe-area
+     padding. Without this the status bar sits on the first line of text and the
+     dismiss button lands underneath it — visible, but impossible to tap. The
+     background paints the strip too, so it does not read as a gap. */
+  padding-top: env(safe-area-inset-top, 0px);
+  background: var(--app-tool-background);
+}
+.compat-notice {
   display: flex;
   align-items: center;
   gap: 12px;
@@ -4313,6 +4332,9 @@ body {
   color: var(--app-primary-foreground);
   font-size: 0.875rem;
 }
+/* A build that cannot sign gateway requests is not a display problem, it is a
+   hard stop for that one provider — colour it as such. */
+.gateway-notice { border-bottom-color: var(--app-error-fg, #b3261e); }
 .compat-notice span { flex: 1; }
 .compat-notice-close {
   background: none;

@@ -95,7 +95,17 @@ class AgentService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startForeground(NOTIFICATION_ID, buildNotification())
+        try {
+            startForeground(NOTIFICATION_ID, buildNotification())
+        } catch (refused: Exception) {
+            // Android 12+ refuses a foreground start that the app is not allowed to
+            // make (typically: from the background), and a manifest type the build
+            // does not hold the permission for raises here too. Uncaught, this takes
+            // the app down on the way to doing anything about it; without the
+            // foreground state the work below still runs — briefly — and the system
+            // ends the service afterwards, which is the honest outcome.
+            Log.w(TAG, "not allowed to enter the foreground: ${refused.message}")
+        }
         acquireWakeLock()
         when (intent?.action) {
             ACTION_ATTACH_EXTERNAL -> {
@@ -115,6 +125,12 @@ class AgentService : Service() {
                 stopStatusPolling()
                 urlOrError = null to null
                 startAgent()
+            }
+            ACTION_STOP_TURN -> {
+                // The notification's action button. Nobody is looking at the page,
+                // so the turn ids are asked for instead of remembered — see
+                // `stopActiveTurns`.
+                Thread { stopActiveTurns() }.start()
             }
             else -> {
                 if (externalPort == 0 && urlOrError.first == null) {
@@ -141,6 +157,73 @@ class AgentService : Service() {
             acceptingStatus = false
             statusExecutor?.shutdownNow()
             statusExecutor = null
+        }
+    }
+
+    /**
+     * Stop every running turn, on behalf of the notification's action button.
+     *
+     * The page cancels its own turn by posting the request id it already holds;
+     * here nobody is looking at the page, so the ids are asked for first. A turn
+     * that ends between the two requests answers with an error code and that is
+     * the desired state anyway — hence a warning, not a failure.
+     */
+    private fun stopActiveTurns() {
+        val port = statusPort
+        if (port == 0) return
+        for (requestId in activeRequestIds(port, statusToken)) {
+            val connection = (java.net.URL("http://127.0.0.1:$port/chat/stop").openConnection()
+                as java.net.HttpURLConnection).apply {
+                connectTimeout = 3000
+                readTimeout = 3000
+                requestMethod = "POST"
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json")
+                statusToken?.let { setRequestProperty("Authorization", "Bearer $it") }
+            }
+            try {
+                val body = JSONObject().put("session_id", requestId).toString()
+                connection.outputStream.use { it.write(body.toByteArray()) }
+                val code = connection.responseCode
+                if (code >= 400) Log.w(TAG, "stopping $requestId answered $code")
+            } catch (failure: Exception) {
+                Log.w(TAG, "could not stop $requestId", failure)
+            } finally {
+                connection.disconnect()
+            }
+        }
+    }
+
+    /**
+     * The request ids of the turns running right now.
+     *
+     * `/health` only counts them; `/chat/active` names them, and that is what the
+     * cancel endpoint takes. A daemon that cannot answer yields an empty list, so
+     * the action does nothing rather than guessing an id.
+     */
+    private fun activeRequestIds(port: Int, token: String?): List<String> {
+        return try {
+            val connection = (java.net.URL("http://127.0.0.1:$port/chat/active").openConnection()
+                as java.net.HttpURLConnection).apply {
+                connectTimeout = 3000
+                readTimeout = 3000
+                if (token != null) setRequestProperty("Authorization", "Bearer $token")
+            }
+            try {
+                if (connection.responseCode != 200) return emptyList()
+                val body = connection.inputStream.bufferedReader().use { it.readText() }
+                val array = runCatching { JSONArray(body) }.getOrNull() ?: return emptyList()
+                buildList {
+                    for (index in 0 until array.length()) {
+                        array.optString(index, "").takeIf { it.isNotEmpty() }?.let { add(it) }
+                    }
+                }
+            } finally {
+                connection.disconnect()
+            }
+        } catch (failure: Exception) {
+            Log.w(TAG, "could not list the running turns", failure)
+            emptyList()
         }
     }
 
@@ -271,6 +354,29 @@ class AgentService : Service() {
             .setSmallIcon(android.R.drawable.stat_sys_download_done)
             .setContentIntent(open)
             .setOngoing(true)
+        // Only while there is work to stop. A turn can run for minutes with the
+        // screen off; without this the only way to end one is to unlock, open the
+        // app and find the stop button — which is exactly what the wake lock was
+        // keeping alive. The action disappears on the next poll, so it cannot be
+        // pressed against an idle agent.
+        if (busyFromPoll > 0 || turnActive) {
+            val stop = PendingIntent.getService(
+                this,
+                STOP_REQUEST_CODE,
+                Intent(this, AgentService::class.java).setAction(ACTION_STOP_TURN),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+            builder.addAction(
+                Notification.Action.Builder(
+                    android.graphics.drawable.Icon.createWithResource(
+                        this,
+                        android.R.drawable.ic_menu_close_clear_cancel,
+                    ),
+                    getString(R.string.notification_action_stop),
+                    stop,
+                ).build(),
+            )
+        }
         when {
             // 折叠态只有一行（系统会截断长文本），展开态才列出每个会话的结果。
             lines.isNotEmpty() -> {
@@ -594,8 +700,29 @@ class AgentService : Service() {
         private const val ACTION_DETACH_EXTERNAL = "com.atomcode.app.DETACH_EXTERNAL"
         private const val EXTRA_EXTERNAL_PORT = "external_port"
 
+        /** The notification's "stop" action; handled in `onStartCommand`. */
+        private const val ACTION_STOP_TURN = "com.atomcode.app.STOP_TURN"
+        private const val STOP_REQUEST_CODE = 2
+
         fun start(context: Context) {
-            context.startForegroundService(Intent(context, AgentService::class.java))
+            startSafely(context, Intent(context, AgentService::class.java))
+        }
+
+        /**
+         * Ask the system to start (or re-deliver to) the agent service.
+         *
+         * `startForegroundService` throws on Android 12+ when the caller may not
+         * start a foreground service — a background start is the usual case. Left
+         * uncaught that is a crash on the way to the UI that wanted the service;
+         * logged, it leaves the app exactly as it already was, which is what every
+         * caller here does with a refusal anyway.
+         */
+        private fun startSafely(context: Context, intent: Intent) {
+            try {
+                context.startForegroundService(intent)
+            } catch (refused: Exception) {
+                Log.w(TAG, "could not start the agent service: ${refused.message}")
+            }
         }
 
         /**
@@ -605,7 +732,8 @@ class AgentService : Service() {
          * 又不会有两份运行时同时写一份会话日志。
          */
         fun attachExternal(context: Context, port: Int) {
-            context.startForegroundService(
+            startSafely(
+                context,
                 Intent(context, AgentService::class.java)
                     .setAction(ACTION_ATTACH_EXTERNAL)
                     .putExtra(EXTRA_EXTERNAL_PORT, port),
@@ -614,7 +742,8 @@ class AgentService : Service() {
 
         /** 切回本机：清掉外部模式并重起进程内 daemon。 */
         fun detachExternal(context: Context) {
-            context.startForegroundService(
+            startSafely(
+                context,
                 Intent(context, AgentService::class.java).setAction(ACTION_DETACH_EXTERNAL),
             )
         }

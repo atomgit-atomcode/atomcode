@@ -719,6 +719,8 @@ const zh = {
   'common.cancel': '取消',
   'compat.oldBrowser': '当前浏览器内核较旧，页面部分样式可能显示异常。建议使用 Chrome / Edge {version} 及以上版本。',
   'compat.dismiss': '不再提示',
+  'gateway.unsigned': '这个构建没有请求签名能力，AtomGit 网关会拒绝每一回合（ATOMCODE_SIG_MISSING）。可以改用其它模型服务，或换用带官方签名覆盖层的构建。',
+  'gateway.dismiss': '知道了',
   'auth.recover.title': '正在恢复访问',
   'auth.recover.body': '当前访问授权暂不可用，页面会自动重试。若终端或 WebUI 已重启，请运行 /webui 并打开新链接。',
   'auth.recover.retry': '重新连接',
@@ -800,6 +802,8 @@ const en: Record<MsgKey, string> = {
 
   'compat.oldBrowser': 'This browser engine is older than this page was built for, so parts of it may look wrong. Chrome / Edge {version} or newer is recommended.',
   'compat.dismiss': "Don't show again",
+  'gateway.unsigned': 'This build cannot sign requests for the AtomGit gateway, so every turn against it is rejected (ATOMCODE_SIG_MISSING). Use another model provider, or a build with the official signing overlay.',
+  'gateway.dismiss': 'Got it',
   'auth.recover.title': 'Restoring access',
   'auth.recover.body': 'Access is temporarily unavailable. This page retries automatically. If the terminal or WebUI restarted, run /webui and open its new link.',
   'auth.recover.retry': 'Reconnect',

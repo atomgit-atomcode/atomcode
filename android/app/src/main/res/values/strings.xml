@@ -16,6 +16,8 @@
     <string name="notification_result_failed">failed (%1$s)</string>
     <string name="notification_result_cancelled">stopped</string>
     <string name="notification_session_unknown">unnamed conversation</string>
+    <!-- The notification's action button, shown only while a turn is running. -->
+    <string name="notification_action_stop">Stop</string>
     <string name="attach_choose">Attach: take a photo or pick a file</string>
     <string name="notification_starting">Starting the agent…</string>
     <string name="starting">Starting the agent…</string>
@@ -34,6 +36,7 @@
     <string name="storage_message">AtomCode needs access to shared storage so the agent can open your repositories by path — Git, shell commands and language servers cannot work with Android\'s document picker URIs. Without it the agent is limited to its private folder.</string>
     <string name="storage_grant">Grant access</string>
     <string name="no_browser">No app on this device can open that link.</string>
+    <string name="no_viewer">No app on this device can open %1$s.</string>
     <string name="helper_installed">Helper installed. Restarting so make / tcc / zig become available.</string>
     <string name="external_start_unseen">The daemon started but discovery did not find it; reopen the app to retry.</string>
     <string name="sessions_private_on">Sessions are now app-private. Reopen the app for it to take effect.</string>
