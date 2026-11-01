@@ -998,6 +998,7 @@ pub enum RuntimeError {
     NoPendingPolicyIntervention,
     InvalidPolicyRecoveryAction,
     DeliveryFailed,
+    CommandRefused(String),
     Unavailable,
     ProviderUnavailable(ProviderUnavailableReason),
     SnapshotUnavailable(String),
@@ -1012,7 +1013,7 @@ pub enum RuntimeError {
 impl fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::GoalUnavailable(message) => f.write_str(message),
+            Self::GoalUnavailable(message) | Self::CommandRefused(message) => f.write_str(message),
             Self::Busy => f.write_str("coding runtime is busy"),
             Self::Cancelled => f.write_str("coding runtime operation was cancelled"),
             Self::SessionInUse { id } => {
@@ -2149,6 +2150,7 @@ impl CodingRuntimeHandle {
                 );
                 let (done, _result) = oneshot::channel();
                 CodingRuntimeControl::Submit {
+                    invocation: None,
                     generation,
                     input,
                     receipt: None,
@@ -2285,6 +2287,36 @@ impl CodingRuntimeHandle {
         self.tx.send(control).map_err(|_| RuntimeUnavailable)
     }
 
+    /// Submit a prompt-producing catalog command through normal vision/cancel handling.
+    pub fn submit_catalog(
+        &self,
+        receipt: atomcode_kernel::event::CommandId,
+        session: String,
+        name: String,
+        input: UserInput,
+    ) -> impl std::future::Future<Output = Result<SubmitReceipt, RuntimeError>> + Send + 'static
+    {
+        let state = self.state.load(Ordering::Acquire);
+        let (done, result) = oneshot::channel();
+        let sent = self
+            .tx
+            .send(CodingRuntimeControl::Submit {
+                generation: runtime_state_generation(state),
+                input,
+                invocation: Some((session.clone(), name)),
+                receipt: Some(receipt),
+                extra_context: None,
+                from: None,
+                expected_session: Some(session),
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable);
+        async move {
+            sent?;
+            result.await.map_err(|_| RuntimeError::Unavailable)?
+        }
+    }
+
     pub async fn submit(&self, input: UserInput) -> Result<SubmitReceipt, RuntimeError> {
         self.deliver(None, input).await
     }
@@ -2313,6 +2345,7 @@ impl CodingRuntimeHandle {
         let (done, result) = oneshot::channel();
         self.tx
             .send(CodingRuntimeControl::Submit {
+                invocation: None,
                 generation: runtime_state_generation(state),
                 input,
                 receipt,
@@ -2338,6 +2371,7 @@ impl CodingRuntimeHandle {
         let (done, result) = oneshot::channel();
         self.tx
             .send(CodingRuntimeControl::Submit {
+                invocation: None,
                 generation: runtime_state_generation(state),
                 input: UserInput::from(text),
                 receipt: None,
@@ -2362,6 +2396,7 @@ impl CodingRuntimeHandle {
         let (done, result) = oneshot::channel();
         self.tx
             .send(CodingRuntimeControl::Submit {
+                invocation: None,
                 generation: runtime_state_generation(state),
                 input: UserInput::from(text),
                 receipt: None,
@@ -3758,6 +3793,7 @@ pub enum CodingRuntimeControl {
     Submit {
         generation: u64,
         input: UserInput,
+        invocation: Option<(String, String)>,
         /// Runtime-authored context admitted with this exact input.
         extra_context: Option<String>,
         /// The driver's own id for this submit, when it has one. Carried into the
@@ -5395,6 +5431,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         }
                     }
                     Some(CodingRuntimeControl::Submit {
+                        invocation,
                         generation: request_generation,
                         mut input,
                         extra_context,
@@ -5432,6 +5469,25 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Busy));
                             continue;
                         }
+                        let prepared_command = if let Some((session, name)) = invocation {
+                            let prepared = resources.as_ref().and_then(|r| r.harness_app.as_ref())
+                                .ok_or_else(|| "catalog unavailable".to_string())
+                                .and_then(|app| atomcode_harness::plugins::handle::catalog_command(&app.context(), &session, &name)
+                                    .map_err(|e| format!("{e:?}")))
+                                .and_then(|(target, command)| command.prepare_input(&target, &input.text)
+                                    .and_then(|prepared| prepared.ok_or_else(|| "This command does not accept images".into()))
+                                    .map(|prepared| (target, prepared)));
+                            match prepared {
+                                Ok((target, prepared)) => {
+                                    input.text = prepared.text.clone();
+                                    Some((target, prepared))
+                                }
+                                Err(message) => {
+                                    let _ = done.send(Err(RuntimeError::CommandRefused(message)));
+                                    continue;
+                                }
+                            }
+                        } else { None };
                         // Resolve historical data before changing policy, goal or turn state.
                         // Only real-user submits can request it; peer reports are data.
                         let reference_context = if from.is_none() {
@@ -5730,6 +5786,15 @@ fn spawn_runtime_owner_with_optional_agent(
                             if let Some(previous)=recovery_context.take() { context["recovery_context"]=serde_json::Value::String(previous); }
                             recovery_context=Some(context.to_string());
                         }
+                        if let Some((target, prepared)) = prepared_command {
+                            let (mut context, origin) = prepared.context;
+                            if let Some(extra) = recovery_context { context.push_str("\n\n"); context.push_str(&extra); }
+                            target.send_contextual(input.text, atomcode_harness::agent::MessageOrigin::User,
+                                input.images, driver_receipt, (context, origin));
+                            kernel_turn_open = true;
+                            let _ = done.send(Ok(receipt));
+                            continue;
+                        }
                         let command = match (from, recovery_context) {
                             (Some(from), _) => AgentCommand::PeerNote {
                                 from,
@@ -5831,7 +5896,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             let Some(tx) = controls.submit_tx.upgrade() else { let _ = done.send(Err(RuntimeError::Unavailable)); continue; };
                             let (submitted, accepted) = oneshot::channel();
                             let expected_session = resources.as_ref().and_then(|r| r.parts.session.as_ref()).map(|s| s.id.clone());
-                            if tx.send(CodingRuntimeControl::Submit { generation, input, extra_context: Some(goal_questions::GoalQuestions::reply_context(question)), receipt: None, from: None, expected_session, done: submitted }).is_err() {
+                            if tx.send(CodingRuntimeControl::Submit { invocation: None, generation, input, extra_context: Some(goal_questions::GoalQuestions::reply_context(question)), receipt: None, from: None, expected_session, done: submitted }).is_err() {
                                 let _ = done.send(Err(RuntimeError::Unavailable));
                                 continue;
                             }
@@ -8813,6 +8878,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             // to "what is a turn".
                             let (started, _) = oneshot::channel();
                             let _ = recovery_tx.send(CodingRuntimeControl::Submit {
+                        invocation: None,
                                 generation: request_generation,
                                 input: UserInput { text: condition, images },
                                 receipt: None,
@@ -8952,6 +9018,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             // at all in the model-paced form.
                             let (started, _) = oneshot::channel();
                             let _ = recovery_tx.send(CodingRuntimeControl::Submit {
+                        invocation: None,
                                 generation: request_generation,
                                 input: UserInput::from(prompt),
                                 receipt: None,

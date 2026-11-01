@@ -1253,11 +1253,12 @@ pub fn run_catalog_command(
     command: Arc<dyn crate::commands::CatalogCommand>,
     id: atomcode_kernel::event::CommandId,
     args: String,
+    images: Vec<atomcode_kernel::message::ImageContent>,
     events: mpsc::UnboundedSender<AgentEvent>,
 ) {
     tokio::spawn(async move {
         let agent = target.clone();
-        let result = command.run(target, &args).await;
+        let result = command.run_with_images(target, &args, images).await;
         let failed = result.is_err();
         let output = result.unwrap_or_else(|e| e);
         // Asked here because here is where it can be answered: the command has
@@ -1741,11 +1742,12 @@ async fn pump(
                 session,
                 name,
                 args,
+                images,
             } => {
                 match catalog_command(&ctx, &session, &name) {
                     Ok((target, command)) => {
                         accept(None);
-                        run_catalog_command(target, command, id, args, events.clone());
+                        run_catalog_command(target, command, id, args, images, events.clone());
                     }
                     Err(error) => reject(error),
                 }

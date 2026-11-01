@@ -2619,13 +2619,53 @@ async fn slash_paste_still_pastes_text_when_there_is_no_picture() {
     task.abort();
 }
 
-/// A picture attached to a **command** goes nowhere, and the screen says so.
+#[tokio::test]
+async fn skill_commands_and_dollar_alias_deliver_the_attached_images() {
+    let dir = scratch("skill-with-picture");
+    let skills = dir.join("image-skills");
+    std::fs::create_dir_all(skills.join("picture-probe")).unwrap();
+    std::fs::write(skills.join("picture-probe/SKILL.md"), "---\nname: picture-probe\ndescription: inspect pictures\n---\nInspect the attached picture. $ARGUMENTS").unwrap();
+    let patch = format!(
+        "[[patch]]\nid = \"skills\"\nconfig = {{ dirs = [{:?}] }}",
+        skills.to_string_lossy()
+    );
+    let s = start(tree(
+        &dir,
+        &replay_vision(
+            r#"{ text = "ok" }, { text = "ok" }, { text = "ok" }, { text = "ok" }"#,
+            true,
+        ),
+        &[&patch],
+    ))
+    .await;
+    let task = s.open().await;
+    s.quiet().await;
+    for command in [
+        "/skills picture-probe inspect this ",
+        "$picture-probe inspect this ",
+        "/picture-probe inspect this ",
+    ] {
+        s.term.type_text(command);
+        s.term.set_clipboard_image(screenshot("for-a-skill"));
+        s.term.press(KeyPress::ctrl('v'));
+        s.quiet().await;
+        s.term.press(KeyPress::plain(Key::Enter));
+        s.quiet().await;
+        assert!(!s.screen().contains("命令带不了图片"), "{}", s.screen());
+    }
+    s.term.type_line("ordinary next message");
+    s.quiet().await;
+    assert_eq!(images_sent(&s), vec![1, 1, 1, 0]);
+    task.abort();
+}
+
+/// A picture attached to a management command is refused visibly.
 ///
-/// No command carries pictures, and the submit path drains them off the
+/// Management commands do not carry pictures, and submit drains them off the
 /// composer before it decides the line was a command — so a screenshot attached
 /// and then `/goal 照着这张图做` vanished with no word about it, which is the
-/// one thing the attachment subsystem exists to prevent. Until some command
-/// does carry them, being told is the fix.
+/// one thing the attachment subsystem exists to prevent. Skill commands have
+/// their separate image-capable route; management commands retain this warning.
 #[tokio::test]
 async fn a_picture_attached_to_a_command_is_not_dropped_in_silence() {
     let dir = scratch("command-with-picture");

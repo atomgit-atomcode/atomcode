@@ -6862,3 +6862,177 @@ async fn referenced_details_are_queried_by_the_mounted_tool_without_inheriting_g
     assert_eq!(std::fs::read(path).unwrap(), before);
     runtime.handle.shutdown().await.unwrap();
 }
+
+// Real runtime + recorded provider input: neither a UI marker nor a successful
+// command acknowledgement is evidence that the model received a picture.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn skill_images_share_one_user_turn_and_use_normal_vision_preprocessing() {
+    struct VisionFallback;
+    #[async_trait::async_trait]
+    impl atomcode_coding::runtime::ImagePreprocessor for VisionFallback {
+        async fn preprocess(
+            &self,
+            text: String,
+            images: Vec<atomcode_kernel::message::ImageContent>,
+            vision: bool,
+            _session: Option<String>,
+        ) -> (UserInput, Option<atomcode_coding::runtime::VisionNotice>) {
+            if vision {
+                (UserInput { text, images }, None)
+            } else {
+                (
+                    UserInput::from(format!("{text}\nVISION_DESCRIPTION_PROBE")),
+                    None,
+                )
+            }
+        }
+    }
+    let env = env();
+    let skills = env.project.path().join("image-skills");
+    std::fs::create_dir_all(skills.join("picture-probe")).unwrap();
+    std::fs::write(skills.join("picture-probe/SKILL.md"), "---\nname: picture-probe\ndescription: inspect an image\n---\nSKILL_CONTEXT_PROBE\n$ARGUMENTS").unwrap();
+    for vision in [true, false] {
+        let recorder = Arc::new(Recorder::default());
+        let mut input = start(env.project.path(), &recorder, SessionMode::Fresh);
+        input.agent.supports_vision = vision;
+        input.prepare.skill_dirs = Some(vec![skills.clone()]);
+        input.image_preprocessor = Some(Arc::new(VisionFallback));
+        let mut runtime = CodingRuntime::start(input).await.unwrap();
+        let session = runtime.session.clone().unwrap().id;
+        for (name, task) in [
+            ("skills", "picture-probe inspect this [Image #1]"),
+            ("picture-probe", "inspect again [Image #2]"),
+        ] {
+            runtime
+                .handle
+                .submit_catalog(
+                    "image-test".into(),
+                    session.clone(),
+                    name.into(),
+                    UserInput {
+                        text: task.into(),
+                        images: vec![atomcode_kernel::message::ImageContent {
+                            media_type: "image/png".into(),
+                            data: "cGljdHVyZQ==".into(),
+                        }],
+                    },
+                )
+                .await
+                .unwrap();
+            loop {
+                let event =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), runtime.events.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                if matches!(event.event, CodingRuntimeEvent::TurnFinished(_)) {
+                    break;
+                }
+            }
+            let request = recorder.last_turn_request();
+            let user = request
+                .iter()
+                .filter(|m| m.role == Role::User && !m.synthetic)
+                .last()
+                .unwrap();
+            assert_eq!(user.images.len(), usize::from(vision));
+            assert_eq!(user.text.contains("VISION_DESCRIPTION_PROBE"), !vision);
+            assert!(request
+                .iter()
+                .any(|m| m.synthetic && m.text.contains("SKILL_CONTEXT_PROBE")));
+        }
+        let snapshot = runtime.handle.snapshot().await.unwrap();
+        assert_eq!(
+            snapshot
+                .messages
+                .iter()
+                .filter(|m| m.role == Role::User && !m.synthetic)
+                .count(),
+            2
+        );
+        let refused = runtime
+            .handle
+            .submit_catalog(
+                "bad-command".into(),
+                session,
+                "skills".into(),
+                UserInput {
+                    text: "missing-skill".into(),
+                    images: vec![atomcode_kernel::message::ImageContent {
+                        media_type: "image/png".into(),
+                        data: "not-sent".into(),
+                    }],
+                },
+            )
+            .await;
+        assert!(refused.is_err());
+        turn(&mut runtime, "ordinary message after refusal").await;
+        let last = recorder.last_turn_request();
+        assert!(last
+            .iter()
+            .filter(|m| m.role == Role::User && !m.synthetic)
+            .last()
+            .unwrap()
+            .images
+            .is_empty());
+        runtime.handle.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn cancelled_skill_images_leave_no_skill_context_for_the_next_message() {
+    struct WaitingVision(Arc<tokio::sync::Notify>);
+    #[async_trait::async_trait]
+    impl atomcode_coding::runtime::ImagePreprocessor for WaitingVision {
+        async fn preprocess(
+            &self,
+            _text: String,
+            _images: Vec<atomcode_kernel::message::ImageContent>,
+            _vision: bool,
+            _session: Option<String>,
+        ) -> (UserInput, Option<atomcode_coding::runtime::VisionNotice>) {
+            self.0.notify_one();
+            std::future::pending().await
+        }
+    }
+    let env = env();
+    let skills = env.project.path().join("cancel-image-skills");
+    std::fs::create_dir_all(skills.join("picture-probe")).unwrap();
+    std::fs::write(skills.join("picture-probe/SKILL.md"), "---\nname: picture-probe\ndescription: inspect an image\n---\nCANCELLED_SKILL_CONTEXT_PROBE").unwrap();
+    let recorder = Arc::new(Recorder::default());
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let mut input = start(env.project.path(), &recorder, SessionMode::Fresh);
+    input.prepare.skill_dirs = Some(vec![skills]);
+    input.image_preprocessor = Some(Arc::new(WaitingVision(entered.clone())));
+    let mut runtime = CodingRuntime::start(input).await.unwrap();
+    let submitted = runtime.handle.submit_catalog(
+        "cancel-image".into(),
+        runtime.session.clone().unwrap().id,
+        "skills".into(),
+        UserInput {
+            text: "picture-probe inspect this".into(),
+            images: vec![atomcode_kernel::message::ImageContent {
+                media_type: "image/png".into(),
+                data: "not-sent".into(),
+            }],
+        },
+    );
+    entered.notified().await;
+    runtime.handle.cancel().await.unwrap();
+    assert!(matches!(
+        submitted.await.unwrap(),
+        atomcode_coding::SubmitReceipt::NotSent { .. }
+    ));
+    while let Some(event) = runtime.events.recv().await {
+        if matches!(event.event, CodingRuntimeEvent::TurnFinished(_)) {
+            break;
+        }
+    }
+    turn(&mut runtime, "plain message after cancellation").await;
+    let request = recorder.last_turn_request();
+    assert!(!request
+        .iter()
+        .any(|m| m.text.contains("CANCELLED_SKILL_CONTEXT_PROBE")));
+    assert!(request.iter().all(|m| m.images.is_empty()));
+    runtime.handle.shutdown().await.unwrap();
+}

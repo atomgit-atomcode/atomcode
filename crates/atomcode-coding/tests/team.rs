@@ -1079,6 +1079,7 @@ async fn a_person_stops_a_member_from_the_catalog() {
                 session: session.into(),
                 name: "stop".into(),
                 args: String::new(),
+                images: Vec::new(),
             })
             .unwrap();
     }
@@ -1410,6 +1411,7 @@ async fn a_person_stopping_a_member_wakes_the_lead_only_when_it_was_owed_a_repor
             session: scout_session.clone(),
             name: "stop".into(),
             args: String::new(),
+            images: Vec::new(),
         })
         .unwrap();
     events_until(&mut handle, |e| matches!(e, AgentEvent::Invoked { .. })).await;
@@ -1462,6 +1464,7 @@ async fn a_person_stopping_a_member_wakes_the_lead_only_when_it_was_owed_a_repor
             session: scout_session.clone(),
             name: "stop".into(),
             args: String::new(),
+            images: Vec::new(),
         })
         .unwrap();
     events_until(&mut handle, |e| matches!(e, AgentEvent::Invoked { .. })).await;

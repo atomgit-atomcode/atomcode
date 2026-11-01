@@ -2307,6 +2307,7 @@ async fn a_command_the_catalog_does_not_have_is_not_found_under_its_own_id() {
             session: session.clone(),
             name: "goal".into(),
             args: "ship it".into(),
+            images: Vec::new(),
         })
         .unwrap();
     let events = drain_quiet(&mut handle).await;

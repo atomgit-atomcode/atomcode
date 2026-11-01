@@ -411,6 +411,7 @@ pub(crate) fn attach(
     let (commands, mut command_rx) = mpsc::unbounded_channel::<AgentCommand>();
     let out = front_end.events();
     let front = front_end.clone();
+    let command_control = control.clone();
     tokio::spawn(async move {
         while let Some(command) = command_rx.recv().await {
             let (receipt, command) = match command {
@@ -451,6 +452,7 @@ pub(crate) fn attach(
                     session,
                     name,
                     args,
+                    images,
                 } => {
                     let found = front
                         .app()
@@ -460,6 +462,49 @@ pub(crate) fn attach(
                                 &app, &session, &name,
                             )
                         });
+                    // Lead input uses the coding runtime's VL boundary. Member
+                    // commands keep their own native inbox, like member messages.
+                    let lead = command_control
+                        .session
+                        .lock()
+                        .expect("session poisoned")
+                        .clone();
+                    if !images.is_empty() && session == lead {
+                        // Queue before spawning, so a following Cancel cannot overtake
+                        // this input. Keep the command pump free during recognition.
+                        let submitted = handle.submit_catalog(
+                            id.clone(),
+                            session,
+                            name,
+                            UserInput { text: args, images },
+                        );
+                        let out = out.clone();
+                        tokio::spawn(async move {
+                            let (failed, queued, output) = match submitted.await {
+                                Ok(atomcode_coding::SubmitReceipt::NotSent { .. }) => {
+                                    reply(&out, receipt, Err((CommandError::NotRunning, None)));
+                                    (true, false, "Command input cancelled".to_string())
+                                }
+                                Ok(_) => (false, true, String::new()),
+                                Err(error) => {
+                                    let message = error.to_string();
+                                    reply(
+                                        &out,
+                                        receipt,
+                                        Err((command_error(error), Some(message.clone()))),
+                                    );
+                                    (true, false, message)
+                                }
+                            };
+                            let _ = out.send(AgentEvent::Invoked {
+                                id,
+                                output,
+                                queued,
+                                failed: Some(failed),
+                            });
+                        });
+                        continue;
+                    }
                     match found {
                         Ok((target, command)) => {
                             reply(&out, receipt, Ok(None));
@@ -468,6 +513,7 @@ pub(crate) fn attach(
                                 command,
                                 id,
                                 args,
+                                images,
                                 out.clone(),
                             );
                         }
@@ -3087,6 +3133,7 @@ pub fn refused(error: RuntimeError) -> HostError {
                 HostError::RewindPointNotFound { turn: turn_id }
             }
             RuntimeError::GoalUnavailable(message)
+            | RuntimeError::CommandRefused(message)
             | RuntimeError::SessionReferenceUnavailable(message) => HostError::Failed { message },
             RuntimeError::CodeRewindUnavailable(message) => {
                 HostError::CodeRewindUnavailable { message }

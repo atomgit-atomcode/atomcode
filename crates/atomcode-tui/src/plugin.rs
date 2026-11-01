@@ -503,6 +503,15 @@ impl AgentClient {
     }
     /// Run a command from the catalog of the agent on screen.
     pub fn invoke(&self, name: &str, args: &str) {
+        self.invoke_with_images(name, args, Vec::new());
+    }
+
+    pub fn invoke_with_images(
+        &self,
+        name: &str,
+        args: &str,
+        images: Vec<atomcode_kernel::message::ImageContent>,
+    ) {
         let id = format!("tui-{}", self.receipts.fetch_add(1, Ordering::SeqCst));
         let session = self.session();
         if crate::commands::catalog_command_starts_turn(
@@ -538,6 +547,7 @@ impl AgentClient {
                 .insert(id.clone(), session.clone());
         }
         self.command(AgentCommand::Invoke {
+            images,
             id,
             session,
             name: name.to_string(),
@@ -6822,6 +6832,7 @@ impl Tui {
                     .turn_invocations
                     .remove(&id);
                 if let Some(line) = invocation {
+                    self.host.stop_recognizing();
                     if failed == Some(false) {
                         return false;
                     }
@@ -7706,6 +7717,9 @@ impl Tui {
                     })
                 });
                 if let Some(command) = command {
+                    if self.run_image_skill_command(&command, &images) {
+                        return false;
+                    }
                     if !images.is_empty() {
                         self.say_refused(&t(Msg::CommandCarriesNoPictures {
                             count: images.len(),
@@ -7720,13 +7734,12 @@ impl Tui {
                 // is NOT a command: it reaches the model untouched instead of
                 // erroring with "没有 /Users/… 这条命令".
                 if crate::command::looks_like_command(&text) {
-                    // A command carries no pictures — no command takes them —
-                    // and `take_shown` above has already drained them off the
-                    // composer. Until one does, **say so**: a screenshot
-                    // attached and then silently dropped is the failure this
-                    // whole subsystem exists to prevent (`attach.rs`: what was
-                    // written and what was attached are decided together), and
-                    // the person's next question is "did it see the picture?".
+                    if self.run_image_skill_command(&text, &images) {
+                        return false;
+                    }
+                    // Image-capable catalog commands were handled above. Remaining
+                    // management commands cannot use the pictures already drained
+                    // from the composer: say so rather than silently dropping them.
                     if !images.is_empty() {
                         self.say_refused(&t(Msg::CommandCarriesNoPictures {
                             count: images.len(),
@@ -9890,6 +9903,51 @@ impl Tui {
     /// between them — the question above the answer, the answer under someone
     /// else's words. Between turns nothing else writes, so it is echoed at
     /// once, and a slow command shows it was taken.
+    fn run_image_skill_command(
+        &self,
+        line: &str,
+        images: &[atomcode_kernel::message::ImageContent],
+    ) -> bool {
+        if images.is_empty() || !self.host.commands.starts_turn(line) {
+            return false;
+        }
+        let body = line.trim().trim_start_matches('/');
+        let (typed, args) = body.split_once(char::is_whitespace).unwrap_or((body, ""));
+        // Hidden direct skill names are invocable but absent from the menu's all().
+        let visible = self.host.commands.find(typed);
+        let canonical = visible
+            .as_ref()
+            .map(|command| command.name.as_ref())
+            .unwrap_or(typed);
+        let descriptions = self
+            .client
+            .described()
+            .map(|d| d.commands)
+            .unwrap_or_default();
+        let is_skill = descriptions
+            .iter()
+            .any(|desc| desc.name.eq_ignore_ascii_case(canonical) && desc.accepts_images);
+        if !is_skill {
+            return false;
+        }
+        self.host.remember_command(line);
+        if let Some(dir) = self.host.image_cache() {
+            for image in images {
+                crate::image_cache::write(&dir, image);
+            }
+        }
+        if self
+            .client
+            .described()
+            .is_some_and(|description| !description.supports_vision)
+        {
+            self.host.start_recognizing();
+        }
+        self.client
+            .invoke_with_images(canonical, args.trim(), images.to_vec());
+        true
+    }
+
     fn run_typed_command(&self, line: &str) {
         self.host.remember_command(line);
         // A successful `/goal <condition>` immediately opens a real turn whose

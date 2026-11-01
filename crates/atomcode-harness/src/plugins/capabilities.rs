@@ -615,10 +615,22 @@ impl crate::commands::CatalogCommand for RunSkill {
             summary: self.skill.description.clone(),
             target: atomcode_kernel::agent::CommandTarget::Session,
             args_requirement: self.skill.args_requirement,
+            accepts_images: true,
         }
     }
 
     async fn run(&self, agent: Arc<crate::agent::Agent>, args: &str) -> Result<String, String> {
+        Ok(self
+            .prepare_input(&agent, args)?
+            .expect("skill input")
+            .send(&agent, Vec::new()))
+    }
+
+    fn prepare_input(
+        &self,
+        agent: &crate::agent::Agent,
+        args: &str,
+    ) -> Result<Option<crate::commands::PreparedCommandInput>, String> {
         // Validate user invocations before expanding templates or queuing context.
         // Both custom commands and user-invocable skills reach this owner through
         // the command catalog. Model-side `use_skill` has its own loading path.
@@ -631,20 +643,20 @@ impl crate::commands::CatalogCommand for RunSkill {
             return Err(format!("`{}` 展开之后是空的", self.name));
         }
         let name = self.name.clone();
-        agent.inject(
-            text,
-            InjectionOrigin::Skill {
-                name: if self.command {
-                    // A command and a skill can share a name but have different
-                    // permissions. This marker cannot be a valid skill name.
-                    format!("[command] {}", self.skill.name)
-                } else {
-                    self.skill.name.clone()
+        Ok(Some(crate::commands::PreparedCommandInput {
+            text: skill_invocation(&name, args),
+            context: (
+                text,
+                InjectionOrigin::Skill {
+                    name: if self.command {
+                        format!("[command] {}", self.skill.name)
+                    } else {
+                        self.skill.name.clone()
+                    },
                 },
-            },
-        );
-        agent.send(skill_invocation(&name, args));
-        Ok(format!("按 `{name}` 开始"))
+            ),
+            output: format!("按 `{name}` 开始"),
+        }))
     }
 
     // Generated from a SKILL.md on disk: it yields its name to any built-in of
@@ -744,6 +756,7 @@ impl crate::commands::CatalogCommand for ListSkills {
             usage: Some(t(Msg::CmdCatalogSkillsUsage).into_owned()),
             summary: t(Msg::CmdCatalogSkills).into_owned(),
             target: atomcode_kernel::agent::CommandTarget::Session,
+            accepts_images: true,
             ..Default::default()
         }
     }
@@ -751,9 +764,19 @@ impl crate::commands::CatalogCommand for ListSkills {
     async fn run(&self, agent: Arc<crate::agent::Agent>, args: &str) -> Result<String, String> {
         let args = args.trim();
         if !args.is_empty() {
-            return self.run_them(agent, args);
+            return Ok(self.prepare_them(&agent, args)?.send(&agent, Vec::new()));
         }
         Ok(self.listing())
+    }
+    fn prepare_input(
+        &self,
+        agent: &crate::agent::Agent,
+        args: &str,
+    ) -> Result<Option<crate::commands::PreparedCommandInput>, String> {
+        if args.trim().is_empty() {
+            return Ok(None);
+        }
+        self.prepare_them(agent, args.trim()).map(Some)
     }
 }
 
@@ -805,7 +828,11 @@ impl ListSkills {
         sections.join("\n\n")
     }
 
-    fn run_them(&self, agent: Arc<crate::agent::Agent>, args: &str) -> Result<String, String> {
+    fn prepare_them(
+        &self,
+        agent: &crate::agent::Agent,
+        args: &str,
+    ) -> Result<crate::commands::PreparedCommandInput, String> {
         let (names, task) = skills_and_task(args, |token| {
             self.0
                 .get(token)
@@ -838,32 +865,31 @@ impl ListSkills {
         }
         // One turn, with a rule between them: sent as several the first would
         // be answered before the second was read.
-        agent.inject(
-            blocks
-                .iter()
-                .map(|(_, text)| text.as_str())
-                .collect::<Vec<_>>()
-                .join("\n\n---\n\n"),
-            InjectionOrigin::Skill {
-                name: blocks
+        Ok(crate::commands::PreparedCommandInput {
+            text: skill_invocation(&invocation, task),
+            context: (
+                blocks
                     .iter()
-                    .map(|(name, _)| name.as_str())
+                    .map(|(_, text)| text.as_str())
                     .collect::<Vec<_>>()
-                    .join(" · "),
-            },
-        );
-        agent.send(skill_invocation("skills", args));
-        // Named back, because a misspelled second name is not an error — it
-        // quietly became the first word of the task, and this line is where
-        // that becomes visible.
-        Ok(format!(
-            "按 {} 开始",
-            names
-                .iter()
-                .map(|name| bare_name(name))
-                .collect::<Vec<_>>()
-                .join(" · ")
-        ))
+                    .join("\n\n---\n\n"),
+                InjectionOrigin::Skill {
+                    name: blocks
+                        .iter()
+                        .map(|(name, _)| name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" · "),
+                },
+            ),
+            output: format!(
+                "按 {} 开始",
+                names
+                    .iter()
+                    .map(|name| bare_name(name))
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            ),
+        })
     }
 }
 
