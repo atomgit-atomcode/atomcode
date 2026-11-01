@@ -789,21 +789,24 @@ fn starts_transcript_line(line: &str) -> bool {
             .any(|tag| trimmed.starts_with(*tag))
 }
 
-/// Append `text` to `into` with every line break folded to one space, so a call
-/// stays on one `\n`-delimited line of the transcript. A trailing space is
-/// dropped, so a part that ends in a break does not leave a gap before the
-/// separator. Written straight into the transcript because most argument lists
-/// are a borrowed slice of the message — `format!` and `String::replace` would
-/// each copy them just to reuse the text unchanged.
+/// Append `text` to `into` with line breaks and blank lines folded to single
+/// spaces, so a call stays on one `\n`-delimited line of the transcript. Empty
+/// segments are skipped and a trailing space is dropped, so a part that starts
+/// or ends in a break does not leave a gap. Written straight into the transcript
+/// because most argument lists are a borrowed slice of the message — `format!`
+/// and `String::replace` would each copy them just to reuse the text unchanged.
 fn push_single_line(into: &mut String, text: &str) {
     let start = into.len();
-    let mut first = true;
+    let mut wrote = false;
     for_each_line(text, |line| {
-        if !first {
+        if line.trim().is_empty() {
+            return;
+        }
+        if wrote {
             into.push(' ');
         }
         into.push_str(line);
-        first = false;
+        wrote = true;
     });
     while into.len() > start && into.ends_with(' ') {
         into.pop();
@@ -3262,6 +3265,21 @@ mod tests {
         };
         let out = render_transcript(&[Message::assistant("", vec![call])]);
         assert!(out.contains("[tool call: read_file {}]\n"), "{out:?}");
+    }
+
+    #[test]
+    fn blank_lines_do_not_leave_gaps_in_a_call() {
+        let mut line = String::from("head ");
+        push_single_line(&mut line, "a\n\nb");
+        assert_eq!(line, "head a b");
+
+        let call = ToolCall {
+            id: "c1".into(),
+            name: "read_file".into(),
+            arguments: "a\n\nb".into(),
+        };
+        let out = render_transcript(&[Message::assistant("", vec![call])]);
+        assert!(out.contains("[tool call: read_file a b]\n"), "{out:?}");
     }
 
     #[test]
