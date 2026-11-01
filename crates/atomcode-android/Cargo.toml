@@ -42,6 +42,9 @@ codingplan-crypto = ["atomcode-daemon/codingplan-crypto"]
 anyhow = "1"
 tracing = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros"] }
+# The SAF world implements `atomcode_capabilities::world::FileSystem`, whose
+# methods are async; the trait itself is declared with this macro.
+async-trait = "0.1"
 # `pluginhost` reads a package's `package.json` (name/version/entry/symbol);
 # the daemon side already depends on these, so nothing new enters the lock.
 serde = { version = "1", features = ["derive"] }
