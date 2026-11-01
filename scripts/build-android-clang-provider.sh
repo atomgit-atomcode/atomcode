@@ -70,7 +70,23 @@ rm -rf "$data"
 mkdir -p "$data/usr/lib" "$data/lib/clang"
 cp -r "$CACHE/clang/root/include" "$data/usr/include"
 cp -r "$CACHE/clang/root/lib/clang/$clang_dir" "$data/lib/clang/$clang_dir"
+# `libunwind.a` is a *static* library the driver links `-lunwind` against; Termux
+# keeps it in its $PREFIX/lib. Without it every link fails with "cannot find
+# libunwind.a" (measured with a Go c-shared build), so it travels in the data
+# package and the launcher adds `-L<root>/lib`.
+mkdir -p "$data/lib"
+cp "$CACHE/clang/root/lib/libunwind.a" "$data/lib/libunwind.a" 2>/dev/null || true
 cp -r "$sysroot/usr/lib/aarch64-linux-android" "$data/usr/lib/aarch64-linux-android"
+
+# Versioned sonames (`libzstd.so.1`, `libxml2.so.16` …) cannot ride in the APK:
+# Gradle only packages `lib*.so` out of jniLibs, and dropping them made every
+# clang invocation die with `CANNOT LINK EXECUTABLE "clang": library
+# "libzstd.so.1" not found` (measured on device). `split.sh` puts them in the
+# split data tree's `libs/`; they travel here and the host adds this directory to
+# LD_LIBRARY_PATH.
+if [ -d "$CACHE/clang-split/data/libs" ]; then
+  cp -r "$CACHE/clang-split/data/libs" "$data/libs"
+fi
 
 echo "→ APK jniLibs"
 rm -rf "$JNI"
@@ -104,7 +120,7 @@ cat > "$data/manifest.json" <<EOF
 EOF
 bundle="$DIST/clang-sysroot-$version-arm64.tar.gz"
 echo "→ data package $bundle"
-tar -czf "$bundle" -C "$data" manifest.json usr lib
+tar -czf "$bundle" -C "$data" manifest.json usr lib libs
 echo "  size   $(du -h "$bundle" | cut -f1)"
 echo "  sha256 $(sha256sum "$bundle" | cut -d' ' -f1)"
 

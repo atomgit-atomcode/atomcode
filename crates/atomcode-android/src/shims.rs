@@ -160,6 +160,17 @@ pub const PROVIDER_TOOLS: &[(&str, &str)] = &[
     ("clang", "libclang.so"),
     ("clang++", "libclang.so"),
     ("lld", "liblld.so"),
+    // clang's LINK is a separate program it looks up by name: without `ld` (or
+    // `ld.lld` with `-fuse-ld`) every link fails with "unable to execute command:
+    // No such file or directory" even though compilation works — measured with a
+    // Go cgo build. Termux's clang finds `ld` in its own $PREFIX/bin; here the
+    // provider supplies it under the name clang asks for.
+    ("ld", "liblld.so"),
+    ("ld.lld", "liblld.so"),
+    // The archiver belongs to the same toolchain: cmake looks `ar` up by name and
+    // refuses to configure without it (`CMAKE_AR-NOTFOUND`, measured on device).
+    ("ar", "libar.so"),
+    ("ranlib", "libranlib.so"),
     // node is the interpreter itself. It replaces the nodejs-mobile plugin, whose
     // last release is 18.20.4 — a program cannot run from our data directory, so
     // the upgrade had to move to the provider shape.
@@ -412,6 +423,17 @@ pub fn install(
     let clang_data = data_dir.join("clang");
     if clang_data.is_dir() {
         std::env::set_var("ATOMCODE_CLANG_DATA", &clang_data);
+        // Termux-built tools ask `$PREFIX/include/...` for things that live in the
+        // data package. cmake is the one that matters: its Android detection reads
+        // `$PREFIX/include/android/api-level.h` and fails the whole configure with
+        // `file failed to open for reading … /include/android/api-level.h` when
+        // PREFIX is empty (measured on device). The package keeps that header under
+        // `usr/include`, so a `include` symlink makes one PREFIX serve both.
+        std::env::set_var("PREFIX", &clang_data);
+        let include = clang_data.join("include");
+        if !include.exists() && clang_data.join("usr/include").is_dir() {
+            let _ = symlink(Path::new("usr/include"), &include);
+        }
     }
     // Zig 在 APK 的 nativeLibraryDir 里找 `../lib`（不存在），只认 `$ZIG_LIB_DIR`。
     // 标准库由 `zig-lib` 数据包链接到 `<data>/zig`——链接本身就是标准库目录（下面直接
@@ -474,19 +496,27 @@ pub fn install(
             let _ = symlink(&target, &link);
         }
     }
-    // Versioned sonames (`libcrypto.so.3`, `librhash.so.1`, `libexpat.so.1` …) cannot
+    // Versioned sonames (`libcrypto.so.3`, `librhash.so.1`, `libzstd.so.1` …) cannot
     // ride in an APK: Gradle packages only `lib*.so` out of jniLibs, so they were
-    // silently missing and a provider died at link time (measured with cmake).
-    // `scripts/termux/split.sh` puts them here instead; loading a shared object from
-    // app data is allowed, executing from it is not.
-    let shared_libs = data_dir.join("libs");
-    if shared_libs.is_dir() {
-        let mut dirs: Vec<String> = std::env::var("LD_LIBRARY_PATH")
-            .ok()
-            .filter(|value| !value.is_empty())
-            .map(|value| value.split(':').map(str::to_string).collect())
-            .unwrap_or_default();
-        dirs.insert(0, shared_libs.display().to_string());
+    // silently missing and a provider died at link time (measured with cmake and
+    // with clang's libLLVM needing libzstd.so.1). `scripts/termux/split.sh` puts
+    // them in a `libs/` directory beside the data; the top-level one covers the
+    // generic providers, `clang/libs` the LLVM package, which has its own root.
+    let candidate_lib_dirs = [data_dir.join("libs"), data_dir.join("clang/libs")];
+    let existing: Vec<String> = candidate_lib_dirs
+        .iter()
+        .filter(|dir| dir.is_dir())
+        .map(|dir| dir.display().to_string())
+        .collect();
+    if !existing.is_empty() {
+        let mut dirs: Vec<String> = existing;
+        dirs.extend(
+            std::env::var("LD_LIBRARY_PATH")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(|value| value.split(':').map(str::to_string).collect::<Vec<_>>())
+                .unwrap_or_default(),
+        );
         std::env::set_var("LD_LIBRARY_PATH", dirs.join(":"));
     }
     Some(InstalledTools {

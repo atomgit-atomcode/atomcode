@@ -47,15 +47,36 @@ int main(int argc, char **argv) {
 
     char resource[MAX_PATH];
     char sysroot[MAX_PATH];
-    const char *injected[2];
+    char libdir[MAX_PATH];
+    const char *injected[3];
     int injected_n = 0;
+
+    /* `-L` belongs on a LINK only: passed to a compile, clang warns
+     * `argument unused during compilation`, and a `-Werror` caller (Go's cgo is
+     * one) turns that warning into a failure — measured. So it is added when the
+     * command line is not compile-only. */
+    int compile_only = 0;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "-S") == 0 ||
+            strcmp(argv[i], "-E") == 0 || strncmp(argv[i], "-M", 2) == 0) {
+            compile_only = 1;
+            break;
+        }
+    }
 
     const char *root = getenv("ATOMCODE_CLANG_DATA");
     if (root != NULL && root[0] != '\0') {
         snprintf(resource, sizeof resource, "-resource-dir=%s/%s", root, CLANG_RESOURCE);
         snprintf(sysroot, sizeof sysroot, "--sysroot=%s", root);
+        /* `libunwind.a` lives in the package's `lib/`, which is where Termux's
+         * clang expects it in its own $PREFIX. Without it a C++/cgo LINK fails
+         * with "cannot find libunwind.a" even though compilation works. */
+        snprintf(libdir, sizeof libdir, "-L%s/lib", root);
         injected[injected_n++] = resource;
         injected[injected_n++] = sysroot;
+        if (!compile_only) {
+            injected[injected_n++] = libdir;
+        }
     } else {
         /* Without the data package there are no headers; say so instead of failing
          * later with "stddef.h file not found", which reads like a broken compiler. */

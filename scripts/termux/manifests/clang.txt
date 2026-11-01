@@ -16,6 +16,11 @@
 # the APK's nativeLibraryDir, where the data package is not.
 exec bin/clang-21 clang-real
 exec bin/lld lld
+# The archiver is part of the toolchain, not an extra: cmake looks `ar` up by name
+# and refuses to configure with `CMAKE_AR-NOTFOUND` when it is absent (measured on
+# device). `ranlib` likewise, for static libraries.
+exec bin/llvm-ar ar
+exec bin/llvm-ranlib ranlib
 
 data include
 data lib/clang

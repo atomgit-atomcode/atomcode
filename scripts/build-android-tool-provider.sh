@@ -62,6 +62,17 @@ rm -rf "$JNI"
 mkdir -p "$JNI"
 cp -r "$CACHE/$name-split/jniLibs/arm64-v8a"/. "$JNI"/
 
+# Termux bakes its own $PREFIX into some binaries, and a path that does not exist
+# here breaks them in ways that look like a broken toolchain (cmake's default
+# `CMAKE_SH` is the one that bit us: every generated Makefile named
+# `/data/data/com.termux/files/usr/bin/sh`). The patch is an equal-length rewrite,
+# so the ELF is untouched apart from those bytes.
+if [ -f scripts/termux/patch-terminux-sh.py ]; then
+  echo "→ patch Termux paths"
+  python3 scripts/termux/patch-terminux-sh.py "$JNI"/*.so 2>/dev/null ||
+    python scripts/termux/patch-terminux-sh.py "$JNI"/*.so 2>/dev/null || true
+fi
+
 data=$CACHE/$name-data
 rm -rf "$data"
 mkdir -p "$data"

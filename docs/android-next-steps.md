@@ -97,22 +97,37 @@ rc=126
 - 上一版文档里「把 zig 做成市场数据包（`links: {"zig": "bin"}`）」是**错的**，已按实测改成
   provider APK；`bin` 字段没有引入，因为它在 Android 上只会产出 126。
 
-### 三个坑（provider 打包时真机踩出来的）
+### 六个坑（provider 打包时真机踩出来的）
 
 1. **版本化 soname 会被 Gradle 静默丢掉。** Gradle 只从 `jniLibs` 打包 `lib*.so`，
-   `libexpat.so.1`、`librhash.so.1`、`libcrypto.so.3` 这类名字匹配不上——文件明明躺在
-   `jniLibs` 里，APK 里却没有，运行时报
-   `CANNOT LINK EXECUTABLE …: library "librhash.so.1" not found`。
-   `scripts/termux/split.sh` 现在把这类库分流到数据包的 `libs/`，宿主把
-   `<product>/libs` 加进 `LD_LIBRARY_PATH`（从 app 数据目录 dlopen 允许，exec 不允许）。
+   `libexpat.so.1`、`librhash.so.1`、`libzstd.so.1`、`libcrypto.so.3` 这类名字匹配不上——
+   文件明明躺在 `jniLibs` 里，APK 里却没有，运行时报
+   `CANNOT LINK EXECUTABLE …: library "librhash.so.1" not found`（clang 甚至因此起不来：
+   `libLLVM.so` 需要 `libzstd.so.1`）。`scripts/termux/split.sh` 把这类库分流到数据包的
+   `libs/`，宿主把 `<product>/libs` 与 `<product>/clang/libs` 加进 `LD_LIBRARY_PATH`
+   （从 app 数据目录 dlopen 允许，exec 不允许）。
 2. **cmake 的根目录不看 `CMAKE_ROOT` 环境变量。** 它从 `argv[0]` 推出
    `<dir>/../share/cmake-X.Y`；命令是 `<product>/bin/cmake`，所以它找的是
    `<product>/share/cmake-X.Y`。往环境里设 `CMAKE_ROOT` 无效（实测仍然
    `CMake Error: Could not find CMAKE_ROOT`），必须由宿主建这个软链接。
-3. **Go 能编译，产物不能执行。** 工具链跑得通（`go build` 成功），但产物落在共享存储上，
-   app 进程 exec 它是 `Permission denied`（126）——与「数据目录不可执行」同一条平台规则。
-   要在手机上跑产物，只能放进某个 APK 的 `nativeLibraryDir`，或走 `pluginhost` 的
-   `dlopen` 路线。
+3. **Termux 把 `$PREFIX/bin/sh` 编进了 cmake 的 `CMAKE_SH`。** 生成的 Makefile 里
+   `SHELL=` 就是这个不存在的路径，`make` 每条配方都以 127 失败（`-DCMAKE_SH` 覆盖不掉）。
+   用 `scripts/termux/patch-terminux-sh.py` 做**等长**字节替换改成 `/bin/sh`（等长才不会
+   破坏 ELF 偏移）。
+4. **cmake 还读 `$ENV{PREFIX}`。** 它的 Android 探测打开
+   `$ENV{PREFIX}/include/android/api-level.h`，`PREFIX` 为空时就是 `/include/...`，
+   于是整个 configure 失败。宿主设 `PREFIX=<product>/clang` 并建 `include → usr/include`
+   软链即可。
+5. **工具链缺的不是编译器，是它旁边那几个名字。** clang 链接要 `ld`（否则 cgo/链接阶段
+   `unable to execute command: No such file or directory`）、cmake 要 `ar`（否则
+   `CMAKE_AR-NOTFOUND`）、静态库要 `ranlib`，C++/cgo 链接还要 `libunwind.a`。前三个由
+   宿主从 `liblld.so`/`llvm-ar`/`llvm-ranlib` 供给；`libunwind.a` 是静态库，随数据包走，
+   由启动器在**链接时**注入 `-L<root>/lib`（编译时注入会被 `-Werror` 的未用参数判死，
+   cgo 正是这么挂的）。
+6. **Go 能编译，产物不能直接执行。** 工具链跑得通（`go build`、`go build -buildmode=c-shared`
+   都成功），但产物落在共享存储上，app 进程 exec 它是 `Permission denied`（126）——与
+   「数据目录不可执行」同一条平台规则。要在手机上跑产物，只能放进某个 APK 的
+   `nativeLibraryDir`，或走 `pluginhost` 的 `dlopen` 路线。
 
 ## 三、包体体积：helper 从 82 MB 降到 33 MB（已完成）
 
