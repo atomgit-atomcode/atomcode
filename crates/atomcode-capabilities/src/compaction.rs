@@ -649,19 +649,21 @@ pub async fn summarize_span(
 /// input is what keeps the summary LLM call fast + cheap regardless of session size —
 /// an UNBOUNDED input (500k+ tokens on a long 1M session) is the real reason a summary
 /// could crawl toward the wall-clock timeout, not the timeout value itself.
+/// The rendered result, truncation marker included, stays at or under this cap.
 const SUMMARY_TOOL_OUTPUT_MAX_CHARS: usize = 2_000;
-/// Of the cap, how many chars to keep from the TAIL (the rest is head). Head+tail — not
-/// head-only like opencode — because a failing tool's error line (build error, stack
-/// trace, bash failure banner) usually sits at the END of a long output; head-only would
-/// drop it and the summary would miss the failure.
+/// Of the body budget (the cap minus the marker reserve), how many chars to keep
+/// from the TAIL (the rest is head). Head+tail — not head-only like opencode —
+/// because a failing tool's error line (build error, stack trace, bash failure
+/// banner) usually sits at the END of a long output; head-only would drop it and
+/// the summary would miss the failure.
 const SUMMARY_TOOL_OUTPUT_TAIL_CHARS: usize = 500;
 /// Tool-call arguments are part of "what happened" even when the result is short
 /// (`write_file`'s content, `edit_file`'s patch). Keep a bounded head+tail so the
-/// summary can name the action without re-reading a whole file.
+/// summary can name the action without re-reading a whole file; the truncation
+/// marker is included in the cap.
 const SUMMARY_TOOL_CALL_MAX_CHARS: usize = 600;
 const SUMMARY_TOOL_CALL_TAIL_CHARS: usize = 200;
-/// Whole-input ceiling for the transcript, marker line included: the body
-/// budget is this minus `SUMMARY_TRANSCRIPT_MARKER_RESERVE`. It is the only
+/// Whole-input ceiling for the transcript, marker line included. It is the only
 /// bound on dialogue text (messages have no per-message cap) and is positional,
 /// not role-aware: an over-budget span can lose dialogue from its middle, which
 /// the marker reports. Tool results and call arguments have per-item caps,
@@ -669,18 +671,18 @@ const SUMMARY_TOOL_CALL_TAIL_CHARS: usize = 200;
 /// this ceiling together (tier1 already allows cutting tool data).
 const SUMMARY_TRANSCRIPT_MAX_CHARS: usize = 120_000;
 const SUMMARY_TRANSCRIPT_TAIL_CHARS: usize = 40_000;
-/// Upper bound for the `\n[conversation truncated N chars]\n` line a whole-span
-/// cut inserts. The cut's body budget is reduced by this, so the rendered
-/// transcript — marker included — never exceeds `SUMMARY_TRANSCRIPT_MAX_CHARS`.
-const SUMMARY_TRANSCRIPT_MARKER_RESERVE: usize = 64;
+/// Upper bound for the marker line a cut inserts (`\n[marker N chars]\n` plus
+/// the pad). Every `cut_body` cap includes it, so the rendered result — marker
+/// included — never exceeds that cap.
+const CUT_MARKER_RESERVE: usize = 64;
 
-/// Bound a text body for the summary input: the full body when it fits,
-/// otherwise a head + tail around a `[truncated N chars]` marker. The common
-/// case borrows the caller's text: a byte length at or under the cap proves the
-/// char count is too, so neither the count nor a copy is needed.
+/// Bound a text body for the summary input: the full body when it fits the cap,
+/// otherwise a head + tail within the cap, marker included. The common case
+/// borrows the caller's text: a byte length at or under the cap proves the char
+/// count is too, so neither the count nor a copy is needed.
 ///
-/// A `tail_chars` wider than `max_chars` is clamped to it, so head and tail
-/// never spend more than the cap between them.
+/// A `tail_chars` wider than the body budget is clamped, so head and tail never
+/// spend more than the budget between them.
 fn bounded_body<'a>(text: &'a str, max_chars: usize, tail_chars: usize) -> Cow<'a, str> {
     if text.len() <= max_chars {
         return Cow::Borrowed(text);
@@ -692,35 +694,41 @@ fn bounded_body<'a>(text: &'a str, max_chars: usize, tail_chars: usize) -> Cow<'
     Cow::Owned(truncated_body(text, total, max_chars, tail_chars))
 }
 
-/// Clip one body to `max_chars` with the per-item `[truncated N chars]` marker.
+/// Clip one body to `max_chars`, marker included.
 fn truncated_body(text: &str, total: usize, max_chars: usize, tail_chars: usize) -> String {
     cut_body(text, total, max_chars, tail_chars, "truncated")
 }
 
 /// The cut itself, for a caller that already counted `total` characters.
 ///
-/// `marker` names what was lost: a clipped body says `[truncated N chars]`,
-/// while the whole-span cut says `[conversation truncated N chars]`, so the
-/// summarizer can tell one message's clip from a missing middle of the
-/// exchange.
+/// `max_chars` is the total rendered cap, marker included: the body budget is
+/// `max_chars - CUT_MARKER_RESERVE`. `marker` names what was lost: a clipped
+/// body says `[truncated N chars]`, while the whole-span cut says
+/// `[conversation truncated N chars]`, so the summarizer can tell one message's
+/// clip from a missing middle of the exchange.
 ///
 /// A tail that begins with a role tag or the tool-call marker is padded by one
 /// space: the marker puts it on a fresh line, and only the cut can create that
 /// line start.
 ///
-/// `total` must exceed `max_chars` (checked in debug builds). A `tail_chars`
-/// wider than `max_chars` is clamped, so head and tail never spend more than
-/// the cap between them.
+/// `total` must exceed `max_chars` and `max_chars` must be wider than the marker
+/// reserve (both checked in debug builds). A `tail_chars` wider than the body
+/// budget is clamped, so head and tail never spend more than that budget.
 fn cut_body(text: &str, total: usize, max_chars: usize, tail_chars: usize, marker: &str) -> String {
     debug_assert!(total > max_chars, "nothing to cut");
-    let tail_chars = tail_chars.min(max_chars);
-    let head_chars = max_chars.saturating_sub(tail_chars);
+    debug_assert!(
+        max_chars > CUT_MARKER_RESERVE,
+        "the cap must leave room for the marker"
+    );
+    let body_max = max_chars - CUT_MARKER_RESERVE;
+    let tail_chars = tail_chars.min(body_max);
+    let head_chars = body_max.saturating_sub(tail_chars);
     let head: String = text.chars().take(head_chars).collect();
     let tail: String = text
         .chars()
         .skip(total.saturating_sub(tail_chars))
         .collect();
-    let cut = total.saturating_sub(max_chars);
+    let cut = total.saturating_sub(body_max);
     // The marker puts the tail on a fresh line; a role tag exactly at the cut
     // boundary must not become a turn.
     let pad = if starts_transcript_line(&tail) {
@@ -916,12 +924,12 @@ fn render_transcript(span: &[Message]) -> String {
     if total <= SUMMARY_TRANSCRIPT_MAX_CHARS {
         return s;
     }
-    // The body gets the ceiling minus a reserve for the marker line, so the
-    // final transcript (marker included) stays within the declared ceiling.
+    // cut_body reserves the marker line, so the final transcript (marker
+    // included) stays within the declared ceiling.
     cut_body(
         &s,
         total,
-        SUMMARY_TRANSCRIPT_MAX_CHARS - SUMMARY_TRANSCRIPT_MARKER_RESERVE,
+        SUMMARY_TRANSCRIPT_MAX_CHARS,
         SUMMARY_TRANSCRIPT_TAIL_CHARS,
         "conversation truncated",
     )
@@ -3077,7 +3085,7 @@ mod tests {
             let text = format!("{}{start}", "a".repeat(90));
             let total = text.chars().count();
             let tail = start.chars().count();
-            let out = cut_body(&text, total, 20, tail, "conversation truncated");
+            let out = cut_body(&text, total, 100, tail, "conversation truncated");
             assert!(out.contains(&format!("\n {start}")), "{out:?}");
             assert!(
                 out.lines().all(|line| {
@@ -3151,14 +3159,15 @@ mod tests {
     fn truncated_body_clamps_a_tail_wider_than_the_cap() {
         // Only debug builds assert that the tail fits; release must still keep
         // the body within the cap when a caller gets it wrong.
-        let text = "z".repeat(100);
-        let out = truncated_body(&text, 100, 10, 50);
+        let text = "z".repeat(300);
+        let out = truncated_body(&text, 300, 100, 150);
         assert_eq!(
             out.matches('z').count(),
-            10,
-            "head and tail spend the cap between them, not the tail alone"
+            100 - CUT_MARKER_RESERVE,
+            "head and tail spend the body budget between them, not the tail alone"
         );
-        assert!(out.contains("[truncated 90 chars]"));
+        assert!(out.chars().count() <= 100);
+        assert!(out.contains("[truncated 264 chars]"));
     }
 
     #[test]
