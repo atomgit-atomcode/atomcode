@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- A file holder, like com.atomcode.tools.ninja: no activity, no service,
+         no IPC. The app links `<product>/bin/pkg-config` at this package's
+         `nativeLibraryDir`. `.pc` files are read from PKG_CONFIG_PATH, which the
+         caller sets — nothing else ships here. -->
+    <application
+        android:allowBackup="false"
+        android:label="AtomCode pkg-config" />
+
+</manifest>

@@ -685,6 +685,7 @@ class AgentService : Service() {
             "com.atomcode.tools.ninja",
             "com.atomcode.tools.cmake",
             "com.atomcode.tools.go",
+            "com.atomcode.tools.pkgconf",
         )
         /**
          * 空闲时多久问一次 daemon。

@@ -63,6 +63,15 @@ rm -rf "$JNI"
 mkdir -p "$JNI"
 cp "$CACHE"/node-split/jniLibs/arm64-v8a/* "$JNI"/
 
+# node spawns shells (`child_process`) and Termux baked its own $PREFIX into that
+# default; the path does not exist here, so it is rewritten to /bin/sh. Equal-length
+# replacement, same as the generic provider build does.
+if [ -f scripts/termux/patch-terminux-sh.py ]; then
+  echo "→ patch Termux paths"
+  python3 scripts/termux/patch-terminux-sh.py "$JNI"/*.so 2>/dev/null ||
+    python scripts/termux/patch-terminux-sh.py "$JNI"/*.so 2>/dev/null || true
+fi
+
 mkdir -p "$DIST"
 # The package root is the node prefix (`include/node`, `lib/node_modules/npm`),
 # exposed as `<product>/node` — an empty link target.

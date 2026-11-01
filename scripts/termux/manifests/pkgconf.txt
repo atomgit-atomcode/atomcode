@@ -1,0 +1,7 @@
+# pkg-config provider: one executable, no data package.
+#
+# `pkg-config` only reads `.pc` files from `PKG_CONFIG_PATH`/`PKG_CONFIG_LIBDIR`
+# (which the caller sets), so nothing beside the binary is needed. The package is
+# the GNU implementation from Termux; it is the name every `configure` script and
+# CMake `find_package` expects.
+exec bin/pkg-config pkg-config

@@ -54,6 +54,9 @@
         <package android:name="com.atomcode.tools.ninja" />
         <package android:name="com.atomcode.tools.cmake" />
         <package android:name="com.atomcode.tools.go" />
+        <!-- pkg-config: a `configure` script or CMake find_package looks it up by
+             name; same carrier as the rest. -->
+        <package android:name="com.atomcode.tools.pkgconf" />
         <!--
           The attachment picker offers "take a photo" next to "pick a file", and the
           output URI must be granted to whichever camera app answers. Since Android 11

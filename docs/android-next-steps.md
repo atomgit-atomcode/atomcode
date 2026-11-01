@@ -83,11 +83,11 @@ rc=126
 | lua / sqlite3 / quickjs / node 18 | B（市场插件包） | ✓ 既有 |
 | **MCP 服务器（二进制）** | **B**：`mcp-example` 插件包（纯 C，11 KB） | **✓ 已实现并实测**：`/mcp/status` `connected, tool_count 2`；模型调用 `mcp__example-bin__now` 拿到时间 |
 | **Go 1.27.3** | **A**：独立 APK `com.atomcode.tools.go`（`libgo.so` + 八个 `lib<tool>.so`），GOROOT 是数据包 `go-data`（127 MB，`src`/`pkg/include`/`VERSION`） | **✓ 已实现，编译通过**：`go version` → `go1.27.3 android/arm64`，`go build` 成功；**产物不能直接执行**——共享存储与数据目录都 noexec（exit 126），这是平台限制，不是包的问题 |
-| **cmake 4.4.5** | **A**：独立 APK `com.atomcode.tools.cmake`（`libcmake.so`/`libctest.so`/`libcpack.so`），模块是数据包 `cmake-data` | **✓ 已实现并实测**：`cmake --version` → `4.4.5`，模块可被找到（见下方「三个坑」）；配置工程还要指定编译器，本机 clang provider 未装 |
+| **cmake 4.4.5** | **A**：独立 APK `com.atomcode.tools.cmake`（`libcmake.so`/`libctest.so`/`libcpack.so`），模块是数据包 `cmake-data` | **✓ 已实现并实测**（2026-11-01）：`cmake --version` → `4.4.5`；`cmake -S … -B … -DCMAKE_C_COMPILER=clang` → `Configuring done`，`cmake --build` → `Built target hello`（7064 字节），见下方「六个坑」 |
 | **ninja 1.13.2** | **A**：独立 APK `com.atomcode.tools.ninja`（`libninja.so`，648 KB） | **✓ 已实现并实测**：`ninja --version` → `1.13.2` |
-| pkg-config | A | **未做**：同样需要 exec 自己，走 A 路线 |
-| **node 24 LTS** | **A**：独立 APK `com.atomcode.tools.node`（Termux `nodejs-lts` 24.22.1，`libnode.so` 45 MB）；npm 树与头文件是市场包 `node-lib`，npm 用 `node <prefix>/lib/node_modules/npm/bin/npm-cli.js` 调（数据目录里的 shebang 脚本不可执行） | **已打包，未上真机**（APK 19 MB + 5.1 MB 数据包）。取代 `nodejs-mobile` 18 插件：它是最后能用的 libnode 版本（GitHub 不可达，npm 上仍指 18.20.4） |
-| **clang 21 + lld 21** | **A**：独立 APK `com.atomcode.tools.clang`（Termux LLVM 21.1.8）；头文件、sysroot、resource dir 是市场包 `clang-sysroot`；`clang` 是启动器（`scripts/termux/launcher/clang.c`），注入 `-resource-dir`/`--sysroot` 后 exec 真 driver | **已打包，未上真机**（APK 114 MB + 30 MB 数据包）。NDK 的 clang 是宿主二进制，不能上设备；产物由 `scripts/build-android-clang-provider.sh` 从 Termux 包生成 |
+| **pkg-config 0.29.2** | **A**：独立 APK `com.atomcode.tools.pkgconf`（`libpkg-config.so`），版本化依赖（`libglib-2.0.so.0`）走数据包 `pkgconf-data` | **✓ 已实现并实测**（2026-11-01）：`pkg-config --version` → `0.29.2`，`PKG_CONFIG_PATH` 下 `--modversion` / `--libs` 都对 |
+| **node 24 LTS** | **A**：独立 APK `com.atomcode.tools.node`（Termux `nodejs-lts` 24.22.1，`libnode.so` 45 MB）；npm 树与头文件是市场包 `node-lib`，npm 用 `node <prefix>/lib/node_modules/npm/bin/npm-cli.js` 调（数据目录里的 shebang 脚本不可执行） | **✓ 已实现并实测**（2026-11-01，APK 37 MB + 22 MB 数据包）：`node --version` → `v26.12.1`，`node -e` 求值正常，`child_process.execSync` 也正常（补丁把 Termux 的 `$PREFIX/bin/sh` 换成 `/bin/sh`）。取代 `nodejs-mobile` 18 插件：它是最后能用的 libnode 版本（GitHub 不可达，npm 上仍指 18.20.4）。注意 deb 的 control 写 `24.22.1`，二进制实际报 `v26.12.1`——版本号以运行结果为准 |
+| **clang 21 + lld 21** | **A**：独立 APK `com.atomcode.tools.clang`（Termux LLVM 21.1.8）；头文件、sysroot、resource dir 是市场包 `clang-sysroot`；`clang` 是启动器（`scripts/termux/launcher/clang.c`），注入 `-resource-dir`/`--sysroot` 后 exec 真 driver | **✓ 已实现并实测**（2026-11-01，APK 72 MB + 30 MB 数据包）：`clang --version` → `21.1.8`，能编译、能链接（`clang main.c -o hello` → 6040 字节），cgo 的 `-buildmode=c-shared` 也通。NDK 的 clang 是宿主二进制，不能上设备；产物由 `scripts/build-android-clang-provider.sh` 从 Termux 包生成 |
 
 ### 结论
 
@@ -179,6 +179,10 @@ XML / Kotlin 源文件比对，少改一处就红（加 provider 时会先撞到
 
 ## 四、已知边界（不是缺陷，但要知道）
 
+- **产物点击的"没有查看器"提示在真机上基本不可达**：`MainActivity.viewerMimeType` 在
+  resolver 与扩展名都认不出时回落到 `*/*`，而设备上总有应用声明 `*/*`（文本编辑器、
+  文件管理器），于是永远弹「打开方式」而不是兜底 toast。这个取舍是有意的——`.patch`
+  这类没有专用查看器的文件正是靠它才能打开；代价是 `no_viewer` toast 只留在理论上。
 - **gateway 鉴权默认开启**：`scripts/build-android.sh` 的 `ATOMCODE_ANDROID_CRYPTO`
   默认 `1`。关掉它（`ATOMCODE_ANDROID_CRYPTO=0`）会得到一个"看起来已登录、但每个
   回合都被网关拒绝"的包 —— 只在明确需要无签名构建时才关。

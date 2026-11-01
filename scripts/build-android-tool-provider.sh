@@ -28,6 +28,7 @@ REPO=$PWD
 
 name=${1:?usage: build-android-tool-provider.sh <name> <termux-package>...}
 shift
+primary=$1
 [ "$#" -gt 0 ] || { echo "error: no Termux packages named" >&2; exit 2; }
 
 MIRROR=${MIRROR:-https://mirrors.tuna.tsinghua.edu.cn/termux/apt/termux-main}
@@ -79,7 +80,17 @@ mkdir -p "$data"
 if [ -d "$CACHE/$name-split/data" ]; then
   cp -r "$CACHE/$name-split/data"/. "$data"/
 fi
-[ -d "$data" ] && echo "→ data: $(du -sh "$data" | cut -f1)"
+if [ -d "$data" ] && [ -n "$(ls -A "$data" 2>/dev/null)" ]; then
+  echo "→ data: $(du -sh "$data" | cut -f1)"
+  # The data half is a market package of its own — the versioned `.so` files Gradle
+  # refuses to package and the read-only trees (GOROOT, cmake modules) live here.
+  # Its version comes from the deb that carries the primary package.
+  deb=$(ls "$CACHE/$name/debs/$primary"*.deb 2>/dev/null | head -1 || true)
+  version=$(ar p "$deb" control.tar.xz 2>/dev/null |
+    tar -xJO ./control 2>/dev/null | awk -F': *' '/^Version:/{print $2}' | head -1 || true)
+  version=${version:-0.0.0}
+  bash scripts/build-android-data-package.sh "$name-data" "$version" "$data" "$name"
+fi
 
 if [ "${SKIP_APK:-0}" = "1" ]; then
   echo "→ SKIP_APK=1, stopping before Gradle"
