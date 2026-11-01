@@ -831,15 +831,16 @@ fn push_single_line(into: &mut String, text: &str) {
 /// transcript line. The transcript is line-oriented, so a pasted `USER: ...`,
 /// `[tool call: ...]` or anchor comment must not become structure; its line
 /// shape stays (every break becomes `\n`) because a body's structure (diffs,
-/// logs) is what the summary needs.
+/// logs) is what the summary needs. Only continuation lines can start a line:
+/// the first is inline after the `ROLE: ` prefix, so it is left unpadded.
 fn push_transcript_text(into: &mut String, text: &str) {
     let mut first = true;
     for_each_line(text, |line| {
         if !first {
             into.push('\n');
-        }
-        if starts_transcript_line(line) {
-            into.push(' ');
+            if starts_transcript_line(line) {
+                into.push(' ');
+            }
         }
         into.push_str(line);
         first = false;
@@ -3102,6 +3103,16 @@ mod tests {
                 "the cut boundary must not start a transcript line: {out:?}"
             );
         }
+    }
+
+    #[test]
+    fn an_inline_first_line_is_not_padded() {
+        let out = render_transcript(&[
+            Message::user("USER: literal"),
+            Message::tool_result("c1", "[truncated 5 chars]", false),
+        ]);
+        assert!(out.contains("USER: USER: literal\n"), "{out:?}");
+        assert!(out.contains("TOOL: [truncated 5 chars]\n"), "{out:?}");
     }
 
     #[test]
