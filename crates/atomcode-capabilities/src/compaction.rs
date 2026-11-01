@@ -671,10 +671,15 @@ const SUMMARY_TOOL_CALL_TAIL_CHARS: usize = 200;
 /// this ceiling together (tier1 already allows cutting tool data).
 const SUMMARY_TRANSCRIPT_MAX_CHARS: usize = 120_000;
 const SUMMARY_TRANSCRIPT_TAIL_CHARS: usize = 40_000;
-/// Upper bound for the marker line a cut inserts (`\n[marker N chars]\n` plus
-/// the pad). Every `cut_body` cap includes it, so the rendered result — marker
-/// included — never exceeds that cap.
-const CUT_MARKER_RESERVE: usize = 64;
+/// Decimal digits in `usize::MAX`; 20 covers the supported platforms.
+const MAX_USIZE_DIGITS: usize = 20;
+
+/// Upper bound on the marker line a cut inserts: `\n[<marker> <cut> chars]\n`
+/// plus the one-char pad. The cut counter is a `usize`, so the bound holds for
+/// every input.
+fn marker_reserve(marker: &str) -> usize {
+    "\n[".len() + marker.len() + " ".len() + MAX_USIZE_DIGITS + " chars]\n".len() + 1
+}
 
 /// Bound a text body for the summary input: the full body when it fits the cap,
 /// otherwise a head + tail within the cap, marker included. The common case
@@ -702,7 +707,7 @@ fn truncated_body(text: &str, total: usize, max_chars: usize, tail_chars: usize)
 /// The cut itself, for a caller that already counted `total` characters.
 ///
 /// `max_chars` is the total rendered cap, marker included: the body budget is
-/// `max_chars - CUT_MARKER_RESERVE`. `marker` names what was lost: a clipped
+/// `max_chars - marker_reserve(marker)`. `marker` names what was lost: a clipped
 /// body says `[truncated N chars]`, while the whole-span cut says
 /// `[conversation truncated N chars]`, so the summarizer can tell one message's
 /// clip from a missing middle of the exchange.
@@ -716,11 +721,12 @@ fn truncated_body(text: &str, total: usize, max_chars: usize, tail_chars: usize)
 /// budget is clamped, so head and tail never spend more than that budget.
 fn cut_body(text: &str, total: usize, max_chars: usize, tail_chars: usize, marker: &str) -> String {
     debug_assert!(total > max_chars, "nothing to cut");
+    let reserve = marker_reserve(marker);
     debug_assert!(
-        max_chars > CUT_MARKER_RESERVE,
+        max_chars > reserve,
         "the cap must leave room for the marker"
     );
-    let body_max = max_chars - CUT_MARKER_RESERVE;
+    let body_max = max_chars.saturating_sub(reserve);
     let tail_chars = tail_chars.min(body_max);
     let head_chars = body_max.saturating_sub(tail_chars);
     let head: String = text.chars().take(head_chars).collect();
@@ -3161,13 +3167,14 @@ mod tests {
         // the body within the cap when a caller gets it wrong.
         let text = "z".repeat(300);
         let out = truncated_body(&text, 300, 100, 150);
+        let body = 100 - marker_reserve("truncated");
         assert_eq!(
             out.matches('z').count(),
-            100 - CUT_MARKER_RESERVE,
+            body,
             "head and tail spend the body budget between them, not the tail alone"
         );
         assert!(out.chars().count() <= 100);
-        assert!(out.contains("[truncated 264 chars]"));
+        assert!(out.contains(&format!("[truncated {} chars]", 300 - body)));
     }
 
     #[test]
