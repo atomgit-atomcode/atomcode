@@ -660,14 +660,19 @@ const SUMMARY_TOOL_OUTPUT_TAIL_CHARS: usize = 500;
 /// summary can name the action without re-reading a whole file.
 const SUMMARY_TOOL_CALL_MAX_CHARS: usize = 600;
 const SUMMARY_TOOL_CALL_TAIL_CHARS: usize = 200;
-/// Whole-input ceiling for the transcript. It is the only bound on dialogue
-/// text (messages have no per-message cap) and is positional, not role-aware:
-/// an over-budget span can lose dialogue from its middle, which the marker
-/// reports. Tool results and call arguments have per-item caps, which keeps
-/// one item from spending the span; many items can still reach this ceiling
-/// together (tier1 already allows cutting tool data).
+/// Whole-input ceiling for the transcript, marker line included: the body
+/// budget is this minus `SUMMARY_TRANSCRIPT_MARKER_RESERVE`. It is the only
+/// bound on dialogue text (messages have no per-message cap) and is positional,
+/// not role-aware: an over-budget span can lose dialogue from its middle, which
+/// the marker reports. Tool results and call arguments have per-item caps,
+/// which keeps one item from spending the span; many items can still reach
+/// this ceiling together (tier1 already allows cutting tool data).
 const SUMMARY_TRANSCRIPT_MAX_CHARS: usize = 120_000;
 const SUMMARY_TRANSCRIPT_TAIL_CHARS: usize = 40_000;
+/// Upper bound for the `\n[conversation truncated N chars]\n` line a whole-span
+/// cut inserts. The cut's body budget is reduced by this, so the rendered
+/// transcript — marker included — never exceeds `SUMMARY_TRANSCRIPT_MAX_CHARS`.
+const SUMMARY_TRANSCRIPT_MARKER_RESERVE: usize = 64;
 
 /// Bound a text body for the summary input: the full body when it fits,
 /// otherwise a head + tail around a `[truncated N chars]` marker. The common
@@ -890,10 +895,12 @@ fn render_transcript(span: &[Message]) -> String {
     if total <= SUMMARY_TRANSCRIPT_MAX_CHARS {
         return s;
     }
+    // The body gets the ceiling minus a reserve for the marker line, so the
+    // final transcript (marker included) stays within the declared ceiling.
     cut_body(
         &s,
         total,
-        SUMMARY_TRANSCRIPT_MAX_CHARS,
+        SUMMARY_TRANSCRIPT_MAX_CHARS - SUMMARY_TRANSCRIPT_MARKER_RESERVE,
         SUMMARY_TRANSCRIPT_TAIL_CHARS,
         "conversation truncated",
     )
@@ -3257,8 +3264,8 @@ mod tests {
             "each tool body fits its cap, so none is clipped"
         );
         assert!(
-            out.chars().count() < SUMMARY_TRANSCRIPT_MAX_CHARS + 200,
-            "the whole summary input is bounded: {} chars",
+            out.chars().count() <= SUMMARY_TRANSCRIPT_MAX_CHARS,
+            "the whole summary input stays under the ceiling (marker included): {} chars",
             out.chars().count()
         );
     }
@@ -3275,8 +3282,8 @@ mod tests {
         span[last] = Message::user(format!("{}TAILMARK", "z".repeat(20_000)));
         let out = render_transcript(&span);
         assert!(
-            out.chars().count() < SUMMARY_TRANSCRIPT_MAX_CHARS + 200,
-            "the whole summary input is bounded: {} chars",
+            out.chars().count() <= SUMMARY_TRANSCRIPT_MAX_CHARS,
+            "the whole summary input stays under the ceiling (marker included): {} chars",
             out.chars().count()
         );
         assert!(
