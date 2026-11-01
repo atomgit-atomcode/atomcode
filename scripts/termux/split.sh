@@ -21,6 +21,7 @@
 # Manifest (one directive per line, `#` comments allowed):
 #   exec <path-in-root> <stem>   # → <jni>/lib<stem>.so   (becomes `bin/<stem>`)
 #   data <path-in-root>          # file or directory → <data>/<path>
+#   lib  <path-in-root>          # a dlopen()ed .so → <jni>/<basename> (kept as is)
 #
 # The shared libraries each executable needs are NOT listed: they are read from
 # the ELF headers (`DT_NEEDED`) and pulled in recursively, so the manifest says
@@ -117,6 +118,19 @@ while read -r kind path stem; do
       mkdir -p "$DATA/$(dirname "$path")"
       cp -a "$src" "$DATA/$path"
       ;;
+    lib)
+      src="$ROOT/$path"
+      [ -f "$src" ] || { echo "error: lib not in tree: $path" >&2; exit 1; }
+      # A shared object the program `dlopen`s at runtime. It goes into
+      # nativeLibraryDir, which is already on LD_LIBRARY_PATH; its own
+      # dependencies are still pulled in automatically.
+      #
+      # Only for a name that already matches `lib*.so`: Gradle packages NOTHING
+      # else from jniLibs, so a versioned soname (`libexpat.so.1`) silently
+      # disappears from the APK. Those belong in the data package instead.
+      cp "$src" "$JNI/$(basename "$path")"
+      collect_libs "$src"
+      ;;
     *)
       echo "error: unknown manifest directive \`$kind\`" >&2
       exit 1
@@ -125,7 +139,22 @@ while read -r kind path stem; do
 done < "$MANIFEST"
 
 for lib in "${lib_order[@]}"; do
-  cp "$lib" "$JNI/$(basename "$lib")"
+  name=$(basename "$lib")
+  case "$name" in
+    lib*.so)
+      cp "$lib" "$JNI/$name"
+      ;;
+    *)
+      # A versioned soname (`librhash.so.1`, `libcrypto.so.3` …). Gradle packages
+      # ONLY `lib*.so` from jniLibs, so these used to vanish from the APK without a
+      # word — measured on device: cmake died with `library "librhash.so.1" not
+      # found` although the file was staged. They go into the data tree instead,
+      # and the host puts `<data>/libs` on LD_LIBRARY_PATH (loading a shared object
+      # from app data is allowed; executing from there is not).
+      mkdir -p "$DATA/libs"
+      cp "$lib" "$DATA/libs/$name"
+      ;;
+  esac
 done
 
 {

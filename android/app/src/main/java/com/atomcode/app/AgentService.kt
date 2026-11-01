@@ -679,6 +679,12 @@ class AgentService : Service() {
             "com.atomcode.tools.zig",
             "com.atomcode.tools.clang",
             "com.atomcode.tools.node",
+            // Build-tool providers: ninja, cmake (+ctest/cpack) and the Go driver.
+            // Each is a program, so each needs the provider shape; their read-only
+            // halves (cmake modules, GOROOT) are market data packages.
+            "com.atomcode.tools.ninja",
+            "com.atomcode.tools.cmake",
+            "com.atomcode.tools.go",
         )
         /**
          * 空闲时多久问一次 daemon。

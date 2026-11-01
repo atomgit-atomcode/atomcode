@@ -1,0 +1,27 @@
+# go provider: the driver in the APK, GOROOT sources as a data package.
+#
+# Go's driver execs its own toolchain out of `$GOROOT/pkg/tool/<goos>_<goarch>/`
+# (Termux builds GOOS=android, hence `android_arm64`). Those tools are programs
+# too, so they cannot live in the data package: they ride here as `lib<tool>.so`
+# and the host links them into the GOROOT tree as symlinks — the inode being
+# executed is still in `nativeLibraryDir`, which is what Android requires.
+#
+# Everything else under `lib/go` is read (the standard library sources the driver
+# compiles against), so it ships as the `go-data` market package. `pkg/tool` is
+# deliberately not in that list: those binaries are here, not there.
+exec bin/go go
+exec lib/go/pkg/tool/android_arm64/asm asm
+exec lib/go/pkg/tool/android_arm64/cgo cgo
+exec lib/go/pkg/tool/android_arm64/compile compile
+exec lib/go/pkg/tool/android_arm64/cover cover
+exec lib/go/pkg/tool/android_arm64/fix fix
+exec lib/go/pkg/tool/android_arm64/link link
+exec lib/go/pkg/tool/android_arm64/preprofile preprofile
+exec lib/go/pkg/tool/android_arm64/vet vet
+
+data lib/go/src
+data lib/go/lib
+data lib/go/misc
+data lib/go/VERSION
+data lib/go/go.env
+data lib/go/pkg/include

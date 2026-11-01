@@ -451,8 +451,11 @@ debug 构建（在 reqwest 客户端层打点），这会改动生产代码，�
 
    构建：`bash scripts/build-android-git.sh` 会一并产出这三个（需要 Linux NDK + Rust 工具链），
    从零构建的前置条件与步骤见该脚本头部注释。
-2. **Git 互通只差凭据与 UI**：设备上已有可用的 `git`，clone / pull / push 机制实测通过；
-   但「把 HTTPS token 安全交给 agent」和 webui 里的 Git 面板还没做（见上一节「还没做」）。
+2. **Git 凭据与 UI：已做**（2026-11-01 核对）。token 只写进 git 自己的
+   `credential.helper=store`，路由是 `GET/POST /git/credentials` 与
+   `DELETE /git/credentials/:host`（列表只回 host/username，永不回 token），
+   webui 的 Git 面板（`SourceControl.tsx`）已经有输入框、列表与删除。
+   真机核对：存 `example.com` 后 `GET` 只返回 `{host, username}`。
 3. **SAF 未接**：现在用全盘访问换取真实路径。若日后要上架 Google Play，需要改用 SAF +
    持久的 `content://` 授予，并给工具层补一个 SAF 世界的实现（`world::{FileSystem,Shell}` 接缝）。
 4. **未验证**：前台服务在 Doze 下长时间运行、内存占用都还没量过；

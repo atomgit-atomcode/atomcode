@@ -164,7 +164,77 @@ pub const PROVIDER_TOOLS: &[(&str, &str)] = &[
     // last release is 18.20.4 — a program cannot run from our data directory, so
     // the upgrade had to move to the provider shape.
     ("node", "libnode.so"),
+    // Build-tool front ends. `cmake` also brings ctest/cpack: a project that can be
+    // configured but not tested is half a toolchain.
+    ("ninja", "libninja.so"),
+    ("cmake", "libcmake.so"),
+    ("ctest", "libctest.so"),
+    ("cpack", "libcpack.so"),
+    // The Go driver. Its own toolchain is linked separately (see
+    // [`GO_TOOLCHAIN_TOOLS`]): those binaries are not commands a person types.
+    ("go", "libgo.so"),
 ];
+
+/// The tools Go's driver execs from `$GOROOT/pkg/tool/android_arm64/`.
+///
+/// They are programs, so they ride in the go provider APK like any other tool — but
+/// their names must stay OUT of `PATH`: `compile`, `link`, `asm` would shadow real
+/// commands and mislead the model. They are linked into the GOROOT tree instead,
+/// which is the only place the driver looks.
+const GO_TOOLCHAIN_TOOLS: &[&str] = &[
+    "asm",
+    "cgo",
+    "compile",
+    "cover",
+    "fix",
+    "link",
+    "preprofile",
+    "vet",
+];
+
+/// Link the Go toolchain into the GOROOT installed by the `go-data` package.
+///
+/// Returns the number of tools linked. `pkg/tool` is the one directory under GOROOT
+/// that must hold executables, and the entries are symlinks into the provider's
+/// library directory — the inode executed stays inside the APK, which is what
+/// Android requires, while the driver finds them at the name it expects.
+fn link_go_toolchain(provider_lib_dirs: &[PathBuf], root: &Path) -> usize {
+    let tool_dir = root.join("pkg/tool/android_arm64");
+    if std::fs::create_dir_all(&tool_dir).is_err() {
+        return 0;
+    }
+    let mut linked = 0;
+    for tool in GO_TOOLCHAIN_TOOLS {
+        let link = tool_dir.join(tool);
+        match find_provider_lib(provider_lib_dirs, &format!("lib{tool}.so")) {
+            Some(target) => {
+                let _ = std::fs::remove_file(&link);
+                if symlink(&target, &link).is_ok() {
+                    linked += 1;
+                }
+            }
+            None => {
+                let _ = std::fs::remove_file(&link);
+            }
+        }
+    }
+    linked
+}
+
+/// The cmake module directory the `cmake-data` package installed, if any.
+///
+/// The name carries the version (`share/cmake-4.4`), so it is discovered instead of
+/// hardcoded — an upgraded data package keeps working.
+fn cmake_module_dir(data_dir: &Path) -> Option<PathBuf> {
+    let share = data_dir.join("cmake/share");
+    let entries = std::fs::read_dir(&share).ok()?;
+    entries.flatten().map(|entry| entry.path()).find(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("cmake-"))
+            && path.is_dir()
+    })
+}
 
 /// Point `<data>/bin` at the provider APKs' binaries.
 ///
@@ -354,6 +424,70 @@ pub fn install(
             dir = %zig_lib.display(),
             "zig is available but its standard library is not installed; install the zig-lib package"
         );
+    }
+    // Go: the driver ships in a provider APK, the standard library as the `go-data`
+    // package, and the toolchain tools are linked into GOROOT's `pkg/tool` — the only
+    // place the driver looks. Both halves have to be there before it can compile
+    // anything, so nothing is exported when one is missing.
+    let goroot = data_dir.join("go");
+    if bin_dir.join("go").exists() {
+        if goroot.is_dir() {
+            let linked = link_go_toolchain(provider_lib_dirs, &goroot);
+            if linked == GO_TOOLCHAIN_TOOLS.len() {
+                std::env::set_var("GOROOT", &goroot);
+                // Nothing in a phone's home is writable by this process: keep the
+                // build cache and GOPATH inside the product tree.
+                std::env::set_var("GOCACHE", data_dir.join("go-cache"));
+                std::env::set_var("GOPATH", data_dir.join("go-path"));
+                // The driver must not try to download another toolchain: the one in
+                // the APK is the only one that can run here, so a `go.mod` toolchain
+                // directive has to fail rather than fetch.
+                std::env::set_var("GOTOOLCHAIN", "local");
+            } else {
+                tracing::warn!(
+                    linked,
+                    expected = GO_TOOLCHAIN_TOOLS.len(),
+                    "go toolchain is incomplete; install the go-data package"
+                );
+            }
+        } else {
+            tracing::info!(
+                dir = %goroot.display(),
+                "go is available but its GOROOT package (go-data) is not installed"
+            );
+        }
+    }
+    // cmake's modules are a data package, and cmake does NOT take their location
+    // from the environment: it derives its root as `<dir of argv[0]>/../share/cmake-X.Y`
+    // and refuses with `CMake Error: Could not find CMAKE_ROOT` otherwise (measured
+    // on device; `CMAKE_ROOT` in the env is ignored at bootstrap). The command is
+    // `<data>/bin/cmake`, so that derivation lands on `<data>/share/cmake-X.Y` — a
+    // symlink into the data package bridges the two.
+    if let Some(modules) = cmake_module_dir(data_dir) {
+        if let (Some(name), Ok(())) = (
+            modules.file_name(),
+            std::fs::create_dir_all(data_dir.join("share")),
+        ) {
+            let link = data_dir.join("share").join(name);
+            let target = Path::new("..").join("cmake").join("share").join(name);
+            let _ = std::fs::remove_file(&link);
+            let _ = symlink(&target, &link);
+        }
+    }
+    // Versioned sonames (`libcrypto.so.3`, `librhash.so.1`, `libexpat.so.1` …) cannot
+    // ride in an APK: Gradle packages only `lib*.so` out of jniLibs, so they were
+    // silently missing and a provider died at link time (measured with cmake).
+    // `scripts/termux/split.sh` puts them here instead; loading a shared object from
+    // app data is allowed, executing from it is not.
+    let shared_libs = data_dir.join("libs");
+    if shared_libs.is_dir() {
+        let mut dirs: Vec<String> = std::env::var("LD_LIBRARY_PATH")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .map(|value| value.split(':').map(str::to_string).collect())
+            .unwrap_or_default();
+        dirs.insert(0, shared_libs.display().to_string());
+        std::env::set_var("LD_LIBRARY_PATH", dirs.join(":"));
     }
     Some(InstalledTools {
         bin_dir,
@@ -688,6 +822,58 @@ mod tests {
             "an absent provider leaves no link behind"
         );
         assert!(std::fs::read_link(bin.join("make")).is_ok());
+    }
+
+    /// Go's tools are programs too, but they must NOT land in `PATH`: the driver
+    /// looks them up under GOROOT, and `compile`/`link`/`asm` in `PATH` would
+    /// shadow real commands and mislead the model.
+    #[cfg(unix)]
+    #[test]
+    fn the_go_toolchain_is_linked_into_goroot_not_into_path() {
+        let work = tempfile::tempdir().unwrap();
+        let provider = work.path().join("go-provider");
+        let goroot = work.path().join("go");
+        std::fs::create_dir_all(&provider).unwrap();
+        std::fs::create_dir_all(&goroot).unwrap();
+        for tool in GO_TOOLCHAIN_TOOLS {
+            std::fs::write(provider.join(format!("lib{tool}.so")), b"binary").unwrap();
+        }
+
+        assert_eq!(
+            link_go_toolchain(&[provider.clone()], &goroot),
+            GO_TOOLCHAIN_TOOLS.len()
+        );
+        let tool_dir = goroot.join("pkg/tool/android_arm64");
+        assert_eq!(
+            std::fs::read_link(tool_dir.join("compile")).unwrap(),
+            provider.join("libcompile.so"),
+            "the driver looks the tool up by name under GOROOT"
+        );
+
+        // A tool the provider no longer carries leaves no dangling link behind.
+        std::fs::remove_file(provider.join("libvet.so")).unwrap();
+        assert_eq!(
+            link_go_toolchain(&[provider], &goroot),
+            GO_TOOLCHAIN_TOOLS.len() - 1
+        );
+        assert!(!tool_dir.join("vet").exists());
+    }
+
+    /// The cmake module directory is versioned (`cmake-4.4`); discovering it keeps a
+    /// data-package upgrade from needing a host release.
+    #[test]
+    fn cmake_modules_are_found_by_their_versioned_directory_name() {
+        let work = tempfile::tempdir().unwrap();
+        assert!(
+            cmake_module_dir(work.path()).is_none(),
+            "no data package yet"
+        );
+        std::fs::create_dir_all(work.path().join("cmake/share/cmake-4.4")).unwrap();
+        std::fs::write(work.path().join("cmake/share/README"), b"x").unwrap();
+        assert_eq!(
+            cmake_module_dir(work.path()).unwrap(),
+            work.path().join("cmake/share/cmake-4.4")
+        );
     }
 
     // A build that ships only git must not leave dangling links for the tools

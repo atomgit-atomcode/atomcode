@@ -1,0 +1,14 @@
+# cmake provider: the driver in the APK, its modules as a data package.
+#
+# `share/cmake-4.4` is read, never executed — it is the module set every
+# `project()` / `find_package()` call loads — so it travels as the `cmake-data`
+# market package and the app points cmake at it. The binary would otherwise look
+# for modules next to itself, in the APK's nativeLibraryDir, where they are not.
+#
+# `ctest` and `cpack` ship with it: a project that can be configured but not tested
+# or packaged is half a toolchain.
+exec bin/cmake cmake
+exec bin/ctest ctest
+exec bin/cpack cpack
+
+data share/cmake-4.4

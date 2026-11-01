@@ -48,6 +48,12 @@
              executable on this platform. -->
         <package android:name="com.atomcode.tools.clang" />
         <package android:name="com.atomcode.tools.node" />
+        <!-- Build-tool providers: ninja, cmake (+ctest/cpack) and the Go driver.
+             Same carrier and same reason as the two above; each ships its read-only
+             half (cmake modules, GOROOT) as a market data package. -->
+        <package android:name="com.atomcode.tools.ninja" />
+        <package android:name="com.atomcode.tools.cmake" />
+        <package android:name="com.atomcode.tools.go" />
         <!--
           The attachment picker offers "take a photo" next to "pick a file", and the
           output URI must be granted to whichever camera app answers. Since Android 11

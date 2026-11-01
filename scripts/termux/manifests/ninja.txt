@@ -1,0 +1,5 @@
+# ninja provider: one executable, no data package.
+#
+# `ninja` is a build-tool front end — it only reads its own build files and spawns
+# the compiler from the command line, so nothing beside the binary is needed.
+exec bin/ninja ninja

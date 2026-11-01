@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- A file holder, like com.atomcode.tools.zig / .clang / .node: no activity,
+         no service, no IPC.
+
+         The main app links `<product>/bin/ninja` at this package's
+         `nativeLibraryDir`, because that is the only directory Android lets an app
+         execute from. The tool's own files are read-only and travel as a market
+         data package, not here. -->
+    <application
+        android:allowBackup="false"
+        android:label="AtomCode Ninja" />
+
+</manifest>

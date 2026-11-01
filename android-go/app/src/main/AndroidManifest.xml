@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- A file holder, like com.atomcode.tools.ninja / .cmake: no activity, no
+         service, no IPC. The app links `<product>/bin/go` at this package's
+         `nativeLibraryDir` and points GOROOT at the `go-data` market package; the
+         toolchain tools are linked into `$GOROOT/pkg/tool/android_arm64/` from
+         here, because they are programs too. -->
+    <application
+        android:allowBackup="false"
+        android:label="AtomCode Go" />
+
+</manifest>

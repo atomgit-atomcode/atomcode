@@ -82,10 +82,12 @@ rc=126
 | python3 | B（内置 RustPython） + 市场 CPython 插件 | ✓ 既有 |
 | lua / sqlite3 / quickjs / node 18 | B（市场插件包） | ✓ 既有 |
 | **MCP 服务器（二进制）** | **B**：`mcp-example` 插件包（纯 C，11 KB） | **✓ 已实现并实测**：`/mcp/status` `connected, tool_count 2`；模型调用 `mcp__example-bin__now` 拿到时间 |
-| Go | A（`CGO_ENABLED=0 GOOS=linux GOARCH=arm64`，静态） | **未做**：本机没有 Go 工具链，且产物必须进 APK（A 路线） |
+| **Go 1.27.3** | **A**：独立 APK `com.atomcode.tools.go`（`libgo.so` + 八个 `lib<tool>.so`），GOROOT 是数据包 `go-data`（127 MB，`src`/`pkg/include`/`VERSION`） | **✓ 已实现，编译通过**：`go version` → `go1.27.3 android/arm64`，`go build` 成功；**产物不能直接执行**——共享存储与数据目录都 noexec（exit 126），这是平台限制，不是包的问题 |
+| **cmake 4.4.5** | **A**：独立 APK `com.atomcode.tools.cmake`（`libcmake.so`/`libctest.so`/`libcpack.so`），模块是数据包 `cmake-data` | **✓ 已实现并实测**：`cmake --version` → `4.4.5`，模块可被找到（见下方「三个坑」）；配置工程还要指定编译器，本机 clang provider 未装 |
+| **ninja 1.13.2** | **A**：独立 APK `com.atomcode.tools.ninja`（`libninja.so`，648 KB） | **✓ 已实现并实测**：`ninja --version` → `1.13.2` |
+| pkg-config | A | **未做**：同样需要 exec 自己，走 A 路线 |
 | **node 24 LTS** | **A**：独立 APK `com.atomcode.tools.node`（Termux `nodejs-lts` 24.22.1，`libnode.so` 45 MB）；npm 树与头文件是市场包 `node-lib`，npm 用 `node <prefix>/lib/node_modules/npm/bin/npm-cli.js` 调（数据目录里的 shebang 脚本不可执行） | **已打包，未上真机**（APK 19 MB + 5.1 MB 数据包）。取代 `nodejs-mobile` 18 插件：它是最后能用的 libnode 版本（GitHub 不可达，npm 上仍指 18.20.4） |
 | **clang 21 + lld 21** | **A**：独立 APK `com.atomcode.tools.clang`（Termux LLVM 21.1.8）；头文件、sysroot、resource dir 是市场包 `clang-sysroot`；`clang` 是启动器（`scripts/termux/launcher/clang.c`），注入 `-resource-dir`/`--sysroot` 后 exec 真 driver | **已打包，未上真机**（APK 114 MB + 30 MB 数据包）。NDK 的 clang 是宿主二进制，不能上设备；产物由 `scripts/build-android-clang-provider.sh` 从 Termux 包生成 |
-| cmake / ninja / pkg-config | A | **未做**：同上（cmake 还会 exec 编译器，必须在 A 路线） |
 
 ### 结论
 
@@ -94,6 +96,23 @@ rc=126
 - 纯数据包（stdlib、wheel、字库、模型）不受这条约束影响，A/B 之外随时可装。
 - 上一版文档里「把 zig 做成市场数据包（`links: {"zig": "bin"}`）」是**错的**，已按实测改成
   provider APK；`bin` 字段没有引入，因为它在 Android 上只会产出 126。
+
+### 三个坑（provider 打包时真机踩出来的）
+
+1. **版本化 soname 会被 Gradle 静默丢掉。** Gradle 只从 `jniLibs` 打包 `lib*.so`，
+   `libexpat.so.1`、`librhash.so.1`、`libcrypto.so.3` 这类名字匹配不上——文件明明躺在
+   `jniLibs` 里，APK 里却没有，运行时报
+   `CANNOT LINK EXECUTABLE …: library "librhash.so.1" not found`。
+   `scripts/termux/split.sh` 现在把这类库分流到数据包的 `libs/`，宿主把
+   `<product>/libs` 加进 `LD_LIBRARY_PATH`（从 app 数据目录 dlopen 允许，exec 不允许）。
+2. **cmake 的根目录不看 `CMAKE_ROOT` 环境变量。** 它从 `argv[0]` 推出
+   `<dir>/../share/cmake-X.Y`；命令是 `<product>/bin/cmake`，所以它找的是
+   `<product>/share/cmake-X.Y`。往环境里设 `CMAKE_ROOT` 无效（实测仍然
+   `CMake Error: Could not find CMAKE_ROOT`），必须由宿主建这个软链接。
+3. **Go 能编译，产物不能执行。** 工具链跑得通（`go build` 成功），但产物落在共享存储上，
+   app 进程 exec 它是 `Permission denied`（126）——与「数据目录不可执行」同一条平台规则。
+   要在手机上跑产物，只能放进某个 APK 的 `nativeLibraryDir`，或走 `pluginhost` 的
+   `dlopen` 路线。
 
 ## 三、包体体积：helper 从 82 MB 降到 33 MB（已完成）
 
