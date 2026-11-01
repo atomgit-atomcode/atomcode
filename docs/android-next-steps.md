@@ -165,6 +165,10 @@ helper APK：**82 MB → 33 MB**（剩下的主体是 `libatomcode.so`，即设�
 
 **仍未做**：把 `com.atomcode.tools.zig` 这个 APK **发布到市场**（清单里一个 `helper`
 条目），并在插件页加第二个「下载并安装」。目前它靠 `adb install` 装，代码侧全部就位。
+`com.atomcode.tools.ninja` / `.cmake` / `.go` 也处于同一状态：APK 可编可装、宿主能链接、
+真机验证过，但**还没进市场清单**（市场仓库是独立的 `E:/atomcode-plugins`，推送权限仍在等；
+2026-11-01 决定先不发，继续用 `adb install`）。要发时的步骤见 `docs/plugin-market.md`
+的「发布」小节：`catalog.tsv` 加一行 → `tools/publish.sh` → commit/push。
 
 **注意**：`shims::HELPER_TOOLS` / `PROVIDER_TOOLS`、`packages.rs::HELPER_COMMANDS`、
 `AgentService.HELPER_PACKAGES` 与 manifest 的 `<queries>` 是必须同步的四份清单。
