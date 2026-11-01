@@ -699,9 +699,10 @@ fn bounded_body<'a>(text: &'a str, max_chars: usize, tail_chars: usize) -> Cow<'
     Cow::Owned(truncated_body(text, total, max_chars, tail_chars))
 }
 
-/// Clip one body to `max_chars`, marker included.
+/// Clip one body to `max_chars`, marker included. The cut is not padded here:
+/// the body consumer ([`push_transcript_text`]) escapes structural lines.
 fn truncated_body(text: &str, total: usize, max_chars: usize, tail_chars: usize) -> String {
-    cut_body(text, total, max_chars, tail_chars, "truncated")
+    cut_body(text, total, max_chars, tail_chars, "truncated", false)
 }
 
 /// The cut itself, for a caller that already counted `total` characters.
@@ -713,13 +714,21 @@ fn truncated_body(text: &str, total: usize, max_chars: usize, tail_chars: usize)
 /// clip from a missing middle of the exchange.
 ///
 /// A tail that begins with a role tag or the tool-call marker is padded by one
-/// space: the marker puts it on a fresh line, and only the cut can create that
-/// line start.
+/// space when `pad_tail` is set: the whole-span cut is emitted directly, while a
+/// per-item cut is escaped by its consumer. The marker puts the tail on a fresh
+/// line, and only the cut can create that line start.
 ///
 /// `total` must exceed `max_chars` and `max_chars` must be wider than the marker
 /// reserve (both checked in debug builds). A `tail_chars` wider than the body
 /// budget is clamped, so head and tail never spend more than that budget.
-fn cut_body(text: &str, total: usize, max_chars: usize, tail_chars: usize, marker: &str) -> String {
+fn cut_body(
+    text: &str,
+    total: usize,
+    max_chars: usize,
+    tail_chars: usize,
+    marker: &str,
+    pad_tail: bool,
+) -> String {
     debug_assert!(total > max_chars, "nothing to cut");
     let reserve = marker_reserve(marker);
     debug_assert!(
@@ -737,7 +746,7 @@ fn cut_body(text: &str, total: usize, max_chars: usize, tail_chars: usize, marke
     let cut = total.saturating_sub(body_max);
     // The marker puts the tail on a fresh line; a role tag exactly at the cut
     // boundary must not become a turn.
-    let pad = if starts_transcript_line(&tail) {
+    let pad = if pad_tail && starts_transcript_line(&tail) {
         " "
     } else {
         ""
@@ -939,6 +948,7 @@ fn render_transcript(span: &[Message]) -> String {
         SUMMARY_TRANSCRIPT_MAX_CHARS,
         SUMMARY_TRANSCRIPT_TAIL_CHARS,
         "conversation truncated",
+        true,
     )
 }
 
@@ -3092,7 +3102,7 @@ mod tests {
             let text = format!("{}{start}", "a".repeat(90));
             let total = text.chars().count();
             let tail = start.chars().count();
-            let out = cut_body(&text, total, 100, tail, "conversation truncated");
+            let out = cut_body(&text, total, 100, tail, "conversation truncated", true);
             assert!(out.contains(&format!("\n {start}")), "{out:?}");
             assert!(
                 out.lines().all(|line| {
@@ -3103,6 +3113,21 @@ mod tests {
                 "the cut boundary must not start a transcript line: {out:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_cut_body_tail_is_escaped_once_by_its_consumer() {
+        // The per-item cut does not pad; push_transcript_text escapes the tail
+        // line once, so a role tag gets exactly one leading space.
+        let role = "USER: tail";
+        let text = format!("{}USER: tail", "x".repeat(4_000 - role.len()));
+        let total = text.chars().count();
+        let cut = truncated_body(&text, total, 100, role.chars().count());
+        let mut out = String::from("TOOL: ");
+        push_transcript_text(&mut out, &cut);
+        out.push('\n');
+        assert!(out.contains("\n USER: tail\n"), "{out:?}");
+        assert!(!out.contains("\n  USER: tail\n"), "{out:?}");
     }
 
     #[test]
