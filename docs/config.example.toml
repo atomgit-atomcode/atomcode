@@ -255,6 +255,12 @@ mode = "follow_system"
 #   ATOMCODE_REVIEW_MAX_DURATION_SECS=900
 # 工具返回的截断阈值见下方 [tools.output]；环境变量优先于配置文件：
 #   ATOMCODE_TOOL_OUTPUT_THRESHOLD_BYTES=204800
+# open_file（打开产物/文件）在桌面端用哪个程序打开。不设置时按平台默认：
+# macOS `open`、Windows `explorer.exe`、Linux `xdg-open`；SSH / CI 会话拒绝打开
+# 并给出路径。设置后优先生效（SSH/CI 也照用，指向远端查看器时才有意义）：
+# 文件路径（或 URL）作为最后一个参数追加，不经过 shell；含空格的路径用双引号：
+#   ATOMCODE_OPEN_COMMAND=code -r
+#   ATOMCODE_OPEN_COMMAND="C:\Program Files\Viewer\view.exe" --new
 [coding]
 max_rounds = 0
 

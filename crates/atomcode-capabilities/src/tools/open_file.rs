@@ -17,7 +17,10 @@
 //! [`LocalOpener`] is this machine's desktop: it picks the launcher by OS + environment
 //! (`open` / `xdg-open` / `explorer.exe` / `wslview`), and a headless / SSH / CI session
 //! REFUSES with a human-readable reason (and the path) instead of pretending a window
-//! opened. Launching a GUI is a user-visible side effect ⇒ the tool is always `Risky`.
+//! opened. `ATOMCODE_OPEN_COMMAND` overrides that guess with a launcher the person names
+//! (an editor nobody registered as the default handler); the file is appended as its last
+//! argument, so nothing goes through a shell. Launching a GUI is a user-visible side
+//! effect ⇒ the tool is always `Risky`.
 
 use super::{err, ok, resolve_path};
 use async_trait::async_trait;
@@ -111,6 +114,9 @@ enum OpenStrategy {
     WindowsStart,
     /// `wslview <path>` — wslu's WSL→Windows bridge.
     Wslview,
+    /// A launcher the person configured (`ATOMCODE_OPEN_COMMAND`), split into
+    /// program and arguments. Wins over every OS guess above.
+    Custom(Vec<String>),
     /// No GUI session — refuse, naming the disqualifying signal.
     Headless(String),
 }
@@ -119,6 +125,12 @@ enum OpenStrategy {
 /// SSH / CI checks come BEFORE OS dispatch: `ssh user@mac` still reports `macos` but a
 /// window would open on the *server*.
 fn pick_open_strategy() -> OpenStrategy {
+    // An explicit configuration beats every guess below — including the SSH/CI
+    // refusal: pointing `ATOMCODE_OPEN_COMMAND` at a remote viewer (`code`,
+    // `ssh -t host …`) is exactly the case those checks would otherwise deny.
+    if let Some(command) = configured_open_command() {
+        return OpenStrategy::Custom(command);
+    }
     if let Some(reason) = ssh_signal() {
         return OpenStrategy::Headless(reason);
     }
@@ -147,17 +159,21 @@ fn pick_open_strategy() -> OpenStrategy {
     }
     #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
     {
-        if is_wsl() {
-            // `wslview` (wslu) is the canonical WSL opener; if it's missing the spawn
-            // below fails with a clear message + the path for manual viewing.
-            return OpenStrategy::Wslview;
-        }
         let has_display = std::env::var("DISPLAY")
             .map(|v| !v.is_empty())
             .unwrap_or(false)
             || std::env::var("WAYLAND_DISPLAY")
                 .map(|v| !v.is_empty())
                 .unwrap_or(false);
+        // `wslview` (wslu) is the canonical WSL opener, but it is an extra package:
+        // plenty of WSL2 installs have WSLg and no wslu. Preferring it unconditionally
+        // made those fail with "failed to launch `wslview`" while `xdg-open` was right
+        // there and working (measured in a Linux container on a WSL2 host). So it is
+        // used only when it is actually installed; otherwise the display check below
+        // decides, exactly as on any other Linux.
+        if is_wsl() && command_on_path("wslview") {
+            return OpenStrategy::Wslview;
+        }
         if !has_display {
             return OpenStrategy::Headless(
                 "no graphical session ($DISPLAY and $WAYLAND_DISPLAY both empty — likely a \
@@ -189,6 +205,56 @@ fn ci_signal() -> Option<String> {
     None
 }
 
+/// A launcher the person configured, e.g. `ATOMCODE_OPEN_COMMAND="code -r"`.
+///
+/// The OS detection below can only find the *default* handler, and a daemon's
+/// environment is the wrong place to guess an editor nobody registered as one.
+/// The value is a command line; the file (or URL) is appended as its last
+/// argument, so nothing here goes through a shell.
+fn configured_open_command() -> Option<Vec<String>> {
+    let raw = std::env::var("ATOMCODE_OPEN_COMMAND").ok()?;
+    parse_open_command(&raw)
+}
+
+/// Split a configured command line into program + arguments.
+///
+/// Whitespace separates; double quotes group (`"C:\Program Files\X\x.exe" --new`).
+/// No escapes and no shell, and an unclosed quote is taken literally: refusing to
+/// open anything over a stray quote helps nobody.
+fn parse_open_command(raw: &str) -> Option<Vec<String>> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut started = false;
+    for ch in raw.chars() {
+        match ch {
+            '"' => {
+                quoted = !quoted;
+                started = true;
+            }
+            c if c.is_whitespace() && !quoted => {
+                if started {
+                    parts.push(std::mem::take(&mut current));
+                    started = false;
+                }
+            }
+            c => {
+                current.push(c);
+                started = true;
+            }
+        }
+    }
+    if started {
+        parts.push(current);
+    }
+    parts.retain(|part| !part.is_empty());
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts)
+    }
+}
+
 #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
 fn is_wsl() -> bool {
     if std::env::var("WSL_DISTRO_NAME")
@@ -202,13 +268,41 @@ fn is_wsl() -> bool {
         .unwrap_or(false)
 }
 
-fn strategy_command_name(s: &OpenStrategy) -> &'static str {
+/// Whether `program` resolves to something runnable, by walking `PATH`.
+///
+/// Not `which` (absent from minimal images) and not a probe spawn (that would open
+/// nothing): the strategy choice only needs to know whether the name is there
+/// before it promises a launch.
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+fn command_on_path(program: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| is_executable_file(&dir.join(program)))
+}
+
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(path) {
+        Ok(meta) => meta.is_file() && meta.permissions().mode() & 0o111 != 0,
+        Err(_) => false,
+    }
+}
+
+fn strategy_command_name(s: &OpenStrategy) -> String {
     match s {
-        OpenStrategy::MacOpen => "open",
-        OpenStrategy::XdgOpen => "xdg-open",
-        OpenStrategy::WindowsStart => "explorer.exe",
-        OpenStrategy::Wslview => "wslview",
-        OpenStrategy::Headless(_) => "(headless)",
+        OpenStrategy::MacOpen => "open".into(),
+        OpenStrategy::XdgOpen => "xdg-open".into(),
+        OpenStrategy::WindowsStart => "explorer.exe".into(),
+        OpenStrategy::Wslview => "wslview".into(),
+        // The configured program, which is a runtime string — the reason this
+        // returns `String` rather than `&'static str`.
+        OpenStrategy::Custom(parts) => parts
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "(configured command)".into()),
+        OpenStrategy::Headless(_) => "(headless)".into(),
     }
 }
 
@@ -307,6 +401,14 @@ pub async fn open_local_path(target: &Path) -> Result<String, String> {
             c.arg(&target_str);
             c
         }
+        OpenStrategy::Custom(parts) => {
+            let program = parts
+                .first()
+                .ok_or_else(|| "open_file: ATOMCODE_OPEN_COMMAND names no program".to_string())?;
+            let mut c = Command::new(program);
+            c.args(&parts[1..]).arg(&target_str);
+            c
+        }
         OpenStrategy::Headless(reason) => {
             return Err(format!(
                 "open_file: cannot open in GUI: {reason}.\n\nFile path for manual viewing:\n  {}",
@@ -364,6 +466,14 @@ pub async fn open_local_url(url: &str) -> Result<String, String> {
         OpenStrategy::Wslview => {
             let mut c = Command::new("wslview");
             c.arg(url);
+            c
+        }
+        OpenStrategy::Custom(parts) => {
+            let program = parts
+                .first()
+                .ok_or_else(|| "open_file: ATOMCODE_OPEN_COMMAND names no program".to_string())?;
+            let mut c = Command::new(program);
+            c.args(&parts[1..]).arg(url);
             c
         }
         OpenStrategy::Headless(reason) => {
@@ -542,10 +652,44 @@ mod tests {
             OpenStrategy::XdgOpen,
             OpenStrategy::WindowsStart,
             OpenStrategy::Wslview,
+            OpenStrategy::Custom(vec!["my-opener".into()]),
             OpenStrategy::Headless("x".into()),
         ] {
             assert!(!strategy_command_name(&s).is_empty());
         }
+    }
+
+    /// A configured launcher is named by its program, which is what the message
+    /// (and `describe`) shows — not the whole command line.
+    #[test]
+    fn a_configured_command_is_named_by_its_program() {
+        let named = strategy_command_name(&OpenStrategy::Custom(vec!["code".into(), "-r".into()]));
+        assert_eq!(named, "code");
+    }
+
+    /// `ATOMCODE_OPEN_COMMAND` is a command line, and the file is appended as one
+    /// argument — so a launcher whose own path has spaces must survive quoting.
+    #[test]
+    fn a_configured_command_splits_into_program_and_arguments() {
+        assert_eq!(
+            parse_open_command("code -r"),
+            Some(vec!["code".to_string(), "-r".to_string()])
+        );
+        assert_eq!(
+            parse_open_command(r#""C:\Program Files\Viewer\view.exe" --new"#),
+            Some(vec![
+                r"C:\Program Files\Viewer\view.exe".to_string(),
+                "--new".to_string()
+            ])
+        );
+        // An unclosed quote is taken literally rather than rejecting the setting.
+        assert_eq!(
+            parse_open_command(r#"viewer "unfinished"#),
+            Some(vec!["viewer".to_string(), "unfinished".to_string()])
+        );
+        // Empty and whitespace-only mean "not configured", not "a program called ''".
+        assert_eq!(parse_open_command(""), None);
+        assert_eq!(parse_open_command("   "), None);
     }
 
     #[test]
@@ -564,6 +708,32 @@ mod tests {
         if !in_ci {
             assert!(ci_signal().is_none());
         }
+    }
+
+    /// `wslview` is preferred on WSL only when it can actually run, so the probe
+    /// must tell an executable from a plain file — and must not trust a directory.
+    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+    #[test]
+    fn only_an_executable_file_counts_as_a_launcher() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("wslview");
+        std::fs::write(&executable, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let plain = dir.path().join("not-executable");
+        std::fs::write(&plain, "x").unwrap();
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(is_executable_file(&executable));
+        assert!(
+            !is_executable_file(&plain),
+            "a non-executable file is not a launcher"
+        );
+        assert!(
+            !is_executable_file(dir.path()),
+            "a directory is not a launcher"
+        );
+        assert!(!is_executable_file(&dir.path().join("missing")));
     }
 
     #[test]
