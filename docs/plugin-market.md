@@ -4,8 +4,17 @@ Android 端「运行时插件」的市场源。目标是把「装什么」从翻
 变成按分类浏览——就像外卖平台用「疯狂星期四」「新人特惠」这类侧栏分区，而不是把所有店
 铺平铺成一列。`numpy`、`cpython` 归在 `python` 下，`node` 归在 `js` 下。
 
-**市场仓库与 `atomcode` 主仓相互独立**，本地位于 `E:/atomcode-plugins`（尚未推送：
-组织下建仓的权限还在等）。这里只放元数据与包体，不含客户端代码。
+**市场仓库与 `atomcode` 主仓相互独立**。这里描述的插件仓库（CPython/numpy/lua/sqlite3/
+cheaders/node/quickjs/svg/cffi/text/zig-lib，11 个条目）本地位于 `E:/atomcode-plugins`，
+**没有配置 remote，尚未发布到任何地方**——组织下建仓的权限仍在等，这与下面第 3 节
+`android-next-steps.md` 里 provider（独立 APK）走的是另一个、已经发布的仓库是两件事，
+不要混着看。这里只放元数据与包体，不含客户端代码。
+
+（provider 市场 `qiaoen_python/atomcode-android-plugins` 已于 2026-11-01 发布到
+AtomGit，见 `docs/android-next-steps.md` 对应小节；它和这份插件仓库是两套独立的
+`market base`/`helper.json`，provider 走 `helper.json` 的 `helpers` 数组，插件走
+`market.json` 的 `plugins` 数组加 `catalog.tsv`。两者可以共用同一个 `market.json`
+的 `plugins` + `helpers` 字段，但目前分别落在两个仓库里。）
 
 ## 三层元数据
 
@@ -275,8 +284,16 @@ node --test /tmp/out
 
 ## 已知边界
 
-- 仓库还没推送，客户端目前指向设备本地目录；等组织建仓权限到位，把 `base` 换成 raw 链接即可，
-  代码不用改。
-- LFS 的媒体基址在 AtomGit 上还没确认（GitHub 是 `media.githubusercontent.com/media/...`）；
-  未确认前建议先用 `repo-plain`，或保持本地目录。
+- 这份插件仓库（`E:/atomcode-plugins`）还没推送，客户端目前指向设备本地目录；等组织
+  建仓权限到位，把 `base` 换成 raw 链接即可，代码不用改。
+- **AtomGit 的 raw 链接已经在 provider 仓库上验证过，结论定了**（2026-11-01）：
+  - 网页版端点 `atomgit.com/<owner>/<repo>/raw/branch/<ref>/<path>` 返回 SPA 的
+    HTML 壳（`Content-Type: text/html`），**不能用**；
+  - 真正可用的是官方 API `https://api.atomgit.com/api/v5/repos/<owner>/<repo>/raw/<path>`
+    （host 是 `api.atomgit.com`，不是 `atomgit.com`），匿名可访问，返回裸字节；
+  - **LFS 文件在这条 API 上也只返回 133 字节的指针文本**，不是真实内容——AtomGit
+    没有 GitHub 风格的媒体直通（`media.githubusercontent.com` 那种），所以 `repo-lfs`
+    这个 `storage` 选项在 AtomGit 上事实不可用，二进制必须走普通 git blob（`repo-plain`）。
+    单文件 74 MB、总量 394 MB 时普通 push 正常。
+  - 示例见 `qiaoen_python/atomcode-android-plugins`（provider 市场，已发布 14 个 APK）。
 - 分类以 `categories.json` 为准，插件只声明 `category` 单值；要「一个插件进多个分区」时再扩。

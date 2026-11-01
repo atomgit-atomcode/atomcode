@@ -31,8 +31,11 @@
   initialize / tools/list / tools/call 与两条失败路径（越界、二进制），不需要真机；
 - 真机安装路径与 `mcp-example` 相同（`POST /packages/install`，再让 `mcp.json` 指向别名）。
 
-**仍未做（不在本仓库内）**：把 `mcp-filesystem` 与 `com.atomcode.tools.zig` 一样发布到
-市场仓库并加目录条目——仓库推送权限还在等。产物已经可编、可自测，发布是纯搬运。
+**发布状态（2026-11-01 更新）**：旧的市场仓库 `E:/atomcode-plugins` 因推送权限受阻，
+已换成个人公开仓库 [`qiaoen_python/atomcode-android-plugins`](https://atomgit.com/qiaoen_python/atomcode-android-plugins)
+（AtomGit）。目前该仓库只发布了 14 个 provider APK + 数据包（见下方第 3 节），
+`mcp-filesystem` 这个插件本身尚未搬过去——产物已经可编、可自测，发布是纯搬运，
+流程见该仓库的 `tools/write_market.py`。
 
 **落点**：`scripts/mcp-filesystem/`、`scripts/build-android-mcp-filesystem.sh`、
 `docs/plugin-market.md`。
@@ -169,12 +172,26 @@ $ zig run hello.zig              → hello zig 42   （标准库走 $ZIG_LIB_DIR
 helper APK：**82 MB → 33 MB**（剩下的主体是 `libatomcode.so`，即设备上的
 `atomcode daemon` CLI，见 `docs/external-daemon.md`）。
 
-**仍未做**：把 `com.atomcode.tools.zig` 这个 APK **发布到市场**（清单里一个 `helper`
-条目），并在插件页加第二个「下载并安装」。目前它靠 `adb install` 装，代码侧全部就位。
-`com.atomcode.tools.ninja` / `.cmake` / `.go` 也处于同一状态：APK 可编可装、宿主能链接、
-真机验证过，但**还没进市场清单**（市场仓库是独立的 `E:/atomcode-plugins`，推送权限仍在等；
-2026-11-01 决定先不发，继续用 `adb install`）。要发时的步骤见 `docs/plugin-market.md`
-的「发布」小节：`catalog.tsv` 加一行 → `tools/publish.sh` → commit/push。
+**已发布到市场**（2026-11-01）：`com.atomcode.tools.zig` 及其余 13 个 provider
+（clang/node/ninja/cmake/go/pkgconf/bash/rsync/openssh/unzip/tar/perl/tools）全部
+发布到新市场仓库 [`qiaoen_python/atomcode-android-plugins`](https://atomgit.com/qiaoen_python/atomcode-android-plugins)。
+真机验证：`GET /packages/market` 返回 `helpers: 14`，`GET /packages/market/helper?name=unzip`
+下载落地、sha256 校验通过。
+
+接入方式——`config.toml` 或环境变量：
+
+```toml
+[market]
+base = "https://api.atomgit.com/api/v5/repos/qiaoen_python/atomcode-android-plugins/raw"
+```
+
+**踩的坑**：AtomGit 网页版的 `raw/branch/main/...` 端点返回 SPA 的 HTML 壳，不是裸文件；
+真正能用的是官方 API `GET /api/v5/repos/{owner}/{repo}/raw/{path}`（host 是
+`api.atomgit.com`，不是 `atomgit.com`）。Git LFS 在这条 API 上只返回 133 字节的指针
+文本（`version/oid/size`），不是真实字节——跟 `docs/plugin-market.md` 记录的
+「LFS raw 链接返回指针不是包体」是同一个坑，这次在新仓库上又踩了一遍；二进制改回
+普通 git blob 存储后才正常。`git lfs untrack` 不会把已提交的 LFS 对象转回普通 blob，
+要 `git rm --cached` 再重新 `git add` 才生效。
 
 **注意**：`shims::HELPER_TOOLS` / `PROVIDER_TOOLS`、`packages.rs::HELPER_COMMANDS`、
 `AgentService.HELPER_PACKAGES` 与 manifest 的 `<queries>` 是必须同步的四份清单。
