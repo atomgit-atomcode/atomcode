@@ -54,6 +54,13 @@ def main() -> int:
             rel = name[len(strip):].lstrip("/")
             if not rel:
                 continue
+            # Termux ships man pages as `App::Cpan.3.gz`, and `:` is not a legal
+            # filename character on Windows: extraction aborts there and leaves a
+            # half-written tree (measured with perl — `bin/perl` came out truncated
+            # at 6.8 KB). Nothing on the device reads documentation, so it is skipped
+            # rather than sanitised.
+            if rel.startswith("share/man/") or rel.startswith("share/doc/"):
+                continue
             dest = os.path.join(root, *rel.split("/"))
             if member.isdir():
                 os.makedirs(dest, exist_ok=True)

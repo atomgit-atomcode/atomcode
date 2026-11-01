@@ -199,6 +199,13 @@ pub const PROVIDER_TOOLS: &[(&str, &str)] = &[
     ("sftp", "libsftp.so"),
     ("ssh-keygen", "libssh-keygen.so"),
     ("ssh-add", "libssh-add.so"),
+    // Info-ZIP unzip and GNU tar: the platform's toybox versions stop at the basics
+    // (`-P`, Zip64, `--transform`, archive auto-detection are the gap).
+    ("unzip", "libunzip.so"),
+    ("tar", "libtar.so"),
+    // perl: the driver is `libperl-driver.so` because `libperl.so` is the shared
+    // library it links against, and both cannot share a stem in jniLibs.
+    ("perl", "libperl-driver.so"),
 ];
 
 /// The tools Go's driver execs from `$GOROOT/pkg/tool/android_arm64/`.
@@ -492,6 +499,33 @@ pub fn install(
                 dir = %goroot.display(),
                 "go is available but its GOROOT package (go-data) is not installed"
             );
+        }
+    }
+    // perl's built-in @INC points at Termux's own prefix, which does not exist here.
+    // PERL5LIB is prepended to @INC, so the module tree in the data package is what
+    // `use` actually finds. The order matters: the arch-specific directory first, as
+    // perl's own default does.
+    let perl5 = data_dir.join("perl/lib/perl5");
+    if perl5.is_dir() {
+        let mut dirs: Vec<String> = Vec::new();
+        for candidate in [
+            perl5.join("5.44.0/aarch64-android"),
+            perl5.join("5.44.0"),
+            perl5.join("site_perl/5.44.0/aarch64-android"),
+            perl5.join("site_perl/5.44.0"),
+        ] {
+            if candidate.is_dir() {
+                dirs.push(candidate.display().to_string());
+            }
+        }
+        // Whatever a person already configured stays behind ours, not instead of it.
+        if let Ok(existing) = std::env::var("PERL5LIB") {
+            if !existing.is_empty() {
+                dirs.extend(existing.split(':').map(str::to_string));
+            }
+        }
+        if !dirs.is_empty() {
+            std::env::set_var("PERL5LIB", dirs.join(":"));
         }
     }
     // cmake's modules are a data package, and cmake does NOT take their location

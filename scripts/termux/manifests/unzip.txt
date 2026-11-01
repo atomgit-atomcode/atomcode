@@ -1,0 +1,7 @@
+# unzip provider: one executable, one library.
+#
+# toybox has an `unzip`, but it stops at the basics: no `-P` for an encrypted
+# archive, no Zip64, no `-X` restore of ownership/permissions. Termux's Info-ZIP
+# build does all of that; its only library (`libbz2`) carries a versioned soname
+# Gradle will not package, so it lands in the data package's `libs/`.
+exec bin/unzip unzip

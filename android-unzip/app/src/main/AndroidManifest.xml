@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- A file holder, like com.atomcode.tools.ninja: no activity, no service,
+         no IPC. The app links `<product>/bin/unzip` at this package's
+         `nativeLibraryDir`; `libbz2.so.1.0` travels as `unzip-data`. -->
+    <application
+        android:allowBackup="false"
+        android:label="AtomCode unzip" />
+
+</manifest>

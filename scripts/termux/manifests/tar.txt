@@ -1,0 +1,9 @@
+# tar provider: GNU tar, next to the platform's toybox one.
+#
+# toybox's `tar` covers the basics; GNU tar is what build scripts and release
+# tooling actually use: `--transform`, `--exclude-from`, `-S` sparse files, archive
+# auto-detection (`.tar.xz`, `.tar.zst`) and the `--format` selection. The binary is
+# a bionic build from Termux; its libraries (libacl, libandroid-glob, libiconv,
+# libandroid-selinux) carry versioned sonames Gradle will not package, so they land
+# in the data package's `libs/`.
+exec bin/tar tar

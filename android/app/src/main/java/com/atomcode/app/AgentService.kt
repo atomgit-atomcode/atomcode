@@ -689,6 +689,9 @@ class AgentService : Service() {
             "com.atomcode.tools.bash",
             "com.atomcode.tools.rsync",
             "com.atomcode.tools.openssh",
+            "com.atomcode.tools.unzip",
+            "com.atomcode.tools.tar",
+            "com.atomcode.tools.perl",
         )
         /**
          * 空闲时多久问一次 daemon。

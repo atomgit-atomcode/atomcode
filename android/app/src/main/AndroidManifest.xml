@@ -64,6 +64,12 @@
         <package android:name="com.atomcode.tools.rsync" />
         <!-- The OpenSSH client (ssh/scp/sftp/ssh-keygen): client only. -->
         <package android:name="com.atomcode.tools.openssh" />
+        <!-- Info-ZIP unzip and GNU tar: the full-featured versions of the two
+             archives the platform only half supports. -->
+        <package android:name="com.atomcode.tools.unzip" />
+        <package android:name="com.atomcode.tools.tar" />
+        <!-- perl: the interpreter in the APK, its module tree as `perl-data`. -->
+        <package android:name="com.atomcode.tools.perl" />
         <!--
           The attachment picker offers "take a photo" next to "pick a file", and the
           output URI must be granted to whichever camera app answers. Since Android 11

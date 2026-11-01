@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- A file holder, like com.atomcode.tools.ninja: no activity, no service,
+         no IPC. The app links `<product>/bin/perl` at this package's
+         `nativeLibraryDir`; the 67 MB module tree is the `perl-data` package. -->
+    <application
+        android:allowBackup="false"
+        android:label="AtomCode perl" />
+
+</manifest>

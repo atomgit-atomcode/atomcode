@@ -86,6 +86,9 @@ rc=126
 | **cmake 4.4.5** | **A**：独立 APK `com.atomcode.tools.cmake`（`libcmake.so`/`libctest.so`/`libcpack.so`），模块是数据包 `cmake-data` | **✓ 已实现并实测**（2026-11-01）：`cmake --version` → `4.4.5`；`cmake -S … -B … -DCMAKE_C_COMPILER=clang` → `Configuring done`，`cmake --build` → `Built target hello`（7064 字节），见下方「六个坑」 |
 | **ninja 1.13.2** | **A**：独立 APK `com.atomcode.tools.ninja`（`libninja.so`，648 KB） | **✓ 已实现并实测**：`ninja --version` → `1.13.2` |
 | **pkg-config 0.29.2** | **A**：独立 APK `com.atomcode.tools.pkgconf`（`libpkg-config.so`），版本化依赖（`libglib-2.0.so.0`）走数据包 `pkgconf-data` | **✓ 已实现并实测**（2026-11-01）：`pkg-config --version` → `0.29.2`，`PKG_CONFIG_PATH` 下 `--modversion` / `--libs` 都对 |
+| **unzip 6.0** | **A**：独立 APK `com.atomcode.tools.unzip`（`libunzip.so`），`libbz2.so.1.0` 走 `unzip-data` | **✓ 已实现并实测**（2026-11-01）：解包 CPython 生成的 zip 成功。平台 toybox 的 `unzip` 没有 `-P`、Zip64，Gradle 不打包的版本化库照旧走数据包 |
+| **GNU tar 1.35** | **A**：独立 APK `com.atomcode.tools.tar`（`libtar.so`），无数据包（依赖全在 sysroot 里） | **✓ 已实现并实测**：`--format=posix --transform 's,^,pre,/'` 打包再解包，内容正确。toybox 的 `tar` 没有 `--transform`/`--exclude-from`/归档自动识别 |
+| **perl 5.44.0** | **A**：独立 APK `com.atomcode.tools.perl`（`libperl-driver.so` + `libperl.so`），模块树 67 MB 走 `perl-data`；宿主设 `PERL5LIB` 指向数据包（内置 `@INC` 指 Termux 前缀） | **✓ 已实现并实测**：`perl -v` → v5.44.0，`perl -MJSON::PP` 加载核心模块成功。驱动刻意叫 `perl-driver`：`libperl.so` 是它链接的共享库，同名会在 jniLibs 里互相覆盖 |
 | **bash 5.3.20** | **A**：独立 APK `com.atomcode.tools.bash`（`libbash.so`），`readline` 等版本化库走数据包 `bash-data` | **✓ 已实现并实测**（2026-11-01）：`bash --version` → `5.3.20(1)-release`；`#!/bin/bash` + `set -o pipefail` 的脚本跑通——平台自带的 `/system/bin/sh` 是 toybox，跑不了这些 |
 | **rsync 3.5.1** | **A**：独立 APK `com.atomcode.tools.rsync`（`librsync.so`），`libpopt`/`libxxhash`/`libidn2` 等走 `rsync-data` | **✓ 已实现并实测**：`rsync --version` → `3.5.1`，`rsync -a src/ dst/` 同步成功。手机网络抖，`rsync --partial` 比 `git clone` 从头再来实在 |
 | **OpenSSH 10.6p1** | **A**：独立 APK `com.atomcode.tools.openssh`（`libssh.so`/`libscp.so`/`libsftp.so`/`libssh-keygen.so`/`libssh-add.so`），库走 `openssh-data`；**只有客户端，不含 sshd** | **✓ 已实现并实测**：`ssh -V` → `OpenSSH_10.6p1, OpenSSL 3.6.5`；`ssh-keygen -t ed25519` 生成密钥、`sftp` 可用。`termux-auth` 依赖没有在运行时发作 |
@@ -182,6 +185,10 @@ XML / Kotlin 源文件比对，少改一处就红（加 provider 时会先撞到
 
 ## 四、已知边界（不是缺陷，但要知道）
 
+- **`share/man` 里的 `::` 文件名会在解包时炸掉**：Termux 的 man 页叫 `App::Cpan.3.gz`，
+  Windows 不允许 `:`，`scripts/termux/extract.py` 会中止并留下半截的树（perl 那次
+  `bin/perl` 只有 6.8 KB 就是这个）。现在解包统一跳过 `share/man` 与 `share/doc`——
+  设备上没人读文档，跳过比改名安全。
 - **`adb install` 的流式安装会挂**：本机上有几个 provider APK（rsync、openssh）用默认的
   `adb install` 会卡在 `Performing Streamed Install` 直到超时，换成
   `adb install --no-streaming -r <apk>` 立刻成功。装不上时先换这个，不要去怀疑包本身。

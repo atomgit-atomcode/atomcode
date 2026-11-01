@@ -1,0 +1,18 @@
+# perl provider: the interpreter is thin, the module tree is the data package.
+#
+# Termux's `bin/perl` is a small binary that links `libperl.so`; the interpreter and
+# its whole core module tree (`lib/perl5/5.44.0`) are what make perl useful, and they
+# are read, never executed — so they travel as the `perl-data` package. The baked
+# `@INC` points at Termux's own `$PREFIX`, which does not exist here; the host sets
+# `PERL5LIB` at the package's paths, which perl prepends to `@INC`.
+#
+# libperl.so itself is an unversioned name, so it rides in the APK with the program.
+# The driver is named `perl-driver` on purpose: `libperl.so` is the *shared library*
+# perl links against, and giving the driver that same stem would overwrite it in
+# jniLibs. The host links `<product>/bin/perl` at `libperl-driver.so`.
+exec bin/perl perl-driver
+# `lib/libperl.so` in the deb is a symlink into CORE/, and the symlink does not
+# survive this host's toolchain — name the real library explicitly. Unversioned
+# name, so Gradle does package it.
+lib lib/perl5/5.44.0/aarch64-android/CORE/libperl.so
+data lib/perl5
