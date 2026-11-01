@@ -74,6 +74,16 @@ class MainActivity : ComponentActivity() {
     private val pendingShares = java.util.concurrent.CopyOnWriteArrayList<String>()
     /** Text another app shared (`EXTRA_TEXT`), drained with the files. */
     @Volatile private var pendingShareText: String? = null
+    /**
+     * A conversation a notification tap asked for, waiting for the page to exist.
+     *
+     * Same shape as [pendingShares] and for the same reason: the tap can be what
+     * launches the process, and there is no WebView to navigate yet. [load] folds it
+     * into the URL it is about to open.
+     */
+    private var pendingOpenSession: String? = null
+    /** The daemon URL without any `session` parameter — what a tap re-loads from. */
+    private var agentUrl: String? = null
 
     /**
      * One-shot request to be excluded from Doze.
@@ -264,7 +274,10 @@ class MainActivity : ComponentActivity() {
         maybeAttachExternal()
         // A share can be what launched us. The page drains the queue when it
         // mounts, so all that happens here is copying the bytes.
-        if (savedInstanceState == null) ingestShareIntent(intent)
+        if (savedInstanceState == null) {
+            ingestShareIntent(intent)
+            openSessionFrom(intent)
+        }
     }
 
     /**
@@ -279,6 +292,30 @@ class MainActivity : ComponentActivity() {
         setIntent(intent)
         ingestShareIntent(intent)
         nudgeWebForShares()
+        openSessionFrom(intent)
+    }
+
+    /**
+     * Land on the conversation a notification was about.
+     *
+     * The page already knows how to open a conversation named in `?session=` — that
+     * is how a reload restores one — so a tap re-loads with that parameter rather
+     * than inventing a second navigation channel into the WebView. Tapping the same
+     * notification twice does not reload: [load] compares against what is showing.
+     */
+    private fun openSessionFrom(intent: Intent?) {
+        val session = intent?.getStringExtra(EXTRA_OPEN_SESSION)?.takeIf { it.isNotEmpty() } ?: return
+        // Handled once: a config change must not re-navigate out of wherever the
+        // user has since gone.
+        intent.removeExtra(EXTRA_OPEN_SESSION)
+        val base = agentUrl
+        if (base == null) {
+            // Still waiting for the service to hand us a URL; the first `load` carries it.
+            pendingOpenSession = session
+            return
+        }
+        pendingOpenSession = session
+        load(base)
     }
 
     /**
@@ -900,10 +937,33 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun load(url: String) {
-        if (loadedUrl == url) return
-        loadedUrl = url
+        agentUrl = url
+        val session = pendingOpenSession
+        pendingOpenSession = null
+        val target = if (session != null) withSession(url, session) else url
+        if (loadedUrl == target) return
+        // 回前台与自愈重启都会重报同一个 daemon URL；页面此刻可能正显示这条 URL
+        // 加上 `?session=`，直接按字符串比会判成"变了"，把刚跳过去的会话甩回落地页。
+        // 没有新会话要开时，同一个 daemon 就不再重载。
+        if (session == null && loadedUrl?.startsWith(url) == true) return
+        loadedUrl = target
         status.visibility = android.view.View.GONE
-        web.loadUrl(url)
+        // The URL carries the auth token, so it is never logged. Whether a
+        // conversation came with it is the part worth being able to see.
+        Log.i(TAG, "page load: session=${session ?: "-"}")
+        web.loadUrl(target)
+    }
+
+    /**
+     * The daemon URL with `?session=<短 id>` appended.
+     *
+     * The page reads a short id and resolves it through `resolveSession`, which is
+     * how a browser reload lands back in the same conversation; only the first 8
+     * characters go in the URL, so the same shortening applies here.
+     */
+    private fun withSession(url: String, sessionId: String): String {
+        val separator = if (url.contains('?')) '&' else '?'
+        return url + separator + "session=" + Uri.encode(sessionId.take(8))
     }
 
     private fun showError(message: String?) {
@@ -1105,6 +1165,13 @@ class MainActivity : ComponentActivity() {
         private const val STALE_SHARE_MS = 60 * 60_000L
         /** Runtime notification prompt (Android 13+). */
         private const val NOTIFICATION_REQUEST = 0x52
+        /**
+         * Set by a notification tap: which conversation to open.
+         *
+         * `AgentService` builds the intent, so the name lives here where both sides
+         * can see it rather than being spelled out twice.
+         */
+        internal const val EXTRA_OPEN_SESSION = "com.atomcode.app.OPEN_SESSION"
         private var fileCallback: android.webkit.ValueCallback<Array<Uri>>? = null
     }
 }

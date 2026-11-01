@@ -84,6 +84,15 @@ class AgentService : Service() {
      */
     @Volatile private var sessionTitles: Map<String, String> = emptyMap()
     private var sessionTitlesFetchedFor = -1L
+    /**
+     * Per-session child notification id → what it last said, guarded by [statusLock]
+     * alongside the other poll-derived state.
+     *
+     * Two jobs: a poll that finds the same content must not re-post (or a result the
+     * user swiped away comes straight back), and an id that is no longer in the current
+     * set of results must be cancelled instead of lingering as a stale "done" line.
+     */
+    private var postedSessionNotifications: Map<Int, String> = emptyMap()
 
     override fun onBind(intent: Intent?): IBinder = binder
 
@@ -333,10 +342,31 @@ class AgentService : Service() {
         wakeLock?.takeIf { it.isHeld }?.release()
     }
 
+    /**
+     * The tap target for a notification: the app, optionally pointed at one conversation.
+     *
+     * [requestCode] has to differ per notification: `PendingIntent.getActivity` treats
+     * two intents with the same action/component/extras-less shape as the SAME pending
+     * intent, so reusing one code for every session would make all of them open
+     * whichever session was posted last.
+     */
+    private fun openAppIntent(requestCode: Int, openSession: String?): PendingIntent {
+        val intent = Intent(this, MainActivity::class.java)
+        openSession?.takeIf { it.isNotEmpty() }?.let {
+            intent.putExtra(MainActivity.EXTRA_OPEN_SESSION, it)
+        }
+        return PendingIntent.getActivity(
+            this, requestCode, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+    }
+
     private fun buildNotification(
         text: CharSequence = getString(R.string.notification_starting),
         detail: String? = null,
         lines: List<String> = emptyList(),
+        groupedTurns: Boolean = false,
+        openSession: String? = null,
     ): Notification {
         val manager = getSystemService(NotificationManager::class.java)
         if (manager.getNotificationChannel(CHANNEL_ID) == null) {
@@ -344,16 +374,21 @@ class AgentService : Service() {
                 NotificationChannel(CHANNEL_ID, getString(R.string.channel_agent), NotificationManager.IMPORTANCE_LOW)
             )
         }
-        val open = PendingIntent.getActivity(
-            this, 0, Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
+        val open = openAppIntent(0, openSession)
         val builder = Notification.Builder(this, CHANNEL_ID)
             .setContentTitle(getString(R.string.notification_title))
             .setContentText(text)
             .setSmallIcon(android.R.drawable.stat_sys_download_done)
             .setContentIntent(open)
             .setOngoing(true)
+        // When two or more sessions finished, this notification is the collapsed
+        // summary for a group whose members are the per-session notifications
+        // `publishPerSessionNotifications` posts — the shade merges them under one
+        // header instead of each fighting for its own slot. A single result (or an
+        // in-progress turn) has no group: there is nothing else to summarize.
+        if (groupedTurns) {
+            builder.setGroup(GROUP_KEY_RESULTS).setGroupSummary(true)
+        }
         // Only while there is work to stop. A turn can run for minutes with the
         // screen off; without this the only way to end one is to unlock, open the
         // app and find the stop button — which is exactly what the wake lock was
@@ -549,7 +584,98 @@ class AgentService : Service() {
         // stays short because the system truncates anything longer.
         val detail = turns.singleOrNull()?.takeIf { it.outcome == OUTCOME_OK }?.summary
         val manager = getSystemService(NotificationManager::class.java)
-        manager.notify(NOTIFICATION_ID, buildNotification(text, detail, lines))
+        // A single result already names its own conversation, so tapping the summary
+        // is a jump straight to it. With two or more there is no single right target
+        // and the summary opens the app the way it always has — the per-session
+        // children below are what you tap to land on a specific one.
+        manager.notify(
+            NOTIFICATION_ID,
+            buildNotification(
+                text,
+                detail,
+                lines,
+                groupedTurns = turns.size > 1,
+                openSession = turns.singleOrNull()?.sessionId,
+            ),
+        )
+        // Two or more finished sessions used to collapse into one notification whose
+        // only distinction was an inbox-style line of text — tapping it opened the
+        // app with no way to tell which result that tap was even about. Each turn now
+        // also gets its own child notification in the same group, so the shade shows
+        // them separately and each one opens the conversation it belongs to; the
+        // summary above stays the collapsed view when the shade is closed.
+        publishPerSessionNotifications(turns, manager)
+    }
+
+    /**
+     * One child notification per finished session, grouped under [GROUP_KEY_RESULTS].
+     *
+     * The id is derived from the session id so the same conversation's notification
+     * is replaced in place rather than stacking a new one on every poll; a session
+     * that no longer appears in [turns] (its result scrolled out of `last_turns[]`,
+     * or a new turn started) has its child notification cancelled rather than left
+     * stale. Skipped entirely when there is only one result — [buildNotification]'s
+     * own single-turn text already names it, and a lone child notification next to
+     * an identical summary would just be noise.
+     */
+    private fun publishPerSessionNotifications(turns: List<LastTurnResult>, manager: NotificationManager) {
+        val current = if (turns.size > 1) turns else emptyList()
+        val titles = if (current.isNotEmpty()) titlesFor(current) else emptyMap()
+        val posted = mutableMapOf<Int, String>()
+        current.forEach { turn ->
+            val id = perSessionNotificationId(turn.sessionId)
+            val label = titles[turn.sessionId] ?: shortSession(turn.sessionId)
+            val result = resultLabel(turn)
+            // What the notification would say, as a value to compare against the last
+            // thing posted for this session. The poll runs every couple of seconds and
+            // finishes with the same `last_turns[]` each time; notifying unconditionally
+            // would put a result the user just swiped away straight back into the shade.
+            // A NEW finished turn changes `finishedAtUnix`, so it does re-notify.
+            val signature = "$label\u0000$result\u0000${turn.summary ?: ""}\u0000${turn.finishedAtUnix}"
+            posted[id] = signature
+            val previous = synchronized(statusLock) { postedSessionNotifications[id] }
+            if (previous == signature) return@forEach
+            manager.notify(id, buildSessionNotification(id, label, result, turn))
+        }
+        synchronized(statusLock) {
+            // A session whose result scrolled out of `last_turns[]`, or that is no longer
+            // among the newest, must not leave a stale "done" line in the shade forever.
+            (postedSessionNotifications.keys - posted.keys).forEach { manager.cancel(it) }
+            postedSessionNotifications = posted
+        }
+    }
+
+    /** Stable per-session id: `NOTIFICATION_ID` is reserved for the summary. */
+    private fun perSessionNotificationId(sessionId: String?): Int {
+        val key = sessionId ?: ""
+        // `NOTIFICATION_ID` (1) is the summary, and id 0 means "no notification" to some
+        // OEM shells. Clearing the low bit and setting bit 1 keeps this id even, non-zero
+        // and never 1, whatever the hash says.
+        return (key.hashCode() and 0x7FFFFFFE) or 0x2
+    }
+
+    private fun buildSessionNotification(
+        id: Int,
+        label: String,
+        result: String,
+        turn: LastTurnResult,
+    ): Notification {
+        val manager = getSystemService(NotificationManager::class.java)
+        if (manager.getNotificationChannel(CHANNEL_ID) == null) {
+            manager.createNotificationChannel(
+                NotificationChannel(CHANNEL_ID, getString(R.string.channel_agent), NotificationManager.IMPORTANCE_LOW)
+            )
+        }
+        val body = turn.summary?.takeIf { turn.outcome == OUTCOME_OK } ?: result
+        return Notification.Builder(this, CHANNEL_ID)
+            .setContentTitle(label)
+            .setContentText(result)
+            .setStyle(Notification.BigTextStyle().bigText(body))
+            .setSmallIcon(android.R.drawable.stat_sys_download_done)
+            .setContentIntent(openAppIntent(id, turn.sessionId))
+            .setGroup(GROUP_KEY_RESULTS)
+            .setOngoing(false)
+            .build()
     }
 
     private fun singleTurnText(turn: LastTurnResult?): String = when (turn?.outcome) {
@@ -655,6 +781,8 @@ class AgentService : Service() {
         private const val TAG = "AtomCode"
         private const val CHANNEL_ID = "atomcode-agent"
         private const val NOTIFICATION_ID = 1
+        /** Groups the summary notification with each session's own child notification. */
+        private const val GROUP_KEY_RESULTS = "com.atomcode.app.RESULTS"
         /** Lines the expanded notification lists before the system truncates them. */
         private const val MAX_NOTIFICATION_LINES = 4
         /** `/health`'s `last_turns[].outcome` values, as `turn_outcome` serializes them. */

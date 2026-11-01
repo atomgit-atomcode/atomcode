@@ -2490,7 +2490,28 @@ W cr_ContentUriUtils: Cannot open content uri: content://com.atomcode.app.files/
 `.so` 里嵌的仍是旧 `webui/dist`。**改前端后必须先 `cd webui && npm run build` 再
 `build-android.sh`**，否则设备上跑的是上一版页面（Kotlin/Rust 都编译通过，现象却像"改动没生效"）。
 
-**仍未做**：通知按会话区分（多会话时 N 条通知/分组），见 `docs/android-next-steps.md`。
+**多会话区分（已完成，真机验证 2026-11-01）**：两个以上会话各有结果时，摘要通知带
+`GROUP_SUMMARY`，每个会话另发一条同组子通知（id 由会话 id 哈希取偶、非 0），
+点哪条就打开哪条会话。真机 `dumpsys notification` 实测：
+
+```
+id=1            flags=…|GROUP_SUMMARY        groupKey=…RESULTS
+id=1845369214   flags=0  title=…beta          groupKey=…RESULTS
+id=982722954    flags=0  title=…alpha         groupKey=…RESULTS
+```
+
+点击走 `EXTRA_OPEN_SESSION` → `load()` 把 `&session=<短 id>` 拼进 URL，复用页面
+挂载时"从 URL 还原会话"那条既有路径，不新开一条进 WebView 的通道。
+
+两个在真机上踩出来的坑，都记在代码注释里：
+
+- **子通知不能无条件重投**。轮询每 2 秒跑一次、`last_turns[]` 每轮相同，直接
+  `notify` 会把用户刚划掉的结果立刻弹回来。现在按「标题+结果+摘要+finishedAtUnix」
+  做签名比对，没变就不投；新一轮结束会换签名，所以仍然会通知。
+- **`load()` 的相等判断会把刚跳过去的会话甩掉**。回前台自愈会重报同一个 daemon URL，
+  而当前页面是「该 URL + `?session=`」，字符串比判成"变了"→ 重载回落地页。真机
+  logcat 上就是 `page load: session=715ff9b0…` 紧跟着 `page load: session=-`。
+  修法：没有新会话要开时，同一个 daemon 不重载。
 
 #### 六、helper 瘦身 + zig 的 provider APK（真机验证 2026-10-30）
 
@@ -2674,7 +2695,7 @@ $ dumpsys deviceidle → mScreenLocked=true
 | ~~P3~~ | ~~provider 打通~~ **已完成**（官方 overlay 接入 + 真机真实模型回复 + 工具调用 + 写文件 + bash 全通） |
 | ~~P4~~ | ~~Git 互通~~ **已完成**：打包 git 2.47.1 进 `jniLibs`，clone / commit / push 真机实测通过；token 经 `POST /git/credentials` 落进 `~/.git-credentials`，git 自己的 `store` helper 实测读得到；webui Git 面板已实现（`git_ops.rs` 八个路由 + `SourceControl.tsx`），真机复核待做 |
 | P5 | 审批 UI 的移动端适配（webui 已有 `PermissionCard`，需在窄屏复核）；**窄屏排版已修**（顶部安全区、下拉框溢出、composer 控件重排，见上面 P5 小节） |
-| ~~P6~~ | ~~后台长任务的通知与进度~~ **大部分已完成**：回合开始/结束驱动唤醒锁与通知，结束时报告最后一轮的成败（见 P5.11）；多会话区分仍未做 |
+| ~~P6~~ | ~~后台长任务的通知与进度~~ **已完成**：回合开始/结束驱动唤醒锁与通知，结束时报告最后一轮的成败（见 P5.11）；多会话按会话 id 分组为独立子通知并可点击直达该会话（真机验证 2026-11-01，见上面 P5 小节末尾） |
 | P7 | 量内存与 Doze 下的存活；长回合的压力测试 |
 | P8 | 若要上架：SAF + `content://` 的 world 实现，替换全盘访问 |
 
