@@ -2729,7 +2729,7 @@ $ dumpsys deviceidle → mScreenLocked=true
 | ~~P4~~ | ~~Git 互通~~ **已完成**：打包 git 2.47.1 进 `jniLibs`，clone / commit / push 真机实测通过；token 经 `POST /git/credentials` 落进 `~/.git-credentials`，git 自己的 `store` helper 实测读得到；webui Git 面板已实现（`git_ops.rs` 八个路由 + `SourceControl.tsx`），真机复核待做 |
 | P5 | 审批 UI 的移动端适配（webui 已有 `PermissionCard`，需在窄屏复核）；**窄屏排版已修**（顶部安全区、下拉框溢出、composer 控件重排，见上面 P5 小节） |
 | ~~P6~~ | ~~后台长任务的通知与进度~~ **已完成**：回合开始/结束驱动唤醒锁与通知，结束时报告最后一轮的成败（见 P5.11）；多会话按会话 id 分组为独立子通知并可点击直达该会话（真机验证 2026-11-01，见上面 P5 小节末尾） |
-| P7 | 量内存与 Doze 下的存活；长回合的压力测试 |
+| ~~P7~~ | ~~量内存与 Doze 下的存活；长回合的压力测试~~ **已实测（2026-11-02，PLT140 / Android 16）**：`scripts/verify-android-doze.sh` 在回合进行中强制进 Doze（`mState=IDLE`），回合仍以 `ok` 结束、进程 PID 未变（14687 → 14687）、PSS 基线/峰值/结束 = 138916 / 148613 / 136484 KB（峰值比基线高约 9.5 MB，结束后回落到基线以下）。脚本在设备拒绝 `force-idle` 时明确报"没测成"，不假装通过 |
 | P8 | 若要上架：SAF + `content://` 的 world 实现，替换全盘访问 |
 
 ## 7. 边界
