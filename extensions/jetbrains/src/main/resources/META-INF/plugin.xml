@@ -34,14 +34,6 @@
       <li>Fixed: the session-in-use error no longer disappears after a failed turn; the chat no longer flickers while idle.</li>
       <li>Added intention descriptions, so the IDE stops reporting a missing <code>description.html</code>.</li>
     </ul>
-    <h3>0.1.0</h3>
-    <p>Initial JetBrains Marketplace release.</p>
-    <ul>
-      <li>AtomCode tool window for local AI coding workflows.</li>
-      <li>Editor actions and intentions for explaining, fixing, optimizing, and attaching code context.</li>
-      <li>Local daemon discovery, startup, health checks, and bundled daemon support.</li>
-      <li>Session history, provider setup, model selection, diagnostics, and privacy-oriented context controls.</li>
-    </ul>
   ]]></change-notes>
 
   <depends>com.intellij.modules.platform</depends>
