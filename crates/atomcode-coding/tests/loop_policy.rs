@@ -1144,7 +1144,9 @@ impl Waterfall<AgentRequest> for PressureCycle {
 }
 
 /// Reports a scheduled prompt size for each response, so one turn can cross the
-/// trigger, spend both stages, fall below it and rise again.
+/// trigger, spend both stages, fall below it and rise again. The schedule must
+/// cover every response; a missing entry fails the test instead of silently
+/// falling back to high pressure.
 struct ScheduledPressure(AtomicU32, &'static [u32]);
 #[async_trait]
 impl Waterfall<AgentRequest> for ScheduledPressure {
@@ -1156,7 +1158,11 @@ impl Waterfall<AgentRequest> for ScheduledPressure {
         let mut response = next.run(req).await?;
         let index = self.0.fetch_add(1, Ordering::SeqCst) as usize;
         response.usage = Some(atomcode_kernel::stream::TokenUsage {
-            prompt: self.1.get(index).copied().unwrap_or(100),
+            prompt: self
+                .1
+                .get(index)
+                .copied()
+                .expect("ScheduledPressure needs an entry for every response"),
             completion: 1,
             cached: 0,
         });
@@ -1397,7 +1403,7 @@ async fn a_pressure_drop_rearms_the_fast_path_inside_one_turn() {
     let _guard = app.context().on_waterfall::<AgentRequest>(
         Arc::new(ScheduledPressure(
             AtomicU32::new(0),
-            &[100, 100, 100, 10, 100],
+            &[100, 100, 100, 10, 100, 100],
         )),
         false,
     );

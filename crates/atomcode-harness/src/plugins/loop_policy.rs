@@ -877,6 +877,9 @@ struct CompactBeforeRequest {
     /// Number of `tried` entries whose two slots are both spent. A lock-free
     /// hint for `both_tried`: zero means the gate cannot fire, so the request
     /// path skips its lock; the map under the lock remains authoritative.
+    /// The count is global: a both-spent entry from another session also keeps
+    /// it non-zero, so unrelated requests still take the lock. That is the
+    /// conservative direction, and it never changes a decision.
     both_tried_entries: AtomicUsize,
 }
 
