@@ -570,6 +570,11 @@ impl OverflowCompaction {
 /// No timeout of its own — callers bound it with [`SUMMARY_TIMEOUT`] and fall
 /// back to something model-free. Only a normally completed, non-truncated answer
 /// within the byte limit can become an anchor.
+///
+/// The rendered transcript is capped by [`SUMMARY_TRANSCRIPT_MAX_CHARS`]; the
+/// prompt also carries the system prompt, the summary template, a prior anchor
+/// (itself bounded by [`MAX_SUMMARY_BYTES`]) and focus, which sit outside that
+/// transcript cap.
 pub async fn summarize_span(
     provider: &dyn LlmProvider,
     span: &[Message],
@@ -664,12 +669,15 @@ const SUMMARY_TOOL_OUTPUT_TAIL_CHARS: usize = 500;
 /// marker is included in the cap.
 const SUMMARY_TOOL_CALL_MAX_CHARS: usize = 600;
 const SUMMARY_TOOL_CALL_TAIL_CHARS: usize = 200;
-/// Whole-input ceiling for the transcript, marker line included. It is the only
-/// bound on dialogue text (messages have no per-message cap) and is positional,
-/// not role-aware: an over-budget span can lose dialogue from its middle, which
-/// the marker reports. Tool results and call arguments have per-item caps,
-/// which keeps one item from spending the span; many items can still reach
-/// this ceiling together (tier1 already allows cutting tool data).
+/// Whole-input ceiling for the transcript, marker line included. This is the
+/// transcript ceiling, not the whole summarizer prompt: the system prompt,
+/// summary template, an optional prior anchor (bounded by `MAX_SUMMARY_BYTES`)
+/// and focus sit outside it. It is the only bound on dialogue text (messages
+/// have no per-message cap) and is positional, not role-aware: an over-budget
+/// span can lose dialogue from its middle, which the marker reports. Tool
+/// results and call arguments have per-item caps, which keeps one item from
+/// spending the span; many items can still reach this ceiling together (tier1
+/// already allows cutting tool data).
 const SUMMARY_TRANSCRIPT_MAX_CHARS: usize = 120_000;
 const SUMMARY_TRANSCRIPT_TAIL_CHARS: usize = 40_000;
 /// Decimal digits in `usize::MAX`; 20 covers the supported platforms.
@@ -1111,6 +1119,7 @@ strings, and identifiers. Keep every section even when empty.";
 /// Build the USER-message text for the summary call. With a `previous_anchor` it instructs
 /// an UPDATE and embeds the prior anchor as a `<previous-summary>` block; otherwise a fresh
 /// CREATE. `focus` appends a steer. The new `transcript` (events to fold in) is appended last.
+/// The instructions, template, anchor and focus are not counted against the transcript cap.
 fn build_summary_prompt(
     previous_anchor: Option<&str>,
     transcript: &str,
