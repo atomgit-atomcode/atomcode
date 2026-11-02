@@ -6,6 +6,7 @@
 //! is a row, and the loop's own code says only "ask, then obey".
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -873,6 +874,10 @@ struct CompactBeforeRequest {
     token_limit: Option<u32>,
     /// Attempts in each session’s current turn and context-pressure cycle.
     tried: Mutex<HashMap<String, (u64, [bool; 2])>>,
+    /// Number of `tried` entries whose two slots are both spent. A lock-free
+    /// hint for `both_tried`: zero means the gate cannot fire, so the request
+    /// path skips its lock; the map under the lock remains authoritative.
+    both_tried_entries: AtomicUsize,
 }
 
 impl CompactBeforeRequest {
@@ -885,9 +890,17 @@ impl CompactBeforeRequest {
             .entry(session.to_string())
             .or_insert((turn, [false; 2]));
         if entry.0 != turn {
+            if entry.1.iter().all(|tried| *tried) {
+                self.both_tried_entries.fetch_sub(1, Ordering::Relaxed);
+            }
             *entry = (turn, [false; 2]);
         }
-        !std::mem::replace(&mut entry.1[usize::from(slow)], true)
+        let was_both = entry.1.iter().all(|tried| *tried);
+        let first = !std::mem::replace(&mut entry.1[usize::from(slow)], true);
+        if !was_both && entry.1.iter().all(|tried| *tried) {
+            self.both_tried_entries.fetch_add(1, Ordering::Relaxed);
+        }
+        first
     }
 
     /// Whether both stages were already attempted for this turn/cycle. Checked
@@ -908,8 +921,8 @@ impl CompactBeforeRequest {
     /// the optimization pays off once the verdict flips and both slots are spent.
     ///
     /// Read-only: the turn reset belongs to `first_try`, which every request
-    /// that gets past this check still reaches, so a steady turn pays one map
-    /// lookup and no allocation here.
+    /// that gets past this check still reaches. A request that cannot hit the
+    /// gate pays one atomic load; otherwise one map lookup and no allocation.
     ///
     /// This deliberately does not cache `calls_model`'s last verdict: a verdict
     /// that flips — overflow starts needing the stub, or enough turns settle —
@@ -918,6 +931,9 @@ impl CompactBeforeRequest {
     /// therefore still asked for on every request; the projection is skipped
     /// only after both stages have been spent.
     fn both_tried(&self, session: &str, turn: u64) -> bool {
+        if self.both_tried_entries.load(Ordering::Relaxed) == 0 {
+            return false;
+        }
         let tried = self.tried.lock().expect("compaction attempts poisoned");
         tried
             .get(session)
@@ -960,10 +976,15 @@ impl Waterfall<AgentRequest> for CompactBeforeRequest {
             // This must stay ahead of both_tried: a low request is the one that
             // rearms, and the gate would otherwise skip it with the table still
             // spent, silencing the trigger until the next turn.
-            self.tried
-                .lock()
-                .expect("compaction attempts poisoned")
-                .remove(session.id());
+            {
+                let mut tried = self.tried.lock().expect("compaction attempts poisoned");
+                if tried
+                    .remove(session.id())
+                    .is_some_and(|entry| entry.1.iter().all(|tried| *tried))
+                {
+                    self.both_tried_entries.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
             return next.run(req).await;
         }
         if self.both_tried(session.id(), session.current_turn()) {
@@ -1072,6 +1093,7 @@ pub fn mount_compaction_trigger_with_limit(
             threshold,
             token_limit,
             tried: Mutex::new(HashMap::new()),
+            both_tried_entries: AtomicUsize::new(0),
         }),
         false,
     );
