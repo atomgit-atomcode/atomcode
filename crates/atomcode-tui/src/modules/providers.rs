@@ -943,13 +943,11 @@ fn account_field(
             true,
             form.caret,
         ),
-        AccountField::Key => (
-            t(Msg::FieldKey).into_owned(),
-            dots(form.key_len, form.editing.is_some(), caps),
-            focused,
-            false,
-            0,
-        ),
+        AccountField::Key => {
+            let value = dots(form.key_len, form.editing.is_some(), caps);
+            let caret = if form.key_len == 0 { 0 } else { value.len() };
+            (t(Msg::FieldKey).into_owned(), value, focused, true, caret)
+        }
     }
 }
 
@@ -968,13 +966,11 @@ fn model_field(
             false,
             0,
         ),
-        ModelField::Key => (
-            t(Msg::FieldKey).into_owned(),
-            dots(form.key_len, false, caps),
-            focused,
-            false,
-            0,
-        ),
+        ModelField::Key => {
+            let value = dots(form.key_len, false, caps);
+            let caret = value.len();
+            (t(Msg::FieldKey).into_owned(), value, focused, true, caret)
+        }
         ModelField::Model => (
             pt(PMsg::ProviderPanelFieldModel).into_owned(),
             form.model.clone(),
@@ -1977,6 +1973,71 @@ mod tests {
         let dot = crate::caps::Caps::default().g(crate::caps::Glyph::Bullet);
         assert!(out.contains(&dot.to_string().repeat(5)), "{out}");
         assert!(out.contains("密钥"), "{out}");
+    }
+
+    #[test]
+    fn input_carets_are_visible_on_focused_account_and_model_keys() {
+        let original = view();
+        let mut accounts = original.accounts().to_vec();
+        accounts[0].has_key = false;
+        let v = ProvidersView::new(
+            accounts,
+            original.models().to_vec(),
+            original.protocols().to_vec(),
+            original.efforts().to_vec(),
+        );
+        for len in [0, 5, 128] {
+            let mut account = AccountForm::connect(&v, v.account("deepseek").unwrap());
+            account.focus = AccountField::Key;
+            account.key_len = len;
+            let mut model = ModelForm::add(&v, None).unwrap();
+            model.focus = ModelField::Key;
+            model.key_len = len;
+            for form in [Form::Account(account), Form::Model(model)] {
+                let field = match &form {
+                    Form::Account(f) => f
+                        .fields(&v)
+                        .iter()
+                        .position(|field| *field == AccountField::Key),
+                    Form::Model(f) => f
+                        .fields(&v)
+                        .iter()
+                        .position(|field| *field == ModelField::Key),
+                }
+                .expect("key field is offered");
+                let panel = Panel {
+                    form: Some(form),
+                    ..Panel::new()
+                };
+                for w in [8, 20, 40, 80] {
+                    let line = field_line(&v, &panel, field, w, crate::caps::Caps::default());
+                    assert!(line.width() <= w);
+                    assert!(
+                        line.spans.iter().any(|s| s.style.reverse && s.width() > 0),
+                        "{line:?}"
+                    );
+                }
+            }
+        }
+        let mut form = AccountForm::edit(&v, v.account("deepseek").unwrap());
+        form.focus = AccountField::Key;
+        let field = form
+            .fields(&v)
+            .iter()
+            .position(|f| *f == AccountField::Key)
+            .unwrap();
+        let mut panel = Panel {
+            form: Some(Form::Account(form)),
+            ..Panel::new()
+        };
+        let focused = field_line(&v, &panel, field, 80, crate::caps::Caps::default());
+        assert!(focused.plain().contains(&*t(Msg::KeyLeaveBlankToKeep)));
+        assert!(focused.spans.iter().any(|s| s.style.reverse));
+        if let Some(Form::Account(form)) = panel.form.as_mut() {
+            form.focus = AccountField::Name;
+        }
+        let unfocused = field_line(&v, &panel, field, 80, crate::caps::Caps::default());
+        assert!(!unfocused.spans.iter().any(|s| s.style.reverse));
     }
 
     /// On the levels row the legend says what Space does there — turn the

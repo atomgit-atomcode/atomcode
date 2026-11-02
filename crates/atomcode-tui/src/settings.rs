@@ -102,13 +102,8 @@ impl KeybindingEditor {
                 })
                 .into_owned(),
             ),
-            KeybindingMode::Manual(edit) => {
+            KeybindingMode::Manual(_) => {
                 out.push(t(Msg::KeybindingsManual).into_owned());
-                out.push(format!(
-                    "{}|{}",
-                    &edit.value[..edit.caret],
-                    &edit.value[edit.caret..]
-                ));
             }
         }
         if let Some(error) = self.error.as_deref() {

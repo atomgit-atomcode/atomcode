@@ -409,24 +409,30 @@ impl Overlay for Wizard {
             StepKind::Type { placeholder } => {
                 out.push(Line::raw(String::new()));
                 let typed = self.typed.read().expect("wizard poisoned").clone();
-                let (text, style) = if typed.is_empty() {
-                    (
-                        placeholder.clone(),
-                        Style::new().fg(Color::role(Role::Muted)),
-                    )
-                } else {
-                    (typed, Style::new())
-                };
-                out.push(
-                    Line::from_spans(vec![
-                        Span::styled(
-                            format!("  {} ", caps.g(Glyph::Prompt)),
-                            Style::new().fg(Color::role(Role::Accent)),
-                        ),
-                        Span::styled(crate::text::for_screen(&text).into_owned(), style),
-                    ])
-                    .truncate(w),
+                let prefix = width::take_width(
+                    &format!("  {} ", caps.g(Glyph::Prompt)),
+                    w.saturating_sub(1),
                 );
+                let room = w.saturating_sub(width::str_width(&prefix));
+                let mut spans = vec![Span::styled(
+                    prefix,
+                    Style::new().fg(Color::role(Role::Accent)),
+                )];
+                let text = crate::text::for_screen(&typed);
+                spans.extend(crate::modules::chrome::caret_spans(
+                    &text,
+                    text.len(),
+                    Style::new(),
+                    room,
+                    *caps,
+                ));
+                if typed.is_empty() {
+                    spans.push(Span::styled(
+                        crate::text::for_screen(placeholder).into_owned(),
+                        Style::new().fg(Color::role(Role::Muted)),
+                    ));
+                }
+                out.push(Line::from_spans(spans).truncate(w));
             }
             StepKind::Wait { .. } => {
                 out.push(Line::raw(String::new()));
@@ -567,6 +573,34 @@ mod tests {
             .iter()
             .map(|l| l.plain())
             .collect()
+    }
+
+    #[test]
+    fn input_carets_are_visible_in_empty_and_long_wizard_answers() {
+        let (wizard, _) = wizard(vec![StepDef::new(
+            "name",
+            "Name",
+            StepKind::Type {
+                placeholder: "Project name".into(),
+            },
+        )]);
+        let moment = Moment::default();
+        for value in ["", "a-long-project-name-that-needs-scrolling"] {
+            *wizard.typed.write().unwrap() = value.into();
+            for w in [8, 20, 80] {
+                let lines = wizard.render(&Viewport::new(Rect::sized(w, 20), &moment));
+                assert!(lines.iter().all(|line| line.width() <= w as usize));
+                assert_eq!(
+                    lines
+                        .iter()
+                        .flat_map(|line| &line.spans)
+                        .filter(|s| s.style.reverse && s.width() > 0)
+                        .count(),
+                    1,
+                    "{lines:?}"
+                );
+            }
+        }
     }
 
     /// Nothing here decides what is asked.

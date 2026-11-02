@@ -132,6 +132,19 @@ impl View for Settings {
                     width::take_width(&format!("  {text}"), w),
                     theme::fg(Role::Accent),
                 ),
+                Row::KeybindingEdit { value, caret } => {
+                    let prefix = " ".repeat(2.min(w.saturating_sub(1)));
+                    let room = w.saturating_sub(prefix.len());
+                    let mut spans = vec![Span::raw(prefix)];
+                    spans.extend(chrome::caret_spans(
+                        &value,
+                        caret,
+                        theme::fg(Role::Accent),
+                        room,
+                        vp.moment.caps,
+                    ));
+                    Line::from_spans(spans)
+                }
                 Row::Nothing => Line::styled(
                     width::take_width(&t(Msg::SettingsNoMatch), w),
                     theme::fg(Role::Muted),
@@ -192,6 +205,10 @@ impl View for Settings {
 #[derive(Clone, Debug, PartialEq)]
 enum Row {
     Keybinding(String),
+    KeybindingEdit {
+        value: String,
+        caret: usize,
+    },
     /// The panel's name and its pages, on one row: `设置  Config  Status …`.
     ///
     /// One row, not two. The name and the pages answer the same question —
@@ -352,6 +369,12 @@ fn rows_for(
     rows.push(Row::Rule);
     if let Some(editor) = panel.keybindings.as_ref() {
         rows.extend(editor.lines().into_iter().map(Row::Keybinding));
+        if let crate::settings::KeybindingMode::Manual(edit) = &editor.mode {
+            rows.push(Row::KeybindingEdit {
+                value: edit.value.clone(),
+                caret: edit.caret,
+            });
+        }
         rows.push(Row::Rule);
         return rows;
     }
@@ -547,6 +570,19 @@ fn fit(mut rows: Vec<Row>, h: usize) -> Vec<Row> {
             break;
         };
         rows.remove(at);
+    }
+    // The row taking text must survive even when the remaining contents do not
+    // fit. Use these same rows for hit testing, so scrolling to it cannot make
+    // a click refer to the setting that used to occupy its screen position.
+    if h > 0 {
+        if let Some(at) = rows.iter().position(|row| {
+            matches!(
+                row,
+                Row::Editing { .. } | Row::KeybindingEdit { .. } | Row::Search { caret: Some(_) }
+            )
+        }) {
+            rows.drain(..at.saturating_sub(h - 1));
+        }
     }
     rows.truncate(h);
     rows
@@ -4401,6 +4437,56 @@ mod tests {
             block.text, "2",
             "the caret sits on the character it is on, not past the end"
         );
+    }
+
+    #[test]
+    fn input_carets_stay_visible_while_manually_editing_long_shortcuts() {
+        use crate::settings::{KeybindingEditor, KeybindingMode, NEWLINE_KEYS};
+        let value = "alt+j, ctrl+j, shift+enter, alt+enter";
+        let mut editor = KeybindingEditor::opening("default");
+        editor.mode = KeybindingMode::Manual(Edit::opening(NEWLINE_KEYS.into(), value.into()));
+        let panel = Panel {
+            keybindings: Some(editor),
+            ..Panel::new()
+        };
+        let m = moment(Some(panel), two());
+        for w in [8, 20, 80] {
+            for h in [1, 3, 6, 24] {
+                let rows = lines(&m, w, h);
+                assert!(rows.len() <= h as usize);
+                let blocks: Vec<_> = rows
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .filter(|s| s.style.reverse)
+                    .collect();
+                assert_eq!(blocks.len(), 1, "{w}x{h}: {rows:?}");
+                assert_eq!(blocks[0].text, " ");
+            }
+        }
+    }
+
+    #[test]
+    fn a_short_settings_panel_keeps_the_active_edit_without_making_it_clickable() {
+        let panel = Panel {
+            editing: Some(Edit::opening("coding.max_rounds".into(), "123".into())),
+            cursor: 1,
+            ..Panel::new()
+        };
+        let m = moment(Some(panel), two());
+        for h in [1, 3, 6, 14] {
+            let vp = Viewport::new(Rect::sized(70, h), &m);
+            let rows = Settings::render(&State, &vp);
+            let active = rows
+                .iter()
+                .position(|line| line.spans.iter().any(|s| s.style.reverse))
+                .expect("the active edit survives clipping");
+            assert!(rows[active].plain().contains("123"));
+            assert_eq!(geometry(&m, &vp).setting_at(active), None);
+        }
+        let searching = moment(Some(Panel::new()), two());
+        let one_row = lines(&searching, 20, 1);
+        assert_eq!(one_row.len(), 1);
+        assert!(one_row[0].spans.iter().any(|s| s.style.reverse));
     }
 
     #[test]
