@@ -552,6 +552,23 @@ impl FileIndex {
             }
         }
 
+        // `require_git(false)` 同时关掉了 ignore crate 的 `.git` 边界检测（其
+        // `has_git` 只在 `require_git` 时计算），与 `parents(true)` 组合后，直到
+        // 文件系统根的所有祖先 .gitignore 都会应用进来：家目录里常见的
+        // `~/.gitignore`（常含 `.env`、`*.log`）会把家目录下任何项目——包括真正的
+        // git 仓库——的条目静默滤出索引（实测 Windows：`%TEMP%` 位于家目录下，
+        // 含 `.env` 的 `~/.gitignore` 让 `walk_keeps_dotfiles` 拿到空索引）。
+        //
+        // 因此按根目录是否在 VCS 检出内选择合法组合：
+        // - 检出内：`parents(true) + require_git(true)`——仓库根的 .gitignore 对以
+        //   子目录为根的遍历仍然生效，而 crate 的 saw_git 边界保证仓库之外的祖先
+        //   规则不漏进来；
+        // - 检出外：`parents(false) + require_git(false)`——根目录自己的
+        //   .gitignore/.ignore 照旧生效（这正是 require_git(false) 的存在意义），
+        //   祖先规则与 git 一致地不适用。
+        let in_vcs = root
+            .ancestors()
+            .any(|d| d.join(".git").exists() || d.join(".jj").exists());
         let mut builder = WalkBuilder::new(&root);
         builder
             .hidden(false)
@@ -559,8 +576,8 @@ impl FileIndex {
             .git_global(true)
             .git_exclude(true)
             .ignore(true)
-            .parents(true)
-            .require_git(false)
+            .parents(in_vcs)
+            .require_git(in_vcs)
             .max_filesize(None);
         // None = unbounded (full subtree); Some(1) = root + its direct children.
         builder.max_depth(max_depth);
@@ -936,6 +953,68 @@ mod tests {
         let result = filter_walk(&idx, "", "");
         let names: Vec<&str> = result.iter().map(|e| e.rel_path.as_str()).collect();
         assert!(names.contains(&".env"), "got: {:?}", names);
+    }
+
+    /// Regression (observed on Windows, where `%TEMP%` lives under the home
+    /// directory): a walk root that is NOT inside any VCS checkout must not
+    /// inherit ancestor `.gitignore`s — a home-dir `~/.gitignore` (commonly
+    /// listing `.env`, `*.log`) used to filter every project under the home
+    /// out of the index, because `require_git(false)` disables the ignore
+    /// crate's `.git`-boundary detection and `parents(true)` then applied
+    /// every ancestor's rules.
+    #[test]
+    fn a_plain_root_does_not_inherit_ancestor_gitignores() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Environmental premise: no `.git` on the tempdir's ancestor chain.
+        // Where that does not hold (e.g. TEMP pointed inside a checkout),
+        // ancestor gitignores applying is legitimate git semantics and this
+        // test's premise is false, so it skips.
+        if tmp.path().ancestors().any(|d| d.join(".git").exists()) {
+            eprintln!("skip: tempdir is inside a git checkout");
+            return;
+        }
+        // outer/ is not a repo; its .gitignore must not govern inner/.
+        write_file(&tmp.path().join("outer/.gitignore"), ".env\n");
+        write_file(&tmp.path().join("outer/inner/.env"), "KEY=val");
+
+        let idx = FileIndex::new(tmp.path().join("outer/inner"), ".ours");
+        let result = filter_walk(&idx, "", "");
+        let names: Vec<&str> = result.iter().map(|e| e.rel_path.as_str()).collect();
+        assert!(names.contains(&".env"), "got: {:?}", names);
+    }
+
+    /// Regression: a walk rooted AT a repo must not inherit gitignores from
+    /// above the repo boundary (git never applies an outer repo's rules to a
+    /// nested one either).
+    #[test]
+    fn a_repo_root_does_not_inherit_gitignores_above_the_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_file(&tmp.path().join("outer/.gitignore"), ".env\n");
+        // A `.git` directory alone marks the repo boundary for the walker.
+        write_file(&tmp.path().join("outer/repo/.git/HEAD"), "ref: x");
+        write_file(&tmp.path().join("outer/repo/.env"), "KEY=val");
+
+        let idx = FileIndex::new(tmp.path().join("outer/repo"), ".ours");
+        let result = filter_walk(&idx, "", "");
+        let names: Vec<&str> = result.iter().map(|e| e.rel_path.as_str()).collect();
+        assert!(names.contains(&".env"), "got: {:?}", names);
+    }
+
+    /// The other half of the contract: a walk rooted BELOW the repo root still
+    /// respects the repo's own .gitignore (the reason `parents` is on at all).
+    #[test]
+    fn a_walk_below_the_repo_root_still_respects_the_repo_gitignore() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_file(&tmp.path().join("repo/.git/HEAD"), "ref: x");
+        write_file(&tmp.path().join("repo/.gitignore"), "ignored.txt\n");
+        write_file(&tmp.path().join("repo/sub/ignored.txt"), "x");
+        write_file(&tmp.path().join("repo/sub/kept.txt"), "y");
+
+        let idx = FileIndex::new(tmp.path().join("repo/sub"), ".ours");
+        let result = filter_walk(&idx, "", "");
+        let names: Vec<&str> = result.iter().map(|e| e.rel_path.as_str()).collect();
+        assert!(names.contains(&"kept.txt"), "got: {:?}", names);
+        assert!(!names.contains(&"ignored.txt"), "got: {:?}", names);
     }
 
     #[test]
