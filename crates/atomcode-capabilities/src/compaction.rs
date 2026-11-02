@@ -649,7 +649,8 @@ pub async fn summarize_span(
 /// input is what keeps the summary LLM call fast + cheap regardless of session size —
 /// an UNBOUNDED input (500k+ tokens on a long 1M session) is the real reason a summary
 /// could crawl toward the wall-clock timeout, not the timeout value itself.
-/// The rendered result, truncation marker included, stays at or under this cap.
+/// The bounded body and truncation marker stay at or under this cap; structural
+/// escaping in the consumer may add one leading space per escaped line.
 const SUMMARY_TOOL_OUTPUT_MAX_CHARS: usize = 2_000;
 /// Of the body budget (the cap minus the marker reserve), how many chars to keep
 /// from the TAIL (the rest is head). Head+tail — not head-only like opencode —
@@ -682,9 +683,10 @@ fn marker_reserve(marker: &str) -> usize {
 }
 
 /// Bound a text body for the summary input: the full body when it fits the cap,
-/// otherwise a head + tail within the cap, marker included. The common case
-/// borrows the caller's text: a byte length at or under the cap proves the char
-/// count is too, so neither the count nor a copy is needed.
+/// otherwise a head + tail within the cap, marker included, before the consumer
+/// escapes structural lines. The common case borrows the caller's text: a byte
+/// length at or under the cap proves the char count is too, so neither the count
+/// nor a copy is needed.
 ///
 /// A `tail_chars` wider than the body budget is clamped, so head and tail never
 /// spend more than the budget between them.
@@ -700,7 +702,8 @@ fn bounded_body<'a>(text: &'a str, max_chars: usize, tail_chars: usize) -> Cow<'
 }
 
 /// Clip one body to `max_chars`, marker included. The cut is not padded here:
-/// the body consumer ([`push_transcript_text`]) escapes structural lines.
+/// the body consumer ([`push_transcript_text`]) escapes structural lines, which
+/// can add one space per escaped line after the cap.
 fn truncated_body(text: &str, total: usize, max_chars: usize, tail_chars: usize) -> String {
     cut_body(text, total, max_chars, tail_chars, "truncated", false)
 }
@@ -708,8 +711,10 @@ fn truncated_body(text: &str, total: usize, max_chars: usize, tail_chars: usize)
 /// The cut itself, for a caller that already counted `total` characters.
 ///
 /// `max_chars` is the total rendered cap, marker included: the body budget is
-/// `max_chars - marker_reserve(marker)`. `marker` names what was lost: a clipped
-/// body says `[truncated N chars]`, while the whole-span cut says
+/// `max_chars - marker_reserve(marker)`. The whole-span caller applies this cap
+/// to the final output; a per-item body may be escaped by its consumer
+/// afterwards, which can add one space per escaped line. `marker` names what was
+/// lost: a clipped body says `[truncated N chars]`, while the whole-span cut says
 /// `[conversation truncated N chars]`, so the summarizer can tell one message's
 /// clip from a missing middle of the exchange.
 ///
@@ -842,6 +847,9 @@ fn push_single_line(into: &mut String, text: &str) {
 /// shape stays (every break becomes `\n`) because a body's structure (diffs,
 /// logs) is what the summary needs. Only continuation lines can start a line:
 /// the first is inline after the `ROLE: ` prefix, so it is left unpadded.
+/// Escaping runs after a per-item cap and can add one leading space per escaped
+/// continuation line; the whole-span cap is applied to the final transcript, so
+/// those spaces are included there.
 fn push_transcript_text(into: &mut String, text: &str) {
     let mut first = true;
     for_each_line(text, |line| {
