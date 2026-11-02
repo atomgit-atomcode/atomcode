@@ -1640,11 +1640,17 @@ getpid 5902
 源文件清单直接解析它自己的 `Makefile`（`CORE_O`/`AUX_O`/`LIB_O`），不手抄。
 
 ```sh
-bash scripts/build-android-lupa-wheel.sh <lupa-sdist.tar.gz>
+bash scripts/build-android-lupa-wheel.sh          # 不给参数也行：脚本自己去 PyPI 取 2.8
+bash scripts/build-android-lupa-wheel.sh <sdist>  # 也可以指定本地包
 bash scripts/build-android-lupa-plugin.sh
 → dist/lupa-2.8-cp312-cp312-linux_aarch64.whl  (250 KB)
 → dist/lupa-2.8-arm64.tar.gz                   (244 KB，插件包)
 ```
+
+取源码包那条路刻意**不用 `pip download --no-binary`**：那会让 pip 去准备构建依赖、在这台
+机器上直接卡死（`exit 124`），而这里只想要那 6 MB 的字节。做法是查 PyPI 的 JSON 拿 sdist
+直链再 `curl`，`LUPA_VERSION` 换版本、`LUPA_SDIST_URL=<镜像直链>` 换源（清华
+`https://pypi.tuna.tsinghua.edu.cn/packages/...` 实测 200、同样能编出 250 KB 的 wheel）。
 
 真机验证（装成插件后由 agent 回合里的 bash 工具执行）：
 
