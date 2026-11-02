@@ -3793,6 +3793,8 @@ pub enum ChatEvent {
         /// for this call. Omitted (false) for everything but a non-sensitive bash.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         allow_all_bash: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_rule: Option<atomcode_capabilities::tools::approval::ProjectRuleProposal>,
     },
     /// The model asks the user a structured question. The browser answers through
     /// `/chat/user-input`, correlated by session and native request id.
@@ -4047,6 +4049,8 @@ mod chat_event_type_tests {
             payload: serde_json::json!({
                 "call_id": "call-42",
                 "tool": "bash",
+                "reason": "the exact backend reason",
+                "project_rule": {"rule":"Bash(git status)", "file":"/project/settings.local.json"},
                 "args": "{\"command\":\"git status\"}"
             }),
             snapshot: None,
@@ -4055,6 +4059,10 @@ mod chat_event_type_tests {
             atomcode_coding::CodingRuntimeEvent::Request(request),
             "session-1",
         );
+
+        let projected = serde_json::to_value(&events[0]).unwrap();
+        assert_eq!(projected["reason"], "the exact backend reason");
+        assert_eq!(projected["project_rule"]["rule"], "Bash(git status)");
 
         assert!(matches!(
             events.as_slice(),
@@ -4566,6 +4574,11 @@ impl ChatRuntimeProjector {
                 if request.kind != APPROVAL_KIND {
                     return Vec::new();
                 }
+                let project_rule = request
+                    .payload
+                    .get("project_rule")
+                    .cloned()
+                    .and_then(|v| serde_json::from_value(v).ok());
                 let Ok(approval) = serde_json::from_value::<ApprovalRequest>(request.payload)
                 else {
                     return Vec::new();
@@ -4573,10 +4586,13 @@ impl ChatRuntimeProjector {
                 vec![ChatEvent::PermissionRequest {
                     session_id: permission_session_id.to_string(),
                     tool_name: approval.tool,
-                    reason: "Requires approval".into(),
+                    reason: approval
+                        .reason
+                        .unwrap_or_else(|| "Requires approval".into()),
                     call_id: approval.call_id,
                     arguments: approval.args,
                     allow_all_bash: approval.allow_all_bash,
+                    project_rule,
                 }]
             }
             // Silent, cache-friendly tool-output folding is invisible transcript
@@ -5322,6 +5338,7 @@ async fn process_chat_request(
         let cancel = cancel_token.clone();
         let runtime_session_id = perm_session_key.clone();
         let runtime_user_inputs = pending_user_inputs.clone();
+        let runtime_permission_routes = pending_permissions.clone();
         tokio::spawn(async move {
             CurrentContext::scope(tel_ctx, || async move {
                 live_api::run_chat_turn_v2(
@@ -5331,6 +5348,7 @@ async fn process_chat_request(
                     cancel,
                     runtime_cfg,
                     perm_rx,
+                    runtime_permission_routes,
                     if interactive_user_input {
                         Some(runtime_user_inputs)
                     } else {
@@ -5503,6 +5521,8 @@ pub struct PermissionDecisionRequest {
     /// which the runtime that asked already knows.
     #[serde(default)]
     pub tool_name: Option<String>,
+    #[serde(default)]
+    pub call_id: Option<String>,
 }
 
 async fn chat_permission(
@@ -5518,9 +5538,19 @@ async fn chat_permission(
             permission_bridge::ChatPermission {
                 decision: PermissionDecision::AllowOnce,
                 persist_mcp_tool: true,
+                persist_project_rule: false,
+                call_id: None,
             },
         );
         return Json(serde_json::json!({ "success": ok }));
+    }
+    if req.decision == "allow_project" {
+        let ok = req.call_id.as_deref().is_some_and(|call| {
+            state
+                .pending_permissions
+                .deliver_project(&req.session_id, call)
+        });
+        return Json(serde_json::json!({"success": ok}));
     }
     let decision = parse_permission_decision(&req.decision);
     if state.pending_permissions.deliver(&req.session_id, decision) {

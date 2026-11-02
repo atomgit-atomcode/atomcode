@@ -407,6 +407,10 @@ const zh = {
   'perm.deny': '拒绝',
   'perm.approve': '批准',
   'perm.alwaysAllow': '本会话总是允许',
+  'perm.saveProject': '批准并保存精确项目规则',
+  'perm.requestExpired': '审批请求已失效，请查看当前请求。',
+  'perm.projectRule': '将保存的规则与位置',
+  'perm.projectRuleActivation': '精确匹配此命令；保存后在重新加载或新会话中生效。',
   'perm.allowAllBash': '本会话允许所有 Bash（含破坏性）',
   'perm.allowPersist': '永久允许此工具',
 
@@ -1040,6 +1044,10 @@ const en: Record<MsgKey, string> = {
   'perm.deny': 'Deny',
   'perm.approve': 'Approve',
   'perm.alwaysAllow': 'Always allow this session',
+  'perm.saveProject': 'Approve and save exact project rule',
+  'perm.requestExpired': 'This approval request is no longer pending.',
+  'perm.projectRule': 'Rule and destination',
+  'perm.projectRuleActivation': 'Matches this exact command; saved rules apply after reload or in a new session.',
   'perm.allowAllBash': 'Allow ALL Bash this session (incl. destructive)',
   'perm.allowPersist': 'Always allow this tool',
 

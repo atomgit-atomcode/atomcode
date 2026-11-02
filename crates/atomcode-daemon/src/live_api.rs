@@ -431,6 +431,7 @@ pub(crate) async fn run_chat_turn_v2(
     cancel: CancellationToken,
     runtime_cfg: atomcode_coding::CodingRuntimeConfig,
     mut perm_rx: Option<mpsc::UnboundedReceiver<crate::permission_bridge::ChatPermission>>,
+    permission_routes: crate::permission_bridge::PermissionResponders,
     user_input_responders: Option<crate::permission_bridge::UserInputResponders>,
     approval_mode: ApprovalMode,
 ) {
@@ -539,6 +540,7 @@ pub(crate) async fn run_chat_turn_v2(
                 let _ = runtime_event_tx.send(event);
             }
             CodingRuntimeEvent::Request(request) if request.kind == APPROVAL_KIND => {
+                permission_routes.pending_call(&session_id, request.payload.get("call_id").and_then(serde_json::Value::as_str));
                 let _ = runtime_event_tx.send(CodingRuntimeEvent::Request(request.clone()));
                 let Ok(approval) = serde_json::from_value::<ApprovalRequest>(request.payload)
                 else {
@@ -572,7 +574,12 @@ pub(crate) async fn run_chat_turn_v2(
                     PermissionDecision::AllowAlwaysAll => ApprovalResponse::allow_all_bash(),
                     PermissionDecision::Deny => ApprovalResponse::deny(),
                 };
-                let value = serde_json::to_value(response).unwrap_or(serde_json::Value::Null);
+                let mut value = serde_json::to_value(response).unwrap_or(serde_json::Value::Null);
+                if answer.persist_project_rule {
+                    value = if answer.call_id.as_deref() == Some(approval.call_id.as_str()) {
+                        serde_json::json!({"decision":"allow", "save_project_rule":true})
+                    } else { serde_json::json!({"decision":"deny"}) };
+                }
                 let _ = handle.respond(request.id, value).await;
             }
             CodingRuntimeEvent::Request(request)
@@ -809,6 +816,8 @@ pub(crate) enum LiveWireEvent {
         /// for this call. Omitted (false) for everything but a non-sensitive bash.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         allow_all_bash: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_rule: Option<atomcode_capabilities::tools::approval::ProjectRuleProposal>,
     },
     #[serde(rename = "user_input_request")]
     UserInputRequest {
@@ -1044,13 +1053,21 @@ impl NativeLiveWireProjector {
             },
             crate::live_hub::LiveViewEvent::Runtime(Runtime::Request(request)) => {
                 if request.kind == APPROVAL_KIND {
+                    let project_rule = request
+                        .payload
+                        .get("project_rule")
+                        .cloned()
+                        .and_then(|v| serde_json::from_value(v).ok());
                     let approval: ApprovalRequest = serde_json::from_value(request.payload).ok()?;
                     LiveWireEvent::PermissionRequest {
                         tool_name: approval.tool,
-                        reason: "Requires approval".into(),
+                        reason: approval
+                            .reason
+                            .unwrap_or_else(|| "Requires approval".into()),
                         call_id: approval.call_id,
                         arguments: approval.args,
                         allow_all_bash: approval.allow_all_bash,
+                        project_rule,
                     }
                 } else if request.kind == REQUEST_USER_INPUT_KIND {
                     LiveWireEvent::UserInputRequest {
@@ -2479,6 +2496,8 @@ pub(crate) struct LivePermissionReq {
     /// the pending approval itself, never this field.
     #[serde(default)]
     pub tool_name: Option<String>,
+    #[serde(default)]
+    pub call_id: Option<String>,
 }
 
 /// Carry out "always allow this MCP tool" through `handle` — the runtime the
@@ -2537,6 +2556,13 @@ pub(crate) async fn live_permission(Json(req): Json<LivePermissionReq>) -> impl 
     let Some((id, payload)) = crate::native_live::pending_of_kind(APPROVAL_KIND) else {
         return Json(serde_json::json!({ "accepted": false }));
     };
+    if req.decision == "allow_project"
+        && (req.call_id.as_deref().is_none()
+            || req.call_id.as_deref() != payload.get("call_id").and_then(serde_json::Value::as_str)
+            || payload.get("project_rule").is_none())
+    {
+        return Json(serde_json::json!({"accepted": false}));
+    }
     let decision = if req.decision == "allow_persist" {
         // "Always allow this MCP tool" names the tool the request is for, not
         // whatever the client sent alongside its answer (same as /chat).
@@ -2581,7 +2607,10 @@ pub(crate) async fn live_permission(Json(req): Json<LivePermissionReq>) -> impl 
         }
         PermissionDecision::Deny => atomcode_capabilities::tools::ApprovalResponse::deny(),
     };
-    let value = serde_json::to_value(response).unwrap_or(serde_json::Value::Null);
+    let mut value = serde_json::to_value(response).unwrap_or(serde_json::Value::Null);
+    if req.decision == "allow_project" {
+        value = serde_json::json!({"decision":"allow", "save_project_rule":true});
+    }
     let ok = crate::native_live::respond_confirmed(id, value)
         .await
         .is_ok();
@@ -2797,6 +2826,17 @@ pub(crate) async fn live_mcp_trust(State(state): State<AppState>) -> impl IntoRe
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_live_approval_preserves_the_reason_and_bound_project_proposal() {
+        let mut projector = super::NativeLiveWireProjector::default();
+        let wire = projector.project(crate::live_hub::LiveViewEvent::Runtime(atomcode_coding::CodingRuntimeEvent::Request(atomcode_coding::RuntimeRequest {
+            id:42, kind:atomcode_capabilities::tools::APPROVAL_KIND.into(), snapshot:None,
+            payload:serde_json::json!({"call_id":"call-42","tool":"bash","args":"{}","reason":"specific safety reason","project_rule":{"rule":"Bash(rm -rf scratch)","file":"/project/settings.local.json"}}),
+        }))).unwrap();
+        let value = serde_json::to_value(wire).unwrap();
+        assert_eq!(value["reason"], "specific safety reason");
+        assert_eq!(value["project_rule"]["rule"], "Bash(rm -rf scratch)");
+    }
     #[test]
     fn model_wire_uses_runtime_names_and_ignores_member_descriptions() {
         use atomcode_coding::CodingRuntimeEvent;

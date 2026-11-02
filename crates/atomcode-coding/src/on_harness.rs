@@ -1694,6 +1694,7 @@ pub struct HostModes {
     pub plan_mcp_grants: Arc<dyn atomcode_capabilities::tools::PermissionStore>,
     /// Every other "always allow", in the store the approval seam remembers into.
     pub approval_grants: Arc<dyn atomcode_capabilities::tools::PermissionStore>,
+    pub project_rules: Option<Arc<dyn atomcode_capabilities::tools::approval::ProjectRuleStore>>,
 }
 
 impl HostState {
@@ -2172,6 +2173,7 @@ fn compose_hosted(
         )));
         registry.register(Arc::new(crate::host_rows::GrantsHostPlugin(
             modes.approval_grants,
+            modes.project_rules,
         )));
     }
     if let Some(host) = models {

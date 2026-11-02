@@ -12,6 +12,237 @@ use atomcode_capabilities::tools::PermissionRules;
 use atomcode_capabilities::ProductDirs;
 use serde::Deserialize;
 
+struct ProjectRules {
+    cwd: Arc<std::sync::RwLock<PathBuf>>,
+    root: PathBuf,
+    dirs: ProductDirs,
+    baseline: Arc<PermissionRules>,
+    active: Arc<PermissionRules>,
+}
+
+pub(crate) fn project_rule_store(
+    cwd: Arc<std::sync::RwLock<PathBuf>>,
+    root: PathBuf,
+    dirs: ProductDirs,
+    baseline: Arc<PermissionRules>,
+    active: Arc<PermissionRules>,
+) -> Arc<dyn atomcode_capabilities::tools::approval::ProjectRuleStore> {
+    Arc::new(ProjectRules {
+        cwd,
+        root,
+        dirs,
+        baseline,
+        active,
+    })
+}
+
+#[async_trait::async_trait]
+impl atomcode_capabilities::tools::approval::ProjectRuleStore for ProjectRules {
+    fn explanation(&self, call: &atomcode_kernel::tool::ToolCall) -> String {
+        let Ok(cwd) = self.cwd.read() else {
+            return "Working directory is unavailable; approval required.".into();
+        };
+        if *cwd != self.root {
+            return "The project changed; this approval is stale.".into();
+        }
+        let cause = serde_json::from_str::<serde_json::Value>(&call.arguments)
+            .ok()
+            .and_then(|v| {
+                v.get("command")
+                    .and_then(|c| c.as_str())
+                    .and_then(atomcode_capabilities::tools::bash::check_destructive_command)
+            })
+            .unwrap_or_else(|| {
+                "This tool requires approval under the ordinary safety policy.".into()
+            });
+        format!(
+            "{cause}\n{}",
+            self.active.explanation(
+                &atomcode_capabilities::tools::SensitivePaths::of(&self.dirs),
+                &call.name,
+                &call.arguments,
+                &cwd
+            )
+        )
+    }
+
+    async fn propose(
+        &self,
+        call: &atomcode_kernel::tool::ToolCall,
+    ) -> Option<atomcode_capabilities::tools::approval::ProjectRuleProposal> {
+        if call.name != "bash" {
+            return None;
+        }
+        let cwd = self.cwd.read().ok()?.clone();
+        if cwd != self.root {
+            return None;
+        }
+        let args: serde_json::Value = serde_json::from_str(&call.arguments).ok()?;
+        let command = args.get("command")?.as_str()?.trim();
+        if command.is_empty() || command.len() > 8192 || command.contains(['*', '?']) {
+            return None;
+        }
+        // The capabilities parser validates eligibility through the normal rule
+        // matcher; no second shell parser or project directory lookup is introduced.
+        let rule = format!(
+            "Bash({})",
+            atomcode_capabilities::tools::normalize_command_for_grant(command)
+        );
+        let (candidate, invalid) = PermissionRules::parse(std::slice::from_ref(&rule), &[]);
+        if !invalid.is_empty() {
+            return None;
+        }
+        let sensitive = atomcode_capabilities::tools::SensitivePaths::of(&self.dirs);
+        if sensitive
+            .references_in(
+                &call.arguments,
+                &cwd,
+                &atomcode_capabilities::world::LocalFs::unfenced(),
+            )
+            .await
+        {
+            return None;
+        }
+        if candidate.decide(&sensitive, &call.name, &call.arguments, &cwd)
+            != atomcode_capabilities::tools::permission_rules::RuleDecision::Allow
+        {
+            return None;
+        }
+        let settings = load(&self.baseline, &self.dirs, &cwd).ok()?;
+        if settings
+            .rules
+            .decide(&sensitive, &call.name, &call.arguments, &cwd)
+            == atomcode_capabilities::tools::permission_rules::RuleDecision::Deny
+        {
+            return None;
+        }
+        Some(
+            atomcode_capabilities::tools::approval::ProjectRuleProposal {
+                rule,
+                file: self
+                    .dirs
+                    .project(&cwd)
+                    .join("settings.local.json")
+                    .to_str()?
+                    .into(),
+            },
+        )
+    }
+
+    async fn save(
+        &self,
+        call: &atomcode_kernel::tool::ToolCall,
+        proposal: &atomcode_capabilities::tools::approval::ProjectRuleProposal,
+    ) -> Result<(), String> {
+        if self.propose(call).await.as_ref() != Some(proposal) {
+            return Err("the project or policy changed; this proposal is stale".into());
+        }
+        let path = PathBuf::from(&proposal.file);
+        let rule = proposal.rule.clone();
+        let sensitive = atomcode_capabilities::tools::SensitivePaths::of(&self.dirs);
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || save_exact_rule(&path, &rule, &sensitive, &root))
+            .await
+            .map_err(|e| e.to_string())?
+    }
+}
+
+/// Patch only permissions.allow under an advisory writer lock, then atomically
+/// replace the file. Broken policy and symlinks are errors, never empty settings.
+fn save_exact_rule(
+    path: &Path,
+    rule: &str,
+    sensitive: &atomcode_capabilities::tools::SensitivePaths,
+    cwd: &Path,
+) -> Result<(), String> {
+    use fs2::FileExt;
+    use std::io::Write;
+    let operation = || -> Result<(), Box<dyn std::error::Error>> {
+        let directory = path.parent().ok_or("missing project settings directory")?;
+        std::fs::create_dir_all(directory)?;
+        if std::fs::symlink_metadata(directory)?
+            .file_type()
+            .is_symlink()
+        {
+            return Err("project settings directory is a symlink".into());
+        }
+        let lock_path = directory.join("permission-rules.lock");
+        if std::fs::symlink_metadata(&lock_path)
+            .is_ok_and(|m| !m.is_file() || m.file_type().is_symlink())
+        {
+            return Err("invalid permission writer lock".into());
+        }
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)?;
+        lock.try_lock_exclusive()?;
+        let mut value = match std::fs::symlink_metadata(path) {
+            Ok(meta)
+                if meta.is_file()
+                    && !meta.file_type().is_symlink()
+                    && meta.len() <= 2 * 1024 * 1024 =>
+            {
+                serde_json::from_slice::<serde_json::Value>(&std::fs::read(path)?)?
+            }
+            Ok(_) => {
+                return Err("settings must be a regular, non-symlink JSON file under 2 MiB".into())
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => serde_json::json!({}),
+            Err(e) => return Err(e.into()),
+        };
+        let settings: Settings = serde_json::from_value(value.clone())?;
+        let (rules, invalid) =
+            PermissionRules::parse(&settings.permissions.allow, &settings.permissions.deny);
+        if !invalid.is_empty() {
+            return Err("settings contain malformed permission rules".into());
+        }
+        let command = rule
+            .strip_prefix("Bash(")
+            .and_then(|s| s.strip_suffix(')'))
+            .ok_or("expected an exact Bash rule")?;
+        if command.contains(['*', '?']) {
+            return Err("project save cannot broaden a command into a wildcard".into());
+        }
+        if rules.decide(
+            sensitive,
+            "bash",
+            &serde_json::json!({"command":command}).to_string(),
+            cwd,
+        ) == atomcode_capabilities::tools::permission_rules::RuleDecision::Deny
+        {
+            return Err("a deny rule now blocks this command".into());
+        }
+        let root = value.as_object_mut().ok_or("settings must be an object")?;
+        let permissions = root
+            .entry("permissions")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .ok_or("permissions must be an object")?;
+        let allows = permissions
+            .entry("allow")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut()
+            .ok_or("permissions.allow must be an array")?;
+        if !allows.iter().all(|v| v.is_string()) {
+            return Err("permissions.allow contains a non-string rule".into());
+        }
+        if allows.iter().any(|v| v.as_str() == Some(rule)) {
+            return Ok(());
+        }
+        allows.push(serde_json::Value::String(rule.into()));
+        let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+        temporary.write_all(&serde_json::to_vec_pretty(&value)?)?;
+        temporary.write_all(b"\n")?;
+        temporary.as_file().sync_all()?;
+        temporary.persist(path)?;
+        Ok(())
+    };
+    operation().map_err(|error| error.to_string())
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct PermissionSettings {
     pub rules: Arc<PermissionRules>,
@@ -111,7 +342,7 @@ pub(crate) fn load(
                     path.display()
                 ));
             }
-            rules.extend(parsed);
+            rules.extend(parsed.with_source(path.display().to_string()));
             sources.push(path);
         }
     }
@@ -159,6 +390,88 @@ impl PermissionSettings {
 mod tests {
     use super::*;
     use atomcode_capabilities::tools::{RuleDecision, SensitivePaths};
+
+    #[test]
+    fn exact_rule_writer_preserves_data_deduplicates_and_refuses_broken_policy() {
+        let root = tempfile::tempdir().unwrap();
+        let dirs = ProductDirs::new(root.path().join("user"), ".ours");
+        let cwd = root.path().join("project");
+        let path = dirs.project(&cwd).join("settings.local.json");
+        let sensitive = SensitivePaths::of(&dirs);
+        write(
+            &path,
+            serde_json::json!({"other":{"keep":1}, "permissions":{"allow":[], "deny":["Bash(rm -rf protected)"]}}),
+        );
+        save_exact_rule(&path, "Bash(rm -rf scratch)", &sensitive, &cwd).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        save_exact_rule(&path, "Bash(rm -rf scratch)", &sensitive, &cwd).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["other"]["keep"], 1);
+        assert_eq!(value["permissions"]["allow"].as_array().unwrap().len(), 1);
+        assert!(save_exact_rule(&path, "Bash(rm -rf protected)", &sensitive, &cwd).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        for broken in [
+            "{bad",
+            r#"{"permissions":{"allow":false}}"#,
+            r#"{"permissions":{"deny":[42]}}"#,
+        ] {
+            std::fs::write(&path, broken).unwrap();
+            assert!(save_exact_rule(&path, "Bash(rm -rf scratch)", &sensitive, &cwd).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_rule_writer_refuses_symlinks_and_an_active_writer_lock() {
+        use fs2::FileExt;
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let dirs = ProductDirs::new(root.path().join("user"), ".ours");
+        let cwd = root.path().join("project");
+        let directory = dirs.project(&cwd);
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("settings.local.json");
+        let outside = root.path().join("outside.json");
+        std::fs::write(&outside, "{}").unwrap();
+        symlink(&outside, &path).unwrap();
+        let sensitive = SensitivePaths::of(&dirs);
+        assert!(save_exact_rule(&path, "Bash(rm -rf scratch)", &sensitive, &cwd).is_err());
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "{}");
+        std::fs::remove_file(&path).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .write(true)
+            .open(directory.join("permission-rules.lock"))
+            .unwrap();
+        lock.lock_exclusive().unwrap();
+        assert!(save_exact_rule(&path, "Bash(rm -rf scratch)", &sensitive, &cwd).is_err());
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn project_rule_proposals_are_bound_to_the_original_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let old = root.path().join("old");
+        let next = root.path().join("next");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&next).unwrap();
+        let dirs = ProductDirs::new(root.path().join("user"), ".ours");
+        let cwd = Arc::new(std::sync::RwLock::new(old.clone()));
+        let rules = Arc::new(PermissionRules::default());
+        let store =
+            project_rule_store(cwd.clone(), old.clone(), dirs.clone(), rules.clone(), rules);
+        let call = atomcode_kernel::tool::ToolCall {
+            id: "call".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({"command":"rm -rf scratch"}).to_string(),
+        };
+        let proposal = store.propose(&call).await.unwrap();
+        *cwd.write().unwrap() = next.clone();
+        assert!(store.save(&call, &proposal).await.is_err());
+        assert!(!dirs.project(&old).join("settings.local.json").exists());
+        assert!(!dirs.project(&next).join("settings.local.json").exists());
+    }
 
     fn write(path: &Path, value: serde_json::Value) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();

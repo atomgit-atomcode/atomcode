@@ -74,7 +74,7 @@ export type SSEEvent =
   | { type: 'tool_progress'; id: string; progress: string }
   | { type: 'tool_result'; id: string; name: string; output: string; success: boolean; duration_ms: number }
   | { type: 'tokens'; prompt: number; completion: number; total: number }
-  | { type: 'permission_request'; session_id: string; tool_name: string; reason: string; call_id: string; arguments: unknown; allow_all_bash?: boolean }
+  | { type: 'permission_request'; session_id: string; tool_name: string; reason: string; call_id: string; arguments: unknown; allow_all_bash?: boolean; project_rule?: { rule: string; file: string } }
   | UserInputRequestEvent
   | { type: 'user_input_resolved'; request_id: number }
   | { type: 'done'; tokens: unknown; tool_calls: unknown; session_id: string; stats?: TurnStats; stop_reason?: string; message?: string }
@@ -259,8 +259,9 @@ export async function streamChat(
 
 export async function respondPermission(
   sessionId: string,
-  decision: 'allow' | 'deny' | 'always_allow' | 'allow_persist' | 'allow_all_bash',
+  decision: 'allow' | 'deny' | 'always_allow' | 'allow_persist' | 'allow_all_bash' | 'allow_project',
   toolName?: string,
+  callId?: string,
 ): Promise<{ success: boolean }> {
   const resp = await apiFetch('/chat/permission', {
     method: 'POST',
@@ -268,7 +269,7 @@ export async function respondPermission(
       'Content-Type': 'application/json',
       ...authHeaders(),
     },
-    body: JSON.stringify({ session_id: sessionId, decision, tool_name: toolName }),
+    body: JSON.stringify({ session_id: sessionId, decision, tool_name: toolName, call_id: callId }),
   });
   // A request that did not land throws: the card must stay up to be answered
   // again, or the person thinks it was approved while the turn waits on an
@@ -1087,7 +1088,7 @@ export type LiveWireEvent =
   | { type: 'warning'; message: string }
   | { type: 'persistence_warning'; message: string }
   | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean; server_message?: string | null }
-  | { type: 'permission_request'; tool_name: string; reason: string; call_id: string; arguments: string; allow_all_bash?: boolean }
+  | { type: 'permission_request'; tool_name: string; reason: string; call_id: string; arguments: string; allow_all_bash?: boolean; project_rule?: { rule: string; file: string } }
   | { type: 'user_input_request'; request_id: number; header: string; question: string; mode: 'single' | 'multiple' | 'text'; options: { label: string; description?: string }[] }
   | { type: 'user_input_resolved'; request_id: number }
   | PolicyInterventionEvent
@@ -1359,13 +1360,14 @@ export async function postLiveReasoningEffort(
 }
 
 export async function postLivePermission(
-  decision: 'allow' | 'deny' | 'always_allow' | 'allow_persist' | 'allow_all_bash',
+  decision: 'allow' | 'deny' | 'always_allow' | 'allow_persist' | 'allow_all_bash' | 'allow_project',
   toolName?: string,
+  callId?: string,
 ): Promise<{ accepted: boolean }> {
   const resp = await apiFetch('/live/permission', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ decision, tool_name: toolName }),
+    body: JSON.stringify({ decision, tool_name: toolName, call_id: callId }),
   });
   if (!resp.ok) throw new Error(`answer live permission failed: ${resp.status}`);
   return resp.json();

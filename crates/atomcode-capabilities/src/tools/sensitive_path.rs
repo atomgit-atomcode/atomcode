@@ -699,6 +699,12 @@ mod tests {
             "cd - && cat config.toml",
             "cd \"$DEST\" && cat config.toml",
             "for i in 1 2; do cd ..; done; cat config.toml",
+            "cd src; for i in 1 2; do command cd ..; done; cat config.toml",
+            "CDPATH=/private; cd src; for i in 1 2; do cat config.toml; done",
+            "printf -v CDPATH /private; cd src; for i in 1 2; do cat config.toml; done",
+            "trap 'cd /private' DEBUG; cd src; for i in 1 2; do cat config.toml; done",
+            "cd src; pushd /private; for i in 1 2; do cat config.toml; done",
+            "cd src; for i in 1 2; do 'c''d' ..; done; cat config.toml",
             "while true; do cd ..; done; cat config.toml",
             "move() { cd ..; }; move; cat config.toml",
         ] {
@@ -715,6 +721,10 @@ mod tests {
         }
         std::fs::create_dir(temp.path().join("src")).unwrap();
         std::fs::write(temp.path().join("src/main.rs"), "fn main() {}").unwrap();
+        assert!(!guard.references_in(
+            r#"{"command":"cd src && for i in 1 2 3; do cat main.rs 2>&1 | tail -5; done"}"#,
+            temp.path(), &world
+        ).await);
         assert!(
             !guard
                 .references_in(

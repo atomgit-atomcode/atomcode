@@ -613,6 +613,7 @@ pub enum Msg<'a> {
 
     // ── Approval panel ──
     ApprovalAllowOnce,
+    ApprovalSaveProject,
     ApprovalAlwaysAllow {
         tool: &'a str,
     },

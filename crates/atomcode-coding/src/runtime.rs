@@ -10950,6 +10950,7 @@ fn harness_host_state(
             },
             plan_mcp_grants: Arc::clone(&parts.mcp_plan_grants),
             approval_grants: parts.approval.store(),
+            project_rules: None,
         }),
     })
 }
@@ -11049,6 +11050,13 @@ fn tree_inputs(
         &config.dirs,
         &config.working_dir,
     )?;
+    let project_rules = crate::permission_settings::project_rule_store(
+        parts.shared_cwd.clone(),
+        config.working_dir.clone(),
+        config.dirs.clone(),
+        config.permission_rules.clone(),
+        permissions.rules.clone(),
+    );
     let mut effective = config.clone();
     effective.permission_rules = permissions.rules.clone();
     let config = &effective;
@@ -11091,6 +11099,9 @@ fn tree_inputs(
             current: config.provider_name.clone(),
         });
     let mut host = harness_host_state(parts, config, prepare).map_err(|error| error.to_string())?;
+    if let Some(modes) = host.modes.as_mut() {
+        modes.project_rules = Some(project_rules);
+    }
     host.permission_settings = Some(permissions);
     Ok(TreeInputs {
         presence,

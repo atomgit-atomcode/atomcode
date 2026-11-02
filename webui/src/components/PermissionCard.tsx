@@ -15,6 +15,7 @@ interface PermissionRequest {
    *  "allow all Bash (incl. destructive)" button may be offered. A sensitive
    *  target leaves it false, so the floor is drawn server-side, not here. */
   allow_all_bash?: boolean;
+  project_rule?: { rule: string; file: string };
 }
 
 interface PermissionCardProps {
@@ -23,7 +24,7 @@ interface PermissionCardProps {
   /** Optional override for the decision action. When provided, replaces the
    *  default respondPermission call. Used by live-session approval (POST /live/permission)
    *  so the non-sync /chat path is unchanged. */
-  onDecide?: (decision: 'allow' | 'deny' | 'always_allow' | 'allow_persist' | 'allow_all_bash', toolName?: string) => Promise<void>;
+  onDecide?: (decision: 'allow' | 'deny' | 'always_allow' | 'allow_persist' | 'allow_all_bash' | 'allow_project', toolName?: string) => Promise<void>;
 }
 
 function formatArgs(args: unknown): string {
@@ -48,7 +49,7 @@ export function PermissionCard({ req, onDone, onDecide }: PermissionCardProps) {
   const [loading, setLoading] = useState(false);
   const [failed, setFailed] = useState<string | null>(null);
 
-  async function decide(decision: 'allow' | 'deny' | 'always_allow' | 'allow_persist' | 'allow_all_bash') {
+  async function decide(decision: 'allow' | 'deny' | 'always_allow' | 'allow_persist' | 'allow_all_bash' | 'allow_project') {
     if (loading) return;
     setLoading(true);
     setFailed(null);
@@ -56,7 +57,8 @@ export function PermissionCard({ req, onDone, onDecide }: PermissionCardProps) {
       if (onDecide) {
         await onDecide(decision, req.tool_name);
       } else {
-        await respondPermission(req.session_id, decision, req.tool_name);
+        const result = await respondPermission(req.session_id, decision, req.tool_name, req.call_id);
+        if (!result.success) throw new Error(t('perm.requestExpired'));
       }
     } catch (error) {
       // The answer never reached the daemon. Closing here used to read as
@@ -103,6 +105,7 @@ export function PermissionCard({ req, onDone, onDecide }: PermissionCardProps) {
           <button class="btn" disabled={loading} onClick={() => decide('always_allow')}>
             {t('perm.alwaysAllow')}
           </button>
+          {req.project_rule && <button class="btn" disabled={loading} onClick={() => decide('allow_project')}>{t('perm.saveProject')}</button>}
           {req.allow_all_bash && (
             <button class="btn btn-danger" disabled={loading} onClick={() => decide('allow_all_bash')}>
               {t('perm.allowAllBash')}
@@ -117,6 +120,7 @@ export function PermissionCard({ req, onDone, onDecide }: PermissionCardProps) {
       }
     >
       {req.reason && <p class="permission-lead">{req.reason}</p>}
+      {req.project_rule && <div class="field-group"><span class="modal-label">{t('perm.projectRule')}</span><pre class="tool-body-row-content">{req.project_rule.rule}{'\n'}{req.project_rule.file}</pre><p>{t('perm.projectRuleActivation')}</p></div>}
       {failed && <p class="permission-lead permission-failed">{t('perm.sendFailed', { error: failed })}</p>}
       <div class="field-group">
         <span class="modal-label">{t('perm.args')}</span>

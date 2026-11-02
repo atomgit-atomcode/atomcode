@@ -529,6 +529,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
 
         // ── 审批面板 ──
         Msg::ApprovalAllowOnce => "允许一次".into(),
+        Msg::ApprovalSaveProject => "批准并保存精确项目规则".into(),
         Msg::ApprovalAlwaysAllow { tool } => format!("本会话总是允许 {tool}").into(),
         Msg::ApprovalAlwaysAllowFolder => "本会话总是允许写入此目录".into(),
         Msg::ApprovalAlwaysAllowCommand => "本会话总是允许此命令".into(),

@@ -110,6 +110,16 @@
       </table>
       <p><strong>始终自动放行</strong>的:项目<em>内</em>的读取、搜索、glob、编辑,以及 <code>cd</code>、<code>list_dir</code>、<code>grep</code>、<code>web_search</code>、待办清单。</p>
 
+      <h2 id="test-command-rules">授权重复运行项目测试</h2>
+      <p>用户/项目 JSON 设置支持命令规则。例如，在项目的 <code>.atomcode/settings.local.json</code> 中配置：</p>
+<pre><code>{
+  "permissions": {
+    "allow": ["Bash(cargo test --bin ponent defense_tests*)"],
+    "deny": ["Bash(git push --force*)"]
+  }
+}</code></pre>
+      <p>已授权命令可与只读辅助命令及固定数字列表循环组合：<code>cd /project &amp;&amp; for i in 1 2 3; do cargo test --bin ponent defense_tests 2&gt;&amp;1 | tail -5; done</code>。每个命令分别检查，deny 规则优先。动态展开、循环内改目录、写文件重定向仍走原有审批流程。</p>
+      <p>这是执行项目代码的授权，不表示测试被认定为只读，也不限制测试程序的实际文件写入或联网行为。凭据和敏感路径检查仍然生效。</p>
       <h2 id="choices">弹窗里你的选择</h2>
       <p>当一个工具落到"询问 / 始终询问 / 按资源询问"任一级时,你会看到这几个选项:</p>
       <ul>
@@ -160,6 +170,10 @@
         <strong>--dangerously-skip-permissions(危险)</strong>
         <p>用这个参数启动会把上面四级<strong>全部短路成自动放行</strong>——包括 <code>rm -rf</code>、<code>git push --force</code>、写项目外——完全不弹窗。只在你不介意丢失的一次性 / 沙箱环境里用。</p>
       </div>
+
+      <h2 id="project-rules">审批原因与项目规则</h2>
+      <p>审批请求会展示具体原因、命中的权限规则及来源文件，并指出尚未被允许规则覆盖的命令段。符合条件的 Bash 请求还会提供「批准并保存精确项目规则」，确认前显示完整规则和目标 <code>.atomcode/settings.local.json</code> 路径。</p>
+      <p>此操作只批准当前调用，并保存精确命令规则；规则在重新加载或新会话中生效。它保留配置中的其他字段。已有拒绝规则、损坏配置、项目切换或保存失败都会拒绝本次操作，不会降级为静默批准。敏感路径等独立安全审批不提供此保存选项。</p>
 
       <h2 id="config">配置参考</h2>
       <p>MCP 信任写在 <code>mcp.json</code> 里——项目级 <code>.mcp.json</code> 或用户级 <code>~/.atomcode/mcp.json</code>——按 server 配置:</p>

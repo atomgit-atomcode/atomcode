@@ -836,7 +836,7 @@ impl ApprovalPolicy for Asker {
         if grantable && remembered {
             return Decision::Allow;
         }
-        let question = crate::seams::Question::approval(
+        let mut question = crate::seams::Question::approval(
             tool.name(),
             &call.arguments,
             grantable.then_some(scope.as_str()),
@@ -866,6 +866,26 @@ impl ApprovalPolicy for Asker {
             );
             return Decision::Allow;
         }
+        let project_store = self.ctx.service::<crate::seams::ProjectRuleStoreSvc>();
+        let proposal = if grantable && group.is_some() {
+            match &project_store {
+                Some(store) => store.propose(call).await,
+                None => None,
+            }
+        } else {
+            None
+        };
+        let explanation = project_store.as_ref().map(|store| store.explanation(call));
+        if let Some(reason) = &explanation {
+            question.prompt.push_str(&format!("\n{reason}"));
+        }
+        if let Some(proposal) = &proposal {
+            question.prompt.push_str(&format!("\nSave exact rule: {}\nFile: {}\nSaved rules apply after reload or in a new session; this call is approved once.", proposal.rule, proposal.file));
+            question.options.push(crate::seams::Answer::labelled(
+                "allow_project",
+                "Approve and save exact project rule",
+            ));
+        }
         crate::agent::record_asked(&self.ctx, &question);
         let request = ApprovalRequest {
             call_id: call.id.clone(),
@@ -874,24 +894,40 @@ impl ApprovalPolicy for Asker {
             // call and running a different one is the whole failure this
             // contract exists to prevent.
             args: call.arguments.clone(),
-            // The panel's own "why is this being asked" line. This round-trip
-            // is a plain approval — a gate that re-confirms despite a session
-            // grant is the one with something to explain — so there is none.
-            reason: None,
+            // Preserve the enforcing policy's explanation across driver projections.
+            reason: explanation,
             // Whether the driver may show the fourth "allow all bash" button for
             // this call. `Some` group ⇔ a non-sensitive bash; a sensitive one is
             // `None` here, so the floor is drawn before the wire, not on it.
             allow_all_bash: group.is_some(),
         };
-        let answer = self
-            .request(
-                APPROVAL_KIND,
-                serde_json::to_value(&request).unwrap_or(Value::Null),
-            )
-            .await;
+        let mut payload = serde_json::to_value(&request).unwrap_or(Value::Null);
+        if let Some(proposal) = &proposal {
+            payload["project_rule"] = serde_json::to_value(proposal).unwrap_or(Value::Null);
+        }
+        let answer = self.request(APPROVAL_KIND, payload).await;
         // A missing answer parses as deny, which is the point: `from_value`
         // fails closed on `Null`.
-        let decision = PermissionDecision::from_value(&answer.unwrap_or(Value::Null));
+        let answer = answer.unwrap_or(Value::Null);
+        if answer.get("save_project_rule").and_then(Value::as_bool) == Some(true) {
+            let result = match (
+                &project_store,
+                &proposal,
+                answer.get("decision").and_then(Value::as_str),
+            ) {
+                (Some(store), Some(proposal), Some("allow")) => store.save(call, proposal).await,
+                _ => Err("this approval did not offer saving a project rule".into()),
+            };
+            if let Err(error) = result {
+                crate::agent::record_answered(&self.ctx, Some(crate::seams::ANSWER_DENY.into()));
+                return Decision::Deny(format!(
+                    "Project rule was not saved; command not approved: {error}"
+                ));
+            }
+            crate::agent::record_answered(&self.ctx, Some("allow_project".into()));
+            return Decision::Allow;
+        }
+        let decision = PermissionDecision::from_value(&answer);
         // A blanket is only a blanket when it was offered (`group` is `Some`). An
         // `AllowAlwaysAll` echoed for a call that never offered it — a sensitive
         // target, or any non-bash tool — is NOT quietly downgraded to a per-tool

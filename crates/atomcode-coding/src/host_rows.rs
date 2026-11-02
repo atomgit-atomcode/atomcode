@@ -694,6 +694,7 @@ impl Plugin for ModesHostPlugin {
 /// session — the lifetime the chain's approval middleware already gives it.
 pub(crate) struct GrantsHostPlugin(
     pub(crate) Arc<dyn atomcode_capabilities::tools::PermissionStore>,
+    pub(crate) Option<Arc<dyn atomcode_capabilities::tools::approval::ProjectRuleStore>>,
 );
 
 #[async_trait]
@@ -702,7 +703,7 @@ impl Plugin for GrantsHostPlugin {
         "grants-host"
     }
     fn provides(&self) -> &'static [&'static str] {
-        &["grants"]
+        &["grants", "project-rule-store"]
     }
     fn description(&self) -> &'static str {
         "the coding runtime's session grants, so a rebuilt tree remembers what the person allowed"
@@ -711,6 +712,11 @@ impl Plugin for GrantsHostPlugin {
         let _ = ctx
             .provide::<atomcode_harness::seams::GrantsSvc>(self.0.clone())
             .map_err(|e| e.to_string())?;
+        if let Some(store) = &self.1 {
+            let _ = ctx
+                .provide::<atomcode_harness::seams::ProjectRuleStoreSvc>(store.clone())
+                .map_err(|e| e.to_string())?;
+        }
         Ok(())
     }
 }

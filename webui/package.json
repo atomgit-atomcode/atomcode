@@ -11,6 +11,7 @@
     "test": "node --experimental-strip-types --test \"src/**/*.test.ts\"",
     "test:timeline": "node scripts/timeline-e2e.mjs",
     "test:user-input": "node scripts/user-input-e2e.mjs",
+    "test:permission": "node scripts/permission-e2e.mjs",
     "test:workbench": "node scripts/workbench-e2e.mjs"
   },
   "engines": {

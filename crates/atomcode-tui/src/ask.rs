@@ -671,26 +671,46 @@ fn choice_for(kind: &str, payload: &Value, events: &[LoggedEvent]) -> Option<Que
     match kind {
         APPROVAL_KIND => {
             let request: ApprovalRequest = serde_json::from_value(payload.clone()).ok()?;
-            Some(
-                asked(&|q| {
-                    q.about.as_ref().is_some_and(|a| {
-                        // Match on the exact executing bytes, not the tool NAME. A gate
-                        // renames the tool it asks about (`bash (writes outside the
-                        // workspace)`) while the wire request carries the raw call name
-                        // (`bash`), so a name compare misses and the fallback below would
-                        // synthesize a poorer question — no "allow all bash" option, the
-                        // raw header — that disagrees with the card the log already drew.
-                        // The arguments ARE the reconciliation anchor; a tool-name prefix
-                        // keeps the match scoped without demanding the gate's exact wording.
-                        a.arguments == request.args
-                            && (a.tool == request.tool
-                                || a.tool.starts_with(&format!("{} ", request.tool)))
-                    })
+            let mut question = asked(&|q| {
+                q.about.as_ref().is_some_and(|a| {
+                    // Match on the exact executing bytes, not the tool NAME. A gate
+                    // renames the tool it asks about (`bash (writes outside the
+                    // workspace)`) while the wire request carries the raw call name
+                    // (`bash`), so a name compare misses and the fallback below would
+                    // synthesize a poorer question — no "allow all bash" option, the
+                    // raw header — that disagrees with the card the log already drew.
+                    // The arguments ARE the reconciliation anchor; a tool-name prefix
+                    // keeps the match scoped without demanding the gate's exact wording.
+                    a.arguments == request.args
+                        && (a.tool == request.tool
+                            || a.tool.starts_with(&format!("{} ", request.tool)))
                 })
-                .unwrap_or_else(|| {
-                    Question::approval(&request.tool, &request.args, Some(""), None, None)
-                }),
-            )
+            })
+            .unwrap_or_else(|| {
+                Question::approval(&request.tool, &request.args, Some(""), None, None)
+            });
+            if let Some(reason) = request.reason.filter(|r| !r.is_empty()) {
+                if !question.prompt.contains(&reason) {
+                    question.prompt.push_str(&format!("\n{reason}"));
+                }
+            }
+            if let Some(proposal) = payload.get("project_rule").cloned().and_then(|v| {
+                serde_json::from_value::<
+                        atomcode_capabilities::tools::approval::ProjectRuleProposal,
+                    >(v)
+                    .ok()
+            }) {
+                if !question.options.iter().any(|a| a.value == "allow_project") {
+                    question.options.push(Answer::labelled(
+                        "allow_project",
+                        pt(PMsg::ApprovalSaveProject).into_owned(),
+                    ));
+                    question
+                        .prompt
+                        .push_str(&format!("\n{}\n{}", proposal.rule, proposal.file));
+                }
+            }
+            Some(question)
         }
         // The kernel's own two checkpoints: a turn that hit the round fuse, and
         // one whose output kept being cut off after the automatic recovery gave
@@ -852,6 +872,9 @@ pub fn response_for(kind: &str, reply: Option<Reply>) -> Value {
     let answer = reply.and_then(Reply::into_value);
     match kind {
         APPROVAL_KIND => match answer.as_deref() {
+            Some("allow_project") => {
+                serde_json::json!({"decision":"allow", "save_project_rule":true})
+            }
             Some(ANSWER_ALLOW) => serde_json::json!({ "decision": "allow" }),
             Some(ANSWER_ALWAYS) => serde_json::json!({ "decision": "allow_always" }),
             // The blanket answer carries the old front end's wire shape so a driver
@@ -1518,6 +1541,7 @@ pub fn answer_label(value: &str, fallback: &str) -> String {
     // it covers, and this row has the scope on a line of its own.
     match value {
         ANSWER_ALLOW => pt(PMsg::ApprovalAllowOnce).into_owned(),
+        "allow_project" => pt(PMsg::ApprovalSaveProject).into_owned(),
         ANSWER_ALWAYS => t(Msg::AskAlwaysAllow).into_owned(),
         // The session-wide blanket — the same product words the old front end offered.
         ANSWER_ALWAYS_ALL => pt(PMsg::ApprovalAllowAllBash).into_owned(),
@@ -1958,6 +1982,24 @@ mod tests {
             let value = response_for(APPROVAL_KIND, answer.map(Reply::from));
             assert_eq!(value["decision"], decision, "{answer:?}");
         }
+    }
+
+    #[test]
+    fn project_approval_shows_the_bound_rule_and_uses_an_explicit_save_response() {
+        let payload = serde_json::json!({"call_id":"c", "tool":"bash", "args":r#"{"command":"rm -rf scratch"}"#, "reason":"Recursive removal requires approval", "project_rule":{"rule":"Bash(rm -rf scratch)","file":"/project/settings.local.json"}});
+        let question = q(APPROVAL_KIND, &payload, &[]).unwrap();
+        assert!(question
+            .prompt
+            .contains("Recursive removal requires approval"));
+        assert!(question.prompt.contains("Bash(rm -rf scratch)"));
+        assert!(question.prompt.contains("/project/settings.local.json"));
+        assert!(question.has("allow_project"));
+        let value = response_for(APPROVAL_KIND, Some(Reply::from("allow_project")));
+        assert_eq!(
+            value,
+            serde_json::json!({"decision":"allow", "save_project_rule":true})
+        );
+        assert!(!Sheet::one(question).can_edit_option());
     }
 
     /// The live modal reconciles against the RENAMED gate tool. A gate asks about
