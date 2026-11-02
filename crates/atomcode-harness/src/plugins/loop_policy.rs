@@ -880,6 +880,11 @@ struct CompactBeforeRequest {
     /// The count is global: a both-spent entry from another session also keeps
     /// it non-zero, so unrelated requests still take the lock. That is the
     /// conservative direction, and it never changes a decision.
+    /// The hint is best-effort: an entry for a session that never returns (no
+    /// low-pressure request and no new turn) keeps the count non-zero, so the
+    /// lock-free path can stay disabled. Reclaiming needs a session-lifecycle
+    /// signal this plugin does not receive; evicting a live entry would allow a
+    /// duplicate attempt, so the stale hint is preferred to that.
     both_tried_entries: AtomicUsize,
 }
 

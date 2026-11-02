@@ -520,7 +520,7 @@ async fn a_later_compaction_keeps_what_the_earlier_summary_said() {
 }
 
 /// A compaction strategy that says it would call a model and never finds
-/// anything to commit — and counts how often it was asked.
+/// anything to commit — and counts how often `compact` was attempted.
 struct Reluctant(Arc<AtomicU32>);
 
 #[async_trait]
@@ -589,15 +589,19 @@ async fn a_slow_compaction_is_tried_once_a_turn_and_its_start_is_always_closed()
     let swap = "[[remove]]\nid = \"compaction-tail\"\n\n\
                 [[insert]]\nid = \"compaction-reluctant\"\nname = \"compaction-reluctant\"\n\n\
                 [[remove]]\nid = \"repeat-fuse\"\n\n[[remove]]\nid = \"tool-loop-guard\"";
-    let asked = Arc::new(AtomicU32::new(0));
+    let compacts = Arc::new(AtomicU32::new(0));
     let mut registry = atomcode_coding::on_harness::catalog();
-    registry.register(Arc::new(ReluctantRow(asked.clone(), 0.0000001)));
+    registry.register(Arc::new(ReluctantRow(compacts.clone(), 0.0000001)));
     let mut app = App::new(registry, tree(&dir, &script, &[swap]));
     app.start().await.expect("must mount");
 
     run_turn(&app, "first").await.unwrap();
     // The first request has no usage to measure; the four after it all do.
-    assert_eq!(asked.load(Ordering::SeqCst), 1, "asked once in the turn");
+    assert_eq!(
+        compacts.load(Ordering::SeqCst),
+        1,
+        "one compact attempt in the turn"
+    );
 
     let events: Vec<SessionEvent> = app
         .context()
@@ -1193,9 +1197,9 @@ id = "repeat-fuse"
 [[remove]]
 id = "tool-loop-guard"
 "#;
-    let asked = Arc::new(AtomicU32::new(0));
+    let compacts = Arc::new(AtomicU32::new(0));
     let mut registry = atomcode_coding::on_harness::catalog();
-    registry.register(Arc::new(ReluctantRow(asked.clone(), 0.0005)));
+    registry.register(Arc::new(ReluctantRow(compacts.clone(), 0.0005)));
     let mut app = App::new(registry, tree(&dir, &script, &[swap]));
     app.start().await.unwrap();
     let _guard = app
@@ -1203,7 +1207,7 @@ id = "tool-loop-guard"
         .on_waterfall::<AgentRequest>(Arc::new(PressureCycle(AtomicU32::new(0))), false);
     run_turn(&app, "one long task").await.unwrap();
     assert_eq!(
-        asked.load(Ordering::SeqCst),
+        compacts.load(Ordering::SeqCst),
         2,
         "falling below the trigger must permit the next pressure cycle in the same turn"
     );
