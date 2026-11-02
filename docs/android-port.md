@@ -2207,8 +2207,30 @@ $ printf 'protocol=https\nhost=atomgit.com\n\n' | git credential fill
   password=…
 ```
 
-即：写进去的凭据被 git 自己的 helper 读了出来。未验证的是「真 token 打真远端」——需要
-一个私有仓库和有效 token。
+即：写进去的凭据被 git 自己的 helper 读了出来。
+
+**真 token 打真远端（已实测 2026-11-02）**
+
+做法：在构建机上起一个带 Basic 鉴权的 git smart-HTTP 服务（`git http-backend` + 自签
+TLS，未鉴权一律 401），用 `adb reverse tcp:8899` 让设备把 `127.0.0.1:8899` 打到宿主机，
+再用应用自己的 `POST /git/credentials` 存入 `probeuser`，最后让**设备上的 git** 去访问它。
+
+```
+设备侧   GET  /repo.git/info/refs?service=git-upload-pack   → 200，clone 成功
+设备侧   POST /repo.git/git-upload-pack                     → 200
+设备侧   GET  /repo.git/info/refs?service=git-receive-pack  → 200
+设备侧   POST /repo.git/git-receive-pack                    → 200，push 成功
+服务端日志每次都是 auth=probeuser:…  ok=True
+远端仓库  真的多出提交 800ea57 probe-write
+```
+
+也就是说：存进去的 token 一路走到 HTTP Basic 并完成了读写两个方向，不是"helper 能读出
+来"而已。
+
+**一个由此暴露的边界**：`store_at` 写出的凭据行 scheme 固定是 `https://`，而 git 的
+store helper 是**按 scheme 匹配**的，所以应用**无法**给纯 `http://` 的远端提供凭据（会走到
+`could not read Username ... terminal prompts disabled`）。这是刻意的安全取舍——PAT 不该
+走明文——但意味着自建 http 远端用不上这条链路，要么上 https，要么用别的 helper。
 
 **P4 剩余面（已完成）**
 
