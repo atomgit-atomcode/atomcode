@@ -889,7 +889,7 @@ pub fn config_rows(cfg: &crate::CodingAgentConfig) -> Result<Layer, String> {
     //
     // Desktop never installs a backend, so this is a no-op there.
     if atomcode_capabilities::saf::installed_backend().is_some() {
-        tracing::info!("SAF: swapping the `fs` row to `fs-saf`");
+        tracing::debug!("SAF: swapping the `fs` row to `fs-saf`");
         out = out.swap("fs", "fs-saf");
     } else {
         tracing::debug!("SAF: no backend installed, keeping the local world");

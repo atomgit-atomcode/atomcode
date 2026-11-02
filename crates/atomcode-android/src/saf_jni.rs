@@ -256,7 +256,7 @@ pub fn install(env: &mut JNIEnv<'_>, _class: jni::objects::JClass<'_>) -> bool {
         let _ = TREE.set((vm, global));
     }
     atomcode_capabilities::saf::install_backend(std::sync::Arc::new(JniBackend));
-    tracing::info!(
+    tracing::debug!(
         installed = atomcode_capabilities::saf::installed_backend().is_some(),
         "SAF: backend installed"
     );

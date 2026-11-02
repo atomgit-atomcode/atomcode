@@ -271,14 +271,20 @@ class MainActivity : ComponentActivity() {
         // Before the runtime mounts: the `fs-saf` row refuses to apply until a
         // backend is installed, and a grant from a previous run has to be
         // re-announced to this fresh process.
+        //
+        // Only when all-files access is missing, though. A granted folder is the
+        // fallback a Play-distributable build needs, not a preference: with real
+        // storage access the agent should work on real paths, which `bash`, `git`
+        // and language servers all understand — `content://` documents support
+        // none of that.
         SafTree.restore(this)
-        if (SafTree.isReady()) {
-            Log.i(TAG, "SAF world available: ${SafTree.displayName}")
+        storageGrantedAtStart = Environment.isExternalStorageManager()
+        if (!storageGrantedAtStart && SafTree.isReady()) {
+            Log.i(TAG, "no all-files access; using the granted folder ${SafTree.displayName}")
             NativeAgent.nativeInstallSaf()
         }
         AgentService.start(this)
         bindService(Intent(this, AgentService::class.java), connection, Context.BIND_AUTO_CREATE)
-        storageGrantedAtStart = Environment.isExternalStorageManager()
         maybeAttachExternal()
         // A share can be what launched us. The page drains the queue when it
         // mounts, so all that happens here is copying the bytes.

@@ -456,10 +456,10 @@ debug 构建（在 reqwest 客户端层打点），这会改动生产代码，�
    `DELETE /git/credentials/:host`（列表只回 host/username，永不回 token），
    webui 的 Git 面板（`SourceControl.tsx`）已经有输入框、列表与删除。
    真机核对：存 `example.com` 后 `GET` 只返回 `{host, username}`。
-3. **SAF 未接**：现在用全盘访问换取真实路径。若日后要上架 Google Play，需要改用 SAF +
-   持久的 `content://` 授予，并给工具层补一个 SAF 世界的实现（`world::{FileSystem,Shell}` 接缝）。
-4. **未验证**：前台服务在 Doze 下长时间运行、内存占用都还没量过；
-   审批卡在窄屏上的表现也没看（`PermissionCard` 是 webui 现有的组件）。
+3. ~~**SAF 未接**~~ **已接通（真机验证 2026-11-02）**：上架 Google Play 不能带
+   `MANAGE_EXTERNAL_STORAGE`，所以补了 content:// 上的世界实现。详见下面的
+   「SAF 世界」小节。
+4. **未验证**：审批卡在窄屏上的表现还没看（`PermissionCard` 是 webui 现有的组件）。
 
 ### P5：窄屏适配（已实现，真机实测 2026-10-25）
 
@@ -2730,7 +2730,45 @@ $ dumpsys deviceidle → mScreenLocked=true
 | P5 | 审批 UI 的移动端适配（webui 已有 `PermissionCard`，需在窄屏复核）；**窄屏排版已修**（顶部安全区、下拉框溢出、composer 控件重排，见上面 P5 小节） |
 | ~~P6~~ | ~~后台长任务的通知与进度~~ **已完成**：回合开始/结束驱动唤醒锁与通知，结束时报告最后一轮的成败（见 P5.11）；多会话按会话 id 分组为独立子通知并可点击直达该会话（真机验证 2026-11-01，见上面 P5 小节末尾） |
 | ~~P7~~ | ~~量内存与 Doze 下的存活；长回合的压力测试~~ **已实测（2026-11-02，PLT140 / Android 16）**：`scripts/verify-android-doze.sh` 在回合进行中强制进 Doze（`mState=IDLE`），回合仍以 `ok` 结束、进程 PID 未变（14687 → 14687）、PSS 基线/峰值/结束 = 138916 / 148613 / 136484 KB（峰值比基线高约 9.5 MB，结束后回落到基线以下）。脚本在设备拒绝 `force-idle` 时明确报"没测成"，不假装通过 |
-| P8 | 若要上架：SAF + `content://` 的 world 实现，替换全盘访问 |
+| ~~P8~~ | ~~若要上架：SAF + `content://` 的 world 实现，替换全盘访问~~ **已实现（真机验证 2026-11-02）**：`capabilities::saf` 是 content:// 上的 `FileSystem`（后端为 trait，8 项单测在构建机跑），`SafTree.kt` 提供 DocumentsContract 后端，`fs-saf` 行 + `swap("fs","fs-saf")` 完成装配切换。规则是**全盘访问优先**：拿得到就用真实磁盘（bash/git/LSP 都认路径），拿不到才落到授权文件夹 |
+
+### SAF 世界：没有路径时的文件系统（真机验证 2026-11-02）
+
+上架 Google Play 的构建不能带 `MANAGE_EXTERNAL_STORAGE`。拿不到全盘访问时，应用目录
+之外的文件只剩 `content://` 文档——**没有路径**。`world` 接缝让这件事可以是换一行，
+而不是给每个工具加一个模式：
+
+| 位置 | 作用 |
+|---|---|
+| `crates/atomcode-capabilities/src/saf.rs` | content:// 上的 `FileSystem`；后端是 `SafBackend` trait，所以越界判定、错误映射、目录创建都在构建机上测（8 项） |
+| `crates/atomcode-android/src/saf_jni.rs` | 平台后端：把 `SafTree` 的调用接成 `SafBackend` |
+| `android/.../SafTree.kt` | DocumentsContract 上的列目录/读写/建目录/stat，授权用 `takePersistableUriPermission` 跨重启 |
+| `crates/atomcode-harness/.../world.rs` | `fs-saf` 行：把授权树当成世界 |
+| `crates/atomcode-coding/src/on_harness.rs` | 装上后端时 `swap("fs","fs-saf")`；桌面没有后端，因此是 no-op |
+
+三个设计点：
+
+- **越界判定是纯词法的**（先折 `.`/`..` 再问平台）。SAF 文档不能互相指向，没有软链接可
+  解析，所以 `canonicalize` 是精确的，也不存在"检查完到使用之间"的竞态。
+- **这个世界不能执行命令**。`content://` 文档没法 `exec`，编译器也读不了它。只有 SAF
+  权限的构建把 shell 留在应用私有目录，授权树里的文件可读写、不可运行。
+- **全盘访问优先**。拿得到真实存储就用真实磁盘（`bash`/`git`/LSP 都认路径）；拿不到才
+  落到授权文件夹。授权本身是持久的，所以两种形态之间来回切换只需在系统设置里改那条
+  权限，不需要重新授权。
+
+真机验证（PLT140 / Android 16，全盘访问 `deny`）：
+
+```
+SAF tree granted: primary:AtomCode     ← 选择器授权
+read_file calc.py  → #!/usr/bin/env python3
+write_file saf-probe.txt → /sdcard/AtomCode/saf-probe.txt 内容 "written through SAF"
+```
+
+**踩到的坑**：`nativeInstallSaf` 声明在 Kotlin `object NativeAgent` 里，是*实例*方法，
+JNI 传过来的是那个单例而不是类；把它当 `JClass` 存下来再对 `SafTree` 调
+`call_static_method`，表现出来就是"后端装上了、世界却没换"。改成 install 时用
+`find_class("com/atomcode/app/SafTree")` 取真正的类（install 跑在 UI 线程，有应用类
+加载器）。这个错误在构建机上完全看不出来，只有真机跑一次工具才暴露。
 
 ## 7. 边界
 
