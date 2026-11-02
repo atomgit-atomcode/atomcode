@@ -1,3 +1,4 @@
+import { nextContextSummary } from '../lib/contextSummaries';
 import { adjacentTimelineStart, archivedMessage, assistantTurnRange, boundedTimelineRange, cacheSession, residentStart, segmentMessages, targetTimelineStart, timelineLimits } from '../lib/timelineMemory';
 import { useTimelineMessages, useTimelinePage, useTimelineSearch } from '../lib/useTimelineMessages';
 import { loadAfterSessionSwitch } from '../lib/sessionSwitch';
@@ -123,6 +124,7 @@ import { disposeNotifications, maybeNotifyTurnFinished } from '../lib/notificati
 import { artifactsByAssistantIndex, type TurnArtifact } from '../lib/turnArtifacts';
 
 interface Message {
+  contextSummary?: boolean;
   archiveKey?: string;
   archiveBytes?: number;
   archiveArtifacts?: TurnArtifact[];
@@ -573,6 +575,21 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     pushCommandNotice(t('chat.steerRecovered'));
   }
   const [tokens, setTokens] = useState<TokenUsage | null>(null);
+  const [compacting, setCompacting] = useState(false);
+  const [summaryCount, setSummaryCount] = useState<number | null>(null);
+  const summaryCountRef = useRef<number | null>(null);
+  function resetSummaryCount() {
+    summaryCountRef.current = null;
+    setSummaryCount(null);
+  }
+  function updateSummaryCount(count?: number, record = false) {
+    const next = nextContextSummary(summaryCountRef.current, count, record);
+    summaryCountRef.current = next.count;
+    setSummaryCount(next.count);
+    if (next.notice) pushCommandNotice(t('context.summaryRecorded', { count: next.count! }), true);
+  }
+
+  const latestSummaryIndex = messages.map(message => message.contextSummary === true).lastIndexOf(true);
   const [turnStats, setTurnStats] = useState<TurnStats | null>(null);
   const [historyHint, setHistoryHint] = useState<string | null>(null);
   // Auxiliary persistence failures belong to application chrome, not the
@@ -981,6 +998,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       setSearch('');
       setMatchIdx(0);
       setTokens(null);
+      resetSummaryCount();
+      setCompacting(false);
       setTurnStats(null);
       setHistoryHint(null);
       setPersistenceWarning(null);
@@ -1082,6 +1101,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
 
         let nextHint: string | null = null;
         if (sessionResult.status === 'fulfilled' && sessionResult.value && Array.isArray(sessionResult.value.messages)) {
+          updateSummaryCount(sessionResult.value.summary_count);
           const currentCached = messageCacheRef.current.get(loadId);
           const cachedTodos = todoCacheRef.current.get(loadId);
           const cachedTodoVisibility = todoVisibilityCacheRef.current.get(loadId);
@@ -1639,6 +1659,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       case 'tool_output': return { type: 'tool_output', chunk: e.chunk };
       case 'tool_progress': return { type: 'tool_progress', id: e.id, progress: e.progress };
       case 'tool_result': return { type: 'tool_result', id: e.id, name: e.name, output: e.output, success: e.success, duration_ms: e.duration_ms };
+      case 'context_summary': return e;
+      case 'context_compacting': return e;
       case 'tokens': return { type: 'tokens', prompt: e.prompt, completion: e.completion, total: e.total };
       case 'warning': return { type: 'warning', message: e.message };
       case 'persistence_warning': return { type: 'persistence_warning', message: e.message };
@@ -1663,6 +1685,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     }
     // snapshot：确立实时会话 id 并把视图切到它（连上即对齐）。
     if (e.type === 'snapshot') {
+      if (activeIdRef.current !== e.session_id) resetSummaryCount();
+      updateSummaryCount(e.summary_count);
+      setCompacting(false);
       setLiveSnapshotReady(true);
       setLoading(false);
       setGoalProgress(e.goal ?? null);
@@ -1787,6 +1812,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         setMatchIdx(0);
         setSearchOpen(false);
         setTokens(null);
+        resetSummaryCount();
+        setCompacting(false);
         setTurnStats(null);
         setHistoryHint(null);
         setPersistenceWarning(null);
@@ -1860,6 +1887,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         liveLifecycleRef.current = lifecycle.state;
         const terminal = lifecycle.terminal;
         setBusy(lifecycle.state.running);
+        if (!e.running) setCompacting(false);
         if (e.running) setTurnStats(null);
         else if (terminal) setTurnStats(completedTurnStats(e.stats, e.stop_reason));
         if (terminal) {
@@ -1913,6 +1941,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         break;
       }
       case 'error': {
+        setCompacting(false);
         const lifecycle = reduceLiveLifecycle(liveLifecycleRef.current, {
           type: 'error',
           message: e.message,
@@ -2062,7 +2091,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     pushCommandNotice(text);
   }
 
-  function pushCommandNotice(text: string) {
+  function pushCommandNotice(text: string, contextSummary = false) {
     setMessages((prev) => {
       const last = prev[prev.length - 1];
       const insertBeforeBusyAssistant = !!(last && last.role === 'assistant' && busyRef.current);
@@ -2072,7 +2101,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       // (the reported "刷了一屏"). The run resets once real content follows, so a
       // genuine later repeat still shows.
       if (isDuplicateTrailingNotice(prev, text, insertBeforeBusyAssistant)) return prev;
-      const note: Message = { role: 'system', parts: [{ kind: 'notice', text }], ts: Date.now() };
+      const note: Message = { role: 'system', parts: [{ kind: 'notice', text }], ts: Date.now(), contextSummary };
       // Keep an in-flight streaming assistant reply as the last element so
       // appendToLastAssistant still targets IT, not this notice.
       if (insertBeforeBusyAssistant) {
@@ -2092,6 +2121,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     try {
       const detail = await getSession(projectHash, id);
       if (activeIdRef.current === id) {
+        updateSummaryCount(detail.summary_count);
         setMessages(sessionMessagesToDisplay(detail.messages));
       }
     } catch { /* refresh failure is non-fatal; the notice still gives feedback */ }
@@ -2405,6 +2435,13 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
 
   function handleEvent(event: SSEEvent) {
     switch (event.type) {
+      case 'context_compacting':
+        setCompacting(event.active);
+        break;
+      case 'context_summary':
+        setCompacting(false);
+        updateSummaryCount(event.count, event.record);
+        break;
       case 'runtime_info':
         rememberRuntimeModel({ provider: event.provider, model: event.model });
         providerRef.current = event.provider;
@@ -2509,6 +2546,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         break;
 
       case 'done': {
+        setCompacting(false);
         // A normal terminal keeps only successful calls; a user cancellation
         // retires the active plan at the same boundary as kernel/TUI.
         stampLastAssistantCompletion();
@@ -2553,6 +2591,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       }
 
       case 'stopped':
+        setCompacting(false);
         // User cancellation is an authoritative interruption boundary: the
         // previous plan remains historical but is no longer active.
         stampLastAssistantCompletion();
@@ -2569,6 +2608,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         break;
 
       case 'error':
+        setCompacting(false);
         stampLastAssistantCompletion();
         resetTodoBatch(false);
         // A session another atomcode holds says so in words, with what to do —
@@ -3706,6 +3746,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
               {(tokens.total / 1000).toFixed(1)}k tokens
             </span>
           )}
+          {summaryCount != null && summaryCount > 0 && (latestSummaryIndex >= 0
+            ? <button class="footer-tokens footer-summary-count" type="button" onClick={() => navigateTurn(latestSummaryIndex)}>{tokens ? '· ' : ''}{t('context.summaryCount', { count: summaryCount })}</button>
+            : <span class="footer-tokens">{tokens ? '· ' : ''}{t('context.summaryCount', { count: summaryCount })}</span>)}
         </div>
         <div class="input-footer-actions">
           <ModeSelector
@@ -4022,7 +4065,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
             // no turn grouping, no streaming cursor).
             if (msg.role === 'system') {
               const fullText = msg.parts.map((p) => (p.kind === 'notice' ? p.text : '')).join('');
-              const sysCls = 'msg-notice command-output' + (isActiveSearchMatch ? ' is-active-search-match' : '');
+              const sysCls = (msg.contextSummary ? 'msg-notice context-summary-note' : 'msg-notice command-output') + (isActiveSearchMatch ? ' is-active-search-match' : '');
               return (
                 <div class={sysCls} key={origIdx} ref={setMatchRef}>
                   {highlightText(fullText, search)}
@@ -4056,6 +4099,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
           });
         })()}
 
+        {historyDisplay.showLive && compacting && <div class="msg-notice context-summary-note" role="status">{t('context.summarizing')}</div>}
         {historyDisplay.showLive && range.end < messages.length && <div class="timeline-history-status">
           <button onClick={() => showTimelinePage(range.end)}>{t('chat.historyLoadNext')}</button>
           <button onClick={() => showTimelinePage(null)}>{t('chat.timelineLatest')}</button>

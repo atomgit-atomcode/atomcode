@@ -450,6 +450,8 @@ pub struct AppendSessionMessagesResponse {
 /// Session detail response
 #[derive(Debug, Serialize)]
 pub struct SessionDetail {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_count: Option<u64>,
     pub id: String,
     pub name: String,
     pub working_dir: PathBuf,
@@ -2289,6 +2291,27 @@ async fn get_sessions_by_working_dir(
     }
 }
 
+/// Read-only projection from the native event log. Missing/legacy data is
+/// unknown, never a guessed zero. No counter is persisted beside the log.
+pub(crate) fn context_summary_count(working_dir: &std::path::Path, id: &str) -> Option<u64> {
+    let dirs = atomcode_coding::config::product_dirs_from_env();
+    // A live cwd is not a storage identity: /cd can leave the log in its
+    // original bucket. Check global ambiguity even when the new cwd happens
+    // to contain a different session with the same ID.
+    let root = NativeSessionManager::sessions_root(dirs.user());
+    let scan = NativeSessionManager::scan_catalog(&root);
+    let matches: Vec<_> = scan.entries.iter().filter(|entry| entry.id == id).collect();
+    if matches.len() > 1 {
+        return None;
+    }
+    let manager = match matches.first() {
+        Some(entry) => NativeSessionManager::with_root(root.join(&entry.project_bucket)),
+        None => NativeSessionManager::for_project(working_dir, &dirs),
+    };
+    let events = manager.load_events(id).ok()?;
+    Some(atomcode_kernel::session::context_summary_count(&events))
+}
+
 /// GET /projects/:hash/sessions/:id - Get session detail
 async fn get_session_detail(Path((hash, id)): Path<(String, String)>) -> impl IntoResponse {
     match crate::legacy_convert::load_catalog_session_view_in_project(&hash, &id) {
@@ -2307,6 +2330,10 @@ async fn get_session_detail(Path((hash, id)): Path<(String, String)>) -> impl In
             // the stale marker check happens inside `read_todo_sidecar`.)
             let todos = read_todo_sidecar_for_detail(&session);
             let detail = SessionDetail {
+                summary_count: context_summary_count(
+                    std::path::Path::new(&session.meta.working_dir),
+                    &session.meta.id,
+                ),
                 id: session.meta.id,
                 name: session.meta.name,
                 working_dir: PathBuf::from(session.meta.working_dir),
@@ -3700,6 +3727,10 @@ pub struct ImageInput {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type")]
 pub enum ChatEvent {
+    #[serde(rename = "context_compacting")]
+    ContextCompacting { active: bool },
+    #[serde(rename = "context_summary")]
+    ContextSummary { count: u64, record: bool },
     /// Exact provider/model resolved for this request.
     #[serde(rename = "runtime_info")]
     RuntimeInfo { provider: String, model: String },
@@ -4517,6 +4548,8 @@ impl ArtifactDetector {
 }
 
 struct ChatRuntimeProjector {
+    summary_location: Option<(PathBuf, String)>,
+    summary_count: Option<u64>,
     artifacts: ArtifactDetector,
     live_tools: HashMap<String, (String, std::time::Instant)>,
     total_tokens: usize,
@@ -4529,6 +4562,8 @@ struct ChatRuntimeProjector {
 impl Default for ChatRuntimeProjector {
     fn default() -> Self {
         Self {
+            summary_location: None,
+            summary_count: None,
             artifacts: ArtifactDetector::new(),
             live_tools: HashMap::new(),
             total_tokens: 0,
@@ -4549,7 +4584,23 @@ impl ChatRuntimeProjector {
         use atomcode_coding::runtime::CompactionCompletion;
         use atomcode_coding::TurnCompletion;
 
-        match event {
+        let started = matches!(&event, CodingRuntimeEvent::CompactionStarted { .. });
+        let finished = matches!(&event, CodingRuntimeEvent::CompactionFinished { .. });
+        let committed = matches!(&event,
+            CodingRuntimeEvent::CompactionFinished { completion: CompactionCompletion::Completed(outcome) } if outcome.committed);
+        if committed {
+            if let Some((working_dir, id)) = &self.summary_location {
+                if let Some(count) = context_summary_count(working_dir, id) {
+                    if self.summary_count != Some(count) {
+                        let record = self.summary_count.is_some_and(|before| count > before);
+                        self.summary_count = Some(count);
+                        return vec![ChatEvent::ContextSummary { count, record }];
+                    }
+                    return vec![ChatEvent::ContextCompacting { active: false }];
+                }
+            }
+        }
+        let mut output = match event {
             CodingRuntimeEvent::Agent(event) => self.project_agent(event),
             CodingRuntimeEvent::RequestResolved { id, kind } => {
                 if kind == atomcode_capabilities::tools::request_user_input::REQUEST_USER_INPUT_KIND
@@ -4715,7 +4766,11 @@ impl ChatRuntimeProjector {
             | CodingRuntimeEvent::ProviderReloadFinished(_)
             | CodingRuntimeEvent::ProviderDeactivationFinished(_) => Vec::new(),
             _ => Vec::new(),
+        };
+        if started || finished {
+            output.insert(0, ChatEvent::ContextCompacting { active: started });
         }
+        output
     }
 
     fn project_agent(&mut self, event: atomcode_kernel::event::AgentEvent) -> Vec<ChatEvent> {
@@ -5316,6 +5371,13 @@ async fn process_chat_request(
         tel_ctx.repo_origin = Some(detect_repo_origin(&working_dir));
     }
 
+    let summary_baseline = context_summary_count(&working_dir, &perm_session_key);
+    if let Some(count) = summary_baseline {
+        let _ = event_tx.send(ChatEvent::ContextSummary {
+            count,
+            record: false,
+        });
+    }
     // Run turn(s) in a background task on the native kernel stack; the
     // downstream native-event → ChatEvent projector shapes the HTTP stream.
     {
@@ -5362,7 +5424,11 @@ async fn process_chat_request(
         });
     }
 
-    let mut projector = ChatRuntimeProjector::default();
+    let mut projector = ChatRuntimeProjector {
+        summary_location: Some((working_dir.clone(), perm_session_key.clone())),
+        summary_count: summary_baseline,
+        ..Default::default()
+    };
     while let Some(event) = runtime_event_rx.recv().await {
         for chat_event in projector.project_runtime(event, &perm_session_key) {
             if matches!(chat_event, ChatEvent::Done { .. }) {
@@ -8438,6 +8504,134 @@ mod tests {
             assert_eq!(body["snapshot"], "unchecked");
             assert_eq!(body["presentation"], "unchecked");
         }
+    }
+
+    #[test]
+    fn context_summary_projection_reads_committed_history_without_counting_cleanup_or_replay() {
+        let _home = ScopedChatHome::new();
+        let project = tempfile::tempdir().unwrap();
+        let dirs = atomcode_coding::config::product_dirs_from_env();
+        let manager = NativeSessionManager::for_project(project.path(), &dirs);
+        let lease = manager.acquire_lease("summary-test").unwrap();
+        let header = atomcode_kernel::session::SessionHeader::new("summary-test");
+        let mut meta = atomcode_capabilities::session::SessionMeta::new(
+            "summary-test",
+            project.path().to_string_lossy(),
+            0,
+        );
+        meta.owner = atomcode_capabilities::session::StorageOwner::Native;
+        manager
+            .create_event_session(&lease, &header, &meta)
+            .unwrap();
+        let mut projector = ChatRuntimeProjector {
+            summary_location: Some((project.path().into(), "summary-test".into())),
+            summary_count: Some(0),
+            ..Default::default()
+        };
+        use atomcode_kernel::session::{LoggedEvent, SessionEvent};
+        manager
+            .append_events(
+                &lease,
+                &[
+                    LoggedEvent {
+                        seq: 1,
+                        at: 1,
+                        event: SessionEvent::TurnStart { turn: 1 },
+                    },
+                    LoggedEvent {
+                        seq: 2,
+                        at: 2,
+                        event: SessionEvent::Compacted {
+                            turn: 1,
+                            through: 1,
+                            from: 0,
+                            summary: "decisions".into(),
+                        },
+                    },
+                ],
+            )
+            .unwrap();
+        let finished = || CodingRuntimeEvent::CompactionFinished {
+            completion: atomcode_coding::runtime::CompactionCompletion::Completed(
+                atomcode_coding::runtime::CompactionOutcome::from_kernel(
+                    atomcode_kernel::message::CompactTrigger::Auto { utilization: 0.9 },
+                    1,
+                    1,
+                    100,
+                    50,
+                    true,
+                    Some(100),
+                ),
+            ),
+        };
+        let first = projector.project_runtime(finished(), "summary-test");
+        assert!(matches!(
+            first.as_slice(),
+            [ChatEvent::ContextSummary {
+                count: 1,
+                record: true
+            }]
+        ));
+        assert!(matches!(
+            projector
+                .project_runtime(finished(), "summary-test")
+                .as_slice(),
+            [ChatEvent::ContextCompacting { active: false }]
+        ));
+        manager
+            .append_events(
+                &lease,
+                &[LoggedEvent {
+                    seq: 3,
+                    at: 3,
+                    event: SessionEvent::MessagesRewritten {
+                        turn: 1,
+                        texts: vec![],
+                    },
+                }],
+            )
+            .unwrap();
+        assert!(matches!(
+            projector
+                .project_runtime(finished(), "summary-test")
+                .as_slice(),
+            [ChatEvent::ContextCompacting { active: false }]
+        ));
+        assert_eq!(
+            context_summary_count(project.path(), "summary-test"),
+            Some(1)
+        );
+        let changed_cwd = tempfile::tempdir().unwrap();
+        assert_eq!(
+            context_summary_count(changed_cwd.path(), "summary-test"),
+            Some(1)
+        );
+        // A duplicate ID in the new cwd must not take over the original
+        // session's counter, even though it is a directly readable event log.
+        let duplicate_manager = NativeSessionManager::for_project(changed_cwd.path(), &dirs);
+        let duplicate_lease = duplicate_manager.acquire_lease("summary-test").unwrap();
+        let mut duplicate_meta = atomcode_capabilities::session::SessionMeta::new(
+            "summary-test",
+            changed_cwd.path().to_string_lossy(),
+            0,
+        );
+        duplicate_meta.owner = atomcode_capabilities::session::StorageOwner::Native;
+        duplicate_manager
+            .create_event_session(&duplicate_lease, &header, &duplicate_meta)
+            .unwrap();
+        assert_eq!(
+            context_summary_count(changed_cwd.path(), "summary-test"),
+            None
+        );
+        assert_eq!(context_summary_count(project.path(), "summary-test"), None);
+        assert_eq!(context_summary_count(project.path(), "missing"), None);
+        let restored = NativeSessionManager::for_project(project.path(), &dirs)
+            .load_events("summary-test")
+            .unwrap();
+        assert_eq!(
+            atomcode_kernel::session::context_summary_count(&restored),
+            1
+        );
     }
 
     struct ScopedChatHome {

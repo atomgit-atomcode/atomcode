@@ -641,6 +641,15 @@ body {
   white-space: pre-wrap;
 }
 
+.msg-notice.context-summary-note {
+  color: var(--app-secondary-foreground);
+  background: transparent;
+  border-top: 1px solid var(--app-input-border);
+  border-bottom: 1px solid var(--app-input-border);
+  border-radius: 0;
+  padding: 8px 0;
+}
+
 .msg-notice.command-output {
   color: var(--app-primary-foreground);
   background: var(--app-tool-background); background: color-mix(in srgb, var(--app-tool-background), var(--app-primary-background) 30%);
@@ -1209,6 +1218,9 @@ body {
 .footer-hint { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .footer-spacer { flex: 1; }
 .footer-tokens { opacity: 0.7; font-size: 0.75rem; white-space: nowrap; }
+.footer-summary-count { border: 0; background: none; padding: 0; color: inherit; font-family: inherit; cursor: pointer; }
+.footer-summary-count:hover { text-decoration: underline; }
+
 
 .btn-send {
   width: 34px;

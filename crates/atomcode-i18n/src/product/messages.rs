@@ -614,6 +614,12 @@ pub enum Msg<'a> {
     // ── Approval panel ──
     ApprovalAllowOnce,
     ApprovalSaveProject,
+    ContextSummaryCount {
+        count: u64,
+    },
+    ContextSummaryRecorded {
+        count: u64,
+    },
     ApprovalAlwaysAllow {
         tool: &'a str,
     },

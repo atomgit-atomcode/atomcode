@@ -1383,6 +1383,25 @@ pub const ANSWER_ALWAYS: &str = "allow_always";
 pub const ANSWER_ALWAYS_ALL: &str = "allow_always_all";
 pub const ANSWER_DENY: &str = "deny";
 
+/// A committed conversation summary boundary, excluding tool-output cleanup
+/// and empty/no-op boundaries. This is a presentation fact, not a trigger count.
+pub fn is_context_summary(event: &SessionEvent) -> bool {
+    matches!(event, SessionEvent::Compacted { through, from, summary, .. }
+        if through > from && !summary.trim().is_empty())
+}
+
+/// Recorded summary checkpoints in this log, including inherited checkpoints.
+/// Replayed records with the same sequence never count twice. Rewinds preserve
+/// the historical fact that a summary happened; they do not erase this history.
+pub fn context_summary_count(events: &[LoggedEvent]) -> u64 {
+    events
+        .iter()
+        .filter(|e| is_context_summary(&e.event))
+        .map(|e| e.seq)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len() as u64
+}
+
 /// The [`SessionEvent::Answered::by`] of an approval nobody was asked: the
 /// session's execution mode (auto) allowed it on the person's standing say-so.
 /// Written by the asking side from the mode itself, never taken from an answer —

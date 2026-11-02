@@ -698,8 +698,14 @@ use serde::Serialize;
 #[derive(Serialize)]
 #[serde(tag = "type")]
 pub(crate) enum LiveWireEvent {
+    #[serde(rename = "context_compacting")]
+    ContextCompacting { active: bool },
+    #[serde(rename = "context_summary")]
+    ContextSummary { count: u64, record: bool },
     #[serde(rename = "snapshot")]
     Snapshot {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        summary_count: Option<u64>,
         messages: Vec<crate::MessageInfo>,
         session_id: String,
         /// 会话名（Session.name）。让 App 端首次扫码连接就能在顶部显示
@@ -891,6 +897,8 @@ pub(crate) enum LiveWireEvent {
 
 #[derive(Default)]
 struct NativeLiveWireProjector {
+    working_dir: Option<std::path::PathBuf>,
+    summary_count: Option<u64>,
     tools: HashMap<String, (String, std::time::Instant)>,
     session_id: String,
 }
@@ -903,6 +911,35 @@ impl NativeLiveWireProjector {
         use atomcode_coding::CodingRuntimeEvent as Runtime;
         use atomcode_kernel::event::AgentEvent as Kernel;
 
+        // Runtime owns compaction lifecycle and normalizes the raw kernel
+        // events before drivers see them. Read its actual production seam.
+        match &event {
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::CompactionStarted { .. }) => {
+                return Some(LiveWireEvent::ContextCompacting { active: true })
+            }
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::CompactionFinished {
+                completion: CompactionCompletion::Completed(outcome),
+            }) => {
+                if outcome.committed {
+                    if let Some(count) = self
+                        .working_dir
+                        .as_deref()
+                        .and_then(|dir| crate::context_summary_count(dir, &self.session_id))
+                    {
+                        if self.summary_count != Some(count) {
+                            let record = self.summary_count.is_some_and(|before| count > before);
+                            self.summary_count = Some(count);
+                            return Some(LiveWireEvent::ContextSummary { count, record });
+                        }
+                    }
+                }
+                return Some(LiveWireEvent::ContextCompacting { active: false });
+            }
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::CompactionFinished {
+                completion: CompactionCompletion::Interrupted { .. },
+            }) => return Some(LiveWireEvent::ContextCompacting { active: false }),
+            _ => {}
+        }
         Some(match event {
             crate::live_hub::LiveViewEvent::CommandOutput(text) => {
                 LiveWireEvent::CommandOutput { text }
@@ -1205,13 +1242,18 @@ impl NativeLiveWireProjector {
             crate::live_hub::LiveViewEvent::Runtime(Runtime::SessionChanged(changed)) => {
                 let session_id = changed.session_id?;
                 self.session_id = session_id.clone();
+                self.working_dir = Some(changed.working_dir);
+                self.summary_count = None;
                 LiveWireEvent::SessionSwitched { session_id }
             }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::WorkingDirectoryChanged(
                 working_dir,
-            )) => LiveWireEvent::WorkingDir {
-                working_dir: working_dir.to_string_lossy().to_string(),
-            },
+            )) => {
+                self.working_dir = Some(working_dir.clone());
+                LiveWireEvent::WorkingDir {
+                    working_dir: working_dir.to_string_lossy().to_string(),
+                }
+            }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::ControllerWarning(message)) => {
                 LiveWireEvent::Warning { message }
             }
@@ -1229,22 +1271,6 @@ impl NativeLiveWireProjector {
                         if exit.forced { " (forced)" } else { "" }
                     )),
                     stats: None,
-                }
-            }
-            crate::live_hub::LiveViewEvent::Runtime(Runtime::CompactionFinished {
-                completion: CompactionCompletion::Completed(outcome),
-            }) if outcome.committed => {
-                // Silent, cache-friendly tool-output folding is invisible transcript
-                // maintenance — emit nothing (mirrors the TUI `silent_tool_fold`).
-                if outcome.is_silent_auto_tool_fold() {
-                    return None;
-                }
-                LiveWireEvent::Warning {
-                    message: atomcode_config::i18n::format_compaction_mark(
-                        outcome.removed_messages,
-                        outcome.estimated_tokens_before,
-                        outcome.estimated_tokens_after,
-                    ),
                 }
             }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::CompactionFinished {
@@ -1569,9 +1595,11 @@ pub(crate) async fn live_stream(
         &snapshot_wd,
         &join.binding.session_id,
     );
+    let summary_count = crate::context_summary_count(&snapshot_wd, &join.binding.session_id);
     let _ = tx.send((
         join.binding.session_id.clone(),
         LiveWireEvent::Snapshot {
+            summary_count,
             messages: snapshot_messages,
             session_id: join.binding.session_id.clone(),
             session_name,
@@ -1584,6 +1612,8 @@ pub(crate) async fn live_stream(
         },
     ));
     let mut projector = NativeLiveWireProjector {
+        working_dir: Some(snapshot_wd.clone()),
+        summary_count,
         session_id: join.binding.session_id.clone(),
         ..Default::default()
     };
@@ -2826,6 +2856,42 @@ pub(crate) async fn live_mcp_trust(State(state): State<AppState>) -> impl IntoRe
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn normalized_runtime_compaction_progress_has_a_terminal_even_without_a_stored_count() {
+        use atomcode_coding::{
+            runtime::{CompactionCompletion, CompactionOutcome},
+            CodingRuntimeEvent,
+        };
+        let mut projector = super::NativeLiveWireProjector::default();
+        let trigger = atomcode_kernel::message::CompactTrigger::Auto { utilization: 0.9 };
+        let start = projector
+            .project(crate::live_hub::LiveViewEvent::Runtime(
+                CodingRuntimeEvent::CompactionStarted {
+                    trigger: trigger.clone(),
+                },
+            ))
+            .unwrap();
+        assert_eq!(serde_json::to_value(start).unwrap()["active"], true);
+        let done = projector
+            .project(crate::live_hub::LiveViewEvent::Runtime(
+                CodingRuntimeEvent::CompactionFinished {
+                    completion: CompactionCompletion::Completed(CompactionOutcome::from_kernel(
+                        trigger,
+                        1,
+                        0,
+                        100,
+                        100,
+                        false,
+                        Some(100),
+                    )),
+                },
+            ))
+            .unwrap();
+        let wire = serde_json::to_value(done).unwrap();
+        assert_eq!(wire["type"], "context_compacting");
+        assert_eq!(wire["active"], false);
+        assert!(wire.get("count").is_none());
+    }
     #[test]
     fn native_live_approval_preserves_the_reason_and_bound_project_proposal() {
         let mut projector = super::NativeLiveWireProjector::default();

@@ -9,6 +9,9 @@
 export type Lang = 'zh' | 'en';
 
 const zh = {
+  'context.summarizing': '正在摘要上下文…',
+  'context.summaryCount': '已摘要 {count} 次',
+  'context.summaryRecorded': '上下文已摘要 · 第 {count} 次',
   'mention.title': '引用文件或会话',
   'mention.all': '全部',
   'mention.files': '文件',
@@ -652,6 +655,9 @@ const zh = {
 export type MsgKey = keyof typeof zh;
 
 const en: Record<MsgKey, string> = {
+  'context.summarizing': 'Summarizing context…',
+  'context.summaryCount': 'Summarized {count} times',
+  'context.summaryRecorded': 'Context summarized · #{count}',
   'mention.title': 'Reference files or sessions',
   'mention.all': 'All',
   'mention.files': 'Files',

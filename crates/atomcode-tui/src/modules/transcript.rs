@@ -42,6 +42,7 @@ struct Open {
     /// replay and resume cannot disagree about what a turn cost — the same
     /// reason every other block is built here.
     stats: TurnStats,
+    summaries: u64,
     /// When the turn opened, on the log's own clock (`LoggedEvent::at`, in ms).
     /// The difference to the `TurnEnd` reading is the turn's duration — the log
     /// records no elapsed of its own, so it is folded from the two timestamps
@@ -562,11 +563,19 @@ impl Producer for Transcript {
             //
             // Summary folds and dropped history warrant a notice; routine
             // tool-output rewrites stay in the event log without UI noise.
-            SessionEvent::Compacted { through, .. } => {
+            SessionEvent::Compacted { .. }
+                if atomcode_harness::session::is_context_summary(fact) =>
+            {
+                open.summaries += 1;
                 out.emit(
                     at,
                     Arc::new(NoticeBlock {
-                        detail: t(Msg::TranscriptCompacted { through: *through }).into_owned(),
+                        detail: atomcode_i18n::product::t(
+                            atomcode_i18n::product::Msg::ContextSummaryRecorded {
+                                count: open.summaries,
+                            },
+                        )
+                        .into_owned(),
                     }),
                 );
             }
@@ -1165,8 +1174,8 @@ mod tests {
         ]);
         let drawn = said(&s);
         assert!(
-            drawn.contains("已压缩模型") && drawn.contains("#7") && drawn.contains("不是新指令"),
-            "the compaction says how far it reached:\n{drawn}"
+            drawn.contains("上下文已摘要") && drawn.contains("第 1 次"),
+            "a committed summary has a numbered notice:\n{drawn}"
         );
         assert!(
             !drawn.contains("工具输出被就地换短"),

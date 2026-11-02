@@ -65,6 +65,8 @@ export async function failure(r: Response): Promise<ApiCallError> {
 }
 
 export type SSEEvent =
+  | { type: 'context_compacting'; active: boolean }
+  | { type: 'context_summary'; count: number; record: boolean }
   | { type: 'runtime_info'; provider: string; model: string }
   | { type: 'session_assigned'; session_id: string }
   | { type: 'text'; content: string }
@@ -327,6 +329,7 @@ export interface SessionMessage {
 }
 
 export interface SessionDetail {
+  summary_count?: number;
   id: string;
   name: string;
   working_dir: string;
@@ -1069,7 +1072,9 @@ export interface LiveGoalProgress {
 }
 
 export type LiveWireEvent =
-  | { type: 'snapshot'; messages: SessionMessage[]; session_id: string; project_hash: string; provider: string; model?: string | null; mode: ApprovalMode; goal?: LiveGoalProgress | null }
+  | { type: 'context_compacting'; active: boolean }
+  | { type: 'context_summary'; count: number; record: boolean }
+  | { type: 'snapshot'; summary_count?: number; messages: SessionMessage[]; session_id: string; project_hash: string; provider: string; model?: string | null; mode: ApprovalMode; goal?: LiveGoalProgress | null }
   | ({ type: 'goal_changed' } & LiveGoalProgress)
   | { type: 'provider'; provider: string; model?: string | null }
   | { type: 'model'; model: string | null }

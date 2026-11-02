@@ -551,6 +551,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
 
         // ── Approval panel ──
         Msg::ApprovalAllowOnce => "Allow once".into(),
+        Msg::ContextSummaryCount { count } => format!("Summarized {count} times").into(),
+        Msg::ContextSummaryRecorded { count } => format!("Context summarized · #{count}").into(),
         Msg::ApprovalSaveProject => "Approve and save exact project rule".into(),
         Msg::ApprovalAlwaysAllow { tool } => format!("Always allow {tool} (this session)").into(),
         Msg::ApprovalAlwaysAllowFolder => {
