@@ -949,12 +949,20 @@ mod tests {
     #[test]
     fn walk_keeps_dotfiles() {
         let tmp = tempfile::tempdir().unwrap();
-        write_file(&tmp.path().join(".env"), "KEY=val");
+        // A distinctive synthetic dotfile name: a generic `.env` could be
+        // excluded by the machine's GLOBAL gitignore (core.excludesFile /
+        // XDG git/ignore), which the walker honors — that must not be able
+        // to turn this test red (observed in review).
+        write_file(&tmp.path().join(".atomcode-test-dotfile"), "KEY=val");
 
         let idx = FileIndex::new(tmp.path().to_path_buf(), ".ours");
         let result = filter_walk(&idx, "", "");
         let names: Vec<&str> = result.iter().map(|e| e.rel_path.as_str()).collect();
-        assert!(names.contains(&".env"), "got: {:?}", names);
+        assert!(
+            names.contains(&".atomcode-test-dotfile"),
+            "got: {:?}",
+            names
+        );
     }
 
     /// Regression (observed on Windows, where `%TEMP%` lives under the home
@@ -980,13 +988,22 @@ mod tests {
             return;
         }
         // outer/ is not a repo; its .gitignore must not govern inner/.
-        write_file(&tmp.path().join("outer/.gitignore"), ".env\n");
-        write_file(&tmp.path().join("outer/inner/.env"), "KEY=val");
+        // The needle is a distinctive synthetic name: a generic one (`.env`)
+        // could also be excluded by the machine's GLOBAL gitignore, which the
+        // walker honors — that must not be able to turn this test red.
+        write_file(
+            &tmp.path().join("outer/.gitignore"),
+            ".atomcode-test-keep\n",
+        );
+        write_file(
+            &tmp.path().join("outer/inner/.atomcode-test-keep"),
+            "KEY=val",
+        );
 
         let idx = FileIndex::new(tmp.path().join("outer/inner"), ".ours");
         let result = filter_walk(&idx, "", "");
         let names: Vec<&str> = result.iter().map(|e| e.rel_path.as_str()).collect();
-        assert!(names.contains(&".env"), "got: {:?}", names);
+        assert!(names.contains(&".atomcode-test-keep"), "got: {:?}", names);
     }
 
     /// Regression: a walk rooted AT a repo must not inherit gitignores from
@@ -995,15 +1012,22 @@ mod tests {
     #[test]
     fn a_repo_root_does_not_inherit_gitignores_above_the_repo() {
         let tmp = tempfile::tempdir().unwrap();
-        write_file(&tmp.path().join("outer/.gitignore"), ".env\n");
+        // Same distinctive-needle rationale as the plain-root test above.
+        write_file(
+            &tmp.path().join("outer/.gitignore"),
+            ".atomcode-test-keep\n",
+        );
         // A `.git` directory alone marks the repo boundary for the walker.
         write_file(&tmp.path().join("outer/repo/.git/HEAD"), "ref: x");
-        write_file(&tmp.path().join("outer/repo/.env"), "KEY=val");
+        write_file(
+            &tmp.path().join("outer/repo/.atomcode-test-keep"),
+            "KEY=val",
+        );
 
         let idx = FileIndex::new(tmp.path().join("outer/repo"), ".ours");
         let result = filter_walk(&idx, "", "");
         let names: Vec<&str> = result.iter().map(|e| e.rel_path.as_str()).collect();
-        assert!(names.contains(&".env"), "got: {:?}", names);
+        assert!(names.contains(&".atomcode-test-keep"), "got: {:?}", names);
     }
 
     /// The other half of the contract: a walk rooted BELOW the repo root still
@@ -1021,6 +1045,83 @@ mod tests {
         let names: Vec<&str> = result.iter().map(|e| e.rel_path.as_str()).collect();
         assert!(names.contains(&"kept.txt"), "got: {:?}", names);
         assert!(!names.contains(&"ignored.txt"), "got: {:?}", names);
+    }
+
+    /// Regression (review): the `in_vcs` predicate's `.jj` arm must mirror the
+    /// ignore crate's own VCS-boundary set — the crate's `has_git` checks
+    /// `.git`/`.jj` on BOTH the walk-root path (`add_child_path`) and ancestors
+    /// (`add_parents`). If a future ignore version dropped `.jj` there, this
+    /// test goes red and the predicate must be re-narrowed to match.
+    #[test]
+    fn a_jj_only_checkout_still_respects_its_own_gitignore() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A bare `.jj` directory is what the crate's boundary check looks for.
+        write_file(&tmp.path().join("repo/.jj/marker"), "");
+        write_file(&tmp.path().join("repo/.gitignore"), "ignored.txt\n");
+        write_file(&tmp.path().join("repo/ignored.txt"), "x");
+        write_file(&tmp.path().join("repo/kept.txt"), "y");
+        // The subdir fixture pins the `.jj` arm's actual value: the checkout
+        // root's rules must reach a walk rooted BELOW it (the `parents(true)`
+        // branch that only the `.jj` detection switches on).
+        write_file(&tmp.path().join("repo/sub/ignored.txt"), "x");
+        write_file(&tmp.path().join("repo/sub/kept.txt"), "y");
+
+        let idx = FileIndex::new(tmp.path().join("repo"), ".ours");
+        let result = filter_walk(&idx, "", "");
+        let names: Vec<&str> = result.iter().map(|e| e.rel_path.as_str()).collect();
+        assert!(names.contains(&"kept.txt"), "got: {:?}", names);
+        assert!(
+            !names.contains(&"ignored.txt"),
+            "a .jj-only checkout's own .gitignore must still apply: {:?}",
+            names
+        );
+
+        let idx = FileIndex::new(tmp.path().join("repo/sub"), ".ours");
+        let result = filter_walk(&idx, "", "");
+        let names: Vec<&str> = result.iter().map(|e| e.rel_path.as_str()).collect();
+        assert!(names.contains(&"kept.txt"), "got: {:?}", names);
+        assert!(
+            !names.contains(&"ignored.txt"),
+            "a walk below a .jj-only checkout root must still respect its .gitignore: {:?}",
+            names
+        );
+    }
+
+    /// Regression (review): a git worktree/submodule marks its boundary with a
+    /// `.git` FILE, not a directory. The crate's detection (`metadata()`/
+    /// `.exists()`) covers both forms, and so must our `in_vcs` probe.
+    #[test]
+    fn a_worktree_with_a_dotgit_file_still_respects_its_own_gitignore() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_file(
+            &tmp.path().join("repo/.git"),
+            "gitdir: /elsewhere/main/.git/worktrees/repo\n",
+        );
+        write_file(&tmp.path().join("repo/.gitignore"), "ignored.txt\n");
+        write_file(&tmp.path().join("repo/ignored.txt"), "x");
+        write_file(&tmp.path().join("repo/kept.txt"), "y");
+        write_file(&tmp.path().join("repo/sub/ignored.txt"), "x");
+        write_file(&tmp.path().join("repo/sub/kept.txt"), "y");
+
+        let idx = FileIndex::new(tmp.path().join("repo"), ".ours");
+        let result = filter_walk(&idx, "", "");
+        let names: Vec<&str> = result.iter().map(|e| e.rel_path.as_str()).collect();
+        assert!(names.contains(&"kept.txt"), "got: {:?}", names);
+        assert!(
+            !names.contains(&"ignored.txt"),
+            "a worktree (.git file) must still apply its own .gitignore: {:?}",
+            names
+        );
+
+        let idx = FileIndex::new(tmp.path().join("repo/sub"), ".ours");
+        let result = filter_walk(&idx, "", "");
+        let names: Vec<&str> = result.iter().map(|e| e.rel_path.as_str()).collect();
+        assert!(names.contains(&"kept.txt"), "got: {:?}", names);
+        assert!(
+            !names.contains(&"ignored.txt"),
+            "a walk below a worktree root must still respect its .gitignore: {:?}",
+            names
+        );
     }
 
     #[test]
