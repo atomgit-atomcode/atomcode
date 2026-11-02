@@ -268,6 +268,14 @@ class MainActivity : ComponentActivity() {
             }
         })
 
+        // Before the runtime mounts: the `fs-saf` row refuses to apply until a
+        // backend is installed, and a grant from a previous run has to be
+        // re-announced to this fresh process.
+        SafTree.restore(this)
+        if (SafTree.isReady()) {
+            Log.i(TAG, "SAF world available: ${SafTree.displayName}")
+            NativeAgent.nativeInstallSaf()
+        }
         AgentService.start(this)
         bindService(Intent(this, AgentService::class.java), connection, Context.BIND_AUTO_CREATE)
         storageGrantedAtStart = Environment.isExternalStorageManager()
@@ -505,7 +513,28 @@ class MainActivity : ComponentActivity() {
                 }
             }
             .setNegativeButton(android.R.string.cancel, null)
+            // The route a Play-distributable build takes: no all-files permission
+            // is grantable there, so the person hands over one folder instead.
+            .setNeutralButton(getString(R.string.saf_choose_folder)) { _, _ -> requestSafTree() }
             .show()
+    }
+
+    /** Ask the system picker for one folder to work in. */
+    private fun requestSafTree() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+            addFlags(
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                    Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                    Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION,
+            )
+        }
+        try {
+            @Suppress("DEPRECATION")
+            startActivityForResult(intent, SAF_TREE_REQUEST)
+        } catch (failure: Exception) {
+            Log.w(TAG, "no system folder picker on this device", failure)
+            toast(getString(R.string.saf_grant_failed))
+        }
     }
 
     /** What the page may ask the host to do. Loopback page only. */
@@ -983,6 +1012,23 @@ class MainActivity : ComponentActivity() {
     @Deprecated("Deprecated in Java")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == SAF_TREE_REQUEST) {
+            val uri = data?.data
+            if (resultCode != RESULT_OK || uri == null) {
+                Log.i(TAG, "folder picker dismissed without a folder")
+                return
+            }
+            if (!SafTree.attach(this, uri)) {
+                toast(getString(R.string.saf_grant_failed))
+                return
+            }
+            // The runtime is already up by now, so this announces a backend the
+            // `fs-saf` row can use after the next mount; until then the current
+            // world (all-files, in a build that has it) keeps working.
+            NativeAgent.nativeInstallSaf()
+            toast(getString(R.string.saf_granted, SafTree.displayName ?: uri.toString()))
+            return
+        }
         if (requestCode != FILE_CHOOSER_REQUEST) return
         val callback = fileCallback ?: return
         fileCallback = null
@@ -1165,6 +1211,15 @@ class MainActivity : ComponentActivity() {
         private const val STALE_SHARE_MS = 60 * 60_000L
         /** Runtime notification prompt (Android 13+). */
         private const val NOTIFICATION_REQUEST = 0x52
+        /**
+         * The system folder picker.
+         *
+         * A Play-distributable build cannot hold `MANAGE_EXTERNAL_STORAGE`, so a
+         * folder has to be granted one at a time. The grant is persisted
+         * (`takePersistableUriPermission`), which is what lets `SafTree.restore`
+         * bring it back on the next start.
+         */
+        private const val SAF_TREE_REQUEST = 0x53
         /**
          * Set by a notification tap: which conversation to open.
          *

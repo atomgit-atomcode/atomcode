@@ -61,6 +61,7 @@ pub fn catalog() -> PluginRegistry {
         .register(Arc::new(llm::ReplayPlugin))
         .register(Arc::new(world::FsLocalPlugin))
         .register(Arc::new(world::FsReadOnlyPlugin))
+        .register(Arc::new(world::FsSafPlugin))
         .register(Arc::new(world::BashLocalPlugin))
         .register(Arc::new(world_tools::FsWorldToolsPlugin))
         .register(Arc::new(world_tools::SearchWorldToolsPlugin))

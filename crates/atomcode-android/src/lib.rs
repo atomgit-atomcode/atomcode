@@ -22,13 +22,11 @@
 //! toolchain. `jni_api` is the thin translation surface: strings in, URL out.
 
 pub mod host;
-/// A [`atomcode_capabilities::world::FileSystem`] over Android's Storage Access
-/// Framework — the world a Play-distributable build uses instead of all-files
-/// access. Platform-neutral on purpose: the backend is a trait, so the world's
-/// containment and error mapping are tested on the build machine.
-pub mod saf;
 /// The bundled `git` and the shell shims that make it reachable.
 pub mod shims;
 
 #[cfg(target_os = "android")]
 mod jni_api;
+/// The platform half of the SAF world: `SafBackend` over the Kotlin `SafTree`.
+#[cfg(target_os = "android")]
+mod saf_jni;

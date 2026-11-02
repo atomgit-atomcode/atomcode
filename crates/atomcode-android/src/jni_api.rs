@@ -229,6 +229,19 @@ pub extern "system" fn Java_com_atomcode_app_NativeAgent_nativeGatewaySigningAva
     crate::host::gateway_signer_available() as jni::sys::jboolean
 }
 
+/// Hand the granted folder to the SAF world.
+///
+/// Called right after the picker returns — and on every start, when a previous
+/// grant is restored — because the world reads this registry lazily: the `fs-saf`
+/// row refuses to mount until something is installed here.
+#[no_mangle]
+pub extern "system" fn Java_com_atomcode_app_NativeAgent_nativeInstallSaf(
+    mut env: JNIEnv<'_>,
+    class: JClass<'_>,
+) -> jni::sys::jboolean {
+    crate::saf_jni::install(&mut env, class) as jni::sys::jboolean
+}
+
 /// The last start failure, or `null`.
 #[no_mangle]
 pub extern "system" fn Java_com_atomcode_app_NativeAgent_nativeLastError(

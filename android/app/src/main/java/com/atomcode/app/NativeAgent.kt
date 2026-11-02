@@ -54,4 +54,13 @@ object NativeAgent {
 
     /** Why the last [nativeStart] failed, or null. */
     external fun nativeLastError(): String?
+
+    /**
+     * Hand the folder granted through the picker to the Rust SAF world.
+     *
+     * Must be called before the runtime mounts that world — the `fs-saf` row
+     * refuses to apply until a backend is installed — and again on every start,
+     * because a restored grant has to be re-announced to a fresh process.
+     */
+    external fun nativeInstallSaf(): Boolean
 }

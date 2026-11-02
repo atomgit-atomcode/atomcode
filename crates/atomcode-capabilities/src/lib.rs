@@ -124,6 +124,12 @@ pub mod fs;
 /// route through it.
 pub mod world;
 
+/// A [`world::FileSystem`] over Android's Storage Access Framework — the world a
+/// Play-distributable build uses instead of all-files access. The platform half
+/// is a trait ([`saf::SafBackend`]) the host installs, so containment and error
+/// mapping are tested on the build machine and nothing here names Android.
+pub mod saf;
+
 /// What the person's own checkout looks like right now, as git sees it — the
 /// other half of `/diff`. Distinct from [`session::rewind`]'s shadow repository
 /// in every way that matters: this one reads the repository the person works

@@ -117,6 +117,60 @@ impl Plugin for FsReadOnlyPlugin {
     }
 }
 
+// ---- fs-saf -------------------------------------------------------------
+
+/// The world inside a folder the person granted through the system picker.
+///
+/// The row exists so a build without all-files access can still hand the agent a
+/// real place to work: `fs-local` is unreachable there (no `MANAGE_EXTERNAL_STORAGE`,
+/// so nothing outside the app's own directory has a path), while a granted tree is
+/// reachable as `content://` documents. Swapping the `fs` row to this name is the
+/// whole switch — everything below it follows, because no tool touches a path
+/// itself.
+///
+/// The platform half is installed by the host (`saf::install_backend`); without it
+/// this row refuses to mount rather than providing a world that reads nothing.
+pub struct FsSafPlugin;
+
+#[derive(Debug, Deserialize, Default)]
+struct SafRow {
+    /// The path the world reports as its root. Synthetic — SAF has no paths — but
+    /// tools print it, gates compare against it, and the model reads it.
+    #[serde(default)]
+    root: Option<String>,
+    #[serde(default)]
+    read_only: bool,
+}
+
+#[async_trait]
+impl Plugin for FsSafPlugin {
+    fn name(&self) -> &'static str {
+        "fs-saf"
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["fs"]
+    }
+    fn description(&self) -> &'static str {
+        "the folder granted through Android's file picker (Storage Access Framework)"
+    }
+    async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
+        let row: SafRow = parse(config)?;
+        let backend = atomcode_capabilities::saf::installed_backend().ok_or_else(|| {
+            "no folder has been granted through the file picker in this build".to_string()
+        })?;
+        let root = std::path::PathBuf::from(row.root.unwrap_or_else(|| "/saf".to_string()));
+        let world = if row.read_only {
+            atomcode_capabilities::saf::SafFs::read_only(root, backend)
+        } else {
+            atomcode_capabilities::saf::SafFs::new(root, backend)
+        };
+        let _ = ctx
+            .provide::<FsSvc>(std::sync::Arc::new(world))
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
 // ---- bash-local ---------------------------------------------------------
 
 /// This machine's shell — the production spawn, with its tty detach, job

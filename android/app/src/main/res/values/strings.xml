@@ -35,6 +35,9 @@
     <string name="storage_title">Open a real project folder</string>
     <string name="storage_message">AtomCode needs access to shared storage so the agent can open your repositories by path — Git, shell commands and language servers cannot work with Android\'s document picker URIs. Without it the agent is limited to its private folder.</string>
     <string name="storage_grant">Grant access</string>
+    <string name="saf_choose_folder">Pick a folder instead</string>
+    <string name="saf_granted">Using the folder: %1$s</string>
+    <string name="saf_grant_failed">That folder could not be opened.</string>
     <string name="no_browser">No app on this device can open that link.</string>
     <string name="no_viewer">No app on this device can open %1$s.</string>
     <string name="helper_installed">Helper installed. Restarting so make / tcc / zig become available.</string>

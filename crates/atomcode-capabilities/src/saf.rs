@@ -30,8 +30,8 @@
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+use crate::world::{DirEntry, FileInfo, FileSystem, FsError, FsErrorKind};
 use async_trait::async_trait;
-use atomcode_capabilities::world::{DirEntry, FileInfo, FileSystem, FsError, FsErrorKind};
 
 /// One child of a directory, as the platform reports it. Name only: the world
 /// composes the path, because only it knows its synthetic root.
@@ -54,7 +54,9 @@ pub enum SafError {
     /// The document is not there.
     NotFound,
     /// The platform refused: permission revoked, or outside the granted tree.
-    Denied,
+    /// Carries what the platform said, since "which grant went away" is the one
+    /// thing a person can act on.
+    Denied(String),
     /// Anything else the platform said.
     Io(String),
 }
@@ -73,6 +75,26 @@ pub trait SafBackend: Send + Sync {
     /// `None` when the document does not exist, rather than an error: "absent" is
     /// an answer the caller asks for by name in [`FileSystem::info`].
     async fn stat(&self, path: &str) -> Result<Option<SafStat>, SafError>;
+}
+
+/// The platform backend, installed once by the host at startup.
+///
+/// A registry rather than a constructor argument because the row that builds this
+/// world (`fs-saf`) lives in the harness, which must not name Android: the host
+/// installs what it has, and the row asks for it. Absent means "this build has no
+/// SAF access" — the row then refuses to mount instead of silently handing out a
+/// world that reads nothing.
+static BACKEND: std::sync::OnceLock<Arc<dyn SafBackend>> = std::sync::OnceLock::new();
+
+/// Install the platform half. The first call wins: a second grant replaces the
+/// folder, not the backend, so there is nothing here to swap.
+pub fn install_backend(backend: Arc<dyn SafBackend>) {
+    let _ = BACKEND.set(backend);
+}
+
+/// The installed backend, or `None` in a build without SAF access.
+pub fn installed_backend() -> Option<Arc<dyn SafBackend>> {
+    BACKEND.get().cloned()
 }
 
 /// A [`FileSystem`] whose root is a folder the person granted through the picker.
@@ -191,8 +213,8 @@ impl SafFs {
     fn map(&self, path: &Path, error: SafError) -> FsError {
         match error {
             SafError::NotFound => FsError::not_found(&self.root.join(path)),
-            SafError::Denied => FsError::denied(format!(
-                "the platform refused access to {}",
+            SafError::Denied(reason) => FsError::denied(format!(
+                "the platform refused access to {}: {reason}",
                 self.root.join(path).display()
             )),
             SafError::Io(message) => FsError {
@@ -312,7 +334,7 @@ impl FileSystem for SafFs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeSet;
     use std::sync::Mutex;
 
     /// A tree in memory, so the world's own logic is what is under test.
