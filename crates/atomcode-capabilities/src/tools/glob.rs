@@ -291,6 +291,18 @@ mod tests {
         let (base, rest) = split_absolute_base(r"G:\VR2024\**\*.jks").unwrap();
         assert_eq!(base, PathBuf::from(r"G:\VR2024"));
         assert_eq!(rest, "**/*.jks");
+        // Relative patterns are left for base-relative matching.
+        assert!(split_absolute_base("**/*.rs").is_none());
+        assert!(split_absolute_base("src/**/*.ts").is_none());
+    }
+
+    /// `/abs/dir/…` is absolute only where the BUILD TARGET says so: on Windows
+    /// it is root-relative (no drive/UNC prefix), so `split_absolute_base` leaves
+    /// it to base-relative matching. These assertions pin the Unix-root form and
+    /// can only hold on Unix builds.
+    #[cfg(unix)]
+    #[test]
+    fn split_absolute_base_handles_unix_roots() {
         // An absolute exact file path (no metachar) is a degenerate glob that resolves
         // to its own directory + literal name.
         let (base, rest) = split_absolute_base("/abs/dir/screenshare.jks").unwrap();
@@ -301,9 +313,6 @@ mod tests {
         let (base, rest) = split_absolute_base("/abs/dir/").unwrap();
         assert_eq!(base, PathBuf::from("/abs/dir"));
         assert_eq!(rest, "*");
-        // Relative patterns are left for base-relative matching.
-        assert!(split_absolute_base("**/*.rs").is_none());
-        assert!(split_absolute_base("src/**/*.ts").is_none());
     }
 
     #[test]
