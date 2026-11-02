@@ -2234,10 +2234,21 @@ TLS，未鉴权一律 401），用 `adb reverse tcp:8899` 让设备把 `127.0.0.
 也就是说：存进去的 token 一路走到 HTTP Basic 并完成了读写两个方向，不是"helper 能读出
 来"而已。
 
-**一个由此暴露的边界**：`store_at` 写出的凭据行 scheme 固定是 `https://`，而 git 的
-store helper 是**按 scheme 匹配**的，所以应用**无法**给纯 `http://` 的远端提供凭据（会走到
-`could not read Username ... terminal prompts disabled`）。这是刻意的安全取舍——PAT 不该
-走明文——但意味着自建 http 远端用不上这条链路，要么上 https，要么用别的 helper。
+**纯 http 远端（已支持，按 host 显式选择）**
+
+原先 `store_at` 写出的凭据行固定是 `https://`，而 git 的 store helper **按 scheme 匹配**，
+于是自建 http 远端永远拿不到 token，只报 `could not read Username ... terminal prompts
+disabled`。现在 `POST /git/credentials` 多一个 `scheme`（默认 `https`，只收 http/https），
+它决定写进文件的那个前缀——而前缀正是"这个 token 允许发给谁"的边界：
+
+- 默认仍是 `https`，所以不做任何事时 token 依然不可能走明文；
+- 面板上是**按 host 的显式勾选**（"这个远端只有 http（不加密）"），勾了才提示 token 会明文
+  发出；列表里给这类记录标 `http（明文）`；
+- 换回 https 会**改写同一条**，一个 host 只留一条，免得 git 在两个前缀之间挑。
+
+真机实测（2026-11-02）：面板勾选 → 风险提示出现 → 保存后设备上的文件确实是
+`http://probeuser:***@127.0.0.1:8899`、列表标出 `http（明文）`、删除后文件消失；同一套
+凭据让设备对明文鉴权远端完成了 clone 与 push（服务端两侧 `ok=True`）。
 
 **P4 剩余面（已完成）**
 
