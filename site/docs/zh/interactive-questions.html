@@ -94,7 +94,7 @@
           <tr><td><strong>text 文本</strong></td><td>自由文本作答，无选项。</td></tr>
         </tbody>
       </table>
-      <p>单选和多选还会额外提供一行 <strong>“Other——自己输入答案”</strong>，让你不被限死在给定选项里。只有当模型判定选项已穷尽时才会隐藏该行。</p>
+      <p>单选和多选还会额外提供一行 <strong>“Other——自己输入答案”</strong>，让你不被限死在给定选项里。模型不能关闭这条自由输入通道。</p>
 
       <h2 id="在终端里作答">在终端里作答</h2>
       <table>
@@ -107,17 +107,27 @@
           <tr><td><kbd>Space</kbd></td><td>切换当前复选框（多选）；在编辑 Other 行时输入空格</td></tr>
           <tr><td><kbd>Enter</kbd></td><td>单选：提交高亮项 · 多选：在 Submit 行提交 · 文本：提交输入内容</td></tr>
           <tr><td>输入 / <kbd>Backspace</kbd></td><td>编辑 Other 行或自由文本答案</td></tr>
-          <tr><td><kbd>Esc</kbd></td><td>拒答——AtomCode 会按自己的最佳判断继续</td></tr>
-          <tr><td><kbd>Ctrl+C</kbd></td><td>拒答 <em>并</em> 取消当前回合</td></tr>
+          <tr><td><kbd>Ctrl+E</kbd></td><td>编辑高亮选项；在输入框中仍然移动到行尾</td></tr>
+          <tr><td><kbd>Esc</kbd></td><td>编辑选项时取消本次修改；否则拒答整个请求</td></tr>
+          <tr><td><kbd>Ctrl+C</kbd></td><td>拒答整个请求，包括正在编辑时</td></tr>
         </tbody>
       </table>
       <p>单选题一键即可作答（高亮后按 <kbd>Enter</kbd>）；多选题用 <kbd>Enter</kbd>/<kbd>Space</kbd> 勾选各行，只有激活专门的 <strong>Submit</strong> 行才真正提交。</p>
+
+      <h2 id="编辑选项">基于选项修改答案</h2>
+      <p>高亮一个预设选项后按 <kbd>Ctrl+E</kbd>，选项文字会填入就地输入框，光标位于末尾。单选编辑完成后按 <kbd>Enter</kbd> 确认答案；多选按 <kbd>Enter</kbd> 保存并勾选该项，最后到 Submit 行统一提交。可以分别修改多个选项，原选项不会和改写版本重复提交，Other 行已有的文字也会保留。按 <kbd>Esc</kbd> 放弃本次编辑。</p>
+      <p>在 <code>/config</code> 中搜索“编辑问题选项”可以修改快捷键，也可以在配置文件中设置：</p>
+      <pre><code>[ui.keybindings]
+question_edit = "alt+e"</code></pre>
+      <p>选项编辑仅用于普通问题，权限审批选项保持固定。批量问题切换页面会保留编辑草稿，提交前需要先完成或取消未完成的编辑。</p>
 
       <h2 id="一次问多个问题">一次问多个问题</h2>
       <p>当同一个抉择点上有不止一个要问的，AtomCode 会把它们（最多四个）合并进一个面板，而不是反复打断你。用 <kbd>Tab</kbd> 在各题间切换，逐一作答，再一次性提交。只有一个问题时的渲染与以前完全一致。</p>
 
       <h2 id="在-web-ui-中">在 Web UI 中</h2>
       <p>同样的问题会在 <a href="./webui.html">Web UI</a> 里以 <strong>UserInputCard</strong> 卡片出现：单选按钮、复选框或文本框，以及同样的可选自由文本行。多题会变成一个小步进器——用 <kbd>→</kbd> / <kbd>←</kbd> 按钮前后翻题，最后一个 <strong>Submit</strong> 一次性提交全部答案，<strong>Skip</strong> 则拒答。答案通过实时 SSE 通道回传，所以从浏览器发起的回合会像终端一样暂停、再继续。</p>
+
+      <p>点击预设选项旁的“编辑此项”可基于原文修改。单选用“确认此答案”确认，多选用“保存并勾选”保留修改，最后统一提交。输入框支持 Enter 确认、Esc 取消，翻题后修改仍保留。</p>
 
       <h2 id="关闭该功能">关闭该功能</h2>
       <p>该功能默认开启。若要关闭，启动前设置环境变量：</p>

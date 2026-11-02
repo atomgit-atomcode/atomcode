@@ -203,6 +203,9 @@ impl Settings for ConfigSettings {
         if id == atomcode_tui::settings::NEWLINE_KEYS {
             atomcode_tui::keymap::validate_newline_bindings(value)?;
         }
+        if id == atomcode_tui::settings::QUESTION_EDIT_KEY {
+            atomcode_tui::keymap::parse_question_edit_key(value)?;
+        }
         if id == RETRY {
             write_retry(&self.path, Some(value))?;
             return Ok(self.read());
@@ -308,6 +311,38 @@ fn applies_of(policy: atomcode_config::settings::ApplyPolicy) -> Applies {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn question_edit_shortcut_roundtrips_and_rejects_reserved_keys_before_writing() {
+        let path = scratch("question-edit-shortcut");
+        std::fs::write(&path, "# keep me\n").unwrap();
+        let port = ConfigSettings::new(path.clone());
+        let id = atomcode_tui::settings::QUESTION_EDIT_KEY;
+        port.set(id, "alt+e").unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("# keep me"));
+        assert_eq!(
+            atomcode_config::config::Config::load(&path)
+                .unwrap()
+                .ui
+                .keybindings
+                .question_edit
+                .as_deref(),
+            Some("alt+e")
+        );
+        for value in ["e", "1", "ctrl+c", "enter", "tab"] {
+            assert!(port.set(id, value).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
+        }
+        port.reset(id).unwrap();
+        assert!(atomcode_config::config::Config::load(&path)
+            .unwrap()
+            .ui
+            .keybindings
+            .question_edit
+            .is_none());
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn newline_shortcuts_are_arrays_and_conflicts_do_not_touch_disk() {

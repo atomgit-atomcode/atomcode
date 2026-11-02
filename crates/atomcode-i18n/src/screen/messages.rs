@@ -244,6 +244,8 @@ pub enum Msg<'a> {
     AskLegendSwitch,
     /// Left and right, on a typing row with words in it.
     AskLegendCaret,
+    AskLegendEdit,
+    AskLegendCancelEdit,
 
     // ── the input line (`modules/input.rs`) ──
     InputAnswerKeys,

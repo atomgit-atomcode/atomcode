@@ -2259,6 +2259,17 @@ body {
 }
 
 /* === UserInputCard (request_user_input tool) === */
+.user-input-option-main {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+.user-input-option-main > .user-input-option { flex: 1; min-width: 0; }
+.user-input-option-label, .user-input-option-desc { overflow-wrap: anywhere; }
+.user-input-edit-button { flex-shrink: 0; margin-top: 4px; }
+.user-input-option-editor { padding: 4px 10px 12px; }
+.user-input-option-editor .user-input-text { width: 100%; min-width: 0; }
+.user-input-edit-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
 /* Option row: wraps a radio/checkbox + label body inline; the whole label is
    clickable (native label-for semantics via wrapping). */
 .user-input-option {

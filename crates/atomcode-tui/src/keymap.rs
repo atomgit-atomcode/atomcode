@@ -102,6 +102,24 @@ pub fn chord_name(press: KeyPress) -> String {
     parts.join("+")
 }
 
+/// Question editing is scoped to an option row. Preserve the panel's navigation,
+/// submission and cancellation keys, including the chords handled before it.
+pub fn parse_question_edit_key(text: &str) -> Result<KeyPress, String> {
+    let key = parse_chord(text)?;
+    if !matches!(key.key, Key::Char(_) | Key::F(_))
+        || matches!(
+            key,
+            KeyPress {
+                key: Key::Char('c' | 'j' | 'k' | 'z'),
+                mods: Mods::CTRL
+            }
+        )
+    {
+        return Err(format!("{} is reserved in questions", chord_name(key)));
+    }
+    Ok(key)
+}
+
 pub fn parse_newline_bindings(text: &str) -> Result<Option<Vec<KeyPress>>, String> {
     if text.trim() == "default" {
         return Ok(None);

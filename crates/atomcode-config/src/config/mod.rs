@@ -915,6 +915,9 @@ pub struct UiKeybindings {
     /// None restores shipped bindings; an empty list disables the chords.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub newline: Option<Vec<String>>,
+    /// Edit the highlighted suggested answer; absent means Ctrl+E. Interpreted by TUI.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub question_edit: Option<String>,
 }
 
 impl Default for UiConfig {

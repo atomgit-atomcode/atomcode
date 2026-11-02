@@ -171,6 +171,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::AskLegendToggle => "勾选".into(),
         Msg::AskLegendSwitch => "切换题目".into(),
         Msg::AskLegendCaret => "移动光标".into(),
+        Msg::AskLegendEdit => "编辑此项".into(),
+        Msg::AskLegendCancelEdit => "取消编辑".into(),
 
         // ── 输入行 ──
         Msg::InputAnswerKeys => "密码 · 不显示不留存 · enter 送出 · esc 不给".into(),

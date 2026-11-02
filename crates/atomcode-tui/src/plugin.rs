@@ -3787,7 +3787,23 @@ impl Tui {
                 true,
             );
         }
+        let edit_key = view
+            .rows()
+            .iter()
+            .find(|row| row.id == crate::settings::QUESTION_EDIT_KEY)
+            .map(|row| row.value.as_str())
+            .unwrap_or("ctrl+e");
+        if let Err(error) = crate::keymap::parse_question_edit_key(edit_key) {
+            self.host.say(
+                t(Msg::KeybindingsError { error: &error }).into_owned(),
+                true,
+            );
+        }
         let mut moment = self.host.moment.write().expect("moment poisoned");
+        if let Some(sheet) = moment.asking.as_mut() {
+            sheet.edit_key = crate::keymap::parse_question_edit_key(edit_key)
+                .unwrap_or_else(|_| crate::surface::KeyPress::ctrl('e'));
+        }
         if moment.settings == view {
             return false;
         }
@@ -5888,6 +5904,9 @@ impl Tui {
     /// whose policy is `Restart` is one a reload would not reach anyway, so
     /// asking is skipped rather than answered with a lie.
     fn apply_setting(&self, id: &str, value: &str) -> Result<(), String> {
+        if id == crate::settings::QUESTION_EDIT_KEY {
+            crate::keymap::parse_question_edit_key(value)?;
+        }
         let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
             return Err(t(Msg::ScreenNotConnectedSettings).into_owned());
         };
@@ -9105,6 +9124,18 @@ impl Tui {
     /// One path for both the return key and a click on a row, so a confirm and a
     /// pick cannot disagree about what is pointed at.
     fn confirm_question(&self) -> bool {
+        // A click elsewhere in the card must not accidentally commit an edit.
+        if self
+            .host
+            .moment
+            .read()
+            .expect("moment poisoned")
+            .asking
+            .as_ref()
+            .is_some_and(|sheet| sheet.option_edit().is_some())
+        {
+            return false;
+        }
         let press = crate::surface::KeyPress::plain(crate::surface::Key::Enter);
         if let Some((id, step)) = self.host.ask_key(press) {
             self.deliver_answer(id, step);

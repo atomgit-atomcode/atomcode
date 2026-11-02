@@ -190,6 +190,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::AskLegendToggle => "toggle".into(),
         Msg::AskLegendSwitch => "switch question".into(),
         Msg::AskLegendCaret => "move cursor".into(),
+        Msg::AskLegendEdit => "edit option".into(),
+        Msg::AskLegendCancelEdit => "cancel edit".into(),
         Msg::AskGrantWholeTool => "every call of this tool".into(),
         Msg::AskGrantOnly { what } => format!("only {what}").into(),
 

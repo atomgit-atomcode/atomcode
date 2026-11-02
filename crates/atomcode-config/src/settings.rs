@@ -361,6 +361,15 @@ pub static SETTINGS: &[SettingSpec] = &[
         apply: ApplyPolicy::ImmediateUi,
     },
     SettingSpec {
+        id: "ui.keybindings.question_edit",
+        path: &["ui", "keybindings", "question_edit"],
+        label_en: "Keyboard shortcuts / Edit question option",
+        label_zh: "快捷键 / 编辑问题选项",
+        aliases: &["question", "edit", "shortcut", "选项", "编辑", "快捷键"],
+        kind: SettingKind::Text,
+        apply: ApplyPolicy::ImmediateUi,
+    },
+    SettingSpec {
         id: "ui.mode_switch_key",
         path: &["ui", "mode_switch_key"],
         label_en: "Mode switch key",
@@ -583,6 +592,12 @@ impl SettingSpec {
                 .as_ref()
                 .map(|keys| keys.join(", "))
                 .unwrap_or_else(|| "default".into()),
+            "ui.keybindings.question_edit" => config
+                .ui
+                .keybindings
+                .question_edit
+                .clone()
+                .unwrap_or_else(|| "ctrl+e".into()),
             "ui.mode_switch_key" => match config.ui.mode_switch_key {
                 crate::config::ModeSwitchKey::ShiftTab => "shift_tab",
                 crate::config::ModeSwitchKey::Tab => "tab",

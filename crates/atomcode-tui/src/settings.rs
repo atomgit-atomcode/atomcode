@@ -45,6 +45,7 @@ pub const MODE_SWITCH_KEY: &str = "ui.mode_switch_key";
 
 /// Config catalog id interpreted only as a shortcut editing gesture.
 pub const NEWLINE_KEYS: &str = "ui.keybindings.newline";
+pub const QUESTION_EDIT_KEY: &str = "ui.keybindings.question_edit";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KeybindingMode {

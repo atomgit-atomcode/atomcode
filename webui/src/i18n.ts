@@ -416,6 +416,11 @@ const zh = {
   'userInput.close': '关闭并跳过',
   'userInput.other': 'Other',
   'userInput.error': '提交失败，请重试',
+  'userInput.edit': '编辑此项',
+  'userInput.confirmEdit': '确认此答案',
+  'userInput.saveEdit': '保存并勾选',
+  'userInput.cancelEdit': '取消编辑',
+  'userInput.placeholder': '输入自己的答案…',
 
   'policyRecovery.title': '安全策略需要你的选择',
   'policyRecovery.question': '凭据保护已阻止不安全的 shell 操作。请选择安全的后续处理方式：',
@@ -1044,6 +1049,11 @@ const en: Record<MsgKey, string> = {
   'userInput.close': 'Close and skip',
   'userInput.other': 'Other',
   'userInput.error': 'Submit failed, please retry',
+  'userInput.edit': 'Edit option',
+  'userInput.confirmEdit': 'Confirm answer',
+  'userInput.saveEdit': 'Save and select',
+  'userInput.cancelEdit': 'Cancel edit',
+  'userInput.placeholder': 'Type your own answer…',
 
   'policyRecovery.title': 'Security policy needs your decision',
   'policyRecovery.question': 'Credential protection blocked an unsafe shell operation. Choose a safe next step:',

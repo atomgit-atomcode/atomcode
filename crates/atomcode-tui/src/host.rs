@@ -2899,7 +2899,17 @@ impl Host {
             // on its words: two questions worded alike are still two questions.
             Some((id, _)) if m.asking.as_ref().is_some_and(|had| had.id == id) => false,
             Some((id, asked)) => {
-                m.asking = Some(crate::moment::Ask::new(id, asked));
+                let mut sheet = crate::moment::Ask::new(id, asked);
+                let key = m
+                    .settings
+                    .rows()
+                    .iter()
+                    .find(|row| row.id == crate::settings::QUESTION_EDIT_KEY)
+                    .map(|row| row.value.as_str())
+                    .unwrap_or("ctrl+e");
+                sheet.edit_key = crate::keymap::parse_question_edit_key(key)
+                    .unwrap_or_else(|_| crate::surface::KeyPress::ctrl('e'));
+                m.asking = Some(sheet);
                 true
             }
         }
@@ -9577,6 +9587,60 @@ mod tests {
     }
 
     const PEER_ROWS: u16 = 2;
+
+    #[test]
+    fn a_withdrawn_option_edit_cannot_answer_the_replacement_request() {
+        use crate::settings::{Applies, SettingKind, SettingRow, SettingsView, QUESTION_EDIT_KEY};
+        let h = host();
+        h.modules
+            .add_view(Arc::new(Mounted::<crate::modules::ask::Ask>::new()))
+            .unwrap();
+        h.moment.write().unwrap().settings = SettingsView::new(vec![SettingRow {
+            id: QUESTION_EDIT_KEY.into(),
+            label: "Edit option".into(),
+            value: "alt+e".into(),
+            kind: SettingKind::Text,
+            applies: Applies::Immediately,
+        }]);
+        let question = crate::ask::question_for(
+            "request_user_input",
+            &serde_json::json!({"header":"Plan", "question":"Which?", "mode":"single", "options":[{"label":"A"}]}),
+            &[],
+        )
+        .unwrap();
+        let (old, mut receiver) = h.asks.push_with_id(question.clone());
+        h.sync_asking();
+        let key = crate::keymap::parse_question_edit_key("alt+e").unwrap();
+        h.ask_key(key);
+        h.ask_paste(" first");
+        assert!(!h.sync_asking(), "an unchanged request preserves its edit");
+        assert_eq!(
+            h.moment
+                .read()
+                .unwrap()
+                .asking
+                .as_ref()
+                .unwrap()
+                .option_edit()
+                .unwrap()
+                .text,
+            "A first"
+        );
+        assert!(h.asks.withdraw(old));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
+        let (new, _receiver) = h.asks.push_with_id(question);
+        h.sync_asking();
+        assert!(h.asks.take_id(old).is_none());
+        let m = h.moment.read().unwrap();
+        let sheet = m.asking.as_ref().unwrap();
+        assert_eq!(sheet.id, new);
+        assert!(sheet.option_edit().is_none());
+        assert_eq!(sheet.edit_key, key);
+        assert!(sheet.drafts[0].replacements.iter().all(Option::is_none));
+    }
 
     /// A question takes the field's rows without touching what is in it.
     ///
