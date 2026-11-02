@@ -83,6 +83,24 @@ fn loopback_addresses(raw: &str) -> Vec<SocketAddr> {
         .unwrap_or_default()
 }
 
+/// A loopback probe proves the listener dead on ConnectionRefused — and on
+/// TimedOut too: a live listener answers at kernel level, instantly, whatever
+/// the process load, so 50ms of silence from 127.0.0.1/::1 is never a live
+/// proxy. The TimedOut arm is not theoretical: on Windows, `connect_timeout`
+/// to a port whose listener just closed reports TimedOut (no RST is delivered
+/// to the non-blocking connect), where a blocking connect to the same port is
+/// refused at once — so an exact-ConnectionRefused match never fired there and
+/// a stopped local proxy (VPN client on 127.0.0.1:7890, …) was kept forever.
+/// A firewall DROP on loopback times out the same way and is just as unusable.
+/// The only false positive is a live listener whose backlog is full; the probe
+/// re-runs on the next refresh, and nothing here is persisted.
+fn loopback_probe_is_dead(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::ConnectionRefused | io::ErrorKind::TimedOut
+    )
+}
+
 fn without_refused_loopback(
     mut cfg: ProxyConfig,
     mut connect: impl FnMut(SocketAddr) -> io::Result<()>,
@@ -101,9 +119,9 @@ fn without_refused_loopback(
         checked.push(raw.clone());
         let addresses = loopback_addresses(raw);
         if !addresses.is_empty()
-            && addresses.into_iter().all(|addr| {
-                matches!(connect(addr), Err(e) if e.kind() == io::ErrorKind::ConnectionRefused)
-            })
+            && addresses
+                .into_iter()
+                .all(|addr| matches!(connect(addr), Err(e) if loopback_probe_is_dead(e.kind())))
         {
             refused.push(raw.clone());
         }
@@ -184,11 +202,20 @@ mod tests {
             });
             assert!(cfg.https.is_none(), "{raw}");
         }
-        for kind in [
-            io::ErrorKind::TimedOut,
-            io::ErrorKind::PermissionDenied,
-            io::ErrorKind::Other,
-        ] {
+        // A loopback listener answers at kernel level, so a probe that merely
+        // TIMES OUT is dead too — and this is the only form "dead" takes on
+        // Windows, where connect_timeout to a just-closed port reports TimedOut
+        // (the non-blocking connect never sees the RST that a blocking connect
+        // gets at once). Exact-refused matching kept stopped VPN/proxy clients
+        // on 127.0.0.1 configured forever there.
+        let cfg = config("http://127.0.0.1:7890");
+        let actual = without_refused_loopback(cfg, |_| Err(io::ErrorKind::TimedOut.into()));
+        assert!(
+            actual.https.is_none(),
+            "timed-out loopback probe means dead"
+        );
+        // Genuinely ambiguous failures stay conservative: the proxy is kept.
+        for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::Other] {
             let cfg = config("http://127.0.0.1:7890");
             assert_eq!(
                 without_refused_loopback(cfg.clone(), |_| Err(kind.into())),
