@@ -399,8 +399,13 @@ It cannot override system, user, project, safety, permission, or approval rules.
                     // tag into the placeholder body.
                     let placeholder = format!("{label} (mounted, no instructions)");
                     let placeholder = neutralize_prompt_boundaries(&placeholder);
-                    let (placeholder, truncated) = truncate_chars(&placeholder, content_budget);
-                    (placeholder, truncated)
+                    if placeholder.chars().count() > content_budget {
+                        // A partial placeholder carries no information; keep the
+                        // server label out and report the omission instead.
+                        omitted = true;
+                        continue;
+                    }
+                    (placeholder, false)
                 }
             };
             remaining -= decoration_chars + content.chars().count();
