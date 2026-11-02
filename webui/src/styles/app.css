@@ -2266,6 +2266,18 @@ body {
 .scm-ok { color: var(--app-success-foreground); }
 .scm-error { color: var(--app-error-foreground); }
 
+/* A credential stored under `http` can put a token on the wire in cleartext, so
+   it is marked wherever it is listed and while it is being entered. */
+.scm-credential-warning { color: var(--app-warning-foreground, #b45309); }
+.scm-credential-insecure {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.78rem;
+  color: var(--app-secondary-foreground);
+}
+.scm-credential-insecure input { margin: 0; }
+
 .scm-output {
   margin: 0;
   padding: 8px 10px;

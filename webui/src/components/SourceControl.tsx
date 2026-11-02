@@ -56,6 +56,10 @@ export function SourceControl({ onClose, onPick }: SourceControlProps) {
   const [credentialHost, setCredentialHost] = useState('');
   const [credentialUser, setCredentialUser] = useState('');
   const [credentialToken, setCredentialToken] = useState('');
+  // Off by default. Storing a token under `http` is the one thing here that can
+  // put it on the wire in cleartext, so it is a deliberate per-host choice
+  // rather than something inferred from what the person typed.
+  const [credentialInsecure, setCredentialInsecure] = useState(false);
   const [diffKey, setDiffKey] = useState<string | null>(null);
   const [diff, setDiff] = useState<GitDiffResult | null>(null);
   const [diffLoading, setDiffLoading] = useState(false);
@@ -244,11 +248,17 @@ export function SourceControl({ onClose, onPick }: SourceControlProps) {
     setError(null);
     setNotice(null);
     try {
-      const saved = await storeGitCredential(host, username, token);
+      const saved = await storeGitCredential(
+        host,
+        username,
+        token,
+        credentialInsecure ? 'http' : 'https',
+      );
       // Never keep the token in component state after it is stored.
       setCredentialToken('');
       setCredentialHost('');
       setCredentialUser('');
+      setCredentialInsecure(false);
       await reloadCredentials();
       setNotice(t('scm.credentialSaved', { host: saved.host }));
     } catch (failure) {
@@ -516,6 +526,11 @@ export function SourceControl({ onClose, onPick }: SourceControlProps) {
               <div class="scm-row" key={credential.host}>
                 <span class="scm-remote-name mono">{credential.host}</span>
                 <span class="scm-row-path">{credential.username}</span>
+                {credential.scheme === 'http' && (
+                  <span class="scm-credential-warning">
+                    {t('scm.insecureScheme')}
+                  </span>
+                )}
                 <button
                   type="button"
                   class="btn scm-row-action"
@@ -553,6 +568,19 @@ export function SourceControl({ onClose, onPick }: SourceControlProps) {
                   if (event.key === 'Enter') void handleAddCredential();
                 }}
               />
+              <label class="scm-credential-insecure">
+                <input
+                  type="checkbox"
+                  checked={credentialInsecure}
+                  onChange={(event) =>
+                    setCredentialInsecure((event.target as HTMLInputElement).checked)
+                  }
+                />
+                <span>{t('scm.httpOnly')}</span>
+              </label>
+              {credentialInsecure && (
+                <p class="scm-hint scm-credential-warning">{t('scm.httpWarning')}</p>
+              )}
               <div class="scm-actions">
                 <button
                   class="btn btn-primary"

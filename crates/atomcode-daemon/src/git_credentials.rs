@@ -23,10 +23,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::json_error;
 
-/// What a person may see about a stored credential: the host it belongs to and
-/// the account name. Never the token.
+/// What a person may see about a stored credential: the scheme, the host it
+/// belongs to and the account name. Never the token.
+///
+/// The scheme is part of what is shown because it is the thing that decides
+/// whether the token travels in cleartext: git's `store` helper matches the
+/// stored prefix against the remote URL, so `http://` here is exactly "this
+/// token may go out unencrypted", and a person should be able to see that.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CredentialSummary {
+    pub scheme: String,
     pub host: String,
     pub username: String,
 }
@@ -35,6 +41,10 @@ pub struct CredentialSummary {
 pub struct StoreRequest {
     /// Bare host name, e.g. `atomgit.com`. A scheme or a path is refused.
     pub host: String,
+    /// `https` (the default) or `http`. The latter is an explicit per-host
+    /// opt-in: without it a stored token is never offered to a plaintext remote.
+    #[serde(default)]
+    pub scheme: Option<String>,
     /// Account the token belongs to. Required: a token alone cannot be placed
     /// on the right account, and guessing produces a 401 nobody can explain.
     pub username: String,
@@ -50,7 +60,13 @@ pub(crate) async fn store_credential(Json(req): Json<StoreRequest>) -> impl Into
             return json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
         }
     };
-    match store_at(&path, &req.host, &req.username, &req.token) {
+    match store_at(
+        &path,
+        &req.host,
+        &req.username,
+        &req.token,
+        req.scheme.as_deref(),
+    ) {
         Ok(host) => Json(serde_json::json!({ "success": true, "host": host })).into_response(),
         Err(error) => json_error(StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     }
@@ -116,16 +132,44 @@ fn windows_home() -> Option<PathBuf> {
     None
 }
 
+/// The scheme a credential is stored under.
+///
+/// `https` unless the caller opted into `http` for this host. git's `store`
+/// helper matches the stored prefix against the remote URL, so this value is
+/// also the safety property: a token stored as `https` is never offered to a
+/// plaintext remote. `http` exists for a self-hosted remote on a LAN, and it is
+/// the caller's explicit call — never a fallback.
+fn normalize_scheme(scheme: Option<&str>) -> anyhow::Result<&'static str> {
+    match scheme.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        None | Some("") | Some("https") => Ok("https"),
+        Some("http") => Ok("http"),
+        Some(other) => {
+            anyhow::bail!("unsupported scheme {other:?}: give `https` (default) or `http`")
+        }
+    }
+}
+
 /// Store (or replace) the credential for `host`. Returns the normalised host.
-fn store_at(path: &Path, host: &str, username: &str, token: &str) -> anyhow::Result<String> {
+fn store_at(
+    path: &Path,
+    host: &str,
+    username: &str,
+    token: &str,
+    scheme: Option<&str>,
+) -> anyhow::Result<String> {
     let host = normalize_host(host)?;
+    let scheme = normalize_scheme(scheme)?;
     let username = require_single_line(username, "username")?;
     let token = require_single_line(token, "token")?;
 
     let mut lines = read_lines(path);
+    // One entry per host: re-storing replaces the old line whether or not the
+    // scheme changed, so a host cannot end up with both an `http` and an
+    // `https` line and leave git to pick.
     lines.retain(|line| host_of(line).as_deref() != Some(host.as_str()));
     lines.push(format!(
-        "https://{}:{}@{}",
+        "{}://{}:{}@{}",
+        scheme,
         encode(&username),
         encode(&token),
         host
@@ -134,18 +178,16 @@ fn store_at(path: &Path, host: &str, username: &str, token: &str) -> anyhow::Res
     Ok(host)
 }
 
-/// The credentials this file holds, hosts and usernames only.
+/// The credentials this file holds: scheme, host and username.
 fn list_at(path: &Path) -> Vec<CredentialSummary> {
     read_lines(path)
         .into_iter()
         .filter_map(|line| {
-            let (userinfo, host) = line.rsplit_once('@')?;
-            let (username, _token) = userinfo
-                .split_once("://")
-                .map(|(_, rest)| rest)
-                .unwrap_or(userinfo)
-                .split_once(':')?;
+            let (scheme, rest) = line.split_once("://").unwrap_or(("https", line.as_str()));
+            let (userinfo, host) = rest.rsplit_once('@')?;
+            let (username, _token) = userinfo.split_once(':')?;
             Some(CredentialSummary {
+                scheme: scheme.to_ascii_lowercase(),
                 host: host.to_string(),
                 username: decode(username),
             })
@@ -287,12 +329,13 @@ mod tests {
     fn a_stored_token_is_listed_only_as_a_host_and_account() {
         let work = tempfile::tempdir().unwrap();
         let path = work.path().join(".git-credentials");
-        store_at(&path, "AtomGit.com", "alice", "tok_123").unwrap();
+        store_at(&path, "AtomGit.com", "alice", "tok_123", None).unwrap();
 
         let listed = list_at(&path);
         assert_eq!(
             listed,
             vec![CredentialSummary {
+                scheme: "https".into(),
                 host: "atomgit.com".into(),
                 username: "alice".into(),
             }]
@@ -303,12 +346,48 @@ mod tests {
     }
 
     #[test]
+    fn http_is_opt_in_per_host_and_replaces_the_https_entry() {
+        let work = tempfile::tempdir().unwrap();
+        let path = work.path().join(".git-credentials");
+
+        // Default stays https: nothing is ever offered to a plaintext remote
+        // unless the caller says so for that host.
+        store_at(&path, "git.lan", "alice", "tok", None).unwrap();
+        assert_eq!(list_at(&path)[0].scheme, "https");
+
+        // Opting in rewrites the same host rather than adding a second line —
+        // two lines for one host would leave git to pick between them.
+        store_at(&path, "git.lan", "alice", "tok", Some("http")).unwrap();
+        let listed = list_at(&path);
+        assert_eq!(listed.len(), 1, "one entry per host: {listed:?}");
+        assert_eq!(listed[0].scheme, "http");
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(body, "http://alice:tok@git.lan\n");
+
+        // Back to https the same way.
+        store_at(&path, "git.lan", "alice", "tok", Some("HTTPS")).unwrap();
+        assert_eq!(list_at(&path)[0].scheme, "https");
+    }
+
+    #[test]
+    fn an_unknown_scheme_is_refused() {
+        let work = tempfile::tempdir().unwrap();
+        let path = work.path().join(".git-credentials");
+        for bad in ["ftp", "git", "file"] {
+            assert!(
+                store_at(&path, "git.lan", "alice", "tok", Some(bad)).is_err(),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
     fn storing_the_same_host_twice_keeps_one_entry() {
         let work = tempfile::tempdir().unwrap();
         let path = work.path().join(".git-credentials");
-        store_at(&path, "atomgit.com", "alice", "old").unwrap();
-        store_at(&path, "atomgit.com", "alice", "new").unwrap();
-        store_at(&path, "gitcode.com", "bob", "other").unwrap();
+        store_at(&path, "atomgit.com", "alice", "old", None).unwrap();
+        store_at(&path, "atomgit.com", "alice", "new", None).unwrap();
+        store_at(&path, "gitcode.com", "bob", "other", None).unwrap();
 
         let listed = list_at(&path);
         assert_eq!(listed.len(), 2, "one entry per host: {listed:?}");
@@ -321,7 +400,7 @@ mod tests {
     fn removing_the_last_credential_removes_the_file() {
         let work = tempfile::tempdir().unwrap();
         let path = work.path().join(".git-credentials");
-        store_at(&path, "atomgit.com", "alice", "tok").unwrap();
+        store_at(&path, "atomgit.com", "alice", "tok", None).unwrap();
         assert!(remove_at(&path, "atomgit.com").unwrap());
         assert!(!path.exists(), "an empty credential file must not linger");
         assert!(!remove_at(&path, "atomgit.com").unwrap());
@@ -338,7 +417,7 @@ mod tests {
             "",
             "atom git.com",
         ] {
-            assert!(store_at(&path, bad, "alice", "tok").is_err(), "{bad:?}");
+            assert!(store_at(&path, bad, "alice", "tok", None).is_err(), "{bad:?}");
         }
     }
 
@@ -346,7 +425,7 @@ mod tests {
     fn a_token_with_the_separators_is_encoded() {
         let work = tempfile::tempdir().unwrap();
         let path = work.path().join(".git-credentials");
-        store_at(&path, "atomgit.com", "al ice", "to:k@en").unwrap();
+        store_at(&path, "atomgit.com", "al ice", "to:k@en", None).unwrap();
 
         let body = std::fs::read_to_string(&path).unwrap();
         assert_eq!(body, "https://al%20ice:to%3Ak%40en@atomgit.com\n");
@@ -360,7 +439,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let work = tempfile::tempdir().unwrap();
         let path = work.path().join(".git-credentials");
-        store_at(&path, "atomgit.com", "alice", "tok").unwrap();
+        store_at(&path, "atomgit.com", "alice", "tok", None).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(
             mode & 0o777,
@@ -373,7 +452,7 @@ mod tests {
     fn a_multi_line_token_is_refused() {
         let work = tempfile::tempdir().unwrap();
         let path = work.path().join(".git-credentials");
-        assert!(store_at(&path, "atomgit.com", "alice", "a\nb").is_err());
-        assert!(store_at(&path, "atomgit.com", "alice", "").is_err());
+        assert!(store_at(&path, "atomgit.com", "alice", "a\nb", None).is_err());
+        assert!(store_at(&path, "atomgit.com", "alice", "", None).is_err());
     }
 }

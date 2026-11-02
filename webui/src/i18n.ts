@@ -779,6 +779,9 @@ const zh = {
   'scm.saveCredential': '保存凭据',
   'scm.removeCredential': '删除',
   'scm.noCredentials': '还没有保存的凭据',
+  'scm.httpOnly': '这个远端只有 http（不加密）',
+  'scm.httpWarning': '勾选后 token 会以明文发往该主机。只在你自己掌控、且网络可信的远端上使用；能上 https 就不要勾。',
+  'scm.insecureScheme': 'http（明文）',
   'scm.credentialRequired': '请填写主机、账号和 Token',
   'scm.credentialSaved': '已保存 {host} 的凭据',
 } as const;
@@ -1428,6 +1431,10 @@ const en: Record<MsgKey, string> = {
   'scm.saveCredential': 'Save credential',
   'scm.removeCredential': 'Remove',
   'scm.noCredentials': 'No saved credentials yet',
+  'scm.httpOnly': 'This remote only speaks http (unencrypted)',
+  'scm.httpWarning':
+    'The token will be sent to this host in cleartext. Only do this for a remote you control on a network you trust; if it can speak https, leave this off.',
+  'scm.insecureScheme': 'http (cleartext)',
   'scm.credentialRequired': 'Enter the host, account and token',
   'scm.credentialSaved': 'Saved the credential for {host}',
   'sidebar.sourceControl': 'Source control',

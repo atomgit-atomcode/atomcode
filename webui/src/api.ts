@@ -1545,6 +1545,8 @@ export interface GitCloneResult extends GitCommandResult {
 
 /** A stored credential. The token itself is never returned. */
 export interface GitCredential {
+  /** `https` (normal) or `http` — the latter means the token may travel in cleartext. */
+  scheme: string;
   host: string;
   username: string;
 }
@@ -1608,11 +1610,15 @@ export function storeGitCredential(
   host: string,
   username: string,
   token: string,
+  scheme: string = 'https',
 ): Promise<{ success: boolean; host: string }> {
   return postJson<{ success: boolean; host: string }>('/git/credentials', {
     host,
     username,
     token,
+    // git's store helper matches the stored prefix, so this is the decision that
+    // lets a token be sent to a plaintext remote. Default stays `https`.
+    scheme,
   });
 }
 
