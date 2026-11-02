@@ -986,8 +986,10 @@ fn render_transcript(span: &[Message]) -> String {
             // one. A trailing break also separates, but it would leave the
             // marker at an unpadded line start, so pad it there like any
             // escaped continuation line.
+            // Read the final scalar through the reverse iterator: O(1) by
+            // construction, independent of `Iterator::last`'s behaviour.
             if s.chars()
-                .last()
+                .next_back()
                 .is_some_and(|c| is_line_break(c) || !c.is_whitespace())
             {
                 s.push(' ');
