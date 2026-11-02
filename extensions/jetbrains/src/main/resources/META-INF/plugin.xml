@@ -1,7 +1,7 @@
 <idea-plugin>
   <id>com.atomcode.jetbrains</id>
   <name>AtomCode</name>
-  <vendor email="atomcode@atomgit.com">AtomCode</vendor>
+  <vendor url="https://atomcode.atomgit.com/" email="atomcode@atomgit.com">AtomCode</vendor>
 
   <description><![CDATA[
     AtomCode brings a local AI coding agent into JetBrains IDEs, with the chat surface built natively into the IDE instead of a separate window.
