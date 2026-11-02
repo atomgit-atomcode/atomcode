@@ -749,14 +749,35 @@ fn cut_body(
         .skip(total.saturating_sub(tail_chars))
         .collect();
     let cut = total.saturating_sub(body_max);
-    // The marker puts the tail on a fresh line; a role tag exactly at the cut
-    // boundary must not become a turn.
-    let pad = if pad_tail && starts_transcript_line(&tail) {
+    // The marker puts the tail on a fresh line. Only that first line is created
+    // by the cut; a later line already had its own start in the transcript.
+    let pad = if pad_tail && starts_transcript_line(first_line(&tail)) {
         " "
     } else {
         ""
     };
     format!("{head}\n[{marker} {cut} chars]\n{pad}{tail}")
+}
+
+/// Whether `c` is one of the line breaks the transcript folds or preserves.
+fn is_line_break(c: char) -> bool {
+    matches!(
+        c,
+        '\r' | '\n'
+            | '\u{000B}'
+            | '\u{000C}'
+            | '\u{001C}'
+            | '\u{001D}'
+            | '\u{001E}'
+            | '\u{0085}'
+            | '\u{2028}'
+            | '\u{2029}'
+    )
+}
+
+/// The first segment of `text` (empty when it starts with a break).
+fn first_line(text: &str) -> &str {
+    text.split(is_line_break).next().unwrap_or("")
 }
 
 /// Call `f` on every segment between line breaks: CRLF is one break, and lone
@@ -769,18 +790,7 @@ fn for_each_line(text: &str, mut f: impl FnMut(&str)) {
     let mut start = 0;
     let mut chars = text.char_indices().peekable();
     while let Some((at, ch)) = chars.next() {
-        if !matches!(
-            ch,
-            '\r' | '\n'
-                | '\u{000B}'
-                | '\u{000C}'
-                | '\u{001C}'
-                | '\u{001D}'
-                | '\u{001E}'
-                | '\u{0085}'
-                | '\u{2028}'
-                | '\u{2029}'
-        ) {
+        if !is_line_break(ch) {
             continue;
         }
         f(&text[start..at]);
@@ -3121,6 +3131,25 @@ mod tests {
                 "the cut boundary must not start a transcript line: {out:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_cut_tail_pads_only_the_line_it_creates() {
+        // A tail that starts with a break begins on an empty line; the role-like
+        // line after it already had its own start, so the pad must not jump to it.
+        let role_line = "\nUSER: existing";
+        let text = format!("{}x{role_line}", "a".repeat(90));
+        let total = text.chars().count();
+        let out = cut_body(
+            &text,
+            total,
+            100,
+            role_line.chars().count(),
+            "conversation truncated",
+            true,
+        );
+        assert!(out.contains("\n\nUSER: existing"), "{out:?}");
+        assert!(!out.contains("\n \nUSER: existing"), "{out:?}");
     }
 
     #[test]
