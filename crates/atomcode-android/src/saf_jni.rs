@@ -233,13 +233,23 @@ impl SafBackend for JniBackend {
 /// Called from Kotlin once a folder has been granted, and on every start when a
 /// previous grant is restored. Idempotent: the class ref is captured on the first
 /// call and the backend is installed once.
-pub fn install(env: &mut JNIEnv<'_>, class: jni::objects::JClass<'_>) -> bool {
+pub fn install(env: &mut JNIEnv<'_>, _class: jni::objects::JClass<'_>) -> bool {
     if TREE.get().is_none() {
         let Ok(vm) = env.get_java_vm() else {
             tracing::warn!("SAF: could not get the JVM");
             return false;
         };
-        let Ok(global) = env.new_global_ref(&class) else {
+        // The JNI signature of a method declared in a Kotlin `object` receives the
+        // SINGLETON, not its class — `NativeAgent` is such an object, so the ref
+        // handed in here is an instance and cannot be used as a class for
+        // `call_static_method`. The class this backend actually calls is `SafTree`,
+        // and looking it up is safe right here because this runs on a Java thread
+        // that has the application class loader.
+        let Ok(tree_class) = env.find_class("com/atomcode/app/SafTree") else {
+            tracing::warn!("SAF: could not resolve the SafTree class");
+            return false;
+        };
+        let Ok(global) = env.new_global_ref(tree_class) else {
             tracing::warn!("SAF: could not hold the SafTree class");
             return false;
         };
