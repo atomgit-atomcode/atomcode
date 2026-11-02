@@ -622,8 +622,22 @@ impl Tool for AtomgitApiTool {
         "Call any AtomGit REST API endpoint that has no dedicated tool (prefer \
          atomgit_repo / atomgit_pr / atomgit_issue when they cover the action). \
          The auth token is attached server-side — NEVER put credentials in the \
-         arguments. `path` is relative to the API base, e.g. \"/user/orgs\" or \
-         \"/repos/{owner}/{repo}/branches\". Returns the raw JSON response."
+         arguments. `path` is relative to the API base, e.g. \"/search\" (unified \
+         search over repos/users/groups/PRs/issues) or \"/repos/{owner}/{repo}\". \
+         Returns the raw JSON response.\n\n\
+         Before building a request, read the official API docs instead of guessing \
+         paths or parameter names from other platforms:\n\
+         - https://atomgit.com/llms.txt — agent-facing entry point (short)\n\
+         - https://atomgit.com/.well-known/openapi.md — every endpoint and \
+         parameter with enums and defaults (preferred; compact)\n\
+         - https://atomgit.com/.well-known/openapi.json — same spec as full JSON \
+         (large; read selectively)\n\n\
+         Unknown query parameters may be ignored silently, and an out-of-range \
+         value may return an empty page, so \"no results\" is not proof that the \
+         resource does not exist. Check names and enums against the docs first \
+         (search takes type/q/p/pp; repo_type is 0=code 1=model 2=dataset). If the \
+         docs are unreachable, stay with the examples above and say so instead of \
+         inventing an endpoint."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
