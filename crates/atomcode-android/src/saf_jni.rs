@@ -236,14 +236,20 @@ impl SafBackend for JniBackend {
 pub fn install(env: &mut JNIEnv<'_>, class: jni::objects::JClass<'_>) -> bool {
     if TREE.get().is_none() {
         let Ok(vm) = env.get_java_vm() else {
+            tracing::warn!("SAF: could not get the JVM");
             return false;
         };
         let Ok(global) = env.new_global_ref(&class) else {
+            tracing::warn!("SAF: could not hold the SafTree class");
             return false;
         };
         let _ = TREE.set((vm, global));
     }
     atomcode_capabilities::saf::install_backend(std::sync::Arc::new(JniBackend));
+    tracing::info!(
+        installed = atomcode_capabilities::saf::installed_backend().is_some(),
+        "SAF: backend installed"
+    );
     true
 }
 

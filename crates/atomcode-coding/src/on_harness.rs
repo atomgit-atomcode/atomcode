@@ -879,6 +879,21 @@ pub fn config_rows(cfg: &crate::CodingAgentConfig) -> Result<Layer, String> {
     if names_sessions_with_a_model(cfg) {
         out = out.swap("session-title-first-prompt", "session-title-model");
     }
+    // A build that has a granted folder works in that folder instead of the disk.
+    //
+    // The Android app cannot hold all-files access in a Play-distributable build,
+    // and outside the app's own directory there are then no paths at all — only
+    // `content://` documents. What makes this a swap rather than a second mode is
+    // the world seam: `fs` is the only row that knows where files live, so
+    // everything above it (tools, gates, the walk) follows without knowing.
+    //
+    // Desktop never installs a backend, so this is a no-op there.
+    if atomcode_capabilities::saf::installed_backend().is_some() {
+        tracing::info!("SAF: swapping the `fs` row to `fs-saf`");
+        out = out.swap("fs", "fs-saf");
+    } else {
+        tracing::debug!("SAF: no backend installed, keeping the local world");
+    }
     // With the checkpoint, a front end that draws the question is asked before a
     // turn is cut off by its budget or ends with its answer cut off.
     if cfg.round_cap_checkpoint {
