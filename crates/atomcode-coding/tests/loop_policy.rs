@@ -1363,6 +1363,12 @@ async fn a_spent_turn_stops_asking_the_strategy_until_the_next_turn() {
 /// path only stops asking once both stages are spent, which a stable verdict
 /// never reaches — this pins that cost so a future "optimization" cannot make
 /// the trigger deaf to the stub.
+///
+/// Not the same case as `a_spent_turn_stops_asking_the_strategy_until_the_next_turn`:
+/// that verdict flips after one ask (2 asks / 2 attempts); this one never flips,
+/// so every request still asks (`asked` grows) while only the slow stage is
+/// attempted (`attempts == 1`). `asked` counts `calls_model`; `attempts` counts
+/// `compact` — different counters for different stages.
 #[tokio::test]
 async fn a_stable_verdict_is_still_asked_each_request() {
     let dir = scratch("stable-verdict");
