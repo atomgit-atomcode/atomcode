@@ -140,7 +140,11 @@ fn windows_home() -> Option<PathBuf> {
 /// plaintext remote. `http` exists for a self-hosted remote on a LAN, and it is
 /// the caller's explicit call — never a fallback.
 fn normalize_scheme(scheme: Option<&str>) -> anyhow::Result<&'static str> {
-    match scheme.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+    match scheme
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
         None | Some("") | Some("https") => Ok("https"),
         Some("http") => Ok("http"),
         Some(other) => {
@@ -417,7 +421,10 @@ mod tests {
             "",
             "atom git.com",
         ] {
-            assert!(store_at(&path, bad, "alice", "tok", None).is_err(), "{bad:?}");
+            assert!(
+                store_at(&path, bad, "alice", "tok", None).is_err(),
+                "{bad:?}"
+            );
         }
     }
 
