@@ -867,13 +867,9 @@ fn truncate(text: &str, max: usize) -> String {
         + "…"
 }
 
-/// Runs before the request goes out: if the last round's usage crossed the
-/// threshold, ask the compaction provider for a decision and log it. The
-/// resulting prompt is smaller *and* still fully derived from the log.
-struct CompactBeforeRequest {
-    ctx: Context,
-    threshold: f32,
-    token_limit: Option<u32>,
+/// Per-session stage attempts and their lock-free hints. Kept separate from the
+/// request row so the cross-session contract can be tested without a Context.
+struct CompactionGate {
     /// Attempts in each session’s current turn and context-pressure cycle.
     tried: Mutex<HashMap<String, (u64, [bool; 2])>>,
     /// Per-session, lock-free gate hints (one direct-mapped slot per session
@@ -881,6 +877,17 @@ struct CompactBeforeRequest {
     /// the lock remains authoritative. A slot collision evicts another session's
     /// hint, which costs an optimization, never a decision.
     hint: GateHint,
+}
+
+/// Runs before the request goes out: if the last round's usage crossed the
+/// threshold, ask the compaction provider for a decision and log it. The
+/// resulting prompt is smaller *and* still fully derived from the log.
+struct CompactBeforeRequest {
+    ctx: Context,
+    threshold: f32,
+    token_limit: Option<u32>,
+    /// Stage attempts and their per-session hints.
+    gate: CompactionGate,
 }
 
 /// Hint key for a session: hash in the high bits, low bit reserved for the
@@ -915,7 +922,25 @@ impl GateHint {
     }
 }
 
-impl CompactBeforeRequest {
+impl CompactionGate {
+    fn new() -> Self {
+        Self {
+            tried: Mutex::new(HashMap::new()),
+            hint: GateHint::new(),
+        }
+    }
+
+    /// Lower pressure rearms the session: drop its entry and clear the hint.
+    fn rearm(&self, session: &str) {
+        {
+            let mut tried = self.tried.lock().expect("compaction attempts poisoned");
+            tried.remove(session);
+        }
+        self.hint.set(session, false);
+    }
+}
+
+impl CompactionGate {
     /// At most one attempt per stage per turn or pressure cycle. A no-op or
     /// failed summary must not bill again on every request while pressure stays
     /// high. A later provider report below the trigger rearms both stages.
@@ -994,7 +1019,7 @@ impl Waterfall<AgentRequest> for CompactBeforeRequest {
             .service::<crate::seams::LlmSvc>()
             .map(|p| p.context_window())
             .unwrap_or(0);
-        let used = last_prompt_tokens(&session);
+        let used = session.last_prompt_tokens();
         let trigger_tokens = self
             .token_limit
             .map_or(window as f32 * self.threshold, |limit| {
@@ -1007,14 +1032,10 @@ impl Waterfall<AgentRequest> for CompactBeforeRequest {
             // This must stay ahead of both_tried: a low request is the one that
             // rearms, and the gate would otherwise skip it with the table still
             // spent, silencing the trigger until the next turn.
-            {
-                let mut tried = self.tried.lock().expect("compaction attempts poisoned");
-                tried.remove(session.id());
-            }
-            self.hint.set(session.id(), false);
+            self.gate.rearm(session.id());
             return next.run(req).await;
         }
-        if self.both_tried(session.id(), session.current_turn()) {
+        if self.gate.both_tried(session.id(), session.current_turn()) {
             return next.run(req).await;
         }
 
@@ -1026,7 +1047,10 @@ impl Waterfall<AgentRequest> for CompactBeforeRequest {
             used_tokens: used,
         };
         let slow = compaction.calls_model(&session, &ask);
-        if !self.first_try(session.id(), session.current_turn(), slow) {
+        if !self
+            .gate
+            .first_try(session.id(), session.current_turn(), slow)
+        {
             return next.run(req).await;
         }
         if slow {
@@ -1057,13 +1081,6 @@ pub(crate) fn reproject(req: &mut ModelRequest, session: &crate::session::Sessio
         .collect();
     messages.extend(session.derive_messages());
     req.messages = messages;
-}
-
-/// Prompt tokens of the last request: what the provider reported for it, or —
-/// for a session seeded from a stored conversation, which carries no usage
-/// facts — what the stored answer recorded.
-pub(crate) fn last_prompt_tokens(session: &crate::session::SessionLog) -> u32 {
-    session.last_prompt_tokens()
 }
 
 pub struct CompactionPlugin;
@@ -1119,8 +1136,7 @@ pub fn mount_compaction_trigger_with_limit(
             ctx: ctx.clone(),
             threshold,
             token_limit,
-            tried: Mutex::new(HashMap::new()),
-            hint: GateHint::new(),
+            gate: CompactionGate::new(),
         }),
         false,
     );
@@ -1839,5 +1855,36 @@ mod hint_tests {
         hint.set(a, false);
         assert!(!hint.hit(a));
         assert!(hint.hit(&b));
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::CompactionGate;
+
+    #[test]
+    fn sessions_do_not_silence_each_other() {
+        let gate = CompactionGate::new();
+
+        assert!(gate.first_try("a", 7, true));
+        assert!(gate.first_try("a", 7, false));
+        assert!(gate.both_tried("a", 7));
+
+        assert!(!gate.both_tried("b", 7));
+        assert!(gate.first_try("b", 7, true));
+        assert!(gate.first_try("b", 7, false));
+        assert!(gate.both_tried("b", 7));
+
+        // B spending both does not reset A's spent slots.
+        assert!(!gate.first_try("a", 7, true));
+        assert!(!gate.first_try("a", 7, false));
+
+        // A new turn rearms A; B's own turn stays spent.
+        assert!(gate.first_try("a", 8, true));
+        assert!(!gate.first_try("b", 7, true));
+
+        gate.rearm("a");
+        assert!(!gate.both_tried("a", 8));
+        assert!(gate.first_try("a", 8, true));
     }
 }
