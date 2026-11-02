@@ -407,6 +407,8 @@ struct FsWorldPatch<'a> {
     /// Places outside `root` a mutation may still land.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     also_writable: Vec<&'a std::path::Path>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    also_readable: Vec<&'a std::path::Path>,
 }
 
 /// For `skip_serializing_if`, which hands the field over by reference.
@@ -1850,6 +1852,28 @@ fn compose_hosted(
     // a tree on every reprepare, including the `/cd` that follows `/worktree`,
     // so the rule has to hold for the directory it is handed and not for an
     // event that has already been and gone.
+    // Rebuilt from the effective registry on every mount, so disabled or
+    // replaced skills do not leave stale grants in the next execution world.
+    let skill_reads: Vec<std::path::PathBuf> = host
+        .skills
+        .as_ref()
+        .map(|loaded| {
+            loaded
+                .registry
+                .all()
+                .iter()
+                .filter_map(|skill| {
+                    let path = &skill.source_path;
+                    if path.file_name().is_some_and(|name| name == "SKILL.md") {
+                        path.parent().map(std::path::Path::to_path_buf)
+                    } else {
+                        Some(path.clone())
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let readable: Vec<&std::path::Path> = skill_reads.iter().map(|p| p.as_path()).collect();
     let boundary = if is_a_linked_worktree(working_dir) {
         let mut writable = vec![std::env::temp_dir()];
         // Windows spells the same place twice, and a build that picked the
@@ -1870,6 +1894,7 @@ fn compose_hosted(
                     root: Some(working_dir),
                     writes_only: true,
                     also_writable: extra,
+                    also_readable: readable.clone(),
                 },
             )
             .map_err(|e| e.to_string())?
@@ -1882,6 +1907,7 @@ fn compose_hosted(
                         root: None,
                         writes_only: false,
                         also_writable: Vec::new(),
+                        also_readable: readable.clone(),
                     },
                 )
                 .map_err(|e| e.to_string())?,
@@ -1892,6 +1918,7 @@ fn compose_hosted(
                         root: Some(working_dir),
                         writes_only: false,
                         also_writable: Vec::new(),
+                        also_readable: readable.clone(),
                     },
                 )
                 .map_err(|e| e.to_string())?,

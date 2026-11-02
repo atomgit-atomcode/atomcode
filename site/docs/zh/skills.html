@@ -122,6 +122,10 @@ description: 发布一个新的 release tag,更新 changelog,并打包
 - 不允许绕过测试,任何失败都必须先修复
 - 发布失败时,回滚所有本地 tag 和 changelog 改动</code></pre>
 
+      <h2 id="bundled-resources">技能自带资源</h2>
+      <p>已加载的目录技能可以用 <code>read_file</code> 读取其 <code>SKILL.md</code> 同目录及子目录中的文件，包括工作区外已安装插件的技能。资源相对路径应以技能目录为基准。独立 Markdown 技能只授权读取该文件。</p>
+      <p>这只增加读取范围：工作区写入限制与敏感文件审批仍然有效。链接不能把读取范围扩展到无关位置。禁用或删除技能后，重新加载技能以更新执行环境的资源访问范围。</p>
+
       <h2 id="allowed-tools">工具预授权：allowed-tools</h2>
       <p><code>allowed-tools</code> 声明调用此 skill 的当前回合可以免去常规审批的工具。它不是排他白名单：未列出的工具仍可调用，继续按现有权限与审批规则处理。</p>
       <p>推荐使用 <code>allowed-tools</code>；兼容下划线别名 <code>allowed_tools</code>，校验规则相同。重复声明该字段（包括两种写法混用）会拒绝加载。</p>

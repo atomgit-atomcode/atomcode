@@ -1074,3 +1074,72 @@ async fn host_automation_tools_mount_on_the_lead_without_widening_delegation() {
     );
     mounted.shutdown().await;
 }
+
+/// A headless world can read exactly the effective skill bundles. Rebuilding
+/// without them revokes those grants; a flat skill never grants its parent.
+#[tokio::test]
+async fn loaded_skill_resources_are_readable_in_a_fenced_mount_and_revoked_on_rebuild() {
+    let project = tempfile::tempdir().unwrap();
+    let bundles = tempfile::tempdir().unwrap();
+    let bundle = bundles.path().join("ask");
+    std::fs::create_dir_all(&bundle).unwrap();
+    std::fs::write(
+        bundle.join("SKILL.md"),
+        "---\nname: ask\ndescription: offline docs\n---\nRead docs-zh.json.\n",
+    )
+    .unwrap();
+    let resource = bundle.join("docs-zh.json");
+    std::fs::write(&resource, "offline docs").unwrap();
+    let flat = bundles.path().join("flat.md");
+    std::fs::write(
+        &flat,
+        "---\nname: flat\ndescription: flat skill\n---\nText.\n",
+    )
+    .unwrap();
+    let neighbor = bundles.path().join("unrelated.json");
+    std::fs::write(&neighbor, "private").unwrap();
+    let cfg = CodingAgentConfig::new(
+        "k",
+        "http://unused",
+        "test",
+        project.path(),
+        atomcode_coding::config::product_dirs_from_env(),
+    );
+    assert!(!cfg.is_attended());
+    let opts = PrepareOptions {
+        tools: true,
+        skill_dirs: Some(vec![]),
+        plugin_skill_dirs: vec![(
+            bundles.path().into(),
+            "docs".into(),
+            atomcode_capabilities::skills::TemplateKind::Skill,
+        )],
+        ..quiet_options()
+    };
+    let mounted = support::mount(&cfg, opts, Arc::new(CannedProvider)).await;
+    let fs = mounted
+        .context()
+        .service::<atomcode_harness::seams::FsSvc>()
+        .unwrap();
+    assert_eq!(fs.read_text(&resource).await.unwrap(), "offline docs");
+    assert!(fs.read_text(&flat).await.is_ok());
+    assert!(fs.read_text(&neighbor).await.is_err());
+    assert!(fs.write_text(&resource, "changed").await.is_err());
+    mounted.shutdown().await;
+    let next = support::mount(
+        &cfg,
+        PrepareOptions {
+            tools: true,
+            skill_dirs: Some(vec![]),
+            ..quiet_options()
+        },
+        Arc::new(CannedProvider),
+    )
+    .await;
+    let fs = next
+        .context()
+        .service::<atomcode_harness::seams::FsSvc>()
+        .unwrap();
+    assert!(fs.read_text(&resource).await.is_err());
+    next.shutdown().await;
+}

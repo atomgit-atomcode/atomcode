@@ -45,6 +45,9 @@ struct FsRow {
     /// scratch file breaks the toolchain without protecting anything.
     #[serde(default)]
     also_writable: Vec<String>,
+    /// Existing resource directories or exact files; never grants mutations.
+    #[serde(default)]
+    also_readable: Vec<String>,
 }
 
 pub struct FsLocalPlugin;
@@ -72,19 +75,23 @@ impl Plugin for FsLocalPlugin {
         //
         // `writes_only` is the middle case, and the one a checkout wants: the
         // same root, applied to mutations alone.
-        let world: Arc<dyn FileSystem> = match (row.root.map(PathBuf::from), row.read_only) {
-            (Some(root), true) => Arc::new(LocalFs::read_only(root)),
+        let mut world = match (row.root.map(PathBuf::from), row.read_only) {
+            (Some(root), true) => LocalFs::read_only(root),
             (Some(root), false) if row.writes_only => {
                 let mut world = LocalFs::writes_fenced(root);
                 for dir in &row.also_writable {
                     world = world.also_writable(dir);
                 }
-                Arc::new(world)
+                world
             }
-            (Some(root), false) => Arc::new(LocalFs::new(root)),
-            (None, true) => Arc::new(LocalFs::read_only_unfenced()),
-            (None, false) => Arc::new(LocalFs::unfenced()),
+            (Some(root), false) => LocalFs::new(root),
+            (None, true) => LocalFs::read_only_unfenced(),
+            (None, false) => LocalFs::unfenced(),
         };
+        for path in &row.also_readable {
+            world = world.also_readable(path);
+        }
+        let world: Arc<dyn FileSystem> = Arc::new(world);
         let _ = ctx.provide::<FsSvc>(world).map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -108,10 +115,14 @@ impl Plugin for FsReadOnlyPlugin {
     async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
         let row: FsRow = parse(config)?;
         // Read-only is the point of this row; a root is optional, as above.
-        let world: Arc<dyn FileSystem> = match row.root.map(PathBuf::from) {
-            Some(root) => Arc::new(LocalFs::read_only(root)),
-            None => Arc::new(LocalFs::read_only_unfenced()),
+        let mut world = match row.root.map(PathBuf::from) {
+            Some(root) => LocalFs::read_only(root),
+            None => LocalFs::read_only_unfenced(),
         };
+        for path in &row.also_readable {
+            world = world.also_readable(path);
+        }
+        let world: Arc<dyn FileSystem> = Arc::new(world);
         let _ = ctx.provide::<FsSvc>(world).map_err(|e| e.to_string())?;
         Ok(())
     }

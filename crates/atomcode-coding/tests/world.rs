@@ -152,6 +152,45 @@ async fn start(tree: ConfigTree) -> App {
 }
 
 #[tokio::test]
+async fn read_file_uses_extra_read_grants_without_opening_the_write_boundary() {
+    let dir = scratch("skill-resource-tool");
+    let bundle = tempfile::tempdir().unwrap();
+    let resource = bundle.path().join("docs-zh.json");
+    std::fs::write(&resource, "offline-resource-marker").unwrap();
+    let read_patch = format!(
+        "[[patch]]\nid = \"fs\"\nconfig = {{ root = {:?}, also_readable = [{:?}] }}",
+        dir.to_string_lossy(),
+        bundle.path().to_string_lossy()
+    );
+    let app = start(tree(
+        &dir,
+        &script_one(
+            "read_file",
+            &format!(r#"{{ file_path = {:?} }}"#, resource.to_string_lossy()),
+        ),
+        &[YOLO, &read_patch],
+    ))
+    .await;
+    run_turn(&app, "read the skill resource").await.unwrap();
+    let text = app
+        .context()
+        .only_session()
+        .unwrap()
+        .derive_messages()
+        .iter()
+        .map(|m| m.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("offline-resource-marker"), "{text}");
+    let fs = app.context().service::<FsSvc>().unwrap();
+    assert!(fs.write_text(&resource, "changed").await.is_err());
+    assert_eq!(
+        std::fs::read_to_string(resource).unwrap(),
+        "offline-resource-marker"
+    );
+}
+
+#[tokio::test]
 async fn the_world_fences_paths_outside_its_root() {
     let dir = scratch("fence");
     let outside = std::env::temp_dir().join("plexus-outside-the-root.txt");

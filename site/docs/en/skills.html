@@ -122,6 +122,10 @@ When the user says "ship a new version", "cut a release", or "tag it".
 - Never skip tests — fix any failure first.
 - If publish fails, roll back the local tag and changelog edits.</code></pre>
 
+      <h2 id="bundled-resources">Bundled resources</h2>
+      <p>A loaded directory skill can use <code>read_file</code> to read files beside its <code>SKILL.md</code> and in its subdirectories, including installed plugin skills outside the workspace. Resolve relative resource paths against the skill directory. A standalone Markdown skill grants access only to that file.</p>
+      <p>This adds read access only: workspace write restrictions and sensitive-file approvals still apply. Links cannot extend a skill's access to unrelated locations. Reload skills after disabling or removing them to update the execution world's resource access.</p>
+
       <h2 id="allowed-tools">Tool preauthorization: allowed-tools</h2>
       <p><code>allowed-tools</code> preauthorizes matching tools for the turn that invokes a skill. It is not an exclusive tool whitelist: other tools remain available and follow normal permission and approval rules.</p>
       <p>Prefer <code>allowed-tools</code>. The underscore alias <code>allowed_tools</code> accepts the same syntax and validation. Repeated declarations, including mixed spellings, refuse loading.</p>
