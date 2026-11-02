@@ -989,8 +989,9 @@ rollback     → version 1.0, previous_version 2.0   （磁盘内容 payload-1�
 uninstall    → packages 下只剩 cpython，无 demopkg 链接
 ```
 
-**已知未做**：只保留一代版本（退回两步需要重装）；CPython 的 `_ctypes` 未编入（缺 libffi），
-所以 `ctypes` 不可用；健康检查只验证「能否加载」，不验证插件跑起来是否真的正确。
+**已知未做**：只保留一代版本（退回两步需要重装）；健康检查只验证「能否加载」，不验证
+插件跑起来是否真的正确。（`_ctypes` 一度未编入，现在已可用——真机上
+`python3 -c "import ctypes; print(ctypes.sizeof(ctypes.c_int))"` → `4`。）
 
 
 ### P5.9：helper APK —— 跑「进程模型」工具（真机验证 2026-10-25）
@@ -2371,7 +2372,8 @@ localabstract:webview_devtools_remote_<pid>` + CDP）驱动页面，视口 360×
 - 单测：`webui/src/lib/imageAttach.test.ts`（7 条：等比缩放、极端全景不塌成 0 像素、
   3–8 MB 照片的落点、是否值得解码、PNG/JPEG 选择、质量阶梯单调）。
 
-**未做**（记在 next-steps）：直接拍照（`ACTION_IMAGE_CAPTURE` + `FileProvider`）。
+**已实现并真机验证**（2026-10-30）：拍照走 chooser 的 initial intent，两个入口在同一屏；
+实现细节与真机踩出的两个 bug 见本节「四、相机直传」。
 
 #### 二、通知栏报回合结果
 
@@ -2420,8 +2422,9 @@ localabstract:webview_devtools_remote_<pid>` + CDP）驱动页面，视口 360×
   被复活**（判据见单测 `an_edited_or_deleted_example_is_left_alone`）。台账是隐藏文件、
   在示例目录之外——放目录里边删目录就一起没了，删除就会失效。
 
-**仍未做**：市场侧的 zig 二进制包（见下节），以及环境运行时（Go / node 22 / clang /
-cmake，都是仓库外的交叉编译产物）。
+**已发布**（2026-11-01/02）：zig 以及 go / node / clang / cmake / ninja / pkgconf /
+bash / rsync / openssh / unzip / tar / perl / tools 共 14 个 provider 全部进市场仓库，
+见「六」与「八」两节。
 
 #### 四、相机直传：不用退出应用去拍照
 
@@ -2595,9 +2598,10 @@ helper APK：**82 MB → 33 MB**（剩下的主体是 `libatomcode.so`，即设�
 **面板安装已实现**（见下一节「八」）：「运行时插件」页按市场清单逐行列出 provider，各带
 自己的安装按钮与已安装判定。
 
-**仍未做（仓库外）**：把 `com.atomcode.tools.zig` 与重新瘦身后的 `com.atomcode.tools`
-**发布到市场仓库**（清单里的两条 `[[helpers]]` + 两个 APK）。发布之前，设备上只能靠
-`adb install` 或本地市场夹具。
+**已发布**（2026-11-02）：`com.atomcode.tools`、`com.atomcode.tools.zig` 及其余 12 个
+provider 全部进 [`qiaoen_python/atomcode-android-plugins`](https://atomgit.com/qiaoen_python/atomcode-android-plugins)，
+包体走 Release 附件而不是 git 历史。真机 `GET /packages/market` 返回 14 条，逐个下载
+并 sha256 校验通过。
 
 #### 七、二进制 MCP 服务器：pluginhost 插件（真机验证 2026-10-30）
 
