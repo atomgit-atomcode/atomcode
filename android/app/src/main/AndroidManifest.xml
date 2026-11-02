@@ -18,15 +18,24 @@
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <!--
-      A coding agent needs real POSIX paths. SAF hands out content:// URIs, which
-      no `bash`, `git` or LSP can open; the alternative is this permission, which
-      is what every on-device IDE/terminal uses. It is granted per-app in system
-      settings, never silently, and the app falls back to its private directory
-      when it is absent.
+      Deliberately NOT `MANAGE_EXTERNAL_STORAGE`.
+
+      A coding agent wants real POSIX paths: SAF hands out `content://` URIs that
+      no `bash`, `git` or LSP can open. That permission gave the app shared
+      storage as real paths — and got it rejected from Play, because the policy
+      only allows it for apps whose *core* function cannot work any other way.
+
+      So the app ships without it and works in two worlds instead:
+        - its private directory, where bash/git/compilers work normally;
+        - one folder the person grants through the system picker, reachable to the
+          file tools through the SAF world (`fs-saf`).
+
+      The cost is real and worth stating: a granted folder is *not* usable by
+      `bash` or `git`, because there are no paths to hand them. A build that
+      wants shared storage as real paths again adds the permission back here
+      (plus `tools:ignore="ScopedStorage"`) and the old path returns — see
+      `docs/android-port.md`「SAF 世界」.
     -->
-    <uses-permission
-        android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
-        tools:ignore="ScopedStorage" />
 
     <!--
       The optional helper APK carries tools that must spawn child processes
@@ -123,9 +132,9 @@
           user-started coding-agent run is what the category is for.
 
           It costs two declarations: the platform permission above, and the subtype
-          property below (the policy the type is documented with). Play
-          distribution is not a consideration for this build either way —
-          MANAGE_EXTERNAL_STORAGE already rules it out.
+          property below (the policy the type is documented with). Nothing rules
+          Play out any more — the all-files permission that used to is gone — so
+          this type is the one to justify when the listing is reviewed.
         -->
         <service
             android:name=".AgentService"

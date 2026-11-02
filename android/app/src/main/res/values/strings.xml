@@ -32,10 +32,10 @@
     <string name="external_token_message">The daemon on port %1$d requires a token. Paste it here, or restart the daemon with --no-auth. Tokens are never read from shared storage.</string>
     <string name="external_token_hint">token</string>
     <string name="external_token_connect">Connect</string>
-    <string name="storage_title">Open a real project folder</string>
-    <string name="storage_message">AtomCode needs access to shared storage so the agent can open your repositories by path — Git, shell commands and language servers cannot work with Android\'s document picker URIs. Without it the agent is limited to its private folder.</string>
+    <string name="storage_title">Give the agent a folder</string>
+    <string name="storage_message">The agent works inside its own folder, where Git, shell commands and language servers all run normally. Pick a shared folder as well and the file tools can read and write it — but Android hands those out as document URIs, so Git and shell commands still cannot run there.</string>
     <string name="storage_grant">Grant access</string>
-    <string name="saf_choose_folder">Pick a folder instead</string>
+    <string name="saf_choose_folder">Pick a folder</string>
     <string name="saf_granted">Using the folder: %1$s</string>
     <string name="saf_grant_failed">That folder could not be opened.</string>
     <string name="no_browser">No app on this device can open that link.</string>

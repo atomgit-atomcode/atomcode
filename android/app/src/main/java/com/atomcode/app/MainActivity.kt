@@ -496,32 +496,19 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Ask for all-files access, once, with an explanation.
+     * Offer the folder picker, once, with an explanation.
      *
-     * Without it the agent still runs, but only inside its private directory —
-     * useful for trying things out, useless for opening the repository the
-     * person actually wants to work on.
+     * There is no all-files permission to ask for any more (see the manifest):
+     * the system picker is the only route to anything outside the sandbox. The
+     * dialog says what that costs — a granted folder is file-level access, not a
+     * place `bash` or `git` can work — so nobody grants it expecting more.
      */
     private fun promptStorageAccess() {
         AlertDialog.Builder(this)
             .setTitle(getString(R.string.storage_title))
             .setMessage(getString(R.string.storage_message))
-            .setPositiveButton(getString(R.string.storage_grant)) { _, _ ->
-                val app = Intent(
-                    Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
-                    Uri.parse("package:$packageName"),
-                )
-                try {
-                    startActivity(app)
-                } catch (e: Exception) {
-                    Log.w(TAG, "per-app storage settings unavailable, opening the list", e)
-                    startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
-                }
-            }
+            .setPositiveButton(getString(R.string.saf_choose_folder)) { _, _ -> requestSafTree() }
             .setNegativeButton(android.R.string.cancel, null)
-            // The route a Play-distributable build takes: no all-files permission
-            // is grantable there, so the person hands over one folder instead.
-            .setNeutralButton(getString(R.string.saf_choose_folder)) { _, _ -> requestSafTree() }
             .show()
     }
 

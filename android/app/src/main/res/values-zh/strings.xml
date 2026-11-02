@@ -37,10 +37,10 @@
     <string name="external_token_message">端口 %1$d 的守护进程需要令牌。请在此粘贴，或用 --no-auth 重启该守护进程。令牌不会从共享存储读取。</string>
     <string name="external_token_hint">令牌</string>
     <string name="external_token_connect">连接</string>
-    <string name="storage_title">打开真实项目目录</string>
-    <string name="storage_message">AtomCode 需要访问共享存储，智能体才能按路径打开你的仓库 —— Git、shell 命令和语言服务器无法使用 Android 文档选择器提供的 URI。不授予的话，智能体只能使用它的私有目录。</string>
+    <string name="storage_title">给智能体一个文件夹</string>
+    <string name="storage_message">智能体在它自己的目录里工作，Git、shell 命令和语言服务器在那里都能正常跑。再挑一个共享文件夹，文件工具就能读写它 —— 但 Android 交出来的是文档 URI，所以 Git 和 shell 命令在那里仍然用不了。</string>
     <string name="storage_grant">授予访问</string>
-    <string name="saf_choose_folder">改为选择文件夹</string>
+    <string name="saf_choose_folder">选择文件夹</string>
     <string name="saf_granted">正在使用文件夹：%1$s</string>
     <string name="saf_grant_failed">打不开这个文件夹。</string>
     <string name="no_browser">本机没有能打开该链接的应用。</string>
