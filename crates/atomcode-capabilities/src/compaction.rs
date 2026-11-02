@@ -967,7 +967,10 @@ fn render_transcript(span: &[Message]) -> String {
         // Before the call lines: a message can carry both, and the marker belongs on the
         // text line, never glued to a `[tool call: ...]` line.
         if !m.images.is_empty() {
-            if !m.text.is_empty() {
+            // The separator belongs to whatever the body actually wrote: a
+            // trailing space or newline already separates, and the role prefix
+            // ends in one space.
+            if s.chars().last().is_some_and(|c| !c.is_whitespace()) {
                 s.push(' ');
             }
             s.push_str(&format!("[{} image(s) attached]", m.images.len()));
@@ -3549,6 +3552,20 @@ mod tests {
         let out = render_transcript(&[Message::assistant("", vec![call])]);
         assert!(out.contains("[tool call: read_file {}]\n"), "{out:?}");
         assert!(!out.contains("[tool call:  "), "{out:?}");
+    }
+
+    #[test]
+    fn an_image_marker_uses_the_rendered_tail_not_the_raw_text() {
+        let img = atomcode_kernel::message::ImageContent {
+            media_type: "image/png".into(),
+            data: "AAAA".into(),
+        };
+        let out = render_transcript(&[Message::user_with_images("text  ", vec![img])]);
+        assert!(out.contains("USER: text  [1 image(s) attached]"), "{out:?}");
+        assert!(
+            !out.contains("USER: text   [1 image(s) attached]"),
+            "the rendered tail already ends in a space"
+        );
     }
 
     #[test]
