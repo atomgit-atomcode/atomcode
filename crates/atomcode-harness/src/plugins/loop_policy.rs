@@ -876,12 +876,11 @@ struct CompactBeforeRequest {
     token_limit: Option<u32>,
     /// Attempts in each session’s current turn and context-pressure cycle.
     tried: Mutex<HashMap<String, (u64, [bool; 2])>>,
-    /// Last `first_try`'s session key and both-slots bit. A one-entry hint for
-    /// `both_tried`: a different key or a zero bit skips the map lock; the map
-    /// under the lock remains authoritative. An entry for a session that never
-    /// returns cannot keep the hint non-zero — any live session's next
-    /// `first_try` replaces it, and a miss only costs one projection.
-    last_both: AtomicU64,
+    /// Per-session, lock-free gate hints (one direct-mapped slot per session
+    /// hash). A miss only costs the gate's lock or one projection; the map under
+    /// the lock remains authoritative. A slot collision evicts another session's
+    /// hint, which costs an optimization, never a decision.
+    hint: GateHint,
 }
 
 /// Hint key for a session: hash in the high bits, low bit reserved for the
@@ -890,6 +889,30 @@ fn session_key(session: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     session.hash(&mut hasher);
     hasher.finish() & !1
+}
+
+const GATE_HINT_SLOTS: usize = 16;
+
+/// One direct-mapped atomic hint per session slot: the session key with the
+/// both-slots bit. Different sessions keep their hints unless their hashes land
+/// in the same slot; even then the map under the lock decides the gate.
+struct GateHint([AtomicU64; GATE_HINT_SLOTS]);
+
+impl GateHint {
+    fn new() -> Self {
+        Self(std::array::from_fn(|_| AtomicU64::new(0)))
+    }
+    fn slot(key: u64) -> usize {
+        (key >> 1) as usize % GATE_HINT_SLOTS
+    }
+    fn set(&self, session: &str, both: bool) {
+        let key = session_key(session);
+        self.0[Self::slot(key)].store(key | if both { 1 } else { 0 }, Ordering::Relaxed);
+    }
+    fn hit(&self, session: &str) -> bool {
+        let key = session_key(session);
+        self.0[Self::slot(key)].load(Ordering::Relaxed) == (key | 1)
+    }
 }
 
 impl CompactBeforeRequest {
@@ -906,10 +929,7 @@ impl CompactBeforeRequest {
         }
         let first = !std::mem::replace(&mut entry.1[usize::from(slow)], true);
         let both = entry.1.iter().all(|tried| *tried);
-        self.last_both.store(
-            session_key(session) | if both { 1 } else { 0 },
-            Ordering::Relaxed,
-        );
+        self.hint.set(session, both);
         first
     }
 
@@ -942,7 +962,7 @@ impl CompactBeforeRequest {
     /// therefore still asked for on every request; the projection is skipped
     /// only after both stages have been spent.
     fn both_tried(&self, session: &str, turn: u64) -> bool {
-        if self.last_both.load(Ordering::Relaxed) != (session_key(session) | 1) {
+        if !self.hint.hit(session) {
             return false;
         }
         let tried = self.tried.lock().expect("compaction attempts poisoned");
@@ -991,8 +1011,7 @@ impl Waterfall<AgentRequest> for CompactBeforeRequest {
                 let mut tried = self.tried.lock().expect("compaction attempts poisoned");
                 tried.remove(session.id());
             }
-            self.last_both
-                .store(session_key(session.id()), Ordering::Relaxed);
+            self.hint.set(session.id(), false);
             return next.run(req).await;
         }
         if self.both_tried(session.id(), session.current_turn()) {
@@ -1101,7 +1120,7 @@ pub fn mount_compaction_trigger_with_limit(
             threshold,
             token_limit,
             tried: Mutex::new(HashMap::new()),
-            last_both: AtomicU64::new(0),
+            hint: GateHint::new(),
         }),
         false,
     );
@@ -1790,5 +1809,35 @@ mod round_budget_tests {
             Some(StopReason::StoppedByPolicy),
             "an unlimited round budget must not disable the deadline"
         );
+    }
+}
+
+#[cfg(test)]
+mod hint_tests {
+    use super::{session_key, GateHint};
+
+    #[test]
+    fn the_gate_hint_is_per_session() {
+        let hint = GateHint::new();
+        let a = "session-a";
+        let b = (0..1_000)
+            .map(|i| format!("session-b{i}"))
+            .find(|b| GateHint::slot(session_key(a)) != GateHint::slot(session_key(b)))
+            .expect("a session with a distinct hint slot");
+
+        hint.set(a, true);
+        assert!(hint.hit(a));
+        assert!(!hint.hit(&b));
+
+        hint.set(&b, true);
+        assert!(
+            hint.hit(a),
+            "another session must not evict this one's hint"
+        );
+        assert!(hint.hit(&b));
+
+        hint.set(a, false);
+        assert!(!hint.hit(a));
+        assert!(hint.hit(&b));
     }
 }
