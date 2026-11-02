@@ -1462,6 +1462,18 @@ async fn a_zero_round_turn_builds_a_valid_script() {
     assert!(outcome.text.contains("done"), "{:?}", outcome.text);
     assert_eq!(asked.load(Ordering::SeqCst), 0);
     assert_eq!(attempts.load(Ordering::SeqCst), 0);
+
+    // The script's next answer carries the first response's usage: a
+    // usage-bearing request must still reach the trigger, so the zero counters
+    // above are not a dead-test artifact.
+    let second = run_turn(&app, "second").await.unwrap();
+    assert_eq!(second.steps, 1, "the second turn is one model step");
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        1,
+        "a usage-bearing request asks the strategy"
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
 }
 
 /// Two root sessions share one trigger row. A spends both stages; B's own first
