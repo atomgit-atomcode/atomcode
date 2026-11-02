@@ -883,10 +883,13 @@ fn fold_fullwidth_ascii(c: char) -> char {
 /// Append `text` to `into` with line breaks and blank lines folded to single
 /// spaces, so a call stays on one `\n`-delimited line of the transcript. Empty
 /// segments are skipped and a trailing space is dropped, so a part that starts
-/// or ends in a break does not leave a gap. Written straight into the transcript
-/// because most argument lists are a borrowed slice of the message — `format!`
-/// and `String::replace` would each copy them just to reuse the text unchanged.
-fn push_single_line(into: &mut String, text: &str) {
+/// or ends in a break does not leave a gap. Returns whether a segment was
+/// written: FS/GS/RS are transcript breaks but not Unicode whitespace, so a
+/// field made only of them survives `trim` and still folds to nothing. Written
+/// straight into the transcript because most argument lists are a borrowed
+/// slice of the message — `format!` and `String::replace` would each copy them
+/// just to reuse the text unchanged.
+fn push_single_line(into: &mut String, text: &str) -> bool {
     let start = into.len();
     let mut wrote = false;
     for_each_line(text, |line| {
@@ -901,6 +904,17 @@ fn push_single_line(into: &mut String, text: &str) {
     });
     while into.len() > start && into.ends_with(' ') {
         into.pop();
+    }
+    wrote
+}
+
+/// Append a call field after a single separating space, or nothing at all when
+/// the field folds away, so the line never ends with a dangling space.
+fn push_call_field(into: &mut String, text: &str) {
+    let start = into.len();
+    into.push(' ');
+    if !push_single_line(into, text.trim()) {
+        into.truncate(start);
     }
 }
 
@@ -968,9 +982,14 @@ fn render_transcript(span: &[Message]) -> String {
         // text line, never glued to a `[tool call: ...]` line.
         if !m.images.is_empty() {
             // The separator belongs to whatever the body actually wrote: a
-            // trailing space or newline already separates, and the role prefix
-            // ends in one space.
-            if s.chars().last().is_some_and(|c| !c.is_whitespace()) {
+            // trailing space already separates, and the role prefix ends in
+            // one. A trailing break also separates, but it would leave the
+            // marker at an unpadded line start, so pad it there like any
+            // escaped continuation line.
+            if s.chars()
+                .last()
+                .is_some_and(|c| is_line_break(c) || !c.is_whitespace())
+            {
                 s.push(' ');
             }
             s.push_str(&format!("[{} image(s) attached]", m.images.len()));
@@ -992,14 +1011,8 @@ fn render_transcript(span: &[Message]) -> String {
                 SUMMARY_TOOL_CALL_TAIL_CHARS,
             );
             s.push_str("\n[tool call:");
-            if !name.trim().is_empty() {
-                s.push(' ');
-                push_single_line(&mut s, name.trim());
-            }
-            if !arguments.trim().is_empty() {
-                s.push(' ');
-                push_single_line(&mut s, arguments.trim());
-            }
+            push_call_field(&mut s, &name);
+            push_call_field(&mut s, &arguments);
             s.push(']');
         }
         s.push('\n');
@@ -3552,6 +3565,37 @@ mod tests {
         let out = render_transcript(&[Message::assistant("", vec![call])]);
         assert!(out.contains("[tool call: read_file {}]\n"), "{out:?}");
         assert!(!out.contains("[tool call:  "), "{out:?}");
+    }
+
+    #[test]
+    fn a_call_field_of_breaks_only_does_not_leave_a_space() {
+        // FS/GS/RS are transcript breaks but not Unicode whitespace, so a lone
+        // one survives `trim` and then folds to nothing; the separator must go
+        // with it.
+        let call = ToolCall {
+            id: "c1".into(),
+            name: "\u{001C}".into(),
+            arguments: "\u{001D}\u{001E}".into(),
+        };
+        let out = render_transcript(&[Message::assistant("", vec![call])]);
+        assert!(out.contains("[tool call:]\n"), "{out:?}");
+        assert!(
+            !out.contains("[tool call: "),
+            "no dangling separator: {out:?}"
+        );
+    }
+
+    #[test]
+    fn an_image_marker_after_a_blank_line_is_padded() {
+        let img = atomcode_kernel::message::ImageContent {
+            media_type: "image/png".into(),
+            data: "AAAA".into(),
+        };
+        let out = render_transcript(&[Message::user_with_images("text\n\n", vec![img])]);
+        assert!(
+            out.contains("USER: text\n [1 image(s) attached]"),
+            "a marker that lands on a fresh line must be padded: {out:?}"
+        );
     }
 
     #[test]
