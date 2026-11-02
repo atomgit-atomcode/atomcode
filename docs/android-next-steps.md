@@ -10,7 +10,7 @@
 
 ## 一、功能：待做
 
-### 1. 真正有用的 MCP 集成包（仓库内部分已完成，发布未做）
+### 1. 真正有用的 MCP 集成包（已完成，两个包都已发布）
 
 **现状**：MCP 的**交付形态**已经跑通两种，都是真机验证过的：
 
@@ -31,11 +31,17 @@
   initialize / tools/list / tools/call 与两条失败路径（越界、二进制），不需要真机；
 - 真机安装路径与 `mcp-example` 相同（`POST /packages/install`，再让 `mcp.json` 指向别名）。
 
-**发布状态（2026-11-01 更新）**：旧的市场仓库 `E:/atomcode-plugins` 因推送权限受阻，
-已换成个人公开仓库 [`qiaoen_python/atomcode-android-plugins`](https://atomgit.com/qiaoen_python/atomcode-android-plugins)
-（AtomGit）。目前该仓库只发布了 14 个 provider APK + 数据包（见下方第 3 节），
-`mcp-filesystem` 这个插件本身尚未搬过去——产物已经可编、可自测，发布是纯搬运，
-流程见该仓库的 `tools/write_market.py`。
+**发布状态（2026-11-02 更新）**：市场仓库已换成个人公开仓库
+[`qiaoen_python/atomcode-android-plugins`](https://atomgit.com/qiaoen_python/atomcode-android-plugins)
+（AtomGit），里面现在是 14 个 provider APK + 11 个数据包 + **两个 MCP 插件**：
+
+- `mcp-filesystem`（6837 字节）、`mcp-example`（5174 字节），`category: "mcp"`，
+  包体走 Release 附件（`v1.0`），`artifact.kind = "url"` 直链；
+- 真机 `GET /packages/market?refresh=1` 返回 13 个 plugins（11 数据包 + 2 MCP）+ 14 个
+  helpers，两个附件下载回来 sha256 与清单一致。
+
+清单由该仓库的 `tools/write_market.py` 生成；二进制不在仓库里，大小与哈希记在
+`packages/manifest.json`，所以重新生成清单不需要把几百 MB 拷回来。
 
 **落点**：`scripts/mcp-filesystem/`、`scripts/build-android-mcp-filesystem.sh`、
 `docs/plugin-market.md`。

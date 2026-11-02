@@ -27,6 +27,7 @@ import {
   CdResponse,
 } from '../api';
 import { useT } from '../settings';
+import { needsCleartextWarning, schemeFor } from '../lib/gitCredentialScheme';
 
 /** Turn anything thrown by the API client into one readable line. */
 function errText(error: unknown): string {
@@ -252,7 +253,7 @@ export function SourceControl({ onClose, onPick }: SourceControlProps) {
         host,
         username,
         token,
-        credentialInsecure ? 'http' : 'https',
+        schemeFor(credentialInsecure),
       );
       // Never keep the token in component state after it is stored.
       setCredentialToken('');
@@ -526,7 +527,7 @@ export function SourceControl({ onClose, onPick }: SourceControlProps) {
               <div class="scm-row" key={credential.host}>
                 <span class="scm-remote-name mono">{credential.host}</span>
                 <span class="scm-row-path">{credential.username}</span>
-                {credential.scheme === 'http' && (
+                {needsCleartextWarning(credential.scheme) && (
                   <span class="scm-credential-warning">
                     {t('scm.insecureScheme')}
                   </span>
