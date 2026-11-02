@@ -282,7 +282,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     #[test]
-    fn split_absolute_base_handles_windows_and_unix_roots() {
+    fn split_absolute_base_handles_windows_roots() {
         // Windows drive, forward slashes.
         let (base, rest) = split_absolute_base("G:/VR2024/keystore/*").unwrap();
         assert_eq!(base, PathBuf::from("G:/VR2024/keystore"));

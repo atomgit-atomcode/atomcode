@@ -562,7 +562,9 @@ impl FileIndex {
         // 因此按根目录是否在 VCS 检出内选择合法组合：
         // - 检出内：`parents(true) + require_git(true)`——仓库根的 .gitignore 对以
         //   子目录为根的遍历仍然生效，而 crate 的 saw_git 边界保证仓库之外的祖先
-        //   规则不漏进来；
+        //   git 规则（.gitignore / .git/info/exclude）不漏进来（`.ignore` 文件的
+        //   匹配器不受 saw_git 门控，边界之上的祖先 .ignore 仍生效——与 ripgrep
+        //   行为一致，非本函数要管的事）；
         // - 检出外：`parents(false) + require_git(false)`——根目录自己的
         //   .gitignore/.ignore 照旧生效（这正是 require_git(false) 的存在意义），
         //   祖先规则与 git 一致地不适用。
@@ -965,12 +967,16 @@ mod tests {
     #[test]
     fn a_plain_root_does_not_inherit_ancestor_gitignores() {
         let tmp = tempfile::tempdir().unwrap();
-        // Environmental premise: no `.git` on the tempdir's ancestor chain.
-        // Where that does not hold (e.g. TEMP pointed inside a checkout),
-        // ancestor gitignores applying is legitimate git semantics and this
-        // test's premise is false, so it skips.
-        if tmp.path().ancestors().any(|d| d.join(".git").exists()) {
-            eprintln!("skip: tempdir is inside a git checkout");
+        // Environmental premise: no `.git`/`.jj` on the tempdir's ancestor chain
+        // (mirrors the production predicate above). Where that does not hold
+        // (e.g. TEMP pointed inside a checkout), ancestor gitignores applying is
+        // legitimate git semantics and this test's premise is false, so it skips.
+        if tmp
+            .path()
+            .ancestors()
+            .any(|d| d.join(".git").exists() || d.join(".jj").exists())
+        {
+            eprintln!("skip: tempdir is inside a VCS checkout");
             return;
         }
         // outer/ is not a repo; its .gitignore must not govern inner/.

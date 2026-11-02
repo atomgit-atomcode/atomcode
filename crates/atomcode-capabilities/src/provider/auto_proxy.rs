@@ -191,7 +191,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_proxy_only_bypasses_refused_loopback_ports() {
+    fn auto_proxy_only_bypasses_dead_loopback_proxies() {
         for raw in [
             "http://127.0.0.1:7890",
             "http://[::1]:7890",
