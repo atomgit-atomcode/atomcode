@@ -930,13 +930,13 @@ impl CompactionGate {
         }
     }
 
-    /// Lower pressure rearms the session: drop its entry and clear the hint.
+    /// Lower pressure rearms the session by dropping its entry. The hint is left
+    /// as-is: a stale both bit only makes the next request take the lock and
+    /// re-read the map, and `first_try` refreshes it. Clearing it here would pay
+    /// a hash + atomic store on every low-pressure request.
     fn rearm(&self, session: &str) {
-        {
-            let mut tried = self.tried.lock().expect("compaction attempts poisoned");
-            tried.remove(session);
-        }
-        self.hint.set(session, false);
+        let mut tried = self.tried.lock().expect("compaction attempts poisoned");
+        tried.remove(session);
     }
 }
 
@@ -1882,6 +1882,23 @@ mod gate_tests {
         // The map under the lock is still authoritative: A's slots stay spent.
         assert!(!gate.first_try(a, 7, true));
         assert!(!gate.first_try(a, 7, false));
+    }
+
+    #[test]
+    fn a_rearm_behind_a_stale_hint_still_reopens_the_gate() {
+        let gate = CompactionGate::new();
+
+        assert!(gate.first_try("s", 3, false));
+        assert!(gate.first_try("s", 3, true));
+        assert!(gate.both_tried("s", 3));
+
+        // rearm keeps the hint set on purpose; the map under the lock must
+        // still answer false so the next request can compact again.
+        gate.rearm("s");
+        assert!(!gate.both_tried("s", 3));
+        assert!(gate.first_try("s", 3, false));
+        assert!(gate.first_try("s", 3, true));
+        assert!(gate.both_tried("s", 3));
     }
 
     #[test]
