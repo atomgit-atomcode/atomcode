@@ -1457,7 +1457,9 @@ async fn a_zero_round_turn_builds_a_valid_script() {
     let attempts = Arc::new(AtomicU32::new(0));
     let app = verdict_app_with_rounds(&dir, &asked, &attempts, 1, 0, 0.0005).await;
 
-    run_turn(&app, "first").await.unwrap();
+    let outcome = run_turn(&app, "first").await.unwrap();
+    assert_eq!(outcome.steps, 1, "the closing answer is one model step");
+    assert!(outcome.text.contains("done"), "{:?}", outcome.text);
     assert_eq!(asked.load(Ordering::SeqCst), 0);
     assert_eq!(attempts.load(Ordering::SeqCst), 0);
 }
@@ -1481,14 +1483,20 @@ async fn a_second_session_still_gets_its_own_attempt() {
 
     let a = atomcode_harness::create_agent(&app).await.unwrap();
     let b = atomcode_harness::create_agent(&app).await.unwrap();
+    assert_ne!(a.session_id(), b.session_id());
+    // Both agents reach their first turn's gate; a gate keyed only by turn
+    // would see A's spent slots and skip B.
 
     a.send("first");
     atomcode_harness::drive(&app, &a).await.unwrap();
+    assert_eq!(a.session().current_turn(), 1);
+    assert_eq!(b.session().current_turn(), 0);
     assert_eq!(asked.load(Ordering::SeqCst), 2);
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
 
     b.send("second");
     atomcode_harness::drive(&app, &b).await.unwrap();
+    assert_eq!(b.session().current_turn(), 1);
     assert_eq!(
         asked.load(Ordering::SeqCst),
         3,

@@ -1860,7 +1860,29 @@ mod hint_tests {
 
 #[cfg(test)]
 mod gate_tests {
-    use super::CompactionGate;
+    use super::{session_key, CompactionGate, GateHint};
+
+    #[test]
+    fn a_slot_collision_only_loses_the_hint() {
+        let a = "session-a";
+        let b = (0..1_000)
+            .map(|i| format!("session-collide{i}"))
+            .find(|b| GateHint::slot(session_key(a)) == GateHint::slot(session_key(b)))
+            .expect("a colliding session key");
+        let gate = CompactionGate::new();
+
+        assert!(gate.first_try(a, 7, true));
+        assert!(gate.first_try(a, 7, false));
+        assert!(gate.both_tried(a, 7));
+
+        // B's first_try writes the same hint slot and evicts A's hint.
+        assert!(gate.first_try(&b, 7, true));
+        assert!(!gate.both_tried(a, 7));
+
+        // The map under the lock is still authoritative: A's slots stay spent.
+        assert!(!gate.first_try(a, 7, true));
+        assert!(!gate.first_try(a, 7, false));
+    }
 
     #[test]
     fn sessions_do_not_silence_each_other() {
