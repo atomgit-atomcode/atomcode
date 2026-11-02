@@ -1327,6 +1327,29 @@ async fn verdict_app_with_rounds(
     app
 }
 
+async fn verdict_app_with_script(
+    dir: &std::path::Path,
+    asked: &Arc<AtomicU32>,
+    attempts: &Arc<AtomicU32>,
+    true_for: u32,
+    threshold: f32,
+    script: &str,
+) -> App {
+    let swap = "[[remove]]\nid = \"compaction-tail\"\n\n\
+                [[insert]]\nid = \"compaction-verdict\"\nname = \"compaction-verdict\"\n\n\
+                [[remove]]\nid = \"repeat-fuse\"\n\n[[remove]]\nid = \"tool-loop-guard\"";
+    let mut registry = atomcode_coding::on_harness::catalog();
+    registry.register(Arc::new(VerdictRow {
+        asked: asked.clone(),
+        attempts: attempts.clone(),
+        true_for,
+        threshold,
+    }));
+    let mut app = App::new(registry, tree(dir, script, &[swap]));
+    app.start().await.expect("must mount");
+    app
+}
+
 /// Pressure does not fall between the rounds of a turn. Once both stages have
 /// been spent, the trigger must stop asking the strategy — `calls_model`
 /// projects the whole log — and only a new turn (or a pressure drop) may rearm
@@ -1437,4 +1460,39 @@ async fn a_zero_round_turn_builds_a_valid_script() {
     run_turn(&app, "first").await.unwrap();
     assert_eq!(asked.load(Ordering::SeqCst), 0);
     assert_eq!(attempts.load(Ordering::SeqCst), 0);
+}
+
+/// Two root sessions share one trigger row. A spends both stages; B's own first
+/// turn must still be asked and attempted instead of inheriting A's gate.
+#[tokio::test]
+async fn a_second_session_still_gets_its_own_attempt() {
+    let dir = scratch("two-sessions");
+    std::fs::write(dir.join("a.txt"), "x").unwrap();
+    let call =
+        r#"{ text = "again", calls = [ { name = "read_file", args = { file_path = "a.txt" } } ] }"#;
+    // A: four tool rounds + closing; B: one tool round + closing.
+    let script = format!(
+        "[[patch]]\nid = \"llm\"\nname = \"llm-replay\"\nconfig = {{ context_window = 128000, script = [\n  \
+         {call},\n  {call},\n  {call},\n  {call},\n  {{ text = \"a done\" }},\n  {call},\n  {{ text = \"b done\" }}\n] }}\n"
+    );
+    let asked = Arc::new(AtomicU32::new(0));
+    let attempts = Arc::new(AtomicU32::new(0));
+    let app = verdict_app_with_script(&dir, &asked, &attempts, 1, 0.0000001, &script).await;
+
+    let a = atomcode_harness::create_agent(&app).await.unwrap();
+    let b = atomcode_harness::create_agent(&app).await.unwrap();
+
+    a.send("first");
+    atomcode_harness::drive(&app, &a).await.unwrap();
+    assert_eq!(asked.load(Ordering::SeqCst), 2);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+    b.send("second");
+    atomcode_harness::drive(&app, &b).await.unwrap();
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        3,
+        "the second session must still be asked instead of inheriting A's gate"
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 3);
 }
