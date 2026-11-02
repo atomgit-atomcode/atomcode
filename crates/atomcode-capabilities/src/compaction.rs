@@ -749,9 +749,16 @@ fn cut_body(
         .skip(total.saturating_sub(tail_chars))
         .collect();
     let cut = total.saturating_sub(body_max);
-    // The marker puts the tail on a fresh line. Only that first line is created
-    // by the cut; a later line already had its own start in the transcript.
-    let pad = if pad_tail && starts_transcript_line(first_line(&tail)) {
+    // The marker puts the tail on a fresh line. That line is new only when the
+    // cut fell inside a line; at a line boundary the first tail line is a
+    // genuine transcript line and must keep its role.
+    let tail_start = total.saturating_sub(tail_chars);
+    let split_mid_line = tail_start > 0
+        && text
+            .chars()
+            .nth(tail_start - 1)
+            .is_some_and(|c| !is_line_break(c));
+    let pad = if pad_tail && split_mid_line && starts_transcript_line(first_line(&tail)) {
         " "
     } else {
         ""
@@ -3150,6 +3157,25 @@ mod tests {
         );
         assert!(out.contains("\n\nUSER: existing"), "{out:?}");
         assert!(!out.contains("\n \nUSER: existing"), "{out:?}");
+    }
+
+    #[test]
+    fn a_whole_span_cut_keeps_a_genuine_transcript_line() {
+        // The tail starts exactly at a line boundary, so its first line is a
+        // genuine role line from the transcript, not a fragment made by the cut.
+        let role = "USER: existing";
+        let text = format!("{}\n{role}", "a".repeat(90));
+        let total = text.chars().count();
+        let out = cut_body(
+            &text,
+            total,
+            100,
+            role.chars().count(),
+            "conversation truncated",
+            true,
+        );
+        assert!(out.contains(&format!("\n{role}")), "{out:?}");
+        assert!(!out.contains(&format!("\n {role}")), "{out:?}");
     }
 
     #[test]
