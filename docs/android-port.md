@@ -1648,9 +1648,16 @@ bash scripts/build-android-lupa-plugin.sh
 ```
 
 取源码包那条路刻意**不用 `pip download --no-binary`**：那会让 pip 去准备构建依赖、在这台
-机器上直接卡死（`exit 124`），而这里只想要那 6 MB 的字节。做法是查 PyPI 的 JSON 拿 sdist
-直链再 `curl`，`LUPA_VERSION` 换版本、`LUPA_SDIST_URL=<镜像直链>` 换源（清华
-`https://pypi.tuna.tsinghua.edu.cn/packages/...` 实测 200、同样能编出 250 KB 的 wheel）。
+机器上直接卡死（`exit 124`），而这里只想要那 6 MB 的字节。做法是查索引拿 sdist 路径，再
+`curl` 下来；`LUPA_VERSION` 换版本，`LUPA_SDIST_URL` 指定直链（可给多个，按序尝试），
+`LUPA_MIRRORS` 换回退镜像。
+
+回退不是简单"多给几个源"：清华与阿里云的 JSON 接口都能应答，但**它返回的 sdist 链接仍指向
+`files.pythonhosted.org`**——恰好在 PyPI 不可达时没用。真正有效的是镜像**同样路径**下的副本，
+所以脚本查一次路径，然后把 `https://files.pythonhosted.org<路径>`、`<清华><路径>`、
+`<阿里云>/pypi<路径>` 依次试。索引本身也连不上时，退而解析镜像的 simple 页面拿路径。
+
+实测：故意把第一个地址指向不存在的域名，脚本跳到清华并编出同一个 250176 字节的 wheel。
 
 真机验证（装成插件后由 agent 回合里的 bash 工具执行）：
 

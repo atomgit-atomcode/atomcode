@@ -35,56 +35,101 @@ if [ -z "$SOURCE" ]; then
   SOURCE=$(ls -1 "$REPO"/lupa-*.tar.gz 2>/dev/null | head -1 || true)
 fi
 # The sdist the build needs lives on PyPI; a host that cannot reach it should not
-# need a human to fetch it by hand. `LUPA_VERSION` picks the version and
-# `LUPA_SDIST_URL` points at a mirror's direct link when the index is unreachable.
+# need a human to fetch it by hand. `LUPA_VERSION` picks the version,
+# `LUPA_SDIST_URL` forces one direct link, `LUPA_MIRRORS` replaces the fallbacks.
 #
 # Deliberately NOT `pip download --no-binary`: that asks pip to *build* a wheel
 # (prepare build dependencies) and this host hangs there, which is what made the
-# whole script need a hand-fed tarball. Only the bytes are wanted, so the URL
-# comes from the index API and `curl` fetches it.
+# whole script need a hand-fed tarball. Only the bytes are wanted.
+#
+# The mirrors' JSON API answers, but the sdist link it returns still points at
+# `files.pythonhosted.org` — useless precisely when PyPI is what is unreachable.
+# What does work is the mirror's own copy at the same path, so the path is looked
+# up once and then offered to each host in turn.
 LUPA_VERSION=${LUPA_VERSION:-2.8}
+LUPA_MIRRORS=${LUPA_MIRRORS:-"https://pypi.tuna.tsinghua.edu.cn https://mirrors.aliyun.com/pypi"}
 SDIST_CACHE="$OUT/lupa-sdist"
 
-sdist_url() {
-  python3 - "$LUPA_VERSION" <<'PY'
-import json, sys, urllib.request
-version = sys.argv[1]
+# Prints candidate download URLs, best first. The path comes from the PyPI JSON
+# API; when that is unreachable, the mirror's simple index is parsed instead so
+# at least one host can still be asked.
+sdist_candidates() {
+  python3 - "$LUPA_VERSION" ${LUPA_MIRRORS} <<'PY'
+import json, re, sys, urllib.request
+
+version, mirrors = sys.argv[1], sys.argv[2:]
+
+
+def fetch(url):
+    with urllib.request.urlopen(url, timeout=30) as fh:
+        return fh.read().decode("utf-8", "replace")
+
+
+def path_of(url):
+    rest = url.split("://", 1)[-1]
+    _, _, tail = rest.partition("/")
+    return "/" + tail
+
+
+path = None
 try:
-    with urllib.request.urlopen(f"https://pypi.org/pypi/lupa/{version}/json", timeout=30) as fh:
-        data = json.load(fh)
+    for entry in json.loads(fetch(f"https://pypi.org/pypi/lupa/{version}/json")).get("urls", []):
+        if entry.get("packagetype") == "sdist":
+            path = path_of(entry["url"])
+            break
 except Exception:
+    pass
+
+if path is None:
+    pattern = re.compile(r'href="([^"#]*lupa-%s\.tar\.gz)' % re.escape(version))
+    for mirror in mirrors:
+        try:
+            match = pattern.search(fetch(mirror.rstrip("/") + "/simple/lupa/"))
+        except Exception:
+            continue
+        if match:
+            path = path_of(match.group(1)) if "://" in match.group(1) else "/" + match.group(1).lstrip("/")
+            break
+
+if path is None:
     sys.exit(1)
-for f in data.get("urls", []):
-    if f.get("packagetype") == "sdist":
-        print(f["url"])
-        break
+
+print("https://files.pythonhosted.org" + path)
+for mirror in mirrors:
+    print(mirror.rstrip("/") + path)
 PY
 }
 
 download_sdist() {
   rm -rf "$SDIST_CACHE"
   mkdir -p "$SDIST_CACHE"
-  url=${LUPA_SDIST_URL:-}
-  if [ -z "$url" ]; then
-    echo "→ 查 PyPI 上 lupa $LUPA_VERSION 的源码包地址" >&2
-    url=$(sdist_url) || true
+  local urls="" url
+  if [ -n "${LUPA_SDIST_URL:-}" ]; then
+    urls=$LUPA_SDIST_URL
+  else
+    echo "→ 查 lupa $LUPA_VERSION 的源码包地址" >&2
+    urls=$(sdist_candidates) || true
   fi
-  if [ -z "$url" ]; then
-    echo "  （查不到地址；可以用 LUPA_SDIST_URL=<直链> 指定镜像）" >&2
+  if [ -z "$urls" ]; then
+    echo "  （连索引都查不到；用 LUPA_SDIST_URL=<直链> 指定一个可用的源）" >&2
     return 1
   fi
-  echo "→ 下载 $url" >&2
-  if ! curl -fsSL --retry 3 --connect-timeout 30 -o "$SDIST_CACHE/lupa-$LUPA_VERSION.tar.gz" "$url"; then
-    return 1
-  fi
-  echo "$SDIST_CACHE/lupa-$LUPA_VERSION.tar.gz"
+  for url in $urls; do
+    echo "→ 尝试 $url" >&2
+    if curl -fsSL --retry 2 --connect-timeout 20 \
+        -o "$SDIST_CACHE/lupa-$LUPA_VERSION.tar.gz" "$url"; then
+      echo "$SDIST_CACHE/lupa-$LUPA_VERSION.tar.gz"
+      return 0
+    fi
+  done
+  return 1
 }
 if [ -z "$SOURCE" ] || [ ! -f "$SOURCE" ]; then
   SOURCE=$(download_sdist) || true
 fi
 if [ -z "$SOURCE" ] || [ ! -f "$SOURCE" ]; then
   echo "usage: $0 <lupa-sdist.tar.gz>" >&2
-  echo "  (也可以不传：脚本会从 PyPI 取 lupa $LUPA_VERSION；镜像用 LUPA_SDIST_URL 指定直链)" >&2
+  echo "  (也可以不传：脚本会从 PyPI 取 lupa $LUPA_VERSION，取不到就按同样路径改走镜像)" >&2
   exit 2
 fi
 if [ -z "${PYINC:-}" ] || [ ! -f "$PYINC/Python.h" ]; then
