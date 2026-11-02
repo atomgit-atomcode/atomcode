@@ -378,7 +378,15 @@ impl McpRegistry {
                     let placeholder = format!("{label} (mounted, no instructions)");
                     let placeholder = neutralize_prompt_boundaries(&placeholder);
                     let (placeholder, truncated) = truncate_chars(&placeholder, remaining);
-                    (placeholder, truncated)
+                    let placeholder = format!("{label} (mounted, no instructions)");
+                    let placeholder = neutralize_prompt_boundaries(&placeholder);
+                    if placeholder.chars().count() > remaining {
+                        // A partial placeholder carries no information; keep the
+                        // server label out and report the omission instead.
+                        omitted = true;
+                        continue;
+                    }
+                    (placeholder, false)
                 }
             };
             remaining = remaining.saturating_sub(content.chars().count());
