@@ -895,10 +895,17 @@ impl CompactBeforeRequest {
     /// above the threshold must not pay that projection on every request after
     /// both attempts are spent.
     ///
-    /// Only an ask whose `calls_model` returns true spends the slow slot: the
-    /// built-in tail strategy always answers false, and a model-backed
-    /// summarizer only when the ask is not an overflow stub and it has a settled
-    /// span to summarize. The optimization pays off on those asks.
+    /// `first_try` marks slot 0 for the fast stage (`slow == false`) and slot 1
+    /// for the slow one; only an ask whose `calls_model` returns true takes the
+    /// slow slot. The built-in tail strategy always answers false, and a
+    /// model-backed summarizer only when the ask is not an overflow stub and it
+    /// has a settled span to summarize.
+    ///
+    /// Both slots are therefore spent only after the verdict flips inside the
+    /// turn: an always-true verdict keeps asking until `first_try` refuses the
+    /// spent slow slot, and an always-false verdict only spends the fast one. A
+    /// stable verdict never trips this gate and is still asked on every request;
+    /// the optimization pays off once the verdict flips and both slots are spent.
     ///
     /// Read-only: the turn reset belongs to `first_try`, which every request
     /// that gets past this check still reaches, so a steady turn pays one map

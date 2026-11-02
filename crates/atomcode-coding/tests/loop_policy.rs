@@ -1282,7 +1282,8 @@ async fn verdict_app(
 
 /// A turn of `rounds` tool rounds plus the closing answer, followed by one more
 /// turn's answer. The first request has no usage; the responses after it drive
-/// the trigger. `threshold` sets how many prompt tokens count as pressure.
+/// the trigger. `threshold` is the fraction of the context window that counts as
+/// pressure (the trigger is `window * threshold`), not a raw prompt-token count.
 async fn verdict_app_with_rounds(
     dir: &std::path::Path,
     asked: &Arc<AtomicU32>,
@@ -1293,10 +1294,13 @@ async fn verdict_app_with_rounds(
 ) -> App {
     let call =
         r#"{ text = "again", calls = [ { name = "read_file", args = { file_path = "a.txt" } } ] }"#;
-    let calls = vec![call; rounds].join(",\n  ");
+    let mut steps = vec![call; rounds];
+    steps.push(r#"{ text = "done" }"#);
+    steps.push(r#"{ text = "next" }"#);
     let script = format!(
         "[[patch]]\nid = \"llm\"\nname = \"llm-replay\"\nconfig = {{ context_window = 128000, script = [\n  \
-         {calls},\n  {{ text = \"done\" }},\n  {{ text = \"next\" }}\n] }}\n"
+         {}\n] }}\n",
+        steps.join(",\n  ")
     );
     let swap = "[[remove]]\nid = \"compaction-tail\"\n\n\
                 [[insert]]\nid = \"compaction-verdict\"\nname = \"compaction-verdict\"\n\n\
@@ -1405,4 +1409,16 @@ async fn a_pressure_drop_rearms_the_fast_path_inside_one_turn() {
         "the gate skipped one high request, the drop rearmed, and the rise asked again"
     );
     assert_eq!(attempts.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn a_zero_round_turn_builds_a_valid_script() {
+    let dir = scratch("zero-rounds");
+    let asked = Arc::new(AtomicU32::new(0));
+    let attempts = Arc::new(AtomicU32::new(0));
+    let app = verdict_app_with_rounds(&dir, &asked, &attempts, 1, 0, 0.0005).await;
+
+    run_turn(&app, "first").await.unwrap();
+    assert_eq!(asked.load(Ordering::SeqCst), 0);
+    assert_eq!(attempts.load(Ordering::SeqCst), 0);
 }
