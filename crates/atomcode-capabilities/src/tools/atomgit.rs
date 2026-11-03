@@ -637,7 +637,9 @@ impl Tool for AtomgitApiTool {
          and exceeds web_fetch's 2 MiB cap, so it arrives truncated.\n\n\
          Search requires `type` (one of repo, user, group, pullrequest, issue; \
          missing or invalid returns 400) plus optional `q`, `p`, `pp`, `repo_type` \
-         (0=code, 1=model, 2=dataset; repeatable). Working call, every query value is \
+         (0=code, 1=model, 2=dataset). This tool accepts one string value per query \
+         key; to search multiple repo types, issue a separate request for each type. \
+         Do not pass arrays or duplicate keys. Working call, every query value is \
          a string:\n\
          {\"method\":\"GET\",\"path\":\"/search\",\"query\":{\"type\":\"repo\",\"q\":\"Qwen\",\"repo_type\":\"1\",\"p\":\"1\",\"pp\":\"10\"}}\n\n\
          Unknown query parameters may be ignored silently and an out-of-range value \
