@@ -6950,6 +6950,15 @@ impl Host {
             }
         }
 
+        if let (Some(shown), Some(modal), Some(part)) = (
+            moment.flow.as_ref(),
+            self.overlays.current(),
+            frame.part("flow"),
+        ) {
+            let room = part.rect.h.saturating_sub(3) as usize;
+            modal.set_scroll_limit(shown.lines.len().saturating_sub(1).saturating_sub(room));
+        }
+
         // A flow is at the foot of the screen, where the composer was: the
         // keys are its, not the field's, so nothing puts a caret there.
         if moment.flow.is_some() {
@@ -6970,7 +6979,18 @@ impl Host {
                     ),
                     &moment,
                 );
-                let body = modal.render(&vp);
+                let mut body = modal.render(&vp);
+                let hint = body.pop();
+                let room = vp.rect.h.saturating_sub(1) as usize;
+                modal.set_scroll_limit(body.len().saturating_sub(room));
+                let mut body: Vec<_> = body
+                    .into_iter()
+                    .skip(modal.scroll_offset())
+                    .take(room)
+                    .collect();
+                if vp.rect.h > 0 {
+                    body.extend(hint);
+                }
                 frame.place(
                     modal.id(),
                     rect,
@@ -7572,6 +7592,7 @@ impl Host {
             let lines = modal.render(&crate::moment::Viewport::new(Rect::sized(w, h), moment));
             moment.flow = Some(crate::overlay::Shown {
                 id: modal.id().to_string(),
+                scroll: modal.scroll_offset(),
                 title: modal.title(),
                 lines,
             });
@@ -9842,6 +9863,36 @@ mod tests {
             before,
             "and it is back as it was"
         );
+    }
+
+    #[test]
+    fn a_tall_pairing_flow_can_reach_its_last_row_in_a_short_terminal() {
+        use crate::overlay::Overlay;
+        let h = host();
+        h.modules
+            .add_view(Arc::new(Mounted::<crate::modules::flow::FlowView>::new()))
+            .unwrap();
+        let wizard = crate::wizard::Wizard::new(
+            "pair",
+            "Pair",
+            vec![
+                crate::wizard::StepDef::new("pair", "Phone", crate::wizard::StepKind::Note)
+                    .saying((0..60).map(|n| format!("pair row {n}")).collect()),
+            ],
+            Box::new(|_| {}),
+            "/done",
+        );
+        h.overlays.open(wizard.clone(), Box::new(|_| {}));
+        let first = h.compose((80, 20));
+        let hint = first.part("flow").unwrap().lines.last().unwrap().plain();
+        assert!(!hint.is_empty());
+        wizard.scroll(1000);
+        let last = h.compose((80, 20));
+        let lines = &last.part("flow").unwrap().lines;
+        assert!(lines.iter().any(|l| l.plain().contains("pair row 59")));
+        assert_eq!(lines.last().unwrap().plain(), hint);
+        h.compose((80, 80));
+        assert_eq!(wizard.scroll_offset(), 0);
     }
 
     /// A flow (the onboarding or pairing wizard) is drawn at the foot of the

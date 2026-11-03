@@ -2612,6 +2612,11 @@ impl UserInterface for Tui {
                             Click::WheelUp => -WHEEL_LINES,
                             _ => WHEEL_LINES,
                         };
+                        if let Some(flow) = self.host.overlays.current() {
+                            flow.scroll(by);
+                            stale = true;
+                            continue;
+                        }
                         if self.host.todo_wheel(x, y, by) {
                             stale = true;
                             continue;
