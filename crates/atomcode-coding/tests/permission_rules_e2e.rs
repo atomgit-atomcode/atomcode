@@ -234,6 +234,63 @@ async fn project_authorized_test_loops_run_through_the_native_security_gates() {
     assert!(project.path().join("results").exists());
 }
 
+/// Windows counterpart of the criterion above. Two things differ and nothing else: the script
+/// is invoked through `sh` because Windows has no executable bit, and the loop precondition is
+/// a POSIX shell — without Git for Windows the bash tool falls back to cmd.exe, where the
+/// `for … do … done` form this issue is about does not exist at all. That case says so out
+/// loud instead of passing silently.
+#[cfg(windows)]
+#[tokio::test(flavor = "current_thread")]
+async fn project_authorized_test_loops_run_through_the_native_security_gates_on_windows() {
+    // `detect_windows_bash` looks for Git Bash, and its portable second probe is `where git`,
+    // so a `git` on PATH is the signal that the bash tool will run this command in a POSIX
+    // shell rather than cmd.exe.
+    let has_git_bash = std::process::Command::new("where")
+        .arg("git")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !has_git_bash {
+        eprintln!(
+            "skipping: no Git for Windows on PATH, so the bash tool would fall back to \
+             cmd.exe and a POSIX loop would not run"
+        );
+        return;
+    }
+
+    let project = tempfile::tempdir().unwrap();
+    let script = project.path().join("check");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nprintf 'checked\\n' >> results\nprintf 'ok\\n'\n",
+    )
+    .unwrap();
+    write_project_permissions(
+        project.path(),
+        serde_json::json!({"permissions": {
+            "allow": ["Bash(sh ./check defense)"], "deny": ["Bash(rm *)"]
+        }}),
+    );
+    // Git Bash takes the drive path either way, but forward slashes keep `cd` unambiguous.
+    let cwd = project.path().display().to_string().replace('\\', "/");
+    let command =
+        format!("cd '{cwd}' && for i in 1 2 3; do sh ./check defense 2>&1 | tail -5; done");
+    let result = run_turn(project.path(), &command, PermissionRules::default()).await;
+    assert!(!result.prompted, "an authorized loop must not prompt");
+    assert!(!result.denied);
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("results")).unwrap(),
+        "checked\nchecked\nchecked\n"
+    );
+    let result = run_turn(
+        project.path(),
+        "for i in 1 2; do sh ./check defense; rm -rf results; done",
+        PermissionRules::default(),
+    )
+    .await;
+    assert!(result.denied);
+    assert!(project.path().join("results").exists());
+}
+
 // This criterion executes a real OS subprocess. A paused runtime advances the
 // Bash timeout before that process can finish; matcher and catalog/lifecycle
 // criteria use virtual time where no process must run.
