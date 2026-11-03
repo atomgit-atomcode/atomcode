@@ -10,12 +10,18 @@ const meta = { id, name: 'Context summary', working_dir: '/fixture', project_has
 const messages = [{ role: 'user', content: 'Check the resource boundary' }, { role: 'assistant', content: 'The resource read boundary is ready.' }];
 const other = { ...meta, id: 'browse-fixture', name: 'Other conversation' };
 let switches = 0;
+const terminalRequests = [];
 const clients = new Set();
 let baseline = 3;
 const snapshot = () => ({ type: 'snapshot', session_id: id, session_name: meta.name, project_hash: 'fixture', working_dir: '/fixture', provider: 'fixture', model: 'fixture', mode: 'build', summary_count: baseline, messages });
 const server = createServer(async (req, res) => {
   const path = new URL(req.url, 'http://localhost').pathname;
   const json = value => { res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(value)); };
+  if (path === '/workbench/terminals' && req.method === 'POST') {
+    let body = ''; for await (const chunk of req) body += chunk;
+    terminalRequests.push(JSON.parse(body));
+    res.statusCode = 403; return json({error:'Terminal creation denied for fixture'});
+  }
   if (path.startsWith('/workbench/')) return json([]);
   if (path === '/live/permission') return json({accepted:true});
   if (path === '/live/switch_session') { switches++; return json({ok:true}); }
@@ -94,6 +100,20 @@ try {
   await page.getByRole('button', {name:'Workspace', exact:true}).click();
   const panel = page.getByRole('complementary', {name:'Workspace panel'});
   await panel.waitFor();
+  await panel.getByRole('heading', {name:'Project workspace', exact:true}).waitFor();
+  assert.equal(await panel.locator('.workbench-home-options button').count(), 3);
+  await panel.locator('.workbench-home-options').getByRole('button', {name:'New terminal', exact:false}).click();
+  await panel.getByRole('alert').waitFor();
+  assert.equal(terminalRequests.at(-1).session_id, id);
+  assert.equal(await panel.locator('.workbench-home').count(), 1);
+  assert.equal(await panel.locator('.workbench-home-options').getByRole('button', {name:'New terminal', exact:false}).isEnabled(), true);
+  await panel.locator('.workbench-home-options').getByRole('button', {name:'Files', exact:false}).click();
+  await panel.locator('.workbench-tree').waitFor();
+  await panel.locator('nav').getByRole('button', {name:'Start', exact:true}).click();
+  await panel.locator('.workbench-home-options').getByRole('button', {name:'Git', exact:false}).click();
+  await panel.locator('.workbench-home').waitFor({state:'detached'});
+  await panel.locator('nav').getByRole('button', {name:'Start', exact:true}).click();
+
   const layout = await page.evaluate(() => {
     const messages = document.querySelector('.session-chat-column .messages-container').getBoundingClientRect();
     const composer = document.querySelector('.session-chat-column .input-container').getBoundingClientRect();
@@ -109,15 +129,20 @@ try {
   await page.getByRole('button', {name:'Fullscreen workspace', exact:true}).click();
   const bounds = await panel.boundingBox();
   assert.equal(bounds.x, 0); assert.equal(bounds.y, 0); assert.equal(bounds.width, width); assert.equal(bounds.height, 900);
-  await page.screenshot({path:`/tmp/atomcode-workbench-fullscreen-${width}.png`});
+  await page.screenshot({path:`/tmp/atomcode-workbench-home-${width}.png`});
   await page.keyboard.press('Escape');
   await page.getByRole('button', {name:'Fullscreen workspace', exact:true}).waitFor();
   assert.equal((await panel.boundingBox()).width, splitBounds.width);
   assert.equal(await panel.getAttribute('data-retained-instance'), 'yes');
   await page.getByRole('button', {name:'Fullscreen workspace', exact:true}).click();
   await page.getByRole('button', {name:'Exit workspace fullscreen', exact:true}).click();
+  await panel.locator('nav').getByRole('button', {name:'Files', exact:true}).click();
   await page.getByRole('button', {name:'Close workspace panel', exact:true}).click();
   await panel.waitFor({state:'detached'});
+  await page.getByRole('button', {name:'Workspace', exact:true}).click();
+  await panel.locator('.workbench-tree').waitFor();
+  assert.equal(await panel.locator('.workbench-home').count(), 0);
+  await page.getByRole('button', {name:'Close workspace panel', exact:true}).click();
   await page.screenshot({path:`/tmp/atomcode-chat-layout-${width}.png`});
   assert.deepEqual(errors, []);
   await page.close();

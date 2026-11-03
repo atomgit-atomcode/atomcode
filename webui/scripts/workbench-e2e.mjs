@@ -159,6 +159,7 @@ try {
   await toggle.click();
   const panel = page.locator(".workbench");
   await panel.waitFor();
+  await panel.locator("nav").getByRole("button", {name:"Files", exact:true}).click();
   await panel
     .getByRole("button", { name: "README.md", exact: false })
     .first()
@@ -198,8 +199,8 @@ try {
   await page.evaluate(({session, path}) => window.dispatchEvent(new CustomEvent("workbench-open-file", {detail:{session,path}})), {session:a.id,path:resolve(root,"hello.ts")});
   await until(async () => (await panel.locator(".workbench-preview").textContent()).includes("answer = 42"));
   await page.screenshot({ path: resolve(temp, "files.png"), fullPage: true });
-  await panel.locator("nav button").nth(1).click();
-  await panel.locator(".workbench-terminal-actions button").click();
+  await panel.locator("nav").getByRole("button", {name:"Start", exact:true}).click();
+  await panel.locator(".workbench-home-options").getByRole("button", {name:"New terminal", exact:false}).click();
   await panel.locator(".xterm-helper-textarea").waitFor();
   await panel.locator(".xterm-helper-textarea").focus();
   await page.keyboard.type(
@@ -322,23 +323,24 @@ try {
   await page.getByRole("button", { name: /重新启动终端|Restart terminal/ }).click();
   await page.locator(".xterm-helper-textarea").waitFor();
   await page.locator(".workbench-tabs div button").last().click();
-  await page.locator(".workbench header button").click();
+  await page.getByRole("button", {name:"Close workspace panel", exact:true}).click();
   await page.locator(".workbench-toggle").waitFor();
   // The initial landing page can open the workbench without an LLM round-trip.
   await page.goto(base + "/?token=" + token);
   await page.locator(".workbench-toggle").click();
+  await panel.locator("nav").getByRole("button", {name:"Files", exact:true}).click();
   await page
     .locator(".workbench-tree")
     .getByRole("button", { name: "only-other.txt", exact: false })
     .waitFor();
   assert.ok(new URL(page.url()).searchParams.get("session"));
-  await page.locator(".workbench header button").click();
+  await page.getByRole("button", {name:"Close workspace panel", exact:true}).click();
 
   // Phase 2: real editing, conflict detection, draft protection and Git diffs.
   await page.setViewportSize({ width: 1440, height: 1000 });
   await page.goto(base + "/?session=" + a.id + "&token=" + token);
   await page.locator(".workbench-toggle").click();
-  await panel.locator("nav button").nth(0).click();
+  await panel.locator("nav").getByRole("button", {name:"Files", exact:true}).click();
   await panel
     .locator(".workbench-tree")
     .getByRole("button", { name: "hello.ts", exact: false })
@@ -434,7 +436,7 @@ try {
   await until(() => editor.evaluate(el => !el.readOnly));
   await editor.fill("session A retained draft\n");
   page.once("dialog", (dialog) => dialog.accept());
-  await panel.locator("header button").click();
+  await panel.getByRole("button", {name:"Close workspace panel", exact:true}).click();
   await page.locator(".workbench-toggle").click();
   assert.equal(await editor.inputValue(), "session A retained draft\n");
   await panel.getByRole("separator").focus();

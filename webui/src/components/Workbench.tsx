@@ -17,7 +17,7 @@ type Saved = {
   files: string[];
   selected: string;
   terminals: string[];
-  tab: "files" | "terminal" | "git";
+  tab: "home" | "files" | "terminal" | "git";
   drafts: Record<string, WorkbenchDraft>;
   editing: string[];
   positions: Record<string, number>;
@@ -28,7 +28,7 @@ const empty = (): Saved => ({
   files: [],
   selected: "",
   terminals: [],
-  tab: "files",
+  tab: "home",
   drafts: {},
   editing: [],
   positions: {},
@@ -452,6 +452,9 @@ export function Workbench({
         </div>
       </header>
       <nav aria-label={zh ? "工作区视图" : "Workspace views"}>
+        <button class={saved.tab === "home" ? "active" : ""} onClick={() => update({ tab: "home" })}>
+          {zh ? "开始" : "Start"}
+        </button>
         <button
           class={saved.tab === "files" ? "active" : ""}
           onClick={() => update({ tab: "files" })}
@@ -483,7 +486,32 @@ export function Workbench({
           {error}
         </p>
       )}
-      {saved.tab === "files" ? (
+      {saved.tab === "home" ? (
+        <div class="workbench-home">
+          <div class="workbench-home-heading">
+            <span aria-hidden="true" class="workbench-home-symbol">⌘</span>
+            <h2>{zh ? "项目工作区" : "Project workspace"}</h2>
+            <p>{zh ? "浏览文件、运行命令或检查代码变更" : "Browse files, run commands, or review changes"}</p>
+          </div>
+          <div class="workbench-home-options">
+            <button onClick={() => update({ tab: "files" })}>
+              <span class="workbench-home-icon files" aria-hidden="true">▤</span>
+              <span><strong>{zh ? "文件" : "Files"}</strong><small>{zh ? "浏览、预览与编辑项目文件" : "Browse, preview, and edit project files"}</small></span>
+              <span aria-hidden="true">→</span>
+            </button>
+            <button disabled={busy} onClick={createTerminal}>
+              <span class="workbench-home-icon terminal" aria-hidden="true">›_</span>
+              <span><strong>{zh ? "新建终端" : "New terminal"}</strong><small>{zh ? "在当前项目中打开终端" : "Open a terminal in this project"}</small></span>
+              <span aria-hidden="true">＋</span>
+            </button>
+            <button onClick={() => update({ tab: "git" })}>
+              <span class="workbench-home-icon git" aria-hidden="true">⑂</span>
+              <span><strong>Git</strong><small>{zh ? "查看工作区变更与差异" : "Inspect working tree changes and diffs"}</small></span>
+              <span aria-hidden="true">→</span>
+            </button>
+          </div>
+        </div>
+      ) : saved.tab === "files" ? (
         <>
           <div class="workbench-path">
             <button
