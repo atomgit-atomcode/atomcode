@@ -61,6 +61,8 @@ Think of it as an open-source alternative to Claude Code / Cursor Agent, but run
 
 - **Plan / Build modes** — `/plan` switches to read-only exploration (the agent investigates without touching files); `/build` switches back to full execution
 - **Goal mode** — `/goal <text>` sets a completion condition and the agent loops autonomously, turn after turn, until the goal is met
+- **Recurring work** — `/loop 5m <task>` repeats work at the chosen interval; `/loop stop` ends the loop.
+- **Subagents and teams** — drivers with subagents enabled support delegating work through `task` / `team`.
 - **Code review** — `/review` reviews your current changes, `/review staged` the staged diff, and `/review <base>` against a base ref
 - **Background sessions** — `/bg` runs work in detached slots so you can keep using the TUI while a long task progresses
 
@@ -121,9 +123,13 @@ Connect to any LLM that supports OpenAI's function-calling API:
 ### Web UI
 
 - **`/webui`** (in the TUI) or **`atomcode webui`** (CLI) launches a local browser UI as an alternative to the terminal interface — same agent, same sessions, rendered in your browser
-- **Loopback only** — the server binds to `127.0.0.1` and uses a one-time token; nothing is exposed to the network
+- **Local access by default** — the server binds to `127.0.0.1`. Explicitly use `/webui lan` (binds to `0.0.0.0`) or `--host <addr>` to allow access from other devices. Use the authenticated URL printed at launch.
 - **`/webui stop`** stops the in-process server (a later `/webui` restarts it)
 - **`/webui --port 20001`** chooses a starting port; `--host <addr>` and `--no-open` are also supported. Occupied ports and Windows reserved ports (error 10013) are skipped, up to 100 attempts. Use the printed URL; to change an already running server's port, stop it first.
+
+### IDE Extensions
+
+Use AtomCode in your editor: see the [VS Code extension](extensions/vscode/README.md) and [JetBrains extension](extensions/jetbrains/README.md) for setup and development details.
 
 ### App Remote Access
 
@@ -651,6 +657,7 @@ atomcode/
   crates/
     atomcode-kernel/        # Neutral agent loop and runtime traits
     atomcode-capabilities/  # Providers, tools, MCP, skills, sessions, memory
+    atomcode-harness/       # Composable capability rows and mounting
     atomcode-coding/        # Coding specialization and CodingRuntime lifecycle
     atomcode-review/        # Review specialization
     atomcode-tui/           # Terminal UI
@@ -660,6 +667,8 @@ atomcode/
 
 The coding path is `CLI/TUI/daemon → CodingRuntime → kernel`. The retired core
 agent protocol and `atomcode-bridge` are no longer part of the runtime path.
+
+Capabilities are prepared by `parts::prepare` and mounted into the harness by `runtime::mount`. The session event log is authoritative and is replayed on resume; snapshots are projections. Historical snapshots are converted on opening. See [ADR 0024](docs/adr/0024-the-session-log-is-the-authority.md).
 
 ### Design Principles
 
@@ -732,16 +741,16 @@ cargo run -p atomcode-daemon
 ### Testing
 
 ```bash
-# Run all tests
-cargo test
-
+# Test affected crates (requires cargo-nextest)
 # Run tests for a specific crate
-cargo test -p atomcode-capabilities
-cargo test -p atomcode-tui
+cargo nextest run -p atomcode-capabilities
+cargo nextest run -p atomcode-tui
 
 # Run a specific test
-cargo test -p atomcode-capabilities test_name
+cargo nextest run -p atomcode-capabilities test_name
 ```
+
+Before merging, run `bash gates/compile.sh` to compile all workspace targets and feature-gated tests. Avoid running tests across the entire workspace by default. Nextest does not run doctests; use `cargo test --doc -p <crate>` when needed. Documentation-only changes may skip compilation and tests, but should check diffs and links. See [verification notes](docs/development-verification-notes.md).
 
 ### Useful Commands
 
@@ -750,7 +759,8 @@ cargo test -p atomcode-capabilities test_name
 cargo check
 
 # Format code
-cargo fmt
+cargo fmt --all
+cargo fmt --all -- --check
 
 # Run linter
 cargo clippy
@@ -779,7 +789,10 @@ Contributions are welcome! AtomCode is in active development.
    ```
 4. **Make your changes**, ensure the project builds and tests pass:
    ```bash
-   cargo build && cargo test && cargo clippy
+   cargo fmt --all -- --check
+   bash gates/compile.sh
+   cargo nextest run -p atomcode-capabilities # replace with the affected crate
+   cargo clippy
    ```
 5. **Commit** with a clear message:
    ```bash
