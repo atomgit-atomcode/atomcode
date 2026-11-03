@@ -753,7 +753,6 @@ fn cut_body(
     let body_max = max_chars.saturating_sub(reserve);
     let tail_chars = tail_chars.min(body_max);
     let head_chars = body_max.saturating_sub(tail_chars);
-    let tail_start = total.saturating_sub(tail_chars);
     // `total` is already known, so the kept span is sliced in from each end
     // instead of walking the whole text to split it.
     let head_at = text
@@ -774,7 +773,6 @@ fn cut_body(
     // whole-span cut pads; per-item bodies are escaped by their consumer, so
     // they skip this check.
     let pad = if pad_tail
-        && tail_start > 0
         && before_tail.is_some_and(|c| !is_line_break(c))
         && starts_transcript_line(first_line(tail))
     {
