@@ -1927,6 +1927,8 @@ impl UserInterface for Tui {
         let mut replay: std::collections::VecDeque<Wake> = std::collections::VecDeque::new();
         // Wakes answered since that frame. See [`COALESCE_LIMIT`].
         let mut coalesced = 0usize;
+        let mut painted_size = self.surface.size();
+        let mut last_menu_hover = None;
         // Whether the screen could take a background question at the last frame,
         // so the moment it can is seen once (see [`became_ready`]).
         let mut was_ready = false;
@@ -2092,7 +2094,9 @@ impl UserInterface for Tui {
                     self.pour_bg_question();
                 }
                 was_ready = ready;
-                self.paint();
+                painted_size = self.surface.size();
+                last_menu_hover = None;
+                self.paint(painted_size);
                 stale = false;
                 coalesced = 0;
             }
@@ -3021,7 +3025,10 @@ impl UserInterface for Tui {
                         // nothing to ask, and the pointer moves all day.
                         Click::Hover => {
                             if self.host.context_menu_open() {
-                                stale |= self.host.context_menu_hover(x, y, self.surface.size());
+                                if last_menu_hover != Some((x, y)) {
+                                    last_menu_hover = Some((x, y));
+                                    stale |= self.host.context_menu_hover(x, y, painted_size);
+                                }
                             }
                             // A question is the other thing on screen that follows
                             // a pointer, and for the same reason: the row under
@@ -3676,7 +3683,7 @@ impl Tui {
             || self.host.team_focused())
     }
 
-    fn paint(&self) {
+    fn paint(&self, size: (u16, u16)) {
         self.name_the_window();
         // Where the pointer is, for the status row's marker: the surface is the
         // one that knows, and every way it changes (ctrl+g, `[ui] mouse`, the
@@ -3688,7 +3695,7 @@ impl Tui {
                 m.mouse_handed_back = back;
             }
         }
-        let frame = self.host.compose(self.surface.size());
+        let frame = self.host.compose(size);
         self.surface.present(&frame);
     }
 

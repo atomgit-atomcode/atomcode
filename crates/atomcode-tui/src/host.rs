@@ -965,7 +965,7 @@ fn run_from(
 }
 
 /// The run a slot's rows are drawn as, when they are drawn behind one lid.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Run {
     /// The slot the lid is drawn at: the run's last call. The painter walks the
     /// stream backwards and so reaches it first, and the rows of the calls
@@ -1630,6 +1630,8 @@ impl crate::block::Content for Gone {
 /// earlier members, which draw nothing), and whether a blank row separates it
 /// from the slot above.
 struct RowIndex {
+    #[cfg(test)]
+    measurements: usize,
     /// Earliest measured slot, including hidden slots with no rows.
     loaded_start: usize,
     /// What the measurements below were taken under. A different width, a
@@ -1683,6 +1685,7 @@ struct RowIndex {
 /// re-measured all 1330 slots would cost more than the walk it replaced. With
 /// the tag, a rebuild re-measures the slot that changed and reuses the rest.
 struct Measured {
+    run: Option<Run>,
     /// The block this was measured for, so a slot reused for a different block
     /// is not mistaken for the same one.
     id: crate::block::BlockId,
@@ -1827,6 +1830,8 @@ impl Host {
             pin_gate: Mutex::new(()),
             history_layout_rows: std::sync::atomic::AtomicUsize::new(usize::MAX),
             row_index: Mutex::new(RowIndex {
+                #[cfg(test)]
+                measurements: 0,
                 loaded_start: usize::MAX,
                 width: 0,
                 caps: crate::block::ShapeCaps::of(&crate::caps::Caps::default()),
@@ -1906,6 +1911,8 @@ impl Host {
         *self.stream.write().expect("stream poisoned") = Stream::new();
         *self.presentation.write().expect("presentation poisoned") = Presentation::default_folds();
         *self.row_index.lock().expect("row index poisoned") = RowIndex {
+            #[cfg(test)]
+            measurements: 0,
             loaded_start: usize::MAX,
             width: 0,
             caps: crate::block::ShapeCaps::of(&crate::caps::Caps::default()),
@@ -5952,6 +5959,16 @@ impl Host {
     /// Nothing is open is not an error and not news: the pointer moves over the
     /// screen all the time.
     pub fn context_menu_hover(&self, x: u16, y: u16, size: (u16, u16)) -> bool {
+        {
+            let held = self.context_menu.read().expect("menu poisoned");
+            if held
+                .as_ref()
+                .and_then(|menu| menu.hover_target(x, y, size.0, size.1))
+                .is_none()
+            {
+                return false;
+            }
+        }
         let mut held = self.context_menu.write().expect("menu poisoned");
         let Some(menu) = held.as_mut() else {
             return false;
@@ -6227,11 +6244,13 @@ impl Host {
             stream.slots(),
             &pres,
             moment.activity,
-            if moment.stream_selection.is_some() {
-                usize::MAX
-            } else {
-                self.history_layout_budget(pane.block_scroll, rect.h as usize)
-            },
+            self.selection_layout_budget(
+                rect.w,
+                moment,
+                pane.block_scroll,
+                rect.h as usize,
+                pres.revision(),
+            ),
             moment.scroll.0 > 0 || moment.stream_selection.is_some(),
         );
         let distance = pane
@@ -7187,6 +7206,31 @@ impl Host {
             .saturating_mul(page)
     }
 
+    // Selection gestures measure the prefix once to establish absolute rows.
+    // Keep that baseline across frames, but rebuild it after a reflow or a
+    // presentation/activity change rather than projecting against a suffix.
+    fn selection_layout_budget(
+        &self,
+        width: u16,
+        moment: &Moment,
+        scroll: usize,
+        height: usize,
+        presentation: u64,
+    ) -> usize {
+        if moment.stream_selection.is_some() {
+            let idx = self.row_index.lock().expect("row index poisoned");
+            if idx.loaded_start != 0
+                || idx.width != width
+                || idx.caps != crate::block::ShapeCaps::of(&moment.caps)
+                || idx.presentation != presentation
+                || idx.activity != moment.activity
+            {
+                return usize::MAX;
+            }
+        }
+        self.history_layout_budget(scroll, height)
+    }
+
     #[cfg(test)]
     fn row_index<'a>(
         &'a self,
@@ -7257,6 +7301,7 @@ impl Host {
         while idx.measured.len() < slots.len() {
             let i = idx.measured.len();
             idx.measured.push(Measured {
+                run: None,
                 id: slots[i].block().id,
                 settled: false,
             });
@@ -7276,21 +7321,15 @@ impl Host {
             // can have grown since, and that is the whole reason it is not
             // cached.
             //
-            // A slot of a tool run is never reused, settled or not: whether it
-            // draws a lid, and how many calls that lid names, is a fact about
-            // the *run* — and the run changes shape when a call lands in it
-            // without this slot's id changing at all. The lid the run used to
-            // draw here would ride its cached entry past the new lid drawn at
-            // the run's new last call, and the screen would show both. Tool
-            // slots are a small fraction of the stream; the prose this table
-            // exists to skip is untouched.
-            let in_a_run = lids.runs.get(i).copied().flatten().is_some();
+            // A settled tool slot is reusable when its merged-run geometry is
+            // unchanged. A growing run can move its lid or change its count,
+            // failure summary, or live state without changing the slot id.
+            let run = lids.runs.get(i).copied().flatten();
             let reusable = settled
-                && !in_a_run
                 && idx
                     .measured
                     .get(i)
-                    .is_some_and(|m| m.settled && m.id == b.id);
+                    .is_some_and(|m| m.settled && m.id == b.id && m.run == run);
             if reusable {
                 if let Some(entry) = idx.rows[i].filter(|entry| entry.rows > 0) {
                     let seam = measured_below
@@ -7311,6 +7350,10 @@ impl Host {
             // they were — and collapsing the two made a hidden block add itself
             // to the running kind, which moved every blank below it. The ratchet
             // beside this caught exactly that on its first run.
+            #[cfg(test)]
+            {
+                idx.measurements += 1;
+            }
             let entry = lid_row(
                 &lids,
                 slots,
@@ -7330,7 +7373,11 @@ impl Host {
                     .saturating_add(usize::from(seam));
                 measured_below = Some(entry.kind);
             }
-            let m = Measured { id: b.id, settled };
+            let m = Measured {
+                id: b.id,
+                settled,
+                run,
+            };
             idx.measured[i] = m;
             idx.rows[i] = entry;
         }
@@ -7408,11 +7455,7 @@ impl Host {
             stream.slots(),
             &pres,
             moment.activity,
-            if moment.stream_selection.is_some() {
-                usize::MAX
-            } else {
-                self.history_layout_budget(moment.scroll.0, 0)
-            },
+            self.selection_layout_budget(width, moment, moment.scroll.0, 0, pres.revision()),
             moment.scroll.0 > 0 || moment.stream_selection.is_some(),
         )
         .total
@@ -7626,11 +7669,13 @@ impl Host {
                 stream.slots(),
                 &pres,
                 moment.activity,
-                if moment.stream_selection.is_some() {
-                    usize::MAX
-                } else {
-                    self.history_layout_budget(moment.scroll.0, room.h as usize)
-                },
+                self.selection_layout_budget(
+                    width,
+                    moment,
+                    moment.scroll.0,
+                    room.h as usize,
+                    pres.revision(),
+                ),
                 moment.scroll.0 > 0 || moment.stream_selection.is_some(),
             )
             .total;
@@ -11385,6 +11430,69 @@ mod tests {
     }
 
     #[test]
+    fn selection_retains_history_measurements_and_rebuilds_after_reflow() {
+        let (h, asked) = counted(1_500);
+        let live = h.stream.write().unwrap().writer("selection-probe").open(
+            crate::block::Coord::default(),
+            Arc::new(Counted {
+                lines: vec!["tail".into()],
+                asked: asked.clone(),
+            }),
+        );
+        h.set_history_layout_rows(Some(40));
+        let size = (80, 24);
+        h.compose(size);
+        let mut moment = h.moment.read().unwrap().clone();
+        let view = h.selection_view(size, &moment).unwrap();
+        moment.stream_selection = Some(crate::moment::StreamSelection::at(0, view.top()));
+        *h.moment.write().unwrap() = moment;
+        h.compose(size);
+        let before = h.row_index.lock().unwrap().measurements;
+        h.open_selection_menu(
+            (2, 4),
+            vec![crate::menu::Item::new("copy-selected", "Copy")],
+        );
+        let timer = std::time::Instant::now();
+        for _ in 0..10 {
+            h.compose(size);
+        }
+        println!(
+            "selected menu, 1500 history blocks: {:.3} ms/frame ({})",
+            timer.elapsed().as_secs_f64() * 100.,
+            if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            }
+        );
+        let after_idle = h.row_index.lock().unwrap().measurements;
+        assert!(
+            after_idle - before <= 60,
+            "unchanged history was remeasured: {}",
+            after_idle - before
+        );
+        h.stream.write().unwrap().writer("selection-probe").amend(
+            live,
+            Arc::new(Counted {
+                lines: (0..12).map(|i| format!("tail {i}")).collect(),
+                asked,
+            }),
+        );
+        h.compose(size);
+        assert!(
+            h.row_index.lock().unwrap().measurements - after_idle <= 6,
+            "streaming remeasured the historical prefix"
+        );
+        h.compose((40, 24));
+        let idx = h.row_index.lock().unwrap();
+        assert_eq!(
+            idx.loaded_start, 0,
+            "a reflow must not discard the selected prefix"
+        );
+        assert!(idx.measurements > before);
+    }
+
+    #[test]
     fn history_layout_measures_a_tail_and_scrolls_back_to_the_oldest_block() {
         let (h, asked) = counted(2_000);
         h.set_history_layout_rows(Some(80));
@@ -13707,7 +13815,7 @@ mod tests {
         // that cache: the run grew, the lid moved to the new last call, and
         // the old slot kept drawing the lid it had been measured with. The
         // screen showed `2 个工具` and then `3 个工具` over one run. The index
-        // now never reuses a run's slots, so the lid must land on the new last
+        // reuses a run only while its geometry matches, so the lid must land on the new last
         // call alone — after a compose has already drawn the shorter run.
         let h = host();
         h.presentation
@@ -13740,6 +13848,16 @@ mod tests {
         h.absorb(&call("c2"));
         h.absorb(&result("c2"));
         let _ = h.compose((80, 40));
+
+        let measured = h.row_index.lock().unwrap().measurements;
+        for _ in 0..10 {
+            h.compose((80, 40));
+        }
+        assert_eq!(
+            h.row_index.lock().unwrap().measurements,
+            measured,
+            "an unchanged settled tool group must reuse its measured geometry"
+        );
 
         // The run grows by one call — the exact mutation the reuse missed.
         h.absorb(&call("c3"));
