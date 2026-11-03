@@ -1420,6 +1420,6 @@ mod scrollbar_setting_tests {
             assert_eq!(spec.value(&config), mode);
         }
         assert!(spec.patch(&mut doc, "sometimes").is_err());
-        assert_eq!(spec.value(&crate::config::Config::default()), "auto");
+        assert_eq!(spec.value(&crate::config::Config::default()), "hidden");
     }
 }

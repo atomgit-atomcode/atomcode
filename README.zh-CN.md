@@ -120,6 +120,8 @@ AtomCode 是一款住在你终端里的 AI 编码助手。用自然语言给它�
 - **Bracketed paste** —— 长文本粘贴自动折叠为紧凑的指示器
 - **Skills** —— 从 skill 目录加载的用户自定义命令，像普通斜杠命令一样调用
 
+会话右侧滚动条默认不显示，滚轮和键盘翻页仍可正常使用。可在 `/config` 中设置 `ui.scrollbar` 为 `hidden`（默认）、`auto` 或 `always`。
+
 ### Web UI
 
 - **`/webui`**（TUI 内）或 **`atomcode webui`**（命令行）会在浏览器里打开一个本地 Web 界面，作为终端界面之外的另一种选择——同一个 agent、同一份会话，渲染在浏览器中
