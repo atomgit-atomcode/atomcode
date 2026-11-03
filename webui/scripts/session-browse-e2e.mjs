@@ -16,6 +16,7 @@ const snapshot = () => ({ type: 'snapshot', session_id: id, session_name: meta.n
 const server = createServer(async (req, res) => {
   const path = new URL(req.url, 'http://localhost').pathname;
   const json = value => { res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(value)); };
+  if (path.startsWith('/workbench/')) return json([]);
   if (path === '/live/permission') return json({accepted:true});
   if (path === '/live/switch_session') { switches++; return json({ok:true}); }
   if (path === '/projects/fixture/sessions/' + other.id) return json({ ...other, messages: [{role:'user', content:'Historical question'}, {role:'assistant', content:'Historical answer'}] });
@@ -90,6 +91,34 @@ try {
   await page.getByText('The resource read boundary is ready.', {exact:false}).waitFor();
   assert.equal(await page.getByText('Background stream stays with A.', {exact:false}).count(), 1);
   assert.equal(switches, before);
+  await page.getByRole('button', {name:'Workspace', exact:true}).click();
+  const panel = page.getByRole('complementary', {name:'Workspace panel'});
+  await panel.waitFor();
+  const layout = await page.evaluate(() => {
+    const messages = document.querySelector('.session-chat-column .messages-container').getBoundingClientRect();
+    const composer = document.querySelector('.session-chat-column .input-container').getBoundingClientRect();
+    return {messagesRight:messages.right, composerLeft:composer.left, messagesBottom:messages.bottom, composerTop:composer.top};
+  });
+  const rail = await page.locator('.turn-nav-rail').boundingBox();
+  assert(rail.x + rail.width <= layout.messagesRight, 'turn navigation must stay inside the chat column');
+  assert(layout.composerLeft < layout.messagesRight, 'composer must share the chat column');
+  assert(layout.composerTop >= layout.messagesBottom - 2, 'composer must sit below messages');
+  const splitBounds = await panel.boundingBox();
+  await panel.evaluate(el => { el.dataset.retainedInstance = 'yes'; });
+  await page.screenshot({path:`/tmp/atomcode-workbench-split-${width}.png`});
+  await page.getByRole('button', {name:'Fullscreen workspace', exact:true}).click();
+  const bounds = await panel.boundingBox();
+  assert.equal(bounds.x, 0); assert.equal(bounds.y, 0); assert.equal(bounds.width, width); assert.equal(bounds.height, 900);
+  await page.screenshot({path:`/tmp/atomcode-workbench-fullscreen-${width}.png`});
+  await page.keyboard.press('Escape');
+  await page.getByRole('button', {name:'Fullscreen workspace', exact:true}).waitFor();
+  assert.equal((await panel.boundingBox()).width, splitBounds.width);
+  assert.equal(await panel.getAttribute('data-retained-instance'), 'yes');
+  await page.getByRole('button', {name:'Fullscreen workspace', exact:true}).click();
+  await page.getByRole('button', {name:'Exit workspace fullscreen', exact:true}).click();
+  await page.getByRole('button', {name:'Close workspace panel', exact:true}).click();
+  await panel.waitFor({state:'detached'});
+  await page.screenshot({path:`/tmp/atomcode-chat-layout-${width}.png`});
   assert.deepEqual(errors, []);
   await page.close();
  }

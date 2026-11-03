@@ -517,7 +517,8 @@ try {
   );
   for (const selector of [
     ".workbench",
-    ".workbench header button",
+    '.workbench header button[aria-label="Close workspace panel"]',
+    '.workbench header button[aria-label="Fullscreen workspace"]',
     ".workbench-save",
   ]) {
     assert.ok(

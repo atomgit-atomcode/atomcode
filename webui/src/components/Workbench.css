@@ -192,7 +192,12 @@
   flex-direction: row;
   min-height: 0;
 }
-.session-body:has(.workbench) > :first-child {
+.session-chat-column {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
   flex: 1;
   min-width: 0;
 }
@@ -357,3 +362,15 @@ html[data-theme="dark"] .workbench {
     --workbench-diff-addition: #74c991;
   }
 }
+
+.workbench.workbench-fullscreen {
+  position: fixed;
+  inset: 0;
+  width: 100% !important;
+  max-width: none;
+  height: 100%;
+  z-index: 90;
+  border-left: 0;
+}
+.workbench-fullscreen .workbench-resizer { display: none; }
+.workbench-header-actions { display: flex; flex-shrink: 0; }

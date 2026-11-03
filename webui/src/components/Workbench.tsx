@@ -172,6 +172,17 @@ export function Workbench({
 }) {
   const { lang } = useSettings();
   const zh = lang === "zh";
+  const [fullscreen, setFullscreen] = useState(false);
+  useEffect(() => {
+    if (!fullscreen) return;
+    const escape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || event.defaultPrevented) return;
+      event.preventDefault();
+      setFullscreen(false);
+    };
+    window.addEventListener("keydown", escape);
+    return () => window.removeEventListener("keydown", escape);
+  }, [fullscreen]);
   const [saved, rawSetSaved] = useState<Saved>(() => load(session));
   const current = useRef(saved);
   const dragCleanup = useRef<(() => void) | null>(null);
@@ -393,7 +404,7 @@ export function Workbench({
   }
   return (
     <aside
-      class="workbench"
+      class={"workbench" + (fullscreen ? " workbench-fullscreen" : "")}
       style={{ width: saved.width + "px" }}
       aria-label={zh ? "工作区面板" : "Workspace panel"}
     >
@@ -425,12 +436,20 @@ export function Workbench({
           <strong>{zh ? "工作区" : "Workspace"}</strong>
           <small title={cwd}>{cwd}</small>
         </div>
+        <div class="workbench-header-actions">
+        <button
+          onClick={() => setFullscreen(value => !value)}
+          aria-label={zh ? (fullscreen ? "退出工作区全屏" : "工作区全屏") : (fullscreen ? "Exit workspace fullscreen" : "Fullscreen workspace")}
+          title={zh ? (fullscreen ? "退出全屏（Esc）" : "全屏") : (fullscreen ? "Exit fullscreen (Esc)" : "Fullscreen")}
+          aria-pressed={fullscreen}
+        >{fullscreen ? "⤡" : "⤢"}</button>
         <button
           onClick={closePanel}
           aria-label={zh ? "关闭工作区面板" : "Close workspace panel"}
         >
           ×
         </button>
+        </div>
       </header>
       <nav aria-label={zh ? "工作区视图" : "Workspace views"}>
         <button
