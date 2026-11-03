@@ -666,7 +666,9 @@ const SUMMARY_TOOL_OUTPUT_TAIL_CHARS: usize = 500;
 /// Tool-call arguments are part of "what happened" even when the result is short
 /// (`write_file`'s content, `edit_file`'s patch). Keep a bounded head+tail so the
 /// summary can name the action without re-reading a whole file; the truncation
-/// marker is included in the cap.
+/// marker is included in the cap. The cap applies before the call line's bracket
+/// escaping, which can add one backslash per `[`/`]` (up to doubling the rendered
+/// field); the whole-transcript ceiling counts the escaped text.
 const SUMMARY_TOOL_CALL_MAX_CHARS: usize = 600;
 const SUMMARY_TOOL_CALL_TAIL_CHARS: usize = 200;
 /// Whole-input ceiling for the transcript, marker line included. This is the
@@ -857,7 +859,8 @@ fn starts_transcript_line(line: &str) -> bool {
 /// an ambiguous character are kept, so `ＵＳＥＲ：` and `𝐔ЅЕR:` both read as
 /// `USER:`, while ordinary CJK text stays plain.
 fn starts_with_tag(line: &str, tag: &str) -> bool {
-    let target: Vec<char> = tag.chars().collect();
+    debug_assert!(tag.is_ascii(), "structural tags are ASCII literals");
+    let target = tag.as_bytes();
     debug_assert!(target.len() < 32, "tag fits the position mask");
     // Bit `pos` is set when some reading has matched `pos` tag characters.
     let mut at: u32 = 1;
@@ -873,9 +876,10 @@ fn starts_with_tag(line: &str, tag: &str) -> bool {
             if is_line_prefix_ignorable(c) {
                 next |= 1u32 << pos;
             }
+            let expected = target[pos] as char;
             let folded = fold_fullwidth_ascii(c);
-            let matches = folded.eq_ignore_ascii_case(&target[pos]);
-            let homoglyph = is_homoglyph(c) && target[pos].is_ascii_alphabetic();
+            let matches = folded.eq_ignore_ascii_case(&expected);
+            let homoglyph = is_homoglyph(c) && expected.is_ascii_alphabetic();
             if matches || homoglyph {
                 next |= 1u32 << (pos + 1);
             }
@@ -976,7 +980,8 @@ fn escape_brackets(text: &str) -> Cow<'_, str> {
 /// Append a call field after a single separating space, or nothing at all when
 /// the field folds away, so the line never ends with a dangling space. Brackets
 /// are escaped after the per-item bound, so a cut marker is escaped with the
-/// field and a cut cannot split an escape pair.
+/// field and a cut cannot split an escape pair; the escape adds one backslash
+/// per bracket, so a bracket-heavy field renders at up to twice its bound.
 fn push_call_field(into: &mut String, text: &str) {
     let text = escape_brackets(text.trim());
     let start = into.len();
