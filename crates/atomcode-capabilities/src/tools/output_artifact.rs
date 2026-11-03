@@ -23,17 +23,41 @@ fn is_valid_id(id: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// Drop a wildcard-only `.gitignore` next to the store so the tool outputs
-/// never reach version control — even in a repo where no root rule covers
-/// the artifact directory. Never clobbers an existing `.gitignore`. A
-/// genuine write failure propagates: an unprotected artifact dir is exactly
-/// the failure this sentinel exists to prevent, so it must not be swallowed.
+/// Reduce accidental Git additions without requiring a root ignore rule.
+/// Existing ignore files are preserved. Git force-add and already tracked
+/// files bypass ignore rules; this is not an access-control boundary.
 fn ensure_gitignore_sentinel(dir: &Path) -> std::io::Result<()> {
+    use std::io::Write;
     let sentinel = dir.join(".gitignore");
-    if !sentinel.exists() {
-        std::fs::write(sentinel, "*\n")?;
+    match std::fs::symlink_metadata(&sentinel) {
+        Ok(meta) if meta.file_type().is_file() => return Ok(()),
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "artifact .gitignore must be a regular file",
+            ))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
     }
-    Ok(())
+    // Publish only complete contents, without overwriting a competing writer.
+    let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+    temp.write_all(b"*\n")?;
+    temp.as_file().sync_all()?;
+    match temp.persist_noclobber(&sentinel) {
+        Ok(_) => Ok(()),
+        Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if std::fs::symlink_metadata(&sentinel)?.file_type().is_file() {
+                Ok(())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "artifact .gitignore must be a regular file",
+                ))
+            }
+        }
+        Err(e) => Err(e.error),
+    }
 }
 
 /// Content-addressed store for full tool outputs, one directory per session.
@@ -49,19 +73,16 @@ impl ArtifactStore {
         Self { dir: dir.into() }
     }
 
+    /// Also repairs a missing sentinel on dedup hits and input-only stores.
+    fn prepare_dir(&self) -> std::io::Result<()> {
+        std::fs::create_dir_all(&self.dir)?;
+        ensure_gitignore_sentinel(&self.dir)
+    }
+
     pub fn put(&self, bytes: &[u8]) -> std::io::Result<String> {
         let id = artifact_id(bytes);
         let path = self.dir.join(&id);
-        std::fs::create_dir_all(&self.dir)?;
-        // Keep tool outputs out of version control on the directory's own
-        // terms, not only on the repo-root `.gitignore` the operator happened
-        // to set: drop a wildcard-only sentinel beside the store. Run this on
-        // EVERY put, not just the first write — a store that predates the
-        // sentinel (upgrade) or one whose sentinel was removed would otherwise
-        // stay unprotected on every dedup hit. Never clobbers an existing
-        // `.gitignore`, and a genuine write failure surfaces to the caller —
-        // an unprotected artifact dir is the failure we are defending against.
-        ensure_gitignore_sentinel(&self.dir)?;
+        self.prepare_dir()?;
         if !path.exists() {
             // Write to a temp sibling then rename → readers never see a partial file.
             let tmp = self.dir.join(format!("{id}.tmp"));
@@ -100,6 +121,7 @@ impl ArtifactStore {
     /// cannot be fetched as ordinary model-visible output artifacts.
     pub fn put_input(&self, bytes: &[u8]) -> std::io::Result<String> {
         use std::io::Write;
+        self.prepare_dir()?;
         let id = format!("{:x}", Sha256::digest(bytes));
         let dir = self.dir.join("inputs");
         std::fs::create_dir_all(&dir)?;
@@ -581,6 +603,117 @@ mod tests {
                 .contains(super::ARTIFACT_TRUNCATION_MARKER_PREFIX),
             "and the default still spills it"
         );
+    }
+
+    #[test]
+    fn sentinel_is_repaired_on_output_and_input_dedup_hits() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = super::ArtifactStore::new(dir.path());
+        let output = store.put(b"output").unwrap();
+        std::fs::remove_file(dir.path().join(".gitignore")).unwrap();
+        assert_eq!(store.put(b"output").unwrap(), output);
+        assert_eq!(
+            std::fs::read(dir.path().join(".gitignore")).unwrap(),
+            b"*\n"
+        );
+        let scoped = store.scoped_inputs("session");
+        let input = scoped.put_input(b"input only").unwrap();
+        assert_eq!(
+            std::fs::read(scoped.dir.join(".gitignore")).unwrap(),
+            b"*\n"
+        );
+        std::fs::remove_file(scoped.dir.join(".gitignore")).unwrap();
+        assert_eq!(scoped.put_input(b"input only").unwrap(), input);
+        assert_eq!(scoped.get_input(&input).unwrap(), b"input only");
+        assert_eq!(
+            std::fs::read(scoped.dir.join(".gitignore")).unwrap(),
+            b"*\n"
+        );
+    }
+
+    #[test]
+    fn an_existing_ignore_file_is_preserved_and_non_files_fail_before_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = super::ArtifactStore::new(dir.path());
+        let sentinel = dir.path().join(".gitignore");
+        std::fs::write(&sentinel, b"# user owned\n*.log\n").unwrap();
+        store.put(b"output").unwrap();
+        store.put_input(b"input").unwrap();
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"# user owned\n*.log\n");
+        std::fs::remove_file(&sentinel).unwrap();
+        std::fs::create_dir(&sentinel).unwrap();
+        assert!(store.put(b"new output").is_err());
+        assert!(!dir.path().join(super::artifact_id(b"new output")).exists());
+        assert!(store.put_input(b"new input").is_err());
+    }
+
+    #[test]
+    fn concurrent_first_outputs_publish_one_complete_sentinel() {
+        let dir = tempfile::tempdir().unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+        std::thread::scope(|scope| {
+            for i in 0..16 {
+                let barrier = barrier.clone();
+                let root = dir.path();
+                scope.spawn(move || {
+                    barrier.wait();
+                    let store = super::ArtifactStore::new(root);
+                    let content = format!("output {i}");
+                    let id = store.put(content.as_bytes()).unwrap();
+                    assert_eq!(store.get(&id, 0, 100).unwrap().unwrap(), content.as_bytes());
+                    assert_eq!(std::fs::read(root.join(".gitignore")).unwrap(), b"*\n");
+                });
+            }
+        });
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 17);
+    }
+
+    #[test]
+    fn git_ignores_output_and_input_only_stores_without_a_root_rule() {
+        let repo = tempfile::tempdir().unwrap();
+        let config = tempfile::NamedTempFile::new().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .current_dir(repo.path())
+                .env("GIT_CONFIG_GLOBAL", config.path())
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        let store = super::ArtifactStore::new(repo.path().join("state/outputs"));
+        let output = store.put(b"output").unwrap();
+        let input_store = super::ArtifactStore::new(repo.path().join("state/inputs-only"));
+        let input = input_store.put_input(b"input").unwrap();
+        for path in [
+            format!("state/outputs/{output}"),
+            format!("state/inputs-only/inputs/{input}"),
+        ] {
+            assert!(
+                git(&["check-ignore", "--no-index", "--", &path])
+                    .status
+                    .success(),
+                "not ignored: {path}"
+            );
+            assert!(git(&["ls-files", "--", &path]).stdout.is_empty());
+        }
+        assert!(git(&["status", "--porcelain", "--untracked-files=all"])
+            .stdout
+            .is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_sentinel_is_not_followed_or_accepted_as_git_protection() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("user-file");
+        std::fs::write(&target, b"keep").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join(".gitignore")).unwrap();
+        assert!(super::ArtifactStore::new(dir.path())
+            .put(b"output")
+            .is_err());
+        assert_eq!(std::fs::read(target).unwrap(), b"keep");
     }
 
     #[test]
