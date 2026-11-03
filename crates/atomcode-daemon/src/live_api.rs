@@ -3898,6 +3898,7 @@ mod tests {
         let res2 = crate::legacy_convert::prepare_catalog_session_resume_any_project_in_root(
             root.path(),
             "session-in-proj2",
+            false,
         )
         .unwrap();
         assert!(res2.is_some());

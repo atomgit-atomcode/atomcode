@@ -2128,61 +2128,31 @@ async fn change_dir(
         let new_path = atomcode_capabilities::pathnorm::strip_verbatim_path(&new_path);
         // Fold case to the on-disk truth (Windows, bucket-safe) so a `/cd` with a
         // differently-cased path doesn't leave the footer/new sessions drifting.
-        let new_path = normalize_working_dir_case(new_path);
+        let mut new_path = normalize_working_dir_case(new_path);
 
         // When a native live runtime is attached, it is the working-directory
         // owner. Reject the HTTP mutation if the runtime cannot accept the same
         // transition; otherwise the UI state and the executing runtime diverge.
         let mut opened_session = None;
-        if let Ok(previous_binding) = crate::native_live::binding() {
-            match crate::native_live::change_directory(new_path.clone()).await {
-                Ok(changed) => opened_session = changed.session_id,
+        if crate::native_live::binding().is_ok() {
+            // One shared navigation operation, rather than changing cwd and
+            // then trying to reacquire a session retained by the same owner.
+            let transition =
+                crate::native_live::navigate(new_path.clone(), req.session_id.clone()).await;
+            match transition {
+                Ok(changed) => {
+                    new_path = changed.working_dir;
+                    opened_session = changed.session_id;
+                }
                 Err(error) => {
                     return Json(ChangeDirResponse {
                         session_id: None,
                         success: false,
-                        message: format!("Runtime rejected directory change: {error:?}"),
+                        message: format!("Runtime rejected navigation: {error:?}"),
                         current_dir: project.working_dir.clone(),
                         project_hash: hash_path(&project.working_dir),
                     });
                 }
-            }
-            if let Some(session_id) = req
-                .session_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|session_id| !session_id.is_empty())
-            {
-                if let Err(error) =
-                    crate::live_api::live_switch_session(session_id.to_string()).await
-                {
-                    let rollback_error = match crate::native_live::change_directory(
-                        previous_binding.working_dir.clone(),
-                    )
-                    .await
-                    {
-                        Ok(_) => crate::live_api::live_switch_session(
-                            previous_binding.session_id.clone(),
-                        )
-                        .await
-                        .err()
-                        .map(|error| format!("session restore failed: {error:?}")),
-                        Err(error) => Some(format!("directory restore failed: {error:?}")),
-                    };
-                    return Json(ChangeDirResponse {
-                        session_id: None,
-                        success: false,
-                        message: match rollback_error {
-                            Some(rollback) => format!(
-                                "Runtime rejected session switch: {error:?}; rollback failed: {rollback}"
-                            ),
-                            None => format!("Runtime rejected session switch: {error:?}"),
-                        },
-                        current_dir: project.working_dir.clone(),
-                        project_hash: hash_path(&project.working_dir),
-                    });
-                }
-                opened_session = Some(session_id.to_string());
             }
         }
 

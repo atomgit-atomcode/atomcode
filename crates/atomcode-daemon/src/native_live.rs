@@ -438,13 +438,18 @@ async fn resume(session_id: String, fork_on_busy: bool) -> Result<Resumed, HubEr
     } else {
         crate::legacy_convert::prepare_catalog_session_resume_in_project
     };
+    let prepare_any = if fork_on_busy {
+        crate::legacy_convert::prepare_catalog_session_resume_or_fork_any_project
+    } else {
+        crate::legacy_convert::prepare_catalog_session_resume_any_project
+    };
     let prepared = match prepare(&project_bucket, &session_id) {
         Ok(Some(prepared)) => prepared,
         // Found here but not to be had (unreadable, or in use and not copyable):
         // that is the answer, not a reason to look in every other project and
         // report whatever the second search says instead.
         Err(error) => return Err(HubError::RuntimeRejected(error.to_string())),
-        Ok(None) => crate::legacy_convert::prepare_catalog_session_resume_any_project(&session_id)
+        Ok(None) => prepare_any(&session_id)
             .map_err(|error| HubError::RuntimeRejected(error.to_string()))?
             .ok_or_else(|| {
                 HubError::RuntimeRejected(format!("session {session_id:?} not found in catalog"))
@@ -469,6 +474,21 @@ pub async fn fresh_session(
     expected: &LiveBinding,
 ) -> Result<crate::live_hub::FreshSessionOutcome, HubError> {
     hub().fresh_session(expected).await
+}
+
+/// Navigate a remote client in one runtime transition. A selected session
+/// determines its own working directory; the requested directory is used only
+/// when opening a project without selecting a history session.
+pub async fn navigate(
+    working_dir: PathBuf,
+    session_id: Option<String>,
+) -> Result<atomcode_coding::SessionChanged, HubError> {
+    match session_id.filter(|id| !id.trim().is_empty()) {
+        Some(id) => resume_or_fork_session(id.trim().to_string())
+            .await
+            .map(|resumed| resumed.changed),
+        None => change_directory(working_dir).await,
+    }
 }
 
 pub async fn change_directory(
