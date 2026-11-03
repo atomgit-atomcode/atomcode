@@ -636,7 +636,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   // browser is showing; cleared as soon as the user types (normal mixed filtering).
   const [slashSkillsOnly, setSlashSkillsOnly] = useState(false);
   const [atOpen, setAtOpen] = useState(false);
-  const [atKind, setAtKind] = useState<'all' | 'files' | 'sessions'>('all');
+  const [atKind, setAtKind] = useState<'files' | 'sessions'>('files');
   const [atSessions, setAtSessions] = useState<SessionMetaWithProject[]>([]);
   const [atSessionsFor, setAtSessionsFor] = useState<string | null>(null);
   const [atSessionError, setAtSessionError] = useState(false);
@@ -3235,6 +3235,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         setSlashOpen(false);
         setAtQuery(query);
         setAtIndex(0);
+        if (!atOpen) setAtKind('files');
         setAtOpen(true);
         return;
       }
@@ -3643,7 +3644,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       {atOpen && (
         <div class="at-popover" ref={atRef}>
           <div class="at-tabs" role="tablist" aria-label={t('mention.title')}>
-            {(['all', 'files', 'sessions'] as const).map(kind => <button type="button" role="tab"
+            {(['files', 'sessions'] as const).map(kind => <button type="button" role="tab"
               aria-selected={atKind === kind} class={atKind === kind ? 'active' : ''}
               onClick={() => { setAtKind(kind); setAtIndex(0); }}
               onMouseDown={e => { e.preventDefault(); e.stopPropagation(); setAtKind(kind); setAtIndex(0); }}
@@ -3667,7 +3668,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
               title={item.session ? `${item.session.working_dir} · ${item.session.id}` : item.up ? '..' : (item.full ?? atDirPart + item.name + (item.is_dir ? '/' : ''))}
             >
               <span class="at-icon">{item.session ? '💬' : item.up ? '⬆' : item.is_dir ? '📁' : '📄'}</span>
-              <span class="at-name">{item.session ? item.session.name : item.up ? '..' : (item.full ?? atDirPart + item.name + (item.is_dir ? '/' : ''))}</span>
+              <span class="at-name">{item.session ? `${t('mention.sessionLabel')} · ${!item.session.name || item.session.name.startsWith('session-') ? `${t('mention.unnamedSession')} · ${new Date(item.session.updated_at * 1000).toLocaleString()}` : item.session.name}` : item.up ? '..' : (item.full ?? atDirPart + item.name + (item.is_dir ? '/' : ''))}</span>
               {item.session && <small class="at-session-meta">{item.session.working_dir} · {new Date(item.session.updated_at * 1000).toLocaleString()}</small>}
             </button>
           ))}
