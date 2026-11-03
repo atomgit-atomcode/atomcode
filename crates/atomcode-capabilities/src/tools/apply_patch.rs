@@ -110,7 +110,6 @@ impl ImportPatchTool {
             file_path: String,
         }
         let args: Args = serde_json::from_str(args).map_err(|e| e.to_string())?;
-        let store = store(&self.store)?;
         cancelled(ctx)?;
         let path = resolve_path(&args.file_path, &ctx.working_dir);
         if self.world.info(&path).await.map_err(|e| e.to_string())?.len > 8 * 1024 * 1024 {
@@ -121,6 +120,14 @@ impl ImportPatchTool {
             .read_bytes(&path)
             .await
             .map_err(|e| e.to_string())?;
+        self.import_bytes(bytes, ctx).await
+    }
+
+    /// Explicit host input: bytes came directly from a file picker or upload,
+    /// not model output. Same validation and artifact namespace as import_patch.
+    pub async fn import_bytes(&self, bytes: Vec<u8>, ctx: &ToolContext) -> Result<String, String> {
+        let store = store(&self.store)?;
+        cancelled(ctx)?;
         if bytes.len() > 8 * 1024 * 1024 {
             return Err("patch exceeds 8 MiB import limit".into());
         }

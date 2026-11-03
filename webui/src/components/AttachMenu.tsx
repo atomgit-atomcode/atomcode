@@ -14,6 +14,8 @@ interface AttachMenuProps {
 onInsert: (text: string, replaceSkill?: boolean) => void;
   /** Open the server-side file picker. */
   onPickFile: () => void;
+  onImportPatch?: (file: File) => void;
+  patchDisabled?: boolean;
   /** Attach picked image files (native picker → base64 handled by parent). */
   onAddImages: (files: FileList) => void;
 }
@@ -54,11 +56,12 @@ function SkillIcon() {
   );
 }
 
-export function AttachMenu({ onInsert, onPickFile, onAddImages }: AttachMenuProps) {
+export function AttachMenu({ onInsert, onPickFile, onAddImages, onImportPatch, patchDisabled }: AttachMenuProps) {
   const t = useT();
   const [open, setOpen] = useState(false);
   const { items: skills, loading, failed } = useSkills(open);
   const rootRef = useRef<HTMLDivElement>(null);
+  const patchInputRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Close on outside click.
@@ -103,6 +106,8 @@ export function AttachMenu({ onInsert, onPickFile, onAddImages }: AttachMenuProp
         }}
       />
 
+      <input ref={patchInputRef} type="file" accept=".patch,.diff" style="display:none" aria-label={t('patch.upload')}
+        onChange={event => { const input = event.currentTarget; const file = input.files?.[0]; input.value = ''; if (file) onImportPatch?.(file); }} />
       {open && (
         <div class="attach-popover">
           <button
@@ -127,6 +132,9 @@ export function AttachMenu({ onInsert, onPickFile, onAddImages }: AttachMenuProp
             <span class="attach-row-label">{t('attach.file')}</span>
           </button>
 
+          {onImportPatch && <button class="attach-row" title={patchDisabled ? t('patch.needReady') : undefined} disabled={patchDisabled} onClick={() => { setOpen(false); patchInputRef.current?.click(); }}>
+            <FileIcon /><span class="attach-row-label">{t('patch.upload')}</span>
+          </button>}
           <div class="attach-divider" />
 
           <div class="attach-section-label">

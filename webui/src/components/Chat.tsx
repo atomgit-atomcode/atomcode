@@ -1,3 +1,4 @@
+import { importPatchFile } from '../api';
 import { createPortal } from 'preact/compat';
 import type { ComponentChildren } from 'preact';
 import { SessionBrowse } from './SessionBrowse';
@@ -3608,10 +3609,42 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       ? '~/' + cleanCwd.split('/').slice(3).join('/')
       : cleanCwd;
 
+  const [patchUploading, setPatchUploading] = useState(false);
+  const patchUpload = useRef<AbortController | null>(null);
+  useEffect(() => {
+    setPatchUploading(false);
+    return () => { const upload = patchUpload.current; patchUpload.current = null; upload?.abort(); };
+  }, [sessionId, browseSession?.id]);
+  async function uploadPatch(file: File) {
+    if (!sessionId || busyRef.current || patchUpload.current) return;
+    if (file.size > 8 * 1024 * 1024) { setAttachError(t('patch.tooLarge')); return; }
+    const generation = sessionGenerationRef.current;
+    const controller = new AbortController(); patchUpload.current = controller;
+    setPatchUploading(true); setAttachError(null);
+    try {
+      const reference = await importPatchFile(sessionId, file, controller.signal);
+      if (!controller.signal.aborted && generation === sessionGenerationRef.current) {
+        setInput(value => [value, t('patch.ready') + '\n' + reference].filter(Boolean).join('\n\n'));
+        requestAnimationFrame(() => {
+          const textarea = textareaRef.current;
+          if (!textarea || controller.signal.aborted) return;
+          textarea.style.height = 'auto';
+          textarea.style.height = Math.min(textarea.scrollHeight, 160) + 'px';
+          textarea.focus();
+        });
+      }
+    } catch (error) {
+      if (!controller.signal.aborted && generation === sessionGenerationRef.current) setAttachError(/Unbound|RuntimeUnavailable/.test(String(error)) ? t('patch.connect') : t('patch.failed', {error:String(error)}));
+    } finally {
+      if (patchUpload.current === controller) { patchUpload.current = null; setPatchUploading(false); }
+    }
+  }
+
   // 输入框只渲染一份，按落地/常规两处择一挂载（避免两个 textarea 抢同一 ref）。
   const canStop = busy || recoveryPolicy.allowStop || Boolean(goalProgress?.recovery);
   const inputBox = (
     <div class={'input-box' + (messages.length > 0 ? ' can-collapse' : '') + (canStop ? ' is-running' : '') + (pendingImages.length || attachError ? ' has-input-detail' : '')}>
+      {patchUploading && <div class="input-attach-error" role="status">{t('patch.importing')}</div>}
       {attachError && (
         <div class="input-attach-error" role="alert">
           <span>{attachError}</span>
@@ -3725,6 +3758,8 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
           <AttachMenu
             onInsert={insertAtCursor}
             onPickFile={() => setShowFilePicker(true)}
+            onImportPatch={uploadPatch}
+            patchDisabled={!sessionId || busy || patchUploading}
             onAddImages={addImageFiles}
           />
           <button

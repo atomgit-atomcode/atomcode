@@ -28,3 +28,13 @@ Validation includes 5 files × 400 changed lines / 20 hunks, exact UTF-8/no-fina
 The differential harness records import_patch/apply_patch as intentional post-retirement tool additions. No retired-engine golden is regenerated or changed.
 
 Pre-commit review: reject no-final-newline markers followed by more hunk/file content, avoiding accidental line concatenation. Mixed-state retries report separate already_applied and unchanged targets and perform no writes. Regression tests cover both cases. Existing credential gating also sees every manifest path; import refuses sensitive target snapshots outright. Actual code application participates in the existing verification cadence, while dry-run/already-applied responses do not create a new verification debt.
+
+## Second phase: explicit frontend imports
+
+TUI `/patch <file>` reads a regular local file with an 8 MiB bound, retaining Unicode paths and CRLF bytes. WebUI's attachment menu uploads a `.patch`/`.diff` File as an authenticated raw HTTP body to `/live/patch` with the same body limit. Neither route sends the patch through model output. Both insert only the imported reference into a draft for review; neither automatically sends or applies it.
+
+CodingRuntime validates the current generation, idle state and root session, then uses the existing FsSvc, ProductDirs and session-scoped artifact store. Import has cancellation and a ten-second timeout; it never writes workspace files. A timed-out blocking import may finish an artifact-only write. TUI refuses member views; frontend session changes invalidate the pending draft insertion. WebUI requires an existing bound runtime (enable Sync when unbound), rather than silently switching or creating a second owner.
+
+Verification covers raw Unicode/CRLF byte fidelity, session ownership, upload body limits, desktop/mobile attachment workflows, preserved drafts, and oversized-file rejection. macOS is the execution host. Windows/Linux real execution remains unverified: no Windows runner is available and the local Docker daemon is stopped.
+
+Follow-up browser regression (desktop and mobile): a server-side import refusal preserves the existing draft and a subsequent retry succeeds; a held response released after entering another conversation is cancelled/ignored and does not insert a reference when returning to the live draft. These checks use the real frontend with a synthetic HTTP/SSE server.

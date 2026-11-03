@@ -332,6 +332,10 @@ pub async fn force_release() -> Result<bool, String> {
 /// How long [`force_release`] waits for the released runtime to shut down.
 const FORCE_RELEASE_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+pub async fn import_patch(session: String, bytes: Vec<u8>) -> Result<String, HubError> {
+    hub().import_patch(session, bytes).await
+}
+
 pub fn dispatch(command: DriverCommand) -> Result<(), HubError> {
     hub().dispatch(command)
 }

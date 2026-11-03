@@ -3895,3 +3895,69 @@ mod tests {
         assert_eq!(prepared.view.meta.working_dir, proj2_dir.to_string_lossy());
     }
 }
+
+/// Explicit user upload. Raw bytes bypass model output and command-line argv.
+pub(crate) async fn live_import_patch(
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+    bytes: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(session) = query.get("session_id").filter(|s| !s.is_empty()) else {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error":"session_id required"})),
+        )
+            .into_response();
+    };
+    match crate::native_live::import_patch(session.clone(), bytes.to_vec()).await {
+        Ok(reference) => (
+            axum::http::StatusCode::OK,
+            axum::Json(serde_json::json!({"reference":reference})),
+        )
+            .into_response(),
+        Err(error) => (
+            axum::http::StatusCode::CONFLICT,
+            axum::Json(serde_json::json!({"error":format!("{error:?}")})),
+        )
+            .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod patch_upload_tests {
+    use super::live_import_patch;
+    use axum::{
+        body::Body,
+        extract::DefaultBodyLimit,
+        http::{Request, StatusCode},
+        routing::post,
+        Router,
+    };
+    use tower::ServiceExt;
+    #[tokio::test]
+    async fn patch_upload_requires_session_and_bounds_raw_body_before_dispatch() {
+        let app = Router::new().route(
+            "/live/patch",
+            post(live_import_patch).layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
+        );
+        let missing = app
+            .clone()
+            .oneshot(
+                Request::post("/live/patch")
+                    .body(Body::from("patch"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+        let large = app
+            .oneshot(
+                Request::post("/live/patch?session_id=unused")
+                    .body(Body::from(vec![b'x'; 8 * 1024 * 1024 + 1]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(large.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+}

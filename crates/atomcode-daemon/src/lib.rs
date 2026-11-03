@@ -7670,6 +7670,10 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/live/mcp/trust", post(live_api::live_mcp_trust))
         .route("/command", post(commands::run_command))
         .route(
+            "/live/patch",
+            post(live_api::live_import_patch).layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
+        )
+        .route(
             "/live/switch_session",
             post(live_api::live_switch_session_endpoint),
         )

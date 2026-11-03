@@ -282,6 +282,7 @@ mod tests {
             | C::Usage { .. }
             | C::WorkspaceChanges { .. }
             | C::PendingQuestions { .. }
+            | C::ImportPatch { .. }
             | C::QuestionReplyFinished { .. } => Heard::Nothing,
         }
     }

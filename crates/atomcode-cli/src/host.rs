@@ -2876,6 +2876,15 @@ impl HostControl for RuntimeControl {
                     current: Some(self.config.lock().expect("config poisoned").model.clone()),
                 })
             }
+            HostCommand::ImportPatch { session, bytes } => {
+                self.addressed(&session)?;
+                let reference = self
+                    .handle
+                    .import_patch(session, bytes)
+                    .await
+                    .map_err(refused)?;
+                Ok(HostReply::PatchImported { reference })
+            }
             HostCommand::Changes {
                 session,
                 file,

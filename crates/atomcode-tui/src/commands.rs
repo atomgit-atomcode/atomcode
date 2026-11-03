@@ -929,6 +929,7 @@ fn review_prompt(arg: &str) -> String {
 
 fn session_catalogue() -> Vec<Command> {
     vec![
+        Command::said_taking("patch", t(Msg::CmdTakesPath), t(Msg::CmdAboutPatch)),
         Command::said("compact", t(Msg::CmdAboutCompact)),
         Command::said("cancel-all", t(Msg::CmdAboutCancelAll)),
         Command::said_taking("context", "[prompt]".into(), t(Msg::CmdAboutContext)),
@@ -1169,6 +1170,76 @@ impl CommandSet for SessionCommands {
                 .then(|| Outcome::Refused(t(Msg::WaitsForTheTurn { command }).into_owned()))
         };
         match name {
+            "patch" => {
+                if client.session() != root {
+                    return Outcome::Refused(t(Msg::PatchLeadOnly).into_owned());
+                }
+                if let Some(refusal) = waits_for_the_turn("patch") {
+                    return refusal;
+                }
+                if args.trim().is_empty() {
+                    return Outcome::Refused("/patch <file.patch>".into());
+                }
+                let typed = args.trim();
+                let typed = if typed.starts_with('"') || typed.starts_with('\'') {
+                    let quote = typed.chars().next().unwrap_or('"');
+                    match typed[1..].strip_suffix(quote) {
+                        Some(path) => path,
+                        None => return Outcome::Refused("/patch <file.patch>".into()),
+                    }
+                } else {
+                    typed
+                };
+                let full = match session_path(&client, typed).await {
+                    Ok(path) => path,
+                    Err(why) => return why,
+                };
+                if !tokio::fs::metadata(&full)
+                    .await
+                    .is_ok_and(|info| info.is_file())
+                {
+                    return Outcome::Refused(format!(
+                        "{}: expected a readable regular file",
+                        full.display()
+                    ));
+                }
+                let bytes = match tokio::fs::File::open(&full).await {
+                    Ok(file) => {
+                        use tokio::io::AsyncReadExt;
+                        let mut bytes = Vec::new();
+                        match file.take(8 * 1024 * 1024 + 1).read_to_end(&mut bytes).await {
+                            Ok(_) if bytes.len() <= 8 * 1024 * 1024 => bytes,
+                            Ok(_) => return Outcome::Refused(t(Msg::PatchTooLarge).into_owned()),
+                            Err(error) => return Outcome::Refused(error.to_string()),
+                        }
+                    }
+                    Err(error) => return Outcome::Refused(error.to_string()),
+                };
+                let control = match host(control) {
+                    Ok(control) => control,
+                    Err(why) => return why,
+                };
+                match control
+                    .call(HostCommand::ImportPatch {
+                        session: root.clone(),
+                        bytes,
+                    })
+                    .await
+                {
+                    Ok(HostReply::PatchImported { reference }) => {
+                        if client.root() != root || client.session() != root {
+                            return Outcome::Refused(t(Msg::PatchContextChanged).into_owned());
+                        }
+                        Outcome::Do(Action::Paste(format!(
+                            "{}\n{}",
+                            t(Msg::PatchReady),
+                            reference
+                        )))
+                    }
+                    Ok(_) => Outcome::Refused(t(Msg::RefusedUnsupported).into_owned()),
+                    Err(error) => Outcome::Refused(refusal(error)),
+                }
+            }
             "cancel-all" => {
                 let members = client.cancel_all();
                 Outcome::Said(
@@ -3403,6 +3474,35 @@ fn as_markdown(events: &[atomcode_kernel::session::LoggedEvent]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn patch_command_preserves_file_bytes_and_only_pastes_a_reference() {
+        let host = Arc::new(Recording::default());
+        let (app, client, all) = following(&host);
+        client.status("lead", atomcode_kernel::agent::AgentStatus::Idle);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("补丁 with spaces.patch");
+        let bytes = b"--- a/f\r\n+++ b/f\r\n@@ -1 +1 @@\r\n-old\r\n+new\r\n";
+        std::fs::write(&path, bytes).unwrap();
+        host.replies
+            .lock()
+            .unwrap()
+            .push_back(Ok(HostReply::PatchImported {
+                reference: "short-reference".into(),
+            }));
+        let result = all
+            .dispatch(&format!("/patch \"{}\"", path.display()), &app.context())
+            .await;
+        match result {
+            Outcome::Do(Action::Paste(text)) => {
+                assert!(text.contains("short-reference"));
+                assert!(!text.contains("--- a/f"));
+            }
+            other => panic!("expected reference draft: {other:?}"),
+        }
+        assert!(
+            matches!(host.asked.lock().unwrap().last(), Some(HostCommand::ImportPatch { session, bytes: actual }) if session == "lead" && actual == bytes)
+        );
+    }
 
     /// The sheet a command put up at the foot of the screen.
     fn sheet_of(outcome: Outcome) -> crate::sheet::Sheet {

@@ -29,6 +29,8 @@ use atomcode_kernel::session::SeqNo;
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum HostCommand {
+    /// Import explicit user file bytes without model or argv transport.
+    ImportPatch { session: String, bytes: Vec<u8> },
     /// Put an empty session in place of `session`, in the same working
     /// directory.
     NewSession { session: String },
@@ -350,6 +352,7 @@ impl HostCommand {
         match self {
             Self::NewSession { session }
             | Self::Resume { session, .. }
+            | Self::ImportPatch { session, .. }
             | Self::SetReasoningEffort { session, .. }
             | Self::Undo { session, .. }
             | Self::RewindPoints { session }
@@ -411,6 +414,9 @@ impl HostCommand {
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum HostReply {
+    PatchImported {
+        reference: String,
+    },
     /// Done. The live session is the one it was.
     Done,
     /// Done — and something about it is worth saying.
@@ -1548,6 +1554,10 @@ mod tests {
     /// sampled here.
     fn commands() -> Vec<HostCommand> {
         let all = vec![
+            HostCommand::ImportPatch {
+                session: "a".into(),
+                bytes: b"patch\r\n".to_vec(),
+            },
             HostCommand::NewSession {
                 session: "a".into(),
             },
@@ -1756,6 +1766,7 @@ mod tests {
                 | HostCommand::SignOut { .. }
                 | HostCommand::SignIn { .. }
                 | HostCommand::WhoAmI { .. }
+                | HostCommand::ImportPatch { .. }
                 | HostCommand::Changes { .. }
                 | HostCommand::Providers { .. }
                 | HostCommand::Autonomy { .. }
@@ -1779,6 +1790,9 @@ mod tests {
     fn replies() -> Vec<HostReply> {
         let all = vec![
             HostReply::Done,
+            HostReply::PatchImported {
+                reference: "immutable-reference".into(),
+            },
             HostReply::SessionChanged {
                 session: "b".into(),
             },
@@ -2052,6 +2066,7 @@ mod tests {
         for r in &all {
             match r {
                 HostReply::Done
+                | HostReply::PatchImported { .. }
                 | HostReply::DoneWithNote { .. }
                 | HostReply::SessionChanged { .. }
                 | HostReply::Sessions { .. }

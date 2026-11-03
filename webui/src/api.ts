@@ -1523,3 +1523,15 @@ export async function workbenchPreview(session: string, path: string): Promise<B
   if (!response.ok) throw await failure(response);
   return response.blob();
 }
+
+/** Explicit raw upload: no text decoding, base64 or model echo. */
+export async function importPatchFile(session: string, file: File, signal?: AbortSignal): Promise<string> {
+  if (file.size > 8 * 1024 * 1024) throw new Error('Patch exceeds 8 MiB');
+  const response = await apiFetch('/live/patch?' + new URLSearchParams({ session_id: session }), {
+    method: 'POST', headers: {...authHeaders(), 'Content-Type':'application/octet-stream'}, body: file, signal,
+  });
+  if (!response.ok) throw await failure(response);
+  const value = await response.json();
+  if (typeof value.reference !== 'string') throw new Error('Invalid patch reference');
+  return value.reference;
+}

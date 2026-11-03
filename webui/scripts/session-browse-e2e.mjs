@@ -10,6 +10,10 @@ const meta = { id, name: 'Context summary', working_dir: '/fixture', project_has
 const messages = [{ role: 'user', content: 'Check the resource boundary' }, { role: 'assistant', content: 'The resource read boundary is ready.' }];
 const other = { ...meta, id: 'browse-fixture', name: 'Other conversation' };
 let switches = 0;
+const patchUploads = [];
+let patchReplyMode = 'ok';
+const pendingPatchReplies = [];
+const patchReference = JSON.stringify({artifact_id:'f'.repeat(64), patch_sha256:'a'.repeat(64), file_paths:['unicode file.txt']});
 const terminalRequests = [];
 const clients = new Set();
 let baseline = 3;
@@ -17,6 +21,13 @@ const snapshot = () => ({ type: 'snapshot', session_id: id, session_name: meta.n
 const server = createServer(async (req, res) => {
   const path = new URL(req.url, 'http://localhost').pathname;
   const json = value => { res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(value)); };
+  if (path === '/live/patch') {
+    const chunks = []; for await (const chunk of req) chunks.push(chunk);
+    patchUploads.push({session:new URL(req.url, 'http://localhost').searchParams.get('session_id'), bytes:Buffer.concat(chunks)});
+    if (patchReplyMode === 'fail') { res.statusCode = 409; return json({error:'Fixture import refused'}); }
+    if (patchReplyMode === 'hold') { pendingPatchReplies.push(() => json({reference:patchReference})); return; }
+    return json({reference:patchReference});
+  }
   if (path === '/workbench/terminals' && req.method === 'POST') {
     let body = ''; for await (const chunk of req) body += chunk;
     terminalRequests.push(JSON.parse(body));
@@ -144,6 +155,47 @@ try {
   assert.equal(await panel.locator('.workbench-home').count(), 0);
   await page.getByRole('button', {name:'Close workspace panel', exact:true}).click();
   await page.screenshot({path:`/tmp/atomcode-chat-layout-${width}.png`});
+  const composer = page.locator('.message-input');
+  await composer.fill('Keep my draft');
+  const rawPatch = Buffer.from('--- a/unicode file.txt\r\n+++ b/unicode file.txt\r\n@@ -1 +1 @@\r\n-旧\r\n+新\r\n');
+  const upload = page.locator('input[type="file"][accept=".patch,.diff"]');
+  await upload.setInputFiles({name:'中文 patch.patch', mimeType:'application/octet-stream', buffer:rawPatch});
+  await page.waitForFunction(() => document.querySelector('.message-input')?.value.includes('artifact_id'));
+  assert.deepEqual(patchUploads.at(-1).bytes, rawPatch);
+  assert.equal(patchUploads.at(-1).session, id);
+  const draft = await composer.inputValue();
+  assert(draft.startsWith('Keep my draft'));
+  assert(draft.includes(patchReference));
+  assert(!draft.includes('--- a/unicode'), 'patch body must never enter composer/model text');
+  const count = patchUploads.length;
+  await upload.setInputFiles({name:'large.patch', mimeType:'application/octet-stream', buffer:Buffer.alloc(8*1024*1024+1, 65)});
+  await page.getByRole('alert').filter({hasText:'Patch exceeds the 8 MiB import limit'}).waitFor();
+  assert.equal(patchUploads.length, count);
+  assert.equal(await composer.inputValue(), draft);
+  patchReplyMode = 'fail';
+  await upload.setInputFiles({name:'refused.patch', mimeType:'application/octet-stream', buffer:rawPatch});
+  await page.getByRole('alert').filter({hasText:'Fixture import refused'}).waitFor();
+  assert.equal(await composer.inputValue(), draft);
+  patchReplyMode = 'ok';
+  await upload.setInputFiles({name:'retry.patch', mimeType:'application/octet-stream', buffer:rawPatch});
+  await page.waitForFunction(reference => document.querySelector('.message-input')?.value.split(reference).length === 3, patchReference);
+
+  // A late reply must not insert a reference after leaving the live view.
+  await composer.fill('Draft before leaving');
+  patchReplyMode = 'hold';
+  await upload.setInputFiles({name:'delayed.patch', mimeType:'application/octet-stream', buffer:rawPatch});
+  for (let attempt = 0; attempt < 100 && !pendingPatchReplies.length; attempt++) await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(pendingPatchReplies.length, 1, 'delayed upload must reach server');
+  emit({type:'state', running:true});
+  if (width < 600) await page.locator('.mobile-menu-btn').click();
+  await page.locator('.session-item-main').filter({hasText:'Other conversation'}).click();
+  await page.getByText('Historical answer', {exact:true}).waitFor();
+  for (const reply of pendingPatchReplies.splice(0)) reply();
+  patchReplyMode = 'ok';
+  await page.getByRole('button', {name:'Return to Context summary', exact:true}).click();
+  await composer.waitFor();
+  emit({type:'state', running:false});
+  assert.equal(await composer.inputValue(), 'Draft before leaving');
   assert.deepEqual(errors, []);
   await page.close();
  }

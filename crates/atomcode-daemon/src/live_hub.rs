@@ -1435,6 +1435,17 @@ impl LiveViewHub {
             .map_err(|_| HubError::RuntimeUnavailable)
     }
 
+    pub async fn import_patch(&self, session: String, bytes: Vec<u8>) -> Result<String, HubError> {
+        let (binding, handle) = self.bound_handle()?;
+        if binding.session_id != session {
+            return Err(HubError::RuntimeUnavailable);
+        }
+        handle
+            .import_patch(session, bytes)
+            .await
+            .map_err(|error| HubError::RuntimeRejected(error.to_string()))
+    }
+
     fn bound_handle(&self) -> Result<(LiveBinding, CodingRuntimeHandle), HubError> {
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(error) = &state.snapshot_error {
