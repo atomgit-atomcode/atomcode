@@ -615,9 +615,21 @@ struct Member {
 #[derive(Default)]
 struct Members {
     by_lead: Mutex<HashMap<String, BTreeMap<String, Member>>>,
+    lifecycle: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Member session id → (lead session id, member name), for the finish
     /// listener, which sees facts by session.
     leads: Mutex<HashMap<String, (String, String)>>,
+}
+
+impl Members {
+    fn lifecycle(&self, lead: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.lifecycle
+            .lock()
+            .expect("member lifecycle poisoned")
+            .entry(lead.to_string())
+            .or_default()
+            .clone()
+    }
 }
 
 /// A person stopping a member from a front end (`docs/adr/0023` §8): the same
@@ -1157,6 +1169,26 @@ impl TeamTool {
             worktree,
         } = spec;
         let lead_session = lead.session_id().to_string();
+        let lifecycle = self.members.lifecycle(&lead_session);
+        let _transition = lifecycle.lock().await;
+        {
+            let all = self.members.by_lead.lock().expect("members poisoned");
+            if all
+                .get(&lead_session)
+                .is_some_and(|mine| mine.contains_key(&name))
+            {
+                return Err(format!(
+                    "a member named `{name}` already exists; `tell` it instead"
+                ));
+            }
+            if !resuming && all.get(&lead_session).map_or(0, |mine| mine.len()) >= self.max_members
+            {
+                return Err(format!(
+                    "team has reached its limit of {} members",
+                    self.max_members
+                ));
+            }
+        }
         let agents = self.ctx.require::<AgentsSvc>().map_err(|e| e.to_string())?;
         let parent_tools = lead
             .ctx()
@@ -1451,38 +1483,42 @@ impl TeamTool {
 
     async fn stop(&self, lead: &Arc<Agent>, name: Option<&str>) -> Result<String, String> {
         let agents = self.ctx.require::<AgentsSvc>().map_err(|e| e.to_string())?;
-        let taken: Vec<(String, Member)> = {
-            let mut all = self.members.by_lead.lock().expect("members poisoned");
-            let Some(mine) = all.get_mut(lead.session_id()) else {
+        let lifecycle = self.members.lifecycle(lead.session_id());
+        let _transition = lifecycle.lock().await;
+        let taken: Vec<(String, Arc<Agent>)> = {
+            let all = self.members.by_lead.lock().expect("members poisoned");
+            let Some(mine) = all.get(lead.session_id()) else {
                 return Ok("no members".into());
             };
             let names: Vec<String> = match name {
                 Some(n) => vec![n.to_string()],
                 None => mine.keys().cloned().collect(),
             };
-            let mut taken = Vec::new();
-            for n in names {
-                let Some(member) = mine.remove(&n) else {
-                    let live = mine.keys().cloned().collect::<Vec<_>>().join(", ");
-                    return Err(format!("no member named `{n}`; live members: {live}"));
-                };
-                taken.push((n, member));
-            }
-            taken
+            names
+                .into_iter()
+                .map(|n| {
+                    mine.get(&n)
+                        .map(|member| (n.clone(), member.agent.clone()))
+                        .ok_or_else(|| format!("no member named `{n}`"))
+                })
+                .collect::<Result<_, _>>()?
         };
         let mut stopped = Vec::new();
-        for (n, member) in taken {
+        for (n, agent) in taken {
             // Its log says it was stopped, last, before it goes: a resume of the
             // lead reads that and leaves it where it is (`docs/adr/0024` §13).
             // Last means after the turn it was cancelled out of has unwound.
-            member.agent.cancel();
+            agent.cancel();
             for _ in 0..500 {
-                if member.agent.status() == crate::agent::AgentStatus::Idle {
+                if agent.status() == crate::agent::AgentStatus::Idle {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-            let log = member.agent.session();
+            if agent.status() != crate::agent::AgentStatus::Idle {
+                return Err(format!("member `{n}` is still stopping; its session remains owned; retry stop after it becomes idle"));
+            }
+            let log = agent.session();
             crate::session::commit(
                 &self.ctx,
                 &log,
@@ -1494,8 +1530,16 @@ impl TeamTool {
                 .leads
                 .lock()
                 .expect("leads poisoned")
-                .remove(member.agent.session_id());
-            agents.remove(member.agent.id());
+                .remove(agent.session_id());
+            agents.remove(agent.id());
+            let member = self
+                .members
+                .by_lead
+                .lock()
+                .expect("members poisoned")
+                .get_mut(lead.session_id())
+                .and_then(|mine| mine.remove(&n))
+                .ok_or_else(|| format!("member `{n}` disappeared while stopping"))?;
             let mut note = n.clone();
             if let Some((dir, branch)) = &member.worktree {
                 // The checkout goes; the branch stays for the lead.

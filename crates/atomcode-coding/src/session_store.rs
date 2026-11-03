@@ -22,7 +22,7 @@
 //! bucket, stored under [`storage_id`] with its parent in its index — so no
 //! catalog lists it — and written under a lease of its own, taken when the
 //! agent is created and let go when it is removed. One whose log cannot be kept
-//! does not run: its turns are cancelled. A failed write stops that agent, not
+//! does not run: its creation is refused. A failed write stops that agent, not
 //! the session it was delegated from.
 
 use std::collections::HashMap;
@@ -60,6 +60,7 @@ struct Store {
 }
 
 struct Delegated {
+    agent_id: atomcode_harness::agent::AgentId,
     lease: SessionLease,
     /// Set by the first write that failed, as for the session's own.
     broken: bool,
@@ -80,7 +81,17 @@ impl Store {
         let store = &self.session.store;
         let header = agent.session().header().clone();
         let id = storage_id(&header.id);
-        let lease = store.acquire_lease(&id).map_err(|e| e.to_string())?;
+        let lease = store.acquire_lease(&id).map_err(|e| {
+            let held_here = self.delegated.lock().expect("delegated sessions poisoned")
+                .contains_key(&header.id);
+            tracing::warn!(runtime_session = self.id(), member_session = %header.id,
+                storage_id = %id, agent_id = agent.id(), process_id = std::process::id(),
+                held_by_this_store = held_here, error = %e, "member session lease acquisition failed");
+            format!("{e} (pid={}, parent={}, member={}, held_by_this_store={held_here})",
+                std::process::id(), self.id(), header.id)
+        })?;
+        tracing::debug!(runtime_session = self.id(), member_session = %header.id,
+            agent_id = agent.id(), "member session lease acquired");
         if !store.is_event_session(&id) {
             let working_dir = store
                 .read_meta(self.id())
@@ -105,11 +116,24 @@ impl Store {
             .insert(
                 header.id,
                 Delegated {
+                    agent_id: agent.id(),
                     lease,
                     broken: false,
                 },
             );
         Ok(())
+    }
+
+    fn release(&self, removed: &AgentChange) {
+        let mut held = self.delegated.lock().expect("delegated sessions poisoned");
+        if held
+            .get(&removed.session)
+            .is_some_and(|kept| kept.agent_id == removed.id)
+        {
+            held.remove(&removed.session);
+            tracing::debug!(runtime_session = self.id(), member_session = %removed.session,
+                agent_id = removed.id, "member removed; stored session lease released");
+        }
     }
 
     /// Append to a delegated agent's session under its lease. `None` when this
@@ -288,16 +312,12 @@ impl Plugin for SessionStorePlugin {
                     "session {}: its log cannot be kept, so it does not run: {e}",
                     agent.session_id()
                 ));
-                agent.cancel();
+                agent.reject_creation(e);
             }
         });
         let removed_store = store.clone();
         let _ = ctx.on_emit::<AgentRemoved>(move |removed: &AgentChange| {
-            removed_store
-                .delegated
-                .lock()
-                .expect("delegated sessions poisoned")
-                .remove(&removed.session);
+            removed_store.release(removed);
         });
 
         let agents_ctx = ctx.clone();
@@ -340,5 +360,48 @@ impl Plugin for SessionStorePlugin {
             }
         });
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod lease_owner_tests {
+    use super::*;
+
+    #[test]
+    fn removing_another_incarnation_cannot_release_the_current_members_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let dirs =
+            atomcode_capabilities::ProductDirs::new(dir.path().join("state"), ".test-product");
+        let manager = Arc::new(SessionManager::for_project(dir.path(), &dirs));
+        let store = Store {
+            session: StoredSession {
+                lease: manager.acquire_lease("lead").unwrap(),
+                store: manager.clone(),
+                status: None,
+            },
+            broken: AtomicBool::new(false),
+            delegated: Mutex::new(HashMap::from([(
+                "lead/member".into(),
+                Delegated {
+                    agent_id: 2,
+                    lease: manager.acquire_lease("lead~member").unwrap(),
+                    broken: false,
+                },
+            )])),
+        };
+        let mut removed = AgentChange {
+            id: 1,
+            session: "lead/member".into(),
+            parent: Some("lead".into()),
+            status: atomcode_harness::agent::AgentStatus::Idle,
+        };
+        store.release(&removed);
+        assert!(matches!(
+            manager.acquire_lease("lead~member"),
+            Err(atomcode_capabilities::session::SessionStoreError::SessionInUse { .. })
+        ));
+        removed.id = 2;
+        store.release(&removed);
+        assert!(manager.acquire_lease("lead~member").is_ok());
     }
 }
