@@ -84,6 +84,85 @@ pub fn next(task: &ScheduleTask, now: i64) -> Option<NextRun> {
         estimated: true,
     })
 }
+
+/// The most recent occurrence at or before `now`.
+///
+/// [`next`] answers "when will it run", strictly in the future — that is what the
+/// panel shows and what an OS registration is keyed on. A runner needs the other
+/// direction: "which occurrence has already arrived". Checking `next(now) <= now`
+/// can essentially never be true, which is exactly how the first version of the
+/// in-process runner managed to sweep forever without ever firing a task (caught
+/// on a device, where the rule is the only thing between a due task and a run).
+pub fn previous(task: &ScheduleTask, now: i64) -> Option<i64> {
+    let current = Local.timestamp_opt(now, 0).single()?;
+    previous_in(task, current)
+}
+
+fn previous_in<T: TimeZone>(task: &ScheduleTask, now: DateTime<T>) -> Option<i64> {
+    match &task.schedule {
+        Schedule::Interval { every_minutes } => {
+            let period = i64::from(*every_minutes).checked_mul(60)?;
+            if period == 0 {
+                return None;
+            }
+            // An interval counts from creation; without an anchor there is no
+            // "which occurrence" to speak of.
+            if task.created_at <= 0 {
+                return None;
+            }
+            let elapsed = now.timestamp().checked_sub(task.created_at)?;
+            if elapsed < 0 {
+                return None;
+            }
+            // The anchor is "when the task was created", not a run: occurrences are
+            // anchor + n*period for n >= 1. Returning the anchor itself would fire a
+            // brand-new task immediately, while `next` (and an OS timer) waits a
+            // full period.
+            let count = elapsed.div_euclid(period);
+            if count == 0 {
+                return None;
+            }
+            task.created_at.checked_add(count.checked_mul(period)?)
+        }
+        Schedule::Cron { .. } => None,
+        _ => {
+            let (hour, minute) = match &task.schedule {
+                Schedule::Daily { time } | Schedule::Weekly { time, .. } => clock(time).ok()?,
+                Schedule::Hourly => (now.hour(), 0),
+                _ => return None,
+            };
+            let zone = now.timezone();
+            // Backwards: today, then yesterday, … A missing local time is skipped
+            // and an overlap takes the earlier instant, mirroring [`next_in`].
+            for days_ago in 0..15 {
+                let date = now
+                    .date_naive()
+                    .checked_sub_signed(Duration::days(days_ago))?;
+                if let Schedule::Weekly { weekday, .. } = task.schedule {
+                    if date.weekday().number_from_monday() != u32::from(weekday) {
+                        continue;
+                    }
+                }
+                let hours: Vec<u32> = if matches!(task.schedule, Schedule::Hourly) {
+                    (0..24).rev().collect()
+                } else {
+                    vec![hour]
+                };
+                for hour in hours {
+                    if let Some(candidate) = zone
+                        .from_local_datetime(&date.and_hms_opt(hour, minute, 0)?)
+                        .earliest()
+                    {
+                        if candidate.timestamp() <= now.timestamp() {
+                            return Some(candidate.timestamp());
+                        }
+                    }
+                }
+            }
+            None
+        }
+    }
+}
 fn next_in<T: TimeZone>(task: &ScheduleTask, now: DateTime<T>) -> Option<i64> {
     match &task.schedule {
         Schedule::Interval { every_minutes } => {

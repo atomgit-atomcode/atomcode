@@ -6,6 +6,18 @@ use std::sync::Arc;
 /// The daemon manages jobs but is not the CLI executor. Fail explicitly when
 /// its sibling executable is missing rather than installing an unusable job.
 pub fn execution_binary() -> anyhow::Result<std::path::PathBuf> {
+    // Android has no `atomcode` executable to start: the daemon is a library that
+    // Kotlin loads into the app process, and the platform forbids executing
+    // anything from the app's data directory. `current_exe()` there is the app
+    // process itself, so returning it would spawn a second app instance that runs
+    // `schedule run …` as its own (ignored) arguments — a job that looks started
+    // and never does anything.
+    if cfg!(target_os = "android") {
+        anyhow::bail!(
+            "a scheduled task runs the `atomcode` CLI as a separate process, and Android forbids \
+             starting one from an app (the agent runs inside the app process instead)"
+        );
+    }
     let current = std::env::current_exe()?;
     if current.file_stem().and_then(|s| s.to_str()) == Some("atomcode-daemon") {
         let cli = current.with_file_name(if cfg!(windows) {
@@ -434,9 +446,31 @@ pub fn current() -> anyhow::Result<Box<dyn OsScheduler + Send + Sync>> {
     }))
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+/// Android has no scheduler this product can install a job into.
+///
+/// It used to fall through to the systemd backend, so creating a task there
+/// failed with `systemctl: No such file or directory` — which reads like a
+/// broken phone rather than a platform where the feature is not available at
+/// all. Saying so up front is the only honest answer: the daemon is a library
+/// in the app process, and Android forbids starting a separate `atomcode`.
+#[cfg(target_os = "android")]
 pub fn current() -> anyhow::Result<Box<dyn OsScheduler + Send + Sync>> {
-    // Fallback for other platforms — returns SystemdTimer as best-effort.
+    Ok(Box::new(Unsupported::new(
+        "Android has no system scheduler this app can register with, so there is no \
+         registration to install. Tasks are run by the app itself while it is open: a \
+         task stops when the app is killed, and there is no wakeup that starts it.",
+    )))
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "windows",
+    target_os = "android"
+)))]
+pub fn current() -> anyhow::Result<Box<dyn OsScheduler + Send + Sync>> {
+    // Other platforms keep the best-effort systemd backend: it is the closest
+    // thing to a portable scheduler, and the failure is reported, not hidden.
     let root = dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?
         .join(".config/systemd/user");
@@ -444,6 +478,42 @@ pub fn current() -> anyhow::Result<Box<dyn OsScheduler + Send + Sync>> {
         root,
         runner: Arc::new(RealCommandRunner),
     }))
+}
+
+/// A platform with no scheduler this product can register a job into.
+///
+/// Every method states that, instead of pretending to install something. The
+/// definition is still saved (the store is the authority on what was asked for);
+/// only the OS registration is refused.
+#[cfg(any(test, target_os = "android"))]
+pub struct Unsupported {
+    reason: &'static str,
+}
+
+#[cfg(any(test, target_os = "android"))]
+impl Unsupported {
+    pub fn new(reason: &'static str) -> Self {
+        Self { reason }
+    }
+}
+
+#[cfg(any(test, target_os = "android"))]
+impl OsScheduler for Unsupported {
+    fn install(&self, _task: &ScheduleTask) -> anyhow::Result<()> {
+        anyhow::bail!("{}", self.reason)
+    }
+
+    /// Nothing was ever registered, so there is nothing to remove. Returning an
+    /// error here would make deleting a task look like it failed.
+    fn uninstall(&self, _id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// `Unknown`, not `Missing`: the task is not "not registered yet", the
+    /// platform cannot register it at all. The panel shows this text.
+    fn status(&self, _id: &str) -> InstallState {
+        InstallState::Unknown(self.reason.to_string())
+    }
 }
 
 // ---- Shared helpers ----
@@ -614,6 +684,41 @@ fn schtasks_dow(wd: u8) -> anyhow::Result<&'static str> {
 mod tests {
     use super::*;
     use atomcode_config::schedule::Schedule;
+
+    /// A platform with no scheduler must refuse to register — and say why — rather
+    /// than fall through to systemd and report `systemctl: No such file or
+    /// directory`, which reads like a broken machine. Android is that platform.
+    #[test]
+    fn a_platform_without_a_scheduler_refuses_and_explains() {
+        let scheduler = Unsupported::new("no scheduler on this platform");
+        let task = sample_task("unsupported");
+
+        let error = scheduler.install(&task).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("no scheduler on this platform"),
+            "the refusal must carry the reason: {error:#}"
+        );
+        assert_eq!(
+            scheduler.status("unsupported"),
+            InstallState::Unknown("no scheduler on this platform".into())
+        );
+        // Nothing was registered, so removing it is not a failure.
+        assert!(scheduler.uninstall("unsupported").is_ok());
+    }
+
+    /// The job is started by running the `atomcode` CLI as a child process. On a
+    /// platform where that executable does not exist (Android), saying so beats
+    /// spawning whatever `current_exe()` happens to be and calling it started.
+    #[test]
+    fn an_environment_without_the_cli_reports_why_a_job_cannot_start() {
+        if !cfg!(target_os = "android") {
+            // The guard is Android-only; on a desktop the CLI resolution is real
+            // and covered by the daemon's own tests.
+            return;
+        }
+        let error = execution_binary().unwrap_err();
+        assert!(format!("{error:#}").contains("Android"));
+    }
 
     #[test]
     fn systemd_oncalendar_translation() {

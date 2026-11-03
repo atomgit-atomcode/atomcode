@@ -23,6 +23,40 @@ pub struct Entry {
     pub last_run: Option<RunEvent>,
     pub running: bool,
 }
+/// Whether this entry should be started at `now`.
+///
+/// This lives here instead of in the Android-only runner so the rule can be
+/// tested on any machine — that runner is compiled only for `target_os =
+/// "android"`, so a mistake in this predicate would otherwise surface only on a
+/// phone. (It did: the first version compared `entry.next_run`, which is a
+/// prediction of the *future* occurrence, so no task ever fired.)
+///
+/// The question is "has an occurrence arrived that no run has covered yet":
+/// the latest occurrence at or before `now` is due when the last recorded run
+/// started or finished before it.
+pub fn due_at(entry: &Entry, now: i64) -> bool {
+    let task = &entry.definition.task;
+    if !task.enabled || entry.running {
+        return false;
+    }
+    let Some(occurrence) = crate::timing::previous(task, now) else {
+        return false;
+    };
+    match entry.last_run.as_ref().and_then(last_run_at) {
+        Some(last) => last < occurrence,
+        None => true,
+    }
+}
+
+/// When the recorded run event happened, whatever kind it is.
+fn last_run_at(event: &RunEvent) -> Option<i64> {
+    match event {
+        RunEvent::Started { at, .. }
+        | RunEvent::Session { at, .. }
+        | RunEvent::Finished { at, .. } => Some(*at),
+    }
+}
+
 impl Service {
     pub fn new(store: Store, os: Option<Arc<dyn OsScheduler + Send + Sync>>) -> Self {
         Self { store, os }
@@ -195,6 +229,67 @@ mod tests {
         assert_eq!(restored.catalog().unwrap()[0].registration, "error");
         assert_eq!(restored.store.get("test").unwrap().task.title, "Test");
         assert!(restored.store.history("test").unwrap().is_empty());
+    }
+
+    /// Build an entry without touching the store, so the predicate is what is
+    /// under test rather than the file layout.
+    fn entry(enabled: bool, running: bool, created_at: i64, last_run_at: Option<i64>) -> Entry {
+        let task = serde_json::from_value(serde_json::json!({
+            "id": "t", "title": "T", "prompt": "p", "cwd": std::env::temp_dir(),
+            // 每分钟一次：到期时刻就是 created_at + n*60，便于精确断言。
+            "schedule": {"kind": "interval", "every_minutes": 1},
+            "created_at": created_at,
+            "enabled": enabled
+        }))
+        .unwrap();
+        Entry {
+            definition: crate::Definition {
+                task,
+                revision: "rev".into(),
+            },
+            registration: "unknown".into(),
+            registration_error: None,
+            next_run: None,
+            last_run: last_run_at.map(|at| crate::RunEvent::Finished {
+                run_id: "r".into(),
+                status: "ok".into(),
+                error: None,
+                at,
+            }),
+            running,
+        }
+    }
+
+    #[test]
+    fn a_task_runs_only_when_enabled_idle_and_its_occurrence_is_uncovered() {
+        // 每分钟一次，锚点是创建时刻：到期时刻 = created + n*60。
+        let created = 1_800_000_000;
+        let now = created + 125; // 已过 created+120 这次
+
+        assert!(
+            due_at(&entry(true, false, created, None), now),
+            "occurrence arrived and nothing has run yet"
+        );
+        // 三种绝不能跑的情况。
+        assert!(!due_at(&entry(false, false, created, None), now), "paused");
+        assert!(
+            !due_at(&entry(true, true, created, None), now),
+            "already running"
+        );
+        assert!(
+            !due_at(&entry(true, false, created, None), created + 59),
+            "the first occurrence has not arrived yet"
+        );
+
+        // 已经跑过这次就不再跑；只跑过上一次的仍然要跑。
+        assert!(
+            !due_at(&entry(true, false, created, Some(created + 121)), now),
+            "this occurrence was handled"
+        );
+        assert!(
+            due_at(&entry(true, false, created, Some(created + 60)), now),
+            "the run belongs to the previous occurrence, so this one is still due"
+        );
     }
 }
 
