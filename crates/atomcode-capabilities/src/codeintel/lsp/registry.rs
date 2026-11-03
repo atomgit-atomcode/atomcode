@@ -59,6 +59,24 @@ impl LspServerRegistry {
         add("py", "pylsp", &[], &["pyproject.toml", "setup.py"]);
         add("go", "gopls", &["serve"], &["go.mod"]);
         add("java", "jdtls", &[], &["pom.xml", "build.gradle"]);
+        // C/C++ was the one common language with no entry at all, which made "LSP
+        // on Android" quietly mean "no language server for the toolchain the
+        // clang provider exists for". The binary is shipped by that provider
+        // (`libclangd.so`, see scripts/termux/manifests/clang.txt), so this is
+        // only the mapping — absence still degrades to "no server" as before.
+        for ext in ["c", "h", "cc", "cpp", "cxx", "hpp", "hh", "hxx"] {
+            add(
+                ext,
+                "clangd",
+                &[],
+                &[
+                    "compile_commands.json",
+                    "CMakeLists.txt",
+                    "Makefile",
+                    ".clangd",
+                ],
+            );
+        }
         Self { servers }
     }
 
@@ -125,6 +143,28 @@ mod tests {
         assert_eq!(extension_to_language_id("tsx"), "typescriptreact");
         assert_eq!(extension_to_language_id("cpp"), "cpp");
         assert_eq!(extension_to_language_id("zzz"), "zzz"); // unknown → itself
+    }
+
+    #[test]
+    fn c_and_cpp_map_to_the_language_server_the_clang_provider_ships() {
+        // The clang provider (APK) carries `clangd`; without this mapping the
+        // shipped binary had nothing pointing at it, so C/C++ had no code
+        // intelligence on a device where no compiler package can be installed.
+        let r = LspServerRegistry::with_defaults();
+        for ext in ["c", "h", "cc", "cpp", "cxx", "hpp", "hh", "hxx"] {
+            assert_eq!(
+                r.get(ext).map(|s| s.command.as_str()),
+                Some("clangd"),
+                "{ext}"
+            );
+        }
+        assert!(r
+            .get("cpp")
+            .unwrap()
+            .root_markers
+            .iter()
+            .any(|marker| marker == "compile_commands.json"));
+        assert_eq!(extension_to_language_id("c"), "c");
     }
 
     #[test]

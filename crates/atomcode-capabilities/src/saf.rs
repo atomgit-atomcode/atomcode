@@ -97,6 +97,93 @@ pub fn installed_backend() -> Option<Arc<dyn SafBackend>> {
     BACKEND.get().cloned()
 }
 
+/// The path the granted tree is presented under, recorded when its row mounts.
+///
+/// The daemon serves `/fs/*` over real paths. In a SAF build the session's
+/// working directory is this synthetic root — nothing is on disk behind it — so
+/// the routes that browse or search have to know which path means "the granted
+/// tree". The `fs-saf` row is the only thing that knows, hence the registry.
+static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+pub fn install_root(root: PathBuf) {
+    let _ = ROOT.set(root);
+}
+
+pub fn installed_root() -> Option<PathBuf> {
+    ROOT.get().cloned()
+}
+
+/// How deep the name search descends, and how many matches it returns.
+const SEARCH_MAX_DEPTH: usize = 8;
+const SEARCH_MAX_MATCHES: usize = 200;
+
+/// Directory names the name search never descends into.
+fn is_noise_dir(name: &str) -> bool {
+    matches!(
+        name,
+        ".git" | "node_modules" | "target" | "build" | "dist" | ".gradle" | ".venv" | "__pycache__"
+    )
+}
+
+/// A bounded, name-only search over a world that has no paths.
+///
+/// This is the same `@`-mention contract the real-path search serves, expressed
+/// over the [`FileSystem`] seam: `scope` is the directory to start from (relative
+/// to `fs.root()`), `filter` is the name fragment. Matches come back relative to
+/// `fs.root()`, forward-slashed, with whether each is a directory.
+///
+/// Why not reuse `file_index`: it walks a real directory and reads `.gitignore`,
+/// while SAF hands out `content://` documents with neither. The bounds exist for
+/// the same reason the file picker has them — a grant can be a whole SD card.
+pub async fn search_names(fs: &dyn FileSystem, scope: &str, filter: &str) -> Vec<(String, bool)> {
+    let needle = filter.trim().to_lowercase();
+    let root = fs.root();
+    let start = if scope.trim().is_empty() {
+        root.clone()
+    } else {
+        root.join(scope)
+    };
+    let mut out: Vec<(String, bool)> = Vec::new();
+    let mut queue: std::collections::VecDeque<(PathBuf, usize)> =
+        std::collections::VecDeque::from([(start, 0usize)]);
+
+    while let Some((dir, depth)) = queue.pop_front() {
+        if out.len() >= SEARCH_MAX_MATCHES {
+            break;
+        }
+        // An unreadable branch (revoked grant, deleted document) is skipped rather
+        // than ending the search: one folder must not hide the rest of the tree.
+        let Ok(entries) = fs.list(&dir).await else {
+            continue;
+        };
+        for entry in entries {
+            if out.len() >= SEARCH_MAX_MATCHES {
+                break;
+            }
+            let name = entry
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            // An empty filter is "show me what is here", which is the immediate
+            // children — the same thing typing `@` with nothing after it means.
+            let matched = if needle.is_empty() {
+                depth == 0
+            } else {
+                name.to_lowercase().contains(&needle)
+            };
+            if matched {
+                let relative = entry.path.strip_prefix(&root).unwrap_or(&entry.path);
+                out.push((relative.to_string_lossy().replace('\\', "/"), entry.is_dir));
+            }
+            if entry.is_dir && depth + 1 <= SEARCH_MAX_DEPTH && !is_noise_dir(name) {
+                queue.push_back((entry.path.clone(), depth + 1));
+            }
+        }
+    }
+    out
+}
+
 /// A [`FileSystem`] whose root is a folder the person granted through the picker.
 pub struct SafFs {
     root: PathBuf,
@@ -543,5 +630,52 @@ mod tests {
         let text = fs.describe();
         assert!(text.contains("picker"), "{text}");
         assert!(text.contains("/saf/tree"), "{text}");
+    }
+
+    /// The `@`-mention picker has to keep working where there are no paths. It
+    /// used to be empty in a SAF build, because the search walked a real
+    /// directory that does not exist here.
+    #[tokio::test]
+    async fn a_name_search_reaches_into_subdirectories_and_skips_noise() {
+        let fs = world(
+            Memory::new()
+                .with_file("src/main/java/cn/ApplyStockController.java", b"x")
+                .with_file("src/apply_helper.rs", b"x")
+                .with_file("target/ApplyStockController.class", b"x")
+                .with_file("README.md", b"x"),
+        );
+
+        let found = search_names(&fs, "", "apply").await;
+        let paths: Vec<&str> = found.iter().map(|(path, _)| path.as_str()).collect();
+        assert!(
+            paths.contains(&"src/main/java/cn/ApplyStockController.java"),
+            "{paths:?}"
+        );
+        assert!(paths.contains(&"src/apply_helper.rs"), "{paths:?}");
+        // Build output must not crowd out source matches.
+        assert!(
+            !paths.iter().any(|path| path.starts_with("target/")),
+            "{paths:?}"
+        );
+
+        // An empty filter is "what is here" — the immediate children, the same
+        // thing typing `@` with nothing after it asks for.
+        let top = search_names(&fs, "", "").await;
+        let tops: Vec<&str> = top.iter().map(|(path, _)| path.as_str()).collect();
+        assert_eq!(tops, vec!["README.md", "src", "target"]);
+    }
+
+    /// The scope narrows where the walk starts, exactly like the real-path
+    /// search: `src/` plus filter `apply` must not return a match outside `src`.
+    #[tokio::test]
+    async fn a_scoped_search_stays_inside_the_scope() {
+        let fs = world(
+            Memory::new()
+                .with_file("src/apply.rs", b"x")
+                .with_file("docs/apply.md", b"x"),
+        );
+        let found = search_names(&fs, "src", "apply").await;
+        let paths: Vec<&str> = found.iter().map(|(path, _)| path.as_str()).collect();
+        assert_eq!(paths, vec!["src/apply.rs"]);
     }
 }

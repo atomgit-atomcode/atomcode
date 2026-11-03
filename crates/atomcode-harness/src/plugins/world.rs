@@ -159,6 +159,9 @@ impl Plugin for FsSafPlugin {
             "no folder has been granted through the file picker in this build".to_string()
         })?;
         let root = std::path::PathBuf::from(row.root.unwrap_or_else(|| "/saf".to_string()));
+        // The daemon's `/fs/*` routes work on real paths; they need to recognise
+        // which path means "the granted tree" before they can browse or search it.
+        atomcode_capabilities::saf::install_root(root.clone());
         let world = if row.read_only {
             atomcode_capabilities::saf::SafFs::read_only(root, backend)
         } else {
