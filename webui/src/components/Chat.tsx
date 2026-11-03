@@ -1,3 +1,6 @@
+import { createPortal } from 'preact/compat';
+import type { ComponentChildren } from 'preact';
+import { SessionBrowse } from './SessionBrowse';
 import { TodoGuidanceSources } from './TodoGuidanceSources';
 import { nextContextSummary } from '../lib/contextSummaries';
 import { adjacentTimelineStart, archivedMessage, assistantTurnRange, boundedTimelineRange, cacheSession, residentStart, segmentMessages, targetTimelineStart, timelineLimits } from '../lib/timelineMemory';
@@ -279,6 +282,10 @@ interface PermissionRequestEvent {
 }
 
 interface ChatProps {
+  browseSession?: SessionMetaWithProject | null;
+  onReturnToBound?: () => void;
+  onContinueBrowse?: () => void;
+  onExecutionState?: (active: boolean) => void;
   sessionId: string | null;
   onSessionId: (id: string) => void;
   cwd: string;
@@ -466,7 +473,7 @@ function detectSkillContent(text: string): string | null {
   return title || null;
 }
 
-export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermission, onPermissionResolved, activeSession, restoring, onLiveTurnDone, onOptimisticSession, onOpenCwd, onCwdChanged, onLanding, skillInsert, composerInsert, onSessionRenamed }: ChatProps) {
+export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecutionState, sessionId, onSessionId, cwd, onPermission, pendingPermission, onPermissionResolved, activeSession, restoring, onLiveTurnDone, onOptimisticSession, onOpenCwd, onCwdChanged, onLanding, skillInsert, composerInsert, onSessionRenamed }: ChatProps) {
   const t = useT();
   const [compactTimeline, setCompactTimeline] = useState(() => window.matchMedia('(max-width: 767px)').matches);
   const limits = timelineLimits(compactTimeline);
@@ -495,6 +502,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     // next render. Keep the ref authoritative synchronously so an active
     // `/chat` turn cannot be mistaken for an idle direct-send window.
     busyRef.current = next;
+    if (next) onExecutionState?.(true);
     setBusyState(next);
   }
   // 回合开始时刻（本 tab 主动 submit 时记录；live 恢复/重放不得重置），
@@ -918,7 +926,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       );
       if (syncRef.current && !liveSwitch.allowed) {
         if (prevId) onSessionId(prevId);
-        pushCommandNotice(t('cmd.session.busy'));
+        pushCommandNotice(t('browse.switchBusy'));
         return;
       }
       // A correlated steer still belongs to the session being left. Recover it
@@ -1025,7 +1033,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
             }
             if (result.ok) return true;
             if (result.activeTurn && prevId) {
-              noticeAfterSwitchRef.current = t('cmd.session.busy');
+              noticeAfterSwitchRef.current = t('browse.switchBusy');
               onSessionId(prevId);
               return false;
             }
@@ -3921,6 +3929,15 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     ?? livePermissionCard
     ?? chatPermissionCard
     ?? userInputCard;
+  // Keep the actual interaction mounted when its presentation seat moves between
+  // the live view and history browser (including partially entered answers).
+  const [interactionHost] = useState(() => document.createElement('div'));
+  function interactionSeat(node: HTMLDivElement | null) {
+    if (node && interactionHost.parentNode !== node) node.appendChild(interactionHost);
+  }
+  function withInteraction(view: ComponentChildren) {
+    return <>{view}{createPortal(blockingInteraction, interactionHost)}</>;
+  }
   const hasBlockingInteraction = blockingInteraction != null;
   const wasBlockingInteractionRef = useRef(false);
 
@@ -3934,6 +3951,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     });
     return () => cancelAnimationFrame(frame);
   }, [hasBlockingInteraction]);
+
+  useEffect(() => { onExecutionState?.(busy || hasBlockingInteraction); }, [busy, hasBlockingInteraction, onExecutionState]);
 
   // 落地页快捷提示胶囊：点击把文本填入输入框并聚焦（不自动发送，便于二次编辑）。
   const quickChips: { label: string; insert: string }[] = [
@@ -3954,8 +3973,22 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     });
   }
 
+  if (browseSession) {
+    const target = activeSession?.name || sessionId || '';
+    return withInteraction(<>
+      <div class="session-browse-notice" role="status">
+        <span>{t('browse.readOnly', { viewed: browseSession.name, bound: target })}</span>
+        <button onClick={onReturnToBound}>{t('browse.return', { name: target })}</button>
+        <button disabled={busy || hasBlockingInteraction} onClick={onContinueBrowse}>{t('browse.continue')}</button>
+        {canStop && <button onClick={handleStop}>{t('browse.stop', { name: target })}</button>}
+      </div>
+      <SessionBrowse key={`${browseSession.project_hash}/${browseSession.id}`} session={browseSession} />
+      {blockingInteraction && <div class="interaction-dock-seat" ref={interactionSeat} aria-label={target}></div>}
+    </>);
+  }
+
   if (landing) {
-    return (
+    return withInteraction(
       <>
         <div class="chat-landing">
           <div class="landing-inner">
@@ -3970,7 +4003,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
             <div class="landing-tagline">{t('chat.greeting')}</div>
             <div class="landing-input">
               {blockingInteraction ? (
-                <div class="interaction-dock-seat">{blockingInteraction}</div>
+                <div class="interaction-dock-seat" ref={interactionSeat}></div>
               ) : (
                 <>
                   {inputBox}
@@ -3994,7 +4027,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     );
   }
 
-  return (
+  return withInteraction(
     <>
       {/* Message timeline */}
       <div class="messages-container" ref={scrollRef} onScroll={onTimelineScroll}
@@ -4285,7 +4318,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         )}
         <div class="input-wrap">
           {blockingInteraction ? (
-            <div class="interaction-dock-seat">{blockingInteraction}</div>
+            <div class="interaction-dock-seat" ref={interactionSeat}></div>
           ) : (
             <>
               {inputBox}

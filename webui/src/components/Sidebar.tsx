@@ -23,6 +23,7 @@ import {
 } from '../lib/sidebarView';
 
 interface SidebarProps {
+  runningSessionId?: string | null;
   activeSessionId: string | null;
   onSelect: (session: SessionMetaWithProject) => void;
   onNew: () => void;
@@ -319,6 +320,7 @@ function BellGlyph() {
 }
 
 export function Sidebar({
+  runningSessionId,
   activeSessionId,
   onSelect,
   onNew,
@@ -1255,6 +1257,7 @@ export function Sidebar({
       >
         <button class="session-item-main" onClick={() => onSelect(s)} title={dir}>
           <span class="session-item-name">{s.scheduled && <span class="session-automation-mark" title={t('sidebar.automation')} aria-label={t('sidebar.automation')}>◷</span>}{label}</span>
+          {s.id === runningSessionId && <span class="session-running-mark">{t('browse.running')}</span>}
           <span class="session-item-meta">
             {formatTime(s.updated_at || s.created_at, t, timeNow)}
           </span>
