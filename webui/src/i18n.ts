@@ -9,6 +9,16 @@
 export type Lang = 'zh' | 'en';
 
 const zh = {
+  'todo.source.open': '查看原始指导',
+  'todo.source.reference': '原始用户消息，仅供回溯；较新的指令优先，不会自动应用其中的 patch。',
+  'todo.source.changed': '任务批次已变化，请重新打开原始指导。',
+  'todo.source.loading': '正在读取原始指导…',
+  'todo.source.retry': '重试',
+  'todo.source.empty': '此任务批次未关联原始指导。',
+  'todo.source.message': '用户消息 #{seq}',
+  'todo.source.characters': '字符',
+  'todo.source.previous': '上一页',
+  'todo.source.next': '下一页',
   'context.summarizing': '正在摘要上下文…',
   'context.summaryCount': '已摘要 {count} 次',
   'context.summaryRecorded': '上下文已摘要 · 第 {count} 次',
@@ -655,6 +665,16 @@ const zh = {
 export type MsgKey = keyof typeof zh;
 
 const en: Record<MsgKey, string> = {
+  'todo.source.open': 'Original guidance',
+  'todo.source.reference': 'Original user messages for reference; newer instructions take precedence. Patches are never applied automatically.',
+  'todo.source.changed': 'The task batch changed. Reopen original guidance.',
+  'todo.source.loading': 'Reading original guidance…',
+  'todo.source.retry': 'Retry',
+  'todo.source.empty': 'No original guidance is linked to this task batch.',
+  'todo.source.message': 'User message #{seq}',
+  'todo.source.characters': 'characters',
+  'todo.source.previous': 'Previous',
+  'todo.source.next': 'Next',
   'context.summarizing': 'Summarizing context…',
   'context.summaryCount': 'Summarized {count} times',
   'context.summaryRecorded': 'Context summarized · #{count}',

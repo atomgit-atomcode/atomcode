@@ -4178,3 +4178,9 @@ body {
 
 .timeline-history-status.is-loading { position: sticky; top: 0; z-index: 4; height: 0; min-height: 0; flex: 0 0 0; padding: 0; pointer-events: none; }
 .timeline-history-status.is-loading > span { display: inline-block; padding: 4px 10px; border-radius: 8px; background: var(--app-primary-background); }
+
+.todo-guidance-sources { padding: 6px 12px 12px; border-top: 1px solid var(--app-input-border); }
+.todo-source-hint { color: var(--app-secondary-foreground); font-size: 0.75rem; }
+.todo-source-page { margin-top: 8px; font-size: 0.75rem; }
+.todo-source-page pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 360px; overflow: auto; padding: 10px; background: var(--app-tool-background); font-family: var(--app-monospace-font-family); }
+.todo-source-pagination { display: flex; gap: 8px; margin-top: 8px; }

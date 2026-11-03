@@ -136,7 +136,7 @@ impl CommandSet for ScreenCommands {
                     // in the harness), which writes them into the log between
                     // turns; the screen only passes the words on, as they were
                     // typed — the task keeps its case.
-                    "add" | "clear" => match client {
+                    "add" | "clear" | "source" => match client {
                         Some(client) => {
                             client.invoke("todo", args);
                             Outcome::Quiet

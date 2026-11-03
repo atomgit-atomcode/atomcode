@@ -1,3 +1,4 @@
+import { TodoGuidanceSources } from './TodoGuidanceSources';
 import { nextContextSummary } from '../lib/contextSummaries';
 import { adjacentTimelineStart, archivedMessage, assistantTurnRange, boundedTimelineRange, cacheSession, residentStart, segmentMessages, targetTimelineStart, timelineLimits } from '../lib/timelineMemory';
 import { useTimelineMessages, useTimelinePage, useTimelineSearch } from '../lib/useTimelineMessages';
@@ -677,6 +678,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   const [userInputReq, setUserInputReq] = useState<(RoutedUserInputRequest & { viewKey: number }) | null>(null);
   const [policyIntervention, setPolicyIntervention] = useState<PolicyInterventionEvent | null>(null);
   const [todoItems, setTodoItems] = useState<TodoItem[]>([]);
+  const [todoSourceRevision, setTodoSourceRevision] = useState(0);
   const [todoPreview, setTodoPreview] = useState<TodoItem[] | null>(null);
   const [todoPanelVisible, setTodoPanelVisibleState] = useState(false);
   const todoPanelVisibleRef = useRef(false);
@@ -2505,6 +2507,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         {
           const pending = pendingTodoCallsRef.current.get(event.id);
           if (pending) settleTodoCall(event.id, event.success);
+          if (pending && event.success) setTodoSourceRevision(value => value + 1);
           pendingTodoCallsRef.current.delete(event.id);
         }
         updateToolInLastAssistant(event.id, {
@@ -4277,7 +4280,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
           <div class="goal-recovery-status" role="status">{t('goal.recovery.paused')} {goalProgress.last_reason}</div>
         )}
         {todoPanelVisible && (todoPreview ?? todoItems).length > 0 && (
-          <TodoProgressPanel items={todoPreview ?? todoItems} />
+          <TodoProgressPanel items={todoPreview ?? todoItems} projectHash={activeSession?.id === sessionId ? activeSession.project_hash : undefined} sessionId={sessionId ?? undefined} sourceRevision={todoSourceRevision} />
         )}
         <div class="input-wrap">
           {blockingInteraction ? (
@@ -4296,7 +4299,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   );
 }
 
-function TodoProgressPanel({ items }: { items: TodoItem[] }) {
+function TodoProgressPanel({ items, projectHash, sessionId, sourceRevision }: { items: TodoItem[]; projectHash?: string; sessionId?: string; sourceRevision: number }) {
   const t = useT();
   const [expanded, setExpanded] = useState(false);
   const inProgress = items.filter((item) => item.status === 'in_progress').length;
@@ -4346,6 +4349,7 @@ function TodoProgressPanel({ items }: { items: TodoItem[] }) {
           ))}
         </ol>
       )}
+      {expanded && projectHash && sessionId && <TodoGuidanceSources projectHash={projectHash} sessionId={sessionId} items={items} revision={sourceRevision} />}
     </section>
   );
 }

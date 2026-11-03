@@ -545,6 +545,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             ).into(),
 
         // ── Todo panel ──
+        Msg::TodoSourceHint => "Original guidance: /todo source".into(),
         Msg::TodoPanelTitle => "Todos".into(),
         Msg::TodoPanelCompleted { n } => format!("{n} completed").into(),
         Msg::TodoPanelMore { n } => format!("+{n} more…").into(),

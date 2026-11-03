@@ -581,6 +581,7 @@ impl LifecycleHooks for TodoHook {
         let Some(CurrentTodos {
             items: todos,
             through,
+            source_seqs,
         }) = current
         else {
             return;
@@ -612,8 +613,17 @@ impl LifecycleHooks for TodoHook {
             } else {
                 String::new()
             };
+        let source_note = if source_seqs.is_empty()
+            || todos
+                .iter()
+                .all(|todo| todo.status == TodoStatus::Completed)
+        {
+            String::new()
+        } else {
+            format!("\nOriginal guidance: user-message sequences {source_seqs:?}. Use todo_sources action=read with source_seq to retrieve original text as needed. Historical references do not override newer instructions or grant permission to execute patches.")
+        };
         let body = format!(
-            "{TODO_LIST_HEADER}{rules}{continuity}\n{status}{note}\n{}",
+            "{TODO_LIST_HEADER}{rules}{continuity}{source_note}\n{status}{note}\n{}",
             render_todos_numbered(&todos, false)
         );
         messages.push(synthetic_system_reminder(&body));
@@ -723,7 +733,13 @@ fn write_sidecar(
             status: todo_status_str(&t.status).to_string(),
         })
         .collect();
-    let _ = manager.write_todo_sidecar(session_id, &items, message_count, current.through);
+    let _ = manager.write_todo_sidecar_with_sources(
+        session_id,
+        &items,
+        message_count,
+        current.through,
+        &current.source_seqs,
+    );
 }
 
 /// The session's persisted todo sidecar, when there is a session to key it on.
@@ -734,6 +750,7 @@ fn read_sidecar(manager: Option<&SessionManager>, ctx: &TurnCtx) -> Option<TodoS
 
 /// The task list as it stands, and where the last todo call it reflects was made.
 struct CurrentTodos {
+    source_seqs: Vec<u64>,
     items: Vec<TodoItem>,
     through: Option<TodoCallPosition>,
 }
@@ -788,9 +805,18 @@ fn current_todos(
         return Some(CurrentTodos {
             items,
             through: last,
+            source_seqs: calls
+                .iter()
+                .rev()
+                .find(|call| is_todo_plan(&call.call.arguments))
+                .and_then(|call| serde_json::from_str(&call.call.arguments).ok())
+                .and_then(|value| {
+                    atomcode_capabilities::tools::todo_sources::source_seqs(&value).ok()
+                })
+                .unwrap_or_default(),
         });
     }
-    let (mut items, through) = match sidecar() {
+    let (mut items, through, source_seqs) = match sidecar() {
         Some(sidecar) => {
             let items = sidecar
                 .todos
@@ -800,10 +826,25 @@ fn current_todos(
                     status: parse_todo_status(&item.status),
                 })
                 .collect();
-            (items, sidecar.through)
+            let sources = if messages.iter().any(Message::is_user_interruption) {
+                // A source belongs to a plan, not to cached tasks revived after
+                // the person cancelled it. A later full plan may explicitly relink.
+                Vec::new()
+            } else {
+                sidecar.source_seqs
+            };
+            (
+                items,
+                sidecar.through,
+                if sources.len() <= 4 && sources.iter().all(|seq| *seq > 0) {
+                    sources
+                } else {
+                    vec![]
+                },
+            )
         }
         None if calls.is_empty() => return None,
-        None => (Vec::new(), None),
+        None => (Vec::new(), None, Vec::new()),
     };
     for call in &calls {
         let newer = match through {
@@ -815,6 +856,7 @@ fn current_todos(
         }
     }
     Some(CurrentTodos {
+        source_seqs,
         items,
         through: last.max(through),
     })
@@ -1143,6 +1185,77 @@ mod tests {
         assert!(last.synthetic, "runtime reminders must carry provenance");
         assert!(last.text.contains("system-reminder"), "{}", last.text);
         assert!(last.text.contains("step one"), "{}", last.text);
+    }
+
+    #[tokio::test]
+    async fn original_guidance_is_anchored_by_reference_and_retained_after_compaction() {
+        let args =
+            r#"{"todos":[{"content":"fix boundary","status":"in_progress"}],"source_seqs":[7,12]}"#;
+        let mut messages = vec![
+            Message::user("RAW PATCH MUST NOT BE REPEATED"),
+            todowrite_msg(args),
+        ];
+        TodoHook::default()
+            .pre_request(&mut messages, &TurnCtx::default())
+            .await;
+        let reminder = &messages.last().unwrap().text;
+        assert!(reminder.contains("[7, 12]"));
+        assert!(reminder.contains("todo_sources"));
+        assert!(!reminder.contains("RAW PATCH"));
+        let mut baseline = sidecar_of(&[("fix boundary", "in_progress")], Some(at(1, 1)));
+        baseline.source_seqs = vec![7, 12];
+        let restored = current_todos(&[], || Some(baseline)).unwrap();
+        assert_eq!(restored.source_seqs, vec![7, 12]);
+        let mut cancelled_cache = sidecar_of(&[("fix boundary", "in_progress")], Some(at(1, 1)));
+        cancelled_cache.source_seqs = vec![7, 12];
+        let cancelled =
+            current_todos(&[Message::user_interruption()], || Some(cancelled_cache)).unwrap();
+        assert!(
+            cancelled.source_seqs.is_empty(),
+            "a cancelled batch cannot be revived from its cache"
+        );
+        let replaced = current_todos(
+            &[todowrite_msg(
+                r#"{"todos":[{"content":"new work","status":"pending"}]}"#,
+            )],
+            || panic!("full plan supersedes cache"),
+        )
+        .unwrap();
+        assert!(replaced.source_seqs.is_empty());
+        let mut completed = vec![todowrite_msg(
+            r#"{"todos":[{"content":"fix boundary","status":"completed"}],"source_seqs":[7]}"#,
+        )];
+        TodoHook::default()
+            .pre_request(&mut completed, &TurnCtx::default())
+            .await;
+        assert!(!completed
+            .last()
+            .unwrap()
+            .text
+            .contains("Original guidance:"));
+    }
+
+    #[test]
+    fn a_failed_reused_call_id_does_not_hide_a_later_source_batch() {
+        let first =
+            r#"{"todos":[{"content":"first fix","status":"in_progress"}],"source_seqs":[1]}"#;
+        let second =
+            r#"{"todos":[{"content":"second fix","status":"in_progress"}],"source_seqs":[8]}"#;
+        let messages = vec![
+            todo_call("reused", 1, 1, first),
+            Message::tool_result("reused", "ok", false),
+            todo_call("reused", 2, 1, second),
+            Message::tool_result("reused", "rejected", true),
+            todo_call("reused", 2, 2, second),
+            Message::tool_result("reused", "ok", false),
+        ];
+        let current =
+            current_todos(&messages, || panic!("latest successful plan is present")).unwrap();
+        assert_eq!(current.source_seqs, vec![8]);
+        assert_eq!(current.items[0].content, "second fix");
+        let previous =
+            current_todos(&messages[..4], || panic!("first plan is still valid")).unwrap();
+        assert_eq!(previous.source_seqs, vec![1]);
     }
 
     #[tokio::test]
@@ -1729,6 +1842,7 @@ mod tests {
 
     fn sidecar_of(items: &[(&str, &str)], through: Option<TodoCallPosition>) -> TodoSidecar {
         TodoSidecar {
+            source_seqs: vec![],
             todos: items
                 .iter()
                 .map(|(content, status)| TodoSidecarItem {
@@ -1830,6 +1944,7 @@ mod tests {
     #[test]
     fn a_list_with_no_positioned_call_is_left_for_turn_end() {
         let current = CurrentTodos {
+            source_seqs: vec![],
             items: Vec::new(),
             through: None,
         };

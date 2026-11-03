@@ -2312,6 +2312,116 @@ pub(crate) fn context_summary_count(working_dir: &std::path::Path, id: &str) -> 
     Some(atomcode_kernel::session::context_summary_count(&events))
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct TodoSourcesQuery {
+    source_seq: Option<u64>,
+    batch_seq: Option<u64>,
+    batch_index: Option<usize>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
+fn todo_sources_view(
+    hash: &str,
+    id: &str,
+    query: TodoSourcesQuery,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    use atomcode_capabilities::tools::todo_sources::{
+        list_sources, read_source, source_plan, SourceSession,
+    };
+    let invalid = |message: &str| (StatusCode::BAD_REQUEST, message.to_string());
+    if hash.len() != 16
+        || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte))
+    {
+        return Err(invalid("invalid session identity"));
+    }
+    let root = NativeSessionManager::sessions_root(
+        atomcode_coding::config::product_dirs_from_env().user(),
+    );
+    let manager = NativeSessionManager::with_root(root.join(hash));
+    let header = manager
+        .read_event_header(id)
+        .map_err(|_| (StatusCode::NOT_FOUND, "native session not found".into()))?;
+    if header.parent.is_some() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "member sessions are not independently readable".into(),
+        ));
+    }
+    let events = manager.load_events(id).map_err(|_| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "cannot read native session events".into(),
+        )
+    })?;
+    let plan = source_plan(&events);
+    if let Some(seq) = query.source_seq {
+        if query.batch_seq != plan.batch_seq
+            || query.batch_index != Some(plan.batch_index)
+            || !plan.source_seqs.contains(&seq)
+        {
+            return Err((
+                StatusCode::CONFLICT,
+                "the plan or its source references changed; reload the source list".into(),
+            ));
+        }
+        let session = SourceSession {
+            id: id.into(),
+            events,
+        };
+        let page = read_source(
+            &session,
+            seq,
+            query.offset.unwrap_or(0),
+            query.limit.unwrap_or(4096),
+        )
+        .map_err(|error| invalid(&error))?;
+        return Ok(
+            serde_json::json!({"batch_seq":plan.batch_seq,"batch_index":plan.batch_index,"sources":[],"todos":[],"page":page}),
+        );
+    }
+    let sources: Vec<_> = list_sources(&events, u64::MAX)
+        .into_iter()
+        .filter(|source| plan.source_seqs.contains(&source.seq))
+        .collect();
+    let todos: Vec<_> = plan
+        .todos
+        .iter()
+        .map(|todo| {
+            serde_json::json!({"content":todo.content,"status":match todo.status {
+                atomcode_capabilities::tools::todo::TodoStatus::Pending=>"pending",
+                atomcode_capabilities::tools::todo::TodoStatus::InProgress=>"in_progress",
+                atomcode_capabilities::tools::todo::TodoStatus::Completed=>"completed",
+            }})
+        })
+        .collect();
+    Ok(
+        serde_json::json!({"batch_seq":plan.batch_seq,"batch_index":plan.batch_index,"sources":sources,"todos":todos}),
+    )
+}
+
+async fn get_todo_sources(
+    Path((hash, id)): Path<(String, String)>,
+    axum::extract::Query(query): axum::extract::Query<TodoSourcesQuery>,
+) -> impl IntoResponse {
+    match tokio::task::spawn_blocking(move || todo_sources_view(&hash, &id, query)).await {
+        Ok(Ok(view)) => Json(view).into_response(),
+        Ok(Err((status, error))) => {
+            (status, Json(serde_json::json!({"error":error}))).into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error":"source reader unavailable"})),
+        )
+            .into_response(),
+    }
+}
+
 /// GET /projects/:hash/sessions/:id - Get session detail
 async fn get_session_detail(Path((hash, id)): Path<(String, String)>) -> impl IntoResponse {
     match crate::legacy_convert::load_catalog_session_view_in_project(&hash, &id) {
@@ -7514,6 +7624,10 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
             "/projects/:hash/sessions/:id/transcript",
             get(get_session_transcript),
         )
+        .route(
+            "/projects/:hash/sessions/:id/todo-sources",
+            get(get_todo_sources),
+        )
         .route("/projects/:hash/sessions/:id/rename", patch(rename_session))
         .route("/projects/:hash/sessions/:id/repair", post(repair_session))
         // Model API
@@ -8504,6 +8618,115 @@ mod tests {
             assert_eq!(body["snapshot"], "unchecked");
             assert_eq!(body["presentation"], "unchecked");
         }
+    }
+
+    #[test]
+    fn todo_sources_view_pins_the_committed_batch_and_preserves_original_text() {
+        use atomcode_kernel::session::{LoggedEvent, SessionEvent, SessionHeader};
+        let _home = ScopedChatHome::new();
+        let project = tempfile::tempdir().unwrap();
+        let dirs = atomcode_coding::config::product_dirs_from_env();
+        let manager = NativeSessionManager::for_project(project.path(), &dirs);
+        let hash = NativeSessionManager::project_hash(project.path(), &dirs);
+        let id = "todo-source-test";
+        let lease = manager.acquire_lease(id).unwrap();
+        let header = SessionHeader::new(id);
+        let mut meta = atomcode_capabilities::session::SessionMeta::new(
+            id,
+            project.path().to_string_lossy(),
+            0,
+        );
+        meta.owner = atomcode_capabilities::session::StorageOwner::Native;
+        manager
+            .create_event_session(&lease, &header, &meta)
+            .unwrap();
+        let original = "原始指导\r\n```diff\r\n@@ -1 +1 @@\r\n-old\r\n+new\r\n```";
+        let event = |seq, event| LoggedEvent {
+            seq,
+            at: seq,
+            event,
+        };
+        manager.append_events(&lease, &[
+            event(1, SessionEvent::UserMessage { turn: 1, text: original.into(), images: vec![] }),
+            event(2, SessionEvent::AssistantMessage { turn: 1, round: 1, text: String::new(), tool_calls: vec![atomcode_kernel::tool::ToolCall { id: "plan".into(), name: "todowrite".into(), arguments: serde_json::json!({"todos":[{"content":"apply fix","status":"in_progress"}],"source_seqs":[1]}).to_string() }], reasoning: String::new(), reasoning_blocks: vec![], meta: None }),
+            event(3, SessionEvent::ToolResultLogged { turn:1, round:1, call_id:"plan".into(), content:"ok".into(), is_error:false, images:vec![] }),
+        ]).unwrap();
+        let list = todo_sources_view(&hash, id, TodoSourcesQuery::default()).unwrap();
+        assert_eq!(list["sources"][0]["seq"], 1);
+        let query = |batch_seq| TodoSourcesQuery {
+            source_seq: Some(1),
+            batch_seq: Some(batch_seq),
+            batch_index: Some(0),
+            offset: Some(0),
+            limit: Some(16384),
+        };
+        let page = todo_sources_view(&hash, id, query(2)).unwrap();
+        assert_eq!(page["page"]["text"], original);
+        assert_eq!(
+            todo_sources_view(&hash, id, query(99)).unwrap_err().0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            todo_sources_view("../../escape", id, TodoSourcesQuery::default())
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            todo_sources_view(&hash, "../other", TodoSourcesQuery::default())
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        manager
+            .append_events(
+                &lease,
+                &[
+                    event(
+                        4,
+                        SessionEvent::AssistantMessage {
+                            turn: 2,
+                            round: 1,
+                            text: String::new(),
+                            tool_calls: vec![atomcode_kernel::tool::ToolCall {
+                                id: "clear".into(),
+                                name: "todowrite".into(),
+                                arguments: r#"{"todos":[]}"#.into(),
+                            }],
+                            reasoning: String::new(),
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    event(
+                        5,
+                        SessionEvent::ToolResultLogged {
+                            turn: 2,
+                            round: 1,
+                            call_id: "clear".into(),
+                            content: "ok".into(),
+                            is_error: false,
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            todo_sources_view(&hash, id, query(2)).unwrap_err().0,
+            StatusCode::CONFLICT
+        );
+        assert!(
+            todo_sources_view(&hash, id, TodoSourcesQuery::default()).unwrap()["sources"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            manager.load_events(id).unwrap().len(),
+            5,
+            "source reads append no facts"
+        );
     }
 
     #[test]

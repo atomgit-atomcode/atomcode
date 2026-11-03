@@ -938,6 +938,38 @@ pub fn rewound_turns(events: &[LoggedEvent]) -> std::collections::BTreeSet<u64> 
         .collect()
 }
 
+/// Facts retained by conversation rewind and interruption semantics, before any
+/// model-context compaction. Historical resource readers must not revive inputs
+/// the person retracted, including records that predate explicit TurnStart facts.
+pub fn retained_events(events: &[LoggedEvent]) -> impl Iterator<Item = &LoggedEvent> {
+    let retracted = taken_back(events);
+    let undone: std::collections::HashSet<u64> = events
+        .iter()
+        .filter_map(|entry| match entry.event {
+            SessionEvent::Interrupted { turn, undone: true } => Some(turn),
+            _ => None,
+        })
+        .collect();
+    events.iter().filter(move |entry| {
+        if retracted(entry.seq) {
+            return false;
+        }
+        // The same session-wide facts survive interruption in derive_messages.
+        let session_wide = matches!(
+            &entry.event,
+            SessionEvent::Interrupted { .. }
+                | SessionEvent::Injected {
+                    origin: InjectionOrigin::Memory
+                        | InjectionOrigin::CompactionSummary
+                        | InjectionOrigin::PersonToMember { .. }
+                        | InjectionOrigin::TeamNote { .. },
+                    ..
+                }
+        );
+        session_wide || !undone.contains(&entry.event.turn())
+    })
+}
+
 /// What undos took back: every fact from a `Rewound`'s target up to the
 /// `Rewound` itself. Several stack.
 fn taken_back(events: &[LoggedEvent]) -> impl Fn(SeqNo) -> bool {

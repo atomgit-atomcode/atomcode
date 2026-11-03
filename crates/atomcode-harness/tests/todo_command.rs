@@ -229,3 +229,85 @@ async fn an_edit_stands_after_the_turns_own_todo_calls() {
         .collect();
     assert_eq!(positions, [(turn, 4), (turn, 5)]);
 }
+
+#[tokio::test]
+async fn original_guidance_is_scoped_to_the_agent_and_read_without_a_new_turn() {
+    let (app, agent) = started("sources").await;
+    let log = agent.session();
+    let original = "原始指导\r\n```diff\r\n@@ -1 +1 @@\r\n-old\r\n+new\r\n```";
+    let source = log.append(SessionEvent::UserMessage {
+        turn: 1,
+        text: original.into(),
+        images: vec![],
+    });
+    let args = serde_json::json!({"todos":[{"content":"apply the boundary fix","status":"in_progress"}],"source_seqs":[source]}).to_string();
+    log.append(SessionEvent::AssistantMessage {
+        turn: 1,
+        round: 1,
+        text: String::new(),
+        reasoning: String::new(),
+        reasoning_blocks: vec![],
+        meta: None,
+        tool_calls: vec![atomcode_kernel::tool::ToolCall {
+            id: "source-plan".into(),
+            name: "todowrite".into(),
+            arguments: args.clone(),
+        }],
+    });
+    let tools = app
+        .context()
+        .service::<atomcode_harness::seams::ToolsSvc>()
+        .unwrap();
+    let context = atomcode_kernel::tool::ToolContext {
+        working_dir: ".".into(),
+        cancel: tokio_util::sync::CancellationToken::new(),
+        progress: atomcode_kernel::tool::ProgressSink::noop(),
+        requester: None,
+    };
+    let planner = tools.get("todowrite").unwrap();
+    assert!(
+        planner.execute(&args, &context).await.is_error,
+        "no agent scope must fail closed"
+    );
+    let result =
+        atomcode_harness::agent::as_agent(agent.ctx().clone(), planner.execute(&args, &context))
+            .await;
+    assert!(!result.is_error, "{}", result.content);
+    log.append(SessionEvent::ToolResultLogged {
+        turn: 1,
+        round: 1,
+        call_id: "source-plan".into(),
+        content: result.content,
+        is_error: false,
+        images: vec![],
+    });
+    let before = log.events().len();
+    assert!(todo(&app, &agent, "source")
+        .await
+        .unwrap()
+        .contains(&format!("[{source}]")));
+    let reader = tools.get("todo_sources").unwrap();
+    let read_args = serde_json::json!({"action":"read","source_seq":source}).to_string();
+    let read = atomcode_harness::agent::as_agent(
+        agent.ctx().clone(),
+        reader.execute(&read_args, &context),
+    )
+    .await;
+    assert!(!read.is_error, "{}", read.content);
+    let page: serde_json::Value = serde_json::from_str(&read.content).unwrap();
+    assert_eq!(page["text"], original);
+    assert_eq!(page["session_id"], log.id());
+    assert!(todo(&app, &agent, &format!("source {source}"))
+        .await
+        .unwrap()
+        .contains(original));
+    assert_eq!(
+        log.events().len(),
+        before,
+        "viewing a source submits no user message"
+    );
+    todo(&app, &agent, "clear").await.unwrap();
+    assert!(todo(&app, &agent, &format!("source {source}"))
+        .await
+        .is_err());
+}

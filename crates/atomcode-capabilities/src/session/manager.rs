@@ -50,6 +50,9 @@ const INFLIGHT_SNAPSHOT_VERSION: u32 = 1;
 /// undo truncated history).
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct TodoSidecar {
+    /// Batch source pointers only; raw guidance remains in the event log.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_seqs: Vec<u64>,
     #[serde(default)]
     pub todos: Vec<TodoSidecarItem>,
     /// Conversation message count at write time (stale-detection marker).
@@ -1317,7 +1320,25 @@ impl SessionManager {
         message_count: usize,
         through: Option<TodoCallPosition>,
     ) -> SessionResult<()> {
+        self.write_todo_sidecar_with_sources(id, todos, message_count, through, &[])
+    }
+
+    pub fn write_todo_sidecar_with_sources(
+        &self,
+        id: &str,
+        todos: &[TodoSidecarItem],
+        message_count: usize,
+        through: Option<TodoCallPosition>,
+        source_seqs: &[u64],
+    ) -> SessionResult<()> {
+        if source_seqs.len() > 4 || source_seqs.iter().any(|seq| *seq == 0) {
+            return Err(SessionStoreError::Corrupt {
+                kind: "todo sidecar",
+                message: "invalid source references".into(),
+            });
+        }
         let sidecar = TodoSidecar {
+            source_seqs: source_seqs.to_vec(),
             todos: todos.to_vec(),
             message_count,
             through,

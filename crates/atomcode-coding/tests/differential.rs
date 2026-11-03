@@ -3911,6 +3911,12 @@ async fn catalogs(key: &str, dir: &std::path::Path) -> (Vec<String>, Vec<String>
 /// it. What is left are four things somebody has to decide, not fix.
 const KNOWN_TOOL_DIFFERENCES: &[(&str, &str)] = &[
     (
+        "todo_sources",
+        "row-only feature added after the recorded chain retired: bounded reads of \
+         original user guidance explicitly linked to todo batches. The original \
+         messages remain in the native event log. Keep the historical golden unchanged.",
+    ),
+    (
         "session_reference",
         "coding-row-only feature added after the recorded chain retired: bounded \
          queries over sources explicitly referenced by the current human request. \

@@ -523,6 +523,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             ).into(),
 
         // ── 待办面板 ──
+        Msg::TodoSourceHint => "原始指导：/todo source".into(),
         Msg::TodoPanelTitle => "待办".into(),
         Msg::TodoPanelCompleted { n } => format!("{n} 已完成").into(),
         Msg::TodoPanelMore { n } => format!("+{n} 更多…").into(),

@@ -63,6 +63,7 @@ pub mod search_replace;
 pub mod sensitive_path;
 pub mod task;
 pub mod todo;
+pub mod todo_sources;
 /// Network tools (`web_fetch` / `web_search`). Opt-in `web` feature (HTTP stack).
 #[cfg(feature = "web")]
 pub mod web_fetch;

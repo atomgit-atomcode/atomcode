@@ -604,6 +604,7 @@ pub enum Msg<'a> {
 
     // ── Todo panel ──
     TodoPanelTitle,
+    TodoSourceHint,
     TodoPanelCompleted {
         n: usize,
     },

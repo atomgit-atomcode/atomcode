@@ -328,6 +328,22 @@ export interface SessionMessage {
   created_at?: number;
 }
 
+export interface TodoSourcePage {
+  session_id: string; seq: number; offset: number; next_offset: number | null; total_chars: number; text: string;
+}
+export interface TodoSourceView {
+  batch_seq: number | null; batch_index: number;
+  sources: { seq: number; turn: number; at: number; chars: number; preview: string }[];
+  todos: { content: string; status: 'pending' | 'in_progress' | 'completed' }[];
+  page?: TodoSourcePage;
+}
+export async function getTodoSources(project: string, session: string, signal: AbortSignal,
+  read?: { source_seq: number; batch_seq: number; batch_index: number; offset: number }): Promise<TodoSourceView> {
+  const query = read ? '?' + new URLSearchParams(Object.entries(read).map(([key,value]) => [key,String(value)])) : '';
+  const response = await apiFetch(`/projects/${encodeURIComponent(project)}/sessions/${encodeURIComponent(session)}/todo-sources${query}`, { signal, headers: authHeaders() });
+  return readJson<TodoSourceView>(response);
+}
+
 export interface SessionDetail {
   summary_count?: number;
   id: string;
