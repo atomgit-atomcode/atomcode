@@ -2777,6 +2777,257 @@ $ dumpsys deviceidle → mScreenLocked=true
 ` 把多个目录拼进一条日志，logcat 里会
 显示成两行，`grep | head -3` 只看到第一行会误判成「只认到一个 provider」。
 
+### P9：定时任务边界、默认市场与「等你批准」通知（2026-11-02）
+
+三项都是「功能看起来在、手机上其实不成立」的修补。共同点是**不新增生命周期**：调度仍是
+`OsScheduler` 的一个实现，市场仍是 `market.rs` 的既有 TOML 手术，通知仍复用
+`AgentService` 已有的 `/health` 轮询。
+
+#### 一、定时任务：Android 显式拒绝，而不是假装 systemd
+
+`atomcode-schedule` 的 `current()` 原来在非 mac/linux/windows 平台**回退到 systemd**，
+而 Android 的 `target_os` 是 `"android"`（不是 `"linux"`），于是每次建任务都报
+
+```
+systemctl: No such file or directory
+```
+
+——读起来像设备坏了，实际是平台没有这个能力。而且 `Service::launch`（「立即运行」）会
+`Command::new(execution_binary())`，Android 上 `current_exe()` 是 App 进程/`.so`，spawn 它
+只会得到一个把自己当参数、什么都不做的进程（假成功）。
+
+现在：
+
+| 位置 | 做法 |
+|---|---|
+| `os.rs` 新增 `Unsupported` 后端 | `install` 报「Android 上没有可注册的系统调度器，也没有可启动的 `atomcode` 命令」；`uninstall` 幂等 `Ok`（没注册过东西）；`status` 返回 `Unknown(reason)`，面板直接显示原因 |
+| `execution_binary()` | Android 上显式 `bail!`，不留假进程 |
+| 定义仍在 | 任务定义照常落盘（store 是「人要了什么」的权威），拒绝的只是 OS 注册 |
+
+真机（PLT140 / Android 16，2026-11-02）实测：
+
+```
+POST /schedules {"action":"create", "task":{... "schedule":{"kind":"daily","time":"09:30"}}}
+→ {"entry":{..., "registration":"error",
+    "registration_error":"scheduled tasks are not available on Android: the platform has no
+     system scheduler this app can register a job with, and no `atomcode` command to start one.
+     Use \"Run now\" while the app is open instead."}}
+
+POST /schedules/t-android-probe/run
+→ {"success":false,"error":"a scheduled task runs the `atomcode` CLI as a separate process,
+   and Android forbids starting one from an app (the agent runs inside the app process instead)"}
+```
+
+**这是边界，不是缺陷**：手机上要真正定时跑，需要把 `launch` 从 spawn CLI 改成进程内触发
+（或走 `AlarmManager`），那是功能而不是修复，没在本轮做。
+
+#### 二、默认市场基址：新装不再是一台空手机
+
+APK **不带任何 provider**，运行时全靠市场下载；而 `market.rs` 的 `Settings::from_env()`
+只认 `ATOMCODE_MARKET_BASE` 或 `config.toml` 的 `[market] base`，两者都没有时
+`/packages/market` 报 `market not configured`——新装用户看到的是一个空插件页，且没有
+任何提示告诉他该填什么。
+
+现在 `crates/atomcode-android/src/host.rs` 在首启播种区（与 `example_skills`/`example_mcp`
+同一处）调用 `atomcode_daemon::seed_base_if_absent(DEFAULT_MARKET_BASE)`。规则是**只播不覆盖**，
+判据也钉在 `market.rs::tests`：
+
+- 键**存在**就不动，包括被面板清成 `base = ""`——清空是人的决定，复活它会让清空不可撤销；
+- 其余内容逐字保留（注释、其它段、`[market]` 下的兄弟键）；
+- 判断用「键是否存在」而不是「值是否非空」：最初写成后者，`a_deliberately_emptied_base_is_not_resurrected`
+  直接红了。
+
+真机（卸载重装得到真正的全新状态，2026-11-02）：
+
+```
+$ adb shell run-as com.atomcode.app cat files/atomcode/config.toml
+[market]
+base = "https://api.atomgit.com/api/v5/repos/qiaoen_python/atomcode-android-plugins/raw"
+
+GET /packages/market?refresh=1 → HTTP 200, 15539 bytes
+  success:True  plugins:13  helpers:14
+  helper: tools | com.atomcode.tools | 1.0
+  helper: zig   | com.atomcode.tools.zig | 0.13.0
+  helper: clang | com.atomcode.tools.clang | 21.1.8
+```
+
+**必须是 AtomGit 的 API 端点**（`api.atomgit.com/api/v5/repos/…/raw`）：网页版
+`raw/branch/main/…` 返回 SPA 的 HTML 壳，不是文件（见 `docs/plugin-market.md`）。
+常量只有一处——迁到组织仓库时改 `host.rs` 的 `DEFAULT_MARKET_BASE` 即可。
+
+#### 三、通知能说「等你批准」
+
+`/health` 原来只有 `active_chats` / `active_live` / `last_turns`。agent 卡在审批上时通知
+照样说「正在处理」，而审批卡在没人看的那个屏幕里——手机上这比桌面严重得多。
+
+关键是不能把「注册了 decider」当成「在等回答」：`PermissionResponders` 的 decider 是**整回合**
+注册的，按它计数会把每个 Build 模式的回合都报成「等待批准」。
+
+| 来源 | 含义 |
+|---|---|
+| `live_hub::pending_count_of_kind` | `pending_requests` 里真正阻塞中的请求（原生运行时等着的） |
+| `PermissionResponders.outstanding` | `/chat` 把审批交给客户端的那一刻打标记，`deliver`/`unregister` 清掉 |
+
+`HealthResponse.pending_approvals` 取两者之和；Kotlin `AgentService` 解析它，通知文案
+**排在「busy」之前**（在等你批准 ≠ 在干活），中英双语，缺字段按 0 而不是谎报。
+判据 `permission_bridge::tests::only_an_unanswered_request_counts_as_pending` 钉住
+「登记不算、提问才算、回答或清理即消」。
+
+**真机实测（PLT140 / Android 16，2026-11-02）**。触发一次真实审批不需要真实模型：用一个
+本地假 OpenAI 端点（`adb reverse tcp:18999` 让设备的 `127.0.0.1:18999` 打到宿主，
+脚本就是 `target/fake_provider.py`，不入库），让回合去调一个**必定要求审批**的工具
+`schedule_create`（它的 `requires_explicit_approval` 写死在工具里，不受审批模式影响）。
+普通命令不在此列——`echo` 与 `curl` 都会被自动放行，审批只来自凭据 / 工作区 / 敏感路径
+三个 gate，以及 `schedule_create` 这类自己要求同意的工具：
+
+```
+GET /health   → active_live=1  pending_approvals=1        ← 回合卡住时
+
+adb shell dumpsys notification --noredact
+  android.title=String (AtomCode 智能体)
+  android.text=String (等待你批准后继续 —— 智能体已停在这里)   ← 改之前是「空闲」/「正在处理」
+
+POST /live/stop → active_live=0  pending_approvals=0        ← 计数随之归零
+```
+
+一个观察，值得记下来免得下次误判：放行一次后 `pending_approvals` **没有立刻归零**，
+因为假端点紧接着又发起了下一次工具调用（那是**新的**审批请求，不是旧计数没清）。停掉回合
+即归零，说明计数跟的是运行时真实的阻塞表。
+
+### P10：定时任务真跑、SAF 搜索、clangd、推荐运行时、语音输入（2026-11-03）
+
+五项都是「手机上缺一块就能用一半」的补齐。共同原则：不新建生命周期——定时任务用
+daemon 现有的 runtime/会话/审批，搜索走既有的 `FileSystem` 接缝，LSP 只是给已发布的
+二进制补一条映射。
+
+#### 一、定时任务：真的在进程内跑起来了
+
+P9 里 Android 只能显式拒绝，因为执行端是「spawn 一个 `atomcode` CLI」——手机上做不到。
+现在换了个执行者：**daemon 自己跑**，CLI 那套语义照搬。
+
+`crates/atomcode-daemon/src/schedule_runner.rs`（`#[cfg(target_os = "android")]`）：
+
+| 环节 | 做法 |
+|---|---|
+| 什么时候跑 | 每 30 秒读一次任务列表（规则粒度是分钟，读列表很便宜） |
+| 跑哪个 | `atomcode_schedule::service::due_at(entry, now)`——`enabled && !running && next_run.at <= now`。判定抽在 schedule crate 里而不是 Android 专用模块里，这样构建机就能测（判据 `a_task_runs_only_when_enabled_idle_and_at_or_past_its_next_run`）；到期时间用调度器自己的 `next_run`，不二次推导规则 |
+| 不重复跑 | 先取 `store.begin_revision(id, request_id, revision)` 租约；`request_id = android-<task id>-<到期秒>`，同一到期时刻重启后仍是同一次 |
+| 怎么跑 | `kernel_runtime::start_native_runtime_with_session(cfg, SessionMode::Fresh)`，每次新会话（定时任务是可重复的作业，续昨天的上下文会把它的错误带进今天） |
+| 审批 | 无人可问：一律 `deny` 并计数，回合结束记为 `error` 并写明「no one is present」。与 CLI 的 strict unattended 同一姿态，**不会**挂住 |
+| 记账 | `lease.session(id)` + `lease.finish("ok"/"error", 诊断)`，跑历史与面板照旧 |
+
+同时把 Android 的注册文案改了：以前是「不可用」，现在是「由应用自己运行、应用关闭即停止」。
+
+**边界（不是缺陷）**：只在应用进程活着时触发；没有唤醒机制能让被杀掉的 App 自己起来跑，
+那需要 `AlarmManager` + 广播接收器，是另一个功能。
+
+#### 二、`/fs/search` 在 SAF 世界下可用
+
+SAF 会话的工作目录是合成路径，磁盘上什么都没有，而 `@` 提及搜索走的是
+`FileIndex::search_blocking`（真实目录 + `.gitignore`）。结果是：上架形态（没有全盘访问）
+里 `@` 选择器**永远是空的**。
+
+现在：
+
+- `saf::install_root(root)`：`fs-saf` 行挂载时记下「哪个路径代表授权树」（只有它知道）；
+- `saf::search_names(fs, scope, filter)`：同样的「作用域 + 名字片段」，但走 `FileSystem::list`
+  ——深度上限 8、命中上限 200、跳过 `.git`/`node_modules`/`target`/`build` 等噪声目录；
+- `/fs/search`：真实目录仍走原路径；目录不存在且路径落在授权树里时走 SAF 搜索。
+
+判据：`a_name_search_reaches_into_subdirectories_and_skips_noise`、
+`a_scoped_search_stays_inside_the_scope`。
+
+#### 三、C/C++ 有语言服务器了：clangd 随 clang provider 发布
+
+之前 `lsp` 工具会注册，但设备上一个语言服务器都没有，C/C++ 在 `lsp_registry` 里**连映射都没有**。
+
+- `scripts/termux/manifests/clang.txt` 增加 `exec bin/clangd clangd-real`；
+- 新增 `scripts/termux/launcher/clangd.c`：与 `clang.c` 同一套道理——可执行文件只能住在
+  APK 的 `nativeLibraryDir`，而头文件与资源目录在数据包 `files/` 下，两者永不互为兄弟。
+  clangd 没有自己的 `-resource-dir`，所以启动器把
+  `--extra-arg=-resource-dir=<root>/lib/clang/<ver>` 和 `--extra-arg=--sysroot=<root>` 传给编译器调用；
+- `lsp_registry` 把 `c/h/cc/cpp/cxx/hpp/hh/hxx` 映射到 `clangd`，root markers 为
+  `compile_commands.json` / `CMakeLists.txt` / `Makefile` / `.clangd`。
+
+**打包时抓到的真问题**：清单里最初写 `exec bin/clangd clangd`，而启动器编译产物叫
+`libclangd.so`——脚本先拷 jniLibs 再编译启动器，于是 18 MB 的服务器被 8 KB 的启动器**覆盖**，
+而 split 仍报「5 executables」，从日志上完全看不出来。改成 `clangd-real` 后
+`libclangd-real.so`（18 M）与 `libclangd.so` 并存。这一步是靠 `SKIP_APK=1` 实跑打包发现的，
+不是读代码看出来的。
+
+代价：clang provider APK 大约多 18 MB（外加它的运行库）。不装该 provider 时行为与以前一致
+（有映射、没二进制 → 工具报 `LSP unavailable`，引导改用 `read_symbol`/`grep`，本来就是这个语义）。
+
+#### 四、新装不再是一台不会说话的手机：推荐运行时
+
+APK 不带运行时，市场页是一张长列表，新装的人没有任何线索知道「不装 bash 连仓库脚本都跑不了」。
+现在：
+
+- `webui/src/lib/recommendedProviders.ts`：A+B 档六件（`bash` / `unzip` / `tar` / `pkgconf` /
+  `tools` / `ninja`），每件带一句「为什么」；
+- 面板在 provider 列表上方给出「还差 N 个基础运行时：…」，并在对应行打「建议」标；
+- 安装还是原来那排按钮——**没有**做「一键全装」：每个 provider 都要走系统安装器的一次确认，
+  假装能一键是骗人的；
+- `installedPackages` 为 `null`（桌面浏览器没有宿主桥）时**什么都不报**：说自己看不见的缺口，
+  比不说话更糟。
+
+判据：`recommendedProviders.test.ts`（顺序、已装剔除、市场未发布、状态未知）。
+
+#### 五、语音输入
+
+- Kotlin：`HostBridge.startVoiceInput()` 发 `RecognizerIntent.ACTION_RECOGNIZE_SPEECH`，
+  结果在 `onActivityResult` 收下、放进 `pendingVoiceText`、派发 `atomcode:voice`；
+  `takeVoiceText()` 读一次即清（和分享同一套形状）。
+- 权限：识别器是**另一个应用**，麦克风归它，本应用不持 `RECORD_AUDIO`，音频不进 agent 进程，
+  只有文本进来。
+- webui：composer 里一个麦克风按钮（仅安卓宿主可见），拿不到识别器时明确提示，而不是装作在听。
+
+#### 真机实测（PLT140 / Android 16，2026-11-03）
+
+三项都在设备上跑过了，而且**抓到两个构建机测不出来的真 bug**——这正是这一步的价值。
+
+1. **定时任务真的跑起来了**。建一条 `interval/every_minutes=1` 的任务，两分钟后
+   `GET /schedules/<id>/history`：
+
+   ```
+   {"kind":"started",  "run_id":"manual:android-…-1793711310", …}
+   {"kind":"session",  "session_id":"08391141-…"}
+   {"kind":"finished", "status":"ok"}
+   ```
+
+   抓到的问题：第一版用 `entry.next_run.at <= now` 判断到期，而 `timing::next()` 返回的是
+   **严格未来**的那一次（面板上「预计下次」就是这个语义）。于是扫描每 30 秒跑一次、
+   永远「没到期」，任务一次都不会触发——日志里连一行告警都没有，因为逻辑本身很「正常」。
+   修法：新增 `timing::previous(task, now)` 算最近一次**已到达**的发生时刻，`due_at` 改成
+   「这次发生时刻晚于上次运行」。顺带定死另一个边界：interval 的锚点（创建时刻）本身不是
+   一次运行，否则新任务会立刻跑一遍。
+
+2. **推荐集提示会渲染**。这台设备 14 个 provider 全装了，提示本来就不该出现（那是对的）。
+   为了验证渲染，把 `com.atomcode.tools.ninja` 临时卸掉、重载页面：
+
+   ```
+   还差 1 个基础运行时：Ninja。装完这些，仓库脚本、make 与编译器才齐。
+   ```
+
+   随后用 `run-as` 取出的备份 APK 原位装回，设备恢复原状。
+
+3. **会有第二个真 bug：保存 provider 会抹掉 `[market]`**。这一步本来是顺手验的，结果发现
+   市场基址不见了。受控实验确认：`POST /packages/market/config` 写入成功 → 再
+   `POST /providers` → `config.toml` 里 `[market]` **整段消失**。原因是 `Config::save`
+   把结构体整体序列化回文件，而 `[market]` 不属于 `Config`（插件市场直接读文件）。
+   于是「配好市场 → 装第一个 provider」这个最自然的顺序，正好把 P9 播种的市场基址删掉。
+   修法：`store.rs` 写盘前把**本构建没有建模的顶层表**原样保留（只补新文档里缺的表，
+   不覆盖已写的），判据 `saving_keeps_sections_the_config_type_does_not_model`。
+   修复后在设备上复验：写基址 → 建 provider → `[market]` 仍在。
+
+4. **麦克风按钮存在**，用 WebView 的调试端口直接查 DOM 得到 `!!document.querySelector('.btn-voice') === true`。
+   `uiautomator` 的 dump 读不到 WebView 内容，无障碍树这条路走不通。
+   **识别器本身没有实跑**：拉起它需要真手指点一下按钮（`input tap` 得先知道坐标），所以
+   「点下去会不会把转录插进输入框」这一段仍是未验证的。
+
+（上面的探针全部清理：临时 provider、任务、端口映射、临时脚本都删了，`providers: []`、
+`schedules: []`，被卸载的 ninja 已装回。）
+
 ## 6. 路线
 
 | 阶段 | 内容 |
@@ -2790,6 +3041,8 @@ $ dumpsys deviceidle → mScreenLocked=true
 | ~~P6~~ | ~~后台长任务的通知与进度~~ **已完成**：回合开始/结束驱动唤醒锁与通知，结束时报告最后一轮的成败（见 P5.11）；多会话按会话 id 分组为独立子通知并可点击直达该会话（真机验证 2026-11-01，见上面 P5 小节末尾） |
 | ~~P7~~ | ~~量内存与 Doze 下的存活；长回合的压力测试~~ **已实测（2026-11-02，PLT140 / Android 16）**：`scripts/verify-android-doze.sh` 在回合进行中强制进 Doze（`mState=IDLE`），回合仍以 `ok` 结束、进程 PID 未变（14687 → 14687）、PSS 基线/峰值/结束 = 138916 / 148613 / 136484 KB（峰值比基线高约 9.5 MB，结束后回落到基线以下）。脚本在设备拒绝 `force-idle` 时明确报"没测成"，不假装通过 |
 | ~~P8~~ | ~~若要上架：SAF + `content://` 的 world 实现，替换全盘访问~~ **已实现（真机验证 2026-11-02）**：`capabilities::saf` 是 content:// 上的 `FileSystem`（后端为 trait，8 项单测在构建机跑），`SafTree.kt` 提供 DocumentsContract 后端，`fs-saf` 行 + `swap("fs","fs-saf")` 完成装配切换。规则是**全盘访问优先**：拿得到就用真实磁盘（bash/git/LSP 都认路径），拿不到才落到授权文件夹 |
+| P9 | 定时任务在 Android 上显式拒绝（不再落到 systemd）、首启播种默认市场基址、`/health` 报 `pending_approvals` 并让通知说「等你批准」——见上面 P9 小节 |
+| P10 | 定时任务改为 daemon 进程内执行、`/fs/search` 走 SAF、C/C++ 接 clangd、首启推荐运行时、语音输入——见上面 P10 小节 |
 
 ### SAF 世界：没有路径时的文件系统（真机验证 2026-11-02）
 

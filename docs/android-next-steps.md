@@ -184,12 +184,22 @@ helper APK：**82 MB → 33 MB**（剩下的主体是 `libatomcode.so`，即设�
 真机验证：`GET /packages/market` 返回 `helpers: 14`，`GET /packages/market/helper?name=unzip`
 下载落地、sha256 校验通过。
 
-接入方式——`config.toml` 或环境变量：
+接入方式——**首启自动播种**，也可以手写 `config.toml` 或环境变量：
 
 ```toml
 [market]
 base = "https://api.atomgit.com/api/v5/repos/qiaoen_python/atomcode-android-plugins/raw"
 ```
+
+Android 宿主在启动播种区调 `atomcode_daemon::seed_base_if_absent`（`crates/atomcode-android/src/host.rs`
+的 `DEFAULT_MARKET_BASE`），规则是**只播不覆盖**：
+
+- `[market] base` 这个**键存在**（哪怕被面板清成 `""`）就一个字不动——「清空」是人做过的决定，
+  复活它会让清空变成不可撤销；
+- 其余内容逐字保留（复用 `market.rs` 的 TOML 最小手术，注释和其它段不受影响）。
+
+改之前的表现是：新装 App 打开「插件」页显示「market not configured」，而 APK 里一个 provider
+都不带，等于没有任何途径装运行时——只能靠人知道这个 URL 再手填。
 
 **踩的坑**：AtomGit 网页版的 `raw/branch/main/...` 端点返回 SPA 的 HTML 壳，不是裸文件；
 真正能用的是官方 API `GET /api/v5/repos/{owner}/{repo}/raw/{path}`（host 是
@@ -237,6 +247,17 @@ XML / Kotlin 源文件比对，少改一处就红（加 provider 时会先撞到
 
 ## 五、已知边界（不是缺陷，但要知道）
 
+- **定时任务只在应用打开时运行（2026-11-03 起真的会跑）**：Android 上仍然没有本应用能注册的
+  系统调度器，也没有可 spawn 的 `atomcode` 命令（daemon 是加载进 App 进程的库，数据目录不可
+  `exec`），所以执行端换成 **daemon 自己**：每 30 秒扫一次到期任务，取运行租约、起一个新会话
+  的回合、把结果写回跑历史。语义照搬 CLI 那套（新会话、无人值守下审批一律 deny 并记原因）。
+  代价是手机端没有唤醒机制——App 被杀就不再触发，这需要 `AlarmManager` + 广播接收器，属另一功能。
+  注册状态仍会显示一条说明（没有可安装的系统注册），那是事实而不是故障。
+  详见 `docs/android-port.md` P10。
+- **首启会自动写一条 `[market] base`**：新装 App 的 `config.toml` 里已经有已发布 provider
+  市场的基址（AtomGit API 端点）。规则是只播不覆盖——键存在就不动，包括被面板清成 `""`
+  （清空是人的决定）。改之前新装用户看到的是「market not configured」，而 APK 不带任何
+  运行时，等于没有装东西的入口。
 - **`share/man` 里的 `::` 文件名会在解包时炸掉**：Termux 的 man 页叫 `App::Cpan.3.gz`，
   Windows 不允许 `:`，`scripts/termux/extract.py` 会中止并留下半截的树（perl 那次
   `bin/perl` 只有 6.8 KB 就是这个）。现在解包统一跳过 `share/man` 与 `share/doc`——
