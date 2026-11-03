@@ -15,6 +15,7 @@
   },
   "categories": [
     "Programming Languages",
+    "Machine Learning",
     "Other"
   ],
   "keywords": [
@@ -22,7 +23,19 @@
     "coding",
     "agent",
     "atomcode",
-    "llm"
+    "llm",
+    "chat",
+    "assistant",
+    "ai-chat",
+    "code-review",
+    "mcp",
+    "skills",
+    "multi-model",
+    "deepseek",
+    "claude",
+    "openai",
+    "ollama",
+    "local-first"
   ],
   "icon": "resources/icon.png",
   "main": "./out/extension.js",

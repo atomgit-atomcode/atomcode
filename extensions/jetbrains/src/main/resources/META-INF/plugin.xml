@@ -1,23 +1,38 @@
 <idea-plugin>
   <id>com.atomcode.jetbrains</id>
   <name>AtomCode</name>
-  <vendor email="atomcode@atomgit.com">AtomCode</vendor>
+  <vendor url="https://atomcode.atomgit.com/" email="atomcode@atomgit.com">AtomCode</vendor>
 
   <description><![CDATA[
-    AtomCode brings a local AI coding agent into JetBrains IDEs.
+    AtomCode brings a local AI coding agent into JetBrains IDEs, with the chat surface built natively into the IDE instead of a separate window.
 
-    Use AtomCode from a dedicated tool window, editor context actions, and intentions to explain, fix, optimize, and review code while keeping the IDE workflow native. The plugin connects to a local AtomCode daemon on 127.0.0.1 by default and supports user-configured providers such as OpenAI, Claude, and Ollama through that daemon.
+    <p>Highlights</p>
+    <ul>
+      <li>Slash command menu: <code>/login</code>, <code>/logout</code>, <code>/whoami</code>, <code>/status</code>, <code>/config</code>, <code>/reload</code>, <code>/review</code>, plus every skill the local daemon exposes. Filter as you type (prefix first, subsequence fallback), navigate with arrow keys, complete with Enter or Tab.</li>
+      <li>Model picker and reasoning effort in the composer: the model list scrolls, shows model and provider on two lines, marks the default model, and stays aligned with its control. Effort levels follow what the selected model declares and the selector disappears when a model exposes none.</li>
+      <li>Four approval modes — Build, Accept Edits, Auto, Plan — so agent autonomy matches the task. New and reopened sessions start from <code>default_mode</code> in config.toml.</li>
+      <li>Editor intentions to explain, fix, or optimize a selection, or to add it as conversation context.</li>
+      <li>Session history with search, resume, and rename, plus independent chat tabs in the tool window.</li>
+      <li>Rich rendering in the chat: markdown, code blocks, tool calls, diffs, and queued prompts.</li>
+      <li>Bundled daemon for five platforms (macOS arm64/x64, Linux x64/arm64, Windows x64) with local discovery, health checks, and reuse of an already running compatible daemon.</li>
+    </ul>
+
+    The plugin connects to a local AtomCode daemon on 127.0.0.1 by default and supports user-configured providers such as OpenAI, Claude, and Ollama through that daemon.
 
     Code, selected text, attached files, project metadata, provider settings, and API keys are sent only when needed to fulfill user actions and are handled by the local AtomCode daemon. See the privacy policy for details before configuring external model providers.
   ]]></description>
 
   <change-notes><![CDATA[
-    Initial JetBrains Marketplace release.
+    <h3>5.2.5</h3>
+    <p>2026-11-02</p>
     <ul>
-      <li>Added the AtomCode tool window for local AI coding workflows.</li>
-      <li>Added editor actions and intentions for explaining, fixing, optimizing, and attaching code context.</li>
-      <li>Added local daemon discovery, startup, health checks, and bundled daemon support.</li>
-      <li>Added session history, provider setup, model selection, diagnostics, and privacy-oriented context controls.</li>
+      <li>Slash command menu now lists the seven built-ins plus every skill the daemon exposes, with as-you-type filtering, arrow-key navigation, and Enter/Tab completion.</li>
+      <li>Model picker rebuilt: scrollable list, two-line rows (model and provider), default-model badge, aligned with its control.</li>
+      <li>Reasoning effort selector follows the levels the selected model declares and hides itself when a model exposes none.</li>
+      <li>New and reopened sessions start from <code>default_mode</code> in config.toml instead of a client-side default.</li>
+      <li>Rounded thin borders on the mode, effort, and model controls; their popups are right-aligned with the control.</li>
+      <li>Fixed: the session-in-use error no longer disappears after a failed turn; the chat no longer flickers while idle.</li>
+      <li>Added intention descriptions, so the IDE stops reporting a missing <code>description.html</code>.</li>
     </ul>
   ]]></change-notes>
 
@@ -57,6 +72,23 @@
       <className>com.atomcode.jetbrains.actions.AddContextIntention</className>
       <category>AtomCode</category>
     </intentionAction>
+
+    <!-- 意图的描述目录：缺了它 IDE 每次展示意图都会报
+         "Intention Description Dir URL is null ... while looking for description.html"。 -->
+    <intentionDescriptions>
+      <intentionDescription
+        dirName="ExplainSelectionIntention"
+        className="com.atomcode.jetbrains.actions.ExplainSelectionIntention" />
+      <intentionDescription
+        dirName="FixSelectionIntention"
+        className="com.atomcode.jetbrains.actions.FixSelectionIntention" />
+      <intentionDescription
+        dirName="OptimizeSelectionIntention"
+        className="com.atomcode.jetbrains.actions.OptimizeSelectionIntention" />
+      <intentionDescription
+        dirName="AddContextIntention"
+        className="com.atomcode.jetbrains.actions.AddContextIntention" />
+    </intentionDescriptions>
 
     <projectService serviceImplementation="com.atomcode.jetbrains.services.AtomCodeProjectService" />
     <projectService serviceImplementation="com.atomcode.jetbrains.session.SessionWorkspace" />

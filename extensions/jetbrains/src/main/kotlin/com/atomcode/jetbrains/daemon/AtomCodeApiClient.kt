@@ -5,7 +5,9 @@ import java.util.concurrent.CompletableFuture
 interface AtomCodeApiClient {
     fun health(): CompletableFuture<HealthResponse>
     fun listSessions(): CompletableFuture<List<SessionMeta>>
+    fun listSessionsForWorkingDir(workingDir: String): CompletableFuture<List<SessionMeta>>
     fun searchSessions(query: String): CompletableFuture<List<SessionMeta>>
+    fun setReasoningEffort(provider: String, effort: String?): CompletableFuture<Boolean>
     fun getSession(projectHash: String, sessionId: String): CompletableFuture<SessionDetail>
     fun createSession(title: String?, workingDir: String): CompletableFuture<SessionRef>
     fun streamChat(request: ChatRequest, onEvent: (ChatEvent) -> Unit): CompletableFuture<Void>
@@ -23,7 +25,13 @@ class ExistingDaemonApiClient(
 
     override fun listSessions(): CompletableFuture<List<SessionMeta>> = delegate.listSessions()
 
+    override fun listSessionsForWorkingDir(workingDir: String): CompletableFuture<List<SessionMeta>> =
+        delegate.listSessionsForWorkingDir(workingDir)
+
     override fun searchSessions(query: String): CompletableFuture<List<SessionMeta>> = delegate.searchSessions(query)
+
+    override fun setReasoningEffort(provider: String, effort: String?): CompletableFuture<Boolean> =
+        delegate.setReasoningEffort(provider, effort)
 
     override fun getSession(projectHash: String, sessionId: String): CompletableFuture<SessionDetail> =
         delegate.getSession(projectHash, sessionId)

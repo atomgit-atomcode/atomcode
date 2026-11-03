@@ -1,6 +1,23 @@
 import assert from 'node:assert/strict';
 import * as http from 'node:http';
-import { DaemonClient, classifyDaemonStreamError, formatDaemonHttpError } from '../../src/daemon/client';
+import { DaemonClient, classifyDaemonStreamError, formatDaemonHttpError, sessionInUseId } from '../../src/daemon/client';
+
+function testSessionInUseIsRecognised() {
+  // What a runtime says when the terminal (or the other IDE) holds the lease.
+  const message = 'coding runtime prepare failed: session "0f1b59ae-b738-4e95-80fd-6c0525b1a660" is already in use by another runtime';
+  assert.equal(sessionInUseId(message), '0f1b59ae-b738-4e95-80fd-6c0525b1a660');
+  // The bare store error (no quoting) must match too.
+  assert.equal(
+    sessionInUseId('session s1 is already in use by another runtime'),
+    's1',
+  );
+}
+
+function testOrdinaryErrorsAreNotMistakenForLeaseConflicts() {
+  assert.equal(sessionInUseId('stream closed before the response completed'), null);
+  assert.equal(sessionInUseId('session "abc" failed to load'), null);
+  assert.equal(sessionInUseId(''), null);
+}
 
 function testBodyLimitErrorIsReadable() {
   assert.equal(
@@ -310,6 +327,8 @@ async function testEventsAfterTerminalAreIgnored() {
 testBodyLimitErrorIsReadable();
 testJsonWrappedBodyLimitErrorIsReadable();
 testRegularErrorsKeepServerMessage();
+testSessionInUseIsRecognised();
+testOrdinaryErrorsAreNotMistakenForLeaseConflicts();
 testManualAbortStreamErrorIsStopped();
 testNonManualAbortStreamErrorKeepsMessage();
 testPermissionRequestSseIsForwardedToCallback();

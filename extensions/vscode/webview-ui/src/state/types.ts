@@ -9,6 +9,8 @@ export interface ModelInfo {
   provider_type?: string;
   is_default: boolean;
   effort_applicable?: boolean;
+  /** Levels this endpoint exposes (`low|medium|high|xhigh|max`), from the daemon. */
+  effort_levels?: string[];
   reasoning_effort?: string | null;
 }
 

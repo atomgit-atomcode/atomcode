@@ -72,6 +72,16 @@ export function formatDaemonHttpError(statusCode: number | undefined, raw: strin
   return message;
 }
 
+/**
+ * The session id when a runtime refused it because another client holds the
+ * lease — a session open in the terminal (or the other IDE) cannot be driven
+ * from here at the same time. Returns null for every other message.
+ */
+export function sessionInUseId(message: string): string | null {
+  const match = /session\s+"?([0-9A-Za-z_-]+)"?\s+is already in use by another runtime/.exec(message);
+  return match ? match[1] : null;
+}
+
 export function classifyDaemonStreamError(
   message: string,
   requestAborted: boolean,

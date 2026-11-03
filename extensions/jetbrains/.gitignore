@@ -3,5 +3,9 @@
 .kotlin/
 .idea/
 .DS_Store
+# macOS AppleDouble sidecars: on a network/external volume the OS recreates
+# `._*` next to every file this tree writes (including `._*.class` under
+# build/), and they must never be tracked or packaged.
+._*
 build/
 bin/

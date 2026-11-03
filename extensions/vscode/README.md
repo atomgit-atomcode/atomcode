@@ -17,21 +17,33 @@ AtomCode 提供面向开发流程的辅助能力，包括代码理解、上下�
 
 ## 核心能力
 
-**🧠 代码理解与解释** — 支持对选中代码或文件进行结构化解释，帮助快速理解逻辑与上下文。
+**🧠 代码理解与解释** — 对选中代码或整个文件做结构化解释，快速讲清逻辑与上下文。
 
-**✏️ 编辑辅助建议** — 基于上下文提供代码修改建议，开发者可手动选择是否应用。
+**✏️ 编辑辅助建议** — 基于当前上下文给出修改建议，是否应用完全由你决定。
 
-**🔍 上下文感知分析** — 结合当前文件与工作区信息提供局部分析结果，用于辅助决策。
+**🔍 上下文感知分析** — 自动带上当前文件、选区、附件与工作区信息，局部分析不出圈。
 
-**🔌 多模型接入（用户配置）** — 支持接入不同的模型服务提供方（由用户自行配置 API Key 与服务地址），包括 Claude、OpenAI、DeepSeek、GLM、Qwen、Ollama 及任意 OpenAI 兼容 API。
+**🔌 多模型接入（用户配置）** — 支持 Claude、OpenAI、DeepSeek、GLM、Qwen、Ollama 及任意 OpenAI 兼容 API；也可通过 AtomGit 登录同步 CodingPlan 模型。
 
-**📄 修改对比预览** — 所有代码变更均以差异对比形式展示，由用户确认后生效。
+**🎛 模型选择器** — 输入区直接切换模型，档位跟随服务端 `/models` 返回的可用清单，默认模型带标记。
 
-**💬 会话管理** — 按时间分组的历史会话，支持搜索、恢复、重命名和删除。
+**🎚 推理强度（Effort）** — 按当前模型**声明的档位**提供 `low / medium / high / xhigh / max`，模型不支持时该选项自动隐藏，不会出现"选了 Max 却没变化"。
 
-**🧩 Thinking 模式** — 支持配置模型的 thinking/reasoning 参数（budget、type、keep）。
+**🛡 四种运行模式** — `Build` / `Accept Edits` / `Auto` / `Plan` 逐级放宽或收紧审批；未选过时沿用 config.toml 的 `default_mode`，新建或切换会话会重新对齐。
 
-**📎 文件附件** — 在对话中附加文件作为额外上下文。
+**💬 会话管理** — 历史会话按时间分组，支持搜索、恢复、重命名、删除；会话记录落盘，重开 VS Code 可继续。
+
+**📎 附件与图片** — 可附加文件作为上下文，也可直接粘贴图片，点击可放大查看。
+
+**🔗 @ 文件提及** — 输入 `@` 检索工作区路径，把文件/目录精确投喂给模型。
+
+**🧾 变更预览与产物** — 代码变更以 diff 展示、由你确认后落盘；模型输出的代码、表格、artifactId 可在对话内直接展开查看。
+
+**✅ Todo 面板** — 把当前回合的待办计划显示在对话上方，随时看到执行到哪一步。
+
+**🧩 Thinking / reasoning 参数** — 支持配置模型的 thinking 参数（budget、type、keep）。
+
+**🖥 IDE 语言服务桥接** — 把 VS Code 的定义跳转、引用、符号、工作区符号查询能力暴露给 AtomCode，让 agent 用 IDE 自己的语言服务而不是另建索引。
 
 ---
 
@@ -48,15 +60,34 @@ AtomCode 提供面向开发流程的辅助能力，包括代码理解、上下�
 
 ## 命令
 
+**打开与输入**
+
 | 命令 | 说明 |
 |------|------|
 | `AtomCode: Open in Side Bar` | 侧边栏打开 |
 | `AtomCode: Open in New Tab` | 新标签页打开 |
+| `AtomCode: Open in Preferred Location` | 按设置的位置打开（`atomcode.preferredLocation`） |
+| `AtomCode: Focus Input` | 聚焦输入框 |
 | `AtomCode: New Conversation` | 新建会话 |
+| `AtomCode: Stop Generation` | 停止当前生成 |
+
+**编辑器操作**
+
+| 命令 | 说明 |
+|------|------|
 | `AtomCode: Explain Selection` | 解释选中代码 |
 | `AtomCode: Fix Selection` | 提供修复建议 |
 | `AtomCode: Optimize Selection` | 提供优化建议 |
-| `AtomCode: Stop Generation` | 停止当前操作 |
+| `AtomCode: Add to Chat` | 把选中代码作为上下文加入对话 |
+
+**IDE 语言服务桥接**
+
+| 命令 | 说明 |
+|------|------|
+| `AtomCode：启用 IDE 语言服务桥接（复制配置）` | 开启桥接并复制对端配置 |
+| `AtomCode：停用 IDE 语言服务桥接` | 关闭桥接 |
+| `AtomCode: IDE 语言服务桥接状态` | 查看桥接是否开启、当前绑定 |
+| `AtomCode: 复制当前 IDE 窗口绑定` | 复制当前窗口的绑定信息 |
 
 ---
 
@@ -73,9 +104,22 @@ AtomCode 提供面向开发流程的辅助能力，包括代码理解、上下�
 
 ## 斜杠命令
 
-输入框键入 `/` 打开命令菜单：
+输入框键入 `/` 打开命令菜单。
 
-`/login` · `/logout` · `/whoami` · `/status` · `/config` · `/reload`
+**内置命令**
+
+| 命令 | 说明 |
+|------|------|
+| `/login` | 登录 AtomGit，同步 CodingPlan 模型 |
+| `/logout` | 退出登录 |
+| `/whoami` | 显示当前登录用户 |
+| `/status` | 显示会话状态 |
+| `/config` | 显示配置文件路径 |
+| `/reload` | 重新读取配置文件 |
+
+**技能（Skills）** — 菜单里还会列出当前环境安装的技能（`/<skill-name>`），由本地服务动态提供，带一行说明。技能没声明描述时显示为「运行该技能」。
+
+**菜单交互**：键入文字即按名称过滤（前缀优先、支持子序列匹配，例如 `/kg` 能命中 `karpathy-guidelines`）；`↑/↓` 选择、`Enter`/`Tab` 补全到输入框、`Esc` 收起，选中行会高亮并自动滚动到可视区。
 
 ---
 
@@ -85,8 +129,9 @@ AtomCode 提供面向开发流程的辅助能力，包括代码理解、上下�
 |--------|--------|------|
 | `atomcode.daemon.port` | `13456` | 首选本地服务端口 |
 | `atomcode.daemon.autoStart` | `true` | 是否启用本地服务 |
-| `atomcode.daemon.binaryPath` | — | 自定义服务路径 |
+| `atomcode.daemon.binaryPath` | `""` | 自定义服务路径（留空则自动检测） |
 | `atomcode.preferredLocation` | `sidebar` | 默认打开位置 |
+| `atomcode.chat.fontFamily` | `""` | 代码块/工具输出/输入框字体，留空跟随 `editor.fontFamily`；可填 CSS font-family 列表 |
 | `atomcode.autoSave` | `true` | 操作前自动保存 |
 | `atomcode.sendWithCtrlEnter` | `false` | Ctrl+Enter 发送 |
 | `atomcode.fontSize` | `13` | 聊天面板字号 |

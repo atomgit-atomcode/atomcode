@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { useChatContext } from '../state/ChatProvider';
 import { useT } from '../i18n';
+import { effortLabelFor, effortOptionsFor } from './effortOptions';
 
 type ModelSelectorProps = {
   placement?: 'up' | 'down';
@@ -62,12 +63,8 @@ export function ModelSelector({ placement = 'down', onOpen }: ModelSelectorProps
   const currentEffortModel = state.models.find((m) => m.provider === state.currentProvider);
   const showEffort = !!currentEffortModel?.effort_applicable;
   const currentEffort = currentEffortModel?.reasoning_effort ?? null;
-  const effortOptions: Array<{ value: string | null; label: string }> = [
-    { value: null, label: t('model.effortDefault') },
-    { value: 'high', label: 'High' },
-    { value: 'max', label: 'Max' },
-  ];
-  const effortLabel = effortOptions.find((option) => option.value === currentEffort)?.label ?? t('model.effortDefault');
+  const effortOptions = effortOptionsFor(currentEffortModel?.effort_levels, t('model.effortDefault'));
+  const effortLabel = effortLabelFor(effortOptions, currentEffort, t('model.effortDefault'));
 
   return (
     <>

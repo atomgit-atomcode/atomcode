@@ -13,6 +13,7 @@ import com.atomcode.jetbrains.daemon.PatchThinkingRequest
 import com.atomcode.jetbrains.daemon.ProviderInfo
 import com.atomcode.jetbrains.daemon.SessionDetail
 import com.atomcode.jetbrains.daemon.SessionMeta
+import com.atomcode.jetbrains.daemon.SkillInfo
 import com.atomcode.jetbrains.daemon.SetupSnapshot
 import com.atomcode.jetbrains.diagnostics.AtomCodeDiagnostics
 import com.atomcode.jetbrains.actions.openAtomCodeSettings
@@ -26,7 +27,10 @@ import com.atomcode.jetbrains.settings.AtomCodeContextLevel
 import com.atomcode.jetbrains.settings.AtomCodeSettingsState
 import com.atomcode.jetbrains.ui.header.HeaderPanel
 import com.atomcode.jetbrains.ui.input.InputPanel
+import com.atomcode.jetbrains.ui.input.EffortChoices
 import com.atomcode.jetbrains.ui.input.QueuedPromptView
+import com.atomcode.jetbrains.ui.input.SlashCommand
+import com.atomcode.jetbrains.ui.input.SlashCommands
 import com.atomcode.jetbrains.ui.message.JBCefMessageView
 import com.atomcode.jetbrains.ui.message.MessageAttachmentView
 import com.intellij.diff.DiffContentFactory
@@ -63,6 +67,10 @@ import java.awt.Toolkit
 import java.awt.datatransfer.DataFlavor
 import java.awt.datatransfer.StringSelection
 import java.awt.datatransfer.Transferable
+import java.awt.event.ComponentAdapter
+import java.awt.event.ComponentEvent
+import java.awt.event.MouseAdapter
+import java.awt.event.MouseEvent
 import java.io.ByteArrayInputStream
 import java.awt.image.BufferedImage
 import java.io.ByteArrayOutputStream
@@ -235,6 +243,7 @@ class AtomCodeChatPanel(
         onRemoveContext = { item -> removePendingAttachment(item) },
         onModelSelect = { showModelPickerPopup() },
         onApprovalModeSelect = { mode -> setApprovalMode(mode) },
+        onEffortSelect = { effort -> setReasoningEffort(effort) },
         onPasteFromClipboard = { transferable -> pasteClipboardImage(transferable) },
     )
 
@@ -266,6 +275,18 @@ class AtomCodeChatPanel(
     private val pendingContext = mutableListOf<ChatContextItem>()
     private val pendingImages = mutableListOf<PendingImageAttachment>()
     private val queuedPrompts = ArrayDeque<QueuedPrompt>()
+    /// Skills the daemon exposes as slash commands; refreshed when the link is ready.
+    private var slashSkills: List<SkillInfo> = emptyList()
+    /// 面板自己报的错（建会话、切模型、改模式等失败的路径），和流里的错误一样要
+    /// 挡住欢迎页与历史重渲染——否则消息区被整块重画，错误同样一闪而过。
+    private var lastPanelError: String? = null
+
+    /// 上次渲染过的模型列表：每 2s 的 setup 轮询若数据没变就不重建下拉（重建会闪）。
+    private var lastRenderedModels: List<ModelInfo> = emptyList()
+
+    /// 当前欢迎页的内容签名（语言 + 登录态）。相同就不重画——欢迎页渲染会 clearMessages，
+    /// 每轮刷新都重画就是用户看到的闪屏。
+    private var welcomeSignature: String? = null
     private var disposed = false
     private val connectionListener = java.beans.PropertyChangeListener { event: PropertyChangeEvent ->
         if (disposed) return@PropertyChangeListener
@@ -275,6 +296,8 @@ class AtomCodeChatPanel(
                 if (event.newValue is ConnectionState.Ready) {
                     inputPanel.setApprovalMode(service.approvalMode)
                     inputPanel.setApprovalModeEnabled(!service.approvalModePending)
+                    refreshApprovalModeLabel()
+                    refreshSkills()
                     refreshSetupSnapshot()
                     refreshSessionList()
                 }
@@ -312,6 +335,14 @@ class AtomCodeChatPanel(
         installInputKeyBindings()
 
         service.addConnectionListener(connectionListener)
+        // 面板每次重新显示时向 daemon 要一次模式：改完 config.toml 的
+        // `[permissions] default_mode` 不必重连就能看到生效值（与 VS Code 每次
+        // 打开面板都重读一次对齐）。
+        addComponentListener(object : ComponentAdapter() {
+            override fun componentShown(event: ComponentEvent) {
+                if (service.connectionState is ConnectionState.Ready) refreshApprovalModeLabel()
+            }
+        })
         setupRefreshTimer.start()
         renderConnectionState(service.connectionState)
         applyChatSettings()
@@ -365,7 +396,15 @@ class AtomCodeChatPanel(
     }
 
     fun showWelcomePage() {
+        welcomeSignature = welcomeSignatureOf()
         messageView.showWelcomePage(welcomeLanguage, loggedIn)
+    }
+
+    private fun welcomeSignatureOf(): String = "$welcomeLanguage|$loggedIn"
+
+    /// 消息区一旦有了别的内容，欢迎页签名就失效（下次需要时会重画）。
+    private fun invalidateWelcomePage() {
+        welcomeSignature = null
     }
 
     fun submitPrompt(prompt: String) {
@@ -439,10 +478,40 @@ class AtomCodeChatPanel(
         refreshAfterConnect()
     }
 
+    /// 向 daemon 索取当前模式并刷新标签。请求层同样只在人真的选过模式时才带
+    /// `approval_mode`，所以这里刷新的是"daemon 认为的模式"，而不是本地初值。
+    private fun refreshApprovalModeLabel() {
+        service.refreshApprovalModeNow().thenAccept { mode ->
+            SwingUtilities.invokeLater {
+                if (disposed) return@invokeLater
+                inputPanel.setApprovalMode(mode)
+                inputPanel.setApprovalModeEnabled(!service.approvalModePending)
+            }
+        }
+    }
+
+    /// 新建会话或重新打开旧会话时，模式回到 daemon 当前持有的值——也就是
+    /// config.toml 的 `[permissions] default_mode`——而不是上一个会话结束时留下的
+    /// 模式。否则人一旦选过 Build/Plan，之后每个新会话都会带着它跑。
+    private fun syncApprovalModeForNewConversation() {
+        service.adoptDaemonApprovalMode().thenAccept { mode ->
+            SwingUtilities.invokeLater {
+                if (disposed) return@invokeLater
+                inputPanel.setApprovalMode(mode)
+                inputPanel.setApprovalModeEnabled(!service.approvalModePending)
+            }
+        }
+    }
+
     private fun refreshAfterConnect() {
         service.ensureConnected().thenAccept { state ->
             if (state is ConnectionState.Ready) {
                 SwingUtilities.invokeLater {
+                    refreshSkills()
+                    // A panel built after the connection went Ready never sees the
+                    // connection listener fire, so it would keep the client-side
+                    // Build initial value instead of `[permissions] default_mode`.
+                    refreshApprovalModeLabel()
                     refreshSetupSnapshot()
                     refreshSessionList()
                 }
@@ -468,21 +537,40 @@ class AtomCodeChatPanel(
         setupSnapshot = snapshot
         loggedIn = snapshot.auth?.let { it.loggedIn && !it.expired } == true
 
-        loadingModels = true
-        modelPicker.removeAllItems()
-        snapshot.models.forEach(modelPicker::addItem)
-        snapshot.models.firstOrNull { it.isDefault }?.let {
-            modelPicker.selectedItem = it
+        if (snapshot.models != lastRenderedModels) {
+            lastRenderedModels = snapshot.models
+            loadingModels = true
+            modelPicker.removeAllItems()
+            snapshot.models.forEach(modelPicker::addItem)
+            snapshot.models.firstOrNull { it.isDefault }?.let {
+                modelPicker.selectedItem = it
+            }
+            modelPicker.isEnabled = snapshot.models.isNotEmpty()
+            loadingModels = false
         }
-        modelPicker.isEnabled = snapshot.models.isNotEmpty()
-        loadingModels = false
 
         // Update input panel model name
         val currentModel = snapshot.models.firstOrNull { it.isDefault }?.model
             ?: snapshot.currentModel.ifBlank { null }
             ?: "No model"
         inputPanel.setModelName(currentModel)
-        if (currentSession == null && !generating) {
+        // The effort menu belongs to the selected model: a model declaring
+        // low/medium/high must not offer max (the wire would clamp it).
+        val selectedModel = modelPicker.selectedItem as? ModelInfo
+        inputPanel.setEffortChoices(
+            EffortChoices.forModel(selectedModel),
+            selectedModel?.reasoningEffort,
+        )
+        inputPanel.setEffortEnabled(!generating)
+        // 欢迎页渲染会 clearMessages：错误还挂着时不能换，且内容签名没变时不必重画
+        // （每轮轮询都重画 = 闪屏）。
+        if (welcomeSignature != welcomeSignatureOf() &&
+            WelcomePagePolicy.shouldRenderAutomatically(
+                hasSession = currentSession != null,
+                generating = generating,
+                lastError = liveError(),
+            )
+        ) {
             showWelcomePage()
         }
     }
@@ -537,6 +625,24 @@ class AtomCodeChatPanel(
                 }
                 inputPanel.setApprovalMode(applied)
                 startNextQueuedPromptIfReady()
+            }
+        }
+    }
+
+    private fun setReasoningEffort(effort: String?) {
+        val model = modelPicker.selectedItem as? ModelInfo ?: return
+        inputPanel.setEffortEnabled(false)
+        service.setReasoningEffort(model.provider, effort).whenComplete { ok, error ->
+            SwingUtilities.invokeLater {
+                inputPanel.setEffortEnabled(true)
+                if (error != null) {
+                    addErrorMessage(error.cause?.message ?: error.message ?: "failed to set reasoning effort")
+                } else if (ok != true) {
+                    addErrorMessage("The daemon rejected that reasoning effort.")
+                }
+                // Re-read either way: the label must show what the daemon holds,
+                // not what was clicked.
+                refreshSetupSnapshot(silent = true)
             }
         }
     }
@@ -694,8 +800,10 @@ class AtomCodeChatPanel(
                 currentSession = session
                 persistRuntimeSession()
                 messageView.clear()
+                invalidateWelcomePage()
                 dismissPersistenceWarning()
                 addSystemMessage("Started new session ${session.name.ifBlank { session.id.take(8) }}.")
+                syncApprovalModeForNewConversation()
                 refreshSessionList()
                 inputPanel.focusInput()
             }
@@ -769,7 +877,25 @@ class AtomCodeChatPanel(
         val dialog = JDialog(SwingUtilities.getWindowAncestor(this), "AtomCode Session History", Dialog.ModalityType.APPLICATION_MODAL).apply {
             contentPane = panel; pack(); setLocationRelativeTo(this@AtomCodeChatPanel)
         }
-        load.addActionListener { val selected = list.selectedValue ?: return@addActionListener; dialog.dispose(); loadSession(selected) }
+        // Enter and double-click are how a list in an IDE says "open this one".
+        // Both take the same path as `Load`, and both stay inert unless exactly
+        // one row is selected — the same state that enables the button — so a
+        // multi-selection can never quietly load its lead row.
+        fun loadSelectedSession() {
+            if (list.selectedValuesList.size != 1) return
+            val selected = list.selectedValue ?: return
+            dialog.dispose()
+            loadSession(selected)
+        }
+        load.addActionListener { loadSelectedSession() }
+        list.addMouseListener(object : MouseAdapter() {
+            override fun mouseClicked(event: MouseEvent) {
+                if (event.clickCount >= 2) loadSelectedSession()
+            }
+        })
+        // Enter reaches the button from anywhere in the dialog — including the
+        // search field, where the filter has already run as the person typed.
+        dialog.rootPane.defaultButton = load
         rename.addActionListener {
             val selected = list.selectedValue ?: return@addActionListener
             val nextName = JOptionPane.showInputDialog(dialog, "Session name", selected.displayName)?.trim() ?: return@addActionListener
@@ -922,12 +1048,15 @@ class AtomCodeChatPanel(
                 updateAtomCodeChatTabTitle(project, this@AtomCodeChatPanel, detail.name.ifBlank { detail.id.take(8) })
                 persistRuntimeSession()
                 replaceSelectedSession(detail.id); renderSession(detail); inputPanel.focusInput()
+                // 打开旧会话同样从 config.toml 的 default_mode 起步，不沿用上一个会话的模式。
+                syncApprovalModeForNewConversation()
             }
         }
     }
 
     private fun renderSession(detail: SessionDetail) {
         messageView.clear()
+        invalidateWelcomePage()
         dismissPersistenceWarning()
         var assistantGroupOpen = false
         detail.messages.forEach { message ->
@@ -998,6 +1127,8 @@ class AtomCodeChatPanel(
                 if (error != null) return@invokeLater
                 if (generating || activeGenerationId != null) return@invokeLater
                 if (currentSession?.id != session.id) return@invokeLater
+                // 失败的一轮不落历史，重渲染会把刚显示的错误连带清掉。
+                if (!WelcomePagePolicy.shouldRenderFinishedTurnFromHistory(liveError())) return@invokeLater
 
                 currentSession = SessionRefView(detail.id, detail.name, detail.projectHash, detail.workingDir)
                 updateAtomCodeChatTabTitle(project, this@AtomCodeChatPanel, detail.name.ifBlank { detail.id.take(8) })
@@ -1047,7 +1178,9 @@ class AtomCodeChatPanel(
         val attachments = contextForSend.map { MessageAttachmentView(displayName = it.displayName, path = it.path) } +
             pendingImagesForSend.map { it.toMessageAttachmentView() }
         val images = pendingImagesForSend.map { it.toImageInput() }
-        val approvalModeForSend = service.confirmedApprovalMode
+        // 只在人真的选过模式时才把它带上；否则留空，让 daemon 用它自己的模式
+        // （= config.toml 的 `[permissions] default_mode`）。
+        val approvalModeForSend = service.approvalModeForRequest
 
         if (generating) {
             val queued = QueuedPrompt(
@@ -1076,7 +1209,7 @@ class AtomCodeChatPanel(
         contextNames: List<String>,
         attachments: List<MessageAttachmentView>,
         images: List<ImageInput>,
-        approvalMode: ApprovalMode,
+        approvalMode: ApprovalMode?,
     ) {
         val generationId = ++generationSequence
         activeGenerationId = generationId
@@ -1090,6 +1223,8 @@ class AtomCodeChatPanel(
         generating = true
         inputPanel.setGenerating(true)
         streamHandler.reset()
+        // 人重新提问才算"错误已读"：上一条错误的挡板在这里解除。
+        lastPanelError = null
 
         val provider = (modelPicker.selectedItem as? ModelInfo)?.provider
         service.sendPrompt(message, currentSession, object : ChatStreamListener {
@@ -1343,12 +1478,18 @@ class AtomCodeChatPanel(
     // ── Message helpers ──
 
     private fun addSystemMessage(text: String) {
+        invalidateWelcomePage()
         messageView.addSystemMessage(text)
     }
 
     private fun addErrorMessage(text: String) {
+        invalidateWelcomePage()
+        lastPanelError = text
         messageView.addError(text)
     }
+
+    /// 当前还挂着、尚未被下一次提问清掉的错误（流里的优先，其次是面板自己报的）。
+    private fun liveError(): String? = streamHandler.lastError ?: lastPanelError
 
     // ── Context management ──
 
@@ -1841,11 +1982,122 @@ class AtomCodeChatPanel(
 
     // ── Slash commands ──
 
-    private fun handleLocalInputCommand(prompt: String): Boolean {
-        val command = prompt.split(Regex("\\s+"), limit = 2).firstOrNull()?.lowercase() ?: return false
-        return when (command) {
+    /// Commands this client answers itself. `/review` is deliberately absent: it is
+    /// a prompt the daemon runs, so it travels through the normal send path.
+    private fun handleLocalInputCommand(prompt: String): Boolean =
+        when (SlashCommands.commandWord(prompt)) {
             "/login" -> { login(); true }
+            "/logout" -> { logout(); true }
+            "/whoami" -> { showWhoAmI(); true }
+            "/status" -> { showStatus(); true }
+            "/config" -> { showConfigPath(); true }
+            "/reload" -> { reloadDaemonConfig(); true }
             else -> false
+        }
+
+    private fun logout() {
+        service.logout().whenComplete { auth, error ->
+            SwingUtilities.invokeLater {
+                if (error != null) {
+                    addErrorMessage("退出登录失败：${error.cause?.message ?: error.message}")
+                    return@invokeLater
+                }
+                addSystemMessage(
+                    if (auth?.loggedIn == true) "退出登录未生效，请稍后再试。" else "已退出 AtomGit 登录。",
+                )
+                refreshSetupSnapshot(silent = true)
+            }
+        }
+    }
+
+    private fun showWhoAmI() {
+        service.authStatusNow().whenComplete { auth, error ->
+            SwingUtilities.invokeLater {
+                if (error != null) {
+                    addErrorMessage("读取登录状态失败：${error.cause?.message ?: error.message}")
+                    return@invokeLater
+                }
+                val text = when {
+                    auth == null -> "未登录。"
+                    auth.expired -> "AtomGit 登录已过期，请重新 /login。"
+                    !auth.loggedIn -> "未登录。"
+                    else -> buildString {
+                        appendLine("用户：${auth.userName ?: "（未提供）"}")
+                        appendLine("认证方式：${auth.authPath}")
+                        append("User ID：${auth.userName ?: "—"}")
+                    }
+                }
+                addSystemMessage(text)
+            }
+        }
+    }
+
+    private fun showStatus() {
+        service.healthNow().whenComplete { health, healthError ->
+            service.authStatusNow().whenComplete { auth, _ ->
+                SwingUtilities.invokeLater {
+                    val authLabel = when {
+                        auth == null -> "未登录"
+                        auth.expired -> "已过期"
+                        auth.loggedIn -> "已登录（${auth.userName ?: "?"}）"
+                        else -> "未登录"
+                    }
+                    val model = modelPicker.selectedItem as? ModelInfo
+                    addSystemMessage(
+                        listOf(
+                            if (healthError != null || health == null) "Daemon：不可用" else "Daemon：${health.service} ${health.version}",
+                            "登录：$authLabel",
+                            "模型：" + (model?.let { "${it.provider} (${it.model})" } ?: "未配置"),
+                        ).joinToString("\n"),
+                    )
+                }
+            }
+        }
+    }
+
+    private fun showConfigPath() {
+        service.configInfo().whenComplete { config, error ->
+            SwingUtilities.invokeLater {
+                if (error != null || config == null) {
+                    addErrorMessage("读取配置失败：${error?.cause?.message ?: error?.message ?: "未知错误"}")
+                    return@invokeLater
+                }
+                addSystemMessage(
+                    listOf(
+                        "默认模型：${config.defaultProvider ?: "未配置"}",
+                        "配置文件：${config.path}",
+                        "改完文件后执行 /reload，无需重启。",
+                    ).joinToString("\n"),
+                )
+            }
+        }
+    }
+
+    private fun reloadDaemonConfig() {
+        service.reloadConfig().whenComplete { config, error ->
+            SwingUtilities.invokeLater {
+                if (error != null || config == null) {
+                    addErrorMessage("重新读取配置失败：${error?.cause?.message ?: error?.message ?: "未知错误"}")
+                    return@invokeLater
+                }
+                addSystemMessage("已重新读取配置。默认模型：${config.defaultProvider ?: "未配置"}。")
+                refreshSetupSnapshot(silent = true)
+            }
+        }
+    }
+
+    /// Skills the daemon exposes, refreshed when the connection becomes ready so the
+    /// `/` menu lists what is actually installed.
+    private fun refreshSkills() {
+        if (service.connectionState !is ConnectionState.Ready) return
+        service.listSkills().whenComplete { skills, error ->
+            if (error != null || skills == null) return@whenComplete
+            SwingUtilities.invokeLater {
+                if (disposed) return@invokeLater
+                val changed = skills != slashSkills
+                slashSkills = skills
+                if (changed) inputPanel.updateCommandPopup(SlashCommands.items(skills))
+            }
         }
     }
 
@@ -1877,36 +2129,20 @@ class AtomCodeChatPanel(
         val pointer = java.awt.MouseInfo.getPointerInfo().location; SwingUtilities.convertPointFromScreen(pointer, this); menu.show(this, pointer.x, pointer.y)
     }
 
+    /// `/` 菜单：内置命令 + daemon 的技能由 InputPanel 的选择器渲染（限高可滚动、
+    /// 模糊过滤、点击或 Enter 补进输入框），这里只负责给出清单。
     private fun showCommandMenu() {
-        val menu = JPopupMenu()
-        val items = listOf(
-            SlashCommand("/login", "登录 AtomGit"),
-            SlashCommand("/review", "审查代码"),
-        )
-        items.forEach { command ->
-            menu.add(JMenuItem("${command.name} - ${command.description}").apply {
-                addActionListener { inputPanel.setInputText("${command.name} "); inputPanel.focusInput() }
-            })
-        }
-        inputPanel.showCommandPopup(menu)
+        inputPanel.showCommandPopup(SlashCommands.items(slashSkills))
+        // vscode 打开选择器时才 ensureSlashSkills：命令行里已经能用的内置项先显示，
+        // 技能到达后由 refreshSkills() 就地补上。
+        if (slashSkills.isEmpty()) refreshSkills()
     }
 
+    /// 模型选择器：交给 InputPanel 弹出（可滚动、两行展示模型名 + provider、默认模型带
+    /// default 徽标），选中后回写默认模型。
     private fun showModelPickerPopup() {
-        val menu = JPopupMenu()
-        // 跟随 IDE 主题的选中背景色，退化到固定蓝调保证可读
-        val activeBg = UIManager.getColor("List.selectionBackground") ?: JBColor(0x2F5FA8, 0x2F5FA8)
-        setupSnapshot?.models?.forEach { model ->
-            menu.add(JMenuItem("${model.model} (${model.provider})").apply {
-                if (model.isDefault) {
-                    font = font.deriveFont(java.awt.Font.BOLD)
-                    isOpaque = true
-                    background = activeBg
-                }
-                addActionListener { setDefaultModel(model) }
-            })
-        }
-        if (menu.subElements.isNotEmpty()) {
-            val pointer = java.awt.MouseInfo.getPointerInfo().location; SwingUtilities.convertPointFromScreen(pointer, this); menu.show(this, pointer.x, pointer.y)
+        inputPanel.showModelPickerPopup(setupSnapshot?.models.orEmpty()) { model ->
+            setDefaultModel(model)
         }
     }
 
@@ -1919,7 +2155,6 @@ class AtomCodeChatPanel(
         com.atomcode.jetbrains.ui.extractLastCodeBlock(text)
 }
 
-private data class SlashCommand(val name: String, val description: String)
 private data class QueuedPrompt(
     val id: String,
     val prompt: String,
@@ -1927,7 +2162,7 @@ private data class QueuedPrompt(
     val contextNames: List<String>,
     val attachments: List<MessageAttachmentView>,
     val images: List<ImageInput>,
-    val approvalMode: ApprovalMode,
+    val approvalMode: ApprovalMode?,
 )
 
 private data class PendingImageAttachment(

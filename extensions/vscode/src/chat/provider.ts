@@ -3,7 +3,7 @@ import { parseOpenFileSelection } from './filePosition';
 import * as path from 'path';
 import * as fs from 'fs';
 import { classifyAuthDisplayState } from '../auth/status';
-import { DaemonClient, DaemonHttpError } from '../daemon/client';
+import { DaemonClient, DaemonHttpError, sessionInUseId } from '../daemon/client';
 import {
   AuthStatusResponse,
   ChatRequest,
@@ -1478,7 +1478,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         srt.terminal = { type: 'stopped', generation: streamGeneration };
         this._postTerminalForSession(streamSessionId, { type: 'stopped' }, streamGeneration);
       },
-      onError: (message) => {
+      onError: (rawMessage) => {
+        const message = this._friendlyError(rawMessage);
         const srt = runtimeForStream();
         if (!srt || srt.terminalSeen) return;
         srt.terminalSeen = true;
@@ -3049,7 +3050,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private _messageFromError(e: unknown): string {
-    return e instanceof Error ? e.message : String(e);
+    return this._friendlyError(e instanceof Error ? e.message : String(e));
+  }
+
+  /**
+   * Turn the runtime's lease refusal into something a person can act on: the
+   * session is open in the terminal (or the other IDE) and must be released
+   * there first. Everything else keeps its original text.
+   */
+  private _friendlyError(message: string): string {
+    const sessionId = sessionInUseId(message);
+    if (!sessionId) return message;
+    return vscode.l10n.t(
+      'This session is in use by another client (the terminal or another IDE). Close it there or switch to a different session, then open it here. (session {0})',
+      sessionId.slice(0, 8),
+    );
   }
 
   private _getHtml(webview: vscode.Webview, mode: WebviewMode): string {

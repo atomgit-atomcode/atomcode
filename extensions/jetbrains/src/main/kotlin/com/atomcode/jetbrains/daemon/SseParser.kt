@@ -114,6 +114,15 @@ internal fun String.jsonArrayObjects(key: String): List<String> =
         ?.mapNotNull { it.asObjectOrNull()?.toString() }
         .orEmpty()
 
+/** String elements of the array under `key`; non-string elements are skipped. */
+internal fun String.jsonStringArray(key: String): List<String> =
+    jsonObjectOrNull()
+        ?.array(key)
+        ?.mapNotNull { element ->
+            element.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }?.asString
+        }
+        .orEmpty()
+
 internal fun String.jsonNestedObject(key: String): String? =
     jsonObjectOrNull()?.objectOrNull(key)?.toString()
 
