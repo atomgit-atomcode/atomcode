@@ -244,6 +244,9 @@ name = "recall"
 name = "tool-session-reference"
 
 [[insert]]
+name = "task-specifications"
+
+[[insert]]
 name = "tool-todo"
 
 # Off here, on purpose: coding's `TodoHook` (host-mounted beside `tool-todo`, under

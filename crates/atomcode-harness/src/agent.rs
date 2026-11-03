@@ -943,6 +943,12 @@ impl Agent {
     /// means. It does not queue: a cancel that arrives before a turn opens is
     /// not held against that turn.
     pub fn cancel(&self) {
+        // Idle edits hold `moving` while synchronous persistence listeners run.
+        // A failed listener may request cancellation; idle has no turn to stop,
+        // and reacquiring that same lock would deadlock the edit and its owner.
+        if self.status() == AgentStatus::Idle {
+            return;
+        }
         // Only a turn can be stopping. An idle agent marked stopping stayed so
         // until its next turn opened, and a front end showed it stopping all
         // that while.

@@ -4197,3 +4197,18 @@ body {
 .session-browse-notice button { cursor: pointer; }
 .session-browse-notice button:disabled { opacity: .45; cursor: not-allowed; }
 .session-running-mark { flex-shrink: 0; color: var(--app-secondary-foreground); font-size: 11px; }
+
+.task-specifications { width: min(760px, calc(100vw - 24px)); max-height: 85vh; overflow: auto; padding: 20px; border-radius: 12px; }
+.task-specifications header, .task-specifications footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.task-specifications pre { max-height: 50vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: 12px; border: 1px solid var(--app-border); }
+.task-spec-list { display: flex; flex-direction: column; gap: 8px; }
+.task-spec-list > button { display: flex; flex-direction: column; align-items: flex-start; text-align: left; white-space: pre-wrap; overflow-wrap: anywhere; }
+.task-specifications { display: block; font-size: 14px; line-height: 1.5; }
+.task-specifications p { margin: 10px 0; }
+.task-spec-list > button { height: auto; min-height: 64px; gap: 4px; padding: 10px; }
+.task-spec-list > button span:first-child { color: var(--app-secondary-foreground); font-size: 12px; }
+
+.msg-copy-btn.spec-pinned { color: var(--app-brand); opacity: 1; }
+/* Leave the floating turn-navigation gutter clear for message actions. */
+.user-message-wrapper > .msg-actions { padding-inline-end: 40px; }
+.msg-copy-btn:disabled { cursor: default; opacity: .4; }

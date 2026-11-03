@@ -1435,6 +1435,21 @@ impl LiveViewHub {
             .map_err(|_| HubError::RuntimeUnavailable)
     }
 
+    pub async fn task_specs(
+        &self,
+        session: String,
+        args: String,
+    ) -> Result<serde_json::Value, HubError> {
+        let (binding, handle) = self.bound_handle()?;
+        if binding.session_id != session {
+            return Err(HubError::RuntimeUnavailable);
+        }
+        handle
+            .task_specs(session, args)
+            .await
+            .map_err(|e| HubError::RuntimeRejected(e.to_string()))
+    }
+
     pub async fn import_patch(&self, session: String, bytes: Vec<u8>) -> Result<String, HubError> {
         let (binding, handle) = self.bound_handle()?;
         if binding.session_id != session {

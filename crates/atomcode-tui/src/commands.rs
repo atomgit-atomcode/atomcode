@@ -929,6 +929,7 @@ fn review_prompt(arg: &str) -> String {
 
 fn session_catalogue() -> Vec<Command> {
     vec![
+        Command::said_taking("spec", "[list|pin|unpin]".into(), t(Msg::SpecTitle)),
         Command::said_taking("patch", t(Msg::CmdTakesPath), t(Msg::CmdAboutPatch)),
         Command::said("compact", t(Msg::CmdAboutCompact)),
         Command::said("cancel-all", t(Msg::CmdAboutCancelAll)),
@@ -1128,7 +1129,7 @@ impl CommandSet for SessionCommands {
     /// error rather than a silent winner — so the claim is written down, the way
     /// `SetupCommands` claims `/setup`.
     fn overrides(&self) -> Vec<&'static str> {
-        vec!["review"]
+        vec!["review", "spec"]
     }
     /// What `/agents` dispatches when a row is picked. Not listed: nobody types
     /// it, and a session id in the menu would be noise (`CommandSet::hidden`).
@@ -1170,6 +1171,117 @@ impl CommandSet for SessionCommands {
                 .then(|| Outcome::Refused(t(Msg::WaitsForTheTurn { command }).into_owned()))
         };
         match name {
+            "spec" => {
+                if client.session() != root {
+                    return Outcome::Refused(t(Msg::SpecLeadOnly).into_owned());
+                }
+                let control = match host(control) {
+                    Ok(c) => c,
+                    Err(e) => return e,
+                };
+                let args = args.trim();
+                let (verb, rest) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
+                let pick_mode = matches!(verb, "pin" | "unpin") && rest.trim().is_empty();
+                let request = if args.is_empty() || pick_mode {
+                    "list"
+                } else {
+                    args
+                };
+                let value = match control
+                    .call(HostCommand::TaskSpecs {
+                        session: root.clone(),
+                        args: request.into(),
+                    })
+                    .await
+                {
+                    Ok(HostReply::TaskSpecs { value }) => value,
+                    Ok(_) => return Outcome::Refused(t(Msg::RefusedUnsupported).into_owned()),
+                    Err(e) => return Outcome::Refused(refusal(e)),
+                };
+                if client.root() != root || client.session() != root {
+                    return Outcome::Refused(t(Msg::SpecChanged).into_owned());
+                }
+                if let Some(items) = value["items"].as_array() {
+                    let mut rows = Vec::new();
+                    for item in items {
+                        let Some(seq) = item["seq"].as_u64() else {
+                            continue;
+                        };
+                        let pinned = item["pinned"].as_bool().unwrap_or(false);
+                        if pick_mode && ((verb == "pin" && pinned) || (verb == "unpin" && !pinned))
+                        {
+                            continue;
+                        }
+                        rows.push(
+                            crate::sheet::Row::new(
+                                format!("/spec show {seq}"),
+                                item["preview"].as_str().unwrap_or("").replace('\n', " "),
+                            )
+                            .marked(pinned)
+                            .about(format!(
+                                "#{} · {} bytes · {}",
+                                seq,
+                                item["bytes"],
+                                item["at"]
+                                    .as_u64()
+                                    .and_then(|at| chrono::DateTime::from_timestamp_millis(
+                                        at as i64
+                                    ))
+                                    .map(|at| at
+                                        .with_timezone(&chrono::Local)
+                                        .format("%m-%d %H:%M")
+                                        .to_string())
+                                    .unwrap_or_default()
+                            ))
+                            .preview(vec![item["preview"].as_str().unwrap_or("").into()]),
+                        );
+                    }
+                    if let Some(before) = value["next_before"]
+                        .as_u64()
+                        .filter(|_| !(pick_mode && verb == "unpin"))
+                    {
+                        rows.push(crate::sheet::Row::new(
+                            format!("/spec list {before}"),
+                            t(Msg::SpecOlder).into_owned(),
+                        ));
+                    }
+                    return Outcome::Do(Action::OpenSheet(crate::sheet::Sheet::list(
+                        crate::sheet::List::new(
+                            "spec",
+                            format!(
+                                "{} · {} / {} bytes",
+                                t(Msg::SpecTitle),
+                                value["pinned_bytes"],
+                                value["budget_bytes"]
+                            ),
+                            rows,
+                        ),
+                    )));
+                }
+                if let Some(text) = value["text"].as_str() {
+                    let pinned = value["pinned"].as_bool().unwrap_or(false);
+                    let seq = value["seq"].as_u64().unwrap_or(0);
+                    let mut read = crate::sheet::Read::file(
+                        "spec",
+                        vec![crate::sheet::Piece::new(
+                            format!(
+                                "#{} · {} bytes · {}",
+                                seq,
+                                value["bytes"],
+                                t(Msg::SpecReview)
+                            ),
+                            crate::sheet::Tone::Plain,
+                        )],
+                        text,
+                    );
+                    read.action = Some((
+                        t(if pinned { Msg::SpecUnpin } else { Msg::SpecPin }).into_owned(),
+                        format!("/spec {} {}", if pinned { "unpin" } else { "pin" }, seq),
+                    ));
+                    return Outcome::Do(Action::OpenSheet(crate::sheet::Sheet::read(read)));
+                }
+                self.run("spec", "list", ctx).await
+            }
             "patch" => {
                 if client.session() != root {
                     return Outcome::Refused(t(Msg::PatchLeadOnly).into_owned());
@@ -3474,6 +3586,38 @@ fn as_markdown(events: &[atomcode_kernel::session::LoggedEvent]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn spec_picker_reviews_original_text_before_offering_a_mutation() {
+        let host = Arc::new(Recording::default());
+        let (app, _, all) = following(&host);
+        host.replies.lock().unwrap().extend([
+            Ok(HostReply::TaskSpecs{value:serde_json::json!({"items":[{"seq":12,"at":1700000000000u64,"bytes":24,"preview":"MUST NOT change API","pinned":false}],"pinned_bytes":0,"budget_bytes":8192})}),
+            Ok(HostReply::TaskSpecs{value:serde_json::json!({"seq":12,"text":"MUST NOT change API\nlet exact = 42;","pinned":false,"bytes":35,"pinned_bytes":0,"budget_bytes":8192})}),
+        ]);
+        let listed = sheet_of(all.dispatch("/spec", &app.context()).await);
+        let crate::sheet::Page::List(list) = listed.page else {
+            panic!("message list")
+        };
+        assert_eq!(list.rows[0].value, "/spec show 12");
+        let reviewed = sheet_of(all.dispatch(&list.rows[0].value, &app.context()).await);
+        let crate::sheet::Page::Read(read) = reviewed.page else {
+            panic!("original review")
+        };
+        assert_eq!(
+            read.lines
+                .iter()
+                .map(|l| l.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["MUST NOT change API", "let exact = 42;"]
+        );
+        assert_eq!(read.action.as_ref().unwrap().1, "/spec pin 12");
+        assert_eq!(
+            host.asked.lock().unwrap().len(),
+            2,
+            "review does not automatically pin"
+        );
+    }
+
     #[tokio::test]
     async fn patch_command_preserves_file_bytes_and_only_pastes_a_reference() {
         let host = Arc::new(Recording::default());
@@ -6787,14 +6931,15 @@ mod tests {
     /// `ReviewCommand`, its reviewer run in this conversation — and it mounts
     /// after this set. `CommandSet::overrides` is the only way a name may be
     /// claimed twice, so the claim is written down rather than left to mount
-    /// order; the dispatch below is what says whose command actually runs, since
+    /// order. `spec` also has a local picker over its runtime catalog command.
+    /// The dispatch below says whose review command actually runs, since
     /// the screen's refuses for want of a host and the agent's would have said
     /// `inline`.
     #[tokio::test]
     async fn review_takes_the_name_from_the_agent_catalog() {
         assert_eq!(
             SessionCommands.overrides(),
-            vec!["review"],
+            vec!["review", "spec"],
             "the claim is what makes the overlap legal"
         );
 

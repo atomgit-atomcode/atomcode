@@ -23,6 +23,7 @@ pub mod self_knowledge;
 pub mod session;
 pub mod session_title;
 pub mod skill_permissions;
+pub mod spec;
 pub mod subagent;
 pub mod team;
 pub mod todo_reminder;
@@ -54,6 +55,7 @@ pub fn catalog() -> PluginRegistry {
         .register(Arc::new(registries::CommandsPlugin))
         .register(Arc::new(agents::AgentsPlugin))
         .register(Arc::new(session::SessionPlugin))
+        .register(Arc::new(spec::SpecPlugin))
         .register(Arc::new(session::SessionProjectionsPlugin))
         .register(Arc::new(session::SessionPersistenceJsonlPlugin))
         .register(Arc::new(llm::OpenAiCompatPlugin))

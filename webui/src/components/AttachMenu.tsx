@@ -15,6 +15,7 @@ onInsert: (text: string, replaceSkill?: boolean) => void;
   /** Open the server-side file picker. */
   onPickFile: () => void;
   onImportPatch?: (file: File) => void;
+  onManageSpecs?:()=>void;
   patchDisabled?: boolean;
   /** Attach picked image files (native picker → base64 handled by parent). */
   onAddImages: (files: FileList) => void;
@@ -56,7 +57,7 @@ function SkillIcon() {
   );
 }
 
-export function AttachMenu({ onInsert, onPickFile, onAddImages, onImportPatch, patchDisabled }: AttachMenuProps) {
+export function AttachMenu({ onInsert, onPickFile, onAddImages, onImportPatch, patchDisabled, onManageSpecs }: AttachMenuProps) {
   const t = useT();
   const [open, setOpen] = useState(false);
   const { items: skills, loading, failed } = useSkills(open);
@@ -135,6 +136,7 @@ export function AttachMenu({ onInsert, onPickFile, onAddImages, onImportPatch, p
           {onImportPatch && <button class="attach-row" title={patchDisabled ? t('patch.needReady') : undefined} disabled={patchDisabled} onClick={() => { setOpen(false); patchInputRef.current?.click(); }}>
             <FileIcon /><span class="attach-row-label">{t('patch.upload')}</span>
           </button>}
+          {onManageSpecs&&<button type="button" class="attach-row" onClick={()=>{setOpen(false);onManageSpecs();}}><FileIcon/><span class="attach-row-label">{t('spec.manage')}</span></button>}
           <div class="attach-divider" />
 
           <div class="attach-section-label">

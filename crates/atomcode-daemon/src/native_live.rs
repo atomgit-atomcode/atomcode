@@ -900,3 +900,10 @@ mod tests {
         );
     }
 }
+
+pub async fn task_specs(
+    session: String,
+    args: String,
+) -> Result<serde_json::Value, crate::live_hub::HubError> {
+    hub().task_specs(session, args).await
+}

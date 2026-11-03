@@ -29,6 +29,8 @@ use atomcode_kernel::session::SeqNo;
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum HostCommand {
+    /// Explicit user operations over original task specifications.
+    TaskSpecs { session: String, args: String },
     /// Import explicit user file bytes without model or argv transport.
     ImportPatch { session: String, bytes: Vec<u8> },
     /// Put an empty session in place of `session`, in the same working
@@ -352,6 +354,7 @@ impl HostCommand {
         match self {
             Self::NewSession { session }
             | Self::Resume { session, .. }
+            | Self::TaskSpecs { session, .. }
             | Self::ImportPatch { session, .. }
             | Self::SetReasoningEffort { session, .. }
             | Self::Undo { session, .. }
@@ -414,6 +417,10 @@ impl HostCommand {
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum HostReply {
+    /// Source list, full review or acknowledged retention state.
+    TaskSpecs {
+        value: serde_json::Value,
+    },
     PatchImported {
         reference: String,
     },
@@ -1554,6 +1561,10 @@ mod tests {
     /// sampled here.
     fn commands() -> Vec<HostCommand> {
         let all = vec![
+            HostCommand::TaskSpecs {
+                session: "a".into(),
+                args: "list".into(),
+            },
             HostCommand::ImportPatch {
                 session: "a".into(),
                 bytes: b"patch\r\n".to_vec(),
@@ -1766,6 +1777,7 @@ mod tests {
                 | HostCommand::SignOut { .. }
                 | HostCommand::SignIn { .. }
                 | HostCommand::WhoAmI { .. }
+                | HostCommand::TaskSpecs { .. }
                 | HostCommand::ImportPatch { .. }
                 | HostCommand::Changes { .. }
                 | HostCommand::Providers { .. }
@@ -1790,6 +1802,9 @@ mod tests {
     fn replies() -> Vec<HostReply> {
         let all = vec![
             HostReply::Done,
+            HostReply::TaskSpecs {
+                value: serde_json::json!({"items":[]}),
+            },
             HostReply::PatchImported {
                 reference: "immutable-reference".into(),
             },
@@ -2066,6 +2081,7 @@ mod tests {
         for r in &all {
             match r {
                 HostReply::Done
+                | HostReply::TaskSpecs { .. }
                 | HostReply::PatchImported { .. }
                 | HostReply::DoneWithNote { .. }
                 | HostReply::SessionChanged { .. }

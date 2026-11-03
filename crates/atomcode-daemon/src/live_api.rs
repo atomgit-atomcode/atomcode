@@ -1579,6 +1579,15 @@ pub(crate) async fn live_stream(
         .iter()
         .map(crate::MessageInfo::from_kernel)
         .collect();
+    let sources = crate::snapshot_spec_sources(
+        &join.snapshot,
+        std::path::Path::new(&join.binding.working_dir),
+        &join.binding.session_id,
+    );
+    for (info, (seq, pinned)) in snapshot_messages.iter_mut().zip(sources) {
+        info.source_seq = seq;
+        info.task_spec_pinned = pinned;
+    }
     if let Some(meta) = session_meta.as_ref() {
         crate::attach_snapshot_message_timestamps(
             &mut snapshot_messages,
@@ -2977,6 +2986,8 @@ mod tests {
     // ORIGINAL bytes were stashed to the display-only sidecar during the turn.
     fn missing_user_msg() -> crate::MessageInfo {
         crate::MessageInfo {
+            source_seq: None,
+            task_spec_pinned: false,
             role: "user".into(),
             content: "识别一下".into(),
             synthetic: false,
@@ -3959,5 +3970,23 @@ mod patch_upload_tests {
             .await
             .unwrap();
         assert_eq!(large.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct TaskSpecsReq {
+    session_id: String,
+    args: String,
+}
+/// User-only operation, authenticated by the existing live API middleware.
+pub(crate) async fn live_task_specs(Json(req): Json<TaskSpecsReq>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match crate::native_live::task_specs(req.session_id, req.args).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => (
+            axum::http::StatusCode::CONFLICT,
+            Json(serde_json::json!({"error":format!("{error:?}")})),
+        )
+            .into_response(),
     }
 }

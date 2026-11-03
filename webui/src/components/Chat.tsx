@@ -1,4 +1,5 @@
-import { importPatchFile } from '../api';
+import { TaskSpecifications } from './TaskSpecifications';
+import { importPatchFile, taskSpecs } from '../api';
 import { createPortal } from 'preact/compat';
 import type { ComponentChildren } from 'preact';
 import { SessionBrowse } from './SessionBrowse';
@@ -129,6 +130,8 @@ import { disposeNotifications, maybeNotifyTurnFinished } from '../lib/notificati
 import { artifactsByAssistantIndex, type TurnArtifact } from '../lib/turnArtifacts';
 
 interface Message {
+  sourceSeq?: number;
+  specPinned?: boolean;
   contextSummary?: boolean;
   archiveKey?: string;
   archiveBytes?: number;
@@ -1581,6 +1584,8 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
         inputEpoch += 1;
         loaded.push({
           role: 'user',
+          sourceSeq: msg.source_seq,
+          specPinned: msg.task_spec_pinned,
           parts: [{ kind: 'text', text: stripVisionAnnotation(msg.content ?? '') }],
           images: msg.images && msg.images.length ? msg.images : undefined,
           ts: msg.created_at,
@@ -2188,6 +2193,42 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     });
   }
 
+  const [specPicker,setSpecPicker]=useState<string|null>(null);
+  useLayoutEffect(()=>setSpecPicker(null),[sessionId,browseSession?.id]);
+  const [specActionBusy,setSpecActionBusy]=useState(false);
+  useLayoutEffect(()=>setSpecActionBusy(false),[sessionId]);
+  function updateSpecState(seq:number,pinned:boolean) {
+    setMessages(current=>current.map(message=>message.sourceSeq===seq?{...message,specPinned:pinned}:message));
+  }
+  async function chooseMessageSpec(message:Message) {
+    if(!sessionId||!message.sourceSeq||busyRef.current||specActionBusy)return;
+    if(!message.specPinned){setSpecPicker('show '+message.sourceSeq);return;}
+    const generation=sessionGenerationRef.current;
+    setSpecActionBusy(true);
+    try {
+      await taskSpecs(sessionId,'unpin '+message.sourceSeq);
+      if(generation===sessionGenerationRef.current)updateSpecState(message.sourceSeq,false);
+    } catch(error){if(generation===sessionGenerationRef.current)pushCommandNotice(String(error));}
+    finally{if(generation===sessionGenerationRef.current)setSpecActionBusy(false);}
+  }
+  // Live input acquires an event identity after persistence. Enrich only an
+  // exactly matching ordered user projection, never an isolated text match.
+  useEffect(()=>{
+    if(!sync||busy||!sessionId||!activeSession?.project_hash)return;
+    const controller=new AbortController();
+    void getSession(activeSession.project_hash,sessionId,controller.signal).then(detail=>{
+      if(controller.signal.aborted)return;
+      const originals=detail.messages.filter(message=>message.role==='user'&&!message.synthetic&&!isInternalHistoryUserMessage(message.content??'',message.synthetic));
+      setMessages(current=>{
+        const users=current.filter(message=>message.role==='user');
+        if(users.length!==originals.length||users.some((message,index)=>message.sourceSeq!=null?message.sourceSeq!==originals[index].source_seq:messageText(message)!==stripVisionAnnotation(originals[index].content??'')))return current;
+        let index=0;
+        return current.map(message=>message.role==='user'?{...message,sourceSeq:originals[index].source_seq,specPinned:originals[index++].task_spec_pinned}:message);
+      });
+    }).catch(()=>{});
+    return ()=>controller.abort();
+  },[sync,busy,sessionId,activeSession?.project_hash]);
+
   const slashHandlers: SlashHandlers = useMemo(
     () => ({
       // setMode: 委托给 switchMode；notice 用后端确认的模式（非请求的模式）。
@@ -2255,6 +2296,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
         void deliver(text, [], modeState.confirmedMode);
       },
       execServerCommand: async (command, arg) => {
+
         const SESSION_MUTATING = new Set(['undo', 'compact']);
         if (SESSION_MUTATING.has(command)) {
           if (busyRef.current) { pushCommandNotice(t('cmd.session.busy')); return; }
@@ -3644,6 +3686,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   const canStop = busy || recoveryPolicy.allowStop || Boolean(goalProgress?.recovery);
   const inputBox = (
     <div class={'input-box' + (messages.length > 0 ? ' can-collapse' : '') + (canStop ? ' is-running' : '') + (pendingImages.length || attachError ? ' has-input-detail' : '')}>
+      {specPicker!==null&&sessionId&&createPortal(<TaskSpecifications key={sessionId} sessionId={sessionId} running={busy} initial={specPicker} onChanged={updateSpecState} onClose={()=>setSpecPicker(null)}/>,document.body)}
       {patchUploading && <div class="input-attach-error" role="status">{t('patch.importing')}</div>}
       {attachError && (
         <div class="input-attach-error" role="alert">
@@ -3759,6 +3802,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
             onInsert={insertAtCursor}
             onPickFile={() => setShowFilePicker(true)}
             onImportPatch={uploadPatch}
+            onManageSpecs={()=>setSpecPicker('list')}
             patchDisabled={!sessionId || busy || patchUploading}
             onAddImages={addImageFiles}
           />
@@ -4129,6 +4173,8 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
                   search={search}
                   isActiveSearchMatch={isActiveSearchMatch}
                   steerPending={isSteerPending(msg.pendingSteerId, pendingSteers)}
+                  onSpec={()=>void chooseMessageSpec(msg)}
+                  specDisabled={busy||specActionBusy||!msg.sourceSeq}
                 />
               );
             }
@@ -4749,6 +4795,8 @@ function UserMessageView({
   search,
   isActiveSearchMatch,
   steerPending,
+  onSpec,
+  specDisabled,
 }: {
   msg: Message;
   searchRef?: (el: HTMLElement | null) => void;
@@ -4756,6 +4804,8 @@ function UserMessageView({
   search: string;
   isActiveSearchMatch: boolean;
   steerPending?: boolean;
+  onSpec?:()=>void;
+  specDisabled?:boolean;
 }) {
   const t = useT();
   // 技能/文档型消息默认折叠为一行徽章，点击展开查看原文。
@@ -4799,6 +4849,9 @@ function UserMessageView({
     </button>
   );
 
+  const specButton=onSpec&&<button type="button" class={'msg-copy-btn'+(msg.specPinned?' spec-pinned':'')} disabled={specDisabled} aria-pressed={Boolean(msg.specPinned)} onClick={onSpec} title={!msg.sourceSeq?t('spec.awaitSaved'):t(msg.specPinned?'spec.unpin':'spec.pin')} aria-label={t(msg.specPinned?'spec.unpin':'spec.pin')}>
+    <svg width="14" height="14" viewBox="0 0 16 16" fill={msg.specPinned?'currentColor':'none'} aria-hidden="true"><path d="m5 2 6 0-1 4 3 3H9v4l-1 2-1-2V9H3l3-3Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg>
+  </button>;
   const wrapperClass = 'user-message-wrapper'
     + (isActiveSearchMatch ? ' is-active-search-match' : '')
     + (steerPending ? ' steer-pending' : '');
@@ -4826,7 +4879,7 @@ function UserMessageView({
         {steerBadge}
         <div class="msg-actions">
           {timeLabel && <div class="msg-time msg-time-user">{timeLabel}</div>}
-          {copyBtn}
+          {copyBtn}{specButton}
         </div>
       </div>
     );
@@ -4848,7 +4901,7 @@ function UserMessageView({
       </div>
       <div class="msg-actions">
         {timeLabel && <div class="msg-time msg-time-user">{timeLabel}</div>}
-        {copyBtn}
+        {copyBtn}{specButton}
       </div>
       {steerBadge}
     </div>

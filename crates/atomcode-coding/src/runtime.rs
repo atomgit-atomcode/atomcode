@@ -3058,6 +3058,24 @@ impl CodingRuntimeHandle {
         result.await.map_err(|_| RuntimeError::Unavailable)?
     }
 
+    /// Explicit user's specification operation, scoped to this generation/session.
+    pub async fn task_specs(
+        &self,
+        session: String,
+        args: String,
+    ) -> Result<serde_json::Value, RuntimeError> {
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::TaskSpecs {
+                generation: runtime_state_generation(self.state.load(Ordering::Acquire)),
+                session,
+                args,
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
     /// Explicit user input; never route patch bytes through model output or shell argv.
     pub async fn import_patch(
         &self,
@@ -4013,6 +4031,13 @@ pub enum CodingRuntimeControl {
         /// name asks: one call on the account instead of three.
         windows_only: bool,
         done: oneshot::Sender<Result<Allowance, RuntimeError>>,
+    },
+    /// Explicit user operations over retained task specifications.
+    TaskSpecs {
+        generation: u64,
+        session: String,
+        args: String,
+        done: oneshot::Sender<Result<serde_json::Value, RuntimeError>>,
     },
     /// Import explicit user bytes into the current session's input artifacts.
     ImportPatch {
@@ -6188,6 +6213,30 @@ fn spawn_runtime_owner_with_optional_agent(
                                 spent_unavailable,
                             }));
                         });
+                    }
+                    Some(CodingRuntimeControl::TaskSpecs { generation: requested, session, args, done }) => {
+                        let mutates=matches!(args.split_whitespace().next(),Some("pin"|"unpin"));
+                        let mut result = if requested != generation || (mutates && (active_turn.is_some() || !pending_requests.is_empty())) { Err(RuntimeError::Busy) } else {
+                            resources.as_ref().and_then(|r| r.harness_app.as_ref()).ok_or(RuntimeError::Unavailable).and_then(|app| {
+                                let context=app.context();
+                                let agents=context.service::<atomcode_harness::seams::AgentsSvc>().ok_or(RuntimeError::Unavailable)?;
+                                let target=agents.list().into_iter().find(|a|a.parent().is_none()&&a.session_id()==session).ok_or(RuntimeError::Unavailable)?;
+                                atomcode_harness::plugins::spec::execute(&target,&args).map_err(RuntimeError::CommandRefused)
+                            })
+                        };
+                        if mutates && result.is_ok() {
+                            conversation_revision=conversation_revision.wrapping_add(1);
+                            if let Some(error)=resources.as_ref().and_then(|r|r.parts.take_snapshot_persistence_uncertain()) {
+                                persistence_failure=Some(error.clone());
+                                let _=send_agent_command(&agent,AgentCommand::Shutdown);
+                                agent=None;
+                                let report=StopReport{persistence_failure:Some(error),..Default::default()};
+                                if let Some(error)=fail_close_after_stopped_persistence(&report,resources.as_ref(),&mut goal,&mut loop_state,&mut pending_wakeup,&mut held_turn,&mut active_turn,&mut terminal_reason,&mut turn_stats,&mut conversation_revision,&mut snapshot_waiters,&mut agent_available,controls.state.as_ref(),generation,&runtime_event_tx) {
+                                    result=Err(error);
+                                }
+                            }
+                        }
+                        let _=done.send(result);
                     }
                     Some(CodingRuntimeControl::ImportPatch { generation: requested, session, bytes, done }) => {
                         if requested != generation || active_turn.is_some() || !pending_requests.is_empty() {
@@ -10130,6 +10179,9 @@ fn reject_runtime_control_with_error(
         // like every other awaited control.
         CodingRuntimeControl::ToolCatalog { done, .. }
         | CodingRuntimeControl::SwitchTool { done, .. } => {
+            let _ = done.send(Err(error));
+        }
+        CodingRuntimeControl::TaskSpecs { done, .. } => {
             let _ = done.send(Err(error));
         }
         CodingRuntimeControl::ImportPatch { done, .. } => {
@@ -14192,6 +14244,112 @@ mod tests {
         assert_ne!(next, current);
         assert!(runtime.handle.import_patch(current, bytes).await.is_err());
         runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn task_specifications_are_session_scoped_and_resume_from_the_event_log() {
+        struct SpecProviderFactory;
+        impl CodingProviderFactory for SpecProviderFactory {
+            fn build(
+                &self,
+                _config: &CodingAgentConfig,
+                _session: Option<&str>,
+            ) -> Result<Arc<dyn LlmProvider>, crate::ProviderBuildError> {
+                Ok(Arc::new(
+                    atomcode_kernel::testkit::MockProvider::new(vec![vec![
+                        atomcode_kernel::stream::StreamEvent::TextDelta("answer".into()),
+                        atomcode_kernel::stream::StreamEvent::Done { truncated: false },
+                    ]])
+                    .with_ctx_window(64_000),
+                ))
+            }
+        }
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let dirs = atomcode_capabilities::ProductDirs::new(home.path(), ".spec-entry-test");
+        let mut start = native_start(false);
+        start.provider_factory = Arc::new(SpecProviderFactory);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.agent.dirs = dirs.clone();
+        start.prepare.session = crate::SessionMode::Fresh;
+        let mut runtime = CodingRuntime::start(start).await.unwrap();
+        let id = runtime
+            .handle
+            .fresh_session()
+            .await
+            .unwrap()
+            .session_id
+            .unwrap();
+        runtime
+            .handle
+            .submit(UserInput::from("MUST NOT change API\r\nlet exact = 42;"))
+            .await
+            .unwrap();
+        wait_for_turn_finished(&mut runtime).await;
+        let list = runtime
+            .handle
+            .task_specs(id.clone(), "list".into())
+            .await
+            .unwrap();
+        let seq = list["items"][0]["seq"].as_u64().unwrap();
+        runtime
+            .handle
+            .task_specs(id.clone(), format!("pin {seq}"))
+            .await
+            .unwrap();
+        assert!(runtime
+            .handle
+            .task_specs("other-session".into(), "list".into())
+            .await
+            .is_err());
+        runtime.handle.shutdown().await.unwrap();
+        runtime.task.await.unwrap();
+        let mut start = native_start(false);
+        start.provider_factory = Arc::new(SpecProviderFactory);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.agent.dirs = dirs.clone();
+        start.prepare.session = crate::SessionMode::Resume(id.clone());
+        let runtime = CodingRuntime::start(start).await.unwrap();
+        let show = runtime
+            .handle
+            .task_specs(id.clone(), format!("show {seq}"))
+            .await
+            .unwrap();
+        assert_eq!(show["text"], "MUST NOT change API\r\nlet exact = 42;");
+        assert_eq!(show["pinned"], true);
+        let snapshot = runtime.handle.snapshot().await.unwrap();
+        assert!(snapshot
+            .messages
+            .iter()
+            .any(|m| m.text.contains("let exact = 42;")));
+        runtime
+            .handle
+            .task_specs(id.clone(), format!("unpin {seq}"))
+            .await
+            .unwrap();
+        runtime
+            .handle
+            .task_specs(id.clone(), format!("pin {seq}"))
+            .await
+            .unwrap();
+        // A successful in-memory pin edit must not claim durable success if
+        // the authoritative event writer cannot open its target.
+        let manager =
+            atomcode_capabilities::session::SessionManager::for_project(project.path(), &dirs);
+        let path = manager.root().join(format!("{id}.events"));
+        let backup = path.with_extension("events.test-backup");
+        std::fs::rename(&path, &backup).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(runtime
+            .handle
+            .task_specs(id, format!("unpin {seq}"))
+            .await
+            .is_err());
+        assert_eq!(runtime.handle.status().phase, RuntimePhase::Failed);
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&backup, &path).unwrap();
+        runtime.handle.shutdown().await.unwrap();
+        runtime.task.await.unwrap();
     }
 
     async fn wait_for_turn_finished(runtime: &mut CodingRuntime) {

@@ -202,6 +202,11 @@ impl PluginAgentLoop {
                 let first_content = self.stream_first_content;
                 let loop_retried = loop_retried.clone();
                 Box::pin(async move {
+                    let retained_bytes=atomcode_kernel::session::retention::validate_request(&session.events(), &messages)
+                        .map_err(RequestError::message)?;
+                    if retained_bytes > super::spec::allowance(provider.context_window()) {
+                        return Err(RequestError::message("Task specifications exceed the current model's context allowance. Use /spec to unpin messages or choose a larger context model."));
+                    }
                     stream_once(
                         &*provider,
                         &ctx,

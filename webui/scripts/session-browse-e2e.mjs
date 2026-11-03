@@ -7,9 +7,11 @@ import assert from 'node:assert/strict';
 const root = resolve(import.meta.dirname, '../dist');
 const id = 'context-summary-fixture';
 const meta = { id, name: 'Context summary', working_dir: '/fixture', project_hash: 'fixture', created_at: 1700000000, updated_at: 1700000001, message_count: 2 };
-const messages = [{ role: 'user', content: 'Check the resource boundary' }, { role: 'assistant', content: 'The resource read boundary is ready.' }];
+const specificationText = 'MUST NOT change public API\r\nconst exact = 42;';
+const messages = [{ role: 'user', content: specificationText, source_seq:12, task_spec_pinned:false }, { role: 'assistant', content: 'The resource read boundary is ready.' }];
 const other = { ...meta, id: 'browse-fixture', name: 'Other conversation' };
 let switches = 0;
+let specificationPinned = false;
 const patchUploads = [];
 let patchReplyMode = 'ok';
 const pendingPatchReplies = [];
@@ -21,6 +23,15 @@ const snapshot = () => ({ type: 'snapshot', session_id: id, session_name: meta.n
 const server = createServer(async (req, res) => {
   const path = new URL(req.url, 'http://localhost').pathname;
   const json = value => { res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(value)); };
+  if (path === '/live/spec') {
+    let body='';for await (const chunk of req) body+=chunk;
+    const input=JSON.parse(body);assert.equal(input.session_id,id);
+    if(input.args==='pin 12'){specificationPinned=true;messages[0].task_spec_pinned=true;}
+    if(input.args==='unpin 12'){specificationPinned=false;messages[0].task_spec_pinned=false;}
+    if(input.args.startsWith('pin ')||input.args.startsWith('unpin '))return json({seq:12,pinned:specificationPinned});
+    if(input.args==='show 12')return json({seq:12,text:specificationText,pinned:specificationPinned,bytes:specificationText.length,pinned_bytes:specificationPinned?specificationText.length:0,budget_bytes:8192});
+    return json({session_id:id,items:[{seq:12,turn:2,at:1700000000000,bytes:specificationText.length,preview:specificationText,pinned:specificationPinned}],pinned_bytes:specificationPinned?specificationText.length:0,budget_bytes:8192});
+  }
   if (path === '/live/patch') {
     const chunks = []; for await (const chunk of req) chunks.push(chunk);
     patchUploads.push({session:new URL(req.url, 'http://localhost').searchParams.get('session_id'), bytes:Buffer.concat(chunks)});
@@ -196,6 +207,27 @@ try {
   await composer.waitFor();
   emit({type:'state', running:false});
   assert.equal(await composer.inputValue(), 'Draft before leaving');
+  await page.getByRole('button',{name:'Pin as task specification',exact:true}).click();
+  const specifications=page.getByRole('dialog',{name:'Task specifications'});
+  await specifications.waitFor();
+  await specifications.evaluate(async el=>{await Promise.all(el.closest('.modal-overlay').getAnimations({subtree:true}).map(animation=>animation.finished));});
+  const specBounds=await specifications.boundingBox();
+  await page.screenshot({path:`/tmp/atomcode-spec-picker-${width}.png`});
+  assert(specBounds.x>=0&&specBounds.x+specBounds.width<=width&&specBounds.y>=0&&specBounds.y+specBounds.height<=900,'specification picker fits viewport: '+JSON.stringify(specBounds));
+  assert.equal(specificationPinned,false,'opening a source does not pin automatically');
+  assert.equal(await specifications.locator('pre').textContent(),specificationText);
+  await page.screenshot({path:`/tmp/atomcode-spec-review-${width}.png`});
+  await specifications.getByRole('button',{name:'Pin as task specification',exact:true}).click();
+  await specifications.getByRole('button',{name:'Unpin task specification',exact:true}).waitFor();
+  assert.equal(specificationPinned,true);
+  await specifications.getByRole('button',{name:'Close',exact:true}).click();
+  await specifications.waitFor({state:'detached'});
+  const inlineUnpin=page.getByRole('button',{name:'Unpin task specification',exact:true});
+  assert.equal(await inlineUnpin.getAttribute('aria-pressed'),'true');
+  await inlineUnpin.click();
+  await page.getByRole('button',{name:'Pin as task specification',exact:true}).waitFor();
+  assert.equal(specificationPinned,false);
+
   assert.deepEqual(errors, []);
   await page.close();
  }

@@ -249,6 +249,10 @@ fn draw(sheet: &Sheet, row: Row, w: usize, caps: Caps, room: usize) -> Line {
                 Page::List(list) => t(Msg::SheetListLegend {
                     typed: list.typed.is_some(),
                 }),
+                Page::Read(read) if read.action.is_some() => std::borrow::Cow::Owned(format!(
+                    "Enter · {} · Esc",
+                    read.action.as_ref().unwrap().0
+                )),
                 Page::Read(_) => t(Msg::SheetReadLegend {
                     back: sheet.back.is_some(),
                 }),

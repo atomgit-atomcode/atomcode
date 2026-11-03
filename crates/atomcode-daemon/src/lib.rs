@@ -852,6 +852,11 @@ pub struct ToolResultInfo {
 /// Message info for API response
 #[derive(Debug, Serialize)]
 pub struct MessageInfo {
+    /// Stable original user-event identity, present only for verified native projections.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub task_spec_pinned: bool,
     pub role: String,
     pub content: String,
     /// True when a `Role::User` message was injected by the agent/runtime rather
@@ -979,6 +984,8 @@ impl MessageInfo {
             }
         }
         Self {
+            source_seq: None,
+            task_spec_pinned: false,
             role: role.into(),
             content,
             synthetic: msg.synthetic,
@@ -2815,12 +2822,88 @@ fn read_todo_sidecar_for_detail(
         .unwrap_or_default()
 }
 
+/// Source IDs are derived from one native event projection. A snapshot that is
+/// stale relative to that projection gets no IDs rather than guessed matches.
+pub(crate) fn snapshot_spec_sources(
+    snapshot: &atomcode_kernel::message::SessionSnapshot,
+    working_dir: &std::path::Path,
+    id: &str,
+) -> Vec<(Option<u64>, bool)> {
+    let unknown = vec![(None, false); snapshot.messages.len()];
+    let root = NativeSessionManager::sessions_root(
+        atomcode_coding::config::product_dirs_from_env().user(),
+    );
+    let scan = NativeSessionManager::scan_catalog(&root);
+    let entries: Vec<_> = scan.entries.iter().filter(|entry| entry.id == id).collect();
+    if entries.len() > 1 {
+        return unknown;
+    }
+    let manager = match entries.first() {
+        Some(entry) => NativeSessionManager::with_root(root.join(&entry.project_bucket)),
+        None => NativeSessionManager::for_project(
+            working_dir,
+            &atomcode_coding::config::product_dirs_from_env(),
+        ),
+    };
+    let Ok(events) = manager.load_events(id) else {
+        return unknown;
+    };
+    spec_sources_from_events(snapshot, &events)
+}
+
+fn spec_sources_from_events(
+    snapshot: &atomcode_kernel::message::SessionSnapshot,
+    events: &[atomcode_kernel::session::LoggedEvent],
+) -> Vec<(Option<u64>, bool)> {
+    use atomcode_kernel::{
+        message::Role,
+        session::{derive_traced, retained_events, retention, Provenance, SessionEvent},
+    };
+    let mut result = vec![(None, false); snapshot.messages.len()];
+    let projected = derive_traced(events);
+    let Some(head) = snapshot.messages.len().checked_sub(projected.len()) else {
+        return result;
+    };
+    if snapshot.messages[..head]
+        .iter()
+        .any(|m| m.role != Role::System)
+        || projected
+            .iter()
+            .zip(&snapshot.messages[head..])
+            .any(|(a, b)| {
+                a.message.role != b.role
+                    || a.message.display_text() != b.display_text()
+                    || a.message.tool_calls != b.tool_calls
+                    || a.message.tool_call_id != b.tool_call_id
+            })
+    {
+        return result;
+    }
+    let originals: std::collections::BTreeSet<_> = retained_events(events)
+        .filter_map(|e| matches!(e.event, SessionEvent::UserMessage { .. }).then_some(e.seq))
+        .collect();
+    let pins = retention::active_sources(events);
+    for (index, item) in projected.iter().enumerate() {
+        if let Provenance::Event(seq) = item.source {
+            if originals.contains(&seq) {
+                result[head + index] = (Some(seq), pins.contains_key(&seq));
+            }
+        }
+    }
+    result
+}
+
 fn merge_catalog_session_messages_for_display(
     session: &crate::legacy_convert::CatalogSessionView,
     turn_timestamps: &TurnTimestamps,
 ) -> anyhow::Result<Vec<MessageInfo>> {
     use atomcode_capabilities::session::{DisplayAnchor, PresentationRole};
 
+    let spec_sources = snapshot_spec_sources(
+        &session.snapshot,
+        std::path::Path::new(&session.meta.working_dir),
+        &session.meta.id,
+    );
     let mut presentation = std::collections::BTreeMap::<usize, Vec<_>>::new();
     for entry in &session.presentation.entries {
         let after_message = match entry.anchor {
@@ -2847,6 +2930,8 @@ fn merge_catalog_session_messages_for_display(
                 continue;
             }
             messages.push(MessageInfo {
+                source_seq: None,
+                task_spec_pinned: false,
                 role: match entry.role {
                     PresentationRole::User => "user",
                     PresentationRole::Assistant => "assistant",
@@ -2887,6 +2972,7 @@ fn merge_catalog_session_messages_for_display(
                 && atomcode_capabilities::reminder::is_system_reminder(&message.text));
         if !hidden_internal {
             let mut info = MessageInfo::from_kernel(message);
+            (info.source_seq, info.task_spec_pinned) = spec_sources[index];
             info.created_at =
                 snapshot_message_timestamp(&session.meta, message, index, turn_timestamps);
             messages.push(info);
@@ -2901,6 +2987,8 @@ fn merge_catalog_session_messages_for_display(
                 continue;
             }
             messages.push(MessageInfo {
+                source_seq: None,
+                task_spec_pinned: false,
                 role: match entry.role {
                     PresentationRole::User => "user",
                     PresentationRole::Assistant => "assistant",
@@ -7670,6 +7758,10 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/live/mcp/trust", post(live_api::live_mcp_trust))
         .route("/command", post(commands::run_command))
         .route(
+            "/live/spec",
+            post(live_api::live_task_specs).layer(DefaultBodyLimit::max(4096)),
+        )
+        .route(
             "/live/patch",
             post(live_api::live_import_patch).layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
         )
@@ -10946,6 +11038,8 @@ done
     fn attach_image_sets_replaces_placeholders_in_order_only() {
         fn msg(role: &str, images: Option<Vec<ImageData>>) -> MessageInfo {
             MessageInfo {
+                source_seq: None,
+                task_spec_pinned: false,
                 role: role.into(),
                 content: String::new(),
                 synthetic: false,
@@ -11460,5 +11554,78 @@ mod resolve_daemon_token_tests {
         let t = resolve_daemon_token(None, &store);
         assert!(!t.is_empty());
         assert!(store.is_valid(&t));
+    }
+}
+
+#[cfg(test)]
+mod task_spec_source_tests {
+    use super::*;
+    use atomcode_kernel::session::{retention, InjectionOrigin, LoggedEvent, SessionEvent};
+    #[test]
+    fn source_buttons_use_native_event_ids_even_when_user_text_is_identical() {
+        let text = "identical original text";
+        let event = |seq, event| LoggedEvent { seq, at: 0, event };
+        let events = vec![
+            event(
+                1,
+                SessionEvent::UserMessage {
+                    turn: 1,
+                    text: text.into(),
+                    images: vec![],
+                },
+            ),
+            event(
+                2,
+                SessionEvent::Injected {
+                    turn: 1,
+                    text: text.into(),
+                    origin: InjectionOrigin::Reminder,
+                },
+            ),
+            event(
+                3,
+                SessionEvent::UserMessage {
+                    turn: 2,
+                    text: text.into(),
+                    images: vec![],
+                },
+            ),
+            event(
+                4,
+                SessionEvent::ContextRetention {
+                    turn: 2,
+                    source: 3,
+                    active: true,
+                    bytes: text.len(),
+                    sha256: retention::digest(text),
+                },
+            ),
+        ];
+        let mut snapshot = atomcode_kernel::message::SessionSnapshot::new(
+            atomcode_kernel::session::derive_messages_with_meta(&events),
+        );
+        snapshot
+            .messages
+            .insert(0, atomcode_kernel::message::Message::system("root prompt"));
+        assert_eq!(
+            spec_sources_from_events(&snapshot, &events),
+            vec![
+                (None, false),
+                (Some(1), false),
+                (None, false),
+                (Some(3), true)
+            ]
+        );
+        snapshot
+            .messages
+            .push(atomcode_kernel::message::Message::user(
+                "stale extra message",
+            ));
+        assert!(
+            spec_sources_from_events(&snapshot, &events)
+                .iter()
+                .all(|(seq, _)| seq.is_none()),
+            "a stale projection must not guess identities from individual matching texts"
+        );
     }
 }
