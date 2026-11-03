@@ -64,6 +64,62 @@ impl ArtifactStore {
         Ok(Some(bytes[start..end].to_vec()))
     }
 
+    /// Keep input grants separate across sessions, even when output storage is
+    /// shared by the project. Hash the scope so it can never become a path.
+    pub fn scoped_inputs(&self, scope: &str) -> Self {
+        Self::new(
+            self.dir
+                .join("input-sessions")
+                .join(format!("{:x}", Sha256::digest(scope.as_bytes()))),
+        )
+    }
+
+    /// Immutable input records use full SHA-256 and a separate namespace. They
+    /// cannot be fetched as ordinary model-visible output artifacts.
+    pub fn put_input(&self, bytes: &[u8]) -> std::io::Result<String> {
+        use std::io::Write;
+        let id = format!("{:x}", Sha256::digest(bytes));
+        let dir = self.dir.join("inputs");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(&id);
+        let mut temp = tempfile::NamedTempFile::new_in(&dir)?;
+        temp.write_all(bytes)?;
+        temp.as_file().sync_all()?;
+        match temp.persist_noclobber(&path) {
+            Ok(_) => {}
+            Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if std::fs::read(&path)? != bytes {
+                    return Err(std::io::Error::other(
+                        "input artifact hash collision or corruption",
+                    ));
+                }
+            }
+            Err(e) => return Err(e.error),
+        }
+        Ok(id)
+    }
+
+    pub fn get_input(&self, id: &str) -> std::io::Result<Vec<u8>> {
+        if id.len() != 64
+            || !id
+                .bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        {
+            return Err(std::io::Error::other("invalid input artifact id"));
+        }
+        let path = self.dir.join("inputs").join(id);
+        if std::fs::metadata(&path)?.len() > 64 * 1024 * 1024 {
+            return Err(std::io::Error::other("input artifact too large"));
+        }
+        let bytes = std::fs::read(path)?;
+        if format!("{:x}", Sha256::digest(&bytes)) != id {
+            return Err(std::io::Error::other(
+                "input artifact integrity check failed",
+            ));
+        }
+        Ok(bytes)
+    }
+
     /// Byte length of a stored artifact — an O(1) `metadata` stat, so the fetch
     /// pagination hint doesn't re-read the whole (≤4 MiB) blob just for its size.
     /// `Ok(None)` for a missing file or an id that isn't `[0-9a-f]{16}`.
@@ -1038,5 +1094,25 @@ mod fetch_output_tests {
             "past-end window clamps to total, coherent hint: {}",
             r.content
         );
+    }
+}
+
+#[cfg(test)]
+mod input_integrity_tests {
+    use super::*;
+    #[test]
+    fn inputs_are_session_isolated_and_verified_on_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ArtifactStore::new(dir.path());
+        let a = store.scoped_inputs("lead/a");
+        let b = store.scoped_inputs("lead/b");
+        let id = a.put_input(b"exact input bytes\r\n").unwrap();
+        assert_eq!(id.len(), 64);
+        assert_eq!(a.get_input(&id).unwrap(), b"exact input bytes\r\n");
+        assert!(b.get_input(&id).is_err());
+        assert!(store.get(&id, 0, 100).unwrap().is_none());
+        assert!(a.get_input("../escape").is_err());
+        std::fs::write(a.dir.join("inputs").join(&id), b"changed").unwrap();
+        assert!(a.get_input(&id).is_err());
     }
 }

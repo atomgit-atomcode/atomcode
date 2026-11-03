@@ -432,6 +432,28 @@ impl PermissionRules {
                 RuleDecision::NoMatch
             };
         }
+        if tool == "apply_patch" {
+            let Some(paths) = serde_json::from_str::<serde_json::Value>(args)
+                .ok()
+                .and_then(|v| v.get("file_paths").and_then(|v| v.as_array()).cloned())
+            else {
+                return RuleDecision::NoMatch;
+            };
+            if paths.is_empty() || sensitive.references(args) {
+                return RuleDecision::NoMatch;
+            }
+            return if paths.iter().all(|path| {
+                path.as_str().is_some_and(|path| {
+                    let one = serde_json::json!({"file_path": path}).to_string();
+                    let targets = match_targets(tool, &one, cwd);
+                    self.allow.iter().any(|r| r.matches(tool, &targets))
+                })
+            }) {
+                RuleDecision::Allow
+            } else {
+                RuleDecision::NoMatch
+            };
+        }
         if self.allow.iter().any(|r| r.matches(tool, &targets)) {
             // HARD FLOOR: a user allow-rule pre-authorizes convenience, never a secret. A
             // sensitive target falls through so the normal gates still prompt.
@@ -1135,6 +1157,33 @@ mod tests {
                 &cwd()
             ),
             RuleDecision::Allow
+        );
+    }
+    #[test]
+    fn patch_rules_require_every_target_and_deny_any_target() {
+        let sensitive = crate::tools::sensitive_path::test_guard();
+        let args = r#"{"artifact_id":"abc","file_paths":["src/a","private/b"]}"#;
+        assert_eq!(
+            rules(&["apply_patch(src/*)"], &[]).decide(&sensitive, "apply_patch", args, &cwd()),
+            RuleDecision::NoMatch
+        );
+        assert_eq!(
+            rules(&["apply_patch(src/*)", "apply_patch(private/*)"], &[]).decide(
+                &sensitive,
+                "apply_patch",
+                args,
+                &cwd()
+            ),
+            RuleDecision::Allow
+        );
+        assert_eq!(
+            rules(&["apply_patch"], &["apply_patch(private/*)"]).decide(
+                &sensitive,
+                "apply_patch",
+                args,
+                &cwd()
+            ),
+            RuleDecision::Deny
         );
     }
 }

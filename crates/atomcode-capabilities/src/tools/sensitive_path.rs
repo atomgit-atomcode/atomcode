@@ -137,10 +137,8 @@ impl SensitivePaths {
             return false;
         };
         let mut real_user: Option<Option<PathBuf>> = None;
-        for key in ["file_path", "path"] {
-            let Some(raw) = value.get(key).and_then(|v| v.as_str()) else {
-                continue;
-            };
+        for raw in super::file_target_arg_values(args) {
+            let raw = raw.as_str();
             let path = super::resolve_path(raw, working_dir);
             let named = serde_json::json!({ "path": path }).to_string();
             if self.references(&named) {
@@ -309,14 +307,12 @@ impl SensitivePaths {
         working_dir: &Path,
         world: &dyn crate::world::FileSystem,
     ) -> Option<String> {
-        let value: serde_json::Value = serde_json::from_str(args).ok()?;
+        let _: serde_json::Value = serde_json::from_str(args).ok()?;
         let mut targets = Vec::new();
-        for key in ["file_path", "path"] {
-            if let Some(raw) = value.get(key).and_then(|v| v.as_str()) {
-                let path = super::resolve_path(raw, working_dir);
-                let real = world.canonicalize(&path).await.unwrap_or(path);
-                targets.push(crate::pathnorm::to_display(&real));
-            }
+        for raw in super::file_target_arg_values(args) {
+            let path = super::resolve_path(&raw, working_dir);
+            let real = world.canonicalize(&path).await.unwrap_or(path);
+            targets.push(crate::pathnorm::to_display(&real));
         }
         (!targets.is_empty()).then(|| targets.join("\u{1f}"))
     }

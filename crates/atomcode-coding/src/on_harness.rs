@@ -544,6 +544,10 @@ config = { working_dir = {working_dir} }
 name = "tool-output-artifact"
 config = { dir = {artifacts} }
 
+# User-supplied patches stay outside model output and shell arguments.
+[[insert]]
+name = "tool-patch"
+
 # How the model is told about skills. The generic `skills-advert` row offers a
 # count and a pointer; coding lists the catalog, because every other piece of
 # its skill steering refers to that catalog by name. The generic row goes

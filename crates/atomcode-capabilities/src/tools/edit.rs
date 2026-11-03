@@ -48,7 +48,7 @@ fn edit_path_locks() -> &'static Mutex<HashMap<PathBuf, Weak<PathLock>>> {
 /// is still a perfectly good key — and going through the async seam would turn a
 /// synchronous helper async to buy nothing. The rule "branch only on facts from
 /// your own world" is about what the tool *decides*; this decides nothing.
-fn edit_path_lock(path: &Path) -> Arc<PathLock> {
+pub(crate) fn edit_path_lock(path: &Path) -> Arc<PathLock> {
     let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let mut locks = edit_path_locks().lock().unwrap_or_else(|p| p.into_inner());
     locks.retain(|_, lock| lock.strong_count() > 0);

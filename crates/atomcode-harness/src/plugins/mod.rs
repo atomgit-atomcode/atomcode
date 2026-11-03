@@ -68,6 +68,7 @@ pub fn catalog() -> PluginRegistry {
         .register(Arc::new(opener::OpenFileToolPlugin))
         .register(Arc::new(world_tools::BashWorldToolPlugin))
         .register(Arc::new(tools::FsToolsPlugin))
+        .register(Arc::new(tools::PatchToolsPlugin))
         .register(Arc::new(tools::SearchToolsPlugin))
         .register(Arc::new(tools::AstGrepPlugin))
         .register(Arc::new(tools::BashToolPlugin))
