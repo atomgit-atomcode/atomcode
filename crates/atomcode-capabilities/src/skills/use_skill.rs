@@ -32,12 +32,14 @@ impl Tool for UseSkillTool {
         "use_skill"
     }
     fn description(&self) -> &str {
-        "Invoke a named skill (a reusable prompt/workflow template) and return its content \
-         with your arguments substituted. The name must exactly match a skill listed under \
-         '=== AVAILABLE SKILLS ===' in the system prompt or returned by list_skills. Never invent \
-         or guess a skill name. Trigger a skill when the task matches its listed description — \
-         not only when the user names it. list_skills shows any lower-priority skills omitted \
-         from the prompt catalog."
+        "Load a skill's instructions with arguments substituted. When the user names a skill \
+         or the task clearly matches its description, call this BEFORE searching files, \
+         running commands, planning, proposing fixes, or asking clarifying questions; then \
+         follow the loaded instructions. Bug reports, failed tests, and fixes that still fail \
+         also require checking for a matching skill, without an explicit skill request. \
+         Use only an exact name from '=== AVAILABLE SKILLS ===' or list_skills; never invent \
+         or guess a skill name. list_skills discovers skills omitted from the catalog. \
+         If no description matches, proceed without loading a skill."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
@@ -275,7 +277,7 @@ mod tests {
         assert!(schema.contains("Exact skill name"), "{schema}");
         assert!(schema.contains("never invent"), "{schema}");
         assert!(
-            tool.description().contains("must exactly match"),
+            tool.description().contains("Use only an exact name"),
             "{}",
             tool.description()
         );
