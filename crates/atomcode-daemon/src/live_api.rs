@@ -344,6 +344,7 @@ pub(crate) fn chat_runtime_config(
             config.coding.shell_guard_policy,
         ),
         permission_rules: std::sync::Arc::new(permission_rules),
+        automation_approval: config.permissions.automation_approval,
         initial_mode: config
             .permissions
             .default_mode
