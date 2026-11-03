@@ -13,6 +13,8 @@
     <string name="notification_external">已连接外部守护进程（端口 %1$d）</string>
     <string name="notification_external_lost">端口 %1$d 的外部守护进程已停止响应</string>
     <string name="notification_busy">正在处理 %1$d 个会话……</string>
+    <string name="notification_waiting_approval">等待你批准后继续 —— 智能体已停在这里</string>
+    <string name="notification_waiting_approval_plural">%1$d 个会话在等你批准</string>
     <string name="notification_last_turn_ok">%1$s · 上一轮已完成</string>
     <string name="notification_last_turn_cancelled">%1$s · 上一轮被你停止</string>
     <string name="notification_last_turn_failed">%1$s · 上一轮失败（%2$s）</string>

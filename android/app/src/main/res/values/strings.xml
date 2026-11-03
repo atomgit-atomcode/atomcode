@@ -8,6 +8,10 @@
     <string name="notification_external">Connected to the external daemon on port %1$d</string>
     <string name="notification_external_lost">The external daemon on port %1$d stopped answering</string>
     <string name="notification_busy">Working on %1$d conversation(s)…</string>
+    <!-- A turn is blocked until the person answers. Deliberately distinct from
+         "working": this state cannot end on its own. -->
+    <string name="notification_waiting_approval">Waiting for your approval to continue</string>
+    <string name="notification_waiting_approval_plural">%1$d conversations waiting for your approval</string>
     <string name="notification_last_turn_ok">%1$s · last turn finished</string>
     <string name="notification_last_turn_cancelled">%1$s · last turn stopped by you</string>
     <string name="notification_last_turn_failed">%1$s · last turn failed (%2$s)</string>

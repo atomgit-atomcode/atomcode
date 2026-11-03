@@ -102,7 +102,13 @@ cc="$ndk/toolchains/llvm/prebuilt/$host_tag/bin/aarch64-linux-android${API:-26}-
 echo "→ launcher (clang $clang_dir)"
 "$cc" -O2 -DCLANG_RESOURCE="\"lib/clang/$clang_dir\"" \
   scripts/termux/launcher/clang.c -o "$JNI/libclang.so"
-ls -lh "$JNI/libclang.so" "$JNI/libclang-real.so"
+# `clangd` gets its own launcher for the reason in clangd.c: the language server
+# also has to be told where the data package put the headers and the resource
+# directory, and it has no `-resource-dir` of its own (it goes through --extra-arg).
+"$cc" -O2 -DCLANG_RESOURCE="\"lib/clang/$clang_dir\"" \
+  scripts/termux/launcher/clangd.c -o "$JNI/libclangd.so"
+ls -lh "$JNI/libclang.so" "$JNI/libclang-real.so" "$JNI/libclangd.so" "$JNI/libclangd-real.so" 2>/dev/null || \
+  ls -lh "$JNI/libclang.so" "$JNI/libclang-real.so"
 
 mkdir -p "$DIST"
 # The installer links `<product>/<link>` at this package's directory. `clang` is

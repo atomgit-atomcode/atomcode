@@ -60,7 +60,13 @@ import { FilePicker } from './FilePicker';
 import { PermissionCard } from './PermissionCard';
 import { UserInputCard } from './UserInputCard';
 import { PolicyInterventionCard } from './PolicyInterventionCard';
-import { takeShares, openWithHost } from '../lib/androidHost';
+import {
+  hasAndroidHost,
+  openWithHost,
+  startVoiceInput,
+  takeShares,
+  takeVoiceText,
+} from '../lib/androidHost';
 import { useT } from '../settings';
 import type { MsgKey } from '../i18n';
 import {
@@ -3236,6 +3242,22 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // 语音输入：识别结果是宿主异步送回来的。
+  //
+  // 与分享同一套形状——字段可读，读一次就清，所以挂载时和事件到来时都取一遍；识别器
+  // 取消或什么都没听懂时宿主不写字段，这里自然什么也不插。
+  useEffect(() => {
+    const collect = () => {
+      const heard = takeVoiceText().trim();
+      if (!heard) return;
+      insertAtCursor(heard + ' ');
+    };
+    collect();
+    window.addEventListener('atomcode:voice', collect);
+    return () => window.removeEventListener('atomcode:voice', collect);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // 追加图片（上传或粘贴）：压缩到长边 1568px 后入列，限制总数。
   //
   // 以前这里按 2MB 直接拒绝——手机上拍照的图通常 3–8MB，等于附件功能在
@@ -3605,6 +3627,35 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
           )}
         </div>
         <div class="input-footer-actions">
+          {/* 只有在安卓宿主里才有识别器可借；桌面隐藏，而不是放个点了没反应的按钮。 */}
+          {hasAndroidHost() && (
+            <button
+              class="btn-voice"
+              onClick={() => {
+                // 宿主回来 false：这台设备没有识别器（或不是安卓）。说出来，别装作在听。
+                if (!startVoiceInput()) pushCommandNotice(t('chat.voiceUnavailable'));
+              }}
+              title={t('chat.voice')}
+              aria-label={t('chat.voice')}
+            >
+              {/* lucide `mic` */}
+              <svg
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
+                <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                <path d="M12 19v3" />
+              </svg>
+            </button>
+          )}
           <ModeSelector
             value={modeState.displayMode}
             disabled={Boolean(modeState.pendingMode)}

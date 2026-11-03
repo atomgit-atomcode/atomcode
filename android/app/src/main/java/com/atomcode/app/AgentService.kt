@@ -37,6 +37,14 @@ class AgentService : Service() {
     private data class DaemonStatus(
         val activeTurns: Int,
         val lastTurns: List<LastTurnResult>,
+        /**
+         * Turns blocked waiting for an approval answer.
+         *
+         * Not part of [activeTurns]: work in progress says "busy", this says the
+         * work cannot continue until a person taps something — and that button is
+         * inside a screen nobody is looking at while the app is in the background.
+         */
+        val pendingApprovals: Int = 0,
     )
 
     /**
@@ -525,6 +533,10 @@ class AgentService : Service() {
                 val json = runCatching { JSONObject(body) }.getOrNull()
                     ?: return DaemonStatus(0, emptyList())
                 val active = json.optInt("active_chats", 0) + json.optInt("active_live", 0)
+                // Missing on an older daemon (or an external implementation): 0 is
+                // the honest default — it means "cannot say", and the notification
+                // then keeps the wording it had before rather than inventing a wait.
+                val pendingApprovals = json.optInt("pending_approvals", 0)
                 val turns = json.optJSONArray("last_turns")
                 val lastTurns = buildList {
                     for (index in 0 until (turns?.length() ?: 0)) {
@@ -540,7 +552,7 @@ class AgentService : Service() {
                         )
                     }
                 }
-                DaemonStatus(active, lastTurns)
+                DaemonStatus(active, lastTurns, pendingApprovals)
             } finally {
                 connection.disconnect()
             }
@@ -560,6 +572,19 @@ class AgentService : Service() {
         }
         val turns = if (activeTurns == 0 && externalPort == 0) status.lastTurns else emptyList()
         val text = when {
+            // First, and ahead of "busy": a turn blocked on approval is *not*
+            // making progress, and the thing it needs is the person. Saying
+            // "working" there tells them to wait for something that will never
+            // happen on its own.
+            status.pendingApprovals > 0 ->
+                if (status.pendingApprovals == 1) {
+                    getString(R.string.notification_waiting_approval)
+                } else {
+                    getString(
+                        R.string.notification_waiting_approval_plural,
+                        status.pendingApprovals,
+                    )
+                }
             activeTurns > 0 -> getString(R.string.notification_busy, activeTurns)
             // 外部模式下没有本地运行时，说清“现在是谁在干活”。
             externalPort != 0 -> getString(R.string.notification_external, externalPort)

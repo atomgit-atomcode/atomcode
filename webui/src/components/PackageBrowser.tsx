@@ -8,7 +8,7 @@
 //
 // Served from the same embedded webui as everything else — no second UI stack.
 
-import { useEffect, useRef, useState } from 'preact/hooks';
+import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import {
   listPackages,
   listPackageHealth,
@@ -40,6 +40,7 @@ import {
   stopExternalDaemon,
 } from '../lib/androidHost';
 import { useT } from '../settings';
+import { missingRecommended, recommendedNames } from '../lib/recommendedProviders';
 import { PackageMarket } from './PackageMarket';
 import { PluginCard } from './PluginCard';
 
@@ -187,6 +188,12 @@ export function PackageBrowser({ onClose }: PackageBrowserProps) {
   const [installedPackages, setInstalledPackages] = useState<string[] | null>(null);
   const [providerBusy, setProviderBusy] = useState<string | null>(null);
   const [providerError, setProviderError] = useState<string | null>(null);
+  // 新装的人不知道哪几个 provider 是「不装就什么都干不了」。这份名单把 A+B 档挑出来，
+  // 上面那排安装按钮还是同一套——这里只负责说清楚「缺哪几个、为什么」。
+  const recommended = useMemo(
+    () => missingRecommended(providers, installedPackages),
+    [providers, installedPackages],
+  );
   // Data a removed runtime left outside its package dir. Reported so an
   // uninstall is not silent about the tens of megabytes it keeps.
   const [leftovers, setLeftovers] = useState<LeftoverReport>({ leftovers: [], totalBytes: 0 });
@@ -651,6 +658,16 @@ export function PackageBrowser({ onClose }: PackageBrowserProps) {
             (`tools` for make/tcc, `zig` for zig) because each holds a program that
             Android only runs from an APK's library directory, so "installed" has to
             be answered per package rather than once for all of them. */}
+        {/* 新装时这一页就是全部线索：不点名的话，人会先装个几百 MB 的 python-data，
+            然后卡在 `gcc: not found`。 */}
+        {recommended.length > 0 && (
+          <p class="scm-hint pkg-recommended">
+            {t('pkg.recommendedMissing', {
+              count: recommended.length,
+              names: recommendedNames(recommended),
+            })}
+          </p>
+        )}
         {providers.length > 0 ? (
           <div class="pkg-providers">
             {providers.map((provider) => {
@@ -662,6 +679,9 @@ export function PackageBrowser({ onClose }: PackageBrowserProps) {
                     <span class="pkg-provider-title">
                       {provider.title || provider.name}
                       {provider.version && <span class="scm-hint"> {provider.version}</span>}
+                      {recommended.some((entry) => entry.provider.name === provider.name) && (
+                        <span class="pkg-badge">{t('pkg.recommendedBadge')}</span>
+                      )}
                     </span>
                     <span class={state === 'installed' ? 'scm-hint pkg-helper-ok' : 'scm-hint'}>
                       {state === 'installed'

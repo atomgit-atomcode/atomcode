@@ -25,6 +25,10 @@ interface HostBridge {
   takeShares?(): string;
   /** Open an absolute path with the phone's own viewer; false if it cannot. */
   openPath?(path: string): boolean;
+  /** Hand the microphone to the system recogniser; false when there is none. */
+  startVoiceInput?(): boolean;
+  /** The transcript the recogniser produced; draining on read. */
+  takeVoiceText?(): string;
 }
 
 /** What another app sent us: real paths plus any text that came with them. */
@@ -110,6 +114,38 @@ export function openWithHost(path: string): boolean {
 function host(): HostBridge | null {
   if (typeof window === 'undefined') return null;
   return window.AtomCodeHost ?? null;
+}
+
+/**
+ * Hand the microphone to the phone's speech recogniser.
+ *
+ * The recogniser is a separate app reached by Intent, so this app never holds
+ * `RECORD_AUDIO` and no audio reaches the agent — only the transcript does, via
+ * [takeVoiceText] after the host fires `atomcode:voice`.
+ *
+ * `false` means "no bridge, or this phone has no recogniser". The caller says so
+ * rather than pretending it listened: a mic button that silently does nothing is
+ * worse than one that explains why.
+ */
+export function startVoiceInput(): boolean {
+  const bridge = host();
+  if (!bridge?.startVoiceInput) return false;
+  try {
+    return bridge.startVoiceInput() === true;
+  } catch {
+    return false;
+  }
+}
+
+/** The transcript the recogniser produced, drained like a share. */
+export function takeVoiceText(): string {
+  const bridge = host();
+  if (!bridge?.takeVoiceText) return '';
+  try {
+    return bridge.takeVoiceText();
+  } catch {
+    return '';
+  }
 }
 
 /** Whether the page runs inside the Android app (so the bridge is there). */

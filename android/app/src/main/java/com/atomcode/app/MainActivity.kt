@@ -15,6 +15,7 @@ import android.os.IBinder
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.provider.Settings
+import android.speech.RecognizerIntent
 import android.util.Log
 import java.io.File
 import org.json.JSONArray
@@ -74,6 +75,14 @@ class MainActivity : ComponentActivity() {
     private val pendingShares = java.util.concurrent.CopyOnWriteArrayList<String>()
     /** Text another app shared (`EXTRA_TEXT`), drained with the files. */
     @Volatile private var pendingShareText: String? = null
+    /**
+     * What the system speech recogniser heard, waiting for the page to collect it.
+     *
+     * A field rather than a direct call for the same reason as [pendingShares]: the
+     * result arrives on this activity's `onActivityResult`, and the page may have
+     * been reloaded in between. `HostBridge.takeVoiceText` drains it.
+     */
+    @Volatile private var pendingVoiceText: String? = null
     /**
      * A conversation a notification tap asked for, waiting for the page to exist.
      *
@@ -418,6 +427,17 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * Tell the page a transcript is waiting. Harmless before it loads: the field is
+     * drained on mount (see `HostBridge.takeVoiceText`), so nothing is lost.
+     */
+    private fun nudgeWebForVoice() {
+        runOnUiThread {
+            if (!this::web.isInitialized || loadedUrl == null) return@runOnUiThread
+            web.evaluateJavascript("window.dispatchEvent(new Event('atomcode:voice'))", null)
+        }
+    }
+
     /** Send the viewer intent, and say so when the phone has nothing that takes it. */
     private fun launchViewer(file: File, intent: Intent) {
         try {
@@ -627,6 +647,55 @@ class MainActivity : ComponentActivity() {
             val text = pendingShareText.orEmpty()
             pendingShareText = null
             return JSONObject().put("paths", JSONArray(paths)).put("text", text).toString()
+        }
+
+        /**
+         * Hand the microphone to the phone's own speech recogniser.
+         *
+         * `ACTION_RECOGNIZE_SPEECH` is an Intent, not a permission: the recogniser
+         * app owns the microphone, so this app never holds `RECORD_AUDIO` and no
+         * audio enters the agent process — only the transcript does, through
+         * [takeVoiceText].
+         *
+         * Returns `false` when the phone has no recogniser, so the page can hide the
+         * button instead of offering one that does nothing.
+         */
+        @android.webkit.JavascriptInterface
+        fun startVoiceInput(): Boolean {
+            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                putExtra(
+                    RecognizerIntent.EXTRA_LANGUAGE_MODEL,
+                    RecognizerIntent.LANGUAGE_MODEL_FREE_FORM,
+                )
+                putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+            }
+            if (intent.resolveActivity(packageManager) == null) {
+                Log.i(TAG, "no speech recogniser installed")
+                return false
+            }
+            runOnUiThread {
+                try {
+                    startActivityForResult(intent, VOICE_REQUEST)
+                } catch (missing: android.content.ActivityNotFoundException) {
+                    // Resolved a moment ago and gone now (a recogniser being
+                    // updated). Nothing to recover: the page just gets no text.
+                    Log.i(TAG, "speech recogniser refused the request", missing)
+                }
+            }
+            return true
+        }
+
+        /**
+         * The transcript the recogniser produced, then forgets it.
+         *
+         * Draining on read mirrors [takeShares]: the page calls this when it mounts
+         * and on the `atomcode:voice` event, and the sentence must be inserted once.
+         */
+        @android.webkit.JavascriptInterface
+        fun takeVoiceText(): String {
+            val text = pendingVoiceText.orEmpty()
+            pendingVoiceText = null
+            return text
         }
 
         /**
@@ -1022,6 +1091,24 @@ class MainActivity : ComponentActivity() {
             toast(getString(R.string.saf_granted, SafTree.displayName ?: uri.toString()))
             return
         }
+        if (requestCode == VOICE_REQUEST) {
+            val heard = if (resultCode == RESULT_OK) {
+                data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
+                    ?.firstOrNull()
+                    .orEmpty()
+            } else {
+                ""
+            }
+            if (heard.isBlank()) {
+                // Dismissed, or nothing understood. Silence is the honest answer:
+                // inserting an empty string would look like the mic did nothing.
+                Log.i(TAG, "speech recogniser produced no text (result=$resultCode)")
+                return
+            }
+            pendingVoiceText = heard
+            nudgeWebForVoice()
+            return
+        }
         if (requestCode != FILE_CHOOSER_REQUEST) return
         val callback = fileCallback ?: return
         fileCallback = null
@@ -1213,6 +1300,14 @@ class MainActivity : ComponentActivity() {
          * bring it back on the next start.
          */
         private const val SAF_TREE_REQUEST = 0x53
+        /**
+         * The system speech recogniser.
+         *
+         * `ACTION_RECOGNIZE_SPEECH` hands the microphone to whichever recogniser
+         * app the phone has, so this app needs no `RECORD_AUDIO` permission and no
+         * audio ever enters the agent process — only the text does.
+         */
+        private const val VOICE_REQUEST = 0x54
         /**
          * Set by a notification tap: which conversation to open.
          *

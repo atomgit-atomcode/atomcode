@@ -21,6 +21,18 @@ exec bin/lld lld
 # device). `ranlib` likewise, for static libraries.
 exec bin/llvm-ar ar
 exec bin/llvm-ranlib ranlib
+# The language server. Without it the editor-side features (diagnostics, hover,
+# definitions) have nothing to talk to on a device where no compiler package can
+# be installed — and it has to ride in the APK, because only `nativeLibraryDir`
+# may be executed.
+#
+# The stem is `clangd-real`, not `clangd`: the launcher compiled from
+# scripts/termux/launcher/clangd.c owns `libclangd.so` (that is the name on PATH),
+# and the script copies jniLibs before it compiles launchers. Naming this one
+# `clangd` made the launcher overwrite the 18 MB server — the split still reported
+# five executables, so the loss was invisible until the launcher could not find
+# `libclangd-real.so` on device.
+exec bin/clangd clangd-real
 
 data include
 data lib/clang
