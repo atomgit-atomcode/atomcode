@@ -46,6 +46,8 @@ pub mod native_live;
 mod package_discovery;
 mod packages;
 mod runtime_host;
+#[cfg(target_os = "android")]
+mod schedule_runner;
 mod transcript_view;
 pub mod turn_outcome;
 /// File-sink diagnostic trace (`ctrace!` macro), enabled via `ATOMCODE_TUIX_LOG`.
@@ -71,6 +73,9 @@ pub use live_api::live_set_working_dir;
 pub use live_api::live_switch_session;
 pub mod auth_token;
 mod daemon_token_file;
+// First-run seeding of `[market] base` for builds that ship a known market (the
+// Android app). Only writes when the key is absent — see [`market::seed_base_if_absent`].
+pub use market::seed_base_if_absent;
 pub mod permission_bridge;
 mod telemetry_scope;
 pub mod webui;
@@ -1921,6 +1926,13 @@ pub struct HealthResponse {
     /// notification instead of dropping straight back to "idle"; with more than one
     /// conversation it can name each of them. Empty until a turn finishes.
     pub last_turns: Vec<crate::turn_outcome::LastTurn>,
+    /// Turns blocked on an approval answer right now.
+    ///
+    /// Distinct from `active_chats`/`active_live`, which say work is in progress.
+    /// This says the work **cannot** progress until a person answers — the one
+    /// state a phone has to announce, because the approval card lives in a screen
+    /// nobody is looking at while the app is in the background.
+    pub pending_approvals: usize,
 }
 
 fn executable_sha256() -> &'static str {
@@ -1947,6 +1959,13 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         active_chats: state.active_chats.operations_count().await,
         active_live: crate::native_live::active_count(),
         last_turns: crate::turn_outcome::recent_turns(),
+        // Two transports, two sources, both meaning the same thing: the runtime
+        // has a request it cannot finish without a person. The live hub keeps the
+        // requests the native runtime is blocked on; `/chat` keeps the sessions it
+        // handed an approval to. Neither is "a decider exists".
+        pending_approvals: crate::native_live::pending_count_of_kind(
+            atomcode_capabilities::tools::APPROVAL_KIND,
+        ) + state.pending_permissions.outstanding_count(),
     })
 }
 
@@ -3925,6 +3944,31 @@ pub(crate) fn stop_reason_wire(reason: atomcode_kernel::event::StopReason) -> &'
 
 #[cfg(test)]
 mod chat_event_type_tests {
+    /// The Android notification reads this by name. A rename here would quietly
+    /// turn "waiting for your approval" back into "idle" on every phone, with no
+    /// compile error anywhere — the field is only ever consumed as JSON.
+    #[test]
+    fn health_wire_shape_carries_pending_approvals() {
+        let json = serde_json::to_value(super::HealthResponse {
+            status: "ok",
+            version: "1",
+            service: "atomcode-daemon",
+            binary_hash: "x",
+            instance_id: "id".into(),
+            capabilities: &[],
+            active_chats: 1,
+            active_live: 0,
+            last_turns: Vec::new(),
+            pending_approvals: 2,
+        })
+        .unwrap();
+        assert_eq!(
+            json.get("pending_approvals")
+                .and_then(|value| value.as_u64()),
+            Some(2)
+        );
+    }
+
     #[test]
     fn internal_agent_failure_has_a_distinct_wire_reason() {
         assert_eq!(
@@ -5402,6 +5446,12 @@ async fn process_chat_request(
     let mut projector = ChatRuntimeProjector::default();
     while let Some(event) = runtime_event_rx.recv().await {
         for chat_event in projector.project_runtime(event, &perm_session_key) {
+            // Handing the request to the client is the moment the turn stops
+            // progressing until somebody answers — that is what `/health` reports
+            // as `pending_approvals`, and what a phone announces.
+            if matches!(chat_event, ChatEvent::PermissionRequest { .. }) {
+                pending_permissions.mark_requested(&perm_session_key);
+            }
             if matches!(chat_event, ChatEvent::Done { .. }) {
                 terminal_sent.store(true, std::sync::atomic::Ordering::Release);
             }
@@ -7058,6 +7108,19 @@ async fn fs_search(
     let expanded = normalize_dir_arg(&q.path);
     let dir = expanded.canonicalize().unwrap_or(expanded);
     let dir = atomcode_capabilities::pathnorm::strip_verbatim_path(&dir);
+    // A SAF session's working directory is a synthetic root with nothing behind
+    // it on disk, so the real-path walk below would find no matches at all — the
+    // `@` picker was simply empty in that build. Search the granted tree over the
+    // `FileSystem` seam instead. A real directory still takes the real path.
+    if !dir.is_dir() {
+        if let Some(matches) = saf_search(&dir, &q.q).await {
+            return Json(serde_json::json!({
+                "path": dir.to_string_lossy(),
+                "matches": matches,
+            }))
+            .into_response();
+        }
+    }
     let search_dir = dir.clone();
     let token = q.q.clone();
     let matches = tokio::task::spawn_blocking(move || search_at_mention(&search_dir, &token))
@@ -7068,6 +7131,30 @@ async fn fs_search(
         "matches": matches,
     }))
     .into_response()
+}
+
+/// The `@`-mention search for a granted SAF tree, or `None` when this build has
+/// no such world (or `dir` is outside it).
+///
+/// Same token grammar and same result shape as [`search_at_mention`], so the
+/// webui picker does not learn a second protocol: `scope` narrows the start
+/// directory, `filter` matches names.
+async fn saf_search(dir: &std::path::Path, token: &str) -> Option<Vec<serde_json::Value>> {
+    let root = atomcode_capabilities::saf::installed_root()?;
+    let backend = atomcode_capabilities::saf::installed_backend()?;
+    // A path outside the granted tree is not ours to search.
+    let relative = dir.strip_prefix(&root).ok()?;
+    let (scope, filter) = atomcode_capabilities::file_index::split_token(token);
+    let scope = relative.join(&scope);
+    let scope = scope.to_string_lossy().replace('\\', "/");
+    let world = atomcode_capabilities::saf::SafFs::read_only(root, backend);
+    let matches = atomcode_capabilities::saf::search_names(&world, &scope, &filter).await;
+    Some(
+        matches
+            .into_iter()
+            .map(|(path, is_dir)| serde_json::json!({ "path": path, "is_dir": is_dir }))
+            .collect(),
+    )
 }
 
 #[derive(serde::Deserialize)]
@@ -7684,6 +7771,11 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         ));
 
     let active_chats = state.active_chats.clone();
+    // Android has no system scheduler this app can register with, so a task that
+    // comes due is fired from this process. Elsewhere the OS scheduler owns it and
+    // this loop does not exist.
+    #[cfg(target_os = "android")]
+    schedule_runner::spawn(state.clone());
     let app = public
         .merge(protected)
         .with_state(state)

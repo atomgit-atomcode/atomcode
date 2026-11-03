@@ -95,15 +95,35 @@ fn config_market_base() -> Option<String> {
 /// 不能因为配置文件缺失就让包管理页打不开。
 fn config_market_key(key: &str) -> Option<String> {
     let text = std::fs::read_to_string(atomcode_config::config::Config::default_path()).ok()?;
+    market_key_in(&text, key)
+}
+
+/// 从已读入的 TOML 文本里取 `[market] <key>`；空字符串视为未配置。
+fn market_key_in(text: &str, key: &str) -> Option<String> {
     // `toml::from_str` 才是“解析整份文档”；`Value::from_str`（`text.parse()`）在
     // toml 1.x 里按单个值解析，`[market]` 会被当成意外内容直接失败。
-    let doc: toml::Value = toml::from_str(&text).ok()?;
+    let doc: toml::Value = toml::from_str(text).ok()?;
     let value = doc.get("market")?.get(key)?.as_str()?.to_string();
     if value.is_empty() {
         None
     } else {
         Some(value)
     }
+}
+
+/// `[market] <key>` 这个键是否存在，**不管值是否为空**。
+///
+/// 与 [`market_key_in`] 的区别正是播种需要的：「配了但清空」和「从没配过」是两件事，
+/// 前者是人做过的决定，不能当成空位重新填。
+fn market_key_present(text: &str, key: &str) -> bool {
+    toml::from_str::<toml::Value>(text)
+        .ok()
+        .and_then(|doc| {
+            doc.get("market")
+                .and_then(|table| table.get(key))
+                .map(|_| ())
+        })
+        .is_some()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -661,6 +681,51 @@ fn write_atomically(path: &std::path::Path, contents: &str) -> std::io::Result<(
     std::fs::rename(&temporary, path)
 }
 
+/// First-run seeding for builds that ship a known market (the Android app).
+///
+/// Writes `[market] base` only when the key is **absent**, and leaves every other
+/// line of `config.toml` untouched:
+///
+/// * a person who pointed the market elsewhere keeps their choice;
+/// * an explicitly empty `base` (what the panel writes when it is cleared) is a
+///   decision too — resurrecting the default there would make "clear" undoable.
+///
+/// Returns the base it wrote, or `None` when nothing changed.
+pub fn seed_base_if_absent(base: &str) -> Option<String> {
+    seed_base_at(&atomcode_config::config::Config::default_path(), base)
+}
+
+/// The same seeding against an explicit file — the testable half.
+fn seed_base_at(path: &std::path::Path, base: &str) -> Option<String> {
+    let base = base.trim();
+    if base.is_empty() {
+        return None;
+    }
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    // Presence, not value: an explicitly empty `base = ""` (what the panel writes
+    // when it is cleared) is a decision, and refilling it would make "clear"
+    // undoable. Parsed from the same text about to be rewritten, so a caller
+    // pointing this at another file cannot be misled by the default one.
+    if market_key_present(&text, "base") {
+        return None;
+    }
+    let updated = with_market_base(&text, base);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match write_atomically(path, &updated) {
+        Ok(()) => Some(base.to_string()),
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "cannot seed the default market base"
+            );
+            None
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct MarketBaseBody {
     #[serde(default)]
@@ -830,6 +895,62 @@ pub(crate) async fn set_market_base(Json(body): Json<MarketBaseBody>) -> Respons
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A fresh install that ships a known market gets it written once. Without this
+    // the panel opened on "market not configured" and the phones that can only get
+    // runtimes from a market had no way in.
+    #[test]
+    fn a_missing_base_is_seeded_and_a_present_one_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+
+        // Nothing there yet — the default is written.
+        assert_eq!(
+            seed_base_at(&path, "https://example.test/market").as_deref(),
+            Some("https://example.test/market")
+        );
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("[market]"));
+        assert!(written.contains("base = \"https://example.test/market\""));
+
+        // A second pass changes nothing: the person's file is the authority.
+        assert_eq!(seed_base_at(&path, "https://other.test/market"), None);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), written);
+    }
+
+    // An explicitly cleared market is a decision, not an empty slot to refill:
+    // seeding over it would make the panel's "clear" button undoable.
+    #[test]
+    fn a_deliberately_emptied_base_is_not_resurrected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        let original = "[market]\nbase = \"\"\n";
+        std::fs::write(&path, original).unwrap();
+
+        assert_eq!(seed_base_at(&path, "https://example.test/market"), None);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    // Everything else in the file survives: config.toml is hand-written, and its
+    // comments are the reason this surgery exists instead of a TOML rewrite.
+    #[test]
+    fn seeding_keeps_comments_and_other_sections() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# my settings\n[provider]\nname = \"mine\"\n\n[market]\nmedia_base = \"x\"\n",
+        )
+        .unwrap();
+
+        assert!(seed_base_at(&path, "https://example.test/market").is_some());
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("# my settings"), "{written}");
+        assert!(written.contains("name = \"mine\""), "{written}");
+        // The sibling key under the same table must not be displaced.
+        assert!(written.contains("media_base = \"x\""), "{written}");
+        assert!(written.contains("base = \"https://example.test/market\""));
+    }
 
     // A repository published before there could be more than one provider APK still
     // says `[helper]`; it must keep working, and it must look like a one-item list.

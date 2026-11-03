@@ -45,6 +45,20 @@ use atomcode_telemetry::{CliOverride, SessionMode};
 /// off-device should reach this port, and the token guards what does.
 const LOOPBACK: &str = "127.0.0.1";
 
+/// The published provider market, seeded into a fresh install's `config.toml`.
+///
+/// This APK ships **no** runtime at all — every provider (bash, make/tcc, zig,
+/// clang, node, go, …) is downloaded from a market on demand. Without a default
+/// base the plugin page opened on "market not configured" and the only way in was
+/// to know this URL by hand, which is the same as having no market.
+///
+/// Seeded only when `[market] base` is absent, so a person who points it at their
+/// own repository (or clears it) keeps that choice. The AtomGit **API** endpoint
+/// is deliberate: the web `raw/branch/…` URL returns the SPA's HTML shell, not
+/// the file (measured — see `docs/plugin-market.md`).
+const DEFAULT_MARKET_BASE: &str =
+    "https://api.atomgit.com/api/v5/repos/qiaoen_python/atomcode-android-plugins/raw";
+
 /// What Android hands the host: where the product tree lives, where the agent
 /// should start working, and where the bundled tools are installed.
 #[derive(Debug, Clone)]
@@ -168,6 +182,14 @@ impl AgentServer {
             tracing::info!("example MCP server configured (example-tools)");
         } else if let Some(reason) = &seeded_mcp.config_skipped {
             tracing::info!(reason = %reason, "example MCP server was not configured");
+        }
+
+        // The market the runtimes come from. This APK carries none of them, so an
+        // empty market is an empty phone: the plugin page had nothing to install and
+        // the only route in was pasting a URL. Seeded only when `[market] base` is
+        // absent — a person who chose another source, or cleared it, keeps that.
+        if let Some(written) = atomcode_daemon::seed_base_if_absent(DEFAULT_MARKET_BASE) {
+            tracing::info!(base = %written, "default market seeded");
         }
 
         // Sessions live in the shared workspace by default: an externally started

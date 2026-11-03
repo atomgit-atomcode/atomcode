@@ -278,6 +278,11 @@ pub fn pending_of_kind(
     hub().pending_of_kind(kind)
 }
 
+/// How many live-runtime requests of `kind` are blocked waiting for a person.
+pub fn pending_count_of_kind(kind: &str) -> usize {
+    hub().pending_count_of_kind(kind)
+}
+
 pub fn cancel() -> Result<(), HubError> {
     hub().cancel()
 }

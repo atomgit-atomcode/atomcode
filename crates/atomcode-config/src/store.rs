@@ -265,6 +265,7 @@ impl ConfigStore {
     fn persist_locked(&self, next: &Config, disk: Option<&Config>) -> Result<ConfigSnapshot> {
         ensure_parent(&self.path)?;
         let content = next.serialize_for_disk(disk)?;
+        let content = preserve_unmodelled_sections(&self.path, content);
         atomic_replace(&self.path, content.as_bytes())?;
         // Parse tolerantly: the content we just wrote may legitimately carry a
         // preserved-but-invalid `[providers.<name>]` section (round-tripped from
@@ -287,6 +288,44 @@ impl ConfigStore {
             config,
             revision: ConfigRevision::from_bytes(content.as_bytes()),
         })
+    }
+}
+
+/// Keep top-level tables this build has no field for.
+///
+/// [`Config`] owns the settings it models; serializing it back therefore drops
+/// everything else. That is not academic: the plugin market keeps its base in
+/// `[market]` and reads the file directly, so saving a provider — the very next
+/// thing a person does after configuring a market — deleted the market base and
+/// left the panel saying "market not configured". Any other section a build does
+/// not model had the same fate.
+///
+/// Only *whole tables* are carried over, and only when the new document does not
+/// mention them: a section the current build does write stays exactly as written,
+/// so this cannot resurrect a value the config layer deliberately removed.
+fn preserve_unmodelled_sections(path: &Path, rendered: String) -> String {
+    let Ok(existing) = std::fs::read_to_string(path) else {
+        return rendered;
+    };
+    let (Ok(old), Ok(mut new)) = (
+        existing.parse::<DocumentMut>(),
+        rendered.parse::<DocumentMut>(),
+    ) else {
+        // An unparseable file on either side is not worth failing the save over;
+        // the caller already validated what it is about to write.
+        return rendered;
+    };
+    let mut carried = false;
+    for (key, item) in old.iter() {
+        if item.is_table() && !new.contains_key(key) {
+            new.insert(key, item.clone());
+            carried = true;
+        }
+    }
+    if carried {
+        new.to_string()
+    } else {
+        rendered
     }
 }
 
@@ -419,6 +458,50 @@ output_per_million = 4.0
         assert!(!migrated.contains("[providers.custom.pricing]"));
         assert!(!migrated.contains("[models.profile.pricing]"));
         assert!(!migrated.contains("per_million"));
+    }
+
+    /// A section this build does not model must survive a save.
+    ///
+    /// The plugin market keeps `[market] base` in `config.toml` and reads the file
+    /// directly. Saving a provider used to serialize `Config` over the file, which
+    /// dropped that section — so configuring a market and then adding a provider left
+    /// the panel saying "market not configured" (seen on a device).
+    #[test]
+    fn saving_keeps_sections_the_config_type_does_not_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"[market]
+base = "https://example.invalid/market"
+media_base = "https://example.invalid/media"
+
+[providers.old]
+type = "openai"
+model = "demo"
+"#,
+        )
+        .unwrap();
+
+        let store = ConfigStore::new(&path);
+        let mut next = store.read().unwrap().config.clone();
+        next.providers.insert(
+            "new".into(),
+            serde_json::from_value(serde_json::json!({
+                "type": "openai", "model": "demo", "base_url": "https://example.invalid/v1"
+            }))
+            .unwrap(),
+        );
+        next.save(&path).unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("[market]"), "{written}");
+        assert!(
+            written.contains("https://example.invalid/market"),
+            "{written}"
+        );
+        assert!(written.contains("media_base"), "{written}");
+        assert!(written.contains("[providers.new]"), "{written}");
     }
 
     #[test]

@@ -33,6 +33,14 @@ impl From<PermissionDecision> for ChatPermission {
 #[derive(Clone, Default)]
 pub struct PermissionResponders {
     inner: Arc<RwLock<HashMap<String, UnboundedSender<ChatPermission>>>>,
+    /// Sessions whose approval request has been handed to the client and not yet
+    /// answered.
+    ///
+    /// `inner` is not this: a decider is registered for the *whole* turn, so its
+    /// length says "turns that could ask", not "turns that did ask and are now
+    /// blocked". A phone needs the second one — it is the difference between
+    /// "working" and "waiting for you".
+    outstanding: Arc<RwLock<std::collections::HashSet<String>>>,
 }
 
 /// A pending `/chat` structured-input request, keyed by the native runtime request id.
@@ -96,10 +104,30 @@ impl PermissionResponders {
     /// `/chat` 结束时清理。
     pub fn unregister(&self, session_id: &str) {
         self.inner.write().unwrap().remove(session_id);
+        self.outstanding.write().unwrap().remove(session_id);
+    }
+
+    /// Record that this session's turn is now blocked on an approval answer.
+    ///
+    /// Called where the approval request is handed to the client — that is the
+    /// moment the turn stops making progress until somebody answers.
+    pub fn mark_requested(&self, session_id: &str) {
+        self.outstanding
+            .write()
+            .unwrap()
+            .insert(session_id.to_owned());
+    }
+
+    /// How many turns are blocked on an approval answer right now.
+    pub fn outstanding_count(&self) -> usize {
+        self.outstanding.read().unwrap().len()
     }
 
     /// 把决定送给对应 session 的 decider。返回是否成功（session 是否在等待）。
     pub fn deliver(&self, session_id: &str, answer: impl Into<ChatPermission>) -> bool {
+        // An answer was given. Even if the send fails (the turn is gone) the
+        // request is no longer waiting for a person, so the mark goes either way.
+        self.outstanding.write().unwrap().remove(session_id);
         if let Some(tx) = self.inner.read().unwrap().get(session_id) {
             tx.send(answer.into()).is_ok()
         } else {
@@ -146,6 +174,31 @@ mod tests {
     fn deliver_to_unknown_session_returns_false() {
         let reg = PermissionResponders::new();
         assert!(!reg.deliver("nope", PermissionDecision::Deny));
+    }
+
+    /// `/health`'s `pending_approvals` must mean "blocked on a person", not "a
+    /// decider exists". A decider is registered for the whole turn, so counting
+    /// those would report every Build-mode turn as waiting.
+    #[test]
+    fn only_an_unanswered_request_counts_as_pending() {
+        let reg = PermissionResponders::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        reg.register("sess-1".into(), tx);
+
+        // Registered but nothing asked yet: not waiting.
+        assert_eq!(reg.outstanding_count(), 0);
+
+        reg.mark_requested("sess-1");
+        assert_eq!(reg.outstanding_count(), 1);
+
+        // The answer clears it, whether or not the send lands.
+        assert!(reg.deliver("sess-1", PermissionDecision::AllowOnce));
+        assert_eq!(reg.outstanding_count(), 0);
+
+        // A turn that ends without an answer must not leave a stale "waiting".
+        reg.mark_requested("sess-1");
+        reg.unregister("sess-1");
+        assert_eq!(reg.outstanding_count(), 0);
     }
 
     #[tokio::test]

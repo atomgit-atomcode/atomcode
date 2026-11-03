@@ -1107,6 +1107,22 @@ impl LiveViewHub {
             .map(|(id, pending)| (*id, pending.payload.clone()))
     }
 
+    /// How many requests of `kind` are waiting for a person right now.
+    ///
+    /// The boundary this exists for: `pending_requests` holds requests the runtime
+    /// is *blocked on*. A registered decider is not the same thing — that one lives
+    /// for the whole turn. So this is the only honest source for "the agent is
+    /// waiting for your approval", which a phone has to say out loud because the
+    /// approval card is inside a screen nobody is looking at.
+    pub fn pending_count_of_kind(&self, kind: &str) -> usize {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state
+            .pending_requests
+            .values()
+            .filter(|pending| pending.kind == kind)
+            .count()
+    }
+
     pub fn cancel(&self) -> Result<(), HubError> {
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         if !state.turn_active {
@@ -1686,7 +1702,7 @@ mod tests {
     use super::{
         correlate_web_steers_locked, map_session_transition_error, redact_correlated_steer_images,
         session_change_is_noop, HubError, HubState, LiveBinding, LiveRuntimeControl, LiveViewEvent,
-        LiveViewHub, PendingWebSteer,
+        LiveViewHub, PendingRequest, PendingWebSteer,
     };
 
     #[test]
@@ -2205,6 +2221,36 @@ mod tests {
             })
             .unwrap_err();
         assert_eq!(error, HubError::Unbound);
+    }
+
+    /// `/health`'s `pending_approvals` is computed from this count. It has to
+    /// count only the kind asked about, and reach zero when the entry clears —
+    /// a stale "waiting" keeps telling the person to act on nothing.
+    #[test]
+    fn pending_requests_are_counted_by_kind_and_drop_to_zero() {
+        let hub = LiveViewHub::new();
+        {
+            let mut state = hub.state.lock().unwrap_or_else(|error| error.into_inner());
+            for (id, kind) in [(1u64, "approval"), (2, "approval"), (3, "other")] {
+                state.pending_requests.insert(
+                    id,
+                    PendingRequest {
+                        kind: kind.into(),
+                        payload: serde_json::json!({}),
+                    },
+                );
+            }
+        }
+        assert_eq!(hub.pending_count_of_kind("approval"), 2);
+        assert_eq!(hub.pending_count_of_kind("other"), 1);
+        assert_eq!(hub.pending_count_of_kind("absent"), 0);
+
+        hub.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .pending_requests
+            .clear();
+        assert_eq!(hub.pending_count_of_kind("approval"), 0);
     }
 
     #[tokio::test]
