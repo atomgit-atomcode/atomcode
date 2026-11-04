@@ -717,3 +717,17 @@ test('live dispatch failures cancel the old body instead of leaving a falsely he
     assert.equal(cancelled, true); assert.equal(body.locked, false);
   } finally { globalThis.fetch = originalFetch; }
 });
+
+test('workbench reports HTML fallback with an actionable diagnostic', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response('<html>SPA</html>', { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+  try {
+    const { workbenchRequest } = await import('./api.ts');
+    await assert.rejects(workbenchRequest('files?session_id=test&path='), (error: unknown) => {
+      assert.equal((error as { code: string }).code, 'unexpected_html');
+      assert.match(String(error), /relay pairing/);
+      assert.doesNotMatch(String(error), /<html>/);
+      return true;
+    });
+  } finally { globalThis.fetch = originalFetch; }
+});

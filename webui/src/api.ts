@@ -29,6 +29,12 @@ export function getToken(): string {
  */
 async function readJson<T>(r: Response): Promise<T> {
   if (!r.ok) throw await failure(r);
+  if (r.headers.get('content-type')?.split(';')[0].trim().toLowerCase() === 'text/html') {
+    throw new ApiCallError(
+      'The API returned a page instead of data. Check the server address and relay pairing. / 接口返回了页面而不是数据，请检查服务地址与中继配对。',
+      r.status, 'unexpected_html',
+    );
+  }
   return r.json() as Promise<T>;
 }
 

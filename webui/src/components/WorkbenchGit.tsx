@@ -11,15 +11,22 @@ export function WorkbenchGit({
   session,
   version,
   onOpen,
+  maximized,
+  onMaximize,
+  onRestore,
 }: {
   session: string;
   version: number;
   onOpen: (path: string) => void;
+  maximized: boolean;
+  onMaximize: () => void;
+  onRestore: () => void;
 }) {
   const { lang } = useSettings();
   const zh = lang === "zh";
   const [changes, setChanges] = useState<Change[]>([]);
   const [selected, setSelected] = useState<Change | null>(null);
+  useEffect(() => { if (!selected) onRestore(); }, [selected]);
   const [staged, setStaged] = useState(false);
   const [diff, setDiff] = useState("");
   const [error, setError] = useState("");
@@ -142,7 +149,13 @@ export function WorkbenchGit({
                 {zh ? "暂存区" : "Staged"}
               </button>
             )}
-            <span />
+            <span title={selected.path}>{selected.path}</span>
+            <button
+              aria-label={zh ? (maximized ? "恢复差异布局" : "最大化差异") : (maximized ? "Restore diff layout" : "Maximize diff")}
+              title={zh ? "最大化 / 恢复（Esc）" : "Maximize / restore (Esc)"}
+              aria-pressed={maximized}
+              onClick={onMaximize}
+            >{maximized ? "⤡" : "⤢"}</button>
             {selected.worktree !== "D" && selected.index !== "D" && (
               <button onClick={() => onOpen(selected.path)}>
                 {zh ? "打开文件" : "Open file"}

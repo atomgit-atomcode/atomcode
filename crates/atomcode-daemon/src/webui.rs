@@ -44,6 +44,23 @@ pub fn asset_or_index(path: &str) -> Option<std::borrow::Cow<'static, [u8]>> {
 
 /// axum handler：服务任意 webui 路径。
 pub async fn serve_webui(uri: Uri) -> Response {
+    // Unknown API endpoints must never become a successful SPA page or a dev redirect.
+    let path = uri.path();
+    if ["/api", "/workbench"].iter().any(|prefix| {
+        path == *prefix
+            || path
+                .strip_prefix(prefix)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+    }) {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({
+                "error": "Unknown API endpoint. Check the server address and relay routing.",
+                "code": "unknown_api_endpoint"
+            })),
+        )
+            .into_response();
+    }
     // dev 模式：设置 ATOMCODE_WEBUI_DEV=http://localhost:5173 后，
     // 重定向到 vite dev server，前端开发可享受热更新而非嵌入 bundle。
     if let Ok(dev) = std::env::var("ATOMCODE_WEBUI_DEV") {
@@ -69,6 +86,25 @@ pub async fn serve_webui(uri: Uri) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unknown_api_paths_return_json_instead_of_spa_or_redirect() {
+        for path in [
+            "/api",
+            "/api/workbench/files",
+            "/workbench",
+            "/workbench/missing",
+        ] {
+            let response = serve_webui(path.parse().unwrap()).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["code"], "unknown_api_endpoint");
+        }
+    }
 
     #[test]
     fn is_built_agrees_with_the_embedded_assets() {
