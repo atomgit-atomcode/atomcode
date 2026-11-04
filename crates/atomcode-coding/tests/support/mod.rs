@@ -179,6 +179,7 @@ pub fn allow() -> Option<serde_json::Value> {
 /// Options that keep `prepare` free of network and home-directory I/O.
 pub fn quiet_options() -> PrepareOptions {
     PrepareOptions {
+        prompt_overrides: Default::default(),
         session: atomcode_coding::SessionMode::Disabled,
         tools: true,
         skill_dirs: Some(Vec::new()),

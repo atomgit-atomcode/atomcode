@@ -594,6 +594,19 @@ const BIN_NAME: &str = env!("CARGO_BIN_NAME");
         .multiple(false)
 ))]
 struct Cli {
+    /// Replace the coding persona only; retain tool and project instructions
+    #[arg(long, conflicts_with = "system_prompt_file")]
+    system_prompt: Option<String>,
+    /// Read a replacement coding persona from a UTF-8 file
+    #[arg(long, value_name = "PATH")]
+    system_prompt_file: Option<std::path::PathBuf>,
+    /// Append instructions after the selected coding persona
+    #[arg(long, conflicts_with = "append_system_prompt_file")]
+    append_system_prompt: Option<String>,
+    /// Read appended persona instructions from a UTF-8 file
+    #[arg(long, value_name = "PATH")]
+    append_system_prompt_file: Option<std::path::PathBuf>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 
@@ -1568,6 +1581,12 @@ async fn run(process_start: std::time::Instant) -> Result<i32> {
 
     // No --help was passed. Parse normally to get the Cli struct.
     let cli = Cli::parse();
+    let prompt_overrides = resolve_prompt_overrides(&cli)?;
+    if cli.command.is_some()
+        && (prompt_overrides.replace.is_some() || prompt_overrides.append.is_some())
+    {
+        anyhow::bail!("Root system-prompt flags apply to the main coding agent; use subcommand-specific options where available");
+    }
     // OS schedulers do not inherit a terminal's custom product home. Resolve
     // that explicit host input before loading config, auth or session services.
     if let Some(Commands::Schedule(schedule_cmd::ScheduleCli::Run {
@@ -2424,6 +2443,7 @@ async fn run(process_start: std::time::Instant) -> Result<i32> {
         // fail-closed timeout so an unanswered approval can't park the run forever.
         !is_headless,
     );
+    runtime_cfg.prompt_overrides = prompt_overrides.clone();
     runtime_cfg.next_prompt_suggestions = !is_headless;
     let provider_bootstrap = if is_headless {
         atomcode_coding::ProviderBootstrap::Required
@@ -2727,12 +2747,14 @@ async fn run(process_start: std::time::Instant) -> Result<i32> {
                     let provider = cli.provider.clone();
                     let skip_permissions = cli.dangerously_skip_permissions;
                     let no_tools = cli.no_tools;
+                    let prompt_overrides = prompt_overrides.clone();
                     let review_home = review_home.clone();
                     std::sync::Arc::new(move |working_dir: std::path::PathBuf| {
                         let config_path = config_path.clone();
                         let telemetry = telemetry.clone();
                         let provider = provider.clone();
                         let review_home = review_home.clone();
+                        let prompt_overrides = prompt_overrides.clone();
                         Box::pin(async move {
                             let config = if config_path.exists() {
                                 atomcode_config::config::Config::load(&config_path)
@@ -2748,6 +2770,7 @@ async fn run(process_start: std::time::Instant) -> Result<i32> {
                                 skip_permissions,
                                 true,
                             );
+                            runtime_cfg.prompt_overrides = prompt_overrides;
                             runtime_cfg.next_prompt_suggestions = true;
                             let front_end = atomcode_coding::front_end::FrontEnd::new();
                             let (runtime, config, _) = spawn_native_cli_runtime(
@@ -3011,6 +3034,29 @@ fn init_file_logging() {
         .with_env_filter(filter)
         .with_writer(std::sync::Mutex::new(file))
         .try_init(); // Err only if a subscriber is already set — fine, ignore.
+}
+
+fn resolve_prompt_overrides(cli: &Cli) -> anyhow::Result<atomcode_coding::host::PromptOverrides> {
+    fn read(
+        text: &Option<String>,
+        file: &Option<std::path::PathBuf>,
+    ) -> anyhow::Result<Option<String>> {
+        let value = match (text, file) {
+            (Some(text), _) => Some(text.clone()),
+            (_, Some(path)) => Some(std::fs::read_to_string(path).map_err(|e| {
+                anyhow::anyhow!("Cannot read system prompt file {}: {e}", path.display())
+            })?),
+            _ => None,
+        };
+        if value.as_ref().is_some_and(|text| text.trim().is_empty()) {
+            anyhow::bail!("System prompt overrides must not be empty");
+        }
+        Ok(value)
+    }
+    Ok(atomcode_coding::host::PromptOverrides {
+        replace: read(&cli.system_prompt, &cli.system_prompt_file)?,
+        append: read(&cli.append_system_prompt, &cli.append_system_prompt_file)?,
+    })
 }
 
 /// Apply launch-time provider/model overrides to the process-owned config.
@@ -5223,6 +5269,48 @@ mod tests {
         DEFAULT_LOG_DIRECTIVES,
     };
     use clap::Parser;
+
+    #[test]
+    fn coding_prompt_flags_preserve_bytes_and_reject_conflicts_or_bad_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("persona.md");
+        std::fs::write(&file, "文件原文\n  preserved\n").unwrap();
+        let cli = Cli::try_parse_from([
+            "atomcode",
+            "--system-prompt-file",
+            file.to_str().unwrap(),
+            "--append-system-prompt",
+            "APPEND",
+        ])
+        .unwrap();
+        let resolved = super::resolve_prompt_overrides(&cli).unwrap();
+        assert_eq!(resolved.replace.as_deref(), Some("文件原文\n  preserved\n"));
+        assert_eq!(resolved.append.as_deref(), Some("APPEND"));
+        assert!(Cli::try_parse_from([
+            "atomcode",
+            "--system-prompt",
+            "x",
+            "--system-prompt-file",
+            "y"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "atomcode",
+            "--append-system-prompt",
+            "x",
+            "--append-system-prompt-file",
+            "y"
+        ])
+        .is_err());
+        let cli = Cli::try_parse_from(["atomcode", "--system-prompt", "  "]).unwrap();
+        assert!(super::resolve_prompt_overrides(&cli).is_err());
+        std::fs::remove_file(&file).unwrap();
+        assert!(super::resolve_prompt_overrides(
+            &Cli::try_parse_from(["atomcode", "--system-prompt-file", file.to_str().unwrap(),])
+                .unwrap()
+        )
+        .is_err());
+    }
     use clap_complete::Shell;
     use std::path::PathBuf;
 

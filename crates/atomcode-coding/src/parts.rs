@@ -93,6 +93,8 @@ impl SubagentPolicy {
 /// (fs/bash tools + codeintel). Defaults = the full production-parity agent.
 #[derive(Clone, Debug)]
 pub struct PrepareOptions {
+    /// Explicit persona overrides survive model changes and rebuilds.
+    pub prompt_overrides: crate::host::PromptOverrides,
     pub session: SessionMode,
     /// Whether this driver exposes any tools to the model. `false` keeps the
     /// normal coding runtime/provider lifecycle but publishes an empty tool
@@ -278,6 +280,7 @@ impl Default for PrepareOptions {
             front_end: None,
             review_delegate: None,
             host_plugins: HostPlugins::default(),
+            prompt_overrides: Default::default(),
             identity: crate::persona::ProductIdentity::default(),
         }
     }
@@ -437,6 +440,7 @@ pub fn prepare_from_config(cfg: &crate::config::CodingRuntimeConfig) -> PrepareO
         .map(|c| resolve_external_subagents(&c.subagent, cfg.interactive).0)
         .unwrap_or_default();
     PrepareOptions {
+        prompt_overrides: cfg.prompt_overrides.clone(),
         mcp: cfg.mcp,
         external_subagents,
         ..PrepareOptions::default()
@@ -2681,6 +2685,7 @@ mod tests {
             front_end: None,
             review_delegate: None,
             host_plugins: Default::default(),
+            prompt_overrides: Default::default(),
             identity: Default::default(),
         };
 
@@ -3029,6 +3034,7 @@ mod tests {
             front_end: None,
             review_delegate: None,
             host_plugins: Default::default(),
+            prompt_overrides: Default::default(),
             identity: Default::default(),
         }
     }

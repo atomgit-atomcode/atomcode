@@ -651,7 +651,11 @@ name = "ui-handle"
 /// default identity — the agent would introduce itself as AtomCode again after
 /// the first `/model`. A tree with no such row gets `{ model }`, and the patch
 /// fails the way it always has.
-fn persona_patch(app: &App, model: &str) -> serde_json::Value {
+fn persona_patch(
+    app: &App,
+    model: &str,
+    cfg: Option<&crate::CodingAgentConfig>,
+) -> serde_json::Value {
     let mut config = app
         .tree()
         .entries
@@ -660,6 +664,9 @@ fn persona_patch(app: &App, model: &str) -> serde_json::Value {
         .and_then(|entry| entry.config.as_object().cloned())
         .unwrap_or_default();
     config.insert("model".into(), serde_json::Value::from(model));
+    if let Some(cfg) = cfg {
+        config.insert("system_prompt".into(), serde_json::json!(cfg.system_prompt));
+    }
     serde_json::Value::Object(config)
 }
 
@@ -1317,7 +1324,7 @@ pub async fn swap_provider_for(
     };
     let mut layer = Layer::new()
         .patch("llm", LlmInjectedRow { provider_id: &id })
-        .and_then(|layer| layer.patch("persona-atomcode", persona_patch(app, model)))
+        .and_then(|layer| layer.patch("persona-atomcode", persona_patch(app, model, config)))
         .and_then(|layer| layer.patch("tool-code-review", CodeReviewModelPatch { model }))
         .map_err(|e| restore(e.to_string()))?;
     if let Some(config) = config {
@@ -3176,12 +3183,23 @@ impl Plugin for CodingPersonaPlugin {
         // rather than of the `ATOMCODE_MEMORY_TOOL` / `ATOMCODE_REQUEST_USER_INPUT` envs the
         // chain reads, which cannot see a tree that failed to mount the tool. See
         // `coding_persona_rows`.
-        let text = crate::persona::coding_persona_rows(
+        let default_text = crate::persona::coding_persona_rows(
             &model,
             &row.identity(),
             &has,
             &*atomcode_harness::product_dirs(ctx)?,
         );
+        let mut text = row
+            .prompt_overrides
+            .replace
+            .as_ref()
+            .or(row.system_prompt.as_ref())
+            .cloned()
+            .unwrap_or(default_text);
+        if let Some(append) = &row.prompt_overrides.append {
+            text.push_str("\n\n");
+            text.push_str(append);
+        }
         // Rank 0, and an id of this row's own: the identity line goes first,
         // and the generic row it replaces is removed by `CODING_ROWS` rather
         // than overwritten here.

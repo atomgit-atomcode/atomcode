@@ -11190,6 +11190,20 @@ fn tree_inputs(
     // patch is the last word on any row — except the explicit model-only catalog
     // closure below, which no layer may reopen.
     let mut extra = vec![crate::on_harness::config_rows(config)?];
+    extra.push(
+        atomcode_plexus::Layer::new()
+            .patch(
+                "persona-atomcode",
+                serde_json::json!({
+                    "model": config.model,
+                    "product": prepare.identity.name(),
+                    "provider": prepare.identity.provider(),
+                    "system_prompt": config.system_prompt,
+                    "prompt_overrides": prepare.prompt_overrides,
+                }),
+            )
+            .map_err(|e| e.to_string())?,
+    );
     extra.extend(prepare.host_plugins.layers.iter().cloned());
     // `tools = false` is an explicit model-only contract, not just a request
     // to skip prepare-time registrations. Native rows mount their own tools;
@@ -13008,6 +13022,7 @@ pub mod testkit {
             front_end: None,
             review_delegate: None,
             host_plugins: Default::default(),
+            prompt_overrides: Default::default(),
             identity: Default::default(),
         };
         let plugin_hooks = Arc::new(crate::plugin_hooks::StaticPluginHookSource::default());
@@ -14180,6 +14195,7 @@ mod tests {
                 front_end: None,
                 review_delegate: None,
                 host_plugins: Default::default(),
+                prompt_overrides: Default::default(),
                 identity: Default::default(),
             },
             provider_factory: Arc::new(TestProviderFactory {

@@ -34,6 +34,8 @@ pub struct CodingAgentConfig {
     pub api_key: String,
     pub base_url: String,
     pub model: String,
+    /// Configured base persona; other prompt contributions remain independent.
+    pub system_prompt: Option<String>,
     /// Final image-input capability resolved from the model profile override or
     /// the backwards-compatible Auto heuristic.
     pub supports_vision: bool,
@@ -283,6 +285,10 @@ pub struct CodingRuntimeConfig {
     pub api_key: String,
     pub base_url: String,
     pub model: String,
+    /// Configured base persona; other prompt contributions remain independent.
+    pub system_prompt: Option<String>,
+    /// Explicit host overrides retained across runtime rebuilds.
+    pub prompt_overrides: crate::host::PromptOverrides,
     pub preferred_language: Option<Locale>,
     pub todo: atomcode_config::config::TodoToolConfig,
     /// Resolved `[tools.atomgit]` switch — see `CodingAgentConfig::atomgit_enabled`.
@@ -624,6 +630,8 @@ impl CodingRuntimeConfig {
             api_key: r.and_then(|r| r.api_key.clone()).unwrap_or_default(),
             base_url: r.and_then(|r| r.base_url.clone()).unwrap_or_default(),
             model: r.map(|r| r.model.clone()).unwrap_or_default(),
+            system_prompt: r.and_then(|r| r.system_prompt.clone()),
+            prompt_overrides: Default::default(),
             supports_vision: r.map(|r| r.supports_vision).unwrap_or(false),
             preferred_language: Some(atomcode_config::i18n::resolve_initial_locale(
                 None,
@@ -727,6 +735,7 @@ impl CodingRuntimeConfig {
             config.supports_reasoning_effort,
             self.reasoning_effort_levels.as_deref(),
         );
+        config.system_prompt = self.system_prompt.clone();
         config.preferred_language = self.preferred_language;
         config.todo = self.todo.clone();
         config.atomgit_enabled = self.atomgit_enabled;
@@ -1213,6 +1222,7 @@ impl CodingAgentConfig {
             supports_reasoning_effort: false,
             effort_levels: Vec::new(),
             model,
+            system_prompt: None,
             preferred_language: None,
             todo: Default::default(),
             atomgit_enabled: true,
@@ -1627,6 +1637,7 @@ mod tests {
                     "base_url": "https://api.deepseek.com/v1",
                     "api_key": "sk-legacy",
                     "model": "deepseek-chat",
+                    "system_prompt": "LEGACY_PERSONA",
                     "context_window": 128000
                 }
             }
@@ -1641,6 +1652,8 @@ mod tests {
             false,
             true,
         );
+        assert_eq!(rt.system_prompt.as_deref(), Some("LEGACY_PERSONA"));
+        assert_eq!(rt.agent_config().system_prompt, rt.system_prompt);
         assert_eq!(rt.provider_name, "MyDS");
         assert_eq!(rt.base_url, "https://api.deepseek.com/v1");
         assert_eq!(rt.api_key, "sk-legacy");
@@ -1658,7 +1671,7 @@ mod tests {
             "default_model": "acc/coder",
             "provider_accounts": { "acc": { "provider": "deepseek", "api_key": "sk-acc" } },
             "models": {
-                "acc/coder": { "account": "acc", "model": "deepseek-coder", "context_window": 131072 },
+                "acc/coder": { "account": "acc", "model": "deepseek-coder", "context_window": 131072, "system_prompt": "MODEL_PERSONA" },
                 "acc/chat": { "account": "acc", "model": "deepseek-chat", "context_window": 131072 }
             }
         }))
@@ -1673,6 +1686,8 @@ mod tests {
             false,
             true,
         );
+        assert_eq!(rt.system_prompt.as_deref(), Some("MODEL_PERSONA"));
+        assert_eq!(rt.agent_config().system_prompt, rt.system_prompt);
         assert_eq!(rt.provider_name, "acc/coder");
         assert_eq!(rt.model, "deepseek-coder");
         assert_eq!(rt.base_url, "https://api.deepseek.com/v1"); // preset default

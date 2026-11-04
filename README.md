@@ -405,6 +405,11 @@ atomcode -p "Explain the agent loop in this repo"
 atomcode --prompt-file task.md
 ```
 
+Customize the coding persona with `--system-prompt-file persona.md` and optional
+`--append-system-prompt-file constraints.md`. Tool and project instructions remain
+included. See [custom system prompts](docs/custom-system-prompts.md) for configuration
+and lifecycle behavior.
+
 In headless mode, approval-required `bash` calls are auto-approved and logged to stderr; other approval-required tools are denied.
 
 Then just type what you want:

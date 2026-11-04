@@ -303,6 +303,8 @@ pub(crate) fn chat_runtime_config(
         api_key: p.and_then(|p| p.api_key.clone()).unwrap_or_default(),
         base_url: p.and_then(|p| p.base_url.clone()).unwrap_or_default(),
         model: p.map(|p| p.model.clone()).unwrap_or_default(),
+        system_prompt: p.and_then(|p| p.system_prompt.clone()),
+        prompt_overrides: Default::default(),
         supports_vision: p.is_some_and(|p| p.accepts_images()),
         preferred_language: Some(atomcode_config::i18n::resolve_initial_locale(
             None,
