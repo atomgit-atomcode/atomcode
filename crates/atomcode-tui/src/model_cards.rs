@@ -2,14 +2,13 @@
 use crate::i18n::{t, Msg};
 use crate::providers::{ModelRow, ProvidersView};
 use crate::surface::{Key, KeyPress};
-use atomcode_capabilities::model_cards::{catalog, resolve_id, score_label};
+use atomcode_capabilities::model_cards::{catalog, resolve_id};
 use serde_json::Value;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CardPanel {
     configured: String,
     primary: Option<usize>,
-    secondary: Option<usize>,
     pub scroll: usize,
     notes: bool,
 }
@@ -21,20 +20,24 @@ fn ids() -> Vec<&'static str> {
         .map(String::as_str)
         .collect()
 }
+pub(crate) fn viewport_rows(total: usize, height: usize) -> usize {
+    total.min(height.saturating_sub(5).min(16))
+}
+
 impl CardPanel {
     pub fn new(model: &ModelRow) -> Self {
         Self {
             configured: model.id.clone(),
             primary: resolve_id(&model.model).and_then(|id| ids().iter().position(|x| *x == id)),
-            secondary: None,
             scroll: 0,
             notes: false,
         }
     }
-    pub fn clamp(&mut self, view: &ProvidersView, width: usize) {
+    pub fn clamp(&mut self, view: &ProvidersView, width: usize, height: usize) {
+        let total = lines(view, self, width).len();
         self.scroll = self
             .scroll
-            .min(lines(view, self, width).len().saturating_sub(1));
+            .min(total.saturating_sub(viewport_rows(total, height).max(1)));
     }
     /// True closes only this read-only view; never changes a runtime model.
     pub fn key(&mut self, press: KeyPress) -> bool {
@@ -57,19 +60,6 @@ impl CardPanel {
                     Some(at) if forward => (at + 1) % count,
                     Some(at) => (at + count - 1) % count,
                 });
-                if self.primary == self.secondary {
-                    self.secondary = None;
-                }
-                self.scroll = 0;
-            }
-            Key::Tab | Key::BackTab if self.primary.is_some() && count > 1 => {
-                // One extra position means "no comparison".
-                let step = if press.key == Key::BackTab { count } else { 1 };
-                let mut next = (self.secondary.map(|n| n + 1).unwrap_or(0) + step) % (count + 1);
-                if next > 0 && Some(next - 1) == self.primary {
-                    next = (next + step) % (count + 1);
-                }
-                self.secondary = next.checked_sub(1);
                 self.scroll = 0;
             }
             Key::Char('d') => {
@@ -96,45 +86,12 @@ fn task_name(id: &str) -> String {
 fn text(value: &Value) -> &str {
     value.as_str().unwrap_or("—")
 }
-fn task_score(task: Option<&Value>) -> String {
-    let Some(task) = task else {
-        return "—".into();
-    };
+fn padded(value: &str, columns: usize) -> String {
     format!(
-        "{}  ({}/{}, {} {})",
-        task["g"]
-            .as_f64()
-            .map(|n| format!("{n:.1}"))
-            .unwrap_or("—".into()),
-        task["rank"]
-            .as_u64()
-            .map(|n| n.to_string())
-            .unwrap_or("—".into()),
-        task["total"],
-        t(Msg::ModelCardEvidence),
-        task["n"]
+        "{}{}",
+        value,
+        " ".repeat(columns.saturating_sub(crate::width::str_width(value)))
     )
-}
-fn same_conditions(a: &Value, b: &Value) -> bool {
-    [
-        "bench",
-        "source",
-        "source_id",
-        "by",
-        "date",
-        "note",
-        "mode",
-        "settings",
-        "configuration",
-        "api_configuration",
-        "strong_prompting",
-        "evaluator",
-        "engine_label",
-        "evaluation_run_group",
-        "voice",
-    ]
-    .iter()
-    .all(|key| a[*key] == b[*key])
 }
 pub fn lines(view: &ProvidersView, panel: &CardPanel, width: usize) -> Vec<String> {
     let data = catalog();
@@ -163,147 +120,76 @@ pub fn lines(view: &ProvidersView, panel: &CardPanel, width: usize) -> Vec<Strin
         if !no_public {
             out.push(t(Msg::ModelCardEmpty).into_owned());
         }
+        out.push(t(Msg::ModelCardWebHint).into_owned());
         return wrap(out, width);
     };
-    let a = &data["models"][*primary];
-    let b = panel
-        .secondary
-        .and_then(|i| keys.get(i))
-        .map(|id| &data["models"][*id]);
-    out.push(format!("A: {}", text(&a["name"])));
-    if let Some(b) = b {
-        out.push(format!("B: {}", text(&b["name"])));
-    }
+    let card = &data["models"][*primary];
+    out.push(format!(
+        "{}: {}",
+        t(Msg::ModelCardViewing),
+        text(&card["name"])
+    ));
+    out.push(t(Msg::ModelCardReadOnly).into_owned());
     if panel.notes {
         out.push(t(Msg::ModelCardNotes).into_owned());
-        out.push(format!(
-            "{} · {}",
-            text(&data["upstream"]["updated"]),
-            text(&data["upstream"]["commit"])
-        ));
+        out.push(text(&data["upstream"]["updated"]).into());
         out.push(text(&data["attribution"]["credit"]).into());
         out.push(text(&data["attribution"]["license_url"]).into());
-        out.push(text(&data["attribution"]["upstream_notices"]).into());
-        for card in [Some(a), b].into_iter().flatten() {
-            out.push(text(&card["name"]).into());
-            if let Some(note) = card["identity_note"].as_str() {
-                out.push(note.into());
-            }
-            for row in card["evaluations"].as_array().unwrap() {
-                out.push(format!(
-                    "{} · {} · {}",
-                    text(&data["benchmarks"][text(&row["bench"])]["name"]),
-                    text(&row["date"]),
-                    text(&row["by"])
-                ));
-                out.push(text(&row["note"]).into());
-                out.push(text(&row["source"]).into());
-            }
-        }
-        for source in data["sources"].as_object().unwrap().values() {
-            out.push(format!(
-                "{} · {}",
-                text(&source["name"]),
-                text(&source["license"])
-            ));
-            out.push(text(&source["attribution"]).into());
-        }
+        out.push(t(Msg::ModelCardWebHint).into_owned());
         return wrap(out, width);
     }
-    for card in [Some(a), b].into_iter().flatten() {
-        if card["valid_benchmark_count"].as_u64().unwrap_or(0) < 5 {
-            out.push(t(Msg::ModelCardSparse).into_owned());
-        }
-        for (field, label) in [
-            ("best_task", Msg::ModelCardBest),
-            ("worst_task", Msg::ModelCardWorst),
-        ] {
-            if let Some(id) = card[field].as_str() {
-                out.push(format!(
-                    "{}: {} · {}",
-                    text(&card["name"]),
-                    t(label),
-                    task_name(id)
-                ));
-            }
+    for (field, label) in [
+        ("best_task", Msg::ModelCardBest),
+        ("worst_task", Msg::ModelCardWorst),
+    ] {
+        if let Some(id) = card[field].as_str() {
+            out.push(format!("{}: {}", t(label), task_name(id)));
         }
     }
-    out.push(t(Msg::ModelCardTasks).into_owned());
-    out.push(t(Msg::ModelCardScope).into_owned());
-    for definition in data["task_definitions"].as_array().unwrap() {
+    if card["valid_benchmark_count"].as_u64().unwrap_or(0) < 5 {
+        out.push(t(Msg::ModelCardSparse).into_owned());
+    }
+    let definitions = data["task_definitions"].as_array().unwrap();
+    let task_width = definitions
+        .iter()
+        .map(|d| crate::width::str_width(&task_name(text(&d["id"]))))
+        .chain([crate::width::str_width(&t(Msg::ModelCardTasks))])
+        .max()
+        .unwrap_or(0);
+    let score_width = crate::width::str_width(&t(Msg::ModelCardScore)).max(5);
+    out.push(format!(
+        "{} | {} | {}",
+        padded(&t(Msg::ModelCardTasks), task_width),
+        padded(&t(Msg::ModelCardScore), score_width),
+        t(Msg::ModelCardRank)
+    ));
+    for definition in definitions {
         let id = text(&definition["id"]);
-        let find = |card: &Value| {
-            card["tasks"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|task| task["id"] == id)
-                .cloned()
-        };
-        let left = find(a);
-        let right = b.and_then(find);
-        out.push(format!(
-            "{}: A {}{}",
-            task_name(id),
-            task_score(left.as_ref()),
-            if b.is_some() {
-                format!(" | B {}", task_score(right.as_ref()))
-            } else {
-                String::new()
-            }
-        ));
-        if let (Some(l), Some(r)) = (&left, &right) {
-            if l["comparison_set"]["id"].is_null()
-                || l["comparison_set"]["id"] != r["comparison_set"]["id"]
-            {
-                out.push(t(Msg::ModelCardDifferent).into_owned());
-            }
-        }
-    }
-    out.push(t(Msg::ModelCardBenchmarks).into_owned());
-    if b.is_some() {
-        out.push(t(Msg::ModelCardDifferent).into_owned());
-    }
-    let mut right = b
-        .map(|card| {
-            card["evaluations"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    for row in a["evaluations"].as_array().unwrap() {
-        let bench = &data["benchmarks"][text(&row["bench"])];
-        let other = right
+        let task = card["tasks"]
+            .as_array()
+            .unwrap()
             .iter()
-            .position(|r| same_conditions(row, r))
-            .map(|i| right.remove(i));
-        let mut line = format!(
-            "{}: A {}",
-            text(&bench["name"]),
-            score_label(row["score"].as_f64().unwrap(), bench)
-        );
-        if b.is_some() {
-            line.push_str(&format!(
-                " | B {}",
-                other
-                    .map(|r| score_label(r["score"].as_f64().unwrap(), bench))
-                    .unwrap_or("—".into())
-            ));
-        }
-        out.push(line);
-    }
-    for row in right {
-        let bench = &data["benchmarks"][text(&row["bench"])];
+            .find(|task| task["id"] == id);
+        let score = task
+            .and_then(|v| v["g"].as_f64())
+            .map(|v| format!("{v:.1}"))
+            .unwrap_or("—".into());
+        let rank = task
+            .and_then(|v| v["rank"].as_u64().zip(v["total"].as_u64()))
+            .map(|(rank, total)| format!("{rank}/{total}"))
+            .unwrap_or("—".into());
         out.push(format!(
-            "{}: A — | B {}",
-            text(&bench["name"]),
-            score_label(row["score"].as_f64().unwrap(), bench)
+            "{} | {} | {}",
+            padded(&task_name(id), task_width),
+            padded(&score, score_width),
+            rank
         ));
     }
+    out.push(t(Msg::ModelCardScope).into_owned());
+    out.push(t(Msg::ModelCardWebHint).into_owned());
     wrap(out, width)
 }
+
 fn wrap(lines: Vec<String>, width: usize) -> Vec<String> {
     let mut result = Vec::new();
     for line in lines {
@@ -391,18 +277,42 @@ mod tests {
         assert_eq!(view.models()[0].model, "lumen-alpha");
     }
     #[test]
-    fn shift_tab_reverses_comparison_without_selecting_the_primary_card() {
-        let (_, row) = fixture("glm-5.3-flash");
+    fn tab_does_not_enable_comparison_and_summary_names_the_browsed_model() {
+        let (view, row) = fixture("glm-5.3-flash");
         let mut card = CardPanel::new(&row);
+        let before = card.clone();
         card.key(KeyPress::plain(Key::Tab));
-        assert!(card.secondary.is_some());
-        assert_ne!(card.primary, card.secondary);
         card.key(KeyPress::plain(Key::BackTab));
-        assert!(card.secondary.is_none());
-        card.key(KeyPress::plain(Key::BackTab));
-        assert!(card.secondary.is_some());
-        assert_ne!(card.primary, card.secondary);
+        assert_eq!(card, before);
+        let rendered = lines(&view, &card, 140);
+        assert!(rendered
+            .iter()
+            .any(|line| line.contains(t(Msg::ModelCardViewing).as_ref())));
+        assert!(rendered
+            .iter()
+            .any(|line| line.contains(t(Msg::ModelCardRank).as_ref())));
+        assert!(rendered.iter().any(|line| line.contains("/webui")));
+        assert!(!rendered
+            .iter()
+            .any(|line| line.starts_with("A:") || line.starts_with("B:")));
     }
+    #[test]
+    fn card_scroll_stops_at_the_last_full_page_and_short_cards_do_not_scroll() {
+        let (view, row) = fixture("unmapped-model");
+        let mut card = CardPanel::new(&row);
+        let total = lines(&view, &card, 140).len();
+        assert!(total <= 16);
+        card.scroll = usize::MAX;
+        card.clamp(&view, 140, 21);
+        assert_eq!(card.scroll, 0);
+        card.scroll = usize::MAX;
+        card.clamp(&view, 140, 7);
+        assert_eq!(card.scroll, total.saturating_sub(2));
+        card.key(KeyPress::plain(Key::Up));
+        card.clamp(&view, 140, 7);
+        assert_eq!(card.scroll, total.saturating_sub(3));
+    }
+
     #[test]
     fn narrow_cards_keep_configuration_and_scroll_back_from_end() {
         let (view, row) = fixture("glm-5.3-flash");
@@ -413,14 +323,14 @@ mod tests {
             .iter()
             .all(|line| crate::width::str_width(line) <= 24));
         card.key(KeyPress::plain(Key::End));
-        card.clamp(&view, 24);
+        card.clamp(&view, 24, 21);
         let end = card.scroll;
         card.key(KeyPress::plain(Key::Up));
-        card.clamp(&view, 24);
+        card.clamp(&view, 24, 21);
         assert_eq!(card.scroll, end - 1);
     }
     #[test]
-    fn unknown_alias_requires_manual_browsing_and_comparison_uses_two_cards() {
+    fn unknown_alias_requires_manual_browsing_without_changing_configuration() {
         let (view, row) = fixture("deepseek-flash");
         let mut card = CardPanel::new(&row);
         assert!(card.primary.is_none());
@@ -433,9 +343,10 @@ mod tests {
         card.key(KeyPress::plain(Key::Right));
         card.key(KeyPress::plain(Key::Tab));
         assert!(card.primary.is_some());
-        assert!(card.secondary.is_some());
-        assert_ne!(card.primary, card.secondary);
-        assert!(lines(&view, &card, 80)
+        assert!(lines(&view, &card, 140)
+            .iter()
+            .any(|line| line.contains("deepseek-flash")));
+        assert!(!lines(&view, &card, 140)
             .iter()
             .any(|line| line.starts_with("B:")));
     }

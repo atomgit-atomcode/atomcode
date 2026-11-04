@@ -153,8 +153,8 @@ fn layout(view: &ProvidersView, panel: &Panel, h: usize, w: usize) -> Vec<Row> {
     if let Some(card) = &panel.card {
         rows.push(Row::Card(t(Msg::ModelCardHelp).into_owned()));
         let content = crate::model_cards::lines(view, card, w.saturating_sub(2).max(1));
-        let start = card.scroll.min(content.len().saturating_sub(1));
-        let room = h.saturating_sub(5).min(16);
+        let room = crate::model_cards::viewport_rows(content.len(), h);
+        let start = card.scroll.min(content.len().saturating_sub(room.max(1)));
         rows.extend(
             content
                 .iter()
@@ -1491,7 +1491,7 @@ mod tests {
             managed: false,
         };
         let view = crate::providers::ProvidersView::new(vec![], vec![row.clone()], vec![], vec![]);
-        let panel = crate::providers::Panel {
+        let mut panel = crate::providers::Panel {
             card: Some(crate::model_cards::CardPanel::new(&row)),
             ..Default::default()
         };
@@ -1500,6 +1500,14 @@ mod tests {
             let rows = super::layout(&view, &panel, height, width);
             assert_eq!(rows.len(), height);
             assert!(!rows.iter().any(|row| matches!(row, super::Row::Listed(_))));
+            for scroll in [1, 3, 16, usize::MAX] {
+                panel.card.as_mut().unwrap().scroll = scroll;
+                assert_eq!(
+                    super::layout(&view, &panel, usize::MAX, width).len(),
+                    height
+                );
+                assert_eq!(super::layout(&view, &panel, height, width).len(), height);
+            }
         }
     }
 

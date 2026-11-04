@@ -8,6 +8,11 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Msg<'a> {
     ModelCardTitle,
+    ModelCardViewing,
+    ModelCardReadOnly,
+    ModelCardWebHint,
+    ModelCardScore,
+    ModelCardRank,
     ModelCardEmpty,
     ModelCardNoPublic,
     ModelCardHelp,

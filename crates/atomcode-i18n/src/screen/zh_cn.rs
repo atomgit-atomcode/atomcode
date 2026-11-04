@@ -9,12 +9,18 @@ use std::borrow::Cow;
 
 pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
     match msg {
+        Msg::ModelCardViewing => "正在浏览".into(),
+        Msg::ModelCardReadOnly => "仅查看评测，不会切换当前模型。".into(),
+        Msg::ModelCardWebHint => "完整评测与对比：关闭面板后输入 /webui，在模型列表点 ⓘ。".into(),
+        Msg::ModelCardScore => "分数".into(),
+        Msg::ModelCardRank => "排名/参评".into(),
+
         Msg::ModelCardNoPublic => "当前评测目录未收录此型号，暂无公开评测数据。模型仍可使用，缺失不记为零分。".into(),
         Msg::ModelCardTitle => "模型卡".into(),
         Msg::ModelCardEmpty => "暂无已验证映射。←/→ 可浏览明确型号目录。".into(),
-        Msg::ModelCardHelp => "↑↓/PgUp/PgDn 滚动 · ←→ 浏览 · Tab 对比 · d 数据说明 · Esc 返回".into(),
+        Msg::ModelCardHelp => "↑↓ 滚动 · ←→ 浏览型号 · d 数据说明 · Esc 返回".into(),
         Msg::ModelCardScope => "排名来自完整评测集；仅比较同任务、同比较集。无数据不代表不具备能力。".into(),
-        Msg::ModelCardConfigured => "配置模型".into(),
+        Msg::ModelCardConfigured => "所选配置".into(),
         Msg::ModelCardBenchmarks => "公开评测".into(),
         Msg::ModelCardTasks => "任务表现".into(),
         Msg::ModelCardNotes => "数据说明".into(),

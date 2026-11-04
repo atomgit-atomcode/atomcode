@@ -3512,15 +3512,14 @@ impl Host {
         &self,
         press: crate::surface::KeyPress,
     ) -> (bool, Option<crate::providers::Step>) {
-        let card_width = self
+        let (card_columns, card_height) = self
             .hits
             .lock()
             .expect("hits poisoned")
             .providers
-            .map(|rect| rect.w as usize)
-            .unwrap_or(80)
-            .saturating_sub(2)
-            .max(1);
+            .map(|rect| (rect.w as usize, rect.h as usize))
+            .unwrap_or((80, 21));
+        let card_width = card_columns.saturating_sub(2).max(1);
         let mut m = self.moment.write().expect("moment poisoned");
         let view = m.providers.clone();
         let mut secret = self
@@ -3531,12 +3530,12 @@ impl Host {
             return (false, None);
         };
         if let Some(card) = &mut panel.card {
-            card.clamp(&view, card_width);
+            card.clamp(&view, card_width, card_height);
         }
         let before = panel.clone();
         let step = crate::providers::key(&view, panel, &mut secret, press);
         if let Some(card) = &mut panel.card {
-            card.clamp(&view, card_width);
+            card.clamp(&view, card_width, card_height);
         }
         let changed = *panel != before;
         match step {
@@ -3569,15 +3568,14 @@ impl Host {
         if !over {
             return false;
         }
-        let card_width = self
+        let (card_columns, card_height) = self
             .hits
             .lock()
             .expect("hits poisoned")
             .providers
-            .map(|rect| rect.w as usize)
-            .unwrap_or(80)
-            .saturating_sub(2)
-            .max(1);
+            .map(|rect| (rect.w as usize, rect.h as usize))
+            .unwrap_or((80, 21));
+        let card_width = card_columns.saturating_sub(2).max(1);
         let mut m = self.moment.write().expect("moment poisoned");
         let card_view = m.providers.clone();
         if let Some(card) = m
@@ -3585,13 +3583,13 @@ impl Host {
             .as_mut()
             .and_then(|panel| panel.card.as_mut())
         {
-            card.clamp(&card_view, card_width);
+            card.clamp(&card_view, card_width, card_height);
             card.scroll = if by < 0 {
                 card.scroll.saturating_sub(by.unsigned_abs() as usize)
             } else {
                 card.scroll.saturating_add(by as usize)
             };
-            card.clamp(&card_view, card_width);
+            card.clamp(&card_view, card_width, card_height);
             return true;
         }
 

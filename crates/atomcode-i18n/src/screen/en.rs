@@ -21,10 +21,16 @@ use std::borrow::Cow;
 
 pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
     match msg {
+        Msg::ModelCardViewing => "Viewing".into(),
+        Msg::ModelCardReadOnly => "Read-only scores; the current model is unchanged.".into(),
+        Msg::ModelCardWebHint => "Full scores and comparison: close this panel, run /webui, then select the model list info button.".into(),
+        Msg::ModelCardScore => "Score".into(),
+        Msg::ModelCardRank => "Rank/total".into(),
+
         Msg::ModelCardNoPublic => "This model has no public scores in the current catalogue. Model use is unaffected; missing evidence is not a zero score.".into(),
         Msg::ModelCardTitle => "Model card".into(),
         Msg::ModelCardEmpty => "No verified mapping. Left/Right browses explicit catalogue models.".into(),
-        Msg::ModelCardHelp => "↑↓/PgUp/PgDn scroll · ←→ browse · Tab compare · d data notes · Esc back".into(),
+        Msg::ModelCardHelp => "↑↓ scroll · ←→ browse models · d data notes · Esc back".into(),
         Msg::ModelCardScope => "Full-population ranks; compare only the same task and comparison set. Missing evidence does not imply inability.".into(),
         Msg::ModelCardConfigured => "Configured model".into(),
         Msg::ModelCardBenchmarks => "Published evaluations".into(),
