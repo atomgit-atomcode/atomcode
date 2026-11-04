@@ -3017,7 +3017,10 @@ async fn recent_places(
         let Some(dir) = session.working_dir else {
             continue;
         };
-        if dir == here || pinned.iter().any(|already| already == &dir) {
+        if !std::path::Path::new(&dir).is_dir()
+            || dir == here
+            || pinned.iter().any(|already| already == &dir)
+        {
             continue;
         }
         if out.iter().any(|already| already == &dir) {
@@ -7187,6 +7190,49 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn recent_places_skips_missing_paths_and_files_before_filling_the_list() {
+        let root = tempfile::tempdir().unwrap();
+        let removed = root.path().join("removed");
+        std::fs::create_dir(&removed).unwrap();
+        std::fs::remove_dir(&removed).unwrap();
+        let file = root.path().join("file");
+        std::fs::write(&file, "not a directory").unwrap();
+        let dirs: Vec<String> = (0..7)
+            .map(|n| {
+                let dir = root.path().join(format!("project-{n}"));
+                std::fs::create_dir(&dir).unwrap();
+                dir.display().to_string()
+            })
+            .collect();
+        let mut paths = vec![removed.display().to_string(); 6];
+        paths.push(file.display().to_string());
+        paths.extend([dirs[0].clone(), dirs[1].clone(), dirs[1].clone()]);
+        paths.extend(dirs[2..].iter().cloned());
+        let host = Arc::new(Recording::default());
+        host.replies
+            .lock()
+            .unwrap()
+            .push_back(Ok(HostReply::Sessions {
+                sessions: paths
+                    .into_iter()
+                    .enumerate()
+                    .map(|(n, dir)| atomcode_host_api::StoredSession {
+                        id: format!("session-{n}"),
+                        title: None,
+                        working_dir: Some(dir),
+                        created_at: 0,
+                        updated_at: 0,
+                        turns: 1,
+                        needs_newer_version: false,
+                        scheduled: false,
+                    })
+                    .collect(),
+            }));
+        let places = recent_places(Some(host), &dirs[0], &[dirs[1].clone()]).await;
+        assert_eq!(places, dirs[2..7]);
+    }
+
     /// `/cd` 先给「我要去哪儿」的答案,再给「这儿有什么」:标过的目录排最前,
     /// 其次是最近在里面干过活的,最后才是当前目录底下的东西。
     #[tokio::test]
@@ -7206,6 +7252,8 @@ mod tests {
         }
         let here = tempfile::tempdir().unwrap();
         std::fs::create_dir(here.path().join("under-here")).unwrap();
+        let recent_dir = tempfile::tempdir().unwrap();
+        let recent_path = recent_dir.path().display().to_string();
         let host = Arc::new(Recording::default());
         // 先问工作目录,再问会话目录。
         host.replies
@@ -7226,7 +7274,7 @@ mod tests {
                     atomcode_host_api::StoredSession {
                         id: "one".into(),
                         title: None,
-                        working_dir: Some("/w/recent".into()),
+                        working_dir: Some(recent_path.clone()),
                         created_at: 0,
                         updated_at: 2,
                         turns: 1,
@@ -7256,7 +7304,7 @@ mod tests {
             .find("/w/marked")
             .unwrap_or_else(|| panic!("标过的在里面:{text}"));
         let recent = text
-            .find("/w/recent")
+            .find(&recent_path)
             .unwrap_or_else(|| panic!("最近去过的在里面:{text}"));
         assert!(marked < recent, "标过的排在最近去过的前面:\n{text}");
         assert_eq!(
