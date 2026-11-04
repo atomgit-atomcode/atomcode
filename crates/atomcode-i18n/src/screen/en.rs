@@ -21,6 +21,27 @@ use std::borrow::Cow;
 
 pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
     match msg {
+        Msg::ModelCardNoPublic => "This model has no public scores in the current catalogue. Model use is unaffected; missing evidence is not a zero score.".into(),
+        Msg::ModelCardTitle => "Model card".into(),
+        Msg::ModelCardEmpty => "No verified mapping. Left/Right browses explicit catalogue models.".into(),
+        Msg::ModelCardHelp => "↑↓/PgUp/PgDn scroll · ←→ browse · Tab compare · d data notes · Esc back".into(),
+        Msg::ModelCardScope => "Full-population ranks; compare only the same task and comparison set. Missing evidence does not imply inability.".into(),
+        Msg::ModelCardConfigured => "Configured model".into(),
+        Msg::ModelCardBenchmarks => "Published evaluations".into(),
+        Msg::ModelCardTasks => "Task performance".into(),
+        Msg::ModelCardNotes => "Data notes".into(),
+        Msg::ModelCardDifferent => "Different conditions / comparison sets".into(),
+        Msg::ModelCardEvidence => "Evidence".into(),
+        Msg::ModelCardSparse => "Sparse evaluation evidence".into(),
+        Msg::ModelCardBest => "Relative strength".into(),
+        Msg::ModelCardWorst => "Relative weakness".into(),
+        Msg::ModelCardAgents => "Agent tasks".into(),
+        Msg::ModelCardCoding => "Coding".into(),
+        Msg::ModelCardChat => "Chat & writing".into(),
+        Msg::ModelCardMath => "Math".into(),
+        Msg::ModelCardVision => "Vision & documents".into(),
+        Msg::ModelCardSearch => "Web search".into(),
+
         Msg::AutomationOlder => "Load earlier runs".into(),
         Msg::AutomationTitle => "Automations".into(),
         Msg::AutomationEmpty => "No scheduled tasks".into(),

@@ -7,6 +7,27 @@
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Msg<'a> {
+    ModelCardTitle,
+    ModelCardEmpty,
+    ModelCardNoPublic,
+    ModelCardHelp,
+    ModelCardScope,
+    ModelCardConfigured,
+    ModelCardBenchmarks,
+    ModelCardTasks,
+    ModelCardNotes,
+    ModelCardDifferent,
+    ModelCardEvidence,
+    ModelCardSparse,
+    ModelCardBest,
+    ModelCardWorst,
+    ModelCardAgents,
+    ModelCardCoding,
+    ModelCardChat,
+    ModelCardMath,
+    ModelCardVision,
+    ModelCardSearch,
+
     AutomationOlder,
     AutomationTitle,
     AutomationEmpty,

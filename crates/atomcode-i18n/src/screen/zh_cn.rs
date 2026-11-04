@@ -9,6 +9,27 @@ use std::borrow::Cow;
 
 pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
     match msg {
+        Msg::ModelCardNoPublic => "当前评测目录未收录此型号，暂无公开评测数据。模型仍可使用，缺失不记为零分。".into(),
+        Msg::ModelCardTitle => "模型卡".into(),
+        Msg::ModelCardEmpty => "暂无已验证映射。←/→ 可浏览明确型号目录。".into(),
+        Msg::ModelCardHelp => "↑↓/PgUp/PgDn 滚动 · ←→ 浏览 · Tab 对比 · d 数据说明 · Esc 返回".into(),
+        Msg::ModelCardScope => "排名来自完整评测集；仅比较同任务、同比较集。无数据不代表不具备能力。".into(),
+        Msg::ModelCardConfigured => "配置模型".into(),
+        Msg::ModelCardBenchmarks => "公开评测".into(),
+        Msg::ModelCardTasks => "任务表现".into(),
+        Msg::ModelCardNotes => "数据说明".into(),
+        Msg::ModelCardDifferent => "条件或比较集不同".into(),
+        Msg::ModelCardEvidence => "评测证据".into(),
+        Msg::ModelCardSparse => "评测数据较少".into(),
+        Msg::ModelCardBest => "相对强项".into(),
+        Msg::ModelCardWorst => "相对弱项".into(),
+        Msg::ModelCardAgents => "Agent 任务".into(),
+        Msg::ModelCardCoding => "编程".into(),
+        Msg::ModelCardChat => "聊天与写作".into(),
+        Msg::ModelCardMath => "数学".into(),
+        Msg::ModelCardVision => "视觉与文档".into(),
+        Msg::ModelCardSearch => "网页搜索".into(),
+
         Msg::AutomationOlder => "加载更早的运行记录".into(),
         Msg::AutomationTitle => "自动化任务".into(),
         Msg::AutomationEmpty => "暂无自动化任务".into(),

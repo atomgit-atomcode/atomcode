@@ -96,6 +96,10 @@ export type SSEEvent =
   | { type: 'command_output'; text: string };
 
 export interface ModelInfo {
+  model_card_id?: string | null;
+  model_card_status?: 'available' | 'no_public_data' | 'unverified';
+  context_window?: number;
+  supports_vision?: boolean | null;
   provider: string;
   model: string;
   provider_type: string;
@@ -1544,4 +1548,10 @@ export interface TaskSpecView { session_id?:string; items?:TaskSpecItem[]; next_
 export async function taskSpecs(sessionId:string,args:string,signal?:AbortSignal):Promise<TaskSpecView> {
   const response=await apiFetch('/live/spec',{method:'POST',headers:{...authHeaders(),'Content-Type':'application/json'},body:JSON.stringify({session_id:sessionId,args}),signal});
   return readJson<TaskSpecView>(response);
+}
+
+export async function getModelCards(): Promise<import('./lib/modelCards').ModelCards> {
+  const response = await apiFetch('/model-cards', { headers: authHeaders() });
+  if (!response.ok) throw new Error(`model cards failed: ${response.status}`);
+  return response.json();
 }

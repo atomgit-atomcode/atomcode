@@ -3755,6 +3755,10 @@ async fn rename_session(
 /// Model info for API response
 #[derive(Debug, Serialize)]
 pub struct ModelInfo {
+    pub model_card_status: &'static str,
+    pub model_card_id: Option<String>,
+    pub context_window: usize,
+    pub supports_vision: Option<bool>,
     /// Provider name
     pub provider: String,
     /// Model identifier
@@ -3788,6 +3792,11 @@ fn models_from_config(config: &Config) -> Vec<ModelInfo> {
         .filter_map(|id| {
             config.provider_config_for_selection(id).map(|p| ModelInfo {
                 provider: id.clone(),
+                model_card_status: atomcode_capabilities::model_cards::status(&p.model),
+                model_card_id: atomcode_capabilities::model_cards::resolve_id(&p.model)
+                    .map(str::to_owned),
+                context_window: p.context_window,
+                supports_vision: p.supports_vision,
                 model: p.model.clone(),
                 provider_type: p.provider_type.clone(),
                 is_default: id == &default_selection,
@@ -7690,6 +7699,10 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/projects/:hash/sessions/:id/repair", post(repair_session))
         // Model API
         .route("/models", get(get_models))
+        .route(
+            "/model-cards",
+            get(|| async { Json(atomcode_capabilities::model_cards::catalog()) }),
+        )
         // Chat API
         .route(
             "/chat",
@@ -8492,6 +8505,45 @@ mod tests {
             .unwrap();
         assert!(glm.is_default, "effective selection is the default");
         assert_eq!(glm.model, "GLM-5.2");
+    }
+
+    #[test]
+    fn model_cards_use_verified_wire_ids_and_keep_configured_capabilities() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "providers": {
+                "configured": { "type": "openai", "model": "GLM-5.3-Flash", "context_window": 12345, "supports_vision": false },
+                "floating": { "type": "openai", "model": "deepseek-flash" },
+                "unlisted": { "type": "openai", "model": "lumen-alpha" }
+            }
+        })).unwrap();
+        let models = models_from_config(&config);
+        let known = models
+            .iter()
+            .find(|model| model.provider == "configured")
+            .unwrap();
+        assert_eq!(known.model_card_id.as_deref(), Some("glm-5-3-flash"));
+        assert_eq!(known.context_window, 12345);
+        assert_eq!(known.model_card_status, "available");
+        let unlisted = models
+            .iter()
+            .find(|model| model.provider == "unlisted")
+            .unwrap();
+        assert_eq!(unlisted.model_card_status, "no_public_data");
+        assert!(unlisted.model_card_id.is_none());
+        assert_eq!(known.supports_vision, Some(false));
+        assert!(models
+            .iter()
+            .find(|model| model.provider == "floating")
+            .unwrap()
+            .model_card_id
+            .is_none());
+        assert_eq!(
+            atomcode_capabilities::model_cards::catalog()["models"]
+                .as_object()
+                .unwrap()
+                .len(),
+            12
+        );
     }
 
     #[test]

@@ -1338,6 +1338,7 @@ pub enum Form {
 /// The providers panel, while it is up.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Panel {
+    pub card: Option<crate::model_cards::CardPanel>,
     pub tab: Tab,
     /// The row the arrows are on, as an index into the *listed* rows.
     pub cursor: usize,
@@ -1538,6 +1539,12 @@ pub enum Step {
 /// It is here rather than on the form so that the panel — which lives in the
 /// `Moment` — cannot hold a credential even by accident; see this module's doc.
 pub fn key(view: &ProvidersView, panel: &mut Panel, secret: &mut String, press: KeyPress) -> Step {
+    if let Some(card) = &mut panel.card {
+        if card.key(press) {
+            panel.card = None;
+        }
+        return Step::Stay;
+    }
     match panel.form.clone() {
         Some(Form::Account(form)) => account_key(view, panel, form, secret, press),
         Some(Form::Model(form)) => model_key(view, panel, form, secret, press),
@@ -1568,6 +1575,15 @@ fn list_key(view: &ProvidersView, panel: &mut Panel, secret: &mut String, press:
     let at = listed.get(panel.cursor).copied();
     let armed = panel.pending_delete.take();
     match (press.key, press.mods) {
+        (Key::F(2), _) if panel.efforts.is_none() => {
+            if let Some(Listed::Model(index)) = at {
+                if let Some(model) = view.models().get(index) {
+                    panel.card = Some(crate::model_cards::CardPanel::new(model));
+                }
+            }
+            Step::Stay
+        }
+
         // 挑强度时 Esc 是「退一层」:回到刚选完模型的那张列表,面板留着 ——
         // 和别的面板里 Esc 先退一步、再收起是同一个规矩。
         (Key::Esc, _) if panel.efforts.is_some() => {
