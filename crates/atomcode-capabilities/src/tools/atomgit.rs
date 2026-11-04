@@ -622,8 +622,32 @@ impl Tool for AtomgitApiTool {
         "Call any AtomGit REST API endpoint that has no dedicated tool (prefer \
          atomgit_repo / atomgit_pr / atomgit_issue when they cover the action). \
          The auth token is attached server-side — NEVER put credentials in the \
-         arguments. `path` is relative to the API base, e.g. \"/user/orgs\" or \
-         \"/repos/{owner}/{repo}/branches\". Returns the raw JSON response."
+         arguments. `path` is relative to the API base, e.g. \"/search\" (unified \
+         search over repos/users/groups/PRs/issues) or \"/repos/{owner}/{repo}\". \
+         Returns the raw JSON response.\n\n\
+         Read the official docs before building a request instead of guessing paths \
+         or parameter names from other platforms — read small, never a whole spec:\n\
+         1. https://atomgit.com/llms.txt — agent entry point, about 5 KB; start here\n\
+         2. the page for the single endpoint you need, e.g. \
+         https://atomgit-api-doc.atomgit.com/4.search/461.search_by_type.html \
+         (about 210 KB), or extract just that path from \
+         https://atomgit.com/.well-known/openapi.json (about 574 KB; pick one path, \
+         do not load it whole)\n\
+         Do NOT read https://atomgit.com/.well-known/openapi.md: it is about 2.2 MB \
+         and exceeds web_fetch's 2 MiB cap, so it arrives truncated.\n\n\
+         Search requires `type` (one of repo, user, group, pullrequest, issue; \
+         missing or invalid returns 400) plus optional `q`, `p`, `pp`, `repo_type` \
+         (0=code, 1=model, 2=dataset). This tool accepts one string value per query \
+         key; to search multiple repo types, issue a separate request for each type. \
+         Do not pass arrays or duplicate keys. Working call, every query value is \
+         a string:\n\
+         {\"method\":\"GET\",\"path\":\"/search\",\"query\":{\"type\":\"repo\",\"q\":\"Qwen\",\"repo_type\":\"1\",\"p\":\"1\",\"pp\":\"10\"}}\n\n\
+         Unknown query parameters may be ignored silently and an out-of-range value \
+         may return an empty page, so \"no results\" is not proof that the resource \
+         does not exist. If the docs are unreachable, you may still call the \
+         endpoints already established as working (/search, /search/repositories, \
+         /repos/{owner}/{repo}); what you must not do is invent an unconfirmed path \
+         or parameter name."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({

@@ -120,6 +120,8 @@ Connect to any LLM that supports OpenAI's function-calling API:
 - **Bracketed paste** — long paste content collapsed to a compact indicator
 - **Skills** — user-defined commands loaded from your skill directory, invoked like any slash command
 
+The conversation scrollbar is hidden by default; mouse-wheel and keyboard scrolling remain available. Set `ui.scrollbar` in `/config` to `hidden` (default), `auto`, or `always`.
+
 ### Web UI
 
 - **`/webui`** (in the TUI) or **`atomcode webui`** (CLI) launches a local browser UI as an alternative to the terminal interface — same agent, same sessions, rendered in your browser

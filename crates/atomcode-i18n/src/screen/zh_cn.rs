@@ -352,6 +352,12 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             true => format!("服务端返回 HTTP {status},请检查 API key").into(),
             false => format!("服务端返回 HTTP {status}").into(),
         },
+        Msg::OllamaUnavailable { endpoint, local } => if local {
+            format!("无法连接 Ollama：{endpoint}。请在运行 atomcode 的机器上执行 `ollama serve`，然后按 Ctrl+F 重试。默认端口为 11434；使用其他端口时请修改地址。")
+        } else {
+            format!("无法连接 Ollama：{endpoint}。请检查目标机器上的 `ollama serve` 服务、地址、端口和网络访问，然后按 Ctrl+F 重试。")
+        }.into(),
+        Msg::OllamaModelsFound { count } => format!("Ollama 正在运行 · {count} 个模型 · 回车继续 · Ctrl+F 刷新").into(),
         Msg::DiscoverUnreachable => "连不上服务端".into(),
         Msg::ProviderDiscoverFailed { why } => {
             format!("没拉到模型列表:{why}。可以手动输入模型 ID。").into()
@@ -366,6 +372,18 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdAboutKeys => "列出快捷键".into(),
         Msg::CmdAboutTodo => "列出计划清单;`add <任务>` 加一项、`clear` 清空;`show`/`hide` 开关面板".into(),
         Msg::CmdAboutTeam => "展开或折叠团队面板".into(),
+        Msg::CmdAboutPatch => "无损导入 unified diff 文件；确认输入框中的引用后发送".into(),
+        Msg::PatchTooLarge => "补丁超过 8 MiB 导入上限".into(),
+        Msg::PatchLeadOnly => "请先返回主会话，再导入补丁。".into(),
+        Msg::PatchContextChanged => "会话已变更，请在目标会话重新导入补丁。".into(),
+        Msg::SpecLeadOnly => "请返回主会话管理任务规范。".into(),
+        Msg::SpecChanged => "会话已变更，请在目标会话重新打开 /spec。".into(),
+        Msg::SpecTitle => "任务规范".into(),
+        Msg::SpecOlder => "更早的消息".into(),
+        Msg::SpecReview => "请先核对完整原文再操作".into(),
+        Msg::SpecPin => "固定为任务规范".into(),
+        Msg::SpecUnpin => "解除固定".into(),
+        Msg::PatchReady => "请用 apply_patch 应用这份已导入的用户补丁，使用其 artifact_id 和完整 file_paths，不要复述补丁正文：".into(),
         Msg::CmdAboutPaste => "把剪贴板(或一个文件)的内容放进输入框;Ctrl+V 被终端或系统拦下时用它".into(),
         Msg::CmdAboutConfig => "拉出设置面板:搜索、改值;esc 关".into(),
         Msg::CmdAboutProviderPanel => "拉出 provider 面板:账号与模型,增改删;enter 换过去,esc 关".into(),

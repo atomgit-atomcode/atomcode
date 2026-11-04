@@ -238,6 +238,12 @@ pub struct Message {
 impl Message {
     /// Original human text, excluding model-only historical context framing.
     pub fn display_text(&self) -> &str {
+        if self.internal_origin.as_deref() == Some(crate::session::retention::PINNED_ORIGIN) {
+            return self
+                .text
+                .strip_prefix(crate::session::retention::FRAMING)
+                .unwrap_or(&self.text);
+        }
         if self.internal_origin.as_deref() == Some(COMPACTION_RETAINED_MODEL_ORIGIN) {
             self.text
                 .strip_prefix(COMPACTION_RETAINED_FRAMING)
@@ -746,6 +752,13 @@ impl Conversation {
         if let Some(summary) = &plan.summary {
             candidate.push(Message::synthetic_user(summary.clone()));
         }
+        candidate.extend(
+            self.messages[drain_from..drain_to]
+                .iter()
+                .filter(|m| crate::session::retention::is_retained(m))
+                .cloned(),
+        );
+        let retained_count = candidate.len() - drain_from - usize::from(plan.summary.is_some());
         candidate.extend_from_slice(&self.messages[drain_to..]);
         // Apply rewrites. `rewrites` indices are ORIGINAL `self.messages` indices
         // (the same space as drain_from/drain_to), so each must be TRANSLATED into
@@ -758,13 +771,18 @@ impl Conversation {
         //     message was removed by the drain; there is nothing to rewrite.
         //   * otherwise TRANSLATE to the candidate index:
         //       - `orig_i < drain_from` → unchanged (it precedes the drain).
-        //       - `orig_i >= drain_to`  → `drain_from + summary_shift + (orig_i - drain_to)`,
+        //       - `orig_i >= drain_to`  → `drain_from + summary_shift + retained_count + (orig_i - drain_to)`,
         //         where `summary_shift` is 1 iff a summary was inserted at drain_from.
         // An out-of-range translated index is skipped (never panic).
         let summary_shift = usize::from(plan.summary.is_some());
         for (orig_i, new_text) in &plan.rewrites {
             let orig_i = *orig_i;
-            if orig_i < floor {
+            if orig_i < floor
+                || self
+                    .messages
+                    .get(orig_i)
+                    .is_some_and(|m| crate::session::retention::is_retained(m))
+            {
                 continue; // sacred prefix
             }
             if orig_i >= drain_from && orig_i < drain_to {
@@ -775,7 +793,7 @@ impl Conversation {
             } else {
                 // orig_i >= drain_to here (the `[drain_from, drain_to)` case was
                 // skipped above). Map past the removed range and the summary insert.
-                drain_from + summary_shift + (orig_i - drain_to)
+                drain_from + summary_shift + retained_count + (orig_i - drain_to)
             };
             if let Some(m) = candidate.get_mut(cand_i) {
                 m.text = new_text.clone();

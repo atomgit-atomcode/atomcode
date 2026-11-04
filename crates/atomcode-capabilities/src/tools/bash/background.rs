@@ -1012,6 +1012,7 @@ mod tests {
         let files: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .map(|f| f.unwrap())
+            .filter(|e| e.file_name() != ".gitignore")
             .collect();
         assert_eq!(files.len(), 1);
         let captured = std::fs::read_to_string(files[0].path()).unwrap();
@@ -1283,6 +1284,7 @@ mod tests {
                 let files: Vec<_> = std::fs::read_dir(d.path())
                     .unwrap()
                     .map(|e| e.unwrap())
+                    .filter(|e| e.file_name() != ".gitignore")
                     .collect();
                 assert_eq!(files.len(), 1);
                 let captured = std::fs::read_to_string(files[0].path()).unwrap();

@@ -314,6 +314,8 @@ export interface ToolResultInfo {
 }
 
 export interface SessionMessage {
+  source_seq?: number;
+  task_spec_pinned?: boolean;
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
   synthetic?: boolean;
@@ -1522,4 +1524,24 @@ export async function workbenchPreview(session: string, path: string): Promise<B
   const response = await apiFetch('/workbench/preview?' + new URLSearchParams({ session_id: session, path }), { headers: authHeaders() });
   if (!response.ok) throw await failure(response);
   return response.blob();
+}
+
+/** Explicit raw upload: no text decoding, base64 or model echo. */
+export async function importPatchFile(session: string, file: File, signal?: AbortSignal): Promise<string> {
+  if (file.size > 8 * 1024 * 1024) throw new Error('Patch exceeds 8 MiB');
+  const response = await apiFetch('/live/patch?' + new URLSearchParams({ session_id: session }), {
+    method: 'POST', headers: {...authHeaders(), 'Content-Type':'application/octet-stream'}, body: file, signal,
+  });
+  if (!response.ok) throw await failure(response);
+  const value = await response.json();
+  if (typeof value.reference !== 'string') throw new Error('Invalid patch reference');
+  return value.reference;
+}
+
+export interface TaskSpecItem { seq:number; turn:number; at:number; bytes:number; preview:string; pinned:boolean }
+export interface TaskSpecView { session_id?:string; items?:TaskSpecItem[]; next_before?:number|null; pinned_count?:number; pinned_bytes:number; budget_bytes:number; seq?:number; text?:string; pinned?:boolean; bytes?:number }
+/** Explicit user action; the server validates bound session and idle mutations. */
+export async function taskSpecs(sessionId:string,args:string,signal?:AbortSignal):Promise<TaskSpecView> {
+  const response=await apiFetch('/live/spec',{method:'POST',headers:{...authHeaders(),'Content-Type':'application/json'},body:JSON.stringify({session_id:sessionId,args}),signal});
+  return readJson<TaskSpecView>(response);
 }

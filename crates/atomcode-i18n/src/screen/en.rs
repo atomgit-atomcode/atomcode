@@ -387,6 +387,12 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             true => format!("the endpoint answered HTTP {status}; check the API key").into(),
             false => format!("the endpoint answered HTTP {status}").into(),
         },
+        Msg::OllamaUnavailable { endpoint, local } => if local {
+            format!("Could not connect to Ollama at {endpoint}. Run `ollama serve` on the machine running atomcode, then press Ctrl+F to retry. Default port: 11434; edit the address if yours differs.")
+        } else {
+            format!("Could not connect to Ollama at {endpoint}. Check `ollama serve` on the target machine, its address, port and network access, then press Ctrl+F to retry.")
+        }.into(),
+        Msg::OllamaModelsFound { count } => format!("Ollama is running · {count} models · Enter to continue · Ctrl+F to refresh").into(),
         Msg::DiscoverUnreachable => "could not reach the endpoint".into(),
         Msg::ProviderDiscoverFailed { why } => {
             format!("Could not fetch the model list: {why}. Type the model id by hand.").into()
@@ -401,6 +407,18 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdAboutKeys => "list the key bindings".into(),
         Msg::CmdAboutTodo => "print the plan; `add <task>`, `clear`; `show`/`hide` the panel".into(),
         Msg::CmdAboutTeam => "open or fold the team panel".into(),
+        Msg::CmdAboutPatch => "import a unified-diff file without copying its body; review the reference before sending".into(),
+        Msg::PatchTooLarge => "Patch exceeds the 8 MiB import limit".into(),
+        Msg::PatchLeadOnly => "Return to the lead conversation before importing a patch.".into(),
+        Msg::PatchContextChanged => "The conversation changed. Import the patch again in the intended conversation.".into(),
+        Msg::SpecLeadOnly => "Return to the lead conversation to manage task specifications.".into(),
+        Msg::SpecChanged => "The conversation changed. Reopen /spec in the intended conversation.".into(),
+        Msg::SpecTitle => "Task specifications".into(),
+        Msg::SpecOlder => "Older messages".into(),
+        Msg::SpecReview => "Review the original before selecting an action".into(),
+        Msg::SpecPin => "Pin as task specification".into(),
+        Msg::SpecUnpin => "Unpin task specification".into(),
+        Msg::PatchReady => "Apply this imported user patch with apply_patch using its artifact_id and exact file_paths. Do not reproduce its body:".into(),
         Msg::CmdAboutPaste => "put the clipboard (or a file) into the composer; for when the terminal or the system eats Ctrl+V".into(),
         Msg::CmdAboutConfig => "open the settings panel: search, change a value; esc closes it".into(),
         Msg::CmdAboutProviderPanel => "open the provider panel: accounts and models, add/edit/remove; enter switches, esc closes".into(),

@@ -14,6 +14,7 @@ export function createScrollRestoration(options: {
   let suspended = false;
   let disposed = false;
   let frame: number | null = null;
+  let lastTop: number | null = null;
   function stopFrame() { if (frame !== null) options.cancel(frame); frame = null; }
   function capture(): Position {
     return { following: options.following(), top: options.viewport()?.scrollTop ?? 0, session: options.session() };
@@ -23,6 +24,7 @@ export function createScrollRestoration(options: {
     if (!el || el.clientHeight <= 0) return false;
     el.scrollTop = position.following ? Math.max(0, el.scrollHeight - el.clientHeight)
       : Math.min(position.top, Math.max(0, el.scrollHeight - el.clientHeight));
+    lastTop = el.scrollTop;
     return true;
   }
   function finishRestore() {
@@ -70,11 +72,17 @@ export function createScrollRestoration(options: {
     onScroll(): boolean | null {
       const el = options.viewport();
       if (disposed || suspended || restoring || !el || el.clientHeight <= 0) return null;
-      return el.scrollHeight - el.scrollTop - el.clientHeight <= 80;
+      const movedUp = lastTop !== null && el.scrollTop < lastTop - 0.5;
+      const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= 2;
+      // Layout growth is not user intent; reading ends only at the actual bottom.
+      const following = atBottom ? true : movedUp || lastTop === null ? false : options.following();
+      lastTop = el.scrollTop;
+      return following;
     },
     interact() {
       // A real gesture takes priority over any pending browser-resume correction.
       restoring = null; saved = null; stopFrame();
+      lastTop = options.viewport()?.scrollTop ?? null;
     },
     dispose() { disposed = true; stopFrame(); },
   };

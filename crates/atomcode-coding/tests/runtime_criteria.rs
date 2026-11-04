@@ -4412,6 +4412,86 @@ fn in_use(store: &SessionManager, id: &str) -> bool {
     )
 }
 
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
+async fn a_member_with_an_occupied_log_is_rejected_before_it_can_run() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let store = SessionManager::for_project(
+        env.project.path(),
+        &atomcode_coding::config::product_dirs_from_env(),
+    );
+    let mut runtime = CodingRuntime::start(production_start(env.project.path(), &recorder, |_| {}))
+        .await
+        .unwrap();
+    let id = runtime.session.clone().unwrap().id;
+    let member = format!("{id}~mapper");
+    let lease = store.acquire_lease(&member).unwrap();
+    turn(&mut runtime, "delegate a second").await;
+    assert!(
+        !store.is_event_session(&member),
+        "a refused member created a log"
+    );
+    let requests = recorder.requests.lock().unwrap();
+    assert!(
+        !requests
+            .iter()
+            .flatten()
+            .any(|m| m.role == Role::User && m.text == "map what is here"),
+        "a member ran even though it could not own its log"
+    );
+    drop(requests);
+    assert!(in_use(&store, &member));
+    drop(lease);
+    assert!(!in_use(&store, &member));
+    runtime.handle.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
+async fn a_stopped_member_name_is_not_reused_or_appended() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let project = env.project.path();
+    let store =
+        SessionManager::for_project(project, &atomcode_coding::config::product_dirs_from_env());
+    let mut runtime = CodingRuntime::start(production_start(project, &recorder, |_| {}))
+        .await
+        .unwrap();
+    let id = runtime.session.clone().unwrap().id;
+    let original = format!("{id}~mapper");
+    turn(&mut runtime, "delegate a second").await;
+    stored_until(&store, &original, "first member finished", |events| {
+        turns_ended(events) >= 1
+    })
+    .await;
+    turn(&mut runtime, "stop the mapper").await;
+    stored_until(&store, &original, "committed stop", |events| {
+        events.iter().any(|e| {
+            matches!(
+                e.event,
+                atomcode_kernel::session::SessionEvent::Stopped { .. }
+            )
+        })
+    })
+    .await;
+    let old_events = store.load_events(&original).unwrap();
+    turn(&mut runtime, "delegate a second").await;
+    stored_until(&store, &id, "rejected reuse of a stopped member name", |events| events.iter().any(|e|
+        matches!(&e.event, atomcode_kernel::session::SessionEvent::ToolResultLogged { is_error: true, content, .. } if content.contains("choose another")))).await;
+    assert_eq!(store.load_events(&original).unwrap(), old_events);
+    assert_eq!(store.children(&id).len(), 1);
+    assert!(!in_use(&store, &original));
+    runtime.handle.shutdown().await.unwrap();
+    let resumed = CodingRuntime::start(production_start(project, &recorder, |start| {
+        start.prepare.session = SessionMode::Resume(id)
+    }))
+    .await
+    .unwrap();
+    assert!(!in_use(&store, &original));
+    resumed.handle.shutdown().await.unwrap();
+}
+
 /// A team outlives the process (`docs/adr/0024` §11–§13). Each member's log is
 /// a session of its own under the lead, written under a lease of its own and
 /// never listed beside the lead; resuming the lead brings back the members it

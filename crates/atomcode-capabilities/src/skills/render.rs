@@ -32,7 +32,7 @@ pub const PER_SKILL_DESC_CAP: usize = 1024;
 /// reconcile the block in place across `--resume`.
 pub const CATALOG_HEADER: &str = "=== AVAILABLE SKILLS ===";
 
-const GUIDANCE: &str = "Skills are reusable instruction templates for specific tasks. The names listed below are the only skill names you may pass directly to `use_skill`; never invent or guess a skill name from memory, task type, or common workflows. Match a task only against descriptions actually shown below. If a task clearly matches a shown skill's description — not only when the user names the skill — you MUST load that exact skill with `use_skill` and follow it BEFORE doing the work, INCLUDING before asking clarifying questions, exploring, or planning. If this catalog says skills were omitted, call `list_skills` before using an omitted or otherwise unlisted name, and use only an exact name it returns. If no available skill matches, proceed normally. If `use_skill` reports a missing skill, do not guess another name; briefly note it and continue with the best fallback. Announce in one line which skill you're using; if you skip an obviously matching shown skill, say why. If several shown skills match, use the minimal set that covers the request.";
+const GUIDANCE: &str = "Before taking task actions, match the request against the skill descriptions below. If the user names a skill or a description clearly matches, you MUST load that exact skill with `use_skill` BEFORE searching files, running commands, planning, proposing fixes, or asking clarifying questions; then follow its instructions. A bug report, failed test, or a fix that still fails is a task to match, even when no skill is named. Use the minimal matching set. Never invent or guess a skill name: use only exact names from this catalog or `list_skills`. If skills were omitted, call `list_skills` to discover them before choosing an unlisted name. If none match, proceed normally. If loading fails, report it briefly and continue with the best fallback. Announce the skill you load; if you skip an obviously matching skill, say why.";
 
 /// One catalog row, already reduced from a crate-specific `Skill`. `source_rank`
 /// is computed via [`source_rank`]; lower = higher priority when budget forces
@@ -335,15 +335,15 @@ mod tests {
         assert!(out.starts_with("=== AVAILABLE SKILLS ==="));
         assert!(out.contains("use_skill"));
         assert!(
-            out.contains("only skill names you may pass directly"),
+            out.contains("use only exact names from this catalog or `list_skills`"),
             "catalog names form a closed set: {out}"
         );
         assert!(
-            out.contains("never invent or guess a skill name"),
+            out.contains("Never invent or guess a skill name"),
             "must prohibit hallucinated skill names: {out}"
         );
         assert!(
-            out.contains("If no available skill matches, proceed normally"),
+            out.contains("If none match, proceed normally"),
             "no-match fallback: {out}"
         );
         // codex-style anti-bypass framing: mandatory-if-matches + justify a skip.

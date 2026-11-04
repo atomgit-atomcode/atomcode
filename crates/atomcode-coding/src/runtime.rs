@@ -3058,6 +3058,48 @@ impl CodingRuntimeHandle {
         result.await.map_err(|_| RuntimeError::Unavailable)?
     }
 
+    /// Explicit user's specification operation, scoped to this generation/session.
+    pub async fn task_specs(
+        &self,
+        session: String,
+        args: String,
+    ) -> Result<serde_json::Value, RuntimeError> {
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::TaskSpecs {
+                generation: runtime_state_generation(self.state.load(Ordering::Acquire)),
+                session,
+                args,
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
+    /// Explicit user input; never route patch bytes through model output or shell argv.
+    pub async fn import_patch(
+        &self,
+        session: String,
+        bytes: Vec<u8>,
+    ) -> Result<String, RuntimeError> {
+        if bytes.len() > 8 * 1024 * 1024 {
+            return Err(RuntimeError::CommandRefused(
+                "patch exceeds 8 MiB import limit".into(),
+            ));
+        }
+        let state = self.state.load(Ordering::Acquire);
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::ImportPatch {
+                generation: runtime_state_generation(state),
+                session,
+                bytes,
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
     /// What this session has changed in the workspace — every file, or one
     /// file's diff.
     pub async fn workspace_changes(
@@ -3989,6 +4031,20 @@ pub enum CodingRuntimeControl {
         /// name asks: one call on the account instead of three.
         windows_only: bool,
         done: oneshot::Sender<Result<Allowance, RuntimeError>>,
+    },
+    /// Explicit user operations over retained task specifications.
+    TaskSpecs {
+        generation: u64,
+        session: String,
+        args: String,
+        done: oneshot::Sender<Result<serde_json::Value, RuntimeError>>,
+    },
+    /// Import explicit user bytes into the current session's input artifacts.
+    ImportPatch {
+        generation: u64,
+        session: String,
+        bytes: Vec<u8>,
+        done: oneshot::Sender<Result<String, RuntimeError>>,
     },
     /// What this session has changed in the workspace. `file` asks for one
     /// file's diff text instead of the summary of all of them.
@@ -6157,6 +6213,65 @@ fn spawn_runtime_owner_with_optional_agent(
                                 spent_unavailable,
                             }));
                         });
+                    }
+                    Some(CodingRuntimeControl::TaskSpecs { generation: requested, session, args, done }) => {
+                        let mutates=matches!(args.split_whitespace().next(),Some("pin"|"unpin"));
+                        let mut result = if requested != generation || (mutates && (active_turn.is_some() || !pending_requests.is_empty())) { Err(RuntimeError::Busy) } else {
+                            resources.as_ref().and_then(|r| r.harness_app.as_ref()).ok_or(RuntimeError::Unavailable).and_then(|app| {
+                                let context=app.context();
+                                let agents=context.service::<atomcode_harness::seams::AgentsSvc>().ok_or(RuntimeError::Unavailable)?;
+                                let target=agents.list().into_iter().find(|a|a.parent().is_none()&&a.session_id()==session).ok_or(RuntimeError::Unavailable)?;
+                                atomcode_harness::plugins::spec::execute(&target,&args).map_err(RuntimeError::CommandRefused)
+                            })
+                        };
+                        if mutates && result.is_ok() {
+                            conversation_revision=conversation_revision.wrapping_add(1);
+                            if let Some(error)=resources.as_ref().and_then(|r|r.parts.take_snapshot_persistence_uncertain()) {
+                                persistence_failure=Some(error.clone());
+                                let _=send_agent_command(&agent,AgentCommand::Shutdown);
+                                agent=None;
+                                let report=StopReport{persistence_failure:Some(error),..Default::default()};
+                                if let Some(error)=fail_close_after_stopped_persistence(&report,resources.as_ref(),&mut goal,&mut loop_state,&mut pending_wakeup,&mut held_turn,&mut active_turn,&mut terminal_reason,&mut turn_stats,&mut conversation_revision,&mut snapshot_waiters,&mut agent_available,controls.state.as_ref(),generation,&runtime_event_tx) {
+                                    result=Err(error);
+                                }
+                            }
+                        }
+                        let _=done.send(result);
+                    }
+                    Some(CodingRuntimeControl::ImportPatch { generation: requested, session, bytes, done }) => {
+                        if requested != generation || active_turn.is_some() || !pending_requests.is_empty() {
+                            let _ = done.send(Err(RuntimeError::Busy)); continue;
+                        }
+                        let stop = controls.stop_now();
+                        let imported = async {
+                            let runtime = resources.as_ref().ok_or(RuntimeError::Unavailable)?;
+                            let app = runtime.harness_app.as_ref().ok_or(RuntimeError::Unavailable)?;
+                            let context = app.context();
+                            let agents = context.service::<atomcode_harness::seams::AgentsSvc>().ok_or(RuntimeError::Unavailable)?;
+                            if !agents.list().iter().any(|agent| agent.parent().is_none() && agent.session_id() == session) { return Err(RuntimeError::CommandRefused("patch belongs to a different session".into())); }
+                            let world = context.service::<atomcode_harness::seams::FsSvc>().ok_or(RuntimeError::Unavailable)?;
+                            let store = context.service::<atomcode_harness::seams::OutputArtifactsSvc>().ok_or(RuntimeError::Unavailable)?;
+                            let store = Arc::new(store.scoped_inputs(&session));
+                            let provider: atomcode_capabilities::tools::output_artifact::ArtifactStoreProvider = Arc::new(move || Some(store.clone()));
+                            let dirs = atomcode_harness::product_dirs(&context).map_err(RuntimeError::CommandRefused)?;
+                            let tool = atomcode_capabilities::tools::ImportPatchTool::new(world, provider, atomcode_capabilities::tools::SensitivePaths::of(&dirs));
+                            let operation_cancel = stop.child_token();
+                            let tool_context = atomcode_kernel::tool::ToolContext { working_dir: runtime.config.working_dir.clone(), cancel: operation_cancel.clone(), progress: Default::default(), requester: None };
+                            // Hashing/JSON serialization and artifact fsync must not block
+                            // the owner or its stop/timeout signal. This task owns input
+                            // data and world references, never another live agent.
+                            let executor = tokio::runtime::Handle::current();
+                            let mut task = tokio::task::spawn_blocking(move || executor.block_on(tool.import_bytes(bytes, &tool_context)));
+                            tokio::select! {
+                                _ = stop.cancelled() => { operation_cancel.cancel(); task.abort(); Err(RuntimeError::Cancelled) },
+                                result = tokio::time::timeout(std::time::Duration::from_secs(10), &mut task) => match result {
+                                    Ok(Ok(result)) => result.map_err(RuntimeError::CommandRefused),
+                                    Ok(Err(error)) => Err(RuntimeError::CommandRefused(error.to_string())),
+                                    Err(_) => { operation_cancel.cancel(); task.abort(); Err(RuntimeError::CommandRefused("patch import timed out; no workspace files were written".into())) },
+                                },
+                            }
+                        }.await;
+                        let _ = done.send(imported);
                     }
                     // Reading only: unlike the rewind catalog this does not
                     // refuse while a turn is running. Looking at what has
@@ -10064,6 +10179,12 @@ fn reject_runtime_control_with_error(
         // like every other awaited control.
         CodingRuntimeControl::ToolCatalog { done, .. }
         | CodingRuntimeControl::SwitchTool { done, .. } => {
+            let _ = done.send(Err(error));
+        }
+        CodingRuntimeControl::TaskSpecs { done, .. } => {
+            let _ = done.send(Err(error));
+        }
+        CodingRuntimeControl::ImportPatch { done, .. } => {
             let _ = done.send(Err(error));
         }
         CodingRuntimeControl::SideCallProvider { done, .. } => {
@@ -14070,6 +14191,165 @@ mod tests {
             plugin_hooks: Arc::new(crate::StaticPluginHookSource::default()),
             image_preprocessor: None,
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_patch_bytes_are_bound_to_the_current_runtime_session() {
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("中文 file.txt"), b"old\r\n").unwrap();
+        let bytes = "--- a/中文 file.txt\r\n+++ b/中文 file.txt\r\n@@ -1 +1 @@\r\n-old\r\n+new\r\n"
+            .as_bytes()
+            .to_vec();
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.agent.dirs =
+            atomcode_capabilities::ProductDirs::new(home.path(), ".patch-entry-test");
+        start.prepare.session = crate::SessionMode::Fresh;
+        let runtime = CodingRuntime::start(start).await.unwrap();
+        let current = runtime
+            .handle
+            .fresh_session()
+            .await
+            .unwrap()
+            .session_id
+            .unwrap();
+        let reference = runtime
+            .handle
+            .import_patch(current.clone(), bytes.clone())
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&reference).unwrap();
+        assert_eq!(
+            value["patch_sha256"],
+            "4fe615a217f60bf5b378edae29c60a6aa8cf5c8b29f96f64441b45cd922d34f1"
+        );
+        assert_eq!(value["file_paths"], serde_json::json!(["中文 file.txt"]));
+        assert_eq!(
+            std::fs::read(project.path().join("中文 file.txt")).unwrap(),
+            b"old\r\n"
+        );
+        assert!(runtime
+            .handle
+            .import_patch("different-session".into(), bytes.clone())
+            .await
+            .is_err());
+        let next = runtime
+            .handle
+            .fresh_session()
+            .await
+            .unwrap()
+            .session_id
+            .unwrap();
+        assert_ne!(next, current);
+        assert!(runtime.handle.import_patch(current, bytes).await.is_err());
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn task_specifications_are_session_scoped_and_resume_from_the_event_log() {
+        struct SpecProviderFactory;
+        impl CodingProviderFactory for SpecProviderFactory {
+            fn build(
+                &self,
+                _config: &CodingAgentConfig,
+                _session: Option<&str>,
+            ) -> Result<Arc<dyn LlmProvider>, crate::ProviderBuildError> {
+                Ok(Arc::new(
+                    atomcode_kernel::testkit::MockProvider::new(vec![vec![
+                        atomcode_kernel::stream::StreamEvent::TextDelta("answer".into()),
+                        atomcode_kernel::stream::StreamEvent::Done { truncated: false },
+                    ]])
+                    .with_ctx_window(64_000),
+                ))
+            }
+        }
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let dirs = atomcode_capabilities::ProductDirs::new(home.path(), ".spec-entry-test");
+        let mut start = native_start(false);
+        start.provider_factory = Arc::new(SpecProviderFactory);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.agent.dirs = dirs.clone();
+        start.prepare.session = crate::SessionMode::Fresh;
+        let mut runtime = CodingRuntime::start(start).await.unwrap();
+        let id = runtime
+            .handle
+            .fresh_session()
+            .await
+            .unwrap()
+            .session_id
+            .unwrap();
+        runtime
+            .handle
+            .submit(UserInput::from("MUST NOT change API\r\nlet exact = 42;"))
+            .await
+            .unwrap();
+        wait_for_turn_finished(&mut runtime).await;
+        let list = runtime
+            .handle
+            .task_specs(id.clone(), "list".into())
+            .await
+            .unwrap();
+        let seq = list["items"][0]["seq"].as_u64().unwrap();
+        runtime
+            .handle
+            .task_specs(id.clone(), format!("pin {seq}"))
+            .await
+            .unwrap();
+        assert!(runtime
+            .handle
+            .task_specs("other-session".into(), "list".into())
+            .await
+            .is_err());
+        runtime.handle.shutdown().await.unwrap();
+        runtime.task.await.unwrap();
+        let mut start = native_start(false);
+        start.provider_factory = Arc::new(SpecProviderFactory);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.agent.dirs = dirs.clone();
+        start.prepare.session = crate::SessionMode::Resume(id.clone());
+        let runtime = CodingRuntime::start(start).await.unwrap();
+        let show = runtime
+            .handle
+            .task_specs(id.clone(), format!("show {seq}"))
+            .await
+            .unwrap();
+        assert_eq!(show["text"], "MUST NOT change API\r\nlet exact = 42;");
+        assert_eq!(show["pinned"], true);
+        let snapshot = runtime.handle.snapshot().await.unwrap();
+        assert!(snapshot
+            .messages
+            .iter()
+            .any(|m| m.text.contains("let exact = 42;")));
+        runtime
+            .handle
+            .task_specs(id.clone(), format!("unpin {seq}"))
+            .await
+            .unwrap();
+        runtime
+            .handle
+            .task_specs(id.clone(), format!("pin {seq}"))
+            .await
+            .unwrap();
+        // A successful in-memory pin edit must not claim durable success if
+        // the authoritative event writer cannot open its target.
+        let manager =
+            atomcode_capabilities::session::SessionManager::for_project(project.path(), &dirs);
+        let path = manager.root().join(format!("{id}.events"));
+        let backup = path.with_extension("events.test-backup");
+        std::fs::rename(&path, &backup).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(runtime
+            .handle
+            .task_specs(id, format!("unpin {seq}"))
+            .await
+            .is_err());
+        assert_eq!(runtime.handle.status().phase, RuntimePhase::Failed);
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&backup, &path).unwrap();
+        runtime.handle.shutdown().await.unwrap();
+        runtime.task.await.unwrap();
     }
 
     async fn wait_for_turn_finished(runtime: &mut CodingRuntime) {

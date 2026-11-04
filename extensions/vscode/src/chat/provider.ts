@@ -462,6 +462,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     panel: vscode.WebviewPanel,
     sessionId: string,
     projectHash: string,
+    publish = true,
   ): Promise<MessageInfo[] | undefined> {
     const currentLoad = this._panelHistoryLoads.get(panel);
     if (
@@ -506,12 +507,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const targetRuntime = this._getRuntime(sessionId);
         targetRuntime.projectHash = projectHash;
         targetRuntime.messages = messages;
-        this._postOrQueueToPanel(sessionId, {
-          type: 'sessionMessages',
-          messages,
-          terminal: this._terminalForWebview(targetRuntime.terminal),
-          todos: detail.todos,
-        }, targetRuntime.streamGeneration ?? 0);
+        if (publish) {
+          this._postOrQueueToPanel(sessionId, {
+            type: 'sessionMessages',
+            messages,
+            terminal: this._terminalForWebview(targetRuntime.terminal),
+            todos: detail.todos,
+          }, targetRuntime.streamGeneration ?? 0);
+        }
         return messages;
       })
       .finally(() => {
@@ -1709,15 +1712,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (sid) {
       const info = this._panelSessions.get(sid);
       messagesToLoad = info?.messages ?? initialRuntime?.messages;
-      if (!messagesToLoad && info?.messagesPromise) {
+      while (!messagesToLoad) {
+        const current = this._panelSessions.get(sid);
+        messagesToLoad = current?.messages ?? initialRuntime?.messages;
+        if (messagesToLoad || !current?.messagesPromise) break;
+        const pending = current.messagesPromise;
         try {
-          messagesToLoad = await info.messagesPromise;
-          if (messagesToLoad) {
-            info.messages = messagesToLoad;
-            initialRuntime!.messages = messagesToLoad;
+          const loaded = await pending;
+          // A saved local command can replace an older in-flight history read.
+          // Follow the current cache/promise rather than the retired snapshot.
+          if (this._panelSessions.get(sid)?.messagesPromise === pending) {
+            messagesToLoad = loaded;
+            break;
           }
         } catch {
           // The remaining initial state still renders without history.
+          break;
         }
       }
     }
@@ -2748,6 +2758,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private async _persistLocalCommandTranscript(sessionId: string, userText: string, assistantText: string) {
+    const runtime = this._getRuntime(sessionId);
+    const generation = runtime.streamGeneration ?? 0;
     const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     try {
       const result = await this._client.appendSessionMessages(sessionId, {
@@ -2757,23 +2769,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           { role: 'assistant', content: assistantText },
         ],
       });
-      const info = this._panelSessions.get(sessionId);
-      if (info) {
-        info.projectHash = result.project_hash;
-        // Ensure cached messages are loaded before appending
-        if (!info.messages && info.messagesPromise) {
-          info.messages = (await info.messagesPromise) ?? [];
-          info.messagesPromise = undefined;
-        }
-        if (info.messages) {
-          info.messages = [
-            ...info.messages,
-            { role: 'user', content: userText },
-            { role: 'assistant', content: assistantText },
-          ];
+      if (this._sessionRuntimes.get(sessionId) === runtime) {
+        runtime.projectHash = result.project_hash;
+        const info = this._panelSessions.get(sessionId);
+        if (info) info.projectHash = result.project_hash;
+        const panel = this._panels.get(sessionId);
+        if (panel && info && !runtime.isGenerating
+            && (runtime.streamGeneration ?? 0) === generation) {
+          // A pending history read may already contain this saved command. Never
+          // append it to that snapshot again. Retire the older read and refresh
+          // both caches from storage, without replacing the visible transcript.
+          this._panelHistoryLoads.delete(panel);
+          info.messages = undefined;
+          runtime.messages = undefined;
+          try {
+            await this._loadPanelHistory(panel, sessionId, result.project_hash, false);
+          } catch (e) {
+            // The write succeeded. Leave caches invalid so reopening can retry.
+            console.warn(`[AtomCode] Failed to refresh local command history: ${this._messageFromError(e)}`);
+          }
         }
       }
-      this._getRuntime(sessionId).projectHash = result.project_hash;
       await this._refreshSessions();
     } catch (e) {
       console.warn(`[AtomCode] Failed to persist local slash command: ${this._messageFromError(e)}`);

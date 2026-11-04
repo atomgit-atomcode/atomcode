@@ -16,6 +16,9 @@
 
 use serde::{Deserialize, Serialize};
 
+#[path = "session_retention.rs"]
+pub mod retention;
+
 use crate::event::{PolicyIntervention, StopReason};
 use crate::message::{ImageContent, Message, MessageMeta, ReasoningBlock, Role};
 use crate::stream::TokenUsage;
@@ -135,6 +138,15 @@ pub struct RetryAttempt {
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum SessionEvent {
+    /// A person's explicit decision to retain original context. The source text
+    /// remains solely in UserMessage; inactive records release it.
+    ContextRetention {
+        turn: u64,
+        source: SeqNo,
+        active: bool,
+        bytes: usize,
+        sha256: String,
+    },
     TurnStart {
         turn: u64,
     },
@@ -461,7 +473,8 @@ impl SessionEvent {
 
     pub fn turn(&self) -> u64 {
         match self {
-            Self::TurnStart { turn }
+            Self::ContextRetention { turn, .. }
+            | Self::TurnStart { turn }
             | Self::UserMessage { turn, .. }
             | Self::StepStart { turn, .. }
             | Self::StepEnd { turn, .. }
@@ -496,7 +509,8 @@ impl SessionEvent {
     pub fn is_model_visible(&self) -> bool {
         matches!(
             self,
-            Self::UserMessage { .. }
+            Self::ContextRetention { .. }
+                | Self::UserMessage { .. }
                 | Self::AssistantMessage { .. }
                 | Self::ToolResultLogged { .. }
                 | Self::Injected { .. }
@@ -573,7 +587,8 @@ impl SessionEvent {
 /// A file's header records the version that created it; a later build may
 /// append facts of a kind added since. A reader that meets a kind it does not
 /// know treats the file as newer than itself, the same refusal.
-pub const SESSION_FORMAT_VERSION: u32 = 13;
+/// **14** — explicit original-context retention decisions.
+pub const SESSION_FORMAT_VERSION: u32 = 14;
 
 /// One replacement a [`SessionEvent::MessagesRewritten`] makes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -754,6 +769,7 @@ pub fn renumber(events: Vec<LoggedEvent>, first: SeqNo) -> Vec<LoggedEvent> {
         .map(|mut logged| {
             logged.seq = map(logged.seq);
             match &mut logged.event {
+                SessionEvent::ContextRetention { source, .. } => *source = map(*source),
                 SessionEvent::Compacted { through, from, .. } => {
                     *through = map(*through);
                     if *from != 0 {
@@ -861,6 +877,7 @@ fn folded_ranges(
 pub fn visible_turns(events: &[LoggedEvent]) -> std::collections::BTreeSet<u64> {
     let taken_back = taken_back(events);
     let folded = folded_ranges(events, &taken_back);
+    let pinned = retention::active_sources(events);
     let undone: std::collections::HashSet<u64> = events
         .iter()
         .filter_map(|logged| match logged.event {
@@ -870,9 +887,10 @@ pub fn visible_turns(events: &[LoggedEvent]) -> std::collections::BTreeSet<u64> 
         .collect();
     let mut visible = std::collections::BTreeSet::new();
     for logged in events.iter().filter(|logged| !taken_back(logged.seq)) {
-        if folded
-            .iter()
-            .any(|(from, through)| logged.seq > *from && logged.seq <= *through)
+        if !pinned.contains_key(&logged.seq)
+            && folded
+                .iter()
+                .any(|(from, through)| logged.seq > *from && logged.seq <= *through)
         {
             continue;
         }
@@ -958,6 +976,7 @@ pub fn retained_events(events: &[LoggedEvent]) -> impl Iterator<Item = &LoggedEv
         let session_wide = matches!(
             &entry.event,
             SessionEvent::Interrupted { .. }
+                | SessionEvent::ContextRetention { .. }
                 | SessionEvent::Injected {
                     origin: InjectionOrigin::Memory
                         | InjectionOrigin::CompactionSummary
@@ -1152,6 +1171,7 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<TracedMessage> {
         })
         .collect();
 
+    let retained_sources = retention::active_sources(events);
     let mut projection = Projection::new();
     if let Some((seq, summary)) = summary {
         let mut message = Message::system(summary);
@@ -1188,6 +1208,7 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<TracedMessage> {
             return false;
         }
         is_memory
+            || retained_sources.contains_key(&e.seq)
             || !folded
                 .iter()
                 .any(|(from, through)| e.seq > *from && e.seq <= *through)
@@ -1251,7 +1272,8 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<TracedMessage> {
                 projection.push(Message::user_interruption(), Provenance::Derived(seq));
             }
             SessionEvent::UserMessage { text, images, .. } => {
-                let text = text_of(text);
+                let pinned = retained_sources.contains_key(&seq);
+                let text = if pinned { text.clone() } else { text_of(text) };
                 let mut message = if images.is_empty() {
                     Message::user(text)
                 } else {
@@ -1259,7 +1281,19 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<TracedMessage> {
                 };
                 // Only surviving compactions count. The original human event is
                 // immutable; provenance is derived on both live and resumed paths.
-                if folded.iter().any(|(from, _)| *from > 0 && seq <= *from) {
+                if pinned {
+                    message.internal_origin = Some(
+                        if with_meta {
+                            retention::ORIGINAL_ORIGIN
+                        } else {
+                            retention::PINNED_ORIGIN
+                        }
+                        .into(),
+                    );
+                    if !with_meta {
+                        message.text.insert_str(0, retention::FRAMING);
+                    }
+                } else if folded.iter().any(|(from, _)| *from > 0 && seq <= *from) {
                     message.internal_origin =
                         Some(crate::message::COMPACTION_RETAINED_ORIGIN.into());
                     if !with_meta {

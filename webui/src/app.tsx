@@ -534,6 +534,7 @@ export function App() {
         )}
 
         <div class="session-body app-sidebar">
+          <div class="session-chat-column">
           <Chat
             browseSession={browseSession}
             onExecutionState={reportExecution}
@@ -559,6 +560,7 @@ export function App() {
             composerInsert={composerInsert}
             onSessionRenamed={(name) => setActiveSession((prev) => prev ? { ...prev, name } : prev)}
           />
+          </div>
           {workbenchOpen && sessionId && <div style={{ display: browseSession ? 'none' : 'contents' }}><Workbench key={sessionId} session={sessionId} cwd={activeSession?.working_dir || cwd} requestedFile={workbenchFile} onFileOpened={() => setWorkbenchFile(null)} onClose={() => setWorkbenchOpen(false)} /></div>}
         </div>
       </div>

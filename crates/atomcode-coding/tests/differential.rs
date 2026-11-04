@@ -3910,6 +3910,8 @@ async fn catalogs(key: &str, dir: &std::path::Path) -> (Vec<String>, Vec<String>
 /// a row that existed and was not mounted, or a tool a row forgot to bring with
 /// it. What is left are four things somebody has to decide, not fix.
 const KNOWN_TOOL_DIFFERENCES: &[(&str, &str)] = &[
+    ("import_patch", "tree-only: explicit user diff import stores immutable input bytes outside model output; the retired engine golden has no input-artifact channel."),
+    ("apply_patch", "tree-only: applies verified input artifact references through the current world and approval gates; not retrofitted into retired engine recordings."),
     (
         "todo_sources",
         "row-only feature added after the recorded chain retired: bounded reads of \

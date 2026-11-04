@@ -33,6 +33,7 @@ use std::sync::Arc;
 /// separately by the result-aware tool-loop policy.
 const DEFAULT_CHILD_MAX_ROUNDS: u32 = 200;
 
+pub mod apply_patch;
 pub mod approval;
 pub mod ast_grep;
 /// AtomGit REST tools (repo / pr / issue). Opt-in `atomgit` feature.
@@ -64,6 +65,8 @@ pub mod sensitive_path;
 pub mod task;
 pub mod todo;
 pub mod todo_sources;
+mod unified_patch;
+pub use apply_patch::{ApplyPatchTool, ImportPatchTool};
 /// Network tools (`web_fetch` / `web_search`). Opt-in `web` feature (HTTP stack).
 #[cfg(feature = "web")]
 pub mod web_fetch;
@@ -315,10 +318,29 @@ pub(crate) fn target_arg_values(args: &str) -> Vec<String> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(args) else {
         return Vec::new();
     };
-    TARGET_ARG_KEYS
+    let mut targets: Vec<String> = TARGET_ARG_KEYS
         .iter()
         .filter_map(|key| value.get(*key).and_then(|v| v.as_str()).map(String::from))
-        .collect()
+        .collect();
+    if let Some(paths) = value.get("file_paths").and_then(|v| v.as_array()) {
+        targets.extend(paths.iter().filter_map(|v| v.as_str().map(str::to_owned)));
+    }
+    targets
+}
+
+/// Concrete file targets, excluding search patterns and network/query strings.
+pub(crate) fn file_target_arg_values(args: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(args) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<String> = ["file_path", "path"]
+        .into_iter()
+        .filter_map(|k| value.get(k).and_then(|v| v.as_str()).map(str::to_owned))
+        .collect();
+    if let Some(many) = value.get("file_paths").and_then(|v| v.as_array()) {
+        paths.extend(many.iter().filter_map(|v| v.as_str().map(str::to_owned)));
+    }
+    paths
 }
 
 /// Resolve a model-supplied path: leading `~`/`~/` → home dir; absolute → as-is;

@@ -115,6 +115,15 @@ pub static SETTINGS: &[SettingSpec] = &[
         apply: ApplyPolicy::NextStartup,
     },
     SettingSpec {
+        id: "permissions.automation_approval",
+        path: &["permissions", "automation_approval"],
+        label_en: "Schedule change approval (inherit: no prompt only in Auto)",
+        label_zh: "定时任务变更审批（inherit 仅在 auto 下免确认）",
+        aliases: &["schedule", "automation", "定时任务", "自动化"],
+        kind: SettingKind::Choice(&["always", "inherit"]),
+        apply: ApplyPolicy::CapabilityReprepare,
+    },
+    SettingSpec {
         id: "compaction.token_limit",
         path: &["compaction", "token_limit"],
         label_en: "Automatic compaction token budget",
@@ -544,6 +553,9 @@ impl SettingSpec {
 
     pub fn value(&self, config: &Config) -> String {
         match self.id {
+            "permissions.automation_approval" => {
+                config.permissions.automation_approval.as_str().into()
+            }
             "permissions.default_mode" => config
                 .permissions
                 .default_mode
@@ -840,6 +852,37 @@ pub fn patch_selection_retry_max_attempts(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn automation_approval_is_strict_resettable_and_roundtrips() {
+        let spec = super::SETTINGS
+            .iter()
+            .find(|s| s.id == "permissions.automation_approval")
+            .unwrap();
+        assert_eq!(spec.apply, super::ApplyPolicy::CapabilityReprepare);
+        let mut doc = "[permissions]\ndeny = [\"Bash(rm *)\"]\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        for policy in ["inherit", "always"] {
+            spec.patch(&mut doc, policy).unwrap();
+            let config: crate::Config = toml::from_str(&doc.to_string()).unwrap();
+            assert_eq!(spec.value(&config), policy);
+            let restored: crate::Config =
+                toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+            assert_eq!(spec.value(&restored), policy);
+            assert_eq!(restored.permissions.deny, ["Bash(rm *)"]);
+        }
+        let before = doc.to_string();
+        assert!(spec.patch(&mut doc, "off").is_err());
+        assert_eq!(doc.to_string(), before);
+        assert!(
+            toml::from_str::<crate::Config>("[permissions]\nautomation_approval = \"off\"\n")
+                .is_err()
+        );
+        spec.patch(&mut doc, "inherit").unwrap();
+        spec.reset(&mut doc);
+        let config: crate::Config = toml::from_str(&doc.to_string()).unwrap();
+        assert_eq!(spec.value(&config), "always");
+    }
     #[test]
     fn default_mode_setting_preserves_rules_and_can_be_reset() {
         let spec = super::SETTINGS
@@ -1420,6 +1463,6 @@ mod scrollbar_setting_tests {
             assert_eq!(spec.value(&config), mode);
         }
         assert!(spec.patch(&mut doc, "sometimes").is_err());
-        assert_eq!(spec.value(&crate::config::Config::default()), "auto");
+        assert_eq!(spec.value(&crate::config::Config::default()), "hidden");
     }
 }

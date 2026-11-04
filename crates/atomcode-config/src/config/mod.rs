@@ -323,6 +323,27 @@ impl DefaultExecutionMode {
     }
 }
 
+/// Human-consent policy for persistent automation management. Execution mode
+/// and the permissions of the scheduled task itself are separate decisions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationApproval {
+    #[default]
+    Always,
+    Inherit,
+}
+impl AutomationApproval {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Always => "always",
+            Self::Inherit => "inherit",
+        }
+    }
+    pub fn is_always(&self) -> bool {
+        *self == Self::Always
+    }
+}
+
 /// `[permissions]` — user-declared pre-authorization for tool calls, so the common
 /// commands in a project stop prompting without reaching for the all-or-nothing
 /// `--dangerously-skip-permissions`.
@@ -341,6 +362,9 @@ impl DefaultExecutionMode {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PermissionsConfig {
+    /// Inherit permits schedule mutations without a click only in live Auto mode.
+    #[serde(default, skip_serializing_if = "AutomationApproval::is_always")]
+    pub automation_approval: AutomationApproval,
     /// Startup mode; temporary mode changes never write this value back.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_mode: Option<DefaultExecutionMode>,
@@ -355,7 +379,10 @@ pub struct PermissionsConfig {
 impl PermissionsConfig {
     /// No startup mode or rules declared — omit the empty table on save.
     pub fn is_empty(&self) -> bool {
-        self.default_mode.is_none() && self.allow.is_empty() && self.deny.is_empty()
+        self.automation_approval.is_always()
+            && self.default_mode.is_none()
+            && self.allow.is_empty()
+            && self.deny.is_empty()
     }
 }
 
@@ -799,9 +826,9 @@ fn default_terminal_status_glyph() -> bool {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ScrollbarMode {
-    #[default]
     Auto,
     Always,
+    #[default]
     Hidden,
 }
 

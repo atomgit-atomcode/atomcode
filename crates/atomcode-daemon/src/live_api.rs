@@ -344,6 +344,7 @@ pub(crate) fn chat_runtime_config(
             config.coding.shell_guard_policy,
         ),
         permission_rules: std::sync::Arc::new(permission_rules),
+        automation_approval: config.permissions.automation_approval,
         initial_mode: config
             .permissions
             .default_mode
@@ -1579,6 +1580,15 @@ pub(crate) async fn live_stream(
         .iter()
         .map(crate::MessageInfo::from_kernel)
         .collect();
+    let sources = crate::snapshot_spec_sources(
+        &join.snapshot,
+        std::path::Path::new(&join.binding.working_dir),
+        &join.binding.session_id,
+    );
+    for (info, (seq, pinned)) in snapshot_messages.iter_mut().zip(sources) {
+        info.source_seq = seq;
+        info.task_spec_pinned = pinned;
+    }
     if let Some(meta) = session_meta.as_ref() {
         crate::attach_snapshot_message_timestamps(
             &mut snapshot_messages,
@@ -2977,6 +2987,8 @@ mod tests {
     // ORIGINAL bytes were stashed to the display-only sidecar during the turn.
     fn missing_user_msg() -> crate::MessageInfo {
         crate::MessageInfo {
+            source_seq: None,
+            task_spec_pinned: false,
             role: "user".into(),
             content: "识别一下".into(),
             synthetic: false,
@@ -3887,11 +3899,96 @@ mod tests {
         let res2 = crate::legacy_convert::prepare_catalog_session_resume_any_project_in_root(
             root.path(),
             "session-in-proj2",
+            false,
         )
         .unwrap();
         assert!(res2.is_some());
         let prepared = res2.unwrap();
         assert_eq!(prepared.project_bucket, bucket2);
         assert_eq!(prepared.view.meta.working_dir, proj2_dir.to_string_lossy());
+    }
+}
+
+/// Explicit user upload. Raw bytes bypass model output and command-line argv.
+pub(crate) async fn live_import_patch(
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+    bytes: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(session) = query.get("session_id").filter(|s| !s.is_empty()) else {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error":"session_id required"})),
+        )
+            .into_response();
+    };
+    match crate::native_live::import_patch(session.clone(), bytes.to_vec()).await {
+        Ok(reference) => (
+            axum::http::StatusCode::OK,
+            axum::Json(serde_json::json!({"reference":reference})),
+        )
+            .into_response(),
+        Err(error) => (
+            axum::http::StatusCode::CONFLICT,
+            axum::Json(serde_json::json!({"error":format!("{error:?}")})),
+        )
+            .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod patch_upload_tests {
+    use super::live_import_patch;
+    use axum::{
+        body::Body,
+        extract::DefaultBodyLimit,
+        http::{Request, StatusCode},
+        routing::post,
+        Router,
+    };
+    use tower::ServiceExt;
+    #[tokio::test]
+    async fn patch_upload_requires_session_and_bounds_raw_body_before_dispatch() {
+        let app = Router::new().route(
+            "/live/patch",
+            post(live_import_patch).layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
+        );
+        let missing = app
+            .clone()
+            .oneshot(
+                Request::post("/live/patch")
+                    .body(Body::from("patch"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+        let large = app
+            .oneshot(
+                Request::post("/live/patch?session_id=unused")
+                    .body(Body::from(vec![b'x'; 8 * 1024 * 1024 + 1]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(large.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct TaskSpecsReq {
+    session_id: String,
+    args: String,
+}
+/// User-only operation, authenticated by the existing live API middleware.
+pub(crate) async fn live_task_specs(Json(req): Json<TaskSpecsReq>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match crate::native_live::task_specs(req.session_id, req.args).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => (
+            axum::http::StatusCode::CONFLICT,
+            Json(serde_json::json!({"error":format!("{error:?}")})),
+        )
+            .into_response(),
     }
 }

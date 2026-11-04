@@ -636,3 +636,44 @@ async fn a_memory_injection_survives_the_summary() {
         "memory must survive the summary"
     );
 }
+
+#[tokio::test]
+async fn a_late_explicit_specification_survives_model_and_model_free_compaction() {
+    use atomcode_kernel::session::retention;
+    for model in [Some(Summarizer::new()), None] {
+        let mut w = Writer::new();
+        w.ask("initial task");
+        w.answer(&bulk("first", 20_000));
+        let spec = (1..=20)
+            .map(|n| format!("{n}. exact constraint\n"))
+            .collect::<String>()
+            + &(1..=5)
+                .map(|n| format!("MUST NOT violate negative constraint {n}\r\n"))
+                .collect::<String>()
+            + "```rust\nlet exact = 42;\n```";
+        let source = w.ask(&spec);
+        w.answer(&bulk("second", 20_000));
+        w.ask("continue");
+        w.answer(&bulk("third", 20_000));
+        w.log.append(SessionEvent::ContextRetention {
+            turn: w.turn,
+            source,
+            active: true,
+            bytes: spec.len(),
+            sha256: retention::digest(&spec),
+        });
+        let decision = decide_with_strategy(&strategy(model), &w.log, &pressure(16_000, 15_000))
+            .await
+            .expect("ordinary history can be condensed");
+        assert!(
+            decision.through >= source,
+            "the protected source must lie inside the folded span"
+        );
+        w.apply(decision);
+        retention::validate_request(&w.log.events(), &w.seen()).unwrap();
+        assert_eq!(
+            w.seen().iter().filter(|m| m.display_text() == spec).count(),
+            1
+        );
+    }
+}

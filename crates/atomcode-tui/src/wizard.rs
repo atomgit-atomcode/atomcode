@@ -113,6 +113,8 @@ pub struct Wizard {
     answers: RwLock<Vec<(String, Option<String>)>>,
     typed: RwLock<String>,
     cursor: RwLock<usize>,
+    scroll: RwLock<usize>,
+    scroll_limit: RwLock<usize>,
     on_step: OnStep,
     finished_with: String,
 }
@@ -146,6 +148,8 @@ impl Wizard {
             answers: RwLock::new(Vec::new()),
             typed: RwLock::new(String::new()),
             cursor: RwLock::new(0),
+            scroll: RwLock::new(0),
+            scroll_limit: RwLock::new(0),
             on_step,
         });
         if let Some(first) = first {
@@ -279,6 +283,7 @@ impl Wizard {
     }
 
     fn reset_entry(&self) {
+        *self.scroll.write().expect("wizard poisoned") = 0;
         self.typed.write().expect("wizard poisoned").clear();
         *self.cursor.write().expect("wizard poisoned") = 0;
     }
@@ -468,6 +473,26 @@ impl Overlay for Wizard {
         let Some(step) = self.step() else {
             return Step::Cancelled;
         };
+        match press.key {
+            Key::PageDown => {
+                self.scroll(10);
+                return Step::Stay;
+            }
+            Key::PageUp => {
+                self.scroll(-10);
+                return Step::Stay;
+            }
+            Key::Down if matches!(step.kind, StepKind::Note | StepKind::Wait { .. }) => {
+                self.scroll(1);
+                return Step::Stay;
+            }
+            Key::Up if matches!(step.kind, StepKind::Note | StepKind::Wait { .. }) => {
+                self.scroll(-1);
+                return Step::Stay;
+            }
+            _ => {}
+        }
+
         match step.kind {
             StepKind::Note => match press.key {
                 Key::Enter => self.advance(Some(String::new())),
@@ -524,6 +549,22 @@ impl Overlay for Wizard {
         }
     }
 
+    fn scroll(&self, by: i32) {
+        let mut offset = self.scroll.write().expect("wizard poisoned");
+        let limit = *self.scroll_limit.read().expect("wizard poisoned");
+        *offset = offset.saturating_add_signed(by as isize).min(limit);
+    }
+
+    fn set_scroll_limit(&self, limit: usize) {
+        *self.scroll_limit.write().expect("wizard poisoned") = limit;
+        let mut offset = self.scroll.write().expect("wizard poisoned");
+        *offset = (*offset).min(limit);
+    }
+
+    fn scroll_offset(&self) -> usize {
+        *self.scroll.read().expect("wizard poisoned")
+    }
+
     fn size(&self) -> (u8, u8) {
         (70, 70)
     }
@@ -548,6 +589,33 @@ mod tests {
     use crate::frame::Rect;
     use crate::moment::Moment;
     use std::sync::Mutex;
+
+    #[test]
+    fn note_scroll_is_bounded_and_does_not_consume_enter_or_escape() {
+        let wizard = Wizard::new(
+            "pair",
+            "Pair",
+            vec![StepDef::new("pair", "Pair", StepKind::Note)],
+            Box::new(|_| {}),
+            "paired",
+        );
+        wizard.set_scroll_limit(12);
+        assert_eq!(wizard.key(KeyPress::plain(Key::PageDown)), Step::Stay);
+        assert_eq!(wizard.scroll_offset(), 10);
+        wizard.scroll(100);
+        assert_eq!(wizard.scroll_offset(), 12);
+        wizard.scroll(-1);
+        assert_eq!(wizard.scroll_offset(), 11);
+        wizard.set_scroll_limit(3);
+        assert_eq!(wizard.scroll_offset(), 3);
+        wizard.scroll(-100);
+        assert_eq!(wizard.scroll_offset(), 0);
+        assert_eq!(wizard.key(KeyPress::plain(Key::Esc)), Step::Cancelled);
+        assert_eq!(
+            wizard.key(KeyPress::plain(Key::Enter)),
+            Step::Chose("paired".into())
+        );
+    }
 
     /// The ids of the steps that opened, in order, and the wizard they belong to.
     fn wizard(steps: Vec<StepDef>) -> (Arc<Wizard>, Arc<Mutex<Vec<String>>>) {

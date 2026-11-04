@@ -757,6 +757,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     stage_fresh: bool,
 ) -> io::Result<CodingParts> {
     let tools_started = std::time::Instant::now();
+    let bypass_mode = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut registry = ToolRegistry::new();
     let mut names: Vec<String> = Vec::new();
     // Tools a tree takes from here as they are (see `CodingParts::host_only_tools`):
@@ -772,8 +773,17 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // toolsets below are explicitly selected and never inherit this service.
     if opts.tools {
         if let Some(service) = &cfg.automation {
-            for tool in atomcode_capabilities::tools::automation::automation_tools(service.clone())
-            {
+            for tool in atomcode_capabilities::tools::automation::automation_tools_with_approval(
+                service.clone(),
+                {
+                    let bypass = bypass_mode.clone();
+                    let policy = cfg.automation_approval;
+                    Arc::new(move || {
+                        policy == atomcode_config::config::AutomationApproval::Inherit
+                            && bypass.load(std::sync::atomic::Ordering::Acquire)
+                    })
+                },
+            ) {
                 names.push(tool.name().to_string());
                 host_only_tools.push(tool.name().to_string());
                 registry.register(tool);
@@ -1253,7 +1263,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         tool_catalog: Arc::new(std::sync::RwLock::new(None)),
         shared_cwd: std::sync::Arc::new(std::sync::RwLock::new(cfg.working_dir.clone())),
         plan_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        bypass_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        bypass_mode,
         accept_edits: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         turn_execution_policy,
         mcp_plan_grants: std::sync::Arc::new(
@@ -2942,6 +2952,59 @@ mod tests {
         .unwrap();
         let text = std::fs::read_to_string(&target).unwrap();
         assert!(!text.contains("disabled"), "on removes the key: {text}");
+    }
+
+    #[tokio::test]
+    async fn schedule_policy_uses_the_prepared_runtime_mode_flag() {
+        use atomcode_capabilities::tools::automation::AutomationService;
+        struct Backend;
+        impl AutomationService for Backend {
+            fn call(
+                &self,
+                _: &str,
+                _: serde_json::Value,
+                _: &std::path::Path,
+                _: &tokio_util::sync::CancellationToken,
+            ) -> Result<serde_json::Value, String> {
+                Ok(serde_json::json!({"saved":true}))
+            }
+        }
+        let project = tempfile::tempdir().unwrap();
+        for policy in [
+            atomcode_config::config::AutomationApproval::Always,
+            atomcode_config::config::AutomationApproval::Inherit,
+        ] {
+            let mut cfg = CodingAgentConfig::new(
+                "k",
+                "http://localhost",
+                "m",
+                project.path(),
+                crate::config::product_dirs_from_env(),
+            );
+            cfg.automation = Some(Arc::new(Backend));
+            cfg.automation_approval = policy;
+            let parts = prepare(&cfg, io_free_opts()).await.unwrap();
+            let tool = parts
+                .registry
+                .mount(&["schedule_create"])
+                .get("schedule_create")
+                .unwrap();
+            let ctx = atomcode_kernel::tool::ToolContext {
+                working_dir: project.path().into(),
+                cancel: Default::default(),
+                progress: atomcode_kernel::tool::ProgressSink::noop(),
+                requester: None,
+            };
+            for auto in [false, true, false] {
+                parts
+                    .bypass_mode
+                    .store(auto, std::sync::atomic::Ordering::Release);
+                assert_eq!(
+                    tool.execute("{}", &ctx).await.is_error,
+                    !(auto && policy == atomcode_config::config::AutomationApproval::Inherit)
+                );
+            }
+        }
     }
 
     /// `prepare` with all optional capabilities OFF — keeps the call I/O-free (no MCP

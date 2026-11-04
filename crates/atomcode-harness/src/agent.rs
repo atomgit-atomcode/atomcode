@@ -688,6 +688,7 @@ pub struct Agent {
     persist: bool,
     /// What was mounted for this agent alone, torn down when it is removed.
     world: Mutex<Vec<Disposable>>,
+    creation_error: Mutex<Option<String>>,
     status: RwLock<AgentStatus>,
     /// Held across a status move and its announcement, so moves are announced
     /// in the order they happened. Separate from `status` so a listener may
@@ -942,6 +943,12 @@ impl Agent {
     /// means. It does not queue: a cancel that arrives before a turn opens is
     /// not held against that turn.
     pub fn cancel(&self) {
+        // Idle edits hold `moving` while synchronous persistence listeners run.
+        // A failed listener may request cancellation; idle has no turn to stop,
+        // and reacquiring that same lock would deadlock the edit and its owner.
+        if self.status() == AgentStatus::Idle {
+            return;
+        }
         // Only a turn can be stopping. An idle agent marked stopping stayed so
         // until its next turn opened, and a front end showed it stopping all
         // that while.
@@ -1058,6 +1065,15 @@ impl Agent {
 
     pub fn cancel_token(&self) -> CancellationToken {
         self.cancel.read().expect("cancel token poisoned").clone()
+    }
+
+    /// Refuse this agent during synchronous AgentCreated validation.
+    /// The registry rolls back its registrations before create returns an error.
+    pub fn reject_creation(&self, reason: String) {
+        self.creation_error
+            .lock()
+            .expect("creation error poisoned")
+            .get_or_insert(reason);
     }
 
     /// Open a turn: mint this turn's cancellation token and mark the agent
@@ -1257,6 +1273,7 @@ impl Agents {
             seed_len,
             persist: req.persist,
             world: Mutex::new(world),
+            creation_error: Mutex::new(None),
             status: RwLock::new(AgentStatus::Idle),
             moving: Mutex::new(()),
             cancel: RwLock::new(CancellationToken::new()),
@@ -1269,6 +1286,15 @@ impl Agents {
             .expect("agent registry poisoned")
             .insert(id, agent.clone());
         ctx.emit::<AgentCreated>(&AgentInfo { id });
+        let refused = agent
+            .creation_error
+            .lock()
+            .expect("creation error poisoned")
+            .take();
+        if let Some(reason) = refused {
+            self.remove(id);
+            return Err(reason);
+        }
         Ok(agent)
     }
 
