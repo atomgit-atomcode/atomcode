@@ -5,10 +5,13 @@ import test from 'node:test';
 
 const root = process.cwd();
 
+/** Windows checkouts are CRLF; the assertions below are written against LF source text. */
+const readSource = (path: string) => readFileSync(path, 'utf8').replace(/\r\n/g, '\n');
+
 test('input dropdown descriptions remain readable in active menu items', () => {
-  const variables = readFileSync(join(root, 'webview-ui/src/styles/variables.css'), 'utf8');
-  const components = readFileSync(join(root, 'webview-ui/src/styles/components.css'), 'utf8');
-  const input = readFileSync(join(root, 'webview-ui/src/styles/input.css'), 'utf8');
+  const variables = readSource(join(root, 'webview-ui/src/styles/variables.css'));
+  const components = readSource(join(root, 'webview-ui/src/styles/components.css'));
+  const input = readSource(join(root, 'webview-ui/src/styles/input.css'));
 
   assert.match(variables, /--app-menu-selection-foreground:\s*var\(--vscode-menu-selectionForeground,/);
 
@@ -40,10 +43,7 @@ test('input dropdown descriptions remain readable in active menu items', () => {
 });
 
 test('approval modes use canonical order while keeping the bypass wire value', () => {
-  const selector = readFileSync(
-    join(root, 'webview-ui/src/components/ModeSelector.tsx'),
-    'utf8',
-  );
+  const selector = readSource(join(root, 'webview-ui/src/components/ModeSelector.tsx'));
   const build = selector.indexOf("value: 'build'");
   const acceptEdits = selector.indexOf("value: 'accept_edits'");
   const auto = selector.indexOf("value: 'bypass', labelKey: 'mode.auto'");

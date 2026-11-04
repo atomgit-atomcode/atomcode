@@ -19,6 +19,9 @@ import {
 import { formatToolDuration } from '../src/utils/format';
 import { shouldShowIdleNotice } from '../src/utils/streamStatus';
 
+/** Windows checkouts are CRLF; the source-text assertions below are written against LF. */
+const readSource = (path: string) => readFileSync(path, 'utf8').replace(/\r\n/g, '\n');
+
 declare const require: {
   (id: string): typeof import('../src/state/reducer');
 };
@@ -891,7 +894,7 @@ function testDiffViewDropsDiffLanguageSentinel() {
 }
 
 function testDiffSingleLineCssLetsBackgroundFillTheBlock() {
-  const css = readFileSync(join(process.cwd(), 'webview-ui/src/styles/messages.css'), 'utf8');
+  const css = readSource(join(process.cwd(), 'webview-ui/src/styles/messages.css'));
 
   assert.match(css, /\.code-block-wrapper\.is-diff-like\.is-single-line pre\s*\{[^}]*min-height:\s*0;/s);
   assert.match(css, /\.diff-code-line\s*\{[^}]*padding:\s*3px 36px 3px 0;/s);
@@ -902,14 +905,14 @@ function testDiffSingleLineCssLetsBackgroundFillTheBlock() {
 }
 
 function testUserMessageContainerDoesNotForceMarkdownPreWrap() {
-  const css = readFileSync(join(process.cwd(), 'webview-ui/src/styles/messages.css'), 'utf8');
+  const css = readSource(join(process.cwd(), 'webview-ui/src/styles/messages.css'));
 
   assert.match(css, /\.user-message-bubble\s*\{[^}]*white-space:\s*normal;/s);
   assert.match(css, /\.user-message-text\s*\{[^}]*white-space:\s*normal;/s);
 }
 
 function testUserMessageRendersPlainTextInsteadOfMarkdown() {
-  const source = readFileSync(join(process.cwd(), 'webview-ui/src/components/UserMessage.tsx'), 'utf8');
+  const source = readSource(join(process.cwd(), 'webview-ui/src/components/UserMessage.tsx'));
 
   assert.doesNotMatch(source, /import\s+\{\s*Markdown\s*\}/);
   assert.doesNotMatch(source, /<Markdown\s+content=\{message\.text\}/);
@@ -920,21 +923,21 @@ function testUserMessageRendersPlainTextInsteadOfMarkdown() {
 }
 
 function testUserPlainTextCssPreservesLiteralInput() {
-  const css = readFileSync(join(process.cwd(), 'webview-ui/src/styles/messages.css'), 'utf8');
+  const css = readSource(join(process.cwd(), 'webview-ui/src/styles/messages.css'));
 
   assert.match(css, /\.user-message-plain-text\s*\{[^}]*white-space:\s*pre-wrap;/s);
   assert.match(css, /\.user-message-plain-text\s*\{[^}]*overflow-wrap:\s*anywhere;/s);
 }
 
 function testInlineArtifactCodeKeepsCodeBlockBorder() {
-  const css = readFileSync(join(process.cwd(), 'webview-ui/src/styles/messages.css'), 'utf8');
+  const css = readSource(join(process.cwd(), 'webview-ui/src/styles/messages.css'));
 
   assert.doesNotMatch(css, /(^|\n)\.artifact-code-render \.code-block-wrapper pre\s*\{[^}]*border:\s*none;/s);
   assert.match(css, /\.artifact-block \.artifact-code-render \.code-block-wrapper pre\s*\{[^}]*border:\s*none;/s);
 }
 
 function testPreCodeDoesNotUseInlineCodePillStyling() {
-  const css = readFileSync(join(process.cwd(), 'webview-ui/src/styles/messages.css'), 'utf8');
+  const css = readSource(join(process.cwd(), 'webview-ui/src/styles/messages.css'));
 
   assert.match(css, /\.markdown-root pre code\s*\{[^}]*background:\s*transparent;/s);
   assert.match(css, /\.markdown-root pre code\s*\{[^}]*border-radius:\s*0;/s);
@@ -942,7 +945,7 @@ function testPreCodeDoesNotUseInlineCodePillStyling() {
 }
 
 function testMissingUserImagePlaceholderHasStableThumbnailSizing() {
-  const css = readFileSync(join(process.cwd(), 'webview-ui/src/styles/messages.css'), 'utf8');
+  const css = readSource(join(process.cwd(), 'webview-ui/src/styles/messages.css'));
 
   assert.match(css, /\.user-message-image-placeholder\s*\{[^}]*width:\s*min\(180px,\s*100%\);/s);
   assert.match(css, /\.user-message-image-placeholder\s*\{[^}]*height:\s*120px;/s);
@@ -1018,8 +1021,8 @@ function testImagePreviewNavigationIsNoopWhenClosed() {
 }
 
 function testUserMessageImageIsClickableForPreview() {
-  const messagesCss = readFileSync(join(process.cwd(), 'webview-ui/src/styles/messages.css'), 'utf8');
-  const componentsCss = readFileSync(join(process.cwd(), 'webview-ui/src/styles/components.css'), 'utf8');
+  const messagesCss = readSource(join(process.cwd(), 'webview-ui/src/styles/messages.css'));
+  const componentsCss = readSource(join(process.cwd(), 'webview-ui/src/styles/components.css'));
 
   assert.match(messagesCss, /\.user-message-image\s*\{[^}]*cursor:\s*zoom-in;/s);
   assert.match(componentsCss, /\.image-lightbox\s*\{[^}]*z-index:\s*200;/s);
@@ -1031,7 +1034,7 @@ function testUserMessageImagePreviewFiltersMissingImagesAndRecomputesIndex() {
   // renderable entries, so NEXT/PREV never lands on the missing slot and
   // auto-closes the preview. Verified at the source level since reducer tests
   // can't exercise the UserMessage-side filtering.
-  const source = readFileSync(join(process.cwd(), 'webview-ui/src/components/UserMessage.tsx'), 'utf8');
+  const source = readSource(join(process.cwd(), 'webview-ui/src/components/UserMessage.tsx'));
 
   // The OPEN dispatch filters to renderable images before computing the index.
   assert.match(source, /const renderable = \(message\.images \?\? \[\]\)\.filter\(/);
@@ -1041,7 +1044,7 @@ function testUserMessageImagePreviewFiltersMissingImagesAndRecomputesIndex() {
 }
 
 function testUserMessageImagePreviewUsesSharedImageDataUrlHelper() {
-  const source = readFileSync(join(process.cwd(), 'webview-ui/src/components/UserMessage.tsx'), 'utf8');
+  const source = readSource(join(process.cwd(), 'webview-ui/src/components/UserMessage.tsx'));
 
   assert.match(source, /import \{ imageDataUrl \} from '\.\.\/utils\/format';/);
   // The inline data: URL template must be gone — the shared helper is used instead.
@@ -1050,13 +1053,13 @@ function testUserMessageImagePreviewUsesSharedImageDataUrlHelper() {
 }
 
 function testPermissionCardStaysVisibleWhileDecisionIsSubmitting() {
-  const source = readFileSync(join(process.cwd(), 'webview-ui/src/components/AssistantMessage.tsx'), 'utf8');
+  const source = readSource(join(process.cwd(), 'webview-ui/src/components/AssistantMessage.tsx'));
 
   assert.match(source, /block\.request\.status === 'pending' \|\| block\.request\.status === 'submitting'/);
 }
 
 function testPermissionCardOffersPersistentDecisionOptions() {
-  const source = readFileSync(join(process.cwd(), 'webview-ui/src/components/PermissionRequest.tsx'), 'utf8');
+  const source = readSource(join(process.cwd(), 'webview-ui/src/components/PermissionRequest.tsx'));
 
   assert.match(source, /handleRespond\('always_allow'\)/);
   assert.match(source, /handleRespond\('allow_persist'\)/);
@@ -1252,7 +1255,7 @@ function testMarkdownTableRepairKeepsMarkedOneColumnRows() {
 }
 
 function testGenerationDoneReloadsFinishedSessionHistory() {
-  const source = readFileSync(join(process.cwd(), 'src/chat/provider.ts'), 'utf8');
+  const source = readSource(join(process.cwd(), 'src/chat/provider.ts'));
   const onDone = source.match(/onDone:\s*\([^)]*\)\s*=>\s*\{[\s\S]*?\n\s*\},\n\s*onStopped:/)?.[0] ?? '';
 
   assert.match(onDone, /const doneSessionId = sessionId \|\| streamSessionId/);

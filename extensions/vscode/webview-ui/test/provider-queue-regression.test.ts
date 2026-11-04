@@ -3,6 +3,9 @@ import Module from 'node:module';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
+/** Windows checkouts are CRLF; the source-text assertions below are written against LF. */
+const readSource = (path: string) => readFileSync(path, 'utf8').replace(/\r\n/g, '\n');
+
 declare const require: {
   (id: string): typeof import('../../src/chat/provider');
 };
@@ -195,7 +198,7 @@ async function testLocalCommandRefreshFailureCanRecoverWithoutWritingAgain() {
 }
 
 function testReadyMarksPanelOnlyAfterInitialReplay() {
-  const source = readFileSync(join(process.cwd(), 'src/chat/provider.ts'), 'utf8');
+  const source = readSource(join(process.cwd(), 'src/chat/provider.ts'));
   const readyCase = source.match(/case 'ready':[\s\S]*?case 'selectModel':/)?.[0] ?? '';
   assert.ok(readyCase.indexOf('await this._sendInitialState') >= 0);
   assert.ok(
@@ -215,7 +218,7 @@ function testReadyMarksPanelOnlyAfterInitialReplay() {
 }
 
 function testPanelReadyHandlerIsInstalledBeforeWebviewBoots() {
-  const source = readFileSync(join(process.cwd(), 'src/chat/provider.ts'), 'utf8');
+  const source = readSource(join(process.cwd(), 'src/chat/provider.ts'));
   const openStart = source.indexOf('public openInTab(');
   const openEnd = source.indexOf('private _findSessionIdByPanel', openStart);
   const openInTab = source.slice(openStart, openEnd);
@@ -702,7 +705,7 @@ function testReadyDoesNotFlushHistoryAlreadyDeliveredByItsAtomicSnapshot() {
 }
 
 function testClosingTheLastSessionTabStopsTheUnobservableTurn() {
-  const source = readFileSync(join(process.cwd(), 'src/chat/provider.ts'), 'utf8');
+  const source = readSource(join(process.cwd(), 'src/chat/provider.ts'));
   const disposeHandlers = Array.from(source.matchAll(
     /panel\.onDidDispose\(\(\) => \{[\s\S]*?\n    \}\);/g,
   ), (match) => match[0]);
@@ -791,7 +794,7 @@ function testSessionSelectionDoesNotRewriteUnrelatedTabBindings() {
 }
 
 function testSessionSelectionIsNeverBroadcastToUnrelatedTabsAndCanonicalRemapPersists() {
-  const source = readFileSync(join(process.cwd(), 'src/chat/provider.ts'), 'utf8');
+  const source = readSource(join(process.cwd(), 'src/chat/provider.ts'));
   assert.doesNotMatch(
     source,
     /_broadcastMessage\(\{ type: 'sessionSelected'/,
@@ -1285,7 +1288,7 @@ function testRecoveryLockRemainsVisibleAndCannotQueueAnotherTurn() {
   state = chatReducer(state, { type: 'RECOVERY_CLEARED' } as never);
   assert.equal(state.recoveryLocked, false);
 
-  const inputSource = readFileSync(join(process.cwd(), 'webview-ui/src/components/InputArea.tsx'), 'utf8');
+  const inputSource = readSource(join(process.cwd(), 'webview-ui/src/components/InputArea.tsx'));
   assert.match(inputSource, /state\.recoveryLocked/);
   assert.match(inputSource, /state\.isGenerating && !state\.recoveryLocked/);
 }
@@ -2016,7 +2019,7 @@ async function testConcurrentPreparationQueuesTheSecondPromptInsteadOfStartingTw
 }
 
 function testWebviewBridgeClearsQueuedMessagesOnHostInstruction() {
-  const source = readFileSync(join(process.cwd(), 'webview-ui/src/state/ChatProvider.tsx'), 'utf8');
+  const source = readSource(join(process.cwd(), 'webview-ui/src/state/ChatProvider.tsx'));
   const handler = source.match(/switch \(msg\.type\) \{[\s\S]*?case 'clearChat':/)?.[0] ?? '';
 
   assert.match(handler, /case 'clearQueuedMessages':/);
@@ -2024,7 +2027,7 @@ function testWebviewBridgeClearsQueuedMessagesOnHostInstruction() {
 }
 
 function testLatePanelSessionBindingIsPersistedForRestore() {
-  const source = readFileSync(join(process.cwd(), 'webview-ui/src/state/ChatProvider.tsx'), 'utf8');
+  const source = readSource(join(process.cwd(), 'webview-ui/src/state/ChatProvider.tsx'));
   const selectedCase = source.match(/case 'sessionSelected':[\s\S]*?break;/)?.[0] ?? '';
   assert.match(selectedCase, /getVSCodeApi\(\)\.setState\(\{ sessionId: msg\.sessionId, projectHash: msg\.projectHash \}\)/);
 }
@@ -2750,7 +2753,7 @@ async function testStopRestoresQueuedMessagesToInputInsteadOfDiscarding() {
 // Invariant guard: EVERY site that clears queuedMessages on a stop/error/abnormal path
 // must restore-to-input FIRST, so a future edit can't reintroduce a silent-discard.
 function testEveryQueueClearRestoresToInputFirst() {
-  const source = readFileSync(join(process.cwd(), 'src/chat/provider.ts'), 'utf8');
+  const source = readSource(join(process.cwd(), 'src/chat/provider.ts'));
   const clearRe = /\b\w+\.queuedMessages = \[\];/g;
   let m: RegExpExecArray | null;
   let count = 0;
