@@ -764,9 +764,10 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   // Cache of session messages, used to preserve in-progress streaming turns when switching sessions.
   const messageCacheRef = useRef<Map<string, Message[]>>(new Map());
   const messageCacheCountRef = useRef<Map<string, number>>(new Map());
-  // A notice for the session being switched back to: put in once that session's
-  // messages are back, since restoring them replaces the list it would be in.
-  const noticeAfterSwitchRef = useRef<string | null>(null);
+  // Carry navigation feedback across rollback/fork id changes. Render it outside
+  // transcript state so history replacement cannot erase it.
+  const noticeAfterSwitchRef = useRef<{ sessionId: string; text: string } | null>(null);
+  const [sessionSwitchNotice, setSessionSwitchNotice] = useState<string | null>(null);
   // Mirror of messages state to read the latest value without dependency tracking.
   const messagesRef = useRef<Message[]>([]);
   useEffect(() => {
@@ -930,7 +931,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       );
       if (syncRef.current && !liveSwitch.allowed) {
         if (prevId) onSessionId(prevId);
-        pushCommandNotice(t('browse.switchBusy'));
+        setSessionSwitchNotice(t('browse.switchBusy'));
         return;
       }
       // A correlated steer still belongs to the session being left. Recover it
@@ -1004,9 +1005,10 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       } else {
         setMessages([]);
       }
-      const carried = noticeAfterSwitchRef.current;
+      const carried = noticeAfterSwitchRef.current?.sessionId === sessionId
+        ? noticeAfterSwitchRef.current.text : null;
       noticeAfterSwitchRef.current = null;
-      if (carried) pushCommandNotice(carried);
+      setSessionSwitchNotice(carried);
 
       // bot review P2: 切换会话时重置搜索状态,避免残留关键词过滤新会话、matchIdx 超界致计数错乱。
       setSearch('');
@@ -1025,19 +1027,25 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       // 不会回环：远端 session_switched 事件的 handler 会先把 activeIdRef 设为该 id，
       // 故由广播回流引起的 sessionId 变化进不来这个分支（条件已不成立），不会再次广播。
       if (sync && sessionId) {
+        if (!carried) setSessionSwitchNotice(t('sync.switching'));
         const ready = postLiveSwitchSession(sessionId)
           .then((result) => {
             if (sessionGenerationRef.current !== switchGeneration) return false;
             // Another atomcode held it, so the runtime opened a copy: follow it
             // there and say so — the original is untouched where it is open.
             if (result.ok && result.forkedFrom && result.sessionId) {
-              noticeAfterSwitchRef.current = t('sync.sessionForked');
+              noticeAfterSwitchRef.current = { sessionId: result.sessionId, text: t('sync.sessionForked') };
+              setSessionSwitchNotice(noticeAfterSwitchRef.current.text);
               onSessionId(result.sessionId);
               return false;
             }
-            if (result.ok) return true;
+            if (result.ok) {
+              if (!carried) setSessionSwitchNotice(null);
+              return true;
+            }
             if (result.activeTurn && prevId) {
-              noticeAfterSwitchRef.current = t('browse.switchBusy');
+              noticeAfterSwitchRef.current = { sessionId: prevId, text: t('browse.switchBusy') };
+              setSessionSwitchNotice(noticeAfterSwitchRef.current.text);
               onSessionId(prevId);
               return false;
             }
@@ -1048,9 +1056,10 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
             // refused, where it failed again with a line that named nothing.
             if (prevId) {
               const why = result.error ?? 'live runtime rejected the session switch';
-              noticeAfterSwitchRef.current = sessionHeldElsewhere(why)
+              noticeAfterSwitchRef.current = { sessionId: prevId, text: sessionHeldElsewhere(why)
                 ? t('sync.sessionInUse')
-                : t('sync.switchFailed', { error: why });
+                : t('sync.switchFailed', { error: why }) };
+              setSessionSwitchNotice(noticeAfterSwitchRef.current.text);
               onSessionId(prevId);
               return false;
             }
@@ -1062,6 +1071,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
             setSync(false);
             setBusy(false);
             setQueued([]);
+            setSessionSwitchNotice(t('sync.switchFailed', { error: String(error) }));
             reportFailure(t('sync.switchFailed', { error: String(error) }));
             loadedForRef.current = null;
             setLoading(false);
@@ -1180,8 +1190,9 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
         setHistoryHint(nextHint);
         setLoading(false);
       });
+    // A fork may resolve its metadata later within the same project bucket.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId, activeSession?.project_hash]);
+  }, [sessionId, activeSession?.id, activeSession?.project_hash]);
 
   // How close to the bottom (px) still counts as "at the bottom" — a small slack so
   // sub-pixel rounding / layout jitter during streaming doesn't wrongly release follow.
@@ -2043,13 +2054,15 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
               // The runtime is on a copy now: follow it, or this page would
               // keep naming the original while every message lands in the copy.
               if (result.forkedFrom && result.sessionId) {
-                noticeAfterSwitchRef.current = t('sync.sessionForked');
+                noticeAfterSwitchRef.current = { sessionId: result.sessionId, text: t('sync.sessionForked') };
+                setSessionSwitchNotice(noticeAfterSwitchRef.current.text);
                 onSessionId(result.sessionId);
               }
               startLiveStream();
             })
             .catch((error) => {
               setSync(false);
+              setSessionSwitchNotice(t('sync.switchFailed', { error: String(error) }));
               reportFailure(t('sync.switchFailed', { error: String(error) }));
             });
         } else {
@@ -4016,7 +4029,13 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     if (node && interactionHost.parentNode !== node) node.appendChild(interactionHost);
   }
   function withInteraction(view: ComponentChildren) {
-    return <>{view}{createPortal(blockingInteraction, interactionHost)}</>;
+    return <>
+      {sessionSwitchNotice && <div class="session-browse-notice session-switch-notice" role="status">
+        <span>{sessionSwitchNotice}</span>
+        <button onClick={() => setSessionSwitchNotice(null)} aria-label={t('attach.dismissError')}>×</button>
+      </div>}
+      {view}{createPortal(blockingInteraction, interactionHost)}
+    </>;
   }
   const hasBlockingInteraction = blockingInteraction != null;
   const wasBlockingInteractionRef = useRef(false);

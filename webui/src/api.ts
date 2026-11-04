@@ -1271,7 +1271,7 @@ export async function postLiveSwitchSession(
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ session_id: sessionId }),
   });
-  if (!resp.ok) throw new Error(`switch live session failed: ${resp.status}`);
+  if (!resp.ok) throw await failure(resp);
   const body = await resp.json() as {
     ok?: boolean;
     active_turn?: boolean;

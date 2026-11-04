@@ -731,3 +731,14 @@ test('workbench reports HTML fallback with an actionable diagnostic', async () =
     });
   } finally { globalThis.fetch = originalFetch; }
 });
+
+test('live session switch preserves the server rejection diagnostic', async () => {
+  const api = await import('./api.ts');
+  await serving(409, '{"error":"Session is open in another terminal","code":"session_in_use"}', 'application/json', async () => {
+    await assert.rejects(api.postLiveSwitchSession('occupied'), (error: unknown) => {
+      assert.equal((error as { code: string }).code, 'session_in_use');
+      assert.match(String(error), /another terminal/);
+      return true;
+    });
+  });
+});
