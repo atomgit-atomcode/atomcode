@@ -39,6 +39,7 @@ pub mod live_hub;
 mod login_state;
 #[cfg(test)]
 mod login_state_tests;
+mod mention_search;
 pub mod native_live;
 mod runtime_host;
 mod transcript_view;
@@ -7233,21 +7234,23 @@ pub struct FsSearchQuery {
 /// JSON (`path` relative to `dir`, forward-slashed, dirs suffixed `/`). This is
 /// what guarantees the webui `@`-mention picker matches the CLI exactly.
 fn search_at_mention(dir: &std::path::Path, token: &str) -> Vec<serde_json::Value> {
-    let (scope, filter) = atomcode_capabilities::file_index::split_token(token);
-    atomcode_capabilities::file_index::FileIndex::search_blocking(
-        dir,
-        &scope,
-        &filter,
-        atomcode_coding::config::product_dirs_from_env().project_dir_name(),
-    )
-    .into_iter()
-    .map(|e| serde_json::json!({ "path": e.rel_path, "is_dir": e.is_dir }))
-    .collect()
+    static CACHE: std::sync::OnceLock<mention_search::MentionSearchCache> =
+        std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| mention_search::MentionSearchCache::new(8))
+        .search(
+            dir,
+            token,
+            atomcode_coding::config::product_dirs_from_env().project_dir_name(),
+        )
+        .into_iter()
+        .map(|e| serde_json::json!({ "path": e.rel_path, "is_dir": e.is_dir }))
+        .collect()
 }
 
 /// Recursive, gitignore-aware `@`-mention search for the webui picker. Mirrors
 /// the CLI popup by sharing `FileIndex` with the TUI (see [`search_at_mention`]).
-/// The blocking full-tree walk runs on a blocking thread so it never stalls the
+/// The initial walk and cached filtering run on a blocking thread, so neither stalls the
 /// async runtime. Path normalization matches [`fs_list`] so a match handed back
 /// to `/cd`/`/fs/open` lands in the same session bucket.
 async fn fs_search(

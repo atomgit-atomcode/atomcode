@@ -32,3 +32,14 @@ Do not include proxy credentials in the report.
 These changes recover short configuration transitions and make persistent
 failures diagnosable. They do not establish the root cause of every report that
 previously displayed only `could not refresh system proxy settings`.
+
+## Loopback connection probes
+
+Reading system settings and probing a configured loopback proxy are separate
+stages. A definite connection refusal may temporarily select direct access in
+follow-system mode. A timeout, permission failure or unknown socket error keeps
+the proxy route: a listening proxy can time out when its accept queue is full.
+
+The Windows probe waits on both writable and exception Winsock sets and reads
+SO_ERROR from the same socket. A polling timeout with a pending refusal can then
+be distinguished from a genuine timeout. Fixed proxy mode is never bypassed.

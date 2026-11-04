@@ -1,8 +1,11 @@
 //! Request-local routes for follow-system mode. No persisted or process-env writes.
 
 use atomcode_config::proxy::{ProxyConfig, ProxyMode};
+use std::collections::HashMap;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
+#[cfg(not(windows))]
+use std::net::TcpStream;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use atomcode_kernel::stream::ProviderError;
@@ -43,11 +46,7 @@ async fn refresh_with_deadline(
 fn refresh() -> Result<Option<ProxyConfig>, ProviderError> {
     let configured = atomcode_config::proxy::refreshed_follow_system_config()
         .map_err(|error| proxy_refresh_error(error.as_ref()))?;
-    Ok(configured.map(|cfg| {
-        without_dead_loopback(cfg, |addr| {
-            TcpStream::connect_timeout(&addr, Duration::from_millis(50)).map(|_| ())
-        })
-    }))
+    Ok(configured.map(|cfg| without_dead_loopback(cfg, probe_loopback)))
 }
 
 fn proxy_refresh_error(error: &(dyn std::error::Error + 'static)) -> ProviderError {
@@ -94,22 +93,85 @@ fn loopback_addresses(raw: &str) -> Vec<SocketAddr> {
         .unwrap_or_default()
 }
 
-/// A loopback probe proves the listener dead on ConnectionRefused — and on
-/// TimedOut too: a live listener answers at kernel level, instantly, whatever
-/// the process load, so 50ms of silence from 127.0.0.1/::1 is never a live
-/// proxy. The TimedOut arm is not theoretical: on Windows, `connect_timeout`
-/// to a port whose listener just closed reports TimedOut (no RST is delivered
-/// to the non-blocking connect), where a blocking connect to the same port is
-/// refused at once — so an exact-ConnectionRefused match never fired there and
-/// a stopped local proxy (VPN client on 127.0.0.1:7890, …) was kept forever.
-/// A firewall DROP on loopback times out the same way and is just as unusable.
-/// The only false positive is a live listener whose backlog is full; the probe
-/// re-runs on the next refresh, and nothing here is persisted.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(50);
+
+#[cfg(not(windows))]
+fn probe_loopback(addr: SocketAddr) -> io::Result<()> {
+    TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).map(|_| ())
+}
+
+#[cfg(windows)]
+fn probe_loopback(addr: SocketAddr) -> io::Result<()> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{
+        select, WSAGetLastError, FD_SET, SOCKET, SOCKET_ERROR, TIMEVAL,
+    };
+
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_nonblocking(true)?;
+    match socket.connect(&addr.into()) {
+        Ok(()) => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+        Err(error) => return Err(error),
+    }
+    let mut writable = FD_SET {
+        fd_count: 1,
+        fd_array: [0; 64],
+    };
+    writable.fd_array[0] = socket.as_raw_socket() as SOCKET;
+    let mut failed = writable;
+    let timeout = TIMEVAL {
+        tv_sec: 0,
+        tv_usec: PROBE_TIMEOUT.as_micros() as i32,
+    };
+    // SAFETY: both sets contain this live socket and have valid fixed capacities.
+    // All pointers refer to local values that remain alive throughout select.
+    let ready = unsafe {
+        select(
+            0,
+            std::ptr::null_mut(),
+            &mut writable,
+            &mut failed,
+            &timeout,
+        )
+    };
+    if ready == SOCKET_ERROR {
+        // SAFETY: read this thread's error immediately after the failed Winsock call.
+        return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
+    }
+    if ready == 0 {
+        return resolve_probe_result(Err(io::ErrorKind::TimedOut.into()), || socket.take_error());
+    }
+    // Nonblocking connect failures are signalled in exceptfds, not writefds.
+    // SO_ERROR distinguishes a refusal from an unknown/transient failure.
+    match socket.take_error()? {
+        Some(error) => Err(error),
+        None if failed.fd_count != 0 => {
+            Err(io::Error::other("proxy connect failed without SO_ERROR"))
+        }
+        None => Ok(()),
+    }
+}
+
+#[cfg(any(windows, test))]
+fn resolve_probe_result(
+    result: io::Result<()>,
+    pending_error: impl FnOnce() -> io::Result<Option<io::Error>>,
+) -> io::Result<()> {
+    match result {
+        Err(error) if error.kind() == io::ErrorKind::TimedOut => match pending_error()? {
+            Some(cause) => Err(cause),
+            None => Err(error),
+        },
+        other => other,
+    }
+}
+
+/// Only a definite refusal permits direct access. A timeout can mean a live
+/// listener has a full accept queue; next-request recovery cannot undo a bypass.
 fn loopback_probe_is_dead(kind: io::ErrorKind) -> bool {
-    matches!(
-        kind,
-        io::ErrorKind::ConnectionRefused | io::ErrorKind::TimedOut
-    )
+    kind == io::ErrorKind::ConnectionRefused
 }
 
 fn without_dead_loopback(
@@ -123,6 +185,7 @@ fn without_dead_loopback(
     // become direct, not accidentally fall back to a different ALL_PROXY.
     let mut dead = Vec::new();
     let mut checked = Vec::new();
+    let mut probes: HashMap<SocketAddr, Option<io::ErrorKind>> = HashMap::new();
     for raw in [&cfg.http, &cfg.https, &cfg.all].into_iter().flatten() {
         if checked.contains(raw) {
             continue;
@@ -130,9 +193,12 @@ fn without_dead_loopback(
         checked.push(raw.clone());
         let addresses = loopback_addresses(raw);
         if !addresses.is_empty()
-            && addresses
-                .into_iter()
-                .all(|addr| matches!(connect(addr), Err(e) if loopback_probe_is_dead(e.kind())))
+            && addresses.into_iter().all(|addr| {
+                probes
+                    .entry(addr)
+                    .or_insert_with(|| connect(addr).err().map(|error| error.kind()))
+                    .is_some_and(loopback_probe_is_dead)
+            })
         {
             dead.push(raw.clone());
         }
@@ -215,6 +281,31 @@ mod tests {
         assert!(!error.message.contains("private.example"));
     }
 
+    #[test]
+    fn windows_pending_socket_errors_distinguish_refusal_from_unknown_timeout() {
+        let refused = resolve_probe_result(Err(io::ErrorKind::TimedOut.into()), || {
+            Ok(Some(io::ErrorKind::ConnectionRefused.into()))
+        })
+        .unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::ConnectionRefused);
+        assert!(loopback_probe_is_dead(refused.kind()));
+        let timeout =
+            resolve_probe_result(Err(io::ErrorKind::TimedOut.into()), || Ok(None)).unwrap_err();
+        assert_eq!(timeout.kind(), io::ErrorKind::TimedOut);
+        assert!(!loopback_probe_is_dead(timeout.kind()));
+        let unknown = resolve_probe_result(Err(io::ErrorKind::TimedOut.into()), || {
+            Err(io::ErrorKind::PermissionDenied.into())
+        })
+        .unwrap_err();
+        assert!(!loopback_probe_is_dead(unknown.kind()));
+        resolve_probe_result(Ok(()), || panic!("a successful connect needs no fallback")).unwrap();
+        let refused = resolve_probe_result(Err(io::ErrorKind::ConnectionRefused.into()), || {
+            panic!("keep an explicit refusal")
+        })
+        .unwrap_err();
+        assert!(loopback_probe_is_dead(refused.kind()));
+    }
+
     fn config(raw: &str) -> ProxyConfig {
         ProxyConfig {
             https: Some(raw.into()),
@@ -236,19 +327,11 @@ mod tests {
                 );
             assert!(cfg.https.is_none(), "{raw}");
         }
-        // A loopback listener answers at kernel level, so a probe that merely
-        // TIMES OUT is dead too — and this is the only form "dead" takes on
-        // Windows, where connect_timeout to a just-closed port reports TimedOut
-        // (the non-blocking connect never sees the RST that a blocking connect
-        // gets at once). Exact-refused matching kept stopped VPN/proxy clients
-        // on 127.0.0.1 configured forever there.
+        // A live listener with a full accept queue can time out as well.
+        // Unknown reachability must not authorize a direct model request.
         let cfg = config("http://127.0.0.1:7890");
-        let actual = without_dead_loopback(cfg, |_| Err(io::ErrorKind::TimedOut.into()));
-        assert!(
-            actual.https.is_none(),
-            "timed-out loopback probe means dead"
-        );
-        // Genuinely ambiguous failures stay conservative: the proxy is kept.
+        let actual = without_dead_loopback(cfg.clone(), |_| Err(io::ErrorKind::TimedOut.into()));
+        assert_eq!(actual, cfg, "timeout must retain the proxy route");
         for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::Other] {
             let cfg = config("http://127.0.0.1:7890");
             assert_eq!(
@@ -256,6 +339,27 @@ mod tests {
                 cfg
             );
         }
+    }
+
+    #[test]
+    fn each_socket_address_is_probed_once_per_refresh_even_through_aliases() {
+        let mut cfg = config("http://127.0.0.1:7890");
+        cfg.http = Some("http://localhost:7890".into());
+        let mut calls = Vec::new();
+        let actual = without_dead_loopback(cfg, |addr| {
+            calls.push(addr);
+            Err(io::ErrorKind::ConnectionRefused.into())
+        });
+        assert!(actual.http.is_none() && actual.https.is_none());
+        assert_eq!(
+            calls.len(),
+            2,
+            "one IPv4 and one IPv6 probe, no repeated IPv4"
+        );
+        let mut cfg = config("http://127.0.0.1:7890");
+        cfg.http = Some("http://localhost:7890".into());
+        let actual = without_dead_loopback(cfg.clone(), |_| Err(io::ErrorKind::TimedOut.into()));
+        assert_eq!(actual, cfg);
     }
 
     #[test]
@@ -310,7 +414,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let cfg = config(&format!("http://{addr}"));
-        let probe = |addr| TcpStream::connect_timeout(&addr, Duration::from_millis(50)).map(|_| ());
+        let probe = probe_loopback;
         assert!(without_dead_loopback(cfg.clone(), probe).https.is_some());
         // Drain the probe before closing so the same listening port can be rebound.
         drop(listener.accept().unwrap());

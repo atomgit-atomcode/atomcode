@@ -153,7 +153,7 @@ tar = { version = "0.4", optional = true }
 default = ["provider", "tools"]
 # Real LlmProvider adapters (OpenAI-compatible: GLM / DeepSeek / …). `dirs` resolves the
 # wire-dump output dir (config_dir()/wire-dump) for the byte-level ATOMCODE_WIRE_DUMP.
-provider = ["dep:reqwest", "dep:rustls-native-certs", "dep:rustls", "dep:async-stream", "dep:dirs", "dep:httpdate", "dep:atomcode-auth", "dep:atomcode-config", "dep:getrandom", "dep:tracing", "dep:fs2", "dep:hyper"]
+provider = ["dep:reqwest", "dep:rustls-native-certs", "dep:rustls", "dep:async-stream", "dep:dirs", "dep:httpdate", "dep:atomcode-auth", "dep:atomcode-config", "dep:getrandom", "dep:tracing", "dep:fs2", "dep:hyper", "dep:socket2"]
 # Real neutral coding Tools (fs read/write/edit/list + bash + grep/glob) + a generic
 # approval middleware. Pulls fs/process/io tokio features + the search stack.
 tools = ["dep:tempfile", "dep:ignore", "dep:regex", "dep:grep", "dep:globset", "dep:encoding_rs", "dep:chardetng", "dep:tokio-util", "dep:similar", "dep:tree-sitter", "dep:tree-sitter-bash", "dep:sha2", "dep:dirs", "dep:image", "dep:tracing", "tokio/fs", "tokio/process", "tokio/io-util"]
@@ -265,7 +265,11 @@ zeroize = "1"
 # `Win32_System_JobObjects` (+ `Win32_System_Threading` for the IO_COUNTERS that
 # JOBOBJECT_EXTENDED_LIMIT_INFORMATION embeds): the Bash tool assigns each shell
 # child to a kill-on-close Job Object so timeout/cancel reaps the WHOLE process tree.
-windows-sys = { version = "0.61", features = ["Win32_Security", "Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading"] }
+# WinSock supports bounded loopback probes with explicit connection-error readiness.
+windows-sys = { version = "0.61", features = ["Win32_Security", "Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Networking_WinSock"] }
+# Preserve a Windows probe socket so SO_ERROR can disambiguate polling timeouts.
+# Already present in Cargo.lock through the HTTP stack; only the provider needs it.
+socket2 = { version = "0.6", optional = true }
 # Windows SChannel backend for reqwest (dodges rustls-fingerprint RST on *.atomgit.com).
 reqwest = { version = "0.12", features = ["native-tls"], default-features = false, optional = true }
 
