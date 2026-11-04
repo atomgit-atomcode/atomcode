@@ -1,8 +1,7 @@
 //! `bash_start` / `bash_poll` / `bash_kill` — a background job path for commands that would
 //! exceed the foreground `bash` `timeout` ceiling. A job spawns detached, survives across
-//! tool calls, and its output is collected incrementally; the model drives it by polling
-//! (no async delivery). This mirrors codex's exec-session model rather than oh-my-pi's
-//! auto-delivery, which would need an out-of-band message channel into the agent loop.
+//! tool calls, and its output is collected incrementally. Supporting hosts observe
+//! completion by default; polling remains available for collection and manual waiting.
 //!
 //! Command-running entry points (`bash_start`) are gated exactly like foreground `bash` —
 //! see [`crate::tools::is_command_shell_tool`], which the workspace / credential / push-label
@@ -171,6 +170,32 @@ pub struct BackgroundCompletion {
     pub killed: bool,
 }
 
+impl BackgroundCompletion {
+    /// Build a bounded, non-consuming notice only while output remains collectable.
+    /// A terminal poll removes the job, suppressing a redundant model wakeup.
+    pub fn notification(&self) -> Option<String> {
+        let (world, raw) = {
+            let guard = store().lock().unwrap();
+            let job = guard.get(&self.job_id)?;
+            let raw = job.shared.output.lock().unwrap().tail.clone();
+            (Arc::clone(&job.world), raw)
+        };
+        let text = super::sanitize_terminal_output(&world.decode(&raw));
+        let tail: String = text
+            .chars()
+            .rev()
+            .take(2000)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        Some(format!(
+            "Background job {} has finished (exit code: {:?}, killed: {}). Captured output tail (up to 2000 characters):\n{}\nUse bash_poll with job_id {:?} to collect remaining output. This is a process completion notification, not proof that the task succeeded.",
+            self.job_id, self.exit_code, self.killed, tail, self.job_id,
+        ))
+    }
+}
+
 /// Subscribe synchronously, before a poll can collect and remove this job.
 /// Dropping the future only stops observation; it never kills the process.
 pub fn observe_completion(
@@ -331,7 +356,12 @@ pub(crate) fn poll(job_id: &str) -> Result<PollResult, String> {
 
 /// Wait without consuming output or holding the job store lock. The existing reader
 /// remains the only process owner; cancelling this wait leaves the job available.
-async fn wait_for_poll(job_id: &str, wait_ms: u64, ctx: &ToolContext) -> Result<(), String> {
+async fn wait_for_poll(
+    job_id: &str,
+    wait_ms: u64,
+    wait_until: PollWaitUntil,
+    ctx: &ToolContext,
+) -> Result<(), String> {
     let wait_started = tokio::time::Instant::now();
     let (shared, delivered) = {
         let guard = store().lock().unwrap();
@@ -365,12 +395,12 @@ async fn wait_for_poll(job_id: &str, wait_ms: u64, ctx: &ToolContext) -> Result<
         let has_output = shared.output.lock().unwrap().total > delivered;
         let status = shared.status.lock().unwrap().clone();
         let left_running = shared.left_running();
-        if has_output
+        if (has_output && matches!(wait_until, PollWaitUntil::Output))
             || (!matches!(status, Status::Running) && !left_running)
             || status != initial_status
             || left_running != initial_left_running
         {
-            timing.outcome = if has_output {
+            timing.outcome = if has_output && matches!(wait_until, PollWaitUntil::Output) {
                 "output"
             } else if !matches!(status, Status::Running) && !left_running {
                 "finished"
@@ -597,10 +627,14 @@ fn poll_status_line(r: &PollResult) -> String {
     }
 }
 
+fn default_notify_on_exit() -> bool {
+    true
+}
+
 #[derive(Deserialize)]
 struct StartArgs {
     command: String,
-    #[serde(default)]
+    #[serde(default = "default_notify_on_exit")]
     notify_on_exit: bool,
 }
 
@@ -609,9 +643,19 @@ struct JobArgs {
     job_id: String,
 }
 
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PollWaitUntil {
+    #[default]
+    Exit,
+    Output,
+}
+
 #[derive(Deserialize)]
 struct PollArgs {
     job_id: String,
+    #[serde(default)]
+    wait_until: PollWaitUntil,
     #[serde(default)]
     wait_ms: Option<u64>,
     #[serde(default)]
@@ -677,8 +721,9 @@ impl Tool for BashStartTool {
         "Start a shell command in the BACKGROUND and return a job id immediately (does not \
          wait for it to finish). Use this instead of a large `timeout` for work that legitimately \
          runs longer than the foreground `bash` limit (builds, servers, long test suites). \
-         Collect its output later with `bash_poll` (waits for output or exit; repeat until it \
-         reports it exited), and stop \
+         Completion notifications default on in supporting hosts; do independent work or end \
+         your response to await completion, then collect output with `bash_poll`. Set \
+         notify_on_exit=false for servers/watchers or manual polling. Stop \
          it early with `bash_kill`. Keep build output streaming: `| tail` hides progress and \
          may mask a failed build's exit code. Same shell, working directory, and environment as `bash`."
         }; }
@@ -704,8 +749,8 @@ impl Tool for BashStartTool {
             "type": "object",
             "properties": {
                 "command": { "type": "string", "description": "The shell command to run in the background" },
-                "notify_on_exit": { "type": "boolean", "default": false,
-                    "description": "Request a completion notification from a supporting host for bounded work (builds/tests). Leave false for servers/watchers or manual polling. After notification, use bash_poll to collect output." }
+                "notify_on_exit": { "type": "boolean", "default": true,
+                    "description": "Completion notifications default on in supporting hosts for bounded work (builds/tests). Set false for servers/watchers or manual polling. After notification, use bash_poll to collect output." }
             },
             "required": ["command"]
         })
@@ -750,7 +795,7 @@ impl Tool for BashStartTool {
             )),
             Ok(id) => ok(format!(
                 "Started background job {id}. Collect output with bash_poll {{\"job_id\":\"{id}\",\"wait_ms\":60000}} \
-                 (returns early on output or exit; repeat until it reports it exited). Do not use \
+                 (collects output until exit, status change or timeout; repeat while running). Do not use \
                  sleep or restart the same command while waiting. Stop it with bash_kill {{\"job_id\":\"{id}\"}}."
             )),
             Err(e) => err(e),
@@ -808,7 +853,8 @@ fn poll_description(preview: bool) -> &'static str {
     macro_rules! base { () => {
         "Read output produced by a background `bash_start` job since your last poll, plus \
          whether it is still running or has exited. Waits up to wait_ms (default 10000, max \
-         60000), returning early on output or exit; 0 checks immediately. Use this instead \
+         60000), collecting output until exit, status change or timeout. Set wait_until to \
+         output to return early on new output; 0 checks immediately. Use this instead \
          of shell sleep, and repeat until it reports it exited. A wait timeout leaves the \
          job running; it does not mean failure. Do not restart a running build. \
          When a poll has no new output and still reports running, avoid repeated waiting \
@@ -841,7 +887,8 @@ impl Tool for BashPollTool {
             "type": "object",
             "properties": {
                 "job_id": { "type": "string", "description": "The job id returned by bash_start" },
-                "wait_ms": { "type": "integer", "minimum": 0, "default": 10000, "description": "Maximum wait in milliseconds, clamped to 60000; returns early on output or exit. Use 0 for an immediate check." }
+                "wait_until": { "type": "string", "enum": ["exit", "output"], "default": "exit", "description": "Default exit accumulates output during the bounded wait; output returns early on new output. Both return on status changes." },
+                "wait_ms": { "type": "integer", "minimum": 0, "default": 10000, "description": "Maximum wait in milliseconds, clamped to 60000; collects output until exit, status change or timeout. Use 0 for an immediate check." }
             },
             "required": ["job_id"]
         })
@@ -874,7 +921,14 @@ async fn execute_poll(
         Ok(lines) => lines,
         Err(error) => return err(format!("bash_poll: {error}")),
     };
-    if let Err(e) = wait_for_poll(&a.job_id, a.wait_ms.unwrap_or(DEFAULT_POLL_WAIT_MS), ctx).await {
+    if let Err(e) = wait_for_poll(
+        &a.job_id,
+        a.wait_ms.unwrap_or(DEFAULT_POLL_WAIT_MS),
+        a.wait_until,
+        ctx,
+    )
+    .await
+    {
         return err(e);
     }
     match poll(&a.job_id) {
@@ -1482,7 +1536,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(300)).await;
                 process.finish.cancel();
             });
-            let args = json!({"job_id": id, "wait_ms": 60000}).to_string();
+            let args = json!({"job_id": id, "wait_ms": 60000, "wait_until": "output"}).to_string();
             let first = BashPollTool.execute(&args, &ctx(Path::new("."))).await;
             assert_eq!(first.content, "PRIVATE_OUTPUT\nstatus: running");
             let second = BashPollTool.execute(&args, &ctx(Path::new("."))).await;
@@ -1586,15 +1640,19 @@ mod tests {
         async {
             let (id, _tx, process) = poll_job().await;
             let context = ctx(Path::new("."));
-            wait_for_poll(&id, 20, &context).await.unwrap();
+            wait_for_poll(&id, 20, PollWaitUntil::Exit, &context)
+                .await
+                .unwrap();
             let cancel = context.cancel.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 cancel.cancel();
             });
-            assert!(wait_for_poll(&id, 1000, &context).await.is_err());
+            assert!(wait_for_poll(&id, 1000, PollWaitUntil::Exit, &context)
+                .await
+                .is_err());
             let fresh = ctx(Path::new("."));
-            let mut pending = Box::pin(wait_for_poll(&id, 10000, &fresh));
+            let mut pending = Box::pin(wait_for_poll(&id, 10000, PollWaitUntil::Exit, &fresh));
             tokio::select! {
                 _ = &mut pending => panic!("the silent job should still be running"),
                 _ = tokio::time::sleep(Duration::from_millis(75)) => {}
@@ -1604,9 +1662,11 @@ mod tests {
                 !process.finish.is_cancelled(),
                 "timing observers must not stop the job"
             );
-            assert!(wait_for_poll("PRIVATE_INVALID_JOB", 1000, &fresh)
-                .await
-                .is_err());
+            assert!(
+                wait_for_poll("PRIVATE_INVALID_JOB", 1000, PollWaitUntil::Exit, &fresh)
+                    .await
+                    .is_err()
+            );
             kill(&id).unwrap();
             assert_eq!(drain(&id).await.1, Status::Killed);
         }
@@ -1642,7 +1702,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(300)).await;
             process.finish.cancel();
         });
-        let args = json!({"job_id": id, "wait_ms": 60000}).to_string();
+        let args = json!({"job_id": id, "wait_ms": 60000, "wait_until": "output"}).to_string();
         let started = tokio::time::Instant::now();
         let first = BashPollTool.execute(&args, &ctx(Path::new("."))).await;
         assert!(!first.is_error, "{}", first.content);
@@ -1658,6 +1718,63 @@ mod tests {
         assert!(second.content.ends_with("status: exited (code 0)"));
         assert_eq!(started.elapsed(), Duration::from_millis(500));
         assert!(poll(&id).is_err(), "a collected terminal job is reaped");
+    }
+
+    #[test]
+    fn background_notifications_default_on_with_explicit_opt_out() {
+        let default: StartArgs = serde_json::from_value(json!({"command":"build"})).unwrap();
+        let manual: StartArgs =
+            serde_json::from_value(json!({"command":"watch", "notify_on_exit":false})).unwrap();
+        assert!(default.notify_on_exit);
+        assert!(!manual.notify_on_exit);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn default_poll_collects_output_until_exit() {
+        let (id, tx, process) = poll_job().await;
+        tokio::spawn(async move {
+            for chunk in [b"first\n".to_vec(), b"second\n".to_vec()] {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                tx.send(Chunk::Stdout(chunk)).unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            process.finish.cancel();
+        });
+        let started = tokio::time::Instant::now();
+        let result = BashPollTool
+            .execute(
+                &json!({"job_id": id, "wait_ms": 60000}).to_string(),
+                &ctx(Path::new(".")),
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(result.content, "first\nsecond\nstatus: exited (code 0)");
+        assert_eq!(started.elapsed(), Duration::from_millis(700));
+        assert!(poll(&id).is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn collecting_poll_deadline_preserves_running_job_and_incremental_output() {
+        let (id, tx, process) = poll_job().await;
+        tx.send(Chunk::Stdout(b"building\n".to_vec())).unwrap();
+        let started = tokio::time::Instant::now();
+        let result = BashPollTool
+            .execute(
+                &json!({"job_id": id, "wait_ms": 1000}).to_string(),
+                &ctx(Path::new(".")),
+            )
+            .await;
+        assert_eq!(result.content, "building\nstatus: running");
+        assert_eq!(started.elapsed(), Duration::from_millis(1000));
+        assert!(!process.finish.is_cancelled());
+        let next = BashPollTool
+            .execute(
+                &json!({"job_id": id, "wait_ms": 0}).to_string(),
+                &ctx(Path::new(".")),
+            )
+            .await;
+        assert_eq!(next.content, "status: running");
+        kill(&id).unwrap();
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

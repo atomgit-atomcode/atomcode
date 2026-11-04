@@ -1,4 +1,4 @@
-//! Runtime-owned observations of explicit `bash_start` completion requests.
+//! Runtime-owned observations of `bash_start` completion requests.
 //! No process ownership: cancellation forgets notifications and leaves polling available.
 use atomcode_capabilities::tools::bash::{observe_completion, BackgroundCompletion};
 use atomcode_kernel::tool::{ToolCall, ToolResult};
@@ -30,7 +30,7 @@ impl BackgroundJobs {
             && serde_json::from_str::<serde_json::Value>(&call.arguments)
                 .ok()
                 .is_some_and(|args| {
-                    args.get("notify_on_exit").and_then(|v| v.as_bool()) == Some(true)
+                    args.get("notify_on_exit").and_then(|v| v.as_bool()) != Some(false)
                 })
         {
             self.calls.insert(call.id.clone());
@@ -50,6 +50,12 @@ impl BackgroundJobs {
             self.pending.insert(job.to_string());
             self.waits.push(wait);
         }
+    }
+    /// Collected jobs must not park a goal waiting for a suppressed notification.
+    pub fn uncollected(&self) -> bool {
+        self.pending
+            .iter()
+            .any(|id| observe_completion(id).is_some())
     }
     pub fn pending(&self) -> bool {
         !self.pending.is_empty()
@@ -216,6 +222,47 @@ pub(crate) mod tests {
         assert!(!jobs.pending());
         collect(&completion).await;
     }
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn omitted_notification_flag_subscribes_and_collected_results_do_not_notify() {
+        let (mut call, result, finish) = job(true).await;
+        call.arguments = serde_json::json!({"command":"controlled build"}).to_string();
+        let mut jobs = BackgroundJobs::default();
+        jobs.started(&call);
+        jobs.result(&result);
+        assert!(jobs.pending());
+        finish.cancel();
+        let completion = jobs.next().await;
+        assert!(completion
+            .notification()
+            .unwrap()
+            .contains("exit code: Some(0)"));
+        collect(&completion).await;
+        assert!(completion.notification().is_none());
+        assert!(!jobs.uncollected());
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_terminal_poll_retires_work_before_the_observer_is_drained() {
+        let (call, result, finish) = job(true).await;
+        let mut jobs = BackgroundJobs::default();
+        jobs.started(&call);
+        jobs.result(&result);
+        let id = crate::discipline::started_job(&result.content)
+            .unwrap()
+            .to_owned();
+        let observer = observe_completion(&id).unwrap();
+        finish.cancel();
+        let completion = observer.await;
+        collect(&completion).await;
+        assert!(jobs.pending(), "the observer still needs draining");
+        assert!(
+            !jobs.uncollected(),
+            "a goal must not wait for collected work"
+        );
+        assert!(jobs.next().await.notification().is_none());
+        assert!(!jobs.pending());
+    }
+
     #[test]
     fn repeated_reads_do_not_count_but_changed_results_and_mutations_do() {
         use atomcode_kernel::message::Message;

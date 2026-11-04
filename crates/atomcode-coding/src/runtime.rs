@@ -4703,7 +4703,7 @@ fn spawn_runtime_owner_with_optional_agent(
                     state.active
                         && held_turn.is_some()
                         && !kernel_turn_open
-                        && background_jobs.pending()
+                        && background_jobs.uncollected()
                 })
                 .and_then(|state| {
                     if state.cap_reached().is_some() {
@@ -5125,7 +5125,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             // repeated identical observational receipts do not count as new
                             // progress; unknown commands/mutations remain conservative. Stop
                             // after the existing bounded number of stagnant rounds.
-                            if background_jobs.pending() {
+                            if background_jobs.uncollected() {
                                 if let Some(state) = goal.as_mut() {
                                     state.last_reason = Some("waiting for explicitly requested background completion".into());
                                     let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
@@ -9993,14 +9993,11 @@ fn spawn_runtime_owner_with_optional_agent(
                         break;
                     },
                 },
-                completion = background_jobs.next(), if background_jobs.pending() => {
+                completion = background_jobs.next(), if background_jobs.pending() && !kernel_turn_open && pending_requests.is_empty() => {
                     if cancel_pending || controls.stop_now().is_cancelled() || persistence_failure.is_some() || pending_policy_intervention.is_some() || !agent_available {
                         continue;
                     }
-                    let text = format!(
-                        "Background job {} has finished (exit code: {:?}, killed: {}). Use bash_poll with job_id {:?} to collect its output. This is a process completion notification, not proof that the task succeeded.",
-                        completion.job_id, completion.exit_code, completion.killed, completion.job_id,
-                    );
+                    let Some(text) = completion.notification() else { continue; };
                     if loop_state.is_some() || goal.as_ref().is_some_and(|state| !state.active) {
                         // A completion cannot shorten the person's /loop cadence
                         // or re-engage a paused goal. Carry it with the next input.
@@ -22364,6 +22361,46 @@ mod tests {
         );
 
         handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn background_completion_waits_for_the_current_turn_to_finish() {
+        let (_handle, mut commands, events, mut runtime_events, _wake, _active, adapter) =
+            controller_test_runtime(Arc::new(GoalNotMetProviderFactory::default())).await;
+        let (call, result, finish) = crate::background_jobs::tests::job(true).await;
+        events.send(AgentEvent::TurnStarted { turn: None }).unwrap();
+        events.send(AgentEvent::ToolStarted { call }).unwrap();
+        events.send(AgentEvent::ToolResult { result }).unwrap();
+        while !matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::Agent(AgentEvent::ToolResult { .. }))
+        ) {}
+        finish.cancel();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), commands.recv())
+                .await
+                .is_err()
+        );
+        events
+            .send(AgentEvent::TurnComplete {
+                turn: None,
+                reason: StopReason::Stopped,
+                provider_failure: None,
+            })
+            .unwrap();
+        // The runtime first settles the completed turn's authoritative snapshot.
+        assert!(matches!(
+            commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        events
+            .send(AgentEvent::Snapshot {
+                snapshot: SessionSnapshot::new(vec![]),
+            })
+            .unwrap();
+        assert!(matches!(commands.recv().await,
+            Some(AgentCommand::SendSyntheticMessage { text }) if text.contains("Background job")));
+        adapter.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
