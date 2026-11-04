@@ -3994,3 +3994,20 @@ pub(crate) async fn live_task_specs(Json(req): Json<TaskSpecsReq>) -> axum::resp
             .into_response(),
     }
 }
+
+#[derive(serde::Deserialize)]
+pub(crate) struct PersonaReq {
+    session_id: String,
+}
+
+pub(crate) async fn live_persona(Json(req): Json<PersonaReq>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match crate::native_live::persona(req.session_id).await {
+        Ok(persona) => Json(serde_json::json!({"persona":persona})).into_response(),
+        Err(error) => (
+            axum::http::StatusCode::CONFLICT,
+            Json(serde_json::json!({"error":format!("{error:?}")})),
+        )
+            .into_response(),
+    }
+}

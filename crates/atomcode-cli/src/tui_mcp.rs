@@ -835,6 +835,7 @@ mod tests {
                         used: 0,
                         model: "m".into(),
                         working_dir: self.working_dir.to_string_lossy().into_owned(),
+                        persona: None,
                         system_prompt: None,
                     }),
                 ),

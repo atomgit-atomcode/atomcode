@@ -1561,3 +1561,13 @@ export async function getModelCards(): Promise<import('./lib/modelCards').ModelC
   if (!response.ok) throw new Error(`model cards failed: ${response.status}`);
   return response.json();
 }
+
+export interface PersonaInfo { source: string; appended: boolean | null; text: string }
+/** Inspect only the bound session; never switches the live runtime. */
+export async function getLivePersona(sessionId: string): Promise<{persona: PersonaInfo | null}> {
+  const response = await apiFetch('/live/persona', {
+    method: 'POST', headers: {...authHeaders(), 'Content-Type':'application/json'},
+    body: JSON.stringify({session_id: sessionId}),
+  });
+  return readJson<{persona: PersonaInfo | null}>(response);
+}

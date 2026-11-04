@@ -413,6 +413,17 @@ impl HostCommand {
     }
 }
 
+/// Mounted persona inspection returned only for an explicit prompt query.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PersonaInfo {
+    /// builtin, config, explicit, or host. Unknown future sources remain extensible.
+    pub source: String,
+    /// None when the host cannot declare whether it appended instructions.
+    pub appended: Option<bool>,
+    /// Exact mounted persona fragment, including append text, not the full system prompt.
+    pub text: String,
+}
+
 /// What a command that went through produced.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -541,6 +552,8 @@ pub enum HostReply {
         /// The system prompt, when it was asked for and the host has one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         system_prompt: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        persona: Option<PersonaInfo>,
     },
     /// What was typed into this project before, newest first and de-duplicated.
     History {
@@ -1984,6 +1997,7 @@ mod tests {
                 used: 48_000,
                 model: "glm-5".into(),
                 working_dir: "/w".into(),
+                persona: None,
                 system_prompt: None,
             },
             HostReply::Usage {

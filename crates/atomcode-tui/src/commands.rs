@@ -933,7 +933,11 @@ fn session_catalogue() -> Vec<Command> {
         Command::said_taking("patch", t(Msg::CmdTakesPath), t(Msg::CmdAboutPatch)),
         Command::said("compact", t(Msg::CmdAboutCompact)),
         Command::said("cancel-all", t(Msg::CmdAboutCancelAll)),
-        Command::said_taking("context", "[prompt]".into(), t(Msg::CmdAboutContext)),
+        Command::said_taking(
+            "context",
+            "[prompt|persona]".into(),
+            t(Msg::CmdAboutContext),
+        ),
         Command::said("agents", t(Msg::CmdAboutAgents)),
         Command::said("transcript", t(Msg::CmdAboutTranscript)),
         Command::said("clear", t(Msg::CmdAboutClear)),
@@ -1387,7 +1391,7 @@ impl CommandSet for SessionCommands {
                 // 它的那一刻很具体 —— agent 表现得像是被告知了一件谁也不记得
                 // 告诉过它的事,而那份提示词是挂着的各行各写一段拼出来的,
                 // 没有任何一处能读到全文。
-                if args.trim() == "prompt" {
+                if matches!(args.trim(), "prompt" | "persona") {
                     let control = match host(control) {
                         Ok(control) => control,
                         Err(refusal) => return refusal,
@@ -1399,6 +1403,26 @@ impl CommandSet for SessionCommands {
                         })
                         .await
                     {
+                        Ok(HostReply::Context {
+                            persona: Some(persona),
+                            ..
+                        }) if args.trim() == "persona" => {
+                            let source = match persona.source.as_str() {
+                                "builtin" => t(Msg::PersonaBuiltin),
+                                "config" => t(Msg::PersonaConfig),
+                                "explicit" => t(Msg::PersonaExplicit),
+                                _ => t(Msg::PersonaHost),
+                            };
+                            let appended = match persona.appended {
+                                Some(true) => t(Msg::PersonaAppended),
+                                Some(false) => t(Msg::PersonaNotAppended),
+                                None => t(Msg::PersonaAppendUnknown),
+                            };
+                            Outcome::Said(format!("{} · {}\n\n{}", source, appended, persona.text))
+                        }
+                        Ok(HostReply::Context { .. }) if args.trim() == "persona" => {
+                            Outcome::Said(t(Msg::PersonaUnavailable).into_owned())
+                        }
                         Ok(HostReply::Context {
                             system_prompt: Some(prompt),
                             ..
@@ -5149,6 +5173,7 @@ mod tests {
                 used: 50_000,
                 model: "glm-5".into(),
                 working_dir: "/w".into(),
+                persona: None,
                 system_prompt: None,
             }));
         let (app, _client, all) = following(&host);
@@ -5192,6 +5217,7 @@ mod tests {
                 used: 0,
                 model: "m".into(),
                 working_dir: "/w".into(),
+                persona: None,
                 system_prompt: Some("You are a coding agent.\nTools: …".into()),
             }),
             Ok(HostReply::Context {
@@ -5199,6 +5225,7 @@ mod tests {
                 used: 0,
                 model: "m".into(),
                 working_dir: "/w".into(),
+                persona: None,
                 system_prompt: None,
             }),
         ]);
@@ -5226,6 +5253,51 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn context_persona_shows_provenance_and_the_exact_fragment() {
+        let host = Arc::new(Recording::default());
+        host.replies
+            .lock()
+            .unwrap()
+            .push_back(Ok(HostReply::Context {
+                window: 1,
+                used: 0,
+                model: "m".into(),
+                working_dir: "/w".into(),
+                system_prompt: Some("FULL_SYSTEM_SHOULD_NOT_BE_SHOWN".into()),
+                persona: Some(atomcode_host_api::PersonaInfo {
+                    source: "explicit".into(),
+                    appended: Some(true),
+                    text: "PERSONA\n\nAPPENDED 原文".into(),
+                }),
+            }));
+        host.replies
+            .lock()
+            .unwrap()
+            .push_back(Ok(HostReply::Context {
+                window: 1,
+                used: 0,
+                model: "m".into(),
+                working_dir: "/w".into(),
+                system_prompt: Some("OLD_HOST_PROMPT".into()),
+                persona: None,
+            }));
+        let (app, _client, all) = following(&host);
+        match all.dispatch("/context persona", &app.context()).await {
+            Outcome::Said(text) => {
+                assert!(text.contains(&*t(Msg::PersonaExplicit)));
+                assert!(text.contains(&*t(Msg::PersonaAppended)));
+                assert!(text.ends_with("PERSONA\n\nAPPENDED 原文"));
+                assert!(!text.contains("FULL_SYSTEM_SHOULD_NOT_BE_SHOWN"));
+            }
+            other => panic!("{other:?}"),
+        }
+        match all.dispatch("/context persona", &app.context()).await {
+            Outcome::Said(text) => assert_eq!(text, t(Msg::PersonaUnavailable)),
+            other => panic!("{other:?}"),
+        }
+    }
+
     /// A host that cannot say what the window is says nothing rather than
     /// `0 / 0`, and the counted half still reaches the person.
     #[tokio::test]
@@ -5239,6 +5311,7 @@ mod tests {
                 used: 0,
                 model: String::new(),
                 working_dir: "/w".into(),
+                persona: None,
                 system_prompt: None,
             }));
         let (app, _client, all) = following(&host);
@@ -5849,6 +5922,7 @@ mod tests {
                 used: 0,
                 model: "m".into(),
                 working_dir: dir.display().to_string(),
+                persona: None,
                 system_prompt: None,
             }));
         host
@@ -6251,6 +6325,7 @@ mod tests {
                     used: 0,
                     model: "m".into(),
                     working_dir: dir.path().display().to_string(),
+                    persona: None,
                     system_prompt: None,
                 }));
         }
@@ -7264,6 +7339,7 @@ mod tests {
                 used: 0,
                 model: "m".into(),
                 working_dir: here.path().display().to_string(),
+                persona: None,
                 system_prompt: None,
             }));
         host.replies

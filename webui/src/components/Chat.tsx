@@ -41,7 +41,7 @@ import { rankSessionReferences, sessionReferenceToken, sessionReferenceTokens } 
 import { sessionReferenceCandidates } from '../api';
 import { VNode } from 'preact';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, listDir, searchFiles, changeDir, postConfigReload, postCommand, postLiveCompact, postUserInputAnswer, postLivePolicyInterventionResolution, openWorkspaceFile, type CommandResult, type RoutedUserInputRequest, type PolicyInterventionEvent, type TurnStats } from '../api';
+import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, listDir, searchFiles, changeDir, postConfigReload, postCommand, getLivePersona, postLiveCompact, postUserInputAnswer, postLivePolicyInterventionResolution, openWorkspaceFile, type CommandResult, type RoutedUserInputRequest, type PolicyInterventionEvent, type TurnStats } from '../api';
 import {
   parseSlashCommand,
   buildCommandMap,
@@ -2309,6 +2309,21 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
         void deliver(text, [], modeState.confirmedMode);
       },
       execServerCommand: async (command, arg) => {
+        if (command === 'context' && arg.trim() === 'persona') {
+          if (!sessionId) { pushCommandNotice(t('cmd.persona.unavailable')); return; }
+          const generation = sessionGenerationRef.current;
+          try {
+            const {persona} = await getLivePersona(sessionId);
+            if (generation !== sessionGenerationRef.current) return;
+            if (!persona) { pushCommandNotice(t('cmd.persona.unavailable')); return; }
+            const source = persona.source === 'builtin' ? 'cmd.persona.builtin' : persona.source === 'config' ? 'cmd.persona.config' : persona.source === 'explicit' ? 'cmd.persona.explicit' : 'cmd.persona.host';
+            const appended = persona.appended === true ? 'cmd.persona.yes' : persona.appended === false ? 'cmd.persona.no' : 'cmd.persona.unknown';
+            pushCommandNotice(`${t(source)} · ${t(appended)}\n\n${persona.text}`);
+          } catch {
+            if (generation === sessionGenerationRef.current) pushCommandNotice(t('cmd.persona.unavailable'));
+          }
+          return;
+        }
 
         const SESSION_MUTATING = new Set(['undo', 'compact']);
         if (SESSION_MUTATING.has(command)) {

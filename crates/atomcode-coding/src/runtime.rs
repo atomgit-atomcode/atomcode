@@ -643,9 +643,22 @@ pub struct RuntimeContextStats {
     /// 每个别的调用方要的都是一个数。人想看它的那一刻很具体:agent 表现得
     /// 像是被告知了一件谁也不记得告诉过它的事。
     pub system_prompt: Option<String>,
+    /// Current mounted persona, only when explicitly requested.
+    pub persona: Option<RuntimePersonaInfo>,
     /// On-demand asset status, captured from the mounted services rather than
     /// reconstructed by a driver. Populated only with `context_stats_with(true)`.
     pub assets: Option<RuntimeAssetSources>,
+}
+
+/// Inspection of the mounted persona contribution, separate from the full prompt.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct RuntimePersonaInfo {
+    /// builtin, config, explicit, or host. Unknown future sources remain extensible.
+    pub source: String,
+    /// None when the host cannot declare whether it appended instructions.
+    pub appended: Option<bool>,
+    /// Exact mounted persona fragment, including append text, not the full system prompt.
+    pub text: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -6821,6 +6834,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             model: runtime.config.model.clone(),
                             working_dir: runtime.config.working_dir.clone(),
                             system_prompt,
+                            persona: prompt.then(|| runtime_persona_info(runtime)).flatten(),
                             assets: prompt.then(|| runtime_asset_sources(runtime)),
                         }));
                     }
@@ -11555,6 +11569,37 @@ fn record_code_rewind(live: &atomcode_harness::agent::Agent, turn: u64) {
             scope: atomcode_harness::session::RewindScope::Code,
         },
     );
+}
+
+fn runtime_persona_info(runtime: &RuntimeResources) -> Option<RuntimePersonaInfo> {
+    let app = runtime.harness_app.as_ref()?;
+    let text = app
+        .context()
+        .service::<atomcode_harness::seams::SystemPromptSvc>()?
+        .fragment("persona-atomcode")?;
+    let entry = app
+        .tree()
+        .entries
+        .iter()
+        .find(|entry| entry.id == "persona-atomcode")?;
+    let (source, appended) = if entry.name == "persona-atomcode" {
+        let row = crate::host::PersonaConfig::from_config(&entry.config).ok()?;
+        let source = if row.prompt_overrides.replace.is_some() {
+            "explicit"
+        } else if row.system_prompt.is_some() {
+            "config"
+        } else {
+            "builtin"
+        };
+        (source, Some(row.prompt_overrides.append.is_some()))
+    } else {
+        ("host", None)
+    };
+    Some(RuntimePersonaInfo {
+        source: source.into(),
+        appended,
+        text,
+    })
 }
 
 fn runtime_asset_sources(runtime: &RuntimeResources) -> RuntimeAssetSources {

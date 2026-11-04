@@ -508,6 +508,16 @@ async fn a_host_persona_reads_the_identity_and_keeps_it_across_a_model_switch() 
         recorder.system()
     );
 
+    assert!(
+        runtime
+            .handle
+            .context_stats_with(true)
+            .await
+            .unwrap()
+            .persona
+            .is_none(),
+        "a host using a private fragment id must not be guessed from its plugin name"
+    );
     runtime
         .handle
         .reassemble_provider(env.agent("model-b"))
@@ -597,6 +607,30 @@ async fn two_runtimes_in_one_process_are_who_they_were_told_they_are() {
     stop(stock_runtime).await;
 }
 
+async fn inspect_persona(runtime: &CodingRuntime, source: &str, appended: bool, expected: &str) {
+    assert!(runtime
+        .handle
+        .context_stats()
+        .await
+        .unwrap()
+        .persona
+        .is_none());
+    let info = runtime
+        .handle
+        .context_stats_with(true)
+        .await
+        .unwrap()
+        .persona
+        .unwrap();
+    assert_eq!(info.source, source);
+    assert_eq!(info.appended, Some(appended));
+    assert!(info.text.starts_with(expected), "{}", info.text);
+    assert!(
+        !info.text.contains(PROJECT_MARK),
+        "project instructions are a separate contribution"
+    );
+}
+
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn configured_personas_follow_models_and_explicit_overrides_survive_rebuilds() {
     let env = env();
@@ -617,6 +651,13 @@ async fn configured_personas_follow_models_and_explicit_overrides_survive_rebuil
         "{system}"
     );
     assert!(system.contains(PROJECT_MARK));
+    inspect_persona(
+        &runtime,
+        "config",
+        true,
+        "CONFIGURED_PERSONA_A\n\nAPPENDED_VERBATIM",
+    )
+    .await;
     let mut next = env.agent("model-b");
     next.system_prompt = Some("CONFIGURED_PERSONA_B".into());
     runtime.handle.reassemble_provider(next).await.unwrap();
@@ -627,6 +668,7 @@ async fn configured_personas_follow_models_and_explicit_overrides_survive_rebuil
         "{system}"
     );
     assert!(!system.contains("CONFIGURED_PERSONA_A"));
+    inspect_persona(&runtime, "config", true, "CONFIGURED_PERSONA_B").await;
     runtime
         .handle
         .reassemble_provider(env.agent("model-c"))
@@ -637,6 +679,7 @@ async fn configured_personas_follow_models_and_explicit_overrides_survive_rebuil
     assert!(system.starts_with("You are "));
     assert!(!system.contains("CONFIGURED_PERSONA_B"));
     assert_eq!(system.matches("APPENDED_VERBATIM").count(), 1);
+    inspect_persona(&runtime, "builtin", true, "You are ").await;
     stop(runtime).await;
 
     let mut input = env.start(
@@ -664,6 +707,13 @@ async fn configured_personas_follow_models_and_explicit_overrides_survive_rebuil
             "{system}"
         );
         assert!(!system.contains("IGNORED_CONFIG"));
+        inspect_persona(
+            &runtime,
+            "explicit",
+            true,
+            "EXPLICIT_PERSONA\n\nEXPLICIT_APPEND",
+        )
+        .await;
         assert!(system.contains(PROJECT_MARK));
     }
     let id = runtime.session.clone().unwrap().id;
@@ -679,6 +729,7 @@ async fn configured_personas_follow_models_and_explicit_overrides_survive_rebuil
     turn(&mut runtime, "resumed").await;
     let system = recorder.system();
     assert!(system.starts_with("RESUMED_PERSONA"));
+    inspect_persona(&runtime, "explicit", false, "RESUMED_PERSONA").await;
     assert!(!system.contains("EXPLICIT_PERSONA"));
     assert!(system.contains(PROJECT_MARK));
     stop(runtime).await;

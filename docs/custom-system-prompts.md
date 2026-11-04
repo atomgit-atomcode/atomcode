@@ -30,3 +30,9 @@ system_prompt = "你是一位代码导师。"
 切换模型时，配置中的 persona 随当前模型更新；没有配置的模型恢复内置 persona。本次启动指定的 CLI 替换和追加保持不变，包括 reload、undo、会话切换和 runtime 重建；TUI 新建后台 runtime 同样携带它们。
 
 CLI 提示词不会持久化到会话日志。下次进程启动恢复会话时，使用当次参数及配置；需要长期使用时写入 config.toml，或每次传入同一个文件。当前不提供 persona 预设库、运行中 persona 切换命令或 SystemPromptHook。
+
+## 查看实际生效内容
+
+TUI 和 WebUI 输入 `/context persona`，可查看当前挂载 persona 的来源、是否追加指令及原文。`/context prompt` 在 TUI 中仍显示完整系统提示词；普通 `/context` 仍显示上下文预算。
+
+WebUI 只查询该视图对应的已绑定运行时，不会为了查看提示词切换绑定。浏览离线历史或其他会话时会提示不可查询。自定义宿主的追加状态无法确定时显示“未知”；若宿主使用私有片段 ID，无法可靠识别 persona 时会提示未提供查看信息，不猜测原文。

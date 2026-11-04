@@ -742,3 +742,20 @@ test('live session switch preserves the server rejection diagnostic', async () =
     });
   });
 });
+
+test('persona inspection scopes the live read and propagates a stale-session rejection', async () => {
+  const originalFetch = globalThis.fetch;
+  let body: unknown;
+  globalThis.fetch = (async (url, init) => {
+    assert.equal(String(url), '/live/persona');
+    body = JSON.parse(String(init?.body));
+    return new Response(JSON.stringify({persona:{source:'explicit',appended:true,text:'原文\nAPPEND'}}), {status:200});
+  }) as typeof fetch;
+  try {
+    const {getLivePersona} = await import('./api.ts');
+    assert.equal((await getLivePersona('session-a')).persona?.text, '原文\nAPPEND');
+    assert.deepEqual(body, {session_id:'session-a'});
+    globalThis.fetch = (async () => new Response('{"error":"StaleBinding"}', {status:409})) as typeof fetch;
+    await assert.rejects(getLivePersona('session-b'));
+  } finally { globalThis.fetch = originalFetch; }
+});
