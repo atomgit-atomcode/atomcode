@@ -41,17 +41,28 @@ async fn refresh_with_deadline(
 /// Run on the blocking pool: OS resolution may launch scutil, and TCP probes
 /// must never block the agent executor or its cancellation path.
 fn refresh() -> Result<Option<ProxyConfig>, ProviderError> {
-    let configured =
-        atomcode_config::proxy::refreshed_follow_system_config().map_err(|_| ProviderError {
-            retryable: true,
-            message: "could not refresh system proxy settings".into(),
-            ..Default::default()
-        })?;
+    let configured = atomcode_config::proxy::refreshed_follow_system_config()
+        .map_err(|error| proxy_refresh_error(error.as_ref()))?;
     Ok(configured.map(|cfg| {
         without_refused_loopback(cfg, |addr| {
             TcpStream::connect_timeout(&addr, Duration::from_millis(50)).map(|_| ())
         })
     }))
+}
+
+fn proxy_refresh_error(error: &(dyn std::error::Error + 'static)) -> ProviderError {
+    let reason = error.downcast_ref::<atomcode_config::system_proxy::ProxyReadError>();
+    // Only the classified leaf error is safe to display. Never echo an unknown
+    // source error: it may include proxy URLs or credentials.
+    let detail = reason
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "OS proxy query failed".into());
+    ProviderError {
+        retryable: reason.is_some_and(|why| why.is_retryable()),
+        code: Some("system_proxy_refresh_failed".into()),
+        message: format!("could not refresh system proxy settings: {detail}. Check system proxy settings or use /proxy to configure the intended proxy mode."),
+        ..Default::default()
+    }
 }
 
 fn loopback_addresses(raw: &str) -> Vec<SocketAddr> {
@@ -163,6 +174,27 @@ mod tests {
         assert!(error.retryable);
         assert!(error.message.contains("timed out"));
         assert_eq!(started.elapsed(), REFRESH_TIMEOUT);
+    }
+
+    #[test]
+    fn classified_proxy_errors_keep_safe_details_and_stop_permanent_retries() {
+        use atomcode_config::system_proxy::{ProxyReadError, ProxySetting};
+        let source =
+            ProxyReadError::from_io(ProxySetting::ProxyEnable, io::Error::from_raw_os_error(222));
+        let error = proxy_refresh_error(&source);
+        assert!(!error.retryable);
+        assert_eq!(error.code.as_deref(), Some("system_proxy_refresh_failed"));
+        assert!(error.message.contains("ProxyEnable"));
+        assert!(error.message.contains("OS error 222"));
+        assert!(error.message.contains("/proxy"));
+        let source = io::Error::new(
+            io::ErrorKind::Other,
+            "http://user:secret@private.example:7890",
+        );
+        let error = proxy_refresh_error(&source);
+        assert!(!error.retryable);
+        assert!(!error.message.contains("secret"));
+        assert!(!error.message.contains("private.example"));
     }
 
     fn config(raw: &str) -> ProxyConfig {

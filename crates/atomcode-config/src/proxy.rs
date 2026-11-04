@@ -235,12 +235,23 @@ fn follow_system_env(
 /// `None` preserves the existing builder policy for fixed/no-proxy modes and
 /// standalone embedders that have not installed the product's process policy.
 pub fn refreshed_follow_system_config() -> anyhow::Result<Option<ProxyConfig>> {
-    if env::var(MODE_ENV).ok().as_deref() != Some(ProxyMode::FollowSystem.as_str()) {
+    let mode = env::var(MODE_ENV).ok();
+    let Some(system) =
+        refresh_system_proxy_for_mode(mode.as_deref(), crate::system_proxy::resolve_checked)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(follow_system_config(startup_env(), &system)))
+}
+
+fn refresh_system_proxy_for_mode(
+    mode: Option<&str>,
+    read: impl FnOnce() -> Result<crate::system_proxy::SystemProxy, crate::system_proxy::ProxyReadError>,
+) -> Result<Option<crate::system_proxy::SystemProxy>, crate::system_proxy::ProxyReadError> {
+    if mode != Some(ProxyMode::FollowSystem.as_str()) {
         return Ok(None);
     }
-    let system = crate::system_proxy::try_resolve()
-        .ok_or_else(|| anyhow::anyhow!("could not refresh system proxy settings"))?;
-    Ok(Some(follow_system_config(startup_env(), &system)))
+    read().map(Some)
 }
 
 fn follow_system_config(
@@ -337,6 +348,24 @@ pub fn apply_process_proxy_config(cfg: &ProxyConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_and_disabled_modes_do_not_read_system_settings_and_follow_errors_are_preserved() {
+        for mode in [None, Some("no_proxy"), Some("default_proxy")] {
+            assert_eq!(
+                refresh_system_proxy_for_mode(mode, || panic!("must not query the OS")),
+                Ok(None)
+            );
+        }
+        let why = crate::system_proxy::ProxyReadError::from_io(
+            crate::system_proxy::ProxySetting::ProxyServer,
+            std::io::Error::from_raw_os_error(5),
+        );
+        assert_eq!(
+            refresh_system_proxy_for_mode(Some("follow_system"), || Err(why.clone())),
+            Err(why)
+        );
+    }
 
     #[test]
     fn follow_system_refresh_observes_os_changes_without_retaining_old_proxy() {
