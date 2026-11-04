@@ -1185,7 +1185,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
 
   // How close to the bottom (px) still counts as "at the bottom" — a small slack so
   // sub-pixel rounding / layout jitter during streaming doesn't wrongly release follow.
-  const BOTTOM_SLACK = 80;
+  const BOTTOM_SLACK = 2;
   const recomputeAtBottom = () => {
     const el = scrollRef.current;
     if (!el || document.visibilityState === 'hidden') return;
@@ -3589,6 +3589,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   // 消息气泡时都生效;阻止浏览器默认查找以免误触原生 UI。
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if (e.isComposing || e.keyCode === 229) return;
       const mod = e.metaKey || e.ctrlKey;
       if (mod && e.key.toLowerCase() === 'f') {
         if (messages.length === 0) return;
@@ -4301,6 +4302,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
             placeholder={t('chat.searchPlaceholder')}
             onInput={(e) => { setSearch((e.target as HTMLInputElement).value); setMatchIdx(0); }}
             onKeyDown={(e) => {
+              if (e.isComposing || e.keyCode === 229) return;
               // Enter/↓ = 下一条;Shift+Enter/↑ = 上一条。输入框内 ↑/↓ 不移动光标
               // (单行输入无光标位置歧义),直接在匹配间跳转。
               if (e.key === 'Enter') {

@@ -754,6 +754,7 @@ export function Sidebar({
   useEffect(() => {
     if (!historyPreview) return;
     const close = (event: KeyboardEvent) => {
+      if (event.isComposing || event.keyCode === 229) return;
       if (event.key === 'Escape') {
         ++previewGeneration.current;
         setHistoryPreview(null);
@@ -955,6 +956,7 @@ export function Sidebar({
   useEffect(() => {
     if (!searchOpen) return;
     const onKey = (e: KeyboardEvent) => {
+      if (e.isComposing || e.keyCode === 229) return;
       if (e.key === 'Escape') setSearchOpen(false);
     };
     document.addEventListener('keydown', onKey);

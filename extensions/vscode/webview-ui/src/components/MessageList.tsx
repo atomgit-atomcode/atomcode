@@ -12,27 +12,36 @@ export function MessageList() {
   const bottomRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [isUserScrolledUp, setIsUserScrolledUp] = useState(false);
+  const followingRef = useRef(true);
+  const lastScrollTop = useRef(0);
+
+  const setFollowing = useCallback((following: boolean) => {
+    followingRef.current = following;
+    setIsUserScrolledUp(!following);
+  }, []);
 
   const scrollToBottom = useCallback(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-    setIsUserScrolledUp(false);
-  }, []);
+    setFollowing(true);
+  }, [setFollowing]);
 
-  // Detect whether the user has scrolled away from the bottom
+  // Upward movement releases follow immediately. Proximity alone never resumes it.
   const handleScroll = useCallback(() => {
     const el = containerRef.current;
     if (!el) return;
-    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
-    setIsUserScrolledUp(!atBottom);
-  }, []);
+    if (el.scrollHeight - el.scrollTop - el.clientHeight <= 2) setFollowing(true);
+    else if (el.scrollTop < lastScrollTop.current - 0.5) setFollowing(false);
+    lastScrollTop.current = el.scrollTop;
+  }, [setFollowing]);
 
   // Only auto-scroll if the user hasn't scrolled up
   // Use instant scroll to avoid layout repaint flicker during frequent
   // tool-result updates (bash commands with long output). Smooth scroll
   // is reserved for the manual scroll-to-bottom button click.
   useEffect(() => {
-    if (!isUserScrolledUp) {
+    if (followingRef.current) {
       bottomRef.current?.scrollIntoView();
+      lastScrollTop.current = containerRef.current?.scrollTop ?? 0;
     }
   }, [state.messages, state.queuedMessages, state.isGenerating]);
 

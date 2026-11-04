@@ -91,6 +91,19 @@ try {
       };
       request.onerror = () => resolve(false);
     })));
+    // A small real wheel gesture must release follow even inside the former 80px slack.
+    await page.locator('.messages-container').evaluate(node => { node.scrollTop = node.scrollHeight; });
+    await page.waitForTimeout(100);
+    await page.locator('.messages-container').hover();
+    await page.mouse.wheel(0, -25);
+    await page.waitForTimeout(100);
+    const up = await page.locator('.messages-container').evaluate(node => ({top: node.scrollTop, gap:node.scrollHeight-node.clientHeight-node.scrollTop}));
+    for (const client of clients) for (const event of [{type:'state',running:true},{type:'text',content:'scroll-repro-chunk'},{type:'state',running:false}]) client.write(`data: ${JSON.stringify(event)}\n\n`);
+    await page.waitForTimeout(200);
+    const streamed = await page.locator('.messages-container').evaluate(node => ({top: node.scrollTop, gap:node.scrollHeight-node.clientHeight-node.scrollTop}));
+    assert.ok(up.gap > 2);
+    assert.ok(streamed.gap > 2, 'WebUI small upward scroll stays away from latest');
+    assert.equal(streamed.top, up.top, 'stream updates preserve the small-scroll reading position');
     const initialCommand = await page.locator('.tool-name-secondary').first().innerText();
     await page.locator('.messages-container').evaluate(node => { node.scrollTop = 0; });
     await new Promise(resolve => setTimeout(resolve, 550));

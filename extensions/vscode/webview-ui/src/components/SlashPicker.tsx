@@ -55,7 +55,7 @@ export function SlashPicker({ filter, skills = [], onSelect, onClose }: SlashPic
     (e: KeyboardEvent) => {
       if (filtered.length === 0) return;
       // Don't intercept keystrokes while IME is composing
-      if (e.isComposing || e.key === 'Process') return;
+      if (e.isComposing || e.keyCode === 229 || e.key === 'Process') return;
 
       if (e.key === 'ArrowDown') {
         e.preventDefault();
