@@ -3430,10 +3430,27 @@ impl Host {
     pub fn provider_discovery_id(&self) -> Option<u64> {
         let m = self.moment.read().expect("moment poisoned");
         match m.providers_panel.as_ref()?.form.as_ref()? {
+            crate::providers::Form::Account(form) => form.discovery.as_ref().map(|d| d.id),
             crate::providers::Form::Model(form) if form.picking.is_some() => {
                 Some(form.discovery_id)
             }
             _ => None,
+        }
+    }
+
+    pub fn provider_draft_discovered(
+        &self,
+        request: u64,
+        listed: Result<Vec<crate::providers::Discovered>, String>,
+    ) {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let Some(crate::providers::Form::Account(form)) =
+            m.providers_panel.as_mut().and_then(|p| p.form.as_mut())
+        else {
+            return;
+        };
+        if let Some(discovery) = form.discovery.as_mut().filter(|d| d.id == request) {
+            discovery.result = Some(listed);
         }
     }
 
@@ -8324,6 +8341,48 @@ mod tests {
         mods.add_view(Arc::new(Mounted::<input::Input>::new()))
             .unwrap();
         Host::new(mods, default_layout())
+    }
+
+    #[test]
+    fn late_ollama_discovery_cannot_fill_a_draft_after_its_address_changed() {
+        use crate::providers::{AccountDiscovery, AccountForm, Form, Panel, ProvidersView};
+        let h = host();
+        let mut form = AccountForm::add(&ProvidersView::default());
+        form.discovery = Some(AccountDiscovery {
+            id: 10,
+            result: None,
+        });
+        h.moment.write().unwrap().providers_panel = Some(Panel {
+            form: Some(Form::Account(form)),
+            ..Panel::new()
+        });
+        h.provider_draft_discovered(9, Err("stale failure".into()));
+        let result = || {
+            let m = h.moment.read().unwrap();
+            let Some(Form::Account(form)) = m.providers_panel.as_ref().unwrap().form.as_ref()
+            else {
+                panic!("draft");
+            };
+            form.discovery.as_ref().unwrap().result.clone()
+        };
+        assert_eq!(result(), None);
+        h.provider_draft_discovered(10, Ok(vec![]));
+        assert_eq!(result(), Some(Ok(vec![])));
+        {
+            let mut m = h.moment.write().unwrap();
+            let Some(Form::Account(form)) = m.providers_panel.as_mut().unwrap().form.as_mut()
+            else {
+                panic!("draft");
+            };
+            form.endpoint = "http://localhost:12345".into();
+            form.discovery = None;
+        }
+        h.provider_draft_discovered(10, Err("old address".into()));
+        let m = h.moment.read().unwrap();
+        let Some(Form::Account(form)) = m.providers_panel.as_ref().unwrap().form.as_ref() else {
+            panic!("draft");
+        };
+        assert!(form.discovery.is_none());
     }
 
     #[test]

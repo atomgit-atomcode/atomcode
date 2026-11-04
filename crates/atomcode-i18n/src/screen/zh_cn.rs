@@ -352,6 +352,12 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             true => format!("服务端返回 HTTP {status},请检查 API key").into(),
             false => format!("服务端返回 HTTP {status}").into(),
         },
+        Msg::OllamaUnavailable { endpoint, local } => if local {
+            format!("无法连接 Ollama：{endpoint}。请在运行 atomcode 的机器上执行 `ollama serve`，然后按 Ctrl+F 重试。默认端口为 11434；使用其他端口时请修改地址。")
+        } else {
+            format!("无法连接 Ollama：{endpoint}。请检查目标机器上的 `ollama serve` 服务、地址、端口和网络访问，然后按 Ctrl+F 重试。")
+        }.into(),
+        Msg::OllamaModelsFound { count } => format!("Ollama 正在运行 · {count} 个模型 · 回车继续 · Ctrl+F 刷新").into(),
         Msg::DiscoverUnreachable => "连不上服务端".into(),
         Msg::ProviderDiscoverFailed { why } => {
             format!("没拉到模型列表:{why}。可以手动输入模型 ID。").into()

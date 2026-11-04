@@ -387,6 +387,12 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             true => format!("the endpoint answered HTTP {status}; check the API key").into(),
             false => format!("the endpoint answered HTTP {status}").into(),
         },
+        Msg::OllamaUnavailable { endpoint, local } => if local {
+            format!("Could not connect to Ollama at {endpoint}. Run `ollama serve` on the machine running atomcode, then press Ctrl+F to retry. Default port: 11434; edit the address if yours differs.")
+        } else {
+            format!("Could not connect to Ollama at {endpoint}. Check `ollama serve` on the target machine, its address, port and network access, then press Ctrl+F to retry.")
+        }.into(),
+        Msg::OllamaModelsFound { count } => format!("Ollama is running · {count} models · Enter to continue · Ctrl+F to refresh").into(),
         Msg::DiscoverUnreachable => "could not reach the endpoint".into(),
         Msg::ProviderDiscoverFailed { why } => {
             format!("Could not fetch the model list: {why}. Type the model id by hand.").into()

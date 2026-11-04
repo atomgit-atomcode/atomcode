@@ -546,6 +546,13 @@ pub enum Msg<'a> {
         key: bool,
     },
     DiscoverUnreachable,
+    OllamaUnavailable {
+        endpoint: &'a str,
+        local: bool,
+    },
+    OllamaModelsFound {
+        count: usize,
+    },
     /// The word a `※ recap:` line opens with.
     RecapLabel,
     /// Ctrl+Z where it cannot stop: no job control (Windows), or started with

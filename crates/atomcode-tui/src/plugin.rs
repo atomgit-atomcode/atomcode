@@ -3966,6 +3966,27 @@ impl Tui {
         let Some(port) = ctx.service::<crate::plugin::ProvidersSvc>() else {
             return Err(t(Msg::NoProviderPort).into_owned());
         };
+        if let Step::DiscoverDraft { endpoint } = &step {
+            let Some(request) = self.host.provider_discovery_id() else {
+                return Ok(None);
+            };
+            if let Some(listing) = port.discover_ollama(endpoint) {
+                let host = self.host.clone();
+                let keys = self.wake.lock().expect("wake poisoned").clone();
+                tokio::spawn(async move {
+                    host.provider_draft_discovered(request, listing.await);
+                    if let Some(keys) = keys {
+                        let _ = keys.send(Wake::Fact);
+                    }
+                });
+            } else {
+                self.host.provider_draft_discovered(
+                    request,
+                    Err(t(Msg::ProviderDiscoverUnsupported).into_owned()),
+                );
+            }
+            return Ok(None);
+        }
         // Listing an endpoint's models writes nothing, so it is not followed by
         // a reload: the answer fills the picker the form put up, off the frame.
         if let Step::Discover { account } = step {
@@ -3997,16 +4018,25 @@ impl Tui {
         // when a model was saved (see `Providers::probe`).
         let mut check: Option<(String, Option<String>)> = None;
         let said = match step {
-            Step::Use { .. } | Step::Stay | Step::Close | Step::Discover { .. } => None,
+            Step::Use { .. }
+            | Step::Stay
+            | Step::Close
+            | Step::Discover { .. }
+            | Step::DiscoverDraft { .. } => None,
             Step::SaveAccount {
                 id: Some(id),
                 draft,
+                ..
             } => {
                 port.edit_account(&id, &draft)?;
                 check = Some((id.clone(), None));
                 Some(t(Msg::ProviderEdited { id: &id }).into_owned())
             }
-            Step::SaveAccount { id: None, draft } => {
+            Step::SaveAccount {
+                id: None,
+                draft,
+                listed,
+            } => {
                 let id = port.add_account(&draft)?;
                 check = Some((id.clone(), None));
                 // Straight into its model list: an account with no model under
@@ -4015,7 +4045,15 @@ impl Tui {
                 self.host.show_providers(port.rows());
                 self.host.walk_into_provider(&id);
                 if self.host.connect_provider_models(&id) {
-                    if let Err(why) = self.apply_provider_step(Step::Discover {
+                    if let Some(listed) = listed {
+                        if let Some(request) = self.host.provider_discovery_id() {
+                            if let Some(why) =
+                                self.host.providers_discovered(&id, request, Ok(listed))
+                            {
+                                self.host.say(&why, true);
+                            }
+                        }
+                    } else if let Err(why) = self.apply_provider_step(Step::Discover {
                         account: id.clone(),
                     }) {
                         self.host.say(&why, true);
@@ -13794,6 +13832,7 @@ mod provider_probe_tests {
         tui.apply_provider_step(Step::SaveAccount {
             id: None,
             draft: account(),
+            listed: None,
         })
         .expect("the write lands");
         checked(&mut woken).await;
@@ -13816,6 +13855,7 @@ mod provider_probe_tests {
         tui.apply_provider_step(Step::SaveAccount {
             id: None,
             draft: account(),
+            listed: None,
         })
         .expect("the write lands");
         checked(&mut woken).await;
@@ -13886,6 +13926,7 @@ mod provider_probe_tests {
             tui.apply_provider_step(Step::SaveAccount {
                 id: Some("gw".into()),
                 draft: account(),
+                listed: None,
             })
             .expect("the write lands");
         }

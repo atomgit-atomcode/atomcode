@@ -8,7 +8,7 @@ import { headerBody, headerProblem, type HeaderRow } from "../lib/providerHeader
 // account endpoints, which share one writer with the terminal's `/provider`
 // panel and patch the file in place, leaving a person's comments alone.
 
-import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import {
   getConfig,
   postConfigReload,
@@ -612,6 +612,12 @@ function AddProviderCard({
     requiresKey: mode === 'preset' && !!chosen?.requires_api_key && chosen?.type !== 'ollama' && Object.keys(headerBody(draft.headers ?? [])).length === 0,
   });
   const endpoint = draft.baseUrl.trim() || chosen?.default_base_url || '';
+  const discoveryRequest = useMemo(() => ({
+    type: chosen?.type ?? 'openai',
+    base_url: endpoint,
+    api_key: draft.apiKey.trim() || undefined,
+    headers: headerBody(draft.headers ?? []),
+  }), [chosen?.type, endpoint, draft.apiKey, draft.headers]);
 
   async function submit() {
     if (blocker || saving || headerProblem(draft.headers ?? [])) return;
@@ -754,15 +760,11 @@ function AddProviderCard({
         rows={draft.models}
         levels={levelsOf(config)}
         setRows={(models) => setDraft({ ...typed, models })}
+        discoveryIdentity={discoveryRequest}
+        autoDiscover={chosen?.type === 'ollama'}
         discover={
           chosen?.discoverable !== false && endpoint && validBaseUrl(endpoint) && !apiKeyProblem(draft.apiKey) && !headerProblem(draft.headers ?? [])
-            ? () =>
-                discoverProviderModels({
-                  type: chosen?.type ?? 'openai',
-                  base_url: endpoint,
-                  api_key: draft.apiKey.trim() || undefined,
-        headers: headerBody(draft.headers ?? []),
-                })
+            ? () => discoverProviderModels(discoveryRequest)
             : null
         }
         discoverable={chosen?.discoverable !== false}
@@ -802,6 +804,8 @@ function ModelRowsEditor({
   levels,
   discover,
   discoverable,
+  discoveryIdentity,
+  autoDiscover = false,
   existing = [],
 }: {
   rows: ModelDraft[];
@@ -810,6 +814,9 @@ function ModelRowsEditor({
   /** `null` while the form has not got what a listing needs yet. */
   discover: (() => Promise<DiscoveredModelInfo[]>) | null;
   discoverable: boolean;
+  /** Connection identity, independent of the freshly rendered callback. */
+  discoveryIdentity: unknown;
+  autoDiscover?: boolean;
   existing?: string[];
 }) {
   const { t } = useSettings();
@@ -819,18 +826,51 @@ function ModelRowsEditor({
   // One row's reasoning settings open at a time, under that row.
   const [reasoningRow, setReasoningRow] = useState<number | null>(null);
 
+  // Invalidate synchronously on connection edits, before an old promise can
+  // settle and before effects run. The callback itself need not be memoized.
+  const active = useRef({ identity: discoveryIdentity, request: 0, mounted: true });
+  if (active.current.identity !== discoveryIdentity) {
+    active.current = { identity: discoveryIdentity, request: active.current.request + 1, mounted: true };
+  }
+  const discoverRef = useRef(discover);
+  discoverRef.current = discover;
+
   async function fetchModels() {
+    const discover = discoverRef.current;
     if (!discover) return;
+    const state = active.current;
+    const request = ++state.request;
+    const current = () => active.current === state && state.mounted && state.request === request;
     setFetching(true);
     setFetchError(null);
+    setPicking(null);
     try {
-      setPicking(await discover());
+      const models = await discover();
+      if (current()) setPicking(models);
     } catch (e) {
-      setFetchError(e instanceof Error ? e.message : String(e));
+      if (current()) setFetchError(e instanceof Error ? e.message : String(e));
     } finally {
-      setFetching(false);
+      if (current()) setFetching(false);
     }
   }
+
+  useLayoutEffect(() => {
+    const state = active.current;
+    state.mounted = true;
+    setFetchError(null);
+    setPicking(null);
+    setFetching(false);
+    // Debounce address edits; a manual retry cancels this scheduled probe too.
+    const request = state.request;
+    const timer = autoDiscover && discoverRef.current ? setTimeout(() => {
+      if (active.current === state && state.request === request) void fetchModels();
+    }, 300) : undefined;
+    return () => {
+      clearTimeout(timer);
+      state.mounted = false;
+      state.request++;
+    };
+  }, [discoveryIdentity, autoDiscover]);
 
   const update = (i: number, patch: Partial<ModelDraft>) =>
     setRows(rows.map((r, j) => (j === i ? { ...r, ...patch } : r)));
@@ -841,13 +881,13 @@ function ModelRowsEditor({
         <label class="add-model-label">{t('providers.models')}</label>
         {discoverable ? (
           <button class="provider-action-btn" type="button" disabled={!discover || fetching} onClick={() => void fetchModels()}>
-            {fetching ? t('providers.fetching') : t('providers.fetchModels')}
+            {fetching ? t('providers.fetching') : fetchError ? t('providers.retryModels') : t('providers.fetchModels')}
           </button>
         ) : (
           <span class="field-hint">{t('providers.fetchUnsupported')}</span>
         )}
       </div>
-      {fetchError && <div class="modal-error">{fetchError}</div>}
+      {fetchError && <div class="modal-error" role="alert">{fetchError}</div>}
       <div class="model-draft-list">
         <ModelColumns removable />
         {rows.map((row, i) => (
@@ -1287,6 +1327,8 @@ function AddModelsPanel({
         levels={levels}
         existing={existing}
         discoverable={discoverable}
+        discoveryIdentity={`${account.id}:${account.type}:${account.base_url}`}
+        autoDiscover={account.type === 'ollama'}
         discover={
           discoverable && account.base_url
             ? () =>

@@ -74,7 +74,7 @@ impl View for Providers {
         }
         let view = &vp.moment.providers;
         let caps = vp.moment.caps;
-        layout(view, panel, vp.rect.h as usize)
+        layout(view, panel, vp.rect.h as usize, w)
             .into_iter()
             .map(|row| draw(view, panel, row, w, caps))
             .collect()
@@ -97,7 +97,7 @@ impl View for Providers {
         let mut open = panel.clone();
         open.query.clear();
         Height::Hug(
-            layout(&moment.providers, &open, usize::MAX)
+            layout(&moment.providers, &open, usize::MAX, width as usize)
                 .len()
                 .min(u16::MAX as usize) as u16,
         )
@@ -137,7 +137,7 @@ enum Row {
     BatchCount,
     BatchModel(usize),
     BatchCapabilities(usize, usize),
-    DiscoveryError,
+    DiscoveryMessage(String),
     AccountSection(bool),
     /// The model picker over the add form: the listing is on its way.
     PickLoading,
@@ -147,7 +147,7 @@ enum Row {
     Pick(usize),
 }
 
-fn layout(view: &ProvidersView, panel: &Panel, h: usize) -> Vec<Row> {
+fn layout(view: &ProvidersView, panel: &Panel, h: usize, w: usize) -> Vec<Row> {
     let mut rows = vec![Row::Rule, Row::Header];
     if let Some(Form::Model(ModelForm {
         picking: Some(picking),
@@ -226,8 +226,29 @@ fn layout(view: &ProvidersView, panel: &Panel, h: usize) -> Vec<Row> {
                 if !form.model.is_empty() {
                     rows.extend((0..3).map(Row::Capabilities));
                 }
-                if form.discovery_error.is_some() {
-                    rows.push(Row::DiscoveryError);
+                if let Some(error) = &form.discovery_error {
+                    rows.extend(
+                        width::wrap(error, w.saturating_sub(2).max(1))
+                            .into_iter()
+                            .map(Row::DiscoveryMessage),
+                    );
+                }
+            }
+            if let Form::Account(form) = form {
+                if let Some(discovery) = &form.discovery {
+                    let message = match &discovery.result {
+                        None => t(Msg::ProviderDiscovering).into_owned(),
+                        Some(Err(error)) => error.clone(),
+                        Some(Ok(models)) => t(Msg::OllamaModelsFound {
+                            count: models.len(),
+                        })
+                        .into_owned(),
+                    };
+                    rows.extend(
+                        width::wrap(&message, w.saturating_sub(2).max(1))
+                            .into_iter()
+                            .map(Row::DiscoveryMessage),
+                    );
                 }
             }
             rows.push(Row::Blank);
@@ -455,11 +476,7 @@ fn draw(view: &ProvidersView, panel: &Panel, row: Row, w: usize, caps: crate::ca
             };
             Line::styled(format!("  {text}"), theme::fg(Role::Muted)).truncate(w)
         }
-        Row::DiscoveryError => {
-            let text = match &panel.form {
-                Some(Form::Model(form)) => form.discovery_error.as_deref().unwrap_or_default(),
-                _ => "",
-            };
+        Row::DiscoveryMessage(text) => {
             Line::styled(format!("  {text}"), theme::fg(Role::Warning)).truncate(w)
         }
         Row::PickLoading => Line::styled(
@@ -1118,7 +1135,7 @@ fn levels_text(
         .join("")
 }
 
-fn legend(panel: &Panel) -> Vec<(String, String)> {
+fn legend(view: &ProvidersView, panel: &Panel) -> Vec<(String, String)> {
     let key = |k: &str, msg: Msg<'_>| (k.to_string(), t(msg).into_owned());
     match &panel.form {
         Some(Form::Model(ModelForm {
@@ -1152,6 +1169,12 @@ fn legend(panel: &Panel) -> Vec<(String, String)> {
             ),
             key("^s", Msg::ProviderSaveOnly),
             key("esc", Msg::LegendBack),
+        ],
+        Some(Form::Account(form)) if form.is_ollama(view) => vec![
+            key("⏎", Msg::ProviderContinue),
+            key("^f", Msg::ProviderDiscoverHint),
+            key("^o", Msg::ProviderAdvanced),
+            key("esc", Msg::LegendCancel),
         ],
         Some(Form::Account(form)) if form.preset.is_some() => vec![
             key("⏎", Msg::ProviderContinue),
@@ -1278,7 +1301,7 @@ fn legend_buttons(
             .unwrap_or_default(),
         _ => (false, false),
     };
-    legend(panel)
+    legend(view, panel)
         .into_iter()
         .map(|(key, label)| {
             let press = if panel.form.is_some() {
@@ -1324,7 +1347,12 @@ pub fn action_at(
     row: usize,
 ) -> Option<crate::surface::KeyPress> {
     let panel = moment.providers_panel.as_ref()?;
-    let rows = layout(&moment.providers, panel, vp.rect.h as usize);
+    let rows = layout(
+        &moment.providers,
+        panel,
+        vp.rect.h as usize,
+        vp.rect.w as usize,
+    );
     if let Some(Row::Listed(at)) = rows.get(row) {
         let (start, text) = row_edit_button(&moment.providers, panel, *at, vp.rect.w as usize)?;
         return (col >= start && col < start + width::str_width(&text))
@@ -1383,7 +1411,12 @@ pub fn geometry(moment: &Moment, vp: &Viewport<'_>) -> Geometry {
             header: None,
         };
     };
-    let rows = layout(&moment.providers, panel, vp.rect.h as usize);
+    let rows = layout(
+        &moment.providers,
+        panel,
+        vp.rect.h as usize,
+        vp.rect.w as usize,
+    );
     // 小标题不接鼠标:点它既不该选中它(停不住),也不该顺手把它底下那个模型
     // 换上——点一条分界线不是在挑东西。
     let listed = moment.providers.listed(panel);
@@ -1490,6 +1523,56 @@ mod tests {
             .flat_map(|row| (0..240).map(move |col| (col, row)))
             .find(|(col, row)| action_at(m, &vp, *col, *row) == Some(key))
             .expect("button is visible")
+    }
+
+    #[test]
+    fn ollama_startup_guidance_and_retry_are_visible_in_a_narrow_panel() {
+        let view = ProvidersView::new(
+            vec![],
+            vec![],
+            vec![Protocol {
+                id: "ollama".into(),
+                label: "Ollama".into(),
+                endpoint: Some("http://localhost:11434".into()),
+                needs_key: false,
+            }],
+            vec![],
+        );
+        let mut form = AccountForm::add(&view);
+        form.discovery = Some(crate::providers::AccountDiscovery {
+            id: 1,
+            result: Some(Err("Ollama: run ollama serve on the machine running atomcode, then retry. Default port: 11434.".into())),
+        });
+        let mut m = moment(Some(Panel {
+            form: Some(Form::Account(form)),
+            ..Panel::new()
+        }));
+        m.providers = view;
+        let rows = layout(&m.providers, m.providers_panel.as_ref().unwrap(), 40, 40);
+        let text = rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::DiscoveryMessage(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(text.contains("ollama serve"));
+        assert!(text.contains("11434"));
+        assert!(drawn(&m, 40, 40).contains("^f"));
+        // Editing an address clears its diagnostic, but must keep retry discoverable.
+        let mut edited = m.clone();
+        let Some(Form::Account(form)) = edited.providers_panel.as_mut().unwrap().form.as_mut()
+        else {
+            panic!("account");
+        };
+        form.discovery = None;
+        assert!(drawn(&edited, 40, 40).contains("^f"));
+        assert!(
+            rows.iter()
+                .filter(|row| matches!(row, Row::DiscoveryMessage(_)))
+                .count()
+                > 1
+        );
     }
 
     #[test]
@@ -1602,7 +1685,7 @@ mod tests {
         let m = moment(Some(panel));
         let vp = Viewport::new(Rect::sized(80, 30), &m);
         let mut checked = 0;
-        for (row, item) in layout(&m.providers, m.providers_panel.as_ref().unwrap(), 30)
+        for (row, item) in layout(&m.providers, m.providers_panel.as_ref().unwrap(), 30, 80)
             .iter()
             .enumerate()
         {
@@ -1809,7 +1892,7 @@ mod tests {
         let m = moment(Some(panel));
         for width in [20, 40, 80, 120] {
             let vp = Viewport::new(Rect::sized(width, 18), &m);
-            let rows = layout(&m.providers, m.providers_panel.as_ref().unwrap(), 18);
+            let rows = layout(&m.providers, m.providers_panel.as_ref().unwrap(), 18, 80);
             assert!(rows.len() <= 18);
             let at = rows
                 .iter()
@@ -2144,7 +2227,7 @@ mod tests {
         let m = moment(Some(Panel::new()));
         let vp = Viewport::new(Rect::sized(80, 24), &m);
         let geom = geometry(&m, &vp);
-        let rows = layout(&m.providers, m.providers_panel.as_ref().unwrap(), 24);
+        let rows = layout(&m.providers, m.providers_panel.as_ref().unwrap(), 24, 80);
         let first = rows
             .iter()
             .position(|row| matches!(row, Row::Listed(0)))
@@ -2196,7 +2279,7 @@ mod tests {
             providers_panel: Some(panel.clone()),
             ..Moment::default()
         };
-        let rows = layout(&m.providers, &panel, 14);
+        let rows = layout(&m.providers, &panel, 14, 80);
         let shown: Vec<usize> = rows
             .iter()
             .filter_map(|row| match row {
