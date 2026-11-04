@@ -5048,7 +5048,12 @@ mod tests {
         // workspace gate's `grantable:false` floor, which the marker-substring form MISSES
         // (`/etc`, home dotfiles, secret extensions). These must stay off the blanket or
         // "allow all bash" would silently cover the one command that must always ask.
+        // The system-prefix set is platform-specific (`/etc` vs `C:\Windows`), so each
+        // build pins its own protected target.
+        #[cfg(unix)]
         assert_eq!(group("rm /etc/hosts"), None);
+        #[cfg(windows)]
+        assert_eq!(group("rm C:/Windows/System32/drivers/etc/hosts"), None);
         assert_eq!(group("shred ~/backup.key"), None);
         assert_eq!(group("mv ~/.bashrc /tmp/x"), None);
         assert_eq!(group("truncate -s0 ./cert.crt"), None);

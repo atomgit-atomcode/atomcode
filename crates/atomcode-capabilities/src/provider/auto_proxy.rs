@@ -44,7 +44,7 @@ fn refresh() -> Result<Option<ProxyConfig>, ProviderError> {
     let configured = atomcode_config::proxy::refreshed_follow_system_config()
         .map_err(|error| proxy_refresh_error(error.as_ref()))?;
     Ok(configured.map(|cfg| {
-        without_refused_loopback(cfg, |addr| {
+        without_dead_loopback(cfg, |addr| {
             TcpStream::connect_timeout(&addr, Duration::from_millis(50)).map(|_| ())
         })
     }))
@@ -94,16 +94,34 @@ fn loopback_addresses(raw: &str) -> Vec<SocketAddr> {
         .unwrap_or_default()
 }
 
-fn without_refused_loopback(
+/// A loopback probe proves the listener dead on ConnectionRefused — and on
+/// TimedOut too: a live listener answers at kernel level, instantly, whatever
+/// the process load, so 50ms of silence from 127.0.0.1/::1 is never a live
+/// proxy. The TimedOut arm is not theoretical: on Windows, `connect_timeout`
+/// to a port whose listener just closed reports TimedOut (no RST is delivered
+/// to the non-blocking connect), where a blocking connect to the same port is
+/// refused at once — so an exact-ConnectionRefused match never fired there and
+/// a stopped local proxy (VPN client on 127.0.0.1:7890, …) was kept forever.
+/// A firewall DROP on loopback times out the same way and is just as unusable.
+/// The only false positive is a live listener whose backlog is full; the probe
+/// re-runs on the next refresh, and nothing here is persisted.
+fn loopback_probe_is_dead(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::ConnectionRefused | io::ErrorKind::TimedOut
+    )
+}
+
+fn without_dead_loopback(
     mut cfg: ProxyConfig,
     mut connect: impl FnMut(SocketAddr) -> io::Result<()>,
 ) -> ProxyConfig {
     if cfg.mode != ProxyMode::FollowSystem {
         return cfg;
     }
-    // Resolve ALL_PROXY before filtering. A refused scheme-specific proxy must
+    // Resolve ALL_PROXY before filtering. A dead scheme-specific proxy must
     // become direct, not accidentally fall back to a different ALL_PROXY.
-    let mut refused = Vec::new();
+    let mut dead = Vec::new();
     let mut checked = Vec::new();
     for raw in [&cfg.http, &cfg.https, &cfg.all].into_iter().flatten() {
         if checked.contains(raw) {
@@ -112,17 +130,17 @@ fn without_refused_loopback(
         checked.push(raw.clone());
         let addresses = loopback_addresses(raw);
         if !addresses.is_empty()
-            && addresses.into_iter().all(|addr| {
-                matches!(connect(addr), Err(e) if e.kind() == io::ErrorKind::ConnectionRefused)
-            })
+            && addresses
+                .into_iter()
+                .all(|addr| matches!(connect(addr), Err(e) if loopback_probe_is_dead(e.kind())))
         {
-            refused.push(raw.clone());
+            dead.push(raw.clone());
         }
     }
     let usable = |scheme: Option<String>| {
         scheme
             .or_else(|| cfg.all.clone())
-            .filter(|raw| !refused.contains(raw))
+            .filter(|raw| !dead.contains(raw))
     };
     cfg.http = usable(cfg.http.clone());
     cfg.https = usable(cfg.https.clone());
@@ -205,25 +223,36 @@ mod tests {
     }
 
     #[test]
-    fn auto_proxy_only_bypasses_refused_loopback_ports() {
+    fn auto_proxy_only_bypasses_dead_loopback_proxies() {
         for raw in [
             "http://127.0.0.1:7890",
             "http://[::1]:7890",
             "localhost:7890",
         ] {
-            let cfg = without_refused_loopback(config(raw), |_| {
-                Err(io::ErrorKind::ConnectionRefused.into())
-            });
+            let cfg =
+                without_dead_loopback(
+                    config(raw),
+                    |_| Err(io::ErrorKind::ConnectionRefused.into()),
+                );
             assert!(cfg.https.is_none(), "{raw}");
         }
-        for kind in [
-            io::ErrorKind::TimedOut,
-            io::ErrorKind::PermissionDenied,
-            io::ErrorKind::Other,
-        ] {
+        // A loopback listener answers at kernel level, so a probe that merely
+        // TIMES OUT is dead too — and this is the only form "dead" takes on
+        // Windows, where connect_timeout to a just-closed port reports TimedOut
+        // (the non-blocking connect never sees the RST that a blocking connect
+        // gets at once). Exact-refused matching kept stopped VPN/proxy clients
+        // on 127.0.0.1 configured forever there.
+        let cfg = config("http://127.0.0.1:7890");
+        let actual = without_dead_loopback(cfg, |_| Err(io::ErrorKind::TimedOut.into()));
+        assert!(
+            actual.https.is_none(),
+            "timed-out loopback probe means dead"
+        );
+        // Genuinely ambiguous failures stay conservative: the proxy is kept.
+        for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::Other] {
             let cfg = config("http://127.0.0.1:7890");
             assert_eq!(
-                without_refused_loopback(cfg.clone(), |_| Err(kind.into())),
+                without_dead_loopback(cfg.clone(), |_| Err(kind.into())),
                 cfg
             );
         }
@@ -238,7 +267,7 @@ mod tests {
         ] {
             let cfg = config(raw);
             assert_eq!(
-                without_refused_loopback(cfg.clone(), |_| panic!("remote probe")),
+                without_dead_loopback(cfg.clone(), |_| panic!("remote probe")),
                 cfg
             );
         }
@@ -246,7 +275,7 @@ mod tests {
             let mut cfg = config("http://127.0.0.1:7890");
             cfg.mode = mode;
             assert_eq!(
-                without_refused_loopback(cfg.clone(), |_| panic!("fixed probe")),
+                without_dead_loopback(cfg.clone(), |_| panic!("fixed probe")),
                 cfg
             );
         }
@@ -255,7 +284,7 @@ mod tests {
     #[test]
     fn auto_proxy_localhost_keeps_proxy_if_either_address_is_listening() {
         let cfg = config("http://localhost:7890");
-        let actual = without_refused_loopback(cfg.clone(), |addr| {
+        let actual = without_dead_loopback(cfg.clone(), |addr| {
             if addr.is_ipv4() {
                 Err(io::ErrorKind::ConnectionRefused.into())
             } else {
@@ -269,8 +298,7 @@ mod tests {
     fn auto_proxy_does_not_fall_back_to_all_after_scheme_proxy_is_refused() {
         let mut cfg = config("http://127.0.0.1:7890");
         cfg.all = Some("http://remote.corp:8080".into());
-        let actual =
-            without_refused_loopback(cfg, |_| Err(io::ErrorKind::ConnectionRefused.into()));
+        let actual = without_dead_loopback(cfg, |_| Err(io::ErrorKind::ConnectionRefused.into()));
         assert!(actual.https.is_none());
         assert_eq!(actual.http.as_deref(), Some("http://remote.corp:8080"));
         assert!(actual.all.is_none());
@@ -283,13 +311,13 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let cfg = config(&format!("http://{addr}"));
         let probe = |addr| TcpStream::connect_timeout(&addr, Duration::from_millis(50)).map(|_| ());
-        assert!(without_refused_loopback(cfg.clone(), probe).https.is_some());
+        assert!(without_dead_loopback(cfg.clone(), probe).https.is_some());
         // Drain the probe before closing so the same listening port can be rebound.
         drop(listener.accept().unwrap());
         drop(listener);
-        assert!(without_refused_loopback(cfg.clone(), probe).https.is_none());
+        assert!(without_dead_loopback(cfg.clone(), probe).https.is_none());
         let _restored = TcpListener::bind(addr).unwrap();
-        assert!(without_refused_loopback(cfg.clone(), probe).https.is_some());
+        assert!(without_dead_loopback(cfg.clone(), probe).https.is_some());
         assert_eq!(cfg.mode, ProxyMode::FollowSystem);
     }
 }
