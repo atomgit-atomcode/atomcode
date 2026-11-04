@@ -81,7 +81,7 @@ impl Tool for GrepTool {
     }
     fn description(&self) -> &str {
         "Search file contents by regular expression under a directory (gitignore-aware; \
-         build/cache dirs and .log files are skipped by default). For known paths prefer read_file directly; discovery filters do not prove absence. respect_gitignore=false includes ignored/build content; include_hidden and follow_symlinks are independent. Prefer this over `bash grep`/`rg`. \
+         build/cache dirs and .log files are skipped by default). For known paths prefer read_file directly; discovery filters do not prove absence. respect_gitignore=false includes ignored/build content; include_hidden and follow_symlinks are independent. Retry empty filtered searches within the same path; do not expand to parent directories or an entire disk without the user's request. Prefer this over `bash grep`/`rg`. \
          Use it to LOCATE code, then read the exact window with `read_file` (offset/limit/\
          ranges) rather than dumping whole files or slicing them with a shell/`python` \
          script. Smart-case: case-insensitive unless the pattern contains an uppercase \
@@ -126,7 +126,7 @@ impl Tool for GrepTool {
         let root = resolve_path(&raw, &ctx.working_dir);
         let scope = crate::pathnorm::to_display(&root);
         let timeout_secs = options.timeout_secs;
-        let timeout_hint = options.filter_hint();
+        let timeout_hint = options.filter_hint(&scope);
         let scan_cancel = ctx.cancel.child_token();
         let _stop_scan = scan_cancel.clone().drop_guard();
         let search = async {
@@ -240,7 +240,7 @@ impl Tool for GrepTool {
                     },
                     result.files_searched,
                     result.scan.summary(),
-                    options.filter_hint()
+                    options.filter_hint(&scope)
                 )),
                 Ok(result) => {
                     let lines: Vec<String> = result
@@ -261,15 +261,17 @@ impl Tool for GrepTool {
                 Err(e) => err(format!("grep: {e}")),
             }
         };
-        tokio::select! {
-            biased;
-            _ = ctx.cancel.cancelled() => err("grep: cancelled before completion."),
-            result = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), search) => {
-                result.unwrap_or_else(|_| err(format!(
-                    "grep: search timed out after {timeout_secs}s in {scope}; scan incomplete. Narrow the path. {timeout_hint}"
-                )))
+        super::search_with_activity(&scope, &ctx.progress, async {
+            tokio::select! {
+                biased;
+                _ = ctx.cancel.cancelled() => err("grep: cancelled before completion."),
+                result = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), search) => {
+                    result.unwrap_or_else(|_| err(format!(
+                        "grep: search timed out after {timeout_secs}s in {scope}; scan incomplete. Narrow the path. {timeout_hint}"
+                    )))
+                }
             }
-        }
+        }).await
     }
 }
 

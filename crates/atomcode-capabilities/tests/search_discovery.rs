@@ -372,6 +372,8 @@ async fn a_blocked_world_times_out_without_claiming_files_do_not_exist() {
 async fn windows_junctions_can_be_searched_with_explicit_link_following() {
     let project = tempfile::tempdir().unwrap();
     let target = tempfile::tempdir().unwrap();
+    std::fs::create_dir(project.path().join(".git")).unwrap();
+    std::fs::write(project.path().join(".gitignore"), "linked/\n").unwrap();
     std::fs::write(target.path().join("junction.txt"), "junction_needle").unwrap();
     let junction = project.path().join("linked");
     let status = std::process::Command::new("cmd")
@@ -385,6 +387,19 @@ async fn windows_junctions_can_be_searched_with_explicit_link_following() {
         "{}",
         String::from_utf8_lossy(&status.stderr)
     );
+    let c = context(project.path());
+    let read = ReadFileTool::new(false)
+        .execute(r#"{"file_path":"linked/junction.txt"}"#, &c)
+        .await;
+    assert!(
+        !read.is_error && read.content.contains("junction_needle"),
+        "{}",
+        read.content
+    );
+    let exact = GlobTool::new(dirs(project.path()))
+        .execute(r#"{"pattern":"linked/junction.txt"}"#, &c)
+        .await;
+    assert!(exact.content.contains("1 files found"), "{}", exact.content);
     let result = GrepTool::new(dirs(project.path()))
         .execute(
             r#"{"pattern":"junction_needle","respect_gitignore":false,"follow_symlinks":true}"#,
@@ -504,5 +519,86 @@ async fn metadata_queries_are_bounded_and_cancellable_before_the_walk() {
                 );
             }
         }
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn slow_search_activity_names_the_scope_and_stops_with_the_request() {
+    let dir = tempfile::tempdir().unwrap();
+    for cancel in [false, true] {
+        for grep in [false, true] {
+            let mut c = context(dir.path());
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let captured = seen.clone();
+            c.progress = atomcode_kernel::tool::ProgressSink::new(Arc::new(move |msg| {
+                captured.lock().unwrap().push(msg);
+            }));
+            let world = Arc::new(WaitingWorld(LocalFs::unfenced(), WaitAt::Metadata));
+            let options = WalkOptions {
+                timeout_secs: 3,
+                ..Default::default()
+            };
+            let tool: Box<dyn Tool> = if grep {
+                Box::new(GrepTool::with_world(world, dirs(dir.path())).with_options(options))
+            } else {
+                Box::new(GlobTool::with_world(world, dirs(dir.path())).with_options(options))
+            };
+            let trigger = c.cancel.clone();
+            let action = async {
+                if cancel {
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                    trigger.cancel();
+                }
+            };
+            let (result, _) = tokio::join!(tool.execute(r#"{"pattern":"needle.*"}"#, &c), action);
+            assert!(result.is_error);
+            assert!(result
+                .content
+                .contains(if cancel { "cancelled" } else { "timed out" }));
+            {
+                let messages = seen.lock().unwrap();
+                assert_eq!(messages.len(), if cancel { 1 } else { 2 });
+                assert!(messages[0].contains("1s elapsed"));
+                assert!(
+                    messages[0].contains(&atomcode_capabilities::pathnorm::to_display(dir.path()))
+                );
+            }
+            let count = seen.lock().unwrap().len();
+            tokio::time::advance(std::time::Duration::from_secs(5)).await;
+            assert_eq!(
+                seen.lock().unwrap().len(),
+                count,
+                "no activity survives termination"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn filtered_empty_search_keeps_recovery_within_the_requested_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    setup(dir.path());
+    std::fs::create_dir(dir.path().join("scoped")).unwrap();
+    let c = context(dir.path());
+    for tool in [
+        Box::new(GlobTool::new(dirs(dir.path()))) as Box<dyn Tool>,
+        Box::new(GrepTool::new(dirs(dir.path()))),
+    ] {
+        let result = tool
+            .execute(r#"{"pattern":"missing.*","path":"scoped"}"#, &c)
+            .await;
+        assert!(!result.is_error);
+        assert!(result.content.contains("does not prove the file is absent"));
+        let scope = dir.path().join("scoped");
+        let path_json =
+            serde_json::to_string(&atomcode_capabilities::pathnorm::to_display(&scope)).unwrap();
+        assert!(
+            result.content.contains(&format!("\"path\":{path_json}")),
+            "{}",
+            result.content
+        );
+        assert!(result
+            .content
+            .contains("Do not expand to parent directories or entire disks"));
     }
 }

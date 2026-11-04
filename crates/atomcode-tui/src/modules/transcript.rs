@@ -212,6 +212,18 @@ impl Producer for Transcript {
         ID
     }
 
+    fn tool_progress(&self, call_id: &str, message: &str, out: &mut StreamWriter<'_>) -> bool {
+        let mut open = self.open.lock().expect("transcript poisoned");
+        let Some((id, block)) = open.calls.get_mut(call_id) else {
+            return false;
+        };
+        if block.progress.as_deref() == Some(message) {
+            return false;
+        }
+        block.progress = Some(message.to_owned());
+        out.amend(*id, Arc::new(block.with(Outcome::Pending)))
+    }
+
     fn reset(&self) {
         *self.open.lock().expect("transcript poisoned") = Open::default();
         self.turns.lock().expect("transcript poisoned").clear();

@@ -71,7 +71,7 @@ impl Tool for GlobTool {
         "Find files by glob pattern (e.g. `**/*.rs`, `src/**/*.ts`) under a base \
          directory, gitignore-aware by default. For a known file path use read_file directly; discovery can omit files. Set respect_gitignore/include_hidden/follow_symlinks explicitly when needed. `**` crosses directories, `*` does not. Build/VCS/ \
          cache directories are skipped. Relative base paths resolve against the working \
-         directory."
+         directory. If a filtered search is empty, retry within the same path with the relevant filters; do not expand to parent directories or an entire disk without the user's request."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
@@ -119,7 +119,7 @@ impl Tool for GlobTool {
         };
         let scope = crate::pathnorm::to_display(&base);
         let timeout_secs = options.timeout_secs;
-        let timeout_hint = options.filter_hint();
+        let timeout_hint = options.filter_hint(&scope);
         let scan_cancel = ctx.cancel.child_token();
         let _stop_scan = scan_cancel.clone().drop_guard();
         let search = async {
@@ -209,7 +209,7 @@ impl Tool for GlobTool {
                             format!("No files matching \"{pattern}\" under the active filters")
                         },
                         scan.summary(),
-                        options.filter_hint()
+                        options.filter_hint(&scope)
                     ))
                 }
                 Ok((mut hits, scan)) => {
@@ -228,15 +228,17 @@ impl Tool for GlobTool {
                 Err(e) => err(format!("glob: {e}")),
             }
         };
-        tokio::select! {
-            biased;
-            _ = ctx.cancel.cancelled() => err("glob: cancelled before completion."),
-            result = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), search) => {
-                result.unwrap_or_else(|_| err(format!(
-                    "glob: search timed out after {timeout_secs}s in {scope}; scan incomplete. Narrow the path. {timeout_hint}"
-                )))
+        super::search_with_activity(&scope, &ctx.progress, async {
+            tokio::select! {
+                biased;
+                _ = ctx.cancel.cancelled() => err("glob: cancelled before completion."),
+                result = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), search) => {
+                    result.unwrap_or_else(|_| err(format!(
+                        "glob: search timed out after {timeout_secs}s in {scope}; scan incomplete. Narrow the path. {timeout_hint}"
+                    )))
+                }
             }
-        }
+        }).await
     }
 }
 

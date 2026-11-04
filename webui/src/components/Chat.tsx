@@ -76,7 +76,7 @@ import {
   ensureActiveDescendantVisible,
   splitAtToken,
 } from '../lib/atMention';
-import { toolResultStatus, updateToolProgress, upsertToolPart, type ToolRow, type MsgPart } from '../lib/toolRows';
+import { settlePendingToolParts, toolResultStatus, updateToolProgress, upsertToolPart, type ToolRow, type MsgPart } from '../lib/toolRows';
 import { backgroundPresentation, groupEmptyPolls, type PollGroups } from '../lib/backgroundTools';
 import { commitTodoCall, todoToolDetail, type TodoTitles } from '../lib/todoToolDetail';
 import {
@@ -2089,7 +2089,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       for (let index = prev.length - 1; index >= 0; index -= 1) {
         if (prev[index].role !== 'assistant') continue;
         const next = prev.slice();
-        next[index] = { ...next[index], ts };
+        next[index] = { ...next[index], ts, parts: settlePendingToolParts(next[index].parts) };
         return next;
       }
       return prev;

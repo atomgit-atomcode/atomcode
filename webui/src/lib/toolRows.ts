@@ -42,7 +42,9 @@ export function upsertToolPart(parts: MsgPart[], tool: ToolRow): MsgPart[] {
   if (idx < 0) return [...parts, { kind: 'tool', tool }];
   const existing = (parts[idx] as { kind: 'tool'; tool: ToolRow }).tool;
   const next = parts.slice();
-  next[idx] = { kind: 'tool', tool: { ...existing, ...tool } };
+  const merged = { ...existing, ...tool };
+  if (merged.status !== 'pending') delete merged.progress;
+  next[idx] = { kind: 'tool', tool: merged };
   return next;
 }
 
@@ -52,7 +54,7 @@ export function updateToolProgress(
   progress: string,
 ): MsgPart[] {
   return parts.map((part) =>
-    part.kind === 'tool' && part.tool.id === id
+    part.kind === 'tool' && part.tool.id === id && part.tool.status === 'pending'
       ? { kind: 'tool' as const, tool: { ...part.tool, progress } }
       : part,
   );
@@ -61,4 +63,15 @@ export function updateToolProgress(
 export function toolResultStatus(success: boolean, output: string): ToolRow['status'] {
   if (success) return 'done';
   return output.startsWith('Code review incomplete') ? 'incomplete' : 'error';
+}
+
+/** An authoritative turn terminal cannot leave a tool visually running, even
+ * when its individual result was interrupted or never reached this client. */
+export function settlePendingToolParts(parts: MsgPart[]): MsgPart[] {
+  return parts.map(part => {
+    if (part.kind !== 'tool' || !['pending', 'waiting_approval'].includes(part.tool.status)) return part;
+    const tool: ToolRow = { ...part.tool, status: 'incomplete' };
+    delete tool.progress;
+    return { kind: 'tool', tool };
+  });
 }

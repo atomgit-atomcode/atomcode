@@ -893,6 +893,9 @@ fn behind_a_lid(block: &crate::block::Block) -> bool {
         // not swallowed by the neighbouring calls' group count.
         && !block.content.as_tool_call().is_some_and(|call| {
             call.edit_text_mismatch()
+                // A slow call's activity must stay visible even when a later
+                // parallel call would otherwise own the merged run's lid.
+                || (call.is_running() && call.progress.is_some())
                 || (call.name == "bash_poll" && call.idle_poll_job().is_none())
         })
 }
@@ -2200,6 +2203,15 @@ impl Host {
                 .slots()
                 .iter()
                 .any(|s| s.block().kind() == "reasoning")
+    }
+
+    /// Update one live call through its owning producer. Late/orphan activity
+    /// is ignored and never becomes a notice or a persisted transcript fact.
+    pub fn tool_progress(&self, call_id: &str, message: &str) -> bool {
+        let mut stream = self.stream.write().expect("stream poisoned");
+        self.modules.producers().iter().any(|producer| {
+            producer.tool_progress(call_id, message, &mut stream.writer(producer.id()))
+        })
     }
 
     /// Deliver one committed fact to every module, with no sequence number of

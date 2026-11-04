@@ -139,6 +139,12 @@ pub trait Producer: Send + Sync {
     /// sequence number of its start — cannot do it from the event alone.
     fn absorb(&self, logged: &atomcode_harness::session::LoggedEvent, out: &mut StreamWriter<'_>);
 
+    /// Ephemeral activity for an existing pending tool. It can only amend the
+    /// producer's own live block and must not append history or settle anything.
+    fn tool_progress(&self, _call_id: &str, _message: &str, _out: &mut StreamWriter<'_>) -> bool {
+        false
+    }
+
     /// Forget what is open: the next fact belongs to another session's stream.
     fn reset(&self) {}
     /// Say something first, if this producer has anything to say.

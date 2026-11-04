@@ -6842,9 +6842,8 @@ impl Tui {
                     false
                 }
             }
-            AgentEvent::ToolProgress { message, .. } => {
-                self.host.say_for(message, false, 1_500);
-                true
+            AgentEvent::ToolProgress { call_id, message } => {
+                self.host.tool_progress(&call_id, &message)
             }
             AgentEvent::StreamRecovery {
                 attempt,
@@ -14685,23 +14684,118 @@ mod midturn_command_tests {
     }
 
     #[test]
-    fn tool_scan_progress_is_visible_without_adding_transcript_rows() {
+    fn tool_progress_replaces_only_the_pending_card_and_never_becomes_history() {
+        use crate::block::{Content, RenderCtx};
+        let (host, tui, _) = screen();
+        host.modules
+            .add_producer(crate::modules::transcript::Transcript::new())
+            .unwrap();
+        let facts = crate::conformance::facts();
+        for fact in &facts {
+            if matches!(
+                fact,
+                atomcode_harness::session::SessionEvent::ToolResultLogged { .. }
+            ) {
+                break;
+            }
+            host.absorb(fact);
+        }
+        let before = kinds(&host);
+        for seconds in [1, 2] {
+            assert!(tui.on_event(AgentEvent::ToolProgress {
+                call_id: "c1".into(),
+                message: format!("Searching · {seconds}s elapsed · linked"),
+            }));
+        }
+        let read = |call: &str| {
+            let stream = host.stream.read().unwrap();
+            let block = stream
+                .slots()
+                .iter()
+                .find_map(|slot| {
+                    slot.block()
+                        .content
+                        .as_tool_call()
+                        .filter(|tool| tool.call_id == call)
+                })
+                .unwrap();
+            let ctx = RenderCtx::bare(120);
+            (
+                block.progress.clone(),
+                block
+                    .summary_lines(&ctx)
+                    .iter()
+                    .map(|line| line.plain())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                block.content_hash(),
+            )
+        };
+        assert_eq!(kinds(&host), before);
+        assert!(read("c1").1.contains("2s elapsed"));
+        assert!(!read("c1").1.contains("1s elapsed"));
+        assert_eq!(read("c2").0, None);
+        let moment = host.moment.read().unwrap().clone();
+        let drawn = host
+            .transcript_lines(120, &moment)
+            .iter()
+            .map(|line| line.plain())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            drawn.contains("2s elapsed"),
+            "parallel calls must not hide progress behind their group: {drawn}"
+        );
+        assert!(moment.notice.is_none());
+        let result = facts.iter().find(|fact| matches!(fact, atomcode_harness::session::SessionEvent::ToolResultLogged { call_id, .. } if call_id == "c1")).unwrap();
+        host.absorb(result);
+        let finished = read("c1");
+        assert_eq!(finished.0, None);
+        assert!(!tui.on_event(AgentEvent::ToolProgress {
+            call_id: "c1".into(),
+            message: "late activity".into()
+        }));
+        assert_eq!(read("c1"), finished);
+        host.switch_view();
+        assert!(!tui.on_event(AgentEvent::ToolProgress {
+            call_id: "c2".into(),
+            message: "old session".into()
+        }));
+        // A terminal without individual tool results must also remove activity.
+        for fact in &facts {
+            if matches!(
+                fact,
+                atomcode_harness::session::SessionEvent::ToolResultLogged { .. }
+            ) {
+                break;
+            }
+            host.absorb(fact);
+        }
+        assert!(host.tool_progress("c1", "Searching before interruption"));
+        let terminal = facts
+            .iter()
+            .find(|fact| {
+                matches!(
+                    fact,
+                    atomcode_harness::session::SessionEvent::TurnEnd { .. }
+                )
+            })
+            .unwrap();
+        host.absorb(terminal);
+        assert_eq!(read("c1").0, None);
+        assert!(!host.tool_progress("c1", "late interrupted activity"));
+    }
+
+    #[test]
+    fn orphan_tool_progress_does_not_become_a_global_notice() {
         let (host, tui, _) = screen();
         let before = kinds(&host);
-        assert!(tui.on_event(AgentEvent::ToolProgress {
+        assert!(!tui.on_event(AgentEvent::ToolProgress {
             call_id: "search-1".into(),
-            message: "Searching: 1000 entries visited".into()
+            message: "Searching · 2s elapsed · linked".into()
         }));
         assert_eq!(kinds(&host), before);
-        assert!(host
-            .moment
-            .read()
-            .unwrap()
-            .notice
-            .as_ref()
-            .unwrap()
-            .text
-            .contains("1000"));
+        assert!(host.moment.read().unwrap().notice.is_none());
     }
 
     #[test]

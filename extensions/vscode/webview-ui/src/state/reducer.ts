@@ -289,6 +289,7 @@ function settleOpenTools(
           status,
           output: output ?? tool.output,
           success: status === 'error' ? false : tool.success,
+          progress: undefined,
         }
       : tool,
   );
@@ -684,7 +685,7 @@ function chatReducerInner(state: ChatState, action: ChatAction): ChatState {
       const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
       if (assistant?.toolCalls) {
         const tools = assistant.toolCalls.map((tool) =>
-          tool.id === action.id ? { ...tool, progress: action.progress } : tool,
+          tool.id === action.id && tool.status === 'running' ? { ...tool, progress: action.progress } : tool,
         );
         const updatedTool = tools.find((tool) => tool.id === action.id);
         msgs[assistantIndex] = updatedTool

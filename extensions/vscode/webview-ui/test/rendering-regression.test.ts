@@ -187,11 +187,14 @@ function testToolBatchReplayUpsertsCallsById() {
 function testErrorMarksRunningToolsError() {
   let state = startAssistantState();
   state = chatReducer(state, { type: 'TOOL_START', id: 'tool-1', name: 'read', args: '{"path":"file.ts"}' });
+  state = chatReducer(state, { type: 'TOOL_PROGRESS', id: 'tool-1', progress: 'Searching' });
   state = chatReducer(state, { type: 'GENERATION_ERROR', message: 'stream closed' });
+  state = chatReducer(state, { type: 'TOOL_PROGRESS', id: 'tool-1', progress: 'late search' });
 
   const tool = state.messages[0].toolCalls?.[0];
   assert.equal(tool?.status, 'error');
   assert.equal(tool?.output, 'stream closed');
+  assert.equal(tool?.progress, undefined);
   assert.equal(state.messages[0].blocks?.[0].type === 'tool' ? state.messages[0].blocks[0].tool.status : undefined, 'error');
 }
 
@@ -202,6 +205,9 @@ function testToolProgressReplacesLatestActivity() {
   state = chatReducer(state, { type: 'TOOL_PROGRESS', id: 'review-1', progress: 'round 2 · read_file' });
 
   assert.equal(state.messages[0].toolCalls?.[0]?.progress, 'round 2 · read_file');
+  state = chatReducer(state, { type: 'TOOL_RESULT', id: 'review-1', name: 'code_review', output: 'done', success: true, durationMs: 20 });
+  state = chatReducer(state, { type: 'TOOL_PROGRESS', id: 'review-1', progress: 'late activity' });
+  assert.equal(state.messages[0].toolCalls?.[0]?.progress, undefined);
 }
 
 function testPartialReviewResultIsMarkedIncomplete() {

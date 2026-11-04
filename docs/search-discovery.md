@@ -51,8 +51,22 @@ use `/reload` or reopen the session. A directory switch reads the new project's
 search settings rather than carrying overrides from the old project.
 
 Timeouts are bounded to 1–300 seconds; entry limits to 1–1,000,000. The default entry
-limit counts visited files/directories, not just matches. Long scans report progress.
+limit counts visited files/directories, not just matches. Searches lasting longer than
+one second update their own tool card with the requested scope and elapsed time;
+quick lookups remain quiet. Activity replaces the previous update, never adds global
+notices or session-log entries, and ends with the request. Empty filtered results
+include same-path retry guidance; they do not authorize widening to a parent or disk.
 A stopped, timed-out or capped scan must not report a definitive absence. Partial
 results include their scan status; a timeout interrupting a blocked read reports an
 incomplete-scan error. Filesystem implementations that cannot honor alternate
 filter rules reject those options explicitly.
+
+## Windows verification
+
+The `search_discovery` integration suite includes a Windows-only junction case:
+create a junction to an external directory, ignore `linked/` in Git, read an exact
+file path through the junction, and discover it with ignore bypass and link following.
+Run `cargo nextest run -p atomcode-capabilities --test search_discovery` on Windows
+for that platform's execution evidence; a macOS/Linux run does not execute this case.
+For UI acceptance, also check a slow search's scoped activity in its tool card and
+cancel it before the deadline; the card must stop updating after cancellation.
