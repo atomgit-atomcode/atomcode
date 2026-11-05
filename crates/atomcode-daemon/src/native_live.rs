@@ -22,7 +22,7 @@ static REMOTE_COMMAND: StdMutex<Option<tokio::sync::mpsc::UnboundedSender<String
 pub trait EmbeddedSessions: Send + Sync {
     fn owns(&self, session: &str) -> bool;
     fn hidden(&self, session: &str) -> bool;
-    async fn switch(&self, expected: String, session: String) -> Result<Resumed, String>;
+    async fn switch(&self, expected: String, session: String) -> Result<Resumed, HubError>;
 }
 
 static EMBEDDED_SESSIONS: StdMutex<Option<std::sync::Weak<dyn EmbeddedSessions>>> =
@@ -434,8 +434,7 @@ async fn resume(session_id: String, fork_on_busy: bool) -> Result<Resumed, HubEr
                 .await
                 .map_err(|error| {
                     HubError::RuntimeRejected(format!("session navigation failed: {error}"))
-                })?
-                .map_err(HubError::RuntimeRejected);
+                })?;
         }
     }
     let project_bucket = atomcode_capabilities::session::SessionManager::project_hash(

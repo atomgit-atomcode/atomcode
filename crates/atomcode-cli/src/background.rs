@@ -1871,6 +1871,15 @@ impl HostControl for Background {
     }
 }
 
+// Keep actionable refusals typed across the embedded-driver boundary.
+fn embedded_navigation_error(error: HostError) -> atomcode_daemon::live_hub::HubError {
+    use atomcode_daemon::live_hub::HubError;
+    match error {
+        HostError::Busy { .. } => HubError::ActiveTurn,
+        error => HubError::RuntimeRejected(format!("{error:?}")),
+    }
+}
+
 #[async_trait]
 impl atomcode_daemon::native_live::EmbeddedSessions for Background {
     fn owns(&self, session: &str) -> bool {
@@ -1898,12 +1907,12 @@ impl atomcode_daemon::native_live::EmbeddedSessions for Background {
         &self,
         expected: String,
         target: String,
-    ) -> Result<atomcode_daemon::native_live::Resumed, String> {
+    ) -> Result<atomcode_daemon::native_live::Resumed, atomcode_daemon::live_hub::HubError> {
         let _op = self.op.lock().await;
         let reply = self
             .resume_locked(expected, target.clone(), true)
             .await
-            .map_err(|error| format!("{error:?}"))?;
+            .map_err(embedded_navigation_error)?;
         // The operation already committed. Do not ask for another full replay:
         // it can exceed its bound while the incoming turn is still running,
         // which must not turn a successful switch into a reported failure.
@@ -1933,6 +1942,21 @@ impl atomcode_daemon::native_live::EmbeddedSessions for Background {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_navigation_preserves_busy_refusals() {
+        use atomcode_daemon::live_hub::HubError;
+        assert_eq!(
+            embedded_navigation_error(HostError::Busy {
+                reason: "finishing".into()
+            }),
+            HubError::ActiveTurn
+        );
+        assert!(matches!(
+            embedded_navigation_error(HostError::NotFound),
+            HubError::RuntimeRejected(_)
+        ));
+    }
 
     /// 范围里有几个文件在变,是真的去问 git。
     ///

@@ -12,6 +12,7 @@ const messages = [{ role: 'user', content: specificationText, source_seq:12, tas
 const other = { ...meta, id: 'browse-fixture', name: 'Other conversation' };
 const third = { ...meta, id: 'slow-browse-fixture', name: 'Slow historical conversation with a long title for layout coverage' };
 let releaseSlowHistory = null;
+let switchRejection = null;
 let switches = 0;
 let specificationPinned = false;
 const patchUploads = [];
@@ -48,7 +49,12 @@ const server = createServer(async (req, res) => {
   }
   if (path.startsWith('/workbench/')) return json([]);
   if (path === '/live/permission') return json({accepted:true});
-  if (path === '/live/switch_session') { switches++; return json({ok:true}); }
+  if (path === '/live/switch_session') {
+    switches++;
+    let body=''; for await(const chunk of req)body+=chunk;
+    if(switchRejection && JSON.parse(body).session_id!==id) return json(switchRejection);
+    return json({ok:true});
+  }
   if (path === '/projects/fixture/sessions/' + other.id) return json({ ...other, messages: [{role:'user', content:'Historical question'}, {role:'assistant', content:'Historical answer'}] });
   if (path === '/projects/fixture/sessions/' + third.id) { releaseSlowHistory = () => json({ ...third, messages: [{role:'user',content:'Stale slow history'}] }); return; }
   if (path === '/live') {
@@ -271,6 +277,29 @@ try {
   assert.deepEqual(errors, []);
   await page.close();
  }
+  for (const refusal of [
+    {ok:false,active_turn:true,error:'session switch rejected: ActiveTurn'},
+    {ok:false,active_turn:false,error:'session switch rejected: RuntimeRejected("Failed { message: \"coding runtime is busy\" }")'},
+  ]) {
+    const page=await browser.newPage({viewport:{width:1200,height:900}});
+    await page.addInitScript(()=>{localStorage.setItem('atomcode.lang','en');localStorage.setItem('atomcode.sidebar.view.v1','flat');});
+    await page.goto(base+'/?sync=1&session=context-summary');
+    await page.locator('.message-input').waitFor();
+    await page.getByText('The resource read boundary is ready.',{exact:false}).waitFor();
+    switchRejection=refusal;
+    await page.locator('.session-item-main').filter({hasText:other.name}).click();
+    await page.locator('.session-switch-notice').filter({hasText:'The current task is running, finishing, or switching.'}).waitFor();
+    assert.equal(await page.locator('.session-switch-notice').innerText().then(t=>t.includes('RuntimeRejected')),false);
+    await page.waitForFunction(name=>document.querySelector('.session-item.active .session-item-name')?.textContent===name,meta.name);
+    assert.equal(await page.locator('.session-item.active .session-item-name').innerText(),meta.name);
+    await page.locator('.message-input').waitFor();
+    switchRejection=null;
+    const count=switches;
+    await page.locator('.session-item-main').filter({hasText:other.name}).click();
+    await page.getByText('Historical answer',{exact:true}).waitFor();
+    assert.equal(switches,count+1,'busy rejection must keep sync available for a later retry');
+    await page.close();
+  }
   console.log('session browsing: history while running, return, completion retention, no rebind: passed');
 } finally {
   await browser.close();

@@ -171,6 +171,20 @@ test('live session switch returns a structured active-turn rejection', async () 
   }
 });
 
+test('legacy embedded busy strings retain an actionable session-switch refusal', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    const { postLiveSwitchSession } = await import('./api.ts');
+    for (const [message, expected] of [
+      ['session switch rejected: RuntimeRejected("Failed { message: \"coding runtime is busy\" }")', true],
+      ['session switch rejected: RuntimeRejected("session not found")', false],
+    ] as const) {
+      globalThis.fetch = (async () => new Response(JSON.stringify({ok:false,error:message}), {headers:{'Content-Type':'application/json'}})) as typeof fetch;
+      assert.equal((await postLiveSwitchSession('other')).activeTurn, expected);
+    }
+  } finally { globalThis.fetch = originalFetch; }
+});
+
 test('live mode still rejects protocol-level failures', async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response(
