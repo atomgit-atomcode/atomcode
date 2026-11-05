@@ -809,12 +809,23 @@ fn format_messages_for_provider(
 ) -> (Option<String>, Vec<Value>) {
     // Leading System messages lift to the top-level `system` (joined). Anthropic has no
     // system message ROLE on the wire.
-    let system_text: String = messages
+    let system_parts = messages
         .iter()
         .filter(|m| m.role == Role::System)
-        .map(|m| m.text.as_str())
-        .collect::<Vec<_>>()
-        .join("\n\n");
+        .map(|m| m.text.as_str());
+    let (bytes, count) = system_parts
+        .clone()
+        .fold((0, 0usize), |(bytes, count), text| {
+            (bytes + text.len(), count + 1)
+        });
+    let mut system_text = String::with_capacity(bytes + count.saturating_sub(1) * 2);
+    for (index, text) in system_parts.enumerate() {
+        // Empty messages still occupy a position in the original join.
+        if index > 0 {
+            system_text.push_str("\n\n");
+        }
+        system_text.push_str(text);
+    }
     let system = if system_text.is_empty() {
         None
     } else {
@@ -1868,6 +1879,37 @@ mod tests {
     }
 
     // ---- request building ----
+
+    #[test]
+    fn system_join_matches_reference_including_empty_and_interleaved_messages() {
+        for texts in [
+            vec![],
+            vec![""],
+            vec!["", ""],
+            vec!["first", "", "third"],
+            vec![" 中文\n", "\t ", "tail"],
+        ] {
+            let mut messages = vec![Message::user("not a system message")];
+            for text in texts {
+                messages.push(Message::system(text));
+                messages.push(Message::user("between"));
+            }
+            let expected = messages
+                .iter()
+                .filter(|m| m.role == Role::System)
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let expected = if expected.is_empty() {
+                None
+            } else {
+                Some(expected)
+            };
+            for deepseek in [false, true] {
+                assert_eq!(format_messages(&messages, deepseek).0, expected);
+            }
+        }
+    }
 
     #[test]
     fn system_is_lifted_to_top_level_and_roles_map_to_content() {
