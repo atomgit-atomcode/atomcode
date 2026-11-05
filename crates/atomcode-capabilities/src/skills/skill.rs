@@ -10,6 +10,14 @@ use std::process::Command;
 
 use atomcode_kernel::agent::ArgsRequirement;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AutoLoad {
+    #[default]
+    Unspecified,
+    Debugging,
+    Never,
+}
+
 #[derive(Clone, Debug)]
 pub struct Skill {
     pub name: String,
@@ -22,6 +30,8 @@ pub struct Skill {
     /// If false (`user-invocable: false` in frontmatter), hidden from the `/` menu;
     /// the model can still auto-invoke it. Absent → true.
     pub user_invocable: bool,
+    /// Static automatic loading policy, independent of manual invocation.
+    pub auto_load: AutoLoad,
     /// Whether the disk declared an argument requirement for this skill. The
     /// default is `Unspecified`, which preserves legacy command behaviour
     /// exactly: a front matter without `args:` neither routes a front end to a
@@ -37,6 +47,10 @@ impl Skill {
     /// `$ARGUMENTS[N]` / `$N` (positional), `$ARGUMENTS` (all; appended if absent),
     /// `${CLAUDE_SESSION_ID}`, `${CLAUDE_SKILL_DIR}`, and `` !`cmd` `` (shell pre-exec).
     pub fn expand(&self, arguments: &str, session_id: &str) -> String {
+        self.expand_inner(arguments, session_id, true)
+    }
+
+    fn expand_inner(&self, arguments: &str, session_id: &str, run_shell: bool) -> String {
         let positional: Vec<&str> = arguments.split_whitespace().collect();
         let skill_dir = self.skill_dir.to_string_lossy();
 
@@ -56,7 +70,11 @@ impl Skill {
             .template
             .replace("${CLAUDE_SESSION_ID}", session_id)
             .replace("${CLAUDE_SKILL_DIR}", skill_dir.as_ref());
-        let shell_expanded = expand_shell_injections(&pre);
+        let shell_expanded = if run_shell {
+            expand_shell_injections(&pre)
+        } else {
+            pre
+        };
 
         // SINGLE left-to-right pass: each substitution's value is emitted literally and
         // never re-scanned — so an argument that itself contains `$1` is NOT re-expanded.
@@ -94,6 +112,35 @@ impl Skill {
             Some(note) => format!("{note}\n\n{body}"),
             None => body,
         }
+    }
+
+    /// Static auto-loading never executes shell snippets or supplies guessed args.
+    pub fn expand_static_for_injection(&self, session_id: &str) -> Result<String, &'static str> {
+        if self.template.contains("!`") {
+            return Err("dynamic_shell");
+        }
+        if self.args_requirement == ArgsRequirement::Required
+            || self.template.contains("$ARGUMENTS")
+            || self
+                .template
+                .as_bytes()
+                .windows(2)
+                .any(|pair| pair[0] == b'$' && pair[1].is_ascii_digit())
+        {
+            return Err("arguments_required");
+        }
+        if self.template.len() > 12 * 1024 {
+            return Err("body_budget");
+        }
+        let body = self.expand_inner("", session_id, false);
+        let content = match self.bundled_resource_note() {
+            Some(note) => format!("{note}\n\n{body}"),
+            None => body,
+        };
+        if content.len() > 16 * 1024 {
+            return Err("body_budget");
+        }
+        Ok(content)
     }
 
     /// A `<system-reminder>` naming the skill's install directory, emitted only for
@@ -228,6 +275,8 @@ struct Frontmatter {
     /// If false (`user-invocable: false`), hidden from the `/` menu — the model can
     /// still auto-invoke. Absent → true.
     user_invocable: bool,
+    auto_load: AutoLoad,
+    auto_load_error: Option<String>,
     /// Whether the front matter declared `args: required|optional|none`. The
     /// default `Unspecified` keeps a legacy skill's behaviour unchanged.
     args_requirement: ArgsRequirement,
@@ -245,6 +294,8 @@ impl Default for Frontmatter {
             allowed_tools: Vec::new(),
             tools_error: None,
             user_invocable: true,
+            auto_load: AutoLoad::Unspecified,
+            auto_load_error: None,
             args_requirement: ArgsRequirement::Unspecified,
             args_error: None,
         }
@@ -422,6 +473,24 @@ fn parse_frontmatter(content: &str) -> (Frontmatter, String) {
             match tool_list(v) {
                 Ok(tools) => fm.allowed_tools = tools,
                 Err(error) => fm.tools_error = Some(error),
+            }
+        } else if let Some(v) = line.strip_prefix("auto-load:") {
+            if fm.auto_load != AutoLoad::Unspecified {
+                fm.auto_load = AutoLoad::Never;
+                fm.auto_load_error =
+                    Some("duplicate auto-load declaration; automatic loading disabled".into());
+            } else {
+                fm.auto_load = match fm_value(without_yaml_comment(v))
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
+                    "debugging" => AutoLoad::Debugging,
+                    "off" | "never" | "false" => AutoLoad::Never,
+                    _ => {
+                        fm.auto_load_error = Some("invalid auto-load value (expected debugging or off); automatic loading disabled".into());
+                        AutoLoad::Never
+                    }
+                };
             }
         } else if let Some(v) = line.strip_prefix("user-invocable:") {
             // Mirror core: only the literal `false` hides it; anything else stays true.
@@ -607,6 +676,9 @@ fn build_skill(
     // unknown `args:` value degrades to the default instead, and is reported
     // here so the person can fix the typo without losing the command.
     let mut warnings = Vec::new();
+    if let Some(error) = fm.auto_load_error {
+        warnings.push(error);
+    }
     if let Some(error) = fm.args_error {
         warnings.push(error);
     }
@@ -637,6 +709,7 @@ fn build_skill(
         template,
         allowed_tools: fm.allowed_tools,
         user_invocable: fm.user_invocable,
+        auto_load: fm.auto_load,
         args_requirement: fm.args_requirement,
         skill_dir: skill_dir.to_path_buf(),
         source_path: source.to_path_buf(),
@@ -758,6 +831,7 @@ mod tests {
             template: template.into(),
             allowed_tools: vec![],
             user_invocable: true,
+            auto_load: Default::default(),
             args_requirement: ArgsRequirement::Unspecified,
             skill_dir: PathBuf::from("/sk"),
             source_path: PathBuf::from("/sk/SKILL.md"),

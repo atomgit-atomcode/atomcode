@@ -40,11 +40,17 @@ fn parse<T: for<'de> Deserialize<'de> + Default>(config: &Value) -> Result<T, St
 
 // ---- skills -------------------------------------------------------------
 
-#[derive(Debug, Deserialize, Default)]
+fn auto_skills_enabled() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize)]
 struct SkillsRow {
     /// Extra directories to load skills from, on top of the standard ones.
     #[serde(default)]
     dirs: Vec<String>,
+    #[serde(default = "auto_skills_enabled")]
+    auto_load: bool,
     /// Project root the standard per-project skill directories resolve against.
     #[serde(default)]
     project_root: Option<String>,
@@ -53,6 +59,17 @@ struct SkillsRow {
     /// test — can point the catalog somewhere other than the invoking user.
     #[serde(default)]
     home: Option<String>,
+}
+
+impl Default for SkillsRow {
+    fn default() -> Self {
+        Self {
+            dirs: Vec::new(),
+            auto_load: true,
+            project_root: None,
+            home: None,
+        }
+    }
 }
 
 /// `skills-advert`: the one sentence that tells the model skills exist.
@@ -157,6 +174,7 @@ impl Plugin for SkillsPlugin {
                 Arc::new(ListSkillsTool::new(registry.clone())),
             ],
         )?;
+        super::skill_auto_load::mount(ctx, registry.clone(), row.auto_load);
         // And a command, so a person can see what is installed without asking
         // the model to call a tool on their behalf
         // (`docs/plans/2026-09-18-tui-panels-and-commands-inventory.md` B1,
@@ -176,7 +194,10 @@ impl Plugin for SkillsPlugin {
                  per-project and per-user skill directories plus anything the \
                  row's `dirs` config adds. To add one, drop a markdown file in \
                  a skill directory and restart; nothing needs recompiling. \
-                 `list_skills` shows what is loaded now."
+                 `list_skills` shows what is loaded now. Static debugging workflows can be \
+                 loaded before a user turn; auto-load: debugging opts in, auto-load: off opts out. \
+                 The skills row auto_load:false or user [no-auto-skills] disables auto-loading. \
+                 Automatic loading executes no embedded commands and grants no allowed-tools."
             ),
         );
         Ok(())
@@ -1404,6 +1425,7 @@ mod tests {
             template: "body".into(),
             allowed_tools: vec![],
             user_invocable: true,
+            auto_load: Default::default(),
             args_requirement: requirement,
             skill_dir: PathBuf::from("/sk"),
             source_path: PathBuf::from("/sk/SKILL.md"),

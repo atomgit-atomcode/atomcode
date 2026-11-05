@@ -39,6 +39,8 @@ impl Tool for UseSkillTool {
          also require checking for a matching skill, without an explicit skill request. \
          Use only an exact name from '=== AVAILABLE SKILLS ===' or list_skills; never invent \
          or guess a skill name. list_skills discovers skills omitted from the catalog. \
+         Respect explicit user requests not to load skills. \
+         If the matching skill body is already supplied, follow it without loading it again. \
          If no description matches, proceed without loading a skill."
     }
     fn parameters_schema(&self) -> serde_json::Value {

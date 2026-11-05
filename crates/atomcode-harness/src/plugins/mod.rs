@@ -22,6 +22,7 @@ pub mod registries;
 pub mod self_knowledge;
 pub mod session;
 pub mod session_title;
+pub mod skill_auto_load;
 pub mod skill_permissions;
 pub mod spec;
 pub mod subagent;
