@@ -1128,19 +1128,15 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             // Only a cold acquisition can establish that the previous runtime
             // exited. Reload/model switches reuse ownership and must not close
             // an active turn or recover its preview as a second assistant reply.
+            let mut recovery_summary = None;
             if !reuse_lease
                 .as_ref()
                 .is_some_and(|source| source.lease().id() == id)
                 && manager.is_event_session(id)
             {
-                if manager
+                recovery_summary = manager
                     .recover_interrupted_turn(&lease)
-                    .map_err(io::Error::from)?
-                {
-                    startup_warnings.push(
-                        "上一轮异常中断，已恢复保存的执行进度；未完成工具不会自动重跑。".into(),
-                    );
-                }
+                    .map_err(io::Error::from)?;
             }
             let (loaded, pending_resume_prompt) = manager
                 .open_for_resume_noting(&lease, &mut startup_warnings)
@@ -1149,6 +1145,15 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             // kernel's empty-start seam — that would silently fresh-start under the
             // SAME session id and corrupt on-disk state.
             check_snapshot_version(&loaded.snapshot)?;
+            if let Some(mut summary) = recovery_summary {
+                if let Some(tasks) =
+                    crate::todo::recovery_task_summary(&loaded.snapshot.messages, &manager, id)
+                {
+                    summary.push('\n');
+                    summary.push_str(&tasks);
+                }
+                startup_warnings.push(summary);
+            }
             Some(SessionBinding {
                 id: id.clone(),
                 manager,

@@ -3906,6 +3906,27 @@ async fn a_cold_resume_recovers_abandoned_progress_before_the_next_request() {
                 .collect::<Vec<_>>(),
         )
         .unwrap();
+    manager
+        .write_todo_sidecar(
+            &id,
+            &[
+                atomcode_capabilities::session::manager::TodoSidecarItem {
+                    content: "read source".into(),
+                    status: "completed".into(),
+                },
+                atomcode_capabilities::session::manager::TodoSidecarItem {
+                    content: "finish fix".into(),
+                    status: "in_progress".into(),
+                },
+                atomcode_capabilities::session::manager::TodoSidecarItem {
+                    content: "run tests".into(),
+                    status: "pending".into(),
+                },
+            ],
+            0,
+            None,
+        )
+        .unwrap();
     drop(lease);
     let mut resumed =
         CodingRuntime::start(production_start(env.project.path(), &recorder, |start| {
@@ -3932,7 +3953,31 @@ async fn a_cold_resume_recovers_abandoned_progress_before_the_next_request() {
             .count(),
         1
     );
-    turn(&mut resumed, "continue after verifying the state").await;
+    resumed
+        .handle
+        .submit(UserInput::from("continue after verifying the state"))
+        .await
+        .unwrap();
+    let mut warnings = Vec::new();
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), resumed.events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match event.event {
+            CodingRuntimeEvent::ControllerWarning(text) => warnings.push(text),
+            CodingRuntimeEvent::TurnFinished(_) => break,
+            _ => {}
+        }
+    }
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("结果未知 1 项")
+                && warning.contains("已完成 1，进行中 1，待办 1")
+                && warning.contains("finish fix")),
+        "{warnings:?}"
+    );
     let seen = recorder.last_request();
     assert!(
         seen.iter()

@@ -11,6 +11,14 @@ use super::{manager::SessionResult, SessionLease, SessionManager};
 
 const RECOVERED: &str = "上一轮未正常结束，已恢复已保存的输出和执行记录。未收到结果的工具状态未知；继续前请核对现场，避免重复执行。";
 
+fn summary_label(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(80)
+        .collect()
+}
+
 fn recovery_facts(events: &[LoggedEvent]) -> Vec<SessionEvent> {
     let Some(turn) = events.iter().rev().find_map(|logged| match logged.event {
         SessionEvent::TurnStart { turn } => Some(turn),
@@ -29,6 +37,9 @@ fn recovery_facts(events: &[LoggedEvent]) -> Vec<SessionEvent> {
     let mut completed = HashSet::new();
     let mut answered = HashSet::new();
     let mut calls = Vec::new();
+    let mut names = BTreeMap::new();
+    let mut last_confirmed = None;
+    let mut results = 0;
     for logged in atomcode_kernel::session::retained_events(events)
         .filter(|logged| logged.event.turn() == turn)
     {
@@ -52,19 +63,70 @@ fn recovery_facts(events: &[LoggedEvent]) -> Vec<SessionEvent> {
             } => {
                 completed.insert(*round);
                 calls.extend(tool_calls.iter().map(|call| (*round, call.id.clone())));
+                names.extend(
+                    tool_calls
+                        .iter()
+                        .map(|call| ((*round, call.id.clone()), call.name.clone())),
+                );
             }
             SessionEvent::PartialReply { round, .. } => {
                 completed.insert(*round);
             }
-            SessionEvent::ToolResultLogged { call_id, .. } => {
-                answered.insert(call_id.clone());
+            SessionEvent::ToolStarted { round, call, .. } => {
+                names.insert((*round, call.id.clone()), call.name.clone());
+            }
+            SessionEvent::ToolResultLogged {
+                round,
+                call_id,
+                is_error,
+                ..
+            } => {
+                let key = (*round, call_id.clone());
+                if answered.insert(key.clone()) {
+                    results += 1;
+                }
+                if !is_error {
+                    last_confirmed = names.get(&key).cloned();
+                }
             }
             _ => {}
         }
     }
+    let unknown: Vec<_> = calls
+        .iter()
+        .filter(|key| !answered.contains(*key))
+        .map(|key| names.get(key).cloned().unwrap_or_else(|| "tool".into()))
+        .collect();
+    let recovered_reply = previews
+        .into_iter()
+        .rev()
+        .find(|(round, (text, reasoning))| {
+            !completed.contains(round) && (!text.is_empty() || !reasoning.is_empty())
+        });
+    let mut detail = format!(
+        "{RECOVERED}\n恢复摘要：已保存回复 {} 段，工具结果 {} 条，结果未知 {} 项。",
+        completed.len() + usize::from(recovered_reply.is_some()),
+        results,
+        unknown.len()
+    );
+    if let Some(name) = last_confirmed {
+        detail.push_str(&format!("\n最近已确认的工具：{}。", summary_label(&name)));
+    }
+    if !unknown.is_empty() {
+        detail.push_str(&format!(
+            "\n结果未知的调用：{}{}。",
+            unknown
+                .iter()
+                .take(4)
+                .map(|name| summary_label(name))
+                .collect::<Vec<_>>()
+                .join("、"),
+            if unknown.len() > 4 { "等" } else { "" }
+        ));
+    }
     let mut facts = Vec::new();
     for (round, call_id) in calls {
-        if answered.insert(call_id.clone()) {
+        if answered.insert((round, call_id.clone())) {
             facts.push(SessionEvent::ToolResultLogged {
                 turn, round, call_id,
                 content: "Runtime exited before a tool result was recorded. Execution outcome is unknown: it may have completed or changed external state. Verify the actual state before retrying; do not assume it failed or rerun automatically.".into(),
@@ -72,14 +134,7 @@ fn recovery_facts(events: &[LoggedEvent]) -> Vec<SessionEvent> {
             });
         }
     }
-    if let Some((round, (text, reasoning))) =
-        previews
-            .into_iter()
-            .rev()
-            .find(|(round, (text, reasoning))| {
-                !completed.contains(round) && (!text.is_empty() || !reasoning.is_empty())
-            })
-    {
+    if let Some((round, (text, reasoning))) = recovered_reply {
         facts.push(SessionEvent::PartialReply {
             turn,
             round,
@@ -95,7 +150,7 @@ fn recovery_facts(events: &[LoggedEvent]) -> Vec<SessionEvent> {
     facts.push(SessionEvent::Notice {
         turn,
         notice: NoticeKind::SessionInterrupted,
-        detail: RECOVERED.into(),
+        detail,
         retry: None,
     });
     facts.push(SessionEvent::TurnEnd {
@@ -112,15 +167,24 @@ fn recovery_facts(events: &[LoggedEvent]) -> Vec<SessionEvent> {
 impl SessionManager {
     /// Call only after acquiring ownership from a previous runtime, before replay.
     /// A live runtime reusing its lease must not call this during a rebuild.
-    pub fn recover_interrupted_turn(&self, lease: &SessionLease) -> SessionResult<bool> {
+    /// Returns the same informational summary recorded in the recovery notice.
+    pub fn recover_interrupted_turn(&self, lease: &SessionLease) -> SessionResult<Option<String>> {
         let events = self.load_events(lease.id())?;
         let inherited = self.read_event_header(lease.id())?.inherited;
         // An unfinished turn inherited from a fork belongs to its parent, not
         // this agent. Only this session's own work can be recovered here.
         let facts = recovery_facts(&events[inherited.min(events.len())..]);
         if facts.is_empty() {
-            return Ok(false);
+            return Ok(None);
         }
+        let summary = facts.iter().find_map(|event| match event {
+            SessionEvent::Notice {
+                notice: NoticeKind::SessionInterrupted,
+                detail,
+                ..
+            } => Some(detail.clone()),
+            _ => None,
+        });
         let seq = events.last().map_or(1, |event| event.seq + 1);
         let at = chrono::Utc::now().timestamp_millis().max(0) as u64;
         let appended: Vec<_> = facts
@@ -133,7 +197,7 @@ impl SessionManager {
             })
             .collect();
         self.append_events(lease, &appended)?;
-        Ok(true)
+        Ok(summary)
     }
 }
 
@@ -214,7 +278,8 @@ mod tests {
             String::from_utf8_lossy(&child.stderr)
         );
         let lease = manager.acquire_lease("recovery").unwrap();
-        assert!(manager.recover_interrupted_turn(&lease).unwrap());
+        let summary = manager.recover_interrupted_turn(&lease).unwrap().unwrap();
+        assert!(summary.contains("已保存回复 1 段"), "{summary}");
         let stored = manager.load_events("recovery").unwrap();
         assert!(stored.iter().any(
             |e| matches!(&e.event, SessionEvent::PartialReply { text, .. } if text == "已查到根因")
@@ -239,7 +304,7 @@ mod tests {
                 ..
             }
         ));
-        assert!(!manager.recover_interrupted_turn(&lease).unwrap());
+        assert!(manager.recover_interrupted_turn(&lease).unwrap().is_none());
         assert_eq!(stored, manager.load_events("recovery").unwrap());
     }
 
@@ -256,7 +321,7 @@ mod tests {
             .create_event_session(&lease, &header, &meta)
             .unwrap();
         manager.append_events(&lease, &log(start())).unwrap();
-        assert!(!manager.recover_interrupted_turn(&lease).unwrap());
+        assert!(manager.recover_interrupted_turn(&lease).unwrap().is_none());
     }
 
     #[test]
@@ -290,6 +355,94 @@ mod tests {
             error: None,
         });
         assert!(recovery_facts(&log(events)).is_empty());
+    }
+
+    #[test]
+    fn the_summary_distinguishes_recorded_results_success_and_unknown_calls() {
+        let mut events = start();
+        events.push(SessionEvent::AssistantMessage {
+            turn: 1,
+            round: 1,
+            text: String::new(),
+            reasoning: String::new(),
+            tool_calls: ["read_file", "bash", "write_file"]
+                .iter()
+                .enumerate()
+                .map(|(i, name)| ToolCall {
+                    id: i.to_string(),
+                    name: (*name).into(),
+                    arguments: "private-command-arguments".into(),
+                })
+                .collect(),
+            reasoning_blocks: vec![],
+            meta: None,
+        });
+        for (id, failed) in [("0", false), ("1", true)] {
+            events.push(SessionEvent::ToolResultLogged {
+                turn: 1,
+                round: 1,
+                call_id: id.into(),
+                content: "private-tool-output".into(),
+                is_error: failed,
+                images: vec![],
+            });
+        }
+        let facts = recovery_facts(&log(events));
+        let detail = facts
+            .iter()
+            .find_map(|event| match event {
+                SessionEvent::Notice { detail, .. } => Some(detail),
+                _ => None,
+            })
+            .unwrap();
+        assert!(detail.contains("工具结果 2 条，结果未知 1 项"), "{detail}");
+        assert!(detail.contains("最近已确认的工具：read_file"), "{detail}");
+        assert!(detail.contains("结果未知的调用：write_file"), "{detail}");
+        assert!(!detail.contains("private-"));
+        assert_eq!(
+            summary_label(&format!("\x1b\n{}", "字".repeat(100)))
+                .chars()
+                .count(),
+            80
+        );
+        assert!(!summary_label("\x1b\nread_file")
+            .chars()
+            .any(char::is_control));
+    }
+
+    #[test]
+    fn a_tool_id_reused_in_a_later_round_still_needs_its_own_result() {
+        let mut events = start();
+        for round in [1, 2] {
+            events.push(SessionEvent::AssistantMessage {
+                turn: 1,
+                round,
+                text: String::new(),
+                reasoning: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "reused".into(),
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                }],
+                reasoning_blocks: vec![],
+                meta: None,
+            });
+            if round == 1 {
+                events.push(SessionEvent::ToolResultLogged {
+                    turn: 1,
+                    round,
+                    call_id: "reused".into(),
+                    content: "first finished".into(),
+                    is_error: false,
+                    images: vec![],
+                });
+            }
+        }
+        let facts = recovery_facts(&log(events));
+        assert_eq!(facts.iter().filter(|e| matches!(e, SessionEvent::ToolResultLogged { round: 2, call_id, .. } if call_id == "reused")).count(), 1);
+        assert!(facts.iter().any(
+            |e| matches!(e, SessionEvent::Notice { detail, .. } if detail.contains("结果未知 1 项"))
+        ));
     }
 
     #[test]

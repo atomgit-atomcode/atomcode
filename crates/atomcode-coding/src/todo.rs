@@ -862,6 +862,70 @@ fn current_todos(
     })
 }
 
+/// Informational resume display, using the same fold as the live task list.
+/// It neither changes task status nor asks the agent to execute anything.
+pub(crate) fn recovery_task_summary(
+    messages: &[Message],
+    manager: &SessionManager,
+    id: &str,
+) -> Option<String> {
+    let mut unavailable = false;
+    let current = current_todos(messages, || match manager.read_todo_sidecar(id) {
+        Ok(sidecar) => sidecar,
+        Err(_) => {
+            unavailable = true;
+            None
+        }
+    });
+    if unavailable {
+        return Some("任务清单暂不可用，请在继续前核对。".into());
+    }
+    let current = current?;
+    let count = |status| {
+        current
+            .items
+            .iter()
+            .filter(|item| item.status == status)
+            .count()
+    };
+    let completed = count(TodoStatus::Completed);
+    let active = count(TodoStatus::InProgress);
+    let pending = count(TodoStatus::Pending);
+    let mut summary =
+        format!("任务清单（上次记录）：已完成 {completed}，进行中 {active}，待办 {pending}。");
+    let open = current
+        .items
+        .iter()
+        .filter(|item| item.status == TodoStatus::InProgress)
+        .chain(
+            current
+                .items
+                .iter()
+                .filter(|item| item.status == TodoStatus::Pending),
+        );
+    for item in open.take(4) {
+        let label: String = item
+            .content
+            .chars()
+            .filter(|ch| !ch.is_control())
+            .take(80)
+            .collect();
+        let status = if item.status == TodoStatus::InProgress {
+            "进行中"
+        } else {
+            "待办"
+        };
+        summary.push_str(&format!("\n- {status}：{label}"));
+    }
+    if active + pending > 4 {
+        summary.push_str(&format!(
+            "\n另有 {} 项未完成任务未展开。",
+            active + pending - 4
+        ));
+    }
+    Some(summary)
+}
+
 /// Map the canonical sidecar status strings back to [`TodoStatus`].
 fn parse_todo_status(status: &str) -> TodoStatus {
     match status {
@@ -966,6 +1030,54 @@ mod tests {
                 .contains("The MOMENT you START"),
             "incremental todowrite shape must not repeat drive rules"
         );
+    }
+
+    #[test]
+    fn recovery_summary_uses_the_live_task_fold_and_prioritizes_open_work() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = SessionManager::with_root(root.path().join("0123456789abcdef"));
+        let messages = vec![todowrite_msg(
+            r#"{"todos":[{"content":"read source","status":"completed"},{"content":"apply fix","status":"in_progress"},{"content":"run tests","status":"pending"}]}"#,
+        )];
+        let summary = recovery_task_summary(&messages, &manager, "recovery").unwrap();
+        assert!(summary.contains("已完成 1，进行中 1，待办 1"), "{summary}");
+        assert!(summary.contains("进行中：apply fix") && summary.contains("待办：run tests"));
+        assert!(
+            !summary.contains("read source"),
+            "completed task bodies are not repeated"
+        );
+    }
+
+    #[test]
+    fn recovery_summary_uses_the_compacted_sidecar_and_bounds_task_previews() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = SessionManager::with_root(root.path().join("0123456789abcdef"));
+        let items: Vec<_> = (0..7)
+            .map(|i| TodoSidecarItem {
+                content: format!("{i}\x1b{}", "字".repeat(120)),
+                status: if i == 6 { "in_progress" } else { "pending" }.into(),
+            })
+            .collect();
+        manager
+            .write_todo_sidecar("recovery", &items, 0, None)
+            .unwrap();
+        let summary = recovery_task_summary(&[], &manager, "recovery").unwrap();
+        assert!(summary.contains("已完成 0，进行中 1，待办 6"), "{summary}");
+        assert_eq!(
+            summary
+                .lines()
+                .filter(|line| line.starts_with("- "))
+                .count(),
+            4
+        );
+        assert!(summary.lines().nth(1).unwrap().starts_with("- 进行中：6"));
+        assert!(summary.contains("另有 3 项"));
+        assert!(!summary.contains('\x1b'));
+        assert!(summary.chars().count() < 450);
+        std::fs::write(manager.todo_sidecar_path("recovery").unwrap(), "broken").unwrap();
+        assert!(recovery_task_summary(&[], &manager, "recovery")
+            .unwrap()
+            .contains("暂不可用"));
     }
 
     // ---- the status line: stated, never a demand to check -------------------------------

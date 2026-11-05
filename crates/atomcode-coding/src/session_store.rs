@@ -109,16 +109,21 @@ impl Store {
             store
                 .create_event_session(&lease, &header, &meta)
                 .map_err(|e| e.to_string())?;
-        } else if store
+        } else if let Some(mut summary) = store
             .recover_interrupted_turn(&lease)
             .map_err(|e| e.to_string())?
         {
             // AgentCreated runs before a restored member can execute. Its
             // lease has just been acquired; refresh the seed from the log so
             // the next commit uses the sequence after the recovery facts.
-            agent
-                .session()
-                .restore(store.load_events(&id).map_err(|e| e.to_string())?);
+            let events = store.load_events(&id).map_err(|e| e.to_string())?;
+            let messages = atomcode_kernel::session::derive_messages_with_meta(&events);
+            if let Some(tasks) = crate::todo::recovery_task_summary(&messages, store, &id) {
+                summary.push('\n');
+                summary.push_str(&tasks);
+            }
+            agent.session().restore(events);
+            self.warn(format!("{}: {summary}", header.id));
         }
         self.delegated
             .lock()
