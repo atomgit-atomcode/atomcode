@@ -1,0 +1,216 @@
+.model-card-dialog {
+  width:min(960px,calc(100vw - 32px));
+  max-height:90dvh;
+  padding:0;
+  border:1px solid var(--app-border-subtle);
+  border-radius:16px;
+  background:var(--app-primary-background);
+  color:var(--app-primary-foreground);
+  box-shadow:0 24px 90px #0003
+}
+
+.model-card-dialog::backdrop {
+  background:#0006
+}
+.model-card-dialog>header {
+  display:flex;
+  justify-content:space-between;
+  gap:16px;
+  padding:20px 24px;
+  border-bottom:1px solid var(--app-border-subtle)
+}
+.model-card-dialog h2,.model-card-dialog p {
+  margin:0
+}
+.model-card-dialog h2 {
+  font-size:1.125rem
+}
+.model-card-dialog header p {
+  margin-top:5px;
+  color:var(--app-caption-foreground);
+  overflow-wrap:anywhere
+}
+.model-card-dialog header button {
+  align-self:start;
+  font-size:1.5rem;
+  border:0;
+  background:none;
+  color:inherit;
+  cursor:pointer
+}
+.mc-body {
+  padding:20px 24px;
+  overflow:auto
+}
+.mc-body>p {
+  margin:12px 0
+}
+.mc-config,.mc-pickers {
+  display:flex;
+  gap:16px;
+  flex-wrap:wrap
+}
+.mc-config {
+  font-size:0.8125rem;
+  color:var(--app-caption-foreground)
+}
+.mc-muted {
+  color:var(--app-caption-foreground);
+  font-size:0.75rem;
+  line-height:1.6
+}
+.mc-empty {
+  padding:12px;
+  border:1px dashed var(--app-border-subtle);
+  border-radius:8px
+}
+.mc-pickers {
+  margin:20px 0
+}
+.mc-pickers label {
+  flex:1;
+  min-width:190px;
+  font-size:0.75rem
+}
+.mc-pickers select {
+  display:block;
+  width:100%;
+  margin-top:6px;
+  padding:9px;
+  border:1px solid var(--app-border-subtle);
+  border-radius:8px;
+  background:var(--app-primary-background);
+  color:inherit
+}
+.mc-headings {
+  display:grid;
+  grid-template-columns:1fr;
+  gap:16px
+}
+.mc-headings.comparing {
+  grid-template-columns:1fr 1fr
+}
+.mc-headings section {
+  padding:16px;
+  background:var(--app-secondary-background);
+  border-radius:10px
+}
+.mc-headings p {
+  margin-top:8px
+}
+.model-card-dialog small {
+  display:block;
+  color:var(--app-caption-foreground);
+  font-size:0.6875rem;
+  line-height:1.6;
+  overflow-wrap:anywhere
+}
+.mc-body h3 {
+  margin:24px 0 10px;
+  font-size:0.9375rem
+}
+.mc-table-scroll {
+  overflow-x:auto
+}
+.model-card-dialog table {
+  width:100%;
+  border-collapse:collapse;
+  font-size:0.8125rem;
+  table-layout:fixed
+}
+.model-card-dialog th,.model-card-dialog td {
+  padding:12px 10px;
+  border-bottom:1px solid var(--app-border-subtle);
+  text-align:left;
+  vertical-align:top;
+  overflow-wrap:anywhere
+}
+.model-card-dialog th {
+  font-weight:500
+}
+.mc-score strong {
+  font-variant-numeric:tabular-nums
+}
+.mc-bar {
+  display:block;
+  margin:7px 0;
+  background:var(--app-border-subtle);
+  border-radius:3px;
+  height:4px
+}
+.mc-bar i {
+  display:block;
+  background:var(--app-brand);
+  height:100%;
+  border-radius:3px
+}
+.mc-score summary {
+  font-size:0.6875rem;
+  color:var(--app-caption-foreground);
+  cursor:pointer
+}
+.mc-notes {
+  margin-top:24px;
+  padding-top:16px;
+  border-top:1px solid var(--app-border-subtle)
+}
+.mc-notes>summary {
+  cursor:pointer
+}
+.mc-notes p {
+  margin:10px 0;
+  font-size:0.75rem;
+  overflow-wrap:anywhere
+}
+.mc-notes pre {
+  white-space:pre-wrap;
+  font-size:0.6875rem
+}
+.mc-notes a {
+  color:var(--app-brand)
+}
+.model-card-row {
+  display:flex;
+  align-items:stretch
+}
+.model-card-row>.model-item {
+  flex:1;
+  min-width:0
+}
+.model-card-info {
+  flex-shrink:0;
+  border:0;
+  background:transparent;
+  color:var(--app-caption-foreground);
+  padding:8px 12px;
+  cursor:pointer
+}
+.model-card-info:hover {
+  color:var(--app-brand);
+  background:var(--app-secondary-background)
+}
+
+@media(max-width:600px) {
+  .model-card-dialog {
+  width:100vw;
+  max-width:none;
+  max-height:100dvh;
+  height:100dvh;
+  margin:0;
+  border-radius:0
+}
+.model-card-dialog>header,.mc-body {
+  padding:16px
+}
+.mc-headings.comparing {
+  grid-template-columns:1fr
+}
+.model-card-dialog th,.model-card-dialog td {
+  padding:9px 5px;
+  font-size:0.75rem
+}
+.mc-pickers {
+  gap:10px
+}
+
+}

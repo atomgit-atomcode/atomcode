@@ -643,9 +643,22 @@ pub struct RuntimeContextStats {
     /// 每个别的调用方要的都是一个数。人想看它的那一刻很具体:agent 表现得
     /// 像是被告知了一件谁也不记得告诉过它的事。
     pub system_prompt: Option<String>,
+    /// Current mounted persona, only when explicitly requested.
+    pub persona: Option<RuntimePersonaInfo>,
     /// On-demand asset status, captured from the mounted services rather than
     /// reconstructed by a driver. Populated only with `context_stats_with(true)`.
     pub assets: Option<RuntimeAssetSources>,
+}
+
+/// Inspection of the mounted persona contribution, separate from the full prompt.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct RuntimePersonaInfo {
+    /// builtin, config, explicit, or host. Unknown future sources remain extensible.
+    pub source: String,
+    /// None when the host cannot declare whether it appended instructions.
+    pub appended: Option<bool>,
+    /// Exact mounted persona fragment, including append text, not the full system prompt.
+    pub text: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -4703,7 +4716,7 @@ fn spawn_runtime_owner_with_optional_agent(
                     state.active
                         && held_turn.is_some()
                         && !kernel_turn_open
-                        && background_jobs.pending()
+                        && background_jobs.uncollected()
                 })
                 .and_then(|state| {
                     if state.cap_reached().is_some() {
@@ -5125,7 +5138,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             // repeated identical observational receipts do not count as new
                             // progress; unknown commands/mutations remain conservative. Stop
                             // after the existing bounded number of stagnant rounds.
-                            if background_jobs.pending() {
+                            if background_jobs.uncollected() {
                                 if let Some(state) = goal.as_mut() {
                                     state.last_reason = Some("waiting for explicitly requested background completion".into());
                                     let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
@@ -6821,6 +6834,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             model: runtime.config.model.clone(),
                             working_dir: runtime.config.working_dir.clone(),
                             system_prompt,
+                            persona: prompt.then(|| runtime_persona_info(runtime)).flatten(),
                             assets: prompt.then(|| runtime_asset_sources(runtime)),
                         }));
                     }
@@ -9993,14 +10007,11 @@ fn spawn_runtime_owner_with_optional_agent(
                         break;
                     },
                 },
-                completion = background_jobs.next(), if background_jobs.pending() => {
+                completion = background_jobs.next(), if background_jobs.pending() && !kernel_turn_open && pending_requests.is_empty() => {
                     if cancel_pending || controls.stop_now().is_cancelled() || persistence_failure.is_some() || pending_policy_intervention.is_some() || !agent_available {
                         continue;
                     }
-                    let text = format!(
-                        "Background job {} has finished (exit code: {:?}, killed: {}). Use bash_poll with job_id {:?} to collect its output. This is a process completion notification, not proof that the task succeeded.",
-                        completion.job_id, completion.exit_code, completion.killed, completion.job_id,
-                    );
+                    let Some(text) = completion.notification() else { continue; };
                     if loop_state.is_some() || goal.as_ref().is_some_and(|state| !state.active) {
                         // A completion cannot shorten the person's /loop cadence
                         // or re-engage a paused goal. Carry it with the next input.
@@ -11193,6 +11204,20 @@ fn tree_inputs(
     // patch is the last word on any row — except the explicit model-only catalog
     // closure below, which no layer may reopen.
     let mut extra = vec![crate::on_harness::config_rows(config)?];
+    extra.push(
+        atomcode_plexus::Layer::new()
+            .patch(
+                "persona-atomcode",
+                serde_json::json!({
+                    "model": config.model,
+                    "product": prepare.identity.name(),
+                    "provider": prepare.identity.provider(),
+                    "system_prompt": config.system_prompt,
+                    "prompt_overrides": prepare.prompt_overrides,
+                }),
+            )
+            .map_err(|e| e.to_string())?,
+    );
     extra.extend(prepare.host_plugins.layers.iter().cloned());
     // `tools = false` is an explicit model-only contract, not just a request
     // to skip prepare-time registrations. Native rows mount their own tools;
@@ -11544,6 +11569,37 @@ fn record_code_rewind(live: &atomcode_harness::agent::Agent, turn: u64) {
             scope: atomcode_harness::session::RewindScope::Code,
         },
     );
+}
+
+fn runtime_persona_info(runtime: &RuntimeResources) -> Option<RuntimePersonaInfo> {
+    let app = runtime.harness_app.as_ref()?;
+    let text = app
+        .context()
+        .service::<atomcode_harness::seams::SystemPromptSvc>()?
+        .fragment("persona-atomcode")?;
+    let entry = app
+        .tree()
+        .entries
+        .iter()
+        .find(|entry| entry.id == "persona-atomcode")?;
+    let (source, appended) = if entry.name == "persona-atomcode" {
+        let row = crate::host::PersonaConfig::from_config(&entry.config).ok()?;
+        let source = if row.prompt_overrides.replace.is_some() {
+            "explicit"
+        } else if row.system_prompt.is_some() {
+            "config"
+        } else {
+            "builtin"
+        };
+        (source, Some(row.prompt_overrides.append.is_some()))
+    } else {
+        ("host", None)
+    };
+    Some(RuntimePersonaInfo {
+        source: source.into(),
+        appended,
+        text,
+    })
 }
 
 fn runtime_asset_sources(runtime: &RuntimeResources) -> RuntimeAssetSources {
@@ -13011,6 +13067,7 @@ pub mod testkit {
             front_end: None,
             review_delegate: None,
             host_plugins: Default::default(),
+            prompt_overrides: Default::default(),
             identity: Default::default(),
         };
         let plugin_hooks = Arc::new(crate::plugin_hooks::StaticPluginHookSource::default());
@@ -14183,6 +14240,7 @@ mod tests {
                 front_end: None,
                 review_delegate: None,
                 host_plugins: Default::default(),
+                prompt_overrides: Default::default(),
                 identity: Default::default(),
             },
             provider_factory: Arc::new(TestProviderFactory {
@@ -22364,6 +22422,46 @@ mod tests {
         );
 
         handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn background_completion_waits_for_the_current_turn_to_finish() {
+        let (_handle, mut commands, events, mut runtime_events, _wake, _active, adapter) =
+            controller_test_runtime(Arc::new(GoalNotMetProviderFactory::default())).await;
+        let (call, result, finish) = crate::background_jobs::tests::job(true).await;
+        events.send(AgentEvent::TurnStarted { turn: None }).unwrap();
+        events.send(AgentEvent::ToolStarted { call }).unwrap();
+        events.send(AgentEvent::ToolResult { result }).unwrap();
+        while !matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::Agent(AgentEvent::ToolResult { .. }))
+        ) {}
+        finish.cancel();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), commands.recv())
+                .await
+                .is_err()
+        );
+        events
+            .send(AgentEvent::TurnComplete {
+                turn: None,
+                reason: StopReason::Stopped,
+                provider_failure: None,
+            })
+            .unwrap();
+        // The runtime first settles the completed turn's authoritative snapshot.
+        assert!(matches!(
+            commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        events
+            .send(AgentEvent::Snapshot {
+                snapshot: SessionSnapshot::new(vec![]),
+            })
+            .unwrap();
+        assert!(matches!(commands.recv().await,
+            Some(AgentCommand::SendSyntheticMessage { text }) if text.contains("Background job")));
+        adapter.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

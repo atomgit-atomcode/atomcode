@@ -1042,6 +1042,31 @@ mod tests {
     }
 }
 
+/// Keep slow searches observable without spawning a second task or changing
+/// their existing deadline/cancellation semantics. Fast lookups emit nothing.
+async fn search_with_activity(
+    scope: &str,
+    progress: &atomcode_kernel::tool::ProgressSink,
+    search: impl std::future::Future<Output = ToolResult>,
+) -> ToolResult {
+    use tokio::time::{Duration, Instant, MissedTickBehavior};
+    let began = Instant::now();
+    let mut ticks =
+        tokio::time::interval_at(began + Duration::from_secs(1), Duration::from_secs(1));
+    ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    tokio::pin!(search);
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut search => return result,
+            _ = ticks.tick() => progress.emit(format!(
+                "Searching · {}s elapsed · {scope} · cancel to stop",
+                began.elapsed().as_secs()
+            )),
+        }
+    }
+}
+
 /// Per-call discovery switches override the mounted project/user defaults.
 #[derive(Default, serde::Deserialize)]
 pub(crate) struct SearchOverrides {

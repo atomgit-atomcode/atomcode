@@ -893,6 +893,9 @@ fn behind_a_lid(block: &crate::block::Block) -> bool {
         // not swallowed by the neighbouring calls' group count.
         && !block.content.as_tool_call().is_some_and(|call| {
             call.edit_text_mismatch()
+                // A slow call's activity must stay visible even when a later
+                // parallel call would otherwise own the merged run's lid.
+                || (call.is_running() && call.progress.is_some())
                 || (call.name == "bash_poll" && call.idle_poll_job().is_none())
         })
 }
@@ -2202,6 +2205,15 @@ impl Host {
                 .any(|s| s.block().kind() == "reasoning")
     }
 
+    /// Update one live call through its owning producer. Late/orphan activity
+    /// is ignored and never becomes a notice or a persisted transcript fact.
+    pub fn tool_progress(&self, call_id: &str, message: &str) -> bool {
+        let mut stream = self.stream.write().expect("stream poisoned");
+        self.modules.producers().iter().any(|producer| {
+            producer.tool_progress(call_id, message, &mut stream.writer(producer.id()))
+        })
+    }
+
     /// Deliver one committed fact to every module, with no sequence number of
     /// its own — for a caller that has only the event. A producer that needs
     /// the number (an undo naming the turn it went back to) sees zero, which
@@ -3500,6 +3512,14 @@ impl Host {
         &self,
         press: crate::surface::KeyPress,
     ) -> (bool, Option<crate::providers::Step>) {
+        let (card_columns, card_height) = self
+            .hits
+            .lock()
+            .expect("hits poisoned")
+            .providers
+            .map(|rect| (rect.w as usize, rect.h as usize))
+            .unwrap_or((80, 21));
+        let card_width = card_columns.saturating_sub(2).max(1);
         let mut m = self.moment.write().expect("moment poisoned");
         let view = m.providers.clone();
         let mut secret = self
@@ -3509,8 +3529,14 @@ impl Host {
         let Some(panel) = m.providers_panel.as_mut() else {
             return (false, None);
         };
+        if let Some(card) = &mut panel.card {
+            card.clamp(&view, card_width, card_height);
+        }
         let before = panel.clone();
         let step = crate::providers::key(&view, panel, &mut secret, press);
+        if let Some(card) = &mut panel.card {
+            card.clamp(&view, card_width, card_height);
+        }
         let changed = *panel != before;
         match step {
             crate::providers::Step::Stay => (changed, None),
@@ -3542,7 +3568,31 @@ impl Host {
         if !over {
             return false;
         }
+        let (card_columns, card_height) = self
+            .hits
+            .lock()
+            .expect("hits poisoned")
+            .providers
+            .map(|rect| (rect.w as usize, rect.h as usize))
+            .unwrap_or((80, 21));
+        let card_width = card_columns.saturating_sub(2).max(1);
         let mut m = self.moment.write().expect("moment poisoned");
+        let card_view = m.providers.clone();
+        if let Some(card) = m
+            .providers_panel
+            .as_mut()
+            .and_then(|panel| panel.card.as_mut())
+        {
+            card.clamp(&card_view, card_width, card_height);
+            card.scroll = if by < 0 {
+                card.scroll.saturating_sub(by.unsigned_abs() as usize)
+            } else {
+                card.scroll.saturating_add(by as usize)
+            };
+            card.clamp(&card_view, card_width, card_height);
+            return true;
+        }
+
         if let Some(crate::providers::Form::Model(form)) = m
             .providers_panel
             .as_mut()

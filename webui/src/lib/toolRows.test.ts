@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { toolResultStatus, updateToolProgress, upsertToolPart, type MsgPart, type ToolRow } from './toolRows.ts';
+import { settlePendingToolParts, toolResultStatus, updateToolProgress, upsertToolPart, type MsgPart, type ToolRow } from './toolRows.ts';
 
 const tool = (id: string, over: Partial<ToolRow> = {}): ToolRow => ({
   id,
@@ -59,4 +59,34 @@ test('non-tool parts and ordering are preserved', () => {
 
 test('partial review result is incomplete rather than a clean success or generic failure', () => {
   assert.equal(toolResultStatus(false, 'Code review incomplete (MaxRounds)'), 'incomplete');
+});
+
+test('search progress updates only its pending card and cannot revive a finished call', () => {
+  let parts: MsgPart[] = [{ kind: 'tool', tool: tool('search') }, { kind: 'tool', tool: tool('other') }];
+  parts = updateToolProgress(parts, 'search', 'Searching · 1s elapsed · linked');
+  assert.equal(parts[0].kind === 'tool' && parts[0].tool.progress, 'Searching · 1s elapsed · linked');
+  assert.equal(parts[1].kind === 'tool' && parts[1].tool.progress, undefined);
+  parts = upsertToolPart(parts, tool('search', { status: 'done', output: 'No matches' }));
+  parts = updateToolProgress(parts, 'search', 'late search activity');
+  assert.equal(parts[0].kind === 'tool' && parts[0].tool.progress, undefined);
+  assert.equal(parts[0].kind === 'tool' && parts[0].tool.status, 'done');
+});
+
+
+test('turn termination settles only open tools and discards their activity', () => {
+  const parts: MsgPart[] = [
+    { kind: 'text', text: 'partial reply' },
+    { kind: 'tool', tool: tool('open', { progress: 'Searching', output: 'partial output' }) },
+    { kind: 'tool', tool: tool('approved', { status: 'waiting_approval' }) },
+    { kind: 'tool', tool: tool('done', { status: 'done', output: 'result' }) },
+  ];
+  const settled = settlePendingToolParts(parts);
+  assert.deepEqual(settled[0], parts[0]);
+  for (const index of [1, 2]) {
+    assert.equal(settled[index].kind === 'tool' && settled[index].tool.status, 'incomplete');
+    assert.equal(settled[index].kind === 'tool' && settled[index].tool.progress, undefined);
+  }
+  assert.equal(settled[1].kind === 'tool' && settled[1].tool.output, 'partial output');
+  assert.deepEqual(settled[3], parts[3]);
+  assert.deepEqual(updateToolProgress(settled, 'open', 'late progress'), settled);
 });

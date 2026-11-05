@@ -2393,7 +2393,7 @@ impl Plugin for CapabilityCommandsPlugin {
             52,
             "This host supports background completion notifications. For bounded work that \
              may take a long time, including downloads, SDK installation, builds and tests, \
-             prefer bash_start with notify_on_exit=true. Keep the real operation in that \
+             use bash_start (notify_on_exit defaults to true). Keep the real operation in that \
              tracked job so its exit status and output are available. While it runs, do \
              independent work if useful; otherwise end your response and wait for the host \
              notification, then collect output with bash_poll and check the result. Do not \
@@ -2405,7 +2405,7 @@ impl Plugin for CapabilityCommandsPlugin {
              Do not claim an untracked external process is being observed by the host.",
         );
         atomcode_harness::plugins::self_knowledge::describes(ctx, "background-completion", 42,
-            "The host supports optional background-job completion notifications. It resumes this session when explicitly observed work terminates; cancellation and runtime replacement retire pending notifications. A /loop keeps its chosen cadence, and a paused goal is not resumed by a notification.");
+            "The host supports background-job completion notifications by default. Set notify_on_exit=false for servers/watchers or manual polling. It resumes this session when observed work terminates; cancellation and runtime replacement retire pending notifications. A /loop keeps its chosen cadence, and a paused goal is not resumed by a notification.");
         for command in [
             Arc::new(GoalCommand(self.0.clone()))
                 as Arc<dyn atomcode_harness::commands::CatalogCommand>,

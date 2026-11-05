@@ -4212,3 +4212,12 @@ body {
 /* Leave the floating turn-navigation gutter clear for message actions. */
 .user-message-wrapper > .msg-actions { padding-inline-end: 40px; }
 .msg-copy-btn:disabled { cursor: default; opacity: .4; }
+
+.session-switch-notice {
+  flex-wrap: nowrap;
+  align-items: flex-start;
+  flex-shrink: 0;
+  background: var(--app-tool-background);
+}
+.session-switch-notice > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.session-switch-notice > button { flex-shrink: 0; padding: 0 6px; }

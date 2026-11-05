@@ -933,7 +933,11 @@ fn session_catalogue() -> Vec<Command> {
         Command::said_taking("patch", t(Msg::CmdTakesPath), t(Msg::CmdAboutPatch)),
         Command::said("compact", t(Msg::CmdAboutCompact)),
         Command::said("cancel-all", t(Msg::CmdAboutCancelAll)),
-        Command::said_taking("context", "[prompt]".into(), t(Msg::CmdAboutContext)),
+        Command::said_taking(
+            "context",
+            "[prompt|persona]".into(),
+            t(Msg::CmdAboutContext),
+        ),
         Command::said("agents", t(Msg::CmdAboutAgents)),
         Command::said("transcript", t(Msg::CmdAboutTranscript)),
         Command::said("clear", t(Msg::CmdAboutClear)),
@@ -1387,7 +1391,7 @@ impl CommandSet for SessionCommands {
                 // 它的那一刻很具体 —— agent 表现得像是被告知了一件谁也不记得
                 // 告诉过它的事,而那份提示词是挂着的各行各写一段拼出来的,
                 // 没有任何一处能读到全文。
-                if args.trim() == "prompt" {
+                if matches!(args.trim(), "prompt" | "persona") {
                     let control = match host(control) {
                         Ok(control) => control,
                         Err(refusal) => return refusal,
@@ -1399,6 +1403,26 @@ impl CommandSet for SessionCommands {
                         })
                         .await
                     {
+                        Ok(HostReply::Context {
+                            persona: Some(persona),
+                            ..
+                        }) if args.trim() == "persona" => {
+                            let source = match persona.source.as_str() {
+                                "builtin" => t(Msg::PersonaBuiltin),
+                                "config" => t(Msg::PersonaConfig),
+                                "explicit" => t(Msg::PersonaExplicit),
+                                _ => t(Msg::PersonaHost),
+                            };
+                            let appended = match persona.appended {
+                                Some(true) => t(Msg::PersonaAppended),
+                                Some(false) => t(Msg::PersonaNotAppended),
+                                None => t(Msg::PersonaAppendUnknown),
+                            };
+                            Outcome::Said(format!("{} · {}\n\n{}", source, appended, persona.text))
+                        }
+                        Ok(HostReply::Context { .. }) if args.trim() == "persona" => {
+                            Outcome::Said(t(Msg::PersonaUnavailable).into_owned())
+                        }
                         Ok(HostReply::Context {
                             system_prompt: Some(prompt),
                             ..
@@ -3017,7 +3041,10 @@ async fn recent_places(
         let Some(dir) = session.working_dir else {
             continue;
         };
-        if dir == here || pinned.iter().any(|already| already == &dir) {
+        if !std::path::Path::new(&dir).is_dir()
+            || dir == here
+            || pinned.iter().any(|already| already == &dir)
+        {
             continue;
         }
         if out.iter().any(|already| already == &dir) {
@@ -5146,6 +5173,7 @@ mod tests {
                 used: 50_000,
                 model: "glm-5".into(),
                 working_dir: "/w".into(),
+                persona: None,
                 system_prompt: None,
             }));
         let (app, _client, all) = following(&host);
@@ -5189,6 +5217,7 @@ mod tests {
                 used: 0,
                 model: "m".into(),
                 working_dir: "/w".into(),
+                persona: None,
                 system_prompt: Some("You are a coding agent.\nTools: …".into()),
             }),
             Ok(HostReply::Context {
@@ -5196,6 +5225,7 @@ mod tests {
                 used: 0,
                 model: "m".into(),
                 working_dir: "/w".into(),
+                persona: None,
                 system_prompt: None,
             }),
         ]);
@@ -5223,6 +5253,51 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn context_persona_shows_provenance_and_the_exact_fragment() {
+        let host = Arc::new(Recording::default());
+        host.replies
+            .lock()
+            .unwrap()
+            .push_back(Ok(HostReply::Context {
+                window: 1,
+                used: 0,
+                model: "m".into(),
+                working_dir: "/w".into(),
+                system_prompt: Some("FULL_SYSTEM_SHOULD_NOT_BE_SHOWN".into()),
+                persona: Some(atomcode_host_api::PersonaInfo {
+                    source: "explicit".into(),
+                    appended: Some(true),
+                    text: "PERSONA\n\nAPPENDED 原文".into(),
+                }),
+            }));
+        host.replies
+            .lock()
+            .unwrap()
+            .push_back(Ok(HostReply::Context {
+                window: 1,
+                used: 0,
+                model: "m".into(),
+                working_dir: "/w".into(),
+                system_prompt: Some("OLD_HOST_PROMPT".into()),
+                persona: None,
+            }));
+        let (app, _client, all) = following(&host);
+        match all.dispatch("/context persona", &app.context()).await {
+            Outcome::Said(text) => {
+                assert!(text.contains(&*t(Msg::PersonaExplicit)));
+                assert!(text.contains(&*t(Msg::PersonaAppended)));
+                assert!(text.ends_with("PERSONA\n\nAPPENDED 原文"));
+                assert!(!text.contains("FULL_SYSTEM_SHOULD_NOT_BE_SHOWN"));
+            }
+            other => panic!("{other:?}"),
+        }
+        match all.dispatch("/context persona", &app.context()).await {
+            Outcome::Said(text) => assert_eq!(text, t(Msg::PersonaUnavailable)),
+            other => panic!("{other:?}"),
+        }
+    }
+
     /// A host that cannot say what the window is says nothing rather than
     /// `0 / 0`, and the counted half still reaches the person.
     #[tokio::test]
@@ -5236,6 +5311,7 @@ mod tests {
                 used: 0,
                 model: String::new(),
                 working_dir: "/w".into(),
+                persona: None,
                 system_prompt: None,
             }));
         let (app, _client, all) = following(&host);
@@ -5846,6 +5922,7 @@ mod tests {
                 used: 0,
                 model: "m".into(),
                 working_dir: dir.display().to_string(),
+                persona: None,
                 system_prompt: None,
             }));
         host
@@ -6248,6 +6325,7 @@ mod tests {
                     used: 0,
                     model: "m".into(),
                     working_dir: dir.path().display().to_string(),
+                    persona: None,
                     system_prompt: None,
                 }));
         }
@@ -7187,6 +7265,49 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn recent_places_skips_missing_paths_and_files_before_filling_the_list() {
+        let root = tempfile::tempdir().unwrap();
+        let removed = root.path().join("removed");
+        std::fs::create_dir(&removed).unwrap();
+        std::fs::remove_dir(&removed).unwrap();
+        let file = root.path().join("file");
+        std::fs::write(&file, "not a directory").unwrap();
+        let dirs: Vec<String> = (0..7)
+            .map(|n| {
+                let dir = root.path().join(format!("project-{n}"));
+                std::fs::create_dir(&dir).unwrap();
+                dir.display().to_string()
+            })
+            .collect();
+        let mut paths = vec![removed.display().to_string(); 6];
+        paths.push(file.display().to_string());
+        paths.extend([dirs[0].clone(), dirs[1].clone(), dirs[1].clone()]);
+        paths.extend(dirs[2..].iter().cloned());
+        let host = Arc::new(Recording::default());
+        host.replies
+            .lock()
+            .unwrap()
+            .push_back(Ok(HostReply::Sessions {
+                sessions: paths
+                    .into_iter()
+                    .enumerate()
+                    .map(|(n, dir)| atomcode_host_api::StoredSession {
+                        id: format!("session-{n}"),
+                        title: None,
+                        working_dir: Some(dir),
+                        created_at: 0,
+                        updated_at: 0,
+                        turns: 1,
+                        needs_newer_version: false,
+                        scheduled: false,
+                    })
+                    .collect(),
+            }));
+        let places = recent_places(Some(host), &dirs[0], &[dirs[1].clone()]).await;
+        assert_eq!(places, dirs[2..7]);
+    }
+
     /// `/cd` 先给「我要去哪儿」的答案,再给「这儿有什么」:标过的目录排最前,
     /// 其次是最近在里面干过活的,最后才是当前目录底下的东西。
     #[tokio::test]
@@ -7206,6 +7327,8 @@ mod tests {
         }
         let here = tempfile::tempdir().unwrap();
         std::fs::create_dir(here.path().join("under-here")).unwrap();
+        let recent_dir = tempfile::tempdir().unwrap();
+        let recent_path = recent_dir.path().display().to_string();
         let host = Arc::new(Recording::default());
         // 先问工作目录,再问会话目录。
         host.replies
@@ -7216,6 +7339,7 @@ mod tests {
                 used: 0,
                 model: "m".into(),
                 working_dir: here.path().display().to_string(),
+                persona: None,
                 system_prompt: None,
             }));
         host.replies
@@ -7226,7 +7350,7 @@ mod tests {
                     atomcode_host_api::StoredSession {
                         id: "one".into(),
                         title: None,
-                        working_dir: Some("/w/recent".into()),
+                        working_dir: Some(recent_path.clone()),
                         created_at: 0,
                         updated_at: 2,
                         turns: 1,
@@ -7256,7 +7380,7 @@ mod tests {
             .find("/w/marked")
             .unwrap_or_else(|| panic!("标过的在里面:{text}"));
         let recent = text
-            .find("/w/recent")
+            .find(&recent_path)
             .unwrap_or_else(|| panic!("最近去过的在里面:{text}"));
         assert!(marked < recent, "标过的排在最近去过的前面:\n{text}");
         assert_eq!(

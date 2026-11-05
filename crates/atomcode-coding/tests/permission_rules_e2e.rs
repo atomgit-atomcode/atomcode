@@ -43,6 +43,7 @@ fn prepare_options() -> PrepareOptions {
         front_end: None,
         review_delegate: None,
         host_plugins: Default::default(),
+        prompt_overrides: Default::default(),
         identity: Default::default(),
     }
 }

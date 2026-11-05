@@ -1,5 +1,5 @@
 import { lazy, Suspense } from "preact/compat";
-import { useEffect, useRef, useState } from "preact/hooks";
+import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import { ApiCallError, workbenchPreview, workbenchRequest } from "../api";
 import { useSettings } from "../settings";
 import "./Workbench.css";
@@ -173,17 +173,23 @@ export function Workbench({
   const { lang } = useSettings();
   const zh = lang === "zh";
   const [fullscreen, setFullscreen] = useState(false);
-  useEffect(() => {
-    if (!fullscreen) return;
+  const [contentMaximized, setContentMaximized] = useState(false);
+  useLayoutEffect(() => {
+    if (!fullscreen && !contentMaximized) return;
     const escape = (event: KeyboardEvent) => {
       if (event.key !== "Escape" || event.defaultPrevented) return;
       event.preventDefault();
-      setFullscreen(false);
+      if (contentMaximized) setContentMaximized(false);
+      else setFullscreen(false);
     };
     window.addEventListener("keydown", escape);
     return () => window.removeEventListener("keydown", escape);
-  }, [fullscreen]);
+  }, [fullscreen, contentMaximized]);
   const [saved, rawSetSaved] = useState<Saved>(() => load(session));
+  useEffect(() => setContentMaximized(false), [session, saved.tab]);
+  useEffect(() => {
+    if (saved.tab === "files" && !saved.files.includes(saved.selected)) setContentMaximized(false);
+  }, [saved.tab, saved.selected, saved.files]);
   const current = useRef(saved);
   const dragCleanup = useRef<(() => void) | null>(null);
   function setSaved(update: Saved | ((old: Saved) => Saved)) {
@@ -204,6 +210,7 @@ export function Workbench({
     }
   }
   const [entries, setEntries] = useState<Entry[]>([]);
+  const [filesState, setFilesState] = useState<"loading" | "ready" | "failed">("loading");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [version, setVersion] = useState(0);
@@ -271,14 +278,21 @@ export function Workbench({
     let cancelled = false;
     setError("");
     setEntries([]);
+    setFilesState("loading");
     workbenchRequest<Entry[]>(
       "files?" + new URLSearchParams({ session_id: session, path: saved.path }),
     )
       .then((data) => {
-        if (!cancelled) setEntries(data);
+        if (!cancelled) {
+          setEntries(data);
+          setFilesState("ready");
+        }
       })
       .catch((e) => {
-        if (!cancelled) setError(String(e));
+        if (!cancelled) {
+          setError(String(e));
+          setFilesState("failed");
+        }
       });
     return () => {
       cancelled = true;
@@ -404,7 +418,7 @@ export function Workbench({
   }
   return (
     <aside
-      class={"workbench" + (fullscreen ? " workbench-fullscreen" : "")}
+      class={"workbench" + ((fullscreen || contentMaximized) ? " workbench-fullscreen" : "") + (contentMaximized ? " workbench-content-maximized" : "")}
       style={{ width: saved.width + "px" }}
       aria-label={zh ? "工作区面板" : "Workspace panel"}
     >
@@ -438,6 +452,7 @@ export function Workbench({
         </div>
         <div class="workbench-header-actions">
         <button
+          hidden={contentMaximized}
           onClick={() => setFullscreen(value => !value)}
           aria-label={zh ? (fullscreen ? "退出工作区全屏" : "工作区全屏") : (fullscreen ? "Exit workspace fullscreen" : "Fullscreen workspace")}
           title={zh ? (fullscreen ? "退出全屏（Esc）" : "全屏") : (fullscreen ? "Exit fullscreen (Esc)" : "Fullscreen")}
@@ -528,6 +543,12 @@ export function Workbench({
             class="workbench-tree"
             aria-label={zh ? "文件列表" : "File list"}
           >
+            {filesState === "loading" && <p role="status">{zh ? "正在加载目录…" : "Loading directory…"}</p>}
+            {filesState === "failed" && <p role="status">
+              {zh ? "目录加载失败。" : "Directory could not be loaded."}
+              <button onClick={() => setVersion(v => v + 1)}>{zh ? "重试" : "Retry"}</button>
+            </p>}
+            {filesState === "ready" && entries.length === 0 && <p role="status">{zh ? "空目录" : "Empty directory"}</p>}
             {entries.map((entry) => (
               <button
                 key={entry.name}
@@ -563,8 +584,7 @@ export function Workbench({
           </div>
           {saved.files.includes(saved.selected) ? (
             <>
-              {!/\.(png|jpe?g|gif|webp)$/i.test(saved.selected) && (
-                <div class="workbench-file-mode">
+              <div class="workbench-file-mode">
                   <button
                     class={
                       !saved.editing.includes(saved.selected) ? "active" : ""
@@ -580,6 +600,7 @@ export function Workbench({
                     {zh ? "预览" : "Preview"}
                   </button>
                   <button
+                    disabled={/\.(png|jpe?g|gif|webp)$/i.test(saved.selected)}
                     class={
                       saved.editing.includes(saved.selected) ? "active" : ""
                     }
@@ -590,8 +611,13 @@ export function Workbench({
                     {zh ? "编辑" : "Edit"}
                   </button>
                   <code title={saved.selected}>{saved.selected}</code>
-                </div>
-              )}
+                  <button
+                    aria-label={zh ? (contentMaximized ? "恢复文件布局" : "最大化文件") : (contentMaximized ? "Restore file layout" : "Maximize file")}
+                    title={zh ? "最大化 / 恢复（Esc）" : "Maximize / restore (Esc)"}
+                    aria-pressed={contentMaximized}
+                    onClick={() => setContentMaximized(v => !v)}
+                  >{contentMaximized ? "⤡" : "⤢"}</button>
+              </div>
               {saved.editing.includes(saved.selected) ? (
                 <WorkbenchEditor
                   key={saved.selected}
@@ -650,7 +676,9 @@ export function Workbench({
           )}
         </>
       ) : saved.tab === "git" ? (
-        <WorkbenchGit session={session} version={version} onOpen={openFile} />
+        <WorkbenchGit session={session} version={version} onOpen={openFile}
+          maximized={contentMaximized} onMaximize={() => setContentMaximized(v => !v)}
+          onRestore={() => setContentMaximized(false)} />
       ) : (
         <>
           <div class="workbench-terminal-actions">

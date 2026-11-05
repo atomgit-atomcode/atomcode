@@ -111,6 +111,7 @@ impl View for Providers {
 /// shape `crate::modules::settings` uses, and for the same reason.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Row {
+    Card(String),
     /// The rule the panel starts with.
     Rule,
     /// The name and the two lists: `provider  账号  模型`.
@@ -149,6 +150,33 @@ enum Row {
 
 fn layout(view: &ProvidersView, panel: &Panel, h: usize, w: usize) -> Vec<Row> {
     let mut rows = vec![Row::Rule, Row::Header];
+    if let Some(card) = &panel.card {
+        rows.push(Row::Card(t(Msg::ModelCardHelp).into_owned()));
+        let content = crate::model_cards::lines(view, card, w.saturating_sub(2).max(1));
+        let room = crate::model_cards::viewport_rows(content.len(), h);
+        let start = card.scroll.min(content.len().saturating_sub(room.max(1)));
+        rows.extend(
+            content
+                .iter()
+                .skip(start)
+                .take(room)
+                .cloned()
+                .map(Row::Card),
+        );
+        rows.push(Row::Card(format!(
+            "Esc {} · d {}",
+            t(Msg::LegendBack),
+            t(Msg::ModelCardNotes)
+        )));
+        rows.push(Row::Card(format!(
+            "{}–{} / {}",
+            start + 1,
+            (start + room).min(content.len()),
+            content.len()
+        )));
+        return rows;
+    }
+
     if let Some(Form::Model(ModelForm {
         picking: Some(picking),
         ..
@@ -501,6 +529,9 @@ fn draw(view: &ProvidersView, panel: &Panel, row: Row, w: usize, caps: crate::ca
             )
         }
         Row::Pick(at) => pick_line(panel, at, w),
+        Row::Card(text) => {
+            Line::styled(format!("  {text}"), theme::fg(Role::Secondary)).truncate(w)
+        }
         Row::Legend => {
             let mut line = Line::styled("  ", theme::fg(Role::Muted));
             for (index, (text, key)) in legend_buttons(view, panel, caps).into_iter().enumerate() {
@@ -1267,6 +1298,9 @@ fn legend(view: &ProvidersView, panel: &Panel) -> Vec<(String, String)> {
                 ("^d".to_string(), pt(PMsg::ProviderMenuDelete).into_owned()),
                 key("↑↓", Msg::LegendSelect),
             ];
+            if panel.tab == Tab::Models {
+                out.insert(0, key("F2", Msg::ModelCardTitle));
+            }
             if panel.tab == Tab::Accounts {
                 out.insert(1, key("^e", Msg::ProviderEdit));
             }
@@ -1317,6 +1351,7 @@ fn legend_buttons(
                 }
             } else if panel.efforts.is_none() {
                 match key.as_str() {
+                    "F2" => Some(KeyPress::plain(crate::surface::Key::F(2))),
                     "^a" => Some(KeyPress::ctrl('a')),
                     "^n" => Some(KeyPress::ctrl('n')),
                     "^e" if editable => Some(KeyPress::ctrl('e')),
@@ -1442,6 +1477,40 @@ pub fn tab_at(col: usize) -> Option<Tab> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn model_card_height_is_stable_and_has_no_model_switch_hit_rows() {
+        let row = crate::providers::ModelRow {
+            id: "card".into(),
+            account: "account".into(),
+            model: "glm-5.3-flash".into(),
+            window: 12345,
+            vision: Some(true),
+            effort: None,
+            levels: vec![],
+            current: true,
+            managed: false,
+        };
+        let view = crate::providers::ProvidersView::new(vec![], vec![row.clone()], vec![], vec![]);
+        let mut panel = crate::providers::Panel {
+            card: Some(crate::model_cards::CardPanel::new(&row)),
+            ..Default::default()
+        };
+        for width in [24, 80, 140] {
+            let height = super::layout(&view, &panel, usize::MAX, width).len();
+            let rows = super::layout(&view, &panel, height, width);
+            assert_eq!(rows.len(), height);
+            assert!(!rows.iter().any(|row| matches!(row, super::Row::Listed(_))));
+            for scroll in [1, 3, 16, usize::MAX] {
+                panel.card.as_mut().unwrap().scroll = scroll;
+                assert_eq!(
+                    super::layout(&view, &panel, usize::MAX, width).len(),
+                    height
+                );
+                assert_eq!(super::layout(&view, &panel, height, width).len(), height);
+            }
+        }
+    }
+
     use super::*;
     use crate::frame::Rect;
     use crate::providers::{AccountRow, ModelRow, Protocol};

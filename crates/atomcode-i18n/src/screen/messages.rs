@@ -7,6 +7,32 @@
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Msg<'a> {
+    ModelCardTitle,
+    ModelCardViewing,
+    ModelCardReadOnly,
+    ModelCardWebHint,
+    ModelCardScore,
+    ModelCardRank,
+    ModelCardEmpty,
+    ModelCardNoPublic,
+    ModelCardHelp,
+    ModelCardScope,
+    ModelCardConfigured,
+    ModelCardBenchmarks,
+    ModelCardTasks,
+    ModelCardNotes,
+    ModelCardDifferent,
+    ModelCardEvidence,
+    ModelCardSparse,
+    ModelCardBest,
+    ModelCardWorst,
+    ModelCardAgents,
+    ModelCardCoding,
+    ModelCardChat,
+    ModelCardMath,
+    ModelCardVision,
+    ModelCardSearch,
+
     AutomationOlder,
     AutomationTitle,
     AutomationEmpty,
@@ -2337,6 +2363,14 @@ pub enum Msg<'a> {
     },
     /// `/context prompt` against a host that assembles no system prompt.
     ContextNoPrompt,
+    PersonaBuiltin,
+    PersonaConfig,
+    PersonaExplicit,
+    PersonaHost,
+    PersonaAppended,
+    PersonaNotAppended,
+    PersonaAppendUnknown,
+    PersonaUnavailable,
     /// The row under an empty composer offering what might be said next. It
     /// names the key, because a dim line with no key on it reads as a label.
     ComposerSuggested {

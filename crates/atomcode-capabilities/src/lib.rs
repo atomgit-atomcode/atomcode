@@ -228,3 +228,6 @@ pub mod session;
 /// the user via driver slash-commands. Opt-in `memory` feature. See [`memory`].
 #[cfg(feature = "memory")]
 pub mod memory;
+
+/// Shared offline model evaluation data and explicit identity matching.
+pub mod model_cards;

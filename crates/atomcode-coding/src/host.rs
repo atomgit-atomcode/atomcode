@@ -89,6 +89,16 @@ pub fn contribute_prompt(ctx: &Context, id: &str, rank: i32, text: &str) {
     atomcode_harness::plugins::tools::contribute_prompt(ctx, id, rank, text)
 }
 
+/// Explicit persona overrides supplied by a driver, independent of model selection.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct PromptOverrides {
+    /// Replace the built-in or model-configured persona only.
+    pub replace: Option<String>,
+    /// Append verbatim to the selected persona.
+    pub append: Option<String>,
+}
+
 /// The config the `persona-atomcode` row is mounted with — so also what a
 /// host's persona swapped onto that row receives.
 ///
@@ -104,6 +114,10 @@ pub fn contribute_prompt(ctx: &Context, id: &str, rank: i32, text: &str) {
 #[derive(Clone, Debug, serde::Deserialize)]
 #[non_exhaustive]
 pub struct PersonaConfig {
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    #[serde(default)]
+    pub prompt_overrides: PromptOverrides,
     /// The model the conversation runs on, as the person chose it. Empty means
     /// nobody said; coding's own persona then asks the running provider.
     #[serde(default)]
@@ -127,6 +141,8 @@ fn default_provider() -> String {
 impl Default for PersonaConfig {
     fn default() -> Self {
         Self {
+            system_prompt: None,
+            prompt_overrides: Default::default(),
             model: String::new(),
             product: default_product(),
             provider: default_provider(),

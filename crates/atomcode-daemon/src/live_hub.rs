@@ -1435,6 +1435,22 @@ impl LiveViewHub {
             .map_err(|_| HubError::RuntimeUnavailable)
     }
 
+    pub async fn persona(
+        &self,
+        session: String,
+    ) -> Result<Option<atomcode_coding::runtime::RuntimePersonaInfo>, HubError> {
+        let (binding, handle) = self.bound_handle()?;
+        if binding.session_id != session {
+            return Err(HubError::RuntimeUnavailable);
+        }
+        let context = handle
+            .context_stats_with(true)
+            .await
+            .map_err(|e| HubError::RuntimeRejected(e.to_string()))?;
+        self.bound_handle_for(&binding)?;
+        Ok(context.persona)
+    }
+
     pub async fn task_specs(
         &self,
         session: String,
@@ -2007,6 +2023,33 @@ mod tests {
             },
         )
         .expect("the first runtime event must not be treated as stale");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn persona_inspection_rejects_another_view_without_rebinding() {
+        let project = tempfile::tempdir().unwrap();
+        let runtime =
+            atomcode_coding::runtime::testkit::runtime_with_a_fake_agent(project.path(), None)
+                .await;
+        let hub = LiveViewHub::new();
+        hub.bind(
+            "session-a",
+            project.path().to_path_buf(),
+            snapshot("one"),
+            Arc::new(RealControl {
+                handle: runtime.handle.clone(),
+            }),
+        )
+        .unwrap();
+        let before = hub.binding().unwrap();
+        assert!(matches!(
+            hub.persona("session-b".into()).await,
+            Err(HubError::RuntimeUnavailable)
+        ));
+        let after = hub.binding().unwrap();
+        assert_eq!(before.id, after.id);
+        assert_eq!(before.session_id, after.session_id);
+        runtime.handle.shutdown().await.unwrap();
     }
 
     #[derive(Clone)]

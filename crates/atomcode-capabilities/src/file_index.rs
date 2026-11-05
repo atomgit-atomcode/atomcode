@@ -10,6 +10,10 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 
 use ignore::WalkBuilder;
@@ -248,6 +252,21 @@ pub fn filter_entries(entries: &[Entry], scope_dir: &str, filter: &str) -> Vec<E
 // FileIndex
 // ---------------------------------------------------------------------------
 
+struct PendingWalk {
+    receiver: std::sync::mpsc::Receiver<Vec<Entry>>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl Drop for PendingWalk {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+}
+
+fn keep_index_entry(entry: &ignore::DirEntry) -> bool {
+    entry.depth() == 0 || entry.file_name() != ".git"
+}
+
 /// Lazy project file/directory index, gitignore-filtered, cached for the
 /// session. Built on first `filter()` call in a background thread so the
 /// event loop is never blocked by a synchronous file-system walk.
@@ -256,7 +275,7 @@ pub struct FileIndex {
     entries: RefCell<Option<Vec<Entry>>>,
     /// When `Some`, a background build is in progress. The receiver
     /// returns the completed entries once the walk finishes.
-    pending: RefCell<Option<std::sync::mpsc::Receiver<Vec<Entry>>>>,
+    pending: RefCell<Option<PendingWalk>>,
     /// True once the initial background build has been kicked off, so we
     /// don't spawn a second thread while the first is still running.
     building: RefCell<bool>,
@@ -316,14 +335,7 @@ impl FileIndex {
         *self.entries.borrow_mut() = Some(Self::scan_shallow(&self.root.borrow(), &self.own));
 
         // Stage 2: spawn background thread for the full walk.
-        let (tx, rx) = std::sync::mpsc::channel();
-        *self.pending.borrow_mut() = Some(rx);
-        let root = self.root.borrow().clone();
-        let own = self.own.clone();
-        std::thread::spawn(move || {
-            let walked = Self::walk_inner(root, &own);
-            let _ = tx.send(walked);
-        });
+        self.spawn_walk();
         true
     }
 
@@ -353,6 +365,22 @@ impl FileIndex {
             None => return Vec::new(),
         };
         filter_entries(entries, scope_dir, filter)
+    }
+
+    /// Complete first search for blocking services; later queries reuse the full
+    /// index and the same background refresh window as the interactive picker.
+    pub fn filter_blocking(&self, scope_dir: &str, filter: &str) -> Vec<Entry> {
+        self.drain_pending();
+        if self.built_at.borrow().is_none() {
+            let _ = self.pending.borrow_mut().take();
+            let walked = Self::walk_inner(self.root.borrow().clone(), &self.own);
+            *self.entries.borrow_mut() = Some(walked);
+            *self.built_at.borrow_mut() = Some(Instant::now());
+            *self.building.borrow_mut() = false;
+        }
+        self.maybe_refresh();
+        let entries = self.entries.borrow();
+        filter_entries(entries.as_deref().unwrap_or_default(), scope_dir, filter)
     }
 
     /// Every **file** under `root` (directories left out), relative and
@@ -405,7 +433,7 @@ impl FileIndex {
         }
         let mut pending = self.pending.borrow_mut();
         let Some(rx) = pending.as_mut() else { return };
-        match rx.try_recv() {
+        match rx.receiver.try_recv() {
             Ok(walked) => {
                 *self.entries.borrow_mut() = Some(walked);
                 *self.built_at.borrow_mut() = Some(Instant::now());
@@ -439,26 +467,48 @@ impl FileIndex {
         if !stale {
             return;
         }
+        self.spawn_walk();
+    }
+
+    fn spawn_walk(&self) {
         *self.building.borrow_mut() = true;
-        let (tx, rx) = std::sync::mpsc::channel();
-        *self.pending.borrow_mut() = Some(rx);
+        let (tx, receiver) = std::sync::mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        *self.pending.borrow_mut() = Some(PendingWalk {
+            receiver,
+            cancelled: cancelled.clone(),
+        });
         let root = self.root.borrow().clone();
         let own = self.own.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(Self::walk_inner(root, &own));
+            let _ = tx.send(Self::walk_inner_cancellable(root, &own, Some(cancelled)));
         });
     }
 
     fn walk_inner(root: PathBuf, own: &str) -> Vec<Entry> {
+        Self::walk_inner_cancellable(root, own, None)
+    }
+
+    fn walk_inner_cancellable(
+        root: PathBuf,
+        own: &str,
+        cancelled: Option<Arc<AtomicBool>>,
+    ) -> Vec<Entry> {
         // A full recursive index of an entire home directory or filesystem
         // root is never a useful `@`-mention scope, and traverses millions of
         // files (macOS `~/Library`, caches, every node_modules outside a repo)
         // — pegging a core at 100% CPU for minutes. Serve only the top level
         // there; `MAX_INDEX_ENTRIES` still backstops any other huge tree.
         if Self::is_home_or_filesystem_root(&root) {
-            return Self::walk_with_depth(root, Some(1), MAX_INDEX_ENTRIES, own);
+            return Self::walk_with_depth_cancellable(
+                root,
+                Some(1),
+                MAX_INDEX_ENTRIES,
+                own,
+                cancelled,
+            );
         }
-        Self::walk_with_depth(root, None, MAX_INDEX_ENTRIES, own)
+        Self::walk_with_depth_cancellable(root, None, MAX_INDEX_ENTRIES, own, cancelled)
     }
 
     /// True when `root` is a filesystem root (`/`, `C:\`, …) or the user's
@@ -493,6 +543,27 @@ impl FileIndex {
         max_entries: usize,
         own: &str,
     ) -> Vec<Entry> {
+        Self::walk_with_depth_cancellable(root, max_depth, max_entries, own, None)
+    }
+
+    fn walk_with_depth_cancellable(
+        root: PathBuf,
+        max_depth: Option<usize>,
+        max_entries: usize,
+        own: &str,
+        cancelled: Option<Arc<AtomicBool>>,
+    ) -> Vec<Entry> {
+        if cancelled
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            return Vec::new();
+        }
+        // VCS ancestry and ignore matching must use the same real path. Literal
+        // ancestors of a relative/symlink root can miss the enclosing repository.
+        // Entries remain relative; the FileIndex still retains the caller's root.
+        let root = std::fs::canonicalize(&root).unwrap_or(root);
+
         let mut out = Vec::new();
         // Dedup key shared across the allowlist pass and the main walk, so an
         // allowlisted dir that is NOT gitignored isn't indexed twice.
@@ -506,6 +577,12 @@ impl FileIndex {
         // `node_modules/` / `target/` stay filtered out as before.
         let own = Some(own).filter(|name| !name.is_empty());
         for name in ALWAYS_INDEX_DIRS.iter().copied().chain(own) {
+            if cancelled
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Relaxed))
+            {
+                return out;
+            }
             let dir = root.join(name);
             if !dir.is_dir() {
                 continue;
@@ -531,8 +608,14 @@ impl FileIndex {
                 .parents(false)
                 .require_git(false)
                 .max_filesize(None);
-            b.max_depth(sub_depth);
+            b.max_depth(sub_depth).filter_entry(keep_index_entry);
             for result in b.build() {
+                if cancelled
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(Ordering::Relaxed))
+                {
+                    return out;
+                }
                 let Ok(dent) = result else { continue };
                 // Paths are under `dir`, itself under `root`, so strip_prefix
                 // yields `<name>/…` — the same shape the main walk produces.
@@ -552,6 +635,31 @@ impl FileIndex {
             }
         }
 
+        if cancelled
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            return out;
+        }
+        // `require_git(false)` 同时关掉了 ignore crate 的 `.git` 边界检测（其
+        // `has_git` 只在 `require_git` 时计算），与 `parents(true)` 组合后，直到
+        // 文件系统根的所有祖先 .gitignore 都会应用进来：家目录里常见的
+        // `~/.gitignore`（常含 `.env`、`*.log`）会把家目录下任何项目——包括真正的
+        // git 仓库——的条目静默滤出索引（实测 Windows：`%TEMP%` 位于家目录下，
+        // 含 `.env` 的 `~/.gitignore` 让 `walk_keeps_dotfiles` 拿到空索引）。
+        //
+        // 因此按根目录是否在 VCS 检出内选择合法组合：
+        // - 检出内：`parents(true) + require_git(true)`——仓库根的 .gitignore 对以
+        //   子目录为根的遍历仍然生效，而 crate 的 saw_git 边界保证仓库之外的祖先
+        //   git 规则（.gitignore / .git/info/exclude）不漏进来（`.ignore` 文件的
+        //   匹配器不受 saw_git 门控，边界之上的祖先 .ignore 仍生效——与 ripgrep
+        //   行为一致，非本函数要管的事）；
+        // - 检出外：`parents(false) + require_git(false)`——根目录自己的
+        //   .gitignore/.ignore 照旧生效（这正是 require_git(false) 的存在意义），
+        //   祖先规则与 git 一致地不适用。
+        let in_vcs = root
+            .ancestors()
+            .any(|d| d.join(".git").exists() || d.join(".jj").exists());
         let mut builder = WalkBuilder::new(&root);
         builder
             .hidden(false)
@@ -559,14 +667,20 @@ impl FileIndex {
             .git_global(true)
             .git_exclude(true)
             .ignore(true)
-            .parents(true)
-            .require_git(false)
+            .parents(in_vcs)
+            .require_git(in_vcs)
             .max_filesize(None);
         // None = unbounded (full subtree); Some(1) = root + its direct children.
-        builder.max_depth(max_depth);
+        builder.max_depth(max_depth).filter_entry(keep_index_entry);
         let walker = builder.build();
 
         for result in walker {
+            if cancelled
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Relaxed))
+            {
+                break;
+            }
             let Ok(dent) = result else { continue };
             let Ok(rel) = dent.path().strip_prefix(&root) else {
                 continue;
@@ -600,8 +714,8 @@ impl FileIndex {
     /// lazily trigger a fresh shallow scan + background rebuild for the
     /// new root. Called by `apply_cd` when the user switches directories.
     pub fn reset(&self, new_root: PathBuf) {
-        // Cancel any in-flight background build by taking the receiver
-        // and dropping it — the spawned thread's send will fail silently.
+        // Dropping pending signals the old walker to stop at its next entry;
+        // its result can no longer overwrite this root's cache.
         let _ = self.pending.borrow_mut().take();
         *self.root.borrow_mut() = new_root;
         *self.entries.borrow_mut() = None;
@@ -930,12 +1044,233 @@ mod tests {
     #[test]
     fn walk_keeps_dotfiles() {
         let tmp = tempfile::tempdir().unwrap();
-        write_file(&tmp.path().join(".env"), "KEY=val");
+        // A distinctive synthetic dotfile name: a generic `.env` could be
+        // excluded by the machine's GLOBAL gitignore (core.excludesFile /
+        // XDG git/ignore), which the walker honors — that must not be able
+        // to turn this test red (observed in review).
+        write_file(&tmp.path().join(".atomcode-test-dotfile"), "KEY=val");
 
         let idx = FileIndex::new(tmp.path().to_path_buf(), ".ours");
         let result = filter_walk(&idx, "", "");
         let names: Vec<&str> = result.iter().map(|e| e.rel_path.as_str()).collect();
-        assert!(names.contains(&".env"), "got: {:?}", names);
+        assert!(
+            names.contains(&".atomcode-test-dotfile"),
+            "got: {:?}",
+            names
+        );
+    }
+
+    /// Regression (observed on Windows, where `%TEMP%` lives under the home
+    /// directory): a walk root that is NOT inside any VCS checkout must not
+    /// inherit ancestor `.gitignore`s — a home-dir `~/.gitignore` (commonly
+    /// listing `.env`, `*.log`) used to filter every project under the home
+    /// out of the index, because `require_git(false)` disables the ignore
+    /// crate's `.git`-boundary detection and `parents(true)` then applied
+    /// every ancestor's rules.
+    #[test]
+    fn a_plain_root_does_not_inherit_ancestor_gitignores() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Environmental premise: no `.git`/`.jj` on the tempdir's ancestor chain
+        // (mirrors the production predicate above). Where that does not hold
+        // (e.g. TEMP pointed inside a checkout), ancestor gitignores applying is
+        // legitimate git semantics and this test's premise is false, so it skips.
+        if tmp
+            .path()
+            .ancestors()
+            .any(|d| d.join(".git").exists() || d.join(".jj").exists())
+        {
+            eprintln!("skip: tempdir is inside a VCS checkout");
+            return;
+        }
+        // outer/ is not a repo; its .gitignore must not govern inner/.
+        // The needle is a distinctive synthetic name: a generic one (`.env`)
+        // could also be excluded by the machine's GLOBAL gitignore, which the
+        // walker honors — that must not be able to turn this test red.
+        write_file(
+            &tmp.path().join("outer/.gitignore"),
+            ".atomcode-test-keep\n",
+        );
+        write_file(
+            &tmp.path().join("outer/inner/.atomcode-test-keep"),
+            "KEY=val",
+        );
+
+        let idx = FileIndex::new(tmp.path().join("outer/inner"), ".ours");
+        let result = filter_walk(&idx, "", "");
+        let names: Vec<&str> = result.iter().map(|e| e.rel_path.as_str()).collect();
+        assert!(names.contains(&".atomcode-test-keep"), "got: {:?}", names);
+    }
+
+    /// Regression: a walk rooted AT a repo must not inherit gitignores from
+    /// above the repo boundary (git never applies an outer repo's rules to a
+    /// nested one either).
+    #[test]
+    fn a_repo_root_does_not_inherit_gitignores_above_the_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Same distinctive-needle rationale as the plain-root test above.
+        write_file(
+            &tmp.path().join("outer/.gitignore"),
+            ".atomcode-test-keep\n",
+        );
+        // A `.git` directory alone marks the repo boundary for the walker.
+        write_file(&tmp.path().join("outer/repo/.git/HEAD"), "ref: x");
+        write_file(
+            &tmp.path().join("outer/repo/.atomcode-test-keep"),
+            "KEY=val",
+        );
+
+        let idx = FileIndex::new(tmp.path().join("outer/repo"), ".ours");
+        let result = filter_walk(&idx, "", "");
+        let names: Vec<&str> = result.iter().map(|e| e.rel_path.as_str()).collect();
+        assert!(names.contains(&".atomcode-test-keep"), "got: {:?}", names);
+    }
+
+    /// The other half of the contract: a walk rooted BELOW the repo root still
+    /// respects the repo's own .gitignore (the reason `parents` is on at all).
+    #[test]
+    fn a_walk_below_the_repo_root_still_respects_the_repo_gitignore() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_file(&tmp.path().join("repo/.git/HEAD"), "ref: x");
+        write_file(&tmp.path().join("repo/.gitignore"), "ignored.txt\n");
+        write_file(&tmp.path().join("repo/sub/ignored.txt"), "x");
+        write_file(&tmp.path().join("repo/sub/kept.txt"), "y");
+
+        let idx = FileIndex::new(tmp.path().join("repo/sub"), ".ours");
+        let result = filter_walk(&idx, "", "");
+        let names: Vec<&str> = result.iter().map(|e| e.rel_path.as_str()).collect();
+        assert!(names.contains(&"kept.txt"), "got: {:?}", names);
+        assert!(!names.contains(&"ignored.txt"), "got: {:?}", names);
+    }
+
+    /// Regression (review): the `in_vcs` predicate's `.jj` arm must mirror the
+    /// ignore crate's own VCS-boundary set — the crate's `has_git` checks
+    /// `.git`/`.jj` on BOTH the walk-root path (`add_child_path`) and ancestors
+    /// (`add_parents`). If a future ignore version dropped `.jj` there, this
+    /// test goes red and the predicate must be re-narrowed to match.
+    #[test]
+    fn a_jj_only_checkout_still_respects_its_own_gitignore() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A bare `.jj` directory is what the crate's boundary check looks for.
+        write_file(&tmp.path().join("repo/.jj/marker"), "");
+        write_file(&tmp.path().join("repo/.gitignore"), "ignored.txt\n");
+        write_file(&tmp.path().join("repo/ignored.txt"), "x");
+        write_file(&tmp.path().join("repo/kept.txt"), "y");
+        // The subdir fixture pins the `.jj` arm's actual value: the checkout
+        // root's rules must reach a walk rooted BELOW it (the `parents(true)`
+        // branch that only the `.jj` detection switches on).
+        write_file(&tmp.path().join("repo/sub/ignored.txt"), "x");
+        write_file(&tmp.path().join("repo/sub/kept.txt"), "y");
+
+        let idx = FileIndex::new(tmp.path().join("repo"), ".ours");
+        let result = filter_walk(&idx, "", "");
+        let names: Vec<&str> = result.iter().map(|e| e.rel_path.as_str()).collect();
+        assert!(names.contains(&"kept.txt"), "got: {:?}", names);
+        assert!(
+            !names.contains(&"ignored.txt"),
+            "a .jj-only checkout's own .gitignore must still apply: {:?}",
+            names
+        );
+
+        let idx = FileIndex::new(tmp.path().join("repo/sub"), ".ours");
+        let result = filter_walk(&idx, "", "");
+        let names: Vec<&str> = result.iter().map(|e| e.rel_path.as_str()).collect();
+        assert!(names.contains(&"kept.txt"), "got: {:?}", names);
+        assert!(
+            !names.contains(&"ignored.txt"),
+            "a walk below a .jj-only checkout root must still respect its .gitignore: {:?}",
+            names
+        );
+    }
+
+    /// Regression (review): a git worktree/submodule marks its boundary with a
+    /// `.git` FILE, not a directory. The crate's detection (`metadata()`/
+    /// `.exists()`) covers both forms, and so must our `in_vcs` probe.
+    #[test]
+    fn a_worktree_with_a_dotgit_file_still_respects_its_own_gitignore() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_file(
+            &tmp.path().join("repo/.git"),
+            "gitdir: /elsewhere/main/.git/worktrees/repo\n",
+        );
+        write_file(&tmp.path().join("repo/.gitignore"), "ignored.txt\n");
+        write_file(&tmp.path().join("repo/ignored.txt"), "x");
+        write_file(&tmp.path().join("repo/kept.txt"), "y");
+        write_file(&tmp.path().join("repo/sub/ignored.txt"), "x");
+        write_file(&tmp.path().join("repo/sub/kept.txt"), "y");
+
+        let idx = FileIndex::new(tmp.path().join("repo"), ".ours");
+        let result = filter_walk(&idx, "", "");
+        let names: Vec<&str> = result.iter().map(|e| e.rel_path.as_str()).collect();
+        assert!(names.contains(&"kept.txt"), "got: {:?}", names);
+        assert!(
+            !names.contains(&"ignored.txt"),
+            "a worktree (.git file) must still apply its own .gitignore: {:?}",
+            names
+        );
+
+        let idx = FileIndex::new(tmp.path().join("repo/sub"), ".ours");
+        let result = filter_walk(&idx, "", "");
+        let names: Vec<&str> = result.iter().map(|e| e.rel_path.as_str()).collect();
+        assert!(names.contains(&"kept.txt"), "got: {:?}", names);
+        assert!(
+            !names.contains(&"ignored.txt"),
+            "a walk below a worktree root must still respect its .gitignore: {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn relative_walk_root_keeps_repo_rules_above_the_process_cwd() {
+        const CHILD: &str = "ATOMCODE_INDEX_RELATIVE_ROOT_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let files = FileIndex::files_blocking(Path::new("inner"), ".ours");
+            assert!(
+                files.iter().any(|name| name == "review-kept.txt"),
+                "{files:?}"
+            );
+            assert!(
+                !files.iter().any(|name| name == "review-ignored.txt"),
+                "{files:?}"
+            );
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        write_file(&tmp.path().join("repo/.git/HEAD"), "ref: x");
+        write_file(&tmp.path().join("repo/.gitignore"), "review-ignored.txt\n");
+        write_file(&tmp.path().join("repo/sub/inner/review-ignored.txt"), "x");
+        write_file(&tmp.path().join("repo/sub/inner/review-kept.txt"), "y");
+        let absolute = FileIndex::files_blocking(&tmp.path().join("repo/sub/inner"), ".ours");
+        assert_eq!(absolute, ["review-kept.txt"]);
+        // Change cwd in a child, never in the parallel test process.
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "file_index::tests::relative_walk_root_keeps_repo_rules_above_the_process_cwd",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .current_dir(tmp.path().join("repo/sub"))
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_walk_root_keeps_the_target_repositories_rules() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_file(&tmp.path().join("repo/.git/HEAD"), "ref: x");
+        write_file(&tmp.path().join("repo/.gitignore"), "review-ignored.txt\n");
+        write_file(&tmp.path().join("repo/sub/review-ignored.txt"), "x");
+        write_file(&tmp.path().join("repo/sub/review-kept.txt"), "y");
+        std::os::unix::fs::symlink(tmp.path().join("repo/sub"), tmp.path().join("alias")).unwrap();
+        let files = FileIndex::files_blocking(&tmp.path().join("alias"), ".ours");
+        assert_eq!(files, ["review-kept.txt"]);
     }
 
     #[test]
@@ -1339,6 +1674,47 @@ mod tests {
             "full walk after reset should still have only_b.txt, got: {:?}",
             full_names
         );
+    }
+
+    #[test]
+    fn reset_and_drop_cancel_pending_walks_and_cancelled_walks_return_no_entries() {
+        let root = tempfile::tempdir().unwrap();
+        write_file(&root.path().join("src/kept.rs"), "x");
+        let idx = FileIndex::new(root.path().to_path_buf(), ".ours");
+        idx.build_async();
+        let first = idx.pending.borrow().as_ref().unwrap().cancelled.clone();
+        idx.reset(root.path().to_path_buf());
+        assert!(first.load(Ordering::Relaxed));
+        assert!(
+            FileIndex::walk_inner_cancellable(root.path().to_path_buf(), ".ours", Some(first))
+                .is_empty()
+        );
+        idx.build_async();
+        let second = idx.pending.borrow().as_ref().unwrap().cancelled.clone();
+        drop(idx);
+        assert!(second.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn blocking_search_reuses_full_entries_and_refreshes_when_stale() {
+        let root = tempfile::tempdir().unwrap();
+        write_file(&root.path().join("src/deep/first.rs"), "x");
+        let idx = FileIndex::new(root.path().to_path_buf(), ".ours");
+        assert_eq!(idx.filter_blocking("", "first").len(), 1);
+        write_file(&root.path().join("src/deep/new.rs"), "x");
+        assert!(idx.filter_blocking("", "new").is_empty());
+        idx.mark_stale();
+        idx.filter_blocking("", "new");
+        let start = Instant::now();
+        while idx.pending.borrow().is_some() {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "refresh did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+            idx.filter_blocking("", "new");
+        }
+        assert_eq!(idx.filter_blocking("", "new").len(), 1);
     }
 
     #[test]

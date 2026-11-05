@@ -465,7 +465,7 @@ fn shell_tool_description(
              Reserve bash for real shell work — git, builds, package managers, running \
              commands — and for pipelines / aggregation (wc, sort, uniq, awk, git log) \
              the dedicated tools can't do. For long builds/tests use `bash_start`, then \
-             `bash_poll` with wait_ms (up to 60000); it returns early on output or exit. \
+             `bash_poll` with wait_ms (up to 60000); it collects output until exit, status change or timeout. \
              Do not use shell sleep to wait or duplicate a running build.\n\
              This shell is NON-INTERACTIVE: stdin is not connected to a terminal, so a \
              program cannot be driven with typed input once started. Do NOT launch REPLs (python/node/irb), \
@@ -5048,7 +5048,12 @@ mod tests {
         // workspace gate's `grantable:false` floor, which the marker-substring form MISSES
         // (`/etc`, home dotfiles, secret extensions). These must stay off the blanket or
         // "allow all bash" would silently cover the one command that must always ask.
+        // The system-prefix set is platform-specific (`/etc` vs `C:\Windows`), so each
+        // build pins its own protected target.
+        #[cfg(unix)]
         assert_eq!(group("rm /etc/hosts"), None);
+        #[cfg(windows)]
+        assert_eq!(group("rm C:/Windows/System32/drivers/etc/hosts"), None);
         assert_eq!(group("shred ~/backup.key"), None);
         assert_eq!(group("mv ~/.bashrc /tmp/x"), None);
         assert_eq!(group("truncate -s0 ./cert.crt"), None);

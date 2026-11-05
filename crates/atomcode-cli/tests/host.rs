@@ -311,6 +311,7 @@ async fn started_with_vision(
     let start = CodingRuntimeStart {
         agent: agent.clone(),
         prepare: PrepareOptions {
+            prompt_overrides: Default::default(),
             request_user_input: true,
             session: SessionMode::Fresh,
             tools: true,
@@ -567,6 +568,7 @@ async fn a_finished_turn_offers_what_might_be_said_next() {
     let start = CodingRuntimeStart {
         agent: agent.clone(),
         prepare: PrepareOptions {
+            prompt_overrides: Default::default(),
             request_user_input: true,
             session: SessionMode::Fresh,
             tools: true,
@@ -3450,6 +3452,7 @@ async fn started_without_a_provider_on(
     let start = CodingRuntimeStart {
         agent: agent.clone(),
         prepare: PrepareOptions {
+            prompt_overrides: Default::default(),
             request_user_input: true,
             session: SessionMode::Fresh,
             tools: true,

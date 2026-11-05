@@ -291,6 +291,7 @@ pub fn derive_tier_config(
     // share the switch with their parent (no main-off / sub-on split).
     let mut tier = base.clone();
     tier.model = provider.model.clone();
+    tier.system_prompt = provider.system_prompt.clone();
     tier.supports_vision = provider.accepts_images();
     tier.provider_name = provider_name.to_string();
     if let Some(base_url) = &provider.base_url {
@@ -351,6 +352,7 @@ pub fn derive_tier_config_from_resolved(
     // share the switch with their parent (no main-off / sub-on split).
     let mut tier = base.clone();
     tier.model = resolved.model.clone();
+    tier.system_prompt = resolved.system_prompt.clone();
     tier.supports_vision = resolved.supports_vision;
     tier.provider_name = resolved.selection_id.clone();
     if let Some(base_url) = &resolved.base_url {

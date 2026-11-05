@@ -406,3 +406,17 @@ html[data-theme="dark"] .workbench {
 .workbench-home-icon.files { color: #d49a35; }
 .workbench-home-icon.terminal { color: #7195dc; }
 .workbench-home-icon.git { color: #52a981; }
+
+/* Keep content mounted so drafts, selections and scroll positions survive. */
+.workbench-content-maximized .workbench-path,
+.workbench-content-maximized .workbench-tree,
+.workbench-content-maximized .workbench-changes,
+.workbench-content-maximized .workbench-git-caption {
+  display: none;
+}
+.workbench-diff-actions > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}

@@ -2779,6 +2779,11 @@ impl HostControl for RuntimeControl {
                     model: now.model,
                     working_dir: now.working_dir.display().to_string(),
                     system_prompt: now.system_prompt,
+                    persona: now.persona.map(|p| atomcode_host_api::PersonaInfo {
+                        source: p.source,
+                        appended: p.appended,
+                        text: p.text,
+                    }),
                 })
             }
             // Best-effort by contract: a meter that is slow or down does not

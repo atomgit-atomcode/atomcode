@@ -303,6 +303,8 @@ pub(crate) fn chat_runtime_config(
         api_key: p.and_then(|p| p.api_key.clone()).unwrap_or_default(),
         base_url: p.and_then(|p| p.base_url.clone()).unwrap_or_default(),
         model: p.map(|p| p.model.clone()).unwrap_or_default(),
+        system_prompt: p.and_then(|p| p.system_prompt.clone()),
+        prompt_overrides: Default::default(),
         supports_vision: p.is_some_and(|p| p.accepts_images()),
         preferred_language: Some(atomcode_config::i18n::resolve_initial_locale(
             None,
@@ -3985,6 +3987,23 @@ pub(crate) async fn live_task_specs(Json(req): Json<TaskSpecsReq>) -> axum::resp
     use axum::response::IntoResponse;
     match crate::native_live::task_specs(req.session_id, req.args).await {
         Ok(value) => Json(value).into_response(),
+        Err(error) => (
+            axum::http::StatusCode::CONFLICT,
+            Json(serde_json::json!({"error":format!("{error:?}")})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct PersonaReq {
+    session_id: String,
+}
+
+pub(crate) async fn live_persona(Json(req): Json<PersonaReq>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match crate::native_live::persona(req.session_id).await {
+        Ok(persona) => Json(serde_json::json!({"persona":persona})).into_response(),
         Err(error) => (
             axum::http::StatusCode::CONFLICT,
             Json(serde_json::json!({"error":format!("{error:?}")})),

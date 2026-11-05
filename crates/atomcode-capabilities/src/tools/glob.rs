@@ -71,7 +71,7 @@ impl Tool for GlobTool {
         "Find files by glob pattern (e.g. `**/*.rs`, `src/**/*.ts`) under a base \
          directory, gitignore-aware by default. For a known file path use read_file directly; discovery can omit files. Set respect_gitignore/include_hidden/follow_symlinks explicitly when needed. `**` crosses directories, `*` does not. Build/VCS/ \
          cache directories are skipped. Relative base paths resolve against the working \
-         directory."
+         directory. If a filtered search is empty, retry within the same path with the relevant filters; do not expand to parent directories or an entire disk without the user's request."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
@@ -119,7 +119,7 @@ impl Tool for GlobTool {
         };
         let scope = crate::pathnorm::to_display(&base);
         let timeout_secs = options.timeout_secs;
-        let timeout_hint = options.filter_hint();
+        let timeout_hint = options.filter_hint(&scope);
         let scan_cancel = ctx.cancel.child_token();
         let _stop_scan = scan_cancel.clone().drop_guard();
         let search = async {
@@ -209,7 +209,7 @@ impl Tool for GlobTool {
                             format!("No files matching \"{pattern}\" under the active filters")
                         },
                         scan.summary(),
-                        options.filter_hint()
+                        options.filter_hint(&scope)
                     ))
                 }
                 Ok((mut hits, scan)) => {
@@ -228,15 +228,17 @@ impl Tool for GlobTool {
                 Err(e) => err(format!("glob: {e}")),
             }
         };
-        tokio::select! {
-            biased;
-            _ = ctx.cancel.cancelled() => err("glob: cancelled before completion."),
-            result = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), search) => {
-                result.unwrap_or_else(|_| err(format!(
-                    "glob: search timed out after {timeout_secs}s in {scope}; scan incomplete. Narrow the path. {timeout_hint}"
-                )))
+        super::search_with_activity(&scope, &ctx.progress, async {
+            tokio::select! {
+                biased;
+                _ = ctx.cancel.cancelled() => err("glob: cancelled before completion."),
+                result = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), search) => {
+                    result.unwrap_or_else(|_| err(format!(
+                        "glob: search timed out after {timeout_secs}s in {scope}; scan incomplete. Narrow the path. {timeout_hint}"
+                    )))
+                }
             }
-        }
+        }).await
     }
 }
 
@@ -282,7 +284,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     #[test]
-    fn split_absolute_base_handles_windows_and_unix_roots() {
+    fn split_absolute_base_handles_windows_roots() {
         // Windows drive, forward slashes.
         let (base, rest) = split_absolute_base("G:/VR2024/keystore/*").unwrap();
         assert_eq!(base, PathBuf::from("G:/VR2024/keystore"));
@@ -291,6 +293,18 @@ mod tests {
         let (base, rest) = split_absolute_base(r"G:\VR2024\**\*.jks").unwrap();
         assert_eq!(base, PathBuf::from(r"G:\VR2024"));
         assert_eq!(rest, "**/*.jks");
+        // Relative patterns are left for base-relative matching.
+        assert!(split_absolute_base("**/*.rs").is_none());
+        assert!(split_absolute_base("src/**/*.ts").is_none());
+    }
+
+    /// `/abs/dir/…` is absolute only where the BUILD TARGET says so: on Windows
+    /// it is root-relative (no drive/UNC prefix), so `split_absolute_base` leaves
+    /// it to base-relative matching. These assertions pin the Unix-root form and
+    /// can only hold on Unix builds.
+    #[cfg(unix)]
+    #[test]
+    fn split_absolute_base_handles_unix_roots() {
         // An absolute exact file path (no metachar) is a degenerate glob that resolves
         // to its own directory + literal name.
         let (base, rest) = split_absolute_base("/abs/dir/screenshare.jks").unwrap();
@@ -301,9 +315,6 @@ mod tests {
         let (base, rest) = split_absolute_base("/abs/dir/").unwrap();
         assert_eq!(base, PathBuf::from("/abs/dir"));
         assert_eq!(rest, "*");
-        // Relative patterns are left for base-relative matching.
-        assert!(split_absolute_base("**/*.rs").is_none());
-        assert!(split_absolute_base("src/**/*.ts").is_none());
     }
 
     #[test]

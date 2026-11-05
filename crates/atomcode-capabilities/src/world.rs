@@ -186,8 +186,14 @@ impl WalkOptions {
         self.max_entries = self.max_entries.clamp(1, 1_000_000);
         self
     }
-    pub fn filter_hint(&self) -> String {
-        format!("respect_gitignore={}, include_hidden={}, follow_symlinks={}. For a known filename, use read_file directly. Broaden only the specified directory; use respect_gitignore=false/include_hidden=true/follow_symlinks=true when needed. These options do not bypass permissions.", self.respect_gitignore, self.include_hidden, self.follow_symlinks)
+    pub fn filter_hint(&self, scope: &str) -> String {
+        let retry = serde_json::json!({
+            "path": scope,
+            "respect_gitignore": false,
+            "include_hidden": true,
+            "follow_symlinks": true,
+        });
+        format!("Active filters: respect_gitignore={}, include_hidden={}, follow_symlinks={}. An empty filtered search does not prove the file is absent. For a known filename, use read_file directly. Retry within this same path; when relevant, adjust ignore/hidden/link switches using {retry}. Do not expand to parent directories or entire disks without the user's request. These options do not bypass permissions.", self.respect_gitignore, self.include_hidden, self.follow_symlinks)
     }
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

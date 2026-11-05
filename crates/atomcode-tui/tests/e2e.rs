@@ -10735,6 +10735,7 @@ impl atomcode_host_api::HostControl for WorksIn {
                 used: 0,
                 model: "replay".into(),
                 working_dir: self.here.clone(),
+                persona: None,
                 system_prompt: None,
             });
         }

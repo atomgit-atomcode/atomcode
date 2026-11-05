@@ -29,6 +29,12 @@ export function getToken(): string {
  */
 async function readJson<T>(r: Response): Promise<T> {
   if (!r.ok) throw await failure(r);
+  if (r.headers.get('content-type')?.split(';')[0].trim().toLowerCase() === 'text/html') {
+    throw new ApiCallError(
+      'The API returned a page instead of data. Check the server address and relay pairing. / 接口返回了页面而不是数据，请检查服务地址与中继配对。',
+      r.status, 'unexpected_html',
+    );
+  }
   return r.json() as Promise<T>;
 }
 
@@ -96,6 +102,10 @@ export type SSEEvent =
   | { type: 'command_output'; text: string };
 
 export interface ModelInfo {
+  model_card_id?: string | null;
+  model_card_status?: 'available' | 'no_public_data' | 'unverified';
+  context_window?: number;
+  supports_vision?: boolean | null;
   provider: string;
   model: string;
   provider_type: string;
@@ -1261,7 +1271,7 @@ export async function postLiveSwitchSession(
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ session_id: sessionId }),
   });
-  if (!resp.ok) throw new Error(`switch live session failed: ${resp.status}`);
+  if (!resp.ok) throw await failure(resp);
   const body = await resp.json() as {
     ok?: boolean;
     active_turn?: boolean;
@@ -1544,4 +1554,20 @@ export interface TaskSpecView { session_id?:string; items?:TaskSpecItem[]; next_
 export async function taskSpecs(sessionId:string,args:string,signal?:AbortSignal):Promise<TaskSpecView> {
   const response=await apiFetch('/live/spec',{method:'POST',headers:{...authHeaders(),'Content-Type':'application/json'},body:JSON.stringify({session_id:sessionId,args}),signal});
   return readJson<TaskSpecView>(response);
+}
+
+export async function getModelCards(): Promise<import('./lib/modelCards').ModelCards> {
+  const response = await apiFetch('/model-cards', { headers: authHeaders() });
+  if (!response.ok) throw new Error(`model cards failed: ${response.status}`);
+  return response.json();
+}
+
+export interface PersonaInfo { source: string; appended: boolean | null; text: string }
+/** Inspect only the bound session; never switches the live runtime. */
+export async function getLivePersona(sessionId: string): Promise<{persona: PersonaInfo | null}> {
+  const response = await apiFetch('/live/persona', {
+    method: 'POST', headers: {...authHeaders(), 'Content-Type':'application/json'},
+    body: JSON.stringify({session_id: sessionId}),
+  });
+  return readJson<{persona: PersonaInfo | null}>(response);
 }

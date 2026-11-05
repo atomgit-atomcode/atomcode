@@ -96,7 +96,10 @@ export function createApiFetch(
   fetchFn: typeof fetch = (input, init) => fetch(input, init),
 ): typeof fetch {
   return (input, init) => {
-    if (remote && !credentials) return Promise.resolve(new Response(null, { status: 401 }));
+    if (remote && !credentials) return Promise.resolve(Response.json({
+      error: 'Relay is not paired. Open a fresh pairing link or scan the QR code again. / 中继未配对，请重新打开配对链接或扫码。',
+      code: 'relay_unpaired',
+    }, { status: 401 }));
     const args = credentials ? relayRequest(credentials, input, init) : [input, init] as const;
     return fetchFn(...args);
   };

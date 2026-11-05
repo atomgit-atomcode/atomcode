@@ -927,3 +927,10 @@ pub async fn task_specs(
 ) -> Result<serde_json::Value, crate::live_hub::HubError> {
     hub().task_specs(session, args).await
 }
+
+/// Inspect the currently bound persona without rebinding a viewed session.
+pub async fn persona(
+    session: String,
+) -> Result<Option<atomcode_coding::runtime::RuntimePersonaInfo>, crate::live_hub::HubError> {
+    hub().persona(session).await
+}

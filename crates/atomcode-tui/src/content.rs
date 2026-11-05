@@ -1111,6 +1111,8 @@ pub struct ToolCallBlock {
     /// [`crate::text::without_cd_into`]); without it, nothing is left out.
     /// Fixed at the call: a later `/cd` does not move where this one ran.
     pub dir: Option<String>,
+    /// Latest live activity, never reconstructed from or written to the session log.
+    pub progress: Option<String>,
 }
 
 impl ToolCallBlock {
@@ -1276,6 +1278,7 @@ impl ToolCallBlock {
             args: args.into(),
             outcome: Outcome::Pending,
             dir: None,
+            progress: None,
         }
     }
     /// The same call, made in `dir`.
@@ -1288,6 +1291,11 @@ impl ToolCallBlock {
             call_id: self.call_id.clone(),
             name: self.name.clone(),
             args: self.args.clone(),
+            progress: if matches!(outcome, Outcome::Pending) {
+                self.progress.clone()
+            } else {
+                None
+            },
             outcome,
             dir: self.dir.clone(),
         }
@@ -1507,8 +1515,16 @@ impl ToolCallBlock {
         ]
     }
 
+    fn activity_note(&self) -> (String, Style) {
+        if let Some(progress) = self.progress.as_ref().filter(|_| self.is_running()) {
+            (progress.clone(), muted())
+        } else {
+            outcome_note(&self.outcome)
+        }
+    }
+
     fn note_line(&self, w: u16) -> Line {
-        let (note, note_style) = outcome_note(&self.outcome);
+        let (note, note_style) = self.activity_note();
         Line::from_spans(vec![
             Span::styled(
                 format!(
@@ -1992,14 +2008,18 @@ impl Content for ToolCallBlock {
             Outcome::Interrupted => "interrupted".into(),
         };
         let dir = self.dir.as_deref().unwrap_or_default();
-        hash_of(&[
+        let mut fields = vec![
             "tool_call",
             &self.call_id,
             &self.name,
             &self.args,
             &tag,
             dir,
-        ])
+        ];
+        if let Some(progress) = self.progress.as_deref().filter(|_| self.is_running()) {
+            fields.push(progress);
+        }
+        hash_of(&fields)
     }
     /// The shape `atomcode-tuix` ships, because two front ends with two looks
     /// are two products:
@@ -2135,6 +2155,22 @@ impl Content for ToolCallBlock {
     /// you scan past, and a lid that grew a row per wrapped command would cost the
     /// whole run it hides.
     fn summary_lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+        if self.is_running() && self.progress.is_some() {
+            if ctx.width == 0 {
+                return Vec::new();
+            }
+            let lead = format!("{} ", Caps::default().g(Glyph::ToolMark));
+            let mut rows = self.opening_rows(
+                ctx.width,
+                &lead,
+                self.mark().1,
+                self.folded_reason_style(),
+                self.folded_style(),
+            );
+            rows.truncate(FOLDED_ROWS);
+            rows.push(self.note_line(ctx.width));
+            return rows;
+        }
         if self.edit_text_mismatch() {
             let w = ctx.width;
             if w == 0 {
@@ -2206,7 +2242,7 @@ impl Content for ToolCallBlock {
         if matches!(self.outcome, Outcome::Ok(_)) {
             return rows;
         }
-        let (note, note_style) = outcome_note(&self.outcome);
+        let (note, note_style) = self.activity_note();
         if note.is_empty() {
             return rows;
         }
@@ -2256,7 +2292,7 @@ impl Content for ToolCallBlock {
                     .join(" / "),
                 muted(),
             ),
-            None => outcome_note(&self.outcome),
+            None => self.activity_note(),
         };
         // The note is capped to a share of the line. It is the secondary half —
         // the reader is scanning for *what ran* — and an uncapped one-line
@@ -5042,6 +5078,7 @@ mod tests {
                 args: r#"{"file_path":"very/long/path/to/a/file.rs"}"#.into(),
                 outcome: Outcome::Failed("no such file or directory".into()),
                 dir: None,
+                progress: None,
             }),
             Box::new(NoticeBlock {
                 detail: "rate limited; waiting 30s".into(),
@@ -5120,6 +5157,7 @@ mod tests {
                 "Edited a.rs (1 replacement)\n@@ -1,2 +1,2 @@\n keep\n-old\n+new".into(),
             ),
             dir: None,
+            progress: None,
         };
         let lines = block.lines(&crate::block::RenderCtx::bare(80));
         // The `(+N -M)` count rides the naming line, right after the file — not a
@@ -5160,6 +5198,7 @@ mod tests {
             args: r#"{"file_path":"a.html","content":"<h1>hi</h1>\nbye"}"#.into(),
             outcome: Outcome::Ok("Wrote a.html".into()),
             dir: None,
+            progress: None,
         };
         let lines = block.lines(&crate::block::RenderCtx::bare(80));
         let naming = lines
@@ -6429,6 +6468,7 @@ mod edit_mismatch_display_tests {
             args: r#"{"file_path":"a.md"}"#.into(),
             outcome: Outcome::Failed(detail.into()),
             dir: None,
+            progress: None,
         };
         assert!(!block.always_open());
         let hash = block.content_hash();
@@ -6459,6 +6499,7 @@ mod edit_mismatch_display_tests {
                 args: r#"{"file_path":"a.md"}"#.into(),
                 outcome,
                 dir: None,
+                progress: None,
             };
             assert!(block.always_open());
         }

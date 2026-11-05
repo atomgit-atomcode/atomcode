@@ -177,6 +177,7 @@ impl Env {
                 front_end: None,
                 review_delegate: None,
                 host_plugins,
+                prompt_overrides: Default::default(),
                 identity,
             },
             provider_factory: Arc::new(Factory(recorder.clone())),
@@ -507,6 +508,16 @@ async fn a_host_persona_reads_the_identity_and_keeps_it_across_a_model_switch() 
         recorder.system()
     );
 
+    assert!(
+        runtime
+            .handle
+            .context_stats_with(true)
+            .await
+            .unwrap()
+            .persona
+            .is_none(),
+        "a host using a private fragment id must not be guessed from its plugin name"
+    );
     runtime
         .handle
         .reassemble_provider(env.agent("model-b"))
@@ -594,4 +605,132 @@ async fn two_runtimes_in_one_process_are_who_they_were_told_they_are() {
     assert!(!stock.system().contains(NAME));
     stop(renamed_runtime).await;
     stop(stock_runtime).await;
+}
+
+async fn inspect_persona(runtime: &CodingRuntime, source: &str, appended: bool, expected: &str) {
+    assert!(runtime
+        .handle
+        .context_stats()
+        .await
+        .unwrap()
+        .persona
+        .is_none());
+    let info = runtime
+        .handle
+        .context_stats_with(true)
+        .await
+        .unwrap()
+        .persona
+        .unwrap();
+    assert_eq!(info.source, source);
+    assert_eq!(info.appended, Some(appended));
+    assert!(info.text.starts_with(expected), "{}", info.text);
+    assert!(
+        !info.text.contains(PROJECT_MARK),
+        "project instructions are a separate contribution"
+    );
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn configured_personas_follow_models_and_explicit_overrides_survive_rebuilds() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut input = env.start(
+        &recorder,
+        SessionMode::Fresh,
+        other_product(),
+        HostPlugins::default(),
+    );
+    input.agent.system_prompt = Some("CONFIGURED_PERSONA_A".into());
+    input.prepare.prompt_overrides.append = Some("APPENDED_VERBATIM".into());
+    let mut runtime = CodingRuntime::start(input).await.unwrap();
+    turn(&mut runtime, "first").await;
+    let system = recorder.system();
+    assert!(
+        system.starts_with("CONFIGURED_PERSONA_A\n\nAPPENDED_VERBATIM"),
+        "{system}"
+    );
+    assert!(system.contains(PROJECT_MARK));
+    inspect_persona(
+        &runtime,
+        "config",
+        true,
+        "CONFIGURED_PERSONA_A\n\nAPPENDED_VERBATIM",
+    )
+    .await;
+    let mut next = env.agent("model-b");
+    next.system_prompt = Some("CONFIGURED_PERSONA_B".into());
+    runtime.handle.reassemble_provider(next).await.unwrap();
+    turn(&mut runtime, "second").await;
+    let system = recorder.system();
+    assert!(
+        system.starts_with("CONFIGURED_PERSONA_B\n\nAPPENDED_VERBATIM"),
+        "{system}"
+    );
+    assert!(!system.contains("CONFIGURED_PERSONA_A"));
+    inspect_persona(&runtime, "config", true, "CONFIGURED_PERSONA_B").await;
+    runtime
+        .handle
+        .reassemble_provider(env.agent("model-c"))
+        .await
+        .unwrap();
+    turn(&mut runtime, "default persona").await;
+    let system = recorder.system();
+    assert!(system.starts_with("You are "));
+    assert!(!system.contains("CONFIGURED_PERSONA_B"));
+    assert_eq!(system.matches("APPENDED_VERBATIM").count(), 1);
+    inspect_persona(&runtime, "builtin", true, "You are ").await;
+    stop(runtime).await;
+
+    let mut input = env.start(
+        &recorder,
+        SessionMode::Fresh,
+        other_product(),
+        HostPlugins::default(),
+    );
+    input.agent.system_prompt = Some("IGNORED_CONFIG".into());
+    input.prepare.prompt_overrides.replace = Some("EXPLICIT_PERSONA".into());
+    input.prepare.prompt_overrides.append = Some("EXPLICIT_APPEND".into());
+    let mut runtime = CodingRuntime::start(input).await.unwrap();
+    for (index, rebuild) in [false, true].into_iter().enumerate() {
+        if rebuild {
+            runtime
+                .handle
+                .reprepare_config(env.agent("model-c"))
+                .await
+                .unwrap();
+        }
+        turn(&mut runtime, &format!("override {index}")).await;
+        let system = recorder.system();
+        assert!(
+            system.starts_with("EXPLICIT_PERSONA\n\nEXPLICIT_APPEND"),
+            "{system}"
+        );
+        assert!(!system.contains("IGNORED_CONFIG"));
+        inspect_persona(
+            &runtime,
+            "explicit",
+            true,
+            "EXPLICIT_PERSONA\n\nEXPLICIT_APPEND",
+        )
+        .await;
+        assert!(system.contains(PROJECT_MARK));
+    }
+    let id = runtime.session.clone().unwrap().id;
+    stop(runtime).await;
+    let mut input = env.start(
+        &recorder,
+        SessionMode::Resume(id),
+        other_product(),
+        HostPlugins::default(),
+    );
+    input.prepare.prompt_overrides.replace = Some("RESUMED_PERSONA".into());
+    let mut runtime = CodingRuntime::start(input).await.unwrap();
+    turn(&mut runtime, "resumed").await;
+    let system = recorder.system();
+    assert!(system.starts_with("RESUMED_PERSONA"));
+    inspect_persona(&runtime, "explicit", false, "RESUMED_PERSONA").await;
+    assert!(!system.contains("EXPLICIT_PERSONA"));
+    assert!(system.contains(PROJECT_MARK));
+    stop(runtime).await;
 }

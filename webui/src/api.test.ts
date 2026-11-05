@@ -717,3 +717,45 @@ test('live dispatch failures cancel the old body instead of leaving a falsely he
     assert.equal(cancelled, true); assert.equal(body.locked, false);
   } finally { globalThis.fetch = originalFetch; }
 });
+
+test('workbench reports HTML fallback with an actionable diagnostic', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response('<html>SPA</html>', { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+  try {
+    const { workbenchRequest } = await import('./api.ts');
+    await assert.rejects(workbenchRequest('files?session_id=test&path='), (error: unknown) => {
+      assert.equal((error as { code: string }).code, 'unexpected_html');
+      assert.match(String(error), /relay pairing/);
+      assert.doesNotMatch(String(error), /<html>/);
+      return true;
+    });
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('live session switch preserves the server rejection diagnostic', async () => {
+  const api = await import('./api.ts');
+  await serving(409, '{"error":"Session is open in another terminal","code":"session_in_use"}', 'application/json', async () => {
+    await assert.rejects(api.postLiveSwitchSession('occupied'), (error: unknown) => {
+      assert.equal((error as { code: string }).code, 'session_in_use');
+      assert.match(String(error), /another terminal/);
+      return true;
+    });
+  });
+});
+
+test('persona inspection scopes the live read and propagates a stale-session rejection', async () => {
+  const originalFetch = globalThis.fetch;
+  let body: unknown;
+  globalThis.fetch = (async (url, init) => {
+    assert.equal(String(url), '/live/persona');
+    body = JSON.parse(String(init?.body));
+    return new Response(JSON.stringify({persona:{source:'explicit',appended:true,text:'原文\nAPPEND'}}), {status:200});
+  }) as typeof fetch;
+  try {
+    const {getLivePersona} = await import('./api.ts');
+    assert.equal((await getLivePersona('session-a')).persona?.text, '原文\nAPPEND');
+    assert.deepEqual(body, {session_id:'session-a'});
+    globalThis.fetch = (async () => new Response('{"error":"StaleBinding"}', {status:409})) as typeof fetch;
+    await assert.rejects(getLivePersona('session-b'));
+  } finally { globalThis.fetch = originalFetch; }
+});
