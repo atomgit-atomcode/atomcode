@@ -91,6 +91,7 @@ pub struct LiveJoin {
     /// Latest Goal controller state. Unlike turn replay, this must survive a
     /// completed turn so late `/live` subscribers can restore the Goal UI.
     pub goal_progress: Option<atomcode_coding::GoalProgress>,
+    pub pending_turn_model: Option<atomcode_coding::runtime::RunningModelIdentity>,
     pub replay: Vec<LiveObservation>,
     pub receiver: broadcast::Receiver<LiveObservation>,
 }
@@ -138,6 +139,7 @@ struct HubState {
     binding: Option<BoundRuntime>,
     snapshot: Option<Arc<SessionSnapshot>>,
     model: Option<String>,
+    pending_turn_model: Option<atomcode_coding::runtime::RunningModelIdentity>,
     snapshot_error: Option<String>,
     replay: Vec<LiveObservation>,
     goal_progress: Option<atomcode_coding::GoalProgress>,
@@ -491,6 +493,7 @@ impl LiveViewHub {
         });
         state.snapshot = Some(Arc::new(snapshot));
         state.model = None;
+        state.pending_turn_model = None;
         state.snapshot_error = None;
         state.replay.clear();
         state.goal_progress = None;
@@ -528,6 +531,7 @@ impl LiveViewHub {
             binding,
             snapshot,
             model: state.model.clone(),
+            pending_turn_model: state.pending_turn_model.clone(),
             goal_progress: state.goal_progress.clone(),
             replay: state.replay.clone(),
             receiver,
@@ -560,6 +564,7 @@ impl LiveViewHub {
         state.binding = None;
         state.snapshot = None;
         state.model = None;
+        state.pending_turn_model = None;
         state.snapshot_error = None;
         state.replay.clear();
         state.goal_progress = None;
@@ -598,6 +603,7 @@ impl LiveViewHub {
         state.binding = None;
         state.snapshot = None;
         state.model = None;
+        state.pending_turn_model = None;
         state.snapshot_error = None;
         state.replay.clear();
         state.goal_progress = None;
@@ -649,6 +655,7 @@ impl LiveViewHub {
         let identity = current.identity.clone();
         if clear_model {
             state.model = None;
+            state.pending_turn_model = None;
         }
         state.snapshot = Some(Arc::new(snapshot));
         state.snapshot_error = None;
@@ -839,6 +846,16 @@ impl LiveViewHub {
             .await
             .map_err(|error| HubError::RuntimeRejected(error.to_string()))
     }
+    pub async fn current_turn_model(
+        &self,
+    ) -> Result<Option<atomcode_coding::runtime::RunningModelIdentity>, HubError> {
+        self.bound_handle()?
+            .1
+            .current_turn_model()
+            .await
+            .map_err(|error| HubError::RuntimeRejected(error.to_string()))
+    }
+
     pub async fn model_selection(
         &self,
     ) -> Result<atomcode_config::mode_models::ModeSelection, HubError> {
@@ -869,19 +886,10 @@ impl LiveViewHub {
             .map_err(|error| HubError::RuntimeRejected(error.to_string()))
     }
 
-    /// Whether the bound runtime is mid-turn, parked awaiting approval, or already
-    /// reconfiguring. A provider reload in any of these states hard-kills the
-    /// in-flight turn (via `AgentCommand::Shutdown`) and drops its context — the
-    /// runtime respawns from the last on-disk snapshot, which predates the
-    /// interrupted turn. The provider-switch entry points refuse so the user stops
-    /// the turn first. Unbound → false (nothing to interrupt).
-    ///
-    /// This is a best-effort guard, not an atomic gate: the caller releases this
-    /// lock before it re-acquires state to dispatch, and the runtime processes a
-    /// concurrently-queued submit ahead of the reassemble, so a turn that starts
-    /// in that narrow window can still be caught. Closing it fully needs
-    /// runtime-level coordination (out of this fix's scope). The phase set mirrors
-    /// [`Self::bind_with_provider`]'s active-turn set so both refuse identically.
+    /// Whether the bound runtime is mid-turn, awaiting interaction or changing
+    /// capabilities. Implicit reloads during message submission keep this guard;
+    /// explicit selection uses `select_provider` and the runtime's safe patch.
+    /// Unbound means there is no active work to protect.
     pub fn turn_in_progress(&self) -> bool {
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         if state.turn_active {
@@ -902,11 +910,23 @@ impl LiveViewHub {
         next: atomcode_coding::CodingAgentConfig,
         provider_fingerprint: String,
     ) -> Result<atomcode_coding::RuntimeGeneration, HubError> {
-        // Refuse to swap the provider while a turn is running: reassemble would
-        // hard-kill it and silently discard the interrupted turn's work.
+        // Message admission must not silently change a running turn's selection.
+        // Explicit user selection has a separate safe path below.
         if self.turn_in_progress() {
             return Err(HubError::ActiveTurn);
         }
+        self.select_provider(expected, next, provider_fingerprint)
+            .await
+    }
+
+    /// Explicit selection uses the transactional harness patch. A running turn
+    /// retains its captured provider; the new selection is for the next turn.
+    pub async fn select_provider(
+        &self,
+        expected: &LiveBinding,
+        next: atomcode_coding::CodingAgentConfig,
+        provider_fingerprint: String,
+    ) -> Result<atomcode_coding::RuntimeGeneration, HubError> {
         let handle = self.bound_handle_for(expected)?;
         let provider = next.provider_name.clone();
         let generation = handle
@@ -1169,15 +1189,27 @@ impl LiveViewHub {
             return Err(HubError::StaleEvent);
         }
         if envelope.generation > current.identity.generation {
+            let carries_turn = matches!(
+                &envelope.event,
+                CodingRuntimeEvent::ProviderSelectionPending { current: Some(_) }
+            );
             let current = state.binding.as_mut().expect("binding checked above");
             current.identity.generation = envelope.generation;
-            state.replay.clear();
-            state.model = None;
-            state.goal_progress = None;
-            state.pending_requests.clear();
-            state.pending_web_steers.clear();
-            state.turn_active = false;
-            state.snapshot_error = None;
+            if carries_turn {
+                // A safe provider patch retains this agent, turn and requests.
+                for observation in &mut state.replay {
+                    observation.generation = envelope.generation;
+                }
+            } else {
+                state.replay.clear();
+                state.model = None;
+                state.pending_turn_model = None;
+                state.goal_progress = None;
+                state.pending_requests.clear();
+                state.pending_web_steers.clear();
+                state.turn_active = false;
+                state.snapshot_error = None;
+            }
         }
         state.last_runtime_sequence = Some(envelope.sequence);
 
@@ -1229,6 +1261,12 @@ impl LiveViewHub {
             _ => None,
         };
         let mut replay = state.turn_active;
+        if matches!(
+            &event,
+            CodingRuntimeEvent::TurnFinished(_) | CodingRuntimeEvent::RuntimeStopped(_)
+        ) {
+            state.pending_turn_model = None;
+        }
         match &event {
             CodingRuntimeEvent::Agent(AgentEvent::TurnStarted { .. }) => {
                 // A new turn closes the prior driver-owned recovery window. A turn
@@ -1344,6 +1382,7 @@ impl LiveViewHub {
                     // the replacement snapshot. Never pair it with the previous
                     // session's snapshot during that window.
                     state.model = None;
+                    state.pending_turn_model = None;
                     state.snapshot_error = Some("session snapshot pending".into());
                     state.replay.clear();
                     state.goal_progress = None;
@@ -1363,6 +1402,9 @@ impl LiveViewHub {
             CodingRuntimeEvent::WorkingDirectoryChanged(working_dir) => {
                 let current = state.binding.as_mut().expect("binding checked above");
                 current.identity.working_dir = working_dir.clone();
+            }
+            CodingRuntimeEvent::ProviderSelectionPending { current } => {
+                state.pending_turn_model = current.clone();
             }
             CodingRuntimeEvent::ProviderChanged { provider, model } => {
                 state.model = Some(model.clone());
@@ -1581,19 +1623,31 @@ impl LiveViewHub {
                 actual: current.identity.generation,
             });
         }
+        let carries_turn = provider.is_some()
+            && matches!(
+                current.control.status().phase,
+                RuntimePhase::InTurn | RuntimePhase::WaitingApproval
+            );
         if let Some((provider, fingerprint)) = provider {
             current.identity.provider = provider;
             current.identity.provider_fingerprint = fingerprint;
         }
         if current.identity.generation < generation.0 {
             current.identity.generation = generation.0;
-            state.replay.clear();
-            state.model = None;
-            state.goal_progress = None;
-            state.pending_requests.clear();
-            state.pending_web_steers.clear();
-            state.turn_active = false;
-            state.last_runtime_sequence = None;
+            if carries_turn {
+                for observation in &mut state.replay {
+                    observation.generation = generation.0;
+                }
+            } else {
+                state.replay.clear();
+                state.model = None;
+                state.pending_turn_model = None;
+                state.goal_progress = None;
+                state.pending_requests.clear();
+                state.pending_web_steers.clear();
+                state.turn_active = false;
+                state.last_runtime_sequence = None;
+            }
         }
         Ok(())
     }
@@ -3212,6 +3266,112 @@ mod tests {
         // must also be refused — mirrors bind_with_provider's active set.
         control.status.lock().unwrap().phase = RuntimePhase::Reconfiguring;
         assert!(hub.turn_in_progress());
+    }
+
+    #[test]
+    fn next_turn_model_metadata_survives_join_without_dropping_approval() {
+        let hub = LiveViewHub::new();
+        let (control, commands) = control();
+        let status = control.status.clone();
+        let binding = hub
+            .bind(
+                "session-1",
+                PathBuf::from("/one"),
+                snapshot("base"),
+                control,
+            )
+            .unwrap();
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 1,
+                event: CodingRuntimeEvent::Request(atomcode_coding::RuntimeRequest {
+                    id: 71,
+                    kind: "approval".into(),
+                    payload: serde_json::json!({}),
+                    snapshot: None,
+                }),
+            },
+        )
+        .unwrap();
+        hub.state
+            .lock()
+            .unwrap()
+            .pending_web_steers
+            .push_back(PendingWebSteer {
+                runtime_input: UserInput::from("keep this steer"),
+                client_input_id: "web-steer".into(),
+            });
+        let current = atomcode_coding::runtime::RunningModelIdentity {
+            provider: "old".into(),
+            model: "old-model".into(),
+        };
+        status.lock().unwrap().generation = 2;
+        status.lock().unwrap().phase = RuntimePhase::WaitingApproval;
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 2,
+                sequence: 2,
+                event: CodingRuntimeEvent::ProviderSelectionPending {
+                    current: Some(current.clone()),
+                },
+            },
+        )
+        .unwrap();
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 2,
+                sequence: 3,
+                event: CodingRuntimeEvent::ProviderChanged {
+                    provider: "next".into(),
+                    model: "next-model".into(),
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(hub.join().unwrap().pending_turn_model, Some(current));
+        assert_eq!(hub.join().unwrap().model.as_deref(), Some("next-model"));
+        assert_eq!(hub.state.lock().unwrap().pending_requests.len(), 1);
+        status.lock().unwrap().generation = 3;
+        let before = hub.binding().unwrap();
+        hub.commit_reconfigure_generation(
+            &before,
+            atomcode_coding::RuntimeGeneration(3),
+            Some(("third".into(), "third-fingerprint".into())),
+        )
+        .unwrap();
+        assert_eq!(hub.state.lock().unwrap().pending_requests.len(), 1);
+        assert!(hub.turn_in_progress());
+        // A slower acknowledgement must not roll back a newer model selection.
+        assert!(matches!(
+            hub.commit_reconfigure_generation(
+                &binding,
+                atomcode_coding::RuntimeGeneration(2),
+                Some(("next".into(), "old-fingerprint".into()))
+            ),
+            Err(HubError::RuntimeGenerationChanged { .. })
+        ));
+        assert_eq!(hub.binding().unwrap().provider, "third");
+        assert_eq!(hub.state.lock().unwrap().pending_web_steers.len(), 1);
+        hub.respond(71, serde_json::Value::Null).unwrap();
+        assert!(commands
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|command| matches!(command, DriverCommand::Respond { id: 71, .. })));
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 3,
+                sequence: 4,
+                event: CodingRuntimeEvent::ProviderSelectionPending { current: None },
+            },
+        )
+        .unwrap();
+        assert!(hub.join().unwrap().pending_turn_model.is_none());
     }
 
     #[test]

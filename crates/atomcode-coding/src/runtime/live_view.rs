@@ -18,6 +18,7 @@ pub struct RuntimeLiveView {
     goal: Option<SequencedRuntimeEvent>,
     policy: Option<SequencedRuntimeEvent>,
     turn: Option<SequencedRuntimeEvent>,
+    provider_pending: Option<SequencedRuntimeEvent>,
 }
 
 impl RuntimeLiveView {
@@ -50,6 +51,7 @@ impl RuntimeLiveView {
             goal: None,
             policy: None,
             turn: None,
+            provider_pending: None,
         }
     }
 
@@ -68,6 +70,7 @@ impl RuntimeLiveView {
             .iter_mut()
             .chain(self.policy.iter_mut())
             .chain(self.turn.iter_mut())
+            .chain(self.provider_pending.iter_mut())
         {
             event.generation = generation;
         }
@@ -88,6 +91,7 @@ impl RuntimeLiveView {
             self.goal = None;
             self.policy = None;
             self.turn = None;
+            self.provider_pending = None;
             self.valid = seed.is_some();
             if let Some((snapshot, mode, model)) = seed {
                 self.model = model;
@@ -122,6 +126,9 @@ impl RuntimeLiveView {
                 }
                 CodingRuntimeEvent::RequestResolved { id, .. } => {
                     self.pending.remove(id);
+                }
+                CodingRuntimeEvent::ProviderSelectionPending { current } => {
+                    self.provider_pending = current.as_ref().map(|_| envelope.clone());
                 }
                 CodingRuntimeEvent::GoalChanged(_) => {
                     self.goal = Some(envelope.clone());
@@ -173,6 +180,10 @@ impl RuntimeLiveView {
                 } else {
                     self.turn = None;
                 }
+                if completed {
+                    self.provider_pending = None;
+                }
+                self.events.extend(self.provider_pending.clone());
                 self.events.extend(self.goal.clone());
                 if matches!(
                     &envelope.event,

@@ -619,6 +619,9 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     effort: string | null;
   } | null>(null);
   const providerRef = useRef<string | null>(null);
+  const [currentTurnModel, setCurrentTurnModel] = useState<RuntimeModelIdentity | null>(null);
+  const currentTurnModelRef = useRef<RuntimeModelIdentity | null>(null);
+  const modelSwitchRequest = useRef(0);
   const prePlanModel = useRef<{model:string;reasoning_effort:string|null}|null>(null);
   const providerPinnedRef = useRef(false);
   const [runtimeModel, setRuntimeModel] = useState<RuntimeModelIdentity | null>(null);
@@ -929,6 +932,9 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     // sessionId 变成自己的 id（activeIdRef 已同步），不重置，以免清空刚看到的对话。
     if (sessionId !== activeIdRef.current) {
       prePlanModel.current = null;
+      setCurrentTurnModel(null);
+      currentTurnModelRef.current = null;
+      modelSwitchRequest.current++;
       const switchGeneration = sessionGenerationRef.current;
       const prevId = activeIdRef.current;
       const liveSwitch = liveSessionSwitchDisposition(
@@ -1717,6 +1723,8 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     }
     // snapshot：确立实时会话 id 并把视图切到它（连上即对齐）。
     if (e.type === 'snapshot') {
+      setCurrentTurnModel(null);
+      currentTurnModelRef.current = null;
       if (activeIdRef.current !== e.session_id) resetSummaryCount();
       updateSummaryCount(e.summary_count);
       setCompacting(false);
@@ -1780,6 +1788,11 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     // ProviderChanged 的权威回声（本端确认的切换 / 别的 tab / TUI），一律采纳并解除
     // pin——pin 只用于防止「重连快照」回退一次尚未传播的本地切换，不该挡真实的变更事件，
     // 否则本端切过一次模型后就永远不再跟随 TUI 的模型切换（S1）。
+    if (e.type === 'provider_selection_pending') {
+      currentTurnModelRef.current = e.current;
+      setCurrentTurnModel(e.current);
+      return;
+    }
     if (e.type === 'provider') {
       rememberRuntimeModel({ provider: e.provider, model: e.model });
       providerRef.current = e.provider;
@@ -1788,6 +1801,14 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       return;
     }
     if (e.type === 'model') {
+      // Model metadata from the still-running request belongs to its captured
+      // provider, never to the selection that will serve the following turn.
+      if (currentTurnModelRef.current) {
+        const current = {...currentTurnModelRef.current, model:e.model};
+        currentTurnModelRef.current = current;
+        setCurrentTurnModel(current);
+        return;
+      }
       const current = runtimeModelRef.current;
       if (current) rememberRuntimeModel({ ...current, model: e.model });
       return;
@@ -2225,9 +2246,12 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       return;
     }
     const previous = provider;
+    const request = ++modelSwitchRequest.current;
+    const generation = sessionGenerationRef.current;
     providerRef.current = name;
     setProvider(name);
     void postLiveProvider(name, sessionId).then((res) => {
+      if (request !== modelSwitchRequest.current || generation !== sessionGenerationRef.current) return;
       if (res.ok) return;
       if (providerRef.current !== name) return;
       // Rejected (e.g. a turn is running): undo the optimistic selection and unpin
@@ -2237,6 +2261,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       providerPinnedRef.current = false;
       pushCommandNotice(res.activeTurn ? t('cmd.model.syncBusy') : (res.error ?? t('cmd.model.syncBusy')));
     }).catch((error) => {
+      if (request !== modelSwitchRequest.current || generation !== sessionGenerationRef.current) return;
       if (providerRef.current !== name) return;
       providerRef.current = previous;
       setProvider(previous);
@@ -3765,7 +3790,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   // 输入框只渲染一份，按落地/常规两处择一挂载（避免两个 textarea 抢同一 ref）。
   const canStop = busy || recoveryPolicy.allowStop || Boolean(goalProgress?.recovery);
   const inputBox = (
-    <div class={'input-box' + (messages.length > 0 ? ' can-collapse' : '') + (canStop ? ' is-running' : '') + (pendingImages.length || attachError ? ' has-input-detail' : '')}>
+    <div class={'input-box' + (messages.length > 0 ? ' can-collapse' : '') + (canStop ? ' is-running' : '') + (pendingImages.length || attachError || currentTurnModel || (!sync && busy && provider !== runtimeModel?.provider) ? ' has-input-detail' : '')}>
       {specPicker!==null&&sessionId&&createPortal(<TaskSpecifications key={sessionId} sessionId={sessionId} running={busy} initial={specPicker} onChanged={updateSpecState} onClose={()=>setSpecPicker(null)}/>,document.body)}
       {patchUploading && <div class="input-attach-error" role="status">{t('patch.importing')}</div>}
       {attachError && (
@@ -3933,6 +3958,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
             onError={pushCommandNotice}
             value={provider}
             runtime={sync || busy ? runtimeModel : null}
+            currentTurn={sync ? currentTurnModel : busy && provider !== runtimeModel?.provider ? runtimeModel : null}
             liveEffort={reasoningEffort?.provider === provider ? reasoningEffort.effort : undefined}
             onEffortChange={(provider, effort) => setReasoningEffort({provider, effort})}
             onChange={(p) => switchProvider(p)}

@@ -391,6 +391,15 @@ pub(crate) fn attach(
                 // mode moves under the person's hands when their own Shift+Tab
                 // (or `/mode`) asks for it, and a screen that had to ask back
                 // would be one frame behind its own keystroke.
+                CodingRuntimeEvent::ProviderSelectionPending {
+                    current: Some(current),
+                } => {
+                    let session = watched.session.lock().expect("config poisoned").clone();
+                    watched.announce(HostEvent::ModelSelectionPending {
+                        session,
+                        current_model: current.model,
+                    });
+                }
                 CodingRuntimeEvent::ModeChanged { mode } => {
                     let session = watched.session.lock().expect("session poisoned").clone();
                     watched.announce(HostEvent::ModeChanged {

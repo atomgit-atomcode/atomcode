@@ -25,6 +25,8 @@ const zh = {
   'hooks.exit': "退出码：",
   'hooks.incomplete': "测试超时或脚本无法启动",
 
+  'model.nextTurn': '下回合生效',
+  'model.nextTurnStatus': '当前回合：{current} → 下回合：{next}',
   'modeBindings.switching': '模式正在切换，请稍候。',
   'modeBindings.title': '模式与模型',
   'modeBindings.configure': '配置模式模型…',
@@ -808,6 +810,8 @@ const en: Record<MsgKey, string> = {
   'hooks.exit': "Exit code:",
   'hooks.incomplete': "Test timed out or script could not start",
 
+  'model.nextTurn': 'Next turn',
+  'model.nextTurnStatus': 'Current turn: {current} → Next turn: {next}',
   'modeBindings.switching': 'A mode switch is pending. Please wait.',
   'modeBindings.title': 'Mode models',
   'modeBindings.configure': 'Configure mode models…',

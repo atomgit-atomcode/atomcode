@@ -42,6 +42,7 @@ function areModelsEqual(a: ModelInfo[], b: ModelInfo[]): boolean {
 export function ModelSelector({
   value,
   runtime,
+  currentTurn,
   liveEffort,
   busy = false,
   onError,
@@ -51,6 +52,7 @@ export function ModelSelector({
 }: {
   value: string | null;
   runtime?: RuntimeModelIdentity | null;
+  currentTurn?: RuntimeModelIdentity | null;
   liveEffort?: string | null;
   busy?: boolean;
   onError?: (message: string) => void;
@@ -163,9 +165,10 @@ export function ModelSelector({
     return stripped || m.provider;
   };
   return (
-    <div class="model-controls">
+    <div class={'model-controls' + (currentTurn ? ' has-pending-model' : '')}>
       {cardModel && <ModelCardDialog model={cardModel} onClose={() => setCardModel(null)} />}
       {effortError && <span role="alert">{effortError}</span>}
+      {currentTurn && current && <span class="model-next-turn" role="status">{t('model.nextTurnStatus', {current:currentTurn.model??currentTurn.provider, next:current.model})}</span>}
       {current?.effort_applicable && (
         <div class="model-selector effort-selector model-selector-up" ref={effortRef}>
           <button
@@ -202,7 +205,7 @@ export function ModelSelector({
       )}
       <div class="model-selector model-selector-up" ref={ref}>
         <button class="model-selector-trigger" onClick={() => { setOpen((o) => !o); setEffortOpen(false); }} type="button">
-          <span class="model-selector-label">{current ? current.model : t('model.label')}</span>
+          <span class="model-selector-label">{current ? current.model : t('model.label')}{currentTurn && <span class="model-next-turn-badge"> · {t('model.nextTurn')}</span>}</span>
           {current && isDup(current.model) && (
             <span class="model-selector-provider">{providerLabel(current)}</span>
           )}

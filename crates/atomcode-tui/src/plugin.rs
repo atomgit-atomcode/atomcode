@@ -2329,6 +2329,25 @@ impl UserInterface for Tui {
                 // change would put a sentence in the conversation for a badge
                 // that already says it — a person's own Shift+Tab would read as
                 // news.
+                Wake::Host(HostEvent::ModelSelectionPending {
+                    session,
+                    current_model,
+                }) => {
+                    let visible = {
+                        let moment = self.host.moment.read().expect("moment poisoned");
+                        moment.viewing == session || moment.lead == session
+                    };
+                    if visible {
+                        self.host.say(
+                            t(Msg::ModelNextTurn {
+                                model: &current_model,
+                            })
+                            .into_owned(),
+                            false,
+                        );
+                        stale = true;
+                    }
+                }
                 Wake::Host(HostEvent::ModeChanged { session, mode }) => {
                     stale |= took_mode(&self.host.moment, &session, Some(mode));
                 }

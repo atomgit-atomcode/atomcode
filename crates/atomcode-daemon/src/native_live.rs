@@ -345,12 +345,25 @@ pub async fn update_mode_bindings(
 ) -> Result<(), HubError> {
     hub().update_mode_bindings(bindings).await
 }
+pub async fn current_turn_model(
+) -> Result<Option<atomcode_coding::runtime::RunningModelIdentity>, HubError> {
+    hub().current_turn_model().await
+}
+
 pub async fn model_selection() -> Result<atomcode_config::mode_models::ModeSelection, HubError> {
     hub().model_selection().await
 }
 
 pub async fn set_mode(mode: RuntimeMode) -> Result<(), HubError> {
     hub().set_mode(mode).await
+}
+
+pub async fn select_provider(
+    expected: &LiveBinding,
+    next: atomcode_coding::CodingAgentConfig,
+    fingerprint: String,
+) -> Result<atomcode_coding::RuntimeGeneration, HubError> {
+    hub().select_provider(expected, next, fingerprint).await
 }
 
 pub async fn reload_provider(

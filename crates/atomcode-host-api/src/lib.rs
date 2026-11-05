@@ -1352,6 +1352,11 @@ pub enum HostEvent {
     /// not draw it, and this is the road it travels instead — the same bargain
     /// [`HostEvent::Autonomy`] strikes, and for the same reason.
     ModeChanged { session: String, mode: Mode },
+    /// A model was selected for the next turn; the active turn keeps this one.
+    ModelSelectionPending {
+        session: String,
+        current_model: String,
+    },
     /// Something the person might say next, offered after a turn ended by
     /// itself.
     ///
@@ -2221,6 +2226,10 @@ mod tests {
                 session: "b".into(),
                 mode: Mode::Plan,
             },
+            HostEvent::ModelSelectionPending {
+                session: "b".into(),
+                current_model: "running-model".into(),
+            },
             HostEvent::Suggested {
                 session: "b".into(),
                 text: "接着把登录那条补上".into(),
@@ -2240,6 +2249,7 @@ mod tests {
                 HostEvent::SessionChanged { .. }
                 | HostEvent::Autonomy { .. }
                 | HostEvent::ModeChanged { .. }
+                | HostEvent::ModelSelectionPending { .. }
                 | HostEvent::Suggested { .. }
                 | HostEvent::BackgroundChanged { .. }
                 | HostEvent::GoalEnded { .. }

@@ -1110,6 +1110,7 @@ export type LiveWireEvent =
   | { type: 'snapshot'; summary_count?: number; messages: SessionMessage[]; session_id: string; project_hash: string; provider: string; model?: string | null; mode: ApprovalMode; goal?: LiveGoalProgress | null }
   | ({ type: 'goal_changed' } & LiveGoalProgress)
   | { type: 'provider'; provider: string; model?: string | null }
+  | { type: 'provider_selection_pending'; current: {provider:string;model:string}|null }
   | { type: 'model'; model: string | null }
   | { type: 'reasoning_effort'; provider: string; effort: string | null; applicable: boolean }
   | { type: 'mode'; mode: ApprovalMode }

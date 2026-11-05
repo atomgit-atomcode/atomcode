@@ -728,6 +728,10 @@ pub(crate) enum LiveWireEvent {
         /// initial wire snapshot carries it explicitly for late subscribers.
         goal: Option<LiveGoalSnapshot>,
     },
+    #[serde(rename = "provider_selection_pending")]
+    ProviderSelectionPending {
+        current: Option<atomcode_coding::runtime::RunningModelIdentity>,
+    },
     #[serde(rename = "provider")]
     Provider {
         provider: String,
@@ -1217,6 +1221,9 @@ impl NativeLiveWireProjector {
                 provider,
                 model: Some(model),
             },
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::ProviderSelectionPending {
+                current,
+            }) => LiveWireEvent::ProviderSelectionPending { current },
             crate::live_hub::LiveViewEvent::Runtime(Runtime::ReasoningEffortChanged {
                 provider,
                 effort,
@@ -1623,6 +1630,14 @@ pub(crate) async fn live_stream(
             goal: initial_goal.as_ref().map(goal_snapshot),
         },
     ));
+    if let Some(current) = join.pending_turn_model.clone() {
+        let _ = tx.send((
+            join.binding.session_id.clone(),
+            LiveWireEvent::ProviderSelectionPending {
+                current: Some(current),
+            },
+        ));
+    }
     let mut projector = NativeLiveWireProjector {
         working_dir: Some(snapshot_wd.clone()),
         summary_count,
@@ -2046,10 +2061,28 @@ pub(crate) async fn live_message(
             ImageContent { media_type, data }
         })
         .collect();
+    // Steering still belongs to the captured turn model even after an explicit
+    // selection changed the model for the following turn.
+    let current_turn_model = if original_images.is_empty() {
+        None
+    } else {
+        match crate::native_live::current_turn_model().await {
+            Ok(current) => current,
+            Err(error) => {
+                return Json(
+                    serde_json::json!({"accepted":false,"error":format!("Cannot determine the image input model: {error:?}")}),
+                )
+            }
+        }
+    };
+    let input_provider = current_turn_model
+        .as_ref()
+        .map(|model| model.provider.as_str())
+        .unwrap_or(&provider_name);
     let runtime_text = preprocess_live_caption(
         &req.message,
         &original_images,
-        Some(&provider_name),
+        Some(input_provider),
         Some(&join.binding.session_id),
         &join.binding.working_dir,
         state.telemetry.clone(),
@@ -2206,10 +2239,11 @@ pub(crate) struct LiveProviderReq {
     pub session_id: Option<String>,
 }
 
-/// POST /live/provider — webui 切换模型即时同步。
+/// POST /live/provider — 同步模型选择；运行中选择从下一回合生效。
 ///
 /// 与"发送消息才带 provider"不同，下拉框一变就调本端点，让对端立即跟随而无需先发消息。
-/// 该端点仍是 live runtime 的即时切换接口；TUI `/model` 另会更新新会话默认值。
+/// 该端点使用 runtime 的安全 provider patch；当前回合继续持有原 provider。
+/// TUI `/model` 另会更新新会话默认值。
 pub(crate) async fn live_provider(
     State(state): State<AppState>,
     Json(req): Json<LiveProviderReq>,
@@ -2280,7 +2314,7 @@ pub(crate) async fn live_provider(
         &join.binding.working_dir,
         state.telemetry.clone(),
     );
-    match crate::native_live::reload_provider(
+    match crate::native_live::select_provider(
         &join.binding,
         crate::kernel_runtime::coding_config_from_runtime(&runtime_config),
         requested_fingerprint,
@@ -2288,9 +2322,7 @@ pub(crate) async fn live_provider(
     .await
     {
         Ok(_) => Json(serde_json::json!({ "ok": true })),
-        // A turn is running: reassembling the provider would hard-kill it and drop
-        // the interrupted turn's context. Surface a distinct flag so the client can
-        // revert its optimistic selection and tell the user to stop the turn first.
+        // Busy remains possible during compaction or a competing transition.
         Err(crate::live_hub::HubError::ActiveTurn) => Json(serde_json::json!({
             "ok": false,
             "active_turn": true,

@@ -94,8 +94,14 @@ impl Drop for StartupPhase {
     }
 }
 
-/// Runtime facts emitted by the coding engine without depending on the legacy
-/// `atomcode-core` driver protocol.
+/// Sanitized identity of the provider captured by a running turn.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RunningModelIdentity {
+    pub provider: String,
+    pub model: String,
+}
+
+/// Runtime facts emitted by the coding engine without depending on legacy drivers.
 #[non_exhaustive]
 #[derive(Clone, Debug)]
 pub enum CodingRuntimeEvent {
@@ -165,6 +171,11 @@ pub enum CodingRuntimeEvent {
     },
     Reconfigured {
         operation: ReconfigureKind,
+    },
+    /// Presentation metadata only: the current turn still owns this model,
+    /// while ProviderChanged names the selection for subsequent turns.
+    ProviderSelectionPending {
+        current: Option<RunningModelIdentity>,
     },
     ProviderChanged {
         provider: String,
@@ -2647,6 +2658,15 @@ impl CodingRuntimeHandle {
         result.await.map_err(|_| RuntimeError::Unavailable)?
     }
 
+    /// Model retained by a running turn after a new selection, if any.
+    pub async fn current_turn_model(&self) -> Result<Option<RunningModelIdentity>, RuntimeError> {
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::CurrentTurnModel { done })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
     /// Current selection and effort, ordered through the runtime owner.
     pub async fn model_selection(
         &self,
@@ -4001,6 +4021,9 @@ pub enum CodingRuntimeControl {
         generation: u64,
         done: oneshot::Sender<Result<CodingAgentConfig, RuntimeError>>,
     },
+    CurrentTurnModel {
+        done: oneshot::Sender<Result<Option<RunningModelIdentity>, RuntimeError>>,
+    },
     ModelSelection {
         generation: u64,
         done: oneshot::Sender<Result<atomcode_config::mode_models::ModeSelection, RuntimeError>>,
@@ -4656,6 +4679,7 @@ fn spawn_runtime_owner_with_optional_agent(
         let mut next_turn_id = 0u64;
         let mut conversation_revision = 0u64;
         let mut active_turn = None;
+        let mut turn_model_before_selection: Option<(u64, u64, RunningModelIdentity)> = None;
         let mut mode_model_return: Option<crate::mode_models::SavedModeModel> = None;
         // Keep each request kind until its correlated response is delivered.
         // `request_user_input` image answers need runtime-owned preprocessing.
@@ -4716,6 +4740,25 @@ fn spawn_runtime_owner_with_optional_agent(
             });
         }
         loop {
+            if turn_model_before_selection
+                .as_ref()
+                .is_some_and(|(epoch, turn, _)| *epoch != generation || active_turn != Some(*turn))
+            {
+                if let Some((epoch, _, _)) = turn_model_before_selection.take() {
+                    if epoch == generation {
+                        if let Some(runtime) = resources.as_ref() {
+                            if let Some(snapshot) = runtime.parts.snapshot_hook() {
+                                snapshot.set_model_attribution(
+                                    &runtime.config.provider_name,
+                                    &runtime.config.model,
+                                );
+                            }
+                        }
+                    }
+                    let _ = runtime_event_tx
+                        .send(CodingRuntimeEvent::ProviderSelectionPending { current: None });
+                }
+            }
             background_jobs.retain_generation(generation);
             if follow_up_epoch != generation {
                 follow_up_elapsed = std::time::Duration::ZERO;
@@ -6995,6 +7038,11 @@ fn spawn_runtime_owner_with_optional_agent(
                         });
                         let _=done.send(answer);
                     }
+                    Some(CodingRuntimeControl::CurrentTurnModel {done}) => {
+                        let result=resources.as_ref().ok_or(RuntimeError::Unavailable)
+                            .map(|_|turn_model_before_selection.as_ref().map(|(_, _, model)|model.clone()));
+                        let _=done.send(result);
+                    }
                     Some(CodingRuntimeControl::ModelSelection { generation: requested, done }) => {
                         let answer=resources.as_ref().ok_or(RuntimeError::Unavailable).and_then(|runtime| {
                             if requested!=generation { return Err(RuntimeError::Busy); }
@@ -7464,6 +7512,13 @@ fn spawn_runtime_owner_with_optional_agent(
                         // `ProviderUnavailable`: the provider had been swapped
                         // behind a seam nobody was reading.
                         if agent.is_some() {
+                                let running_model = active_turn.map(|_| {
+                                    turn_model_before_selection.as_ref().map(|(_, _, model)| model.clone())
+                                        .unwrap_or_else(|| RunningModelIdentity {
+                                            provider: runtime.config.provider_name.clone(),
+                                            model: current_runtime_model(&runtime).unwrap_or_else(|| runtime.config.model.clone()),
+                                        })
+                                });
                             if let (Some(app), Some(slots)) = (
                                 runtime.harness_app.as_mut(),
                                 runtime.harness_providers.clone(),
@@ -7529,11 +7584,12 @@ fn spawn_runtime_owner_with_optional_agent(
                                     &next,
                                     &side_provider,
                                 );
-                                // Turns from here on are billed to the new model.
-                                // The chain says the same thing from `assemble`,
-                                // which only runs once the swap has succeeded.
-                                if let Some(snapshot) = runtime.parts.snapshot_hook() {
-                                    snapshot.set_model_attribution(&next.provider_name, &next.model);
+                                // The running loop captured its provider at turn start.
+                                // Keep its accounting identity until that turn ends.
+                                if running_model.is_none() {
+                                    if let Some(snapshot) = runtime.parts.snapshot_hook() {
+                                        snapshot.set_model_attribution(&next.provider_name, &next.model);
+                                    }
                                 }
                                 tell(&runtime, crate::told::reconfigured(&runtime.config, &next));
                                 runtime.config = next;
@@ -7555,14 +7611,23 @@ fn spawn_runtime_owner_with_optional_agent(
                                 controls
                                     .provider_unavailable_reason
                                     .store(0, Ordering::Release);
+                                // Keep the generation receipt ordered even when two
+                                // drivers select concurrently. This is the same agent,
+                                // so its active steer correlations remain valid.
                                 generation = generation.wrapping_add(1);
+                                if active_turn.is_none() {
+                                    pending_steer_acknowledgements.clear();
+                                }
                                 event_generation.store(generation, Ordering::Release);
-                                pending_steer_acknowledgements.clear();
                                 controls.state.store(
                                     runtime_phase_state(generation, resumed),
                                     Ordering::Release,
                                 );
                                 runtime_event_tx.carry_live_view(generation);
+                                if let (Some(turn), Some(current)) = (active_turn, running_model) {
+                                    turn_model_before_selection = Some((generation, turn, current.clone()));
+                                    let _ = runtime_event_tx.send(CodingRuntimeEvent::ProviderSelectionPending { current: Some(current) });
+                                }
                                 if resources.as_ref().and_then(|runtime| runtime.config.subagent_config.as_ref()).is_some_and(|config| !config.modes.is_empty()) {
                                     let text=if atomcode_config::i18n::current_locale()==atomcode_config::locale::Locale::ZhCn {
                                         "临时使用所选模型/强度；切换到已配置的模式时重新应用绑定。"
@@ -10503,6 +10568,9 @@ fn reject_runtime_control_with_error(
         // A stopping runtime cannot say which mode it is in either — the flags
         // belong to a tree that is being torn down.
         CodingRuntimeControl::Configuration { done, .. } => {
+            let _ = done.send(Err(error));
+        }
+        CodingRuntimeControl::CurrentTurnModel { done } => {
             let _ = done.send(Err(error));
         }
         CodingRuntimeControl::ModelSelection { done, .. } => {
@@ -18269,6 +18337,140 @@ mod tests {
             ),
             "{terminal:?}"
         );
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn active_model_selection_keeps_the_current_request_and_uses_the_last_choice_next_turn() {
+        #[derive(Clone)]
+        struct SelectionFactory {
+            calls: Arc<std::sync::Mutex<Vec<String>>>,
+            started: Arc<tokio::sync::Notify>,
+            finish: Arc<tokio::sync::Notify>,
+        }
+        struct SelectionProvider {
+            model: String,
+            factory: SelectionFactory,
+        }
+        #[async_trait::async_trait]
+        impl LlmProvider for SelectionProvider {
+            fn model_name(&self) -> &str {
+                &self.model
+            }
+            async fn chat_stream(
+                &self,
+                _messages: &[Message],
+                _tools: &[atomcode_kernel::tool::ToolDef],
+                _options: &atomcode_kernel::provider::ChatOptions,
+            ) -> Result<
+                futures::stream::BoxStream<'static, atomcode_kernel::stream::StreamEvent>,
+                atomcode_kernel::stream::ProviderError,
+            > {
+                self.factory.calls.lock().unwrap().push(self.model.clone());
+                self.factory.started.notify_one();
+                let wait = self.model == "test";
+                let finish = self.factory.finish.clone();
+                let events = futures::stream::once(async move {
+                    if wait {
+                        finish.notified().await;
+                    }
+                    vec![
+                        atomcode_kernel::stream::StreamEvent::TextDelta("answer".into()),
+                        atomcode_kernel::stream::StreamEvent::Done { truncated: false },
+                    ]
+                });
+                Ok(Box::pin(futures::StreamExt::flat_map(
+                    events,
+                    futures::stream::iter,
+                )))
+            }
+        }
+        impl CodingProviderFactory for SelectionFactory {
+            fn build(
+                &self,
+                config: &CodingAgentConfig,
+                _session: Option<&str>,
+            ) -> Result<Arc<dyn LlmProvider>, crate::ProviderBuildError> {
+                if config.model == "invalid" {
+                    return Err(crate::ProviderBuildError::Adapter(
+                        "invalid selection".into(),
+                    ));
+                }
+                Ok(Arc::new(SelectionProvider {
+                    model: config.model.clone(),
+                    factory: self.clone(),
+                }))
+            }
+        }
+        let factory = SelectionFactory {
+            calls: Default::default(),
+            started: Default::default(),
+            finish: Default::default(),
+        };
+        let mut start = native_start(false);
+        start.provider_factory = Arc::new(factory.clone());
+        let mut next = start.agent.clone();
+        let mut runtime = CodingRuntime::start(start).await.unwrap();
+        runtime
+            .handle
+            .submit(UserInput::from("keep running"))
+            .await
+            .unwrap();
+        factory.started.notified().await;
+        let generation = runtime.handle.status().generation;
+        for (index, model) in ["second", "third"].into_iter().enumerate() {
+            next.model = model.into();
+            next.provider_name = model.into();
+            runtime
+                .handle
+                .reassemble_provider(next.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                runtime.handle.status().generation,
+                generation + index as u64 + 1
+            );
+            assert_eq!(runtime.handle.status().phase, RuntimePhase::InTurn);
+            assert_eq!(
+                runtime
+                    .handle
+                    .current_turn_model()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .model,
+                "test"
+            );
+        }
+        next.model = "invalid".into();
+        assert!(runtime.handle.reassemble_provider(next).await.is_err());
+        assert_eq!(runtime.handle.configuration().await.unwrap().model, "third");
+        assert_eq!(*factory.calls.lock().unwrap(), vec!["test"]);
+        factory.finish.notify_one();
+        loop {
+            if matches!(
+                runtime.events.recv().await.unwrap().event,
+                CodingRuntimeEvent::TurnFinished(_)
+            ) {
+                break;
+            }
+        }
+        runtime.handle.mode().await.unwrap();
+        assert!(runtime.handle.current_turn_model().await.unwrap().is_none());
+        runtime
+            .handle
+            .submit(UserInput::from("next turn"))
+            .await
+            .unwrap();
+        loop {
+            if matches!(
+                runtime.events.recv().await.unwrap().event,
+                CodingRuntimeEvent::TurnFinished(_)
+            ) {
+                break;
+            }
+        }
+        assert_eq!(*factory.calls.lock().unwrap(), vec!["test", "third"]);
         runtime.handle.shutdown().await.unwrap();
     }
 

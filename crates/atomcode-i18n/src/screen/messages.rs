@@ -2404,6 +2404,9 @@ pub enum Msg<'a> {
     CompactAfterTurn,
     /// The runtime refused because it is busy (a turn, a compaction or a
     /// rebuild under way) — what the host says in place of its own words.
+    ModelNextTurn {
+        model: &'a str,
+    },
     RuntimeBusy,
     /// `/effort <level>` with a level this model does not take; `levels` are
     /// the ones it does.

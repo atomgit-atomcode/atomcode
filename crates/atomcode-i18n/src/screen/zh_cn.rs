@@ -1526,6 +1526,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("正在回复,/{command} 要等这一轮结束再用;按 Esc 可以先停下这一轮").into()
         }
         Msg::CompactAfterTurn => "这一轮结束后就压缩".into(),
+        Msg::ModelNextTurn { model } => format!("当前回合继续使用 {model}；新选择的模型从下回合生效。").into(),
         Msg::RuntimeBusy => "正在忙(回复、压缩或重新装配进行中),稍后再试".into(),
         Msg::EffortNotForThisModel { wanted, levels } => {
             format!("当前模型不支持 {wanted};它支持:{levels}, default(或 auto)").into()

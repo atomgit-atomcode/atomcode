@@ -266,6 +266,7 @@ mod tests {
             | C::ContextStats { .. }
             | C::Mode { .. }
             | C::ModelSelection { .. }
+            | C::CurrentTurnModel { .. }
             | C::Configuration { .. }
             | C::UpdateModeBindings { .. }
             | C::WaitMcpReady { .. }

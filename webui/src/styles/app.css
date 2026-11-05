@@ -4242,3 +4242,9 @@ body {
 .mode-bindings-body fieldset { border: 1px solid var(--app-border); border-radius: 8px; padding: 12px; display: grid; gap: 12px; }
 .mode-bindings-body label { display: flex; flex-direction: column; gap: 6px; }
 .mode-bindings-body select { width: 100%; padding: 8px; background: var(--app-primary-background); color: var(--app-primary-foreground); border: 1px solid var(--app-border); border-radius: 6px; }
+
+.model-next-turn { font-size: 12px; color: var(--app-secondary-foreground); overflow-wrap: anywhere; max-width: 320px; line-height: 1.4; }
+.model-next-turn-badge { color: var(--app-brand); font-size: 11px; }
+
+.model-controls.has-pending-model { flex-wrap: wrap; justify-content: flex-end; }
+.model-controls.has-pending-model .model-next-turn { flex-basis: 100%; text-align: right; }
