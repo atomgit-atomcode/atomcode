@@ -1700,6 +1700,36 @@ mod tests {
         assert_eq!(expand_pastes(&m.input, m.pastes.as_slice()), body);
     }
 
+    // Same copy-on-write contract for the other payloads a frame snapshot
+    // shares: a render must keep the pastes, history and last prompt it was
+    // taken with, while the live state keeps growing.
+    #[test]
+    fn a_frame_snapshot_keeps_the_pastes_and_history_it_was_taken_with() {
+        let mut live = Moment::default();
+        let body = big(PASTE_FOLD_LINES);
+        live.insert_paste(&body, Timestamp::millis(0));
+        live.history = Arc::new(vec!["first".into()]);
+        live.last_sent = Some(Arc::new("sent".into()));
+        let snapshot = live.clone();
+
+        // A later, different block is a second paste, not the expand gesture.
+        live.insert_paste(
+            &format!("{body}\nsecond line"),
+            Timestamp::millis(DOUBLE_PASTE_EXPAND_MS + 1),
+        );
+        Arc::make_mut(&mut live.history).push("second".into());
+        live.last_sent = Some(Arc::new("sent again".into()));
+
+        assert_eq!(*snapshot.pastes, vec![body], "the snapshot keeps its paste");
+        assert_eq!(*snapshot.history, vec!["first".to_string()]);
+        assert_eq!(
+            snapshot.last_sent.as_deref().map(String::as_str),
+            Some("sent")
+        );
+        assert_eq!(live.pastes.len(), 2, "the live state still grew");
+        assert_eq!(live.history.len(), 2);
+    }
+
     #[test]
     fn a_long_single_line_paste_folds_to_a_chars_marker() {
         let mut m = Moment::default();

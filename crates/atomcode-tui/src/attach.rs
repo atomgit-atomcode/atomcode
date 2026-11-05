@@ -174,13 +174,16 @@ impl Attachments {
     /// Nothing dedups: the same picture pasted twice is two attachments,
     /// because the person pasted twice and the second one is in there.
     pub fn add(&mut self, image: ImageContent) -> String {
+        self.add_shared(Arc::new(image))
+    }
+
+    /// The same attach with the bytes already shared with the gallery, so a
+    /// recalled picture is renumbered without copying its base64.
+    fn add_shared(&mut self, image: Arc<ImageContent>) -> String {
         let inner = Arc::make_mut(&mut self.inner);
         let n = inner.next;
         inner.next += 1;
-        let pending = Pending {
-            marker: n,
-            image: Arc::new(image),
-        };
+        let pending = Pending { marker: n, image };
         // The send queue is drained at submit; the gallery keeps a handle so the
         // picture can be reopened from the history long after it was sent.
         inner.gallery.push(pending.clone());
@@ -196,6 +199,16 @@ impl Attachments {
             .iter()
             .find(|p| p.marker == n)
             .map(|p| p.image.as_ref())
+    }
+
+    /// The shared handle behind [`image_at`], so re-attaching a recalled picture
+    /// can reuse the bytes instead of cloning them.
+    fn image_shared(&self, n: usize) -> Option<Arc<ImageContent>> {
+        self.inner
+            .gallery
+            .iter()
+            .find(|p| p.marker == n)
+            .map(|p| Arc::clone(&p.image))
     }
 
     /// Re-attach the images a recalled line refers to, under FRESH marker
@@ -225,9 +238,9 @@ impl Attachments {
             if queued.contains(&old) || !handled.insert(old) {
                 continue;
             }
-            match self.image_at(old).cloned() {
+            match self.image_shared(old) {
                 Some(image) => {
-                    let fresh = self.add(image);
+                    let fresh = self.add_shared(image);
                     *line = line.replace(&marker(old), &fresh);
                 }
                 None => missing.push(old),
@@ -622,6 +635,53 @@ mod tests {
             "clearing the composer keeps it"
         );
         assert_eq!(a.image_at(9), None, "a number never added has no image");
+    }
+
+    // A frame renders from a cloned Moment; with the bytes shared behind one
+    // Arc, every mutation must copy-on-write so a snapshot in flight keeps the
+    // state it was taken with. The compiler cannot enforce that, so pin it.
+    #[test]
+    fn a_frame_snapshot_is_not_written_back_when_the_live_composer_changes() {
+        let mut live = Attachments::new();
+        live.add(img("one"));
+        let snapshot = live.clone();
+
+        live.add(img("two"));
+        let _ = live.take_shown("[Image #2]");
+        live.clear();
+
+        assert!(!snapshot.is_empty(), "the snapshot keeps its pending image");
+        assert_eq!(
+            snapshot.image_at(1),
+            Some(&img("one")),
+            "the snapshot keeps its own bytes"
+        );
+        assert_eq!(
+            snapshot.image_at(2),
+            None,
+            "an image added after the snapshot stays out of it"
+        );
+        assert!(live.is_empty());
+    }
+
+    // Recalling a sent line that names a picture re-attaches the gallery's own
+    // bytes under a fresh number: the marker changes, the base64 does not move.
+    #[test]
+    fn a_recalled_picture_shares_the_bytes_it_was_recalled_from() {
+        let mut a = Attachments::new();
+        let sent = a.add(img("one"));
+        // Send it: the queue drains, the gallery keeps the bytes — which is
+        // exactly the state a recalled history line resolves against.
+        let _ = a.take_shown(&format!("sent {sent}"));
+        let before = a.image_shared(1).expect("the gallery has it");
+        let mut line = "sent [Image #1]".to_string();
+        assert!(a.rehydrate_recalled(&mut line).is_empty());
+        let after = a.image_shared(2).expect("the recall renumbered it");
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "the recalled image reuses the gallery's bytes"
+        );
+        assert!(line.contains("[Image #2]"), "{line}");
     }
 
     // A click position (a byte offset) inside an `[Image #N]` span opens that

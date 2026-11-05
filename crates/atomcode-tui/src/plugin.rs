@@ -13204,7 +13204,7 @@ mod paste_burst_tests {
         }
         let moment = host.moment.read().unwrap();
         assert_eq!(
-            crate::moment::expand_pastes(&moment.input, &moment.pastes),
+            crate::moment::expand_pastes(&moment.input, moment.pastes.as_slice()),
             text
         );
         assert!(!moment.pending_working && !moment.turn_open);
