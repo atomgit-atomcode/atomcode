@@ -329,6 +329,55 @@ fn layout(
         let at = rows.len() - 1;
         rows.splice(at..at, std::iter::repeat_n(Row::Blank, anchor - rows.len()));
     }
+    config_window(rows, panel.cursor, h)
+}
+
+/// Keep the pointed setting visible. Rendering and click geometry both use
+/// this window, so a scrolled row retains its index in the filtered list.
+fn config_window(mut rows: Vec<Row>, cursor: usize, h: usize) -> Vec<Row> {
+    if rows.len() <= h || h < 6 {
+        return fit(rows, h);
+    }
+    // As in fit(), give up decoration before sacrificing list entries.
+    while rows.len() > h {
+        let Some(at) = rows
+            .iter()
+            .rposition(|row| matches!(row, Row::Rule | Row::Legend | Row::Blank))
+        else {
+            break;
+        };
+        rows.remove(at);
+    }
+    if rows.len() <= h {
+        return rows;
+    }
+    let entries = rows
+        .iter()
+        .filter(|row| matches!(row, Row::Setting { .. } | Row::Editing { .. }))
+        .count();
+    if entries == 0 {
+        return fit(rows, h);
+    }
+    let fixed = rows.len() - entries;
+    let room = h.saturating_sub(fixed + 1).max(1);
+    let at = cursor
+        .min(entries - 1)
+        .saturating_sub(room - 1)
+        .min(entries.saturating_sub(room));
+    let mut index = 0;
+    rows.retain(|row| {
+        if matches!(row, Row::Setting { .. } | Row::Editing { .. }) {
+            let visible = (at..at + room).contains(&index);
+            index += 1;
+            visible
+        } else {
+            true
+        }
+    });
+    rows.push(Row::Scroll {
+        above: at,
+        below: entries.saturating_sub(at + room),
+    });
     fit(rows, h)
 }
 
@@ -2237,6 +2286,69 @@ pub fn value_column(row: &crate::settings::SettingRow) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn long_config_lists_follow_selection_and_keep_click_indices() {
+        let settings = SettingsView::new(
+            (0..60)
+                .map(|i| {
+                    row(
+                        &format!("setting.{i}"),
+                        &format!("Setting {i}"),
+                        "true",
+                        SettingKind::Boolean,
+                    )
+                })
+                .collect(),
+        );
+        let mut panel = Panel::new();
+        for h in [6, 10, 24, 50] {
+            for cursor in [0, 1, 20, 59, 30, 0] {
+                panel.cursor = cursor;
+                let rows = layout(&settings, &panel, None, None, 80, h);
+                assert!(rows.len() <= h);
+                assert!(
+                    rows.iter()
+                        .any(|r| matches!(r, Row::Setting { index } if *index == cursor)),
+                    "cursor {cursor} at height {h}"
+                );
+                assert!(rows.iter().any(|r| matches!(r, Row::Scroll { .. })));
+                let m = moment(Some(panel.clone()), settings.clone());
+                let vp = Viewport::new(
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        w: 80,
+                        h: h as u16,
+                    },
+                    &m,
+                );
+                let geom = geometry(&m, &vp);
+                for (y, row) in rows.iter().enumerate() {
+                    if let Row::Setting { index } = row {
+                        assert_eq!(geom.setting_at(y), Some(*index));
+                    }
+                }
+            }
+        }
+        panel.cursor = 0;
+        for key in [
+            Key::PageDown,
+            Key::PageDown,
+            Key::Down,
+            Key::Up,
+            Key::PageUp,
+        ] {
+            crate::settings::key(&settings, &mut panel, crate::surface::KeyPress::plain(key));
+            let rows = layout(&settings, &panel, None, None, 80, 10);
+            assert!(rows
+                .iter()
+                .any(|r| matches!(r, Row::Setting { index } if *index == panel.cursor)));
+        }
+        panel.cursor = 0;
+        panel.query = "Setting 59".into();
+        let rows = layout(&settings, &panel, None, None, 80, 10);
+        assert!(rows.iter().any(|r| matches!(r, Row::Setting { index: 0 })));
+    }
     #[test]
     fn source_details_show_loaded_state_without_hiding_the_path() {
         use atomcode_host_api::{SourceFile, SourceGroup};

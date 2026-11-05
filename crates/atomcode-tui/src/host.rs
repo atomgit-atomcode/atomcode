@@ -3243,8 +3243,7 @@ impl Host {
     /// criterion that pins it is `a_click_missing_the_panel_hits_nothing`.
     /// Scroll the settings panel under the pointer, and say whether it took it.
     ///
-    /// Only the pages that are read rather than filtered scroll, and only when
-    /// the pointer is actually over the panel: a wheel anywhere else belongs to
+    /// Only when the pointer is actually over the panel: a wheel anywhere else belongs to
     /// the conversation, which is the thing people scroll all day. Answering
     /// every wheel event while the panel happened to be open would take the
     /// wheel away from the transcript the panel does not even cover.
@@ -3259,11 +3258,19 @@ impl Host {
             return false;
         }
         let mut m = self.moment.write().expect("moment poisoned");
+        let count = m
+            .settings_panel
+            .as_ref()
+            .map_or(0, |panel| m.settings.matching(&panel.query).len());
         let Some(panel) = m.settings_panel.as_mut() else {
             return false;
         };
         if panel.tab == crate::settings::Tab::Config {
-            return false;
+            if panel.editing.is_none() && panel.keybindings.is_none() {
+                panel.move_by(by, count);
+                panel.pending_reset = None;
+            }
+            return true;
         }
         // Clamped at the top here and at the bottom where the rows are counted:
         // this side does not know how long the page is.
@@ -10504,16 +10511,15 @@ mod tests {
             "off the panel, the wheel is not the panel's"
         );
 
-        // The settings page is narrowed by typing, not scrolled: a list you can
-        // both filter and scroll has two ways to lose the row you were on.
+        // On Config the wheel moves the selection, which the viewport follows.
         {
             let mut m = h.moment.write().expect("moment poisoned");
             let panel = m.settings_panel.as_mut().expect("a panel");
             panel.show(crate::settings::Tab::Config);
         }
         assert!(
-            !h.settings_wheel(rect.x + 1, rect.y + 1, 3),
-            "the page that is filtered does not scroll"
+            h.settings_wheel(rect.x + 1, rect.y + 1, 3),
+            "the configuration list consumes the wheel too"
         );
     }
 
