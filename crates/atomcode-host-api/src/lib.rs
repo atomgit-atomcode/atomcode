@@ -29,6 +29,14 @@ use atomcode_kernel::session::SeqNo;
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum HostCommand {
+    /// Host-local hooks configuration preview and explicit script diagnostic.
+    Hooks { session: String, args: String },
+    /// Explicit user registration of a one-shot same-session follow-up.
+    FollowUp { session: String, args: String },
+    /// Explicit user operations over original task specifications.
+    TaskSpecs { session: String, args: String },
+    /// Import explicit user file bytes without model or argv transport.
+    ImportPatch { session: String, bytes: Vec<u8> },
     /// Put an empty session in place of `session`, in the same working
     /// directory.
     NewSession { session: String },
@@ -350,6 +358,10 @@ impl HostCommand {
         match self {
             Self::NewSession { session }
             | Self::Resume { session, .. }
+            | Self::TaskSpecs { session, .. }
+            | Self::FollowUp { session, .. }
+            | Self::Hooks { session, .. }
+            | Self::ImportPatch { session, .. }
             | Self::SetReasoningEffort { session, .. }
             | Self::Undo { session, .. }
             | Self::RewindPoints { session }
@@ -407,10 +419,34 @@ impl HostCommand {
     }
 }
 
+/// Mounted persona inspection returned only for an explicit prompt query.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PersonaInfo {
+    /// builtin, config, explicit, or host. Unknown future sources remain extensible.
+    pub source: String,
+    /// None when the host cannot declare whether it appended instructions.
+    pub appended: Option<bool>,
+    /// Exact mounted persona fragment, including append text, not the full system prompt.
+    pub text: String,
+}
+
 /// What a command that went through produced.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum HostReply {
+    Hooks {
+        value: serde_json::Value,
+    },
+    FollowUp {
+        value: serde_json::Value,
+    },
+    /// Source list, full review or acknowledged retention state.
+    TaskSpecs {
+        value: serde_json::Value,
+    },
+    PatchImported {
+        reference: String,
+    },
     /// Done. The live session is the one it was.
     Done,
     /// Done — and something about it is worth saying.
@@ -528,6 +564,8 @@ pub enum HostReply {
         /// The system prompt, when it was asked for and the host has one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         system_prompt: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        persona: Option<PersonaInfo>,
     },
     /// What was typed into this project before, newest first and de-duplicated.
     History {
@@ -1261,6 +1299,9 @@ pub struct StoredSession {
     /// there, refused if they try to resume it (`docs/adr/0024` §16).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub needs_newer_version: bool,
+    /// A persistent conversation used by an automation task.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub scheduled: bool,
 }
 
 /// Something that happened on the host, whoever caused it.
@@ -1311,6 +1352,11 @@ pub enum HostEvent {
     /// not draw it, and this is the road it travels instead — the same bargain
     /// [`HostEvent::Autonomy`] strikes, and for the same reason.
     ModeChanged { session: String, mode: Mode },
+    /// A model was selected for the next turn; the active turn keeps this one.
+    ModelSelectionPending {
+        session: String,
+        current_model: String,
+    },
     /// Something the person might say next, offered after a turn ended by
     /// itself.
     ///
@@ -1545,6 +1591,18 @@ mod tests {
     /// sampled here.
     fn commands() -> Vec<HostCommand> {
         let all = vec![
+            HostCommand::Hooks {
+                session: "a".into(),
+                args: "list".into(),
+            },
+            HostCommand::TaskSpecs {
+                session: "a".into(),
+                args: "list".into(),
+            },
+            HostCommand::ImportPatch {
+                session: "a".into(),
+                bytes: b"patch\r\n".to_vec(),
+            },
             HostCommand::NewSession {
                 session: "a".into(),
             },
@@ -1753,6 +1811,10 @@ mod tests {
                 | HostCommand::SignOut { .. }
                 | HostCommand::SignIn { .. }
                 | HostCommand::WhoAmI { .. }
+                | HostCommand::TaskSpecs { .. }
+                | HostCommand::FollowUp { .. }
+                | HostCommand::Hooks { .. }
+                | HostCommand::ImportPatch { .. }
                 | HostCommand::Changes { .. }
                 | HostCommand::Providers { .. }
                 | HostCommand::Autonomy { .. }
@@ -1776,6 +1838,15 @@ mod tests {
     fn replies() -> Vec<HostReply> {
         let all = vec![
             HostReply::Done,
+            HostReply::Hooks {
+                value: serde_json::json!({"items":[]}),
+            },
+            HostReply::TaskSpecs {
+                value: serde_json::json!({"items":[]}),
+            },
+            HostReply::PatchImported {
+                reference: "immutable-reference".into(),
+            },
             HostReply::SessionChanged {
                 session: "b".into(),
             },
@@ -1788,6 +1859,7 @@ mod tests {
                     updated_at: 2,
                     turns: 3,
                     needs_newer_version: true,
+                    scheduled: true,
                 }],
             },
             HostReply::Undone {
@@ -1951,6 +2023,7 @@ mod tests {
                 used: 48_000,
                 model: "glm-5".into(),
                 working_dir: "/w".into(),
+                persona: None,
                 system_prompt: None,
             },
             HostReply::Usage {
@@ -2048,6 +2121,10 @@ mod tests {
         for r in &all {
             match r {
                 HostReply::Done
+                | HostReply::TaskSpecs { .. }
+                | HostReply::FollowUp { .. }
+                | HostReply::Hooks { .. }
+                | HostReply::PatchImported { .. }
                 | HostReply::DoneWithNote { .. }
                 | HostReply::SessionChanged { .. }
                 | HostReply::Sessions { .. }
@@ -2149,6 +2226,10 @@ mod tests {
                 session: "b".into(),
                 mode: Mode::Plan,
             },
+            HostEvent::ModelSelectionPending {
+                session: "b".into(),
+                current_model: "running-model".into(),
+            },
             HostEvent::Suggested {
                 session: "b".into(),
                 text: "接着把登录那条补上".into(),
@@ -2168,6 +2249,7 @@ mod tests {
                 HostEvent::SessionChanged { .. }
                 | HostEvent::Autonomy { .. }
                 | HostEvent::ModeChanged { .. }
+                | HostEvent::ModelSelectionPending { .. }
                 | HostEvent::Suggested { .. }
                 | HostEvent::BackgroundChanged { .. }
                 | HostEvent::GoalEnded { .. }

@@ -80,3 +80,12 @@ test('does not report a hydrated call that has no authoritative tool result', ()
   }]);
   assert.deepEqual(result.get(0), []);
 });
+
+
+test('archived tool metadata preserves full-turn artifact links without resident outputs', () => {
+  const messages = [
+    { role: 'assistant' as const, parts: [], archiveArtifacts: [{ path: '/project/a.ts', label: 'a.ts' }] },
+    { role: 'assistant' as const, parts: [] },
+  ];
+  assert.deepEqual(artifactsByAssistantIndex(messages).get(1), [{ path: '/project/a.ts', label: 'a.ts' }]);
+});

@@ -590,6 +590,10 @@ pub(crate) async fn discover_models(Json(req): Json<DiscoverModelsRequest>) -> i
     }
     let body = match fetch_discovery_body(url, protocol, &transport, DISCOVERY_TIMEOUT).await {
         Ok(body) => body,
+        Err(error @ DiscoveryRequestError::OllamaUnavailable { .. }) => {
+            return json_error(StatusCode::BAD_GATEWAY, error.ollama_guidance().unwrap())
+                .into_response()
+        }
         Err(DiscoveryRequestError::Timeout) => {
             return json_error(StatusCode::GATEWAY_TIMEOUT, "Model discovery timed out")
                 .into_response()
@@ -1227,6 +1231,54 @@ mod tests {
             axum::serve(listener, router).await.unwrap();
         });
         reqwest::Url::parse(&format!("http://{address}/models")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn ollama_discovery_keeps_http_rejections_instead_of_suggesting_startup() {
+        use axum::response::IntoResponse;
+        let router = Router::new().route("/api/tags", get(|| async { StatusCode::UNAUTHORIZED }));
+        let url = spawn_discovery_server(router).await;
+        let base_url = format!("http://{}:{}", url.host_str().unwrap(), url.port().unwrap());
+        let response = super::discover_models(axum::Json(super::DiscoverModelsRequest {
+            provider_type: "ollama".into(),
+            base_url,
+            api_key: None,
+            provider_name: None,
+            headers: None,
+        }))
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let message = String::from_utf8(body.to_vec()).unwrap();
+        assert!(message.contains("401"));
+        assert!(!message.contains("ollama serve"));
+    }
+
+    #[tokio::test]
+    async fn ollama_discovery_reports_how_to_start_a_refused_daemon() {
+        use axum::response::IntoResponse;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let response = super::discover_models(axum::Json(super::DiscoverModelsRequest {
+            provider_type: "ollama".into(),
+            base_url: format!("http://{address}"),
+            api_key: None,
+            provider_name: None,
+            headers: None,
+        }))
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let message = String::from_utf8(body.to_vec()).unwrap();
+        assert!(message.contains("ollama serve"), "{message}");
+        assert!(message.contains(&address.to_string()));
     }
 
     #[test]

@@ -1344,7 +1344,8 @@ async fn every_record_carries_the_time_it_was_committed() {
     run_turn(&app, "what time is it").await.unwrap();
     let logged = app.context().only_session().unwrap().events();
     assert!(!logged.is_empty());
-    settle(&app, id, logged.len()).await;
+    let durable: Vec<_> = logged.iter().filter(|e| !e.event.is_transient()).collect();
+    settle(&app, id, durable.len()).await;
     assert!(logged.iter().all(|e| e.at == AT), "{logged:#?}");
     let heard = heard.lock().unwrap().clone();
     assert!(
@@ -1358,7 +1359,8 @@ async fn every_record_carries_the_time_it_was_committed() {
         .load(id)
         .await
         .unwrap();
-    assert_eq!(stored.len(), logged.len());
+    assert_eq!(stored.len(), durable.len());
+    assert!(stored.iter().all(|e| !e.event.is_transient()));
     assert!(stored.iter().all(|e| e.at == AT), "{stored:#?}");
 
     // A file from before commit times: same records, no `at`.
@@ -1387,7 +1389,7 @@ async fn every_record_carries_the_time_it_was_committed() {
         .load(id)
         .await
         .unwrap();
-    assert_eq!(reread.len(), logged.len());
+    assert_eq!(reread.len(), durable.len());
     assert!(reread.iter().all(|e| e.at == 0), "{reread:#?}");
 }
 

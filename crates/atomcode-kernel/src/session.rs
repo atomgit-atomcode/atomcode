@@ -16,6 +16,9 @@
 
 use serde::{Deserialize, Serialize};
 
+#[path = "session_retention.rs"]
+pub mod retention;
+
 use crate::event::{PolicyIntervention, StopReason};
 use crate::message::{ImageContent, Message, MessageMeta, ReasoningBlock, Role};
 use crate::stream::TokenUsage;
@@ -113,6 +116,8 @@ pub enum NoticeKind {
     /// A team member the resumed lead had and had not stopped could not be
     /// brought back. `detail` names it and why.
     MemberNotRestored,
+    /// A newly owned session contained an unfinished turn from a previous runtime.
+    SessionInterrupted,
 }
 
 /// Where a [`NoticeKind::ProviderRetry`] stands, as numbers a screen can say in
@@ -135,6 +140,15 @@ pub struct RetryAttempt {
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum SessionEvent {
+    /// A person's explicit decision to retain original context. The source text
+    /// remains solely in UserMessage; inactive records release it.
+    ContextRetention {
+        turn: u64,
+        source: SeqNo,
+        active: bool,
+        bytes: usize,
+        sha256: String,
+    },
     TurnStart {
         turn: u64,
     },
@@ -170,6 +184,20 @@ pub enum SessionEvent {
         round: u32,
         delta: String,
         reasoning: bool,
+    },
+    /// Incremental recovery data, never rendered or sent to a model directly.
+    /// A new attempt resets the previous preview; completed messages supersede it.
+    ReplyCheckpoint {
+        turn: u64,
+        round: u32,
+        text: String,
+        reasoning: String,
+        reset: bool,
+    },
+    /// Transient UI boundary, never written to a session file.
+    ReasoningDiscarded {
+        turn: u64,
+        round: u32,
     },
     AssistantMessage {
         turn: u64,
@@ -382,8 +410,9 @@ pub enum SessionEvent {
     /// Chunks are not kept on disk, so without this the part of the answer the
     /// person had already read would be gone from a resumed session — and from
     /// the model, which is told it was interrupted without being told where.
-    /// Committed just before [`SessionEvent::Interrupted`], only for a person's
-    /// cancel and only when something had arrived. A kept turn shows the model
+    /// Committed just before [`SessionEvent::Interrupted`] on a person's cancel,
+    /// or from saved checkpoints when recovering an abnormally ended runtime,
+    /// and only when something had arrived. A kept turn shows the model
     /// its text as an assistant message ahead of the interruption note; the
     /// reasoning stays in the log for a screen, never in a request (an unsigned
     /// thinking block is one some providers refuse), and a tool call that had
@@ -446,14 +475,25 @@ pub enum SessionEvent {
 }
 
 impl SessionEvent {
+    /// Live presentation only; neither chunks nor discarded previews are durable facts.
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            Self::AssistantChunk { .. } | Self::ReasoningDiscarded { .. }
+        )
+    }
+
     pub fn turn(&self) -> u64 {
         match self {
-            Self::TurnStart { turn }
+            Self::ContextRetention { turn, .. }
+            | Self::TurnStart { turn }
             | Self::UserMessage { turn, .. }
             | Self::StepStart { turn, .. }
             | Self::StepEnd { turn, .. }
             | Self::RequestHeader { turn, .. }
+            | Self::ReplyCheckpoint { turn, .. }
             | Self::AssistantChunk { turn, .. }
+            | Self::ReasoningDiscarded { turn, .. }
             | Self::AssistantMessage { turn, .. }
             | Self::PartialReply { turn, .. }
             | Self::Stopped { turn }
@@ -482,7 +522,8 @@ impl SessionEvent {
     pub fn is_model_visible(&self) -> bool {
         matches!(
             self,
-            Self::UserMessage { .. }
+            Self::ContextRetention { .. }
+                | Self::UserMessage { .. }
                 | Self::AssistantMessage { .. }
                 | Self::ToolResultLogged { .. }
                 | Self::Injected { .. }
@@ -559,7 +600,10 @@ impl SessionEvent {
 /// A file's header records the version that created it; a later build may
 /// append facts of a kind added since. A reader that meets a kind it does not
 /// know treats the file as newer than itself, the same refusal.
-pub const SESSION_FORMAT_VERSION: u32 = 13;
+/// **14** — explicit original-context retention decisions.
+/// **15** — incremental reply checkpoints and SessionInterrupted notices for
+/// recovery after an abnormal exit.
+pub const SESSION_FORMAT_VERSION: u32 = 15;
 
 /// One replacement a [`SessionEvent::MessagesRewritten`] makes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -740,6 +784,7 @@ pub fn renumber(events: Vec<LoggedEvent>, first: SeqNo) -> Vec<LoggedEvent> {
         .map(|mut logged| {
             logged.seq = map(logged.seq);
             match &mut logged.event {
+                SessionEvent::ContextRetention { source, .. } => *source = map(*source),
                 SessionEvent::Compacted { through, from, .. } => {
                     *through = map(*through);
                     if *from != 0 {
@@ -847,6 +892,7 @@ fn folded_ranges(
 pub fn visible_turns(events: &[LoggedEvent]) -> std::collections::BTreeSet<u64> {
     let taken_back = taken_back(events);
     let folded = folded_ranges(events, &taken_back);
+    let pinned = retention::active_sources(events);
     let undone: std::collections::HashSet<u64> = events
         .iter()
         .filter_map(|logged| match logged.event {
@@ -856,9 +902,10 @@ pub fn visible_turns(events: &[LoggedEvent]) -> std::collections::BTreeSet<u64> 
         .collect();
     let mut visible = std::collections::BTreeSet::new();
     for logged in events.iter().filter(|logged| !taken_back(logged.seq)) {
-        if folded
-            .iter()
-            .any(|(from, through)| logged.seq > *from && logged.seq <= *through)
+        if !pinned.contains_key(&logged.seq)
+            && folded
+                .iter()
+                .any(|(from, through)| logged.seq > *from && logged.seq <= *through)
         {
             continue;
         }
@@ -922,6 +969,39 @@ pub fn rewound_turns(events: &[LoggedEvent]) -> std::collections::BTreeSet<u64> 
             _ => None,
         })
         .collect()
+}
+
+/// Facts retained by conversation rewind and interruption semantics, before any
+/// model-context compaction. Historical resource readers must not revive inputs
+/// the person retracted, including records that predate explicit TurnStart facts.
+pub fn retained_events(events: &[LoggedEvent]) -> impl Iterator<Item = &LoggedEvent> {
+    let retracted = taken_back(events);
+    let undone: std::collections::HashSet<u64> = events
+        .iter()
+        .filter_map(|entry| match entry.event {
+            SessionEvent::Interrupted { turn, undone: true } => Some(turn),
+            _ => None,
+        })
+        .collect();
+    events.iter().filter(move |entry| {
+        if retracted(entry.seq) {
+            return false;
+        }
+        // The same session-wide facts survive interruption in derive_messages.
+        let session_wide = matches!(
+            &entry.event,
+            SessionEvent::Interrupted { .. }
+                | SessionEvent::ContextRetention { .. }
+                | SessionEvent::Injected {
+                    origin: InjectionOrigin::Memory
+                        | InjectionOrigin::CompactionSummary
+                        | InjectionOrigin::PersonToMember { .. }
+                        | InjectionOrigin::TeamNote { .. },
+                    ..
+                }
+        );
+        session_wide || !undone.contains(&entry.event.turn())
+    })
 }
 
 /// What undos took back: every fact from a `Rewound`'s target up to the
@@ -1106,6 +1186,7 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<TracedMessage> {
         })
         .collect();
 
+    let retained_sources = retention::active_sources(events);
     let mut projection = Projection::new();
     if let Some((seq, summary)) = summary {
         let mut message = Message::system(summary);
@@ -1142,6 +1223,7 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<TracedMessage> {
             return false;
         }
         is_memory
+            || retained_sources.contains_key(&e.seq)
             || !folded
                 .iter()
                 .any(|(from, through)| e.seq > *from && e.seq <= *through)
@@ -1205,7 +1287,8 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<TracedMessage> {
                 projection.push(Message::user_interruption(), Provenance::Derived(seq));
             }
             SessionEvent::UserMessage { text, images, .. } => {
-                let text = text_of(text);
+                let pinned = retained_sources.contains_key(&seq);
+                let text = if pinned { text.clone() } else { text_of(text) };
                 let mut message = if images.is_empty() {
                     Message::user(text)
                 } else {
@@ -1213,7 +1296,19 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<TracedMessage> {
                 };
                 // Only surviving compactions count. The original human event is
                 // immutable; provenance is derived on both live and resumed paths.
-                if folded.iter().any(|(from, _)| *from > 0 && seq <= *from) {
+                if pinned {
+                    message.internal_origin = Some(
+                        if with_meta {
+                            retention::ORIGINAL_ORIGIN
+                        } else {
+                            retention::PINNED_ORIGIN
+                        }
+                        .into(),
+                    );
+                    if !with_meta {
+                        message.text.insert_str(0, retention::FRAMING);
+                    }
+                } else if folded.iter().any(|(from, _)| *from > 0 && seq <= *from) {
                     message.internal_origin =
                         Some(crate::message::COMPACTION_RETAINED_ORIGIN.into());
                     if !with_meta {
@@ -1368,6 +1463,25 @@ pub const ANSWER_ALWAYS: &str = "allow_always";
 /// call is eligible (see [`crate::tool::Tool::allow_all_group`]).
 pub const ANSWER_ALWAYS_ALL: &str = "allow_always_all";
 pub const ANSWER_DENY: &str = "deny";
+
+/// A committed conversation summary boundary, excluding tool-output cleanup
+/// and empty/no-op boundaries. This is a presentation fact, not a trigger count.
+pub fn is_context_summary(event: &SessionEvent) -> bool {
+    matches!(event, SessionEvent::Compacted { through, from, summary, .. }
+        if through > from && !summary.trim().is_empty())
+}
+
+/// Recorded summary checkpoints in this log, including inherited checkpoints.
+/// Replayed records with the same sequence never count twice. Rewinds preserve
+/// the historical fact that a summary happened; they do not erase this history.
+pub fn context_summary_count(events: &[LoggedEvent]) -> u64 {
+    events
+        .iter()
+        .filter(|e| is_context_summary(&e.event))
+        .map(|e| e.seq)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len() as u64
+}
 
 /// The [`SessionEvent::Answered::by`] of an approval nobody was asked: the
 /// session's execution mode (auto) allowed it on the person's standing say-so.

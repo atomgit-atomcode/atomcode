@@ -265,6 +265,10 @@ mod tests {
             | C::Snapshot { .. }
             | C::ContextStats { .. }
             | C::Mode { .. }
+            | C::ModelSelection { .. }
+            | C::CurrentTurnModel { .. }
+            | C::Configuration { .. }
+            | C::UpdateModeBindings { .. }
             | C::WaitMcpReady { .. }
             | C::McpStatus { .. }
             | C::McpTools { .. }
@@ -282,6 +286,7 @@ mod tests {
             | C::Usage { .. }
             | C::WorkspaceChanges { .. }
             | C::PendingQuestions { .. }
+            | C::TaskSpecs { .. } | C::FollowUp { .. } | C::ImportPatch { .. }
             | C::QuestionReplyFinished { .. } => Heard::Nothing,
         }
     }

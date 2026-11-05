@@ -761,6 +761,9 @@ impl Surface for Headless {
     /// that matters is derived from the pair rather than from either one.
     fn set_mouse(&self, on: bool) {
         use std::sync::atomic::Ordering;
+        // Settings updates and explicit toggles share the same effective gate:
+        // a confirmed tmux mouse=off must not be bypassed by a later refresh.
+        let on = on && crate::caps::mouse_reported();
         if self.grab.swap(on, Ordering::SeqCst) == on {
             return;
         }
@@ -2507,6 +2510,9 @@ impl Surface for Terminal {
     }
     fn set_mouse(&self, on: bool) {
         use std::sync::atomic::Ordering;
+        // Apply the same capability/tmux gate as startup and explicit Ctrl+G,
+        // including settings refreshes that call the surface directly.
+        let on = on && crate::caps::mouse_reported();
         if self.grab.swap(on, Ordering::SeqCst) == on {
             return;
         }
@@ -2854,15 +2860,11 @@ pub const BURST_PENDING: std::time::Duration = std::time::Duration::from_millis(
 /// And how long to wait once a second one has arrived — i.e. once this really
 /// is a burst.
 ///
-/// Wider than [`BURST_PENDING`] on Windows because a paste there arrives as
-/// several stdin records and the terminal takes a few milliseconds to translate
-/// each: the gap to bridge is between records, not between characters. Nothing
-/// is at stake in widening it, because by now there is no other explanation for
-/// what is arriving.
-#[cfg(target_os = "windows")]
-pub const BURST_ACTIVE: std::time::Duration = std::time::Duration::from_millis(15);
-#[cfg(not(target_os = "windows"))]
-pub const BURST_ACTIVE: std::time::Duration = std::time::Duration::from_millis(4);
+/// Once two keys arrive within BURST_PENDING, bridge short terminal record
+/// gaps. Keep this below the 60ms cadence used by the human-typing regression;
+/// lone keys still pay only BURST_PENDING. Without this, a newline in the next
+/// terminal record becomes a submit rather than part of the paste.
+pub const BURST_ACTIVE: std::time::Duration = std::time::Duration::from_millis(40);
 
 /// The most characters gathered into one synthesised paste.
 pub const BURST_CAP: usize = 8192;
@@ -3212,6 +3214,50 @@ mod tests {
         assert_eq!(slots.len(), 16);
     }
     use super::*;
+
+    #[test]
+    fn real_terminal_settings_cannot_bypass_a_disabled_mouse_gate() {
+        // A child provides a cold capability cache without changing parallel tests' env.
+        const CHILD: &str = "ATOMCODE_TEST_MOUSE_GATE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "surface::tests::real_terminal_settings_cannot_bypass_a_disabled_mouse_gate",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("ATOMCODE_MOUSE", "0")
+                .env_remove("TMUX")
+                .env_remove("TMUX_PANE")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let terminal = Terminal {
+            raw: false,
+            state: std::sync::atomic::AtomicU8::new(pointer_state(ansi::Pointer::Terminal)),
+            grab: std::sync::atomic::AtomicBool::new(false),
+            hover: std::sync::atomic::AtomicBool::new(false),
+            caps: crate::caps::Caps::default(),
+            painted: LastPainted::default(),
+            startup: Mutex::new(None),
+            link_hover: Mutex::new(link_pointer::LinkHover::default()),
+            #[cfg(target_os = "linux")]
+            clipboard: Mutex::new(None),
+            // Exercise the actual terminal setter without writing to a real tty.
+            away: std::sync::atomic::AtomicBool::new(true),
+            stderr: None,
+            margin: 0,
+        };
+        terminal.set_mouse(true);
+        assert!(
+            !terminal.mouse(),
+            "settings bypassed the effective mouse gate"
+        );
+        assert_eq!(terminal.pointer_mode(), ansi::Pointer::Terminal);
+    }
 
     /// A console's own mode is the answer where there is a console: crossterm
     /// says yes whenever `TERM` is set even if turning the mode on failed, and

@@ -91,9 +91,10 @@ pub fn search_line(query: &str, caret: Option<usize>, w: usize, caps: crate::cap
             theme::fg(Role::Warning),
         )
     };
+    let room = w.saturating_sub(width::str_width(&lead));
     let mut spans = vec![Span::styled(lead, theme::fg(Role::Border))];
     match caret {
-        Some(at) => spans.extend(caret_spans(query, at, base, w.saturating_sub(2))),
+        Some(at) => spans.extend(caret_spans(query, at, base, room, caps)),
         None => spans.push(Span::styled(query.to_string(), base)),
     }
     Line::from_spans(spans).truncate(w)
@@ -112,10 +113,14 @@ pub fn edit_line(
     caps: crate::caps::Caps,
 ) -> Line {
     let base = theme::fg(Role::Warning);
+    if w <= LEAD + 2 {
+        return Line::from_spans(caret_spans(value, caret, base, w, caps));
+    }
     let label_room = w
         .saturating_sub(LEAD)
         .saturating_sub(2)
-        .clamp(LABEL_MIN, LABEL_MAX);
+        .clamp(LABEL_MIN, LABEL_MAX)
+        .min(w.saturating_sub(LEAD + 2 + 8));
     let label = width::take_width(label, label_room);
     let pad = label_room.saturating_sub(width::str_width(&label));
     let mut spans = vec![
@@ -127,46 +132,67 @@ pub fn edit_line(
     // that — a value longer than the room scrolls off the end rather than
     // wrapping, which is what every field on a terminal does.
     let room = w.saturating_sub(LEAD + label_room + 2);
-    spans.extend(caret_spans(value, caret, base, room));
+    spans.extend(caret_spans(value, caret, base, room, caps));
     Line::from_spans(spans).truncate(w)
 }
 
 /// `text` split around `at`, with a block where the next character goes.
 ///
-/// The caret is drawn *over* the character at `at` rather than before it, which
+/// The caret is drawn *over* the grapheme at `at` rather than before it, which
 /// is what a terminal caret does and what makes the end of a line work: there is
 /// no character to sit on, so a block is appended instead and both cases read
 /// the same.
 #[allow(
     clippy::string_slice,
-    reason = "`at` is snapped to `is_char_boundary` just above"
+    reason = "the caret and its following slice are snapped to grapheme boundaries"
 )]
-pub fn caret_spans(text: &str, at: usize, base: Style, room: usize) -> Vec<Span> {
+pub fn caret_spans(
+    text: &str,
+    at: usize,
+    base: Style,
+    room: usize,
+    caps: crate::caps::Caps,
+) -> Vec<Span> {
+    use unicode_segmentation::UnicodeSegmentation;
+
+    if room == 0 {
+        return Vec::new();
+    }
     let at = at.min(text.len());
-    // Snap to a character boundary: a byte offset from the middle of a
-    // multi-byte character would panic on the slice, and every path that moves
-    // the caret already keeps it on a boundary — this is the belt to that
-    // braces, on the one function that slices.
-    let at = (0..=at)
-        .rev()
-        .find(|i| text.is_char_boundary(*i))
-        .unwrap_or(0);
+    // A block covers the whole displayed grapheme, including combining marks
+    // and joined emoji, even when an editing key moved by a single character.
+    let at = if at == text.len() {
+        at
+    } else {
+        text.grapheme_indices(true)
+            .map(|(i, _)| i)
+            .take_while(|i| *i <= at)
+            .last()
+            .unwrap_or(0)
+    };
     let before = &text[..at];
     let rest = &text[at..];
-    let mut slots = rest.chars();
-    let on = slots.next();
-    let after: String = slots.collect();
-    let caret = Style::new().reverse();
-    let mut spans = vec![Span::styled(before.to_string(), base)];
-    match on {
-        Some(c) => spans.push(Span::styled(c.to_string(), caret)),
-        None => spans.push(Span::styled(" ", caret)),
-    }
-    spans.push(Span::styled(after, base));
-    // The caret's own cell comes out of the room, so a full-width line still
-    // has somewhere to put it.
-    let _ = room;
-    spans
+    let (on, after, caret) = if caps.colors == crate::caps::Colors::None {
+        // With SGR disabled a reversed space is invisible. A pipe marks the
+        // insertion point without hiding the character that follows it.
+        ("|", rest, Style::new())
+    } else {
+        let on = rest.graphemes(true).next().unwrap_or("");
+        let after = &rest[on.len()..];
+        let on = match width::str_width(on) {
+            0 => " ",
+            n if n > room => " ", // even a one-cell field keeps a visible caret
+            _ => on,
+        };
+        (on, after, Style::new().reverse())
+    };
+    let before = width::take_width_from_end(before, room.saturating_sub(width::str_width(on)));
+    let remaining = room.saturating_sub(width::str_width(&before) + width::str_width(on));
+    vec![
+        Span::styled(before, base),
+        Span::styled(on, caret),
+        Span::styled(width::take_width(after, remaining), base),
+    ]
 }
 
 /// A line padded out to `w` in `style`, so a highlight covers the whole row
@@ -246,4 +272,80 @@ pub fn tab_at(name: &str, labels: &[&str], col: usize) -> Option<usize> {
         .into_iter()
         .find(|(_, from, to)| (*from..*to).contains(&col))
         .map(|(page, _, _)| page)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::caps::Caps;
+
+    fn caret(line: &Line) -> &str {
+        let blocks: Vec<_> = line
+            .spans
+            .iter()
+            .filter(|span| span.style.reverse)
+            .collect();
+        assert_eq!(blocks.len(), 1, "one visible caret: {line:?}");
+        assert!(blocks[0].width() > 0);
+        &blocks[0].text
+    }
+
+    #[test]
+    fn input_carets_survive_empty_long_and_narrow_fields() {
+        for text in [
+            "",
+            "abcdefghijklmnopqrstuv",
+            "方案一使用自定义地址",
+            "e\u{301}👩‍💻终点",
+        ] {
+            for w in [1, 2, 3, 8, 20, 40, 80] {
+                let search = search_line(text, Some(text.len()), w, Caps::default());
+                assert!(search.width() <= w);
+                assert_eq!(caret(&search), " ");
+                let field = edit_line("Address", text, text.len(), w, Caps::default());
+                assert!(field.width() <= w);
+                assert_eq!(caret(&field), " ");
+            }
+        }
+        assert!(!search_line("query", None, 40, Caps::default())
+            .spans
+            .iter()
+            .any(|s| s.style.reverse));
+    }
+
+    #[test]
+    fn input_carets_scroll_to_the_character_being_edited() {
+        let text = "prefix-prefix-中e\u{301}👩‍💻suffix";
+        for (at, on) in [(14, "中"), (17, "e\u{301}"), (20, "👩‍💻"), (21, "👩‍💻")] {
+            let line = edit_line("Address", text, at, 20, Caps::default());
+            assert!(line.width() <= 20);
+            assert_eq!(caret(&line), on);
+        }
+    }
+
+    #[test]
+    fn input_carets_have_a_plain_terminal_fallback_and_keep_unicode_whole() {
+        let plain = Caps {
+            colors: crate::caps::Colors::None,
+            unicode: false,
+            ..Caps::default()
+        };
+        let text = "abc中e\u{301}👩‍💻xyz";
+        for caps in [Caps::default(), plain] {
+            for at in 0..=text.len() + 1 {
+                for room in 0..=20 {
+                    let line = Line::from_spans(caret_spans(text, at, Style::new(), room, caps));
+                    assert!(line.width() <= room);
+                    if room == 0 {
+                        assert!(line.plain().is_empty());
+                    } else if caps.colors == crate::caps::Colors::None {
+                        assert!(line.plain().contains('|'), "{line:?}");
+                        assert!(crate::ansi::transcript(&[line], room as u16, caps).contains('|'));
+                    } else {
+                        caret(&line);
+                    }
+                }
+            }
+        }
+    }
 }

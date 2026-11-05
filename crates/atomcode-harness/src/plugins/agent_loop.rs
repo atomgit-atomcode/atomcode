@@ -172,6 +172,7 @@ impl PluginAgentLoop {
         let request_started = std::time::Instant::now();
         let mut timing = crate::diagnostics::PhaseTiming::start("request_pipeline");
         let diagnostic_session = session.clone();
+        let loop_retried = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let result = agent_ctx
             .waterfall::<AgentRequest, _>(&mut req, move |req| {
                 tracing::debug!(
@@ -199,7 +200,13 @@ impl PluginAgentLoop {
                 }
                 let idle = self.stream_idle;
                 let first_content = self.stream_first_content;
+                let loop_retried = loop_retried.clone();
                 Box::pin(async move {
+                    let retained_bytes=atomcode_kernel::session::retention::validate_request(&session.events(), &messages)
+                        .map_err(RequestError::message)?;
+                    if retained_bytes > super::spec::allowance(provider.context_window()) {
+                        return Err(RequestError::message("Task specifications exceed the current model's context allowance. Use /spec to unpin messages or choose a larger context model."));
+                    }
                     stream_once(
                         &*provider,
                         &ctx,
@@ -211,6 +218,7 @@ impl PluginAgentLoop {
                         options,
                         idle,
                         first_content,
+                        &loop_retried,
                     )
                     .await
                 }) as BoxFuture<'_, Result<ModelResponse, RequestError>>
@@ -309,6 +317,75 @@ impl PluginAgentLoop {
     }
 }
 
+/// Recovery checkpoints are incremental, so a long reply is written at most
+/// twice (checkpoint plus completed message), never as quadratic full snapshots.
+struct ReplyCheckpointBuffer<'a> {
+    ctx: &'a Context,
+    session: &'a SessionLog,
+    turn: u64,
+    round: u32,
+    text: String,
+    reasoning: String,
+    deadline: tokio::time::Instant,
+}
+
+impl<'a> ReplyCheckpointBuffer<'a> {
+    fn new(ctx: &'a Context, session: &'a SessionLog, turn: u64, round: u32) -> Self {
+        crate::session::commit(
+            ctx,
+            session,
+            SessionEvent::ReplyCheckpoint {
+                turn,
+                round,
+                text: String::new(),
+                reasoning: String::new(),
+                reset: true,
+            },
+        );
+        Self {
+            ctx,
+            session,
+            turn,
+            round,
+            text: String::new(),
+            reasoning: String::new(),
+            deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        }
+    }
+
+    fn pending(&self) -> bool {
+        !self.text.is_empty() || !self.reasoning.is_empty()
+    }
+
+    fn observe(&mut self, event: &StreamEvent) {
+        match event {
+            StreamEvent::TextDelta(text) => self.text.push_str(text),
+            StreamEvent::Reasoning(text) => self.reasoning.push_str(text),
+            _ => return,
+        }
+        if self.text.len() + self.reasoning.len() >= 16 * 1024 {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.pending() {
+            crate::session::commit(
+                self.ctx,
+                self.session,
+                SessionEvent::ReplyCheckpoint {
+                    turn: self.turn,
+                    round: self.round,
+                    text: std::mem::take(&mut self.text),
+                    reasoning: std::mem::take(&mut self.reasoning),
+                    reset: false,
+                },
+            );
+        }
+        self.deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+    }
+}
+
 /// Drive one provider stream to completion, logging chunks as they arrive.
 ///
 /// Chunks are logged verbatim, not re-rendered from the finished message: a
@@ -330,7 +407,105 @@ async fn stream_once(
     options: ChatOptions,
     idle: Option<std::time::Duration>,
     first_content: Option<std::time::Duration>,
+    loop_retried: &std::sync::atomic::AtomicBool,
 ) -> Result<ModelResponse, RequestError> {
+    use atomcode_kernel::reasoning_loop::{REASONING_LOOP_CODE, RETRY_NOTICE, STOP_NOTICE};
+    loop {
+        let result = stream_attempt(
+            provider,
+            ctx,
+            session,
+            turn,
+            round,
+            &messages,
+            &tools,
+            options.clone(),
+            idle,
+            first_content,
+        )
+        .await;
+        let discarded = match result {
+            Ok(response) => return Ok(response),
+            Err(StreamAttemptError::Request(error)) => return Err(error),
+            Err(StreamAttemptError::ReasoningLoop(partial)) => partial,
+        };
+        // Typed detector output, never a provider-supplied code or a generic
+        // partial failure. No text, tool or signed block can reach this arm.
+        crate::session::commit(
+            ctx,
+            session,
+            SessionEvent::ReasoningDiscarded { turn, round },
+        );
+        // A failed reasoning-loop attempt must never be revived after a crash.
+        crate::session::commit(
+            ctx,
+            session,
+            SessionEvent::ReplyCheckpoint {
+                turn,
+                round,
+                text: String::new(),
+                reasoning: String::new(),
+                reset: true,
+            },
+        );
+        if let Some(usage) = discarded.usage {
+            crate::session::commit(ctx, session, SessionEvent::Usage { turn, round, usage });
+        }
+        if options.request_recovery.as_ref().is_some_and(|b| {
+            let state = b.snapshot();
+            state.attempts >= state.max_attempts
+        }) {
+            return Err(RequestError {
+                code: Some(atomcode_kernel::provider::REQUEST_RECOVERY_EXHAUSTED_CODE.into()),
+                ..RequestError::message("检测到推理复读，已停止：自动恢复预算已用尽。")
+            });
+        }
+        let retry = !loop_retried.swap(true, std::sync::atomic::Ordering::SeqCst);
+        let detail = if retry { RETRY_NOTICE } else { STOP_NOTICE };
+        crate::session::commit(
+            ctx,
+            session,
+            SessionEvent::Notice {
+                turn,
+                notice: crate::session::NoticeKind::ProviderRetry,
+                detail: detail.into(),
+                retry: None,
+            },
+        );
+        if !retry {
+            return Err(RequestError {
+                code: Some(REASONING_LOOP_CODE.into()),
+                ..RequestError::message(STOP_NOTICE)
+            });
+        }
+        // The caller races this entire operation with cancellation. Each actual
+        // attempt still charges options.request_recovery inside stream_attempt.
+        tokio::task::yield_now().await;
+    }
+}
+
+enum StreamAttemptError {
+    Request(RequestError),
+    ReasoningLoop(ModelResponse),
+}
+impl From<RequestError> for StreamAttemptError {
+    fn from(error: RequestError) -> Self {
+        Self::Request(error)
+    }
+}
+
+async fn stream_attempt(
+    provider: &dyn LlmProvider,
+    ctx: &Context,
+    session: &SessionLog,
+    turn: u64,
+    round: u32,
+    messages: &[Message],
+    tools: &[ToolDef],
+    options: ChatOptions,
+    idle: Option<std::time::Duration>,
+    first_content: Option<std::time::Duration>,
+) -> Result<ModelResponse, StreamAttemptError> {
     if let Some(budget) = &options.request_recovery {
         let state = budget.try_attempt().map_err(|limit| RequestError {
             retryable: true,
@@ -348,16 +523,27 @@ async fn stream_once(
     }
     let mut options = options;
     options.rate_limit_retry_owner = atomcode_kernel::provider::RateLimitRetryOwner::Kernel;
+    let mut checkpoint = ReplyCheckpointBuffer::new(ctx, session, turn, round);
     let mut stream = provider
-        .chat_stream(&messages, &tools, &options)
+        .chat_stream(messages, tools, &options)
         .await
         .map_err(|e| RequestError::from_provider(&e))?;
     let mut out = ModelResponse::default();
     let mut reasoning_block_text = String::new();
     let mut saw_tool_stream = false;
+    let mut guard = atomcode_kernel::reasoning_loop::ReasoningLoopDetector::new(
+        options.reasoning_loop_guard.clone().unwrap_or_default(),
+    );
     let mut watchdog = atomcode_capabilities::provider::StreamWatchdog::new(first_content, idle);
     loop {
-        let next = match watchdog.next(&mut stream).await {
+        let next = tokio::select! {
+            result = watchdog.next(&mut stream) => result,
+            _ = tokio::time::sleep_until(checkpoint.deadline), if checkpoint.pending() => {
+                checkpoint.flush();
+                continue;
+            }
+        };
+        let next = match next {
             Ok(next) => next,
             // Silence is not an answer. Retryable, and carrying what already
             // streamed, so recovery can keep it.
@@ -384,11 +570,16 @@ async fn stream_once(
                         budget_ms
                     ))
                 }
-                .with_partial(out));
+                .with_partial(out)
+                .into());
             }
         };
         let Some(event) = next else { break };
         watchdog.observe(&event);
+        if guard.observe(&event) {
+            return Err(StreamAttemptError::ReasoningLoop(out));
+        }
+        checkpoint.observe(&event);
         match event {
             StreamEvent::TextDelta(text) => {
                 // Through the one write path like every other fact. A chunk
@@ -472,7 +663,7 @@ async fn stream_once(
                 if saw_tool_stream {
                     error.retryable = false;
                 }
-                return Err(error);
+                return Err(error.into());
             }
             StreamEvent::Done { truncated } => out.truncated = truncated,
             _ => {}
@@ -488,7 +679,7 @@ async fn stream_once(
     // Reported as a typed failure so a retry policy can decide, rather than
     // silently producing an empty assistant message.
     if out.text.trim().is_empty() && out.tool_calls.is_empty() {
-        return Err(RequestError::empty());
+        return Err(RequestError::empty().into());
     }
     Ok(out)
 }
@@ -1045,6 +1236,11 @@ fn partial_reply(events: &[LoggedEvent], turn: u64) -> Option<SessionEvent> {
         .collect();
     let (mut round, mut text, mut reasoning) = (0, String::new(), String::new());
     for logged in events {
+        if let SessionEvent::ReasoningDiscarded { turn: t, round: r } = &logged.event {
+            if *t == turn && *r == round && !finished.contains(r) {
+                reasoning.clear();
+            }
+        }
         if let SessionEvent::AssistantChunk {
             turn: t,
             round: r,
@@ -1305,9 +1501,50 @@ mod content_deadline_tests {
             ChatOptions::default(),
             Some(Duration::from_secs(120)),
             Some(Duration::from_secs(600)),
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await
     }
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn streamed_progress_is_checkpointed_during_silence_before_a_turn_finishes() {
+        let app = atomcode_plexus::App::new(
+            atomcode_plexus::PluginRegistry::new(),
+            atomcode_plexus::ConfigTree::from_layers(Vec::new()).unwrap(),
+        );
+        let ctx = app.context();
+        let log = SessionLog::new("crash-test");
+        let provider = TimedProvider(vec![
+            (0, StreamEvent::TextDelta("已检查文件".into())),
+            (60, StreamEvent::TextDelta("later".into())),
+        ]);
+        let retried = std::sync::atomic::AtomicBool::new(false);
+        let request = stream_once(
+            &provider,
+            &ctx,
+            &log,
+            1,
+            1,
+            vec![],
+            vec![],
+            ChatOptions::default(),
+            Some(Duration::from_secs(120)),
+            None,
+            &retried,
+        );
+        tokio::pin!(request);
+        tokio::select! {
+            result = &mut request => panic!("request ended prematurely: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+        }
+        assert!(log.events().iter().any(|event| matches!(&event.event,
+            SessionEvent::ReplyCheckpoint { text, reset: false, .. } if text == "已检查文件")));
+        assert!(
+            log.derive_messages().is_empty(),
+            "preview data never enters a live request"
+        );
+        // Dropping the request models a runtime disappearing without TurnEnd.
+    }
+
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn first_content_after_two_minutes_is_not_abandoned() {
         let out = run(&TimedProvider(vec![(
@@ -1479,6 +1716,7 @@ mod content_deadline_tests {
             ChatOptions::default(),
             Some(Duration::from_secs(120)),
             Some(Duration::from_secs(600)),
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await
         .unwrap();
@@ -1494,8 +1732,10 @@ mod content_deadline_tests {
         assert!(out.text.is_empty() && out.reasoning.is_empty());
         assert_eq!(out.tool_calls.len(), 1);
         assert!(
-            log.events().is_empty(),
-            "observational arguments must never be persisted as assistant text"
+            log.events().iter().all(|event| matches!(&event.event,
+                SessionEvent::ReplyCheckpoint { text, reasoning, reset: true, .. }
+                    if text.is_empty() && reasoning.is_empty())),
+            "only an empty attempt boundary may be persisted, never tool argument fragments"
         );
     }
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -1530,6 +1770,7 @@ mod content_deadline_tests {
             ChatOptions::default(),
             Some(Duration::from_secs(120)),
             Some(Duration::from_secs(600)),
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await
         .unwrap();
@@ -1569,11 +1810,153 @@ mod content_deadline_tests {
             options,
             Some(Duration::from_secs(300)),
             Some(Duration::from_secs(600)),
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await
         .unwrap();
         assert_eq!(response.text, "abcd");
         assert_eq!(began.elapsed(), Duration::from_secs(780));
         assert_eq!(budget.snapshot().attempts, 2);
+    }
+    fn repeating_reasoning() -> Vec<StreamEvent> {
+        (0..100)
+            .map(|_| {
+                StreamEvent::Reasoning(
+                    "重新检查这个假设后，又回到完全相同的分析，没有新的事实与进展。".into(),
+                )
+            })
+            .collect()
+    }
+    async fn guarded(
+        provider: &dyn LlmProvider,
+        options: ChatOptions,
+        retried: &std::sync::atomic::AtomicBool,
+    ) -> (Result<ModelResponse, RequestError>, Arc<SessionLog>) {
+        let app = atomcode_plexus::App::new(
+            atomcode_plexus::PluginRegistry::new(),
+            atomcode_plexus::ConfigTree::from_layers(Vec::new()).unwrap(),
+        );
+        let log = Arc::new(SessionLog::new("loop-test"));
+        let result = stream_once(
+            provider,
+            &app.context(),
+            &log,
+            1,
+            1,
+            vec![],
+            vec![],
+            options,
+            None,
+            None,
+            retried,
+        )
+        .await;
+        (result, log)
+    }
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn exact_loop_is_discarded_and_resampled_once() {
+        let provider = atomcode_kernel::testkit::RecordingProvider::new(vec![
+            repeating_reasoning(),
+            vec![
+                StreamEvent::TextDelta("success".into()),
+                StreamEvent::Done { truncated: false },
+            ],
+        ]);
+        let calls = provider.calls();
+        let (result, log) = guarded(
+            &provider,
+            Default::default(),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .await;
+        let response = result.unwrap();
+        assert_eq!(response.text, "success");
+        assert!(response.reasoning.is_empty());
+        assert_eq!(calls.lock().unwrap().len(), 2);
+        assert_eq!(
+            log.events()
+                .iter()
+                .filter(|e| matches!(e.event, SessionEvent::ReasoningDiscarded { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            log.derive_messages().is_empty(),
+            "a failed response is never model-visible"
+        );
+    }
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn loop_exhaustion_is_not_generic_partial_recovery() {
+        let provider = atomcode_kernel::testkit::RecordingProvider::new(vec![
+            repeating_reasoning(),
+            repeating_reasoning(),
+        ]);
+        let calls = provider.calls();
+        let (result, log) = guarded(
+            &provider,
+            Default::default(),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .await;
+        let error = result.unwrap_err();
+        assert!(!error.retryable && error.partial.is_none() && !error.empty_response);
+        assert_eq!(
+            error.code.as_deref(),
+            Some(atomcode_kernel::reasoning_loop::REASONING_LOOP_CODE)
+        );
+        assert_eq!(calls.lock().unwrap().len(), 2);
+        assert_eq!(
+            log.events()
+                .iter()
+                .filter(|e| matches!(e.event, SessionEvent::ReasoningDiscarded { .. }))
+                .count(),
+            2
+        );
+    }
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn resampling_obeys_the_shared_provider_attempt_limit() {
+        let provider =
+            atomcode_kernel::testkit::RecordingProvider::new(vec![repeating_reasoning()]);
+        let budget =
+            atomcode_kernel::provider::RequestRecoveryBudget::new(1, Duration::from_secs(10));
+        let (result, _) = guarded(
+            &provider,
+            ChatOptions {
+                request_recovery: Some(budget.clone()),
+                ..Default::default()
+            },
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .await;
+        assert_eq!(
+            result.unwrap_err().code.as_deref(),
+            Some(atomcode_kernel::provider::REQUEST_RECOVERY_EXHAUSTED_CODE)
+        );
+        assert_eq!(budget.snapshot().attempts, 1);
+        assert_eq!(provider.calls().lock().unwrap().len(), 1);
+    }
+    #[test]
+    fn cancellation_never_revives_discarded_reasoning_as_a_partial_reply() {
+        let log = SessionLog::new("discard-cancel");
+        log.append(SessionEvent::AssistantChunk {
+            turn: 1,
+            round: 1,
+            delta: "bad loop".into(),
+            reasoning: true,
+        });
+        log.append(SessionEvent::ReasoningDiscarded { turn: 1, round: 1 });
+        assert!(partial_reply(&log.events(), 1).is_none());
+        log.append(SessionEvent::AssistantChunk {
+            turn: 1,
+            round: 1,
+            delta: "fresh unfinished reasoning".into(),
+            reasoning: true,
+        });
+        match partial_reply(&log.events(), 1).unwrap() {
+            SessionEvent::PartialReply { reasoning, .. } => {
+                assert_eq!(reasoning, "fresh unfinished reasoning")
+            }
+            _ => panic!("expected partial reply"),
+        }
     }
 }

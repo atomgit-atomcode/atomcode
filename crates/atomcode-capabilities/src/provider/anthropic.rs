@@ -2157,6 +2157,7 @@ mod tests {
             tool_choice: ToolChoice::Required,
             rate_limit_retry_owner: Default::default(),
             request_recovery: None,
+            reasoning_loop_guard: None,
         };
         let tools = vec![ToolDef {
             name: "read".into(),

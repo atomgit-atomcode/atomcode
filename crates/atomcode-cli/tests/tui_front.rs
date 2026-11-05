@@ -118,6 +118,7 @@ fn start(
         CodingRuntimeStart {
             agent: agent.clone(),
             prepare: PrepareOptions {
+                prompt_overrides: Default::default(),
                 request_user_input: true,
                 session,
                 tools: true,

@@ -21,6 +21,8 @@
 //! as a broken hook and does NOT block — see [`deliberate_block_reason`]. Any other
 //! non-zero exit is a non-blocking error and the turn proceeds.
 
+pub mod inspection;
+
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -178,7 +180,8 @@ struct HookEntry {
 
 /// What reading one hooks file came to — the answer `atomcode hooks list/paths` shows
 /// beside the path, so "the file is there" is never mistaken for "its hooks run".
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
 pub enum HooksFileStatus {
     /// No file: no hooks from it, and nothing wrong.
     Missing,

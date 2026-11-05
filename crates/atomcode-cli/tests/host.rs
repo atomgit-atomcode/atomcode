@@ -285,6 +285,17 @@ async fn started(
     skill_dirs: Vec<std::path::PathBuf>,
     mcp: bool,
 ) -> (HostConnection, Arc<FrontEnd>) {
+    started_with_vision(env, subagents, config, skill_dirs, mcp, None).await
+}
+
+async fn started_with_vision(
+    env: &Env,
+    subagents: SubagentPolicy,
+    config: Option<Arc<dyn HostConfig>>,
+    skill_dirs: Vec<std::path::PathBuf>,
+    mcp: bool,
+    image_preprocessor: Option<Arc<dyn atomcode_coding::runtime::ImagePreprocessor>>,
+) -> (HostConnection, Arc<FrontEnd>) {
     // The configuration source goes to `connect`, not onto the front end: the
     // front end no longer carries it (2026-09-18, the adapter moved here).
     let host_config = config;
@@ -300,6 +311,7 @@ async fn started(
     let start = CodingRuntimeStart {
         agent: agent.clone(),
         prepare: PrepareOptions {
+            prompt_overrides: Default::default(),
             request_user_input: true,
             session: SessionMode::Fresh,
             tools: true,
@@ -322,7 +334,7 @@ async fn started(
         },
         provider_factory: Arc::new(Factory(env.script.clone())),
         plugin_hooks: Arc::new(StaticPluginHookSource::default()),
-        image_preprocessor: None,
+        image_preprocessor,
     };
     let runtime = CodingRuntime::start(start)
         .await
@@ -474,6 +486,7 @@ async fn a_front_end_talks_to_a_member_stops_it_and_reads_it_after() {
             session: scout.clone(),
             name: "stop".into(),
             args: String::new(),
+            images: Vec::new(),
         })
         .unwrap();
     until(&mut connection, |e| {
@@ -555,6 +568,7 @@ async fn a_finished_turn_offers_what_might_be_said_next() {
     let start = CodingRuntimeStart {
         agent: agent.clone(),
         prepare: PrepareOptions {
+            prompt_overrides: Default::default(),
             request_user_input: true,
             session: SessionMode::Fresh,
             tools: true,
@@ -1854,6 +1868,7 @@ async fn the_runtimes_own_capabilities_are_commands_in_the_catalog() {
             session: session.clone(),
             name: "queue".into(),
             args: "先看 README".into(),
+            images: Vec::new(),
         })
         .unwrap();
     let seen = until(
@@ -1886,6 +1901,7 @@ async fn the_runtimes_own_capabilities_are_commands_in_the_catalog() {
             session: session.clone(),
             name: "policy".into(),
             args: "skip".into(),
+            images: Vec::new(),
         })
         .unwrap();
     let seen = until(
@@ -3436,6 +3452,7 @@ async fn started_without_a_provider_on(
     let start = CodingRuntimeStart {
         agent: agent.clone(),
         prepare: PrepareOptions {
+            prompt_overrides: Default::default(),
             request_user_input: true,
             session: SessionMode::Fresh,
             tools: true,
@@ -3753,4 +3770,113 @@ async fn signing_in_adopts_the_saved_default_even_when_the_fingerprint_is_unchan
         if description.model.as_deref() == Some("lumen-alpha"))),
         "the screen learns the new model: {seen:#?}"
     );
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn an_image_skill_invocation_is_one_receipted_user_message() {
+    let env = env();
+    let skills = env.project.path().join("picture-skills");
+    std::fs::create_dir_all(skills.join("picture-probe")).unwrap();
+    std::fs::write(
+        skills.join("picture-probe/SKILL.md"),
+        "---\nname: picture-probe\ndescription: inspect pictures\n---\nPICTURE_SKILL_CONTEXT",
+    )
+    .unwrap();
+    let (mut connection, _) =
+        connected_full(&env, SubagentPolicy::Disabled, None, vec![skills]).await;
+    let session = connection.session.clone();
+    connection.commands.send(subscribe(&session)).unwrap();
+    connection
+        .commands
+        .send(AgentCommand::Invoke {
+            id: "picture-command".into(),
+            session: session.clone(),
+            name: "skills".into(),
+            args: "picture-probe inspect [Image #1]".into(),
+            images: vec![atomcode_kernel::message::ImageContent {
+                media_type: "image/png".into(),
+                data: "cGljdHVyZQ==".into(),
+            }],
+        })
+        .unwrap();
+    let seen = [
+        through_turn(&mut connection).await,
+        quiet(&mut connection).await,
+    ]
+    .concat();
+    let users: Vec<_> = seen
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::Fact(fact) => match &fact.event {
+                SessionEvent::UserMessage { images, text, .. } => Some((images, text)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(users.len(), 1, "{seen:#?}");
+    assert_eq!(users[0].0.len(), 1);
+    assert!(users[0].1.contains("picture-probe"));
+    assert_eq!(seen.iter().filter(|e| matches!(e, AgentEvent::Invoked { id, failed: Some(false), queued: true, .. } if id == "picture-command")).count(), 1, "{seen:#?}");
+    assert_eq!(seen.iter().filter(|e| matches!(e, AgentEvent::Accepted { command, .. } if command == "picture-command")).count(), 1, "{seen:#?}");
+    connection.commands.send(AgentCommand::Shutdown).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn cancelling_an_image_skill_does_not_wait_for_the_vision_helper() {
+    struct WaitingVision(Arc<tokio::sync::Notify>);
+    #[async_trait::async_trait]
+    impl atomcode_coding::runtime::ImagePreprocessor for WaitingVision {
+        async fn preprocess(
+            &self,
+            _text: String,
+            _images: Vec<atomcode_kernel::message::ImageContent>,
+            _vision: bool,
+            _session: Option<String>,
+        ) -> (
+            atomcode_coding::UserInput,
+            Option<atomcode_coding::runtime::VisionNotice>,
+        ) {
+            self.0.notify_one();
+            std::future::pending().await
+        }
+    }
+    let env = env();
+    let skills = env.project.path().join("cancel-picture-skills");
+    std::fs::create_dir_all(skills.join("picture-probe")).unwrap();
+    std::fs::write(
+        skills.join("picture-probe/SKILL.md"),
+        "---\nname: picture-probe\ndescription: inspect pictures\n---\nCANCEL_SKILL_CONTEXT",
+    )
+    .unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let (mut connection, _) = started_with_vision(
+        &env,
+        SubagentPolicy::Disabled,
+        None,
+        vec![skills],
+        false,
+        Some(Arc::new(WaitingVision(entered.clone()))),
+    )
+    .await;
+    let session = connection.session.clone();
+    connection
+        .commands
+        .send(AgentCommand::Invoke {
+            id: "cancel-picture".into(),
+            session,
+            name: "skills".into(),
+            args: "picture-probe inspect".into(),
+            images: vec![atomcode_kernel::message::ImageContent {
+                media_type: "image/png".into(),
+                data: "not-sent".into(),
+            }],
+        })
+        .unwrap();
+    entered.notified().await;
+    connection.commands.send(AgentCommand::Cancel).unwrap();
+    let seen = until(&mut connection, |event| matches!(event, AgentEvent::Invoked { id, failed: Some(true), queued: false, .. } if id == "cancel-picture")).await;
+    assert!(!seen.iter().any(|event| matches!(event, AgentEvent::Fact(fact) if matches!(fact.event, SessionEvent::UserMessage { .. }))));
+    assert!(env.script.requests.lock().unwrap().is_empty());
+    connection.commands.send(AgentCommand::Shutdown).unwrap();
 }

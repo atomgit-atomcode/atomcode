@@ -102,6 +102,24 @@ pub fn chord_name(press: KeyPress) -> String {
     parts.join("+")
 }
 
+/// Question editing is scoped to an option row. Preserve the panel's navigation,
+/// submission and cancellation keys, including the chords handled before it.
+pub fn parse_question_edit_key(text: &str) -> Result<KeyPress, String> {
+    let key = parse_chord(text)?;
+    if !matches!(key.key, Key::Char(_) | Key::F(_))
+        || matches!(
+            key,
+            KeyPress {
+                key: Key::Char('c' | 'j' | 'k' | 'z'),
+                mods: Mods::CTRL
+            }
+        )
+    {
+        return Err(format!("{} is reserved in questions", chord_name(key)));
+    }
+    Ok(key)
+}
+
 pub fn parse_newline_bindings(text: &str) -> Result<Option<Vec<KeyPress>>, String> {
     if text.trim() == "default" {
         return Ok(None);
@@ -329,6 +347,16 @@ pub enum Action {
     /// changes which model is answering is a key nobody can afford to press by
     /// accident. Reversible for the same reason: `Shift+F2` steps back.
     CycleModel {
+        forward: bool,
+    },
+    /// Step the reasoning effort to the next declared level, or the previous.
+    ///
+    /// The one-key form of `/effort <level>`, and it runs exactly that — the
+    /// closed set is whatever the selected model declares, `default` last, the
+    /// same list `/effort` and the panel offer. A model that declares no levels
+    /// has nothing to cycle, and `/effort` says so instead of the key
+    /// pretending. Reversible: `Shift+F3` steps back.
+    CycleEffort {
         forward: bool,
     },
     /// Open a reverse search over the input history (`Ctrl+R`).
@@ -645,6 +673,17 @@ impl Keymap for Default_ {
                 KeyPress::new(Key::F(2), Mods::SHIFT),
                 Action::CycleModel { forward: false },
             ),
+            // Same idea one key over: `F3` steps the reasoning effort the way
+            // `F2` steps models, through the closed list `/effort` offers.
+            // Nothing else claims F3.
+            (
+                KeyPress::plain(Key::F(3)),
+                Action::CycleEffort { forward: true },
+            ),
+            (
+                KeyPress::new(Key::F(3), Mods::SHIFT),
+                Action::CycleEffort { forward: false },
+            ),
             (KeyPress::plain(Key::Left), Action::CaretLeft),
             (KeyPress::plain(Key::Right), Action::CaretRight),
             (KeyPress::plain(Key::Home), Action::CaretHome),
@@ -778,6 +817,12 @@ mod tests {
                 assert_eq!(
                     keys.resolve(KeyPress::plain(Key::F(2))),
                     Some(Action::CycleModel { forward: true })
+                );
+            } else if n == 3 {
+                assert!(result.is_err(), "F3 steps the reasoning effort");
+                assert_eq!(
+                    keys.resolve(KeyPress::plain(Key::F(3))),
+                    Some(Action::CycleEffort { forward: true })
                 );
             } else {
                 result.unwrap();
@@ -961,6 +1006,20 @@ mod tests {
         assert_eq!(
             keys.resolve(KeyPress::new(Key::F(2), Mods::SHIFT)),
             Some(Action::CycleModel { forward: false })
+        );
+    }
+
+    #[test]
+    fn f3_steps_effort_and_shift_f3_steps_back() {
+        let keys = Keys::new();
+        keys.add(&Default_).unwrap();
+        assert_eq!(
+            keys.resolve(KeyPress::plain(Key::F(3))),
+            Some(Action::CycleEffort { forward: true })
+        );
+        assert_eq!(
+            keys.resolve(KeyPress::new(Key::F(3), Mods::SHIFT)),
+            Some(Action::CycleEffort { forward: false })
         );
     }
 

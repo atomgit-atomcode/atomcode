@@ -53,6 +53,7 @@ mod background_jobs;
 pub mod config;
 mod controllers;
 pub mod discipline;
+mod follow_up;
 pub mod front_end;
 pub mod host;
 pub mod on_harness;
@@ -146,3 +147,5 @@ pub use atomcode_capabilities::cc_hooks;
 pub use atomcode_plexus as plexus;
 
 mod session_reference;
+
+mod mode_models;

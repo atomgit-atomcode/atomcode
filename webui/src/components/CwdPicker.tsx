@@ -178,7 +178,7 @@ export function CwdPicker({ current, onPick, onClose }: CwdPickerProps) {
                 onInput={(e) => setInputPath((e.target as HTMLInputElement).value)}
                 onKeyDown={(e) => {
                   // 忽略输入法组字阶段的回车（选词确认），避免误触发跳转。
-                  if (e.isComposing) return;
+                  if (e.isComposing || e.keyCode === 229) return;
                   if (e.key === 'Enter') handleJump();
                 }}
                 placeholder="~/..."
@@ -234,7 +234,7 @@ export function CwdPicker({ current, onPick, onClose }: CwdPickerProps) {
                   setMkdirError(null);
                 }}
                 onKeyDown={(e) => {
-                  if (e.isComposing) return;
+                  if (e.isComposing || e.keyCode === 229) return;
                   if (e.key === 'Enter') handleCreateFolder();
                 }}
               />

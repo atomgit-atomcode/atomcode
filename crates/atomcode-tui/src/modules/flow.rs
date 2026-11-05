@@ -38,7 +38,24 @@ impl View for FlowView {
             panel_edge(w, vp.moment.caps),
             Line::from_spans(chrome::header_parts(&shown.title, &[], usize::MAX).0).truncate(w),
         ];
-        out.extend(shown.lines.iter().map(|line| line.clone().truncate(w)));
+        let room = vp.rect.h.saturating_sub(3) as usize;
+        let body_len = shown.lines.len().saturating_sub(1);
+        let offset = shown.scroll.min(body_len.saturating_sub(room));
+        out.extend(
+            shown
+                .lines
+                .iter()
+                .take(body_len)
+                .skip(offset)
+                .take(room)
+                .map(|line| line.clone().truncate(w)),
+        );
+        if vp.rect.h > 2 {
+            if let Some(hint) = shown.lines.last() {
+                out.push(hint.clone().truncate(w));
+            }
+        }
+        out.truncate(vp.rect.h as usize);
         out
     }
 
@@ -57,12 +74,37 @@ mod tests {
     use super::*;
     use crate::frame::Rect;
 
+    #[test]
+    fn overflowing_flow_scrolls_its_body_and_keeps_the_hint_visible() {
+        let mut moment = Moment {
+            flow: Some(crate::overlay::Shown {
+                id: "app-pair".into(),
+                title: "Pair".into(),
+                scroll: 0,
+                lines: (0..40)
+                    .map(|n| Line::raw(format!("qr row {n}")))
+                    .chain([Line::raw("enter continue · esc cancel")])
+                    .collect(),
+            }),
+            ..Default::default()
+        };
+        let first = FlowView::render(&State, &Viewport::new(Rect::sized(80, 12), &moment));
+        assert_eq!(first.len(), 12);
+        assert_eq!(first.last().unwrap().plain(), "enter continue · esc cancel");
+        assert_eq!(first[2].plain(), "qr row 0");
+        moment.flow.as_mut().unwrap().scroll = 40;
+        let last = FlowView::render(&State, &Viewport::new(Rect::sized(80, 12), &moment));
+        assert_eq!(last[10].plain(), "qr row 39");
+        assert_eq!(last.last().unwrap().plain(), "enter continue · esc cancel");
+    }
+
     /// 表头是流程的名字,底下是它自己画的那些行,整块和它要的一样高。
     #[test]
     fn a_flow_is_a_rule_its_title_and_what_it_drew() {
         let moment = Moment {
             flow: Some(crate::overlay::Shown {
                 id: "onboarding".into(),
+                scroll: 0,
                 title: "首次设置".into(),
                 lines: vec![Line::raw("  选一个语言"), Line::raw("  enter 继续")],
             }),

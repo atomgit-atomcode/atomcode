@@ -402,6 +402,15 @@ fn run_oauth(
     })?;
     show_login_chrome(say, session.url());
 
+    // 把页面直接送到人面前，省掉一次复制粘贴：走本机自己的 opener —— 鸿蒙 PC 上
+    // 就是设备浏览器经 `aa`（见 capabilities::open_file）。best-effort：二维码和
+    // URL 反正留在屏幕上，错过了没有损失；但错过要说出来，不然寂静会被读成
+    // "已经打开了"。
+    if let Err(reason) = atomcode_capabilities::tools::open_file::open_local_url_sync(session.url())
+    {
+        say.say(&tr(SMsg::LoginAutoOpenFailed { reason: &reason }).into_owned());
+    }
+
     let ticks = session.spawn_poller(Duration::from_secs(2));
     loop {
         match ticks.recv() {

@@ -301,6 +301,13 @@ fn discovery_reason(error: &atomcode_capabilities::provider::discovery::Discover
         DiscoveryError::Unsupported => tr(SMsg::ProviderDiscoverUnsupported).into_owned(),
         DiscoveryError::BadUrl(why) => why.clone(),
         DiscoveryError::NotAListing => tr(SMsg::DiscoverNotAListing).into_owned(),
+        DiscoveryError::Request(DiscoveryRequestError::OllamaUnavailable { endpoint, local }) => {
+            tr(SMsg::OllamaUnavailable {
+                endpoint,
+                local: *local,
+            })
+            .into_owned()
+        }
         DiscoveryError::Request(DiscoveryRequestError::Timeout) => {
             tr(SMsg::DiscoverTimedOut).into_owned()
         }
@@ -318,6 +325,36 @@ fn discovery_reason(error: &atomcode_capabilities::provider::discovery::Discover
             tr(SMsg::DiscoverUnreachable).into_owned()
         }
     }
+}
+
+fn discovery_future(
+    base_url: String,
+    wire: String,
+    transport: atomcode_capabilities::provider::discovery::DiscoveryTransport,
+) -> atomcode_tui::providers::DiscoverFuture {
+    use atomcode_capabilities::provider::discovery::discover;
+    Box::pin(async move {
+        discover(&base_url, &wire, &transport)
+            .await
+            .map(|models| {
+                models
+                    .into_iter()
+                    .map(|model| atomcode_tui::providers::Discovered {
+                        id: model.id,
+                        window: model.context_window,
+                        name: model.name,
+                        max_tokens: model.max_tokens,
+                        vision: model.supports_vision,
+                        effort: model.reasoning_effort,
+                        levels: model.reasoning_effort_levels,
+                    })
+                    .collect()
+            })
+            .map_err(|error| {
+                let why = discovery_reason(&error);
+                tr(SMsg::ProviderDiscoverFailed { why: &why }).into_owned()
+            })
+    })
 }
 
 impl Providers for ConfigProviders {
@@ -431,9 +468,7 @@ impl Providers for ConfigProviders {
     /// listing the web UI's `/providers/discover-models` reads, by the same
     /// code (`atomcode_capabilities::provider::discovery`).
     fn discover(&self, account: &str) -> Option<atomcode_tui::providers::DiscoverFuture> {
-        use atomcode_capabilities::provider::discovery::{
-            discover, discovery_protocol, DiscoveryTransport,
-        };
+        use atomcode_capabilities::provider::discovery::{discovery_protocol, DiscoveryTransport};
         let config = self.load();
         // The service's own models; nothing to pick from here.
         if config.account_is_codingplan_managed(account) {
@@ -449,28 +484,15 @@ impl Providers for ConfigProviders {
             user_agent: endpoint.user_agent.clone(),
             skip_tls_verify: endpoint.skip_tls_verify,
         };
-        Some(Box::pin(async move {
-            discover(&base_url, &wire, &transport)
-                .await
-                .map(|models| {
-                    models
-                        .into_iter()
-                        .map(|model| atomcode_tui::providers::Discovered {
-                            id: model.id,
-                            window: model.context_window,
-                            name: model.name,
-                            max_tokens: model.max_tokens,
-                            vision: model.supports_vision,
-                            effort: model.reasoning_effort,
-                            levels: model.reasoning_effort_levels,
-                        })
-                        .collect()
-                })
-                .map_err(|error| {
-                    let why = discovery_reason(&error);
-                    tr(SMsg::ProviderDiscoverFailed { why: &why }).into_owned()
-                })
-        }))
+        Some(discovery_future(base_url, wire, transport))
+    }
+
+    fn discover_ollama(&self, endpoint: &str) -> Option<atomcode_tui::providers::DiscoverFuture> {
+        Some(discovery_future(
+            endpoint.to_string(),
+            "ollama".into(),
+            Default::default(),
+        ))
     }
 
     /// One request to the endpoint just saved (`atomcode_capabilities::provider::probe`),

@@ -80,6 +80,7 @@ async fn configured_chat_options_reach_the_provider() {
         temperature: Some(0.2),
         rate_limit_retry_owner: RateLimitRetryOwner::Provider,
         request_recovery: None,
+        reasoning_loop_guard: None,
     };
 
     let mut handle = agent_handle(provider, Some(configured.clone()));

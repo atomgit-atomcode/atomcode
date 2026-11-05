@@ -131,6 +131,7 @@ mod tests {
         use crate::moment::{Moment, ScrollPos, ScrollbarMode};
         let now = tokio::time::Instant::now();
         let mut m = Moment::default();
+        m.scrollbar_mode = ScrollbarMode::Auto;
         assert!(!visible(&m, now));
         m.scroll = ScrollPos(10);
         assert!(visible(&m, now));
@@ -150,6 +151,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn flash_expires_on_the_event_loop_clock() {
         let mut m = crate::moment::Moment::default();
+        m.scrollbar_mode = crate::moment::ScrollbarMode::Auto;
         touch(&mut m);
         assert!(visible(&m, tokio::time::Instant::now()));
         tokio::time::sleep(std::time::Duration::from_millis(801)).await;

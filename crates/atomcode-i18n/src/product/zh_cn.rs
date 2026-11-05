@@ -331,7 +331,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
   ── 模式与模型 ──
     Shift+Tab                        无补全菜单时切换到下一个执行模式（/config 里 ui.mode_switch_key=tab 可改用 Tab 切换、→/Enter 补全；鸿蒙默认即 tab）
     F2 / Shift+F2                    下一个 / 上一个模型（Mac：Fn+F2 / Fn+Shift+F2）
-    Ctrl+T                           切换 reasoning_effort
+    /effort                          切换推理强度（reasoning_effort，无快捷键）
 
   ── 翻看输出 ──
     Shift+Up / Shift+Down            向上 / 向下滚动一行
@@ -348,7 +348,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
     Esc                              清空输入 / 关闭弹层 / 取消当前操作
     Esc Esc                          空闲且输入为空时撤销上一轮
     Ctrl+C                           取消当前操作；空闲时再次按下退出
-    Ctrl+O                           切换工具实时输出
+    Ctrl+O / Alt+R                   折叠 / 展开推理过程
+    Ctrl+T                           折叠 / 展开工具实时输出
     Ctrl+V / Ctrl+Alt+V              粘贴文本或图片 **
 
   ── 斜杠菜单 / 弹层导航 ──
@@ -523,12 +524,16 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             ).into(),
 
         // ── 待办面板 ──
+        Msg::TodoSourceHint => "原始指导：/todo source".into(),
         Msg::TodoPanelTitle => "待办".into(),
         Msg::TodoPanelCompleted { n } => format!("{n} 已完成").into(),
         Msg::TodoPanelMore { n } => format!("+{n} 更多…").into(),
 
         // ── 审批面板 ──
         Msg::ApprovalAllowOnce => "允许一次".into(),
+        Msg::ContextSummaryCount { count } => format!("已摘要 {count} 次").into(),
+        Msg::ContextSummaryRecorded { count } => format!("上下文已摘要 · 第 {count} 次").into(),
+        Msg::ApprovalSaveProject => "批准并保存精确项目规则".into(),
         Msg::ApprovalAlwaysAllow { tool } => format!("本会话总是允许 {tool}").into(),
         Msg::ApprovalAlwaysAllowFolder => "本会话总是允许写入此目录".into(),
         Msg::ApprovalAlwaysAllowCommand => "本会话总是允许此命令".into(),

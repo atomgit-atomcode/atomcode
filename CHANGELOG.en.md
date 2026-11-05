@@ -24,6 +24,30 @@ For whoever edits this file; this block is never shown.
 - Compiled into the binary; rebuild to see a change.
 -->
 
+## v5.2.6 (2026-11-05)
+
+### Overview
+
+This release focuses on continuity for long-running tasks and a more consistent experience across clients. Sessions can recover saved partial output and execution records after an abnormal exit, selected original task requirements survive context compaction, and reasoning loops have bounded detection and recovery. WebUI adds a project workbench for files, terminals, and Git. TUI and WebUI also gain model information, comparisons, and persona inspection, alongside improvements to skills, mobile session switching, and Windows reliability.
+
+### Changes
+
+- **Interrupted-session recovery and team persistence**: Streaming replies periodically save recovery records. Reopening a session preserves saved partial output and identifies the interrupted turn. Tools without recorded results are marked as having an unknown outcome and are not rerun automatically. Improve team-member lease ownership, stopping, and log persistence to reduce missing records at turn completion. Sessions containing the new recovery records require this or a newer version.
+- **Preserve original requirements and task progress**: Retain selected original user requirements across context compaction so important constraints remain available. Task plans can reference their original user guidance. TUI and WebUI show recorded context-summary counts beside token usage to make context changes easier to follow.
+- **WebUI project workbench**: Add a project start page and session-scoped access to files, terminals, and Git. Support a fullscreen workspace, more room for file content, and clearer narrow-screen layouts, errors, and operation feedback.
+- **Reasoning-loop detection and recovery**: Detect clear repetition loops in reasoning streams, stop the current generation, and attempt one automatic recovery when replay is safe. Stop explicitly when retrying is unsafe or the recovery budget is exhausted. Discarded reasoning cannot reappear in partial replies.
+- **Explicit one-shot follow-up tasks**: Register the next task to run after the current turn succeeds, either in the same session or in an independent session, with controls to inspect and clear registrations. Independent tasks use unattended approval rules and do not inherit temporary grants from the original session. Shared settings also expose automation approval policies.
+- **Model information and local model setup**: Add offline model cards and comparisons to TUI and WebUI. Setup can detect Ollama and offer guidance when its local service is unavailable. Simplify model-card presentation while keeping list scrolling stable.
+- **Custom personas and provenance inspection**: Configure and override the assistant persona and system prompt. Use `/context persona` or WebUI to inspect the effective persona fragment and its source after model switches, session resumes, or configuration reloads.
+- **More complete skill invocation**: Improve when matching workflows are loaded for debugging and similar tasks. Preserve images attached to direct skill invocations, allow read-only access to resources belonging to loaded skills, improve catalog budgeting, and avoid dependency-tree scans and directory cycles.
+- **Import and apply patch files**: TUI and WebUI can import raw text patches for inspection and application through immutable patch artifacts, making existing diff files easier to use without repeatedly pasting large patches.
+- **Terminal scrolling and input**: Preserve the reading position when users scroll upward. Reduce selection and context-menu overhead during long streaming sessions, including dense mouse-move traffic, and hide the conversation scrollbar by default. Guard shortcuts during IME composition, allow suggested question answers to be edited, and fix caret visibility, SSH wheel/history interactions, window titles, and missing recent directories in `/cd`.
+- **Mobile pairing and session navigation**: Make pairing content scrollable while keeping action hints visible when terminal zoom clips the QR code. Mobile and WebUI share project and session navigation, with clearer ownership errors and switching feedback. Browsing history no longer rebinds the active session. Improve link opening on HarmonyOS PC.
+- **File search and language services**: Fix repository-external ignore rules leaking into file indexes and inconsistent ignore boundaries for relative or symlinked roots. Cancel obsolete scans and reuse WebUI search indexes to reduce repeated traversal. LSP initialization and settings file paths support template variables, with local outlines, bounded retries for empty results, and clearer search-scope feedback.
+- **Windows proxy handling and background execution**: Provide clearer diagnostics and bounded retries when reading system proxy settings fails. Improve loopback probing: only explicit connection refusal permits a direct route, while timeouts preserve the proxy. Background command polling collects output and exit status promptly, completion notifications are enabled by default, and several Windows path and test-compatibility issues are fixed.
+- **Permissions and tool-output protection**: Improve approval matching for compound Bash commands and saving exact project rules. Tool-output directories create their own Git ignore sentinel to reduce accidental tracking of full outputs. Tighten MCP server identity and prompt-label validation, and guide AtomGit API calls to consult documentation first.
+- **Companion IDE plugin improvements**: VS Code improves local command-history refresh and model-specific reasoning choices. JetBrains improves project-scoped session history, model and slash-command selection, default execution modes, and error feedback; reduces redundant redraws; and fixes macOS sidecar files affecting packaging and runtime behavior.
+
 ## v5.2.5 (2026-10-28)
 
 ### Overview

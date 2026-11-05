@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.2.5</span>
+    <span class="dhdr-ver">v5.2.6</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -94,7 +94,7 @@
           <tr><td><strong>text</strong></td><td>Free-form text answer, no options.</td></tr>
         </tbody>
       </table>
-      <p>For <code>single</code> and <code>multiple</code>, an <strong>“Other — type your own answer”</strong> row is offered as well, so you are never trapped inside the listed options. The agent can suppress it only when it marks the options as exhaustive.</p>
+      <p>For <code>single</code> and <code>multiple</code>, an <strong>“Other — type your own answer”</strong> row is offered as well, so you are never trapped inside the listed options. The model cannot disable this free-text answer channel.</p>
 
       <h2 id="answering-in-the-terminal">Answering in the terminal</h2>
       <table>
@@ -107,17 +107,27 @@
           <tr><td><kbd>Space</kbd></td><td>Toggle the current checkbox (multiple); type a space when editing the Other row</td></tr>
           <tr><td><kbd>Enter</kbd></td><td>single: submit the highlighted option · multiple: submit from the Submit row · text: submit the buffer</td></tr>
           <tr><td>type / <kbd>Backspace</kbd></td><td>Edit the Other row or the free-text answer</td></tr>
-          <tr><td><kbd>Esc</kbd></td><td>Decline the question — the agent proceeds with its own best judgment</td></tr>
-          <tr><td><kbd>Ctrl+C</kbd></td><td>Decline <em>and</em> cancel the running turn</td></tr>
+          <tr><td><kbd>Ctrl+E</kbd></td><td>Edit the highlighted option; inside an input, move to the end</td></tr>
+          <tr><td><kbd>Esc</kbd></td><td>Cancel the current option edit; otherwise decline the whole request</td></tr>
+          <tr><td><kbd>Ctrl+C</kbd></td><td>Decline the whole request, including while editing</td></tr>
         </tbody>
       </table>
       <p>A <code>single</code> question needs just one keystroke to answer (highlight, then <kbd>Enter</kbd>). A <code>multiple</code> question toggles rows with <kbd>Enter</kbd>/<kbd>Space</kbd> and only confirms when you activate the dedicated <strong>Submit</strong> row.</p>
+
+      <h2 id="editing-options">Edit a suggested answer</h2>
+      <p>Highlight an option and press <kbd>Ctrl+E</kbd> to edit its label inline, with the caret at the end. In single choice, <kbd>Enter</kbd> confirms the answer. In multiple choice, it saves and checks that option; use the Submit row to send the full answer. Several options can be edited independently, without also submitting their original labels or overwriting the Other draft. <kbd>Esc</kbd> discards the current edit.</p>
+      <p>Search for “Edit question option” in <code>/config</code> to change the shortcut, or configure:</p>
+      <pre><code>[ui.keybindings]
+question_edit = "alt+e"</code></pre>
+      <p>Editing applies only to ordinary questions; permission choices remain fixed. Batch pages preserve drafts, and unfinished edits must be saved or cancelled before submission.</p>
 
       <h2 id="several-questions-at-once">Several questions at once</h2>
       <p>When the agent has more than one thing to ask at the same decision point, it batches them — up to four — into a single panel instead of interrupting you repeatedly. Use <kbd>Tab</kbd> to move between questions, answer each, and submit them together in one round-trip. A lone question renders exactly as before.</p>
 
       <h2 id="in-the-web-ui">In the Web UI</h2>
       <p>The same questions surface as a <strong>UserInputCard</strong> in the <a href="./webui.html">Web UI</a>: radio buttons, checkboxes, or a text box, plus the same optional free-text row. A batch becomes a small stepper — step forward / back with the <kbd>→</kbd> / <kbd>←</kbd> buttons, then one <strong>Submit</strong> that posts every answer at once. <strong>Skip</strong> declines. Answers stream back over the live SSE channel, so a turn driven from the browser pauses and resumes just like the terminal.</p>
+
+      <p>Use “Edit option” beside a suggestion to modify its text. “Confirm answer” confirms a single choice; “Save and select” keeps an edited multiple-choice item for the final submission. Enter confirms and Esc cancels an edit. Going back to a batch page preserves its changes.</p>
 
       <h2 id="turning-it-off">Turning it off</h2>
       <p>The feature is enabled by default. To opt out, set the environment variable before launching:</p>

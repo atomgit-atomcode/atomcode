@@ -52,7 +52,7 @@ impl ListSessionsTool {
     /// against a temp dir without `$ATOMCODE_HOME`.
     pub fn list_dir(&self, sessions_dir: &Path, query: Option<&str>, limit: usize) -> String {
         // `list_visible` already validates each `.meta`, sorts by `updated_at`
-        // desc, and excludes scheduled-run sessions (matching /resume). We just
+        // desc, and excludes delegated work (matching /resume). We just
         // filter by the optional title substring and cap at `limit`.
         let needle = query.map(|q| q.to_lowercase());
         let rows: Vec<String> = SessionManager::with_root(sessions_dir)

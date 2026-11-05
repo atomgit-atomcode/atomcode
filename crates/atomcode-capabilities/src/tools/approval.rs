@@ -127,6 +127,11 @@ impl PermissionDecision {
     /// "deny", "remember":bool}`. Anything unrecognized / `Null` (a crashed or
     /// timed-out driver) is treated as `Deny` — FAIL CLOSED.
     pub fn from_value(v: &serde_json::Value) -> Self {
+        // Only the native approval seam that offered a bound proposal handles
+        // this action. Every other gate must refuse it, rather than approve once.
+        if v.get("save_project_rule").and_then(|v| v.as_bool()) == Some(true) {
+            return Self::Deny;
+        }
         let decision = v.get("decision").and_then(|x| x.as_str()).unwrap_or("deny");
         let remember = v.get("remember").and_then(|x| x.as_bool()).unwrap_or(false);
         let scope = v.get("grant_scope").and_then(|x| x.as_str()).unwrap_or("");
@@ -193,6 +198,22 @@ impl PermissionStore for InMemoryPermissionStore {
             .unwrap_or_else(|e| e.into_inner())
             .insert(key.to_string());
     }
+}
+
+/// An exact rule and destination shown before an explicit project-save action.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectRuleProposal {
+    pub rule: String,
+    pub file: String,
+}
+
+/// Host-owned project settings. The proposal is captured before asking; response
+/// bytes never choose the rule or destination that will be written.
+#[async_trait]
+pub trait ProjectRuleStore: Send + Sync {
+    fn explanation(&self, call: &ToolCall) -> String;
+    async fn propose(&self, call: &ToolCall) -> Option<ProjectRuleProposal>;
+    async fn save(&self, call: &ToolCall, proposal: &ProjectRuleProposal) -> Result<(), String>;
 }
 
 /// The generic approval gate. Clone-cheap (Arc-backed store).
@@ -352,6 +373,20 @@ mod tests {
     use atomcode_kernel::tool::ToolCall;
     use std::time::Duration;
     use tokio::sync::mpsc::unbounded_channel;
+
+    #[test]
+    fn project_save_is_refused_by_gates_that_did_not_offer_it() {
+        assert_eq!(
+            PermissionDecision::from_value(
+                &serde_json::json!({"decision":"allow", "save_project_rule":true})
+            ),
+            PermissionDecision::Deny
+        );
+        assert_eq!(
+            parse_permission_decision("allow_project"),
+            PermissionDecision::Deny
+        );
+    }
 
     #[test]
     fn parse_permission_decision_maps_daemon_wire() {

@@ -524,6 +524,7 @@ fn start(
             front_end: None,
             review_delegate: None,
             host_plugins: Default::default(),
+            prompt_overrides: Default::default(),
             identity: Default::default(),
         },
         provider_factory: Arc::new(RecordingFactory(recorder.clone())),
@@ -2365,7 +2366,13 @@ async fn configured_request_options_reach_the_provider_and_follow_a_model_switch
     start.agent.chat_options.temperature = Some(0.25);
     start.agent.chat_options.reasoning_effort =
         Some(atomcode_kernel::provider::ReasoningEffort::High);
+    start.agent.chat_options.reasoning_loop_guard =
+        Some(atomcode_kernel::reasoning_loop::ReasoningLoopConfig {
+            enabled: false,
+            ..Default::default()
+        });
     let mut next = start.agent.clone();
+    next.chat_options.reasoning_loop_guard = None;
     next.model = "recorder-two".into();
     next.chat_options.max_tokens = Some(99);
     next.chat_options.reasoning_effort = Some(atomcode_kernel::provider::ReasoningEffort::Low);
@@ -2373,6 +2380,10 @@ async fn configured_request_options_reach_the_provider_and_follow_a_model_switch
 
     turn(&mut runtime, "hello").await;
     let first = recorder.options.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(
+        first.reasoning_loop_guard.as_ref().map(|g| g.enabled),
+        Some(false)
+    );
     assert_eq!(first.max_tokens, Some(1234), "");
     assert_eq!(first.temperature, Some(0.25), "");
     assert_eq!(
@@ -2384,6 +2395,10 @@ async fn configured_request_options_reach_the_provider_and_follow_a_model_switch
     runtime.handle.reassemble_provider(next).await.unwrap();
     turn(&mut runtime, "again").await;
     let after = recorder.options.lock().unwrap().last().cloned().unwrap();
+    assert!(
+        after.reasoning_loop_guard.is_none(),
+        "model reload resets the local stream policy"
+    );
     assert_eq!(after.max_tokens, Some(99), "after /model");
     assert_eq!(
         after.reasoning_effort,
@@ -3826,6 +3841,163 @@ async fn cancel_hanging_turn(runtime: &mut CodingRuntime, recorder: &Recorder) {
     }
 }
 
+/// A cold resume closes the abandoned turn without dispatching any request or
+/// repeating a tool, and the next prompt sees the last saved work.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
+async fn a_cold_resume_recovers_abandoned_progress_before_the_next_request() {
+    use atomcode_kernel::session::{LoggedEvent, SessionEvent};
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let runtime = CodingRuntime::start(production_start(env.project.path(), &recorder, |_| {}))
+        .await
+        .unwrap();
+    let id = runtime.session.clone().unwrap().id;
+    runtime.handle.shutdown().await.unwrap();
+    let manager = SessionManager::for_project(
+        env.project.path(),
+        &atomcode_coding::config::product_dirs_from_env(),
+    );
+    let lease = manager.acquire_lease(&id).unwrap();
+    let seq = manager
+        .load_events(&id)
+        .unwrap()
+        .last()
+        .map_or(1, |e| e.seq + 1);
+    let events = vec![
+        SessionEvent::TurnStart { turn: 1 },
+        SessionEvent::UserMessage {
+            turn: 1,
+            text: "repair interrupted work".into(),
+            images: vec![],
+        },
+        SessionEvent::AssistantMessage {
+            turn: 1,
+            round: 1,
+            text: "checking".into(),
+            reasoning: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "uncertain-tool".into(),
+                name: "bash".into(),
+                arguments: r#"{"command":"echo should-not-run"}"#.into(),
+            }],
+            reasoning_blocks: vec![],
+            meta: None,
+        },
+        SessionEvent::ReplyCheckpoint {
+            turn: 1,
+            round: 2,
+            text: "last saved progress".into(),
+            reasoning: "unsigned private thought".into(),
+            reset: true,
+        },
+    ];
+    manager
+        .append_events(
+            &lease,
+            &events
+                .into_iter()
+                .enumerate()
+                .map(|(i, event)| LoggedEvent {
+                    seq: seq + i as u64,
+                    at: 10,
+                    event,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    manager
+        .write_todo_sidecar(
+            &id,
+            &[
+                atomcode_capabilities::session::manager::TodoSidecarItem {
+                    content: "read source".into(),
+                    status: "completed".into(),
+                },
+                atomcode_capabilities::session::manager::TodoSidecarItem {
+                    content: "finish fix".into(),
+                    status: "in_progress".into(),
+                },
+                atomcode_capabilities::session::manager::TodoSidecarItem {
+                    content: "run tests".into(),
+                    status: "pending".into(),
+                },
+            ],
+            0,
+            None,
+        )
+        .unwrap();
+    drop(lease);
+    let mut resumed =
+        CodingRuntime::start(production_start(env.project.path(), &recorder, |start| {
+            start.prepare.session = SessionMode::Resume(id.clone());
+        }))
+        .await
+        .unwrap();
+    assert!(
+        recorder.requests.lock().unwrap().is_empty(),
+        "resume must not generate or repeat work automatically"
+    );
+    assert!(manager
+        .load_events(&id)
+        .unwrap()
+        .iter()
+        .any(|e| matches!(e.event, SessionEvent::TurnEnd { turn: 1, .. })));
+    resumed.handle.reload_capabilities().await.unwrap();
+    assert_eq!(
+        manager
+            .load_events(&id)
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.event, SessionEvent::PartialReply { .. }))
+            .count(),
+        1
+    );
+    resumed
+        .handle
+        .submit(UserInput::from("continue after verifying the state"))
+        .await
+        .unwrap();
+    let mut warnings = Vec::new();
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), resumed.events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match event.event {
+            CodingRuntimeEvent::ControllerWarning(text) => warnings.push(text),
+            CodingRuntimeEvent::TurnFinished(_) => break,
+            _ => {}
+        }
+    }
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("结果未知 1 项")
+                && warning.contains("已完成 1，进行中 1，待办 1")
+                && warning.contains("finish fix")),
+        "{warnings:?}"
+    );
+    let seen = recorder.last_request();
+    assert!(
+        seen.iter()
+            .any(|m| m.role == Role::Assistant && m.text == "last saved progress"),
+        "{seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .any(|m| m.role == Role::Tool && m.text.contains("outcome is unknown")),
+        "{seen:?}"
+    );
+    assert!(!seen
+        .iter()
+        .any(|m| m.text.contains("unsigned private thought")
+            || m.reasoning
+                .as_deref()
+                .is_some_and(|r| r.contains("unsigned private thought"))));
+    resumed.handle.shutdown().await.unwrap();
+}
+
 /// A reply the person stopped part way is kept as far as it got
 /// (`docs/adr/0024` §8–9), though chunks are not.
 ///
@@ -4398,6 +4570,86 @@ fn in_use(store: &SessionManager, id: &str) -> bool {
     )
 }
 
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
+async fn a_member_with_an_occupied_log_is_rejected_before_it_can_run() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let store = SessionManager::for_project(
+        env.project.path(),
+        &atomcode_coding::config::product_dirs_from_env(),
+    );
+    let mut runtime = CodingRuntime::start(production_start(env.project.path(), &recorder, |_| {}))
+        .await
+        .unwrap();
+    let id = runtime.session.clone().unwrap().id;
+    let member = format!("{id}~mapper");
+    let lease = store.acquire_lease(&member).unwrap();
+    turn(&mut runtime, "delegate a second").await;
+    assert!(
+        !store.is_event_session(&member),
+        "a refused member created a log"
+    );
+    let requests = recorder.requests.lock().unwrap();
+    assert!(
+        !requests
+            .iter()
+            .flatten()
+            .any(|m| m.role == Role::User && m.text == "map what is here"),
+        "a member ran even though it could not own its log"
+    );
+    drop(requests);
+    assert!(in_use(&store, &member));
+    drop(lease);
+    assert!(!in_use(&store, &member));
+    runtime.handle.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
+async fn a_stopped_member_name_is_not_reused_or_appended() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let project = env.project.path();
+    let store =
+        SessionManager::for_project(project, &atomcode_coding::config::product_dirs_from_env());
+    let mut runtime = CodingRuntime::start(production_start(project, &recorder, |_| {}))
+        .await
+        .unwrap();
+    let id = runtime.session.clone().unwrap().id;
+    let original = format!("{id}~mapper");
+    turn(&mut runtime, "delegate a second").await;
+    stored_until(&store, &original, "first member finished", |events| {
+        turns_ended(events) >= 1
+    })
+    .await;
+    turn(&mut runtime, "stop the mapper").await;
+    stored_until(&store, &original, "committed stop", |events| {
+        events.iter().any(|e| {
+            matches!(
+                e.event,
+                atomcode_kernel::session::SessionEvent::Stopped { .. }
+            )
+        })
+    })
+    .await;
+    let old_events = store.load_events(&original).unwrap();
+    turn(&mut runtime, "delegate a second").await;
+    stored_until(&store, &id, "rejected reuse of a stopped member name", |events| events.iter().any(|e|
+        matches!(&e.event, atomcode_kernel::session::SessionEvent::ToolResultLogged { is_error: true, content, .. } if content.contains("choose another")))).await;
+    assert_eq!(store.load_events(&original).unwrap(), old_events);
+    assert_eq!(store.children(&id).len(), 1);
+    assert!(!in_use(&store, &original));
+    runtime.handle.shutdown().await.unwrap();
+    let resumed = CodingRuntime::start(production_start(project, &recorder, |start| {
+        start.prepare.session = SessionMode::Resume(id)
+    }))
+    .await
+    .unwrap();
+    assert!(!in_use(&store, &original));
+    resumed.handle.shutdown().await.unwrap();
+}
+
 /// A team outlives the process (`docs/adr/0024` §11–§13). Each member's log is
 /// a session of its own under the lead, written under a lease of its own and
 /// never listed beside the lead; resuming the lead brings back the members it
@@ -4447,6 +4699,45 @@ async fn a_team_is_kept_and_comes_back_with_its_lead() {
     );
     runtime.handle.shutdown().await.unwrap();
     assert!(!in_use(&store, &scout), "its lease went with the runtime");
+    // Simulate a member whose process vanished during its next reply.
+    let previous = store.load_events(&scout).unwrap();
+    let scout_turns = turns_ended(&previous);
+    let abandoned = previous.iter().map(|e| e.event.turn()).max().unwrap_or(0) + 1;
+    let seq = previous.last().map_or(1, |e| e.seq + 1);
+    let lease = store.acquire_lease(&scout).unwrap();
+    store
+        .append_events(
+            &lease,
+            &[
+                atomcode_kernel::session::LoggedEvent {
+                    seq,
+                    at: 10,
+                    event: atomcode_kernel::session::SessionEvent::TurnStart { turn: abandoned },
+                },
+                atomcode_kernel::session::LoggedEvent {
+                    seq: seq + 1,
+                    at: 10,
+                    event: atomcode_kernel::session::SessionEvent::UserMessage {
+                        turn: abandoned,
+                        text: "continue member work".into(),
+                        images: vec![],
+                    },
+                },
+                atomcode_kernel::session::LoggedEvent {
+                    seq: seq + 2,
+                    at: 10,
+                    event: atomcode_kernel::session::SessionEvent::ReplyCheckpoint {
+                        turn: abandoned,
+                        round: 1,
+                        text: "scout saved progress".into(),
+                        reasoning: String::new(),
+                        reset: true,
+                    },
+                },
+            ],
+        )
+        .unwrap();
+    drop(lease);
 
     let mut resumed = CodingRuntime::start(production_start(project, &recorder, |start| {
         start.prepare.session = SessionMode::Resume(id.clone());
@@ -4464,9 +4755,11 @@ async fn a_team_is_kept_and_comes_back_with_its_lead() {
         "the scout came back and holds its log"
     );
     assert!(!in_use(&store, &mapper), "the stopped one did not");
+    assert!(store.load_events(&scout).unwrap().iter().any(|e| matches!(&e.event,
+        atomcode_kernel::session::SessionEvent::PartialReply { text, .. } if text == "scout saved progress")));
     turn(&mut resumed, "tell the scout").await;
     stored_until(&store, &scout, "ran a turn after the resume", |e| {
-        turns_ended(e) >= 2
+        turns_ended(e) >= scout_turns + 2
     })
     .await;
     resumed.handle.shutdown().await.unwrap();
@@ -6846,5 +7139,222 @@ async fn referenced_details_are_queried_by_the_mounted_tool_without_inheriting_g
         "{request:?}"
     );
     assert_eq!(std::fs::read(path).unwrap(), before);
+    runtime.handle.shutdown().await.unwrap();
+}
+
+// Real runtime + recorded provider input: neither a UI marker nor a successful
+// command acknowledgement is evidence that the model received a picture.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn skill_images_share_one_user_turn_and_use_normal_vision_preprocessing() {
+    struct VisionFallback;
+    #[async_trait::async_trait]
+    impl atomcode_coding::runtime::ImagePreprocessor for VisionFallback {
+        async fn preprocess(
+            &self,
+            text: String,
+            images: Vec<atomcode_kernel::message::ImageContent>,
+            vision: bool,
+            _session: Option<String>,
+        ) -> (UserInput, Option<atomcode_coding::runtime::VisionNotice>) {
+            if vision {
+                (UserInput { text, images }, None)
+            } else {
+                (
+                    UserInput::from(format!("{text}\nVISION_DESCRIPTION_PROBE")),
+                    None,
+                )
+            }
+        }
+    }
+    let env = env();
+    let skills = env.project.path().join("image-skills");
+    std::fs::create_dir_all(skills.join("picture-probe")).unwrap();
+    std::fs::write(skills.join("picture-probe/SKILL.md"), "---\nname: picture-probe\ndescription: inspect an image\n---\nSKILL_CONTEXT_PROBE\n$ARGUMENTS").unwrap();
+    for vision in [true, false] {
+        let recorder = Arc::new(Recorder::default());
+        let mut input = start(env.project.path(), &recorder, SessionMode::Fresh);
+        input.agent.supports_vision = vision;
+        input.prepare.skill_dirs = Some(vec![skills.clone()]);
+        input.image_preprocessor = Some(Arc::new(VisionFallback));
+        let mut runtime = CodingRuntime::start(input).await.unwrap();
+        let session = runtime.session.clone().unwrap().id;
+        for (name, task) in [
+            ("skills", "picture-probe inspect this [Image #1]"),
+            ("picture-probe", "inspect again [Image #2]"),
+        ] {
+            runtime
+                .handle
+                .submit_catalog(
+                    "image-test".into(),
+                    session.clone(),
+                    name.into(),
+                    UserInput {
+                        text: task.into(),
+                        images: vec![atomcode_kernel::message::ImageContent {
+                            media_type: "image/png".into(),
+                            data: "cGljdHVyZQ==".into(),
+                        }],
+                    },
+                )
+                .await
+                .unwrap();
+            loop {
+                let event =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), runtime.events.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                if matches!(event.event, CodingRuntimeEvent::TurnFinished(_)) {
+                    break;
+                }
+            }
+            let request = recorder.last_turn_request();
+            let user = request
+                .iter()
+                .filter(|m| m.role == Role::User && !m.synthetic)
+                .last()
+                .unwrap();
+            assert_eq!(user.images.len(), usize::from(vision));
+            assert_eq!(user.text.contains("VISION_DESCRIPTION_PROBE"), !vision);
+            assert!(request
+                .iter()
+                .any(|m| m.synthetic && m.text.contains("SKILL_CONTEXT_PROBE")));
+        }
+        let snapshot = runtime.handle.snapshot().await.unwrap();
+        assert_eq!(
+            snapshot
+                .messages
+                .iter()
+                .filter(|m| m.role == Role::User && !m.synthetic)
+                .count(),
+            2
+        );
+        let refused = runtime
+            .handle
+            .submit_catalog(
+                "bad-command".into(),
+                session,
+                "skills".into(),
+                UserInput {
+                    text: "missing-skill".into(),
+                    images: vec![atomcode_kernel::message::ImageContent {
+                        media_type: "image/png".into(),
+                        data: "not-sent".into(),
+                    }],
+                },
+            )
+            .await;
+        assert!(refused.is_err());
+        turn(&mut runtime, "ordinary message after refusal").await;
+        let last = recorder.last_turn_request();
+        assert!(last
+            .iter()
+            .filter(|m| m.role == Role::User && !m.synthetic)
+            .last()
+            .unwrap()
+            .images
+            .is_empty());
+        runtime.handle.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn cancelled_skill_images_leave_no_skill_context_for_the_next_message() {
+    struct WaitingVision(Arc<tokio::sync::Notify>);
+    #[async_trait::async_trait]
+    impl atomcode_coding::runtime::ImagePreprocessor for WaitingVision {
+        async fn preprocess(
+            &self,
+            _text: String,
+            _images: Vec<atomcode_kernel::message::ImageContent>,
+            _vision: bool,
+            _session: Option<String>,
+        ) -> (UserInput, Option<atomcode_coding::runtime::VisionNotice>) {
+            self.0.notify_one();
+            std::future::pending().await
+        }
+    }
+    let env = env();
+    let skills = env.project.path().join("cancel-image-skills");
+    std::fs::create_dir_all(skills.join("picture-probe")).unwrap();
+    std::fs::write(skills.join("picture-probe/SKILL.md"), "---\nname: picture-probe\ndescription: inspect an image\n---\nCANCELLED_SKILL_CONTEXT_PROBE").unwrap();
+    let recorder = Arc::new(Recorder::default());
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let mut input = start(env.project.path(), &recorder, SessionMode::Fresh);
+    input.prepare.skill_dirs = Some(vec![skills]);
+    input.image_preprocessor = Some(Arc::new(WaitingVision(entered.clone())));
+    let mut runtime = CodingRuntime::start(input).await.unwrap();
+    let submitted = runtime.handle.submit_catalog(
+        "cancel-image".into(),
+        runtime.session.clone().unwrap().id,
+        "skills".into(),
+        UserInput {
+            text: "picture-probe inspect this".into(),
+            images: vec![atomcode_kernel::message::ImageContent {
+                media_type: "image/png".into(),
+                data: "not-sent".into(),
+            }],
+        },
+    );
+    entered.notified().await;
+    runtime.handle.cancel().await.unwrap();
+    assert!(matches!(
+        submitted.await.unwrap(),
+        atomcode_coding::SubmitReceipt::NotSent { .. }
+    ));
+    while let Some(event) = runtime.events.recv().await {
+        if matches!(event.event, CodingRuntimeEvent::TurnFinished(_)) {
+            break;
+        }
+    }
+    turn(&mut runtime, "plain message after cancellation").await;
+    let request = recorder.last_turn_request();
+    assert!(!request
+        .iter()
+        .any(|m| m.text.contains("CANCELLED_SKILL_CONTEXT_PROBE")));
+    assert!(request.iter().all(|m| m.images.is_empty()));
+    runtime.handle.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn quota_queries_follow_the_active_endpoint_even_when_model_names_match() {
+    #[derive(Debug)]
+    struct Meter(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl atomcode_coding::RateLimitWindowSource for Meter {
+        fn applies_to(&self, endpoint: &str) -> bool {
+            endpoint == "https://managed.invalid/v1"
+        }
+        async fn fetch_windows(&self) -> Result<Vec<atomcode_coding::RateLimitWindow>, String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            ExhaustedWindow.fetch_windows().await
+        }
+    }
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut input = start(env.project.path(), &recorder, SessionMode::Fresh);
+    input.agent.base_url = "https://managed.invalid/v1".into();
+    input.prepare.rate_limit_source = Some(Arc::new(Meter(calls.clone())));
+    let managed = input.agent.clone();
+    let mut external = managed.clone();
+    external.base_url = "https://external.invalid/v1".into();
+    let runtime = CodingRuntime::start(input).await.unwrap();
+    assert_eq!(runtime.handle.usage(true).await.unwrap().windows.len(), 1);
+    runtime.handle.reassemble_provider(external).await.unwrap();
+    for windows_only in [true, false] {
+        let usage = runtime.handle.usage(windows_only).await.unwrap();
+        assert!(usage.windows.is_empty());
+        assert!(usage.plan.is_none() && usage.spent.is_none());
+        assert!(usage.unavailable.is_none());
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "external endpoints do not query the managed account"
+    );
+    runtime.handle.reassemble_provider(managed).await.unwrap();
+    assert_eq!(runtime.handle.usage(false).await.unwrap().windows.len(), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
     runtime.handle.shutdown().await.unwrap();
 }

@@ -243,6 +243,13 @@ pub(crate) fn attach(
     tokio::spawn(async move {
         let _task = task;
         while let Some(sequenced) = runtime_events.recv().await {
+            // This is a presentation cache, not the runtime's authority. Mode
+            // bindings can change the provider without a driver /model command.
+            if matches!(&sequenced.event, CodingRuntimeEvent::ProviderChanged { .. }) {
+                if let Ok(current) = watched.handle.configuration().await {
+                    *watched.config.lock().expect("config poisoned") = current;
+                }
+            }
             // 共享着的话,网页端照这条事件画。挂没挂在那一侧判断,这里不设第二个
             // 开关——两个「现在共享着吗」的答案迟早会不一致。
             //
@@ -384,6 +391,15 @@ pub(crate) fn attach(
                 // mode moves under the person's hands when their own Shift+Tab
                 // (or `/mode`) asks for it, and a screen that had to ask back
                 // would be one frame behind its own keystroke.
+                CodingRuntimeEvent::ProviderSelectionPending {
+                    current: Some(current),
+                } => {
+                    let session = watched.session.lock().expect("config poisoned").clone();
+                    watched.announce(HostEvent::ModelSelectionPending {
+                        session,
+                        current_model: current.model,
+                    });
+                }
                 CodingRuntimeEvent::ModeChanged { mode } => {
                     let session = watched.session.lock().expect("session poisoned").clone();
                     watched.announce(HostEvent::ModeChanged {
@@ -411,6 +427,7 @@ pub(crate) fn attach(
     let (commands, mut command_rx) = mpsc::unbounded_channel::<AgentCommand>();
     let out = front_end.events();
     let front = front_end.clone();
+    let command_control = control.clone();
     tokio::spawn(async move {
         while let Some(command) = command_rx.recv().await {
             let (receipt, command) = match command {
@@ -451,6 +468,7 @@ pub(crate) fn attach(
                     session,
                     name,
                     args,
+                    images,
                 } => {
                     let found = front
                         .app()
@@ -460,6 +478,49 @@ pub(crate) fn attach(
                                 &app, &session, &name,
                             )
                         });
+                    // Lead input uses the coding runtime's VL boundary. Member
+                    // commands keep their own native inbox, like member messages.
+                    let lead = command_control
+                        .session
+                        .lock()
+                        .expect("session poisoned")
+                        .clone();
+                    if !images.is_empty() && session == lead {
+                        // Queue before spawning, so a following Cancel cannot overtake
+                        // this input. Keep the command pump free during recognition.
+                        let submitted = handle.submit_catalog(
+                            id.clone(),
+                            session,
+                            name,
+                            UserInput { text: args, images },
+                        );
+                        let out = out.clone();
+                        tokio::spawn(async move {
+                            let (failed, queued, output) = match submitted.await {
+                                Ok(atomcode_coding::SubmitReceipt::NotSent { .. }) => {
+                                    reply(&out, receipt, Err((CommandError::NotRunning, None)));
+                                    (true, false, "Command input cancelled".to_string())
+                                }
+                                Ok(_) => (false, true, String::new()),
+                                Err(error) => {
+                                    let message = error.to_string();
+                                    reply(
+                                        &out,
+                                        receipt,
+                                        Err((command_error(error), Some(message.clone()))),
+                                    );
+                                    (true, false, message)
+                                }
+                            };
+                            let _ = out.send(AgentEvent::Invoked {
+                                id,
+                                output,
+                                queued,
+                                failed: Some(failed),
+                            });
+                        });
+                        continue;
+                    }
                     match found {
                         Ok((target, command)) => {
                             reply(&out, receipt, Ok(None));
@@ -468,6 +529,7 @@ pub(crate) fn attach(
                                 command,
                                 id,
                                 args,
+                                images,
                                 out.clone(),
                             );
                         }
@@ -1618,6 +1680,8 @@ impl RuntimeControl {
                         updated_at: u64::try_from(entry.updated_at_ms).unwrap_or(0),
                         turns: u32::try_from(entry.turn_count).unwrap_or(u32::MAX),
                         needs_newer_version: entry.needs_newer_version,
+                        scheduled: entry.origin
+                            == atomcode_capabilities::session::manager::SessionOrigin::Scheduled,
                     },
                 )
             })
@@ -2099,7 +2163,7 @@ impl HostControl for RuntimeControl {
             }
             HostCommand::SetReasoningEffort { session, level } => {
                 self.addressed(&session)?;
-                let mut next = self.config.lock().expect("config poisoned").clone();
+                let mut next = self.handle.configuration().await.map_err(refused)?;
                 next.chat_options.reasoning_effort = level;
                 self.handle
                     .reassemble_provider(next.clone())
@@ -2265,12 +2329,15 @@ impl HostControl for RuntimeControl {
                     .for_model(&model)
                     .map_err(|message| HostError::Failed { message })?;
                 // The thinking level is the session's, not the model's default.
-                next.chat_options.reasoning_effort = self
-                    .config
-                    .lock()
-                    .expect("config poisoned")
-                    .chat_options
-                    .reasoning_effort;
+                next.chat_options.reasoning_effort =
+                    atomcode_kernel::provider::ReasoningEffort::from_config(
+                        self.handle
+                            .model_selection()
+                            .await
+                            .map_err(refused)?
+                            .reasoning_effort
+                            .as_deref(),
+                    );
                 let reply = self.reconfigure(next).await?;
                 // Persist the selection so it survives the next start. Without
                 // this the switch is runtime-only and the next launch resolves
@@ -2436,6 +2503,9 @@ impl HostControl for RuntimeControl {
                     .set_mode(runtime_mode(mode))
                     .await
                     .map_err(refused)?;
+                if let Ok(current) = self.handle.configuration().await {
+                    *self.config.lock().expect("config poisoned") = current;
+                }
                 Ok(HostReply::Done)
             }
             // Read back from the runtime, not from a copy this adapter keeps:
@@ -2731,6 +2801,11 @@ impl HostControl for RuntimeControl {
                     model: now.model,
                     working_dir: now.working_dir.display().to_string(),
                     system_prompt: now.system_prompt,
+                    persona: now.persona.map(|p| atomcode_host_api::PersonaInfo {
+                        source: p.source,
+                        appended: p.appended,
+                        text: p.text,
+                    }),
                 })
             }
             // Best-effort by contract: a meter that is slow or down does not
@@ -2825,8 +2900,52 @@ impl HostControl for RuntimeControl {
                     // What the running graph was built from, which is the one a
                     // person is on — not what the file calls the default, which
                     // a `/model` since then may have moved off.
-                    current: Some(self.config.lock().expect("config poisoned").model.clone()),
+                    current: Some(self.handle.configuration().await.map_err(refused)?.model),
                 })
+            }
+            HostCommand::Hooks { session, args } => {
+                self.addressed(&session)?;
+                let here = self
+                    .handle
+                    .context_stats_with(false)
+                    .await
+                    .map_err(refused)?
+                    .working_dir;
+                let value = atomcode_capabilities::cc_hooks::inspection::command(
+                    &here,
+                    &atomcode_coding::config::product_dirs_from_env(),
+                    &args,
+                )
+                .await
+                .map_err(|message| HostError::Failed { message })?;
+                Ok(HostReply::Hooks { value })
+            }
+            HostCommand::FollowUp { session, args } => {
+                self.addressed(&session)?;
+                let value = self
+                    .handle
+                    .follow_up(Some(session), args)
+                    .await
+                    .map_err(refused)?;
+                Ok(HostReply::FollowUp { value })
+            }
+            HostCommand::TaskSpecs { session, args } => {
+                self.addressed(&session)?;
+                let value = self
+                    .handle
+                    .task_specs(session, args)
+                    .await
+                    .map_err(refused)?;
+                Ok(HostReply::TaskSpecs { value })
+            }
+            HostCommand::ImportPatch { session, bytes } => {
+                self.addressed(&session)?;
+                let reference = self
+                    .handle
+                    .import_patch(session, bytes)
+                    .await
+                    .map_err(refused)?;
+                Ok(HostReply::PatchImported { reference })
             }
             HostCommand::Changes {
                 session,
@@ -2899,9 +3018,10 @@ impl HostControl for RuntimeControl {
             HostCommand::Thinking { session } => {
                 self.addressed(&session)?;
                 let on = self
-                    .config
-                    .lock()
-                    .expect("config poisoned")
+                    .handle
+                    .configuration()
+                    .await
+                    .map_err(refused)?
                     .thinking_enabled
                     .unwrap_or(false);
                 Ok(HostReply::Settings {
@@ -2921,7 +3041,7 @@ impl HostControl for RuntimeControl {
             // path the thinking *level* takes, for the same reason.
             HostCommand::SetThinking { session, on } => {
                 self.addressed(&session)?;
-                let mut next = self.config.lock().expect("config poisoned").clone();
+                let mut next = self.handle.configuration().await.map_err(refused)?;
                 next.thinking_enabled = Some(on);
                 self.handle
                     .reassemble_provider(next.clone())
@@ -3085,6 +3205,7 @@ pub fn refused(error: RuntimeError) -> HostError {
                 HostError::RewindPointNotFound { turn: turn_id }
             }
             RuntimeError::GoalUnavailable(message)
+            | RuntimeError::CommandRefused(message)
             | RuntimeError::SessionReferenceUnavailable(message) => HostError::Failed { message },
             RuntimeError::CodeRewindUnavailable(message) => {
                 HostError::CodeRewindUnavailable { message }

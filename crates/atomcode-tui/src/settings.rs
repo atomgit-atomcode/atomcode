@@ -45,6 +45,7 @@ pub const MODE_SWITCH_KEY: &str = "ui.mode_switch_key";
 
 /// Config catalog id interpreted only as a shortcut editing gesture.
 pub const NEWLINE_KEYS: &str = "ui.keybindings.newline";
+pub const QUESTION_EDIT_KEY: &str = "ui.keybindings.question_edit";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KeybindingMode {
@@ -101,13 +102,8 @@ impl KeybindingEditor {
                 })
                 .into_owned(),
             ),
-            KeybindingMode::Manual(edit) => {
+            KeybindingMode::Manual(_) => {
                 out.push(t(Msg::KeybindingsManual).into_owned());
-                out.push(format!(
-                    "{}|{}",
-                    &edit.value[..edit.caret],
-                    &edit.value[edit.caret..]
-                ));
             }
         }
         if let Some(error) = self.error.as_deref() {
@@ -558,9 +554,8 @@ pub struct Panel {
     /// How far the page is scrolled, for the pages that are read rather than
     /// filtered.
     ///
-    /// The settings page does not use it: it is narrowed by typing, and a list
-    /// you can both filter and scroll has two ways to lose the row you were
-    /// looking at. The other pages have no filter and can be longer than the
+    /// Config derives its visible window from the selected filtered row rather
+    /// than storing a second offset. The other pages have no filter and can be longer than the
     /// panel, which is the case this exists for — the Usage page grew past it
     /// the day the calendar went in, and the panel silently dropped its own
     /// closing rule to make room.

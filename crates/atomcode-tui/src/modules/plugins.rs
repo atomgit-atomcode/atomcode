@@ -17,7 +17,7 @@ use crate::frame::{Line, Span, Style};
 use crate::i18n::{t, Msg};
 use crate::module::{Height, View};
 use crate::modules::chrome::{
-    self, box_edge, caret_spans, pad_to, panel_edge, search_line, LABEL_MAX, LABEL_MIN, LEAD,
+    self, box_edge, edit_line, pad_to, panel_edge, search_line, LABEL_MAX, LABEL_MIN, LEAD,
 };
 use crate::moment::{Moment, Viewport};
 use crate::plugins::{
@@ -515,20 +515,7 @@ fn url_line(panel: &Panel, w: usize, caps: crate::caps::Caps) -> Line {
     let Some(Form::AddMarket(AddMarketForm { url, caret })) = panel.form.as_ref() else {
         return Line::empty();
     };
-    let base = theme::bg(Role::PanelSelBg).under(theme::fg(Role::PanelFg));
-    let pointer = format!("{} ", caps.g(crate::caps::Glyph::Pointer));
-    let label = t(Msg::FieldAddress);
-    let label_room = w.saturating_sub(LEAD + 2).clamp(LABEL_MIN, LABEL_MAX);
-    let shown = width::take_width(&label, label_room);
-    let pad = label_room.saturating_sub(width::str_width(&shown));
-    let room = w.saturating_sub(LEAD + label_room + 2);
-    let mut spans = vec![
-        Span::styled(pointer, base),
-        Span::styled(shown, base),
-        Span::styled(" ".repeat(pad + 2), base),
-    ];
-    spans.extend(caret_spans(url, *caret, base, room));
-    pad_to(Line::from_spans(spans), w, base)
+    edit_line(&t(Msg::FieldAddress), url, *caret, w, caps)
 }
 
 fn legend(panel: &Panel) -> Vec<(String, String)> {

@@ -37,7 +37,11 @@ test('an unpaired relay page asks to pair again without contacting local endpoin
   let calls = 0;
   const fetchFn: typeof fetch = async () => { calls++; return new Response('{}'); };
   const remote = createApiFetch(true, null, fetchFn);
-  assert.equal((await remote('/project')).status, 401);
+  const response = await remote('/project');
+  assert.equal(response.status, 401);
+  const diagnostic = await response.json();
+  assert.equal(diagnostic.code, 'relay_unpaired');
+  assert.match(diagnostic.error, /pairing link/);
   assert.equal((await remote('/auth/status')).status, 401);
   assert.equal(calls, 0);
   const local = createApiFetch(false, null, fetchFn);

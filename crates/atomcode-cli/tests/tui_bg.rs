@@ -214,6 +214,7 @@ fn start(
         CodingRuntimeStart {
             agent: agent.clone(),
             prepare: PrepareOptions {
+                prompt_overrides: Default::default(),
                 request_user_input: true,
                 session: SessionMode::Fresh,
                 tools: true,
@@ -1636,6 +1637,28 @@ async fn shared_navigation_prepares_the_target_project_before_resuming() {
     atomcode_daemon::native_live::resume_or_fork_session(original.clone())
         .await
         .unwrap();
+    let mobile = atomcode_daemon::native_live::navigate(
+        rig.project.path().to_path_buf(),
+        Some(target.into()),
+    )
+    .await
+    .unwrap();
+    assert_ne!(mobile.session_id.as_deref(), Some(target));
+    assert_eq!(
+        mobile.working_dir.canonicalize().unwrap(),
+        project.path().canonicalize().unwrap()
+    );
+    let mobile_id = mobile.session_id.unwrap();
+    rig.until("mobile opens the foreign copy", |rig| {
+        rig.client.root() == mobile_id
+    })
+    .await;
+    atomcode_daemon::native_live::navigate(
+        rig.project.path().to_path_buf(),
+        Some(original.clone()),
+    )
+    .await
+    .unwrap();
     drop(held);
     rig.until("returned after foreign copy", |rig| {
         rig.client.root() == original
@@ -1915,6 +1938,31 @@ async fn a_shared_background_runtime_can_be_opened_from_tui_and_webui_without_a_
         peer.try_recv().is_ok(),
         "old viewers receive the switch announcement"
     );
+    // Mobile /cd uses the same navigation owner. Both sessions are already
+    // leased by this driver, so returning either must reuse its identity.
+    for session in [&target, &first] {
+        let changed = atomcode_daemon::native_live::navigate(
+            rig.project.path().to_path_buf(),
+            Some(session.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(changed.session_id.as_deref(), Some(session.as_str()));
+        rig.until("mobile navigation follows the retained session", |rig| {
+            rig.client.root() == *session
+        })
+        .await;
+    }
+    let previous = atomcode_daemon::native_live::binding().unwrap();
+    assert!(atomcode_daemon::native_live::navigate(
+        rig.project.path().to_path_buf(),
+        Some("missing-mobile-session".into()),
+    )
+    .await
+    .is_err());
+    assert_eq!(atomcode_daemon::native_live::binding().unwrap(), previous);
+    assert_eq!(rig.client.root(), first);
+
     // Let the old runtime finish: its late events must not replace the new view.
     rig.release();
     rig.until_background("task finished", |list| {

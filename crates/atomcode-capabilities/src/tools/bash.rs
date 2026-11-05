@@ -465,7 +465,7 @@ fn shell_tool_description(
              Reserve bash for real shell work — git, builds, package managers, running \
              commands — and for pipelines / aggregation (wc, sort, uniq, awk, git log) \
              the dedicated tools can't do. For long builds/tests use `bash_start`, then \
-             `bash_poll` with wait_ms (up to 60000); it returns early on output or exit. \
+             `bash_poll` with wait_ms (up to 60000); it collects output until exit, status change or timeout. \
              Do not use shell sleep to wait or duplicate a running build.\n\
              This shell is NON-INTERACTIVE: stdin is not connected to a terminal, so a \
              program cannot be driven with typed input once started. Do NOT launch REPLs (python/node/irb), \
@@ -2545,27 +2545,170 @@ pub fn bash_invocations(source: &str) -> Option<Vec<BashInvocation>> {
     Some(invocations)
 }
 
-/// A flat invocation list cannot bound directories changed by loops or functions.
+/// Literal command segments whose existing user grants may be composed safely.
+/// Tests/builds are not inferred safe: policy must explicitly authorize them.
+pub(crate) fn bash_permission_segments(source: &str) -> Option<Vec<String>> {
+    let segments = literal_bash_permission_segments(source)?;
+    if bash_has_repeated_directory_changes(source) {
+        return None;
+    }
+    Some(segments)
+}
+
+fn literal_bash_permission_segments(source: &str) -> Option<Vec<String>> {
+    let tree = parse_bash(source)?;
+    let root = tree.root_node();
+    if root.has_error() {
+        return None;
+    }
+    let bytes = source.as_bytes();
+    let mut stack = vec![root];
+    let mut segments = Vec::new();
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "for_statement" => {
+                let variable = node
+                    .child_by_field_name("variable")?
+                    .utf8_text(bytes)
+                    .ok()?;
+                if variable.is_empty() || !variable.bytes().all(|c| c.is_ascii_lowercase()) {
+                    return None;
+                }
+                let mut cursor = node.walk();
+                let values: Vec<_> = node.children_by_field_name("value", &mut cursor).collect();
+                if values.is_empty()
+                    || values.len() > 64
+                    || values.iter().any(|v| {
+                        v.utf8_text(bytes).map_or(true, |text| {
+                            text.is_empty() || !text.bytes().all(|c| c.is_ascii_digit())
+                        })
+                    })
+                {
+                    return None;
+                }
+            }
+            "command" => {
+                let name = node.child_by_field_name("name")?.utf8_text(bytes).ok()?;
+                // Shell binding builtins can change PATH/CDPATH without an
+                // assignment node (printf -v, read, let, ...). Do not compose
+                // grants across their hidden shell-state effects.
+                if !name
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"_/.-".contains(&c))
+                    || matches!(
+                        name,
+                        "printf"
+                            | "read"
+                            | "readarray"
+                            | "mapfile"
+                            | "getopts"
+                            | "declare"
+                            | "typeset"
+                            | "export"
+                            | "readonly"
+                            | "local"
+                            | "unset"
+                            | "set"
+                            | "shopt"
+                            | "enable"
+                            | "hash"
+                            | "alias"
+                            | "unalias"
+                            | "let"
+                            | "eval"
+                            | "source"
+                            | "."
+                            | "command"
+                            | "builtin"
+                            | "trap"
+                            | "fc"
+                            | "bind"
+                            | "exec"
+                            | "pushd"
+                            | "popd"
+                    )
+                {
+                    return None;
+                }
+                segments.push(normalize_command_for_grant(node.utf8_text(bytes).ok()?));
+            }
+            "file_redirect" if !redirect_is_readonly(node, bytes) => return None,
+            "program"
+            | "list"
+            | "pipeline"
+            | "do_group"
+            | "comment"
+            | "command_name"
+            | "word"
+            | "raw_string"
+            | "string"
+            | "string_content"
+            | "concatenation"
+            | "number"
+            | "redirected_statement"
+            | "file_redirect"
+            | "file_descriptor" => {}
+            "variable_name" if node.parent().is_some_and(|p| p.kind() == "for_statement") => {}
+            _ if node.is_named() || node.kind() == "&" => return None,
+            _ => {}
+        }
+        for i in (0..node.child_count() as u32).rev() {
+            stack.push(node.child(i)?);
+        }
+    }
+    if segments.is_empty() {
+        return None;
+    }
+    Some(segments)
+}
+
+/// A flat invocation list cannot bound directories changed inside loops or functions.
 /// Callers doing path resolution must ask for approval for those constructs.
 pub(crate) fn bash_has_repeated_directory_changes(source: &str) -> bool {
     let Some(tree) = parse_bash(source) else {
         return true;
     };
-    let mut stack = vec![tree.root_node()];
-    while let Some(node) = stack.pop() {
+    if tree.root_node().has_error() {
+        return true;
+    }
+    let mut stack = vec![(tree.root_node(), false)];
+    let mut has_loop = false;
+    while let Some((node, in_loop)) = stack.pop() {
+        has_loop |= node.kind() == "for_statement";
         if matches!(
             node.kind(),
-            "for_statement" | "c_style_for_statement" | "while_statement" | "function_definition"
+            "c_style_for_statement" | "while_statement" | "function_definition" | "until_statement"
         ) {
             return true;
         }
+        if in_loop && node.kind() == "command" {
+            let Some(name) = node
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+            else {
+                return true;
+            };
+            if !name
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"_/.-".contains(&c))
+                || matches!(
+                    name,
+                    "cd" | "pushd" | "popd" | "eval" | "source" | "." | "command" | "builtin"
+                )
+            {
+                return true;
+            }
+        }
         for index in 0..node.named_child_count() as u32 {
             if let Some(child) = node.named_child(index) {
-                stack.push(child);
+                stack.push((child, in_loop || node.kind() == "for_statement"));
             }
         }
     }
-    false
+    // Relax the old blanket only for the same fully literal syntax the policy
+    // composer understands. An outer CDPATH assignment or expansion can alter
+    // directory resolution even when the loop body contains no explicit cd.
+    has_loop && literal_bash_permission_segments(source).is_none()
 }
 
 /// Paths read through shell input redirection (`< file`). Output redirection is a
@@ -4905,7 +5048,12 @@ mod tests {
         // workspace gate's `grantable:false` floor, which the marker-substring form MISSES
         // (`/etc`, home dotfiles, secret extensions). These must stay off the blanket or
         // "allow all bash" would silently cover the one command that must always ask.
+        // The system-prefix set is platform-specific (`/etc` vs `C:\Windows`), so each
+        // build pins its own protected target.
+        #[cfg(unix)]
         assert_eq!(group("rm /etc/hosts"), None);
+        #[cfg(windows)]
+        assert_eq!(group("rm C:/Windows/System32/drivers/etc/hosts"), None);
         assert_eq!(group("shred ~/backup.key"), None);
         assert_eq!(group("mv ~/.bashrc /tmp/x"), None);
         assert_eq!(group("truncate -s0 ./cert.crt"), None);

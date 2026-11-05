@@ -43,6 +43,7 @@ fn prepare_options() -> PrepareOptions {
         front_end: None,
         review_delegate: None,
         host_plugins: Default::default(),
+        prompt_overrides: Default::default(),
         identity: Default::default(),
     }
 }
@@ -74,6 +75,21 @@ struct Outcome {
 /// Run one turn against a fresh assembly built from `rules`, auto-DENYING any approval
 /// request (so an unexpected prompt cannot silently run the command).
 async fn run_turn(project: &std::path::Path, command: &str, rules: PermissionRules) -> Outcome {
+    run_answered_turn(
+        project,
+        command,
+        rules,
+        |_| serde_json::json!({"decision":"deny"}),
+    )
+    .await
+}
+
+async fn run_answered_turn(
+    project: &std::path::Path,
+    command: &str,
+    rules: PermissionRules,
+    mut answer: impl FnMut(&serde_json::Value) -> serde_json::Value,
+) -> Outcome {
     let mut cfg = CodingAgentConfig::new(
         "k",
         "http://unused",
@@ -98,12 +114,14 @@ async fn run_turn(project: &std::path::Path, command: &str, rules: PermissionRul
     let (mut prompted, mut denied) = (false, false);
     while let Some(ev) = h.events.recv().await {
         match ev {
-            AgentEvent::Request { id, kind, .. } if kind == "approval" => {
+            AgentEvent::Request {
+                id, kind, payload, ..
+            } if kind == "approval" => {
                 prompted = true;
                 h.commands
                     .send(AgentCommand::Respond {
                         id,
-                        value: serde_json::json!({ "decision": "deny" }),
+                        value: answer(&payload),
                     })
                     .unwrap();
             }
@@ -121,6 +139,157 @@ fn write_project_permissions(project: &std::path::Path, value: serde_json::Value
     let settings = dirs.project(project).join("settings.local.json");
     std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
     std::fs::write(settings, serde_json::to_vec(&value).unwrap()).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_approval_saves_only_the_offered_exact_project_rule_and_a_new_mount_reads_it() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::create_dir(project.path().join("scratch")).unwrap();
+    write_project_permissions(
+        project.path(),
+        serde_json::json!({"unrelated": {"keep":true}, "permissions":{"allow":[], "deny":[]}}),
+    );
+    let result = run_answered_turn(project.path(), "rm -rf scratch", PermissionRules::default(), |payload| {
+        assert_eq!(payload["project_rule"]["rule"], "Bash(rm -rf scratch)");
+        assert!(payload["reason"].as_str().unwrap().contains("No project/user allow rule covers"));
+        serde_json::json!({"decision":"allow", "save_project_rule":true, "rule":"Bash(*)", "file":"/tmp/ignored"})
+    }).await;
+    assert!(result.prompted);
+    assert!(!result.denied);
+    assert!(!project.path().join("scratch").exists());
+    let dirs = atomcode_coding::config::product_dirs_from_env();
+    let settings: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(dirs.project(project.path()).join("settings.local.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        settings["permissions"]["allow"],
+        serde_json::json!(["Bash(rm -rf scratch)"])
+    );
+    assert_eq!(settings["unrelated"]["keep"], true);
+    let next = run_turn(project.path(), "rm -rf scratch", PermissionRules::default()).await;
+    assert!(!next.prompted && !next.denied);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn saving_a_project_rule_fails_closed_if_settings_change_while_approval_is_pending() {
+    for contents in ["{broken", r#"{"permissions":{"deny":["Bash(rm *)"]}}"#] {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join("scratch")).unwrap();
+        let dirs = atomcode_coding::config::product_dirs_from_env();
+        let path = dirs.project(project.path()).join("settings.local.json");
+        let result = run_answered_turn(
+            project.path(),
+            "rm -rf scratch",
+            PermissionRules::default(),
+            |payload| {
+                assert!(payload.get("project_rule").is_some());
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, contents).unwrap();
+                serde_json::json!({"decision":"allow", "save_project_rule":true})
+            },
+        )
+        .await;
+        assert!(result.prompted && result.denied);
+        assert!(project.path().join("scratch").exists());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), contents);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn project_authorized_test_loops_run_through_the_native_security_gates() {
+    use std::os::unix::fs::PermissionsExt;
+    let project = tempfile::tempdir().unwrap();
+    let script = project.path().join("check");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nprintf 'checked\\n' >> results\nprintf 'ok\\n'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    write_project_permissions(
+        project.path(),
+        serde_json::json!({"permissions": {
+            "allow": ["Bash(./check defense)"], "deny": ["Bash(rm *)"]
+        }}),
+    );
+    let command = format!(
+        "cd '{}' && for i in 1 2 3; do ./check defense 2>&1 | tail -5; done",
+        project.path().display()
+    );
+    let result = run_turn(project.path(), &command, PermissionRules::default()).await;
+    assert!(!result.prompted, "an authorized loop must not prompt");
+    assert!(!result.denied);
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("results")).unwrap(),
+        "checked\nchecked\nchecked\n"
+    );
+    let result = run_turn(
+        project.path(),
+        "for i in 1 2; do ./check defense; rm -rf results; done",
+        PermissionRules::default(),
+    )
+    .await;
+    assert!(result.denied);
+    assert!(project.path().join("results").exists());
+}
+
+/// Windows counterpart of the criterion above. Two things differ and nothing else: the script
+/// is invoked through `sh` because Windows has no executable bit, and the loop precondition is
+/// a POSIX shell — without Git for Windows the bash tool falls back to cmd.exe, where the
+/// `for … do … done` form this issue is about does not exist at all. That case says so out
+/// loud instead of passing silently.
+#[cfg(windows)]
+#[tokio::test(flavor = "current_thread")]
+async fn project_authorized_test_loops_run_through_the_native_security_gates_on_windows() {
+    // `detect_windows_bash` looks for Git Bash, and its portable second probe is `where git`,
+    // so a `git` on PATH is the signal that the bash tool will run this command in a POSIX
+    // shell rather than cmd.exe.
+    let has_git_bash = std::process::Command::new("where")
+        .arg("git")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !has_git_bash {
+        eprintln!(
+            "skipping: no Git for Windows on PATH, so the bash tool would fall back to \
+             cmd.exe and a POSIX loop would not run"
+        );
+        return;
+    }
+
+    let project = tempfile::tempdir().unwrap();
+    let script = project.path().join("check");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nprintf 'checked\\n' >> results\nprintf 'ok\\n'\n",
+    )
+    .unwrap();
+    write_project_permissions(
+        project.path(),
+        serde_json::json!({"permissions": {
+            "allow": ["Bash(sh ./check defense)"], "deny": ["Bash(rm *)"]
+        }}),
+    );
+    // Git Bash takes the drive path either way, but forward slashes keep `cd` unambiguous.
+    let cwd = project.path().display().to_string().replace('\\', "/");
+    let command =
+        format!("cd '{cwd}' && for i in 1 2 3; do sh ./check defense 2>&1 | tail -5; done");
+    let result = run_turn(project.path(), &command, PermissionRules::default()).await;
+    assert!(!result.prompted, "an authorized loop must not prompt");
+    assert!(!result.denied);
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("results")).unwrap(),
+        "checked\nchecked\nchecked\n"
+    );
+    let result = run_turn(
+        project.path(),
+        "for i in 1 2; do sh ./check defense; rm -rf results; done",
+        PermissionRules::default(),
+    )
+    .await;
+    assert!(result.denied);
+    assert!(project.path().join("results").exists());
 }
 
 // This criterion executes a real OS subprocess. A paused runtime advances the

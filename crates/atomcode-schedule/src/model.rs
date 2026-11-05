@@ -30,6 +30,41 @@ impl Service {
         working_dir: &Path,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> anyhow::Result<Value> {
+        if operation == "follow_up_launch" {
+            if cancel.is_cancelled() {
+                anyhow::bail!("follow-up dispatch cancelled");
+            }
+            let task: ScheduleTask = serde_json::from_value(args["task"].clone())?;
+            if task.follow_up.is_none()
+                || !matches!(task.schedule, atomcode_config::schedule::Schedule::Manual)
+            {
+                anyhow::bail!("follow-up dispatcher only accepts explicit one-shot tasks");
+            }
+            let definition = self.store.put(&task, None)?;
+            if cancel.is_cancelled() {
+                anyhow::bail!("follow-up dispatch cancelled before launch");
+            }
+            return Ok(serde_json::to_value(self.launch(
+                &task.id,
+                &task.id,
+                &definition.revision,
+            )?)?);
+        }
+        if operation == "follow_up_history" {
+            if let Some(id) = args["id"].as_str() {
+                let entry = self.inspect(id)?;
+                return Ok(
+                    json!({"entry":entry,"admission":self.launch_receipt(id)?,"history":self.store.history_page(id,None,50)?}),
+                );
+            }
+            let mut definitions = self.store.list()?;
+            definitions.sort_by_key(|d| std::cmp::Reverse(d.task.created_at));
+            let mut entries = Vec::new();
+            for definition in definitions.into_iter().take(20) {
+                entries.push(json!({"entry":self.inspect(&definition.task.id)?,"admission":self.launch_receipt(&definition.task.id)?}));
+            }
+            return Ok(json!(entries));
+        }
         if operation == "schedule_list" {
             let entries = self
                 .catalog()?

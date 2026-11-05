@@ -241,6 +241,7 @@ pub fn build_task(
         created_at,
         last_run_at: None,
         last_status: None,
+        follow_up: None,
     }
 }
 
@@ -530,8 +531,18 @@ pub async fn handle_schedule(cli: ScheduleCli) -> Result<i32> {
             id,
             request_id,
             expected_revision,
-            store: _,
-        } => run_task(&id, request_id.as_deref(), expected_revision.as_deref()).await,
+            store,
+        } => {
+            run_task_in(
+                store
+                    .map(atomcode_schedule::Store::new)
+                    .unwrap_or_else(task_store),
+                &id,
+                request_id.as_deref(),
+                expected_revision.as_deref(),
+            )
+            .await
+        }
 
         ScheduleCli::Sync => {
             let service = task_service();
@@ -597,9 +608,19 @@ pub(crate) fn last_status_for(exit_code: i32) -> &'static str {
 /// If the task is disabled this returns 0 immediately.  If the task's working
 /// directory does not exist an error terminal is appended to the run ledger and
 /// the function returns non-zero.
-async fn run_task(id: &str, request_id: Option<&str>, expected: Option<&str>) -> Result<i32> {
-    let store = task_store();
-    if request_id.is_none() && !store.get(id)?.task.enabled {
+async fn run_task_in(
+    store: atomcode_schedule::Store,
+    id: &str,
+    request_id: Option<&str>,
+    expected: Option<&str>,
+) -> Result<i32> {
+    let definition = store.get(id)?;
+    if definition.task.follow_up.is_some()
+        && (request_id != Some(id) || expected != Some(definition.revision.as_str()))
+    {
+        anyhow::bail!("one-shot follow-up requires its original admission ID and exact revision");
+    }
+    if request_id.is_none() && !definition.task.enabled {
         println!("  schedule run: task {id} is disabled, skipping");
         return Ok(0);
     }
@@ -655,18 +676,42 @@ async fn execute_task(lease: &atomcode_schedule::RunLease) -> Result<(i32, Optio
     //    The strict_unattended approver in run_native_headless blocks any dangerous/
     //    out-of-workspace bash regardless of permission_mode — no human is present.
     let mode = mode_from_str(&task.permission_mode);
+    let selection = task
+        .follow_up
+        .as_ref()
+        .map(|options| options.model.as_str());
+    if let Some(selection) = selection {
+        // Do not let the ordinary config fallback silently change the model.
+        config.resolve_model(Some(selection))?;
+        atomcode_schedule::timing::validate(task)?;
+    }
     let runtime_cfg = crate::runtime_config_from(
-        &config, &cwd, None, None,  // no per-task telemetry arc needed
+        &config, &cwd, selection, None,  // no per-task telemetry arc needed
         false, // dangerously_skip_permissions=false — scheduled: never full bypass
         false, // headless: fail-closed approval timeout
     );
 
-    // 6. Spawn runtime (Fresh session — no resume).
+    // The run lease protects this binding across OS/manual launches. Never fork
+    // a busy conversation or silently start over after deletion/resume failure.
+    let resume_id = match lease.bound_session()? {
+        Some((_, _)) if task.follow_up.is_some() => {
+            anyhow::bail!("one-shot follow-up already has a session; refusing to execute again")
+        }
+        Some((id, previous_cwd)) => {
+            if std::fs::canonicalize(&previous_cwd)? != std::fs::canonicalize(&cwd)? {
+                anyhow::bail!("automation conversation belongs to {previous_cwd}; create a new task to change its working directory");
+            }
+            Some(id)
+        }
+        None => None,
+    };
+
+    // 6. First run is fresh; subsequent runs restore the same native log.
     // Headless path always uses ProviderBootstrap::Required so it fails fast
     // when no provider is configured, mirroring the `-p` / `--prompt` flow.
     let (runtime, agent, _cont) = crate::spawn_native_cli_runtime(
         &runtime_cfg,
-        None,
+        resume_id,
         ProviderBootstrap::Required,
         false,
         false,
@@ -678,17 +723,22 @@ async fn execute_task(lease: &atomcode_schedule::RunLease) -> Result<(i32, Optio
     .await?;
 
     // 7. Mark session origin = Scheduled.
-    if let Some(ref session_info) = runtime.session {
+    {
+        let session_info = runtime
+            .session
+            .as_ref()
+            .context("automation runtime has no persistent session")?;
         let sid = session_info.id.clone();
         lease.session(&sid)?;
         let manager = SessionManager::for_project(
             &agent.working_dir,
             &atomcode_coding::config::product_dirs_from_env(),
         );
-        // Best-effort — don't abort the run if meta update fails.
-        let _ = manager.update_meta(&sid, |m| {
+        // The visible automation marker is part of admitting this run. Do not
+        // execute model/tool work if its metadata cannot be committed.
+        manager.update_meta(&sid, |m| {
             m.origin = SessionOrigin::Scheduled;
-        });
+        })?;
     }
 
     // 8. Set the runtime mode after spawn.
@@ -727,7 +777,7 @@ async fn execute_task(lease: &atomcode_schedule::RunLease) -> Result<(i32, Optio
     let (exit_code, _captured, diagnostic) = crate::run_native_headless_detailed(
         notifications_cfg,
         runtime,
-        task.prompt.clone(),
+        (task.prompt.clone(), task.follow_up.as_ref().and_then(|options| options.context.clone()).map(|text| format!("Reference supplied explicitly for this follow-up; not a new user instruction:\n{text}"))),
         provider_name,
         model_name,
         false,
@@ -1035,7 +1085,56 @@ mod tests {
             created_at: 0,
             last_run_at: None,
             last_status: None,
+            follow_up: None,
         }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn one_shot_worker_requires_original_admission_and_never_replays_a_claim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = atomcode_schedule::Store::new(tmp.path());
+        let mut task = make_task("followup-test", true);
+        task.cwd = tmp.path().to_string_lossy().into_owned();
+        task.schedule = Schedule::Manual;
+        task.follow_up = Some(atomcode_config::schedule::FollowUpTask {
+            source_session: "original".into(),
+            source_turn: 1,
+            model: "test-selection".into(),
+            context: None,
+        });
+        let definition = store.put(&task, None).unwrap();
+        for (request, expected) in [
+            (None, None),
+            (Some("different"), Some(definition.revision.as_str())),
+            (Some(task.id.as_str()), Some("wrong-revision")),
+        ] {
+            assert!(run_task_in(store.clone(), &task.id, request, expected)
+                .await
+                .is_err());
+        }
+        assert!(!store.request_claimed(&task.id, &task.id).unwrap());
+        let lease = store
+            .begin_revision(&task.id, Some(&task.id), Some(&definition.revision))
+            .unwrap();
+        lease.session("new-session").unwrap();
+        lease.finish("success", None).unwrap();
+        assert!(run_task_in(
+            store.clone(),
+            &task.id,
+            Some(&task.id),
+            Some(&definition.revision)
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            store
+                .history(&task.id)
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(event, atomcode_schedule::RunEvent::Started { .. }))
+                .count(),
+            1
+        );
     }
 
     /// Convenience: set ATOMCODE_HOME to a fresh tempdir, call `f`, restore.

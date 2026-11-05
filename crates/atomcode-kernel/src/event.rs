@@ -256,6 +256,9 @@ pub enum AgentCommand {
         name: String,
         #[serde(default)]
         args: String,
+        /// Attachments for prompt-producing catalog commands; absent on old clients.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageContent>,
     },
     /// `command`, for the agent behind `session` rather than the one this
     /// connection drives — a team member the person is talking to, cancelling
@@ -570,6 +573,8 @@ pub enum AgentEvent {
     /// (symmetric to visible text via `on_text_delta`) — so a redaction reaches both
     /// the live channel and storage consistently.
     Reasoning(String),
+    /// Discard only the current request's unsigned reasoning preview.
+    ReasoningDiscarded,
     /// Non-fatal advisory (e.g. a truncated response). The turn still completes.
     Warning(String),
     /// A partial response timed out after replay-unsafe output had already been
@@ -670,6 +675,16 @@ pub enum AgentEvent {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_catalog_invocation_defaults_to_no_images() {
+        let command: AgentCommand = serde_json::from_str(
+            r#"{"Invoke":{"id":"old","session":"lead","name":"skills","args":"probe"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(&command, AgentCommand::Invoke { images, .. } if images.is_empty()));
+        assert!(!serde_json::to_string(&command).unwrap().contains("images"));
+    }
+
     use super::*;
 
     /// A tagged command crosses the wire whole, and the events that answer it
@@ -803,6 +818,7 @@ mod tests {
                 session: "lead/scout".into(),
                 name: "stop".into(),
                 args: "scout".into(),
+                images: Vec::new(),
             },
             AgentCommand::To {
                 session: "lead/scout".into(),

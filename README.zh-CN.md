@@ -27,7 +27,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-5.2.5-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-5.2.6-blue" alt="version">
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS%20PC%20%7C%20Windows-lightgrey" alt="platform">
@@ -61,6 +61,8 @@ AtomCode 是一款住在你终端里的 AI 编码助手。用自然语言给它�
 
 - **Plan / Build 模式** —— `/plan` 切换到只读探索模式（agent 只调研、不改文件），`/build` 切回完整执行
 - **目标模式** —— `/goal <目标>` 设定完成条件后，agent 会一轮接一轮自动循环执行，直到目标达成
+- **定时循环** —— `/loop 5m <任务>` 按指定间隔重复执行，`/loop stop` 停止循环。
+- **子 agent 与团队** —— 在启用子 agent 能力的入口中，可通过 `task` / `team` 委派工作。
 - **代码审查** —— `/review` 审查当前改动，`/review staged` 审查暂存区，`/review <base>` 对比某个基准 ref
 - **后台会话** —— `/bg` 把任务放到分离的槽位执行，长任务进行时你仍可继续使用 TUI
 
@@ -118,12 +120,18 @@ AtomCode 是一款住在你终端里的 AI 编码助手。用自然语言给它�
 - **Bracketed paste** —— 长文本粘贴自动折叠为紧凑的指示器
 - **Skills** —— 从 skill 目录加载的用户自定义命令，像普通斜杠命令一样调用
 
+会话右侧滚动条默认不显示，滚轮和键盘翻页仍可正常使用。可在 `/config` 中设置 `ui.scrollbar` 为 `hidden`（默认）、`auto` 或 `always`。
+
 ### Web UI
 
 - **`/webui`**（TUI 内）或 **`atomcode webui`**（命令行）会在浏览器里打开一个本地 Web 界面，作为终端界面之外的另一种选择——同一个 agent、同一份会话，渲染在浏览器中
-- **仅本地回环** —— server 绑定 `127.0.0.1` 并使用一次性 token，不对网络暴露
+- **默认本地访问** —— server 默认绑定 `127.0.0.1`；显式使用 `/webui lan`（绑定 `0.0.0.0`）或 `--host <addr>` 可允许其他设备访问。请使用启动时打印的带认证信息的 URL。
 - **`/webui stop`** 停止进程内 server（之后再次 `/webui` 会重新启动）
 - **`/webui --port 20001`** 指定起始端口，也支持 `--host <地址>` 和 `--no-open`。端口被占用或被 Windows 保留（错误 10013）时会顺延，最多尝试 100 个端口，以打印的链接为准；修改已运行服务的端口前，先执行 `/webui stop`。
+
+### IDE 扩展
+
+可在编辑器中使用 AtomCode：参见 [VS Code 扩展](extensions/vscode/README.md)和 [JetBrains 扩展](extensions/jetbrains/README.md)的使用与开发说明。
 
 ### App 远程访问
 
@@ -627,6 +635,7 @@ atomcode/
   crates/
     atomcode-kernel/        # 中立 agent 循环与运行时 trait
     atomcode-capabilities/  # provider、tools、MCP、skills、session、memory
+    atomcode-harness/       # 可组合的能力行与装配机制
     atomcode-coding/        # coding 专业化与 CodingRuntime 生命周期
     atomcode-review/        # 代码评审专业化
     atomcode-tui/           # 终端 UI
@@ -636,6 +645,8 @@ atomcode/
 
 coding 主调用链是 `CLI/TUI/daemon → CodingRuntime → kernel`。已经退役的 core agent
 协议和 `atomcode-bridge` 不再位于运行时路径中。
+
+能力通过 `parts::prepare` 准备，再由 `runtime::mount` 挂载到 harness。会话以事件日志为权威来源，恢复时重放日志；快照是投影读法。历史快照在打开时单向转换。参见 [ADR 0024](docs/adr/0024-the-session-log-is-the-authority.md)。
 
 ### 设计原则
 
@@ -708,16 +719,15 @@ cargo run -p atomcode-daemon
 ### 测试
 
 ```bash
-# 运行全部测试
-cargo test
-
-# 运行指定 crate 的测试
-cargo test -p atomcode-capabilities
-cargo test -p atomcode-tui
+# 按受影响 crate 运行测试（需安装 cargo-nextest）
+cargo nextest run -p atomcode-capabilities
+cargo nextest run -p atomcode-tui
 
 # 运行指定的用例
-cargo test -p atomcode-capabilities test_name
+cargo nextest run -p atomcode-capabilities test_name
 ```
+
+合并前运行 `bash gates/compile.sh`，覆盖 workspace 全 target 和 feature 门控测试的编译。不要默认运行整个 workspace 的测试。nextest 不执行 doctest；需要时用 `cargo test --doc -p <crate>`。纯文档修改可省略编译和测试，但需检查 diff 与链接。详见 [验证依据](docs/development-verification-notes.md)。
 
 ### 常用命令
 
@@ -726,7 +736,8 @@ cargo test -p atomcode-capabilities test_name
 cargo check
 
 # 格式化代码
-cargo fmt
+cargo fmt --all
+cargo fmt --all -- --check
 
 # 运行 linter
 cargo clippy
@@ -755,7 +766,10 @@ cargo install --path crates/atomcode-cli
    ```
 4. 修改代码，确保能编译、测试通过：
    ```bash
-   cargo build && cargo test && cargo clippy
+   cargo fmt --all -- --check
+   bash gates/compile.sh
+   cargo nextest run -p atomcode-capabilities # 替换为受影响的 crate
+   cargo clippy
    ```
 5. 清晰地写 commit：
    ```bash

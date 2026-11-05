@@ -364,6 +364,7 @@ impl LspClient {
                     "definition": { "dynamicRegistration": true },
                     "references": { "dynamicRegistration": true },
                     "hover": { "dynamicRegistration": true },
+                    "documentSymbol": { "dynamicRegistration": true, "hierarchicalDocumentSymbolSupport": true, "symbolKind": {"valueSet": (1..=26).collect::<Vec<u32>>()} },
                     "diagnostic": { "dynamicRegistration": true }
                 }
             },
@@ -680,6 +681,20 @@ impl LspClient {
     ) -> Result<Value, String> {
         self.position_request("textDocument/hover", path, line, character, None, cancel)
             .await
+    }
+
+    /// Standard read-only document outline query; the manager opens the document.
+    pub async fn document_symbols(
+        &self,
+        path: &Path,
+        cancel: &CancellationToken,
+    ) -> Result<Value, String> {
+        self.send_request_cancellable(
+            "textDocument/documentSymbol",
+            json!({"textDocument": {"uri": path_to_uri(path)?}}),
+            cancel,
+        )
+        .await
     }
 
     async fn position_request(

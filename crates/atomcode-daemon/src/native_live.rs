@@ -22,7 +22,7 @@ static REMOTE_COMMAND: StdMutex<Option<tokio::sync::mpsc::UnboundedSender<String
 pub trait EmbeddedSessions: Send + Sync {
     fn owns(&self, session: &str) -> bool;
     fn hidden(&self, session: &str) -> bool;
-    async fn switch(&self, expected: String, session: String) -> Result<Resumed, String>;
+    async fn switch(&self, expected: String, session: String) -> Result<Resumed, HubError>;
 }
 
 static EMBEDDED_SESSIONS: StdMutex<Option<std::sync::Weak<dyn EmbeddedSessions>>> =
@@ -332,12 +332,38 @@ pub async fn force_release() -> Result<bool, String> {
 /// How long [`force_release`] waits for the released runtime to shut down.
 const FORCE_RELEASE_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+pub async fn import_patch(session: String, bytes: Vec<u8>) -> Result<String, HubError> {
+    hub().import_patch(session, bytes).await
+}
+
 pub fn dispatch(command: DriverCommand) -> Result<(), HubError> {
     hub().dispatch(command)
 }
 
+pub async fn update_mode_bindings(
+    bindings: atomcode_config::mode_models::ModeModels,
+) -> Result<(), HubError> {
+    hub().update_mode_bindings(bindings).await
+}
+pub async fn current_turn_model(
+) -> Result<Option<atomcode_coding::runtime::RunningModelIdentity>, HubError> {
+    hub().current_turn_model().await
+}
+
+pub async fn model_selection() -> Result<atomcode_config::mode_models::ModeSelection, HubError> {
+    hub().model_selection().await
+}
+
 pub async fn set_mode(mode: RuntimeMode) -> Result<(), HubError> {
     hub().set_mode(mode).await
+}
+
+pub async fn select_provider(
+    expected: &LiveBinding,
+    next: atomcode_coding::CodingAgentConfig,
+    fingerprint: String,
+) -> Result<atomcode_coding::RuntimeGeneration, HubError> {
+    hub().select_provider(expected, next, fingerprint).await
 }
 
 pub async fn reload_provider(
@@ -421,8 +447,7 @@ async fn resume(session_id: String, fork_on_busy: bool) -> Result<Resumed, HubEr
                 .await
                 .map_err(|error| {
                     HubError::RuntimeRejected(format!("session navigation failed: {error}"))
-                })?
-                .map_err(HubError::RuntimeRejected);
+                })?;
         }
     }
     let project_bucket = atomcode_capabilities::session::SessionManager::project_hash(
@@ -434,13 +459,18 @@ async fn resume(session_id: String, fork_on_busy: bool) -> Result<Resumed, HubEr
     } else {
         crate::legacy_convert::prepare_catalog_session_resume_in_project
     };
+    let prepare_any = if fork_on_busy {
+        crate::legacy_convert::prepare_catalog_session_resume_or_fork_any_project
+    } else {
+        crate::legacy_convert::prepare_catalog_session_resume_any_project
+    };
     let prepared = match prepare(&project_bucket, &session_id) {
         Ok(Some(prepared)) => prepared,
         // Found here but not to be had (unreadable, or in use and not copyable):
         // that is the answer, not a reason to look in every other project and
         // report whatever the second search says instead.
         Err(error) => return Err(HubError::RuntimeRejected(error.to_string())),
-        Ok(None) => crate::legacy_convert::prepare_catalog_session_resume_any_project(&session_id)
+        Ok(None) => prepare_any(&session_id)
             .map_err(|error| HubError::RuntimeRejected(error.to_string()))?
             .ok_or_else(|| {
                 HubError::RuntimeRejected(format!("session {session_id:?} not found in catalog"))
@@ -465,6 +495,21 @@ pub async fn fresh_session(
     expected: &LiveBinding,
 ) -> Result<crate::live_hub::FreshSessionOutcome, HubError> {
     hub().fresh_session(expected).await
+}
+
+/// Navigate a remote client in one runtime transition. A selected session
+/// determines its own working directory; the requested directory is used only
+/// when opening a project without selecting a history session.
+pub async fn navigate(
+    working_dir: PathBuf,
+    session_id: Option<String>,
+) -> Result<atomcode_coding::SessionChanged, HubError> {
+    match session_id.filter(|id| !id.trim().is_empty()) {
+        Some(id) => resume_or_fork_session(id.trim().to_string())
+            .await
+            .map(|resumed| resumed.changed),
+        None => change_directory(working_dir).await,
+    }
 }
 
 pub async fn change_directory(
@@ -895,4 +940,25 @@ mod tests {
             "the live hub should bind after MCP tools reach the catalog"
         );
     }
+}
+
+pub async fn task_specs(
+    session: String,
+    args: String,
+) -> Result<serde_json::Value, crate::live_hub::HubError> {
+    hub().task_specs(session, args).await
+}
+
+/// Inspect the currently bound persona without rebinding a viewed session.
+pub async fn persona(
+    session: String,
+) -> Result<Option<atomcode_coding::runtime::RuntimePersonaInfo>, crate::live_hub::HubError> {
+    hub().persona(session).await
+}
+
+pub async fn follow_up(
+    session: String,
+    args: String,
+) -> Result<serde_json::Value, crate::live_hub::HubError> {
+    hub().follow_up(session, args).await
 }

@@ -12,6 +12,9 @@ import {
 
 const root = join(process.cwd(), 'webview-ui');
 
+/** Windows checkouts are CRLF; the assertions below are written against LF source text. */
+const readSource = (path: string) => readFileSync(path, 'utf8').replace(/\r\n/g, '\n');
+
 test('detects @ mentions only at start or after whitespace', () => {
   assert.deepEqual(detectAtMentionRange('@src', 4), {
     start: 0,
@@ -83,8 +86,8 @@ test('scrolls the active @ menu row into the visible list', () => {
 });
 
 test('@ picker active row keeps text readable in light themes', () => {
-  const css = readFileSync(join(root, 'src/styles/input.css'), 'utf8');
-  const variables = readFileSync(join(root, 'src/styles/variables.css'), 'utf8');
+  const css = readSource(join(root, 'src/styles/input.css'));
+  const variables = readSource(join(root, 'src/styles/variables.css'));
 
   assert.match(css, /\.at-mention-picker\s+\.file-picker-item\.active/);
   assert.match(css, /--app-command-menu-active-background/);
@@ -97,7 +100,7 @@ test('@ picker active row keeps text readable in light themes', () => {
 });
 
 test('/ and @ pickers share command menu selection colors', () => {
-  const css = readFileSync(join(root, 'src/styles/input.css'), 'utf8');
+  const css = readSource(join(root, 'src/styles/input.css'));
 
   assert.match(css, /\.slash-item\.active\s*\{[^}]*--app-command-menu-active-background/s);
   assert.match(css, /\.at-mention-picker\s+\.file-picker-item\.active\s*\{[^}]*--app-command-menu-active-background/s);

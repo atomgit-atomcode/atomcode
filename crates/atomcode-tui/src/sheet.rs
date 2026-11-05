@@ -300,6 +300,8 @@ pub struct ReadLine {
 /// 从头读到尾的一段字:一个文件,或者一个文件的改动。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Read {
+    /// Explicit reviewed-content action (Enter); absent on ordinary readers.
+    pub action: Option<(String, String)>,
     pub id: &'static str,
     /// 表头里那段:路径、再加上说明(只读了前 N 行之类)、`+a -r`。
     pub title: Vec<Piece>,
@@ -314,6 +316,7 @@ impl Read {
     /// 一个文件,每行带行号。
     pub fn file(id: &'static str, title: Vec<Piece>, text: &str) -> Self {
         Self {
+            action: None,
             id,
             title,
             lines: Arc::new(
@@ -339,6 +342,7 @@ impl Read {
         let added = lines.iter().filter(|l| l.mark == Mark::Added).count();
         let removed = lines.iter().filter(|l| l.mark == Mark::Removed).count();
         Self {
+            action: None,
             id,
             title: vec![
                 Piece::new(path, Tone::Plain),
@@ -677,6 +681,11 @@ pub fn key_in(sheet: &mut Sheet, press: KeyPress, room: usize, width: usize) -> 
     match &mut sheet.page {
         Page::List(list) => list_key(list, press),
         Page::Read(read) => {
+            if press.key == Key::Enter && sheet.pending.is_none() {
+                if let Some((_, command)) = &read.action {
+                    return Step::Chose(command.clone());
+                }
+            }
             let leave = matches!(
                 (press.key, press.mods),
                 (Key::Esc, _) | (Key::Left, _) | (Key::Char('q'), Mods::NONE)

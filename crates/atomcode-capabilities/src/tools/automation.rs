@@ -15,6 +15,15 @@ pub trait AutomationService: Send + Sync {
     ) -> Result<Value, String>;
 }
 pub fn automation_tools(service: Arc<dyn AutomationService>) -> Vec<Arc<dyn Tool>> {
+    automation_tools_with_approval(service, Arc::new(|| false))
+}
+
+/// Host-only policy decision. The host must bind this to explicit configuration
+/// and its current runtime mode, never model arguments or session tool grants.
+pub fn automation_tools_with_approval(
+    service: Arc<dyn AutomationService>,
+    preauthorized: Arc<dyn Fn() -> bool + Send + Sync>,
+) -> Vec<Arc<dyn Tool>> {
     [
         "schedule_create",
         "schedule_list",
@@ -26,6 +35,7 @@ pub fn automation_tools(service: Arc<dyn AutomationService>) -> Vec<Arc<dyn Tool
         Arc::new(AutomationTool {
             name,
             service: service.clone(),
+            preauthorized: preauthorized.clone(),
         }) as Arc<dyn Tool>
     })
     .collect()
@@ -33,6 +43,7 @@ pub fn automation_tools(service: Arc<dyn AutomationService>) -> Vec<Arc<dyn Tool
 struct AutomationTool {
     name: &'static str,
     service: Arc<dyn AutomationService>,
+    preauthorized: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 #[async_trait]
 impl Tool for AutomationTool {
@@ -41,10 +52,10 @@ impl Tool for AutomationTool {
     }
     fn description(&self) -> &str {
         match self.name {
-            "schedule_create" => "Create an OS-scheduled independent task for the current project. Each occurrence starts a fresh session using the host default model. Uses execution-host local time, not browser time. If another time zone is requested, explain that only host-local scheduling is supported; do not silently approximate recurring DST rules. Requires explicit human approval; never claim success without a saved result. Use plan permissions by default; cron and one-shot rules are not supported.",
+            "schedule_create" => "Create an OS-scheduled independent task for the current project. Each occurrence starts a fresh session using the host default model. Uses execution-host local time, not browser time. If another time zone is requested, explain that only host-local scheduling is supported; do not silently approximate recurring DST rules. Requires explicit human approval unless the user configured schedule approval to inherit the current Auto mode; never claim success without a saved result. Use plan permissions by default; cron and one-shot rules are not supported.",
             "schedule_list" => "List this project's persisted automation tasks with revisions, registration status and estimated next time. Read before editing; registration error means the task is saved but may not run.",
-            "schedule_update" => "Update a persisted automation task using its id and exact observed revision from schedule_list. Supply a complete task record retaining its id and cwd. Requires explicit approval; conflicts require a fresh read, not a blind retry.",
-            _ => "Delete a scheduled task using its id and exact observed revision. Stops future triggers, retains execution sessions and run history, and does not cancel an active run. Requires explicit human approval.",
+            "schedule_update" => "Update a persisted automation task using its id and exact observed revision from schedule_list. Supply a complete task record retaining its id and cwd. Requires explicit approval unless the user configured schedule approval to inherit the current Auto mode; conflicts require a fresh read, not a blind retry.",
+            _ => "Delete a scheduled task using its id and exact observed revision. Stops future triggers, retains execution sessions and run history, and does not cancel an active run. Requires explicit human approval unless the user configured schedule approval to inherit the current Auto mode.",
         }
     }
     fn parameters_schema(&self) -> Value {
@@ -75,7 +86,7 @@ impl Tool for AutomationTool {
         }
     }
     fn risk(&self, _: &str) -> RiskLevel {
-        // Writes perform their own mandatory per-change consent below. A generic
+        // Writes perform their own per-change consent (or explicit host policy) below. A generic
         // risk prompt would ask twice and its session grant/Auto bypass cannot
         // authorize persistent work. Coding plan policy explicitly blocks these persistent mutations.
         RiskLevel::Safe
@@ -86,7 +97,7 @@ impl Tool for AutomationTool {
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
         let result = async {
             let value: Value=serde_json::from_str(args).map_err(|e|e.to_string())?;
-            if self.name!="schedule_list" {
+            if self.name!="schedule_list" && !(self.preauthorized)() {
                 let mut payload=serde_json::to_value(ApprovalRequest {call_id:ctx.progress.source_id().unwrap_or("").to_string(),tool:self.name.into(),args:args.into(),reason:Some(format!("This changes persistent background automation in {}. Approval applies to this exact change, not to arbitrary future tool permissions.",ctx.working_dir.display())),allow_all_bash:false}).map_err(|e|e.to_string())?;
                 payload["requires_explicit_approval"] = Value::Bool(true);
                 let reply=tokio::select! { _=ctx.cancel.cancelled()=>return Err("cancelled".into()), reply=ctx.request("approval",payload)=>reply };
@@ -135,6 +146,27 @@ mod tests {
             progress: ProgressSink::noop(),
             requester: None,
         }
+    }
+    #[tokio::test]
+    async fn host_authorization_tracks_mode_and_never_overrides_cancellation() {
+        use std::sync::atomic::AtomicBool;
+        let backend = Arc::new(Backend(AtomicUsize::new(0)));
+        let auto = Arc::new(AtomicBool::new(false));
+        let tools = automation_tools_with_approval(backend.clone(), {
+            let auto = auto.clone();
+            Arc::new(move || auto.load(Ordering::Acquire))
+        });
+        for tool in tools.iter().filter(|t| t.name() != "schedule_list") {
+            assert!(tool.execute("{}", &context()).await.is_error);
+            auto.store(true, Ordering::Release);
+            assert!(!tool.execute("{}", &context()).await.is_error);
+            let cancelled = context();
+            cancelled.cancel.cancel();
+            assert!(tool.execute("{}", &cancelled).await.is_error);
+            auto.store(false, Ordering::Release);
+            assert!(tool.execute("{}", &context()).await.is_error);
+        }
+        assert_eq!(backend.0.load(Ordering::SeqCst), 3);
     }
     #[tokio::test]
     async fn unattended_mutations_fail_closed_but_reading_is_available() {

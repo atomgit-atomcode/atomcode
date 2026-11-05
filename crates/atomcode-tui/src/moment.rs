@@ -440,9 +440,9 @@ pub struct TeamReturn {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ScrollbarMode {
-    #[default]
     Auto,
     Always,
+    #[default]
     Hidden,
 }
 

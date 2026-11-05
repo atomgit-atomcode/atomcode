@@ -109,7 +109,7 @@ struct Args {
 
 // Providers may fill unused fields in a flat schema. Only a nonempty full
 // list overrides add/update; their default empty todos must not erase the plan.
-fn is_incremental_action(value: &serde_json::Value) -> bool {
+pub(crate) fn is_incremental_action(value: &serde_json::Value) -> bool {
     matches!(
         value.get("action").and_then(|v| v.as_str()),
         Some("add" | "update")
@@ -118,7 +118,7 @@ fn is_incremental_action(value: &serde_json::Value) -> bool {
         .is_none_or(|todos| todos.as_array().is_some_and(Vec::is_empty))
 }
 
-fn todo_arguments(args: &str) -> Result<serde_json::Value, String> {
+pub(crate) fn todo_arguments(args: &str) -> Result<serde_json::Value, String> {
     let mut value: serde_json::Value = serde_json::from_str(args)
         .map_err(|e| format!("todowrite: invalid arguments: {e}. Expected {{\"todos\":[{{\"content\":\"…\",\"status\":\"pending|in_progress|completed\"}}]}}."))?;
     // Keep transcript-derived state aligned with RepairToolArgsMiddleware. The
@@ -382,35 +382,55 @@ pub fn active_todo_calls(messages: &[Message]) -> Vec<ActiveTodoCall<'_>> {
         .iter()
         .rposition(Message::is_user_interruption)
         .map_or(messages, |index| &messages[index + 1..]);
-    let failed_call_ids = active_messages
-        .iter()
-        .filter(|message| message.is_error)
-        .filter_map(|message| message.tool_call_id.as_deref())
-        .collect::<std::collections::HashSet<_>>();
-    active_messages
-        .iter()
-        .flat_map(|m| {
-            m.tool_calls
-                .iter()
-                .enumerate()
-                .map(move |(index, call)| ActiveTodoCall {
+    let mut calls = Vec::new();
+    let mut pending = std::collections::HashMap::new();
+    let mut failed = std::collections::HashSet::new();
+    for message in active_messages {
+        for (index, call) in message.tool_calls.iter().enumerate() {
+            // IDs can be reused in a later round. A settlement belongs to this
+            // occurrence, never every historical call carrying the same ID.
+            pending.remove(call.id.as_str());
+            if is_todo_call(&call.name) {
+                pending.insert(call.id.as_str(), calls.len());
+                calls.push(ActiveTodoCall {
                     call,
-                    meta: m.meta.as_ref(),
+                    meta: message.meta.as_ref(),
                     index,
-                })
-        })
-        .filter(|c| is_todo_call(&c.call.name) && !failed_call_ids.contains(c.call.id.as_str()))
+                });
+            }
+        }
+        if let Some(call_id) = message.tool_call_id.as_deref() {
+            if let Some(index) = pending.remove(call_id) {
+                if message.is_error {
+                    failed.insert(index);
+                }
+            }
+        }
+    }
+    calls
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, call)| (!failed.contains(&index)).then_some(call))
         .collect()
 }
 
 /// Stateless full-list-replace todo tool. No interior state — current list is derived
 /// from the transcript (see `derive_current_todos`).
 #[derive(Clone, Default)]
-pub struct TodoTool;
+pub struct TodoTool {
+    sources: Option<std::sync::Arc<dyn super::todo_sources::TodoSourceAccess>>,
+}
 
 impl TodoTool {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+    pub fn with_sources(
+        sources: std::sync::Arc<dyn super::todo_sources::TodoSourceAccess>,
+    ) -> Self {
+        Self {
+            sources: Some(sources),
+        }
     }
 }
 
@@ -427,7 +447,7 @@ the list, e.g. `#3`); `{\"action\":\"add\",\"content\":\"…\"}` appends a new p
 set it `in_progress`; the MOMENT it is actually done (verified) set it `completed`.\n\
 Each task is ONE specific, verifiable action with a concrete outcome a later turn can execute without re-planning — write `add error handling to load_config`, not `handle errors`, `task 1`, or `处理功能`. Keep \
 EXACTLY ONE task `in_progress` at a time (enforced automatically). Mark a task `completed` ONLY after the work is \
-actually done, never on intent.";
+actually done, never on intent. When planning from detailed user guidance, use todo_sources list to identify the original message(s) and attach source_seqs to the full plan. Never copy the patch into a task title or guess the most recent message as its source. Incremental updates preserve these batch references.";
 
 #[async_trait]
 impl Tool for TodoTool {
@@ -458,7 +478,8 @@ impl Tool for TodoTool {
                 "action": { "type": "string", "enum": ["add", "update"], "description": "UPDATE ONE ITEM (do NOT resend the whole list): `add` a task, or `update` one task's status." },
                 "id": { "type": "integer", "description": "For action=update: the 1-based task number to change (as shown, e.g. #3)." },
                 "status": { "type": "string", "enum": ["pending", "in_progress", "completed"], "description": "For action=update: the new status." },
-                "content": { "type": "string", "description": "For action=add: the new task description." }
+                "content": { "type": "string", "description": "For action=add: the new task description." },
+                "source_seqs": { "type":"array", "items":{"type":"integer"}, "maxItems":4, "description":"For a full plan: exact original user-message sequences returned by todo_sources list. Links this batch to original guidance without copying it. Omit for legacy/no-source plans; incremental edits retain the batch's existing sources." }
             }
         })
     }
@@ -472,6 +493,47 @@ impl Tool for TodoTool {
             Ok(value) => value,
             Err(error) => return err(error),
         };
+        if v.get("source_seqs").is_some() {
+            let checked = (|| -> Result<(), String> {
+                let seqs = super::todo_sources::source_seqs(&v)?;
+                if seqs.is_empty() {
+                    return Ok(());
+                }
+                if is_incremental_action(&v) {
+                    return Err(
+                        "source_seqs belongs to a full plan, not an incremental edit".into(),
+                    );
+                }
+                let session = self
+                    .sources
+                    .as_ref()
+                    .ok_or("source access is unavailable")?
+                    .session()?;
+                let boundary = session
+                    .events
+                    .iter()
+                    .rev()
+                    .find_map(|entry| match &entry.event {
+                        atomcode_kernel::session::SessionEvent::AssistantMessage {
+                            tool_calls,
+                            ..
+                        } if tool_calls.iter().any(|call| {
+                            is_todo_call(&call.name)
+                                && todo_arguments(&call.arguments)
+                                    .is_ok_and(|original| original == v)
+                        }) =>
+                        {
+                            Some(entry.seq)
+                        }
+                        _ => None,
+                    })
+                    .ok_or("the source plan has no executing call in this session")?;
+                super::todo_sources::validate_sources(&session.events, boundary, &seqs)
+            })();
+            if let Err(error) = checked {
+                return err(error);
+            }
+        }
         // Full-list (re)plan shape. Echo an ASCII-safe NUMBERED list as the tool result (goes
         // into the transcript; the renderer draws the pretty version separately). The
         // `<glyph> <id>. <content>` shape seeds the TUI title cache so later `action=update
@@ -568,8 +630,8 @@ mod tests {
         // is the canonical one, so a rename cannot leave the rule behind — and
         // the literal is pinned, so the rename is a decision rather than a typo.
         assert_eq!(TodoTool::new().name(), "todowrite");
-        assert_eq!(TodoTool.name(), TOOL_NAME);
-        assert!(is_todo_call(TodoTool.name()));
+        assert_eq!(TodoTool::new().name(), TOOL_NAME);
+        assert!(is_todo_call(TodoTool::new().name()));
         assert!(is_todo_call(LEGACY_TOOL_NAME));
         assert!(!is_todo_call("read_file"));
         // Both names fold, which is the whole reason the legacy one is kept.

@@ -253,7 +253,7 @@ impl ScheduleCommands {
             Schedule::Weekly { .. } => "weekly",
             Schedule::Hourly => "hourly",
             Schedule::Interval { .. } => "interval",
-            Schedule::Cron { .. } => "daily",
+            Schedule::Manual | Schedule::Cron { .. } => "daily",
         };
         let mut rules = vec![
             Choice::new("daily", tr(Msg::AutomationDaily)),

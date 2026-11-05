@@ -503,6 +503,15 @@ impl AgentClient {
     }
     /// Run a command from the catalog of the agent on screen.
     pub fn invoke(&self, name: &str, args: &str) {
+        self.invoke_with_images(name, args, Vec::new());
+    }
+
+    pub fn invoke_with_images(
+        &self,
+        name: &str,
+        args: &str,
+        images: Vec<atomcode_kernel::message::ImageContent>,
+    ) {
         let id = format!("tui-{}", self.receipts.fetch_add(1, Ordering::SeqCst));
         let session = self.session();
         if crate::commands::catalog_command_starts_turn(
@@ -538,6 +547,7 @@ impl AgentClient {
                 .insert(id.clone(), session.clone());
         }
         self.command(AgentCommand::Invoke {
+            images,
             id,
             session,
             name: name.to_string(),
@@ -1399,6 +1409,8 @@ pub struct Tui {
     /// When the allowance was last asked about, so it is not asked again for
     /// [`ALLOWANCE_EVERY`]. `None` until the first turn ends.
     allowance_checked: Mutex<Option<std::time::Instant>>,
+    /// Invalidates quota requests issued before the active model was replaced.
+    allowance_generation: Arc<AtomicU64>,
     /// Whether the "out of quota — here is `/openrouter`" line has been said.
     /// Once per screen: the account stays out until the window turns over, and a
     /// line that came back every turn would be one more thing to read past.
@@ -1688,7 +1700,9 @@ impl UserInterface for Tui {
             .and_then(|notices| notices.welcome_note.clone());
         let launcher_note_pending = welcome_note.is_some();
         let native_mouse_notice = (!self.surface.mouse()).then(|| {
-            t(if crate::caps::mouse_reported() {
+            t(if crate::tmux_mouse::disabled() {
+                Msg::MouseDisabledByTmux
+            } else if crate::caps::mouse_reported() {
                 Msg::MouseHandedBackAtStart
             } else {
                 Msg::MouseUnreportedAtStart
@@ -1915,6 +1929,8 @@ impl UserInterface for Tui {
         let mut replay: std::collections::VecDeque<Wake> = std::collections::VecDeque::new();
         // Wakes answered since that frame. See [`COALESCE_LIMIT`].
         let mut coalesced = 0usize;
+        let mut painted_size = self.surface.size();
+        let mut last_menu_hover = None;
         // Whether the screen could take a background question at the last frame,
         // so the moment it can is seen once (see [`became_ready`]).
         let mut was_ready = false;
@@ -2080,7 +2096,9 @@ impl UserInterface for Tui {
                     self.pour_bg_question();
                 }
                 was_ready = ready;
-                self.paint();
+                painted_size = self.surface.size();
+                last_menu_hover = None;
+                self.paint(painted_size);
                 stale = false;
                 coalesced = 0;
             }
@@ -2311,6 +2329,25 @@ impl UserInterface for Tui {
                 // change would put a sentence in the conversation for a badge
                 // that already says it — a person's own Shift+Tab would read as
                 // news.
+                Wake::Host(HostEvent::ModelSelectionPending {
+                    session,
+                    current_model,
+                }) => {
+                    let visible = {
+                        let moment = self.host.moment.read().expect("moment poisoned");
+                        moment.viewing == session || moment.lead == session
+                    };
+                    if visible {
+                        self.host.say(
+                            t(Msg::ModelNextTurn {
+                                model: &current_model,
+                            })
+                            .into_owned(),
+                            false,
+                        );
+                        stale = true;
+                    }
+                }
                 Wake::Host(HostEvent::ModeChanged { session, mode }) => {
                     stale |= took_mode(&self.host.moment, &session, Some(mode));
                 }
@@ -2600,6 +2637,11 @@ impl UserInterface for Tui {
                             Click::WheelUp => -WHEEL_LINES,
                             _ => WHEEL_LINES,
                         };
+                        if let Some(flow) = self.host.overlays.current() {
+                            flow.scroll(by);
+                            stale = true;
+                            continue;
+                        }
                         if self.host.todo_wheel(x, y, by) {
                             stale = true;
                             continue;
@@ -3004,7 +3046,10 @@ impl UserInterface for Tui {
                         // nothing to ask, and the pointer moves all day.
                         Click::Hover => {
                             if self.host.context_menu_open() {
-                                stale |= self.host.context_menu_hover(x, y, self.surface.size());
+                                if last_menu_hover != Some((x, y)) {
+                                    last_menu_hover = Some((x, y));
+                                    stale |= self.host.context_menu_hover(x, y, painted_size);
+                                }
                             }
                             // A question is the other thing on screen that follows
                             // a pointer, and for the same reason: the row under
@@ -3659,7 +3704,7 @@ impl Tui {
             || self.host.team_focused())
     }
 
-    fn paint(&self) {
+    fn paint(&self, size: (u16, u16)) {
         self.name_the_window();
         // Where the pointer is, for the status row's marker: the surface is the
         // one that knows, and every way it changes (ctrl+g, `[ui] mouse`, the
@@ -3671,7 +3716,7 @@ impl Tui {
                 m.mouse_handed_back = back;
             }
         }
-        let frame = self.host.compose(self.surface.size());
+        let frame = self.host.compose(size);
         self.surface.present(&frame);
     }
 
@@ -3775,7 +3820,23 @@ impl Tui {
                 true,
             );
         }
+        let edit_key = view
+            .rows()
+            .iter()
+            .find(|row| row.id == crate::settings::QUESTION_EDIT_KEY)
+            .map(|row| row.value.as_str())
+            .unwrap_or("ctrl+e");
+        if let Err(error) = crate::keymap::parse_question_edit_key(edit_key) {
+            self.host.say(
+                t(Msg::KeybindingsError { error: &error }).into_owned(),
+                true,
+            );
+        }
         let mut moment = self.host.moment.write().expect("moment poisoned");
+        if let Some(sheet) = moment.asking.as_mut() {
+            sheet.edit_key = crate::keymap::parse_question_edit_key(edit_key)
+                .unwrap_or_else(|_| crate::surface::KeyPress::ctrl('e'));
+        }
         if moment.settings == view {
             return false;
         }
@@ -3926,6 +3987,27 @@ impl Tui {
         let Some(port) = ctx.service::<crate::plugin::ProvidersSvc>() else {
             return Err(t(Msg::NoProviderPort).into_owned());
         };
+        if let Step::DiscoverDraft { endpoint } = &step {
+            let Some(request) = self.host.provider_discovery_id() else {
+                return Ok(None);
+            };
+            if let Some(listing) = port.discover_ollama(endpoint) {
+                let host = self.host.clone();
+                let keys = self.wake.lock().expect("wake poisoned").clone();
+                tokio::spawn(async move {
+                    host.provider_draft_discovered(request, listing.await);
+                    if let Some(keys) = keys {
+                        let _ = keys.send(Wake::Fact);
+                    }
+                });
+            } else {
+                self.host.provider_draft_discovered(
+                    request,
+                    Err(t(Msg::ProviderDiscoverUnsupported).into_owned()),
+                );
+            }
+            return Ok(None);
+        }
         // Listing an endpoint's models writes nothing, so it is not followed by
         // a reload: the answer fills the picker the form put up, off the frame.
         if let Step::Discover { account } = step {
@@ -3957,16 +4039,25 @@ impl Tui {
         // when a model was saved (see `Providers::probe`).
         let mut check: Option<(String, Option<String>)> = None;
         let said = match step {
-            Step::Use { .. } | Step::Stay | Step::Close | Step::Discover { .. } => None,
+            Step::Use { .. }
+            | Step::Stay
+            | Step::Close
+            | Step::Discover { .. }
+            | Step::DiscoverDraft { .. } => None,
             Step::SaveAccount {
                 id: Some(id),
                 draft,
+                ..
             } => {
                 port.edit_account(&id, &draft)?;
                 check = Some((id.clone(), None));
                 Some(t(Msg::ProviderEdited { id: &id }).into_owned())
             }
-            Step::SaveAccount { id: None, draft } => {
+            Step::SaveAccount {
+                id: None,
+                draft,
+                listed,
+            } => {
                 let id = port.add_account(&draft)?;
                 check = Some((id.clone(), None));
                 // Straight into its model list: an account with no model under
@@ -3975,7 +4066,15 @@ impl Tui {
                 self.host.show_providers(port.rows());
                 self.host.walk_into_provider(&id);
                 if self.host.connect_provider_models(&id) {
-                    if let Err(why) = self.apply_provider_step(Step::Discover {
+                    if let Some(listed) = listed {
+                        if let Some(request) = self.host.provider_discovery_id() {
+                            if let Some(why) =
+                                self.host.providers_discovered(&id, request, Ok(listed))
+                            {
+                                self.host.say(&why, true);
+                            }
+                        }
+                    } else if let Err(why) = self.apply_provider_step(Step::Discover {
                         account: id.clone(),
                     }) {
                         self.host.say(&why, true);
@@ -5672,6 +5771,10 @@ impl Tui {
         let session = self.client.session();
         let host = self.host.clone();
         let nudged = self.allowance_nudged.clone();
+        let client = self.client.clone();
+        let allowance_generation = self.allowance_generation.clone();
+        let generation = allowance_generation.load(Ordering::SeqCst);
+        let addressed_session = session.clone();
         let repaint = ctx.service::<RepaintSvc>();
         tokio::spawn(async move {
             // The cheap form — the windows and nothing else. The plan behind
@@ -5684,7 +5787,11 @@ impl Tui {
                 })
                 .await
             {
-                Ok(HostReply::Usage { windows, .. }) => windows,
+                Ok(HostReply::Usage {
+                    windows,
+                    unavailable: None,
+                    ..
+                }) => windows,
                 // A host that will not say leaves the row as it was. Blanking
                 // it on a failed question would read as "you are back to zero".
                 _ => return,
@@ -5694,26 +5801,31 @@ impl Tui {
             // condition (`atomcode-tuix`'s `openrouter_connect::quota_exhausted`).
             // Once per screen — the account stays out until the window turns
             // over, and the row keeps carrying the figure meanwhile.
-            let mut said = false;
-            if let Some(spent) = crate::moment::Allowance::exhausted(&windows) {
-                if !nudged.swap(true, Ordering::SeqCst) {
-                    host.say(
+            if client.session() != addressed_session {
+                return;
+            }
+            let (changed, warning) = {
+                let mut m = host.moment.write().expect("moment poisoned");
+                if generation != allowance_generation.load(Ordering::SeqCst) {
+                    return;
+                }
+                let warning = crate::moment::Allowance::exhausted(&windows)
+                    .filter(|_| !nudged.swap(true, Ordering::SeqCst))
+                    .map(|spent| {
                         t(Msg::AllowanceExhaustedOpenRouter {
                             label: &spent.label,
                         })
-                        .into_owned(),
-                        false,
-                    );
-                    said = true;
-                }
-            }
-            let changed = {
-                let mut m = host.moment.write().expect("moment poisoned");
+                        .into_owned()
+                    });
                 let nearest = crate::moment::Allowance::nearest(&windows, m.now);
                 let changed = m.allowance != nearest;
                 m.allowance = nearest;
-                changed
+                (changed, warning)
             };
+            let said = warning.is_some();
+            if let Some(warning) = warning {
+                host.say(warning, false);
+            }
             if changed || said {
                 if let Some(repaint) = repaint {
                     repaint.now();
@@ -5876,6 +5988,9 @@ impl Tui {
     /// whose policy is `Restart` is one a reload would not reach anyway, so
     /// asking is skipped rather than answered with a lie.
     fn apply_setting(&self, id: &str, value: &str) -> Result<(), String> {
+        if id == crate::settings::QUESTION_EDIT_KEY {
+            crate::keymap::parse_question_edit_key(value)?;
+        }
         let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
             return Err(t(Msg::ScreenNotConnectedSettings).into_owned());
         };
@@ -6595,6 +6710,8 @@ impl Tui {
                 true
             }
             AgentEvent::Described { description } => {
+                let refresh_allowance = description.session == self.client.session()
+                    || description.session == self.client.root();
                 self.client.describe(&description);
                 // Keep the status row's context window in step with the screen
                 // agent's mounted model. Read it back off the screen agent's
@@ -6628,11 +6745,20 @@ impl Tui {
                     let changed = moment.ctx_window != window
                         || moment.model != model
                         || moment.effort != effort;
+                    let cleared_allowance = refresh_allowance && moment.allowance.take().is_some();
+                    if refresh_allowance {
+                        self.allowance_generation.fetch_add(1, Ordering::SeqCst);
+                    }
                     moment.ctx_window = window;
                     moment.model = model;
                     moment.effort = effort;
-                    changed
+                    changed || cleared_allowance
                 };
+                if refresh_allowance {
+                    *self.allowance_checked.lock().expect("allowance poisoned") = None;
+                    self.allowance_nudged.store(false, Ordering::SeqCst);
+                    self.check_allowance();
+                }
                 // The providers rows too, and only now that the moment is free:
                 // `refresh_providers` writes the same lock this branch held, and
                 // a status row that names the account has to be marked against
@@ -6761,9 +6887,8 @@ impl Tui {
                     false
                 }
             }
-            AgentEvent::ToolProgress { message, .. } => {
-                self.host.say_for(message, false, 1_500);
-                true
+            AgentEvent::ToolProgress { call_id, message } => {
+                self.host.tool_progress(&call_id, &message)
             }
             AgentEvent::StreamRecovery {
                 attempt,
@@ -6820,6 +6945,7 @@ impl Tui {
                     .turn_invocations
                     .remove(&id);
                 if let Some(line) = invocation {
+                    self.host.stop_recognizing();
                     if failed == Some(false) {
                         return false;
                     }
@@ -7704,6 +7830,9 @@ impl Tui {
                     })
                 });
                 if let Some(command) = command {
+                    if self.run_image_skill_command(&command, &images) {
+                        return false;
+                    }
                     if !images.is_empty() {
                         self.say_refused(&t(Msg::CommandCarriesNoPictures {
                             count: images.len(),
@@ -7718,13 +7847,12 @@ impl Tui {
                 // is NOT a command: it reaches the model untouched instead of
                 // erroring with "没有 /Users/… 这条命令".
                 if crate::command::looks_like_command(&text) {
-                    // A command carries no pictures — no command takes them —
-                    // and `take_shown` above has already drained them off the
-                    // composer. Until one does, **say so**: a screenshot
-                    // attached and then silently dropped is the failure this
-                    // whole subsystem exists to prevent (`attach.rs`: what was
-                    // written and what was attached are decided together), and
-                    // the person's next question is "did it see the picture?".
+                    if self.run_image_skill_command(&text, &images) {
+                        return false;
+                    }
+                    // Image-capable catalog commands were handled above. Remaining
+                    // management commands cannot use the pictures already drained
+                    // from the composer: say so rather than silently dropping them.
                     if !images.is_empty() {
                         self.say_refused(&t(Msg::CommandCarriesNoPictures {
                             count: images.len(),
@@ -7897,6 +8025,28 @@ impl Tui {
                 // offers the levels for whoever wants to choose.
                 if let Some(id) = next {
                     self.run_command(&format!("/model {id} default"));
+                }
+                return false;
+            }
+            Action::CycleEffort { forward } => {
+                drop(m);
+                // The list is read fresh — a `/model` or a config edit since
+                // the last look would leave a stale set, and `/effort` owns
+                // the words for "nothing declared" anyway.
+                self.refresh_providers();
+                let picked = {
+                    let m = self.host.moment.read().expect("moment poisoned");
+                    m.providers.live_row().and_then(|row| row.effort_pick())
+                };
+                let current = self
+                    .client
+                    .described()
+                    .and_then(|d| d.reasoning_effort)
+                    .map(|level| level.as_str().to_string())
+                    .unwrap_or_else(|| "default".to_string());
+                match crate::providers::effort_step(&current, picked, forward) {
+                    Some(next) => self.run_command(&format!("/effort {next}")),
+                    None => self.run_command("/effort"),
                 }
                 return false;
             }
@@ -8456,8 +8606,13 @@ impl Tui {
                 // Nothing to take on a terminal that reports no mouse: taking it
                 // would only stop the terminal's own selection.
                 if !self.surface.mouse() && !crate::caps::mouse_reported() {
+                    let why = if crate::tmux_mouse::disabled() {
+                        Msg::MouseDisabledByTmux
+                    } else {
+                        Msg::MouseUnreported
+                    };
                     self.host
-                        .say_for(t(Msg::MouseUnreported).into_owned(), false, MOUSE_NOTICE_MS);
+                        .say_for(t(why).into_owned(), false, MOUSE_NOTICE_MS);
                     return false;
                 }
                 let on = !self.surface.mouse();
@@ -9085,6 +9240,18 @@ impl Tui {
     /// One path for both the return key and a click on a row, so a confirm and a
     /// pick cannot disagree about what is pointed at.
     fn confirm_question(&self) -> bool {
+        // A click elsewhere in the card must not accidentally commit an edit.
+        if self
+            .host
+            .moment
+            .read()
+            .expect("moment poisoned")
+            .asking
+            .as_ref()
+            .is_some_and(|sheet| sheet.option_edit().is_some())
+        {
+            return false;
+        }
         let press = crate::surface::KeyPress::plain(crate::surface::Key::Enter);
         if let Some((id, step)) = self.host.ask_key(press) {
             self.deliver_answer(id, step);
@@ -9883,6 +10050,51 @@ impl Tui {
     /// between them — the question above the answer, the answer under someone
     /// else's words. Between turns nothing else writes, so it is echoed at
     /// once, and a slow command shows it was taken.
+    fn run_image_skill_command(
+        &self,
+        line: &str,
+        images: &[atomcode_kernel::message::ImageContent],
+    ) -> bool {
+        if images.is_empty() || !self.host.commands.starts_turn(line) {
+            return false;
+        }
+        let body = line.trim().trim_start_matches('/');
+        let (typed, args) = body.split_once(char::is_whitespace).unwrap_or((body, ""));
+        // Hidden direct skill names are invocable but absent from the menu's all().
+        let visible = self.host.commands.find(typed);
+        let canonical = visible
+            .as_ref()
+            .map(|command| command.name.as_ref())
+            .unwrap_or(typed);
+        let descriptions = self
+            .client
+            .described()
+            .map(|d| d.commands)
+            .unwrap_or_default();
+        let is_skill = descriptions
+            .iter()
+            .any(|desc| desc.name.eq_ignore_ascii_case(canonical) && desc.accepts_images);
+        if !is_skill {
+            return false;
+        }
+        self.host.remember_command(line);
+        if let Some(dir) = self.host.image_cache() {
+            for image in images {
+                crate::image_cache::write(&dir, image);
+            }
+        }
+        if self
+            .client
+            .described()
+            .is_some_and(|description| !description.supports_vision)
+        {
+            self.host.start_recognizing();
+        }
+        self.client
+            .invoke_with_images(canonical, args.trim(), images.to_vec());
+        true
+    }
+
     fn run_typed_command(&self, line: &str) {
         self.host.remember_command(line);
         // A successful `/goal <condition>` immediately opens a real turn whose
@@ -10861,7 +11073,20 @@ where
     // forwarded straight on, a reversed wheel's first arrow was one ↑ into the
     // composer, and a paste's first character was a keystroke.
     let mut next_up: Option<crossterm::event::Event> = None;
+    let mut paste_continuation = false;
     loop {
+        // Reaching the allocation cap is not a paste boundary. Carry its
+        // classification until a real quiet gap or a non-text event arrives.
+        if paste_continuation && next_up.is_none() {
+            match tokio::time::timeout(crate::surface::BURST_ACTIVE, events.next()).await {
+                Ok(Some(event)) => next_up = Some(event),
+                Ok(None) => break,
+                Err(_) => {
+                    paste_continuation = false;
+                    continue;
+                }
+            }
+        }
         let event = match next_up.take() {
             Some(event) => event,
             None => match events.next().await {
@@ -10880,6 +11105,7 @@ where
         // with it ours the wheel is a mouse event, and an arrow is a key and
         // pays no wait.
         if let Some(up) = crate::surface::bare_arrow(&event).filter(|_| handed_back()) {
+            paste_continuation = false;
             let mut n = 1usize;
             let mut after: Option<crossterm::event::Event> = None;
             loop {
@@ -10907,6 +11133,7 @@ where
             continue;
         }
         let Some(first) = crate::surface::burst_char(&event) else {
+            paste_continuation = false;
             if !forward(event) {
                 break;
             }
@@ -10917,7 +11144,7 @@ where
         // The wider window opens only once a second character has confirmed
         // there is something to bridge: until then a lone keystroke must not
         // pay for the paste case.
-        let mut confirmed = false;
+        let mut confirmed = paste_continuation;
         while held.len() < crate::surface::BURST_CAP {
             let window = if confirmed {
                 crate::surface::BURST_ACTIVE
@@ -10940,7 +11167,8 @@ where
             }
         }
         let chars: Vec<char> = held.iter().map(|(c, _)| *c).collect();
-        let sent = if crate::surface::is_paste_burst(&chars) {
+        let capped = held.len() == crate::surface::BURST_CAP;
+        let sent = if paste_continuation || capped || crate::surface::is_paste_burst(&chars) {
             wake.send(Wake::Input(Input::Paste(chars.into_iter().collect())))
                 .is_ok()
         } else {
@@ -10949,6 +11177,7 @@ where
         if !sent {
             break;
         }
+        paste_continuation = capped && after.is_none();
         next_up = after;
     }
 }
@@ -10986,6 +11215,7 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
             ctx: Mutex::new(None),
             wake: Mutex::new(None),
             allowance_checked: Mutex::new(None),
+            allowance_generation: Arc::new(AtomicU64::new(0)),
             allowance_nudged: Arc::new(AtomicBool::new(false)),
             reasoning_hinted: AtomicBool::new(false),
             asks_ledger: Mutex::new(crate::ask::Ledger::default()),
@@ -12895,6 +13125,88 @@ mod paste_burst_tests {
         seen
     }
 
+    #[tokio::test]
+    async fn fragmented_paste_does_not_leak_submit() {
+        let seen = pumped(vec![
+            (0, press('a')),
+            (0, press('b')),
+            (20, enter()),
+            (20, press('c')),
+            (0, press('d')),
+            (20, enter()),
+        ])
+        .await;
+        let submits = seen
+            .iter()
+            .filter(|input| {
+                matches!(
+                    input,
+                    Input::Key(KeyPress {
+                        key: Key::Enter,
+                        ..
+                    })
+                )
+            })
+            .count();
+        assert_eq!(submits, 0, "pasted newline leaked as an Enter key");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn paste_cap_does_not_leak_the_final_newline() {
+        let mut script = vec![(0, press('x')); crate::surface::BURST_CAP];
+        script.push((0, enter()));
+        let seen = pumped(script).await;
+        let submits = seen
+            .iter()
+            .filter(|input| {
+                matches!(
+                    input,
+                    Input::Key(KeyPress {
+                        key: Key::Enter,
+                        ..
+                    })
+                )
+            })
+            .count();
+        assert_eq!(
+            submits, 0,
+            "a newline immediately after the gather cap became submit"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_manual_enter_after_a_capped_paste_still_submits() {
+        let mut script = vec![(0, press('x')); crate::surface::BURST_CAP];
+        script.push((100, enter()));
+        let seen = pumped(script).await;
+        assert_eq!(seen.len(), 2);
+        assert!(matches!(&seen[0], Input::Paste(text) if text.len() == crate::surface::BURST_CAP));
+        assert_eq!(seen[1], Input::Key(KeyPress::plain(Key::Enter)));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_capped_paste_keeps_all_chunks_and_does_not_start_a_turn() {
+        let text = format!("{}\n第二行\n", "x".repeat(crate::surface::BURST_CAP));
+        let script = text
+            .chars()
+            .map(|c| (0, if c == '\n' { enter() } else { press(c) }))
+            .collect();
+        let seen = pumped(script).await;
+        let (host, tui) = assemble(Headless::new(80, 24));
+        for input in seen {
+            let Input::Paste(text) = input else {
+                panic!("paste leaked a key")
+            };
+            tui.act(Action::Paste(text), &tui.client);
+        }
+        let moment = host.moment.read().unwrap();
+        assert_eq!(
+            crate::moment::expand_pastes(&moment.input, &moment.pastes),
+            text
+        );
+        assert!(!moment.pending_working && !moment.turn_open);
+    }
+
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn native_terminal_pastes_preserve_unicode_and_newlines_without_submitting() {
         let text = "中文粘贴🙂\n第二行 e\u{301}\n第三行内容\n";
@@ -13686,6 +13998,7 @@ mod provider_probe_tests {
         tui.apply_provider_step(Step::SaveAccount {
             id: None,
             draft: account(),
+            listed: None,
         })
         .expect("the write lands");
         checked(&mut woken).await;
@@ -13708,6 +14021,7 @@ mod provider_probe_tests {
         tui.apply_provider_step(Step::SaveAccount {
             id: None,
             draft: account(),
+            listed: None,
         })
         .expect("the write lands");
         checked(&mut woken).await;
@@ -13778,6 +14092,7 @@ mod provider_probe_tests {
             tui.apply_provider_step(Step::SaveAccount {
                 id: Some("gw".into()),
                 draft: account(),
+                listed: None,
             })
             .expect("the write lands");
         }
@@ -14536,23 +14851,118 @@ mod midturn_command_tests {
     }
 
     #[test]
-    fn tool_scan_progress_is_visible_without_adding_transcript_rows() {
+    fn tool_progress_replaces_only_the_pending_card_and_never_becomes_history() {
+        use crate::block::{Content, RenderCtx};
+        let (host, tui, _) = screen();
+        host.modules
+            .add_producer(crate::modules::transcript::Transcript::new())
+            .unwrap();
+        let facts = crate::conformance::facts();
+        for fact in &facts {
+            if matches!(
+                fact,
+                atomcode_harness::session::SessionEvent::ToolResultLogged { .. }
+            ) {
+                break;
+            }
+            host.absorb(fact);
+        }
+        let before = kinds(&host);
+        for seconds in [1, 2] {
+            assert!(tui.on_event(AgentEvent::ToolProgress {
+                call_id: "c1".into(),
+                message: format!("Searching · {seconds}s elapsed · linked"),
+            }));
+        }
+        let read = |call: &str| {
+            let stream = host.stream.read().unwrap();
+            let block = stream
+                .slots()
+                .iter()
+                .find_map(|slot| {
+                    slot.block()
+                        .content
+                        .as_tool_call()
+                        .filter(|tool| tool.call_id == call)
+                })
+                .unwrap();
+            let ctx = RenderCtx::bare(120);
+            (
+                block.progress.clone(),
+                block
+                    .summary_lines(&ctx)
+                    .iter()
+                    .map(|line| line.plain())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                block.content_hash(),
+            )
+        };
+        assert_eq!(kinds(&host), before);
+        assert!(read("c1").1.contains("2s elapsed"));
+        assert!(!read("c1").1.contains("1s elapsed"));
+        assert_eq!(read("c2").0, None);
+        let moment = host.moment.read().unwrap().clone();
+        let drawn = host
+            .transcript_lines(120, &moment)
+            .iter()
+            .map(|line| line.plain())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            drawn.contains("2s elapsed"),
+            "parallel calls must not hide progress behind their group: {drawn}"
+        );
+        assert!(moment.notice.is_none());
+        let result = facts.iter().find(|fact| matches!(fact, atomcode_harness::session::SessionEvent::ToolResultLogged { call_id, .. } if call_id == "c1")).unwrap();
+        host.absorb(result);
+        let finished = read("c1");
+        assert_eq!(finished.0, None);
+        assert!(!tui.on_event(AgentEvent::ToolProgress {
+            call_id: "c1".into(),
+            message: "late activity".into()
+        }));
+        assert_eq!(read("c1"), finished);
+        host.switch_view();
+        assert!(!tui.on_event(AgentEvent::ToolProgress {
+            call_id: "c2".into(),
+            message: "old session".into()
+        }));
+        // A terminal without individual tool results must also remove activity.
+        for fact in &facts {
+            if matches!(
+                fact,
+                atomcode_harness::session::SessionEvent::ToolResultLogged { .. }
+            ) {
+                break;
+            }
+            host.absorb(fact);
+        }
+        assert!(host.tool_progress("c1", "Searching before interruption"));
+        let terminal = facts
+            .iter()
+            .find(|fact| {
+                matches!(
+                    fact,
+                    atomcode_harness::session::SessionEvent::TurnEnd { .. }
+                )
+            })
+            .unwrap();
+        host.absorb(terminal);
+        assert_eq!(read("c1").0, None);
+        assert!(!host.tool_progress("c1", "late interrupted activity"));
+    }
+
+    #[test]
+    fn orphan_tool_progress_does_not_become_a_global_notice() {
         let (host, tui, _) = screen();
         let before = kinds(&host);
-        assert!(tui.on_event(AgentEvent::ToolProgress {
+        assert!(!tui.on_event(AgentEvent::ToolProgress {
             call_id: "search-1".into(),
-            message: "Searching: 1000 entries visited".into()
+            message: "Searching · 2s elapsed · linked".into()
         }));
         assert_eq!(kinds(&host), before);
-        assert!(host
-            .moment
-            .read()
-            .unwrap()
-            .notice
-            .as_ref()
-            .unwrap()
-            .text
-            .contains("1000"));
+        assert!(host.moment.read().unwrap().notice.is_none());
     }
 
     #[test]
@@ -16212,5 +16622,87 @@ mod switched_replay_tests {
             at: 0,
             event: atomcode_kernel::session::SessionEvent::TurnStart { turn: 1 }
         }));
+    }
+}
+
+#[cfg(test)]
+mod allowance_switch_tests {
+    use super::*;
+    use crate::surface::Headless;
+    use atomcode_kernel::agent::AgentDescription;
+    use atomcode_plexus::{App, ConfigTree, PluginRegistry};
+
+    struct Meter {
+        requests: mpsc::UnboundedSender<tokio::sync::oneshot::Sender<HostReply>>,
+    }
+    #[async_trait]
+    impl HostControl for Meter {
+        async fn call(
+            &self,
+            command: HostCommand,
+        ) -> Result<HostReply, atomcode_host_api::HostError> {
+            if matches!(command, HostCommand::Usage { .. }) {
+                let (send, receive) = tokio::sync::oneshot::channel();
+                self.requests.send(send).unwrap();
+                return Ok(receive.await.unwrap());
+            }
+            Ok(HostReply::Done)
+        }
+        fn subscribe(&self) -> mpsc::UnboundedReceiver<HostEvent> {
+            mpsc::unbounded_channel().1
+        }
+    }
+    fn reply(windows: Vec<atomcode_host_api::UsageWindow>) -> HostReply {
+        HostReply::Usage {
+            unavailable: None,
+            stats_unavailable: None,
+            plan: None,
+            stats: None,
+            windows,
+        }
+    }
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn model_switch_clears_cached_quota_and_discards_the_old_pending_answer() {
+        let (host, tui) = assemble(Headless::new(100, 24));
+        let app = App::new(PluginRegistry::new(), ConfigTree::default());
+        *tui.ctx.lock().unwrap() = Some(app.context());
+        tui.client.follow("lead");
+        let (commands, _received) = mpsc::unbounded_channel();
+        let (requests, mut pending) = mpsc::unbounded_channel();
+        tui.client.connect(commands, Arc::new(Meter { requests }));
+        let windows = vec![atomcode_host_api::UsageWindow {
+            label: "5h".into(),
+            exhausted: true,
+            resets_at: "17:51".into(),
+            resets_in_seconds: 100,
+            window_seconds: 18_000,
+            used_percent: Some(99),
+            calls_used: None,
+            call_limit: None,
+        }];
+        {
+            let mut m = host.moment.write().unwrap();
+            m.allowance = crate::moment::Allowance::nearest(&windows, m.now);
+        }
+        tui.check_allowance();
+        let old = pending.recv().await.unwrap();
+        tui.on_event(AgentEvent::Described {
+            description: Box::new(AgentDescription {
+                session: "lead".into(),
+                model: Some("same-wire-name".into()),
+                ..Default::default()
+            }),
+        });
+        assert!(host.moment.read().unwrap().allowance.is_none());
+        let new = pending.recv().await.unwrap();
+        new.send(reply(vec![])).unwrap();
+        tokio::task::yield_now().await;
+        old.send(reply(windows)).unwrap();
+        tokio::task::yield_now().await;
+        assert!(host.moment.read().unwrap().allowance.is_none());
+        assert!(
+            !tui.allowance_nudged.load(Ordering::SeqCst),
+            "a stale exhausted window must not issue a warning"
+        );
     }
 }

@@ -590,9 +590,65 @@ pub struct RunLease {
     write_failed: std::sync::atomic::AtomicBool,
 }
 impl RunLease {
+    /// Latest conversation recorded for this task, paired with the cwd at its
+    /// admission. Reads backwards one bounded record at a time; failed starts
+    /// without a Session fact do not erase the existing binding.
+    pub fn bound_session(&self) -> Result<Option<(String, String)>> {
+        let path = self
+            .store
+            .run_dir(&self.definition.task.id)?
+            .join("events.jsonl");
+        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+        fs2::FileExt::lock_shared(&file)?;
+        let mut cursor = file.metadata()?.len();
+        let mut selected: Option<(String, String)> = None;
+        while let Some((bytes, start)) = line_before(&mut file, cursor)? {
+            cursor = start;
+            match serde_json::from_slice::<RunEvent>(&bytes)? {
+                RunEvent::Session {
+                    run_id, session_id, ..
+                } if selected.is_none() => {
+                    if !valid_id(&session_id) {
+                        bail!("invalid automation session id");
+                    }
+                    selected = Some((run_id, session_id));
+                }
+                RunEvent::Started {
+                    run_id,
+                    task_id,
+                    cwd,
+                    ..
+                } if selected
+                    .as_ref()
+                    .is_some_and(|(selected, _)| *selected == run_id) =>
+                {
+                    if task_id != self.definition.task.id {
+                        bail!("automation binding belongs to another task");
+                    }
+                    return Ok(selected.map(|(_, session)| (session, cwd)));
+                }
+                _ => {}
+            }
+        }
+        if selected.is_some() {
+            bail!("automation session has no matching run admission");
+        }
+        Ok(None)
+    }
     pub fn session(&self, session_id: &str) -> Result<()> {
         if self.write_failed.load(std::sync::atomic::Ordering::SeqCst) {
             bail!("run metadata persistence is uncertain");
+        }
+        if !valid_id(session_id) {
+            bail!("invalid automation session id");
+        }
+        let bound = self.bound_session().map_err(|error| {
+            self.write_failed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            error
+        })?;
+        if bound.is_some_and(|(bound, _)| bound != session_id) {
+            bail!("automation is already bound to another session");
         }
         let result = self.store.append(
             &self.definition.task.id,
@@ -648,6 +704,124 @@ mod tests {
     fn task() -> ScheduleTask {
         serde_json::from_value(serde_json::json!({ "id":"daily-test", "title":"Daily review", "prompt":"Review changes", "cwd":std::env::temp_dir(), "schedule":{"kind":"daily","time":"09:00"} })).unwrap()
     }
+    #[test]
+    fn recurring_runs_keep_their_conversation_across_failures_and_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        let task = task();
+        store.put(&task, None).unwrap();
+        let first = store.begin(&task.id).unwrap();
+        assert_eq!(first.bound_session().unwrap(), None);
+        first.session("task-session").unwrap();
+        assert!(first.session("different-session").is_err());
+        // Interruption releases the execution lease but keeps the session fact.
+        drop(first);
+        let store = Store::new(dir.path());
+        let failed = store.begin(&task.id).unwrap();
+        assert_eq!(
+            failed.bound_session().unwrap(),
+            Some(("task-session".into(), task.cwd.clone()))
+        );
+        failed
+            .finish("error", Some("provider unavailable".into()))
+            .unwrap();
+        let next = store.begin(&task.id).unwrap();
+        assert_eq!(next.bound_session().unwrap().unwrap().0, "task-session");
+        next.session("task-session").unwrap();
+        assert!(store.begin(&task.id).is_err(), "same task cannot overlap");
+        let mut other = task.clone();
+        other.id = "other-task".into();
+        store.put(&other, None).unwrap();
+        let other = store.begin(&other.id).unwrap();
+        assert_eq!(other.bound_session().unwrap(), None);
+        other.session("other-session").unwrap();
+        other.finish("ok", None).unwrap();
+        next.finish("ok", None).unwrap();
+        assert_eq!(
+            store
+                .begin(&task.id)
+                .unwrap()
+                .bound_session()
+                .unwrap()
+                .unwrap()
+                .0,
+            "task-session"
+        );
+    }
+
+    #[test]
+    fn old_tasks_adopt_the_latest_run_but_keep_the_binding_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        let task = task();
+        let definition = store.put(&task, None).unwrap();
+        for (run, session) in [("old", "old-session"), ("recent", "recent-session")] {
+            store
+                .append(
+                    &task.id,
+                    &RunEvent::Started {
+                        run_id: run.into(),
+                        task_id: task.id.clone(),
+                        revision: definition.revision.clone(),
+                        prompt: task.prompt.clone(),
+                        cwd: task.cwd.clone(),
+                        at: 1,
+                    },
+                )
+                .unwrap();
+            store
+                .append(
+                    &task.id,
+                    &RunEvent::Session {
+                        run_id: run.into(),
+                        session_id: session.into(),
+                        at: 2,
+                    },
+                )
+                .unwrap();
+            store
+                .append(
+                    &task.id,
+                    &RunEvent::Finished {
+                        run_id: run.into(),
+                        status: "ok".into(),
+                        error: None,
+                        at: 3,
+                    },
+                )
+                .unwrap();
+        }
+        let mut changed = task.clone();
+        changed.cwd = "/different-project".into();
+        store.put(&changed, Some(&definition.revision)).unwrap();
+        let run = store.begin(&task.id).unwrap();
+        assert_eq!(
+            run.bound_session().unwrap(),
+            Some(("recent-session".into(), task.cwd))
+        );
+    }
+
+    #[test]
+    fn malformed_session_bindings_fail_instead_of_starting_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        let task = task();
+        store.put(&task, None).unwrap();
+        let run = store.begin(&task.id).unwrap();
+        assert!(run.session("../escape").is_err());
+        store
+            .append(
+                &task.id,
+                &RunEvent::Session {
+                    run_id: "missing-admission".into(),
+                    session_id: "safe".into(),
+                    at: 1,
+                },
+            )
+            .unwrap();
+        assert!(run.bound_session().is_err());
+    }
+
     #[test]
     fn definitions_are_atomic_revision_checked_and_existing_json_is_readable() {
         let dir = tempfile::tempdir().unwrap();

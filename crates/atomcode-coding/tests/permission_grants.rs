@@ -59,6 +59,7 @@ async fn always_allow_grants_survive_reassembly() {
         front_end: None,
         review_delegate: None,
         host_plugins: Default::default(),
+        prompt_overrides: Default::default(),
         identity: Default::default(),
     };
     let parts = prepare(&cfg, opts.clone()).await.unwrap();

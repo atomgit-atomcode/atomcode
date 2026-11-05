@@ -41,7 +41,7 @@ impl Default for Screen {
             mascot: false,
             theme: None,
             mouse: true,
-            scrollbar: "auto".into(),
+            scrollbar: "hidden".into(),
         }
     }
 }

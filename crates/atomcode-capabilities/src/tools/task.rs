@@ -169,6 +169,7 @@ impl WorkerScopeGate {
                     Some(rel_dir) => Some(self.deny_read_out_of_scope(tool, &rel_dir)),
                 }
             }
+            "import_patch" | "apply_patch" => Some("patch imports and immutable plans are owned by the lead session; return this task to the lead".into()),
             "edit_file" | "write_file" => self.file_path_violation(tool, args_json, "file_path"),
             "search_replace" => {
                 let value = serde_json::from_str::<serde_json::Value>(args_json)
@@ -294,7 +295,10 @@ pub fn delegated_write_violation(
     tool: &str,
     args: &str,
 ) -> Option<String> {
-    if !matches!(tool, "edit_file" | "write_file" | "search_replace") {
+    if !matches!(
+        tool,
+        "edit_file" | "write_file" | "search_replace" | "import_patch" | "apply_patch"
+    ) {
         return None;
     }
     WorkerScopeGate::new(scopes, working_dir).violation(tool, args)

@@ -15,6 +15,36 @@ use atomcode_plexus::Context;
 
 use crate::agent::Agent;
 
+/// A validated command that opens one user turn. Preparation has no side effects.
+pub struct PreparedCommandInput {
+    pub text: String,
+    pub context: (String, atomcode_kernel::session::InjectionOrigin),
+    pub output: String,
+}
+
+impl PreparedCommandInput {
+    pub fn send(
+        self,
+        agent: &Agent,
+        images: Vec<atomcode_kernel::message::ImageContent>,
+    ) -> String {
+        if images.is_empty() {
+            // Preserve the established text-only command/injection contract.
+            agent.inject(self.context.0, self.context.1);
+            agent.send(self.text);
+        } else {
+            agent.send_contextual(
+                self.text,
+                crate::agent::MessageOrigin::User,
+                images,
+                None,
+                self.context,
+            );
+        }
+        self.output
+    }
+}
+
 /// One command a row puts in the catalog.
 #[async_trait]
 pub trait CatalogCommand: Send + Sync {
@@ -29,6 +59,30 @@ pub trait CatalogCommand: Send + Sync {
     /// Run it against `agent`. What comes back is for a person to read; an
     /// `Err` says why nothing was done.
     async fn run(&self, agent: Arc<Agent>, args: &str) -> Result<String, String>;
+
+    /// Only prompt-producing commands opt in; other commands refuse attachments.
+    fn prepare_input(
+        &self,
+        _agent: &Agent,
+        _args: &str,
+    ) -> Result<Option<PreparedCommandInput>, String> {
+        Ok(None)
+    }
+
+    async fn run_with_images(
+        &self,
+        agent: Arc<Agent>,
+        args: &str,
+        images: Vec<atomcode_kernel::message::ImageContent>,
+    ) -> Result<String, String> {
+        if images.is_empty() {
+            return self.run(agent, args).await;
+        }
+        let prepared = self
+            .prepare_input(&agent, args)?
+            .ok_or("This command does not accept images")?;
+        Ok(prepared.send(&agent, images))
+    }
 
     /// Whether this command was generated from what a person put on disk (a
     /// skill's SKILL.md), rather than named by a built-in row. Such a command

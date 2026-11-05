@@ -40,11 +40,17 @@ fn parse<T: for<'de> Deserialize<'de> + Default>(config: &Value) -> Result<T, St
 
 // ---- skills -------------------------------------------------------------
 
-#[derive(Debug, Deserialize, Default)]
+fn auto_skills_enabled() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize)]
 struct SkillsRow {
     /// Extra directories to load skills from, on top of the standard ones.
     #[serde(default)]
     dirs: Vec<String>,
+    #[serde(default = "auto_skills_enabled")]
+    auto_load: bool,
     /// Project root the standard per-project skill directories resolve against.
     #[serde(default)]
     project_root: Option<String>,
@@ -53,6 +59,17 @@ struct SkillsRow {
     /// test — can point the catalog somewhere other than the invoking user.
     #[serde(default)]
     home: Option<String>,
+}
+
+impl Default for SkillsRow {
+    fn default() -> Self {
+        Self {
+            dirs: Vec::new(),
+            auto_load: true,
+            project_root: None,
+            home: None,
+        }
+    }
 }
 
 /// `skills-advert`: the one sentence that tells the model skills exist.
@@ -157,6 +174,7 @@ impl Plugin for SkillsPlugin {
                 Arc::new(ListSkillsTool::new(registry.clone())),
             ],
         )?;
+        super::skill_auto_load::mount(ctx, registry.clone(), row.auto_load);
         // And a command, so a person can see what is installed without asking
         // the model to call a tool on their behalf
         // (`docs/plans/2026-09-18-tui-panels-and-commands-inventory.md` B1,
@@ -176,7 +194,10 @@ impl Plugin for SkillsPlugin {
                  per-project and per-user skill directories plus anything the \
                  row's `dirs` config adds. To add one, drop a markdown file in \
                  a skill directory and restart; nothing needs recompiling. \
-                 `list_skills` shows what is loaded now."
+                 `list_skills` shows what is loaded now. Static debugging workflows can be \
+                 loaded before a user turn; auto-load: debugging opts in, auto-load: off opts out. \
+                 The skills row auto_load:false or user [no-auto-skills] disables auto-loading. \
+                 Automatic loading executes no embedded commands and grants no allowed-tools."
             ),
         );
         Ok(())
@@ -615,10 +636,22 @@ impl crate::commands::CatalogCommand for RunSkill {
             summary: self.skill.description.clone(),
             target: atomcode_kernel::agent::CommandTarget::Session,
             args_requirement: self.skill.args_requirement,
+            accepts_images: true,
         }
     }
 
     async fn run(&self, agent: Arc<crate::agent::Agent>, args: &str) -> Result<String, String> {
+        Ok(self
+            .prepare_input(&agent, args)?
+            .expect("skill input")
+            .send(&agent, Vec::new()))
+    }
+
+    fn prepare_input(
+        &self,
+        agent: &crate::agent::Agent,
+        args: &str,
+    ) -> Result<Option<crate::commands::PreparedCommandInput>, String> {
         // Validate user invocations before expanding templates or queuing context.
         // Both custom commands and user-invocable skills reach this owner through
         // the command catalog. Model-side `use_skill` has its own loading path.
@@ -631,20 +664,20 @@ impl crate::commands::CatalogCommand for RunSkill {
             return Err(format!("`{}` 展开之后是空的", self.name));
         }
         let name = self.name.clone();
-        agent.inject(
-            text,
-            InjectionOrigin::Skill {
-                name: if self.command {
-                    // A command and a skill can share a name but have different
-                    // permissions. This marker cannot be a valid skill name.
-                    format!("[command] {}", self.skill.name)
-                } else {
-                    self.skill.name.clone()
+        Ok(Some(crate::commands::PreparedCommandInput {
+            text: skill_invocation(&name, args),
+            context: (
+                text,
+                InjectionOrigin::Skill {
+                    name: if self.command {
+                        format!("[command] {}", self.skill.name)
+                    } else {
+                        self.skill.name.clone()
+                    },
                 },
-            },
-        );
-        agent.send(skill_invocation(&name, args));
-        Ok(format!("按 `{name}` 开始"))
+            ),
+            output: format!("按 `{name}` 开始"),
+        }))
     }
 
     // Generated from a SKILL.md on disk: it yields its name to any built-in of
@@ -744,6 +777,7 @@ impl crate::commands::CatalogCommand for ListSkills {
             usage: Some(t(Msg::CmdCatalogSkillsUsage).into_owned()),
             summary: t(Msg::CmdCatalogSkills).into_owned(),
             target: atomcode_kernel::agent::CommandTarget::Session,
+            accepts_images: true,
             ..Default::default()
         }
     }
@@ -751,9 +785,19 @@ impl crate::commands::CatalogCommand for ListSkills {
     async fn run(&self, agent: Arc<crate::agent::Agent>, args: &str) -> Result<String, String> {
         let args = args.trim();
         if !args.is_empty() {
-            return self.run_them(agent, args);
+            return Ok(self.prepare_them(&agent, args)?.send(&agent, Vec::new()));
         }
         Ok(self.listing())
+    }
+    fn prepare_input(
+        &self,
+        agent: &crate::agent::Agent,
+        args: &str,
+    ) -> Result<Option<crate::commands::PreparedCommandInput>, String> {
+        if args.trim().is_empty() {
+            return Ok(None);
+        }
+        self.prepare_them(agent, args.trim()).map(Some)
     }
 }
 
@@ -805,7 +849,11 @@ impl ListSkills {
         sections.join("\n\n")
     }
 
-    fn run_them(&self, agent: Arc<crate::agent::Agent>, args: &str) -> Result<String, String> {
+    fn prepare_them(
+        &self,
+        agent: &crate::agent::Agent,
+        args: &str,
+    ) -> Result<crate::commands::PreparedCommandInput, String> {
         let (names, task) = skills_and_task(args, |token| {
             self.0
                 .get(token)
@@ -838,32 +886,31 @@ impl ListSkills {
         }
         // One turn, with a rule between them: sent as several the first would
         // be answered before the second was read.
-        agent.inject(
-            blocks
-                .iter()
-                .map(|(_, text)| text.as_str())
-                .collect::<Vec<_>>()
-                .join("\n\n---\n\n"),
-            InjectionOrigin::Skill {
-                name: blocks
+        Ok(crate::commands::PreparedCommandInput {
+            text: skill_invocation(&invocation, task),
+            context: (
+                blocks
                     .iter()
-                    .map(|(name, _)| name.as_str())
+                    .map(|(_, text)| text.as_str())
                     .collect::<Vec<_>>()
-                    .join(" · "),
-            },
-        );
-        agent.send(skill_invocation("skills", args));
-        // Named back, because a misspelled second name is not an error — it
-        // quietly became the first word of the task, and this line is where
-        // that becomes visible.
-        Ok(format!(
-            "按 {} 开始",
-            names
-                .iter()
-                .map(|name| bare_name(name))
-                .collect::<Vec<_>>()
-                .join(" · ")
-        ))
+                    .join("\n\n---\n\n"),
+                InjectionOrigin::Skill {
+                    name: blocks
+                        .iter()
+                        .map(|(name, _)| name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" · "),
+                },
+            ),
+            output: format!(
+                "按 {} 开始",
+                names
+                    .iter()
+                    .map(|name| bare_name(name))
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            ),
+        })
     }
 }
 
@@ -1378,6 +1425,7 @@ mod tests {
             template: "body".into(),
             allowed_tools: vec![],
             user_invocable: true,
+            auto_load: Default::default(),
             args_requirement: requirement,
             skill_dir: PathBuf::from("/sk"),
             source_path: PathBuf::from("/sk/SKILL.md"),

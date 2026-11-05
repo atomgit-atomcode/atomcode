@@ -204,7 +204,7 @@ impl SessionManager {
         }
         let mut buffer = Vec::new();
         for logged in events {
-            if matches!(logged.event, SessionEvent::AssistantChunk { .. }) {
+            if logged.event.is_transient() {
                 continue;
             }
             buffer.extend_from_slice(&record_line(logged)?);
@@ -2659,5 +2659,36 @@ mod tests {
             &dir.path().join("knowledge/INDEX.md"),
         );
         assert!(context.prompt.starts_with(MEMORY_INJECTION_HEADER));
+    }
+    #[test]
+    fn discarded_reasoning_is_never_written_to_native_sessions() {
+        let (_dir, manager) = store();
+        let lease = created(&manager, "discarded");
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(
+                        1,
+                        10,
+                        SessionEvent::AssistantChunk {
+                            turn: 1,
+                            round: 1,
+                            delta: "bad prefix".into(),
+                            reasoning: true,
+                        },
+                    ),
+                    logged(
+                        2,
+                        11,
+                        SessionEvent::ReasoningDiscarded { turn: 1, round: 1 },
+                    ),
+                ],
+            )
+            .unwrap();
+        let text = std::fs::read_to_string(manager.events_path("discarded").unwrap()).unwrap();
+        assert!(!text.contains("bad prefix"));
+        assert!(!text.contains("reasoning_discarded"));
+        assert_eq!(text.lines().count(), 1, "only the header remains");
     }
 }

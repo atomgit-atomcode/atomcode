@@ -641,6 +641,15 @@ body {
   white-space: pre-wrap;
 }
 
+.msg-notice.context-summary-note {
+  color: var(--app-secondary-foreground);
+  background: transparent;
+  border-top: 1px solid var(--app-input-border);
+  border-bottom: 1px solid var(--app-input-border);
+  border-radius: 0;
+  padding: 8px 0;
+}
+
 .msg-notice.command-output {
   color: var(--app-primary-foreground);
   background: var(--app-tool-background); background: color-mix(in srgb, var(--app-tool-background), var(--app-primary-background) 30%);
@@ -697,6 +706,12 @@ body {
 }
 
 .tool-header {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  font: inherit;
   display: flex;
   align-items: center;
   padding: 5px 6px;
@@ -766,6 +781,10 @@ body {
 @keyframes tool-spin { to { transform: rotate(360deg); } }
 
 .tool-annotation.success { color: var(--app-success-foreground); }
+.tool-annotation.background, .tool-annotation.neutral { color: var(--app-secondary-foreground); }
+.tool-poll-count { flex-shrink: 0; color: var(--app-secondary-foreground); font-size: .75rem; }
+.tool-poll-attempt { grid-column: 1 / -1; padding: 6px 10px; border-top: 1px solid var(--app-input-border); color: var(--app-secondary-foreground); font-size: .75rem; }
+
 .tool-annotation.error { color: var(--app-error-foreground); }
 .tool-annotation.warning { color: var(--app-warning-accent); }
 .tool-annotation.pending { color: var(--app-tertiary-foreground); }
@@ -1199,6 +1218,9 @@ body {
 .footer-hint { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .footer-spacer { flex: 1; }
 .footer-tokens { opacity: 0.7; font-size: 0.75rem; white-space: nowrap; }
+.footer-summary-count { border: 0; background: none; padding: 0; color: inherit; font-family: inherit; cursor: pointer; }
+.footer-summary-count:hover { text-decoration: underline; }
+
 
 .btn-send {
   width: 34px;
@@ -1685,6 +1707,7 @@ body {
 }
 
 .session-item-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.875rem; line-height: 1.25rem; }
+.session-automation-mark { margin-inline-end: 6px; color: var(--app-secondary-foreground); }
 .session-item.active .session-item-name { font-weight: 600; }
 .session-item-meta { flex-shrink: 0; font-size: 0.75rem; line-height: 1.25rem; color: var(--app-caption-foreground); white-space: nowrap; }
 
@@ -2248,6 +2271,17 @@ body {
 }
 
 /* === UserInputCard (request_user_input tool) === */
+.user-input-option-main {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+.user-input-option-main > .user-input-option { flex: 1; min-width: 0; }
+.user-input-option-label, .user-input-option-desc { overflow-wrap: anywhere; }
+.user-input-edit-button { flex-shrink: 0; margin-top: 4px; }
+.user-input-option-editor { padding: 4px 10px 12px; }
+.user-input-option-editor .user-input-text { width: 100%; min-width: 0; }
+.user-input-edit-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
 /* Option row: wraps a radio/checkbox + label body inline; the whole label is
    clickable (native label-for semantics via wrapping). */
 .user-input-option {
@@ -3406,6 +3440,17 @@ body {
   .input-footer-actions > .mode-selector {
     max-width: 100%;
   }
+  /* Mode is the leftmost control: right anchoring would put its menu off-screen. */
+  .model-selector-up.mode-selector .mode-dropdown {
+    left: 0;
+    right: auto;
+    width: min(320px, calc(100vw - 48px));
+    min-width: 0;
+    box-sizing: border-box;
+    max-height: min(280px, 50vh);
+    max-height: min(280px, 50dvh);
+    overflow-wrap: anywhere;
+  }
   .input-footer-actions > .model-controls {
     width: 100%;
   }
@@ -4033,15 +4078,16 @@ body {
 .btn-auth-retry:disabled { opacity: .6; cursor: wait; }
 
 @media (max-width: 768px) {
-  /* Focus inside reveals the existing toolbar. Attachments/errors stay visible. */
-  .input-box:not(:focus-within):not(.has-input-detail) {
+  /* Only populated conversations collapse; the empty landing keeps its full composer.
+     Focus inside reveals the existing toolbar. Attachments/errors stay visible. */
+  .input-box.can-collapse:not(:focus-within):not(.has-input-detail) {
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto;
     align-items: center;
     gap: 4px;
     padding: 2px 6px;
   }
-  .input-box:not(:focus-within):not(.has-input-detail) .message-input {
+  .input-box.can-collapse:not(:focus-within):not(.has-input-detail) .message-input {
     grid-column: 1;
     grid-row: 1;
     height: 44px !important; /* overrides a previous multiline inline height */
@@ -4050,26 +4096,26 @@ body {
     padding: 10px 4px;
     overflow: hidden;
   }
-  .input-box:not(:focus-within):not(.has-input-detail) .input-footer,
-  .input-box:not(:focus-within):not(.has-input-detail) .input-footer-actions {
+  .input-box.can-collapse:not(:focus-within):not(.has-input-detail) .input-footer,
+  .input-box.can-collapse:not(:focus-within):not(.has-input-detail) .input-footer-actions {
     display: contents;
   }
-  .input-box:not(:focus-within):not(.has-input-detail) .input-footer-primary,
-  .input-box:not(:focus-within):not(.has-input-detail) .mode-selector,
-  .input-box:not(:focus-within):not(.has-input-detail) .model-controls,
-  .input-box:not(:focus-within):not(.has-input-detail) .session-reference-chips,
-  .input-box:not(:focus-within):not(.has-input-detail) .input-turn-controls > .btn-send {
+  .input-box.can-collapse:not(:focus-within):not(.has-input-detail) .input-footer-primary,
+  .input-box.can-collapse:not(:focus-within):not(.has-input-detail) .mode-selector,
+  .input-box.can-collapse:not(:focus-within):not(.has-input-detail) .model-controls,
+  .input-box.can-collapse:not(:focus-within):not(.has-input-detail) .session-reference-chips,
+  .input-box.can-collapse:not(:focus-within):not(.has-input-detail) .input-turn-controls > .btn-send {
     display: none;
   }
-  .input-box:not(:focus-within):not(.has-input-detail) .input-turn-controls {
+  .input-box.can-collapse:not(:focus-within):not(.has-input-detail) .input-turn-controls {
     grid-column: 2;
     grid-row: 1;
   }
-  .input-box:not(:focus-within):not(.has-input-detail):not(.is-running) .input-turn-controls {
+  .input-box.can-collapse:not(:focus-within):not(.has-input-detail):not(.is-running) .input-turn-controls {
     display: none;
   }
-  .input-box:not(:focus-within):not(.has-input-detail) ~ .input-subbar,
-  .input-box:not(:focus-within):not(.has-input-detail) ~ .turn-stats {
+  .input-box.can-collapse:not(:focus-within):not(.has-input-detail) ~ .input-subbar,
+  .input-box.can-collapse:not(:focus-within):not(.has-input-detail) ~ .turn-stats {
     display: none;
   }
 }
@@ -4132,3 +4178,73 @@ body {
 
 .timeline-history-status.is-loading { position: sticky; top: 0; z-index: 4; height: 0; min-height: 0; flex: 0 0 0; padding: 0; pointer-events: none; }
 .timeline-history-status.is-loading > span { display: inline-block; padding: 4px 10px; border-radius: 8px; background: var(--app-primary-background); }
+
+.todo-guidance-sources { padding: 6px 12px 12px; border-top: 1px solid var(--app-input-border); }
+.todo-source-hint { color: var(--app-secondary-foreground); font-size: 0.75rem; }
+.todo-source-page { margin-top: 8px; font-size: 0.75rem; }
+.todo-source-page pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 360px; overflow: auto; padding: 10px; background: var(--app-tool-background); font-family: var(--app-monospace-font-family); }
+.todo-source-pagination { display: flex; gap: 8px; margin-top: 8px; }
+
+/* History browsing never rebinds the running session. */
+.session-browse-notice {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px 24px;
+  padding: 16px 120px 16px 20px;
+  border-bottom: 1px solid var(--app-border);
+  background: var(--app-secondary-background);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.session-browse-summary { flex: 1 1 280px; min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; }
+.session-browse-label { flex: none; color: var(--app-brand); font-size: 12px; font-weight: 600; }
+.session-browse-title { min-width: 0; overflow-wrap: anywhere; color: var(--app-primary-foreground); }
+.session-browse-description { flex-basis: 100%; color: var(--app-secondary-foreground); overflow-wrap: anywhere; }
+.session-browse-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.session-browse-actions button { padding: 7px 12px; border: 1px solid var(--app-input-border); border-radius: 8px; cursor: pointer; color: var(--app-primary-foreground); background: var(--app-primary-background); font: inherit; }
+.session-browse-actions button:hover { background: var(--app-list-hover-background); }
+.session-browse-actions button:focus-visible { outline: 2px solid var(--app-brand); outline-offset: 2px; }
+.session-browse-actions .session-browse-continue { background: var(--app-button-background); border-color: var(--app-button-background); color: var(--app-button-foreground); }
+.session-browse-actions .session-browse-continue:hover { background: var(--app-button-hover-background); }
+@media (max-width: 768px) {
+  .session-browse-notice { padding: 60px 16px 16px; gap: 12px; }
+}
+.session-browse-sidebar-hint { margin: 0; padding: 0 16px 10px; color: var(--app-secondary-foreground); font-size: 12px; line-height: 1.5; }
+.session-running-mark { flex-shrink: 0; padding: 1px 5px; border-radius: 4px; background: var(--app-secondary-background); color: var(--app-secondary-foreground); font-size: 11px; }
+
+.task-specifications { width: min(760px, calc(100vw - 24px)); max-height: 85vh; overflow: auto; padding: 20px; border-radius: 12px; }
+.task-specifications header, .task-specifications footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.task-specifications pre { max-height: 50vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: 12px; border: 1px solid var(--app-border); }
+.task-spec-list { display: flex; flex-direction: column; gap: 8px; }
+.task-spec-list > button { display: flex; flex-direction: column; align-items: flex-start; text-align: left; white-space: pre-wrap; overflow-wrap: anywhere; }
+.task-specifications { display: block; font-size: 14px; line-height: 1.5; }
+.task-specifications p { margin: 10px 0; }
+.task-spec-list > button { height: auto; min-height: 64px; gap: 4px; padding: 10px; }
+.task-spec-list > button span:first-child { color: var(--app-secondary-foreground); font-size: 12px; }
+
+.msg-copy-btn.spec-pinned { color: var(--app-brand); opacity: 1; }
+/* Leave the floating turn-navigation gutter clear for message actions. */
+.user-message-wrapper > .msg-actions { padding-inline-end: 40px; }
+.msg-copy-btn:disabled { cursor: default; opacity: .4; }
+
+.session-switch-notice {
+  flex-wrap: nowrap;
+  align-items: flex-start;
+  flex-shrink: 0;
+  background: var(--app-tool-background);
+}
+.session-switch-notice > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.session-switch-notice > button { flex-shrink: 0; padding: 0 6px; }
+
+.mode-bindings-body { display: flex; flex-direction: column; gap: 16px; }
+.mode-bindings-body fieldset { border: 1px solid var(--app-border); border-radius: 8px; padding: 12px; display: grid; gap: 12px; }
+.mode-bindings-body label { display: flex; flex-direction: column; gap: 6px; }
+.mode-bindings-body select { width: 100%; padding: 8px; background: var(--app-primary-background); color: var(--app-primary-foreground); border: 1px solid var(--app-border); border-radius: 6px; }
+
+.model-next-turn { font-size: 12px; color: var(--app-secondary-foreground); overflow-wrap: anywhere; max-width: 320px; line-height: 1.4; }
+.model-next-turn-badge { color: var(--app-brand); font-size: 11px; }
+
+.model-controls.has-pending-model { flex-wrap: wrap; justify-content: flex-end; }
+.model-controls.has-pending-model .model-next-turn { flex-basis: 100%; text-align: right; }

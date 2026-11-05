@@ -22,6 +22,71 @@
   英文界面读它，某个版本没有英文节时显示这里的中文节。Issues 只写在这份里，英文界面也显示这里的。
 -->
 
+## v5.2.6 (2026-11-05)
+
+### 概览
+
+这一版围绕长任务的连续性与多端使用体验展开：异常退出后可恢复已保存的部分输出与执行记录，原始任务要求可跨上下文压缩保留，并新增推理复读检测与有界恢复。WebUI 新增文件、终端和 Git 项目工作台，TUI 与 WebUI 支持模型资料查看、对比及人设来源检查，同时改善技能调用、手机会话切换和 Windows 终端可靠性。
+
+### 更新内容
+
+- **异常退出恢复与团队会话**：流式回复定期保存恢复记录，重新打开会话时保留已保存的部分输出，并明确提示上一轮异常中断；未收到结果的工具标记为执行结果未知，不会自动重跑。改善团队成员会话的租约、停止和日志保存，减少回合结束时成员记录丢失的问题。包含新恢复记录的会话需使用本版或更新版本打开。
+- **原始需求与任务进度保留**：支持保留用户选定的原始任务要求，避免上下文压缩后遗漏约束；待办计划可关联原始用户指导。TUI 与 WebUI 在 token 用量旁展示已记录的上下文摘要次数，方便判断长任务的上下文变化。
+- **WebUI 项目工作台**：新增项目起始页，以及按会话关联的文件浏览、终端和 Git 工作入口；支持工作区全屏，扩大文件阅读区域，并改善窄屏布局、错误提示与操作反馈。
+- **推理复读检测与恢复**：识别推理流中明确的重复循环，在可安全重试时中止当前生成并进行一次自动恢复；无法安全重试或预算耗尽时明确停止，避免无限消耗 token，并防止已丢弃的推理重新出现在半截回复中。
+- **显式登记一次性后续任务**：可预先指定本轮成功结束后要执行的下一项任务，支持在当前会话继续，或交给独立新会话执行；可查看和清除登记。独立任务沿用无人值守审批，不继承原会话的临时授权；自动化审批策略也可通过共享设置配置。
+- **模型资料与本地模型接入**：TUI 与 WebUI 新增离线模型资料卡和模型对比，便于了解模型能力与差异；配置引导可探测 Ollama，并在本地服务未启动时提供指引。精简模型卡片展示并保持列表滚动位置稳定。
+- **自定义人设与来源检查**：支持配置和覆盖助手人设及系统提示；通过 `/context persona` 或 WebUI 查看当前实际生效的人设片段及来源，便于核对模型切换、会话恢复和配置重载后的行为。
+- **技能调用更完整**：改善调试等任务中匹配技能的加载时机，保留直接调用技能时附带的图片；允许只读访问已加载技能的配套资源，调整技能目录预算，并避免扫描依赖目录或陷入目录循环。
+- **补丁文件导入与应用**：TUI 与 WebUI 支持导入原始文本补丁，并通过不可变补丁产物进行检查和应用，方便处理已有 diff 文件，减少大段补丁反复粘贴。
+- **终端滚动与输入体验**：保留用户主动上滚的阅读位置，改善长会话流式输出中拖选、右键菜单和鼠标移动造成的卡顿；默认隐藏对话滚动条。补充输入法合成期间的快捷键保护，支持编辑问题中的建议答案，并修正光标、SSH 滚轮与输入历史联动、窗口标题及 `/cd` 无效最近目录等问题。
+- **手机配对与会话导航**：配对向导内容可滚动，底部操作提示保持可见，缓解终端放大后二维码被截断的问题；手机与 WebUI 复用统一的项目和会话切换路径，改善占用提示及切换反馈，浏览历史不再改绑当前执行中的会话。补充 HarmonyOS PC 链接打开兼容处理。
+- **文件检索与语言服务**：修正文件索引继承仓库外忽略规则，以及相对路径、符号链接下忽略边界不一致的问题；取消失效的后台扫描，复用 WebUI 文件搜索索引，减少重复遍历。LSP 初始化与设置文件路径支持模板变量，并增加本地大纲、空结果的有界重试和搜索范围提示。
+- **Windows 代理与后台执行**：系统代理读取失败时提供更明确的诊断和有限重试；改进回环代理探测，仅在明确拒绝连接时回退直连，超时仍保留代理路径。后台命令轮询可及时收集输出与退出状态，默认提供完成通知，并修正多项 Windows 路径与测试兼容问题。
+- **权限与工具产物保护**：完善组合 Bash 命令的授权匹配和精确项目规则保存；工具输出目录自动生成自身的 Git 忽略哨兵，降低完整工具输出被意外纳入版本控制的风险。MCP 服务身份和提示标签校验更严格，AtomGit API 调用指引优先要求查阅文档。
+- **IDE 插件配套改进**：VS Code 改善本地命令历史刷新与模型推理档位展示；JetBrains 改善当前工程会话列表、模型与斜杠命令选择、默认执行模式和错误提示，减少重复重绘，并修正 macOS 边车文件导致的打包与运行问题。
+
+### Issues
+
+本节收录 [v5.2.6 里程碑](https://atomgit.com/atomgit_atomcode/atomcode/milestones/1064754?iid=49)下的全部 issue，不区分状态与标签。此列表用于关联跟踪，不表示所有条目均已实现或完成发布验收。
+
+- [#1228 Feature: plan/build 模式支持绑定不同模型和思考强度](https://atomgit.com/atomgit_atomcode/atomcode/issues/1228)
+- [#1367 [共创大赛][Bug] 让agent不要忽略被.git遗忘的内容](https://atomgit.com/atomgit_atomcode/atomcode/issues/1367)
+- [#1654 [Bug][VSCode] .ui 状态重复挂载历史 /login 与 /reload，权威 .events 中无对应 user_message](https://atomgit.com/atomgit_atomcode/atomcode/issues/1654)
+- [#1698 鸿蒙 PC：/login 的登录链接只能看不能打开（希望回车/点击直接用本机浏览器打开）](https://atomgit.com/atomgit_atomcode/atomcode/issues/1698)
+- [#1700 [Feature][讨论] 是否借鉴 open-claude-ui 逆向出的 Claude Code 交互物理学与工程算法以大幅提升用户体验](https://atomgit.com/atomgit_atomcode/atomcode/issues/1700)
+- [#1701 [Feature] atomcode webui希望增加类似dsh-better-sidebar的功能](https://atomgit.com/atomgit_atomcode/atomcode/issues/1701)
+- [#1702 [bug] aarch64(树莓派/Debian 12) TUI 模式下发起工具调用即冻屏，-p 非交互模式正常](https://atomgit.com/atomgit_atomcode/atomcode/issues/1702)
+- [#1703 [Feature][LSP] local 后端补 `document_symbols` 能力 + 空结果自动重试（retry/interval）](https://atomgit.com/atomgit_atomcode/atomcode/issues/1703)
+- [#1704 [Feature][Config] 多项目下 LSP `multiModuleOption.name` 必须手改全局配置；建议（白名单式）支持项目级 config 合并覆盖全局](https://atomgit.com/atomgit_atomcode/atomcode/issues/1704)
+- [#1705 [Feature][Schedule] 定时任务创建/修改/删除的强制审批不受 permissions.default_mode=auto 控制，建议提供配置化开关](https://atomgit.com/atomgit_atomcode/atomcode/issues/1705)
+- [#1706 [Bug] atomcode连接手机时二维码显示不全，不能正常扫码连接](https://atomgit.com/atomgit_atomcode/atomcode/issues/1706)
+- [#1707 [Bug] 手机上查看不同项目，切换失败](https://atomgit.com/atomgit_atomcode/atomcode/issues/1707)
+- [#1708 [共创大赛]-[Feature] `.atomcode/artifacts/`工具输出目录缺少目录级 git 哨兵保护](https://atomgit.com/atomgit_atomcode/atomcode/issues/1708)
+- [#1709 [Bug] session-store: member session log persist fails intermittently — "already in use by another runtime" (lease race at team member stop / turn end)](https://atomgit.com/atomgit_atomcode/atomcode/issues/1709)
+- [#1710 [Bug][Windows/TUI] 长会话流式输出中拖选后右键,整屏持续卡顿(右键菜单触发 1003 每格上报 + 选区切换全量布局预算)](https://atomgit.com/atomgit_atomcode/atomcode/issues/1710)
+- [#1711 [Bug]直接调用skill时，不能传输图片](https://atomgit.com/atomgit_atomcode/atomcode/issues/1711)
+- [#1712 [Bug]atomcode在复杂问题调试时，不能主动调用相关skill进行处理](https://atomgit.com/atomgit_atomcode/atomcode/issues/1712)
+- [#1713 [Feature] 缺少推理复读检测：thinking 内容自循环时无中断与重新生成机制](https://atomgit.com/atomgit_atomcode/atomcode/issues/1713)
+- [#1714 [Feature] Task Specification Pinning：上下文压缩不得把用户给定的权威任务规范降级为摘要](https://atomgit.com/atomgit_atomcode/atomcode/issues/1714)
+- [#1715 [Feature] Lossless Large Patch Application：让工具直接应用用户提供的大 patch，而不是让模型分段复述](https://atomgit.com/atomgit_atomcode/atomcode/issues/1715)
+- [#1716 [共创大赛][Bug]](https://atomgit.com/atomgit_atomcode/atomcode/issues/1716)
+- [#1717 [Feature] Bash 命令审批检测应更智能：本地测试/只读循环应自动放行而非每次询问](https://atomgit.com/atomgit_atomcode/atomcode/issues/1717)
+- [#1718 [Feature] question 选项应支持就地编辑：快捷键把选项文字调入输入框再改，而非只能从零在 type your own 行手敲](https://atomgit.com/atomgit_atomcode/atomcode/issues/1718)
+- [#1719 【建议】技能数量超过阈值后的提示预算治理：目录截断、低优先级技能不可见、无命名空间隔离](https://atomgit.com/atomgit_atomcode/atomcode/issues/1719)
+- [#1720 【问题】插件目录内技能自带资源无法被 read_file 读取（outside the world's root）](https://atomgit.com/atomgit_atomcode/atomcode/issues/1720)
+- [#1722 建议增加「上下文压缩次数」提示功能](https://atomgit.com/atomgit_atomcode/atomcode/issues/1722)
+- [#1723 todo list 应在用户给出长篇代码指导时一并保存原始 patch/diff](https://atomgit.com/atomgit_atomcode/atomcode/issues/1723)
+- [#1724 [webui] 回合运行中在侧栏切换会话被拒绝，且提示是「请先停止当前回合，再执行该命令」的命令口径](https://atomgit.com/atomgit_atomcode/atomcode/issues/1724)
+- [#1725 [webui] @ 引用默认「全部」把会话混进文件候选，自动名 session-&lt;id&gt; 与目录同形难分辨](https://atomgit.com/atomgit_atomcode/atomcode/issues/1725)
+- [#1726 [codingplan] 主模型被写成 supports_vision=false 时缺少视觉兜底：应自动借 qwen3.8-27b 转述图片](https://atomgit.com/atomgit_atomcode/atomcode/issues/1726)
+- [#1727 [webui] 展开「工作区」后主列布局错位：会话内容不再位于输入框上方](https://atomgit.com/atomgit_atomcode/atomcode/issues/1727)
+- [#1728 feat: 增加「模型卡」展示模型 benchmark 分数，辅助用户选择合适模型](https://atomgit.com/atomgit_atomcode/atomcode/issues/1728)
+- [#1729 feat: Ollama 接入缺少「快速配置通道」——添加 provider 时自动检测本机 daemon 并引导启动](https://atomgit.com/atomgit_atomcode/atomcode/issues/1729)
+- [#1730 [Feature] 主 coding agent 支持多种 system prompt 切换/覆盖（--persona / --system-prompt / 消费 config 字段）](https://atomgit.com/atomgit_atomcode/atomcode/issues/1730)
+- [#1731 [Bug] Windows 下 WebUI 工作区「文件」页报 TypeError: Failed to fetch，无法浏览目录](https://atomgit.com/atomgit_atomcode/atomcode/issues/1731)
+- [#1732 [Feature] 支持「任务完成后自动执行预设 prompt」：任务链 / follow-up prompt / post-task hook](https://atomgit.com/atomgit_atomcode/atomcode/issues/1732)
+
 ## v5.2.5 (2026-10-28)
 
 ### 概览

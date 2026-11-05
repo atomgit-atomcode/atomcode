@@ -131,6 +131,31 @@ impl ModelRow {
     }
 }
 
+/// The level `/effort` lands on when stepping from `current` across `levels` —
+/// the pick list exactly as [`ModelRow::effort_pick`] returns it (declared
+/// levels in wire order, `default` last). `None` when nothing is declared:
+/// there is nothing to step through, and `/effort` reports that rather than
+/// the key pretending.
+pub(crate) fn effort_step(
+    current: &str,
+    levels: Option<Vec<String>>,
+    forward: bool,
+) -> Option<String> {
+    let cycle = levels?;
+    if cycle.is_empty() {
+        return None;
+    }
+    let len = cycle.len();
+    Some(match cycle.iter().position(|level| level == current) {
+        Some(at) => cycle[(at + if forward { 1 } else { len - 1 }) % len].clone(),
+        // The level in force is not one this model declares (the config
+        // changed since the session started): enter the list from the near
+        // end instead of guessing a middle rung.
+        None if forward => cycle[0].clone(),
+        None => cycle[len - 1].clone(),
+    })
+}
+
 /// The providers, as of one frame.
 ///
 /// Immutable and cheap to clone, so a `Moment` can carry it and two renders
@@ -560,6 +585,19 @@ pub struct AccountForm {
     pub locked: bool,
     pub preset: Option<String>,
     pub advanced: bool,
+    pub discovery: Option<AccountDiscovery>,
+}
+
+/// A read-only listing for an unsaved Ollama connection. No credential lives here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountDiscovery {
+    pub id: u64,
+    pub result: Option<Result<Vec<Discovered>, String>>,
+}
+
+fn next_discovery_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl AccountForm {
@@ -581,6 +619,7 @@ impl AccountForm {
             locked: false,
             preset: None,
             advanced: true,
+            discovery: None,
         }
     }
 
@@ -620,6 +659,7 @@ impl AccountForm {
             locked,
             preset: None,
             advanced: true,
+            discovery: None,
         }
     }
 
@@ -665,6 +705,25 @@ impl AccountForm {
             out.push(AccountField::Key);
         }
         out
+    }
+
+    pub fn is_ollama(&self, view: &ProvidersView) -> bool {
+        view.protocols()
+            .get(self.protocol)
+            .is_some_and(|p| p.id == "ollama")
+    }
+
+    pub fn start_discovery(&mut self, view: &ProvidersView) -> Step {
+        if !self.is_ollama(view) || self.endpoint.trim().is_empty() {
+            return Step::Stay;
+        }
+        self.discovery = Some(AccountDiscovery {
+            id: next_discovery_id(),
+            result: None,
+        });
+        Step::DiscoverDraft {
+            endpoint: self.endpoint.trim().into(),
+        }
     }
 
     pub fn needs_key(&self, view: &ProvidersView) -> bool {
@@ -964,10 +1023,9 @@ impl ModelForm {
     }
 
     pub fn start_discovery(&mut self) {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         self.discovery_error = None;
         self.selected.clear();
-        self.discovery_id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.discovery_id = next_discovery_id();
         self.picking = Some(Picking::Loading {
             account: self.account_id().to_string(),
         });
@@ -1305,6 +1363,7 @@ pub enum Form {
 /// The providers panel, while it is up.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Panel {
+    pub card: Option<crate::model_cards::CardPanel>,
     pub tab: Tab,
     /// The row the arrows are on, as an index into the *listed* rows.
     pub cursor: usize,
@@ -1470,6 +1529,11 @@ pub enum Step {
     SaveAccount {
         id: Option<String>,
         draft: AccountDraft,
+        /// Reuse the draft's successful listing after the explicit write.
+        listed: Option<Vec<Discovered>>,
+    },
+    DiscoverDraft {
+        endpoint: String,
     },
     SaveModel {
         id: Option<String>,
@@ -1500,6 +1564,12 @@ pub enum Step {
 /// It is here rather than on the form so that the panel — which lives in the
 /// `Moment` — cannot hold a credential even by accident; see this module's doc.
 pub fn key(view: &ProvidersView, panel: &mut Panel, secret: &mut String, press: KeyPress) -> Step {
+    if let Some(card) = &mut panel.card {
+        if card.key(press) {
+            panel.card = None;
+        }
+        return Step::Stay;
+    }
     match panel.form.clone() {
         Some(Form::Account(form)) => account_key(view, panel, form, secret, press),
         Some(Form::Model(form)) => model_key(view, panel, form, secret, press),
@@ -1530,6 +1600,15 @@ fn list_key(view: &ProvidersView, panel: &mut Panel, secret: &mut String, press:
     let at = listed.get(panel.cursor).copied();
     let armed = panel.pending_delete.take();
     match (press.key, press.mods) {
+        (Key::F(2), _) if panel.efforts.is_none() => {
+            if let Some(Listed::Model(index)) = at {
+                if let Some(model) = view.models().get(index) {
+                    panel.card = Some(crate::model_cards::CardPanel::new(model));
+                }
+            }
+            Step::Stay
+        }
+
         // 挑强度时 Esc 是「退一层」:回到刚选完模型的那张列表,面板留着 ——
         // 和别的面板里 Esc 先退一步、再收起是同一个规矩。
         (Key::Esc, _) if panel.efforts.is_some() => {
@@ -1594,8 +1673,10 @@ fn list_key(view: &ProvidersView, panel: &mut Panel, secret: &mut String, press:
                 };
                 if !row.configured {
                     secret.clear();
-                    panel.form = Some(Form::Account(AccountForm::connect(view, row)));
-                    return Step::Stay;
+                    let mut form = AccountForm::connect(view, row);
+                    let step = form.start_discovery(view);
+                    panel.form = Some(Form::Account(form));
+                    return step;
                 }
                 panel.tab = Tab::Models;
                 panel.drill = Some(row.id.clone());
@@ -1770,6 +1851,9 @@ fn account_key(
     press: KeyPress,
 ) -> Step {
     let previous_protocol = form.protocol;
+    let previous_endpoint = form.endpoint.clone();
+    let previous_focus = form.focus;
+    let mut discover = false;
     match (press.key, press.mods) {
         (Key::Esc, _) | (Key::Char('c'), Mods::CTRL) => {
             leave_form(panel, secret);
@@ -1784,6 +1868,7 @@ fn account_key(
                 .unwrap_or(AccountField::Key);
             form.caret = form.focused_len();
         }
+        (Key::Char('f'), Mods::CTRL) if form.is_ollama(view) => discover = true,
         (Key::Enter, _) => return save_account(view, panel, &form, secret),
         (Key::Tab, _) | (Key::Down, _) => form.step_focus(view, true),
         (Key::BackTab, _) | (Key::Up, _) => form.step_focus(view, false),
@@ -1835,8 +1920,21 @@ fn account_key(
         secret.clear();
         form.key_len = 0;
     }
+    if form.endpoint != previous_endpoint || form.protocol != previous_protocol {
+        // Editing immediately invalidates a request, before a replacement is sent.
+        form.discovery = None;
+    }
+    discover |= form.protocol != previous_protocol
+        || (previous_focus == AccountField::Endpoint
+            && form.focus != previous_focus
+            && form.discovery.is_none());
+    let step = if discover {
+        form.start_discovery(view)
+    } else {
+        Step::Stay
+    };
     panel.form = Some(Form::Account(form));
-    Step::Stay
+    step
 }
 
 /// Hand the account form to the port, when it has enough to write.
@@ -1882,8 +1980,14 @@ fn save_account(
         key,
     };
     let id = form.editing.clone();
+    let listed = form
+        .discovery
+        .as_ref()
+        .and_then(|d| d.result.as_ref())
+        .and_then(|result| result.as_ref().ok())
+        .cloned();
     leave_form(panel, secret);
-    Step::SaveAccount { id, draft }
+    Step::SaveAccount { id, draft, listed }
 }
 
 fn model_key(
@@ -2272,6 +2376,9 @@ pub fn paste(panel: &mut Panel, secret: &mut String, text: &str) -> bool {
             let at = snap(field, *caret);
             field.insert_str(at, &line);
             *caret = at + line.len();
+            if form.focus == AccountField::Endpoint {
+                form.discovery = None;
+            }
             true
         }
         Some(Form::Model(form)) => {
@@ -2387,6 +2494,11 @@ pub trait Providers: Send + Sync {
     fn discover(&self, _account: &str) -> Option<DiscoverFuture> {
         None
     }
+
+    /// Read-only Ollama discovery before the account has been saved.
+    fn discover_ollama(&self, _endpoint: &str) -> Option<DiscoverFuture> {
+        None
+    }
 }
 
 /// See [`Providers::discover`].
@@ -2401,6 +2513,61 @@ pub type ProbeFuture =
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effort_steps_over_declared_levels_with_default_last() {
+        let declared = Some(vec![
+            "low".into(),
+            "medium".into(),
+            "high".into(),
+            "default".into(),
+        ]);
+
+        assert_eq!(
+            effort_step("medium", declared.clone(), true).as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            effort_step("medium", declared.clone(), false).as_deref(),
+            Some("low")
+        );
+        // The ends wrap: the last declared level lands on the endpoint's
+        // default, and stepping on from there re-enters the list.
+        assert_eq!(
+            effort_step("high", declared.clone(), true).as_deref(),
+            Some("default")
+        );
+        assert_eq!(
+            effort_step("default", declared.clone(), true).as_deref(),
+            Some("low")
+        );
+        assert_eq!(
+            effort_step("default", declared.clone(), false).as_deref(),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn effort_steps_into_the_list_when_the_level_in_force_is_not_declared() {
+        let declared = Some(vec!["low".into(), "high".into(), "default".into()]);
+
+        // A config edit since the session started left `max` in force: step in
+        // from the near end instead of guessing a middle rung.
+        assert_eq!(
+            effort_step("max", declared.clone(), true).as_deref(),
+            Some("low")
+        );
+        assert_eq!(
+            effort_step("max", declared, false).as_deref(),
+            Some("default")
+        );
+    }
+
+    #[test]
+    fn effort_steps_nowhere_without_declared_levels() {
+        assert_eq!(effort_step("high", None, true), None);
+        assert_eq!(effort_step("default", Some(vec![]), false), None);
+    }
 
     fn account(id: &str, models: usize) -> AccountRow {
         AccountRow {
@@ -2978,7 +3145,7 @@ mod tests {
         let mut secret = String::new();
         run(&view, &mut panel, &mut secret, &[ctrl('e')]);
         let step = run(&view, &mut panel, &mut secret, &[press(Key::Enter)]);
-        let Step::SaveAccount { id, draft } = step else {
+        let Step::SaveAccount { id, draft, .. } = step else {
             panic!("it saves: {step:?}");
         };
         assert_eq!(id.as_deref(), Some("deepseek"));
@@ -3243,6 +3410,73 @@ mod tests {
     }
 
     #[test]
+    fn selecting_ollama_probes_without_saving_and_address_edits_invalidate_the_probe() {
+        let view = view();
+        let mut form = AccountForm::add(&view);
+        form.name = "my-local".into();
+        form.focus = AccountField::Protocol;
+        let mut panel = Panel {
+            form: Some(Form::Account(form)),
+            ..Panel::new()
+        };
+        let mut secret = String::new();
+        assert_eq!(
+            key(&view, &mut panel, &mut secret, press(Key::Right)),
+            Step::DiscoverDraft {
+                endpoint: "http://localhost:11434".into()
+            }
+        );
+        let Some(Form::Account(form)) = panel.form.as_mut() else {
+            panic!("account draft");
+        };
+        let first = form.discovery.as_ref().unwrap().id;
+        form.discovery.as_mut().unwrap().result = Some(Err("Run ollama serve".into()));
+        assert!(matches!(
+            key(&view, &mut panel, &mut secret, ctrl('f')),
+            Step::DiscoverDraft { .. }
+        ));
+        let Some(Form::Account(form)) = panel.form.as_mut() else {
+            panic!("account draft");
+        };
+        assert_ne!(first, form.discovery.as_ref().unwrap().id);
+        form.focus = AccountField::Endpoint;
+        form.caret = form.endpoint.len();
+        key(&view, &mut panel, &mut secret, press(Key::Char('0')));
+        let Some(Form::Account(form)) = panel.form.as_ref() else {
+            panic!("account draft");
+        };
+        assert!(form.discovery.is_none(), "late answer must no longer match");
+        assert!(form.endpoint.ends_with("114340"));
+        assert!(matches!(
+            key(&view, &mut panel, &mut secret, press(Key::Tab)),
+            Step::DiscoverDraft { .. }
+        ));
+    }
+
+    #[test]
+    fn saving_an_ollama_draft_reuses_its_successful_inventory() {
+        let view = view();
+        let mut form = AccountForm::add(&view);
+        form.name = "my-local".into();
+        form.protocol = 1;
+        form.endpoint = "http://localhost:11434".into();
+        form.start_discovery(&view);
+        let models = listed(&[("local-model", None)]);
+        form.discovery.as_mut().unwrap().result = Some(Ok(models.clone()));
+        let mut panel = Panel {
+            form: Some(Form::Account(form)),
+            ..Panel::new()
+        };
+        let Step::SaveAccount { listed, draft, .. } =
+            key(&view, &mut panel, &mut String::new(), press(Key::Enter))
+        else {
+            panic!("explicit save");
+        };
+        assert_eq!(listed, Some(models));
+        assert_eq!(draft.endpoint, "http://localhost:11434");
+    }
+
+    #[test]
     fn changing_a_target_never_reuses_the_previous_targets_typed_key() {
         let mut view = view();
         let mut form = AccountForm::add(&view);
@@ -3310,7 +3544,7 @@ mod tests {
         );
         assert!(paste(&mut panel, &mut secret, "sk-private"));
         assert!(!format!("{panel:?}").contains("sk-private"));
-        let Step::SaveAccount { id, draft } =
+        let Step::SaveAccount { id, draft, .. } =
             key(&view, &mut panel, &mut secret, press(Key::Enter))
         else {
             panic!("connect");

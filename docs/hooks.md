@@ -214,7 +214,7 @@ When several hooks match one event, the **most-restrictive** decision wins
 ```bash
 atomcode hooks list           # loaded hooks, grouped by event
 atomcode hooks paths          # the exact files that are read (with ✓/✗)
-atomcode hooks test <NAME>    # dry-run a hook with a synthetic payload
+atomcode hooks test <NAME>    # execute one hook with a synthetic payload
 ```
 
 `hooks test <NAME>` matches by **event name** (e.g. `PreToolUse`) or a
@@ -248,3 +248,32 @@ does not prohibit a trusted hook script from launching that command. JSON
 3. **Fail-open:** a timeout or crash is treated as "proceed", not "block".
 4. On Windows the command runs under `cmd /C`: use an explicit interpreter,
    and `%VAR%` rather than `${VAR}`; `~` is not expanded.
+
+## TUI and WebUI browser
+
+Enter `/hooks` in either UI. The TUI offers a searchable selection sheet; the
+WebUI opens a dialog. Both show the current **on-disk configuration**, its
+source, event, matcher, command and timeout, plus global/project file diagnostics
+and plugin trust status. Disabled and unknown-event entries remain visible.
+This is a configuration preview, not proof that a running agent has already
+reloaded edited files. Use `/reload` or reopen the session after editing.
+
+In the TUI, select an entry to review it, then choose **Run script test**.
+`/hooks paths` shows configuration paths and diagnostics. Internal selection
+commands are `/hooks show <id>` and `/hooks test <id>`; IDs come from the current
+catalogue, rather than matching an arbitrary command substring. The WebUI uses
+the same discovery/testing service through its dialog.
+
+**Tests really execute the configured script** with a synthetic event payload,
+in the displayed working directory. Merely opening or reviewing hooks never
+executes one. Interactive tests cap the configured timeout at 30 seconds and
+return the real exit code and bounded stdout/stderr (up to 16,000 characters
+each); timeout or failure to start is reported separately from completion. A
+selection whose definition or working directory changed must be refreshed;
+disabled, unknown-event and untrusted-plugin hooks are not eligible for testing.
+Plugin bundle validation remains the same as live execution. The browser does
+not edit configurations, grant trust or change runtime bindings.
+
+Selecting a test explicitly invokes that one hook, regardless of its matcher.
+It does not run a model/tool call or prove that the matcher will match a real
+call; inspect the event, matcher and synthetic payload when interpreting results.

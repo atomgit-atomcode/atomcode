@@ -23,6 +23,7 @@ import {
 } from '../lib/sidebarView';
 
 interface SidebarProps {
+  runningSessionId?: string | null;
   activeSessionId: string | null;
   onSelect: (session: SessionMetaWithProject) => void;
   onNew: () => void;
@@ -319,6 +320,7 @@ function BellGlyph() {
 }
 
 export function Sidebar({
+  runningSessionId,
   activeSessionId,
   onSelect,
   onNew,
@@ -371,7 +373,7 @@ export function Sidebar({
   const [timeNow, setTimeNow] = useState(() => Date.now());
   // Skills menu: list fetched lazily; the count badge shows once loaded.
   const [skillsMenuOpen, setSkillsMenuOpen] = useState(false);
-  const { items: skills, loading: skillsLoading, failed: skillsFailed } = useSkills(skillsMenuOpen);
+  const { items: skills, loading: skillsLoading, failed: skillsFailed, error: skillsError } = useSkills(skillsMenuOpen);
   const [skillsMenuPos, setSkillsMenuPos] = useState<{ top: number; left: number; width: number } | null>(null);
   const skillsMenuRef = useRef<HTMLDivElement | null>(null);
   const skillsBtnRef = useRef<HTMLButtonElement | null>(null);
@@ -752,6 +754,7 @@ export function Sidebar({
   useEffect(() => {
     if (!historyPreview) return;
     const close = (event: KeyboardEvent) => {
+      if (event.isComposing || event.keyCode === 229) return;
       if (event.key === 'Escape') {
         ++previewGeneration.current;
         setHistoryPreview(null);
@@ -953,6 +956,7 @@ export function Sidebar({
   useEffect(() => {
     if (!searchOpen) return;
     const onKey = (e: KeyboardEvent) => {
+      if (e.isComposing || e.keyCode === 229) return;
       if (e.key === 'Escape') setSearchOpen(false);
     };
     document.addEventListener('keydown', onKey);
@@ -1110,7 +1114,7 @@ export function Sidebar({
               minWidth: `${Math.max(skillsMenuPos.width, 200)}px`,
             }}
           >
-            {skillsFailed && <button class="skills-menu-row" onClick={() => void refreshSkills()}>{t('skills.loadFailedRetry')}</button>}
+            {skillsFailed && <button class="skills-menu-row" onClick={(e) => { e.stopPropagation(); void refreshSkills(); }}>{t(skills?.length ? 'skills.refreshFailedRetry' : 'skills.loadFailedRetry')}{skillsError && <small>{skillsError}</small>}</button>}
             {skillsLoading && <div class="group-by-menu-title">{t('sidebar.skillsLoading')}</div>}
             {!skillsLoading && !skillsFailed && (skills?.length ?? 0) === 0 && (
               <div class="group-by-menu-title">{t('sidebar.skillsEmpty')}</div>
@@ -1253,8 +1257,9 @@ export function Sidebar({
           (menuFor === s.id ? ' menu-open' : '')
         }
       >
-        <button class="session-item-main" onClick={() => onSelect(s)} title={dir}>
-          <span class="session-item-name">{label}</span>
+        <button class="session-item-main" onClick={() => onSelect(s)} title={runningSessionId && s.id !== runningSessionId ? `${dir} · ${t('browse.sidebarHint')}` : dir}>
+          <span class="session-item-name">{s.scheduled && <span class="session-automation-mark" title={t('sidebar.automation')} aria-label={t('sidebar.automation')}>◷</span>}{label}</span>
+          {s.id === runningSessionId && <span class="session-running-mark">{t('browse.running')}</span>}
           <span class="session-item-meta">
             {formatTime(s.updated_at || s.created_at, t, timeNow)}
           </span>
@@ -1446,6 +1451,8 @@ export function Sidebar({
           </button>
         )}
       </div>
+
+      {runningSessionId && <p class="session-browse-sidebar-hint">{t('browse.sidebarHint')}</p>}
 
       <div
         class="session-list-body"

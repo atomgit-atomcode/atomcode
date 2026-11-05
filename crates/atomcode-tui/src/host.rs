@@ -893,6 +893,9 @@ fn behind_a_lid(block: &crate::block::Block) -> bool {
         // not swallowed by the neighbouring calls' group count.
         && !block.content.as_tool_call().is_some_and(|call| {
             call.edit_text_mismatch()
+                // A slow call's activity must stay visible even when a later
+                // parallel call would otherwise own the merged run's lid.
+                || (call.is_running() && call.progress.is_some())
                 || (call.name == "bash_poll" && call.idle_poll_job().is_none())
         })
 }
@@ -965,7 +968,7 @@ fn run_from(
 }
 
 /// The run a slot's rows are drawn as, when they are drawn behind one lid.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Run {
     /// The slot the lid is drawn at: the run's last call. The painter walks the
     /// stream backwards and so reaches it first, and the rows of the calls
@@ -1630,6 +1633,8 @@ impl crate::block::Content for Gone {
 /// earlier members, which draw nothing), and whether a blank row separates it
 /// from the slot above.
 struct RowIndex {
+    #[cfg(test)]
+    measurements: usize,
     /// Earliest measured slot, including hidden slots with no rows.
     loaded_start: usize,
     /// What the measurements below were taken under. A different width, a
@@ -1683,6 +1688,7 @@ struct RowIndex {
 /// re-measured all 1330 slots would cost more than the walk it replaced. With
 /// the tag, a rebuild re-measures the slot that changed and reuses the rest.
 struct Measured {
+    run: Option<Run>,
     /// The block this was measured for, so a slot reused for a different block
     /// is not mistaken for the same one.
     id: crate::block::BlockId,
@@ -1827,6 +1833,8 @@ impl Host {
             pin_gate: Mutex::new(()),
             history_layout_rows: std::sync::atomic::AtomicUsize::new(usize::MAX),
             row_index: Mutex::new(RowIndex {
+                #[cfg(test)]
+                measurements: 0,
                 loaded_start: usize::MAX,
                 width: 0,
                 caps: crate::block::ShapeCaps::of(&crate::caps::Caps::default()),
@@ -1906,6 +1914,8 @@ impl Host {
         *self.stream.write().expect("stream poisoned") = Stream::new();
         *self.presentation.write().expect("presentation poisoned") = Presentation::default_folds();
         *self.row_index.lock().expect("row index poisoned") = RowIndex {
+            #[cfg(test)]
+            measurements: 0,
             loaded_start: usize::MAX,
             width: 0,
             caps: crate::block::ShapeCaps::of(&crate::caps::Caps::default()),
@@ -2193,6 +2203,15 @@ impl Host {
                 .slots()
                 .iter()
                 .any(|s| s.block().kind() == "reasoning")
+    }
+
+    /// Update one live call through its owning producer. Late/orphan activity
+    /// is ignored and never becomes a notice or a persisted transcript fact.
+    pub fn tool_progress(&self, call_id: &str, message: &str) -> bool {
+        let mut stream = self.stream.write().expect("stream poisoned");
+        self.modules.producers().iter().any(|producer| {
+            producer.tool_progress(call_id, message, &mut stream.writer(producer.id()))
+        })
     }
 
     /// Deliver one committed fact to every module, with no sequence number of
@@ -2899,7 +2918,17 @@ impl Host {
             // on its words: two questions worded alike are still two questions.
             Some((id, _)) if m.asking.as_ref().is_some_and(|had| had.id == id) => false,
             Some((id, asked)) => {
-                m.asking = Some(crate::moment::Ask::new(id, asked));
+                let mut sheet = crate::moment::Ask::new(id, asked);
+                let key = m
+                    .settings
+                    .rows()
+                    .iter()
+                    .find(|row| row.id == crate::settings::QUESTION_EDIT_KEY)
+                    .map(|row| row.value.as_str())
+                    .unwrap_or("ctrl+e");
+                sheet.edit_key = crate::keymap::parse_question_edit_key(key)
+                    .unwrap_or_else(|_| crate::surface::KeyPress::ctrl('e'));
+                m.asking = Some(sheet);
                 true
             }
         }
@@ -3214,8 +3243,7 @@ impl Host {
     /// criterion that pins it is `a_click_missing_the_panel_hits_nothing`.
     /// Scroll the settings panel under the pointer, and say whether it took it.
     ///
-    /// Only the pages that are read rather than filtered scroll, and only when
-    /// the pointer is actually over the panel: a wheel anywhere else belongs to
+    /// Only when the pointer is actually over the panel: a wheel anywhere else belongs to
     /// the conversation, which is the thing people scroll all day. Answering
     /// every wheel event while the panel happened to be open would take the
     /// wheel away from the transcript the panel does not even cover.
@@ -3230,11 +3258,19 @@ impl Host {
             return false;
         }
         let mut m = self.moment.write().expect("moment poisoned");
+        let count = m
+            .settings_panel
+            .as_ref()
+            .map_or(0, |panel| m.settings.matching(&panel.query).len());
         let Some(panel) = m.settings_panel.as_mut() else {
             return false;
         };
         if panel.tab == crate::settings::Tab::Config {
-            return false;
+            if panel.editing.is_none() && panel.keybindings.is_none() {
+                panel.move_by(by, count);
+                panel.pending_reset = None;
+            }
+            return true;
         }
         // Clamped at the top here and at the bottom where the rows are counted:
         // this side does not know how long the page is.
@@ -3413,10 +3449,27 @@ impl Host {
     pub fn provider_discovery_id(&self) -> Option<u64> {
         let m = self.moment.read().expect("moment poisoned");
         match m.providers_panel.as_ref()?.form.as_ref()? {
+            crate::providers::Form::Account(form) => form.discovery.as_ref().map(|d| d.id),
             crate::providers::Form::Model(form) if form.picking.is_some() => {
                 Some(form.discovery_id)
             }
             _ => None,
+        }
+    }
+
+    pub fn provider_draft_discovered(
+        &self,
+        request: u64,
+        listed: Result<Vec<crate::providers::Discovered>, String>,
+    ) {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let Some(crate::providers::Form::Account(form)) =
+            m.providers_panel.as_mut().and_then(|p| p.form.as_mut())
+        else {
+            return;
+        };
+        if let Some(discovery) = form.discovery.as_mut().filter(|d| d.id == request) {
+            discovery.result = Some(listed);
         }
     }
 
@@ -3466,6 +3519,14 @@ impl Host {
         &self,
         press: crate::surface::KeyPress,
     ) -> (bool, Option<crate::providers::Step>) {
+        let (card_columns, card_height) = self
+            .hits
+            .lock()
+            .expect("hits poisoned")
+            .providers
+            .map(|rect| (rect.w as usize, rect.h as usize))
+            .unwrap_or((80, 21));
+        let card_width = card_columns.saturating_sub(2).max(1);
         let mut m = self.moment.write().expect("moment poisoned");
         let view = m.providers.clone();
         let mut secret = self
@@ -3475,8 +3536,14 @@ impl Host {
         let Some(panel) = m.providers_panel.as_mut() else {
             return (false, None);
         };
+        if let Some(card) = &mut panel.card {
+            card.clamp(&view, card_width, card_height);
+        }
         let before = panel.clone();
         let step = crate::providers::key(&view, panel, &mut secret, press);
+        if let Some(card) = &mut panel.card {
+            card.clamp(&view, card_width, card_height);
+        }
         let changed = *panel != before;
         match step {
             crate::providers::Step::Stay => (changed, None),
@@ -3508,7 +3575,31 @@ impl Host {
         if !over {
             return false;
         }
+        let (card_columns, card_height) = self
+            .hits
+            .lock()
+            .expect("hits poisoned")
+            .providers
+            .map(|rect| (rect.w as usize, rect.h as usize))
+            .unwrap_or((80, 21));
+        let card_width = card_columns.saturating_sub(2).max(1);
         let mut m = self.moment.write().expect("moment poisoned");
+        let card_view = m.providers.clone();
+        if let Some(card) = m
+            .providers_panel
+            .as_mut()
+            .and_then(|panel| panel.card.as_mut())
+        {
+            card.clamp(&card_view, card_width, card_height);
+            card.scroll = if by < 0 {
+                card.scroll.saturating_sub(by.unsigned_abs() as usize)
+            } else {
+                card.scroll.saturating_add(by as usize)
+            };
+            card.clamp(&card_view, card_width, card_height);
+            return true;
+        }
+
         if let Some(crate::providers::Form::Model(form)) = m
             .providers_panel
             .as_mut()
@@ -5942,6 +6033,16 @@ impl Host {
     /// Nothing is open is not an error and not news: the pointer moves over the
     /// screen all the time.
     pub fn context_menu_hover(&self, x: u16, y: u16, size: (u16, u16)) -> bool {
+        {
+            let held = self.context_menu.read().expect("menu poisoned");
+            if held
+                .as_ref()
+                .and_then(|menu| menu.hover_target(x, y, size.0, size.1))
+                .is_none()
+            {
+                return false;
+            }
+        }
         let mut held = self.context_menu.write().expect("menu poisoned");
         let Some(menu) = held.as_mut() else {
             return false;
@@ -6217,11 +6318,13 @@ impl Host {
             stream.slots(),
             &pres,
             moment.activity,
-            if moment.stream_selection.is_some() {
-                usize::MAX
-            } else {
-                self.history_layout_budget(pane.block_scroll, rect.h as usize)
-            },
+            self.selection_layout_budget(
+                rect.w,
+                moment,
+                pane.block_scroll,
+                rect.h as usize,
+                pres.revision(),
+            ),
             moment.scroll.0 > 0 || moment.stream_selection.is_some(),
         );
         let distance = pane
@@ -6940,6 +7043,15 @@ impl Host {
             }
         }
 
+        if let (Some(shown), Some(modal), Some(part)) = (
+            moment.flow.as_ref(),
+            self.overlays.current(),
+            frame.part("flow"),
+        ) {
+            let room = part.rect.h.saturating_sub(3) as usize;
+            modal.set_scroll_limit(shown.lines.len().saturating_sub(1).saturating_sub(room));
+        }
+
         // A flow is at the foot of the screen, where the composer was: the
         // keys are its, not the field's, so nothing puts a caret there.
         if moment.flow.is_some() {
@@ -6960,7 +7072,18 @@ impl Host {
                     ),
                     &moment,
                 );
-                let body = modal.render(&vp);
+                let mut body = modal.render(&vp);
+                let hint = body.pop();
+                let room = vp.rect.h.saturating_sub(1) as usize;
+                modal.set_scroll_limit(body.len().saturating_sub(room));
+                let mut body: Vec<_> = body
+                    .into_iter()
+                    .skip(modal.scroll_offset())
+                    .take(room)
+                    .collect();
+                if vp.rect.h > 0 {
+                    body.extend(hint);
+                }
                 frame.place(
                     modal.id(),
                     rect,
@@ -7157,6 +7280,31 @@ impl Host {
             .saturating_mul(page)
     }
 
+    // Selection gestures measure the prefix once to establish absolute rows.
+    // Keep that baseline across frames, but rebuild it after a reflow or a
+    // presentation/activity change rather than projecting against a suffix.
+    fn selection_layout_budget(
+        &self,
+        width: u16,
+        moment: &Moment,
+        scroll: usize,
+        height: usize,
+        presentation: u64,
+    ) -> usize {
+        if moment.stream_selection.is_some() {
+            let idx = self.row_index.lock().expect("row index poisoned");
+            if idx.loaded_start != 0
+                || idx.width != width
+                || idx.caps != crate::block::ShapeCaps::of(&moment.caps)
+                || idx.presentation != presentation
+                || idx.activity != moment.activity
+            {
+                return usize::MAX;
+            }
+        }
+        self.history_layout_budget(scroll, height)
+    }
+
     #[cfg(test)]
     fn row_index<'a>(
         &'a self,
@@ -7227,6 +7375,7 @@ impl Host {
         while idx.measured.len() < slots.len() {
             let i = idx.measured.len();
             idx.measured.push(Measured {
+                run: None,
                 id: slots[i].block().id,
                 settled: false,
             });
@@ -7246,21 +7395,15 @@ impl Host {
             // can have grown since, and that is the whole reason it is not
             // cached.
             //
-            // A slot of a tool run is never reused, settled or not: whether it
-            // draws a lid, and how many calls that lid names, is a fact about
-            // the *run* — and the run changes shape when a call lands in it
-            // without this slot's id changing at all. The lid the run used to
-            // draw here would ride its cached entry past the new lid drawn at
-            // the run's new last call, and the screen would show both. Tool
-            // slots are a small fraction of the stream; the prose this table
-            // exists to skip is untouched.
-            let in_a_run = lids.runs.get(i).copied().flatten().is_some();
+            // A settled tool slot is reusable when its merged-run geometry is
+            // unchanged. A growing run can move its lid or change its count,
+            // failure summary, or live state without changing the slot id.
+            let run = lids.runs.get(i).copied().flatten();
             let reusable = settled
-                && !in_a_run
                 && idx
                     .measured
                     .get(i)
-                    .is_some_and(|m| m.settled && m.id == b.id);
+                    .is_some_and(|m| m.settled && m.id == b.id && m.run == run);
             if reusable {
                 if let Some(entry) = idx.rows[i].filter(|entry| entry.rows > 0) {
                     let seam = measured_below
@@ -7281,6 +7424,10 @@ impl Host {
             // they were — and collapsing the two made a hidden block add itself
             // to the running kind, which moved every blank below it. The ratchet
             // beside this caught exactly that on its first run.
+            #[cfg(test)]
+            {
+                idx.measurements += 1;
+            }
             let entry = lid_row(
                 &lids,
                 slots,
@@ -7300,7 +7447,11 @@ impl Host {
                     .saturating_add(usize::from(seam));
                 measured_below = Some(entry.kind);
             }
-            let m = Measured { id: b.id, settled };
+            let m = Measured {
+                id: b.id,
+                settled,
+                run,
+            };
             idx.measured[i] = m;
             idx.rows[i] = entry;
         }
@@ -7378,11 +7529,7 @@ impl Host {
             stream.slots(),
             &pres,
             moment.activity,
-            if moment.stream_selection.is_some() {
-                usize::MAX
-            } else {
-                self.history_layout_budget(moment.scroll.0, 0)
-            },
+            self.selection_layout_budget(width, moment, moment.scroll.0, 0, pres.revision()),
             moment.scroll.0 > 0 || moment.stream_selection.is_some(),
         )
         .total
@@ -7562,6 +7709,7 @@ impl Host {
             let lines = modal.render(&crate::moment::Viewport::new(Rect::sized(w, h), moment));
             moment.flow = Some(crate::overlay::Shown {
                 id: modal.id().to_string(),
+                scroll: modal.scroll_offset(),
                 title: modal.title(),
                 lines,
             });
@@ -7595,11 +7743,13 @@ impl Host {
                 stream.slots(),
                 &pres,
                 moment.activity,
-                if moment.stream_selection.is_some() {
-                    usize::MAX
-                } else {
-                    self.history_layout_budget(moment.scroll.0, room.h as usize)
-                },
+                self.selection_layout_budget(
+                    width,
+                    moment,
+                    moment.scroll.0,
+                    room.h as usize,
+                    pres.revision(),
+                ),
                 moment.scroll.0 > 0 || moment.stream_selection.is_some(),
             )
             .total;
@@ -8248,6 +8398,48 @@ mod tests {
         mods.add_view(Arc::new(Mounted::<input::Input>::new()))
             .unwrap();
         Host::new(mods, default_layout())
+    }
+
+    #[test]
+    fn late_ollama_discovery_cannot_fill_a_draft_after_its_address_changed() {
+        use crate::providers::{AccountDiscovery, AccountForm, Form, Panel, ProvidersView};
+        let h = host();
+        let mut form = AccountForm::add(&ProvidersView::default());
+        form.discovery = Some(AccountDiscovery {
+            id: 10,
+            result: None,
+        });
+        h.moment.write().unwrap().providers_panel = Some(Panel {
+            form: Some(Form::Account(form)),
+            ..Panel::new()
+        });
+        h.provider_draft_discovered(9, Err("stale failure".into()));
+        let result = || {
+            let m = h.moment.read().unwrap();
+            let Some(Form::Account(form)) = m.providers_panel.as_ref().unwrap().form.as_ref()
+            else {
+                panic!("draft");
+            };
+            form.discovery.as_ref().unwrap().result.clone()
+        };
+        assert_eq!(result(), None);
+        h.provider_draft_discovered(10, Ok(vec![]));
+        assert_eq!(result(), Some(Ok(vec![])));
+        {
+            let mut m = h.moment.write().unwrap();
+            let Some(Form::Account(form)) = m.providers_panel.as_mut().unwrap().form.as_mut()
+            else {
+                panic!("draft");
+            };
+            form.endpoint = "http://localhost:12345".into();
+            form.discovery = None;
+        }
+        h.provider_draft_discovered(10, Err("old address".into()));
+        let m = h.moment.read().unwrap();
+        let Some(Form::Account(form)) = m.providers_panel.as_ref().unwrap().form.as_ref() else {
+            panic!("draft");
+        };
+        assert!(form.discovery.is_none());
     }
 
     #[test]
@@ -9578,6 +9770,60 @@ mod tests {
 
     const PEER_ROWS: u16 = 2;
 
+    #[test]
+    fn a_withdrawn_option_edit_cannot_answer_the_replacement_request() {
+        use crate::settings::{Applies, SettingKind, SettingRow, SettingsView, QUESTION_EDIT_KEY};
+        let h = host();
+        h.modules
+            .add_view(Arc::new(Mounted::<crate::modules::ask::Ask>::new()))
+            .unwrap();
+        h.moment.write().unwrap().settings = SettingsView::new(vec![SettingRow {
+            id: QUESTION_EDIT_KEY.into(),
+            label: "Edit option".into(),
+            value: "alt+e".into(),
+            kind: SettingKind::Text,
+            applies: Applies::Immediately,
+        }]);
+        let question = crate::ask::question_for(
+            "request_user_input",
+            &serde_json::json!({"header":"Plan", "question":"Which?", "mode":"single", "options":[{"label":"A"}]}),
+            &[],
+        )
+        .unwrap();
+        let (old, mut receiver) = h.asks.push_with_id(question.clone());
+        h.sync_asking();
+        let key = crate::keymap::parse_question_edit_key("alt+e").unwrap();
+        h.ask_key(key);
+        h.ask_paste(" first");
+        assert!(!h.sync_asking(), "an unchanged request preserves its edit");
+        assert_eq!(
+            h.moment
+                .read()
+                .unwrap()
+                .asking
+                .as_ref()
+                .unwrap()
+                .option_edit()
+                .unwrap()
+                .text,
+            "A first"
+        );
+        assert!(h.asks.withdraw(old));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
+        let (new, _receiver) = h.asks.push_with_id(question);
+        h.sync_asking();
+        assert!(h.asks.take_id(old).is_none());
+        let m = h.moment.read().unwrap();
+        let sheet = m.asking.as_ref().unwrap();
+        assert_eq!(sheet.id, new);
+        assert!(sheet.option_edit().is_none());
+        assert_eq!(sheet.edit_key, key);
+        assert!(sheet.drafts[0].replacements.iter().all(Option::is_none));
+    }
+
     /// A question takes the field's rows without touching what is in it.
     ///
     /// The composer steps aside while a question is up (`asked_height`), and the
@@ -9778,6 +10024,36 @@ mod tests {
             before,
             "and it is back as it was"
         );
+    }
+
+    #[test]
+    fn a_tall_pairing_flow_can_reach_its_last_row_in_a_short_terminal() {
+        use crate::overlay::Overlay;
+        let h = host();
+        h.modules
+            .add_view(Arc::new(Mounted::<crate::modules::flow::FlowView>::new()))
+            .unwrap();
+        let wizard = crate::wizard::Wizard::new(
+            "pair",
+            "Pair",
+            vec![
+                crate::wizard::StepDef::new("pair", "Phone", crate::wizard::StepKind::Note)
+                    .saying((0..60).map(|n| format!("pair row {n}")).collect()),
+            ],
+            Box::new(|_| {}),
+            "/done",
+        );
+        h.overlays.open(wizard.clone(), Box::new(|_| {}));
+        let first = h.compose((80, 20));
+        let hint = first.part("flow").unwrap().lines.last().unwrap().plain();
+        assert!(!hint.is_empty());
+        wizard.scroll(1000);
+        let last = h.compose((80, 20));
+        let lines = &last.part("flow").unwrap().lines;
+        assert!(lines.iter().any(|l| l.plain().contains("pair row 59")));
+        assert_eq!(lines.last().unwrap().plain(), hint);
+        h.compose((80, 80));
+        assert_eq!(wizard.scroll_offset(), 0);
     }
 
     /// A flow (the onboarding or pairing wizard) is drawn at the foot of the
@@ -10235,16 +10511,15 @@ mod tests {
             "off the panel, the wheel is not the panel's"
         );
 
-        // The settings page is narrowed by typing, not scrolled: a list you can
-        // both filter and scroll has two ways to lose the row you were on.
+        // On Config the wheel moves the selection, which the viewport follows.
         {
             let mut m = h.moment.write().expect("moment poisoned");
             let panel = m.settings_panel.as_mut().expect("a panel");
             panel.show(crate::settings::Tab::Config);
         }
         assert!(
-            !h.settings_wheel(rect.x + 1, rect.y + 1, 3),
-            "the page that is filtered does not scroll"
+            h.settings_wheel(rect.x + 1, rect.y + 1, 3),
+            "the configuration list consumes the wheel too"
         );
     }
 
@@ -11267,6 +11542,69 @@ mod tests {
             "a four-times-longer session made one scrolled frame cost more: what \
              is above the fold is still being rendered"
         );
+    }
+
+    #[test]
+    fn selection_retains_history_measurements_and_rebuilds_after_reflow() {
+        let (h, asked) = counted(1_500);
+        let live = h.stream.write().unwrap().writer("selection-probe").open(
+            crate::block::Coord::default(),
+            Arc::new(Counted {
+                lines: vec!["tail".into()],
+                asked: asked.clone(),
+            }),
+        );
+        h.set_history_layout_rows(Some(40));
+        let size = (80, 24);
+        h.compose(size);
+        let mut moment = h.moment.read().unwrap().clone();
+        let view = h.selection_view(size, &moment).unwrap();
+        moment.stream_selection = Some(crate::moment::StreamSelection::at(0, view.top()));
+        *h.moment.write().unwrap() = moment;
+        h.compose(size);
+        let before = h.row_index.lock().unwrap().measurements;
+        h.open_selection_menu(
+            (2, 4),
+            vec![crate::menu::Item::new("copy-selected", "Copy")],
+        );
+        let timer = std::time::Instant::now();
+        for _ in 0..10 {
+            h.compose(size);
+        }
+        println!(
+            "selected menu, 1500 history blocks: {:.3} ms/frame ({})",
+            timer.elapsed().as_secs_f64() * 100.,
+            if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            }
+        );
+        let after_idle = h.row_index.lock().unwrap().measurements;
+        assert!(
+            after_idle - before <= 60,
+            "unchanged history was remeasured: {}",
+            after_idle - before
+        );
+        h.stream.write().unwrap().writer("selection-probe").amend(
+            live,
+            Arc::new(Counted {
+                lines: (0..12).map(|i| format!("tail {i}")).collect(),
+                asked,
+            }),
+        );
+        h.compose(size);
+        assert!(
+            h.row_index.lock().unwrap().measurements - after_idle <= 6,
+            "streaming remeasured the historical prefix"
+        );
+        h.compose((40, 24));
+        let idx = h.row_index.lock().unwrap();
+        assert_eq!(
+            idx.loaded_start, 0,
+            "a reflow must not discard the selected prefix"
+        );
+        assert!(idx.measurements > before);
     }
 
     #[test]
@@ -13592,7 +13930,7 @@ mod tests {
         // that cache: the run grew, the lid moved to the new last call, and
         // the old slot kept drawing the lid it had been measured with. The
         // screen showed `2 个工具` and then `3 个工具` over one run. The index
-        // now never reuses a run's slots, so the lid must land on the new last
+        // reuses a run only while its geometry matches, so the lid must land on the new last
         // call alone — after a compose has already drawn the shorter run.
         let h = host();
         h.presentation
@@ -13625,6 +13963,16 @@ mod tests {
         h.absorb(&call("c2"));
         h.absorb(&result("c2"));
         let _ = h.compose((80, 40));
+
+        let measured = h.row_index.lock().unwrap().measurements;
+        for _ in 0..10 {
+            h.compose((80, 40));
+        }
+        assert_eq!(
+            h.row_index.lock().unwrap().measurements,
+            measured,
+            "an unchanged settled tool group must reuse its measured geometry"
+        );
 
         // The run grows by one call — the exact mutation the reuse missed.
         h.absorb(&call("c3"));

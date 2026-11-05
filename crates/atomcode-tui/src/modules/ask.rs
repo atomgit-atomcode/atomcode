@@ -106,25 +106,39 @@ impl View for Ask {
 /// What the legend says: the keys this page answers to, and nothing about what
 /// an answer *means* — that is the harness's, and the wording of each answer
 /// comes from the answerer.
-fn legend(sheet: &Sheet) -> Vec<(&'static str, String)> {
-    let mut keys = vec![("↑↓", t(Msg::AskLegendChoose).into_owned())];
-    if sheet.page().map(Asked::form) == Some(Form::Multiple) {
-        keys.push(("space", t(Msg::AskLegendToggle).into_owned()));
+fn legend(sheet: &Sheet) -> Vec<(String, String)> {
+    let mut keys = Vec::new();
+    if sheet.option_edit().is_none() {
+        keys.push(("↑↓".into(), t(Msg::AskLegendChoose).into_owned()));
+    }
+    if sheet.can_edit_option() {
+        keys.push((
+            crate::keymap::chord_name(sheet.edit_key),
+            t(Msg::AskLegendEdit).into_owned(),
+        ));
+    }
+    if sheet.page().map(Asked::form) == Some(Form::Multiple) && !sheet.typing() {
+        keys.push(("space".into(), t(Msg::AskLegendToggle).into_owned()));
     }
     // On a line with words in it the arrows move the caret, and turning the
     // page is Tab's alone — the legend says whichever is true right now.
     if sheet.editing() {
-        keys.push(("←→", t(Msg::AskLegendCaret).into_owned()));
+        keys.push(("←→".into(), t(Msg::AskLegendCaret).into_owned()));
     }
-    keys.push(("⏎", t(Msg::AskLegendConfirm).into_owned()));
+    keys.push(("⏎".into(), t(Msg::AskLegendConfirm).into_owned()));
     if sheet.is_batch() {
         let turn = match sheet.editing() {
             true => "tab",
             false => "←→",
         };
-        keys.push((turn, t(Msg::AskLegendSwitch).into_owned()));
+        keys.push((turn.into(), t(Msg::AskLegendSwitch).into_owned()));
     }
-    keys.push(("esc", pt(PMsg::ApprovalDeny).into_owned()));
+    let escape = if sheet.option_edit().is_some() {
+        t(Msg::AskLegendCancelEdit).into_owned()
+    } else {
+        pt(PMsg::ApprovalDeny).into_owned()
+    };
+    keys.push(("esc".into(), escape));
     keys
 }
 
@@ -550,10 +564,23 @@ fn slot_line(sheet: &Sheet, k: usize, caps: Caps, w: usize) -> Line {
             let Some(answer) = asked.and_then(|a| a.question.options.get(i)) else {
                 return Line::from_spans(spans).truncate(w);
             };
-            spans.push(Span::styled(
-                crate::ask::answer_label(&answer.value, &answer.label),
-                style,
-            ));
+            if let Some(edit) = sheet.option_edit().filter(|e| e.option == i) {
+                let used: usize = spans.iter().map(Span::width).sum();
+                spans.extend(crate::modules::chrome::caret_spans(
+                    &edit.text,
+                    edit.caret,
+                    style,
+                    w.saturating_sub(used),
+                    caps,
+                ));
+            } else {
+                let label = draft
+                    .and_then(|d| d.replacements.get(i))
+                    .and_then(Option::as_ref)
+                    .cloned()
+                    .unwrap_or_else(|| crate::ask::answer_label(&answer.value, &answer.label));
+                spans.push(Span::styled(label, style));
+            }
             // What "always" would actually cover. A person saying it is owed the
             // scope they are saying it to — and "every call of this tool" is a
             // very different promise from "this one command".
@@ -581,18 +608,29 @@ fn slot_line(sheet: &Sheet, k: usize, caps: Caps, w: usize) -> Line {
         }
         Slot::Other | Slot::Input => {
             let typed = draft.map(|d| d.typed.as_str()).unwrap_or("");
-            // The caret is a reversed cell at the end of what was typed, drawn
-            // only on the row that is taking the keys.
-            let caret = || Span::styled(" ", Style::new().reverse());
+            // Draw a caret only on the row that is taking the keys.
             if typed.is_empty() {
                 if here {
-                    spans.push(caret());
+                    let used: usize = spans.iter().map(Span::width).sum();
+                    spans.extend(crate::modules::chrome::caret_spans(
+                        "",
+                        0,
+                        style,
+                        w.saturating_sub(used),
+                        caps,
+                    ));
                 }
                 spans.push(Span::styled(t(Msg::AskTypeSomething).into_owned(), quiet));
             } else if here {
                 let used: usize = spans.iter().map(Span::width).sum();
                 let at = draft.map_or(typed.len(), |d| d.caret);
-                spans.extend(caret_in(typed, at, style, w.saturating_sub(used)));
+                spans.extend(crate::modules::chrome::caret_spans(
+                    typed,
+                    at,
+                    style,
+                    w.saturating_sub(used),
+                    caps,
+                ));
             } else {
                 // The end of what was typed is the part being worked on, so a
                 // line too long for the row shows its tail, not its head.
@@ -619,27 +657,6 @@ fn slot_line(sheet: &Sheet, k: usize, caps: Caps, w: usize) -> Line {
     // patch behind the words: the pointed-at row is a surface, and a surface that
     // stops at its last letter is a smudge.
     pad(Line::from_spans(spans), w, style)
-}
-
-/// What was typed, with the caret on the cell it is at, kept in `room` cells.
-///
-/// The caret is drawn the way every other field on this screen draws it
-/// ([`crate::modules::chrome::caret_spans`]). A line longer than the room
-/// scrolls so the caret stays on screen: as much of what comes before it as
-/// fits — counted in cells, so a wide character is two — and what comes after
-/// is cut at the edge.
-fn caret_in(typed: &str, at: usize, style: Style, room: usize) -> Vec<Span> {
-    let at = crate::text::snap(typed, at);
-    let (before, rest) = typed.split_at(at);
-    // The caret's own cell: the character it sits on, or one blank past the end.
-    let on = rest.chars().next().map_or(1, crate::width::char_width);
-    let fits = room.saturating_sub(on);
-    let shown = match crate::width::str_width(before) <= fits {
-        true => before.to_string(),
-        false => crate::width::take_width_from_end(before, fits),
-    };
-    let line = format!("{shown}{rest}");
-    crate::modules::chrome::caret_spans(&line, shown.len(), style, room)
 }
 
 fn pad(line: Line, w: usize, style: Style) -> Line {
@@ -1413,5 +1430,25 @@ mod tests {
         let typing = framed(&with(batch), 100).join("\n");
         assert!(typing.contains("←→ 移动光标"), "{typing}");
         assert!(typing.contains("tab 切换题目"), "{typing}");
+    }
+
+    #[test]
+    fn an_option_editor_draws_its_caret_replacement_and_contextual_keys() {
+        use crate::surface::Key;
+        let mut sheet = Sheet::one(multiple());
+        sheet.edit_key = crate::keymap::parse_question_edit_key("alt+e").unwrap();
+        let idle = framed(&with(sheet.clone()), 120).join("\n");
+        assert!(idle.contains("alt+e 编辑此项"), "{idle}");
+        sheet.edit_option();
+        sheet.type_text("，只做第一步");
+        let editing = framed(&with(sheet.clone()), 120).join("\n");
+        assert!(editing.contains("esc 取消编辑"), "{editing}");
+        assert!(!editing.contains("space 勾选"), "{editing}");
+        for width in [20, 40, 120] {
+            assert!(caret_cell(&sheet, width).0 < width as usize);
+        }
+        press(&mut sheet, Key::Enter);
+        let saved = framed(&with(sheet), 120).join("\n");
+        assert!(saved.contains("，只做第一步"), "{saved}");
     }
 }

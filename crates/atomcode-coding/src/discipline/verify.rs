@@ -11,7 +11,7 @@
 //! a successful terminal poll, and must have started after the latest edit. Command
 //! classification is a heuristic; successful execution does not prove business correctness.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::execution_policy::execution_policy_for_messages;
 
@@ -294,6 +294,7 @@ pub fn unverified_edit(messages: &[Message], workspace: &Path) -> Option<NudgedE
     let mut names: HashMap<&str, &str> = HashMap::new();
     let mut bash_cmds: HashMap<&str, String> = HashMap::new();
     let mut edit_paths: HashMap<&str, String> = HashMap::new();
+    let mut patch_code = HashSet::new();
     let mut poll_jobs: HashMap<&str, String> = HashMap::new();
     let mut invoked_after: HashMap<&str, Option<String>> = HashMap::new();
     let mut jobs: HashMap<String, (bool, Option<String>)> = HashMap::new();
@@ -314,6 +315,19 @@ pub fn unverified_edit(messages: &[Message], workspace: &Path) -> Option<NudgedE
                         if let Some(job) = poll_job(&tc.arguments) {
                             poll_jobs.insert(tc.id.as_str(), job);
                         }
+                    } else if tc.name == "apply_patch" {
+                        if serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                            .ok()
+                            .and_then(|v| v.get("file_paths").and_then(|p| p.as_array()).cloned())
+                            .is_some_and(|paths| {
+                                paths.iter().filter_map(|p| p.as_str()).any(|p| {
+                                    path_in_workspace_lexical(p, workspace)
+                                        && !path_is_noncode_doc(p)
+                                })
+                            })
+                        {
+                            patch_code.insert(tc.id.as_str());
+                        }
                     } else if matches!(tc.name.as_str(), "edit_file" | "write_file") {
                         if let Some(p) = edit_path(&tc.arguments) {
                             edit_paths.insert(tc.id.as_str(), p);
@@ -326,6 +340,18 @@ pub fn unverified_edit(messages: &[Message], workspace: &Path) -> Option<NudgedE
                     continue;
                 };
                 match names.get(id).copied() {
+                    Some("apply_patch")
+                        if !msg.is_error
+                            && patch_code.contains(id)
+                            && serde_json::from_str::<serde_json::Value>(&msg.text)
+                                .ok()
+                                .is_some_and(|v| {
+                                    v.get("status").and_then(|s| s.as_str()) == Some("applied")
+                                }) =>
+                    {
+                        last_edit_id = Some(id.to_string());
+                        bash_after_edit = false;
+                    }
                     Some("edit_file") | Some("write_file")
                         if !msg.is_error
                             && edit_paths
@@ -1096,5 +1122,28 @@ mod tests {
             first, second,
             "the same id in a new real user turn is a new edit"
         );
+    }
+    #[test]
+    fn applied_code_patch_owes_verification_but_dry_run_and_retry_do_not() {
+        let call = Message::assistant(
+            "",
+            vec![ToolCall {
+                id: "patch".into(),
+                name: "apply_patch".into(),
+                arguments: r#"{"artifact_id":"id","file_paths":["notes.md","src/main.rs"]}"#.into(),
+            }],
+        );
+        for (status, expected) in [
+            ("applied", true),
+            ("validated", false),
+            ("already_applied", false),
+        ] {
+            let result = Message::tool_result(
+                "patch",
+                serde_json::json!({"status":status}).to_string(),
+                false,
+            );
+            assert_eq!(owed_anywhere(&[call.clone(), result]).is_some(), expected);
+        }
     }
 }

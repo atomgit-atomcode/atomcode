@@ -17,6 +17,10 @@ use atomcode_kernel::agent::ToolLoopPolicy;
 pub struct CodingAgentConfig {
     /// Host-injected persistent automation service; absent in generic library agents.
     pub automation: Option<Arc<dyn atomcode_capabilities::tools::automation::AutomationService>>,
+    /// User-only follow-up dispatch/history port. Never exposed as a model tool.
+    /// Hosts inject a separate one-shot store; libraries do not select executables.
+    pub follow_up_service:
+        Option<Arc<dyn atomcode_capabilities::tools::automation::AutomationService>>,
     /// What the configuration asked for that was left out or changed — a
     /// malformed permission rule, an external agent with an unknown kind — said
     /// in one line each. The runtime tells the person when it starts
@@ -34,6 +38,8 @@ pub struct CodingAgentConfig {
     pub api_key: String,
     pub base_url: String,
     pub model: String,
+    /// Configured base persona; other prompt contributions remain independent.
+    pub system_prompt: Option<String>,
     /// Final image-input capability resolved from the model profile override or
     /// the backwards-compatible Auto heuristic.
     pub supports_vision: bool,
@@ -201,6 +207,8 @@ pub struct CodingAgentConfig {
     /// convenience gates so a matched rule skips (or blocks) the prompt. Shared, so a
     /// `/model` swap re-assembling the agent keeps the same parsed rules.
     pub permission_rules: std::sync::Arc<atomcode_capabilities::tools::PermissionRules>,
+    /// Explicit schedule-management policy; live Auto is still required for inherit.
+    pub automation_approval: atomcode_config::config::AutomationApproval,
     /// Initial mode only; runtime rebuilds preserve the live flags instead.
     pub initial_mode: crate::runtime::RuntimeMode,
     /// Per-provider User-Agent override (`ProviderConfig::user_agent`). `None` ⇒
@@ -281,6 +289,10 @@ pub struct CodingRuntimeConfig {
     pub api_key: String,
     pub base_url: String,
     pub model: String,
+    /// Configured base persona; other prompt contributions remain independent.
+    pub system_prompt: Option<String>,
+    /// Explicit host overrides retained across runtime rebuilds.
+    pub prompt_overrides: crate::host::PromptOverrides,
     pub preferred_language: Option<Locale>,
     pub todo: atomcode_config::config::TodoToolConfig,
     /// Resolved `[tools.atomgit]` switch — see `CodingAgentConfig::atomgit_enabled`.
@@ -316,6 +328,8 @@ pub struct CodingRuntimeConfig {
     pub credential_shell_policy: atomcode_capabilities::tools::CredentialShellPolicy,
     /// Parsed `[permissions]` allow/deny rules (see `CodingAgentConfig::permission_rules`).
     pub permission_rules: std::sync::Arc<atomcode_capabilities::tools::PermissionRules>,
+    /// Explicit schedule-management policy; live Auto is still required for inherit.
+    pub automation_approval: atomcode_config::config::AutomationApproval,
     /// Initial mode only; runtime rebuilds preserve the live flags instead.
     pub initial_mode: crate::runtime::RuntimeMode,
     pub user_agent: Option<String>,
@@ -404,6 +418,8 @@ pub fn lsp_settings_from_config(
                         root_markers: server.root_markers.clone(),
                         options: atomcode_capabilities::codeintel::lsp_policy::LspOptions {
                             disabled: server.options.disabled,
+                            retry_attempts: server.options.retry_attempts,
+                            retry_interval_ms: server.options.retry_interval_ms,
                             init_options_mode: lsp_mode(server.options.init_options_mode),
                             init_options_file: server.options.init_options_file.clone(),
                             init_options: server.options.init_options.clone(),
@@ -495,7 +511,8 @@ pub fn describe_config_file_for(
          - `[compaction]` `token_limit`: optional positive prompt-token budget for earlier \
          automatic history summarization; omit to keep the window-relative policy. \
          Applied when the agent is rebuilt; the model's physical context window is unchanged.\n\
-         - `[permissions]` `default_mode`: startup mode (`build`, `plan`, `accept-edits`, `auto`); explicit -y overrides it; temporary mode switches do not save it. `allow` / `deny`: rules such as `Bash(git *)`, `Read(<path>)` or \
+         - `[modes.plan]` and `[modes.build]` optionally bind a `model` selection id and `reasoning_effort` (unset inherits the model profile; `default` uses the API default). Cross-mode transitions apply them for this session without writing `default_model`; `/model` temporarily overrides until the next mode transition. Configure via `/config` or WebUI mode settings.\n\
+         - `[permissions]` `automation_approval`: `always` (default, consent for each schedule change) or `inherit` (preauthorize schedule changes only in current Auto mode; does not elevate scheduled task execution). Apply via capability reprepare. `default_mode`: startup mode (`build`, `plan`, `accept-edits`, `auto`); explicit -y overrides it; temporary mode switches do not save it. `allow` / `deny`: rules such as `Bash(git *)`, `Read(<path>)` or \
          `mcp__<server>__<tool>`. `deny` wins, and `allow` never opens a sensitive path.\n\
          - `[coding]` `max_rounds` (per turn; 0 = no cap; `ATOMCODE_TURN_MAX_ROUNDS` wins), \
          `repeat_stop_rounds` (stop a turn after this many rounds of the very same tool \
@@ -618,6 +635,8 @@ impl CodingRuntimeConfig {
             api_key: r.and_then(|r| r.api_key.clone()).unwrap_or_default(),
             base_url: r.and_then(|r| r.base_url.clone()).unwrap_or_default(),
             model: r.map(|r| r.model.clone()).unwrap_or_default(),
+            system_prompt: r.and_then(|r| r.system_prompt.clone()),
+            prompt_overrides: Default::default(),
             supports_vision: r.map(|r| r.supports_vision).unwrap_or(false),
             preferred_language: Some(atomcode_config::i18n::resolve_initial_locale(
                 None,
@@ -664,6 +683,7 @@ impl CodingRuntimeConfig {
                 config.coding.shell_guard_policy,
             ),
             permission_rules: std::sync::Arc::new(permission_rules),
+            automation_approval: config.permissions.automation_approval,
             user_agent: r.and_then(|r| r.user_agent.clone()),
             headers: r.map(|r| r.headers.clone()).unwrap_or_default(),
             skip_tls_verify: r.map(|r| r.skip_tls_verify).unwrap_or(false),
@@ -705,6 +725,7 @@ impl CodingRuntimeConfig {
             self.dirs.clone(),
         );
         config.initial_mode = self.initial_mode;
+        config.automation_approval = self.automation_approval;
         config.startup_warnings = self.startup_warnings.clone();
         config.extra_skill_dirs = self.extra_skill_dirs.clone();
         config.compact_token_limit = self.compact_token_limit;
@@ -719,6 +740,7 @@ impl CodingRuntimeConfig {
             config.supports_reasoning_effort,
             self.reasoning_effort_levels.as_deref(),
         );
+        config.system_prompt = self.system_prompt.clone();
         config.preferred_language = self.preferred_language;
         config.todo = self.todo.clone();
         config.atomgit_enabled = self.atomgit_enabled;
@@ -1195,6 +1217,7 @@ impl CodingAgentConfig {
         let model = model.into();
         Self {
             automation: None,
+            follow_up_service: None,
             startup_warnings: Vec::new(),
             extra_skill_dirs: Vec::new(),
             dirs,
@@ -1205,6 +1228,7 @@ impl CodingAgentConfig {
             supports_reasoning_effort: false,
             effort_levels: Vec::new(),
             model,
+            system_prompt: None,
             preferred_language: None,
             todo: Default::default(),
             atomgit_enabled: true,
@@ -1243,6 +1267,7 @@ impl CodingAgentConfig {
             keep_interrupted_context: false,
             credential_shell_policy: Default::default(),
             permission_rules: Default::default(),
+            automation_approval: Default::default(),
             initial_mode: Default::default(),
             user_agent: None,
             headers: Default::default(),
@@ -1259,6 +1284,26 @@ impl CodingAgentConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn automation_approval_reaches_agent_configuration() {
+        for policy in ["always", "inherit"] {
+            let config: atomcode_config::Config = toml::from_str(&format!(
+                "[permissions]\nautomation_approval = {policy:?}\n"
+            ))
+            .unwrap();
+            let runtime = super::CodingRuntimeConfig::from_config(
+                &config,
+                std::path::Path::new("/work"),
+                super::product_dirs_from_env(),
+                None,
+                None,
+                false,
+                false,
+            );
+            assert_eq!(runtime.agent_config().automation_approval.as_str(), policy);
+        }
+    }
+
     #[test]
     fn configured_initial_mode_and_explicit_skip_reach_agent_config() {
         use crate::runtime::RuntimeMode;
@@ -1598,6 +1643,7 @@ mod tests {
                     "base_url": "https://api.deepseek.com/v1",
                     "api_key": "sk-legacy",
                     "model": "deepseek-chat",
+                    "system_prompt": "LEGACY_PERSONA",
                     "context_window": 128000
                 }
             }
@@ -1612,6 +1658,8 @@ mod tests {
             false,
             true,
         );
+        assert_eq!(rt.system_prompt.as_deref(), Some("LEGACY_PERSONA"));
+        assert_eq!(rt.agent_config().system_prompt, rt.system_prompt);
         assert_eq!(rt.provider_name, "MyDS");
         assert_eq!(rt.base_url, "https://api.deepseek.com/v1");
         assert_eq!(rt.api_key, "sk-legacy");
@@ -1629,7 +1677,7 @@ mod tests {
             "default_model": "acc/coder",
             "provider_accounts": { "acc": { "provider": "deepseek", "api_key": "sk-acc" } },
             "models": {
-                "acc/coder": { "account": "acc", "model": "deepseek-coder", "context_window": 131072 },
+                "acc/coder": { "account": "acc", "model": "deepseek-coder", "context_window": 131072, "system_prompt": "MODEL_PERSONA" },
                 "acc/chat": { "account": "acc", "model": "deepseek-chat", "context_window": 131072 }
             }
         }))
@@ -1644,6 +1692,8 @@ mod tests {
             false,
             true,
         );
+        assert_eq!(rt.system_prompt.as_deref(), Some("MODEL_PERSONA"));
+        assert_eq!(rt.agent_config().system_prompt, rt.system_prompt);
         assert_eq!(rt.provider_name, "acc/coder");
         assert_eq!(rt.model, "deepseek-coder");
         assert_eq!(rt.base_url, "https://api.deepseek.com/v1"); // preset default

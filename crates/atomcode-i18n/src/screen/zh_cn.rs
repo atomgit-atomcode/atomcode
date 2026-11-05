@@ -9,6 +9,33 @@ use std::borrow::Cow;
 
 pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
     match msg {
+        Msg::ModelCardViewing => "正在浏览".into(),
+        Msg::ModelCardReadOnly => "仅查看评测，不会切换当前模型。".into(),
+        Msg::ModelCardWebHint => "完整评测与对比：关闭面板后输入 /webui，在模型列表点 ⓘ。".into(),
+        Msg::ModelCardScore => "分数".into(),
+        Msg::ModelCardRank => "排名/参评".into(),
+
+        Msg::ModelCardNoPublic => "当前评测目录未收录此型号，暂无公开评测数据。模型仍可使用，缺失不记为零分。".into(),
+        Msg::ModelCardTitle => "模型卡".into(),
+        Msg::ModelCardEmpty => "暂无已验证映射。←/→ 可浏览明确型号目录。".into(),
+        Msg::ModelCardHelp => "↑↓ 滚动 · ←→ 浏览型号 · d 数据说明 · Esc 返回".into(),
+        Msg::ModelCardScope => "排名来自完整评测集；仅比较同任务、同比较集。无数据不代表不具备能力。".into(),
+        Msg::ModelCardConfigured => "所选配置".into(),
+        Msg::ModelCardBenchmarks => "公开评测".into(),
+        Msg::ModelCardTasks => "任务表现".into(),
+        Msg::ModelCardNotes => "数据说明".into(),
+        Msg::ModelCardDifferent => "条件或比较集不同".into(),
+        Msg::ModelCardEvidence => "评测证据".into(),
+        Msg::ModelCardSparse => "评测数据较少".into(),
+        Msg::ModelCardBest => "相对强项".into(),
+        Msg::ModelCardWorst => "相对弱项".into(),
+        Msg::ModelCardAgents => "Agent 任务".into(),
+        Msg::ModelCardCoding => "编程".into(),
+        Msg::ModelCardChat => "聊天与写作".into(),
+        Msg::ModelCardMath => "数学".into(),
+        Msg::ModelCardVision => "视觉与文档".into(),
+        Msg::ModelCardSearch => "网页搜索".into(),
+
         Msg::AutomationOlder => "加载更早的运行记录".into(),
         Msg::AutomationTitle => "自动化任务".into(),
         Msg::AutomationEmpty => "暂无自动化任务".into(),
@@ -171,6 +198,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::AskLegendToggle => "勾选".into(),
         Msg::AskLegendSwitch => "切换题目".into(),
         Msg::AskLegendCaret => "移动光标".into(),
+        Msg::AskLegendEdit => "编辑此项".into(),
+        Msg::AskLegendCancelEdit => "取消编辑".into(),
 
         // ── 输入行 ──
         Msg::InputAnswerKeys => "密码 · 不显示不留存 · enter 送出 · esc 不给".into(),
@@ -350,6 +379,12 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             true => format!("服务端返回 HTTP {status},请检查 API key").into(),
             false => format!("服务端返回 HTTP {status}").into(),
         },
+        Msg::OllamaUnavailable { endpoint, local } => if local {
+            format!("无法连接 Ollama：{endpoint}。请在运行 atomcode 的机器上执行 `ollama serve`，然后按 Ctrl+F 重试。默认端口为 11434；使用其他端口时请修改地址。")
+        } else {
+            format!("无法连接 Ollama：{endpoint}。请检查目标机器上的 `ollama serve` 服务、地址、端口和网络访问，然后按 Ctrl+F 重试。")
+        }.into(),
+        Msg::OllamaModelsFound { count } => format!("Ollama 正在运行 · {count} 个模型 · 回车继续 · Ctrl+F 刷新").into(),
         Msg::DiscoverUnreachable => "连不上服务端".into(),
         Msg::ProviderDiscoverFailed { why } => {
             format!("没拉到模型列表:{why}。可以手动输入模型 ID。").into()
@@ -364,6 +399,18 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdAboutKeys => "列出快捷键".into(),
         Msg::CmdAboutTodo => "列出计划清单;`add <任务>` 加一项、`clear` 清空;`show`/`hide` 开关面板".into(),
         Msg::CmdAboutTeam => "展开或折叠团队面板".into(),
+        Msg::CmdAboutPatch => "无损导入 unified diff 文件；确认输入框中的引用后发送".into(),
+        Msg::PatchTooLarge => "补丁超过 8 MiB 导入上限".into(),
+        Msg::PatchLeadOnly => "请先返回主会话，再导入补丁。".into(),
+        Msg::PatchContextChanged => "会话已变更，请在目标会话重新导入补丁。".into(),
+        Msg::SpecLeadOnly => "请返回主会话管理任务规范。".into(),
+        Msg::SpecChanged => "会话已变更，请在目标会话重新打开 /spec。".into(),
+        Msg::SpecTitle => "任务规范".into(),
+        Msg::SpecOlder => "更早的消息".into(),
+        Msg::SpecReview => "请先核对完整原文再操作".into(),
+        Msg::SpecPin => "固定为任务规范".into(),
+        Msg::SpecUnpin => "解除固定".into(),
+        Msg::PatchReady => "请用 apply_patch 应用这份已导入的用户补丁，使用其 artifact_id 和完整 file_paths，不要复述补丁正文：".into(),
         Msg::CmdAboutPaste => "把剪贴板(或一个文件)的内容放进输入框;Ctrl+V 被终端或系统拦下时用它".into(),
         Msg::CmdAboutConfig => "拉出设置面板:搜索、改值;esc 关".into(),
         Msg::CmdAboutProviderPanel => "拉出 provider 面板:账号与模型,增改删;enter 换过去,esc 关".into(),
@@ -626,7 +673,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ModelNoneConfigured => "没有配置可选的模型".into(),
         Msg::ModelPickerHint => "换成哪个模型 · enter 换过去".into(),
         Msg::ModelSet { wanted } => format!("模型 → {wanted}").into(),
-        Msg::ModeWhatEachDoes => "plan 只看不动 · ask 动手前问 · edits 改文件不问 · auto 全不问".into(),
+        Msg::ModeWhatEachDoes => "plan 只看不动 · ask 动手前问 · edits 改文件不问 · auto 全不问\n模式与模型绑定：/config，搜索 modes。".into(),
         Msg::ModeUnknown { what } => format!("`{what}` 不是一档;可选:plan、ask、edits、auto").into(),
         Msg::ModeSet { mode } => format!("现在是 {mode}").into(),
         Msg::CdUpOneLevel => "上一层".into(),
@@ -954,6 +1001,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::RawTop => "── atomcode · 本会话全文 ──".into(),
         Msg::RawBottom => "── 以上是本会话全文:可用终端自己的拖选、滚动、搜索 · 按任意键回到 atomcode ──".into(),
         Msg::MouseHandedBack => "鼠标已交还终端 · ctrl+g 收回 · /raw 跨屏选 · 滚轮滚动 · ↑↓/ctrl+p/n 历史 · ctrl+t 展开 · ctrl+o 思考".into(),
+        Msg::MouseDisabledByTmux => "tmux mouse=off · 保留原生鼠标 · 在 tmux 启用鼠标并重启后可用应用滚动".into(),
         Msg::MouseUnreportedAtStart => "这个终端不上报鼠标 · 直接拖选 · 滚轮或 Fn+↑/↓ 翻页 · /raw 跨屏选 · ↑↓ 历史 · ctrl+t 展开 · ctrl+o 思考".into(),
         Msg::MouseUnreported => "这个终端不上报鼠标,鼠标留给终端 · 直接拖选 · 滚轮或 Fn+↑/↓ 翻页".into(),
         Msg::MouseHandedBackAtStart => "鼠标已交还终端 · 拖选复制、右键粘贴 · Ctrl+T 展开/收起工具输出".into(),
@@ -1261,6 +1309,9 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SignedInAgainRerunningSetup => "重新登录成了，重跑 setup…".into(),
         Msg::ConfigNotWritten { error } => format!("配置没写成：{error}").into(),
         Msg::LoginCouldNotStart { error } => format!("登录起不来：{error}").into(),
+        Msg::LoginAutoOpenFailed { reason } => {
+            format!("  未能自动打开浏览器：{reason}").into()
+        }
         Msg::LoginFailed { error } => format!("登录没成：{error}").into(),
         Msg::LoginNoAnswer => "登录没了回音".into(),
         Msg::TokenExchangeFailed { error } => format!("换 token 没成：{error}").into(),
@@ -1447,12 +1498,35 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CopyHandedOver => "已发送复制请求，请粘贴确认。".into(),
         Msg::CopyCouldNotStart => "复制未开始，请稍后重试。".into(),
         Msg::CopyLocalUnavailable => "无法确认复制成功。Ubuntu Wayland 下请安装 wl-clipboard（sudo apt install wl-clipboard）后重试；也可按 Ctrl+G 释放鼠标，使用终端复制。".into(),
+        Msg::PersonaBuiltin => "Persona：内置".into(),
+        Msg::PersonaConfig => "Persona：模型/provider 配置".into(),
+        Msg::PersonaExplicit => "Persona：启动参数/宿主覆盖".into(),
+        Msg::PersonaHost => "Persona：自定义宿主".into(),
+        Msg::PersonaAppended => "追加指令：有".into(),
+        Msg::PersonaNotAppended => "追加指令：无".into(),
+        Msg::HooksExit => "退出码：".into(),
+        Msg::HooksIncomplete => "测试超时或脚本无法启动".into(),
+        Msg::HooksTitle => "Hooks 配置".into(),
+        Msg::HooksNote => "当前磁盘配置；编辑后需重新加载。测试使用模拟载荷，实际执行脚本，最多等待 30 秒。".into(),
+        Msg::HooksTest => "实际执行脚本测试（最多 30 秒）".into(),
+        Msg::HooksPaths => "配置路径、解析诊断与插件信任状态".into(),
+        Msg::HooksBack => "返回 Hooks 列表".into(),
+        Msg::HooksChanged => "会话已切换，请重新打开 /hooks。".into(),
+        Msg::FollowUpAbout => "一次性后续任务：set <prompt> / new <JSON> / show / clear / history [id]".into(),
+        Msg::FollowUpNew { id, spec } => format!("新会话后续任务 {id}（原任务正常结束后启动）：\n{spec}").into(),
+        Msg::FollowUpPending { prompt } => format!("当前或下一任务正常结束后执行一次：\n{prompt}").into(),
+        Msg::FollowUpNone => "尚未登记后续任务。".into(),
+        Msg::FollowUpLeadOnly => "请返回主会话管理后续任务。".into(),
+        Msg::FollowUpCleared => "已撤销待执行的后续任务。".into(),
+        Msg::PersonaUnavailable => "当前宿主未提供已挂载 persona 的查看信息。".into(),
+        Msg::PersonaAppendUnknown => "追加指令：未知".into(),
         Msg::ContextNoPrompt => "这个宿主没有系统提示词可说。".into(),
         Msg::ComposerSuggested { text } => text.to_string().into(),
         Msg::WaitsForTheTurn { command } => {
             format!("正在回复,/{command} 要等这一轮结束再用;按 Esc 可以先停下这一轮").into()
         }
         Msg::CompactAfterTurn => "这一轮结束后就压缩".into(),
+        Msg::ModelNextTurn { model } => format!("当前回合继续使用 {model}；新选择的模型从下回合生效。").into(),
         Msg::RuntimeBusy => "正在忙(回复、压缩或重新装配进行中),稍后再试".into(),
         Msg::EffortNotForThisModel { wanted, levels } => {
             format!("当前模型不支持 {wanted};它支持:{levels}, default(或 auto)").into()

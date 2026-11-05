@@ -1,3 +1,4 @@
+import { ModelCardDialog } from './ModelCardDialog';
 import { useState, useEffect, useRef } from 'preact/hooks';
 import { getModels, ModelInfo, postLiveReasoningEffort, ReasoningEffortError } from '../api';
 import { useT } from '../settings';
@@ -24,6 +25,10 @@ function areModelsEqual(a: ModelInfo[], b: ModelInfo[]): boolean {
       ma.provider !== mb.provider ||
       ma.model !== mb.model ||
       ma.is_default !== mb.is_default ||
+      ma.model_card_id !== mb.model_card_id ||
+      ma.model_card_status !== mb.model_card_status ||
+      ma.context_window !== mb.context_window ||
+      ma.supports_vision !== mb.supports_vision ||
       ma.effort_applicable !== mb.effort_applicable ||
       ma.reasoning_effort !== mb.reasoning_effort ||
       (ma.effort_levels ?? []).join(',') !== (mb.effort_levels ?? []).join(',')
@@ -37,23 +42,28 @@ function areModelsEqual(a: ModelInfo[], b: ModelInfo[]): boolean {
 export function ModelSelector({
   value,
   runtime,
+  currentTurn,
   liveEffort,
   busy = false,
   onError,
   onChange,
   onDefaultChange,
+  onEffortChange,
 }: {
   value: string | null;
   runtime?: RuntimeModelIdentity | null;
+  currentTurn?: RuntimeModelIdentity | null;
   liveEffort?: string | null;
   busy?: boolean;
   onError?: (message: string) => void;
   onChange: (p: string) => void;
   onDefaultChange?: (p: string) => void;
+  onEffortChange?: (provider: string, effort: string | null) => void;
 }) {
   const t = useT();
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [open, setOpen] = useState(false);
+  const [cardModel, setCardModel] = useState<ModelInfo | null>(null);
   const [effortOpen, setEffortOpen] = useState(false);
   const [effortSaving, setEffortSaving] = useState(false);
   const [effortError, setEffortError] = useState<string | null>(null);
@@ -130,6 +140,7 @@ export function ModelSelector({
     setEffortOverride(v);
     setEffortOpen(false);
     void postLiveReasoningEffort(v, target).then(() => {
+      if (currentProvider.current === target) onEffortChange?.(target, v);
       // The write succeeded. A later list refresh failure must not undo that fact.
       void getModels().then(setModels).catch(() => {});
     }).catch((error) => {
@@ -154,8 +165,10 @@ export function ModelSelector({
     return stripped || m.provider;
   };
   return (
-    <div class="model-controls">
+    <div class={'model-controls' + (currentTurn ? ' has-pending-model' : '')}>
+      {cardModel && <ModelCardDialog model={cardModel} onClose={() => setCardModel(null)} />}
       {effortError && <span role="alert">{effortError}</span>}
+      {currentTurn && current && <span class="model-next-turn" role="status">{t('model.nextTurnStatus', {current:currentTurn.model??currentTurn.provider, next:current.model})}</span>}
       {current?.effort_applicable && (
         <div class="model-selector effort-selector model-selector-up" ref={effortRef}>
           <button
@@ -192,7 +205,7 @@ export function ModelSelector({
       )}
       <div class="model-selector model-selector-up" ref={ref}>
         <button class="model-selector-trigger" onClick={() => { setOpen((o) => !o); setEffortOpen(false); }} type="button">
-          <span class="model-selector-label">{current ? current.model : t('model.label')}</span>
+          <span class="model-selector-label">{current ? current.model : t('model.label')}{currentTurn && <span class="model-next-turn-badge"> · {t('model.nextTurn')}</span>}</span>
           {current && isDup(current.model) && (
             <span class="model-selector-provider">{providerLabel(current)}</span>
           )}
@@ -201,8 +214,7 @@ export function ModelSelector({
         {open && (
           <div class="model-dropdown">
             {models.map((m) => (
-              <button
-                key={m.provider}
+              <div class="model-card-row" key={m.provider}><button
                 class={'model-item' + (m.provider === current?.provider && m.model === current?.model ? ' active' : '')}
                 type="button"
                 title={m.provider}
@@ -210,7 +222,7 @@ export function ModelSelector({
               >
                 <span class="model-item-model">{m.model}</span>
                 {isDup(m.model) && <span class="model-item-provider">{providerLabel(m)}</span>}
-              </button>
+              </button><button type="button" class="model-card-info" aria-label={`${t('cards.open')}: ${m.model}`} title={t('cards.open')} onClick={() => { setCardModel(m); setOpen(false); }}>{m.model_card_status === 'no_public_data' ? t('cards.noPublicBadge') : 'ⓘ'}</button></div>
             ))}
           </div>
         )}

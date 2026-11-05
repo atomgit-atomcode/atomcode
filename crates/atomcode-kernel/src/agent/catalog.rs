@@ -55,6 +55,13 @@ pub struct CommandDescription {
     /// build still deserialises.
     #[serde(default)]
     pub args_requirement: ArgsRequirement,
+    /// Whether a catalog invocation may carry image attachments.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub accepts_images: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// What a command acts on, which is what [`crate::event::AgentCommand::Invoke`]

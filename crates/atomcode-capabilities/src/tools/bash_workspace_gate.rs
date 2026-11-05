@@ -1784,9 +1784,19 @@ mod tests {
         // Grant ONE out-of-workspace directory; a sibling delete there auto-approves, a delete in
         // a different folder still prompts.
         // Use fabricated non-temp absolute paths (need not exist — gate is path-based).
+        // The absolute form is platform-specific (`/…` is only root-RELATIVE on Windows, and a
+        // backslash form would be shell-escape-mangled when interpolated into the command).
         let ws = tempfile::tempdir().unwrap();
-        let dir_a = std::path::PathBuf::from("/atomcode-test-outside-grant/a");
-        let dir_b = std::path::PathBuf::from("/atomcode-test-outside-grant/b");
+        #[cfg(unix)]
+        let (dir_a, dir_b) = (
+            std::path::PathBuf::from("/atomcode-test-outside-grant/a"),
+            std::path::PathBuf::from("/atomcode-test-outside-grant/b"),
+        );
+        #[cfg(windows)]
+        let (dir_a, dir_b) = (
+            std::path::PathBuf::from("C:/atomcode-test-outside-grant/a"),
+            std::path::PathBuf::from("C:/atomcode-test-outside-grant/b"),
+        );
         let granted = dir_a.join("granted.txt");
         let sibling = dir_a.join("sibling.txt");
         let other = dir_b.join("other.txt");
@@ -1802,7 +1812,7 @@ mod tests {
         );
         let tool = bash_tool();
 
-        let mut s = bash_call(&format!("rm {}", sibling.to_str().unwrap()));
+        let mut s = bash_call(&format!("rm {}", crate::pathnorm::to_display(&sibling)));
         assert!(
             matches!(
                 gate.before(&mut s, &tool, &silent_rt()).await,
@@ -1810,7 +1820,7 @@ mod tests {
             ),
             "a sibling delete in the granted folder must auto-approve"
         );
-        let mut o = bash_call(&format!("rm {}", other.to_str().unwrap()));
+        let mut o = bash_call(&format!("rm {}", crate::pathnorm::to_display(&other)));
         assert!(
             gate.before(&mut o, &tool, &silent_rt()).await.is_deny(),
             "a delete in a different folder must still prompt"
@@ -1902,6 +1912,10 @@ mod tests {
         );
     }
 
+    /// `/tmp` is a writable temp root on Unix only — on Windows it resolves to a
+    /// root-relative `C:\tmp` that is NOT in TEMP_ROOTS, so the gate correctly
+    /// fails closed there and this scenario can only hold on Unix.
+    #[cfg(unix)]
     #[tokio::test]
     async fn mv_temp_to_temp_proceeds() {
         // No in-workspace source involved → the move doesn't touch the workspace → no prompt.
@@ -2087,7 +2101,10 @@ mod tests {
             crate::tools::sensitive_path::test_guard(),
         );
         let tool = bash_tool();
-        let mut call = bash_call(&format!("rm {}", secret.to_str().unwrap()));
+        // to_display: on Windows the path reaches the shell boundary with forward
+        // slashes — a backslash form would be shell-escape-mangled before the
+        // gate ever saw it. Identity on Unix.
+        let mut call = bash_call(&format!("rm {}", crate::pathnorm::to_display(&secret)));
         let out = gate.before(&mut call, &tool, &silent_rt()).await;
         assert!(
             out.is_deny(),

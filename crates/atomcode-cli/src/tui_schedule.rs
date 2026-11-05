@@ -124,6 +124,7 @@ mod tests {
             created_at: 0,
             last_run_at: None,
             last_status: None,
+            follow_up: None,
         }
     }
 

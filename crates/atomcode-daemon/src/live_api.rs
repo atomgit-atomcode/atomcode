@@ -303,6 +303,8 @@ pub(crate) fn chat_runtime_config(
         api_key: p.and_then(|p| p.api_key.clone()).unwrap_or_default(),
         base_url: p.and_then(|p| p.base_url.clone()).unwrap_or_default(),
         model: p.map(|p| p.model.clone()).unwrap_or_default(),
+        system_prompt: p.and_then(|p| p.system_prompt.clone()),
+        prompt_overrides: Default::default(),
         supports_vision: p.is_some_and(|p| p.accepts_images()),
         preferred_language: Some(atomcode_config::i18n::resolve_initial_locale(
             None,
@@ -344,6 +346,7 @@ pub(crate) fn chat_runtime_config(
             config.coding.shell_guard_policy,
         ),
         permission_rules: std::sync::Arc::new(permission_rules),
+        automation_approval: config.permissions.automation_approval,
         initial_mode: config
             .permissions
             .default_mode
@@ -431,6 +434,7 @@ pub(crate) async fn run_chat_turn_v2(
     cancel: CancellationToken,
     runtime_cfg: atomcode_coding::CodingRuntimeConfig,
     mut perm_rx: Option<mpsc::UnboundedReceiver<crate::permission_bridge::ChatPermission>>,
+    permission_routes: crate::permission_bridge::PermissionResponders,
     user_input_responders: Option<crate::permission_bridge::UserInputResponders>,
     approval_mode: ApprovalMode,
 ) {
@@ -539,6 +543,7 @@ pub(crate) async fn run_chat_turn_v2(
                 let _ = runtime_event_tx.send(event);
             }
             CodingRuntimeEvent::Request(request) if request.kind == APPROVAL_KIND => {
+                permission_routes.pending_call(&session_id, request.payload.get("call_id").and_then(serde_json::Value::as_str));
                 let _ = runtime_event_tx.send(CodingRuntimeEvent::Request(request.clone()));
                 let Ok(approval) = serde_json::from_value::<ApprovalRequest>(request.payload)
                 else {
@@ -572,7 +577,12 @@ pub(crate) async fn run_chat_turn_v2(
                     PermissionDecision::AllowAlwaysAll => ApprovalResponse::allow_all_bash(),
                     PermissionDecision::Deny => ApprovalResponse::deny(),
                 };
-                let value = serde_json::to_value(response).unwrap_or(serde_json::Value::Null);
+                let mut value = serde_json::to_value(response).unwrap_or(serde_json::Value::Null);
+                if answer.persist_project_rule {
+                    value = if answer.call_id.as_deref() == Some(approval.call_id.as_str()) {
+                        serde_json::json!({"decision":"allow", "save_project_rule":true})
+                    } else { serde_json::json!({"decision":"deny"}) };
+                }
                 let _ = handle.respond(request.id, value).await;
             }
             CodingRuntimeEvent::Request(request)
@@ -691,8 +701,14 @@ use serde::Serialize;
 #[derive(Serialize)]
 #[serde(tag = "type")]
 pub(crate) enum LiveWireEvent {
+    #[serde(rename = "context_compacting")]
+    ContextCompacting { active: bool },
+    #[serde(rename = "context_summary")]
+    ContextSummary { count: u64, record: bool },
     #[serde(rename = "snapshot")]
     Snapshot {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        summary_count: Option<u64>,
         messages: Vec<crate::MessageInfo>,
         session_id: String,
         /// 会话名（Session.name）。让 App 端首次扫码连接就能在顶部显示
@@ -711,6 +727,10 @@ pub(crate) enum LiveWireEvent {
         /// Goal controller state is not persisted in SessionSnapshot, so the
         /// initial wire snapshot carries it explicitly for late subscribers.
         goal: Option<LiveGoalSnapshot>,
+    },
+    #[serde(rename = "provider_selection_pending")]
+    ProviderSelectionPending {
+        current: Option<atomcode_coding::runtime::RunningModelIdentity>,
     },
     #[serde(rename = "provider")]
     Provider {
@@ -809,6 +829,8 @@ pub(crate) enum LiveWireEvent {
         /// for this call. Omitted (false) for everything but a non-sensitive bash.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         allow_all_bash: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_rule: Option<atomcode_capabilities::tools::approval::ProjectRuleProposal>,
     },
     #[serde(rename = "user_input_request")]
     UserInputRequest {
@@ -882,6 +904,8 @@ pub(crate) enum LiveWireEvent {
 
 #[derive(Default)]
 struct NativeLiveWireProjector {
+    working_dir: Option<std::path::PathBuf>,
+    summary_count: Option<u64>,
     tools: HashMap<String, (String, std::time::Instant)>,
     session_id: String,
 }
@@ -894,6 +918,35 @@ impl NativeLiveWireProjector {
         use atomcode_coding::CodingRuntimeEvent as Runtime;
         use atomcode_kernel::event::AgentEvent as Kernel;
 
+        // Runtime owns compaction lifecycle and normalizes the raw kernel
+        // events before drivers see them. Read its actual production seam.
+        match &event {
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::CompactionStarted { .. }) => {
+                return Some(LiveWireEvent::ContextCompacting { active: true })
+            }
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::CompactionFinished {
+                completion: CompactionCompletion::Completed(outcome),
+            }) => {
+                if outcome.committed {
+                    if let Some(count) = self
+                        .working_dir
+                        .as_deref()
+                        .and_then(|dir| crate::context_summary_count(dir, &self.session_id))
+                    {
+                        if self.summary_count != Some(count) {
+                            let record = self.summary_count.is_some_and(|before| count > before);
+                            self.summary_count = Some(count);
+                            return Some(LiveWireEvent::ContextSummary { count, record });
+                        }
+                    }
+                }
+                return Some(LiveWireEvent::ContextCompacting { active: false });
+            }
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::CompactionFinished {
+                completion: CompactionCompletion::Interrupted { .. },
+            }) => return Some(LiveWireEvent::ContextCompacting { active: false }),
+            _ => {}
+        }
         Some(match event {
             crate::live_hub::LiveViewEvent::CommandOutput(text) => {
                 LiveWireEvent::CommandOutput { text }
@@ -1044,13 +1097,21 @@ impl NativeLiveWireProjector {
             },
             crate::live_hub::LiveViewEvent::Runtime(Runtime::Request(request)) => {
                 if request.kind == APPROVAL_KIND {
+                    let project_rule = request
+                        .payload
+                        .get("project_rule")
+                        .cloned()
+                        .and_then(|v| serde_json::from_value(v).ok());
                     let approval: ApprovalRequest = serde_json::from_value(request.payload).ok()?;
                     LiveWireEvent::PermissionRequest {
                         tool_name: approval.tool,
-                        reason: "Requires approval".into(),
+                        reason: approval
+                            .reason
+                            .unwrap_or_else(|| "Requires approval".into()),
                         call_id: approval.call_id,
                         arguments: approval.args,
                         allow_all_bash: approval.allow_all_bash,
+                        project_rule,
                     }
                 } else if request.kind == REQUEST_USER_INPUT_KIND {
                     LiveWireEvent::UserInputRequest {
@@ -1160,6 +1221,9 @@ impl NativeLiveWireProjector {
                 provider,
                 model: Some(model),
             },
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::ProviderSelectionPending {
+                current,
+            }) => LiveWireEvent::ProviderSelectionPending { current },
             crate::live_hub::LiveViewEvent::Runtime(Runtime::ReasoningEffortChanged {
                 provider,
                 effort,
@@ -1188,13 +1252,18 @@ impl NativeLiveWireProjector {
             crate::live_hub::LiveViewEvent::Runtime(Runtime::SessionChanged(changed)) => {
                 let session_id = changed.session_id?;
                 self.session_id = session_id.clone();
+                self.working_dir = Some(changed.working_dir);
+                self.summary_count = None;
                 LiveWireEvent::SessionSwitched { session_id }
             }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::WorkingDirectoryChanged(
                 working_dir,
-            )) => LiveWireEvent::WorkingDir {
-                working_dir: working_dir.to_string_lossy().to_string(),
-            },
+            )) => {
+                self.working_dir = Some(working_dir.clone());
+                LiveWireEvent::WorkingDir {
+                    working_dir: working_dir.to_string_lossy().to_string(),
+                }
+            }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::ControllerWarning(message)) => {
                 LiveWireEvent::Warning { message }
             }
@@ -1212,22 +1281,6 @@ impl NativeLiveWireProjector {
                         if exit.forced { " (forced)" } else { "" }
                     )),
                     stats: None,
-                }
-            }
-            crate::live_hub::LiveViewEvent::Runtime(Runtime::CompactionFinished {
-                completion: CompactionCompletion::Completed(outcome),
-            }) if outcome.committed => {
-                // Silent, cache-friendly tool-output folding is invisible transcript
-                // maintenance — emit nothing (mirrors the TUI `silent_tool_fold`).
-                if outcome.is_silent_auto_tool_fold() {
-                    return None;
-                }
-                LiveWireEvent::Warning {
-                    message: atomcode_config::i18n::format_compaction_mark(
-                        outcome.removed_messages,
-                        outcome.estimated_tokens_before,
-                        outcome.estimated_tokens_after,
-                    ),
                 }
             }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::CompactionFinished {
@@ -1536,6 +1589,15 @@ pub(crate) async fn live_stream(
         .iter()
         .map(crate::MessageInfo::from_kernel)
         .collect();
+    let sources = crate::snapshot_spec_sources(
+        &join.snapshot,
+        std::path::Path::new(&join.binding.working_dir),
+        &join.binding.session_id,
+    );
+    for (info, (seq, pinned)) in snapshot_messages.iter_mut().zip(sources) {
+        info.source_seq = seq;
+        info.task_spec_pinned = pinned;
+    }
     if let Some(meta) = session_meta.as_ref() {
         crate::attach_snapshot_message_timestamps(
             &mut snapshot_messages,
@@ -1552,9 +1614,11 @@ pub(crate) async fn live_stream(
         &snapshot_wd,
         &join.binding.session_id,
     );
+    let summary_count = crate::context_summary_count(&snapshot_wd, &join.binding.session_id);
     let _ = tx.send((
         join.binding.session_id.clone(),
         LiveWireEvent::Snapshot {
+            summary_count,
             messages: snapshot_messages,
             session_id: join.binding.session_id.clone(),
             session_name,
@@ -1566,7 +1630,17 @@ pub(crate) async fn live_stream(
             goal: initial_goal.as_ref().map(goal_snapshot),
         },
     ));
+    if let Some(current) = join.pending_turn_model.clone() {
+        let _ = tx.send((
+            join.binding.session_id.clone(),
+            LiveWireEvent::ProviderSelectionPending {
+                current: Some(current),
+            },
+        ));
+    }
     let mut projector = NativeLiveWireProjector {
+        working_dir: Some(snapshot_wd.clone()),
+        summary_count,
         session_id: join.binding.session_id.clone(),
         ..Default::default()
     };
@@ -1987,10 +2061,28 @@ pub(crate) async fn live_message(
             ImageContent { media_type, data }
         })
         .collect();
+    // Steering still belongs to the captured turn model even after an explicit
+    // selection changed the model for the following turn.
+    let current_turn_model = if original_images.is_empty() {
+        None
+    } else {
+        match crate::native_live::current_turn_model().await {
+            Ok(current) => current,
+            Err(error) => {
+                return Json(
+                    serde_json::json!({"accepted":false,"error":format!("Cannot determine the image input model: {error:?}")}),
+                )
+            }
+        }
+    };
+    let input_provider = current_turn_model
+        .as_ref()
+        .map(|model| model.provider.as_str())
+        .unwrap_or(&provider_name);
     let runtime_text = preprocess_live_caption(
         &req.message,
         &original_images,
-        Some(&provider_name),
+        Some(input_provider),
         Some(&join.binding.session_id),
         &join.binding.working_dir,
         state.telemetry.clone(),
@@ -2147,10 +2239,11 @@ pub(crate) struct LiveProviderReq {
     pub session_id: Option<String>,
 }
 
-/// POST /live/provider — webui 切换模型即时同步。
+/// POST /live/provider — 同步模型选择；运行中选择从下一回合生效。
 ///
 /// 与"发送消息才带 provider"不同，下拉框一变就调本端点，让对端立即跟随而无需先发消息。
-/// 该端点仍是 live runtime 的即时切换接口；TUI `/model` 另会更新新会话默认值。
+/// 该端点使用 runtime 的安全 provider patch；当前回合继续持有原 provider。
+/// TUI `/model` 另会更新新会话默认值。
 pub(crate) async fn live_provider(
     State(state): State<AppState>,
     Json(req): Json<LiveProviderReq>,
@@ -2221,7 +2314,7 @@ pub(crate) async fn live_provider(
         &join.binding.working_dir,
         state.telemetry.clone(),
     );
-    match crate::native_live::reload_provider(
+    match crate::native_live::select_provider(
         &join.binding,
         crate::kernel_runtime::coding_config_from_runtime(&runtime_config),
         requested_fingerprint,
@@ -2229,9 +2322,7 @@ pub(crate) async fn live_provider(
     .await
     {
         Ok(_) => Json(serde_json::json!({ "ok": true })),
-        // A turn is running: reassembling the provider would hard-kill it and drop
-        // the interrupted turn's context. Surface a distinct flag so the client can
-        // revert its optimistic selection and tell the user to stop the turn first.
+        // Busy remains possible during compaction or a competing transition.
         Err(crate::live_hub::HubError::ActiveTurn) => Json(serde_json::json!({
             "ok": false,
             "active_turn": true,
@@ -2248,56 +2339,117 @@ pub(crate) async fn live_provider(
 pub(crate) struct LiveModeReq {
     /// "build" | "accept_edits" | "bypass" | "plan"
     pub mode: ApprovalMode,
+    #[serde(default)]
+    pub independent: bool,
+    #[serde(default)]
+    pub current_model: Option<atomcode_config::mode_models::ModeSelection>,
+    #[serde(default)]
+    pub return_model: Option<atomcode_config::mode_models::ModeSelection>,
+    #[serde(default)]
+    pub previous_mode: Option<ApprovalMode>,
+    #[serde(default)]
+    pub running: bool,
 }
 
 #[derive(serde::Serialize)]
 pub(crate) struct ApprovalModeResp {
     pub ok: bool,
     pub mode: ApprovalMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection: Option<atomcode_config::mode_models::ModeSelection>,
 }
 
 pub(crate) async fn approval_mode_get() -> impl IntoResponse {
     Json(ApprovalModeResp {
         ok: true,
         mode: live_current_approval_mode(),
+        error: None,
+        selection: None,
     })
 }
-
-async fn apply_live_mode(mode: ApprovalMode) -> bool {
-    let accepted = match crate::native_live::binding() {
+async fn apply_live_mode(mode: ApprovalMode) -> Result<(), String> {
+    match crate::native_live::binding() {
         Ok(_) => crate::native_live::set_mode(native_runtime_mode(mode))
             .await
-            .is_ok(),
-        Err(_) => true,
-    };
-    if accepted {
-        live_set_mode(mode);
+            .map_err(|error| format!("{error:?}"))?,
+        Err(crate::live_hub::HubError::Unbound) => {}
+        Err(error) => return Err(format!("{error:?}")),
     }
-    accepted
+    live_set_mode(mode);
+    Ok(())
 }
-
+async fn apply_mode_request(req: LiveModeReq) -> ApprovalModeResp {
+    let selected = (|| -> Result<_, String> {
+        if !req.independent || req.previous_mode == Some(req.mode) {
+            return Ok(None);
+        }
+        let config = crate::api_config::load_config()?;
+        let current = req.current_model.as_ref().cloned().or_else(|| {
+            config.effective_model_selection().map(|model| {
+                atomcode_config::mode_models::ModeSelection {
+                    model,
+                    reasoning_effort: None,
+                }
+            })
+        });
+        let Some(current) = current else {
+            return Ok(None);
+        };
+        let mode = match req.mode {
+            ApprovalMode::Plan => "plan",
+            ApprovalMode::Build => "build",
+            _ => "other",
+        };
+        let selection = atomcode_config::mode_models::resolve_driver_selection(
+            &config,
+            mode,
+            req.previous_mode == Some(ApprovalMode::Plan),
+            &current,
+            req.return_model.as_ref(),
+        )
+        .map_err(|error| error.to_string())?;
+        if selection.is_some() && req.running {
+            return Err("Stop the current task before changing a mode-bound model".into());
+        }
+        Ok(selection)
+    })();
+    match selected {
+        Err(error) => ApprovalModeResp {
+            ok: false,
+            mode: live_current_approval_mode(),
+            error: Some(error),
+            selection: None,
+        },
+        Ok(selection) => match apply_live_mode(req.mode).await {
+            Ok(()) => {
+                let selection = if req.independent {
+                    selection
+                } else {
+                    crate::native_live::model_selection().await.ok()
+                };
+                ApprovalModeResp {
+                    ok: true,
+                    mode: live_current_approval_mode(),
+                    error: None,
+                    selection,
+                }
+            }
+            Err(error) => ApprovalModeResp {
+                ok: false,
+                mode: live_current_approval_mode(),
+                error: Some(error),
+                selection: None,
+            },
+        },
+    }
+}
 pub(crate) async fn approval_mode_set(Json(req): Json<LiveModeReq>) -> impl IntoResponse {
-    let ok = apply_live_mode(req.mode).await;
-    Json(ApprovalModeResp {
-        ok,
-        mode: live_current_approval_mode(),
-    })
+    Json(apply_mode_request(req).await)
 }
-
-/// POST /live/mode — webui 底栏「模式」pill 切换审批模式
-/// （build / accept_edits / bypass / plan）。
-///
-/// 更新进程级 LIVE_APPROVAL_MODE；若当前已有 live 会话，则广播 ModeChanged 让
-/// 其他 webui tab / TUI 实时跟随。没有 live 会话时不为一次普通模式切换创建会话。
-/// 下一轮实际用哪个 PermissionDecider 由 run_turn 读 LIVE_APPROVAL_MODE 决定。
-/// 模式是运行时会话状态，不写入 config（与 provider 持久化为默认不同）——避免
-/// Auto（wire: bypass）这种危险态被静默持久化。
 pub(crate) async fn live_mode(Json(req): Json<LiveModeReq>) -> impl IntoResponse {
-    let ok = apply_live_mode(req.mode).await;
-    Json(ApprovalModeResp {
-        ok,
-        mode: live_current_approval_mode(),
-    })
+    Json(apply_mode_request(req).await)
 }
 
 #[derive(serde::Deserialize)]
@@ -2479,6 +2631,8 @@ pub(crate) struct LivePermissionReq {
     /// the pending approval itself, never this field.
     #[serde(default)]
     pub tool_name: Option<String>,
+    #[serde(default)]
+    pub call_id: Option<String>,
 }
 
 /// Carry out "always allow this MCP tool" through `handle` — the runtime the
@@ -2537,6 +2691,13 @@ pub(crate) async fn live_permission(Json(req): Json<LivePermissionReq>) -> impl 
     let Some((id, payload)) = crate::native_live::pending_of_kind(APPROVAL_KIND) else {
         return Json(serde_json::json!({ "accepted": false }));
     };
+    if req.decision == "allow_project"
+        && (req.call_id.as_deref().is_none()
+            || req.call_id.as_deref() != payload.get("call_id").and_then(serde_json::Value::as_str)
+            || payload.get("project_rule").is_none())
+    {
+        return Json(serde_json::json!({"accepted": false}));
+    }
     let decision = if req.decision == "allow_persist" {
         // "Always allow this MCP tool" names the tool the request is for, not
         // whatever the client sent alongside its answer (same as /chat).
@@ -2581,7 +2742,10 @@ pub(crate) async fn live_permission(Json(req): Json<LivePermissionReq>) -> impl 
         }
         PermissionDecision::Deny => atomcode_capabilities::tools::ApprovalResponse::deny(),
     };
-    let value = serde_json::to_value(response).unwrap_or(serde_json::Value::Null);
+    let mut value = serde_json::to_value(response).unwrap_or(serde_json::Value::Null);
+    if req.decision == "allow_project" {
+        value = serde_json::json!({"decision":"allow", "save_project_rule":true});
+    }
     let ok = crate::native_live::respond_confirmed(id, value)
         .await
         .is_ok();
@@ -2798,6 +2962,53 @@ pub(crate) async fn live_mcp_trust(State(state): State<AppState>) -> impl IntoRe
 #[cfg(test)]
 mod tests {
     #[test]
+    fn normalized_runtime_compaction_progress_has_a_terminal_even_without_a_stored_count() {
+        use atomcode_coding::{
+            runtime::{CompactionCompletion, CompactionOutcome},
+            CodingRuntimeEvent,
+        };
+        let mut projector = super::NativeLiveWireProjector::default();
+        let trigger = atomcode_kernel::message::CompactTrigger::Auto { utilization: 0.9 };
+        let start = projector
+            .project(crate::live_hub::LiveViewEvent::Runtime(
+                CodingRuntimeEvent::CompactionStarted {
+                    trigger: trigger.clone(),
+                },
+            ))
+            .unwrap();
+        assert_eq!(serde_json::to_value(start).unwrap()["active"], true);
+        let done = projector
+            .project(crate::live_hub::LiveViewEvent::Runtime(
+                CodingRuntimeEvent::CompactionFinished {
+                    completion: CompactionCompletion::Completed(CompactionOutcome::from_kernel(
+                        trigger,
+                        1,
+                        0,
+                        100,
+                        100,
+                        false,
+                        Some(100),
+                    )),
+                },
+            ))
+            .unwrap();
+        let wire = serde_json::to_value(done).unwrap();
+        assert_eq!(wire["type"], "context_compacting");
+        assert_eq!(wire["active"], false);
+        assert!(wire.get("count").is_none());
+    }
+    #[test]
+    fn native_live_approval_preserves_the_reason_and_bound_project_proposal() {
+        let mut projector = super::NativeLiveWireProjector::default();
+        let wire = projector.project(crate::live_hub::LiveViewEvent::Runtime(atomcode_coding::CodingRuntimeEvent::Request(atomcode_coding::RuntimeRequest {
+            id:42, kind:atomcode_capabilities::tools::APPROVAL_KIND.into(), snapshot:None,
+            payload:serde_json::json!({"call_id":"call-42","tool":"bash","args":"{}","reason":"specific safety reason","project_rule":{"rule":"Bash(rm -rf scratch)","file":"/project/settings.local.json"}}),
+        }))).unwrap();
+        let value = serde_json::to_value(wire).unwrap();
+        assert_eq!(value["reason"], "specific safety reason");
+        assert_eq!(value["project_rule"]["rule"], "Bash(rm -rf scratch)");
+    }
+    #[test]
     fn model_wire_uses_runtime_names_and_ignores_member_descriptions() {
         use atomcode_coding::CodingRuntimeEvent;
         use atomcode_kernel::{agent::AgentDescription, event::AgentEvent};
@@ -2871,6 +3082,8 @@ mod tests {
     // ORIGINAL bytes were stashed to the display-only sidecar during the turn.
     fn missing_user_msg() -> crate::MessageInfo {
         crate::MessageInfo {
+            source_seq: None,
+            task_spec_pinned: false,
             role: "user".into(),
             content: "识别一下".into(),
             synthetic: false,
@@ -3781,11 +3994,131 @@ mod tests {
         let res2 = crate::legacy_convert::prepare_catalog_session_resume_any_project_in_root(
             root.path(),
             "session-in-proj2",
+            false,
         )
         .unwrap();
         assert!(res2.is_some());
         let prepared = res2.unwrap();
         assert_eq!(prepared.project_bucket, bucket2);
         assert_eq!(prepared.view.meta.working_dir, proj2_dir.to_string_lossy());
+    }
+}
+
+/// Explicit user upload. Raw bytes bypass model output and command-line argv.
+pub(crate) async fn live_import_patch(
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+    bytes: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(session) = query.get("session_id").filter(|s| !s.is_empty()) else {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error":"session_id required"})),
+        )
+            .into_response();
+    };
+    match crate::native_live::import_patch(session.clone(), bytes.to_vec()).await {
+        Ok(reference) => (
+            axum::http::StatusCode::OK,
+            axum::Json(serde_json::json!({"reference":reference})),
+        )
+            .into_response(),
+        Err(error) => (
+            axum::http::StatusCode::CONFLICT,
+            axum::Json(serde_json::json!({"error":format!("{error:?}")})),
+        )
+            .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod patch_upload_tests {
+    use super::live_import_patch;
+    use axum::{
+        body::Body,
+        extract::DefaultBodyLimit,
+        http::{Request, StatusCode},
+        routing::post,
+        Router,
+    };
+    use tower::ServiceExt;
+    #[tokio::test]
+    async fn patch_upload_requires_session_and_bounds_raw_body_before_dispatch() {
+        let app = Router::new().route(
+            "/live/patch",
+            post(live_import_patch).layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
+        );
+        let missing = app
+            .clone()
+            .oneshot(
+                Request::post("/live/patch")
+                    .body(Body::from("patch"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+        let large = app
+            .oneshot(
+                Request::post("/live/patch?session_id=unused")
+                    .body(Body::from(vec![b'x'; 8 * 1024 * 1024 + 1]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(large.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct TaskSpecsReq {
+    session_id: String,
+    args: String,
+}
+/// User-only operation, authenticated by the existing live API middleware.
+pub(crate) async fn live_task_specs(Json(req): Json<TaskSpecsReq>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match crate::native_live::task_specs(req.session_id, req.args).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => (
+            axum::http::StatusCode::CONFLICT,
+            Json(serde_json::json!({"error":format!("{error:?}")})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct PersonaReq {
+    session_id: String,
+}
+
+pub(crate) async fn live_persona(Json(req): Json<PersonaReq>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match crate::native_live::persona(req.session_id).await {
+        Ok(persona) => Json(serde_json::json!({"persona":persona})).into_response(),
+        Err(error) => (
+            axum::http::StatusCode::CONFLICT,
+            Json(serde_json::json!({"error":format!("{error:?}")})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct FollowUpReq {
+    session_id: String,
+    args: String,
+}
+
+pub(crate) async fn live_follow_up(Json(req): Json<FollowUpReq>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match crate::native_live::follow_up(req.session_id, req.args).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => (
+            axum::http::StatusCode::CONFLICT,
+            Json(serde_json::json!({"error":format!("{error:?}")})),
+        )
+            .into_response(),
     }
 }

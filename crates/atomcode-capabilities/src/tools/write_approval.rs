@@ -48,6 +48,7 @@ use super::sensitive_path::SensitivePaths;
 
 /// The file-mutation tools this gate owns. Anything else falls through to the normal flow.
 const WRITE_TOOLS: &[&str] = &[
+    "apply_patch",
     "edit_file",
     "write_file",
     "search_replace",
@@ -64,6 +65,7 @@ fn is_write_tool(name: &str) -> bool {
 /// working dir `.`), since it edits every match under that root.
 fn write_targets(tool: &str, args: &str) -> Vec<String> {
     match tool {
+        "apply_patch" => super::target_arg_values(args),
         "edit_file" | "write_file" => {
             #[derive(Deserialize)]
             struct P {

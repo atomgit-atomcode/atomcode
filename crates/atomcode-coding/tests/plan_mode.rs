@@ -52,6 +52,7 @@ async fn plan_mode_blocks_a_write_tool_through_the_assembly() {
         front_end: None,
         review_delegate: None,
         host_plugins: Default::default(),
+        prompt_overrides: Default::default(),
         identity: Default::default(),
     };
 

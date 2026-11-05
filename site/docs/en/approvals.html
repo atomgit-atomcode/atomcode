@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.2.5</span>
+    <span class="dhdr-ver">v5.2.6</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -110,6 +110,16 @@
       </table>
       <p><strong>Always auto-approved:</strong> reading, searching, globbing and editing <em>inside</em> the project, plus <code>cd</code>, <code>list_dir</code>, <code>grep</code>, <code>web_search</code>, and the todo list.</p>
 
+      <h2 id="test-command-rules">Authorize repeated project tests</h2>
+      <p>User/project JSON settings support command rules. For example, in the project's <code>.atomcode/settings.local.json</code>:</p>
+<pre><code>{
+  "permissions": {
+    "allow": ["Bash(cargo test --bin ponent defense_tests*)"],
+    "deny": ["Bash(git push --force*)"]
+  }
+}</code></pre>
+      <p>A granted command can be combined with read-only helpers and fixed numeric loops: <code>cd /project &amp;&amp; for i in 1 2 3; do cargo test --bin ponent defense_tests 2&gt;&amp;1 | tail -5; done</code>. Each command is checked separately; deny rules win. Dynamic expansions, loops that change directories and file-writing redirects use the normal approval flow.</p>
+      <p>This authorizes running project code; it does not classify tests as read-only or confine their filesystem/network effects. Credential and sensitive-path checks still apply.</p>
       <h2 id="choices">Your choices on a prompt</h2>
       <p>When a tool lands in Ask / Always-ask / Scoped-ask, you get these options:</p>
       <ul>
@@ -160,6 +170,10 @@
         <strong>--dangerously-skip-permissions (dangerous)</strong>
         <p>Launching with this flag <strong>short-circuits all four levels to auto-approve</strong> — including <code>rm -rf</code>, <code>git push --force</code>, and writes outside the project — with no prompts at all. Only use it in throwaway or sandboxed environments you don't mind losing.</p>
       </div>
+
+      <h2 id="project-rules">Approval reasons and project rules</h2>
+      <p>Approval requests show the specific reason, matching permission rules and their source files, and command segments not covered by allow rules. Eligible Bash requests also offer “Approve and save exact project rule”, previewing the complete rule and destination <code>.atomcode/settings.local.json</code> path before confirmation.</p>
+      <p>This approves the pending call and saves an exact command rule, effective after reload or in a new session. Other configuration fields are preserved. Existing deny rules, invalid settings, a project change or a failed save reject the operation rather than silently approving it. Independent security approvals such as sensitive paths do not offer this save action.</p>
 
       <h2 id="config">Config reference</h2>
       <p>MCP trust lives in <code>mcp.json</code> — project-level <code>.mcp.json</code> or user-level <code>~/.atomcode/mcp.json</code> — per server:</p>

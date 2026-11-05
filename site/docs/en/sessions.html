@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.2.5</span>
+    <span class="dhdr-ver">v5.2.6</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -183,6 +183,10 @@
         <li>Or just <code>/session</code> and start fresh</li>
         <li>To avoid keeping large tool-call results, tell the model in the prompt to "stop re-reading those big files"</li>
       </ul>
+
+      <h2 id="context-summary-count">Context summary count</h2>
+      <p>TUI and WebUI show the recorded summary count beside existing token usage, hidden before the first summary. Progress appears in the running status or conversation, never in the footer; completion leaves a numbered record. Failures, cancellations, no-ops and tool-output cleanup do not increase the count.</p>
+      <p>The count comes from the session event log, so resume and reconnect do not double count it, and a new session starts fresh. Unknown history before import cannot be reconstructed; undo does not erase the historical fact that a summary happened.</p>
 
       <h2 id="multi-project-workflows">Multi-project workflows</h2>
       <p>AtomCode groups sessions by working directory. Recommended ways to switch:</p>
