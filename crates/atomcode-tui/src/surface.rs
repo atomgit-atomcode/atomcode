@@ -2860,15 +2860,11 @@ pub const BURST_PENDING: std::time::Duration = std::time::Duration::from_millis(
 /// And how long to wait once a second one has arrived — i.e. once this really
 /// is a burst.
 ///
-/// Wider than [`BURST_PENDING`] on Windows because a paste there arrives as
-/// several stdin records and the terminal takes a few milliseconds to translate
-/// each: the gap to bridge is between records, not between characters. Nothing
-/// is at stake in widening it, because by now there is no other explanation for
-/// what is arriving.
-#[cfg(target_os = "windows")]
-pub const BURST_ACTIVE: std::time::Duration = std::time::Duration::from_millis(15);
-#[cfg(not(target_os = "windows"))]
-pub const BURST_ACTIVE: std::time::Duration = std::time::Duration::from_millis(4);
+/// Once two keys arrive within BURST_PENDING, bridge short terminal record
+/// gaps. Keep this below the 60ms cadence used by the human-typing regression;
+/// lone keys still pay only BURST_PENDING. Without this, a newline in the next
+/// terminal record becomes a submit rather than part of the paste.
+pub const BURST_ACTIVE: std::time::Duration = std::time::Duration::from_millis(40);
 
 /// The most characters gathered into one synthesised paste.
 pub const BURST_CAP: usize = 8192;

@@ -11006,7 +11006,20 @@ where
     // forwarded straight on, a reversed wheel's first arrow was one ↑ into the
     // composer, and a paste's first character was a keystroke.
     let mut next_up: Option<crossterm::event::Event> = None;
+    let mut paste_continuation = false;
     loop {
+        // Reaching the allocation cap is not a paste boundary. Carry its
+        // classification until a real quiet gap or a non-text event arrives.
+        if paste_continuation && next_up.is_none() {
+            match tokio::time::timeout(crate::surface::BURST_ACTIVE, events.next()).await {
+                Ok(Some(event)) => next_up = Some(event),
+                Ok(None) => break,
+                Err(_) => {
+                    paste_continuation = false;
+                    continue;
+                }
+            }
+        }
         let event = match next_up.take() {
             Some(event) => event,
             None => match events.next().await {
@@ -11025,6 +11038,7 @@ where
         // with it ours the wheel is a mouse event, and an arrow is a key and
         // pays no wait.
         if let Some(up) = crate::surface::bare_arrow(&event).filter(|_| handed_back()) {
+            paste_continuation = false;
             let mut n = 1usize;
             let mut after: Option<crossterm::event::Event> = None;
             loop {
@@ -11052,6 +11066,7 @@ where
             continue;
         }
         let Some(first) = crate::surface::burst_char(&event) else {
+            paste_continuation = false;
             if !forward(event) {
                 break;
             }
@@ -11062,7 +11077,7 @@ where
         // The wider window opens only once a second character has confirmed
         // there is something to bridge: until then a lone keystroke must not
         // pay for the paste case.
-        let mut confirmed = false;
+        let mut confirmed = paste_continuation;
         while held.len() < crate::surface::BURST_CAP {
             let window = if confirmed {
                 crate::surface::BURST_ACTIVE
@@ -11085,7 +11100,8 @@ where
             }
         }
         let chars: Vec<char> = held.iter().map(|(c, _)| *c).collect();
-        let sent = if crate::surface::is_paste_burst(&chars) {
+        let capped = held.len() == crate::surface::BURST_CAP;
+        let sent = if paste_continuation || capped || crate::surface::is_paste_burst(&chars) {
             wake.send(Wake::Input(Input::Paste(chars.into_iter().collect())))
                 .is_ok()
         } else {
@@ -11094,6 +11110,7 @@ where
         if !sent {
             break;
         }
+        paste_continuation = capped && after.is_none();
         next_up = after;
     }
 }
@@ -13038,6 +13055,88 @@ mod paste_burst_tests {
             seen.push(input);
         }
         seen
+    }
+
+    #[tokio::test]
+    async fn fragmented_paste_does_not_leak_submit() {
+        let seen = pumped(vec![
+            (0, press('a')),
+            (0, press('b')),
+            (20, enter()),
+            (20, press('c')),
+            (0, press('d')),
+            (20, enter()),
+        ])
+        .await;
+        let submits = seen
+            .iter()
+            .filter(|input| {
+                matches!(
+                    input,
+                    Input::Key(KeyPress {
+                        key: Key::Enter,
+                        ..
+                    })
+                )
+            })
+            .count();
+        assert_eq!(submits, 0, "pasted newline leaked as an Enter key");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn paste_cap_does_not_leak_the_final_newline() {
+        let mut script = vec![(0, press('x')); crate::surface::BURST_CAP];
+        script.push((0, enter()));
+        let seen = pumped(script).await;
+        let submits = seen
+            .iter()
+            .filter(|input| {
+                matches!(
+                    input,
+                    Input::Key(KeyPress {
+                        key: Key::Enter,
+                        ..
+                    })
+                )
+            })
+            .count();
+        assert_eq!(
+            submits, 0,
+            "a newline immediately after the gather cap became submit"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_manual_enter_after_a_capped_paste_still_submits() {
+        let mut script = vec![(0, press('x')); crate::surface::BURST_CAP];
+        script.push((100, enter()));
+        let seen = pumped(script).await;
+        assert_eq!(seen.len(), 2);
+        assert!(matches!(&seen[0], Input::Paste(text) if text.len() == crate::surface::BURST_CAP));
+        assert_eq!(seen[1], Input::Key(KeyPress::plain(Key::Enter)));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_capped_paste_keeps_all_chunks_and_does_not_start_a_turn() {
+        let text = format!("{}\n第二行\n", "x".repeat(crate::surface::BURST_CAP));
+        let script = text
+            .chars()
+            .map(|c| (0, if c == '\n' { enter() } else { press(c) }))
+            .collect();
+        let seen = pumped(script).await;
+        let (host, tui) = assemble(Headless::new(80, 24));
+        for input in seen {
+            let Input::Paste(text) = input else {
+                panic!("paste leaked a key")
+            };
+            tui.act(Action::Paste(text), &tui.client);
+        }
+        let moment = host.moment.read().unwrap();
+        assert_eq!(
+            crate::moment::expand_pastes(&moment.input, &moment.pastes),
+            text
+        );
+        assert!(!moment.pending_working && !moment.turn_open);
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
