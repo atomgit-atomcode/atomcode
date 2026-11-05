@@ -8,6 +8,7 @@ import { nextContextSummary } from '../lib/contextSummaries';
 import { adjacentTimelineStart, archivedMessage, assistantTurnRange, boundedTimelineRange, cacheSession, residentStart, segmentMessages, targetTimelineStart, timelineLimits } from '../lib/timelineMemory';
 import { useTimelineMessages, useTimelinePage, useTimelineSearch } from '../lib/useTimelineMessages';
 import { loadAfterSessionSwitch } from '../lib/sessionSwitch';
+import { detectSlashMenuQuery } from '../lib/slashCommands';
 import { useSkills, refreshSkills, invalidateSkills } from '../skills';
 import type { LiveGoalProgress } from '../api';
 // Task 13 — Chat view with streaming rendering
@@ -641,7 +642,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   const [pendingImages, setPendingImages] = useState<ImageData[]>([]);
   const [attachError, setAttachError] = useState<string | null>(null);
   const [slashOpen, setSlashOpen] = useState(false);
-  const { items: slashSkills, loading: slashLoading, failed: slashFailed } = useSkills(slashOpen);
+  const { items: slashSkills, loading: slashLoading, failed: slashFailed, error: slashError } = useSkills(slashOpen);
   const [slashQuery, setSlashQuery] = useState('');
   const [slashIndex, setSlashIndex] = useState(0);
   // The /skills command opens a pure skills browser (no commands). Set while that
@@ -2273,13 +2274,14 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
         invalidateSkills();
         pushCommandNotice(result.live_provider_sync?.message ?? t('cmd.reload.done'));
       },
-      openSlashSkillsMenu: () => {
+      openSlashSkillsMenu: (query = '') => {
         // Open a pure SKILLS browser (not the full '/' command list — that's what
-        // made running /skills look like it "reset to /"). Input stays '/', but the
-        // menu shows only skills; typing anything drops back to normal filtering.
+        // made running /skills look like it "reset to /"). Preserve an explicit
+        // /skills query so typing and selecting remain in the skills browser.
         // Opening refreshes skills; an already open browser can refresh explicitly.
-        setInput('/');
-        setSlashQuery('');
+        const text = query ? `/skills ${query}` : '/';
+        setInput(text);
+        setSlashQuery(query);
         setSlashIndex(0);
         setSlashSkillsOnly(true);
         if (slashOpen) void refreshSkills();
@@ -2288,7 +2290,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
           const ta = textareaRef.current;
           if (!ta) return;
           ta.focus();
-          ta.setSelectionRange(1, 1);
+          ta.setSelectionRange(text.length, text.length);
           ta.style.height = 'auto';
           ta.style.height = Math.min(ta.scrollHeight, 160) + 'px';
         });
@@ -3215,17 +3217,20 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     const pos = ta.selectionStart ?? ta.value.length;
     const before = ta.value.slice(0, pos);
     const after = ta.value.slice(pos);
-    const slashIdx = before.lastIndexOf('/');
+    const range = detectSlashMenuQuery(ta.value, pos);
+    if (!range) return;
+    const slashIdx = range.start;
     const next = before.slice(0, slashIdx) + `/${name} ` + after;
     setInput(next);
     setSlashOpen(false);
-    requestAnimationFrame(() => {
-      ta.focus();
-      const newPos = slashIdx + name.length + 2;
-      ta.setSelectionRange(newPos, newPos);
-      ta.style.height = 'auto';
-      ta.style.height = Math.min(ta.scrollHeight, 160) + 'px';
-    });
+    // Commit this explicit selection immediately. A deferred caret callback can
+    // otherwise overwrite a subsequent select-all/paste and append a second skill.
+    ta.value = next;
+    ta.focus();
+    const newPos = slashIdx + name.length + 2;
+    ta.setSelectionRange(newPos, newPos);
+    ta.style.height = 'auto';
+    ta.style.height = Math.min(ta.scrollHeight, 160) + 'px';
   }
 
   // 把当前 @ 段替换为相对路径 rel，不自动追加空格，目录可继续下钻补全。
@@ -3300,21 +3305,15 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     ta.style.height = Math.min(ta.scrollHeight, 160) + 'px';
 
     const pos = ta.selectionStart ?? val.length;
-    const before = val.slice(0, pos);
 
-    // 检测光标前是否有 /（行首 或 空格后）
-    const slashIdx = before.lastIndexOf('/');
-    if (slashIdx >= 0 && (slashIdx === 0 || before[slashIdx - 1] === ' ')) {
-      const query = before.slice(slashIdx + 1);
-      if (!query.includes(' ') && query.length <= 30) {
-        setAtOpen(false);
-        setSlashQuery(query);
-        setSlashIndex(0);
-        setSlashOpen(true);
-        // Any real keystroke exits the pure-skills browser → normal mixed filtering.
-        setSlashSkillsOnly(false);
-        return;
-      }
+    const slashRange = detectSlashMenuQuery(val, pos);
+    if (slashRange) {
+      setAtOpen(false);
+      setSlashQuery(slashRange.query);
+      setSlashIndex(0);
+      setSlashOpen(true);
+      setSlashSkillsOnly(slashRange.skillsOnly);
+      return;
     }
 
     // 检测光标前是否有 @（行首 或 空格后）。@ 后文本可含 "/" 以进入子目录；
@@ -3805,7 +3804,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       {slashOpen && (
         <div class="slash-popover" ref={slashRef}>
           {slashLoading && <div class="at-empty">{t('attach.skillsLoading')}</div>}
-          {slashFailed && <button class="slash-row" onMouseDown={(e) => { e.preventDefault(); void refreshSkills(); }}>{t('skills.loadFailedRetry')}</button>}
+          {slashFailed && <button class="slash-row" onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); void refreshSkills(); }}>{t(slashSkills?.length ? 'skills.refreshFailedRetry' : 'skills.loadFailedRetry')}{slashError && <span class="slash-desc">{slashError}</span>}</button>}
           {!slashLoading && !slashFailed && slashSkillsOnly && slashSkills?.length === 0 && <div class="at-empty">{t('attach.skillsEmpty')}</div>}
           {buildSlashMenuItems(FRONTEND_COMMANDS, slashSkills ?? [], slashQuery, t as (k: string) => string, slashSkillsOnly).map((item, i) => (
             <button

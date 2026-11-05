@@ -703,7 +703,11 @@ export interface SkillInfo {
 
 export async function getSkills(): Promise<SkillInfo[]> {
   const resp = await apiFetch('/skills', { headers: authHeaders() });
-  return readJson(resp);
+  const value: unknown = await readJson(resp);
+  if (!Array.isArray(value) || value.some(item => !item || typeof item.name !== 'string' || typeof item.description !== 'string')) {
+    throw new Error('Invalid skill list response / 技能列表响应格式异常');
+  }
+  return value as SkillInfo[];
 }
 
 // --- Remote access (relay or local network) status ---

@@ -66,3 +66,20 @@ test('a fresh opening supersedes an in-flight result; ordinary retries coalesce'
   await old;
   assert.deepEqual(store.getSnapshot().items, ['fresh']);
 });
+
+test('refresh failures expose the reason and a successful retry clears it', async () => {
+  let fail = false;
+  const store = createRefreshingList(async () => {
+    if (fail) throw new Error('HTTP 503: service unavailable');
+    return ['known skill'];
+  });
+  await store.refresh();
+  fail = true;
+  await store.refresh();
+  assert.equal(store.getSnapshot().error, 'HTTP 503: service unavailable');
+  assert.deepEqual(store.getSnapshot().items, ['known skill']);
+  fail = false;
+  await store.refresh();
+  assert.equal(store.getSnapshot().error, null);
+  assert.equal(store.getSnapshot().failed, false);
+});

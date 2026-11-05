@@ -373,7 +373,7 @@ export function Sidebar({
   const [timeNow, setTimeNow] = useState(() => Date.now());
   // Skills menu: list fetched lazily; the count badge shows once loaded.
   const [skillsMenuOpen, setSkillsMenuOpen] = useState(false);
-  const { items: skills, loading: skillsLoading, failed: skillsFailed } = useSkills(skillsMenuOpen);
+  const { items: skills, loading: skillsLoading, failed: skillsFailed, error: skillsError } = useSkills(skillsMenuOpen);
   const [skillsMenuPos, setSkillsMenuPos] = useState<{ top: number; left: number; width: number } | null>(null);
   const skillsMenuRef = useRef<HTMLDivElement | null>(null);
   const skillsBtnRef = useRef<HTMLButtonElement | null>(null);
@@ -1114,7 +1114,7 @@ export function Sidebar({
               minWidth: `${Math.max(skillsMenuPos.width, 200)}px`,
             }}
           >
-            {skillsFailed && <button class="skills-menu-row" onClick={() => void refreshSkills()}>{t('skills.loadFailedRetry')}</button>}
+            {skillsFailed && <button class="skills-menu-row" onClick={(e) => { e.stopPropagation(); void refreshSkills(); }}>{t(skills?.length ? 'skills.refreshFailedRetry' : 'skills.loadFailedRetry')}{skillsError && <small>{skillsError}</small>}</button>}
             {skillsLoading && <div class="group-by-menu-title">{t('sidebar.skillsLoading')}</div>}
             {!skillsLoading && !skillsFailed && (skills?.length ?? 0) === 0 && (
               <div class="group-by-menu-title">{t('sidebar.skillsEmpty')}</div>

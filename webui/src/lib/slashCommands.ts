@@ -19,6 +19,18 @@ export function parseSlashCommand(line: string): ParsedCommand | null {
   return { name, arg };
 }
 
+/** Composer completion range. /skills <query> explicitly filters only skills. */
+export function detectSlashMenuQuery(text: string, cursor = text.length): { start: number; query: string; skillsOnly: boolean } | null {
+  const before = text.slice(0, cursor);
+  const browser = /^(\s*)\/skills[ \t]+([^\r\n]*)$/.exec(before);
+  if (browser) return { start: browser[1].length, query: browser[2].trim(), skillsOnly: true };
+  const slash = before.lastIndexOf('/');
+  if (slash < 0 || (slash > 0 && !/\s/.test(before[slash - 1]))) return null;
+  const query = before.slice(slash + 1);
+  if (/\s/.test(query) || query.length > 256) return null;
+  return { start: slash, query, skillsOnly: false };
+}
+
 export type ApprovalMode = 'build' | 'plan' | 'bypass' | 'accept_edits';
 
 /** Chat.tsx 注入的既有页面能力；命令 run() 只调用这些，不含自身业务逻辑。 */
@@ -29,7 +41,7 @@ export interface SlashHandlers {
   changeDir(path: string): void | Promise<void>;
   openSessionSidebar(): void;
   reloadConfig(): void | Promise<void>;
-  openSlashSkillsMenu(): void;
+  openSlashSkillsMenu(query?: string): void;
   notice(text: string): void;
   submitPrompt?(text: string): void | Promise<void>;
   execServerCommand(command: string, arg: string): void | Promise<void>;
@@ -65,7 +77,7 @@ export const FRONTEND_COMMANDS: SlashCommandDef[] = [
   },
   { name: 'resume', descKey: 'cmd.resume.desc', run: (_a, h) => h.openSessionSidebar() },
   { name: 'reload', descKey: 'cmd.reload.desc', run: (_a, h) => h.reloadConfig() },
-  { name: 'skills', descKey: 'cmd.skills.desc', run: (_a, h) => h.openSlashSkillsMenu() },
+  { name: 'skills', descKey: 'cmd.skills.desc', run: (a, h) => h.openSlashSkillsMenu(a) },
   { name: 'help', descKey: 'cmd.help.desc', run: (_a, h) => h.notice(buildHelpText(h.t)) },
   {
     name: 'review',

@@ -60,7 +60,7 @@ function SkillIcon() {
 export function AttachMenu({ onInsert, onPickFile, onAddImages, onImportPatch, patchDisabled, onManageSpecs }: AttachMenuProps) {
   const t = useT();
   const [open, setOpen] = useState(false);
-  const { items: skills, loading, failed } = useSkills(open);
+  const { items: skills, loading, failed, error: skillsError } = useSkills(open);
   const rootRef = useRef<HTMLDivElement>(null);
   const patchInputRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -144,7 +144,7 @@ export function AttachMenu({ onInsert, onPickFile, onAddImages, onImportPatch, p
             <span>{t('attach.skill')}</span>
           </div>
           <div class="attach-skill-list">
-            {failed && <button class="attach-row" onClick={() => void refreshSkills()}>{t('skills.loadFailedRetry')}</button>}
+            {failed && <button class="attach-row" onClick={(e) => { e.stopPropagation(); void refreshSkills(); }}>{t(skills?.length ? 'skills.refreshFailedRetry' : 'skills.loadFailedRetry')}{skillsError && <small>{skillsError}</small>}</button>}
             {loading && <div class="attach-note">{t('attach.skillsLoading')}</div>}
             {!loading && !failed && skills !== null && skills.length === 0 && (
               <div class="attach-note">{t('attach.skillsEmpty')}</div>
