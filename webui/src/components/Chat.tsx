@@ -41,7 +41,7 @@ import { rankSessionReferences, sessionReferenceToken, sessionReferenceTokens } 
 import { sessionReferenceCandidates } from '../api';
 import { VNode } from 'preact';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, listDir, searchFiles, changeDir, postConfigReload, postCommand, getLivePersona, postLiveCompact, postUserInputAnswer, postLivePolicyInterventionResolution, openWorkspaceFile, type CommandResult, type RoutedUserInputRequest, type PolicyInterventionEvent, type TurnStats } from '../api';
+import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, listDir, searchFiles, changeDir, postConfigReload, postCommand, getLivePersona, followUp, postLiveCompact, postUserInputAnswer, postLivePolicyInterventionResolution, openWorkspaceFile, type CommandResult, type RoutedUserInputRequest, type PolicyInterventionEvent, type TurnStats } from '../api';
 import {
   parseSlashCommand,
   buildCommandMap,
@@ -2309,6 +2309,18 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
         void deliver(text, [], modeState.confirmedMode);
       },
       execServerCommand: async (command, arg) => {
+        if (command === 'followup') {
+          if (!sessionId) { pushCommandNotice(t('cmd.persona.unavailable')); return; }
+          const generation = sessionGenerationRef.current;
+          try {
+            const value = await followUp(sessionId, arg);
+            if (generation !== sessionGenerationRef.current) return;
+            pushCommandNotice(value.prompt !== null ? t('cmd.followup.pending', {prompt:value.prompt}) : t(arg.trim()==='clear' ? 'cmd.followup.cleared' : 'cmd.followup.none'));
+          } catch (error) {
+            if (generation === sessionGenerationRef.current) pushCommandNotice(t('chat.connError',{msg:String(error)}));
+          }
+          return;
+        }
         if (command === 'context' && arg.trim() === 'persona') {
           if (!sessionId) { pushCommandNotice(t('cmd.persona.unavailable')); return; }
           const generation = sessionGenerationRef.current;

@@ -2881,6 +2881,15 @@ impl HostControl for RuntimeControl {
                     current: Some(self.config.lock().expect("config poisoned").model.clone()),
                 })
             }
+            HostCommand::FollowUp { session, args } => {
+                self.addressed(&session)?;
+                let value = self
+                    .handle
+                    .follow_up(Some(session), args)
+                    .await
+                    .map_err(refused)?;
+                Ok(HostReply::FollowUp { value })
+            }
             HostCommand::TaskSpecs { session, args } => {
                 self.addressed(&session)?;
                 let value = self

@@ -929,6 +929,11 @@ fn review_prompt(arg: &str) -> String {
 
 fn session_catalogue() -> Vec<Command> {
     vec![
+        Command::said_taking(
+            "followup",
+            "[set <prompt>|show|clear]".into(),
+            t(Msg::FollowUpAbout),
+        ),
         Command::said_taking("spec", "[list|pin|unpin]".into(), t(Msg::SpecTitle)),
         Command::said_taking("patch", t(Msg::CmdTakesPath), t(Msg::CmdAboutPatch)),
         Command::said("compact", t(Msg::CmdAboutCompact)),
@@ -1175,6 +1180,41 @@ impl CommandSet for SessionCommands {
                 .then(|| Outcome::Refused(t(Msg::WaitsForTheTurn { command }).into_owned()))
         };
         match name {
+            "followup" => {
+                if client.session() != root {
+                    return Outcome::Refused(t(Msg::FollowUpLeadOnly).into_owned());
+                }
+                let control = match host(control) {
+                    Ok(c) => c,
+                    Err(e) => return e,
+                };
+                match control
+                    .call(HostCommand::FollowUp {
+                        session: root,
+                        args: args.into(),
+                    })
+                    .await
+                {
+                    Ok(HostReply::FollowUp { value }) => {
+                        if let Some(prompt) =
+                            value.get("prompt").and_then(serde_json::Value::as_str)
+                        {
+                            Outcome::Said(t(Msg::FollowUpPending { prompt }).into_owned())
+                        } else {
+                            Outcome::Said(
+                                t(if args.trim() == "clear" {
+                                    Msg::FollowUpCleared
+                                } else {
+                                    Msg::FollowUpNone
+                                })
+                                .into_owned(),
+                            )
+                        }
+                    }
+                    Ok(other) => Outcome::Refused(format!("unexpected host reply: {other:?}")),
+                    Err(error) => Outcome::Refused(refusal(error)),
+                }
+            }
             "spec" => {
                 if client.session() != root {
                     return Outcome::Refused(t(Msg::SpecLeadOnly).into_owned());
@@ -5250,6 +5290,34 @@ mod tests {
                 .iter()
                 .all(|c| matches!(c, HostCommand::Context { prompt: true, .. })),
             "问的时候要说明是要提示词的:{asked:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn follow_up_registration_is_an_explicit_host_operation() {
+        let host = Arc::new(Recording::default());
+        host.replies.lock().unwrap().extend([
+            Ok(HostReply::FollowUp {
+                value: serde_json::json!({"prompt":"CHECK_ONCE","current_task":true}),
+            }),
+            Ok(HostReply::FollowUp {
+                value: serde_json::json!({"prompt":null,"current_task":false}),
+            }),
+        ]);
+        let (app, _client, all) = following(&host);
+        match all
+            .dispatch("/followup set CHECK_ONCE", &app.context())
+            .await
+        {
+            Outcome::Said(text) => assert!(text.contains("CHECK_ONCE")),
+            other => panic!("{other:?}"),
+        }
+        match all.dispatch("/followup clear", &app.context()).await {
+            Outcome::Said(text) => assert_eq!(text, t(Msg::FollowUpCleared)),
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            matches!(&host.asked.lock().unwrap()[0], HostCommand::FollowUp { args, .. } if args=="set CHECK_ONCE")
         );
     }
 

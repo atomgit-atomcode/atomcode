@@ -405,6 +405,10 @@ atomcode -p "Explain the agent loop in this repo"
 atomcode --prompt-file task.md
 ```
 
+Run one preset after a task normally finishes with
+`atomcode -p "Implement the fix" --follow-up "Review the changes and run relevant tests"`.
+TUI/WebUI expose `/followup set/show/clear`; see [one-shot follow-ups](docs/follow-up.md).
+
 Customize the coding persona with `--system-prompt-file persona.md` and optional
 `--append-system-prompt-file constraints.md`. Tool and project instructions remain
 included. See [custom system prompts](docs/custom-system-prompts.md) for configuration

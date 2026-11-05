@@ -594,6 +594,9 @@ const BIN_NAME: &str = env!("CARGO_BIN_NAME");
         .multiple(false)
 ))]
 struct Cli {
+    /// Run this preset once after the main task normally finishes, in the same session
+    #[arg(long, value_name = "PROMPT")]
+    follow_up: Option<String>,
     /// Replace the coding persona only; retain tool and project instructions
     #[arg(long, conflicts_with = "system_prompt_file")]
     system_prompt: Option<String>,
@@ -1583,9 +1586,11 @@ async fn run(process_start: std::time::Instant) -> Result<i32> {
     let cli = Cli::parse();
     let prompt_overrides = resolve_prompt_overrides(&cli)?;
     if cli.command.is_some()
-        && (prompt_overrides.replace.is_some() || prompt_overrides.append.is_some())
+        && (prompt_overrides.replace.is_some()
+            || prompt_overrides.append.is_some()
+            || cli.follow_up.is_some())
     {
-        anyhow::bail!("Root system-prompt flags apply to the main coding agent; use subcommand-specific options where available");
+        anyhow::bail!("Root prompt/follow-up flags apply to the main coding agent; use subcommand-specific options where available");
     }
     // OS schedulers do not inherit a terminal's custom product home. Resolve
     // that explicit host input before loading config, auth or session services.
@@ -2485,6 +2490,12 @@ async fn run(process_start: std::time::Instant) -> Result<i32> {
         Some(&review_home),
     )
     .await?;
+    if let Some(prompt) = &cli.follow_up {
+        native_runtime
+            .handle
+            .follow_up(None, format!("set {prompt}"))
+            .await?;
+    }
     // The active session id (fresh or resumed) for the on-exit resume hint,
     // captured before the runtime is moved into the headless/TUI arms below.
     // `None` for an ephemeral run (no persisted session → nothing to resume).
@@ -5269,6 +5280,20 @@ mod tests {
         DEFAULT_LOG_DIRECTIVES,
     };
     use clap::Parser;
+
+    #[test]
+    fn headless_follow_up_is_a_literal_user_preset() {
+        let cli = Cli::try_parse_from([
+            "atomcode",
+            "-p",
+            "original",
+            "--follow-up",
+            "Review once\n保留原文",
+        ])
+        .unwrap();
+        assert_eq!(cli.follow_up.as_deref(), Some("Review once\n保留原文"));
+        assert_eq!(cli.prompt.as_deref(), Some("original"));
+    }
 
     #[test]
     fn coding_prompt_flags_preserve_bytes_and_reject_conflicts_or_bad_files() {

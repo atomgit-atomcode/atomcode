@@ -650,6 +650,13 @@ pub struct RuntimeContextStats {
     pub assets: Option<RuntimeAssetSources>,
 }
 
+struct PendingFollowUp {
+    generation: u64,
+    session: Option<String>,
+    turn: Option<u64>,
+    prompt: String,
+}
+
 /// Inspection of the mounted persona contribution, separate from the full prompt.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct RuntimePersonaInfo {
@@ -3071,6 +3078,24 @@ impl CodingRuntimeHandle {
         result.await.map_err(|_| RuntimeError::Unavailable)?
     }
 
+    /// Register/read/clear one user-preset continuation; never a model-facing tool.
+    pub async fn follow_up(
+        &self,
+        session: Option<String>,
+        args: String,
+    ) -> Result<serde_json::Value, RuntimeError> {
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::FollowUp {
+                generation: runtime_state_generation(self.state.load(Ordering::Acquire)),
+                session,
+                args,
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
     /// Explicit user's specification operation, scoped to this generation/session.
     pub async fn task_specs(
         &self,
@@ -4045,6 +4070,12 @@ pub enum CodingRuntimeControl {
         windows_only: bool,
         done: oneshot::Sender<Result<Allowance, RuntimeError>>,
     },
+    FollowUp {
+        generation: u64,
+        session: Option<String>,
+        args: String,
+        done: oneshot::Sender<Result<serde_json::Value, RuntimeError>>,
+    },
     /// Explicit user operations over retained task specifications.
     TaskSpecs {
         generation: u64,
@@ -4589,6 +4620,9 @@ fn spawn_runtime_owner_with_optional_agent(
         // to it that it will open one for. Not the same as `active_turn`: a held
         // turn is one this owner keeps open after the agent finished it, and the
         // agent can open another under it (a message typed while `/loop` waits).
+        let mut follow_up: Option<PendingFollowUp> = None;
+        let mut follow_up_elapsed = std::time::Duration::ZERO;
+        let mut follow_up_epoch = generation;
         let mut kernel_turn_open = false;
         let mut persistence_failure = None;
         // What each panel `Disable` held back, by server, for the matching
@@ -4615,6 +4649,24 @@ fn spawn_runtime_owner_with_optional_agent(
         }
         loop {
             background_jobs.retain_generation(generation);
+            if follow_up_epoch != generation {
+                follow_up_elapsed = std::time::Duration::ZERO;
+                follow_up_epoch = generation;
+            }
+            if follow_up.as_ref().is_some_and(|pending| {
+                pending.generation != generation
+                    || pending.session.as_deref()
+                        != resources
+                            .as_ref()
+                            .and_then(|runtime| runtime.parts.session.as_ref())
+                            .map(|binding| binding.id.as_str())
+            }) || controls.stop_now().is_cancelled()
+                || !agent_available
+                || persistence_failure.is_some()
+            {
+                follow_up = None;
+            }
+
             if cancel_pending
                 || persistence_failure.is_some()
                 || pending_policy_intervention.is_some()
@@ -5659,6 +5711,11 @@ fn spawn_runtime_owner_with_optional_agent(
                         // this conversation's policy for a turn the person never asked
                         // for.
                         if from.is_none() {
+                            if follow_up.as_ref().is_some_and(|pending| pending.turn.is_some()) {
+                                follow_up = None;
+                                let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(
+                                    "Follow-up cleared / 已撤销后续任务：new user input takes priority.".into()));
+                            }
                             if let Some(runtime) = resources.as_ref() {
                                 if !execution_intent.trim().is_empty() {
                                     runtime
@@ -5721,6 +5778,10 @@ fn spawn_runtime_owner_with_optional_agent(
                         } else {
                             next_turn_id = next_turn_id.wrapping_add(1);
                             active_turn = Some(next_turn_id);
+                            follow_up_elapsed = std::time::Duration::ZERO;
+                            if from.is_none() {
+                                if let Some(pending) = follow_up.as_mut().filter(|pending| pending.turn.is_none()) { pending.turn = Some(next_turn_id); }
+                            }
                             turn_stats = RuntimeTurnStats::default();
                             controls.state.store(
                                 runtime_phase_state(generation, RuntimePhase::InTurn),
@@ -6227,6 +6288,33 @@ fn spawn_runtime_owner_with_optional_agent(
                             }));
                         });
                     }
+                    Some(CodingRuntimeControl::FollowUp { generation: requested, session, args, done }) => {
+                        let result = (|| {
+                            if requested != generation { return Err(RuntimeError::Busy); }
+                            let runtime = resources.as_ref().ok_or(RuntimeError::Unavailable)?;
+                            if session.as_deref().is_some_and(|session| runtime.parts.session.as_ref().map(|b| b.id.as_str()) != Some(session)) {
+                                return Err(RuntimeError::CommandRefused("follow-up belongs to a different session".into()));
+                            }
+                            let arg = args.trim_start();
+                            match arg.trim() {
+                                "" | "show" => {},
+                                "clear" => { follow_up = None; },
+                                _ => {
+                                    let prompt = arg.split_once(char::is_whitespace).filter(|(action,_)| *action == "set").map(|(_,prompt)|prompt).ok_or_else(|| RuntimeError::CommandRefused("usage: /followup set <prompt> | show | clear".into()))?;
+                                    if prompt.trim().is_empty() || prompt.len() > 16 * 1024 {
+                                        return Err(RuntimeError::CommandRefused("follow-up prompt must contain 1..16384 UTF-8 bytes".into()));
+                                    }
+                                    if !agent_available || compaction_suspended || cancel_pending || controls.stop_now().is_cancelled()
+                                        || goal.is_some() || loop_state.is_some() || pending_policy_intervention.is_some() || persistence_failure.is_some() {
+                                        return Err(RuntimeError::CommandRefused("follow-up requires an available ordinary task; clear goal/loop first".into()));
+                                    }
+                                    follow_up = Some(PendingFollowUp { generation, session: runtime.parts.session.as_ref().map(|binding|binding.id.clone()), turn: active_turn, prompt: prompt.into() });
+                                }
+                            }
+                            Ok(serde_json::json!({"prompt":follow_up.as_ref().map(|p|p.prompt.as_str()),"current_task":follow_up.as_ref().is_some_and(|p|p.turn.is_some())}))
+                        })();
+                        let _ = done.send(result);
+                    }
                     Some(CodingRuntimeControl::TaskSpecs { generation: requested, session, args, done }) => {
                         let mutates=matches!(args.split_whitespace().next(),Some("pin"|"unpin"));
                         let mut result = if requested != generation || (mutates && (active_turn.is_some() || !pending_requests.is_empty())) { Err(RuntimeError::Busy) } else {
@@ -6537,7 +6625,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         generation: request_generation,
                         done,
                     }) => {
-                        if request_generation == generation { background_jobs.reset(generation); }
+                        if request_generation == generation { background_jobs.reset(generation); follow_up = None; }
                         if request_generation == generation {
                             goal_questions.close(resources.as_ref(), &mut pending_requests, &runtime_event_tx);
                         }
@@ -8927,6 +9015,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         let _ = done.send(Ok(()));
                     }
                     Some(CodingRuntimeControl::StartGoal { generation: request_generation, condition, images, done, recovery_tx }) => {
+                        if follow_up.is_some() { let _ = done.send(Err(RuntimeError::CommandRefused("clear the pending follow-up before starting goal/loop".into()))); continue; }
                         if let Err(error) = goal_checkpoints.available() { let _ = done.send(Err(error)); continue; }
                         if !native_protocol || request_generation != generation || compaction_suspended {
                             let _ = done.send(Err(RuntimeError::Busy));
@@ -9052,7 +9141,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         }
                     }
                     Some(CodingRuntimeControl::StopGoal { generation: request_generation, done }) => {
-                        if request_generation == generation { background_jobs.reset(generation); }
+                        if request_generation == generation { background_jobs.reset(generation); follow_up = None; }
                         if request_generation == generation {
                             goal_questions.close(resources.as_ref(), &mut pending_requests, &runtime_event_tx);
                         }
@@ -9095,6 +9184,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         let _ = done.send(goal_checkpoints.commit(&runtime_event_tx));
                     }
                     Some(CodingRuntimeControl::StartLoop { generation: request_generation, prompt, every, done, recovery_tx }) => {
+                        if follow_up.is_some() { let _ = done.send(Err(RuntimeError::CommandRefused("clear the pending follow-up before starting goal/loop".into()))); continue; }
                         if !native_protocol || request_generation != generation || compaction_suspended {
                             let _ = done.send(Err(RuntimeError::Busy));
                             continue;
@@ -9159,7 +9249,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         }
                     }
                     Some(CodingRuntimeControl::StopLoop { generation: request_generation, done }) => {
-                        if request_generation == generation { background_jobs.reset(generation); }
+                        if request_generation == generation { background_jobs.reset(generation); follow_up = None; }
                         if !native_protocol || request_generation != generation {
                             let _ = done.send(Err(RuntimeError::Unavailable));
                             continue;
@@ -9507,7 +9597,8 @@ fn spawn_runtime_owner_with_optional_agent(
                                 turn_stats.duration = turn_started_at
                                     .take()
                                     .map(|started| started.elapsed())
-                                    .unwrap_or_default();
+                                    .unwrap_or_default()
+                                    .saturating_add(std::mem::take(&mut follow_up_elapsed));
                                 if let Some(error) = resources.as_ref().and_then(|runtime| {
                                     runtime.parts.take_snapshot_persistence_uncertain()
                                 }) {
@@ -9787,6 +9878,36 @@ fn spawn_runtime_owner_with_optional_agent(
                                         let _ = runtime_event_tx.send(CodingRuntimeEvent::LoopChanged(state.progress()));
                                         if let Some(runtime) = resources.as_ref() { runtime.loop_active.store(false, Ordering::Release); }
                                         loop_state = None;
+                                    }
+                                    if follow_up.as_ref().is_some_and(|pending| pending.turn == Some(turn_id)) {
+                                        let pending = follow_up.take().expect("matched follow-up");
+                                        if completion_reason == StopReason::Stopped && goal.is_none() && loop_state.is_none()
+                                            && pending_requests.is_empty() && !controls.stop_now().is_cancelled()
+                                            && persistence_failure.is_none() && pending_policy_intervention.is_none()
+                                            && !background_jobs.uncollected() && agent_available
+                                        {
+                                            let text = format!("[Automatic follow-up / 自动后续任务 — user preset]\n{}", pending.prompt);
+                                            let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(text.clone()));
+                                            // This is a user-authored preset, not an autonomous reminder.
+                                            // Keep its automatic marker in the authoritative user message so
+                                            // history and per-turn execution restrictions retain its provenance.
+                                            if let Some(runtime) = resources.as_ref() {
+                                                runtime.parts.turn_execution_policy.update_from_user_text(&pending.prompt);
+                                            }
+                                            // Consume before dispatch: this continuation cannot schedule itself.
+                                            if send_agent_command(&agent, AgentCommand::SendMessage { text, images: Vec::new() }) {
+                                                follow_up_elapsed = stats.duration;
+                                                turn_stats = stats;
+                                                // Keep the original accepted operation open so all drivers,
+                                                // including headless, await the follow-up's real terminal.
+                                                continue;
+                                            }
+                                            agent_available = false;
+                                            completion_reason = StopReason::InternalError;
+                                        } else {
+                                            let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(
+                                                "Follow-up skipped / 后续任务未执行：task did not finish normally, or still has pending work.".into()));
+                                        }
                                     }
                                     active_turn = None;
                                     if completion_reason == StopReason::Stopped
@@ -10192,7 +10313,8 @@ fn reject_runtime_control_with_error(
         | CodingRuntimeControl::SwitchTool { done, .. } => {
             let _ = done.send(Err(error));
         }
-        CodingRuntimeControl::TaskSpecs { done, .. } => {
+        CodingRuntimeControl::TaskSpecs { done, .. }
+        | CodingRuntimeControl::FollowUp { done, .. } => {
             let _ = done.send(Err(error));
         }
         CodingRuntimeControl::ImportPatch { done, .. } => {
@@ -22422,6 +22544,174 @@ mod tests {
         );
 
         handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_peer_note_cannot_claim_a_pending_follow_up() {
+        let (handle, mut commands, events, mut runtime_events, _wake, _active, adapter) =
+            controller_test_runtime(Arc::new(GoalNotMetProviderFactory::default())).await;
+        handle
+            .follow_up(None, "set HUMAN_TASK_ONLY".into())
+            .await
+            .unwrap();
+        handle
+            .note("peer".into(), "peer finished".into())
+            .await
+            .unwrap();
+        assert!(commands.recv().await.is_some());
+        events.send(AgentEvent::TurnStarted { turn: None }).unwrap();
+        events
+            .send(AgentEvent::TurnComplete {
+                turn: None,
+                reason: StopReason::Stopped,
+                provider_failure: None,
+            })
+            .unwrap();
+        assert!(matches!(
+            commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        events
+            .send(AgentEvent::Snapshot {
+                snapshot: SessionSnapshot::new(vec![
+                    Message::synthetic_user("peer finished"),
+                    Message::assistant("noted", vec![]),
+                ]),
+            })
+            .unwrap();
+        loop {
+            if matches!(
+                tokio::time::timeout(std::time::Duration::from_secs(1), runtime_events.recv())
+                    .await
+                    .unwrap(),
+                Some(CodingRuntimeEvent::TurnFinished(_))
+            ) {
+                break;
+            }
+        }
+        let pending = handle.follow_up(None, "show".into()).await.unwrap();
+        assert_eq!(pending["prompt"], "HUMAN_TASK_ONLY");
+        assert_eq!(pending["current_task"], false);
+        assert!(commands.try_recv().is_err());
+        handle.submit(UserInput::from("human task")).await.unwrap();
+        assert!(commands.recv().await.is_some());
+        assert_eq!(
+            handle.follow_up(None, "show".into()).await.unwrap()["current_task"],
+            true
+        );
+        adapter.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn pending_follow_up_is_retired_on_cancel_replacement_and_new_user_input() {
+        let (handle, mut commands, events, _runtime_events, _wake, _active, adapter) =
+            controller_test_runtime(Arc::new(GoalNotMetProviderFactory::default())).await;
+        handle.follow_up(None, "set OLD".into()).await.unwrap();
+        assert!(handle.start_goal("conflict").await.is_err());
+        handle.cancel().await.unwrap();
+        assert!(handle.follow_up(None, "show".into()).await.unwrap()["prompt"].is_null());
+        handle.follow_up(None, "set OLD".into()).await.unwrap();
+        let (replacement, mut replacement_commands, _replacement_events) = fake_agent();
+        adapter.replace_agent(replacement).await.unwrap();
+        assert!(handle.follow_up(None, "show".into()).await.unwrap()["prompt"].is_null());
+        handle.submit(UserInput::from("first")).await.unwrap();
+        assert!(matches!(
+            replacement_commands.recv().await,
+            Some(AgentCommand::SendMessage { .. })
+        ));
+        handle.follow_up(None, "set OLD".into()).await.unwrap();
+        handle
+            .submit(UserInput::from("new human intent"))
+            .await
+            .unwrap();
+        assert!(handle.follow_up(None, "show".into()).await.unwrap()["prompt"].is_null());
+        drop(events);
+        while commands.try_recv().is_ok() {}
+        adapter.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn follow_up_is_one_shot_and_only_runs_after_a_normal_terminal() {
+        for reason in [
+            StopReason::Stopped,
+            StopReason::Cancelled,
+            StopReason::ProviderError,
+            StopReason::Timeout,
+            StopReason::MaxRounds,
+            StopReason::PromptRejected,
+        ] {
+            let (handle, mut commands, events, mut runtime_events, _wake, _active, adapter) =
+                controller_test_runtime(Arc::new(GoalNotMetProviderFactory::default())).await;
+            handle
+                .follow_up(None, "set PRESET_ONCE".into())
+                .await
+                .unwrap();
+            handle.submit(UserInput::from("original")).await.unwrap();
+            assert!(matches!(
+                commands.recv().await,
+                Some(AgentCommand::SendMessage { .. })
+            ));
+            events.send(AgentEvent::TurnStarted { turn: None }).unwrap();
+            events
+                .send(AgentEvent::TurnComplete {
+                    turn: None,
+                    reason,
+                    provider_failure: None,
+                })
+                .unwrap();
+            assert!(matches!(
+                commands.recv().await,
+                Some(AgentCommand::Snapshot)
+            ));
+            events
+                .send(AgentEvent::Snapshot {
+                    snapshot: SessionSnapshot::new(vec![
+                        Message::user("original"),
+                        Message::assistant("done", vec![]),
+                    ]),
+                })
+                .unwrap();
+            if reason == StopReason::Stopped {
+                assert!(
+                    matches!(commands.recv().await, Some(AgentCommand::SendMessage { text, .. }) if text.contains("PRESET_ONCE") && text.contains("Automatic follow-up"))
+                );
+                events.send(AgentEvent::TurnStarted { turn: None }).unwrap();
+                events
+                    .send(AgentEvent::TurnComplete {
+                        turn: None,
+                        reason: StopReason::Stopped,
+                        provider_failure: None,
+                    })
+                    .unwrap();
+                assert!(matches!(
+                    commands.recv().await,
+                    Some(AgentCommand::Snapshot)
+                ));
+                events
+                    .send(AgentEvent::Snapshot {
+                        snapshot: SessionSnapshot::new(vec![
+                            Message::user("original"),
+                            Message::assistant("follow-up done", vec![]),
+                        ]),
+                    })
+                    .unwrap();
+            }
+            loop {
+                if matches!(
+                    runtime_events.recv().await,
+                    Some(CodingRuntimeEvent::TurnFinished(_))
+                ) {
+                    break;
+                }
+            }
+            assert!(handle.follow_up(None, "show".into()).await.unwrap()["prompt"].is_null());
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(1), commands.recv())
+                    .await
+                    .is_err()
+            );
+            adapter.shutdown().await.unwrap();
+        }
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

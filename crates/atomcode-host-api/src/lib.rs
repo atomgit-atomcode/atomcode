@@ -29,6 +29,8 @@ use atomcode_kernel::session::SeqNo;
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum HostCommand {
+    /// Explicit user registration of a one-shot same-session follow-up.
+    FollowUp { session: String, args: String },
     /// Explicit user operations over original task specifications.
     TaskSpecs { session: String, args: String },
     /// Import explicit user file bytes without model or argv transport.
@@ -355,6 +357,7 @@ impl HostCommand {
             Self::NewSession { session }
             | Self::Resume { session, .. }
             | Self::TaskSpecs { session, .. }
+            | Self::FollowUp { session, .. }
             | Self::ImportPatch { session, .. }
             | Self::SetReasoningEffort { session, .. }
             | Self::Undo { session, .. }
@@ -428,6 +431,9 @@ pub struct PersonaInfo {
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum HostReply {
+    FollowUp {
+        value: serde_json::Value,
+    },
     /// Source list, full review or acknowledged retention state.
     TaskSpecs {
         value: serde_json::Value,
@@ -1791,6 +1797,7 @@ mod tests {
                 | HostCommand::SignIn { .. }
                 | HostCommand::WhoAmI { .. }
                 | HostCommand::TaskSpecs { .. }
+                | HostCommand::FollowUp { .. }
                 | HostCommand::ImportPatch { .. }
                 | HostCommand::Changes { .. }
                 | HostCommand::Providers { .. }
@@ -2096,6 +2103,7 @@ mod tests {
             match r {
                 HostReply::Done
                 | HostReply::TaskSpecs { .. }
+                | HostReply::FollowUp { .. }
                 | HostReply::PatchImported { .. }
                 | HostReply::DoneWithNote { .. }
                 | HostReply::SessionChanged { .. }
