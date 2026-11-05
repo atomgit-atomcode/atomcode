@@ -144,21 +144,32 @@ pub struct ModeSettingRow {
 }
 pub fn setting_rows(config: &Config) -> Vec<ModeSettingRow> {
     let zh = crate::i18n::current_locale() == crate::locale::Locale::ZhCn;
+    setting_rows_for(config, zh)
+}
+
+/// The same rows for a named language.
+///
+/// Split out from [`setting_rows`] so a test can read both languages in one run:
+/// `current_locale` is process-wide, and the two labels have to say the same
+/// thing for the same setting. The group name deliberately does not appear in a
+/// label — the panel already shows these rows together, so prefixing every one
+/// of them only repeats it four times.
+fn setting_rows_for(config: &Config, zh: bool) -> Vec<ModeSettingRow> {
     let choices = model_choices(config);
     let mut rows = Vec::new();
-    for (mode, binding) in [("plan", &config.modes.plan), ("build", &config.modes.build)] {
+    for (mode, name, binding) in [
+        ("plan", "Plan", &config.modes.plan),
+        ("build", "Build", &config.modes.build),
+    ] {
         let model_label = match (mode, zh) {
-            ("plan", true) => "Plan 模型（留空跟随当前）",
-            (_, true) => "Build 模型（留空恢复进入 Plan 前的选择）",
-            ("plan", false) => "Plan model (unset: follow current)",
-            _ => "Build model (unset: restore pre-Plan selection)",
+            ("plan", true) => "Plan 模型（留空跟随当前）".to_string(),
+            (_, true) => "Build 模型（留空恢复进入 Plan 前的选择）".to_string(),
+            ("plan", false) => "Plan model (unset: follow current)".to_string(),
+            _ => "Build model (unset: restore pre-Plan selection)".to_string(),
         };
         rows.push(ModeSettingRow {
             id: format!("modes.{mode}.model"),
-            label: format!(
-                "{} · {model_label}",
-                if zh { "模式与模型" } else { "Mode models" }
-            ),
+            label: model_label,
             value: binding.model.clone().unwrap_or_default(),
             options: std::iter::once(String::new())
                 .chain(choices.iter().map(|c| c.id.clone()))
@@ -183,9 +194,9 @@ pub fn setting_rows(config: &Config) -> Vec<ModeSettingRow> {
         rows.push(ModeSettingRow {
             id: format!("modes.{mode}.reasoning_effort"),
             label: if zh {
-                format!("模式与模型 · {mode} 思考强度（留空使用模型配置）")
+                format!("{name} 思考强度（留空使用模型配置）")
             } else {
-                format!("{mode} effort (unset: model profile)")
+                format!("{name} effort (unset: model profile)")
             },
             value: binding.reasoning_effort.clone().unwrap_or_default(),
             options,
@@ -391,5 +402,49 @@ reasoning_effort_levels = ["low", "high"]
         let json = serde_json::to_string(&model_choices(&cfg)).unwrap();
         assert!(!json.contains("private-"));
         assert!(!json.contains("api_key"));
+    }
+    #[test]
+    fn mode_setting_rows_do_not_repeat_the_group_and_agree_across_locales() {
+        let cfg = Config::default();
+        let zh = setting_rows_for(&cfg, true);
+        let en = setting_rows_for(&cfg, false);
+        let ids: Vec<&str> = zh.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "modes.plan.model",
+                "modes.plan.reasoning_effort",
+                "modes.build.model",
+                "modes.build.reasoning_effort",
+            ]
+        );
+        // One language may not drop a row the other keeps.
+        assert_eq!(
+            ids,
+            en.iter().map(|row| row.id.as_str()).collect::<Vec<_>>()
+        );
+        for row in zh.iter().chain(en.iter()) {
+            // The panel draws these four rows together; carrying the group name
+            // in every label only repeats it four times.
+            assert!(!row.label.contains("模式与模型"), "{}", row.label);
+            assert!(!row.label.contains("Mode models"), "{}", row.label);
+        }
+        // Same setting, same mode word, only the noun is translated.
+        for mode in ["Plan", "Build"] {
+            for (rows, model_word, effort_word) in
+                [(&zh, "模型（", "思考强度（"), (&en, "model (", "effort (")]
+            {
+                assert!(
+                    rows.iter()
+                        .any(|row| row.label.starts_with(&format!("{mode} {model_word}"))),
+                    "{mode} {model_word} missing"
+                );
+                assert!(
+                    rows.iter()
+                        .any(|row| row.label.starts_with(&format!("{mode} {effort_word}"))),
+                    "{mode} {effort_word} missing"
+                );
+            }
+        }
     }
 }
