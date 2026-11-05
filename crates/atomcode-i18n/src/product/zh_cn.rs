@@ -3,6 +3,8 @@ use std::borrow::Cow;
 
 pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
     match msg {
+        Msg::RecapTaskCounts { completed, active, pending } => format!("任务清单记录：已完成 {completed}，进行中 {active}，待办 {pending}。请与实际工作及测试结果核对。").into(),
+        Msg::RecapTasksUnavailable => "任务清单状态暂不可用，请核对后再判断完成情况。".into(),
         Msg::WelcomeBannerLine1 =>
             "欢迎使用 {brand}，请选择一项开始：".into(),
         Msg::WelcomeBannerLine2 =>

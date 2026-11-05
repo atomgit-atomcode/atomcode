@@ -3,6 +3,8 @@ use std::borrow::Cow;
 
 pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
     match msg {
+        Msg::RecapTaskCounts { completed, active, pending } => format!("Task list records: {completed} completed, {active} in progress, {pending} pending. Check these records against actual work and test results.").into(),
+        Msg::RecapTasksUnavailable => "Task-list state is unavailable; verify it before drawing completion conclusions.".into(),
         Msg::WelcomeBannerLine1 =>
             "Welcome to {brand}. Pick an option to get started:".into(),
         Msg::WelcomeBannerLine2 =>

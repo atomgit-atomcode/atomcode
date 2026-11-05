@@ -7358,3 +7358,60 @@ async fn quota_queries_follow_the_active_endpoint_even_when_model_names_match() 
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     runtime.handle.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn recap_uses_the_compacted_task_list_without_a_model_call() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+            .await
+            .unwrap();
+    plan_then_compact(&mut runtime).await;
+    let before = runtime.handle.snapshot().await.unwrap();
+    let calls = recorder.requests.lock().unwrap().len();
+    let text = runtime.handle.recap().await.unwrap().unwrap();
+    assert!(text.contains("#1: the first thing"), "{text}");
+    assert_eq!(
+        recorder.requests.lock().unwrap().len(),
+        calls,
+        "task counts must not be sampled from a model"
+    );
+    assert_eq!(
+        before.messages,
+        runtime.handle.snapshot().await.unwrap().messages,
+        "recap is read-only"
+    );
+    let manager = SessionManager::for_project(
+        env.project.path(),
+        &atomcode_coding::config::product_dirs_from_env(),
+    );
+    let id = runtime.session.as_ref().unwrap().id.clone();
+    std::fs::write(manager.todo_sidecar_path(&id).unwrap(), "broken").unwrap();
+    let unavailable = runtime.handle.recap().await.unwrap().unwrap();
+    assert_eq!(
+        unavailable,
+        atomcode_config::i18n::t(atomcode_config::i18n::Msg::RecapTasksUnavailable)
+    );
+    assert_eq!(recorder.requests.lock().unwrap().len(), calls);
+    runtime.handle.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_session_without_a_task_list_keeps_model_generated_recap() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+            .await
+            .unwrap();
+    turn(&mut runtime, "hello").await;
+    let before = recorder.requests.lock().unwrap().len();
+    assert!(runtime.handle.recap().await.unwrap().is_some());
+    assert_eq!(recorder.requests.lock().unwrap().len(), before + 1);
+    assert!(recorder
+        .last_request()
+        .iter()
+        .any(|message| message.text.contains("Write a recap")));
+    runtime.handle.shutdown().await.unwrap();
+}

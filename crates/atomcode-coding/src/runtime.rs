@@ -2816,21 +2816,24 @@ impl CodingRuntimeHandle {
     /// nothing worth saying, declined, or did not answer in time.
     ///
     /// Read off the conversation as it is now and never added to it: not a
-    /// fact in the log, not something the model reads back. The model is
-    /// asked for inside the loop (it is the loop's to know) and the request
-    /// runs here, outside it, so a slow side call holds nothing up.
+    /// fact in the log, not something the model reads back. The provider
+    /// and task state are captured against the snapshot revision inside the
+    /// loop. A model is used only when no task list is available; that request
+    /// runs outside the loop, so a slow side call holds nothing up.
     pub async fn recap(&self) -> Result<Option<String>, RuntimeError> {
         let state = self.state.load(Ordering::Acquire);
+        let snapshot = self.snapshot_with_revision().await?;
         let (done, result) = oneshot::channel();
         self.tx
             .send(CodingRuntimeControl::SideCallProvider {
+                revision: snapshot.revision,
+                messages: snapshot.snapshot.messages.clone(),
                 generation: runtime_state_generation(state),
                 done,
             })
             .map_err(|_| RuntimeError::Unavailable)?;
-        let provider = result.await.map_err(|_| RuntimeError::Unavailable)??;
-        let snapshot = self.snapshot().await?;
-        Ok(crate::recap::generate_recap(provider, &snapshot.messages).await)
+        let (provider, tasks) = result.await.map_err(|_| RuntimeError::Unavailable)??;
+        Ok(crate::recap::generate_recap(provider, &snapshot.snapshot.messages, tasks).await)
     }
 
     /// What the model can call right now, what the person turned off, and what
@@ -4084,11 +4087,15 @@ pub enum CodingRuntimeControl {
         generation: u64,
         done: oneshot::Sender<Result<Vec<atomcode_harness::seams::ToolListing>, RuntimeError>>,
     },
-    /// The model a side call (the recap) runs on — see [`side_call_provider`].
-    /// Answered at once; the call itself runs outside the loop.
+    /// Recap facts for one snapshot revision. Model calls, when needed, run
+    /// outside the loop; the existing task fold remains the authority.
     SideCallProvider {
         generation: u64,
-        done: oneshot::Sender<Result<Arc<dyn LlmProvider>, RuntimeError>>,
+        revision: u64,
+        messages: Vec<Message>,
+        done: oneshot::Sender<
+            Result<(Option<Arc<dyn LlmProvider>>, crate::recap::TaskState), RuntimeError>,
+        >,
     },
     SwitchTool {
         generation: u64,
@@ -7161,14 +7168,25 @@ fn spawn_runtime_owner_with_optional_agent(
                     }
                     Some(CodingRuntimeControl::SideCallProvider {
                         generation: request_generation,
+                        revision,
+                        messages,
                         done,
                     }) => {
-                        if request_generation != generation {
+                        if request_generation != generation || revision != conversation_revision || active_turn.is_some() {
                             let _ = done.send(Err(RuntimeError::Busy));
                             continue;
                         }
-                        let provider = resources.as_ref().and_then(side_call_provider);
-                        let _ = done.send(provider.ok_or(RuntimeError::Unavailable));
+                        let Some(runtime) = resources.as_ref() else {
+                            let _ = done.send(Err(RuntimeError::Unavailable));
+                            continue;
+                        };
+                        let tasks = crate::todo::recap_todos(&messages, runtime.parts.session.as_ref().map(|session| (session.manager.as_ref(), session.id.as_str())));
+                        let provider = if matches!(tasks, Ok(None)) { side_call_provider(runtime) } else { None };
+                        if matches!(tasks, Ok(None)) && provider.is_none() {
+                            let _ = done.send(Err(RuntimeError::Unavailable));
+                            continue;
+                        }
+                        let _ = done.send(Ok((provider, tasks)));
                     }
                     Some(CodingRuntimeControl::ToolCatalog {
                         generation: request_generation,

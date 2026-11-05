@@ -1,5 +1,11 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Msg<'a> {
+    RecapTaskCounts {
+        completed: usize,
+        active: usize,
+        pending: usize,
+    },
+    RecapTasksUnavailable,
     // WelcomeWizard
     WelcomeBannerLine1,
     WelcomeBannerLine2,

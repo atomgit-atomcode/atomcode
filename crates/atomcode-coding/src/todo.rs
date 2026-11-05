@@ -862,6 +862,30 @@ fn current_todos(
     })
 }
 
+/// Read-only recap projection. Preserve unknown/unavailable instead of inventing
+/// an empty list; a retained full plan does not need the sidecar at all.
+pub(crate) fn recap_todos(
+    messages: &[Message],
+    session: Option<(&SessionManager, &str)>,
+) -> crate::recap::TaskState {
+    let mut unavailable = false;
+    let current = current_todos(messages, || {
+        let (manager, id) = session?;
+        match manager.read_todo_sidecar(id) {
+            Ok(sidecar) => sidecar,
+            Err(_) => {
+                unavailable = true;
+                None
+            }
+        }
+    });
+    if unavailable {
+        Err(())
+    } else {
+        Ok(current.map(|current| current.items))
+    }
+}
+
 /// Informational resume display, using the same fold as the live task list.
 /// It neither changes task status nor asks the agent to execute anything.
 pub(crate) fn recovery_task_summary(

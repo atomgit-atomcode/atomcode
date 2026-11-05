@@ -2,7 +2,8 @@
 //! what is next — the `※ recap:` line a screen draws under a turn the person
 //! was away from, or that ran long.
 //!
-//! The same kind of request as the next-prompt guess
+//! Recorded task state is rendered deterministically. Without a task list,
+//! this uses the same kind of request as the next-prompt guess
 //! ([`crate::next_prompt_suggestion`]): stateless, no tools, never touches the
 //! conversation, and its answer is for the screen only — not a fact in the log
 //! and not something the model reads back.
@@ -10,12 +11,21 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use atomcode_capabilities::tools::todo::{TodoItem, TodoStatus};
+use atomcode_config::i18n::{t, Msg};
 use atomcode_kernel::message::Message;
 use atomcode_kernel::provider::LlmProvider;
+
+/// A projection of the existing task fold, not another task-state owner.
+pub(crate) type TaskState = Result<Option<Vec<TodoItem>>, ()>;
 
 use crate::next_prompt_suggestion::{
     is_structured_side_output, recent_stable_transcript, sample_side_call,
 };
+
+#[cfg(test)]
+#[path = "recap_live_eval.rs"]
+mod live_eval;
 
 /// Longer than the guess's: a recap reads more of the conversation and says
 /// two things, and nobody is waiting on it — the turn is already over.
@@ -37,9 +47,44 @@ Output only the plain-text recap, never JSON or a conversation record: no headin
 /// One recap of the conversation so far, or `None` when there is nothing to
 /// say, the model declined, or the request failed or timed out.
 pub(crate) async fn generate_recap(
-    provider: Arc<dyn LlmProvider>,
+    provider: Option<Arc<dyn LlmProvider>>,
     messages: &[Message],
+    tasks: TaskState,
 ) -> Option<String> {
+    match tasks {
+        Err(()) => return Some(t(Msg::RecapTasksUnavailable).into_owned()),
+        Ok(Some(items)) => {
+            let count = |status| items.iter().filter(|item| item.status == status).count();
+            let mut text = t(Msg::RecapTaskCounts {
+                completed: count(TodoStatus::Completed),
+                active: count(TodoStatus::InProgress),
+                pending: count(TodoStatus::Pending),
+            })
+            .into_owned();
+            if let Some((index, item)) = items
+                .iter()
+                .enumerate()
+                .find(|(_, item)| item.status == TodoStatus::InProgress)
+                .or_else(|| {
+                    items
+                        .iter()
+                        .enumerate()
+                        .find(|(_, item)| item.status == TodoStatus::Pending)
+                })
+            {
+                let label: String = item
+                    .content
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .take(60)
+                    .collect();
+                text.push_str(&format!(" #{}: {label}.", index + 1));
+            }
+            return Some(text.chars().take(MAX_RECAP_CHARS).collect());
+        }
+        Ok(None) => {}
+    }
+    let provider = provider?;
     let transcript = recent_stable_transcript(messages)?;
     let prompt = format!("{INSTRUCTIONS}\n\nConversation records (JSON Lines):\n{transcript}");
     let sample = sample_side_call(provider, prompt, SAMPLE_TIMEOUT, "recap").await?;
@@ -109,6 +154,55 @@ pub(crate) fn sanitize_recap(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn task_records_override_false_completion_prose_without_a_provider() {
+        let items = (0..18)
+            .map(|i| TodoItem {
+                content: if i == 1 {
+                    "<none>\ncurrent task".into()
+                } else {
+                    "pending task".into()
+                },
+                status: if i == 1 {
+                    TodoStatus::InProgress
+                } else {
+                    TodoStatus::Pending
+                },
+            })
+            .collect();
+        let history = vec![Message::assistant(
+            "All tasks are complete. Nothing is pending.",
+            vec![],
+        )];
+        let text = generate_recap(None, &history, Ok(Some(items)))
+            .await
+            .unwrap();
+        assert!(
+            text.starts_with(&*t(Msg::RecapTaskCounts {
+                completed: 0,
+                active: 1,
+                pending: 17
+            })),
+            "{text}"
+        );
+        assert!(text.contains("#2: <none>current task"));
+        assert!(!text.contains("All tasks are complete"));
+        assert!(text.chars().count() <= MAX_RECAP_CHARS);
+        assert!(generate_recap(None, &history, Ok(None)).await.is_none());
+        assert_eq!(
+            generate_recap(None, &history, Err(())).await.unwrap(),
+            t(Msg::RecapTasksUnavailable)
+        );
+        let empty = generate_recap(None, &history, Ok(Some(vec![])))
+            .await
+            .unwrap();
+        assert!(empty.starts_with(&*t(Msg::RecapTaskCounts {
+            completed: 0,
+            active: 0,
+            pending: 0
+        })));
+    }
 
     #[test]
     fn a_recap_is_one_clean_line() {
