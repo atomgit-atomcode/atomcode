@@ -2371,6 +2371,17 @@ pub enum Msg<'a> {
     PersonaNotAppended,
     PersonaAppendUnknown,
     PersonaUnavailable,
+    FollowUpAbout,
+    FollowUpNew {
+        id: &'a str,
+        spec: &'a str,
+    },
+    FollowUpPending {
+        prompt: &'a str,
+    },
+    FollowUpNone,
+    FollowUpCleared,
+    FollowUpLeadOnly,
     /// The row under an empty composer offering what might be said next. It
     /// names the key, because a dim line with no key on it reads as a label.
     ComposerSuggested {

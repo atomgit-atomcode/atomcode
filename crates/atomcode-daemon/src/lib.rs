@@ -7744,6 +7744,10 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/live/mcp/trust", post(live_api::live_mcp_trust))
         .route("/command", post(commands::run_command))
         .route(
+            "/live/followup",
+            post(live_api::live_follow_up).layer(DefaultBodyLimit::max(128 * 1024)),
+        )
+        .route(
             "/live/persona",
             post(live_api::live_persona).layer(DefaultBodyLimit::max(4096)),
         )

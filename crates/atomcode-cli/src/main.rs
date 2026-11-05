@@ -594,6 +594,12 @@ const BIN_NAME: &str = env!("CARGO_BIN_NAME");
         .multiple(false)
 ))]
 struct Cli {
+    /// Run this preset once after the main task normally finishes, in the same session
+    #[arg(long, value_name = "PROMPT")]
+    follow_up: Option<String>,
+    /// Launch a one-shot new-session follow-up using a UTF-8 JSON specification
+    #[arg(long, value_name = "PATH", conflicts_with = "follow_up")]
+    follow_up_new_file: Option<PathBuf>,
     /// Replace the coding persona only; retain tool and project instructions
     #[arg(long, conflicts_with = "system_prompt_file")]
     system_prompt: Option<String>,
@@ -1583,9 +1589,12 @@ async fn run(process_start: std::time::Instant) -> Result<i32> {
     let cli = Cli::parse();
     let prompt_overrides = resolve_prompt_overrides(&cli)?;
     if cli.command.is_some()
-        && (prompt_overrides.replace.is_some() || prompt_overrides.append.is_some())
+        && (prompt_overrides.replace.is_some()
+            || prompt_overrides.append.is_some()
+            || cli.follow_up.is_some()
+            || cli.follow_up_new_file.is_some())
     {
-        anyhow::bail!("Root system-prompt flags apply to the main coding agent; use subcommand-specific options where available");
+        anyhow::bail!("Root prompt/follow-up flags apply to the main coding agent; use subcommand-specific options where available");
     }
     // OS schedulers do not inherit a terminal's custom product home. Resolve
     // that explicit host input before loading config, auth or session services.
@@ -1593,8 +1602,13 @@ async fn run(process_start: std::time::Instant) -> Result<i32> {
         store: Some(root), ..
     })) = &cli.command
     {
-        if !root.is_absolute() || root.file_name().and_then(|s| s.to_str()) != Some("schedules") {
-            anyhow::bail!("--store must be an absolute schedules directory");
+        if !root.is_absolute()
+            || !matches!(
+                root.file_name().and_then(|s| s.to_str()),
+                Some("schedules" | "followups")
+            )
+        {
+            anyhow::bail!("--store must be an absolute schedules or followups directory");
         }
         let home = root
             .parent()
@@ -2485,6 +2499,27 @@ async fn run(process_start: std::time::Instant) -> Result<i32> {
         Some(&review_home),
     )
     .await?;
+    if let Some(path) = &cli.follow_up_new_file {
+        use anyhow::Context;
+        let file = std::fs::File::open(path).context("cannot open follow-up specification")?;
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        file.take(128 * 1024 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > 128 * 1024 {
+            anyhow::bail!("follow-up specification exceeds 128 KiB");
+        }
+        let json = String::from_utf8(bytes).context("follow-up specification must be UTF-8")?;
+        native_runtime
+            .handle
+            .follow_up(None, format!("new {json}"))
+            .await?;
+    }
+    if let Some(prompt) = &cli.follow_up {
+        native_runtime
+            .handle
+            .follow_up(None, format!("set {prompt}"))
+            .await?;
+    }
     // The active session id (fresh or resumed) for the on-exit resume hint,
     // captured before the runtime is moved into the headless/TUI arms below.
     // `None` for an ephemeral run (no persisted session → nothing to resume).
@@ -3331,7 +3366,7 @@ pub(crate) async fn run_native_headless(
     let (code, text, _diagnostic) = run_native_headless_detailed(
         notifications_cfg,
         runtime,
-        prompt,
+        (prompt, None),
         provider_name,
         model_name,
         verbose,
@@ -3349,7 +3384,7 @@ pub(crate) async fn run_native_headless(
 pub(crate) async fn run_native_headless_detailed(
     notifications_cfg: atomcode_config::config::NotificationConfig,
     runtime: atomcode_coding::CodingRuntime,
-    prompt: String,
+    prompt: (String, Option<String>),
     provider_name: String,
     model_name: String,
     verbose: bool,
@@ -3419,7 +3454,10 @@ pub(crate) async fn run_native_headless_detailed(
         return Err(anyhow::Error::new(error));
     }
     let started = std::time::Instant::now();
-    if let Err(error) = handle.submit(UserInput::from(prompt)).await {
+    if let Err(error) = handle
+        .submit_with_context(UserInput::from(prompt.0), prompt.1)
+        .await
+    {
         if jsonl {
             let message = error.to_string();
             write_headless_json_event(&headless_json::HeadlessEvent::Error {
@@ -5269,6 +5307,44 @@ mod tests {
         DEFAULT_LOG_DIRECTIVES,
     };
     use clap::Parser;
+
+    #[test]
+    fn headless_follow_up_is_a_literal_user_preset() {
+        let cli = Cli::try_parse_from([
+            "atomcode",
+            "-p",
+            "original",
+            "--follow-up",
+            "Review once\n保留原文",
+        ])
+        .unwrap();
+        assert_eq!(cli.follow_up.as_deref(), Some("Review once\n保留原文"));
+        assert_eq!(cli.prompt.as_deref(), Some("original"));
+    }
+
+    #[test]
+    fn headless_new_session_follow_up_rejects_ambiguous_modes() {
+        let cli = Cli::try_parse_from([
+            "atomcode",
+            "-p",
+            "task",
+            "--follow-up-new-file",
+            "next.json",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.follow_up_new_file.as_deref(),
+            Some(std::path::Path::new("next.json"))
+        );
+        assert!(Cli::try_parse_from([
+            "atomcode",
+            "--follow-up",
+            "same",
+            "--follow-up-new-file",
+            "next.json"
+        ])
+        .is_err());
+    }
 
     #[test]
     fn coding_prompt_flags_preserve_bytes_and_reject_conflicts_or_bad_files() {

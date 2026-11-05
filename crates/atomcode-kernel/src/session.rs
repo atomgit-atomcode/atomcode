@@ -116,6 +116,8 @@ pub enum NoticeKind {
     /// A team member the resumed lead had and had not stopped could not be
     /// brought back. `detail` names it and why.
     MemberNotRestored,
+    /// A newly owned session contained an unfinished turn from a previous runtime.
+    SessionInterrupted,
 }
 
 /// Where a [`NoticeKind::ProviderRetry`] stands, as numbers a screen can say in
@@ -182,6 +184,15 @@ pub enum SessionEvent {
         round: u32,
         delta: String,
         reasoning: bool,
+    },
+    /// Incremental recovery data, never rendered or sent to a model directly.
+    /// A new attempt resets the previous preview; completed messages supersede it.
+    ReplyCheckpoint {
+        turn: u64,
+        round: u32,
+        text: String,
+        reasoning: String,
+        reset: bool,
     },
     /// Transient UI boundary, never written to a session file.
     ReasoningDiscarded {
@@ -399,8 +410,9 @@ pub enum SessionEvent {
     /// Chunks are not kept on disk, so without this the part of the answer the
     /// person had already read would be gone from a resumed session — and from
     /// the model, which is told it was interrupted without being told where.
-    /// Committed just before [`SessionEvent::Interrupted`], only for a person's
-    /// cancel and only when something had arrived. A kept turn shows the model
+    /// Committed just before [`SessionEvent::Interrupted`] on a person's cancel,
+    /// or from saved checkpoints when recovering an abnormally ended runtime,
+    /// and only when something had arrived. A kept turn shows the model
     /// its text as an assistant message ahead of the interruption note; the
     /// reasoning stays in the log for a screen, never in a request (an unsigned
     /// thinking block is one some providers refuse), and a tool call that had
@@ -479,6 +491,7 @@ impl SessionEvent {
             | Self::StepStart { turn, .. }
             | Self::StepEnd { turn, .. }
             | Self::RequestHeader { turn, .. }
+            | Self::ReplyCheckpoint { turn, .. }
             | Self::AssistantChunk { turn, .. }
             | Self::ReasoningDiscarded { turn, .. }
             | Self::AssistantMessage { turn, .. }
@@ -588,7 +601,9 @@ impl SessionEvent {
 /// append facts of a kind added since. A reader that meets a kind it does not
 /// know treats the file as newer than itself, the same refusal.
 /// **14** — explicit original-context retention decisions.
-pub const SESSION_FORMAT_VERSION: u32 = 14;
+/// **15** — incremental reply checkpoints and SessionInterrupted notices for
+/// recovery after an abnormal exit.
+pub const SESSION_FORMAT_VERSION: u32 = 15;
 
 /// One replacement a [`SessionEvent::MessagesRewritten`] makes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

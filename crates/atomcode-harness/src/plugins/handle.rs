@@ -442,7 +442,8 @@ impl Projector {
                     }
                     crate::session::NoticeKind::CompactionDegraded
                     | crate::session::NoticeKind::ConfigSkipped
-                    | crate::session::NoticeKind::MemberNotRestored => {
+                    | crate::session::NoticeKind::MemberNotRestored
+                    | crate::session::NoticeKind::SessionInterrupted => {
                         AgentEvent::Warning(detail.clone())
                     }
                 }]

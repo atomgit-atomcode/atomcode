@@ -1435,6 +1435,23 @@ impl LiveViewHub {
             .map_err(|_| HubError::RuntimeUnavailable)
     }
 
+    pub async fn follow_up(
+        &self,
+        session: String,
+        args: String,
+    ) -> Result<serde_json::Value, HubError> {
+        let (binding, handle) = self.bound_handle()?;
+        if binding.session_id != session {
+            return Err(HubError::RuntimeUnavailable);
+        }
+        let result = handle
+            .follow_up(Some(session), args)
+            .await
+            .map_err(|e| HubError::RuntimeRejected(e.to_string()))?;
+        self.bound_handle_for(&binding)?;
+        Ok(result)
+    }
+
     pub async fn persona(
         &self,
         session: String,

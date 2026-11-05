@@ -734,3 +734,98 @@ async fn configured_personas_follow_models_and_explicit_overrides_survive_rebuil
     assert!(system.contains(PROJECT_MARK));
     stop(runtime).await;
 }
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_user_preset_follow_up_runs_once_in_the_same_conversation() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime = env.started(&recorder, other_product()).await;
+    let session = runtime.session.clone().unwrap().id;
+    let first = runtime
+        .handle
+        .follow_up(Some(session.clone()), "set CHECK_ONCE 原文".into())
+        .await
+        .unwrap();
+    assert_eq!(first["prompt"], "CHECK_ONCE 原文");
+    assert!(runtime
+        .handle
+        .follow_up(Some("another-session".into()), "clear".into())
+        .await
+        .is_err());
+    assert!(runtime
+        .handle
+        .follow_up(Some(session.clone()), "set   ".into())
+        .await
+        .is_err());
+    turn(&mut runtime, "original task").await;
+    let messages = recorder.last();
+    let followups: Vec<_> = messages
+        .iter()
+        .filter(|m| {
+            m.role == Role::User
+                && m.text.contains("Automatic follow-up")
+                && m.text.contains("CHECK_ONCE 原文")
+        })
+        .collect();
+    assert_eq!(followups.len(), 1);
+    assert!(followups[0].text.contains("Automatic follow-up"));
+    assert_eq!(runtime.session.as_ref().unwrap().id, session);
+    assert!(runtime
+        .handle
+        .follow_up(Some(session.clone()), "show".into())
+        .await
+        .unwrap()["prompt"]
+        .is_null());
+    turn(&mut runtime, "another task").await;
+    assert_eq!(
+        recorder
+            .last()
+            .iter()
+            .filter(|m| m.role == Role::User
+                && m.text.contains("Automatic follow-up")
+                && m.text.contains("CHECK_ONCE 原文"))
+            .count(),
+        1
+    );
+    runtime
+        .handle
+        .follow_up(Some(session.clone()), "set NEVER_RUN".into())
+        .await
+        .unwrap();
+    runtime
+        .handle
+        .follow_up(Some(session), "clear".into())
+        .await
+        .unwrap();
+    turn(&mut runtime, "after clear").await;
+    assert!(!recorder.last().iter().any(|m| m.text.contains("NEVER_RUN")));
+    stop(runtime).await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_follow_up_applies_the_presets_execution_restrictions() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    recorder.steps.lock().unwrap().push_back(vec![
+        StreamEvent::TextDelta("original task done".into()),
+        StreamEvent::Done { truncated: false },
+    ]);
+    recorder.call("bash", json!({"command":"echo FOLLOWUP_MUST_NOT_EXECUTE"}));
+    let mut runtime = env.started(&recorder, other_product()).await;
+    runtime
+        .handle
+        .follow_up(
+            None,
+            "set Do not run any commands. Only review the explanation.".into(),
+        )
+        .await
+        .unwrap();
+    let results = turn(&mut runtime, "original task").await;
+    assert!(
+        results
+            .iter()
+            .any(|result| result.is_error && result.content.contains("execution restriction")),
+        "{results:?}"
+    );
+    stop(runtime).await;
+}

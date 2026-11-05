@@ -934,3 +934,10 @@ pub async fn persona(
 ) -> Result<Option<atomcode_coding::runtime::RuntimePersonaInfo>, crate::live_hub::HubError> {
     hub().persona(session).await
 }
+
+pub async fn follow_up(
+    session: String,
+    args: String,
+) -> Result<serde_json::Value, crate::live_hub::HubError> {
+    hub().follow_up(session, args).await
+}

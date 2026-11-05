@@ -1191,6 +1191,12 @@ pub fn automation_agent_config(
     cfg: &atomcode_coding::CodingRuntimeConfig,
 ) -> atomcode_coding::CodingAgentConfig {
     let mut agent = cfg.agent_config();
+    agent.follow_up_service = Some(std::sync::Arc::new(
+        atomcode_schedule::service::Service::new(
+            atomcode_schedule::Store::new(cfg.dirs.user().join("followups")),
+            None,
+        ),
+    ));
     if cfg.interactive {
         agent.automation = Some(std::sync::Arc::new(
             atomcode_schedule::service::Service::system(cfg.dirs.user().join("schedules")),

@@ -464,6 +464,7 @@ dependencies = [
  "atomcode-kernel",
  "atomcode-plexus",
  "atomcode-review",
+ "atomcode-schedule",
  "atomcode-telemetry",
  "chrono",
  "ctor",

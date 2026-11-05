@@ -87,6 +87,7 @@ export const FRONTEND_COMMANDS: SlashCommandDef[] = [
     run: (a, h) => (a ? h.execServerCommand('forget', a) : h.notice(h.t('cmd.forget.needArg'))),
   },
   { name: 'memory', descKey: 'cmd.memory.desc', run: (a, h) => h.execServerCommand('memory', a) },
+  { name: 'followup', descKey: 'cmd.followup.desc', run: (a, h) => h.execServerCommand('followup', a) },
   { name: 'context', descKey: 'cmd.context.desc', run: (a, h) => h.execServerCommand('context', a) },
   { name: 'compact', descKey: 'cmd.compact.desc', argHint: '[focus]', run: (a, h) => h.execServerCommand('compact', a) },
   { name: 'whoami', descKey: 'cmd.whoami.desc', run: (a, h) => h.execServerCommand('whoami', a) },

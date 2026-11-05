@@ -4011,3 +4011,21 @@ pub(crate) async fn live_persona(Json(req): Json<PersonaReq>) -> axum::response:
             .into_response(),
     }
 }
+
+#[derive(serde::Deserialize)]
+pub(crate) struct FollowUpReq {
+    session_id: String,
+    args: String,
+}
+
+pub(crate) async fn live_follow_up(Json(req): Json<FollowUpReq>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match crate::native_live::follow_up(req.session_id, req.args).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => (
+            axum::http::StatusCode::CONFLICT,
+            Json(serde_json::json!({"error":format!("{error:?}")})),
+        )
+            .into_response(),
+    }
+}

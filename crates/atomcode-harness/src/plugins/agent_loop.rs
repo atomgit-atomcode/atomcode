@@ -317,6 +317,75 @@ impl PluginAgentLoop {
     }
 }
 
+/// Recovery checkpoints are incremental, so a long reply is written at most
+/// twice (checkpoint plus completed message), never as quadratic full snapshots.
+struct ReplyCheckpointBuffer<'a> {
+    ctx: &'a Context,
+    session: &'a SessionLog,
+    turn: u64,
+    round: u32,
+    text: String,
+    reasoning: String,
+    deadline: tokio::time::Instant,
+}
+
+impl<'a> ReplyCheckpointBuffer<'a> {
+    fn new(ctx: &'a Context, session: &'a SessionLog, turn: u64, round: u32) -> Self {
+        crate::session::commit(
+            ctx,
+            session,
+            SessionEvent::ReplyCheckpoint {
+                turn,
+                round,
+                text: String::new(),
+                reasoning: String::new(),
+                reset: true,
+            },
+        );
+        Self {
+            ctx,
+            session,
+            turn,
+            round,
+            text: String::new(),
+            reasoning: String::new(),
+            deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        }
+    }
+
+    fn pending(&self) -> bool {
+        !self.text.is_empty() || !self.reasoning.is_empty()
+    }
+
+    fn observe(&mut self, event: &StreamEvent) {
+        match event {
+            StreamEvent::TextDelta(text) => self.text.push_str(text),
+            StreamEvent::Reasoning(text) => self.reasoning.push_str(text),
+            _ => return,
+        }
+        if self.text.len() + self.reasoning.len() >= 16 * 1024 {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.pending() {
+            crate::session::commit(
+                self.ctx,
+                self.session,
+                SessionEvent::ReplyCheckpoint {
+                    turn: self.turn,
+                    round: self.round,
+                    text: std::mem::take(&mut self.text),
+                    reasoning: std::mem::take(&mut self.reasoning),
+                    reset: false,
+                },
+            );
+        }
+        self.deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+    }
+}
+
 /// Drive one provider stream to completion, logging chunks as they arrive.
 ///
 /// Chunks are logged verbatim, not re-rendered from the finished message: a
@@ -366,6 +435,18 @@ async fn stream_once(
             ctx,
             session,
             SessionEvent::ReasoningDiscarded { turn, round },
+        );
+        // A failed reasoning-loop attempt must never be revived after a crash.
+        crate::session::commit(
+            ctx,
+            session,
+            SessionEvent::ReplyCheckpoint {
+                turn,
+                round,
+                text: String::new(),
+                reasoning: String::new(),
+                reset: true,
+            },
         );
         if let Some(usage) = discarded.usage {
             crate::session::commit(ctx, session, SessionEvent::Usage { turn, round, usage });
@@ -442,6 +523,7 @@ async fn stream_attempt(
     }
     let mut options = options;
     options.rate_limit_retry_owner = atomcode_kernel::provider::RateLimitRetryOwner::Kernel;
+    let mut checkpoint = ReplyCheckpointBuffer::new(ctx, session, turn, round);
     let mut stream = provider
         .chat_stream(messages, tools, &options)
         .await
@@ -454,7 +536,14 @@ async fn stream_attempt(
     );
     let mut watchdog = atomcode_capabilities::provider::StreamWatchdog::new(first_content, idle);
     loop {
-        let next = match watchdog.next(&mut stream).await {
+        let next = tokio::select! {
+            result = watchdog.next(&mut stream) => result,
+            _ = tokio::time::sleep_until(checkpoint.deadline), if checkpoint.pending() => {
+                checkpoint.flush();
+                continue;
+            }
+        };
+        let next = match next {
             Ok(next) => next,
             // Silence is not an answer. Retryable, and carrying what already
             // streamed, so recovery can keep it.
@@ -490,6 +579,7 @@ async fn stream_attempt(
         if guard.observe(&event) {
             return Err(StreamAttemptError::ReasoningLoop(out));
         }
+        checkpoint.observe(&event);
         match event {
             StreamEvent::TextDelta(text) => {
                 // Through the one write path like every other fact. A chunk
@@ -1416,6 +1506,46 @@ mod content_deadline_tests {
         .await
     }
     #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn streamed_progress_is_checkpointed_during_silence_before_a_turn_finishes() {
+        let app = atomcode_plexus::App::new(
+            atomcode_plexus::PluginRegistry::new(),
+            atomcode_plexus::ConfigTree::from_layers(Vec::new()).unwrap(),
+        );
+        let ctx = app.context();
+        let log = SessionLog::new("crash-test");
+        let provider = TimedProvider(vec![
+            (0, StreamEvent::TextDelta("已检查文件".into())),
+            (60, StreamEvent::TextDelta("later".into())),
+        ]);
+        let retried = std::sync::atomic::AtomicBool::new(false);
+        let request = stream_once(
+            &provider,
+            &ctx,
+            &log,
+            1,
+            1,
+            vec![],
+            vec![],
+            ChatOptions::default(),
+            Some(Duration::from_secs(120)),
+            None,
+            &retried,
+        );
+        tokio::pin!(request);
+        tokio::select! {
+            result = &mut request => panic!("request ended prematurely: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+        }
+        assert!(log.events().iter().any(|event| matches!(&event.event,
+            SessionEvent::ReplyCheckpoint { text, reset: false, .. } if text == "已检查文件")));
+        assert!(
+            log.derive_messages().is_empty(),
+            "preview data never enters a live request"
+        );
+        // Dropping the request models a runtime disappearing without TurnEnd.
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn first_content_after_two_minutes_is_not_abandoned() {
         let out = run(&TimedProvider(vec![(
             200,
@@ -1602,8 +1732,10 @@ mod content_deadline_tests {
         assert!(out.text.is_empty() && out.reasoning.is_empty());
         assert_eq!(out.tool_calls.len(), 1);
         assert!(
-            log.events().is_empty(),
-            "observational arguments must never be persisted as assistant text"
+            log.events().iter().all(|event| matches!(&event.event,
+                SessionEvent::ReplyCheckpoint { text, reasoning, reset: true, .. }
+                    if text.is_empty() && reasoning.is_empty())),
+            "only an empty attempt boundary may be persisted, never tool argument fragments"
         );
     }
     #[tokio::test(flavor = "current_thread", start_paused = true)]

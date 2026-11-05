@@ -109,6 +109,16 @@ impl Store {
             store
                 .create_event_session(&lease, &header, &meta)
                 .map_err(|e| e.to_string())?;
+        } else if store
+            .recover_interrupted_turn(&lease)
+            .map_err(|e| e.to_string())?
+        {
+            // AgentCreated runs before a restored member can execute. Its
+            // lease has just been acquired; refresh the seed from the log so
+            // the next commit uses the sequence after the recovery facts.
+            agent
+                .session()
+                .restore(store.load_events(&id).map_err(|e| e.to_string())?);
         }
         self.delegated
             .lock()

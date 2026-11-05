@@ -3841,6 +3841,118 @@ async fn cancel_hanging_turn(runtime: &mut CodingRuntime, recorder: &Recorder) {
     }
 }
 
+/// A cold resume closes the abandoned turn without dispatching any request or
+/// repeating a tool, and the next prompt sees the last saved work.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(engine)]
+async fn a_cold_resume_recovers_abandoned_progress_before_the_next_request() {
+    use atomcode_kernel::session::{LoggedEvent, SessionEvent};
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let runtime = CodingRuntime::start(production_start(env.project.path(), &recorder, |_| {}))
+        .await
+        .unwrap();
+    let id = runtime.session.clone().unwrap().id;
+    runtime.handle.shutdown().await.unwrap();
+    let manager = SessionManager::for_project(
+        env.project.path(),
+        &atomcode_coding::config::product_dirs_from_env(),
+    );
+    let lease = manager.acquire_lease(&id).unwrap();
+    let seq = manager
+        .load_events(&id)
+        .unwrap()
+        .last()
+        .map_or(1, |e| e.seq + 1);
+    let events = vec![
+        SessionEvent::TurnStart { turn: 1 },
+        SessionEvent::UserMessage {
+            turn: 1,
+            text: "repair interrupted work".into(),
+            images: vec![],
+        },
+        SessionEvent::AssistantMessage {
+            turn: 1,
+            round: 1,
+            text: "checking".into(),
+            reasoning: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "uncertain-tool".into(),
+                name: "bash".into(),
+                arguments: r#"{"command":"echo should-not-run"}"#.into(),
+            }],
+            reasoning_blocks: vec![],
+            meta: None,
+        },
+        SessionEvent::ReplyCheckpoint {
+            turn: 1,
+            round: 2,
+            text: "last saved progress".into(),
+            reasoning: "unsigned private thought".into(),
+            reset: true,
+        },
+    ];
+    manager
+        .append_events(
+            &lease,
+            &events
+                .into_iter()
+                .enumerate()
+                .map(|(i, event)| LoggedEvent {
+                    seq: seq + i as u64,
+                    at: 10,
+                    event,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    drop(lease);
+    let mut resumed =
+        CodingRuntime::start(production_start(env.project.path(), &recorder, |start| {
+            start.prepare.session = SessionMode::Resume(id.clone());
+        }))
+        .await
+        .unwrap();
+    assert!(
+        recorder.requests.lock().unwrap().is_empty(),
+        "resume must not generate or repeat work automatically"
+    );
+    assert!(manager
+        .load_events(&id)
+        .unwrap()
+        .iter()
+        .any(|e| matches!(e.event, SessionEvent::TurnEnd { turn: 1, .. })));
+    resumed.handle.reload_capabilities().await.unwrap();
+    assert_eq!(
+        manager
+            .load_events(&id)
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.event, SessionEvent::PartialReply { .. }))
+            .count(),
+        1
+    );
+    turn(&mut resumed, "continue after verifying the state").await;
+    let seen = recorder.last_request();
+    assert!(
+        seen.iter()
+            .any(|m| m.role == Role::Assistant && m.text == "last saved progress"),
+        "{seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .any(|m| m.role == Role::Tool && m.text.contains("outcome is unknown")),
+        "{seen:?}"
+    );
+    assert!(!seen
+        .iter()
+        .any(|m| m.text.contains("unsigned private thought")
+            || m.reasoning
+                .as_deref()
+                .is_some_and(|r| r.contains("unsigned private thought"))));
+    resumed.handle.shutdown().await.unwrap();
+}
+
 /// A reply the person stopped part way is kept as far as it got
 /// (`docs/adr/0024` §8–9), though chunks are not.
 ///
@@ -4542,6 +4654,45 @@ async fn a_team_is_kept_and_comes_back_with_its_lead() {
     );
     runtime.handle.shutdown().await.unwrap();
     assert!(!in_use(&store, &scout), "its lease went with the runtime");
+    // Simulate a member whose process vanished during its next reply.
+    let previous = store.load_events(&scout).unwrap();
+    let scout_turns = turns_ended(&previous);
+    let abandoned = previous.iter().map(|e| e.event.turn()).max().unwrap_or(0) + 1;
+    let seq = previous.last().map_or(1, |e| e.seq + 1);
+    let lease = store.acquire_lease(&scout).unwrap();
+    store
+        .append_events(
+            &lease,
+            &[
+                atomcode_kernel::session::LoggedEvent {
+                    seq,
+                    at: 10,
+                    event: atomcode_kernel::session::SessionEvent::TurnStart { turn: abandoned },
+                },
+                atomcode_kernel::session::LoggedEvent {
+                    seq: seq + 1,
+                    at: 10,
+                    event: atomcode_kernel::session::SessionEvent::UserMessage {
+                        turn: abandoned,
+                        text: "continue member work".into(),
+                        images: vec![],
+                    },
+                },
+                atomcode_kernel::session::LoggedEvent {
+                    seq: seq + 2,
+                    at: 10,
+                    event: atomcode_kernel::session::SessionEvent::ReplyCheckpoint {
+                        turn: abandoned,
+                        round: 1,
+                        text: "scout saved progress".into(),
+                        reasoning: String::new(),
+                        reset: true,
+                    },
+                },
+            ],
+        )
+        .unwrap();
+    drop(lease);
 
     let mut resumed = CodingRuntime::start(production_start(project, &recorder, |start| {
         start.prepare.session = SessionMode::Resume(id.clone());
@@ -4559,9 +4710,11 @@ async fn a_team_is_kept_and_comes_back_with_its_lead() {
         "the scout came back and holds its log"
     );
     assert!(!in_use(&store, &mapper), "the stopped one did not");
+    assert!(store.load_events(&scout).unwrap().iter().any(|e| matches!(&e.event,
+        atomcode_kernel::session::SessionEvent::PartialReply { text, .. } if text == "scout saved progress")));
     turn(&mut resumed, "tell the scout").await;
     stored_until(&store, &scout, "ran a turn after the resume", |e| {
-        turns_ended(e) >= 2
+        turns_ended(e) >= scout_turns + 2
     })
     .await;
     resumed.handle.shutdown().await.unwrap();

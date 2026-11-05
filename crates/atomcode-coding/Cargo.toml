@@ -62,6 +62,7 @@ serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
 
 [dev-dependencies]
+atomcode-schedule = { path = "../atomcode-schedule", default-features = false, features = ["model-tools"] }
 # in-memory capturing Telemetry for the TelemetryHook test.
 atomcode-telemetry = { path = "../atomcode-telemetry", features = ["test-util"] }
 # Enable reset_offline_verdict_for_test() for offline-gate tests.

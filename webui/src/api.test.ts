@@ -759,3 +759,20 @@ test('persona inspection scopes the live read and propagates a stale-session rej
     await assert.rejects(getLivePersona('session-b'));
   } finally { globalThis.fetch = originalFetch; }
 });
+
+test('follow-up management scopes the explicit preset to its session', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls: unknown[] = [];
+  globalThis.fetch = (async (url, init) => {
+    assert.equal(String(url), '/live/followup');
+    calls.push(JSON.parse(String(init?.body)));
+    return new Response('{"prompt":"review once","current_task":true}', {status:200});
+  }) as typeof fetch;
+  try {
+    const {followUp} = await import('./api.ts');
+    assert.equal((await followUp('session-a','set review once')).prompt, 'review once');
+    assert.deepEqual(calls, [{session_id:'session-a',args:'set review once'}]);
+    globalThis.fetch = (async () => new Response('{"error":"StaleBinding"}', {status:409})) as typeof fetch;
+    await assert.rejects(followUp('session-b','clear'));
+  } finally { globalThis.fetch = originalFetch; }
+});

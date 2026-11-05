@@ -1125,6 +1125,23 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             // would bypass ownership and manufacture an incomplete native session.
             // A session a released build stored as a snapshot becomes a log here,
             // once (`docs/adr/0024` §10).
+            // Only a cold acquisition can establish that the previous runtime
+            // exited. Reload/model switches reuse ownership and must not close
+            // an active turn or recover its preview as a second assistant reply.
+            if !reuse_lease
+                .as_ref()
+                .is_some_and(|source| source.lease().id() == id)
+                && manager.is_event_session(id)
+            {
+                if manager
+                    .recover_interrupted_turn(&lease)
+                    .map_err(io::Error::from)?
+                {
+                    startup_warnings.push(
+                        "上一轮异常中断，已恢复保存的执行进度；未完成工具不会自动重跑。".into(),
+                    );
+                }
+            }
             let (loaded, pending_resume_prompt) = manager
                 .open_for_resume_noting(&lease, &mut startup_warnings)
                 .map_err(io::Error::from)?;
