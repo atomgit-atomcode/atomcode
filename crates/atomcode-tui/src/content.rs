@@ -712,7 +712,7 @@ impl Content for UserSaid {
         let prefix: String = chars.by_ref().take(512).collect();
         let omitted = chars.next().is_some();
         let clean = crate::text::for_buffer(&prefix);
-        let mut text = clean.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut text = flatten(&clean);
         if text.is_empty() {
             return None;
         }
@@ -1960,7 +1960,17 @@ fn outcome_note(outcome: &Outcome) -> (String, Style) {
 /// the transcript is one row, and text that keeps them is written where the
 /// scroll is not counting.
 fn flatten(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut words = s.split_whitespace();
+    let Some(first) = words.next() else {
+        return String::new();
+    };
+    let mut out = String::with_capacity(s.len());
+    out.push_str(first);
+    for word in words {
+        out.push(' ');
+        out.push_str(word);
+    }
+    out
 }
 
 /// `line` with a `…` at its end, cut to make room for it inside `w` cells. The
@@ -3620,6 +3630,24 @@ impl Content for TurnEndBlock {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn flatten_matches_whitespace_join_for_empty_and_unicode_input() {
+        let pieces = [
+            "", "word", "中文", " ", "\t\r\n", "\u{a0}", "\u{2003}", "\u{200b}",
+        ];
+        for a in pieces {
+            for b in pieces {
+                for c in pieces {
+                    let input = format!("{a}{b}{c}");
+                    assert_eq!(
+                        flatten(&input),
+                        input.split_whitespace().collect::<Vec<_>>().join(" "),
+                        "{input:?}"
+                    );
+                }
+            }
+        }
+    }
 
     /// A `!` command is echoed `! cmd`, not `❯ !cmd`; what it printed hangs on
     /// the `⎿` gutter, the rows after the first set in under it; and a command
