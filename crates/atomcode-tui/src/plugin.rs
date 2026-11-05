@@ -7983,6 +7983,28 @@ impl Tui {
                 }
                 return false;
             }
+            Action::CycleEffort { forward } => {
+                drop(m);
+                // The list is read fresh — a `/model` or a config edit since
+                // the last look would leave a stale set, and `/effort` owns
+                // the words for "nothing declared" anyway.
+                self.refresh_providers();
+                let picked = {
+                    let m = self.host.moment.read().expect("moment poisoned");
+                    m.providers.live_row().and_then(|row| row.effort_pick())
+                };
+                let current = self
+                    .client
+                    .described()
+                    .and_then(|d| d.reasoning_effort)
+                    .map(|level| level.as_str().to_string())
+                    .unwrap_or_else(|| "default".to_string());
+                match crate::providers::effort_step(&current, picked, forward) {
+                    Some(next) => self.run_command(&format!("/effort {next}")),
+                    None => self.run_command("/effort"),
+                }
+                return false;
+            }
             Action::DeleteWord => {
                 // A marker is one word: Ctrl+W with the caret just past (or inside)
                 // an `[Image #N]` removes the whole chip, never the `7]` tail that

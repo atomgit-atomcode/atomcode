@@ -131,6 +131,31 @@ impl ModelRow {
     }
 }
 
+/// The level `/effort` lands on when stepping from `current` across `levels` —
+/// the pick list exactly as [`ModelRow::effort_pick`] returns it (declared
+/// levels in wire order, `default` last). `None` when nothing is declared:
+/// there is nothing to step through, and `/effort` reports that rather than
+/// the key pretending.
+pub(crate) fn effort_step(
+    current: &str,
+    levels: Option<Vec<String>>,
+    forward: bool,
+) -> Option<String> {
+    let cycle = levels?;
+    if cycle.is_empty() {
+        return None;
+    }
+    let len = cycle.len();
+    Some(match cycle.iter().position(|level| level == current) {
+        Some(at) => cycle[(at + if forward { 1 } else { len - 1 }) % len].clone(),
+        // The level in force is not one this model declares (the config
+        // changed since the session started): enter the list from the near
+        // end instead of guessing a middle rung.
+        None if forward => cycle[0].clone(),
+        None => cycle[len - 1].clone(),
+    })
+}
+
 /// The providers, as of one frame.
 ///
 /// Immutable and cheap to clone, so a `Moment` can carry it and two renders
@@ -2488,6 +2513,61 @@ pub type ProbeFuture =
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effort_steps_over_declared_levels_with_default_last() {
+        let declared = Some(vec![
+            "low".into(),
+            "medium".into(),
+            "high".into(),
+            "default".into(),
+        ]);
+
+        assert_eq!(
+            effort_step("medium", declared.clone(), true).as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            effort_step("medium", declared.clone(), false).as_deref(),
+            Some("low")
+        );
+        // The ends wrap: the last declared level lands on the endpoint's
+        // default, and stepping on from there re-enters the list.
+        assert_eq!(
+            effort_step("high", declared.clone(), true).as_deref(),
+            Some("default")
+        );
+        assert_eq!(
+            effort_step("default", declared.clone(), true).as_deref(),
+            Some("low")
+        );
+        assert_eq!(
+            effort_step("default", declared.clone(), false).as_deref(),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn effort_steps_into_the_list_when_the_level_in_force_is_not_declared() {
+        let declared = Some(vec!["low".into(), "high".into(), "default".into()]);
+
+        // A config edit since the session started left `max` in force: step in
+        // from the near end instead of guessing a middle rung.
+        assert_eq!(
+            effort_step("max", declared.clone(), true).as_deref(),
+            Some("low")
+        );
+        assert_eq!(
+            effort_step("max", declared, false).as_deref(),
+            Some("default")
+        );
+    }
+
+    #[test]
+    fn effort_steps_nowhere_without_declared_levels() {
+        assert_eq!(effort_step("high", None, true), None);
+        assert_eq!(effort_step("default", Some(vec![]), false), None);
+    }
 
     fn account(id: &str, models: usize) -> AccountRow {
         AccountRow {
