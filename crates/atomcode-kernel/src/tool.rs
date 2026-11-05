@@ -385,6 +385,11 @@ impl MountedToolsSnapshot {
         self.defs.to_vec()
     }
 
+    /// Share this immutable catalog without cloning tool names, descriptions or schemas.
+    pub fn defs_arc(&self) -> Arc<[ToolDef]> {
+        Arc::clone(&self.defs)
+    }
+
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.selected.get(name).cloned()
     }
@@ -542,6 +547,25 @@ mod tests {
             *captured.lock().unwrap(),
             vec!["a".to_string(), "b".to_string()]
         );
+    }
+
+    #[test]
+    fn shared_definitions_keep_snapshot_identity_after_publication() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(Dummy("echo", RiskLevel::Safe)));
+        registry.register(Arc::new(Dummy("write", RiskLevel::Risky)));
+        let (mounted, publisher) = registry.mount_updatable(&["echo"]);
+        let first = mounted.snapshot();
+        let shared = first.defs_arc();
+        assert!(Arc::ptr_eq(&shared, &first.defs_arc()));
+        let mut owned = first.defs();
+        owned[0].name.clear();
+        assert_eq!(shared[0].name, "echo");
+        publisher.publish(&registry, &["write"]);
+        let second = mounted.snapshot().defs_arc();
+        assert_eq!(shared[0].name, "echo");
+        assert_eq!(second[0].name, "write");
+        assert!(!Arc::ptr_eq(&shared, &second));
     }
 
     #[test]

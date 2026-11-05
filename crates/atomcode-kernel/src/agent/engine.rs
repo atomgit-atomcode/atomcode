@@ -2168,7 +2168,7 @@ impl RunningAgent {
         // A turn must execute against the exact same tool set advertised to the
         // provider. Runtime catalog updates become visible on the next turn.
         let turn_tools = self.tools.snapshot();
-        let defs = turn_tools.defs();
+        let defs = turn_tools.defs_arc();
         // Mint this turn's id ONCE — constant across all rounds (incl. offer_continuation
         // continuations) of this turn. Monotonic counter ⇒ deterministic.
         let turn_id = self.turn_counter.fetch_add(1, Ordering::Relaxed) + 1;
