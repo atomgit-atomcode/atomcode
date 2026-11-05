@@ -1926,6 +1926,10 @@ pub enum Msg<'a> {
     FieldEffort,
     FieldLevels,
     FieldWindow,
+    /// Source of the current budget, not a measurement of server capacity.
+    ContextBudgetSource,
+    /// Routed responses do not guarantee the next request uses the same model.
+    AutoContextBudgetNote,
     FieldUseAfterSaving,
     VisionYes,
     VisionNo,

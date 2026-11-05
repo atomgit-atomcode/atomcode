@@ -894,6 +894,7 @@ function ModelRowsEditor({
       {fetchError && <div class="modal-error" role="alert">{fetchError}</div>}
       <div class="model-draft-list">
         <ModelColumns removable />
+        <p class="field-hint">{t('providers.contextBudgetHint')}</p>
         {rows.map((row, i) => (
           <div key={i}>
           <div class="model-draft-row">
@@ -919,7 +920,7 @@ function ModelRowsEditor({
               type="text"
               placeholder={t('providers.contextWindowPlaceholder')}
               aria-label={t('providers.contextWindow')}
-              title={t('providers.contextWindow')}
+              title={t('providers.contextBudgetHint')}
               value={row.window}
               onInput={(e) => update(i, { window: (e.target as HTMLInputElement).value })}
             />
@@ -1459,7 +1460,7 @@ function ModelEditor({
           type="text"
           placeholder={t('providers.contextWindowPlaceholder')}
           aria-label={t('providers.contextWindow')}
-          title={t('providers.contextWindow')}
+          title={t('providers.contextBudgetHint')}
           value={ctxWindow}
           onInput={(e) => setCtxWindow((e.target as HTMLInputElement).value)}
         />
@@ -1482,6 +1483,7 @@ function ModelEditor({
           onChange={(v) => setVision(v)}
         />
       </div>
+      <p class="field-hint">{t('providers.contextBudgetHint')}</p>
       <ReasoningFields value={reasoning} levels={levels} onChange={setReasoning} />
       <div class="reasoning-row">
         <span class="add-model-label">{t('providers.reasoningHistory')}</span>

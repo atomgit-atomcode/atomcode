@@ -65,6 +65,8 @@ export function ModelCardDialog({ model, onClose }: { model: ModelInfo; onClose:
     <header><div><h2 id="model-card-title">{t('cards.title')}</h2><p>{model.model}</p></div><button type="button" onClick={onClose} aria-label={t('cards.close')}>×</button></header>
     <div class="mc-body">
       <div class="mc-config"><span>{t('cards.context')}: {model.context_window?.toLocaleString() ?? '—'}</span><span>{t('cards.vision')}: {t(model.supports_vision == null ? 'cards.unknown' : model.supports_vision ? 'cards.yes' : 'cards.no')}</span></div>
+      <p class="mc-muted">{t('cards.contextSource')}</p>
+      {['auto', 'auto-beta'].includes(model.model.split('/').pop() ?? '') && <p class="mc-muted">{t('providers.contextBudgetHint')}</p>}
       {noPublicData && <p class="mc-empty mc-no-public" role="status">{t('cards.noPublic')}</p>}
       {!browse && <button type="button" class="mc-browse" onClick={() => setBrowse(true)}>{t('cards.browseCatalog')}</button>}
       {browse && !data && !failed && <p role="status">{t('cards.loading')}</p>}

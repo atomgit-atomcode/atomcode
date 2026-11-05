@@ -54,6 +54,9 @@ type = "openai"
 api_key = "sk-..."
 model = "deepseek-chat"
 base_url = "https://api.deepseek.com/v1"
+# Local budget, not measured server capacity. For auto routes choose a conservative
+# value for eligible models; discovery suggestions do not pin the next route.
+# See docs/context-window-budget.md. Zero is not an auto-discovery sentinel.
 context_window = 64000
 # Total attempts including the first request. Default: 3; set 1 to disable retries.
 # retry_max_attempts = 5

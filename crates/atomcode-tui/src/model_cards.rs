@@ -112,6 +112,10 @@ pub fn lines(view: &ProvidersView, panel: &CardPanel, width: usize) -> Vec<Strin
                 .map(|v| t(if v { Msg::VisionYes } else { Msg::VisionNo }).into_owned())
                 .unwrap_or("—".into())
         ));
+        out.push(t(Msg::ContextBudgetSource).into_owned());
+        if matches!(model.model.rsplit('/').next(), Some("auto" | "auto-beta")) {
+            out.push(t(Msg::AutoContextBudgetNote).into_owned());
+        }
     }
     if no_public {
         out.push(t(Msg::ModelCardNoPublic).into_owned());

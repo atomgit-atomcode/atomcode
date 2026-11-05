@@ -2215,7 +2215,7 @@ mod tests {
         let out = drawn(&m, 100, 24);
         assert!(!out.contains("启用/停用这一档"), "{out}");
         assert!(
-            out.contains("‹ 自动（按协议默认） ›"),
+            out.contains(&format!("‹ {} ›", t(Msg::WindowAutomatic))),
             "the window is a choice, automatic to begin with: {out}"
         );
     }
