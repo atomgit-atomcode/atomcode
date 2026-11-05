@@ -118,7 +118,8 @@ async function main() {
     fs.rmSync(home, { recursive: true, force: true });
   }
 
-  const processSource = fs.readFileSync(path.join(process.cwd(), 'src/daemon/process.ts'), 'utf8');
+  // Windows checkouts are CRLF; the assertions below are written against LF source text.
+  const processSource = fs.readFileSync(path.join(process.cwd(), 'src/daemon/process.ts'), 'utf8').replace(/\r\n/g, '\n');
   assert.ok(!processSource.includes('client.shutdown('));
   assert.ok(!processSource.includes('process.kill('));
   assert.ok(!processSource.includes('taskkill'));

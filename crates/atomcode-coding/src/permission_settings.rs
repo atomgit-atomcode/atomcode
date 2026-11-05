@@ -449,6 +449,76 @@ mod tests {
         assert!(!path.exists());
     }
 
+    /// Windows counterpart of the criterion above. None of the writer's guarantees lean on
+    /// `symlink(2)`: `LockFileEx` enforces the writer lock here as well, and a directory
+    /// junction — which needs no elevation — is what `symlink_metadata` reports as a link on
+    /// Windows. Real file symlinks require Developer Mode or elevation, so that branch stays
+    /// covered by the unix criterion instead of making this one environment-dependent.
+    #[cfg(windows)]
+    #[test]
+    fn exact_rule_writer_refuses_directory_junctions_and_an_active_writer_lock() {
+        use fs2::FileExt;
+        use std::os::windows::process::CommandExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let dirs = ProductDirs::new(root.path().join("user"), ".ours");
+        let cwd = root.path().join("project");
+        let directory = dirs.project(&cwd);
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("settings.local.json");
+        let sensitive = SensitivePaths::of(&dirs);
+
+        // A junction standing in for the settings directory must be refused rather than
+        // written through to whatever it points at.
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let linked = root.path().join("settings-via-junction");
+        let made = std::process::Command::new("cmd")
+            .arg("/c")
+            .raw_arg(format!(
+                "mklink /J \"{}\" \"{}\"",
+                linked.display(),
+                outside.display()
+            ))
+            .output()
+            .expect("spawn mklink");
+        if made.status.success() && linked.exists() {
+            let through = linked.join("settings.local.json");
+            let error =
+                save_exact_rule(&through, "Bash(rm -rf scratch)", &sensitive, &cwd).unwrap_err();
+            assert!(error.contains("symlink"), "{error}");
+            assert!(!outside.join("settings.local.json").exists());
+        } else {
+            // No junction support in this environment: say so instead of passing silently.
+            eprintln!(
+                "skipping the junction half: mklink /J failed: {}",
+                String::from_utf8_lossy(&made.stderr).trim()
+            );
+        }
+
+        // A lock path occupied by a directory is not a writer lock.
+        let lock_path = directory.join("permission-rules.lock");
+        std::fs::create_dir_all(&lock_path).unwrap();
+        let error = save_exact_rule(&path, "Bash(rm -rf scratch)", &sensitive, &cwd).unwrap_err();
+        assert!(error.contains("writer lock"), "{error}");
+        assert!(!path.exists());
+        std::fs::remove_dir(&lock_path).unwrap();
+
+        // An active writer lock fails the save closed: `LockFileEx` rejects the second
+        // handle with ERROR_LOCK_VIOLATION, the same outcome unix reaches through flock.
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        lock.try_lock_exclusive().unwrap();
+        assert!(save_exact_rule(&path, "Bash(rm -rf scratch)", &sensitive, &cwd).is_err());
+        assert!(!path.exists());
+        let _ = FileExt::unlock(&lock);
+    }
+
     #[tokio::test]
     async fn project_rule_proposals_are_bound_to_the_original_directory() {
         let root = tempfile::tempdir().unwrap();
