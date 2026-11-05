@@ -2052,6 +2052,11 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
           postLiveSwitchSession(sid)
             .then((result) => {
               if (!result.ok) {
+                if (result.activeTurn) {
+                  setSync(false);
+                  setSessionSwitchNotice(t('browse.switchBusy'));
+                  return;
+                }
                 throw new Error(result.error ?? 'live runtime rejected the session switch');
               }
               // The runtime is on a copy now: follow it, or this page would

@@ -1024,7 +1024,7 @@ impl SkillsHostPlugin {
                     loaded.plugins.join(", ")
                 ));
             }
-            text.push_str("`list_skills` shows what is loaded; `use_skill` loads one.");
+            text.push_str("`list_skills` shows what is loaded; `use_skill` loads one. The skills-host row can statically auto-load one eligible debugging workflow before a real user turn; auto-load: debugging opts a skill in, auto-load: off opts it out. Its auto_load:false row setting or a user [no-auto-skills] directive disables automatic loading. Automatic context never executes embedded commands or grants allowed-tools.");
         }
         text
     }
@@ -1052,7 +1052,21 @@ impl Plugin for SkillsHostPlugin {
     fn description(&self) -> &'static str {
         "the skill catalog the coding runtime loaded, plugin skills included"
     }
-    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+    async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
+        #[derive(serde::Deserialize)]
+        struct Options {
+            #[serde(default = "enabled")]
+            auto_load: bool,
+        }
+        fn enabled() -> bool {
+            true
+        }
+        let options = if config.is_null() {
+            Options { auto_load: true }
+        } else {
+            serde_json::from_value::<Options>(config.clone())
+                .map_err(|e| format!("skills-host: {e}"))?
+        };
         self.describe(ctx);
         let LoadedSkills {
             registry, catalog, ..
@@ -1075,6 +1089,7 @@ impl Plugin for SkillsHostPlugin {
             let (id, rank) = crate::on_harness::SKILLS_FRAGMENT;
             atomcode_harness::plugins::tools::contribute_prompt(ctx, id, rank, catalog);
         }
+        atomcode_harness::plugins::skill_auto_load::mount(ctx, registry.clone(), options.auto_load);
         // The command catalog half of what the harness `skills` row did: `/skills`
         // and one command per user-invocable skill — this runtime's own `/setup`
         // among them, and anything a person wrote into `.atomcode/skills/`.

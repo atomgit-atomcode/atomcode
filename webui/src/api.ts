@@ -1286,7 +1286,8 @@ export async function postLiveSwitchSession(
   };
   return {
     ok: body.ok === true,
-    activeTurn: body.active_turn === true,
+    // Older embedded daemons flattened Busy into a nested debug string.
+    activeTurn: body.active_turn === true || (body.ok !== true && /\bcoding runtime is busy\b/i.test(body.error ?? '')),
     error: body.error,
     ...(body.session_id ? { sessionId: body.session_id } : {}),
     ...(body.forked_from ? { forkedFrom: body.forked_from } : {}),
