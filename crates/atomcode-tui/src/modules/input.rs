@@ -690,15 +690,17 @@ mod tests {
     #[test]
     fn a_search_counts_its_matches_not_the_history() {
         let mut m = Moment {
-            history: (0..99)
-                .map(|i| {
-                    if i % 30 == 0 {
-                        format!("cargo {i}")
-                    } else {
-                        format!("x {i}")
-                    }
-                })
-                .collect(),
+            history: std::sync::Arc::new(
+                (0..99)
+                    .map(|i| {
+                        if i % 30 == 0 {
+                            format!("cargo {i}")
+                        } else {
+                            format!("x {i}")
+                        }
+                    })
+                    .collect(),
+            ),
             ..Moment::default()
         };
         crate::search::begin(&mut m);
@@ -755,7 +757,7 @@ mod tests {
             "a user-set name is on the rule:\n{named:?}"
         );
 
-        m.history = vec!["one".into(), "two".into(), "three".into()];
+        m.history = std::sync::Arc::new(vec!["one".into(), "two".into(), "three".into()]);
         m.history_at = Some(2); // the first press back: the newest entry
         assert_eq!(history_caption(&m).as_deref(), Some("历史 1/3"));
         m.history_at = Some(0); // the oldest

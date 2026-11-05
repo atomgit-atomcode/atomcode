@@ -2419,7 +2419,7 @@ impl Host {
             if !typed.trim().is_empty()
                 && m.history.last().map(String::as_str) != Some(typed.as_str())
             {
-                m.history.push(typed);
+                Arc::make_mut(&mut m.history).push(typed);
             }
         }
     }
@@ -5969,7 +5969,7 @@ impl Host {
         };
         let mut moment = self.moment.write().expect("moment poisoned");
         if moment.history.last().map(String::as_str) != Some(recalled) {
-            moment.history.push(recalled.to_owned());
+            Arc::make_mut(&mut moment.history).push(recalled.to_owned());
         }
         moment.history_at = None;
         moment.draft.clear();
@@ -8502,7 +8502,7 @@ mod tests {
         h.remember_command("/connect sk-or-v1-SECRET");
         h.remember_command("/rename my session");
         assert_eq!(
-            h.moment.read().unwrap().history,
+            *h.moment.read().unwrap().history,
             ["/connect", "/rename my session"]
         );
         h.echo_command("/connect sk-or-v1-SECRET");
@@ -8751,7 +8751,7 @@ mod tests {
         {
             let mut m = h.moment.write().expect("moment poisoned");
             m.interrupted = true;
-            m.last_sent = Some("fix the parser".into());
+            m.last_sent = Some(Arc::new("fix the parser".into()));
             m.todo_expanded = true;
             m.todo_offset = 20;
             m.suggestion = Some("接着把登录那条补上".into());
@@ -15456,7 +15456,7 @@ mod tests {
         // only thing that survives, and a second copy would drift from it.
         let h = fed();
         let history = h.moment.read().unwrap().history.clone();
-        assert_eq!(history, vec!["fix the build", "now break it"]);
+        assert_eq!(*history, vec!["fix the build", "now break it"]);
 
         // Consecutive repeats collapse, the way every shell collapses them.
         h.absorb(&SessionEvent::UserMessage {
@@ -15513,7 +15513,7 @@ mod tests {
             images: Vec::new(),
         });
         assert_eq!(
-            h.moment.read().unwrap().history,
+            *h.moment.read().unwrap().history,
             vec!["[Image #1] 看看这是啥？".to_string()],
             "recall the typed words, not the folded caption"
         );

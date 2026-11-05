@@ -1907,7 +1907,8 @@ impl UserInterface for Tui {
             // yet, so there is nothing it could have been attached to. Kept as
             // `last_sent` all the same, so an Escape that stops this first turn
             // hands it back the way it would any other (see `Action::Escape`).
-            self.host.moment.write().expect("moment poisoned").last_sent = Some(text.clone());
+            self.host.moment.write().expect("moment poisoned").last_sent =
+                Some(Arc::new(text.clone()));
             let _ = client.send(text, Vec::new());
         }
 
@@ -4943,7 +4944,7 @@ impl Tui {
             let mut m = self.host.moment.write().expect("moment poisoned");
             // 和一次普通提交一样:这是「最后发出去的那句」,下一次 Escape
             // 要把它退回来。
-            m.last_sent = Some(text.clone());
+            m.last_sent = Some(Arc::new(text.clone()));
             m.interrupted = false;
             // 新的一句已经在路上:上一次停下欠着的撤回不再做 —— 撤回按回合往回退,
             // 会连这一句一起退掉。
@@ -5062,7 +5063,7 @@ impl Tui {
         {
             let mut m = host.moment.write().expect("moment poisoned");
             if m.history.last() != Some(&line) {
-                m.history.push(line);
+                Arc::make_mut(&mut m.history).push(line);
             }
         }
         // 为哪个会话跑的、在哪儿跑:发起这一刻定下。一条命令能跑两分钟,期间
@@ -6841,7 +6842,9 @@ impl Tui {
                 {
                     let mut m = self.host.moment.write().expect("moment poisoned");
                     if m.input.is_empty() {
-                        if let Some(sent) = rejected_text.or_else(|| m.last_sent.clone()) {
+                        if let Some(sent) =
+                            rejected_text.or_else(|| m.last_sent.as_deref().cloned())
+                        {
                             m.input = sent;
                             m.caret = m.input.len();
                             m.history_at = None;
@@ -7153,7 +7156,7 @@ impl Tui {
                             }
                         ) && m.input.is_empty()
                         {
-                            if let Some(sent) = m.last_sent.clone() {
+                            if let Some(sent) = m.last_sent.as_deref().cloned() {
                                 m.input = sent;
                                 m.caret = m.input.len();
                                 m.history_at = None;
@@ -7769,7 +7772,7 @@ impl Tui {
                 // The composer shows `[Pasted #N …]` markers to stay terse; the
                 // model gets the whole paste — put the bodies back before
                 // anything reads the text.
-                let text = crate::moment::expand_pastes(&m.input, &m.pastes);
+                let text = crate::moment::expand_pastes(&m.input, m.pastes.as_slice());
                 let mut text = text.trim().to_string();
                 // A recalled line's markers point at images only the gallery still
                 // holds — the send queue drained on their first submit. Re-attach
@@ -7874,7 +7877,7 @@ impl Tui {
                     // Kept for an Escape that stops the next running turn to hand
                     // back (see the `Escape` arm); the `已中断` note is stale the
                     // instant a new prompt is on its way.
-                    m.last_sent = Some(text.clone());
+                    m.last_sent = Some(Arc::new(text.clone()));
                     m.interrupted = false;
                     // A retraction still owed by the last stop is off: an undo
                     // goes back by turns, and would take this one with it.
@@ -9027,7 +9030,7 @@ impl Tui {
                     m.resend_withdrawn = false;
                     m.stopping = true;
                     if m.input.is_empty() && !queued {
-                        if let Some(sent) = m.last_sent.clone() {
+                        if let Some(sent) = m.last_sent.as_deref().cloned() {
                             // Back in the field — and, if the model had said
                             // nothing yet, out of the conversation once the turn
                             // is over (`Moment::retract`, `try_retract`).
@@ -11551,7 +11554,7 @@ mod history_tests {
 
     fn said(entries: &[&str], typing: &str) -> Moment {
         let mut m = Moment::default();
-        m.history = entries.iter().map(|s| s.to_string()).collect();
+        m.history = std::sync::Arc::new(entries.iter().map(|s| s.to_string()).collect());
         m.input = typing.to_string();
         m.caret = m.input.len();
         m
@@ -11872,7 +11875,7 @@ mod suggestion_tests {
         let mut m = moment.write().unwrap();
         m.input = "接着".into();
         m.caret = m.input.len();
-        m.history = vec!["接着把登录那条补上".into()];
+        m.history = std::sync::Arc::new(vec!["接着把登录那条补上".into()]);
 
         assert!(!take_suggestion(&mut m), "非空行不是这个手势的");
         assert_eq!(m.input, "接着", "而且什么都没往里接");
@@ -13227,7 +13230,7 @@ mod paste_burst_tests {
             }
             let moment = host.moment.read().unwrap();
             assert_eq!(
-                crate::moment::expand_pastes(&moment.input, &moment.pastes),
+                crate::moment::expand_pastes(&moment.input, moment.pastes.as_slice()),
                 text
             );
             assert!(!moment.pending_working);
@@ -13505,7 +13508,10 @@ mod paste_burst_tests {
         tui.act(Action::Paste(text.into()), &tui.client);
         let m = host.moment.read().unwrap();
         assert_eq!(m.input, "[Pasted #1 +5 lines]");
-        assert_eq!(crate::moment::expand_pastes(&m.input, &m.pastes), text);
+        assert_eq!(
+            crate::moment::expand_pastes(&m.input, m.pastes.as_slice()),
+            text
+        );
         assert!(!m.pending_working);
     }
 
@@ -14989,7 +14995,7 @@ mod midturn_command_tests {
         let (host, tui, _) = screen();
         host.add_steering("first", "first message");
         host.add_steering("second", "second message");
-        host.moment.write().unwrap().last_sent = Some("second message".into());
+        host.moment.write().unwrap().last_sent = Some(std::sync::Arc::new("second message".into()));
         tui.on_event(AgentEvent::Rejected {
             command: "first".into(),
             error: atomcode_kernel::event::CommandError::Busy {
@@ -15831,7 +15837,7 @@ mod skills_menu_tests {
         assert!(host.menu_selected().is_some());
         {
             let mut moment = host.moment.write().unwrap();
-            moment.history = vec!["/init".into(), "/skills ".into()];
+            moment.history = Arc::new(vec!["/init".into(), "/skills ".into()]);
             moment.history_at = Some(1);
             moment.caret = 0;
         }
@@ -16000,7 +16006,7 @@ mod args_requirement_menu_tests {
         let mut m = host.moment.write().expect("moment poisoned");
         m.input = line.into();
         m.caret = line.len();
-        m.history.clear();
+        Arc::make_mut(&mut m.history).clear();
         m.history_at = None;
     }
 
