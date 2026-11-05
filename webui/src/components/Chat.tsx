@@ -1,3 +1,4 @@
+import { HooksDialog } from './HooksDialog';
 import { TaskSpecifications } from './TaskSpecifications';
 import { importPatchFile, taskSpecs } from '../api';
 import { createPortal } from 'preact/compat';
@@ -642,6 +643,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   const [showFilePicker, setShowFilePicker] = useState(false);
   const [pendingImages, setPendingImages] = useState<ImageData[]>([]);
   const [attachError, setAttachError] = useState<string | null>(null);
+  const [hooksOpen, setHooksOpen] = useState(false);
   const [slashOpen, setSlashOpen] = useState(false);
   const { items: slashSkills, loading: slashLoading, failed: slashFailed, error: slashError } = useSkills(slashOpen);
   const [slashQuery, setSlashQuery] = useState('');
@@ -2359,6 +2361,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
           }
           return;
         }
+        if (command === 'hooks') { setHooksOpen(true); return; }
         if (command === 'context' && arg.trim() === 'persona') {
           if (!sessionId) { pushCommandNotice(t('cmd.persona.unavailable')); return; }
           const generation = sessionGenerationRef.current;
@@ -3838,6 +3841,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
           )}
         </div>
       )}
+      {hooksOpen && <HooksDialog key={sessionId} onClose={() => setHooksOpen(false)} />}
       {slashOpen && (
         <div class="slash-popover" ref={slashRef}>
           {slashLoading && <div class="at-empty">{t('attach.skillsLoading')}</div>}

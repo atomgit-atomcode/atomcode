@@ -7147,6 +7147,47 @@ pub struct SkillInfo {
     pub description: String,
 }
 
+/// Local hooks inspection never rebinds or mutates the agent runtime.
+async fn get_hooks(State(state): State<AppState>) -> impl IntoResponse {
+    let cwd = state.project.read().await.working_dir.clone();
+    match atomcode_capabilities::cc_hooks::inspection::command(
+        &cwd,
+        &atomcode_coding::config::product_dirs_from_env(),
+        "list",
+    )
+    .await
+    {
+        Ok(value) => (StatusCode::OK, Json(value)),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":error})),
+        ),
+    }
+}
+#[derive(serde::Deserialize)]
+struct HookTestBody {
+    id: String,
+}
+async fn test_hook(
+    State(state): State<AppState>,
+    Json(body): Json<HookTestBody>,
+) -> impl IntoResponse {
+    let cwd = state.project.read().await.working_dir.clone();
+    match atomcode_capabilities::cc_hooks::inspection::command(
+        &cwd,
+        &atomcode_coding::config::product_dirs_from_env(),
+        &format!("test {}", body.id),
+    )
+    .await
+    {
+        Ok(value) => (StatusCode::OK, Json(value)),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":error})),
+        ),
+    }
+}
+
 /// GET /skills - List user-invocable skills for the current project.
 async fn get_skills(State(state): State<AppState>) -> impl IntoResponse {
     let working_dir = { state.project.read().await.working_dir.clone() };
@@ -7797,6 +7838,11 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         )
         // Skills API
         .route("/skills", get(get_skills))
+        .route("/hooks", get(get_hooks))
+        .route(
+            "/hooks/test",
+            post(test_hook).layer(DefaultBodyLimit::max(4096)),
+        )
         // Filesystem API
         .route("/fs/list", get(fs_list))
         .route("/fs/search", get(fs_search))

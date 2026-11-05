@@ -1,0 +1,14 @@
+.hooks-modal { width: min(900px, calc(100vw - 24px)); max-height: calc(100dvh - 32px); }
+.hooks-body { overflow-y: auto; min-height: 0; }
+.hooks-body > * + * { margin-top: 12px; }
+.hooks-layout { display: grid; grid-template-columns: minmax(180px, 1fr) minmax(0, 2fr); gap: 16px; }
+.hooks-layout nav { display: flex; flex-direction: column; gap: 6px; }
+.hooks-entry { display: flex; flex-direction: column; gap: 4px; text-align: left; padding: 10px; border: 1px solid var(--app-border-subtle); border-radius: 8px; background: transparent; color: inherit; overflow-wrap: anywhere; }
+.hooks-entry.active { background: var(--app-command-menu-active-background); }
+.hooks-path, .hooks-detail { overflow-wrap: anywhere; min-width: 0; }
+.hooks-body pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 240px; overflow: auto; font-size: .8rem; }
+.hooks-source { padding: 8px 0; }
+@media (max-width: 600px) { .hooks-layout { grid-template-columns: minmax(0, 1fr); } .hooks-layout nav { max-height: 220px; overflow: auto; } }
+
+.hooks-body .btn { min-height: 36px; padding: 7px 12px; }
+@media (max-width: 600px) { .hooks-body .btn { min-height: 44px; } }

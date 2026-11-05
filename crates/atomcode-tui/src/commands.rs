@@ -930,6 +930,11 @@ fn review_prompt(arg: &str) -> String {
 fn session_catalogue() -> Vec<Command> {
     vec![
         Command::said_taking(
+            "hooks",
+            "[list|paths|show <id>|test <id>]".into(),
+            t(Msg::HooksTitle),
+        ),
+        Command::said_taking(
             "followup",
             "[set <prompt>|show|clear]".into(),
             t(Msg::FollowUpAbout),
@@ -1180,6 +1185,112 @@ impl CommandSet for SessionCommands {
                 .then(|| Outcome::Refused(t(Msg::WaitsForTheTurn { command }).into_owned()))
         };
         match name {
+            "hooks" => {
+                if client.session() != root {
+                    return Outcome::Refused(t(Msg::FollowUpLeadOnly).into_owned());
+                }
+                let control = match host(control) {
+                    Ok(c) => c,
+                    Err(e) => return e,
+                };
+                let value = match control
+                    .call(HostCommand::Hooks {
+                        session: root.clone(),
+                        args: args.into(),
+                    })
+                    .await
+                {
+                    Ok(HostReply::Hooks { value }) => value,
+                    Ok(other) => {
+                        return Outcome::Refused(format!("unexpected host reply: {other:?}"))
+                    }
+                    Err(e) => return Outcome::Refused(refusal(e)),
+                };
+                if client.root() != root || client.session() != root {
+                    return Outcome::Refused(t(Msg::HooksChanged).into_owned());
+                }
+                if args.trim() == "paths" || value.get("result").is_some() {
+                    let text = if let Some(result) = value.get("result") {
+                        let status = if result["completed"].as_bool() == Some(true) {
+                            format!("{} {}", t(Msg::HooksExit), result["exit_code"])
+                        } else {
+                            t(Msg::HooksIncomplete).into_owned()
+                        };
+                        format!(
+                            "{status}\n\nstdout\n{}\n\nstderr\n{}",
+                            result["stdout"].as_str().unwrap_or(""),
+                            result["stderr"].as_str().unwrap_or("")
+                        )
+                    } else {
+                        serde_json::to_string_pretty(&serde_json::json!({"cwd":value["cwd"],"files":value["files"],"plugins":value["plugins"]})).unwrap_or_default()
+                    };
+                    return Outcome::Do(Action::OpenSheet(crate::sheet::Sheet::read(
+                        crate::sheet::Read::file(
+                            "hooks",
+                            vec![crate::sheet::Piece::new(
+                                t(Msg::HooksTitle),
+                                crate::sheet::Tone::Plain,
+                            )],
+                            &text,
+                        ),
+                    )));
+                }
+                let preview = |value: &serde_json::Value| -> Vec<String> {
+                    serde_json::to_string_pretty(value)
+                        .unwrap_or_default()
+                        .lines()
+                        .map(str::to_owned)
+                        .collect()
+                };
+                let mut rows = Vec::new();
+                if let Some(item) = value.get("item") {
+                    if item["testable"].as_bool() == Some(true) {
+                        rows.push(
+                            crate::sheet::Row::new(
+                                format!("/hooks test {}", item["id"].as_str().unwrap_or("")),
+                                t(Msg::HooksTest),
+                            )
+                            .preview(
+                                std::iter::once(t(Msg::HooksNote).into_owned())
+                                    .chain(preview(item))
+                                    .collect(),
+                            ),
+                        );
+                    }
+                    rows.push(
+                        crate::sheet::Row::new("/hooks", t(Msg::HooksBack)).preview(preview(item)),
+                    );
+                } else {
+                    rows.push(
+                        crate::sheet::Row::new("/hooks paths", t(Msg::HooksPaths)).preview(preview(&serde_json::json!({"files":value["files"],"plugins":value["plugins"]}))),
+                    );
+                    if let Some(items) = value["items"].as_array() {
+                        for item in items {
+                            rows.push(
+                                crate::sheet::Row::new(
+                                    format!("/hooks show {}", item["id"].as_str().unwrap_or("")),
+                                    format!(
+                                        "{} · {}",
+                                        item["event"].as_str().unwrap_or(""),
+                                        item["name"].as_str().unwrap_or("")
+                                    ),
+                                )
+                                .about(format!(
+                                    "{} · {}",
+                                    item["scope"].as_str().unwrap_or(""),
+                                    item["command"].as_str().unwrap_or("")
+                                ))
+                                .preview(preview(item)),
+                            );
+                        }
+                    }
+                }
+                Outcome::Do(Action::OpenSheet(crate::sheet::Sheet::list(
+                    crate::sheet::List::new("hooks", t(Msg::HooksTitle), rows).summary(vec![
+                        crate::sheet::Piece::new(t(Msg::HooksNote), crate::sheet::Tone::Plain),
+                    ]),
+                )))
+            }
             "followup" => {
                 if client.session() != root {
                     return Outcome::Refused(t(Msg::FollowUpLeadOnly).into_owned());
@@ -5335,6 +5446,43 @@ mod tests {
             Outcome::Said(text) => assert_eq!(text, "{\"state\":\"uncertain\"}"),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn hooks_browser_reviews_configuration_before_offering_script_execution() {
+        let host = Arc::new(Recording::default());
+        host.replies.lock().unwrap().extend([
+            Ok(HostReply::Hooks {value:serde_json::json!({"files":[],"plugins":[],"items":[{"id":"configured-id","name":"audit","event":"PreToolUse","scope":"project","command":"script","testable":true}]})}),
+            Ok(HostReply::Hooks {value:serde_json::json!({"item":{"id":"configured-id","name":"audit","testable":true}})}),
+        ]);
+        let (app, _client, all) = following(&host);
+        assert!(matches!(
+            all.dispatch("/hooks", &app.context()).await,
+            Outcome::Do(Action::OpenSheet(_))
+        ));
+        match all
+            .dispatch("/hooks show configured-id", &app.context())
+            .await
+        {
+            Outcome::Do(Action::OpenSheet(sheet)) => match sheet.page {
+                crate::sheet::Page::List(list) => {
+                    assert!(list
+                        .rows
+                        .iter()
+                        .all(|row| row.preview.iter().all(|line| !line.contains('\n'))));
+                    assert!(list.rows[0].value.starts_with("/hooks test "));
+                    assert!(list.rows[0].preview.len() > 3);
+                }
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        }
+        assert!(host
+            .asked
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|c| matches!(c,HostCommand::Hooks {args,..} if !args.starts_with("test"))));
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

@@ -9,6 +9,22 @@
 export type Lang = 'zh' | 'en';
 
 const zh = {
+  'hooks.title': "Hooks 配置",
+  'hooks.note': "展示当前磁盘配置，编辑后需 /reload 或重开会话。测试使用模拟事件载荷，但会实际执行脚本，最多等待 30 秒。",
+  'hooks.close': "关闭 Hooks",
+  'hooks.refresh': "刷新配置",
+  'hooks.paths': "配置路径、解析诊断与插件信任",
+  'hooks.trusted': "已信任",
+  'hooks.untrusted': "未信任，不运行",
+  'hooks.invalid': "无效配置",
+  'hooks.empty': "没有可展示的 Hooks，请查看配置路径和诊断。",
+  'hooks.disabled': "已禁用",
+  'hooks.configured': "已配置",
+  'hooks.running': "脚本测试运行中…",
+  'hooks.test': "实际执行脚本测试（最多 30 秒）",
+  'hooks.exit': "退出码：",
+  'hooks.incomplete': "测试超时或脚本无法启动",
+
   'modeBindings.switching': '模式正在切换，请稍候。',
   'modeBindings.title': '模式与模型',
   'modeBindings.configure': '配置模式模型…',
@@ -776,6 +792,22 @@ const zh = {
 export type MsgKey = keyof typeof zh;
 
 const en: Record<MsgKey, string> = {
+  'hooks.title': "Hooks configuration",
+  'hooks.note': "Current disk configuration; use /reload or reopen the session after editing. Tests use synthetic event payloads but really execute scripts, with a 30-second cap.",
+  'hooks.close': "Close hooks",
+  'hooks.refresh': "Refresh configuration",
+  'hooks.paths': "Paths, diagnostics and plugin trust",
+  'hooks.trusted': "Trusted",
+  'hooks.untrusted': "Untrusted, not loaded",
+  'hooks.invalid': "Invalid configuration",
+  'hooks.empty': "No hooks found. Check configuration paths and diagnostics.",
+  'hooks.disabled': "Disabled",
+  'hooks.configured': "Configured",
+  'hooks.running': "Running script test\u2026",
+  'hooks.test': "Run script test (up to 30 seconds)",
+  'hooks.exit': "Exit code:",
+  'hooks.incomplete': "Test timed out or script could not start",
+
   'modeBindings.switching': 'A mode switch is pending. Please wait.',
   'modeBindings.title': 'Mode models',
   'modeBindings.configure': 'Configure mode models…',

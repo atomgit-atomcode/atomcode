@@ -2894,6 +2894,23 @@ impl HostControl for RuntimeControl {
                     current: Some(self.handle.configuration().await.map_err(refused)?.model),
                 })
             }
+            HostCommand::Hooks { session, args } => {
+                self.addressed(&session)?;
+                let here = self
+                    .handle
+                    .context_stats_with(false)
+                    .await
+                    .map_err(refused)?
+                    .working_dir;
+                let value = atomcode_capabilities::cc_hooks::inspection::command(
+                    &here,
+                    &atomcode_coding::config::product_dirs_from_env(),
+                    &args,
+                )
+                .await
+                .map_err(|message| HostError::Failed { message })?;
+                Ok(HostReply::Hooks { value })
+            }
             HostCommand::FollowUp { session, args } => {
                 self.addressed(&session)?;
                 let value = self

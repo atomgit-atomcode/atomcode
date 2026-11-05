@@ -29,6 +29,8 @@ use atomcode_kernel::session::SeqNo;
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum HostCommand {
+    /// Host-local hooks configuration preview and explicit script diagnostic.
+    Hooks { session: String, args: String },
     /// Explicit user registration of a one-shot same-session follow-up.
     FollowUp { session: String, args: String },
     /// Explicit user operations over original task specifications.
@@ -358,6 +360,7 @@ impl HostCommand {
             | Self::Resume { session, .. }
             | Self::TaskSpecs { session, .. }
             | Self::FollowUp { session, .. }
+            | Self::Hooks { session, .. }
             | Self::ImportPatch { session, .. }
             | Self::SetReasoningEffort { session, .. }
             | Self::Undo { session, .. }
@@ -431,6 +434,9 @@ pub struct PersonaInfo {
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum HostReply {
+    Hooks {
+        value: serde_json::Value,
+    },
     FollowUp {
         value: serde_json::Value,
     },
@@ -1580,6 +1586,10 @@ mod tests {
     /// sampled here.
     fn commands() -> Vec<HostCommand> {
         let all = vec![
+            HostCommand::Hooks {
+                session: "a".into(),
+                args: "list".into(),
+            },
             HostCommand::TaskSpecs {
                 session: "a".into(),
                 args: "list".into(),
@@ -1798,6 +1808,7 @@ mod tests {
                 | HostCommand::WhoAmI { .. }
                 | HostCommand::TaskSpecs { .. }
                 | HostCommand::FollowUp { .. }
+                | HostCommand::Hooks { .. }
                 | HostCommand::ImportPatch { .. }
                 | HostCommand::Changes { .. }
                 | HostCommand::Providers { .. }
@@ -1822,6 +1833,9 @@ mod tests {
     fn replies() -> Vec<HostReply> {
         let all = vec![
             HostReply::Done,
+            HostReply::Hooks {
+                value: serde_json::json!({"items":[]}),
+            },
             HostReply::TaskSpecs {
                 value: serde_json::json!({"items":[]}),
             },
@@ -2104,6 +2118,7 @@ mod tests {
                 HostReply::Done
                 | HostReply::TaskSpecs { .. }
                 | HostReply::FollowUp { .. }
+                | HostReply::Hooks { .. }
                 | HostReply::PatchImported { .. }
                 | HostReply::DoneWithNote { .. }
                 | HostReply::SessionChanged { .. }

@@ -1599,3 +1599,23 @@ export async function getModeModels(): Promise<ModeModelsInfo> {
 export async function saveModeModels(bindings: ModeBindings): Promise<ModeModelsInfo> {
   return readJson(await apiFetch('/config/modes',{method:'POST',headers:{...authHeaders(),'Content-Type':'application/json'},body:JSON.stringify(bindings)}));
 }
+
+export interface HookEntry {
+  id: string; name: string; event: string; matcher: string | null; command: string;
+  timeout_ms: number; source: string; scope: string; disabled: boolean; testable: boolean; args?: string[];
+}
+export interface HookCatalogue {
+  cwd: string;
+  files: Array<{ scope: string; path: string; status: { status: string; error?: string; hooks?: number; disabled?: number; unknown_events?: string[] } }>;
+  plugins: Array<{ plugin: string; trusted: boolean; invalid: boolean; hooks: number; events: string[] }>;
+  items: HookEntry[];
+}
+export interface HookTestResult { completed: boolean; exit_code: number | null; stdout: string; stderr: string }
+export async function getHooks(signal?: AbortSignal): Promise<HookCatalogue> {
+  const value = await readJson<HookCatalogue>(await apiFetch('/hooks', { headers: authHeaders(), signal }));
+  if (!value || typeof value.cwd !== 'string' || !Array.isArray(value.items) || !Array.isArray(value.files) || !Array.isArray(value.plugins)) throw new Error('Invalid hooks catalogue response');
+  return value;
+}
+export async function testHook(id: string): Promise<{ item: HookEntry; result: HookTestResult }> {
+  return readJson(await apiFetch('/hooks/test', { method: 'POST', headers: {...authHeaders(), 'Content-Type':'application/json'}, body:JSON.stringify({id}) }));
+}

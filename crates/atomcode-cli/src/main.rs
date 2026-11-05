@@ -4328,42 +4328,8 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
                     // CC stdin payload — event-shaped to MATCH what the live runtime pipes
                     // (see cc_hooks lifecycle methods): only tool events carry tool fields,
                     // PostToolUse carries `tool_response`, UserPromptSubmit carries `prompt`.
-                    let sid = "test-session-0000";
-                    let cwd_s = cwd.display().to_string();
-                    let payload = match hook.event {
-                        HookEvent::PreToolUse => serde_json::json!({
-                            "session_id": sid, "hook_event_name": "PreToolUse", "cwd": cwd_s,
-                            "tool_name": "bash", "tool_input": { "command": "echo hello" },
-                        }),
-                        HookEvent::PostToolUse => serde_json::json!({
-                            "session_id": sid, "hook_event_name": "PostToolUse", "cwd": cwd_s,
-                            "tool_name": "bash", "tool_response": "hello\n",
-                        }),
-                        HookEvent::PostToolUseFailure => serde_json::json!({
-                            "session_id": sid, "hook_event_name": "PostToolUseFailure", "cwd": cwd_s,
-                            "tool_name": "bash", "tool_response": "command failed\n",
-                        }),
-                        HookEvent::UserPromptSubmit => serde_json::json!({
-                            "session_id": sid, "hook_event_name": "UserPromptSubmit",
-                            "cwd": cwd_s, "prompt": "test prompt",
-                        }),
-                        HookEvent::SessionStart => serde_json::json!({
-                            "session_id": sid, "hook_event_name": "SessionStart", "cwd": cwd_s,
-                        }),
-                        HookEvent::SessionEnd => serde_json::json!({
-                            "session_id": sid, "hook_event_name": "SessionEnd", "cwd": cwd_s,
-                        }),
-                        HookEvent::Stop => serde_json::json!({
-                            "session_id": sid, "transcript_path": null,
-                            "hook_event_name": "Stop", "stop_hook_active": false,
-                            "stop_reason": "Stopped", "cwd": cwd_s,
-                        }),
-                        HookEvent::StopFailure => serde_json::json!({
-                            "session_id": sid, "transcript_path": null,
-                            "hook_event_name": "StopFailure", "stop_hook_active": false,
-                            "stop_reason": "ProviderError", "cwd": cwd_s,
-                        }),
-                    };
+                    let payload =
+                        atomcode_capabilities::cc_hooks::inspection::test_payload(hook.event, &cwd);
                     let start = std::time::Instant::now();
                     match run_hook_for_test(hook, &cwd, &payload).await {
                         Some(out) => {
