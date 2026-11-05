@@ -292,7 +292,12 @@ fn style_of(cell: &Cell, caps: crate::caps::Caps) -> Style {
     style
 }
 
-type Mounted = HashMap<(String, String), Arc<Raster>>;
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Mounted {
+    modules: HashMap<String, HashMap<String, Arc<Raster>>>,
+    // Keep per-frame length checks O(1), independent of the module count.
+    len: usize,
+}
 
 /// The mounted bitmaps as of one frame.
 ///
@@ -305,19 +310,18 @@ pub struct RastersView(Arc<Mounted>);
 impl RastersView {
     /// The bitmap mounted under `(module, key)`.
     ///
-    /// The lookup allocates two `String`s today. That is a per-frame cost on the
-    /// module's side; it is bounded by the number of modules, not by the size of
-    /// any bitmap, and it goes away when the key type does.
+    /// Both levels borrow their string keys: a frame does not allocate a
+    /// temporary owned key merely to look up a mounted picture.
     pub fn get(&self, module: &str, key: &str) -> Option<&Arc<Raster>> {
-        self.0.get(&(module.to_string(), key.to_string()))
+        self.0.modules.get(module)?.get(key)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.0.len == 0
     }
 
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.0.len
     }
 }
 
@@ -355,14 +359,22 @@ impl Rasters {
     /// rectangle, and the caller that lost would never hear about it.
     pub fn mount(&self, module: &str, key: &str, raster: Raster) -> Result<(), RasterError> {
         let mut held = self.current.lock().expect("rasters poisoned");
-        if held.contains_key(&(module.to_string(), key.to_string())) {
+        if held
+            .modules
+            .get(module)
+            .is_some_and(|items| items.contains_key(key))
+        {
             return Err(RasterError::NotMounted {
                 module: module.to_string(),
                 key: key.to_string(),
             });
         }
         let mut next = (**held).clone();
-        next.insert((module.to_string(), key.to_string()), Arc::new(raster));
+        next.modules
+            .entry(module.to_owned())
+            .or_default()
+            .insert(key.to_owned(), Arc::new(raster));
+        next.len += 1;
         *held = Arc::new(next);
         self.revision.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -370,11 +382,20 @@ impl Rasters {
 
     pub fn unmount(&self, module: &str, key: &str) {
         let mut held = self.current.lock().expect("rasters poisoned");
-        if !held.contains_key(&(module.to_string(), key.to_string())) {
+        if !held
+            .modules
+            .get(module)
+            .is_some_and(|items| items.contains_key(key))
+        {
             return;
         }
         let mut next = (**held).clone();
-        next.remove(&(module.to_string(), key.to_string()));
+        let items = next.modules.get_mut(module).expect("mounted module exists");
+        items.remove(key);
+        if items.is_empty() {
+            next.modules.remove(module);
+        }
+        next.len -= 1;
         *held = Arc::new(next);
         self.revision.fetch_add(1, Ordering::Relaxed);
     }
@@ -413,8 +434,7 @@ impl Rasters {
         payload: &str,
     ) -> Result<(), RasterError> {
         let mut held = self.current.lock().expect("rasters poisoned");
-        let id = (module.to_string(), key.to_string());
-        let Some(existing) = held.get(&id) else {
+        let Some(existing) = held.modules.get(module).and_then(|items| items.get(key)) else {
             return Err(RasterError::NotMounted {
                 module: module.to_string(),
                 key: key.to_string(),
@@ -428,7 +448,11 @@ impl Rasters {
         }
         let raster = Raster::decode(mounted.0, mounted.1, payload)?;
         let mut next = (**held).clone();
-        next.insert(id, Arc::new(raster));
+        *next
+            .modules
+            .get_mut(module)
+            .and_then(|items| items.get_mut(key))
+            .expect("mounted raster exists") = Arc::new(raster);
         *held = Arc::new(next);
         self.revision.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -796,6 +820,33 @@ mod tests {
         assert!(rasters
             .write_sized("pane", "main", 2, 2, &solid_payload(2, 2))
             .is_ok());
+    }
+
+    #[test]
+    fn borrowed_lookup_keeps_compound_keys_and_old_views_independent() {
+        let rasters = Rasters::new();
+        let keys = [("a\0b", "c"), ("a", "b\0c"), ("a", "other"), ("", "")];
+        for (i, (module, key)) in keys.iter().enumerate() {
+            rasters.mount(module, key, solid(i as u16 + 1, 1)).unwrap();
+        }
+        let old = rasters.view();
+        assert_eq!(old.len(), 4);
+        let before = old.get("a", "other").unwrap().clone();
+        assert!(Arc::ptr_eq(&before, old.get("a", "other").unwrap()));
+        for (i, (module, key)) in keys.iter().enumerate() {
+            assert_eq!(old.get(module, key).unwrap().columns, i as u16 + 1);
+            rasters.unmount(module, key);
+            assert_eq!(rasters.view().len(), 3 - i);
+            assert_eq!(old.len(), 4);
+            assert!(old.get(module, key).is_some());
+        }
+        assert!(rasters.view().is_empty());
+        let revision = rasters.revision();
+        rasters.unmount("a", "other");
+        assert_eq!(rasters.revision(), revision);
+        rasters.mount("a", "other", solid(1, 1)).unwrap();
+        assert_eq!(rasters.view().len(), 1);
+        assert_eq!(old.get("a", "other").unwrap().columns, 3);
     }
 
     #[test]
