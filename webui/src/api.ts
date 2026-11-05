@@ -143,6 +143,7 @@ export interface StreamChatBody {
   provider?: string;
   images?: ImageData[];
   approval_mode?: ApprovalMode;
+  reasoning_effort?: string;
 }
 
 export async function stopChat(requestId: string): Promise<void> {
@@ -1348,16 +1349,19 @@ export async function postCommand(body: {
 /** Switch the approval mode (build / accept_edits / bypass / plan). Runtime
  *  session state — the next turn's PermissionDecider follows it; broadcast to
  *  other tabs. */
+export interface ModeSelection {model:string;reasoning_effort:string|null}
+export interface ModeSelectionResult {ok:boolean;mode:ApprovalMode;error?:string;selection?:ModeSelection}
+export async function postModeSelection(mode: ApprovalMode, context: {
+  independent?: boolean; current_model?: ModeSelection; return_model?: ModeSelection; previous_mode?: ApprovalMode; running?: boolean;
+} = {}): Promise<ModeSelectionResult> {
+  const resp = await apiFetch('/approval_mode', {method:'POST', headers:{'Content-Type':'application/json',...authHeaders()}, body:JSON.stringify({mode,...context})});
+  if(!resp.ok) throw await failure(resp);
+  const body = await readJson<ModeSelectionResult>(resp);
+  if(!body.ok) throw new Error(body.error || 'live runtime rejected the mode switch');
+  return body;
+}
 export async function postLiveMode(mode: ApprovalMode): Promise<ApprovalMode> {
-  const resp = await apiFetch('/approval_mode', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ mode }),
-  });
-  if (!resp.ok) throw new Error(`switch mode failed: ${resp.status}`);
-  const body = (await resp.json()) as ApprovalModeResponse;
-  if (!body.ok) throw new Error('live runtime rejected the mode switch');
-  return body.mode;
+  return (await postModeSelection(mode)).mode;
 }
 
 export async function getApprovalMode(): Promise<ApprovalMode> {
@@ -1583,4 +1587,14 @@ export async function followUp(sessionId: string, args: string): Promise<FollowU
     body:JSON.stringify({session_id:sessionId,args}),
   });
   return readJson<FollowUpView>(response);
+}
+
+export interface ModeBinding { model?: string; reasoning_effort?: string }
+export interface ModeBindings { plan: ModeBinding; build: ModeBinding }
+export interface ModeModelsInfo { bindings: ModeBindings; models: Array<{id:string;label:string;effort_levels:string[]}>; reasoning_effort_levels: string[] }
+export async function getModeModels(): Promise<ModeModelsInfo> {
+  return readJson(await apiFetch('/config/modes',{headers:authHeaders()}));
+}
+export async function saveModeModels(bindings: ModeBindings): Promise<ModeModelsInfo> {
+  return readJson(await apiFetch('/config/modes',{method:'POST',headers:{...authHeaders(),'Content-Type':'application/json'},body:JSON.stringify(bindings)}));
 }

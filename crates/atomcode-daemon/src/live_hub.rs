@@ -829,6 +829,26 @@ impl LiveViewHub {
         Self::dispatch_locked(&state, command)
     }
 
+    pub async fn update_mode_bindings(
+        &self,
+        bindings: atomcode_config::mode_models::ModeModels,
+    ) -> Result<(), HubError> {
+        self.bound_handle()?
+            .1
+            .update_mode_bindings(bindings)
+            .await
+            .map_err(|error| HubError::RuntimeRejected(error.to_string()))
+    }
+    pub async fn model_selection(
+        &self,
+    ) -> Result<atomcode_config::mode_models::ModeSelection, HubError> {
+        self.bound_handle()?
+            .1
+            .model_selection()
+            .await
+            .map_err(|error| HubError::RuntimeRejected(error.to_string()))
+    }
+
     pub async fn set_mode(&self, mode: atomcode_coding::RuntimeMode) -> Result<(), HubError> {
         self.bound_handle()?
             .1

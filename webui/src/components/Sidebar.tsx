@@ -1257,7 +1257,7 @@ export function Sidebar({
           (menuFor === s.id ? ' menu-open' : '')
         }
       >
-        <button class="session-item-main" onClick={() => onSelect(s)} title={dir}>
+        <button class="session-item-main" onClick={() => onSelect(s)} title={runningSessionId && s.id !== runningSessionId ? `${dir} · ${t('browse.sidebarHint')}` : dir}>
           <span class="session-item-name">{s.scheduled && <span class="session-automation-mark" title={t('sidebar.automation')} aria-label={t('sidebar.automation')}>◷</span>}{label}</span>
           {s.id === runningSessionId && <span class="session-running-mark">{t('browse.running')}</span>}
           <span class="session-item-meta">
@@ -1451,6 +1451,8 @@ export function Sidebar({
           </button>
         )}
       </div>
+
+      {runningSessionId && <p class="session-browse-sidebar-hint">{t('browse.sidebarHint')}</p>}
 
       <div
         class="session-list-body"

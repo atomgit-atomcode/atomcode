@@ -265,6 +265,9 @@ mod tests {
             | C::Snapshot { .. }
             | C::ContextStats { .. }
             | C::Mode { .. }
+            | C::ModelSelection { .. }
+            | C::Configuration { .. }
+            | C::UpdateModeBindings { .. }
             | C::WaitMcpReady { .. }
             | C::McpStatus { .. }
             | C::McpTools { .. }

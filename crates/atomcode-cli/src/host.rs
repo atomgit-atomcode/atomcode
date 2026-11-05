@@ -243,6 +243,13 @@ pub(crate) fn attach(
     tokio::spawn(async move {
         let _task = task;
         while let Some(sequenced) = runtime_events.recv().await {
+            // This is a presentation cache, not the runtime's authority. Mode
+            // bindings can change the provider without a driver /model command.
+            if matches!(&sequenced.event, CodingRuntimeEvent::ProviderChanged { .. }) {
+                if let Ok(current) = watched.handle.configuration().await {
+                    *watched.config.lock().expect("config poisoned") = current;
+                }
+            }
             // 共享着的话,网页端照这条事件画。挂没挂在那一侧判断,这里不设第二个
             // 开关——两个「现在共享着吗」的答案迟早会不一致。
             //
@@ -2147,7 +2154,7 @@ impl HostControl for RuntimeControl {
             }
             HostCommand::SetReasoningEffort { session, level } => {
                 self.addressed(&session)?;
-                let mut next = self.config.lock().expect("config poisoned").clone();
+                let mut next = self.handle.configuration().await.map_err(refused)?;
                 next.chat_options.reasoning_effort = level;
                 self.handle
                     .reassemble_provider(next.clone())
@@ -2313,12 +2320,15 @@ impl HostControl for RuntimeControl {
                     .for_model(&model)
                     .map_err(|message| HostError::Failed { message })?;
                 // The thinking level is the session's, not the model's default.
-                next.chat_options.reasoning_effort = self
-                    .config
-                    .lock()
-                    .expect("config poisoned")
-                    .chat_options
-                    .reasoning_effort;
+                next.chat_options.reasoning_effort =
+                    atomcode_kernel::provider::ReasoningEffort::from_config(
+                        self.handle
+                            .model_selection()
+                            .await
+                            .map_err(refused)?
+                            .reasoning_effort
+                            .as_deref(),
+                    );
                 let reply = self.reconfigure(next).await?;
                 // Persist the selection so it survives the next start. Without
                 // this the switch is runtime-only and the next launch resolves
@@ -2484,6 +2494,9 @@ impl HostControl for RuntimeControl {
                     .set_mode(runtime_mode(mode))
                     .await
                     .map_err(refused)?;
+                if let Ok(current) = self.handle.configuration().await {
+                    *self.config.lock().expect("config poisoned") = current;
+                }
                 Ok(HostReply::Done)
             }
             // Read back from the runtime, not from a copy this adapter keeps:
@@ -2878,7 +2891,7 @@ impl HostControl for RuntimeControl {
                     // What the running graph was built from, which is the one a
                     // person is on — not what the file calls the default, which
                     // a `/model` since then may have moved off.
-                    current: Some(self.config.lock().expect("config poisoned").model.clone()),
+                    current: Some(self.handle.configuration().await.map_err(refused)?.model),
                 })
             }
             HostCommand::FollowUp { session, args } => {
@@ -2979,9 +2992,10 @@ impl HostControl for RuntimeControl {
             HostCommand::Thinking { session } => {
                 self.addressed(&session)?;
                 let on = self
-                    .config
-                    .lock()
-                    .expect("config poisoned")
+                    .handle
+                    .configuration()
+                    .await
+                    .map_err(refused)?
                     .thinking_enabled
                     .unwrap_or(false);
                 Ok(HostReply::Settings {
@@ -3001,7 +3015,7 @@ impl HostControl for RuntimeControl {
             // path the thinking *level* takes, for the same reason.
             HostCommand::SetThinking { session, on } => {
                 self.addressed(&session)?;
-                let mut next = self.config.lock().expect("config poisoned").clone();
+                let mut next = self.handle.configuration().await.map_err(refused)?;
                 next.thinking_enabled = Some(on);
                 self.handle
                     .reassemble_provider(next.clone())

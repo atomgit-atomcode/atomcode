@@ -2618,6 +2618,49 @@ impl CodingRuntimeHandle {
         result.await.map_err(|_| RuntimeError::Unavailable)?
     }
 
+    /// Update future mode preferences without reconfiguring the current provider.
+    pub async fn update_mode_bindings(
+        &self,
+        bindings: atomcode_config::mode_models::ModeModels,
+    ) -> Result<(), RuntimeError> {
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::UpdateModeBindings {
+                generation: self.status().generation,
+                bindings,
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
+    /// Host-only configuration snapshot for a subsequent provider edit. Never
+    /// serialize this credential-bearing value into a row or transport response.
+    pub async fn configuration(&self) -> Result<CodingAgentConfig, RuntimeError> {
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::Configuration {
+                generation: self.status().generation,
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
+    /// Current selection and effort, ordered through the runtime owner.
+    pub async fn model_selection(
+        &self,
+    ) -> Result<atomcode_config::mode_models::ModeSelection, RuntimeError> {
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::ModelSelection {
+                generation: self.status().generation,
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
     /// Explicit headless readiness policy. Interactive callers should let MCP
     /// connect in the background and observe new tools from the next turn.
     pub async fn wait_mcp_ready(&self, timeout: std::time::Duration) -> Result<(), RuntimeError> {
@@ -3949,6 +3992,19 @@ pub enum CodingRuntimeControl {
         generation: u64,
         done: oneshot::Sender<Result<RuntimeMode, RuntimeError>>,
     },
+    UpdateModeBindings {
+        generation: u64,
+        bindings: atomcode_config::mode_models::ModeModels,
+        done: oneshot::Sender<Result<(), RuntimeError>>,
+    },
+    Configuration {
+        generation: u64,
+        done: oneshot::Sender<Result<CodingAgentConfig, RuntimeError>>,
+    },
+    ModelSelection {
+        generation: u64,
+        done: oneshot::Sender<Result<atomcode_config::mode_models::ModeSelection, RuntimeError>>,
+    },
     WaitMcpReady {
         generation: u64,
         timeout: std::time::Duration,
@@ -4600,6 +4656,7 @@ fn spawn_runtime_owner_with_optional_agent(
         let mut next_turn_id = 0u64;
         let mut conversation_revision = 0u64;
         let mut active_turn = None;
+        let mut mode_model_return: Option<crate::mode_models::SavedModeModel> = None;
         // Keep each request kind until its correlated response is delivered.
         // `request_user_input` image answers need runtime-owned preprocessing.
         let mut pending_requests = BTreeMap::new();
@@ -6869,23 +6926,81 @@ fn spawn_runtime_owner_with_optional_agent(
                         }
                     }
                     Some(CodingRuntimeControl::SetMode {
-                        generation: request_generation,
-                        mode,
-                        done,
+                        generation: request_generation, mode, done,
                     }) => {
-                        let Some(runtime) = resources.as_ref() else {
-                            let _ = done.send(Err(RuntimeError::Unavailable));
-                            continue;
+                        let Some(runtime) = resources.as_mut() else {
+                            let _ = done.send(Err(RuntimeError::Unavailable)); continue;
                         };
                         if request_generation != generation || compaction_suspended {
-                            let _ = done.send(Err(RuntimeError::Busy));
-                            continue;
+                            let _ = done.send(Err(RuntimeError::Busy)); continue;
                         }
                         let before = current_mode(&runtime.parts);
+                        if before == mode { let _ = done.send(Ok(())); continue; }
+                        let owner = (runtime.parts.session.as_ref().map(|s| s.id.clone()), runtime.config.working_dir.clone());
+                        if mode_model_return.as_ref().is_some_and(|saved| saved.owner != owner) { mode_model_return = None; }
+                        let next = match crate::mode_models::next_config(&runtime.config, before, mode, mode_model_return.as_ref()) {
+                            Ok(next) => next,
+                            Err(error) => { let _ = done.send(Err(error)); continue; }
+                        };
+                        if let Some(next) = next {
+                            if active_turn.is_some() || !pending_requests.is_empty() || held_turn.is_some() || next_prompt_task.is_some() || pending_wakeup.is_some() {
+                                let _ = done.send(Err(RuntimeError::ReconfigureFailed("Stop the current task before changing a mode-bound model".into()))); continue;
+                            }
+                            if agent.is_none() || !agent_available { let _ = done.send(Err(RuntimeError::Unavailable)); continue; }
+                            let session_id = runtime.parts.session.as_ref().map(|s| s.id.as_str());
+                            let candidate = match runtime.provider_factory.build(&next, session_id) {
+                                Ok(provider) => provider,
+                                Err(error) => { let _ = done.send(Err(RuntimeError::ReconfigureFailed(error.to_string()))); continue; }
+                            };
+                            let (Some(app), Some(slots)) = (runtime.harness_app.as_mut(), runtime.harness_providers.as_ref()) else {
+                                let _ = done.send(Err(RuntimeError::Unavailable)); continue;
+                            };
+                            if let Err(error) = crate::on_harness::swap_provider_for(app, slots.as_ref(), candidate.clone(), &next.model, Some(&next)).await {
+                                let _ = done.send(Err(RuntimeError::ReconfigureFailed(error))); continue;
+                            }
+                            if mode == RuntimeMode::Plan {
+                                mode_model_return = Some(crate::mode_models::SavedModeModel { owner,
+                                    selection: runtime.config.provider_name.clone(), effort: runtime.config.chat_options.reasoning_effort });
+                            }
+                            let _ = crate::parts::wire_side_providers(&runtime.parts, &next, &candidate);
+                            if let Some(snapshot) = runtime.parts.snapshot_hook() { snapshot.set_model_attribution(&next.provider_name, &next.model); }
+                            tell(runtime, crate::told::reconfigured(&runtime.config, &next));
+                            runtime.config = next;
+                            // The live agent is unchanged and no turn is in flight.
+                            // Mode changes retain its generation; only the provider seam is patched.
+                            let _ = runtime_event_tx.send(CodingRuntimeEvent::ProviderChanged { provider: runtime.config.provider_name.clone(), model: current_runtime_model(runtime).unwrap_or_default() });
+                            let _ = runtime_event_tx.send(CodingRuntimeEvent::ReasoningEffortChanged { provider: runtime.config.provider_name.clone(), effort: runtime.config.chat_options.reasoning_effort, applicable: runtime.config.supports_reasoning_effort });
+                        }
+                        if before == RuntimeMode::Plan { mode_model_return = None; }
                         set_mode_flags(&runtime.parts, mode);
                         tell(runtime, crate::told::mode_changed(before, mode));
                         let _ = runtime_event_tx.send(CodingRuntimeEvent::ModeChanged { mode });
                         let _ = done.send(Ok(()));
+                    }
+                    Some(CodingRuntimeControl::UpdateModeBindings {generation:requested,bindings,done}) => {
+                        let result=resources.as_mut().ok_or(RuntimeError::Unavailable).and_then(|runtime| {
+                            if requested!=generation {return Err(RuntimeError::Busy);}
+                            let registry=runtime.config.subagent_config.as_mut().ok_or(RuntimeError::Unavailable)?;
+                            atomcode_config::mode_models::validate_binding(registry,&bindings.plan).map_err(|error|RuntimeError::ReconfigureFailed(error.to_string()))?;
+                            atomcode_config::mode_models::validate_binding(registry,&bindings.build).map_err(|error|RuntimeError::ReconfigureFailed(error.to_string()))?;
+                            Arc::make_mut(registry).modes=bindings;
+                            Ok(())
+                        });
+                        let _=done.send(result);
+                    }
+                    Some(CodingRuntimeControl::Configuration {generation:requested,done}) => {
+                        let answer=resources.as_ref().ok_or(RuntimeError::Unavailable).and_then(|runtime| {
+                            if requested!=generation {return Err(RuntimeError::Busy);}
+                            Ok(runtime.config.clone())
+                        });
+                        let _=done.send(answer);
+                    }
+                    Some(CodingRuntimeControl::ModelSelection { generation: requested, done }) => {
+                        let answer=resources.as_ref().ok_or(RuntimeError::Unavailable).and_then(|runtime| {
+                            if requested!=generation { return Err(RuntimeError::Busy); }
+                            Ok(atomcode_config::mode_models::ModeSelection { model:runtime.config.provider_name.clone(), reasoning_effort:runtime.config.chat_options.reasoning_effort.map(|v|v.as_str().to_string()) })
+                        });
+                        let _=done.send(answer);
                     }
                     Some(CodingRuntimeControl::Mode {
                         generation: request_generation,
@@ -7448,6 +7563,12 @@ fn spawn_runtime_owner_with_optional_agent(
                                     Ordering::Release,
                                 );
                                 runtime_event_tx.carry_live_view(generation);
+                                if resources.as_ref().and_then(|runtime| runtime.config.subagent_config.as_ref()).is_some_and(|config| !config.modes.is_empty()) {
+                                    let text=if atomcode_config::i18n::current_locale()==atomcode_config::locale::Locale::ZhCn {
+                                        "临时使用所选模型/强度；切换到已配置的模式时重新应用绑定。"
+                                    } else { "Temporary model/effort selection; entering a configured mode reapplies its binding." };
+                                    let _=runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(text.into()));
+                                }
                                 let _ = runtime_event_tx.send(
                                     CodingRuntimeEvent::ProviderChanged {
                                         provider: provider.clone(),
@@ -8029,6 +8150,16 @@ fn spawn_runtime_owner_with_optional_agent(
                         // What the model is told once this lands: a reload, or
                         // what a reloaded config changed. A new session is not
                         // told anything — it has no conversation above it.
+                        if let ReprepareTarget::ReloadConfig(next)=&target {
+                            if crate::mode_models::only_preferences_changed(&runtime.config,next) {
+                                runtime.config.subagent_config=next.subagent_config.clone();
+                                let changed=session_changed(generation,&runtime);
+                                resources=Some(runtime);
+                                let _=runtime_event_tx.send(CodingRuntimeEvent::Reconfigured{operation:ReconfigureKind::Reprepare});
+                                let _=done.send(Ok(changed));
+                                continue;
+                            }
+                        }
                         let reloaded_from = match &target {
                             ReprepareTarget::Reload { .. } => Some(None),
                             ReprepareTarget::ReloadConfig(_) => Some(Some(runtime.config.clone())),
@@ -8415,6 +8546,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         }
                         let changed = session_changed(generation, &runtime);
                         let cwd = runtime.config.working_dir.clone();
+                        if changes_session { mode_model_return = None; }
                         resources = Some(runtime);
                         controls.state.store(
                             runtime_phase_state(generation, RuntimePhase::Ready),
@@ -10357,6 +10489,7 @@ fn reject_runtime_control_with_error(
         | CodingRuntimeControl::Cancel { done, .. }
         | CodingRuntimeControl::PauseGoal { done, .. }
         | CodingRuntimeControl::SetMode { done, .. }
+        | CodingRuntimeControl::UpdateModeBindings { done, .. }
         | CodingRuntimeControl::WaitMcpReady { done, .. }
         | CodingRuntimeControl::QueueLocalContext { done, .. } => {
             let _ = done.send(Err(error));
@@ -10369,6 +10502,12 @@ fn reject_runtime_control_with_error(
         }
         // A stopping runtime cannot say which mode it is in either — the flags
         // belong to a tree that is being torn down.
+        CodingRuntimeControl::Configuration { done, .. } => {
+            let _ = done.send(Err(error));
+        }
+        CodingRuntimeControl::ModelSelection { done, .. } => {
+            let _ = done.send(Err(error));
+        }
         CodingRuntimeControl::Mode { done, .. } => {
             let _ = done.send(Err(error));
         }
@@ -20211,6 +20350,246 @@ mod tests {
             Some(AgentCommand::Respond { id: 43, .. })
         ));
         handle.shutdown().await.unwrap();
+    }
+
+    fn mode_model_start(build: bool) -> CodingRuntimeStart {
+        let mut start = native_start(false);
+        let config: atomcode_config::Config = toml::from_str(
+            r#"
+            default_provider = "base"
+            [providers.base]
+type = "openai"
+            model = "test"
+            api_key = "base-key"
+            base_url = "https://base.example/v1"
+            reasoning_effort_levels = ["low", "high"]
+            [providers.planner]
+type = "openai"
+            model = "plan-wire"
+            api_key = "plan-key"
+            base_url = "https://plan.example/v1"
+            reasoning_effort_levels = ["low", "high"]
+            [providers.builder]
+type = "openai"
+            model = "build-wire"
+            api_key = "build-key"
+            base_url = "https://build.example/v1"
+            reasoning_effort_levels = ["low"]
+            [modes.plan]
+            model = "planner"
+            reasoning_effort = "high"
+        "#,
+        )
+        .unwrap();
+        start.agent.provider_name = "base".into();
+        start.agent.supports_reasoning_effort = true;
+        start.agent.effort_levels = vec!["low".into(), "high".into()];
+        start.agent.chat_options.reasoning_effort =
+            Some(atomcode_kernel::provider::ReasoningEffort::Low);
+        let mut config = config;
+        if build {
+            config.modes.build = atomcode_config::mode_models::ModeModelBinding {
+                model: Some("builder".into()),
+                reasoning_effort: Some("low".into()),
+            };
+        }
+        start.agent.subagent_config = Some(Arc::new(config));
+        start
+    }
+
+    #[tokio::test]
+    async fn mode_model_plan_entry_and_build_restore_are_atomic_and_do_not_change_defaults() {
+        let runtime = CodingRuntime::start(mode_model_start(false)).await.unwrap();
+        let generation = runtime.handle.status().generation;
+        runtime.handle.set_mode(RuntimeMode::Plan).await.unwrap();
+        assert_eq!(
+            runtime.handle.model_selection().await.unwrap(),
+            atomcode_config::mode_models::ModeSelection {
+                model: "planner".into(),
+                reasoning_effort: Some("high".into())
+            }
+        );
+        assert_eq!(runtime.handle.mode().await.unwrap(), RuntimeMode::Plan);
+        assert_eq!(runtime.handle.status().generation, generation);
+        let mut temporary = runtime.handle.configuration().await.unwrap();
+        assert_eq!(temporary.provider_name, "planner");
+        temporary.chat_options.reasoning_effort =
+            Some(atomcode_kernel::provider::ReasoningEffort::Low);
+        runtime.handle.reassemble_provider(temporary).await.unwrap();
+        runtime.handle.set_mode(RuntimeMode::Plan).await.unwrap();
+        assert_eq!(
+            runtime
+                .handle
+                .model_selection()
+                .await
+                .unwrap()
+                .reasoning_effort
+                .as_deref(),
+            Some("low")
+        );
+        runtime.handle.set_mode(RuntimeMode::Build).await.unwrap();
+        assert_eq!(
+            runtime.handle.model_selection().await.unwrap().model,
+            "base"
+        );
+        assert_eq!(
+            runtime
+                .handle
+                .model_selection()
+                .await
+                .unwrap()
+                .reasoning_effort
+                .as_deref(),
+            Some("low")
+        );
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mode_model_same_mode_keeps_manual_override_and_build_binding_wins() {
+        let start = mode_model_start(true);
+        let manual = start.agent.clone();
+        start
+            .agent
+            .subagent_config
+            .as_ref()
+            .unwrap()
+            .resolve_model(Some("planner"))
+            .unwrap();
+        let runtime = CodingRuntime::start(start).await.unwrap();
+        runtime.handle.set_mode(RuntimeMode::Plan).await.unwrap();
+        runtime.handle.reassemble_provider(manual).await.unwrap();
+        runtime.handle.set_mode(RuntimeMode::Plan).await.unwrap();
+        assert_eq!(
+            runtime.handle.model_selection().await.unwrap().model,
+            "base"
+        );
+        runtime.handle.set_mode(RuntimeMode::Build).await.unwrap();
+        assert_eq!(
+            runtime.handle.model_selection().await.unwrap().model,
+            "builder"
+        );
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn mode_model_changes_are_refused_while_a_turn_is_running() {
+        let mut start = mode_model_start(false);
+        start.provider_factory = Arc::new(PendingProviderFactory);
+        let runtime = CodingRuntime::start(start).await.unwrap();
+        runtime
+            .handle
+            .submit(UserInput::from("hold"))
+            .await
+            .unwrap();
+        assert!(runtime
+            .handle
+            .set_mode(RuntimeMode::Plan)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Stop the current task"));
+        assert_eq!(runtime.handle.mode().await.unwrap(), RuntimeMode::Build);
+        assert_eq!(
+            runtime.handle.model_selection().await.unwrap().model,
+            "base"
+        );
+        runtime.handle.cancel().await.unwrap();
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mode_model_preference_updates_leave_the_current_model_and_session_untouched() {
+        let start = mode_model_start(false);
+        let mut next = start.agent.clone();
+        let runtime = CodingRuntime::start(start).await.unwrap();
+        runtime.handle.set_mode(RuntimeMode::Plan).await.unwrap();
+        Arc::make_mut(next.subagent_config.as_mut().unwrap())
+            .modes
+            .build = atomcode_config::mode_models::ModeModelBinding {
+            model: Some("builder".into()),
+            reasoning_effort: Some("low".into()),
+        };
+        let before = runtime.handle.status().generation;
+        runtime.handle.reprepare_config(next).await.unwrap();
+        assert_eq!(runtime.handle.status().generation, before);
+        assert_eq!(runtime.handle.mode().await.unwrap(), RuntimeMode::Plan);
+        assert_eq!(
+            runtime.handle.model_selection().await.unwrap().model,
+            "planner"
+        );
+        runtime.handle.set_mode(RuntimeMode::Build).await.unwrap();
+        assert_eq!(
+            runtime.handle.model_selection().await.unwrap().model,
+            "builder"
+        );
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mode_model_restores_a_fixed_profile_effort_without_switchable_levels() {
+        let mut start = mode_model_start(false);
+        start.agent.effort_levels.clear();
+        let registry = Arc::make_mut(start.agent.subagent_config.as_mut().unwrap());
+        let base = registry.providers.get_mut("base").unwrap();
+        base.reasoning_effort_levels = None;
+        base.reasoning_effort = Some("low".into());
+        let runtime = CodingRuntime::start(start).await.unwrap();
+        runtime.handle.set_mode(RuntimeMode::Plan).await.unwrap();
+        runtime.handle.set_mode(RuntimeMode::Build).await.unwrap();
+        let selection = runtime.handle.model_selection().await.unwrap();
+        assert_eq!(selection.model, "base");
+        assert_eq!(selection.reasoning_effort.as_deref(), Some("low"));
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mode_model_build_effort_only_restores_the_pre_plan_model() {
+        let mut start = mode_model_start(false);
+        Arc::make_mut(start.agent.subagent_config.as_mut().unwrap())
+            .modes
+            .build
+            .reasoning_effort = Some("high".into());
+        let runtime = CodingRuntime::start(start).await.unwrap();
+        runtime.handle.set_mode(RuntimeMode::Plan).await.unwrap();
+        runtime.handle.set_mode(RuntimeMode::Build).await.unwrap();
+        let actual = runtime.handle.model_selection().await.unwrap();
+        assert_eq!(actual.model, "base");
+        assert_eq!(actual.reasoning_effort.as_deref(), Some("high"));
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mode_model_invalid_effort_keeps_mode_and_provider() {
+        let mut start = mode_model_start(false);
+        Arc::make_mut(start.agent.subagent_config.as_mut().unwrap())
+            .modes
+            .plan
+            .model = Some("builder".into());
+        let runtime = CodingRuntime::start(start).await.unwrap();
+        assert!(runtime.handle.set_mode(RuntimeMode::Plan).await.is_err());
+        assert_eq!(runtime.handle.mode().await.unwrap(), RuntimeMode::Build);
+        assert_eq!(
+            runtime.handle.model_selection().await.unwrap().model,
+            "base"
+        );
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mode_model_provider_failure_keeps_the_old_mode_and_provider() {
+        let mut start = mode_model_start(false);
+        start.provider_factory = Arc::new(UsageProviderFactory {
+            fail_model: std::sync::Mutex::new(Some("plan-wire".into())),
+        });
+        let runtime = CodingRuntime::start(start).await.unwrap();
+        assert!(runtime.handle.set_mode(RuntimeMode::Plan).await.is_err());
+        assert_eq!(runtime.handle.mode().await.unwrap(), RuntimeMode::Build);
+        assert_eq!(
+            runtime.handle.model_selection().await.unwrap().model,
+            "base"
+        );
+        runtime.handle.shutdown().await.unwrap();
     }
 
     #[tokio::test]

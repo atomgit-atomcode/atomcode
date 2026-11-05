@@ -42,7 +42,7 @@ import { rankSessionReferences, sessionReferenceToken, sessionReferenceTokens } 
 import { sessionReferenceCandidates } from '../api';
 import { VNode } from 'preact';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, listDir, searchFiles, changeDir, postConfigReload, postCommand, getLivePersona, followUp, postLiveCompact, postUserInputAnswer, postLivePolicyInterventionResolution, openWorkspaceFile, type CommandResult, type RoutedUserInputRequest, type PolicyInterventionEvent, type TurnStats } from '../api';
+import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, postModeSelection, getModeModels, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, listDir, searchFiles, changeDir, postConfigReload, postCommand, getLivePersona, followUp, postLiveCompact, postUserInputAnswer, postLivePolicyInterventionResolution, openWorkspaceFile, type CommandResult, type RoutedUserInputRequest, type PolicyInterventionEvent, type TurnStats } from '../api';
 import {
   parseSlashCommand,
   buildCommandMap,
@@ -618,12 +618,13 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     effort: string | null;
   } | null>(null);
   const providerRef = useRef<string | null>(null);
+  const prePlanModel = useRef<{model:string;reasoning_effort:string|null}|null>(null);
   const providerPinnedRef = useRef(false);
   const [runtimeModel, setRuntimeModel] = useState<RuntimeModelIdentity | null>(null);
   const runtimeModelRef = useRef<RuntimeModelIdentity | null>(null);
   function rememberRuntimeModel(identity: RuntimeModelIdentity | null) {
     if (runtimeModelRef.current?.provider !== identity?.provider || runtimeModelRef.current?.model !== identity?.model) {
-      setReasoningEffort(null);
+      setReasoningEffort(current => current?.provider === identity?.provider ? current : null);
     }
     runtimeModelRef.current = identity;
     setRuntimeModel(identity);
@@ -925,6 +926,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     // 会话 id 变化（外部切换 / 新建按钮）才重置画布。本 Chat 自建会话首条消息完成后
     // sessionId 变成自己的 id（activeIdRef 已同步），不重置，以免清空刚看到的对话。
     if (sessionId !== activeIdRef.current) {
+      prePlanModel.current = null;
       const switchGeneration = sessionGenerationRef.current;
       const prevId = activeIdRef.current;
       const liveSwitch = liveSessionSwitchDisposition(
@@ -2170,20 +2172,49 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     const nextState = beginModeSwitch(modeState, m);
     if (nextState === modeState) return;
     setModeState(nextState);
-    void postLiveMode(m)
-      .then((confirmed) => {
-        setModeState((cur) => completeModeSwitch(cur, confirmed));
-        onConfirmed?.(confirmed);
+    const beforeMode = modeState.displayMode;
+    const selectedBefore = providerRef.current;
+    const knownEffort = reasoningEffort?.provider === selectedBefore ? reasoningEffort.effort : undefined;
+    const switchGeneration = sessionGenerationRef.current;
+    void (async () => {
+      const beforeEffort = knownEffort !== undefined ? knownEffort
+        : (!sync && selectedBefore ? (await getModels()).find(model => model.provider === selectedBefore)?.reasoning_effort ?? null : null);
+      const result = await postModeSelection(m, {independent:!sync, previous_mode:beforeMode, running:busyRef.current,
+        ...(selectedBefore?{current_model:{model:selectedBefore,reasoning_effort:beforeEffort}}:{}),
+        ...(prePlanModel.current?{return_model:prePlanModel.current}:{})});
+      return {result,beforeEffort};
+    })()
+      .then(({result,beforeEffort}) => {
+        if(switchGeneration!==sessionGenerationRef.current)return;
+        if(!sync && result.selection) {
+          if(m==='plan'&&selectedBefore)prePlanModel.current={model:selectedBefore,reasoning_effort:beforeEffort};
+          providerRef.current=result.selection.model; setProvider(result.selection.model); providerPinnedRef.current=true;
+          setReasoningEffort({provider:result.selection.model,effort:result.selection.reasoning_effort});
+
+        }
+        if(result.selection)pushCommandNotice(t('modeBindings.changed',{mode:result.mode,model:result.selection.model,effort:result.selection.reasoning_effort??t('effort.default')}));
+        if(beforeMode==='plan')prePlanModel.current=null;
+        setModeState((cur) => completeModeSwitch(cur, result.mode));
+        onConfirmed?.(result.mode);
       })
-      .catch(() => setModeState((cur) => failModeSwitch(cur)));
+      .catch((error) => {
+        if(switchGeneration!==sessionGenerationRef.current)return;
+        setModeState((cur) => failModeSwitch(cur));
+        pushCommandNotice(t('modeBindings.failed',{error:String(error)}));
+      });
   }
 
   /** Switch the active provider and notify the backend when in sync mode. */
   function switchProvider(name: string) {
+    if (modeState.pendingMode) { pushCommandNotice(t('modeBindings.switching')); return; }
     providerPinnedRef.current = true;
     if (!sync) {
       providerRef.current = name;
       setProvider(name);
+      void getModeModels().then(info => {
+        const binding = info.bindings[modeState.displayMode === 'plan' ? 'plan' : 'build'];
+        if(binding.model || binding.reasoning_effort)pushCommandNotice(t('modeBindings.temporaryNotice'));
+      }).catch(() => {});
       return;
     }
     const previous = provider;
@@ -2973,6 +3004,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
         ...(provider ? { provider } : {}),
         ...(images.length ? { images } : {}),
         approval_mode: approvalMode,
+        ...(reasoningEffort?.provider===provider ? {reasoning_effort:reasoningEffort.effort??'default'}:{}),
       };
 
       await streamChat(
@@ -3888,11 +3920,12 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
             onChange={(m) => switchMode(m)}
           />
           <ModelSelector
-            busy={busy}
+            busy={busy || Boolean(modeState.pendingMode)}
             onError={pushCommandNotice}
             value={provider}
             runtime={sync || busy ? runtimeModel : null}
             liveEffort={reasoningEffort?.provider === provider ? reasoningEffort.effort : undefined}
+            onEffortChange={(provider, effort) => setReasoningEffort({provider, effort})}
             onChange={(p) => switchProvider(p)}
             onDefaultChange={followDefaultProvider}
           />
@@ -4102,10 +4135,15 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     const target = activeSession?.name || sessionId || '';
     return withInteraction(<>
       <div class="session-browse-notice" role="status">
-        <span>{t('browse.readOnly', { viewed: browseSession.name, bound: target })}</span>
-        <button onClick={onReturnToBound}>{t('browse.return', { name: target })}</button>
-        <button disabled={busy || hasBlockingInteraction} onClick={onContinueBrowse}>{t('browse.continue')}</button>
-        {canStop && <button onClick={handleStop}>{t('browse.stop', { name: target })}</button>}
+        <div class="session-browse-summary">
+          <span class="session-browse-label">{t('browse.label')}</span>
+          <strong class="session-browse-title" title={browseSession.name}>{browseSession.name}</strong>
+          <span class="session-browse-description">{t(busy || hasBlockingInteraction ? 'browse.background' : 'browse.ready', { name: target })}</span>
+        </div>
+        <div class="session-browse-actions">
+          <button class="session-browse-return" onClick={onReturnToBound}>{t(busy || hasBlockingInteraction ? 'browse.returnRunning' : 'browse.returnCurrent')}</button>
+          {!busy && !hasBlockingInteraction && <button class="session-browse-continue" onClick={onContinueBrowse}>{t('browse.continue')}</button>}
+        </div>
       </div>
       <SessionBrowse key={`${browseSession.project_hash}/${browseSession.id}`} session={browseSession} />
       {blockingInteraction && <div class="interaction-dock-seat" ref={interactionSeat} aria-label={target}></div>}

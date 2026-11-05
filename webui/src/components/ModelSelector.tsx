@@ -47,6 +47,7 @@ export function ModelSelector({
   onError,
   onChange,
   onDefaultChange,
+  onEffortChange,
 }: {
   value: string | null;
   runtime?: RuntimeModelIdentity | null;
@@ -55,6 +56,7 @@ export function ModelSelector({
   onError?: (message: string) => void;
   onChange: (p: string) => void;
   onDefaultChange?: (p: string) => void;
+  onEffortChange?: (provider: string, effort: string | null) => void;
 }) {
   const t = useT();
   const [models, setModels] = useState<ModelInfo[]>([]);
@@ -136,6 +138,7 @@ export function ModelSelector({
     setEffortOverride(v);
     setEffortOpen(false);
     void postLiveReasoningEffort(v, target).then(() => {
+      if (currentProvider.current === target) onEffortChange?.(target, v);
       // The write succeeded. A later list refresh failure must not undo that fact.
       void getModels().then(setModels).catch(() => {});
     }).catch((error) => {

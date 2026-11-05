@@ -182,7 +182,7 @@ test('live mode still rejects protocol-level failures', async () => {
     const { postLiveMode } = await import('./api.ts');
     await assert.rejects(
       () => postLiveMode('plan'),
-      /rejected the mode switch/,
+      /runtime is busy/,
     );
   } finally {
     globalThis.fetch = originalFetch;
@@ -775,4 +775,19 @@ test('follow-up management scopes the explicit preset to its session', async () 
     globalThis.fetch = (async () => new Response('{"error":"StaleBinding"}', {status:409})) as typeof fetch;
     await assert.rejects(followUp('session-b','clear'));
   } finally { globalThis.fetch = originalFetch; }
+});
+
+test('mode switches preserve independent selection context and explicit API-default effort', async () => {
+  const originalFetch=globalThis.fetch;
+  let submitted: unknown;
+  globalThis.fetch=async (_url,init)=>{
+    submitted=JSON.parse(String(init?.body));
+    return Response.json({ok:true,mode:'plan',selection:{model:'planner',reasoning_effort:'high'}});
+  };
+  try {
+    const {postModeSelection}=await import('./api.ts');
+    const result=await postModeSelection('plan',{independent:true,previous_mode:'build',current_model:{model:'fast',reasoning_effort:null},running:false});
+    assert.deepEqual(result.selection,{model:'planner',reasoning_effort:'high'});
+    assert.deepEqual(submitted,{mode:'plan',independent:true,previous_mode:'build',current_model:{model:'fast',reasoning_effort:null},running:false});
+  }finally{globalThis.fetch=originalFetch;}
 });

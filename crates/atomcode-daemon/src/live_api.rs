@@ -2307,56 +2307,117 @@ pub(crate) async fn live_provider(
 pub(crate) struct LiveModeReq {
     /// "build" | "accept_edits" | "bypass" | "plan"
     pub mode: ApprovalMode,
+    #[serde(default)]
+    pub independent: bool,
+    #[serde(default)]
+    pub current_model: Option<atomcode_config::mode_models::ModeSelection>,
+    #[serde(default)]
+    pub return_model: Option<atomcode_config::mode_models::ModeSelection>,
+    #[serde(default)]
+    pub previous_mode: Option<ApprovalMode>,
+    #[serde(default)]
+    pub running: bool,
 }
 
 #[derive(serde::Serialize)]
 pub(crate) struct ApprovalModeResp {
     pub ok: bool,
     pub mode: ApprovalMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection: Option<atomcode_config::mode_models::ModeSelection>,
 }
 
 pub(crate) async fn approval_mode_get() -> impl IntoResponse {
     Json(ApprovalModeResp {
         ok: true,
         mode: live_current_approval_mode(),
+        error: None,
+        selection: None,
     })
 }
-
-async fn apply_live_mode(mode: ApprovalMode) -> bool {
-    let accepted = match crate::native_live::binding() {
+async fn apply_live_mode(mode: ApprovalMode) -> Result<(), String> {
+    match crate::native_live::binding() {
         Ok(_) => crate::native_live::set_mode(native_runtime_mode(mode))
             .await
-            .is_ok(),
-        Err(_) => true,
-    };
-    if accepted {
-        live_set_mode(mode);
+            .map_err(|error| format!("{error:?}"))?,
+        Err(crate::live_hub::HubError::Unbound) => {}
+        Err(error) => return Err(format!("{error:?}")),
     }
-    accepted
+    live_set_mode(mode);
+    Ok(())
 }
-
+async fn apply_mode_request(req: LiveModeReq) -> ApprovalModeResp {
+    let selected = (|| -> Result<_, String> {
+        if !req.independent || req.previous_mode == Some(req.mode) {
+            return Ok(None);
+        }
+        let config = crate::api_config::load_config()?;
+        let current = req.current_model.as_ref().cloned().or_else(|| {
+            config.effective_model_selection().map(|model| {
+                atomcode_config::mode_models::ModeSelection {
+                    model,
+                    reasoning_effort: None,
+                }
+            })
+        });
+        let Some(current) = current else {
+            return Ok(None);
+        };
+        let mode = match req.mode {
+            ApprovalMode::Plan => "plan",
+            ApprovalMode::Build => "build",
+            _ => "other",
+        };
+        let selection = atomcode_config::mode_models::resolve_driver_selection(
+            &config,
+            mode,
+            req.previous_mode == Some(ApprovalMode::Plan),
+            &current,
+            req.return_model.as_ref(),
+        )
+        .map_err(|error| error.to_string())?;
+        if selection.is_some() && req.running {
+            return Err("Stop the current task before changing a mode-bound model".into());
+        }
+        Ok(selection)
+    })();
+    match selected {
+        Err(error) => ApprovalModeResp {
+            ok: false,
+            mode: live_current_approval_mode(),
+            error: Some(error),
+            selection: None,
+        },
+        Ok(selection) => match apply_live_mode(req.mode).await {
+            Ok(()) => {
+                let selection = if req.independent {
+                    selection
+                } else {
+                    crate::native_live::model_selection().await.ok()
+                };
+                ApprovalModeResp {
+                    ok: true,
+                    mode: live_current_approval_mode(),
+                    error: None,
+                    selection,
+                }
+            }
+            Err(error) => ApprovalModeResp {
+                ok: false,
+                mode: live_current_approval_mode(),
+                error: Some(error),
+                selection: None,
+            },
+        },
+    }
+}
 pub(crate) async fn approval_mode_set(Json(req): Json<LiveModeReq>) -> impl IntoResponse {
-    let ok = apply_live_mode(req.mode).await;
-    Json(ApprovalModeResp {
-        ok,
-        mode: live_current_approval_mode(),
-    })
+    Json(apply_mode_request(req).await)
 }
-
-/// POST /live/mode — webui 底栏「模式」pill 切换审批模式
-/// （build / accept_edits / bypass / plan）。
-///
-/// 更新进程级 LIVE_APPROVAL_MODE；若当前已有 live 会话，则广播 ModeChanged 让
-/// 其他 webui tab / TUI 实时跟随。没有 live 会话时不为一次普通模式切换创建会话。
-/// 下一轮实际用哪个 PermissionDecider 由 run_turn 读 LIVE_APPROVAL_MODE 决定。
-/// 模式是运行时会话状态，不写入 config（与 provider 持久化为默认不同）——避免
-/// Auto（wire: bypass）这种危险态被静默持久化。
 pub(crate) async fn live_mode(Json(req): Json<LiveModeReq>) -> impl IntoResponse {
-    let ok = apply_live_mode(req.mode).await;
-    Json(ApprovalModeResp {
-        ok,
-        mode: live_current_approval_mode(),
-    })
+    Json(apply_mode_request(req).await)
 }
 
 #[derive(serde::Deserialize)]

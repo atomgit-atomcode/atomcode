@@ -3866,6 +3866,8 @@ fn resolve_chat_provider(
 /// Chat request body
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     /// User message content
     pub message: String,
     /// Working directory (defaults to current dir)
@@ -5561,6 +5563,32 @@ async fn process_chat_request(
     {
         let mut runtime_cfg =
             live_api::chat_runtime_config(&config, &provider_name, &working_dir, telemetry.clone());
+        if let Some(effort) = req.reasoning_effort.as_deref() {
+            if effort != "default" {
+                atomcode_config::mode_models::validate_binding(
+                    &config,
+                    &atomcode_config::mode_models::ModeModelBinding {
+                        model: Some(provider_name.clone()),
+                        reasoning_effort: Some(effort.into()),
+                    },
+                )?;
+            }
+            runtime_cfg.reasoning_effort = if effort == "default" {
+                None
+            } else {
+                Some(effort.into())
+            };
+        }
+        // /chat already carries an explicit selection, including temporary overrides.
+        // Initialize its mode before startup so idempotent SetMode does not replace it.
+        runtime_cfg.initial_mode = match approval_mode {
+            crate::approval_mode::ApprovalMode::Plan => atomcode_coding::RuntimeMode::Plan,
+            crate::approval_mode::ApprovalMode::Auto => atomcode_coding::RuntimeMode::Auto,
+            crate::approval_mode::ApprovalMode::AcceptEdits => {
+                atomcode_coding::RuntimeMode::AcceptEdits
+            }
+            _ => atomcode_coding::RuntimeMode::Build,
+        };
         runtime_cfg.dangerously_skip_permissions = approval_mode
             == crate::approval_mode::ApprovalMode::Auto
             || (approval_mode == crate::approval_mode::ApprovalMode::Build
@@ -7781,6 +7809,10 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         // Config API (P0)
         .route("/config", get(api_config::get_config))
         .route("/config/reload", post(api_config::reload_config))
+        .route(
+            "/config/modes",
+            get(api_config::get_mode_models).post(api_config::set_mode_models),
+        )
         // Provider API (P0)
         .route(
             "/providers",
@@ -9293,6 +9325,7 @@ mod tests {
         let state = chat_test_state(&home);
         let session_id = "11111111-1111-4111-8111-111111111111";
         let request = |request_id: &str| ChatRequest {
+            reasoning_effort: None,
             message: "hold this turn".into(),
             working_dir: Some(home._dir.path().to_path_buf()),
             provider: None,
@@ -9340,6 +9373,7 @@ mod tests {
             State(state.clone()),
             axum::Extension(SessionMode::Vscode),
             Json(ChatRequest {
+                reasoning_effort: None,
                 message: "hold this turn".into(),
                 working_dir: Some(home._dir.path().to_path_buf()),
                 provider: None,
@@ -9596,6 +9630,7 @@ mod tests {
         let operation_id = admission.operation_id.clone();
         process_chat_request(
             ChatRequest {
+                reasoning_effort: None,
                 message: "this runtime cannot acquire the held session".into(),
                 working_dir: Some(working_dir),
                 provider: Some("main".into()),
@@ -10535,6 +10570,7 @@ mod tests {
         let operation_id = admission.operation_id.clone();
         process_chat_request(
             ChatRequest {
+                reasoning_effort: None,
                 message: "explain this screenshot".into(),
                 working_dir: Some(home._dir.path().to_path_buf()),
                 provider: Some("main".into()),
@@ -10656,6 +10692,7 @@ done
         let operation_id = admission.operation_id.clone();
         process_chat_request(
             ChatRequest {
+                reasoning_effort: None,
                 message: "which tools do you have".into(),
                 working_dir: Some(dir.clone()),
                 provider: Some("main".into()),

@@ -718,7 +718,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ModelNoneConfigured => "no model is configured to pick from".into(),
         Msg::ModelPickerHint => "switch to which model · enter switches".into(),
         Msg::ModelSet { wanted } => format!("model → {wanted}").into(),
-        Msg::ModeWhatEachDoes => "plan looks without touching · ask asks first · edits writes files without asking · auto asks nothing".into(),
+        Msg::ModeWhatEachDoes => "plan looks without touching · ask asks first · edits writes files without asking · auto asks nothing\nMode model bindings: /config, search modes.".into(),
         Msg::ModeUnknown { what } => format!("`{what}` is not a mode; it takes plan, ask, edits or auto").into(),
         Msg::ModeSet { mode } => format!("now on {mode}").into(),
         Msg::CdUpOneLevel => "up one level".into(),

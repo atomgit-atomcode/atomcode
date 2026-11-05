@@ -1,3 +1,4 @@
+import { ModeModelsDialog } from './ModeModelsDialog';
 import { invalidateSkills } from '../skills';
 import { headerBody, headerProblem, type HeaderRow } from "../lib/providerHeaders";
 // Model settings: providers as accounts, with the models that hang off each.
@@ -135,6 +136,7 @@ function modelsOf(config: ConfigInfo, account: ProviderAccountInfo): ProviderInf
 }
 
 export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
+  const [modeSettings, setModeSettings] = useState(false);
   const { t } = useSettings();
   const [config, setConfig] = useState<ConfigInfo | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -242,6 +244,8 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
           </div>
           <div class="modal-body">
             <div class="model-config-page">
+              {modeSettings && <ModeModelsDialog onClose={() => setModeSettings(false)} />}
+              <button class="provider-action-btn" type="button" onClick={() => setModeSettings(true)}>{t('modeBindings.title')}</button>
               <div class="model-config-intro">
                 <div>
                   <h4>{t('settings.modelsTitle')}</h4>

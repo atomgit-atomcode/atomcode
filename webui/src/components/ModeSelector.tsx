@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'preact/hooks';
 import { ApprovalMode } from '../api';
 import { useT } from '../settings';
 import { MsgKey } from '../i18n';
+import { ModeModelsDialog } from './ModeModelsDialog';
 
 // Approval modes shown in the pill dropdown. Order = display order.
 // The Auto mode keeps the `bypass` wire value for protocol compatibility and
@@ -24,6 +25,7 @@ export function ModeSelector({
 }) {
   const t = useT();
   const [open, setOpen] = useState(false);
+  const [configuring, setConfiguring] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!open) return;
@@ -50,6 +52,7 @@ export function ModeSelector({
         <span class="model-selector-label">{t(current.label)}</span>
         <span class="model-selector-chevron">▾</span>
       </button>
+      {configuring && <ModeModelsDialog onClose={() => setConfiguring(false)} />}
       {open && (
         <div class="model-dropdown mode-dropdown">
           {MODE_OPTIONS.map((o) => (
@@ -72,6 +75,7 @@ export function ModeSelector({
               <span class="mode-item-desc">{t(o.desc)}</span>
             </button>
           ))}
+          <button class="model-item" type="button" onClick={() => { setOpen(false); setConfiguring(true); }}>{t('modeBindings.configure')}</button>
         </div>
       )}
     </div>

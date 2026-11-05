@@ -10,6 +10,8 @@ const meta = { id, name: 'Context summary', working_dir: '/fixture', project_has
 const specificationText = 'MUST NOT change public API\r\nconst exact = 42;';
 const messages = [{ role: 'user', content: specificationText, source_seq:12, task_spec_pinned:false }, { role: 'assistant', content: 'The resource read boundary is ready.' }];
 const other = { ...meta, id: 'browse-fixture', name: 'Other conversation' };
+const third = { ...meta, id: 'slow-browse-fixture', name: 'Slow historical conversation with a long title for layout coverage' };
+let releaseSlowHistory = null;
 let switches = 0;
 let specificationPinned = false;
 const patchUploads = [];
@@ -48,6 +50,7 @@ const server = createServer(async (req, res) => {
   if (path === '/live/permission') return json({accepted:true});
   if (path === '/live/switch_session') { switches++; return json({ok:true}); }
   if (path === '/projects/fixture/sessions/' + other.id) return json({ ...other, messages: [{role:'user', content:'Historical question'}, {role:'assistant', content:'Historical answer'}] });
+  if (path === '/projects/fixture/sessions/' + third.id) { releaseSlowHistory = () => json({ ...third, messages: [{role:'user',content:'Stale slow history'}] }); return; }
   if (path === '/live') {
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store' });
     res.write(`data: ${JSON.stringify(snapshot())}\n\n`);
@@ -63,7 +66,7 @@ const server = createServer(async (req, res) => {
   if (path === '/live/mode') return json({ mode: 'build' });
   if (path === '/live/session') return json({ success: true, session_id: id });
   if (path === '/chat/active') return json([]);
-  if (path === '/sessions' || path === '/projects/fixture/sessions') return json([meta, other]);
+  if (path === '/sessions' || path === '/projects/fixture/sessions') return json([meta, other, third]);
   if (path === '/projects' || path === '/skills') return json([]);
   try {
     const file = resolve(root, path === '/' ? 'index.html' : '.' + path);
@@ -94,7 +97,30 @@ try {
   await page.getByText('Historical answer', {exact:true}).waitFor();
   assert.equal(switches, before);
   assert.equal(await page.locator('.message-input').count(), 0);
-  assert.equal(await page.getByRole('button', {name:'Continue this session', exact:true}).isDisabled(), true);
+  assert.equal(await page.getByRole('button', {name:'Continue this session', exact:true}).count(), 0);
+  await page.getByText('The task is still running', {exact:false}).waitFor();
+  const openSidebar = async () => { if (width < 600) await page.locator('.mobile-menu-btn').click(); };
+  await openSidebar();
+  await page.getByText('Task running · other sessions open read-only', {exact:true}).waitFor();
+  await page.locator('.session-item-main').filter({hasText:third.name}).click();
+  await page.waitForFunction(name => document.querySelector('.session-browse-title')?.textContent === name, third.name);
+  for(let attempt=0;!releaseSlowHistory&&attempt<50;attempt++)await page.waitForTimeout(20);
+  assert(releaseSlowHistory, 'slow history request started');
+  await openSidebar();
+  await page.locator('.session-item-main').filter({hasText:other.name}).click();
+  await page.getByText('Historical answer', {exact:true}).waitFor();
+  releaseSlowHistory(); releaseSlowHistory=null;
+  await page.waitForTimeout(100);
+  assert.equal(await page.getByText('Stale slow history', {exact:true}).count(), 0);
+  assert.equal(await page.locator('.session-browse-title').innerText(),other.name);
+  assert.equal(switches,before,'browsing must not rebind the live session');
+  assert.equal(await page.locator('.session-item.active .session-item-name').innerText(),other.name);
+  const banner = await page.locator('.session-browse-notice').boundingBox();
+  assert(banner.width<=width,'notice must fit the viewport');
+  for(const button of await page.locator('.session-browse-actions button').all()) {
+    const bounds=await button.boundingBox(); assert(bounds.x>=banner.x&&bounds.x+bounds.width<=banner.x+banner.width+1);
+  }
+  await page.screenshot({path:`/tmp/atomcode-session-browse-${width}.png`});
   emit({type:'text', content:' Background stream stays with A.'});
   emit({type:'permission_request', tool_name:'bash', reason:'Approval from running A', call_id:'browse-call', arguments:'{"command":"pwd"}'});
   await page.getByText('Approval from running A', {exact:true}).waitFor();
@@ -104,7 +130,7 @@ try {
   await page.getByText('Give your answer', {exact:true}).waitFor();
   const answer = page.locator('.interaction-dock-seat textarea');
   await answer.fill('Keep this answer');
-  await page.getByRole('button', {name:'Return to Context summary', exact:true}).click();
+  await page.getByRole('button', {name:'Return to running session', exact:true}).click();
   assert.equal(await page.locator('.interaction-dock-seat textarea').inputValue(), 'Keep this answer');
   if (width < 600) await page.locator('.mobile-menu-btn').click();
   await page.locator('.session-item-main').filter({hasText:'Other conversation'}).click();
@@ -112,9 +138,9 @@ try {
   emit({type:'user_input_resolved', request_id:42});
   await page.getByText('Give your answer', {exact:true}).waitFor({state:'detached'});
   emit({type:'state', running:false});
-  await page.waitForFunction(() => ![...document.querySelectorAll('button')].find(b => b.textContent === 'Continue this session')?.disabled);
+  await page.getByRole('button', {name:'Continue this session', exact:true}).waitFor();
   assert.equal(await page.getByText('Historical answer', {exact:true}).count(), 1);
-  await page.getByRole('button', {name:'Return to Context summary', exact:true}).click();
+  await page.getByRole('button', {name:'Return to original session', exact:true}).click();
   await page.locator('.message-input').waitFor();
   await page.getByText('The resource read boundary is ready.', {exact:false}).waitFor();
   assert.equal(await page.getByText('Background stream stays with A.', {exact:false}).count(), 1);
@@ -203,7 +229,7 @@ try {
   await page.getByText('Historical answer', {exact:true}).waitFor();
   for (const reply of pendingPatchReplies.splice(0)) reply();
   patchReplyMode = 'ok';
-  await page.getByRole('button', {name:'Return to Context summary', exact:true}).click();
+  await page.getByRole('button', {name:'Return to running session', exact:true}).click();
   await composer.waitFor();
   emit({type:'state', running:false});
   assert.equal(await composer.inputValue(), 'Draft before leaving');
@@ -228,6 +254,20 @@ try {
   await page.getByRole('button',{name:'Pin as task specification',exact:true}).waitFor();
   assert.equal(specificationPinned,false);
 
+  // Finishing does not silently activate the viewed history; continuing is explicit.
+  emit({type:'state', running:true});
+  await page.locator('.session-running-mark').waitFor();
+  if(width<600)await page.locator('.mobile-menu-btn').click();
+  await page.locator('.session-item-main').filter({hasText:other.name}).click();
+  await page.getByText('Historical answer',{exact:true}).waitFor();
+  const beforeContinue=switches;
+  emit({type:'state', running:false});
+  await page.getByRole('button',{name:'Continue this session',exact:true}).waitFor();
+  assert.equal(switches,beforeContinue);
+  await page.getByRole('button',{name:'Continue this session',exact:true}).click();
+  await page.locator('.message-input').waitFor();
+  await page.waitForFunction(() => !document.querySelector('.session-browse-notice'));
+  assert.equal(switches,beforeContinue+1);
   assert.deepEqual(errors, []);
   await page.close();
  }

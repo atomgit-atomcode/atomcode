@@ -147,3 +147,5 @@ pub use atomcode_capabilities::cc_hooks;
 pub use atomcode_plexus as plexus;
 
 mod session_reference;
+
+mod mode_models;

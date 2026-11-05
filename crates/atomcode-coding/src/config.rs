@@ -511,6 +511,7 @@ pub fn describe_config_file_for(
          - `[compaction]` `token_limit`: optional positive prompt-token budget for earlier \
          automatic history summarization; omit to keep the window-relative policy. \
          Applied when the agent is rebuilt; the model's physical context window is unchanged.\n\
+         - `[modes.plan]` and `[modes.build]` optionally bind a `model` selection id and `reasoning_effort` (unset inherits the model profile; `default` uses the API default). Cross-mode transitions apply them for this session without writing `default_model`; `/model` temporarily overrides until the next mode transition. Configure via `/config` or WebUI mode settings.\n\
          - `[permissions]` `automation_approval`: `always` (default, consent for each schedule change) or `inherit` (preauthorize schedule changes only in current Auto mode; does not elevate scheduled task execution). Apply via capability reprepare. `default_mode`: startup mode (`build`, `plan`, `accept-edits`, `auto`); explicit -y overrides it; temporary mode switches do not save it. `allow` / `deny`: rules such as `Bash(git *)`, `Read(<path>)` or \
          `mcp__<server>__<tool>`. `deny` wins, and `allow` never opens a sensitive path.\n\
          - `[coding]` `max_rounds` (per turn; 0 = no cap; `ATOMCODE_TURN_MAX_ROUNDS` wins), \

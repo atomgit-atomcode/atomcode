@@ -340,6 +340,15 @@ pub fn dispatch(command: DriverCommand) -> Result<(), HubError> {
     hub().dispatch(command)
 }
 
+pub async fn update_mode_bindings(
+    bindings: atomcode_config::mode_models::ModeModels,
+) -> Result<(), HubError> {
+    hub().update_mode_bindings(bindings).await
+}
+pub async fn model_selection() -> Result<atomcode_config::mode_models::ModeSelection, HubError> {
+    hub().model_selection().await
+}
+
 pub async fn set_mode(mode: RuntimeMode) -> Result<(), HubError> {
     hub().set_mode(mode).await
 }

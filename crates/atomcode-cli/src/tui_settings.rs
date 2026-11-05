@@ -117,6 +117,17 @@ impl ConfigSettings {
                     kind: kind_of(spec.kind),
                     applies: applies_of(spec.apply),
                 })
+                .chain(
+                    atomcode_config::mode_models::setting_rows(&config)
+                        .into_iter()
+                        .map(|row| SettingRow {
+                            id: row.id,
+                            label: row.label,
+                            value: row.value,
+                            kind: SettingKind::Choice(row.options),
+                            applies: Applies::Reprepare,
+                        }),
+                )
                 .chain(retry_row(&config))
                 .collect(),
         )
@@ -206,6 +217,14 @@ impl Settings for ConfigSettings {
         if id == atomcode_tui::settings::QUESTION_EDIT_KEY {
             atomcode_tui::keymap::parse_question_edit_key(value)?;
         }
+        if id.starts_with("modes.") {
+            atomcode_config::ConfigStore::new(self.path.clone())
+                .update_document(|document| {
+                    atomcode_config::mode_models::patch_setting(document, id, Some(value))
+                })
+                .map_err(|error| format!("{error:#}"))?;
+            return Ok(self.read());
+        }
         if id == RETRY {
             write_retry(&self.path, Some(value))?;
             return Ok(self.read());
@@ -234,6 +253,14 @@ impl Settings for ConfigSettings {
     /// "restore the default" means, and the two look identical on screen the
     /// day it is done.
     fn reset(&self, id: &str) -> Result<SettingsView, String> {
+        if id.starts_with("modes.") {
+            atomcode_config::ConfigStore::new(self.path.clone())
+                .update_document(|document| {
+                    atomcode_config::mode_models::patch_setting(document, id, None)
+                })
+                .map_err(|error| format!("{error:#}"))?;
+            return Ok(self.read());
+        }
         if id == RETRY {
             write_retry(&self.path, None)?;
             return Ok(self.read());
@@ -462,9 +489,63 @@ mod tests {
             })
             .collect();
         assert!(
-            extra.iter().all(|id| *id == RETRY),
+            extra.iter().all(|id| *id == RETRY
+                || [
+                    "modes.plan.model",
+                    "modes.plan.reasoning_effort",
+                    "modes.build.model",
+                    "modes.build.reasoning_effort"
+                ]
+                .contains(id)),
             "a row from nowhere: {extra:?}"
         );
+    }
+
+    #[test]
+    fn mode_bindings_use_model_choices_and_reject_unsupported_effort_before_writing() {
+        let path = scratch("mode-model-bindings");
+        std::fs::write(
+            &path,
+            r#"# preserve me
+[providers.fast]
+type="openai"
+model="fast-model"
+reasoning_effort_levels=["low"]
+[providers.deep]
+type="openai"
+model="deep-model"
+reasoning_effort_levels=["low","high"]
+"#,
+        )
+        .unwrap();
+        let port = ConfigSettings::new(path.clone());
+        port.set("modes.plan.model", "deep").unwrap();
+        port.set("modes.plan.reasoning_effort", "high").unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert!(port.set("modes.plan.model", "missing").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        port.set("modes.plan.model", "fast").unwrap();
+        let rows = port.rows();
+        let effort = rows
+            .rows()
+            .iter()
+            .find(|row| row.id == "modes.plan.reasoning_effort")
+            .unwrap();
+        assert_eq!(effort.value, "");
+        assert_eq!(
+            effort.kind,
+            SettingKind::Choice(vec!["".into(), "default".into(), "low".into()])
+        );
+        assert!(port.set("modes.plan.reasoning_effort", "high").is_err());
+        port.reset("modes.plan.model").unwrap();
+        assert!(atomcode_config::Config::load(&path)
+            .unwrap()
+            .modes
+            .is_empty());
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("# preserve me"));
+        let _ = std::fs::remove_file(path);
     }
 
     /// The one setting the catalog cannot hold: the current model's retries.
@@ -643,7 +724,7 @@ mod tests {
         std::fs::write(&path, "this is not toml {{{").unwrap();
         let port = ConfigSettings::new(path);
         let rows = port.rows();
-        assert_eq!(rows.len(), atomcode_config::settings::SETTINGS.len());
+        assert_eq!(rows.len(), atomcode_config::settings::SETTINGS.len() + 4);
     }
 
     #[test]

@@ -673,7 +673,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ModelNoneConfigured => "没有配置可选的模型".into(),
         Msg::ModelPickerHint => "换成哪个模型 · enter 换过去".into(),
         Msg::ModelSet { wanted } => format!("模型 → {wanted}").into(),
-        Msg::ModeWhatEachDoes => "plan 只看不动 · ask 动手前问 · edits 改文件不问 · auto 全不问".into(),
+        Msg::ModeWhatEachDoes => "plan 只看不动 · ask 动手前问 · edits 改文件不问 · auto 全不问\n模式与模型绑定：/config，搜索 modes。".into(),
         Msg::ModeUnknown { what } => format!("`{what}` 不是一档;可选:plan、ask、edits、auto").into(),
         Msg::ModeSet { mode } => format!("现在是 {mode}").into(),
         Msg::CdUpOneLevel => "上一层".into(),

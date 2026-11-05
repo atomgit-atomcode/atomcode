@@ -4185,18 +4185,34 @@ body {
 .todo-source-page pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 360px; overflow: auto; padding: 10px; background: var(--app-tool-background); font-family: var(--app-monospace-font-family); }
 .todo-source-pagination { display: flex; gap: 8px; margin-top: 8px; }
 
+/* History browsing never rebinds the running session. */
 .session-browse-notice {
   display: flex;
+  flex: 0 0 auto;
   flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
-  padding: 12px 20px;
+  gap: 12px 24px;
+  padding: 16px 120px 16px 20px;
   border-bottom: 1px solid var(--app-border);
-  color: var(--app-secondary-foreground);
+  background: var(--app-secondary-background);
+  font-size: 13px;
+  line-height: 1.5;
 }
-.session-browse-notice button { cursor: pointer; }
-.session-browse-notice button:disabled { opacity: .45; cursor: not-allowed; }
-.session-running-mark { flex-shrink: 0; color: var(--app-secondary-foreground); font-size: 11px; }
+.session-browse-summary { flex: 1 1 280px; min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; }
+.session-browse-label { flex: none; color: var(--app-brand); font-size: 12px; font-weight: 600; }
+.session-browse-title { min-width: 0; overflow-wrap: anywhere; color: var(--app-primary-foreground); }
+.session-browse-description { flex-basis: 100%; color: var(--app-secondary-foreground); overflow-wrap: anywhere; }
+.session-browse-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.session-browse-actions button { padding: 7px 12px; border: 1px solid var(--app-input-border); border-radius: 8px; cursor: pointer; color: var(--app-primary-foreground); background: var(--app-primary-background); font: inherit; }
+.session-browse-actions button:hover { background: var(--app-list-hover-background); }
+.session-browse-actions button:focus-visible { outline: 2px solid var(--app-brand); outline-offset: 2px; }
+.session-browse-actions .session-browse-continue { background: var(--app-button-background); border-color: var(--app-button-background); color: var(--app-button-foreground); }
+.session-browse-actions .session-browse-continue:hover { background: var(--app-button-hover-background); }
+@media (max-width: 768px) {
+  .session-browse-notice { padding: 60px 16px 16px; gap: 12px; }
+}
+.session-browse-sidebar-hint { margin: 0; padding: 0 16px 10px; color: var(--app-secondary-foreground); font-size: 12px; line-height: 1.5; }
+.session-running-mark { flex-shrink: 0; padding: 1px 5px; border-radius: 4px; background: var(--app-secondary-background); color: var(--app-secondary-foreground); font-size: 11px; }
 
 .task-specifications { width: min(760px, calc(100vw - 24px)); max-height: 85vh; overflow: auto; padding: 20px; border-radius: 12px; }
 .task-specifications header, .task-specifications footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
@@ -4221,3 +4237,8 @@ body {
 }
 .session-switch-notice > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .session-switch-notice > button { flex-shrink: 0; padding: 0 6px; }
+
+.mode-bindings-body { display: flex; flex-direction: column; gap: 16px; }
+.mode-bindings-body fieldset { border: 1px solid var(--app-border); border-radius: 8px; padding: 12px; display: grid; gap: 12px; }
+.mode-bindings-body label { display: flex; flex-direction: column; gap: 6px; }
+.mode-bindings-body select { width: 100%; padding: 8px; background: var(--app-primary-background); color: var(--app-primary-foreground); border: 1px solid var(--app-border); border-radius: 6px; }

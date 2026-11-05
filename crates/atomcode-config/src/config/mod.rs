@@ -583,6 +583,11 @@ impl CompactionConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(
+        default,
+        skip_serializing_if = "crate::mode_models::ModeModels::is_empty"
+    )]
+    pub modes: crate::mode_models::ModeModels,
     #[serde(default, skip_serializing_if = "CompactionConfig::is_default")]
     pub compaction: CompactionConfig,
     #[serde(default)]
@@ -1146,6 +1151,7 @@ impl Default for Config {
             provider_accounts: HashMap::new(),
             models: HashMap::new(),
             default_model: None,
+            modes: Default::default(),
             datalog: Default::default(),
             notifications: Default::default(),
             network: Default::default(),
@@ -3972,6 +3978,7 @@ model = "missing-type"
             provider_accounts: HashMap::new(),
             models: HashMap::new(),
             default_model: None,
+            modes: Default::default(),
             datalog: DatalogConfig {
                 enabled: false,
                 dir: Some("/var/log/ac".to_string()),
