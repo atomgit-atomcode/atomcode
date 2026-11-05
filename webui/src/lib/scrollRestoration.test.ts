@@ -142,3 +142,34 @@ test('layout shrink at the bottom does not look like upward reading', () => {
   f.setFollowing(f.scroll.onScroll()!);
   assert.equal(f.follows(), true);
 });
+
+test('layout measures reply space before following and tracks the corrected position', () => {
+  const viewport = { scrollTop: 0, scrollHeight: 600, clientHeight: 400 };
+  const scroll = createScrollRestoration({
+    viewport: () => viewport, session: () => 'a', following: () => true,
+    setFollowing() {}, schedule: () => 0, cancel() {},
+    prepareLayout: () => { viewport.scrollHeight = 1000; },
+  });
+  scroll.layout();
+  assert.equal(viewport.scrollTop, 600);
+  assert.equal(scroll.onScroll(), true);
+  viewport.clientHeight = 500;
+  scroll.layout();
+  assert.equal(viewport.scrollTop, 500);
+  assert.equal(scroll.onScroll(), true, 'viewport resizing does not look like scrolling up');
+});
+
+test('an oversized new prompt can open at its beginning and release following', () => {
+  const viewport = { scrollTop: 0, scrollHeight: 2000, clientHeight: 400 };
+  let following = true;
+  const scroll = createScrollRestoration({
+    viewport: () => viewport, session: () => 'a', following: () => following,
+    setFollowing: value => { following = value; }, schedule: () => 0, cancel() {},
+    followingTop: () => { following = false; return 800; },
+  });
+  scroll.layout();
+  assert.equal(viewport.scrollTop, 800);
+  viewport.scrollHeight += 100;
+  scroll.layout();
+  assert.equal(viewport.scrollTop, 800, 'streaming keeps the long prompt readable');
+});

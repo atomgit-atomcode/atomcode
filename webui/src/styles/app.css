@@ -4248,3 +4248,6 @@ body {
 
 .model-controls.has-pending-model { flex-wrap: wrap; justify-content: flex-end; }
 .model-controls.has-pending-model .model-next-turn { flex-basis: 100%; text-align: right; }
+
+/* Reserve the current turn’s reading area using the actual scroller height. */
+.turn-reply-space { flex: 0 0 auto; pointer-events: none; overflow-anchor: none; }

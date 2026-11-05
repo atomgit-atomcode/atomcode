@@ -2,6 +2,10 @@
 export interface ChatViewport { scrollTop: number; scrollHeight: number; clientHeight: number }
 export function createScrollRestoration(options: {
   viewport: () => ChatViewport | null;
+  /** Size local reply space before reading scroll geometry. */
+  prepareLayout?: () => void;
+  /** Allow a new oversized prompt to open at its beginning once. */
+  followingTop?: (bottom: number) => number;
   session: () => string | null;
   following: () => boolean;
   setFollowing: (following: boolean) => void;
@@ -20,9 +24,11 @@ export function createScrollRestoration(options: {
     return { following: options.following(), top: options.viewport()?.scrollTop ?? 0, session: options.session() };
   }
   function apply(position: Position): boolean {
+    options.prepareLayout?.();
     const el = options.viewport();
     if (!el || el.clientHeight <= 0) return false;
-    el.scrollTop = position.following ? Math.max(0, el.scrollHeight - el.clientHeight)
+    const bottom = Math.max(0, el.scrollHeight - el.clientHeight);
+    el.scrollTop = position.following ? (options.followingTop?.(bottom) ?? bottom)
       : Math.min(position.top, Math.max(0, el.scrollHeight - el.clientHeight));
     lastTop = el.scrollTop;
     return true;
@@ -68,6 +74,7 @@ export function createScrollRestoration(options: {
         if (restoring.session !== options.session()) { restoring = null; saved = null; return; }
         if (apply(restoring) && frame === null) finishRestore();
       } else if (options.following()) apply(capture());
+      else options.prepareLayout?.();
     },
     onScroll(): boolean | null {
       const el = options.viewport();

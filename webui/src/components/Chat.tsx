@@ -151,6 +151,8 @@ interface Message {
   ts?: number;
   /** Browser-local correlation for an optimistic /live submission. Never persisted. */
   pendingSteerId?: string;
+  /** Local viewport anchor; never part of session persistence. */
+  turnAnchorId?: string;
 }
 
 interface QueuedMessage {
@@ -727,6 +729,9 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   // ONLY while the user is at the bottom; scrolling up releases the follow so history
   // stays put. A ref (not state) avoids re-rendering on every scroll event.
   const scrollRef = useRef<HTMLDivElement>(null);
+  const turnAnchorRef = useRef<string | null>(null);
+  const turnSpaceRef = useRef<HTMLDivElement>(null);
+  const positionedTurnRef = useRef<string | null>(null);
   const atBottomRef = useRef(true);
   const timelineScrollRef = useRef(0);
   const timelineIgnoreScrollRef = useRef(0);
@@ -1261,6 +1266,35 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   useEffect(() => {
     const restore = createScrollRestoration({
       viewport: () => scrollRef.current,
+      prepareLayout: () => {
+        const viewport = scrollRef.current;
+        const space = turnSpaceRef.current;
+        if (!viewport || !space || viewport.clientHeight <= 0) return;
+        const anchor = Array.from(viewport.querySelectorAll<HTMLElement>('[data-turn-anchor]'))
+          .find(node => node.dataset.turnAnchor === turnAnchorRef.current);
+        const padding = getComputedStyle(viewport);
+        const available = viewport.clientHeight - parseFloat(padding.paddingTop) - parseFloat(padding.paddingBottom);
+        const content = anchor ? space.getBoundingClientRect().top - anchor.getBoundingClientRect().top : available;
+        const height = Math.max(0, Math.ceil(available - content));
+        if (space.style.height !== `${height}px`) space.style.height = `${height}px`;
+      },
+      followingTop: bottom => {
+        const viewport = scrollRef.current;
+        if (!viewport || positionedTurnRef.current === turnAnchorRef.current) return bottom;
+        const anchor = Array.from(viewport.querySelectorAll<HTMLElement>('[data-turn-anchor]'))
+          .find(node => node.dataset.turnAnchor === turnAnchorRef.current);
+        if (!anchor) return bottom;
+        positionedTurnRef.current = turnAnchorRef.current;
+        const top = viewport.scrollTop + anchor.getBoundingClientRect().top - viewport.getBoundingClientRect().top
+          - parseFloat(getComputedStyle(viewport).paddingTop);
+        if (bottom > top + 2) {
+          // A long prompt opens at its beginning even when it fills the viewport.
+          atBottomRef.current = false;
+          setShowJumpBtn(true);
+          return Math.max(0, top);
+        }
+        return bottom;
+      },
       session: () => activeIdRef.current,
       following: () => atBottomRef.current,
       setFollowing: (following) => {
@@ -2886,9 +2920,16 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     // sendMessage, so merely QUEUEING a message while reading history doesn't yank them.
     setHistoryTarget(null); setHistoryReset(value => value + 1);
     setHistoryDisplay({ active: false, showLive: true, liveStart: 0 });
+    navScrollIntent.current.interact();
+    scrollRestorationRef.current?.interact();
     atBottomRef.current = true;
     setShowJumpBtn(false);
     const startsNewTurn = !busyRef.current;
+    const turnAnchorId = startsNewTurn ? randomId() : undefined;
+    if (turnAnchorId) {
+      turnAnchorRef.current = turnAnchorId;
+      setTimelineStart(null);
+    }
     if (startsNewTurn) {
       setTodoPanelVisible(reduceTodoPanelVisibility(
         todoPanelVisibleRef.current,
@@ -2933,6 +2974,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
           images: images.length ? images : undefined,
           ts: now,
           pendingSteerId: pendingSteer.id,
+          turnAnchorId,
         },
         { role: 'assistant', parts: [], pendingSteerId: pendingSteer.id },
       ]);
@@ -3017,7 +3059,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     const now = Date.now();
     setMessages((prev) => [
       ...prev,
-      { role: 'user', parts: [{ kind: 'text', text }], images: images.length ? images : undefined, ts: now },
+      { role: 'user', parts: [{ kind: 'text', text }], images: images.length ? images : undefined, ts: now, turnAnchorId },
       { role: 'assistant', parts: [] },
     ]);
 
@@ -4278,7 +4320,11 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
 
           return visibleMessages.map(({ msg, origIdx }) => {
             const isLast = origIdx === lastIdx;
-            const setMatchRef = (el: HTMLElement | null) => { matchRefs.current[origIdx] = el; };
+            const setMatchRef = (el: HTMLElement | null) => {
+              matchRefs.current[origIdx] = el;
+              if (el && msg.turnAnchorId) el.dataset.turnAnchor = msg.turnAnchorId;
+              else if (el) delete el.dataset.turnAnchor;
+            };
             const timeLabel = formatMsgTime(msg.ts);
             const isActiveSearchMatch = origIdx === navHighlight || (searchOpen && searchTrim ? (origIdx === matchPositions[matchIdx]) : false);
 
@@ -4381,7 +4427,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
           </div>
         )}
 
-        <div />
+        <div ref={turnSpaceRef} class="turn-reply-space" aria-hidden="true" />
         </div>
         {/* Zero-height sticky seat, following Harness: the control belongs to the
             conversation scroller and is centered on the same content lane. */}
