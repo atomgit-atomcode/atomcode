@@ -347,7 +347,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
   ── Mode and model ──
     Shift+Tab                        Without a menu, cycle to the next mode (set ui.mode_switch_key=tab in /config to cycle with Tab and accept completion via →/Enter; HarmonyOS defaults to tab)
     F2 / Shift+F2                    Next / previous model (Mac: Fn+F2 / Fn+Shift+F2)
-    Ctrl+T                           Cycle reasoning_effort
+    /effort                          Cycle reasoning effort (no shortcut)
 
   ── Browse output ──
     Shift+Up / Shift+Down            Scroll up / down one line
@@ -364,7 +364,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
     Esc                              Clear input / close modal / cancel action
     Esc Esc                          Undo previous turn when idle with empty input
     Ctrl+C                           Cancel action; press again while idle to exit
-    Ctrl+O                           Toggle tool real-time output
+    Ctrl+O / Alt+R                   Toggle reasoning details
+    Ctrl+T                           Toggle tool real-time output
     Ctrl+V / Ctrl+Alt+V              Paste text or image **
 
   ── Slash menu / modal navigation ──
