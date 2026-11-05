@@ -17,6 +17,10 @@ use atomcode_kernel::agent::ToolLoopPolicy;
 pub struct CodingAgentConfig {
     /// Host-injected persistent automation service; absent in generic library agents.
     pub automation: Option<Arc<dyn atomcode_capabilities::tools::automation::AutomationService>>,
+    /// User-only follow-up dispatch/history port. Never exposed as a model tool.
+    /// Hosts inject a separate one-shot store; libraries do not select executables.
+    pub follow_up_service:
+        Option<Arc<dyn atomcode_capabilities::tools::automation::AutomationService>>,
     /// What the configuration asked for that was left out or changed — a
     /// malformed permission rule, an external agent with an unknown kind — said
     /// in one line each. The runtime tells the person when it starts
@@ -1212,6 +1216,7 @@ impl CodingAgentConfig {
         let model = model.into();
         Self {
             automation: None,
+            follow_up_service: None,
             startup_warnings: Vec::new(),
             extra_skill_dirs: Vec::new(),
             dirs,

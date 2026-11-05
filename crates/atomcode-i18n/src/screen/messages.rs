@@ -2372,6 +2372,10 @@ pub enum Msg<'a> {
     PersonaAppendUnknown,
     PersonaUnavailable,
     FollowUpAbout,
+    FollowUpNew {
+        id: &'a str,
+        spec: &'a str,
+    },
     FollowUpPending {
         prompt: &'a str,
     },

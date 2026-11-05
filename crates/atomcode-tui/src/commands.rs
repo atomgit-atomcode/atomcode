@@ -1196,6 +1196,25 @@ impl CommandSet for SessionCommands {
                     .await
                 {
                     Ok(HostReply::FollowUp { value }) => {
+                        if args.trim().starts_with("history") {
+                            return Outcome::Said(
+                                value
+                                    .get("prompt")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("")
+                                    .into(),
+                            );
+                        }
+                        if let Some(id) = value
+                            .get("execution_id")
+                            .and_then(serde_json::Value::as_str)
+                        {
+                            let spec = serde_json::to_string_pretty(&value["new_session"])
+                                .unwrap_or_default();
+                            return Outcome::Said(
+                                t(Msg::FollowUpNew { id, spec: &spec }).into_owned(),
+                            );
+                        }
                         if let Some(prompt) =
                             value.get("prompt").and_then(serde_json::Value::as_str)
                         {
@@ -5291,6 +5310,31 @@ mod tests {
                 .all(|c| matches!(c, HostCommand::Context { prompt: true, .. })),
             "问的时候要说明是要提示词的:{asked:?}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn new_session_follow_up_shows_target_and_history_without_claiming_success() {
+        let host = Arc::new(Recording::default());
+        host.replies.lock().unwrap().extend([
+            Ok(HostReply::FollowUp { value: serde_json::json!({"prompt":"review", "execution_id":"followup-1", "new_session":{"permission_mode":"plan","model":"selection"}}) }),
+            Ok(HostReply::FollowUp { value: serde_json::json!({"prompt":"{\"state\":\"uncertain\"}"}) }),
+        ]);
+        let (app, _client, all) = following(&host);
+        match all.dispatch("/followup show", &app.context()).await {
+            Outcome::Said(text) => {
+                assert!(text.contains("followup-1"));
+                assert!(text.contains("selection"));
+                assert!(text.contains("plan"));
+            }
+            other => panic!("{other:?}"),
+        }
+        match all
+            .dispatch("/followup history followup-1", &app.context())
+            .await
+        {
+            Outcome::Said(text) => assert_eq!(text, "{\"state\":\"uncertain\"}"),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

@@ -655,6 +655,7 @@ struct PendingFollowUp {
     session: Option<String>,
     turn: Option<u64>,
     prompt: String,
+    new_session: Option<crate::follow_up::NewSession>,
 }
 
 /// Inspection of the mounted persona contribution, separate from the full prompt.
@@ -2338,7 +2339,7 @@ impl CodingRuntimeHandle {
     }
 
     pub async fn submit(&self, input: UserInput) -> Result<SubmitReceipt, RuntimeError> {
-        self.deliver(None, input).await
+        self.deliver(None, input, None).await
     }
 
     /// As [`Self::submit`], carrying the driver's own id for this message.
@@ -2352,13 +2353,23 @@ impl CodingRuntimeHandle {
         receipt: atomcode_kernel::event::CommandId,
         input: UserInput,
     ) -> Result<SubmitReceipt, RuntimeError> {
-        self.deliver(Some(receipt), input).await
+        self.deliver(Some(receipt), input, None).await
+    }
+
+    /// Submit a real user request with separately framed reference context.
+    pub async fn submit_with_context(
+        &self,
+        input: UserInput,
+        context: Option<String>,
+    ) -> Result<SubmitReceipt, RuntimeError> {
+        self.deliver(None, input, context).await
     }
 
     async fn deliver(
         &self,
         receipt: Option<atomcode_kernel::event::CommandId>,
         input: UserInput,
+        extra_context: Option<String>,
     ) -> Result<SubmitReceipt, RuntimeError> {
         let mut timing = atomcode_harness::diagnostics::PhaseTiming::start("runtime_deliver");
         let state = self.state.load(Ordering::Acquire);
@@ -2369,7 +2380,7 @@ impl CodingRuntimeHandle {
                 generation: runtime_state_generation(state),
                 input,
                 receipt,
-                extra_context: None,
+                extra_context,
                 from: None,
                 expected_session: None,
                 done,
@@ -6296,11 +6307,19 @@ fn spawn_runtime_owner_with_optional_agent(
                                 return Err(RuntimeError::CommandRefused("follow-up belongs to a different session".into()));
                             }
                             let arg = args.trim_start();
+                            if arg.trim() == "history" || arg.starts_with("history ") {
+                                let text = crate::follow_up::history(&runtime.config, arg.strip_prefix("history").map(str::trim).filter(|id| !id.is_empty())).map_err(RuntimeError::CommandRefused)?;
+                                return Ok(serde_json::json!({"prompt":text,"current_task":false}));
+                            }
                             match arg.trim() {
                                 "" | "show" => {},
                                 "clear" => { follow_up = None; },
                                 _ => {
-                                    let prompt = arg.split_once(char::is_whitespace).filter(|(action,_)| *action == "set").map(|(_,prompt)|prompt).ok_or_else(|| RuntimeError::CommandRefused("usage: /followup set <prompt> | show | clear".into()))?;
+                                    let new_session = arg.strip_prefix("new ").map(|json| crate::follow_up::NewSession::parse(json, &runtime.config)).transpose().map_err(RuntimeError::CommandRefused)?;
+                                    if new_session.is_some() && (runtime.parts.session.is_none() || runtime.config.follow_up_service.is_none()) {
+                                        return Err(RuntimeError::CommandRefused("new-session follow-up requires a persistent source session and host dispatcher".into()));
+                                    }
+                                    let prompt = if let Some(options) = &new_session { options.prompt.as_str() } else { arg.split_once(char::is_whitespace).filter(|(action,_)| *action == "set").map(|(_,prompt)|prompt).ok_or_else(|| RuntimeError::CommandRefused("usage: /followup set <prompt> | new <JSON> | show | clear | history [id]".into()))? };
                                     if prompt.trim().is_empty() || prompt.len() > 16 * 1024 {
                                         return Err(RuntimeError::CommandRefused("follow-up prompt must contain 1..16384 UTF-8 bytes".into()));
                                     }
@@ -6308,10 +6327,10 @@ fn spawn_runtime_owner_with_optional_agent(
                                         || goal.is_some() || loop_state.is_some() || pending_policy_intervention.is_some() || persistence_failure.is_some() {
                                         return Err(RuntimeError::CommandRefused("follow-up requires an available ordinary task; clear goal/loop first".into()));
                                     }
-                                    follow_up = Some(PendingFollowUp { generation, session: runtime.parts.session.as_ref().map(|binding|binding.id.clone()), turn: active_turn, prompt: prompt.into() });
+                                    follow_up = Some(PendingFollowUp { generation, session: runtime.parts.session.as_ref().map(|binding|binding.id.clone()), turn: active_turn, prompt: prompt.into(), new_session });
                                 }
                             }
-                            Ok(serde_json::json!({"prompt":follow_up.as_ref().map(|p|p.prompt.as_str()),"current_task":follow_up.as_ref().is_some_and(|p|p.turn.is_some())}))
+                            Ok(serde_json::json!({"prompt":follow_up.as_ref().map(|p|p.prompt.as_str()),"current_task":follow_up.as_ref().is_some_and(|p|p.turn.is_some()),"new_session":follow_up.as_ref().and_then(|p|p.new_session.as_ref()),"execution_id":follow_up.as_ref().and_then(|p|p.new_session.as_ref()).map(|o|o.id.as_str())}))
                         })();
                         let _ = done.send(result);
                     }
@@ -9886,6 +9905,14 @@ fn spawn_runtime_owner_with_optional_agent(
                                             && persistence_failure.is_none() && pending_policy_intervention.is_none()
                                             && !background_jobs.uncollected() && agent_available
                                         {
+                                            if let Some(options) = pending.new_session {
+                                                let result = resources.as_ref().ok_or_else(|| "runtime unavailable".to_string()).and_then(|runtime| {
+                                                    let session = pending.session.as_deref().ok_or_else(|| "follow-up requires a persistent source session".to_string())?;
+                                                    options.launch(&runtime.config, session, turn_id, &controls.stop_now())
+                                                });
+                                                let message = result.unwrap_or_else(|error| format!("Follow-up launch not confirmed; inspect history / 后续任务启动未确认，请查看 history {}: {error}", options.id));
+                                                let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(message));
+                                            } else {
                                             let text = format!("[Automatic follow-up / 自动后续任务 — user preset]\n{}", pending.prompt);
                                             let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(text.clone()));
                                             // This is a user-authored preset, not an autonomous reminder.
@@ -9904,6 +9931,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                             }
                                             agent_available = false;
                                             completion_reason = StopReason::InternalError;
+                                            }
                                         } else {
                                             let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(
                                                 "Follow-up skipped / 后续任务未执行：task did not finish normally, or still has pending work.".into()));
@@ -22599,6 +22627,22 @@ mod tests {
             handle.follow_up(None, "show".into()).await.unwrap()["current_task"],
             true
         );
+        adapter.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn explicit_follow_up_reference_uses_context_instead_of_rewriting_the_user_prompt() {
+        let (handle, mut commands, _events, _runtime_events, _wake, _active, adapter) =
+            controller_test_runtime(Arc::new(GoalNotMetProviderFactory::default())).await;
+        handle
+            .submit_with_context(
+                UserInput::from("review this"),
+                Some("reference only".into()),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(commands.recv().await,
+            Some(AgentCommand::SendMessageWithContext { text, context, .. }) if text == "review this" && serde_json::from_str::<serde_json::Value>(&context).unwrap()["runtime_context"] == "reference only"));
         adapter.shutdown().await.unwrap();
     }
 

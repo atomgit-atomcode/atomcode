@@ -2315,7 +2315,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
           try {
             const value = await followUp(sessionId, arg);
             if (generation !== sessionGenerationRef.current) return;
-            pushCommandNotice(value.prompt !== null ? t('cmd.followup.pending', {prompt:value.prompt}) : t(arg.trim()==='clear' ? 'cmd.followup.cleared' : 'cmd.followup.none'));
+            pushCommandNotice(arg.trim().startsWith('history') ? value.prompt ?? '' : value.execution_id ? t('cmd.followup.new', {id:value.execution_id, spec:JSON.stringify(value.new_session, null, 2)}) : value.prompt !== null ? t('cmd.followup.pending', {prompt:value.prompt}) : t(arg.trim()==='clear' ? 'cmd.followup.cleared' : 'cmd.followup.none'));
           } catch (error) {
             if (generation === sessionGenerationRef.current) pushCommandNotice(t('chat.connError',{msg:String(error)}));
           }

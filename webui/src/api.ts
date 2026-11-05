@@ -1572,7 +1572,7 @@ export async function getLivePersona(sessionId: string): Promise<{persona: Perso
   return readJson<{persona: PersonaInfo | null}>(response);
 }
 
-export interface FollowUpView { prompt: string | null; current_task: boolean }
+export interface FollowUpView { prompt: string | null; current_task: boolean; new_session?: unknown; execution_id?: string | null }
 export async function followUp(sessionId: string, args: string): Promise<FollowUpView> {
   const response = await apiFetch('/live/followup', {
     method:'POST', headers:{...authHeaders(),'Content-Type':'application/json'},
