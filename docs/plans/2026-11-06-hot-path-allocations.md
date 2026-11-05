@@ -14,3 +14,14 @@ Baseline: a86dfaf30 on release/v5.2.7. Work in isolated feat/hot-path-allocs; pr
 6. Bash grants: direct normalized whitespace assembly and invocation reconstruction without temporary vectors. Preserve parsing, comment stripping, quoting and deny precedence; differential and permission tests.
 
 Do not touch cold-path joins, reasoning-loop vectors, release profiles or schema clone/caching. Do not claim measured latency improvements without a benchmark. Final validation: affected crate suites, cargo fmt --all/--check, diff check, Cargo.lock inspection, and full gates/compile.sh. Integrate separate commits into the current branch without overwriting unrelated changes; no push requested.
+
+## Validation
+
+All six changes implemented without new dependencies or Cargo.lock changes. Differential cases cover Unicode whitespace, empty System messages, SGR bytes across styles/capabilities, shell comments/quoting/empty arguments; snapshot tests cover shared tool definitions and old raster views.
+
+- atomcode-tui library suite: 1720 passed.
+- atomcode-kernel suite: 159 passed.
+- atomcode-capabilities default-feature library suite: 1171 passed (including provider and shell permission tests).
+- cargo fmt --all and cargo fmt --all -- --check: passed.
+- gates/compile.sh: workspace/all-targets, feature-gated targets and both negative canaries passed.
+- No latency or allocation-count benchmark was performed; improvements are established by removal of the specific intermediate allocations, not a measured end-to-end speedup.

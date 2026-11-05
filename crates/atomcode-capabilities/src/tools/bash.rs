@@ -1932,10 +1932,31 @@ pub fn shell_always_grant_scope(sensitive: &SensitivePaths, args: &str, command:
 }
 
 pub fn normalize_command_for_grant(command: &str) -> String {
-    strip_bash_comments(command)
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    let command = strip_bash_comments(command);
+    join_command_words(command.split_whitespace(), command.len())
+}
+
+fn join_command_words<'a>(words: impl Iterator<Item = &'a str>, capacity: usize) -> String {
+    let mut out = String::with_capacity(capacity);
+    for (index, word) in words.enumerate() {
+        if index != 0 {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    out
+}
+
+/// Reconstruct the entire invocation before stripping comments, just as policy
+/// matching did with join. Empty arguments still contribute a separator.
+pub(super) fn normalize_invocation_for_grant(invocation: BashInvocation) -> String {
+    let mut command = invocation.command;
+    command.reserve(invocation.arguments.iter().map(|arg| arg.len() + 1).sum());
+    for argument in invocation.arguments {
+        command.push(' ');
+        command.push_str(&argument);
+    }
+    normalize_command_for_grant(&command)
 }
 
 /// Faithful, condensed port of the production `check_destructive_command`: it
@@ -2197,8 +2218,7 @@ pub fn check_destructive_command(command: &str) -> Option<String> {
                         return Some(format!("destructive command piped to shell: {r}"));
                     }
                     if p.starts_with("echo ") || p.starts_with("printf ") {
-                        let payload: String =
-                            p.split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
+                        let payload = join_command_words(p.split_whitespace().skip(1), p.len());
                         let inner = payload.trim_matches(|c| c == '"' || c == '\'');
                         if let Some(r) = check_destructive_command(inner) {
                             return Some(format!(
@@ -3878,6 +3898,74 @@ fn apply_askpass_env_sets_sudo_ssh_vars() {
 mod tests {
     use super::*;
     use atomcode_kernel::tool::ToolContext;
+
+    #[test]
+    fn grant_normalization_matches_join_with_comments_quotes_and_unicode() {
+        let pieces = [
+            "",
+            "echo",
+            "中文",
+            " ",
+            "\t\n",
+            "\u{a0}",
+            "\u{2003}",
+            "# comment\n",
+            "'quoted # value'",
+            "\"two words\"",
+            "a\\ b",
+            "$(echo x)",
+            "| bash",
+            "; rm -rf /",
+        ];
+        for a in pieces {
+            for b in pieces {
+                for c in pieces {
+                    let command = format!("{a}{b}{c}");
+                    let expected = strip_bash_comments(&command)
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    assert_eq!(
+                        normalize_command_for_grant(&command),
+                        expected,
+                        "{command:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invocation_normalization_preserves_empty_arguments_and_comment_boundaries() {
+        let pieces = [
+            "",
+            "echo",
+            "# comment",
+            "\nnext",
+            "'# quoted'",
+            "中文",
+            "a b",
+        ];
+        for command in pieces {
+            for first in pieces {
+                for last in pieces {
+                    let invocation = BashInvocation {
+                        command: command.into(),
+                        arguments: vec![first.into(), String::new(), last.into()],
+                    };
+                    let reconstructed = std::iter::once(invocation.command.as_str())
+                        .chain(invocation.arguments.iter().map(String::as_str))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    assert_eq!(
+                        normalize_invocation_for_grant(invocation),
+                        normalize_command_for_grant(&reconstructed),
+                        "{reconstructed:?}",
+                    );
+                }
+            }
+        }
+    }
 
     // `run_shell` — the streaming shell executor (owned here since bridge's `!cmd` handler
     // moved off `core::tool::bash`). Direct unit coverage of capture/exit/streaming/UTF-8.

@@ -250,14 +250,11 @@ impl PermissionRules {
         }
         if matches!(canonical_tool(tool).as_str(), "bash" | "bashstart") {
             if let Some(invocations) = command.as_deref().and_then(super::bash::bash_invocations) {
-                targets.extend(invocations.into_iter().map(|i| {
-                    normalize_command_for_grant(
-                        &std::iter::once(i.command)
-                            .chain(i.arguments)
-                            .collect::<Vec<_>>()
-                            .join(" "),
-                    )
-                }));
+                targets.extend(
+                    invocations
+                        .into_iter()
+                        .map(super::bash::normalize_invocation_for_grant),
+                );
             }
         }
         let rules = self
@@ -380,14 +377,11 @@ impl PermissionRules {
         let mut deny_targets = targets.clone();
         if bash {
             if let Some(invocations) = command.as_deref().and_then(super::bash::bash_invocations) {
-                deny_targets.extend(invocations.into_iter().map(|i| {
-                    normalize_command_for_grant(
-                        &std::iter::once(i.command)
-                            .chain(i.arguments)
-                            .collect::<Vec<_>>()
-                            .join(" "),
-                    )
-                }));
+                deny_targets.extend(
+                    invocations
+                        .into_iter()
+                        .map(super::bash::normalize_invocation_for_grant),
+                );
             }
         }
         if self.deny.iter().any(|r| {
