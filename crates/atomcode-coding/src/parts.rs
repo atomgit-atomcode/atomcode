@@ -1450,10 +1450,15 @@ impl CodingParts {
         std::mem::take(&mut self.startup_warnings)
     }
 
-    /// The host-owned CodingPlan quota source, if any. Used at `/goal` start to
-    /// size the round budget from the live request quota.
-    pub(crate) fn rate_limit_source(&self) -> Option<&Arc<dyn RateLimitWindowSource>> {
-        self.rate_limit_source.as_ref()
+    /// The host-owned quota source, only for the active endpoint it meters.
+    /// Shared by usage queries, goal budgeting and the rate-limit policy.
+    pub(crate) fn rate_limit_source(
+        &self,
+        base_url: &str,
+    ) -> Option<&Arc<dyn RateLimitWindowSource>> {
+        self.rate_limit_source
+            .as_ref()
+            .filter(|source| source.applies_to(base_url))
     }
 
     pub(crate) fn take_snapshot_persistence_uncertain(&self) -> Option<String> {

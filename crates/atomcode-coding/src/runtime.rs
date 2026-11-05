@@ -6293,7 +6293,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         }
                         let source = resources
                             .as_ref()
-                            .and_then(|runtime| runtime.parts.rate_limit_source().cloned());
+                            .and_then(|runtime| runtime.parts.rate_limit_source(&runtime.config.base_url).cloned());
                         tokio::spawn(async move {
                             // No source at all: this really is a host that
                             // counts nothing, and an empty answer says so.
@@ -9260,7 +9260,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             // an env override short-circuits to the default, and with no live
                             // rate-limit source there is nothing to derive from.
                             if crate::config::goal_max_rounds_env().is_none() {
-                                if let Some(source) = runtime.parts.rate_limit_source().cloned() {
+                                if let Some(source) = runtime.parts.rate_limit_source(&runtime.config.base_url).cloned() {
                                     let default = runtime.config.goal_max_rounds;
                                     let tx = recovery_tx.clone();
                                     tokio::spawn(async move {
@@ -11338,7 +11338,7 @@ fn harness_host_state(
                 meter: crate::telemetry::McpTelemetry::new(telemetry, config.working_dir.clone()),
             },
         ),
-        rate_limit_source: parts.rate_limit_source().cloned(),
+        rate_limit_source: parts.rate_limit_source(&config.base_url).cloned(),
         front_end: prepare.front_end.clone(),
         delegated_llm: parts.delegated_provider(),
         team_events: parts.subagent_knobs().map(|_| {

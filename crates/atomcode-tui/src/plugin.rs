@@ -1409,6 +1409,8 @@ pub struct Tui {
     /// When the allowance was last asked about, so it is not asked again for
     /// [`ALLOWANCE_EVERY`]. `None` until the first turn ends.
     allowance_checked: Mutex<Option<std::time::Instant>>,
+    /// Invalidates quota requests issued before the active model was replaced.
+    allowance_generation: Arc<AtomicU64>,
     /// Whether the "out of quota — here is `/openrouter`" line has been said.
     /// Once per screen: the account stays out until the window turns over, and a
     /// line that came back every turn would be one more thing to read past.
@@ -5750,6 +5752,10 @@ impl Tui {
         let session = self.client.session();
         let host = self.host.clone();
         let nudged = self.allowance_nudged.clone();
+        let client = self.client.clone();
+        let allowance_generation = self.allowance_generation.clone();
+        let generation = allowance_generation.load(Ordering::SeqCst);
+        let addressed_session = session.clone();
         let repaint = ctx.service::<RepaintSvc>();
         tokio::spawn(async move {
             // The cheap form — the windows and nothing else. The plan behind
@@ -5762,7 +5768,11 @@ impl Tui {
                 })
                 .await
             {
-                Ok(HostReply::Usage { windows, .. }) => windows,
+                Ok(HostReply::Usage {
+                    windows,
+                    unavailable: None,
+                    ..
+                }) => windows,
                 // A host that will not say leaves the row as it was. Blanking
                 // it on a failed question would read as "you are back to zero".
                 _ => return,
@@ -5772,26 +5782,31 @@ impl Tui {
             // condition (`atomcode-tuix`'s `openrouter_connect::quota_exhausted`).
             // Once per screen — the account stays out until the window turns
             // over, and the row keeps carrying the figure meanwhile.
-            let mut said = false;
-            if let Some(spent) = crate::moment::Allowance::exhausted(&windows) {
-                if !nudged.swap(true, Ordering::SeqCst) {
-                    host.say(
+            if client.session() != addressed_session {
+                return;
+            }
+            let (changed, warning) = {
+                let mut m = host.moment.write().expect("moment poisoned");
+                if generation != allowance_generation.load(Ordering::SeqCst) {
+                    return;
+                }
+                let warning = crate::moment::Allowance::exhausted(&windows)
+                    .filter(|_| !nudged.swap(true, Ordering::SeqCst))
+                    .map(|spent| {
                         t(Msg::AllowanceExhaustedOpenRouter {
                             label: &spent.label,
                         })
-                        .into_owned(),
-                        false,
-                    );
-                    said = true;
-                }
-            }
-            let changed = {
-                let mut m = host.moment.write().expect("moment poisoned");
+                        .into_owned()
+                    });
                 let nearest = crate::moment::Allowance::nearest(&windows, m.now);
                 let changed = m.allowance != nearest;
                 m.allowance = nearest;
-                changed
+                (changed, warning)
             };
+            let said = warning.is_some();
+            if let Some(warning) = warning {
+                host.say(warning, false);
+            }
             if changed || said {
                 if let Some(repaint) = repaint {
                     repaint.now();
@@ -6676,6 +6691,8 @@ impl Tui {
                 true
             }
             AgentEvent::Described { description } => {
+                let refresh_allowance = description.session == self.client.session()
+                    || description.session == self.client.root();
                 self.client.describe(&description);
                 // Keep the status row's context window in step with the screen
                 // agent's mounted model. Read it back off the screen agent's
@@ -6709,11 +6726,20 @@ impl Tui {
                     let changed = moment.ctx_window != window
                         || moment.model != model
                         || moment.effort != effort;
+                    let cleared_allowance = refresh_allowance && moment.allowance.take().is_some();
+                    if refresh_allowance {
+                        self.allowance_generation.fetch_add(1, Ordering::SeqCst);
+                    }
                     moment.ctx_window = window;
                     moment.model = model;
                     moment.effort = effort;
-                    changed
+                    changed || cleared_allowance
                 };
+                if refresh_allowance {
+                    *self.allowance_checked.lock().expect("allowance poisoned") = None;
+                    self.allowance_nudged.store(false, Ordering::SeqCst);
+                    self.check_allowance();
+                }
                 // The providers rows too, and only now that the moment is free:
                 // `refresh_providers` writes the same lock this branch held, and
                 // a status row that names the account has to be marked against
@@ -11170,6 +11196,7 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
             ctx: Mutex::new(None),
             wake: Mutex::new(None),
             allowance_checked: Mutex::new(None),
+            allowance_generation: Arc::new(AtomicU64::new(0)),
             allowance_nudged: Arc::new(AtomicBool::new(false)),
             reasoning_hinted: AtomicBool::new(false),
             asks_ledger: Mutex::new(crate::ask::Ledger::default()),
@@ -16576,5 +16603,87 @@ mod switched_replay_tests {
             at: 0,
             event: atomcode_kernel::session::SessionEvent::TurnStart { turn: 1 }
         }));
+    }
+}
+
+#[cfg(test)]
+mod allowance_switch_tests {
+    use super::*;
+    use crate::surface::Headless;
+    use atomcode_kernel::agent::AgentDescription;
+    use atomcode_plexus::{App, ConfigTree, PluginRegistry};
+
+    struct Meter {
+        requests: mpsc::UnboundedSender<tokio::sync::oneshot::Sender<HostReply>>,
+    }
+    #[async_trait]
+    impl HostControl for Meter {
+        async fn call(
+            &self,
+            command: HostCommand,
+        ) -> Result<HostReply, atomcode_host_api::HostError> {
+            if matches!(command, HostCommand::Usage { .. }) {
+                let (send, receive) = tokio::sync::oneshot::channel();
+                self.requests.send(send).unwrap();
+                return Ok(receive.await.unwrap());
+            }
+            Ok(HostReply::Done)
+        }
+        fn subscribe(&self) -> mpsc::UnboundedReceiver<HostEvent> {
+            mpsc::unbounded_channel().1
+        }
+    }
+    fn reply(windows: Vec<atomcode_host_api::UsageWindow>) -> HostReply {
+        HostReply::Usage {
+            unavailable: None,
+            stats_unavailable: None,
+            plan: None,
+            stats: None,
+            windows,
+        }
+    }
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn model_switch_clears_cached_quota_and_discards_the_old_pending_answer() {
+        let (host, tui) = assemble(Headless::new(100, 24));
+        let app = App::new(PluginRegistry::new(), ConfigTree::default());
+        *tui.ctx.lock().unwrap() = Some(app.context());
+        tui.client.follow("lead");
+        let (commands, _received) = mpsc::unbounded_channel();
+        let (requests, mut pending) = mpsc::unbounded_channel();
+        tui.client.connect(commands, Arc::new(Meter { requests }));
+        let windows = vec![atomcode_host_api::UsageWindow {
+            label: "5h".into(),
+            exhausted: true,
+            resets_at: "17:51".into(),
+            resets_in_seconds: 100,
+            window_seconds: 18_000,
+            used_percent: Some(99),
+            calls_used: None,
+            call_limit: None,
+        }];
+        {
+            let mut m = host.moment.write().unwrap();
+            m.allowance = crate::moment::Allowance::nearest(&windows, m.now);
+        }
+        tui.check_allowance();
+        let old = pending.recv().await.unwrap();
+        tui.on_event(AgentEvent::Described {
+            description: Box::new(AgentDescription {
+                session: "lead".into(),
+                model: Some("same-wire-name".into()),
+                ..Default::default()
+            }),
+        });
+        assert!(host.moment.read().unwrap().allowance.is_none());
+        let new = pending.recv().await.unwrap();
+        new.send(reply(vec![])).unwrap();
+        tokio::task::yield_now().await;
+        old.send(reply(windows)).unwrap();
+        tokio::task::yield_now().await;
+        assert!(host.moment.read().unwrap().allowance.is_none());
+        assert!(
+            !tui.allowance_nudged.load(Ordering::SeqCst),
+            "a stale exhausted window must not issue a warning"
+        );
     }
 }

@@ -7315,3 +7315,46 @@ async fn cancelled_skill_images_leave_no_skill_context_for_the_next_message() {
     assert!(request.iter().all(|m| m.images.is_empty()));
     runtime.handle.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn quota_queries_follow_the_active_endpoint_even_when_model_names_match() {
+    #[derive(Debug)]
+    struct Meter(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl atomcode_coding::RateLimitWindowSource for Meter {
+        fn applies_to(&self, endpoint: &str) -> bool {
+            endpoint == "https://managed.invalid/v1"
+        }
+        async fn fetch_windows(&self) -> Result<Vec<atomcode_coding::RateLimitWindow>, String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            ExhaustedWindow.fetch_windows().await
+        }
+    }
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut input = start(env.project.path(), &recorder, SessionMode::Fresh);
+    input.agent.base_url = "https://managed.invalid/v1".into();
+    input.prepare.rate_limit_source = Some(Arc::new(Meter(calls.clone())));
+    let managed = input.agent.clone();
+    let mut external = managed.clone();
+    external.base_url = "https://external.invalid/v1".into();
+    let runtime = CodingRuntime::start(input).await.unwrap();
+    assert_eq!(runtime.handle.usage(true).await.unwrap().windows.len(), 1);
+    runtime.handle.reassemble_provider(external).await.unwrap();
+    for windows_only in [true, false] {
+        let usage = runtime.handle.usage(windows_only).await.unwrap();
+        assert!(usage.windows.is_empty());
+        assert!(usage.plan.is_none() && usage.spent.is_none());
+        assert!(usage.unavailable.is_none());
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "external endpoints do not query the managed account"
+    );
+    runtime.handle.reassemble_provider(managed).await.unwrap();
+    assert_eq!(runtime.handle.usage(false).await.unwrap().windows.len(), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    runtime.handle.shutdown().await.unwrap();
+}
