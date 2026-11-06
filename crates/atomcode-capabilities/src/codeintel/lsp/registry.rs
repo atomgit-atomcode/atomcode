@@ -98,6 +98,8 @@ pub fn extension_to_language_id(ext: &str) -> String {
         "c" | "h" => "c",
         "cc" | "cpp" | "cxx" | "hpp" | "hh" => "cpp",
         "cs" => "csharp",
+        // The Cangjie SDK server requires this exact, case-sensitive identifier.
+        "cj" => "Cangjie",
         "rb" => "ruby",
         "php" => "php",
         other => other,
@@ -124,6 +126,7 @@ mod tests {
         assert_eq!(extension_to_language_id("rs"), "rust");
         assert_eq!(extension_to_language_id("tsx"), "typescriptreact");
         assert_eq!(extension_to_language_id("cpp"), "cpp");
+        assert_eq!(extension_to_language_id("cj"), "Cangjie");
         assert_eq!(extension_to_language_id("zzz"), "zzz"); // unknown → itself
     }
 

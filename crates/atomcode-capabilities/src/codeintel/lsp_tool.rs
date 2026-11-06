@@ -811,6 +811,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_document_symbols_reaches_manager_without_a_position() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.cj"), "func 启动() {}\n").unwrap();
+        let tool = LspTool::new(Arc::new(LspManager::with_registry(
+            LspServerRegistry::empty(),
+        )));
+        for backend in [None, Some("local")] {
+            let mut args = json!({"operation":"document_symbols", "file_path":"main.cj"});
+            if let Some(backend) = backend {
+                args["backend"] = json!(backend);
+            }
+            let result = tool.execute(&args.to_string(), &ctx(dir.path())).await;
+            assert!(!result.is_error, "{}", result.content);
+            // This manager error proves dispatch got past the IDE-only guard and
+            // position validation, without needing an installed server binary.
+            assert!(
+                result.content.contains("no language server configured"),
+                "{}",
+                result.content
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn path_outside_workspace_is_rejected_before_reading() {
         let workspace = tempfile::tempdir().unwrap();
         let outside = tempfile::NamedTempFile::new().unwrap();
