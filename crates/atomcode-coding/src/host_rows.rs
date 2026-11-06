@@ -1175,7 +1175,16 @@ impl Plugin for HostToolsPlugin {
     fn description(&self) -> &'static str {
         "tools the coding runtime built itself: its controllers' and its capability graph's"
     }
-    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+    async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
+        #[derive(serde::Deserialize, Default)]
+        struct Row {
+            auto_review: Option<bool>,
+        }
+        let row: Row = if config.is_null() {
+            Row::default()
+        } else {
+            serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
+        };
         atomcode_harness::plugins::tools::mount(ctx, self.0.clone())?;
         // The product disables the harness's `tool-code-review` row and mounts
         // its own reviewer here (the product's limits and provider slot), so
@@ -1196,7 +1205,12 @@ impl Plugin for HostToolsPlugin {
                         "code-review" => 58,
                         _ => 57,
                     };
-                    atomcode_harness::plugins::tools::contribute_prompt(ctx, &id, rank, text);
+                    let guidance = if key == "code-review" && row.auto_review == Some(false) {
+                        format!("{text}\n{}", crate::review_rows::MANUAL_REVIEW_POLICY)
+                    } else {
+                        text.to_string()
+                    };
+                    atomcode_harness::plugins::tools::contribute_prompt(ctx, &id, rank, &guidance);
                 }
             }
         }

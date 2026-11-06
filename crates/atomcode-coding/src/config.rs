@@ -108,6 +108,8 @@ pub struct CodingAgentConfig {
     /// `[coding].max_rounds` or `ATOMCODE_TURN_MAX_ROUNDS`; exact repetition guards remain
     /// active independently.
     pub max_rounds: u32,
+    /// Encourage code_review before handoff; false keeps explicit reviews available.
+    pub auto_review: bool,
     /// When the coarse repetition fuse (`repeat-fuse`) stops a turn: after this
     /// many rounds of the very same tool calls. `None` keeps the row's own (6);
     /// `Some(0)` removes the fuse. Rounds that waited a minute or more are not
@@ -344,6 +346,7 @@ pub struct CodingRuntimeConfig {
     pub upstream_retry_max_attempts: Option<u32>,
     pub loop_max_rounds: u32,
     pub turn_max_rounds: u32,
+    pub auto_review: bool,
     /// `[coding] repeat_stop_rounds`; see [`CodingAgentConfig::repeat_stop_rounds`].
     pub repeat_stop_rounds: Option<u32>,
     pub subagent_config: Option<Arc<atomcode_config::config::Config>>,
@@ -514,7 +517,8 @@ pub fn describe_config_file_for(
          - `[modes.plan]` and `[modes.build]` optionally bind a `model` selection id and `reasoning_effort` (unset inherits the model profile; `default` uses the API default). Cross-mode transitions apply them for this session without writing `default_model`; `/model` temporarily overrides until the next mode transition. Configure via `/config` or WebUI mode settings.\n\
          - `[permissions]` `automation_approval`: `always` (default, consent for each schedule change) or `inherit` (preauthorize schedule changes only in current Auto mode; does not elevate scheduled task execution). Apply via capability reprepare. `default_mode`: startup mode (`build`, `plan`, `accept-edits`, `auto`); explicit -y overrides it; temporary mode switches do not save it. `allow` / `deny`: rules such as `Bash(git *)`, `Read(<path>)` or \
          `mcp__<server>__<tool>`. `deny` wins, and `allow` never opens a sensitive path.\n\
-         - `[coding]` `max_rounds` (per turn; 0 = no cap; `ATOMCODE_TURN_MAX_ROUNDS` wins), \
+         - `[coding]` `auto_review` (default true; false removes automatic pre-handoff review guidance while retaining explicit reviews; `ATOMCODE_AUTO_REVIEW` overrides), \
+         `max_rounds` (per turn; 0 = no cap; `ATOMCODE_TURN_MAX_ROUNDS` wins), \
          `repeat_stop_rounds` (stop a turn after this many rounds of the very same tool \
          calls; default 6, 0 = never; a round that waited a minute or more is not counted) \
          and `shell_guard_policy`: a shell command that reaches for credentials is asked \
@@ -697,6 +701,10 @@ impl CodingRuntimeConfig {
                 config.coding.max_rounds,
                 std::env::var("ATOMCODE_TURN_MAX_ROUNDS").ok().as_deref(),
             ),
+            auto_review: resolve_auto_review(
+                config.coding.auto_review,
+                std::env::var("ATOMCODE_AUTO_REVIEW").ok().as_deref(),
+            ),
             repeat_stop_rounds: config.coding.repeat_stop_rounds,
             subagent_config: Some(Arc::new(config.clone())),
             // Default off; only the interactive TUI opts in (see the CLI's
@@ -768,6 +776,7 @@ impl CodingRuntimeConfig {
         config.upstream_retry_max_attempts = self.upstream_retry_max_attempts;
         config.loop_max_rounds = self.loop_max_rounds;
         config.max_rounds = self.turn_max_rounds;
+        config.auto_review = self.auto_review;
         config.repeat_stop_rounds = self.repeat_stop_rounds;
         config.subagent_config = self.subagent_config.clone();
         config.interactive = self.interactive;
@@ -1181,6 +1190,15 @@ pub fn resolve_loop_max_rounds(configured: u32, env: Option<&str>) -> u32 {
         .unwrap_or(configured)
 }
 
+/// Environment policy overrides the config; invalid values keep the config value.
+pub fn resolve_auto_review(configured: bool, env: Option<&str>) -> bool {
+    match env.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("0" | "false" | "off") => false,
+        Some("1" | "true" | "on") => true,
+        _ => configured,
+    }
+}
+
 /// Resolve the per-turn round cap.
 ///
 /// Env `ATOMCODE_TURN_MAX_ROUNDS` (if a valid u32) takes priority over the
@@ -1243,6 +1261,7 @@ impl CodingAgentConfig {
             request_timeout: Some(Duration::from_secs(300)),
             max_continuations: 50,
             max_rounds: default_turn_max_rounds(),
+            auto_review: true,
             repeat_stop_rounds: None,
             round_cap_checkpoint: false,
             next_prompt_suggestions: false,
@@ -1284,6 +1303,41 @@ impl CodingAgentConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn auto_review_environment_policy_is_independent() {
+        for configured in [true, false] {
+            assert_eq!(super::resolve_auto_review(configured, None), configured);
+            assert_eq!(
+                super::resolve_auto_review(configured, Some("invalid")),
+                configured
+            );
+            for value in ["0", "false", " OFF "] {
+                assert!(!super::resolve_auto_review(configured, Some(value)));
+            }
+            for value in ["1", "true", " ON "] {
+                assert!(super::resolve_auto_review(configured, Some(value)));
+            }
+        }
+    }
+
+    #[test]
+    fn auto_review_policy_reaches_agent_configuration() {
+        let config = atomcode_config::Config::default();
+        let mut runtime = super::CodingRuntimeConfig::from_config(
+            &config,
+            std::path::Path::new("/work"),
+            super::product_dirs_from_env(),
+            None,
+            None,
+            false,
+            false,
+        );
+        for enabled in [false, true] {
+            runtime.auto_review = enabled;
+            assert_eq!(runtime.agent_config().auto_review, enabled);
+        }
+    }
+
     #[test]
     fn automation_approval_reaches_agent_configuration() {
         for policy in ["always", "inherit"] {

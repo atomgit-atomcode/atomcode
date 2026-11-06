@@ -367,6 +367,10 @@ pub(crate) fn chat_runtime_config(
             config.coding.max_rounds,
             std::env::var("ATOMCODE_TURN_MAX_ROUNDS").ok().as_deref(),
         ),
+        auto_review: atomcode_coding::config::resolve_auto_review(
+            config.coding.auto_review,
+            std::env::var("ATOMCODE_AUTO_REVIEW").ok().as_deref(),
+        ),
         repeat_stop_rounds: config.coding.repeat_stop_rounds,
         subagent_config: Some(Arc::new(config.clone())),
         // Daemon path has no TUI checkpoint picker; keep the hard round-cap.
@@ -3555,6 +3559,7 @@ mod tests {
             "test".into(),
         );
         let mut config = atomcode_config::Config::default();
+        config.coding.auto_review = false;
         config.permissions.default_mode = Some(atomcode_config::config::DefaultExecutionMode::Plan);
         let runtime = live_runtime_config(
             &config,
@@ -3563,6 +3568,13 @@ mod tests {
             telemetry,
         );
         assert!(runtime.interactive);
+        assert_eq!(
+            runtime.agent_config().auto_review,
+            atomcode_coding::config::resolve_auto_review(
+                false,
+                std::env::var("ATOMCODE_AUTO_REVIEW").ok().as_deref()
+            )
+        );
         assert_eq!(
             runtime.agent_config().initial_mode,
             atomcode_coding::RuntimeMode::Plan

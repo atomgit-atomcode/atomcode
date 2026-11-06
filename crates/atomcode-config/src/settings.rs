@@ -239,6 +239,15 @@ pub static SETTINGS: &[SettingSpec] = &[
         apply: ApplyPolicy::AgentReassemble,
     },
     SettingSpec {
+        id: "coding.auto_review",
+        path: &["coding", "auto_review"],
+        label_en: "Automatic pre-handoff review",
+        label_zh: "任务完成前自动评审",
+        aliases: &["review", "评审", "自动评审"],
+        kind: SettingKind::Boolean,
+        apply: ApplyPolicy::AgentReassemble,
+    },
+    SettingSpec {
         id: "coding.max_rounds",
         path: &["coding", "max_rounds"],
         label_en: "Turn max rounds",
@@ -579,6 +588,7 @@ impl SettingSpec {
             "tools.atomgit.tool_search" => config.tools.atomgit.tool_search.to_string(),
             "tools.atomgit.enabled" => config.tools.atomgit.enabled.to_string(),
             "tools.todo.eager" => format!("{:?}", config.tools.todo.eager).to_lowercase(),
+            "coding.auto_review" => config.coding.auto_review.to_string(),
             "coding.max_rounds" => config.coding.max_rounds.to_string(),
             "coding.shell_guard_policy" => {
                 format!("{:?}", config.coding.shell_guard_policy).to_lowercase()
@@ -1146,6 +1156,21 @@ mod tests {
         assert_eq!(setting.value(&configured), "read-only");
         // An out-of-range value is rejected.
         assert!(setting.patch(&mut DocumentMut::new(), "yolo").is_err());
+    }
+
+    #[test]
+    fn auto_review_is_a_separate_default_on_config_switch() {
+        let setting = SETTINGS
+            .iter()
+            .find(|s| s.id == "coding.auto_review")
+            .unwrap();
+        assert_eq!(setting.value(&Config::default()), "true");
+        let mut document = DocumentMut::new();
+        setting.patch(&mut document, "false").unwrap();
+        let config: Config = toml::from_str(&document.to_string()).unwrap();
+        assert!(!config.coding.auto_review);
+        assert_eq!(setting.value(&config), "false");
+        assert!(matches!(setting.apply, ApplyPolicy::AgentReassemble));
     }
 
     #[test]

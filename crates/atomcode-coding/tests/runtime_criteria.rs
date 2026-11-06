@@ -7415,3 +7415,53 @@ async fn a_session_without_a_task_list_keeps_model_generated_recap() {
         .any(|message| message.text.contains("Write a recap")));
     runtime.handle.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn disabling_automatic_review_keeps_explicit_reviews_and_survives_reload() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let setup = production_start(env.project.path(), &recorder, |start| {
+        start.agent.auto_review = false;
+    });
+    let mut next = setup.agent.clone();
+    let mut runtime = CodingRuntime::start(setup).await.unwrap();
+    for stage in ["initial", "capability reload", "provider rebuild"] {
+        if stage == "capability reload" {
+            runtime.handle.reload_capabilities().await.unwrap();
+        } else if stage == "provider rebuild" {
+            runtime
+                .handle
+                .reassemble_provider(next.clone())
+                .await
+                .unwrap();
+        }
+        turn(&mut runtime, "hello").await;
+        let prompt = system_text(&recorder.last_request());
+        assert!(
+            prompt.contains("Automatic pre-handoff review is disabled"),
+            "{stage}: {prompt}"
+        );
+        assert!(
+            !prompt.contains("Use it before handing work back"),
+            "{stage}: {prompt}"
+        );
+        assert!(prompt.contains("When the user asks to review code"));
+        let definitions = recorder.defs.lock().unwrap();
+        let offered = definitions.last().unwrap();
+        assert!(
+            offered.iter().any(|tool| tool.name == "code_review"),
+            "{stage}"
+        );
+        assert!(
+            offered.iter().any(|tool| tool.name == "bash"),
+            "other tools remain available"
+        );
+    }
+    next.auto_review = true;
+    runtime.handle.reprepare_config(next).await.unwrap();
+    turn(&mut runtime, "hello again").await;
+    assert!(
+        !system_text(&recorder.last_request()).contains("Automatic pre-handoff review is disabled")
+    );
+    runtime.handle.shutdown().await.unwrap();
+}

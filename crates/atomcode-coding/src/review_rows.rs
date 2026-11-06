@@ -29,6 +29,9 @@ fn parse<T: for<'de> Deserialize<'de> + Default>(config: &Value) -> Result<T, St
 
 #[derive(Debug, Deserialize, Default)]
 struct ReviewRow {
+    /// None keeps the historical automatic pre-handoff guidance.
+    #[serde(default)]
+    auto_review: Option<bool>,
     /// What the child reviewer is told it is running.
     ///
     /// Config rather than "just read the seam", and that is the whole design of
@@ -110,22 +113,27 @@ impl Plugin for ReviewToolPlugin {
         // This row's guidance for this row's tool. It lived in the coding persona as
         // `## CODE REVIEW`, which described the tool on BOTH assemblies — and stayed describing
         // it after this row was patched out of the tree.
-        contribute_prompt(
-            ctx,
-            "tool-code-review",
-            58,
+        let policy = if row.auto_review == Some(false) {
+            MANUAL_REVIEW_POLICY
+        } else {
+            "Use it before handing work back — not instead of running the tests."
+        };
+        let guidance = format!(
             "`code_review` runs a reviewer over the current changes and reports what it \
-             finds. It reads; it never edits. Use it before handing work back — not \
-             instead of running the tests. When the person asks to review code, a diff, staged \
+             finds. It reads; it never edits. {policy} When the person asks to review code, a diff, staged \
              changes, a commit, or a branch range, call it before writing the review and pass \
              the requested scope and path filters straight to it rather than pre-reading the \
              diff with ordinary read/search tools, which is what the scoped reviewer is for. It \
              may report findings you did not find; weigh them. Do not claim it fixed files or \
-             posted comments — it does neither.",
+             posted comments — it does neither."
         );
+        contribute_prompt(ctx, "tool-code-review", 58, &guidance);
         Ok(())
     }
 }
+
+/// Shared policy for the standalone and production host-tool mount paths.
+pub(crate) const MANUAL_REVIEW_POLICY: &str = "Automatic pre-handoff review is disabled. Call code_review only when the person explicitly asks for a review; do not call it just because a task is finished. Keep running the applicable tests.";
 
 /// The reviewer prompt, taken from the shipped review specialization rather
 /// than restated here. Two copies of a hard-won prompt drift, and the one that

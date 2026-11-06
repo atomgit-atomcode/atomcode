@@ -259,6 +259,11 @@ mode = "follow_system"
 # 工具返回的截断阈值见下方 [tools.output]；环境变量优先于配置文件：
 #   ATOMCODE_TOOL_OUTPUT_THRESHOLD_BYTES=204800
 [coding]
+# true 保留默认评审指导；false 明确要求仅在用户提出评审请求时调用 code_review。
+# /config 中的“任务完成前自动评审”可修改此项；显式 /review 和其他工具不受影响。
+# ATOMCODE_AUTO_REVIEW=0/false/off 关闭，1/true/on 开启；--no-review 优先级最高。
+# 这是模型行为指导，并非禁止模型调用工具的执行权限开关。
+auto_review = true
 max_rounds = 0
 
 # ---- Plan / Build 模式模型绑定（可选）----

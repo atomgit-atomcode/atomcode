@@ -875,6 +875,16 @@ pub fn config_rows(cfg: &crate::CodingAgentConfig) -> Result<Layer, String> {
         .map_err(|e| e.to_string())?;
     let mut out = model_rows(cfg)?
         .patch(
+            "tool-code-review",
+            serde_json::json!({"auto_review": cfg.auto_review}),
+        )
+        .map_err(|e| e.to_string())?
+        .patch(
+            "host-tools",
+            serde_json::json!({"auto_review": cfg.auto_review}),
+        )
+        .map_err(|e| e.to_string())?
+        .patch(
             "builtin-tool-search",
             serde_json::json!({"enabled": cfg.atomgit_tool_search}),
         )

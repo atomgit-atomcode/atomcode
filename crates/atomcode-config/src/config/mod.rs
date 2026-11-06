@@ -67,6 +67,8 @@ pub fn platform_rules() -> &'static str {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CodingConfig {
+    /// Default pre-handoff code review guidance; explicit reviews remain available.
+    pub auto_review: bool,
     pub max_rounds: u32,
     pub shell_guard_policy: ShellGuardPolicy,
     /// After how many rounds of the very same tool calls a turn is stopped as a
@@ -389,6 +391,7 @@ impl PermissionsConfig {
 impl Default for CodingConfig {
     fn default() -> Self {
         Self {
+            auto_review: true,
             max_rounds: 0,
             shell_guard_policy: ShellGuardPolicy::Prompt,
             repeat_stop_rounds: None,

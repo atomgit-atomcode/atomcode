@@ -680,6 +680,10 @@ struct Cli {
     #[arg(long, requires = "headless_input")]
     no_tools: bool,
 
+    /// Disable default pre-handoff review guidance; explicit /review remains available.
+    #[arg(long)]
+    no_review: bool,
+
     /// Headless stdout format: assistant text (default) or versioned JSON Lines.
     #[arg(
         long,
@@ -1599,6 +1603,11 @@ async fn run(process_start: std::time::Instant) -> Result<i32> {
 
     // No --help was passed. Parse normally to get the Cli struct.
     let cli = Cli::parse();
+    // Launch-only override: inherited by deferred runtimes and reloads, never
+    // written to config.toml. CLI takes precedence over an inherited env value.
+    if cli.no_review {
+        std::env::set_var("ATOMCODE_AUTO_REVIEW", "0");
+    }
     let prompt_overrides = resolve_prompt_overrides(&cli)?;
     if cli.command.is_some()
         && (prompt_overrides.replace.is_some()
@@ -5100,6 +5109,18 @@ fn install_panic_hook(telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>) 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn no_review_is_available_without_disabling_tools_or_interactivity() {
+        use clap::Parser;
+        let cli = super::Cli::try_parse_from(["atomcode", "--no-review"]).unwrap();
+        assert!(cli.no_review);
+        assert!(!cli.no_tools);
+        let headless =
+            super::Cli::try_parse_from(["atomcode", "--no-review", "-p", "fix it"]).unwrap();
+        assert!(headless.no_review);
+        assert!(!headless.no_tools);
+    }
+
     #[test]
     fn powershell_headless_authorization_is_not_inherited_from_bash() {
         for tool in ["pwsh", "pwsh_start"] {
