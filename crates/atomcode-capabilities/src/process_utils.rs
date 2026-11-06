@@ -279,13 +279,13 @@ pub fn is_running_as_admin() -> bool {
     false
 }
 
-#[cfg(all(test, feature = "cc-hooks", unix))]
+#[cfg(all(test, unix))]
 pub(crate) struct EnvVarGuard {
     saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
     _lock: std::sync::MutexGuard<'static, ()>,
 }
 
-#[cfg(all(test, feature = "cc-hooks", unix))]
+#[cfg(all(test, unix))]
 impl EnvVarGuard {
     pub(crate) fn new(keys: &[&'static str]) -> Self {
         use std::sync::{Mutex, OnceLock};
@@ -300,7 +300,7 @@ impl EnvVarGuard {
     }
 }
 
-#[cfg(all(test, feature = "cc-hooks", unix))]
+#[cfg(all(test, unix))]
 impl Drop for EnvVarGuard {
     fn drop(&mut self) {
         for (key, value) in &self.saved {

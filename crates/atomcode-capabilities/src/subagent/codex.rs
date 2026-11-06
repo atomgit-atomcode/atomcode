@@ -542,6 +542,7 @@ exit 0
     #[tokio::test]
     async fn run_cancel_returns_cancelled() {
         use std::os::unix::fs::PermissionsExt;
+        use tokio_util::sync::CancellationToken;
         let dir = tempfile::tempdir().unwrap();
         let stub = dir.path().join("codex-slow.sh");
         std::fs::write(&stub, "#!/bin/sh\nsleep 30\n").unwrap();
