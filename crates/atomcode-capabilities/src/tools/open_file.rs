@@ -154,6 +154,19 @@ fn ohos_aa_argv(url: &str) -> Vec<String> {
     ]
 }
 
+/// Which `aa` to invoke. The device ships `/bin/aa` — the real signed ELF — and
+/// `/usr/bin/aa`, a wrapper whose first line is `# aa`, not a shebang, so a bare
+/// `execve` on it dies with ENOEXEC and every call pays the fallback round-trip
+/// before reaching the same binary. Prefer the ELF when it exists as a file;
+/// keep `aa` (PATH) as the default elsewhere. Pure so the choice is testable.
+fn ohos_aa_program(bin_aa_is_file: bool) -> &'static str {
+    if bin_aa_is_file {
+        "/bin/aa"
+    } else {
+        "aa"
+    }
+}
+
 /// Resolve an existing script before interpreting it: ENOENT may mean the
 /// interpreter is missing, but must never turn a missing command into success.
 fn script_path(cmd: &Command) -> Option<PathBuf> {
@@ -178,21 +191,27 @@ fn script_path(cmd: &Command) -> Option<PathBuf> {
     })
 }
 
+/// Copy the env/cwd contract of `cmd` onto a replacement command, so every spawn
+/// path (direct, `sh`-interpreted, PATH retry) behaves identically.
+fn inherit_command_context(cmd: &Command, to: &mut Command) {
+    for (key, value) in cmd.get_envs() {
+        if let Some(value) = value {
+            to.env(key, value);
+        } else {
+            to.env_remove(key);
+        }
+    }
+    if let Some(cwd) = cmd.get_current_dir() {
+        to.current_dir(cwd);
+    }
+}
+
 /// Interpret the verified wrapper itself, rather than exec'ing it again and
 /// consulting the same broken shebang. URL arguments are never shell source.
 fn shell_fallback_command(cmd: &Command, path: &Path) -> Command {
     let mut sh = Command::new("sh");
     sh.arg(path).args(cmd.get_args());
-    for (key, value) in cmd.get_envs() {
-        if let Some(value) = value {
-            sh.env(key, value);
-        } else {
-            sh.env_remove(key);
-        }
-    }
-    if let Some(cwd) = cmd.get_current_dir() {
-        sh.current_dir(cwd);
-    }
+    inherit_command_context(cmd, &mut sh);
     sh
 }
 
@@ -206,20 +225,61 @@ fn run_aa(mut cmd: Command, timeout: std::time::Duration) -> Result<(), String> 
     cmd.stdin(std::process::Stdio::null())
         .stdout(diagnostics.try_clone().map_err(|e| e.to_string())?)
         .stderr(diagnostics);
-    // The fallback needs the same output destination and argv; construct it here
-    // so stream configuration is not lost when the wrapper interpreter is absent.
-    let spawn = cmd.spawn();
-    let mut child = match spawn {
+    // Stream reconfiguration and the sh-interpretation fallback are shared by
+    // every failure path below, so a retry behaves like the original attempt:
+    // same diagnostics file, same env/cwd contract.
+    let spawn_streams = |command: &mut Command| -> std::io::Result<std::process::Child> {
+        let diagnostics = output
+            .reopen()
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(
+                diagnostics
+                    .try_clone()
+                    .map_err(|e| std::io::Error::other(e.to_string()))?,
+            )
+            .stderr(diagnostics)
+            .spawn()
+    };
+    let script_interpret =
+        |command: &Command, trigger: &str| -> Result<std::process::Child, String> {
+            let path = script_path(command)
+                .ok_or_else(|| format!("{trigger}: no #! script to interpret"))?;
+            spawn_streams(&mut shell_fallback_command(command, &path)).map_err(|e| e.to_string())
+        };
+    let mut child = match cmd.spawn() {
         Ok(child) => child,
+        // `ohos_aa_program` picks `/bin/aa` only when it stat's as a file, but it
+        // may still lack the exec bit (EACCES). Retrying the plain PATH `aa`
+        // keeps the selection from being a new failure surface; the retry
+        // inherits the same env/cwd contract. Only EACCES goes here: ENOENT on an
+        // absolute path must keep failing ("a missing command must never turn
+        // into success", pinned by `aa_checks_failures_…`'s missing case), and
+        // ENOEXEC belongs to script_interpret for every program — an absolute #!
+        // script with a missing interpreter relies on it. The retry's own 2|8
+        // re-enters script_interpret, which only recognizes `#!` scripts — a
+        // wrapper like `# aa` ends as a fully-contextualized error.
+        Err(error)
+            if matches!(error.raw_os_error(), Some(13))
+                && Path::new(cmd.get_program()).is_absolute() =>
+        {
+            let mut via_path = Command::new("aa");
+            via_path.args(cmd.get_args());
+            inherit_command_context(&cmd, &mut via_path);
+            match spawn_streams(&mut via_path) {
+                Ok(child) => child,
+                Err(retry) if matches!(retry.raw_os_error(), Some(2 | 8)) => {
+                    script_interpret(&via_path, &format!("{error}; PATH fallback: {retry}"))?
+                }
+                Err(retry) => return Err(format!("{error}; PATH fallback: {retry}")),
+            }
+        }
+        // ENOENT (a `#!` script whose interpreter is missing) and ENOEXEC on any
+        // program: interpret the verified script through `sh` rather than
+        // exec'ing it again into the same error.
         Err(error) if matches!(error.raw_os_error(), Some(2 | 8)) => {
-            let path = script_path(&cmd).ok_or_else(|| error.to_string())?;
-            let diagnostics = output.reopen().map_err(|e| e.to_string())?;
-            shell_fallback_command(&cmd, &path)
-                .stdin(std::process::Stdio::null())
-                .stdout(diagnostics.try_clone().map_err(|e| e.to_string())?)
-                .stderr(diagnostics)
-                .spawn()
-                .map_err(|e| e.to_string())?
+            script_interpret(&cmd, &error.to_string())?
         }
         Err(error) => return Err(error.to_string()),
     };
@@ -535,7 +595,8 @@ fn open_local_url_impl(url: &str) -> Result<String, String> {
             // HarmonyOS PC: hand the URL to the device's own browser through the
             // device-side ability manager — the argv shape is pinned by
             // [`ohos_aa_argv`]'s test, because a dropped `-a`/`-A` still "succeeds".
-            let mut c = Command::new("aa");
+            // The program skips the `/usr/bin/aa` wrapper (see [`ohos_aa_program`]).
+            let mut c = Command::new(ohos_aa_program(Path::new("/bin/aa").is_file()));
             for arg in ohos_aa_argv(url) {
                 c.arg(arg);
             }
@@ -773,6 +834,15 @@ mod tests {
         assert_eq!(value("-U"), url);
     }
 
+    /// `/bin/aa` is the real signed ELF; the PATH `aa` wrapper costs an ENOEXEC
+    /// round-trip. The selection must prefer the ELF when it exists as a file and
+    /// stay portable (`aa`) where it does not.
+    #[test]
+    fn ohos_aa_prefers_the_real_elf_over_the_wrapper() {
+        assert_eq!(ohos_aa_program(true), "/bin/aa");
+        assert_eq!(ohos_aa_program(false), "aa");
+    }
+
     /// The ENOEXEC fallback must rerun exactly the same program and argv through
     /// `sh`, with the URL still one argv entry — nothing handed to a shell for
     /// re-parsing, so a URL with `&` in it cannot turn into a background job.
@@ -804,6 +874,32 @@ mod tests {
             std::time::Duration::from_secs(1)
         )
         .is_err());
+    }
+
+    /// An absolute program that cannot be spawned (EACCES: exists but no exec
+    /// bit) must not become a new failure surface: `run_aa` retries the plain
+    /// PATH `aa`. Safe to pin on every machine with no arguments — on a device
+    /// with a real `aa`, the retry runs it bare (usage text, exit 0 → `Ok`); on
+    /// machines without one the retry fails ENOENT and the error says so. Either
+    /// way the retry demonstrably executed, and no browser can ever open.
+    #[cfg(unix)]
+    #[test]
+    fn eaccess_falls_back_to_path_aa_and_reports_both_failures() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aa");
+        std::fs::write(&path, b"not an executable").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let result = run_aa(Command::new(&path), std::time::Duration::from_secs(1));
+        match result {
+            // Device with a real `aa`: the retry ran it bare (usage, exit 0).
+            Ok(()) => {}
+            // No `aa` in PATH: retry failed ENOENT, error carries the context.
+            Err(error) => assert!(
+                error.contains("PATH fallback"),
+                "EACCES retry must be visible in the error: {error}"
+            ),
+        }
     }
 
     #[test]
