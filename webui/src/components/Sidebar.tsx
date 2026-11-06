@@ -1,3 +1,4 @@
+import { ModalOverlay } from './ModalOverlay';
 import { ScheduleIcon } from './Automation';
 // Session sidebar (Claude-Code-inspired: brand + collapse at top, CC-style
 // new-conversation row, live-filtered session list, settings at the bottom;
@@ -398,7 +399,7 @@ export function Sidebar({
     { top?: number; bottom?: number; right: number } | null
   >(null);
   // Session search: a centered modal dialog (same .modal-overlay/.modal-card
-  // family as the rename/delete dialogs), closes on backdrop click / Escape.
+  // family as the rename/delete dialogs), closed through its explicit button.
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   // Cross-project search results (the sidebar list itself is per-project, so the
@@ -751,19 +752,6 @@ export function Sidebar({
     }
   }
 
-  useEffect(() => {
-    if (!historyPreview) return;
-    const close = (event: KeyboardEvent) => {
-      if (event.isComposing || event.keyCode === 229) return;
-      if (event.key === 'Escape') {
-        ++previewGeneration.current;
-        setHistoryPreview(null);
-      }
-    };
-    document.addEventListener('keydown', close);
-    return () => document.removeEventListener('keydown', close);
-  }, [historyPreview !== null]);
-
   // Settings menu: fixed-anchored above its button; close on outside/scroll/resize.
   useEffect(() => {
     if (!settingsMenuOpen) return;
@@ -951,17 +939,6 @@ export function Sidebar({
     setMcpMenuPos({ top: rect.bottom + 4, left: rect.left, width: rect.width });
     setMcpMenuOpen(true);
   }
-
-  // Close the search dialog on Escape (backdrop click is handled on the overlay).
-  useEffect(() => {
-    if (!searchOpen) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.isComposing || e.keyCode === 229) return;
-      if (e.key === 'Escape') setSearchOpen(false);
-    };
-    document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
-  }, [searchOpen]);
 
   // Focus the input on open; reset query/results on close so a reopen starts
   // fresh instead of flashing the previous search's stale results.
@@ -1621,7 +1598,7 @@ export function Sidebar({
 
       {/* Session search dialog (centered modal) */}
       {searchOpen && createPortal(
-        <div class="modal-overlay" onClick={(e) => { if (e.target === e.currentTarget) setSearchOpen(false); }}>
+        <ModalOverlay>
           <div class="modal-card search-modal-card">
             <div class="search-input-row">
               <SearchIcon />
@@ -1634,6 +1611,7 @@ export function Sidebar({
                 onInput={(e) => setSearchQuery((e.target as HTMLInputElement).value)}
                 autofocus
               />
+              <button type="button" class="ghost-btn modal-close" onClick={() => setSearchOpen(false)} aria-label={t('settings.close')}>×</button>
             </div>
             <label style={{ display: 'block', padding: '8px 16px' }}>
               <input type="checkbox" checked={includeUnavailable} onChange={(e) => {
@@ -1703,18 +1681,18 @@ export function Sidebar({
               })()}
             </div>
           </div>
-        </div>,
+        </ModalOverlay>,
         document.body,
       )}
 
       {historyPreview && createPortal(
-        <div class="modal-overlay" onClick={(e) => { if (e.target === e.currentTarget) { ++previewGeneration.current; setHistoryPreview(null); } }}>
+        <ModalOverlay>
           <div class="modal-card" role="dialog" aria-modal="true" aria-label={historyPreview.title} style={{ width: 'min(900px, 90vw)' }}>
             <div class="modal-header"><h3>{historyPreview.title}</h3><button onClick={() => { ++previewGeneration.current; setHistoryPreview(null); }} aria-label={t('sidebar.closeHistory')}>×</button></div>
             <p style={{ padding: '0 16px' }}>{t('sidebar.unavailableWorkspace')}</p>
             <pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', overflow: 'auto', maxHeight: '65vh', padding: '16px' }}>{historyPreview.text}</pre>
           </div>
-        </div>, document.body,
+        </ModalOverlay>, document.body,
       )}
 
       {/* Per-session actions menu. Fixed + portaled to <body> so neither the

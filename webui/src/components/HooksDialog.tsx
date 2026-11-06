@@ -1,3 +1,4 @@
+import { ModalOverlay } from './ModalOverlay';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import { getHooks, testHook, type HookCatalogue, type HookTestResult } from '../api';
@@ -37,7 +38,6 @@ export function HooksDialog({ onClose }: { onClose: () => void }) {
   }, []);
   useEffect(() => {
     const key = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); if (!runningRef.current) onClose(); }
       if (event.key === 'Tab') {
         const nodes = Array.from(dialog.current?.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled)') ?? []);
         if (nodes.length === 0) { event.preventDefault(); dialog.current?.focus(); return; }
@@ -57,7 +57,7 @@ export function HooksDialog({ onClose }: { onClose: () => void }) {
     catch (e) { if (alive.current) setError(String(e)); }
     finally { runningRef.current = false; if (alive.current) setRunning(false); }
   }
-  return createPortal(<div class="modal-overlay" onClick={e => { if (e.target === e.currentTarget && !runningRef.current) onClose(); }}>
+  return createPortal(<ModalOverlay>
     <section ref={dialog} tabIndex={-1} class="modal-card hooks-modal" role="dialog" aria-modal="true" aria-labelledby="hooks-title">
       <header class="modal-header"><h3 id="hooks-title">{t('hooks.title')}</h3><button type="button" class="ghost-btn modal-close" disabled={running} onClick={() => { if (!runningRef.current) onClose(); }} aria-label={t('hooks.close')}>×</button></header>
       <div class="modal-body hooks-body">
@@ -81,5 +81,5 @@ export function HooksDialog({ onClose }: { onClose: () => void }) {
         </>}
       </div>
     </section>
-  </div>, document.body);
+  </ModalOverlay>, document.body);
 }

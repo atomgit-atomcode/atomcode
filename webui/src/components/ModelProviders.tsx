@@ -1,3 +1,4 @@
+import { ModalOverlay } from './ModalOverlay';
 import { ModeModelsDialog } from './ModeModelsDialog';
 import { invalidateSkills } from '../skills';
 import { headerBody, headerProblem, type HeaderRow } from "../lib/providerHeaders";
@@ -228,12 +229,7 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
 
   return (
     <>
-      <div
-        class="modal-overlay"
-        onClick={(e) => {
-          if (e.target === e.currentTarget) onClose();
-        }}
-      >
+      <ModalOverlay>
         <div class="modal-card model-config-modal">
           <div class="modal-header">
             <span>⚙</span>
@@ -328,7 +324,7 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
             </div>
           </div>
         </div>
-      </div>
+      </ModalOverlay>
       {confirm && (
         <ConfirmDialog
           title={confirm.kind === 'account' ? t('providers.deleteAccountTitle') : t('settings.deleteTitle')}
@@ -1103,12 +1099,7 @@ function ModelPicker({
   );
   const pickable = visible.filter((m) => !takenSet.has(m.id)).map((m) => m.id);
   return (
-    <div
-      class="modal-overlay"
-      onClick={(e) => {
-        if (e.target === e.currentTarget) onCancel();
-      }}
-    >
+    <ModalOverlay>
       <div class="modal-card modal-card-sm model-picker-modal" role="dialog" aria-label={t('providers.pickTitle')}>
         <div class="modal-header">
           <h3>{t('providers.pickTitle')}</h3>
@@ -1181,7 +1172,7 @@ function ModelPicker({
           </button>
         </div>
       </div>
-    </div>
+    </ModalOverlay>
   );
 }
 

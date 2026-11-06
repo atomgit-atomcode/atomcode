@@ -1,3 +1,4 @@
+import { ModalOverlay } from './ModalOverlay';
 // Generic confirmation modal. Replaces native window.confirm/alert so every
 // destructive confirmation shares the webui modal style (matches DeleteDialog).
 
@@ -41,7 +42,6 @@ export function ConfirmDialog({
 
   useLayoutEffect(() => {
     function onKey(e: KeyboardEvent) {
-      if (e.key === 'Escape' && !busy) { e.preventDefault(); e.stopPropagation(); onClose(); }
       if (e.key === 'Tab') {
         const buttons = Array.from(card.current?.querySelectorAll<HTMLButtonElement>('button:not(:disabled)') || []);
         const first = buttons[0], last = buttons[buttons.length - 1];
@@ -69,12 +69,7 @@ export function ConfirmDialog({
   }
 
   return (
-    <div
-      class="modal-overlay"
-      onClick={(e) => {
-        if (e.target === e.currentTarget && !busy) onClose();
-      }}
-    >
+    <ModalOverlay>
       <div class="modal-card modal-card-sm" ref={card} role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1}>
         <div class="modal-header">
           <span>{icon}</span>
@@ -100,6 +95,6 @@ export function ConfirmDialog({
           </button>
         </div>
       </div>
-    </div>
+    </ModalOverlay>
   );
 }

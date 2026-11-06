@@ -50,7 +50,7 @@ test('interaction dock owns focus safely and chat restores the composer afterwar
 });
 
 test('ordinary management dialogs remain modal', () => {
-  assert.match(read('src/components/SettingsDialogs.tsx'), /class="modal-overlay"/);
-  assert.match(read('src/components/SessionDialogs.tsx'), /class="modal-overlay"/);
-  assert.match(read('src/components/CwdPicker.tsx'), /class="modal-overlay"/);
+  assert.match(read('src/components/SettingsDialogs.tsx'), /<ModalOverlay/);
+  assert.match(read('src/components/SessionDialogs.tsx'), /<ModalOverlay/);
+  assert.match(read('src/components/CwdPicker.tsx'), /<ModalOverlay/);
 });

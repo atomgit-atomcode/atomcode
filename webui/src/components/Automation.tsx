@@ -1,3 +1,4 @@
+import { ModalOverlay } from './ModalOverlay';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { useSettings } from '../settings';
 import { randomId } from '../lib/randomId';
@@ -263,10 +264,9 @@ export function Automation({ cwd, onClose, onSession, onCreateInChat }: Props) {
   }
 
   return <>
-    <div class="modal-overlay automation-overlay" onClick={event => { if (event.target === event.currentTarget) navigate(onClose); }}>
+    <ModalOverlay class="automation-overlay">
       <div class="modal-card automation-modal" role="dialog" aria-modal="true" aria-labelledby="automation-title" ref={dialog} onKeyDown={event => {
         if (deleteConfirm || discardAction || event.defaultPrevented) return;
-        if (event.key === 'Escape') { event.stopPropagation(); event.preventDefault(); navigate(draft ? closeEditor : onClose); }
         if (event.key === 'Tab') {
           const nodes = Array.from(dialog.current?.querySelectorAll<HTMLElement>('button:not(:disabled),input:not(:disabled),textarea:not(:disabled),select:not(:disabled),a[href]') || []).filter(node => node.getClientRects().length);
           const first = nodes[0], last = nodes[nodes.length - 1];
@@ -289,7 +289,7 @@ export function Automation({ cwd, onClose, onSession, onCreateInChat }: Props) {
           {settled && !loadError && visible.length === 0 && !selected && <div class="automation-empty"><ScheduleIcon/><p>{entries.length === 0 ? text('还没有自动化任务', 'No automations yet') : text('没有匹配的任务', 'No matching tasks')}</p><span class="field-hint">{entries.length === 0 ? text('新建任务后，可在这里查看规则和运行记录。', 'Create a task to manage its rule and runs here.') : text('试试其他关键词或状态筛选。', 'Try another search or status filter.')}</span></div>}
         </div>
       </div>
-    </div>
+    </ModalOverlay>
     {deleteConfirm && <ConfirmDialog title={text('删除自动化任务', 'Delete automation')} body={text(`确定删除「${deleteConfirm.task.title}」？未来触发将停止，已启动的运行、记录和会话仍保留。`, `Delete “${deleteConfirm.task.title}”? Future triggers stop; existing runs, records and sessions are retained.`)} confirmLabel={text('删除任务', 'Delete task')} cancelLabel={text('取消', 'Cancel')} onConfirm={remove} onClose={() => { if (!busy) setDeleteConfirm(null); }}/>}
     {discardAction && <ConfirmDialog title={text('放弃未保存的更改？', 'Discard unsaved changes?')} body={text('当前草稿尚未保存，离开后将丢弃这些更改。', 'This draft has not been saved. Leaving will discard your changes.')} danger={false} icon="" confirmLabel={text('放弃更改', 'Discard changes')} cancelLabel={text('继续编辑', 'Keep editing')} onConfirm={() => { const action = discardAction; setDiscardAction(null); action(); }} onClose={() => setDiscardAction(null)}/>}
   </>;

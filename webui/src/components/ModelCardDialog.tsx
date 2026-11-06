@@ -18,9 +18,9 @@ export function ModelCardDialog({ model, onClose }: { model: ModelInfo; onClose:
   useEffect(() => {
     const element = dialog.current!;
     element.showModal();
-    const closed = () => onClose();
-    element.addEventListener('cancel', closed);
-    return () => { element.removeEventListener('cancel', closed); element.close(); };
+    const preventDismiss = (event: Event) => event.preventDefault();
+    element.addEventListener('cancel', preventDismiss);
+    return () => { element.removeEventListener('cancel', preventDismiss); element.close(); };
   }, []);
   useEffect(() => {
     if (!browse) return;
@@ -58,10 +58,7 @@ export function ModelCardDialog({ model, onClose }: { model: ModelInfo; onClose:
     for (const row of remaining) rows.push({ b: row });
   }
   const cardHeading = (card: ModelCard) => <><strong>{card.name}</strong><small>{card.maker}</small></>;
-  return <dialog class="model-card-dialog" ref={dialog} aria-labelledby="model-card-title" onClick={e => {
-    const rect = e.currentTarget.getBoundingClientRect();
-    if (e.target === e.currentTarget && (e.clientX < rect.left || e.clientX > rect.right || e.clientY < rect.top || e.clientY > rect.bottom)) onClose();
-  }}>
+  return <dialog class="model-card-dialog" ref={dialog} aria-labelledby="model-card-title">
     <header><div><h2 id="model-card-title">{t('cards.title')}</h2><p>{model.model}</p></div><button type="button" onClick={onClose} aria-label={t('cards.close')}>×</button></header>
     <div class="mc-body">
       <div class="mc-config"><span>{t('cards.context')}: {model.context_window?.toLocaleString() ?? '—'}</span><span>{t('cards.vision')}: {t(model.supports_vision == null ? 'cards.unknown' : model.supports_vision ? 'cards.yes' : 'cards.no')}</span></div>

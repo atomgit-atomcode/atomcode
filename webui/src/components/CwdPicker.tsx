@@ -1,3 +1,4 @@
+import { ModalOverlay } from './ModalOverlay';
 // Task 15b — Working directory picker modal
 
 import { useEffect, useRef, useState } from 'preact/hooks';
@@ -152,17 +153,13 @@ export function CwdPicker({ current, onPick, onClose }: CwdPickerProps) {
   const crumbs = parseBreadcrumb(browsePath);
 
   return (
-    <div
-      class="modal-overlay"
-      onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
-      }}
-    >
+    <ModalOverlay>
       <div class="modal-card cwd-picker">
         <div class="modal-header">
           <span>📁</span>
           <h3>{t('cwd.title')}</h3>
           <span class="modal-sub" style="margin-left:auto">{t('cwd.affectsSession')}</span>
+          <button type="button" class="ghost-btn modal-close" onClick={onClose} aria-label={t('settings.close')}>×</button>
         </div>
 
         <div class="modal-body">
@@ -286,6 +283,6 @@ export function CwdPicker({ current, onPick, onClose }: CwdPickerProps) {
           </button>
         </div>
       </div>
-    </div>
+    </ModalOverlay>
   );
 }

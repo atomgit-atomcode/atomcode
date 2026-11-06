@@ -1,3 +1,4 @@
+import { ModalOverlay } from './ModalOverlay';
 // Rename + delete dialogs for a session (triggered from the sidebar item menu).
 
 import { useEffect, useRef, useState } from 'preact/hooks';
@@ -36,12 +37,7 @@ export function RenameDialog({ session, onClose, onDone }: RenameDialogProps) {
   }
 
   return (
-    <div
-      class="modal-overlay"
-      onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
-      }}
-    >
+    <ModalOverlay>
       <div class="modal-card modal-card-sm">
         <div class="modal-header">
           <span>✎</span>
@@ -74,7 +70,7 @@ export function RenameDialog({ session, onClose, onDone }: RenameDialogProps) {
           </button>
         </div>
       </div>
-    </div>
+    </ModalOverlay>
   );
 }
 
@@ -116,12 +112,7 @@ export function DeleteDialog({ session, onClose, onDone }: DeleteDialogProps) {
   }
 
   return (
-    <div
-      class="modal-overlay"
-      onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
-      }}
-    >
+    <ModalOverlay>
       <div class="modal-card modal-card-sm">
         <div class="modal-header">
           <span>🗑</span>
@@ -143,6 +134,6 @@ export function DeleteDialog({ session, onClose, onDone }: DeleteDialogProps) {
           </button>
         </div>
       </div>
-    </div>
+    </ModalOverlay>
   );
 }
