@@ -1298,6 +1298,12 @@ pub enum Msg<'a> {
     /// 种子齐了、转发给 agent 之后说。说的是「这条命令接住了」,不是「模型答完了」
     /// ——后者是那个回合的事,由它在屏上自己出现。
     SetupRunningSkill,
+    SetupCapabilities,
+    SetupAutomations,
+    SetupDismiss,
+    SetupConfirm,
+    SetupWorking,
+    SetupUsage,
     PluginNothingInstalled,
     PluginInstalledList {
         lines: &'a str,

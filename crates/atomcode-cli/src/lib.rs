@@ -28,6 +28,7 @@ fn _tests_assert_in_chinese() {
 #[cfg(unix)]
 pub mod askpass;
 pub mod desktop;
+pub mod project_setup;
 pub mod relay;
 pub mod tui_bg;
 pub mod tui_changelog;
@@ -296,6 +297,13 @@ pub mod tui_front {
             crate::tui_places::row_layer(),
             crate::tui_share::row_layer(),
         ];
+        let hint_root = working_dir.clone();
+        let hint_dirs = dirs.clone();
+        let capabilities = tokio::task::spawn_blocking(move || {
+            crate::project_setup::startup_hint(&hint_root, &hint_dirs)
+        })
+        .await
+        .unwrap_or(None);
         let mut rows: Vec<Arc<dyn atomcode_plexus::Plugin>> = vec![
             Arc::new(crate::tui_settings::SettingsRow),
             Arc::new(crate::tui_providers::ProvidersRow),
@@ -320,6 +328,7 @@ pub mod tui_front {
                 notice: opening_notice,
                 keys: keys_note,
                 news,
+                capabilities,
             }),
             Arc::new(crate::tui_upgrade::UpgradeRow),
             Arc::new(crate::tui_changelog::ChangelogRow {
@@ -362,9 +371,15 @@ pub mod tui_front {
                 settings: Some(crate::tui_settings::ConfigSettings::new(
                     config_path.clone(),
                 )),
-                providers: Some(crate::tui_providers::ConfigProviders::new(config_path)),
+                providers: Some(crate::tui_providers::ConfigProviders::new(
+                    config_path.clone(),
+                )),
                 plugins: Some(crate::tui_plugins::DiskPlugins::new(working_dir.clone())),
-                setup: Some(crate::tui_setup::DiskSetup::new(working_dir, dirs.clone())),
+                setup: Some(crate::tui_setup::DiskSetup::new(
+                    working_dir,
+                    dirs.clone(),
+                    config_path,
+                )),
                 dirs: Some(dirs),
             },
             connection,

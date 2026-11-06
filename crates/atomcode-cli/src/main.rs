@@ -861,11 +861,23 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Install seed files (skills/commands/hooks/MCP) to `~/.atomcode/`.
+    /// Check project capabilities and install optional tools after confirmation.
     Setup {
         /// Take over a stale lock AND force reinstall even if seeds are already present.
         #[arg(long)]
         force: bool,
+        /// Inspect capabilities without installing seed skills.
+        #[arg(long, conflicts_with_all = ["install", "skip"])]
+        check: bool,
+        /// Review a setup plan: ast-grep or context7. Requires --yes to apply it.
+        #[arg(long, value_parser = ["ast-grep", "context7"], conflicts_with = "skip")]
+        install: Option<String>,
+        /// Apply the requested installation/configuration plan.
+        #[arg(long, requires = "install")]
+        yes: bool,
+        /// Acknowledge the current project recommendations without installing.
+        #[arg(long)]
+        skip: bool,
     },
     /// Manage hooks (list, test, enable/disable)
     #[command(subcommand)]
@@ -2051,9 +2063,23 @@ async fn run(process_start: std::time::Instant) -> Result<i32> {
                     .await;
                 return Ok(0);
             }
-            Commands::Setup { force } => {
+            Commands::Setup {
+                force,
+                check,
+                install,
+                yes,
+                skip,
+            } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
-                let exit_code = run_setup_command(force);
+                let exit_code = run_setup_command(
+                    force,
+                    check,
+                    install.as_deref(),
+                    yes,
+                    skip,
+                    cli.config.clone().unwrap_or_else(Config::default_path),
+                )
+                .await;
                 telemetry
                     .shutdown(std::time::Duration::from_millis(500))
                     .await;
@@ -3895,32 +3921,63 @@ pub(crate) async fn run_native_headless_detailed(
     Ok((exit_code, captured, failure_diagnostic))
 }
 
-/// Drive `atomcode_capabilities::setup::run` end-to-end and return the CLI exit code
-/// (0 on success, 1 on any setup error). `setup::run` is synchronous; we
-/// run it directly since `Commands::Setup` already runs outside the TUI loop.
-fn run_setup_command(force: bool) -> i32 {
-    use atomcode_capabilities::setup;
-
-    let project_root = match std::env::current_dir() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("setup error: cannot read current directory: {e}");
-            return 1;
+/// Seed bootstrap and capability setup share the same local service as the TUI.
+async fn run_setup_command(
+    force: bool,
+    check: bool,
+    install: Option<&str>,
+    yes: bool,
+    skip: bool,
+    config_path: std::path::PathBuf,
+) -> i32 {
+    let result: anyhow::Result<()> = async {
+        use atomcode_capabilities::setup;
+        let root = std::env::current_dir()?;
+        let dirs = atomcode_coding::config::product_dirs_from_env();
+        let service = atomcode::project_setup::ProjectSetup {
+            root: root.clone(),
+            dirs: dirs.clone(),
+            config_path,
+        };
+        if skip {
+            println!("{}", service.dismiss()?);
+            return Ok(());
         }
-    };
-    let mut opts = setup::RunOptions::new(
-        project_root,
-        atomcode_coding::config::product_dirs_from_env(),
-    );
-    opts.force = force;
-
-    match setup::run(opts) {
-        Ok(report) => {
+        if let Some(id) = install {
+            let plan = service.plan(id).await?;
+            println!("{}", plan.detail);
+            if !yes {
+                println!("{} setup --install {id} --yes", env!("CARGO_BIN_NAME"));
+                return Ok(());
+            }
+            let result = tokio::select! {
+                result = service.apply(id, &plan.token) => result?,
+                _ = tokio::signal::ctrl_c() => anyhow::bail!("Setup cancelled; inspect the package manager before retrying"),
+            };
+            println!("{result}");
+            return Ok(());
+        }
+        if !check {
+            let mut opts = setup::RunOptions::new(root, dirs);
+            opts.force = force;
+            let report = tokio::task::spawn_blocking(move || setup::run(opts)).await??;
             println!("{}", report.render_cli());
-            0
         }
+        let report = service.check(force).await?;
+        println!("{}", report.summary);
+        for entry in report.entries {
+            println!("\n{}: {}\n{}", entry.name, entry.status, entry.detail);
+            if entry.installable {
+                println!("  {} setup --install {}", env!("CARGO_BIN_NAME"), entry.id);
+            }
+        }
+        Ok(())
+    }
+    .await;
+    match result {
+        Ok(()) => 0,
         Err(e) => {
-            eprintln!("setup error: {e}");
+            eprintln!("setup: {e:#}");
             1
         }
     }

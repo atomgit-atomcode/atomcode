@@ -146,7 +146,7 @@ plexus_service!(PlacesSvc => dyn crate::places::Places, "tui-places", Seam, "The
 // scanning the project and locking a file are the launcher's to do — this crate
 // keeps its `atomcode-capabilities` features down to `tools` on purpose, and
 // `/setup` on a brand-new machine is the one thing that needs more than that.
-plexus_service!(SetupSvc => dyn crate::setup::Setup, "tui-setup", Seam, "Installing the seed skills on a machine that has none yet");
+plexus_service!(SetupSvc => dyn crate::setup::Setup, "tui-setup", Seam, "Inspecting project capabilities, reviewing setup actions, and bootstrapping seed skills");
 
 /// The session's clock, and the only place this crate reads one.
 ///

@@ -1,23 +1,9 @@
-//! 种子安装：全新机器上第一次 `/setup` 那一步，以及它读的那个口子。
-//!
-//! 和 [`crate::plugins`] 是同一副骨架，理由也同一条（`docs/adr/0022` §3）：
-//! **种子是什么、装到哪、装了什么** 是产品那边才能回答的 —— 这个 crate 刻意只开
-//! `atomcode-capabilities` 的 `tools` feature，而装种子要 `setup` feature（解压 tar.zst、
-//! 扫描项目、原子写、文件锁）。所以端口是 async 的，实现在启动器那一侧。
-//!
-//! **为什么要有这个口子**：`/setup` 这条命令本身不用新写 —— `harness` 把每个
-//! `user_invocable` 的 skill 自动登记成一条命令，而种子 skill
-//! （`assets/setup-seeds/skills/atomcode-automation-recommender/SKILL.md`，frontmatter
-//! 是 `name: setup`）正是这样一条。装过种子的机器上，屏幕侧什么都不必做。
-//! 缺的只是**全新机器上第一次输 `/setup`**：那一刻种子还不在磁盘上，agent 的命令
-//! 目录里也就没有它，命令会落到「没有 /setup 这条命令」。老前端
-//! （`tuix/src/event_loop/commands.rs:3947`）为这一步写了一段专门的代码：装上种子 →
-//! 重载插件 → 再把 `setup` skill 展开成人的一个回合。
-//!
-//! 这里把「装」拆成一个端口，「装完重载、然后转发」留在
-//! [`crate::commands::SetupCommands`] —— 那一半是屏幕的编排，不是产品的事实。
+//! Local setup port. The host owns scanning, installed-binary checks, configuration
+//! edits and confirmed installation; the screen owns lists and confirmation sheets.
+//! Seed bootstrap remains available for the model-driven automation recommender.
+//! This crate does not enable the capabilities `setup` feature or own MCP clients.
 
-/// 装种子，以及问一句「装过没有」。
+/// Local capability setup and the existing seed-skill bootstrap.
 ///
 /// 由启动屏幕的那一方填，和 [`crate::plugins::Plugins`] 同一个形状、同一条理由。
 /// 回来的 `Ok` 是一句给人看的话（产物自带的报告原样带回来），`Err` 是启动器的拒绝。
@@ -31,4 +17,57 @@ pub trait Setup: Send + Sync {
 
     /// 装上种子，回一句给人看的话（装了什么、跳过了什么、有没有失败的）。
     async fn install(&self) -> Result<String, String>;
+
+    fn capability_setup(&self) -> bool {
+        false
+    }
+
+    /// Local capability inspection. `None` preserves seed-only embedders.
+    async fn check(
+        &self,
+        _root: &std::path::Path,
+        _force: bool,
+    ) -> Result<Option<CapabilityReport>, String> {
+        Ok(None)
+    }
+    async fn plan(&self, _root: &std::path::Path, _id: &str) -> Result<CapabilityPlan, String> {
+        Err("Capability installation is unavailable".into())
+    }
+    async fn apply(
+        &self,
+        _root: &std::path::Path,
+        _id: &str,
+        _token: &str,
+    ) -> Result<String, String> {
+        Err("Capability installation is unavailable".into())
+    }
+    async fn cancel(&self) -> Result<String, String> {
+        Err("No setup operation is running".into())
+    }
+    async fn dismiss(&self, _root: &std::path::Path) -> Result<String, String> {
+        Ok(String::new())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CapabilityReport {
+    pub summary: String,
+    pub entries: Vec<CapabilityEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CapabilityEntry {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    pub detail: String,
+    pub installable: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct CapabilityPlan {
+    pub id: String,
+    pub detail: String,
+    /// Host-generated identity of the exact plan the user is confirming.
+    pub token: String,
 }

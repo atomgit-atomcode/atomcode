@@ -3278,30 +3278,8 @@ impl CommandSet for HelpCommands {
         Outcome::Said(out)
     }
 }
-
-/// `/setup`: put the seed skills on disk if this machine never has, then hand
-/// the name to the agent — which owns what running it means.
-///
-/// **Why the screen owns this at all.** `/setup` is a skill
-/// (`assets/setup-seeds/skills/atomcode-automation-recommender/SKILL.md` —
-/// `name: setup`, `user_invocable: true`), and the `skills` row registers one
-/// command per user-invocable skill, so on a machine where the seeds *are*
-/// installed the agent's catalog already offers `/setup` and there is nothing to
-/// add here. On a machine where they are not, that command does not exist yet —
-/// and typing `/setup` is answered with "no such command" by the very command
-/// that would have installed what it needs. Unpacking the seeds is the one step
-/// the agent cannot take, because it has to have the skill before it can be
-/// asked for one.
-///
-/// **Why it declares `overrides`.** Both machines have to end in the same place,
-/// so this set claims the name unconditionally rather than only when the agent
-/// lacks it. Who would notice the difference is the person, at the moment one of
-/// the two worked and the other did not.
-///
-/// What is left of tuix's `/setup` (`event_loop/commands.rs:3947`) is exactly
-/// this: install → reload → forward. The reload is not optional — writing the
-/// files is not making them so, and the command about to be handed over is one
-/// of the things that arrives by that rebuild.
+/// Local capability inspection and reviewed setup actions. The automation option
+/// retains seed bootstrap → reload → invoke, including seed-only embedders.
 pub struct SetupCommands;
 
 fn setup_catalogue() -> Vec<Command> {
@@ -3330,6 +3308,99 @@ impl CommandSet for SetupCommands {
         let Some(port) = ctx.service::<crate::plugin::SetupSvc>() else {
             return Outcome::Refused(t(Msg::NoSetupPort).into_owned());
         };
+        let args = args.trim();
+        let words: Vec<_> = args.split_whitespace().collect();
+        if port.capability_setup()
+            && !matches!(
+                words.first(),
+                Some(&"automations" | &"hooks" | &"mcp" | &"skills" | &"all")
+            )
+        {
+            if words.as_slice() == ["cancel"] {
+                return match port.cancel().await {
+                    Ok(text) => Outcome::Said(text),
+                    Err(error) => Outcome::Refused(error),
+                };
+            }
+            let root = match working_dir(client.control(), client.root()).await {
+                Ok(root) => std::path::PathBuf::from(root),
+                Err(error) => return Outcome::Refused(error),
+            };
+            return match words.as_slice() {
+                [] | ["check"] | ["--force"] => match port.check(&root, args == "--force").await {
+                    Ok(Some(report)) => {
+                        let mut rows: Vec<_> = report
+                            .entries
+                            .into_iter()
+                            .map(|entry| {
+                                let verb = if entry.installable { "install" } else { "info" };
+                                crate::sheet::Row::new(
+                                    format!("/setup {verb} {}", entry.id),
+                                    entry.name,
+                                )
+                                .about(entry.status)
+                                .preview(crate::width::wrap(&entry.detail, 56))
+                            })
+                            .collect();
+                        rows.push(crate::sheet::Row::new(
+                            "/setup automations",
+                            t(Msg::SetupAutomations),
+                        ));
+                        rows.push(crate::sheet::Row::new("/setup skip", t(Msg::SetupDismiss)));
+                        Outcome::Do(Action::OpenSheet(crate::sheet::Sheet::list(
+                            crate::sheet::List::new("setup", t(Msg::SetupCapabilities), rows),
+                        )))
+                    }
+                    Ok(None) => Outcome::Refused(t(Msg::NoSetupPort).into_owned()),
+                    Err(error) => Outcome::Refused(error),
+                },
+                ["info", id] => match port.check(&root, false).await {
+                    Ok(Some(report)) => match report.entries.into_iter().find(|e| e.id == *id) {
+                        Some(e) => Outcome::Said(format!("{}: {}\n{}", e.name, e.status, e.detail)),
+                        None => Outcome::Refused(t(Msg::SetupUsage).into_owned()),
+                    },
+                    Ok(None) => Outcome::Refused(t(Msg::NoSetupPort).into_owned()),
+                    Err(error) => Outcome::Refused(error),
+                },
+                ["skip"] => match port.dismiss(&root).await {
+                    Ok(text) => Outcome::Said(text),
+                    Err(error) => Outcome::Refused(error),
+                },
+                ["install", id] => match port.plan(&root, id).await {
+                    Ok(plan) => {
+                        let text = crate::width::wrap(&plan.detail, 56).join("\n");
+                        let mut read = crate::sheet::Read::file(
+                            "setup",
+                            vec![crate::sheet::Piece::new(
+                                t(Msg::SetupConfirm),
+                                crate::sheet::Tone::Plain,
+                            )],
+                            &text,
+                        );
+                        read.action = Some((
+                            t(Msg::SetupConfirm).into_owned(),
+                            format!("/setup install {} --confirm {}", plan.id, plan.token),
+                        ));
+                        Outcome::Do(Action::OpenSheet(crate::sheet::Sheet::read(read)))
+                    }
+                    Err(error) => Outcome::Refused(error),
+                },
+                ["install", id, "--confirm", token] => {
+                    if let Some(ui) = ctx.service::<atomcode_harness::seams::UiSvc>() {
+                        ui.say(&t(Msg::SetupWorking));
+                    }
+                    match port.apply(&root, id, token).await {
+                        Ok(text) => Outcome::Said(text),
+                        Err(error) => Outcome::Refused(error),
+                    }
+                }
+                _ => Outcome::Refused(t(Msg::SetupUsage).into_owned()),
+            };
+        }
+        let args = args
+            .strip_prefix("automations")
+            .map(str::trim_start)
+            .unwrap_or(args);
         // The common case, and the whole reason this is a question rather than
         // an attempt: on a machine that has run `/setup` once, unfolding the
         // seeds, taking the file lock and rebuilding the graph are all work with
@@ -8376,8 +8447,20 @@ mod setup_tests {
     #[async_trait]
     impl atomcode_host_api::HostControl for Recording {
         async fn call(&self, command: HostCommand) -> Result<HostReply, HostError> {
+            let context = matches!(command, HostCommand::Context { .. });
             self.asked.lock().unwrap().push(command);
-            Ok(HostReply::Done)
+            if context {
+                Ok(HostReply::Context {
+                    window: 0,
+                    used: 0,
+                    model: String::new(),
+                    working_dir: "/current-project".into(),
+                    system_prompt: None,
+                    persona: None,
+                })
+            } else {
+                Ok(HostReply::Done)
+            }
         }
         fn subscribe(&self) -> tokio::sync::mpsc::UnboundedReceiver<atomcode_host_api::HostEvent> {
             tokio::sync::mpsc::unbounded_channel().1
@@ -8389,6 +8472,8 @@ mod setup_tests {
     #[derive(Default)]
     struct FakeSetup {
         installed: bool,
+        capabilities: bool,
+        applied: std::sync::Mutex<Vec<(String, String)>>,
         installs: std::sync::Mutex<usize>,
     }
 
@@ -8396,6 +8481,48 @@ mod setup_tests {
     impl crate::setup::Setup for FakeSetup {
         fn installed(&self) -> bool {
             self.installed
+        }
+        fn capability_setup(&self) -> bool {
+            self.capabilities
+        }
+        async fn check(
+            &self,
+            root: &std::path::Path,
+            _force: bool,
+        ) -> Result<Option<crate::setup::CapabilityReport>, String> {
+            assert_eq!(root, std::path::Path::new("/current-project"));
+            Ok(Some(crate::setup::CapabilityReport {
+                summary: "capabilities".into(),
+                entries: vec![crate::setup::CapabilityEntry {
+                    id: "context7".into(),
+                    name: "Context7".into(),
+                    status: "optional".into(),
+                    detail: "Docs".into(),
+                    installable: true,
+                }],
+            }))
+        }
+        async fn plan(
+            &self,
+            root: &std::path::Path,
+            id: &str,
+        ) -> Result<crate::setup::CapabilityPlan, String> {
+            assert_eq!(root, std::path::Path::new("/current-project"));
+            Ok(crate::setup::CapabilityPlan {
+                id: id.into(),
+                detail: "Add a disabled server".into(),
+                token: "reviewed".into(),
+            })
+        }
+        async fn apply(
+            &self,
+            root: &std::path::Path,
+            id: &str,
+            token: &str,
+        ) -> Result<String, String> {
+            assert_eq!(root, std::path::Path::new("/current-project"));
+            self.applied.lock().unwrap().push((id.into(), token.into()));
+            Ok("added disabled".into())
         }
         async fn install(&self) -> Result<String, String> {
             *self.installs.lock().unwrap() += 1;
@@ -8416,6 +8543,10 @@ mod setup_tests {
     }
 
     fn rig(installed: bool) -> Rig {
+        rig_with(installed, false)
+    }
+
+    fn rig_with(installed: bool, capabilities: bool) -> Rig {
         let app = App::new(PluginRegistry::new(), ConfigTree::default());
         let host = Arc::new(Recording::default());
         let client = Arc::new(crate::plugin::AgentClient::default());
@@ -8427,6 +8558,8 @@ mod setup_tests {
             .provide::<crate::plugin::AgentClientSvc>(client);
         let port = Arc::new(FakeSetup {
             installed,
+            capabilities,
+            applied: Default::default(),
             installs: std::sync::Mutex::new(0),
         });
         let _ = app
@@ -8461,6 +8594,48 @@ mod setup_tests {
                 _ => None,
             })
         }
+    }
+
+    #[tokio::test]
+    async fn capability_setup_checks_then_requires_review_before_applying_in_current_directory() {
+        let rig = rig_with(true, true);
+        rig.sent(); // Discard the initial Describe sent when the client follows lead.
+        let report = rig.all.dispatch("/setup", &rig.app.context()).await;
+        assert!(matches!(report, Outcome::Do(Action::OpenSheet(_))));
+        assert!(
+            rig.sent().is_empty(),
+            "inspection must not start a model turn"
+        );
+        assert!(rig.port.applied.lock().unwrap().is_empty());
+        assert_eq!(*rig.port.installs.lock().unwrap(), 0);
+        let review = rig
+            .all
+            .dispatch("/setup install context7", &rig.app.context())
+            .await;
+        let Outcome::Do(Action::OpenSheet(sheet)) = review else {
+            panic!("must review first")
+        };
+        let crate::sheet::Page::Read(read) = sheet.page else {
+            panic!("reviewed plan")
+        };
+        assert!(rig.port.applied.lock().unwrap().is_empty());
+        let (_, command) = read.action.unwrap();
+        let result = rig.all.dispatch(&command, &rig.app.context()).await;
+        assert!(matches!(result, Outcome::Said(_)));
+        assert_eq!(
+            *rig.port.applied.lock().unwrap(),
+            vec![("context7".into(), "reviewed".into())]
+        );
+        assert!(rig.sent().is_empty());
+    }
+
+    #[tokio::test]
+    async fn automation_recommendations_still_use_the_existing_skill_path() {
+        let rig = rig_with(true, true);
+        rig.all
+            .dispatch("/setup automations hooks", &rig.app.context())
+            .await;
+        assert!(rig.sent().iter().any(|c| matches!(c, atomcode_kernel::event::AgentCommand::Invoke { name, args, .. } if name == "setup" && args == "hooks")));
     }
 
     /// On a machine that already has the seeds, `/setup` is one thing: hand the

@@ -72,6 +72,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # `/app` 的中继客户端:下载时读流、校验 sha256(随 relay.rs 从 tuix 搬来)。
 futures = "0.3"
 sha2 = "0.10"
+# Resolve executables for the project capability setup service.
+which = "7"
+# Run confirmed installers outside project-local package-manager configuration.
+tempfile = "3"
 # 手输配对用的那串「口令」是配对链接的 base64——App 认的是这个形状。
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
@@ -127,8 +131,6 @@ atomcode-telemetry = { path = "../atomcode-telemetry", features = ["test-util"] 
 async-trait = "0.1"
 ctor = "0.2"
 predicates = "3"
-tempfile = "3"
-which = "7"
 # Serialize env-var-mutating uninstall tests (moved from atomcode-core).
 serial_test = "3"
 

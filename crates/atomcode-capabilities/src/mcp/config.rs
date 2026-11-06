@@ -730,6 +730,42 @@ fn collect_merged_mcp_server_maps(root: &Map<String, Value>) -> Map<String, Valu
     out
 }
 
+/// Add an optional HTTP server without enabling it, replacing an existing entry,
+/// adding credentials, or changing any approval grants. Used by onboarding hosts.
+pub fn add_disabled_http_server_into_text(
+    existing: Option<&str>,
+    name: &str,
+    url: &str,
+) -> Result<String> {
+    if name.is_empty() || url::Url::parse(url)?.scheme() != "https" {
+        bail!("a server name and an HTTPS URL are required");
+    }
+    let mut root = match existing {
+        Some(text) => json_for_rewrite(text, &GIVEN_TEXT)?,
+        None => json!({}),
+    };
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("MCP config root must be a JSON object"))?;
+    for key in ["servers", "mcpServers"] {
+        if obj.get(key).is_some_and(|v| !v.is_object()) {
+            bail!("{key} must be a JSON object");
+        }
+    }
+    let mut servers = collect_merged_mcp_server_maps(obj);
+    if servers.contains_key(name) {
+        bail!("MCP server '{name}' already exists; its configuration was preserved");
+    }
+    servers.insert(name.to_string(), json!({"url":url,"disabled":true}));
+    obj.insert("mcpServers".into(), Value::Object(servers));
+    obj.remove("servers");
+    let text = format!("{}\n", serde_json::to_string_pretty(&root)?);
+    // Validate all preserved entries through the production reader, after
+    // normalizing legacy/current maps the same way existing editors do.
+    parse_mcp_servers(&text, McpConfigSource::Project)?;
+    Ok(text)
+}
+
 /// Add or replace a **stdio** MCP server entry in a JSON config file (`.mcp.json` or `$ATOMCODE_HOME/mcp.json`).
 ///
 /// Merges existing `servers` and `mcpServers` maps, then writes a single `mcpServers` object (drops the legacy
@@ -2025,5 +2061,54 @@ mod hosted_tests {
         assert!(tokens.load_token("s0").is_err());
         assert!(tokens.save_token("s0", token("x")).is_err());
         assert_eq!(unreadable.raw().as_deref(), Some("sealed with another key"));
+    }
+}
+
+#[cfg(test)]
+mod recommendation_tests {
+    use super::*;
+
+    #[test]
+    fn optional_http_add_preserves_both_maps_and_never_grants_execution() {
+        let original = r#"{"servers":{"legacy":{"command":"a","trust":true}},"mcpServers":{"modern":{"url":"https://example.com","headers":{"X-Key":"kept"}}},"other":7}"#;
+        let text = add_disabled_http_server_into_text(
+            Some(original),
+            "docs",
+            "https://mcp.context7.com/mcp",
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["other"], 7);
+        assert_eq!(value["mcpServers"]["legacy"]["trust"], true);
+        assert_eq!(value["mcpServers"]["modern"]["headers"]["X-Key"], "kept");
+        let parsed = parse_mcp_servers(&text, McpConfigSource::Project).unwrap();
+        let added = parsed.iter().find(|s| s.name == "docs").unwrap();
+        assert!(added.disabled);
+        assert!(!added.trust);
+        assert!(added.auto_approve.is_empty());
+        assert!(
+            matches!(&added.config, McpTransportConfig::Http { headers, auth: None, .. } if headers.is_empty())
+        );
+        assert!(
+            add_disabled_http_server_into_text(Some(&text), "docs", "https://other.com").is_err()
+        );
+    }
+
+    #[test]
+    fn optional_http_add_refuses_invalid_input_instead_of_replacing_it() {
+        for invalid in [
+            "bad json",
+            "[]",
+            r#"{"mcpServers":null}"#,
+            r#"{"servers":[]}"#,
+            r#"{"servers":{"broken":{"args":[]}}}"#,
+        ] {
+            assert!(
+                add_disabled_http_server_into_text(Some(invalid), "docs", "https://example.com")
+                    .is_err(),
+                "{invalid}"
+            );
+        }
+        assert!(add_disabled_http_server_into_text(None, "docs", "http://example.com").is_err());
     }
 }

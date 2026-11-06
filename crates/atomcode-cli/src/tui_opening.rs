@@ -47,6 +47,7 @@ pub struct OpeningRow {
     /// working directory and the model, an aside about this build, not news
     /// standing over the screen. Recorded as told when the welcome is drawn.
     pub news: Option<crate::tui_changelog::Launch>,
+    pub capabilities: Option<crate::project_setup::CapabilityHint>,
 }
 
 /// The first-launch keys line, and where to record that it was drawn.
@@ -63,6 +64,7 @@ pub struct KeysNote {
 struct RememberWhenSeen {
     keys: Option<PathBuf>,
     news: Option<crate::tui_changelog::Launch>,
+    capabilities: Option<crate::project_setup::CapabilityHint>,
 }
 
 impl WelcomeNoteSeen for RememberWhenSeen {
@@ -73,6 +75,11 @@ impl WelcomeNoteSeen for RememberWhenSeen {
         if let Some(news) = &self.news {
             news.told();
         }
+        if let Some(hint) = &self.capabilities {
+            if let Err(error) = hint.shown() {
+                tracing::warn!(%error, "could not remember capability notice");
+            }
+        }
     }
 }
 
@@ -80,11 +87,13 @@ impl WelcomeNoteSeen for RememberWhenSeen {
 fn welcome_note(
     keys: Option<&KeysNote>,
     news: Option<&crate::tui_changelog::Launch>,
+    capabilities: Option<&crate::project_setup::CapabilityHint>,
 ) -> Option<String> {
     let lines: Vec<&str> = keys
         .map(|keys| keys.text.as_str())
         .into_iter()
         .chain(news.and_then(|news| news.notice.as_deref()))
+        .chain(capabilities.map(|hint| hint.text.as_str()))
         .collect();
     (!lines.is_empty()).then(|| lines.join("\n"))
 }
@@ -207,16 +216,21 @@ impl Plugin for OpeningRow {
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
         let _ = ctx
             .provide::<OpeningNoticesSvc>(Arc::new(OpeningNotices {
-                welcome_note: welcome_note(self.keys.as_ref(), self.news.as_ref()),
+                welcome_note: welcome_note(
+                    self.keys.as_ref(),
+                    self.news.as_ref(),
+                    self.capabilities.as_ref(),
+                ),
                 ..notices(self.notice.as_deref())
             }))
             .map_err(|e| e.to_string())?;
         let news = self.news.clone().filter(|news| news.notice.is_some());
-        if self.keys.is_some() || news.is_some() {
+        if self.keys.is_some() || news.is_some() || self.capabilities.is_some() {
             let _ = ctx
                 .provide::<WelcomeNoteSeenSvc>(Arc::new(RememberWhenSeen {
                     keys: self.keys.as_ref().map(|keys| keys.marker.clone()),
                     news,
+                    capabilities: self.capabilities.clone(),
                 }))
                 .map_err(|e| e.to_string())?;
         }
@@ -277,9 +291,14 @@ mod tests {
             notice: Some("config.toml did not parse".into()),
             keys: keys_note(&marker),
             news: None,
+            capabilities: None,
         };
         let said = OpeningNotices {
-            welcome_note: welcome_note(row.keys.as_ref(), row.news.as_ref()),
+            welcome_note: welcome_note(
+                row.keys.as_ref(),
+                row.news.as_ref(),
+                row.capabilities.as_ref(),
+            ),
             ..notices(row.notice.as_deref())
         };
         assert_eq!(said.notices, vec!["config.toml did not parse".to_string()]);
@@ -290,6 +309,7 @@ mod tests {
         RememberWhenSeen {
             keys: Some(marker.clone()),
             news: None,
+            capabilities: None,
         }
         .seen();
         assert!(marker.exists(), "remembered once it was drawn");
