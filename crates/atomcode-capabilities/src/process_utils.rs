@@ -449,6 +449,9 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn normalize_utf8_locale_env_replaces_c_locale() {
+        // `BTreeMap` is not imported at module scope: this test only compiles
+        // on unix, so a Windows-only `cargo check` never sees it.
+        use std::collections::BTreeMap;
         let mut env = BTreeMap::from([
             ("LC_ALL".to_string(), "C".to_string()),
             ("LANG".to_string(), "C".to_string()),
@@ -464,6 +467,9 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn normalize_utf8_locale_env_preserves_existing_utf8_locale() {
+        // `BTreeMap` is not imported at module scope: this test only compiles
+        // on unix, so a Windows-only `cargo check` never sees it.
+        use std::collections::BTreeMap;
         let mut env = BTreeMap::from([
             ("LC_ALL".to_string(), "zh_CN.UTF-8".to_string()),
             ("LANG".to_string(), "zh_CN.UTF-8".to_string()),
