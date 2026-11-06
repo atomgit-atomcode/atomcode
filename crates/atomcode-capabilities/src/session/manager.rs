@@ -66,6 +66,23 @@ pub struct TodoSidecar {
     /// before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub through: Option<TodoCallPosition>,
+    /// The list as it stood before the calls `todos` reflects since it: what an
+    /// undo falls back to when the plan itself is no longer in the log (a
+    /// converted or compacted session). An undo takes a suffix of turns, so
+    /// recovering this one state and re-applying the standing calls is enough.
+    /// `None` in a sidecar written before this existed, or one with no earlier
+    /// state to keep.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<TodoSidecarBaseline>,
+}
+
+/// A recoverable pre-increment state of a [`TodoSidecar`].
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct TodoSidecarBaseline {
+    #[serde(default)]
+    pub todos: Vec<TodoSidecarItem>,
+    #[serde(default)]
+    pub through: Option<TodoCallPosition>,
 }
 
 /// Where in a session a todo call was made: the kernel turn, the round within it,
@@ -1473,7 +1490,32 @@ impl SessionManager {
         through: Option<TodoCallPosition>,
         source_seqs: &[u64],
     ) -> SessionResult<()> {
-        if source_seqs.len() > 4 || source_seqs.iter().any(|seq| *seq == 0) {
+        // Keep the state before this write's calls so an undo that takes one
+        // back can rebuild the list even when the plan itself is no longer in
+        // the log. An older baseline is already the furthest recoverable point.
+        let baseline = match self.read_todo_sidecar(id) {
+            Ok(Some(previous)) => previous.baseline.or(Some(TodoSidecarBaseline {
+                todos: previous.todos,
+                through: previous.through,
+            })),
+            _ => None,
+        };
+        self.write_todo_sidecar_full(id, todos, message_count, through, source_seqs, baseline)
+    }
+
+    /// The writer with the baseline chosen by the caller: an undo rebuild keeps
+    /// the state it recovered from (so a later undo can reach it again) and
+    /// clears it only when the plan it described was taken back.
+    pub(super) fn write_todo_sidecar_full(
+        &self,
+        id: &str,
+        todos: &[TodoSidecarItem],
+        message_count: usize,
+        through: Option<TodoCallPosition>,
+        source_seqs: &[u64],
+        baseline: Option<TodoSidecarBaseline>,
+    ) -> SessionResult<()> {
+        if source_seqs.len() > 4 || source_seqs.contains(&0) {
             return Err(SessionStoreError::Corrupt {
                 kind: "todo sidecar",
                 message: "invalid source references".into(),
@@ -1484,6 +1526,7 @@ impl SessionManager {
             todos: todos.to_vec(),
             message_count,
             through,
+            baseline,
         };
         let bytes = serialize_bounded(&sidecar, "todo sidecar", MAX_TODO_SIDECAR_BYTES)?;
         atomic_write(&self.todo_sidecar_path(id)?, &bytes)
@@ -1565,11 +1608,29 @@ impl SessionManager {
             }
             other => other,
         };
-        if let Err(error) = self.write_todo_sidecar(
+        // The plan's original-guidance pointers travel with the items; a fork is
+        // a copy of the same conversation, so they still name its user messages.
+        // The recoverable baseline travels too, with the same position rule as
+        // `through`: past the fork's last turn it keeps its items, not its anchor.
+        let sources: &[u64] =
+            if sidecar.source_seqs.len() <= 4 && sidecar.source_seqs.iter().all(|seq| *seq > 0) {
+                &sidecar.source_seqs
+            } else {
+                &[]
+            };
+        let baseline = sidecar.baseline.map(|mut baseline| {
+            if baseline.through.is_some_and(|at| at.turn > last_turn) {
+                baseline.through = None;
+            }
+            baseline
+        });
+        if let Err(error) = self.write_todo_sidecar_full(
             destination_id,
             &sidecar.todos,
             sidecar.message_count,
             through,
+            sources,
+            baseline,
         ) {
             tracing::warn!(
                 %error,

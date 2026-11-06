@@ -1988,6 +1988,7 @@ mod tests {
                 .collect(),
             message_count: 40,
             through,
+            baseline: None,
         }
     }
 
