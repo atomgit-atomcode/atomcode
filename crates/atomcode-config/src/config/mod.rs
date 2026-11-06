@@ -61,6 +61,31 @@ pub fn platform_rules() -> &'static str {
     }
 }
 
+/// Default-on stdio DAP debugging; optional adapter overrides, no credential payloads.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DapConfig {
+    pub enabled: bool,
+    pub adapters: std::collections::BTreeMap<String, DapAdapterConfig>,
+}
+
+impl Default for DapConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            adapters: Default::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DapAdapterConfig {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
 /// `[coding]` table. Turn-level knobs for the main coding agent. `max_rounds` is
 /// the per-turn round cap (the interactive checkpoint threshold); `0` = unbounded.
 /// Env `ATOMCODE_TURN_MAX_ROUNDS` overrides this.
@@ -660,6 +685,9 @@ pub struct Config {
     /// LSP integration configuration.
     #[serde(default)]
     pub lsp: LspConfig,
+    /// Dynamic debugging; runtime sessions are never persisted.
+    #[serde(default)]
+    pub dap: DapConfig,
     /// `task` subagent tool policy. Missing from older configs uses the defaults in
     /// [`SubAgentConfig`], including an optional per-subtask round budget (default unbounded).
     #[serde(default)]
@@ -1161,6 +1189,7 @@ impl Default for Config {
             auto_update: true,
             telemetry: Default::default(),
             lsp: Default::default(),
+            dap: Default::default(),
             subagent: Default::default(),
             team: Default::default(),
             loop_config: Default::default(),
@@ -3794,6 +3823,28 @@ model = "missing-type"
     }
 
     #[test]
+    fn dap_is_default_on_and_rejects_unknown_adapter_fields() {
+        assert!(Config::default().dap.enabled);
+        assert!(toml::from_str::<Config>("[dap]").unwrap().dap.enabled);
+        assert!(
+            !toml::from_str::<Config>("[dap]\nenabled=false")
+                .unwrap()
+                .dap
+                .enabled
+        );
+        let config: Config = toml::from_str("[dap]\nenabled=true\n[dap.adapters.python]\ncommand='python3'\nargs=['-m','debugpy.adapter']").unwrap();
+        assert!(config.dap.enabled);
+        assert_eq!(
+            config.dap.adapters["python"].args,
+            ["-m", "debugpy.adapter"]
+        );
+        assert!(toml::from_str::<Config>(
+            "[dap.adapters.python]\ncommand='python3'\nenv={TOKEN='not-accepted'}"
+        )
+        .is_err());
+    }
+
+    #[test]
     fn migrate_keeps_custom_coding_round_caps() {
         for expected in [0, 199, 500] {
             let mut cfg = Config::with_default_provider("x");
@@ -3991,6 +4042,7 @@ model = "missing-type"
             auto_update: true,
             telemetry: Default::default(),
             lsp: Default::default(),
+            dap: Default::default(),
             subagent: Default::default(),
             team: Default::default(),
             loop_config: Default::default(),

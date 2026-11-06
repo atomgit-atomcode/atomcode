@@ -438,3 +438,13 @@ theme = "auto"
 [tools.atomgit]
 # enabled = true
 # tool_search = true
+
+# ---- DAP 调试（默认开启，按需发现本地 Python/debugpy 或 LLDB）----
+# 无需填写本节即可使用已安装的适配器；缺依赖时提示安装，不会自动下载。
+# 完整说明见 docs/dap-debugging.md。所有 debug 操作沿用执行审批。
+# 设置 enabled = false 可关闭；下方适配器配置用于覆盖自动发现。
+# [dap]
+# enabled = true
+# [dap.adapters.python]
+# command = "/path/to/venv/bin/python"
+# args = ["-m", "debugpy.adapter"]

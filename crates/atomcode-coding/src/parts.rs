@@ -856,6 +856,13 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 .iter()
                 .map(|s| s.to_string()),
         );
+        if cfg.dap.enabled {
+            registry.register(Arc::new(
+                atomcode_capabilities::tools::debug::DebugTool::new(cfg.dap.clone()),
+            ));
+            names.push("debug".into());
+            host_only_tools.push("debug".into());
+        }
         if atomcode_capabilities::codeintel::register_lsp_tool(&mut registry, &cfg.lsp) {
             names.push("lsp".into());
             host_only_tools.push("lsp".into());

@@ -198,6 +198,7 @@ pub struct CodingAgentConfig {
     /// Opt-in read-only LSP policy. The manager is created by this runtime's tool
     /// assembly, so provider/session reloads cannot create a second hidden owner.
     pub lsp: atomcode_capabilities::codeintel::LspSettings,
+    pub dap: atomcode_capabilities::tools::debug::Settings,
     /// On Ctrl-C / cancel: `false` (default) ⇒ CANCEL = UNDO (roll back the interrupted
     /// turn). `true` ⇒ PRESERVE the partial turn + backfill dangling tool_calls + inject
     /// an interruption marker, forwarded to the kernel `Agent` builder
@@ -360,6 +361,7 @@ pub struct CodingRuntimeConfig {
     pub next_prompt_suggestions: bool,
     pub supports_vision: bool,
     pub lsp: atomcode_capabilities::codeintel::LspSettings,
+    pub dap: atomcode_capabilities::tools::debug::Settings,
     /// `[web_search]`, see [`web_search_from_config`].
     pub web_search_provider: Option<String>,
     pub web_search_api_key: Option<String>,
@@ -385,6 +387,29 @@ fn lsp_features(
         hover: features.hover.map(lsp_mode),
         diagnostics: features.diagnostics.map(lsp_mode),
         document_symbols: features.document_symbols.map(lsp_mode),
+    }
+}
+
+/// Keep the file schema in the config leaf and the debugger policy in L1.
+pub fn dap_settings_from_config(
+    config: &atomcode_config::config::DapConfig,
+) -> atomcode_capabilities::tools::debug::Settings {
+    use atomcode_capabilities::tools::debug::{Adapter, Settings};
+    Settings {
+        enabled: config.enabled,
+        adapters: config
+            .adapters
+            .iter()
+            .map(|(id, adapter)| {
+                (
+                    id.clone(),
+                    Adapter {
+                        command: adapter.command.clone(),
+                        args: adapter.args.clone(),
+                    },
+                )
+            })
+            .collect(),
     }
 }
 
@@ -517,6 +542,7 @@ pub fn describe_config_file_for(
          - `[modes.plan]` and `[modes.build]` optionally bind a `model` selection id and `reasoning_effort` (unset inherits the model profile; `default` uses the API default). Cross-mode transitions apply them for this session without writing `default_model`; `/model` temporarily overrides until the next mode transition. Configure via `/config` or WebUI mode settings.\n\
          - `[permissions]` `automation_approval`: `always` (default, consent for each schedule change) or `inherit` (preauthorize schedule changes only in current Auto mode; does not elevate scheduled task execution). Apply via capability reprepare. `default_mode`: startup mode (`build`, `plan`, `accept-edits`, `auto`); explicit -y overrides it; temporary mode switches do not save it. `allow` / `deny`: rules such as `Bash(git *)`, `Read(<path>)` or \
          `mcp__<server>__<tool>`. `deny` wins, and `allow` never opens a sensitive path.\n\
+         - `[dap]` `enabled` (default true): local DAP debugging with automatic Python/debugpy and LLDB discovery on launch. Optional `[dap.adapters.<id>]` `command` / `args` override built-ins; adapters are installed separately. Reload configuration after editing; never put credentials in adapter arguments. Debugging uses execution approval and is not restored with a session.\n\
          - `[coding]` `auto_review` (default true; false removes automatic pre-handoff review guidance while retaining explicit reviews; `ATOMCODE_AUTO_REVIEW` overrides), \
          `max_rounds` (per turn; 0 = no cap; `ATOMCODE_TURN_MAX_ROUNDS` wins), \
          `repeat_stop_rounds` (stop a turn after this many rounds of the very same tool \
@@ -719,6 +745,7 @@ impl CodingRuntimeConfig {
                     .is_ok_and(|v| v.eq_ignore_ascii_case("off"));
                 lsp
             },
+            dap: dap_settings_from_config(&config.dap),
             web_search_provider: web_search_from_config(&config.web_search).0,
             web_search_api_key: web_search_from_config(&config.web_search).1,
         }
@@ -789,6 +816,7 @@ impl CodingRuntimeConfig {
         config.round_cap_checkpoint = self.round_cap_checkpoint;
         config.next_prompt_suggestions = self.next_prompt_suggestions;
         config.lsp = self.lsp.clone();
+        config.dap = self.dap.clone();
         config.web_search_provider = self.web_search_provider.clone();
         config.web_search_api_key = self.web_search_api_key.clone();
         config
@@ -1283,6 +1311,7 @@ impl CodingAgentConfig {
             web_search_provider: None,
             web_search_api_key: None,
             lsp: Default::default(),
+            dap: Default::default(),
             keep_interrupted_context: false,
             credential_shell_policy: Default::default(),
             permission_rules: Default::default(),

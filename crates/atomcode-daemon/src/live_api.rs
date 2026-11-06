@@ -379,6 +379,7 @@ pub(crate) fn chat_runtime_config(
         // auxiliary model request until that driver renders the suggestion.
         next_prompt_suggestions: false,
         lsp: atomcode_coding::config::lsp_settings_from_config(&config.lsp),
+        dap: atomcode_coding::config::dap_settings_from_config(&config.dap),
         web_search_provider: atomcode_coding::config::web_search_from_config(&config.web_search).0,
         web_search_api_key: atomcode_coding::config::web_search_from_config(&config.web_search).1,
     }

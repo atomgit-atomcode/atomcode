@@ -188,6 +188,13 @@ impl LlmProvider for RecordingProvider {
             ])));
         }
         let first = match last {
+            Some(m) if m.role == Role::User && m.text == "launch debug fixture" => {
+                StreamEvent::ToolCall(ToolCall {
+                    id: format!("call-{n}"),
+                    name: "debug".into(),
+                    arguments: serde_json::json!({"action":"launch","adapter":"fixture","program":"child.py"}).to_string(),
+                })
+            }
             Some(m) if m.role == Role::User && m.text.starts_with("retrieve referenced definition") => {
                 StreamEvent::ToolCall(ToolCall { id: format!("call-{n}"), name: "session_reference".into(),
                     arguments: serde_json::json!({"source": "0123456789abcdef/source", "query": "TubeSeq"}).to_string() })
@@ -7464,4 +7471,143 @@ async fn disabling_automatic_review_keeps_explicit_reviews_and_survives_reload()
         !system_text(&recorder.last_request()).contains("Automatic pre-handoff review is disabled")
     );
     runtime.handle.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn dap_debugging_is_default_on_and_obeys_disable_and_model_only_tool_closures() {
+    use atomcode_capabilities::tools::debug::{Adapter, Settings};
+    let configured = || Settings {
+        enabled: true,
+        adapters: [(
+            "fixture".into(),
+            Adapter {
+                command: "never-spawned-until-launch".into(),
+                args: vec![],
+            },
+        )]
+        .into(),
+    };
+    assert!(offered_tools(|_| {})
+        .await
+        .iter()
+        .any(|tool| tool.name == "debug"));
+    assert!(!offered_tools(|s| s.agent.dap.enabled = false)
+        .await
+        .iter()
+        .any(|tool| tool.name == "debug"));
+    assert!(offered_tools(|s| s.agent.dap = configured())
+        .await
+        .iter()
+        .any(|tool| tool.name == "debug"));
+    assert!(!offered_tools(|s| {
+        s.agent.dap = configured();
+        s.prepare.tools = false;
+    })
+    .await
+    .iter()
+    .any(|tool| tool.name == "debug"));
+}
+
+// This test needs real OS process I/O and process reaping; virtual-clock
+// auto-advance would race the fixture's Python startup and Tokio's reaper.
+#[cfg(unix)]
+#[tokio::test]
+async fn dap_processes_follow_the_production_runtime_lifecycle() {
+    use atomcode_capabilities::tools::{debug::Adapter, PermissionRules};
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let fixture = env.project.path().join("adapter.py");
+    std::fs::write(
+        &fixture,
+        include_str!("../../atomcode-capabilities/src/tools/debug/fixture.py"),
+    )
+    .unwrap();
+    let setup = production_start(env.project.path(), &recorder, |start| {
+        start.agent.dap.adapters.insert(
+            "fixture".into(),
+            Adapter {
+                command: "python3".into(),
+                args: vec!["-u".into(), fixture.to_string_lossy().into_owned()],
+            },
+        );
+        start.agent.permission_rules = Arc::new(PermissionRules::parse(&["debug".into()], &[]).0);
+    });
+    let mut runtime = CodingRuntime::start(setup).await.unwrap();
+    async fn launched(runtime: &mut CodingRuntime, project: &std::path::Path) -> Vec<i32> {
+        // Remove the last launch's evidence so a refused tool cannot pass by
+        // reading a stale pid file.
+        let _ = std::fs::remove_file(project.join("pids"));
+        turn(runtime, "launch debug fixture").await;
+        std::fs::read_to_string(project.join("pids"))
+            .unwrap()
+            .split_whitespace()
+            .map(|pid| pid.parse().unwrap())
+            .collect()
+    }
+    fn alive(pid: i32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("Unix kill utility is required")
+            .success()
+    }
+    async fn gone(pids: &[i32]) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if pids.iter().all(|pid| !alive(*pid)) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "debug process survived runtime teardown: {pids:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+    let pids = launched(&mut runtime, env.project.path()).await;
+    let mut config = runtime.handle.configuration().await.unwrap();
+    runtime
+        .handle
+        .reassemble_provider(config.clone())
+        .await
+        .unwrap();
+    assert!(
+        pids.iter().all(|pid| alive(*pid)),
+        "provider-only patch must preserve debugging"
+    );
+    runtime.handle.reload_capabilities().await.unwrap();
+    assert!(
+        pids.iter().all(|pid| alive(*pid)),
+        "in-place skill reload keeps the same tool owner"
+    );
+    runtime
+        .handle
+        .reload_capabilities_with_plugin_skills(Some(Vec::new()))
+        .await
+        .unwrap();
+    gone(&pids).await;
+
+    let pids = launched(&mut runtime, env.project.path()).await;
+    config.dap.enabled = false;
+    runtime
+        .handle
+        .reprepare_config(config.clone())
+        .await
+        .unwrap();
+    gone(&pids).await;
+    assert!(!runtime
+        .handle
+        .tool_catalog()
+        .await
+        .unwrap()
+        .iter()
+        .any(|tool| tool.name == "debug"));
+
+    config.dap.enabled = true;
+    runtime.handle.reprepare_config(config).await.unwrap();
+    let pids = launched(&mut runtime, env.project.path()).await;
+    runtime.handle.shutdown().await.unwrap();
+    gone(&pids).await;
 }
