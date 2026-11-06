@@ -3166,6 +3166,8 @@ pub struct TurnEndBlock {
     /// the task was done when it was not (reported against 5.1.0). Ignored for
     /// every other stop, which already says it was cut short.
     pub open_items: usize,
+    /// Members still working when this live turn ended; never inferred on replay.
+    pub members_working: usize,
     /// When the turn ended, as the person's own clock reads it (`21:42`) — see
     /// [`clock_of`]. `None` when the log recorded no time for it.
     pub ended_at: Option<String>,
@@ -3446,10 +3448,20 @@ pub fn byte_size(n: u64) -> String {
 /// vocabulary is the product's rather than new. What is added is the cause,
 /// where a person can do something about it: a turn that ran out of rounds says
 /// so, in words, instead of showing them a variant name or nothing at all.
-fn turn_end_note(stop: StopReason, done_index: usize, open_items: usize) -> (Glyph, String, Style) {
+fn turn_end_note(
+    stop: StopReason,
+    done_index: usize,
+    open_items: usize,
+    members_working: usize,
+) -> (Glyph, String, Style) {
     use StopReason::*;
     let warn = Style::new().fg(Color::role(Role::Warning));
     match stop {
+        Stopped if members_working > 0 => (
+            Glyph::Interrupted,
+            t(Msg::StopWithMembersRunning { n: members_working }).into_owned(),
+            warn,
+        ),
         // The model stopped on its own with the list still open: said as a stop,
         // with the count and what to do about it — never a celebratory verb.
         Stopped if open_items > 0 => (
@@ -3563,6 +3575,7 @@ impl Content for TurnEndBlock {
                 self.done_index,
             ),
             &self.open_items.to_string(),
+            &self.members_working.to_string(),
             self.ended_at.as_deref().unwrap_or(""),
         ])
     }
@@ -3588,8 +3601,15 @@ impl Content for TurnEndBlock {
         }
         let w = ctx.width;
         let caps = Caps::default();
-        let (mark, said, style) = turn_end_note(self.stop, self.done_index, self.open_items);
-        let clean = matches!(self.stop, StopReason::Stopped) && self.open_items == 0;
+        let (mark, said, style) = turn_end_note(
+            self.stop,
+            self.done_index,
+            self.open_items,
+            self.members_working,
+        );
+        let clean = matches!(self.stop, StopReason::Stopped)
+            && self.open_items == 0
+            && self.members_working == 0;
         // When it ended rides beside the word for a clean finish
         // (`✻ Nailed it 21:42 · 12.5s · …`). Every other outcome's words are a
         // sentence — a cause, what to do next — and a time glued to its end reads
@@ -3920,6 +3940,7 @@ mod tests {
             },
             done_index: 1,
             open_items,
+            members_working: 0,
             ended_at: Some("21:42".into()),
         }
         .lines(&RenderCtx::bare(200))
@@ -4791,6 +4812,7 @@ mod tests {
             stats: TurnStats::default(),
             done_index: 0,
             open_items: 0,
+            members_working: 0,
             ended_at: None,
         };
         let lines = block.lines(&crate::block::RenderCtx::bare(100));
@@ -4821,6 +4843,7 @@ mod tests {
             stats: TurnStats::default(),
             done_index: 0,
             open_items: 0,
+            members_working: 0,
             ended_at: None,
         };
         let lines = short.lines(&crate::block::RenderCtx::bare(100));
@@ -4852,6 +4875,7 @@ mod tests {
                 stats: TurnStats::default(),
                 done_index: 0,
                 open_items: 0,
+                members_working: 0,
                 ended_at: None,
             }
             .lines(&crate::block::RenderCtx::bare(80))
@@ -4930,11 +4954,11 @@ mod tests {
 
         // Every reason is one of two outcomes, and the mark says which. The clean
         // end wears the `✻` sparkle; nothing cut short does.
-        let mark = |stop| turn_end_note(stop, 0, 0).0;
+        let mark = |stop| turn_end_note(stop, 0, 0, 0).0;
         assert_eq!(mark(StopReason::Stopped), Glyph::Sparkle);
         // A stop the model chose, with the task list still open, is not a finish.
         assert_ne!(
-            turn_end_note(StopReason::Stopped, 0, 2).0,
+            turn_end_note(StopReason::Stopped, 0, 2, 0).0,
             Glyph::Sparkle,
             "an open list does not wear the finish mark"
         );
@@ -4974,6 +4998,7 @@ mod tests {
             },
             done_index: 0,
             open_items: 0,
+            members_working: 0,
             ended_at: None,
         };
         let text = drawn(&block, 100);
@@ -5012,6 +5037,7 @@ mod tests {
             },
             done_index: 0,
             open_items: 0,
+            members_working: 0,
             ended_at: None,
         };
         let text = drawn(&block, 80);
@@ -5037,6 +5063,7 @@ mod tests {
             stats: TurnStats::default(),
             done_index: 0,
             open_items: 0,
+            members_working: 0,
             ended_at: None,
         };
         let lines = block.lines(&crate::block::RenderCtx::bare(80));
@@ -5066,6 +5093,7 @@ mod tests {
             },
             done_index: 0,
             open_items: 0,
+            members_working: 0,
             ended_at: None,
         };
         let outcome = format!("{} Done", Caps::default().g(Glyph::Ok));
@@ -5105,6 +5133,7 @@ mod tests {
             },
             done_index: 0,
             open_items: 0,
+            members_working: 0,
             ended_at: None,
         };
         for w in 0..160u16 {
@@ -5175,6 +5204,7 @@ mod tests {
                 stats: TurnStats::default(),
                 done_index: 0,
                 open_items: 0,
+                members_working: 0,
                 ended_at: None,
             }),
             Box::new(TurnEndBlock {
@@ -5183,6 +5213,7 @@ mod tests {
                 stats: TurnStats::default(),
                 done_index: 0,
                 open_items: 0,
+                members_working: 0,
                 ended_at: None,
             }),
             // With figures, and with figures plus a cause: the caption is
@@ -5200,6 +5231,7 @@ mod tests {
                 },
                 done_index: 1,
                 open_items: 0,
+                members_working: 0,
                 ended_at: None,
             }),
             Box::new(TurnEndBlock {
@@ -5215,6 +5247,7 @@ mod tests {
                 },
                 done_index: 0,
                 open_items: 0,
+                members_working: 0,
                 ended_at: None,
             }),
         ];

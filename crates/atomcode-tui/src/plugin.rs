@@ -6634,12 +6634,30 @@ impl Tui {
                         *self.last_reply.lock().expect("reply poisoned") = text.clone();
                     }
                 }
-                self.host
-                    .absorb_logged(&atomcode_kernel::session::LoggedEvent {
+                let members_working = if committed.session == self.client.root()
+                    && matches!(
+                        &committed.event,
+                        atomcode_kernel::session::SessionEvent::TurnEnd {
+                            stop: atomcode_kernel::event::StopReason::Stopped,
+                            ..
+                        }
+                    ) {
+                    self.members
+                        .moment_members()
+                        .iter()
+                        .filter(|member| !member.gone && member.activity == Activity::Working)
+                        .count()
+                } else {
+                    0
+                };
+                self.host.absorb_logged_with_members(
+                    &atomcode_kernel::session::LoggedEvent {
                         seq: committed.seq,
                         at: committed.at,
                         event: committed.event.clone(),
-                    });
+                    },
+                    members_working,
+                );
                 // What an undo took back is the whole log's to say, so it is
                 // read off the facts rather than folded fact by fact.
                 if matches!(

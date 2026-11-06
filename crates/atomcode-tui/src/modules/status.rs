@@ -205,6 +205,13 @@ impl View for Status {
             // gold that makes "it is still going" read at a glance.
             Activity::Working => Some((working_indicator(vp.moment), theme::fg(Role::Warning))),
             // The live line already says the turn is stopping.
+            Activity::Idle if vp.moment.working_members() > 0 => Some((
+                t(Msg::LiveWaitingForMember {
+                    n: vp.moment.working_members(),
+                })
+                .into_owned(),
+                theme::fg(Role::Warning),
+            )),
             Activity::Stopping | Activity::Idle => None,
         };
         if let Some((text, _)) = &activity {

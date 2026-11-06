@@ -2283,6 +2283,11 @@ impl Host {
     /// Producers first, then views: a view that reacts to the same fact should
     /// see a screen whose stream already contains it.
     pub fn absorb_logged(&self, logged: &LoggedEvent) {
+        self.absorb_logged_with_members(logged, 0);
+    }
+
+    /// Live-only context, captured before immutable transcript blocks are emitted.
+    pub fn absorb_logged_with_members(&self, logged: &LoggedEvent, members_working: usize) {
         let fact = &logged.event;
         {
             let mut m = self.moment.write().expect("moment poisoned");
@@ -2360,7 +2365,7 @@ impl Host {
         // result landing on that lid can still change how many rows the lid
         // draws, since it carries the result (`summary_lines`).
         self.pinned(true, || {
-            self.fold(logged);
+            self.fold(logged, members_working);
         });
     }
 
@@ -2369,7 +2374,7 @@ impl Host {
     ///
     /// Split out of [`Host::absorb`] so that the pin can wrap it: the pin is
     /// "measure, change, measure again", and the change is this.
-    fn fold(&self, logged: &LoggedEvent) {
+    fn fold(&self, logged: &LoggedEvent, members_working: usize) {
         let fact = &logged.event;
         // What this fold appended, as the blocks themselves: a fact may open
         // several at once (one per tool call in a message), and each of them is a
@@ -2381,7 +2386,10 @@ impl Host {
             let before = stream.len();
             let dir = self.session_dir.read().expect("dir poisoned").clone();
             for p in self.modules.producers() {
-                let mut w = stream.writer(p.id()).in_dir(dir.clone());
+                let mut w = stream
+                    .writer(p.id())
+                    .in_dir(dir.clone())
+                    .with_members_working(members_working);
                 p.absorb(logged, &mut w);
             }
             for slot in &stream.slots()[before..] {
@@ -13717,6 +13725,61 @@ mod tests {
             "the prose does not sit after the turn's only run: before={lids_before} \
              after={lids_after}\n{rows:#?}"
         );
+    }
+
+    #[test]
+    fn live_turn_end_captures_member_work_without_rewriting_history() {
+        use crate::block::RenderCtx;
+        use crate::i18n::{t, Msg};
+        let h = host();
+        h.absorb(&SessionEvent::TurnStart { turn: 1 });
+        let end = LoggedEvent {
+            seq: 2,
+            at: 0,
+            event: SessionEvent::TurnEnd {
+                turn: 1,
+                stop: atomcode_harness::seams::StopReason::Stopped,
+                error: None,
+            },
+        };
+        h.absorb_logged_with_members(&end, 2);
+        let endings = |h: &Host| -> Vec<String> {
+            h.stream
+                .read()
+                .unwrap()
+                .slots()
+                .iter()
+                .filter(|slot| slot.block().kind() == "turn_end")
+                .flat_map(|slot| slot.block().content.lines(&RenderCtx::bare(160)))
+                .map(|line| line.plain())
+                .collect()
+        };
+        let captured = endings(&h);
+        let expected = t(Msg::StopWithMembersRunning { n: 2 }).into_owned();
+        assert!(
+            captured.iter().any(|line| line.contains(&expected)),
+            "{captured:?}"
+        );
+        h.moment.write().unwrap().members.clear();
+        assert_eq!(endings(&h), captured, "settled history retains its meaning");
+        let replay = host();
+        replay.absorb(&SessionEvent::TurnStart { turn: 1 });
+        replay.absorb_logged(&end);
+        assert!(!endings(&replay).iter().any(|line| line.contains(&expected)));
+        let failed = host();
+        failed.absorb(&SessionEvent::TurnStart { turn: 1 });
+        failed.absorb_logged_with_members(
+            &LoggedEvent {
+                event: SessionEvent::TurnEnd {
+                    turn: 1,
+                    stop: atomcode_harness::seams::StopReason::ProviderError,
+                    error: Some("failure".into()),
+                },
+                ..end
+            },
+            2,
+        );
+        assert!(!endings(&failed).iter().any(|line| line.contains(&expected)));
     }
 
     #[test]

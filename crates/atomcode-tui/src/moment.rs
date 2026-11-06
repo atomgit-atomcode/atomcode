@@ -1072,8 +1072,18 @@ impl Moment {
         });
         self
     }
-    /// Set who is running under this agent. Every field of this struct has to
-    /// be settable by a test, or it is not really injected state.
+    /// Current work owned by the lead, without duplicating registry state.
+    pub fn working_members(&self) -> usize {
+        if self.viewing != self.lead {
+            return 0;
+        }
+        self.members
+            .iter()
+            .filter(|member| !member.gone && member.activity == Activity::Working)
+            .count()
+    }
+
+    /// Set who is running under this agent.
     pub fn with_members(mut self, members: Vec<MemberNow>) -> Self {
         self.members = members;
         self

@@ -814,6 +814,7 @@ impl Producer for Transcript {
                     let idx = *seq;
                     if matches!(stop, atomcode_harness::seams::StopReason::Stopped)
                         && open_items == 0
+                        && out.members_working() == 0
                     {
                         *seq += 1;
                     }
@@ -833,6 +834,7 @@ impl Producer for Transcript {
                     stats,
                     done_index,
                     open_items,
+                    members_working: out.members_working(),
                     ended_at: crate::content::clock_of(logged.at),
                 };
                 if matches!(stop, atomcode_harness::seams::StopReason::ProviderError) {

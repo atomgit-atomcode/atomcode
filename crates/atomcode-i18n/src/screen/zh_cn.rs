@@ -1136,6 +1136,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StopAt { at } => format!("停下 {at}").into(),
 
         // ── the live strip and the folded-lines notes (`modules/live.rs`, `host.rs`) ──
+        Msg::StopWithMembersRunning { n } => format!("本轮结束 · 仍有 {n} 个子 agent 工作").into(),
+        Msg::LiveWaitingForMember { n } => format!("等待 {n} 个子 agent 完成").into(),
         Msg::LiveStopping => "正在停止".into(),
         Msg::LiveRecognizingImage => "正在识别图片".into(),
         Msg::LiveCompacting => "正在压缩".into(),

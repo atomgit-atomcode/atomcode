@@ -384,6 +384,10 @@ fn waiting_on_background(state: &State, moment: &Moment) -> Option<String> {
     if doing(state, moment).is_some() || moment.activity != Activity::Idle {
         return None;
     }
+    let n = moment.working_members();
+    if n > 0 {
+        return Some(t(Msg::LiveWaitingForMember { n }).into_owned());
+    }
     match moment.bg.working_for(&moment.lead) {
         0 => None,
         n => Some(t(Msg::LiveWaitingForBackground { n }).into_owned()),
@@ -662,6 +666,40 @@ mod tests {
 
     /// The `已中断` line is up only while idle — never under a turn still
     /// running or landing — and never over a password being answered.
+    #[test]
+    fn idle_lead_waits_for_live_members_only() {
+        let state = State::default();
+        let mut moment = Moment::default();
+        moment.lead = "lead".into();
+        moment.viewing = "lead".into();
+        moment.members = vec![crate::moment::MemberNow {
+            activity: Activity::Working,
+            session: "lead/member".into(),
+            ..Default::default()
+        }];
+        let expected = t(Msg::LiveWaitingForMember { n: 1 }).into_owned();
+        assert_eq!(
+            waiting_on_background(&state, &moment),
+            Some(expected.clone())
+        );
+        assert!(draw(&state, &moment, 100, ROWS)
+            .iter()
+            .any(|line| line.contains(&expected)));
+        moment.activity = Activity::Working;
+        assert!(waiting_on_background(&state, &moment).is_none());
+        moment.activity = Activity::Stopping;
+        assert!(waiting_on_background(&state, &moment).is_none());
+        moment.activity = Activity::Idle;
+        moment.viewing = "lead/member".into();
+        assert!(waiting_on_background(&state, &moment).is_none());
+        moment.viewing = "lead".into();
+        moment.members[0].gone = true;
+        assert!(waiting_on_background(&state, &moment).is_none());
+        moment.members[0].gone = false;
+        moment.members[0].activity = Activity::Idle;
+        assert!(waiting_on_background(&state, &moment).is_none());
+    }
+
     #[test]
     fn the_stopped_note_shows_only_idle_and_not_over_a_password() {
         let mut m = Moment::default();
