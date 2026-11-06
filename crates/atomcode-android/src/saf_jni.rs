@@ -228,6 +228,33 @@ impl SafBackend for JniBackend {
             }))
         })
     }
+
+    /// The granted tree's URI, read fresh on every operation.
+    ///
+    /// The world compares this against the value it captured when it was opened, so
+    /// a folder swapped under a running session is a refused write rather than a
+    /// silent redirect into the new folder.
+    async fn identity(&self) -> Result<String, SafError> {
+        with_env(|env| {
+            let Some((_, class)) = TREE.get() else {
+                return Ok(String::new());
+            };
+            let value = env
+                .call_static_method(class, "currentTreeId", "()Ljava/lang/String;", &[])
+                .map_err(|failure| SafError::Io(format!("currentTreeId: {failure}")))?;
+            let object = value
+                .l()
+                .map_err(|failure| SafError::Io(format!("currentTreeId: {failure}")))?;
+            if object.is_null() {
+                return Ok(String::new());
+            }
+            let object = JObject::from(object);
+            let text = env
+                .get_string((&object).into())
+                .map_err(|failure| SafError::Io(format!("currentTreeId: {failure}")))?;
+            Ok(text.into())
+        })
+    }
 }
 
 /// Called from Kotlin once a folder has been granted, and on every start when a

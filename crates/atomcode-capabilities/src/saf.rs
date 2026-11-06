@@ -75,6 +75,20 @@ pub trait SafBackend: Send + Sync {
     /// `None` when the document does not exist, rather than an error: "absent" is
     /// an answer the caller asks for by name in [`FileSystem::info`].
     async fn stat(&self, path: &str) -> Result<Option<SafStat>, SafError>;
+
+    /// Identity of the tree this backend is bound to — for Android, the granted
+    /// tree URI.
+    ///
+    /// [SafFs] captures it on first use and refuses further work once it changes.
+    /// The grant is process-wide, so a person picking a *different* folder while a
+    /// turn is running would otherwise redirect that session's writes into the new
+    /// folder, without the runtime ever seeing a directory switch.
+    ///
+    /// Empty means "this backend has no identity" and disables the check, which is
+    /// what the in-repo test backends return.
+    async fn identity(&self) -> Result<String, SafError> {
+        Ok(String::new())
+    }
 }
 
 /// The platform backend, installed once by the host at startup.
@@ -189,6 +203,8 @@ pub struct SafFs {
     root: PathBuf,
     backend: Arc<dyn SafBackend>,
     read_only: bool,
+    /// The tree identity this world was opened against, captured on first use.
+    bound: std::sync::OnceLock<String>,
 }
 
 impl SafFs {
@@ -197,6 +213,7 @@ impl SafFs {
             root,
             backend,
             read_only: false,
+            bound: std::sync::OnceLock::new(),
         }
     }
 
@@ -206,7 +223,39 @@ impl SafFs {
             root,
             backend,
             read_only: true,
+            bound: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Refuse to keep working on a tree that was replaced under this world.
+    ///
+    /// The parked grant is process-wide, so picking a *different* folder while a
+    /// turn runs would otherwise redirect every later write of that session into the
+    /// new folder: the session never asked for it, and the runtime never saw a
+    /// directory switch. Binding the instance to the identity it first saw turns
+    /// that silent redirect into an explicit refusal the runtime can act on
+    /// (re-mount is what makes the new folder usable).
+    ///
+    /// An empty identity means the backend cannot tell (test backends), and the
+    /// check is skipped rather than guessed.
+    async fn verify_binding(&self) -> Result<(), FsError> {
+        let identity = self
+            .backend
+            .identity()
+            .await
+            .map_err(|error| self.map(&self.root, error))?;
+        if identity.is_empty() {
+            return Ok(());
+        }
+        let bound = self.bound.get_or_init(|| identity.clone());
+        if bound != &identity {
+            return Err(FsError::denied(format!(
+                "the granted folder changed while this session was open (it now points at \
+                 {}, which this session never asked for); reopen the session to use it",
+                identity
+            )));
+        }
+        Ok(())
     }
 
     /// The backend-facing relative path, or [`FsErrorKind::Denied`].
@@ -326,6 +375,7 @@ impl FileSystem for SafFs {
     }
 
     async fn read_bytes(&self, path: &Path) -> Result<Vec<u8>, FsError> {
+        self.verify_binding().await?;
         let rel = self.relative(path)?;
         if rel.is_empty() {
             return Err(FsError::not_a_file(path));
@@ -340,6 +390,7 @@ impl FileSystem for SafFs {
                 path.display()
             )));
         }
+        self.verify_binding().await?;
         let rel = self.relative(path)?;
         if rel.is_empty() {
             return Err(FsError::not_a_file(path));
@@ -360,10 +411,12 @@ impl FileSystem for SafFs {
             )));
         }
         let rel = self.relative(path)?;
+        self.verify_binding().await?;
         self.ensure_dir(&rel).await
     }
 
     async fn list(&self, path: &Path) -> Result<Vec<DirEntry>, FsError> {
+        self.verify_binding().await?;
         let rel = self.relative(path)?;
         let base = self.root.join(&rel);
         let mut entries: Vec<DirEntry> = self
@@ -384,6 +437,7 @@ impl FileSystem for SafFs {
     }
 
     async fn info(&self, path: &Path) -> Result<FileInfo, FsError> {
+        self.verify_binding().await?;
         let rel = self.relative(path)?;
         match self
             .backend
@@ -429,6 +483,16 @@ mod tests {
     struct Memory {
         dirs: Mutex<BTreeSet<String>>,
         files: Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
+        /// What `identity()` reports. Empty by default, which disables the binding
+        /// check — existing tests are about the world's logic, not the identity.
+        identity: Mutex<String>,
+    }
+
+    impl Memory {
+        /// Pretend the person re-granted a different folder mid-session.
+        fn set_identity(&self, id: &str) {
+            *self.identity.lock().unwrap() = id.to_string();
+        }
     }
 
     impl Memory {
@@ -461,6 +525,10 @@ mod tests {
 
     #[async_trait]
     impl SafBackend for Memory {
+        async fn identity(&self) -> Result<String, SafError> {
+            Ok(self.identity.lock().unwrap().clone())
+        }
+
         async fn list(&self, path: &str) -> Result<Vec<SafEntry>, SafError> {
             if !self.dirs.lock().unwrap().contains(path) {
                 return Err(SafError::NotFound);
@@ -534,6 +602,30 @@ mod tests {
 
     fn world(memory: Memory) -> SafFs {
         SafFs::new(PathBuf::from("/saf/tree"), Arc::new(memory))
+    }
+
+    /// A folder granted over another one must not silently redirect a running
+    /// session: the grant is process-wide, so without this the session's next write
+    /// would land in a folder it never asked for.
+    #[tokio::test]
+    async fn a_folder_swapped_mid_session_refuses_instead_of_redirecting() {
+        let memory = Arc::new(Memory::new().with_file("notes.txt", b"first tree"));
+        memory.set_identity("content://tree-a");
+        let fs = SafFs::new(PathBuf::from("/saf/tree"), memory.clone());
+        let path = PathBuf::from("/saf/tree/notes.txt");
+
+        // First use binds the world to the tree it was opened against.
+        assert_eq!(fs.read_bytes(&path).await.unwrap(), b"first tree");
+
+        // The person re-grants a different folder.
+        memory.set_identity("content://tree-b");
+
+        let error = fs.read_bytes(&path).await.unwrap_err();
+        let text = format!("{error:?}");
+        assert!(text.contains("granted folder changed"), "{text}");
+        // Writes are refused the same way — that is the one that would corrupt.
+        assert!(fs.write_bytes(&path, b"into the wrong tree").await.is_err());
+        assert!(fs.list(&PathBuf::from("/saf/tree")).await.is_err());
     }
 
     #[tokio::test]

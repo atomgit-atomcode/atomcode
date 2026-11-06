@@ -89,6 +89,18 @@ object SafTree {
         ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove(KEY_TREE).apply()
     }
 
+    /**
+     * Identity of the current grant, read by the Rust side on every SAF operation.
+     *
+     * The grant is process-wide, so a person picking a *different* folder while a
+     * turn runs would otherwise redirect that session's writes into the new folder
+     * without the runtime ever seeing a directory switch. The world captures this
+     * value when it is opened and refuses to work once it changes; empty means "no
+     * grant", which the world reads as "cannot tell" too.
+     */
+    @JvmStatic
+    fun currentTreeId(): String = treeUri?.toString().orEmpty()
+
     fun isReady(): Boolean = treeUri != null
 
     private fun treeDocumentId(): String? =
