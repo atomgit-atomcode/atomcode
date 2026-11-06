@@ -2328,7 +2328,7 @@ pub(crate) fn context_summary_count(working_dir: &std::path::Path, id: &str) -> 
     // A live cwd is not a storage identity: /cd can leave the log in its
     // original bucket. Check global ambiguity even when the new cwd happens
     // to contain a different session with the same ID.
-    let root = NativeSessionManager::sessions_root(dirs.user());
+    let root = NativeSessionManager::sessions_root(&dirs);
     let scan = NativeSessionManager::scan_catalog(&root);
     let matches: Vec<_> = scan.entries.iter().filter(|entry| entry.id == id).collect();
     if matches.len() > 1 {
@@ -2370,9 +2370,8 @@ fn todo_sources_view(
     {
         return Err(invalid("invalid session identity"));
     }
-    let root = NativeSessionManager::sessions_root(
-        atomcode_coding::config::product_dirs_from_env().user(),
-    );
+    let root =
+        NativeSessionManager::sessions_root(&atomcode_coding::config::product_dirs_from_env());
     let manager = NativeSessionManager::with_root(root.join(hash));
     let header = manager
         .read_event_header(id)
@@ -2849,9 +2848,8 @@ pub(crate) fn snapshot_spec_sources(
     id: &str,
 ) -> Vec<(Option<u64>, bool)> {
     let unknown = vec![(None, false); snapshot.messages.len()];
-    let root = NativeSessionManager::sessions_root(
-        atomcode_coding::config::product_dirs_from_env().user(),
-    );
+    let root =
+        NativeSessionManager::sessions_root(&atomcode_coding::config::product_dirs_from_env());
     let scan = NativeSessionManager::scan_catalog(&root);
     let entries: Vec<_> = scan.entries.iter().filter(|entry| entry.id == id).collect();
     if entries.len() > 1 {
@@ -8053,7 +8051,6 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         )
         .route("/packages/:name", delete(packages::remove_package))
         .route("/packages/:name/rollback", post(packages::rollback_package))
-        .merge(workbench::routes())
         .merge(workbench::routes())
         // MCP API
         .route("/mcp/status", get(mcp_status))

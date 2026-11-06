@@ -1442,7 +1442,7 @@ pub fn prepare_catalog_session_resume_or_fork_any_project(
     id: &str,
 ) -> anyhow::Result<Option<PreparedCatalogSessionResume>> {
     prepare_catalog_session_resume_any_project_in_root(
-        &SessionManager::sessions_root(atomcode_coding::config::product_dirs_from_env().user()),
+        &SessionManager::sessions_root(&atomcode_coding::config::product_dirs_from_env()),
         id,
         true,
     )

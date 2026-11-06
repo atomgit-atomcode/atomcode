@@ -118,7 +118,7 @@ enum OpenStrategy {
     WindowsStart,
     /// `wslview <path>` — wslu's WSL→Windows bridge.
     Wslview,
-/// A launcher the person configured (`ATOMCODE_OPEN_COMMAND`), split into
+    /// A launcher the person configured (`ATOMCODE_OPEN_COMMAND`), split into
     /// program and arguments. Wins over every OS guess above.
     Custom(Vec<String>),
     /// `aa start -a <ability> -b <bundle> -U <url>` — HarmonyOS PC's device-side ability
@@ -298,7 +298,7 @@ fn pick_open_strategy() -> OpenStrategy {
             || std::env::var("WAYLAND_DISPLAY")
                 .map(|v| !v.is_empty())
                 .unwrap_or(false);
-return pick_unix_strategy(cfg!(target_env = "ohos"), has_display);
+        return pick_unix_strategy(cfg!(target_env = "ohos"), has_display);
     }
     #[allow(unreachable_code)]
     OpenStrategy::Headless("unsupported platform".into())
@@ -431,7 +431,7 @@ fn is_executable_file(path: &Path) -> bool {
 
 fn strategy_command_name(s: &OpenStrategy) -> String {
     match s {
-OpenStrategy::MacOpen => "open".into(),
+        OpenStrategy::MacOpen => "open".into(),
         OpenStrategy::XdgOpen => "xdg-open".into(),
         OpenStrategy::WindowsStart => "explorer.exe".into(),
         OpenStrategy::Wslview => "wslview".into(),
@@ -542,7 +542,7 @@ pub async fn open_local_path(target: &Path) -> Result<String, String> {
             c.arg(&target_str);
             c
         }
-OpenStrategy::Custom(parts) => {
+        OpenStrategy::Custom(parts) => {
             let program = parts
                 .first()
                 .ok_or_else(|| "open_file: ATOMCODE_OPEN_COMMAND names no program".to_string())?;
@@ -634,7 +634,7 @@ fn open_local_url_impl(url: &str) -> Result<String, String> {
             c.arg(url);
             c
         }
-OpenStrategy::Custom(parts) => {
+        OpenStrategy::Custom(parts) => {
             let program = parts
                 .first()
                 .ok_or_else(|| "open_file: ATOMCODE_OPEN_COMMAND names no program".to_string())?;
@@ -842,7 +842,7 @@ mod tests {
             OpenStrategy::XdgOpen,
             OpenStrategy::WindowsStart,
             OpenStrategy::Wslview,
-OpenStrategy::Custom(vec!["my-opener".into()]),
+            OpenStrategy::Custom(vec!["my-opener".into()]),
             OpenStrategy::OhosAa,
             OpenStrategy::Headless("x".into()),
         ] {
@@ -850,7 +850,7 @@ OpenStrategy::Custom(vec!["my-opener".into()]),
         }
     }
 
-/// A configured launcher is named by its program, which is what the message
+    /// A configured launcher is named by its program, which is what the message
     /// (and `describe`) shows — not the whole command line.
     #[test]
     fn a_configured_command_is_named_by_its_program() {

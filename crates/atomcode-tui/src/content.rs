@@ -2163,7 +2163,7 @@ impl Content for ToolCallBlock {
             let mut rows = self.opening_rows(
                 ctx.width,
                 &lead,
-                self.mark().1,
+                self.mark(&ctx.caps).1,
                 self.folded_reason_style(),
                 self.folded_style(),
             );

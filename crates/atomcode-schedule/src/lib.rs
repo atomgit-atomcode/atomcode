@@ -792,7 +792,12 @@ mod tests {
                 .unwrap();
         }
         let mut changed = task.clone();
-        changed.cwd = "/different-project".into();
+        // An absolute path on EVERY platform: a bare `/different-project` is
+        // root-relative on Windows, and the store (rightly) refuses it.
+        changed.cwd = std::env::temp_dir()
+            .join("different-project")
+            .display()
+            .to_string();
         store.put(&changed, Some(&definition.revision)).unwrap();
         let run = store.begin(&task.id).unwrap();
         assert_eq!(

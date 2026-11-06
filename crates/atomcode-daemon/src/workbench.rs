@@ -76,7 +76,7 @@ async fn workspace(state: &AppState, id: &str) -> Result<(String, PathBuf), Stri
     let _ = state;
     tokio::task::spawn_blocking(move || {
         let root = crate::NativeSessionManager::sessions_root(
-            atomcode_coding::config::product_dirs_from_env().user(),
+            &atomcode_coding::config::product_dirs_from_env(),
         );
         let session = crate::resolve_session_in_root(&root, &id)
             .map_err(|e| e.to_string())?
