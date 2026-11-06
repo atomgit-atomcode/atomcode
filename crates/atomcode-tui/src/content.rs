@@ -10,7 +10,7 @@ use crate::caps::{Caps, Glyph};
 use crate::frame::{Color, Line, Span, Style};
 use crate::i18n::product::{t as pt, Msg as PMsg};
 use crate::i18n::{t, Msg};
-use crate::theme::Role;
+use crate::theme::{self, Role};
 use crate::width;
 use atomcode_capabilities::tools::request_user_input::{
     parse_batch, read_result, ReadAnswer, REQUEST_USER_INPUT_KIND,
@@ -341,7 +341,11 @@ impl Content for WelcomeBlock {
         // Shape is not in the hash — same class as width. `Content` promises the
         // hash covers what the block *says* and never the bytes it renders, and
         // "did the cat get drawn" is rendered bytes.
+        let branch = crate::git_branch::current(&self.cwd);
         let mut parts: Vec<&str> = vec!["welcome", self.version, &self.cwd, &self.heading];
+        if let Some(branch) = branch.as_deref() {
+            parts.push(branch);
+        }
         if let Some(model) = &self.model {
             parts.push(model);
         }
@@ -383,18 +387,44 @@ impl Content for WelcomeBlock {
         // `∙ proj` and `set a goal…` on one line.
         let mut below: Vec<Line> = Vec::new();
         let bullet = ctx.caps.g(Glyph::Bullet);
-        for text in std::iter::once(Some(self.cwd.as_str()))
+        for (index, text) in std::iter::once(Some(self.cwd.as_str()))
             .chain(std::iter::once(self.model.as_deref()))
             .flatten()
+            .enumerate()
         {
-            // The cwd and model read at full strength — they are the two facts a
-            // person most wants at a glance when a session opens, not chrome.
             below.extend(wrapped(
                 text,
                 content_w as u16,
                 Style::default(),
                 &format!("{bullet} "),
             ));
+            if index == 0 {
+                if let Some(branch) = crate::git_branch::current(&self.cwd) {
+                    let suffix = format!(" [{branch}]");
+                    let fits = below.last().is_some_and(|line| {
+                        let used: usize = line
+                            .spans
+                            .iter()
+                            .map(|span| width::str_width(&span.text))
+                            .sum();
+                        used + width::str_width(&suffix) <= content_w
+                    });
+                    if fits {
+                        below
+                            .last_mut()
+                            .unwrap()
+                            .spans
+                            .push(Span::styled(suffix, theme::fg(Role::Brand)));
+                    } else {
+                        below.extend(wrapped(
+                            &format!("[{branch}]"),
+                            content_w as u16,
+                            theme::fg(Role::Brand),
+                            "  ",
+                        ));
+                    }
+                }
+            }
         }
         // Under them, dim and without a bullet: an aside about the screen, not
         // a fact about the session.
@@ -4249,6 +4279,34 @@ mod tests {
             .iter()
             .map(Line::plain)
             .collect()
+    }
+
+    #[test]
+    fn welcome_shows_a_brand_coloured_branch_and_fits_narrow_rows() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        std::fs::write(
+            root.path().join(".git/HEAD"),
+            "ref: refs/heads/feature/demo\n",
+        )
+        .unwrap();
+        let mut block = welcome();
+        block.cwd = root.path().display().to_string();
+        let rows = block.lines(&wctx(120, false));
+        assert!(rows
+            .iter()
+            .any(|line| line.plain().contains("[feature/demo]")));
+        assert!(rows
+            .iter()
+            .flat_map(|line| &line.spans)
+            .any(
+                |span| span.text.contains("[feature/demo]") && span.style == theme::fg(Role::Brand)
+            ));
+        for width in [20, 40, 80] {
+            assert!(lines_of(&block, width, false)
+                .iter()
+                .all(|line| width::str_width(line) <= width as usize));
+        }
     }
 
     #[test]

@@ -127,3 +127,5 @@ fn _tests_assert_in_chinese() {
 mod generation;
 
 mod model_cards;
+
+mod git_branch;

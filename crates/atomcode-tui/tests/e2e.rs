@@ -9954,7 +9954,11 @@ async fn the_described_thinking_level_lands_on_the_status_row_beside_the_model()
     // stands" is not a level, and inventing one would be a claim about the
     // session that nothing made.
     assert!(
-        !status_row(&s).contains('['),
+        !status_row(&s)
+            .split('│')
+            .next()
+            .unwrap_or_default()
+            .contains('['),
         "a level was drawn with nothing described: {:?}",
         status_row(&s)
     );

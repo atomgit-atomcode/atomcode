@@ -326,6 +326,10 @@ impl View for Status {
         // a real filesystem path), so the collapse happens here, not at the source.
         let cwd_full = crate::text::collapse_home(&vp.moment.cwd);
         let cwd_base = path_basename(&cwd_full).to_string();
+        let branch = crate::git_branch::current(&vp.moment.cwd);
+        let branch_suffix = branch.map(|name| format!(" [{name}]")).unwrap_or_default();
+        let cwd_full = format!("{cwd_full}{branch_suffix}");
+        let cwd_base = format!("{cwd_base}{branch_suffix}");
         // What the model is carrying now: the last request's prompt, or — when a
         // fold has shrunk the view since it was reported — what the fold left.
         let used = gauge_tokens(state, vp.moment);
@@ -385,6 +389,13 @@ impl View for Status {
                 if let Some((usage, count)) = text.split_once(" · ") {
                     row.push(El::styled(usage.to_string(), style_for(*seg)));
                     row.push(El::styled(format!(" · {count}"), dim));
+                    continue;
+                }
+            }
+            if matches!(seg, StatusSeg::Cwd) && !branch_suffix.is_empty() {
+                if let Some(path) = text.strip_suffix(&branch_suffix) {
+                    row.push(El::styled(path.to_string(), dim));
+                    row.push(El::styled(branch_suffix.clone(), theme::fg(Role::Brand)));
                     continue;
                 }
             }
