@@ -293,11 +293,21 @@ try {
     await page.waitForFunction(name=>document.querySelector('.session-item.active .session-item-name')?.textContent===name,meta.name);
     assert.equal(await page.locator('.session-item.active .session-item-name').innerText(),meta.name);
     await page.locator('.message-input').waitFor();
+    if (refusal.active_turn) {
+      emit({type:"state",running:true});
+      await page.waitForTimeout(100);
+      emit({type:"state",running:false,stop_reason:"end_turn"});
+    } else {
+      // A successful authoritative handover also invalidates a previous refusal.
+      emit({type:"session_switched",session_id:id});
+    }
+    await page.waitForFunction(() => !document.querySelector(".session-switch-notice"));
     switchRejection=null;
     const count=switches;
     await page.locator('.session-item-main').filter({hasText:other.name}).click();
     await page.getByText('Historical answer',{exact:true}).waitFor();
     assert.equal(switches,count+1,'busy rejection must keep sync available for a later retry');
+    await page.waitForFunction(() => !document.querySelector('.session-switch-notice'));
     await page.close();
   }
   console.log('session browsing: history while running, return, completion retention, no rebind: passed');

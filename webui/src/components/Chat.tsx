@@ -945,7 +945,9 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       const liveSwitch = liveSessionSwitchDisposition(
         liveLifecycleRef.current.running || busyRef.current,
       );
-      if (syncRef.current && !liveSwitch.allowed) {
+      // Existing sessions can move to the background; the runtime owner
+      // decides whether interactions or reconfiguration prevent handover.
+      if (syncRef.current && !sessionId && !liveSwitch.allowed) {
         if (prevId) onSessionId(prevId);
         setSessionSwitchNotice(t('browse.switchBusy'));
         return;
@@ -1880,6 +1882,11 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     // 否则 loadedForRef 会阻止加载，导致 historyHint 永远不被清除。
     // 重启 SSE 连接以取得新会话的 authoritative snapshot 和 replay window。
     if (e.type === 'session_switched') {
+      if (noticeAfterSwitchRef.current?.text === t('browse.switchBusy')) {
+        noticeAfterSwitchRef.current = null;
+      }
+      setSessionSwitchNotice(current =>
+        current === t('browse.switchBusy') || current === t('sync.switching') ? null : current);
       liveSessionIdRef.current = e.session_id;
       // 本端正是发起此次切换的视图（侧栏切到已存在会话→postLiveSwitchSession→广播
       // 回流），或重复广播：此时我们已经在该会话上、历史也正在/已经加载，绝不能再清空
@@ -1978,6 +1985,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
         if (e.running) setTurnStats(null);
         else if (terminal) setTurnStats(completedTurnStats(e.stats, e.stop_reason));
         if (terminal) {
+          setSessionSwitchNotice(current => current === t('browse.switchBusy') ? null : current);
           stampLastAssistantCompletion();
           finishTodoTurn(e.stop_reason === 'cancelled');
           if (terminal.discardQueued) {
