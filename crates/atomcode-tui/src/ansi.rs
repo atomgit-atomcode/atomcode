@@ -38,8 +38,8 @@ pub const ERASE_LINE: &str = "\x1b[K";
 ///
 /// Alternate scroll (DECSET 1007) is deliberately not part of this universal
 /// sequence. It is enabled separately only on HarmonyOS, whose terminal keeps
-/// the mouse but does not report wheel events. There the input pump separates a
-/// multi-arrow wheel burst from a lone Up/Down history key. Other platforms use
+/// the mouse but does not report wheel events. There both grouped and isolated
+/// wheel arrows scroll; Ctrl+P/Ctrl+N recall input history. Other platforms use
 /// reported mouse events (the default), or the terminal's native scrollback
 /// when the mouse is handed back.
 ///

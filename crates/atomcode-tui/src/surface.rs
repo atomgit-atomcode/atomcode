@@ -153,12 +153,13 @@ pub enum Input {
     /// terminal is when a person has just been somewhere else — taking a
     /// screenshot, most often.
     Focus(bool),
-    /// The same arrow key `n` times (`n >= 2`), arriving too fast to have been
+    /// The same arrow key `n` times, usually arriving too fast to have been
     /// pressed: what a terminal sends for the wheel when the pointer is handed
     /// back — iTerm2's "scroll wheel sends arrow keys when in alternate screen
     /// mode", Terminal.app's own. Only gathered while the pointer is the
     /// terminal's (`pump_input`); with it ours, the wheel is a mouse event and
-    /// an arrow is only ever a key.
+    /// an arrow is only ever a key. HiShell's explicit alternate-scroll mode
+    /// also routes isolated arrows here (`n = 1`); history uses Ctrl+P/Ctrl+N.
     ArrowBurst {
         up: bool,
         n: usize,

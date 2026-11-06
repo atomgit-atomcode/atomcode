@@ -154,9 +154,10 @@ fn ohos_aa_argv(url: &str) -> Vec<String> {
     ]
 }
 
-/// Resolve an existing script before interpreting it: ENOENT may mean the
-/// interpreter is missing, but must never turn a missing command into success.
-fn script_path(cmd: &Command) -> Option<PathBuf> {
+/// Resolve a shell wrapper after an exec failure. ENOENT may mean its shebang
+/// interpreter is missing; ENOEXEC can also mean a text wrapper has no shebang.
+/// Never feed a binary (including one for the wrong CPU) to the shell.
+fn script_path(cmd: &Command, allow_plain_text: bool) -> Option<PathBuf> {
     use std::io::Read;
     let program = Path::new(cmd.get_program());
     let paths: Vec<PathBuf> = if program.components().count() > 1 || program.is_absolute() {
@@ -166,16 +167,35 @@ fn script_path(cmd: &Command) -> Option<PathBuf> {
             .map(|dir| dir.join(program))
             .collect()
     };
-    paths.into_iter().find(|path| {
-        if !path.is_file() {
+    // Match exec's first executable PATH entry, rather than skipping a broken
+    // binary and accidentally running a different wrapper later on PATH.
+    let path = paths.into_iter().find(|path| {
+        let Ok(meta) = path.metadata() else {
+            return false;
+        };
+        if !meta.is_file() {
             return false;
         }
-        let mut prefix = [0; 2];
-        std::fs::File::open(path)
-            .and_then(|mut file| file.read_exact(&mut prefix))
-            .is_ok()
-            && prefix == *b"#!"
-    })
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if meta.permissions().mode() & 0o111 == 0 {
+                return false;
+            }
+        }
+        true
+    })?;
+    let mut prefix = Vec::new();
+    std::fs::File::open(&path)
+        .ok()?
+        .take(4096)
+        .read_to_end(&mut prefix)
+        .ok()?;
+    let text = !prefix.is_empty()
+        && prefix
+            .iter()
+            .all(|byte| !byte.is_ascii_control() || matches!(*byte, b'\n' | b'\r' | b'\t'));
+    (prefix.starts_with(b"#!") || allow_plain_text && text).then_some(path)
 }
 
 /// Interpret the verified wrapper itself, rather than exec'ing it again and
@@ -212,7 +232,8 @@ fn run_aa(mut cmd: Command, timeout: std::time::Duration) -> Result<(), String> 
     let mut child = match spawn {
         Ok(child) => child,
         Err(error) if matches!(error.raw_os_error(), Some(2 | 8)) => {
-            let path = script_path(&cmd).ok_or_else(|| error.to_string())?;
+            let path = script_path(&cmd, error.raw_os_error() == Some(8))
+                .ok_or_else(|| error.to_string())?;
             let diagnostics = output.reopen().map_err(|e| e.to_string())?;
             shell_fallback_command(&cmd, &path)
                 .stdin(std::process::Stdio::null())
@@ -804,6 +825,29 @@ mod tests {
             std::time::Duration::from_secs(1)
         )
         .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn aa_interprets_text_without_shebang_but_rejects_binary_exec_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aa");
+        let url = "https://example.test/?a=1&b=$(bad)";
+        std::fs::write(
+            &path,
+            "[ \"$1\" = 'https://example.test/?a=1&b=$(bad)' ] || exit 9\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut command = Command::new(&path);
+        command.arg(url);
+        assert!(run_aa(command, std::time::Duration::from_secs(1)).is_ok());
+        // A real binary for the wrong architecture is also ENOEXEC. It must
+        // remain an error, never be reinterpreted as shell commands.
+        std::fs::write(&path, b"\x7fELF\0wrong architecture").unwrap();
+        assert!(script_path(&Command::new(&path), true).is_none());
+        assert!(run_aa(Command::new(&path), std::time::Duration::from_secs(1)).is_err());
     }
 
     #[test]

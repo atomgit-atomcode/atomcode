@@ -2525,7 +2525,12 @@ impl UserInterface for Tui {
                 Wake::Input(Input::ArrowBurst { up, n }) => {
                     // A lone ↓ the composer and the conversation have no use
                     // for steps into the team panel, as a pressed one does.
-                    if !up && n == 1 && self.down_reaches_team() && self.host.focus_team() {
+                    if !up
+                        && n == 1
+                        && !crate::ansi::alternate_scroll_enabled()
+                        && self.down_reaches_team()
+                        && self.host.focus_team()
+                    {
                         stale = true;
                         continue;
                     }
@@ -2543,7 +2548,7 @@ impl UserInterface for Tui {
                     if arrows_scroll(
                         self.surface.mouse(),
                         crate::caps::mouse_reported(),
-                        crate::ansi::alternate_scroll_enabled() && n > 1,
+                        crate::ansi::alternate_scroll_enabled(),
                         self.arrows_reach_the_composer()
                             && !(n == 1 && self.caret_moves_within_draft(up)),
                     ) {
@@ -10970,10 +10975,10 @@ fn sanitize_paste(text: &str) -> String {
 fn arrows_scroll(
     mouse_held: bool,
     mouse_reported: bool,
-    alternate_scroll_burst: bool,
+    alternate_scroll: bool,
     would_scroll: bool,
 ) -> bool {
-    !mouse_held && (mouse_reported || alternate_scroll_burst) && would_scroll
+    !mouse_held && (mouse_reported || alternate_scroll) && would_scroll
 }
 
 /// Read the terminal, gathering keystroke bursts that are really a paste.
@@ -11026,7 +11031,13 @@ async fn pump_terminal_input<S>(
         })
         .filter_map(|result| futures::future::ready(result.ok()));
     futures::pin_mut!(events);
-    pump_input(events, wake.clone(), handed_back).await;
+    pump_input(
+        events,
+        wake.clone(),
+        handed_back,
+        crate::ansi::alternate_scroll_enabled(),
+    )
+    .await;
     let _ = wake.send(Wake::Closed);
 }
 
@@ -11056,8 +11067,12 @@ async fn terminal_input_failure_is_reported_and_never_followed_by_more_text() {
 /// stream needs a tty, and what is worth judging here is not that crossterm
 /// reads — it is the timing decision, and a judgement that cannot supply the
 /// timing judges nothing. Everything above is one line of plumbing.
-async fn pump_input<S>(events: S, wake: mpsc::UnboundedSender<Wake>, handed_back: impl Fn() -> bool)
-where
+async fn pump_input<S>(
+    events: S,
+    wake: mpsc::UnboundedSender<Wake>,
+    handed_back: impl Fn() -> bool,
+    alternate_scroll: bool,
+) where
     S: futures::Stream<Item = crossterm::event::Event> + Unpin,
 {
     use futures::StreamExt;
@@ -11128,10 +11143,11 @@ where
                     _ => break,
                 }
             }
-            // A lone arrow has exactly the same bytes as a keyboard press.
-            // Preserve normal caret/history navigation, including over SSH.
-            // Only a confirmed multi-arrow burst takes the wheel path.
-            let sent = if n == 1 {
+            // HiShell also sends isolated wheel arrows. In its explicitly
+            // enabled alternate-scroll mode they must never recall input
+            // history; Ctrl+P/Ctrl+N remain unambiguous history keys. Other
+            // terminals preserve the usual single-arrow keyboard behavior.
+            let sent = if n == 1 && !alternate_scroll {
                 forward(event)
             } else {
                 wake.send(Wake::Input(Input::ArrowBurst { up, n })).is_ok()
@@ -11536,8 +11552,9 @@ mod history_tests {
     use super::arrows_scroll;
 
     /// With the mouse handed back, arrows the wheel may have sent scroll.
-    /// HarmonyOS contributes only grouped alternate-scroll bursts; a lone arrow
-    /// still walks input history. With the mouse held arrows always remain keys.
+    /// HarmonyOS contributes grouped and isolated alternate-scroll arrows;
+    /// input history has the explicit Ctrl+P/Ctrl+N keys. With the mouse held,
+    /// arrows always remain keys.
     #[test]
     fn arrows_scroll_only_where_the_wheel_can_send_them() {
         assert!(arrows_scroll(false, true, false, true), "mouse handed back");
@@ -13119,6 +13136,14 @@ mod paste_burst_tests {
 
     /// [`pumped`], with the pointer handed back to the terminal (`true`) or ours.
     async fn pumped_with(script: Vec<(u64, Event)>, handed_back: bool) -> Vec<Input> {
+        pumped_with_scroll(script, handed_back, false).await
+    }
+
+    async fn pumped_with_scroll(
+        script: Vec<(u64, Event)>,
+        handed_back: bool,
+        alternate_scroll: bool,
+    ) -> Vec<Input> {
         let events = futures::stream::unfold(script.into_iter(), |mut rest| async move {
             let (gap_ms, event) = rest.next()?;
             tokio::time::sleep(std::time::Duration::from_millis(gap_ms)).await;
@@ -13127,7 +13152,7 @@ mod paste_burst_tests {
         .fuse();
         futures::pin_mut!(events);
         let (tx, mut rx) = mpsc::unbounded_channel();
-        super::pump_input(events, tx, move || handed_back).await;
+        super::pump_input(events, tx, move || handed_back, alternate_scroll).await;
         let mut seen = Vec::new();
         while let Ok(Wake::Input(input)) = rx.try_recv() {
             seen.push(input);
@@ -13338,6 +13363,50 @@ mod paste_burst_tests {
             if up { KeyCode::Up } else { KeyCode::Down },
             KeyModifiers::NONE,
         ))
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn harmony_isolated_wheel_arrows_never_become_history_keys() {
+        assert_eq!(
+            pumped_with_scroll(
+                vec![(0, arrow(true)), (35, arrow(false)), (35, arrow(true))],
+                true,
+                true
+            )
+            .await,
+            vec![
+                Input::ArrowBurst { up: true, n: 1 },
+                Input::ArrowBurst { up: false, n: 1 },
+                Input::ArrowBurst { up: true, n: 1 }
+            ]
+        );
+        assert_eq!(
+            pumped_with_scroll(vec![(0, arrow(true))], false, true).await,
+            vec![Input::Key(KeyPress::plain(Key::Up))],
+            "a terminal reporting real mouse events keeps keyboard arrows"
+        );
+        assert_eq!(
+            pumped_with_scroll(
+                vec![
+                    (
+                        0,
+                        Event::Key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL))
+                    ),
+                    (
+                        0,
+                        Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL))
+                    ),
+                ],
+                true,
+                true,
+            )
+            .await,
+            vec![
+                Input::Key(KeyPress::ctrl('p')),
+                Input::Key(KeyPress::ctrl('n'))
+            ],
+            "explicit history shortcuts remain keyboard input"
+        );
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

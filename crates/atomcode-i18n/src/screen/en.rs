@@ -549,8 +549,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
     Ctrl+A / Ctrl+E                 start / end of the current line
     Ctrl+U / Ctrl+K                 delete to line start / end
     Ctrl+Z                          suspend to the shell, fg to return (not on Windows)
-    Up / Down                       move the caret, and page through history once at the end
-    Ctrl+P / Ctrl+N                 page through history (with the mouse handed back, ↑↓ scroll instead)
+    Up / Down                       move the caret, then history (HiShell: scroll chat at the edge)
+    Ctrl+P / Ctrl+N                 previous / next input history (use these keys in HiShell)
     click the composer              put the caret where you clicked
     Ctrl+R                          search what you have typed in this project before; type to narrow, ctrl-r again for older, enter takes it, esc gives your draft back
 
@@ -1068,8 +1068,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::RawBottom => "── the whole conversation, above: select, scroll and search it with the terminal · any key returns to atomcode ──".into(),
         Msg::MouseHandedBack => "mouse handed back · ctrl+g take it · /raw select across screens · wheel scroll · ↑↓/ctrl+p/n history · ctrl+t open · ctrl+o thinking".into(),
         Msg::MouseDisabledByTmux => "tmux mouse=off · application mouse stays off · enable mouse in tmux and restart to use application scrolling".into(),
-        Msg::MouseUnreportedAtStart => "this terminal reports no mouse · drag to select · wheel or Fn+Up/Down scroll · /raw select across screens · Up/Down history · ctrl+t open · ctrl+o thinking".into(),
-        Msg::MouseUnreported => "this terminal reports no mouse, so it keeps it · drag to select · wheel or Fn+Up/Down scroll".into(),
+        Msg::MouseUnreportedAtStart => "Input history: Ctrl+P previous · Ctrl+N next · Ctrl+R search\n/keys for all shortcuts · terminal keeps mouse; drag to select".into(),
+        Msg::MouseUnreported => "this terminal reports no mouse, so it keeps it · drag to select · wheel scroll · Ctrl+P/N input history".into(),
         Msg::MouseHandedBackAtStart => "Mouse handed to terminal · drag to copy, right-click to paste · Ctrl+T expands/collapses tool output".into(),
         Msg::ReasoningNotReceived => "No reasoning received yet; incoming content will appear live.".into(),
         Msg::ReasoningHiddenHint => "reasoning is hidden · ctrl-o shows/hides it · tool output: ctrl-t".into(),

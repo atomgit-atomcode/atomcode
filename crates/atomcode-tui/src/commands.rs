@@ -4065,12 +4065,17 @@ mod tests {
             "Ctrl+T",
             "Ctrl+L",
             "Ctrl+G / /mouse",
+            "Ctrl+P / Ctrl+N",
             "Ctrl+R",
             "Shift+Tab",
             "Esc Esc",
         ] {
             assert!(body.contains(key), "missing {key}:\n{body}");
         }
+        assert!(
+            body.contains("HiShell"),
+            "HiShell's history-key exception must be discoverable in /keys"
+        );
         // 旧散文形态的行内分隔（` · `）不再出现：现在是逐行两列。
         assert!(
             !body.contains(" · "),

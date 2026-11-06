@@ -512,8 +512,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
     Ctrl+A / Ctrl+E                 到当前行首 / 行尾
     Ctrl+U / Ctrl+K                 删除到当前行首 / 行尾
     Ctrl+Z                          挂起回到 shell，fg 回来（Windows 不支持）
-    Up / Down                       在输入里移动游标，到头则翻历史
-    Ctrl+P / Ctrl+N                 翻历史（鼠标交还终端时 ↑↓ 用来滚动对话）
+    Up / Down                       在输入里移动游标，到头翻历史（HiShell：到头滚动对话）
+    Ctrl+P / Ctrl+N                 上一条 / 下一条输入历史（HiShell 请使用这组快捷键）
     点击输入框                      定位游标
     Ctrl+R                          搜索这个项目里以前打过的东西；继续打字缩小范围，再按往更老翻，Enter 接受，Esc 还回草稿
 
@@ -1008,8 +1008,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::RawBottom => "── 以上是本会话全文:可用终端自己的拖选、滚动、搜索 · 按任意键回到 atomcode ──".into(),
         Msg::MouseHandedBack => "鼠标已交还终端 · ctrl+g 收回 · /raw 跨屏选 · 滚轮滚动 · ↑↓/ctrl+p/n 历史 · ctrl+t 展开 · ctrl+o 思考".into(),
         Msg::MouseDisabledByTmux => "tmux mouse=off · 保留原生鼠标 · 在 tmux 启用鼠标并重启后可用应用滚动".into(),
-        Msg::MouseUnreportedAtStart => "这个终端不上报鼠标 · 直接拖选 · 滚轮或 Fn+↑/↓ 翻页 · /raw 跨屏选 · ↑↓ 历史 · ctrl+t 展开 · ctrl+o 思考".into(),
-        Msg::MouseUnreported => "这个终端不上报鼠标,鼠标留给终端 · 直接拖选 · 滚轮或 Fn+↑/↓ 翻页".into(),
+        Msg::MouseUnreportedAtStart => "输入历史：Ctrl+P 上一条 · Ctrl+N 下一条 · Ctrl+R 搜索\n/keys 查看全部快捷键 · 终端保留鼠标，可直接拖选".into(),
+        Msg::MouseUnreported => "这个终端不上报鼠标,鼠标留给终端 · 直接拖选 · 滚轮翻页 · Ctrl+P/N 翻输入历史".into(),
         Msg::MouseHandedBackAtStart => "鼠标已交还终端 · 拖选复制、右键粘贴 · Ctrl+T 展开/收起工具输出".into(),
         Msg::ReasoningNotReceived => "尚未收到思考内容；收到后会实时展示。".into(),
         Msg::ReasoningHiddenHint => "思考过程已收起 · ctrl-o 展开/隐藏 · 工具输出用 ctrl-t".into(),
