@@ -28,6 +28,17 @@ pub struct ProductDirs {
     user: PathBuf,
     project_dir_name: String,
     home_dir_name: String,
+    /// Where sessions live, when the host wants them somewhere other than
+    /// `<user>/sessions`.
+    ///
+    /// The default is right for a desktop. Android points sessions at a directory
+    /// an externally started daemon can also read, so switching to it keeps one
+    /// history — while `config.toml` and its keys stay in the app's private tree.
+    ///
+    /// This used to be a process-global `OnceLock` in the session module, which let
+    /// one host's setting move the sessions root of every runtime in the same
+    /// process. It belongs to the dirs the host hands out, like every other path.
+    sessions_root: Option<PathBuf>,
 }
 
 impl ProductDirs {
@@ -39,7 +50,21 @@ impl ProductDirs {
             user: user.into(),
             home_dir_name: project_dir_name.clone(),
             project_dir_name,
+            sessions_root: None,
         }
+    }
+
+    /// Pin where sessions live. `None` keeps `<user>/sessions`.
+    pub fn with_sessions_root(mut self, root: Option<PathBuf>) -> Self {
+        self.sessions_root = root;
+        self
+    }
+
+    /// Where session history lives: the host's choice, or `<user>/sessions`.
+    pub fn sessions_root(&self) -> PathBuf {
+        self.sessions_root
+            .clone()
+            .unwrap_or_else(|| self.user.join("sessions"))
     }
 
     /// The user tree's default name under a person's home, when it differs from

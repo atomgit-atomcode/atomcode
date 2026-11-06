@@ -1867,14 +1867,10 @@ async fn run(process_start: std::time::Instant) -> Result<i32> {
                 no_auth,
             } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
-                // Same knob the Android host uses: point the daemon's sessions at the
-                // directory the app reads, so switching to it keeps one history.
-                if let Ok(dir) = std::env::var("ATOMCODE_SESSIONS_DIR") {
-                    let dir = dir.trim();
-                    if !dir.is_empty() {
-                        let _ = atomcode_capabilities::session::set_sessions_root(dir);
-                    }
-                }
+                // `$ATOMCODE_SESSIONS_DIR` — same knob the Android host uses to keep
+                // one history with the app. Read where the host resolves its
+                // directories (`product_dirs_from_env`), not pinned here: a
+                // process-global would also move every other runtime's sessions root.
                 eprintln!("Starting AtomCode daemon on port {}...", port);
                 eprintln!("Press Ctrl+C to stop.");
                 // Run the bundled server IN-PROCESS (same `run_server` the webui uses),
@@ -2355,7 +2351,7 @@ async fn run(process_start: std::time::Instant) -> Result<i32> {
                 None => {
                     let scan = atomcode_capabilities::session::SessionManager::scan_catalog(
                         &atomcode_capabilities::session::SessionManager::sessions_root(
-                            atomcode_coding::config::product_dirs_from_env().user(),
+                            &atomcode_coding::config::product_dirs_from_env(),
                         ),
                     );
                     let entries = resume_candidates(scan.entries, sel);

@@ -298,7 +298,7 @@ fn build_v1_agent(state: SharedState) -> impl ConnectTo<Client> + 'static {
                 async move |req: ResumeSessionRequest, responder, cx: ConnectionTo<Client>| {
                     let engine_ref = require_engine(&engine)?;
                     // Persisted history: same native catalog as `session/list`.
-                    let scan = SessionManager::scan_all(atomcode_coding::config::product_dirs_from_env().user());
+                    let scan = SessionManager::scan_all(&atomcode_coding::config::product_dirs_from_env());
                     let (mcp_configs, ignored) =
                         mcp::acp_mcp_server_configs(&req.mcp_servers);
                     mcp::log_ignored_mcp_server_names(&ignored);
@@ -347,7 +347,7 @@ fn build_v1_agent(state: SharedState) -> impl ConnectTo<Client> + 'static {
                 let msg_ids = Arc::clone(&msg_ids);
                 async move |req: LoadSessionRequest, responder, cx: ConnectionTo<Client>| {
                     let engine_ref = require_engine(&engine)?;
-                    let scan = SessionManager::scan_all(atomcode_coding::config::product_dirs_from_env().user());
+                    let scan = SessionManager::scan_all(&atomcode_coding::config::product_dirs_from_env());
                     let (mcp_configs, ignored) = mcp::acp_mcp_server_configs(&req.mcp_servers);
                     mcp::log_ignored_mcp_server_names(&ignored);
                     // Restore FIRST: replay only makes sense for a session that
@@ -425,7 +425,7 @@ fn build_v1_agent(state: SharedState) -> impl ConnectTo<Client> + 'static {
             {
                 let sessions = Arc::clone(&sessions);
                 async move |req: DeleteSessionRequest, responder, _cx: ConnectionTo<Client>| {
-                    let scan = SessionManager::scan_all(atomcode_coding::config::product_dirs_from_env().user());
+                    let scan = SessionManager::scan_all(&atomcode_coding::config::product_dirs_from_env());
                     let resp = handle_delete_session(&sessions, &req.session_id, &scan).await?;
                     responder.respond(resp)
                 }
@@ -436,7 +436,7 @@ fn build_v1_agent(state: SharedState) -> impl ConnectTo<Client> + 'static {
             {
                 let sessions = Arc::clone(&sessions);
                 async move |req: ListSessionsRequest, responder, _cx: ConnectionTo<Client>| {
-                    let scan = SessionManager::scan_all(atomcode_coding::config::product_dirs_from_env().user());
+                    let scan = SessionManager::scan_all(&atomcode_coding::config::product_dirs_from_env());
                     let resp = handle_list_sessions(&sessions, &req, &scan).await?;
                     responder.respond(resp)
                 }

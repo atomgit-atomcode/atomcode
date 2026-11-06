@@ -1496,7 +1496,7 @@ impl Background {
         if project_navigation {
             use atomcode_capabilities::session::SessionManager;
             let dirs = atomcode_coding::config::product_dirs_from_env();
-            let scan = SessionManager::scan_all(dirs.user());
+            let scan = SessionManager::scan_all(&dirs);
             let entry = scan
                 .entries
                 .iter()

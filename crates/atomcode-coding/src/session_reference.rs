@@ -51,7 +51,7 @@ impl Tool for ReferenceTool {
             let ctx = atomcode_harness::agent::scoped(&self.ctx);
             let session = ctx.service::<SessionSvc>().ok_or("No current session")?;
             let allowed = allowed_sources(&session)?;
-            let root = atomcode_capabilities::session::SessionManager::sessions_root(atomcode_harness::product_dirs(&ctx)?.user());
+            let root = atomcode_capabilities::session::SessionManager::sessions_root(&*atomcode_harness::product_dirs(&ctx)?);
             let task = tokio::task::spawn_blocking(move || atomcode_capabilities::session::reference::query(&root, &allowed, &request));
             tokio::select! {
                 _ = tool_ctx.cancel.cancelled() => Err("Reference query cancelled".into()),
@@ -114,7 +114,7 @@ mod tests {
     async fn only_current_human_references_authorize_source_queries() {
         let home = tempfile::tempdir().unwrap();
         let dirs = atomcode_capabilities::ProductDirs::new(home.path(), ".reference-test");
-        let root = SessionManager::sessions_root(dirs.user());
+        let root = SessionManager::sessions_root(&dirs);
         let reference = atomcode_capabilities::session::reference::SessionReference {
             bucket: "0123456789abcdef".into(),
             id: "source".into(),

@@ -6794,7 +6794,7 @@ async fn referenced_details_are_queried_by_the_mounted_tool_without_inheriting_g
         id: "source".into(),
     };
     let source = SessionManager::with_root(
-        SessionManager::sessions_root(setup.agent.dirs.user()).join(&reference.bucket),
+        SessionManager::sessions_root(&setup.agent.dirs).join(&reference.bucket),
     );
     let lease = source.acquire_lease(&reference.id).unwrap();
     let mut meta = SessionMeta::new(&reference.id, "/source", 1);

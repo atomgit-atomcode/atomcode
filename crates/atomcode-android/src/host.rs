@@ -216,16 +216,13 @@ impl AgentServer {
         if let Err(error) = std::fs::create_dir_all(&sessions) {
             tracing::warn!(dir = %sessions.display(), %error, "cannot create the sessions directory");
         }
-        if atomcode_capabilities::session::set_sessions_root(&sessions) {
-            // The directory itself is in the field: "shared workspace" would be a
-            // lie once the private marker has moved it into the product tree.
-            tracing::info!(dir = %sessions.display(), "sessions root pinned");
-        } else {
-            tracing::warn!(
-                dir = %sessions.display(),
-                "sessions root was already pinned; keeping the first one"
-            );
-        }
+        // Publish the choice where the host resolves its directories
+        // (`product_dirs_from_env`), instead of pinning a process-global that would
+        // move the sessions root of every runtime in this process. The directory
+        // itself is in the field: "shared workspace" would be a lie once the private
+        // marker has moved it into the product tree.
+        std::env::set_var(SESSIONS_ENV, &sessions);
+        tracing::info!(dir = %sessions.display(), "sessions root pinned");
 
         // Keeping the CPU awake has to follow the runtime's turn lifecycle: a
         // poller cannot wake an already sleeping device to discover that a turn

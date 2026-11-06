@@ -25,36 +25,6 @@ use super::presentation::{
 };
 use super::transcript::{TurnRecord, TurnTimestamp, RECORD_VERSION};
 
-/// Where sessions live, when the host wants them somewhere other than
-/// `<user tree>/sessions`.
-///
-/// The default is right for a desktop. The Android build points sessions at the
-/// shared workspace so an externally started daemon and the in-app one read the
-/// *same* history — while `config.toml` and the keys in it stay in the app's
-/// private tree. Set once, before any runtime exists: `OnceLock` on purpose, so
-/// there is never a window where half the process wrote to one root.
-static SESSIONS_ROOT_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
-
-/// Point sessions at `path`. `false` means an override was already pinned —
-/// the first one wins, and the host logs it rather than silently moving history.
-pub fn set_sessions_root(path: impl Into<PathBuf>) -> bool {
-    SESSIONS_ROOT_OVERRIDE.set(path.into()).is_ok()
-}
-
-/// The pinned override, if a host set one.
-pub fn sessions_root_override() -> Option<&'static Path> {
-    SESSIONS_ROOT_OVERRIDE.get().map(PathBuf::as_path)
-}
-
-/// Pure decision behind [`SessionManager::sessions_root`], so it can be asserted
-/// without pinning a process-wide value.
-fn resolve_sessions_root(user_dir: &Path, override_root: Option<&Path>) -> PathBuf {
-    match override_root {
-        Some(root) => root.to_path_buf(),
-        None => user_dir.join("sessions"),
-    }
-}
-
 /// Fast-listing metadata for ONE session — read to populate a `/resume` picker WITHOUT
 /// parsing the (large) snapshot / transcript files. Persisted as `<id>.meta`.
 pub const META_VERSION: u32 = 1;
@@ -1127,17 +1097,19 @@ impl SessionManager {
                 || (record.contains_key("event") && record.contains_key("seq")))
     }
 
-    /// `<user tree>/sessions` — every project's buckets.
+    /// Where session history lives: `<user tree>/sessions`, or the root the host
+    /// pinned on its [`ProductDirs`].
     ///
-    /// A host may pin this elsewhere with [`set_sessions_root`]; that is how the
-    /// Android build shares one history with an externally started daemon.
-    pub fn sessions_root(user_dir: &Path) -> PathBuf {
-        resolve_sessions_root(user_dir, sessions_root_override())
+    /// This used to read a process-global pinned by whichever host started first,
+    /// so one Android host could move the sessions root of every runtime in the
+    /// process. It is host-supplied data now, like the rest of the tree.
+    pub fn sessions_root(dirs: &ProductDirs) -> PathBuf {
+        dirs.sessions_root()
     }
 
     /// Copy the pre-v4.16 macOS session tree into the canonical sessions root.
     /// An initialized canonical root is never modified.
-    pub fn migrate_from_legacy(user_dir: &Path) -> SessionResult<usize> {
+    pub fn migrate_from_legacy(dirs: &ProductDirs) -> SessionResult<usize> {
         #[cfg(target_os = "macos")]
         {
             let Some(legacy_root) =
@@ -1145,11 +1117,11 @@ impl SessionManager {
             else {
                 return Ok(0);
             };
-            migrate_sessions_from(&legacy_root, &Self::sessions_root(user_dir))
+            migrate_sessions_from(&legacy_root, &Self::sessions_root(dirs))
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = user_dir;
+            let _ = dirs;
             Ok(0)
         }
     }
@@ -1158,7 +1130,7 @@ impl SessionManager {
     /// the SAME bucket production uses (so old `<id>.json` and new `<id>.snapshot`
     /// sessions of the same project land together).
     pub fn for_project(working_dir: &Path, dirs: &ProductDirs) -> Self {
-        let root = Self::sessions_root(dirs.user()).join(Self::project_hash(working_dir, dirs));
+        let root = Self::sessions_root(dirs).join(Self::project_hash(working_dir, dirs));
         Self {
             root,
             #[cfg(test)]
@@ -3297,8 +3269,8 @@ impl SessionManager {
         });
     }
 
-    pub fn scan_all(user_dir: &Path) -> CatalogScan {
-        Self::scan_catalog(&Self::sessions_root(user_dir))
+    pub fn scan_all(dirs: &ProductDirs) -> CatalogScan {
+        Self::scan_catalog(&Self::sessions_root(dirs))
     }
 
     /// List all sessions in this project bucket, NEWEST FIRST. Reads ONLY `*.meta`
@@ -4634,6 +4606,78 @@ fn lock_unsupported(error: &io::Error) -> bool {
         || matches!(error.raw_os_error(), Some(38) | Some(95))
 }
 
+/// Take over a lock directory whose owner is gone, without two takers racing.
+///
+/// Deleting the stale directory directly is the obvious implementation and it is
+/// wrong: two runtimes can both decide the owner is dead, and the second
+/// `remove_dir_all` then deletes the directory the first has just re-created — so
+/// both walk away believing they hold the session. (Measured by a reviewer:
+/// "first owner still alive, second acquire succeeded".)
+///
+/// Takeover is therefore serialized by a marker file created with `create_new`, and
+/// the owner is re-checked *after* winning it. By then the directory can only be
+/// the stale one or a live owner's, so a re-check is enough to decide.
+///
+/// Returns `true` when the directory was stale and has been removed, meaning the
+/// caller may retry `create_dir`.
+fn take_over_stale_lock_dir(dir: &Path) -> bool {
+    let Some(marker) = StaleClaim::take(dir) else {
+        // Another runtime is taking over right now; let the caller retry.
+        return false;
+    };
+    let stale = !lock_dir_owner_alive(dir);
+    if stale {
+        let _ = fs::remove_dir_all(dir);
+    }
+    drop(marker);
+    stale
+}
+
+/// The marker that serializes takeovers, and removes itself on every exit path —
+/// including a panic, so a failed takeover cannot wedge the session forever.
+struct StaleClaim(PathBuf);
+
+impl StaleClaim {
+    /// `None` means someone else holds the claim (or holds a claim whose owner is
+    /// gone and could not be cleared).
+    fn take(dir: &Path) -> Option<Self> {
+        let mut marker = dir.as_os_str().to_os_string();
+        marker.push(".takeover");
+        let path = PathBuf::from(marker);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                let _ = std::io::Write::write_all(&mut file, std::process::id().to_string().as_bytes());
+                Some(Self(path))
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                // A taker that crashed leaves the marker behind. Clear it only when
+                // its owner is gone; otherwise it is a live takeover to wait on.
+                let pid = fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<u32>().ok());
+                if let Some(pid) = pid {
+                    if !pid_alive(pid) {
+                        let _ = fs::remove_file(&path);
+                        return Self::take(dir);
+                    }
+                }
+                None
+            }
+            Err(_) => None,
+        }
+    }
+}
+
+impl Drop for StaleClaim {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
 /// Take the directory-shaped lease lock, taking over one whose owner is gone.
 fn take_lock_dir(id: &str, lease: &Path) -> SessionResult<PathBuf> {
     let dir = lease.with_extension("lease.d");
@@ -4647,8 +4691,14 @@ fn take_lock_dir(id: &str, lease: &Path) -> SessionResult<PathBuf> {
                 });
             }
             // The owner died without releasing (hard kill, or a crash that
-            // skipped `Drop`). Nothing is holding the session, so take it over.
-            let _ = fs::remove_dir_all(&dir);
+            // skipped `Drop`). Take over through the serialized path so a second
+            // taker cannot delete the lock this one is about to create.
+            if !take_over_stale_lock_dir(&dir) {
+                return Err(SessionStoreError::SessionInUse {
+                    id: id.to_string(),
+                    path: lease.to_path_buf(),
+                });
+            }
             match create_lock_dir(&dir) {
                 Ok(()) => Ok(dir),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -4687,9 +4737,31 @@ fn lock_dir_owner_alive(dir: &Path) -> bool {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn pid_alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// macOS has no `/proc`. `kill(pid, 0)` only probes for the process: `0` means it
+/// exists, `EPERM` means it exists but belongs to someone else — both alive.
+/// Anything else (`ESRCH`) means gone. Reading `/proc` here (the previous
+/// behaviour) answered "gone" for every pid, which turned a *live* owner's lock
+/// into a stealable one.
+#[cfg(target_os = "macos")]
+fn pid_alive(pid: u32) -> bool {
+    // SAFETY: signal 0 delivers nothing; it is a pure existence probe.
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn pid_alive(_pid: u32) -> bool {
+    // No `/proc` and no cheap probe: treat the owner as alive. Stealing a lock from
+    // a running runtime corrupts a session; refusing to take over one leftovers
+    // only makes the user retry.
+    true
 }
 
 #[cfg(not(unix))]
@@ -4758,9 +4830,8 @@ fn lock_session_dir(path: &Path, deadline: std::time::Instant) -> io::Result<Ses
                 return Ok(SessionLock::Dir(dir));
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                if !lock_dir_owner_alive(&dir) {
-                    // Owner died without releasing: the artifact is free.
-                    let _ = fs::remove_dir_all(&dir);
+                if take_over_stale_lock_dir(&dir) {
+                    // Owner died without releasing: the artifact is free now.
                     continue;
                 }
                 let now = std::time::Instant::now();
@@ -5150,20 +5221,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_sessions_root_follows_the_host_override_when_set() {
+    fn the_sessions_root_follows_the_dirs_the_host_handed_out() {
         // 桌面默认是 <user tree>/sessions；宿主钉了别处就完全照它来（Android 把会话
-        // 放进共享工作目录，好让外部 daemon 与 App 读同一份历史）。
+        // 放进共享工作目录，好让外部 daemon 与 App 读同一份历史）。这是**这一份**
+        // 产品目录的性质，不是进程级全局：同进程里另一个 runtime 的目录不受影响。
         let user = Path::new("/data/user/0/com.atomcode.app/files/atomcode");
+        let desktop = ProductDirs::new(user, ".atomcode");
         assert_eq!(
-            resolve_sessions_root(user, None),
+            SessionManager::sessions_root(&desktop),
             PathBuf::from("/data/user/0/com.atomcode.app/files/atomcode/sessions")
         );
+
+        let android = ProductDirs::new(user, ".atomcode")
+            .with_sessions_root(Some(PathBuf::from("/storage/emulated/0/AtomCode/.sessions")));
         assert_eq!(
-            resolve_sessions_root(
-                user,
-                Some(Path::new("/storage/emulated/0/AtomCode/.sessions"))
-            ),
+            SessionManager::sessions_root(&android),
             PathBuf::from("/storage/emulated/0/AtomCode/.sessions")
+        );
+        // The desktop dirs are untouched by the Android host's choice.
+        assert_eq!(
+            SessionManager::sessions_root(&desktop),
+            PathBuf::from("/data/user/0/com.atomcode.app/files/atomcode/sessions")
         );
     }
 
@@ -8117,6 +8195,37 @@ mod tests {
             let taken = take_lock_dir("s1", &lease).expect("a dead owner's lock is taken over");
             assert!(taken.is_dir());
             let _ = fs::remove_dir_all(&taken);
+        }
+    }
+
+    #[test]
+    fn a_takeover_in_flight_stops_the_second_taker_from_deleting_the_new_lock() {
+        // The bug being pinned: both takers see a dead owner, and the slower one's
+        // `remove_dir_all` deletes the directory the faster one has just created —
+        // so both believe they hold the session.
+        let dir = tempfile::tempdir().unwrap();
+        let lease = dir.path().join("s1.lease");
+        let lock = take_lock_dir("s1", &lease).expect("the first owner takes the lock");
+
+        let mut marker = lock.as_os_str().to_os_string();
+        marker.push(".takeover");
+        let marker = PathBuf::from(marker);
+
+        // A takeover is in flight (its claim belongs to this live process), so a
+        // second taker must decline rather than delete the directory under it.
+        fs::write(&marker, std::process::id().to_string()).unwrap();
+        assert!(!take_over_stale_lock_dir(&lock));
+        assert!(lock.is_dir(), "the in-flight recipient's lock is untouched");
+        fs::remove_file(&marker).unwrap();
+
+        // The claim's owner died: the marker is reclaimed and the takeover proceeds.
+        #[cfg(unix)]
+        {
+            fs::write(&marker, u32::MAX.to_string()).unwrap();
+            fs::write(lock.join("owner"), u32::MAX.to_string()).unwrap();
+            assert!(take_over_stale_lock_dir(&lock));
+            assert!(!lock.exists(), "the stale lock is gone");
+            assert!(!marker.exists(), "the reclaimed marker is cleaned up");
         }
     }
 

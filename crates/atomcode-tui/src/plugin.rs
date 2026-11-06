@@ -9153,7 +9153,7 @@ impl Tui {
                 .expect("session suggestions poisoned");
             if !cache.loading && cache.checked.is_none_or(|t| t.elapsed().as_secs() >= 5) {
                 if let Some(dirs) = self.host.dirs.get() {
-                    let root = SessionManager::sessions_root(dirs.user());
+                    let root = SessionManager::sessions_root(dirs);
                     cache.loading = true;
                     let shared = self.session_references.clone();
                     let wake = self.wake.lock().expect("wake poisoned").clone();

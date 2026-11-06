@@ -5445,7 +5445,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                         let _ = done.send(Err(RuntimeError::Unavailable));
                                         continue;
                                     };
-                                    let root = atomcode_capabilities::session::SessionManager::sessions_root(runtime.config.dirs.user());
+                                    let root = atomcode_capabilities::session::SessionManager::sessions_root(&runtime.config.dirs);
                                     let read = tokio::task::spawn_blocking(move || {
                                         atomcode_capabilities::session::reference::resolve(&root, &references)
                                     });
@@ -22694,7 +22694,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let mut config = native_start(false).agent;
         config.dirs = atomcode_capabilities::ProductDirs::new(home.path(), ".reference-test");
-        let root = SessionManager::sessions_root(home.path());
+        let root = SessionManager::sessions_root(&config.dirs);
         let reference = SessionReference {
             bucket: "0123456789abcdef".into(),
             id: "source".into(),

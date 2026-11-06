@@ -245,11 +245,21 @@ pub struct CodingAgentConfig {
 /// called by the host, explicitly, where it builds the config. A program
 /// embedding the runtime under another name builds its own `ProductDirs`.
 pub fn product_dirs_from_env() -> atomcode_capabilities::ProductDirs {
-    atomcode_capabilities::ProductDirs::new(
+    let dirs = atomcode_capabilities::ProductDirs::new(
         atomcode_config::config::Config::config_dir(),
         atomcode_config::distribution::PROJECT_DIR_NAME,
     )
-    .with_home_dir_name(atomcode_config::distribution::HOME_DIR_NAME)
+    .with_home_dir_name(atomcode_config::distribution::HOME_DIR_NAME);
+    // `$ATOMCODE_SESSIONS_DIR` — where the Android host points sessions so an
+    // externally started daemon and the in-app one read one history. Resolved here,
+    // with the rest of the host's directories, rather than by pinning a
+    // process-global that would move every runtime in the process.
+    let sessions = std::env::var("ATOMCODE_SESSIONS_DIR").ok();
+    let sessions = sessions
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from);
+    dirs.with_sessions_root(sessions)
 }
 
 /// Tell the message tables where `dirs` are, so `{user_dir}` / `{project_dir}`

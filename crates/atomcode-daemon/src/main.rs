@@ -163,7 +163,7 @@ async fn main() {
     // Ensure legacy sessions (macOS pre-v4.16 ~/Library/Application Support/atomcode/sessions)
     // are migrated to the canonical location ($ATOMCODE_HOME/sessions) before any handler reads it.
     if let Err(error) = atomcode_capabilities::session::SessionManager::migrate_from_legacy(
-        atomcode_coding::config::product_dirs_from_env().user(),
+        &atomcode_coding::config::product_dirs_from_env(),
     ) {
         tracing::warn!("[session] Failed to migrate legacy sessions: {error}");
     }

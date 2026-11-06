@@ -808,9 +808,7 @@ async fn a_busy_session_is_resumed_as_an_announced_fork() {
     assert!(note.contains(&source), "{note}");
     assert!(note.contains(&changed), "{note}");
 
-    let scan = atomcode_capabilities::session::SessionManager::scan_all(
-        atomcode_coding::config::product_dirs_from_env().user(),
-    );
+    let scan = atomcode_capabilities::session::SessionManager::scan_all(&atomcode_coding::config::product_dirs_from_env());
     let fork = scan
         .entries
         .iter()

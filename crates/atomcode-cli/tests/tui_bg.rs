@@ -938,7 +938,7 @@ async fn a_foreign_busy_resume_is_rejected_without_a_fork_or_project_rebinding()
     let (rig, history) = a_history_and_fresh_foreground().await;
     let dirs = atomcode_coding::config::product_dirs_from_env();
     let bucket = SessionManager::project_hash(rig.project.path(), &dirs);
-    let root = SessionManager::sessions_root(dirs.user());
+    let root = SessionManager::sessions_root(&dirs);
     let foreign = root.join("0123456789abcdef");
     std::fs::create_dir_all(&foreign).unwrap();
     for file in std::fs::read_dir(root.join(&bucket)).unwrap() {
@@ -955,7 +955,7 @@ async fn a_foreign_busy_resume_is_rejected_without_a_fork_or_project_rebinding()
     let (_fork, _lease) = manager
         .fork_native_session(&history, target, atomcode_capabilities::session::now_ms())
         .unwrap();
-    assert!(SessionManager::scan_all(dirs.user())
+    assert!(SessionManager::scan_all(&dirs)
         .entries
         .iter()
         .any(|entry| entry.id == target));
