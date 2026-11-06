@@ -76,6 +76,7 @@ sha2 = "0.10"
 which = "7"
 # Run confirmed installers outside project-local package-manager configuration.
 tempfile = "3"
+fs2 = "0.4"
 # 手输配对用的那串「口令」是配对链接的 base64——App 认的是这个形状。
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }

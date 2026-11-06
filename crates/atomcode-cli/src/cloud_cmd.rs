@@ -18,6 +18,12 @@ const SKILL: &str = include_str!("../assets/huaweicloud/skill/SKILL.md");
 pub enum CloudCli {
     /// Enable the bundled Huawei Cloud sandbox MCP (requires Node >=22.19 and npm).
     Enable,
+    /// Internal local dependency preparation.
+    #[command(hide = true)]
+    Prepare {
+        #[arg(long)]
+        user_dir: PathBuf,
+    },
     /// Disable the integration for new sessions; does not delete cloud resources.
     Disable,
     /// Show local integration state without accessing cloud credentials.
@@ -29,6 +35,13 @@ pub enum CloudCli {
 pub fn handle(command: CloudCli) -> Result<()> {
     let dirs = atomcode_coding::config::product_dirs_from_env();
     match command {
+        CloudCli::Prepare { user_dir } => {
+            let dirs = ProductDirs::new(user_dir, atomcode_config::distribution::PROJECT_DIR_NAME);
+            prepare(&dirs, |path| {
+                check_node()?;
+                install_dependencies(path)
+            })?;
+        }
         CloudCli::Enable => {
             check_node()?;
             enable(&dirs, install_dependencies)?;
@@ -173,15 +186,150 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn enable(dirs: &ProductDirs, install: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
+/// Register a disabled server quickly; dependency installation runs in a detached worker.
+/// Existing registrations (including user-owned ones) and explicit deletions are respected.
+pub fn preinstall() -> Result<()> {
+    let dirs = atomcode_coding::config::product_dirs_from_env();
+    let executable = std::env::current_exe()?;
+    register_preinstalled(&dirs, &executable)?;
+    if owned_entry(read_optional(&dirs.user().join("mcp.json"))?.as_deref())?.is_none() {
+        return Ok(());
+    }
+    if atomcode_config::config::offline::is_offline_active() {
+        return Ok(());
+    }
+    let marker = root(&dirs).join("node_modules/undici/package.json");
+    if marker.is_file() {
+        return Ok(());
+    }
+    // Avoid repeated network attempts on every launch. Enabling the server retries immediately.
+    let attempt = dirs.user().join("integrations/huaweicloud-attempt");
+    if std::fs::metadata(&attempt)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|time| time.elapsed().ok())
+        .is_some_and(|age| age.as_secs() < 3600)
+    {
+        return Ok(());
+    }
+    atomic_write(&attempt, b"local dependency preparation\n")?;
+    let mut child = Command::new(executable);
+    child
+        .args(["cloud", "prepare", "--user-dir"])
+        .arg(dirs.user())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        child.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    let mut worker = child.spawn()?;
+    std::thread::spawn(move || {
+        let _ = worker.wait();
+    });
+    Ok(())
+}
+
+fn register_preinstalled(dirs: &ProductDirs, executable: &Path) -> Result<()> {
+    use fs2::FileExt;
+    let directory = dirs.user().join("integrations");
+    std::fs::create_dir_all(&directory)?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(directory.join("huaweicloud-install.lock"))?;
+    // Never wait for another launch's npm installation on the UI thread.
+    if let Err(error) = lock.try_lock_exclusive() {
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            return Ok(());
+        }
+        return Err(error.into());
+    }
     let config = dirs.user().join("mcp.json");
     let before = read_optional(&config)?;
-    owned_entry(before.as_deref())?;
-    let skill = skill_path(dirs);
-    let prior_skill = read_optional(&skill)?;
-    if prior_skill.as_deref().is_some_and(|text| text != SKILL) {
-        bail!("huaweicloud-preview skill already exists with local changes; preserve or rename it before enabling");
+    if owned_entry(before.as_deref())?.is_some() {
+        return Ok(());
     }
+    let marker = dirs.user().join("integrations/huaweicloud-registered");
+    if marker.exists() {
+        return Ok(());
+    }
+    let launcher = write_launcher(dirs, executable)?;
+    let merged = merge_stdio_mcp_server_into_text(
+        before.as_deref(),
+        SERVER,
+        "node",
+        &[launcher
+            .to_str()
+            .context("integration path is not UTF-8")?
+            .into()],
+    )?;
+    let mut value: Value = serde_json::from_str(&merged)?;
+    let entry = &mut value["mcpServers"][SERVER];
+    entry["managedBy"] = json!(OWNER);
+    entry["disabled"] = json!(true);
+    entry["trust"] = json!(false);
+    entry["autoApprove"] = json!([]);
+    entry["timeout_ms"] = json!(300000);
+    if read_optional(&config)? != before {
+        bail!("MCP config changed during preinstallation; retry on next launch");
+    }
+    atomic_write(&config, serde_json::to_string_pretty(&value)?.as_bytes())?;
+    // Do not replace a locally customized routing skill.
+    let skill = skill_path(dirs);
+    std::fs::create_dir_all(skill.parent().unwrap())?;
+    let mut file = tempfile::NamedTempFile::new_in(skill.parent().unwrap())?;
+    file.write_all(SKILL.as_bytes())?;
+    match file.persist_noclobber(&skill) {
+        Ok(_) => {}
+        Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e.error.into()),
+    }
+    atomic_write(&marker, b"registered\n")?;
+    Ok(())
+}
+
+fn write_launcher(dirs: &ProductDirs, executable: &Path) -> Result<PathBuf> {
+    let launcher = root(dirs).with_extension("mjs");
+    let source = format!(
+        r#"import {{ spawn }} from 'node:child_process';
+import {{ pathToFileURL }} from 'node:url';
+import {{ existsSync }} from 'node:fs';
+if (!existsSync({})) {{
+const child = spawn({}, ['cloud', 'prepare', '--user-dir', {}], {{ stdio: 'ignore' }});
+await new Promise((resolve, reject) => {{
+  child.on('error', reject);
+  child.on('exit', code => code === 0 ? resolve() : reject(new Error('Huawei Cloud installation failed; run atomcode cloud doctor, then reconnect in MCP')));
+}});
+}}
+console.log = console.warn = console.error = () => {{}};
+const {{ serve }} = await import(pathToFileURL({}).href);
+await serve();
+"#,
+        serde_json::to_string(&root(dirs).join("node_modules/undici/package.json"))?,
+        serde_json::to_string(executable)?,
+        serde_json::to_string(dirs.user())?,
+        serde_json::to_string(&root(dirs).join("adapter.mjs"))?
+    );
+    atomic_write(&launcher, source.as_bytes())?;
+    Ok(launcher)
+}
+
+fn prepare(dirs: &ProductDirs, install: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
+    use fs2::FileExt;
+    let directory = dirs.user().join("integrations");
+    std::fs::create_dir_all(&directory)?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(directory.join("huaweicloud-install.lock"))?;
+    lock.lock_exclusive()?;
     let dest = root(dirs);
     let parent = dest.parent().unwrap();
     std::fs::create_dir_all(parent)?;
@@ -216,16 +364,34 @@ fn enable(dirs: &ProductDirs, install: impl FnOnce(&Path) -> Result<()>) -> Resu
                 bail!("Huawei Cloud integration cache was modified; preserve it and remove the cache directory before retrying");
             }
         }
+        if !dest.join("node_modules/undici/package.json").is_file() {
+            install(&dest)?;
+        }
     }
     if !dest.join("node_modules/undici/package.json").is_file() {
-        bail!("Huawei Cloud cache dependencies are missing; remove the integration cache and enable again");
+        bail!(
+            "Huawei Cloud cache dependencies are missing; reconnect in MCP to retry installation"
+        );
     }
-    let adapter = dest
-        .join("adapter.mjs")
+    Ok(())
+}
+
+fn enable(dirs: &ProductDirs, install: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
+    let config = dirs.user().join("mcp.json");
+    let before = read_optional(&config)?;
+    owned_entry(before.as_deref())?;
+    let skill = skill_path(dirs);
+    let prior_skill = read_optional(&skill)?;
+    if prior_skill.as_deref().is_some_and(|text| text != SKILL) {
+        bail!("huaweicloud-preview skill already exists with local changes; preserve or rename it before enabling");
+    }
+    prepare(dirs, install)?;
+    let launcher = write_launcher(dirs, &std::env::current_exe()?)?;
+    let launcher = launcher
         .to_str()
         .context("integration path is not UTF-8")?
         .to_string();
-    let merged = merge_stdio_mcp_server_into_text(before.as_deref(), SERVER, "node", &[adapter])?;
+    let merged = merge_stdio_mcp_server_into_text(before.as_deref(), SERVER, "node", &[launcher])?;
     let mut value: Value = serde_json::from_str(&merged)?;
     let entry = &mut value["mcpServers"][SERVER];
     entry["managedBy"] = json!(OWNER);
@@ -282,6 +448,15 @@ fn status(dirs: &ProductDirs) -> Result<()> {
         Some(entry) if entry["disabled"] == true => "disabled",
         Some(_) => "enabled",
     };
+    let dependencies = if root(dirs)
+        .join("node_modules/undici/package.json")
+        .is_file()
+    {
+        "ready"
+    } else {
+        "not ready; enable/reconnect in MCP to retry, or run atomcode cloud doctor"
+    };
+    println!("Local dependencies: {dependencies}");
     let grants = entry.as_ref().is_some_and(|entry| {
         entry["trust"] == true
             || entry["autoApprove"]
@@ -310,6 +485,83 @@ mod tests {
         ProductDirs::new(root, ".test-product")
     }
     #[test]
+    fn preinstallation_is_disabled_and_preserves_settings_and_deletion() {
+        let temp = tempfile::tempdir().unwrap();
+        let dirs = dirs(temp.path());
+        let executable = Path::new("/a path/atomcode");
+        register_preinstalled(&dirs, executable).unwrap();
+        let config = dirs.user().join("mcp.json");
+        let mut value: Value =
+            serde_json::from_str(&read_optional(&config).unwrap().unwrap()).unwrap();
+        assert_eq!(value["mcpServers"][SERVER]["disabled"], true);
+        assert_eq!(value["mcpServers"][SERVER]["trust"], false);
+        assert!(skill_path(&dirs).is_file());
+        value["mcpServers"][SERVER]["disabled"] = json!(false);
+        value["mcpServers"][SERVER]["trust"] = json!(true);
+        atomic_write(&config, value.to_string().as_bytes()).unwrap();
+        register_preinstalled(&dirs, executable).unwrap();
+        assert_eq!(read_optional(&config).unwrap().unwrap(), value.to_string());
+        std::fs::remove_file(&config).unwrap();
+        register_preinstalled(&dirs, executable).unwrap();
+        assert!(!config.exists());
+    }
+
+    #[test]
+    fn preinstallation_preserves_user_server_and_custom_skill() {
+        let temp = tempfile::tempdir().unwrap();
+        let dirs = dirs(temp.path());
+        let config = dirs.user().join("mcp.json");
+        let custom = r#"{"mcpServers":{"huaweicloud":{"command":"custom"}}}"#;
+        atomic_write(&config, custom.as_bytes()).unwrap();
+        assert!(register_preinstalled(&dirs, Path::new("atomcode")).is_err());
+        assert_eq!(read_optional(&config).unwrap().as_deref(), Some(custom));
+        std::fs::remove_file(&config).unwrap();
+        atomic_write(&skill_path(&dirs), b"local skill").unwrap();
+        register_preinstalled(&dirs, Path::new("atomcode")).unwrap();
+        assert_eq!(
+            read_optional(&skill_path(&dirs)).unwrap().as_deref(),
+            Some("local skill")
+        );
+    }
+
+    #[test]
+    fn simultaneous_preparation_publishes_one_complete_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let dirs = dirs(temp.path());
+        let installs = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    prepare(&dirs, |path| {
+                        installs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        fake_install(path)
+                    })
+                    .unwrap()
+                });
+            }
+        });
+        assert_eq!(installs.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn dependency_failure_leaves_disabled_registration_and_can_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let dirs = dirs(temp.path());
+        register_preinstalled(&dirs, Path::new("atomcode")).unwrap();
+        let before = read_optional(&dirs.user().join("mcp.json")).unwrap();
+        assert!(prepare(&dirs, |_| bail!("offline")).is_err());
+        assert!(!root(&dirs).exists());
+        prepare(&dirs, fake_install).unwrap();
+        std::fs::remove_dir_all(root(&dirs).join("node_modules")).unwrap();
+        prepare(&dirs, fake_install).unwrap();
+        prepare(&dirs, |_| panic!("cache should be reused")).unwrap();
+        assert_eq!(
+            read_optional(&dirs.user().join("mcp.json")).unwrap(),
+            before
+        );
+    }
+
+    #[test]
     fn enable_disable_preserve_other_servers_and_never_grant_trust() {
         let temp = tempfile::tempdir().unwrap();
         let dirs = dirs(temp.path());
@@ -324,6 +576,11 @@ mod tests {
         assert_eq!(value["mcpServers"]["other"]["env"]["TOKEN"], "kept");
         assert_eq!(value["mcpServers"][SERVER]["trust"], false);
         assert_eq!(value["mcpServers"][SERVER]["autoApprove"], json!([]));
+        assert_eq!(
+            value["mcpServers"][SERVER]["args"][0],
+            json!(root(&dirs).with_extension("mjs"))
+        );
+        assert!(root(&dirs).with_extension("mjs").is_file());
         let parsed = atomcode_capabilities::mcp::parse_mcp_servers(
             &serde_json::to_string(&value).unwrap(),
             atomcode_capabilities::mcp::McpConfigSource::User,

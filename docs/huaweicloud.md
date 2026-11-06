@@ -1,10 +1,10 @@
 # Huawei Cloud sandbox preview (V1)
 
-AtomCode includes an opt-in HuaweiCloud Devkit adapter. It is off until explicitly enabled; normal sessions do not install dependencies or start a Huawei Cloud process. It uses the existing MCP lifecycle, panel, tool search and approval mechanisms. This version supports sandbox preview and diagnostics, not unrestricted cloud administration.
+AtomCode includes an opt-in HuaweiCloud Devkit adapter. It is off until explicitly enabled; coding, WebUI, daemon and ACP startup register it disabled and prepare pinned local dependencies in a background process. No cloud connection starts until enabled. It uses the existing MCP lifecycle, panel, tool search and approval mechanisms. This version supports sandbox preview and diagnostics, not unrestricted cloud administration.
 
 ## Enable and diagnose
 
-Install Node.js **22.19 or newer** with npm, then run:
+Install Node.js **22.19 or newer** with npm. On startup, open the MCP panel and enable `huaweicloud`; no manual plugin installation or session restart is needed for this panel action. Enabling/reconnecting retries missing dependencies. Background failures are retried on a later startup after one hour. Existing registrations and deliberate deletion are respected. The following terminal commands remain available:
 
 ```sh
 atomcode cloud enable
@@ -62,4 +62,5 @@ Optional install smoke test (requires npm registry access, runs under a throwawa
 
 ```sh
 node scripts/huaweicloud-smoke.mjs target/debug/atomcode
+node scripts/huaweicloud-preinstall-smoke.mjs target/debug/atomcode
 ```

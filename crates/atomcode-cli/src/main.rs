@@ -1607,6 +1607,12 @@ async fn run(process_start: std::time::Instant) -> Result<i32> {
 
     // No --help was passed. Parse normally to get the Cli struct.
     let cli = Cli::parse();
+    if let Some(Commands::Cloud(cloud_cmd::CloudCli::Prepare { user_dir })) = &cli.command {
+        return cloud_cmd::handle(cloud_cmd::CloudCli::Prepare {
+            user_dir: user_dir.clone(),
+        })
+        .map(|()| 0);
+    }
     // Launch-only override: inherited by deferred runtimes and reloads, never
     // written to config.toml. CLI takes precedence over an inherited env value.
     if cli.no_review {
@@ -1813,6 +1819,21 @@ async fn run(process_start: std::time::Instant) -> Result<i32> {
         .maybe_emit_install_completed(&resolved.atomcode_dir)
         .await;
     // ── End telemetry init ────────────────────────────────────────────────────
+
+    if matches!(
+        &cli.command,
+        None | Some(
+            Commands::Resume { .. }
+                | Commands::Login
+                | Commands::Codingplan
+                | Commands::Webui { .. }
+                | Commands::Daemon { .. }
+                | Commands::Acp
+        )
+    ) {
+        // Optional local integration must never block or fail the coding session.
+        let _ = cloud_cmd::preinstall();
+    }
 
     // Handle subcommands. Most are self-contained (`handle_command` runs
     // and exits); `Login` (and its hidden alias `Codingplan`) run the

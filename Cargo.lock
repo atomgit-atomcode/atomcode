@@ -336,6 +336,7 @@ dependencies = [
  "crossterm",
  "ctor",
  "dirs",
+ "fs2",
  "futures",
  "is-terminal",
  "libc",

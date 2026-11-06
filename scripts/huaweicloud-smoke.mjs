@@ -23,12 +23,15 @@ try {
   const server = read().mcpServers.huaweicloud;
   assert.equal(server.trust, false); assert.deepEqual(server.autoApprove, []); assert.equal(server.timeout_ms, 300000);
   assert.equal(read().mcpServers.other.env.EXAMPLE, 'preserved');
+  // CLI enable must keep the retry launcher rather than bypassing it.
+  assert.ok(!server.args[0].endsWith('/adapter.mjs'));
+  rmSync(join(server.args[0].slice(0, -4), 'node_modules'), { recursive: true, force: true });
   const requests = [
     { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} },
     { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} },
     { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'huaweicloud_retrieve_skill', arguments: { name: 'huawei-sandbox' } } },
   ].map(value => JSON.stringify(value)).join('\n') + '\n';
-  const result = spawnSync(server.command, server.args, { env, input: requests, encoding: 'utf8', timeout: 20000 });
+  const result = spawnSync(server.command, server.args, { env, input: requests, encoding: 'utf8', timeout: 180000 });
   assert.equal(result.status, 0, result.error?.message || result.stderr);
   const replies = result.stdout.trim().split('\n').map(line => JSON.parse(line));
   const tools = replies.find(reply => reply.id === 2)?.result?.tools;
