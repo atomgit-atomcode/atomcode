@@ -48,7 +48,9 @@ use crate::controllers::{
     EvalOutcome, GoalPhase, GoalProgress, GoalRecoveryKind, GoalResult, GoalState, GoalTerminal,
     LoopProgress, LoopState, ScheduleWakeupTool, WakeupRequest,
 };
-use crate::parts::{prepare_with_plugin_hook_source_reusing_lease, SessionLeaseSource};
+use crate::parts::{
+    prepare_with_plugin_hook_source_reusing_lease, SessionBinding, SessionLeaseSource,
+};
 #[cfg(test)]
 use crate::prepare_with_plugin_hook_source;
 use crate::{CodingAgentConfig, CodingProviderFactory, PluginHookSource, PrepareOptions};
@@ -4729,16 +4731,19 @@ fn spawn_runtime_owner_with_optional_agent(
         // rebuild replaces the parts and the person's switches outlive it.
         let mut mcp_disable_holds: BTreeMap<String, McpDisableHold> = BTreeMap::new();
         if agent_available {
-            replay_pending_resume_prompt(
+            kernel_turn_open = replay_pending_resume_prompt(
                 &agent,
-                resources.as_mut(),
+                resources
+                    .as_mut()
+                    .and_then(|runtime| runtime.parts.session.as_mut()),
                 controls.state.as_ref(),
                 generation,
                 &mut next_turn_id,
                 &mut active_turn,
                 &mut turn_stats,
                 &mut agent_available,
-            );
+                &runtime_event_tx,
+            ) == ResumeReplayOutcome::Sent;
         }
         if let Some(reason) = provider_unavailable_reason {
             let _ = runtime_event_tx.send(CodingRuntimeEvent::ProviderUnavailable {
@@ -5148,15 +5153,46 @@ fn spawn_runtime_owner_with_optional_agent(
                         if let Some(runtime) = resources.as_ref() {
                             runtime.parts.team_manager.begin_generation(generation);
                         }
+                        // The replacement is the only live agent this binding
+                        // has before the next rebuild, so a resume replay the
+                        // previous one could not deliver is retried here rather
+                        // than reported over.
+                        let replay = replay_pending_resume_prompt(
+                            &agent,
+                            resources
+                                .as_mut()
+                                .and_then(|runtime| runtime.parts.session.as_mut()),
+                            controls.state.as_ref(),
+                            generation,
+                            &mut next_turn_id,
+                            &mut active_turn,
+                            &mut turn_stats,
+                            &mut agent_available,
+                            &runtime_event_tx,
+                        );
+                        kernel_turn_open |= replay == ResumeReplayOutcome::Sent;
                         if resume_after_replace {
                             compaction_suspended = false;
-                            controls
-                                .state
-                                .store(
+                            // A deferred replay already stored the failed phase;
+                            // a sent one stored the turn it opened.
+                            if replay == ResumeReplayOutcome::Idle
+                                || replay == ResumeReplayOutcome::Obsolete
+                            {
+                                controls.state.store(
                                     runtime_phase_state(generation, RuntimePhase::Ready),
                                     Ordering::Release,
                                 );
+                            }
                         }
+                        // `done` reports the replacement, which is installed
+                        // whether or not the replay ran: the caller has no other
+                        // agent to fall back to, and this channel only carries
+                        // `()`. A deferred replay is not silent — it left the
+                        // failed phase and a `ControllerWarning` carrying the
+                        // reason on the event stream, the surfaces every replay
+                        // site reports through. An outcome that could also say
+                        // "installed, replay pending" would change `manage`'s
+                        // signature for every control.
                         let _ = done.send(());
                     }
                     Some(OwnerControl::Shutdown { done }) => {
@@ -7637,10 +7673,36 @@ fn spawn_runtime_owner_with_optional_agent(
                                     pending_steer_acknowledgements.clear();
                                 }
                                 event_generation.store(generation, Ordering::Release);
-                                controls.state.store(
-                                    runtime_phase_state(generation, resumed),
-                                    Ordering::Release,
+                                pending_steer_acknowledgements.clear();
+                                // A resume whose replay the previous generation
+                                // could not deliver is retried here: the patch
+                                // changed the provider behind the agent, and the
+                                // prompt and its retraction are still the log's.
+                                // Reporting `resumed` instead would claim a
+                                // readiness that lets a new turn run past a
+                                // prompt the log still hides.
+                                let replay = replay_pending_resume_prompt(
+                                    &agent,
+                                    resources
+                                        .as_mut()
+                                        .and_then(|runtime| runtime.parts.session.as_mut()),
+                                    controls.state.as_ref(),
+                                    generation,
+                                    &mut next_turn_id,
+                                    &mut active_turn,
+                                    &mut turn_stats,
+                                    &mut agent_available,
+                                    &runtime_event_tx,
                                 );
+                                kernel_turn_open |= replay == ResumeReplayOutcome::Sent;
+                                if replay == ResumeReplayOutcome::Idle
+                                    || replay == ResumeReplayOutcome::Obsolete
+                                {
+                                    controls.state.store(
+                                        runtime_phase_state(generation, resumed),
+                                        Ordering::Release,
+                                    );
+                                }
                                 runtime_event_tx.carry_live_view(generation);
                                 if let (Some(turn), Some(current)) = (active_turn, running_model) {
                                     turn_model_before_selection = Some((generation, turn, current.clone()));
@@ -7670,6 +7732,21 @@ fn spawn_runtime_owner_with_optional_agent(
                                         operation: ReconfigureKind::Provider,
                                     },
                                 );
+                                // The swap committed and its provider events
+                                // went out under the new generation, so the
+                                // caller is told it happened. A replay the new
+                                // provider deferred already left the failure
+                                // phase and a `ControllerWarning` carrying the
+                                // reason, and callers read the phase off this
+                                // runtime's status: the pending replay is visible
+                                // there, not only in this value. Reporting the
+                                // swap as failed would send the caller back to
+                                // the old provider while this runtime runs the
+                                // new one. A distinct "swapped, replay pending"
+                                // outcome would take a result type the daemon's
+                                // snapshot commit and the CLI's config write both
+                                // understand — a caller contract change this path
+                                // cannot decide.
                                 let _ = done.send(Ok(RuntimeGeneration(generation)));
                                 continue;
                             }
@@ -7803,18 +7880,28 @@ fn spawn_runtime_owner_with_optional_agent(
                                 let reasoning_effort_applicable =
                                     runtime.config.supports_reasoning_effort;
                                 runtime_event_tx.seed_live_view(generation, &runtime);
-                                replay_pending_resume_prompt(
+                                let replay = replay_pending_resume_prompt(
                                     &agent,
-                                    Some(&mut runtime),
+                                    runtime.parts.session.as_mut(),
                                     controls.state.as_ref(),
                                     generation,
                                     &mut next_turn_id,
                                     &mut active_turn,
                                     &mut turn_stats,
                                     &mut agent_available,
+                                    &runtime_event_tx,
                                 );
+                                kernel_turn_open |= replay == ResumeReplayOutcome::Sent;
                                 resources = Some(runtime);
-                                if active_turn.is_none() {
+                                // A replay that could not run already set the
+                                // failure phase; a ready store here would hide
+                                // it and let a turn run past its pending prompt.
+                                // The caller is still told the swap happened:
+                                // see the send below for why that is the contract.
+                                if active_turn.is_none()
+                                    && agent_available
+                                    && replay != ResumeReplayOutcome::Deferred
+                                {
                                     controls.state.store(
                                         runtime_phase_state(generation, RuntimePhase::Ready),
                                         Ordering::Release,
@@ -7838,6 +7925,16 @@ fn spawn_runtime_owner_with_optional_agent(
                                         operation: ReconfigureKind::Provider,
                                     },
                                 );
+                                // The swap committed: the daemon commits this
+                                // generation as the binding's provider identity,
+                                // so an `Err` here would leave it pointed at the
+                                // old one and route later requests by the wrong
+                                // provider. A deferred replay is reported through
+                                // the failed phase and the warning above, and the
+                                // next rebuild retries it. Reporting "committed,
+                                // replay pending" separately would take a result
+                                // type the daemon and CLI commit on; that is a
+                                // caller contract change this path cannot decide.
                                 let _ = done.send(Ok(RuntimeGeneration(generation)));
                             }
                             Err(candidate_error) => {
@@ -8627,14 +8724,38 @@ fn spawn_runtime_owner_with_optional_agent(
                             }
                             None => {}
                         }
+                        // A resumed session may carry a prompt its previous
+                        // process accepted but never answered. This binding is
+                        // the switch's only chance to hand it back; no other
+                        // step of this path replays it.
+                        let replay = replay_pending_resume_prompt(
+                            &agent,
+                            runtime.parts.session.as_mut(),
+                            controls.state.as_ref(),
+                            generation,
+                            &mut next_turn_id,
+                            &mut active_turn,
+                            &mut turn_stats,
+                            &mut agent_available,
+                            &runtime_event_tx,
+                        );
+                        kernel_turn_open |= replay == ResumeReplayOutcome::Sent;
                         let changed = session_changed(generation, &runtime);
                         let cwd = runtime.config.working_dir.clone();
                         if changes_session { mode_model_return = None; }
                         resources = Some(runtime);
-                        controls.state.store(
-                            runtime_phase_state(generation, RuntimePhase::Ready),
-                            Ordering::Release,
-                        );
+                        // A replay that could not run already set the failure
+                        // phase; a ready store here would hide it and let a
+                        // turn run past its pending prompt.
+                        if active_turn.is_none()
+                            && agent_available
+                            && replay != ResumeReplayOutcome::Deferred
+                        {
+                            controls.state.store(
+                                runtime_phase_state(generation, RuntimePhase::Ready),
+                                Ordering::Release,
+                            );
+                        }
                         runtime_event_tx.session_changed(changed.clone(), resources.as_ref());
                         if changes_session {
                             if let Some(intervention) = pending_policy_intervention.take() {
@@ -8651,6 +8772,17 @@ fn spawn_runtime_owner_with_optional_agent(
                         }
                         let _ = runtime_event_tx
                             .send(CodingRuntimeEvent::Reconfigured { operation });
+                        // The switch itself committed, so the caller is told it
+                        // happened. A replay this candidate could not prepare is
+                        // not a failed switch: its failed phase and the
+                        // `ControllerWarning` naming the reason are what the
+                        // caller's status read reports, and the next rebuild
+                        // retries it — an `Err` here would send the caller back
+                        // to a session this generation no longer holds. A distinct
+                        // "switched, replay pending" outcome would take a result
+                        // type the daemon's snapshot commit and the CLI's config
+                        // write both understand; that is a caller contract change
+                        // this path cannot decide.
                         let _ = done.send(Ok(changed));
                     }
                     Some(CodingRuntimeControl::ApplyUndo {
@@ -10797,26 +10929,78 @@ fn request_cancel_snapshot(agent: &Option<AgentHandle>) -> bool {
         && send_agent_command(agent, AgentCommand::Snapshot)
 }
 
+/// What a runtime generation must do about a resume prompt the session handed
+/// back when it was bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResumeReplayOutcome {
+    /// No prompt was waiting.
+    Idle,
+    /// The prompt reached the agent under a new turn.
+    Sent,
+    /// The prompt was dropped because the conversation moved on.
+    Obsolete,
+    /// The replay could not be prepared; the prompt is still pending, so the
+    /// generation must not report ready while the conversation is without it.
+    Deferred,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn replay_pending_resume_prompt(
     agent: &Option<AgentHandle>,
-    resources: Option<&mut RuntimeResources>,
+    session: Option<&mut SessionBinding>,
     runtime_state: &AtomicU64,
     generation: u64,
     next_turn_id: &mut u64,
     active_turn: &mut Option<u64>,
     turn_stats: &mut RuntimeTurnStats,
     agent_available: &mut bool,
-) {
-    let Some(runtime) = resources else {
-        return;
+    event_tx: &RuntimeEventEmitter,
+) -> ResumeReplayOutcome {
+    let Some(binding) = session else {
+        return ResumeReplayOutcome::Idle;
     };
-    let Some(binding) = runtime.parts.session.as_mut() else {
-        return;
+    let Some(prompt) = binding.pending_resume_prompt.take() else {
+        return ResumeReplayOutcome::Idle;
     };
-    let Some(prompt) = binding.pending_resume_prompt.as_ref() else {
-        return;
-    };
+    // Loading a session only hands the prompt back; the retraction happens here,
+    // immediately before the replay is actually sent. A preview that dropped the
+    // prompt therefore leaves the conversation unchanged.
+    match binding
+        .manager
+        .prepare_resume_replay(&binding.lease, &prompt)
+    {
+        Ok(atomcode_capabilities::session::manager::PrepareResumeReplay::Prepared) => {}
+        Ok(atomcode_capabilities::session::manager::PrepareResumeReplay::Obsolete) => {
+            let _ = event_tx.send(CodingRuntimeEvent::ControllerWarning(
+                "the resumed prompt was not replayed because the conversation moved on".into(),
+            ));
+            return ResumeReplayOutcome::Obsolete;
+        }
+        Err(error) => {
+            // The prompt was handed back under a pending view that hides it, so
+            // continuing would let a new turn run past a prompt the log still
+            // holds. Keep the prompt so a rebuild retries it, and stop this
+            // generation: reporting ready would let exactly that happen.
+            //
+            // No timer retries this. The prepare failed against the candidate
+            // this generation just built, and nothing about that candidate
+            // changes on its own, so an immediate retry would repeat the same
+            // read. The prompt and its marker are the log's: the next rebuild
+            // (`/model`, a provider reload, a resume) retries the prepare when it
+            // builds a new generation.
+            binding.pending_resume_prompt = Some(prompt);
+            let _ = event_tx.send(CodingRuntimeEvent::ControllerWarning(format!(
+                "the resumed prompt could not be prepared for replay: {error}; \
+                 it stays pending and will be replayed when the runtime is rebuilt"
+            )));
+            *agent_available = false;
+            runtime_state.store(
+                runtime_phase_state(generation, RuntimePhase::Failed),
+                Ordering::Release,
+            );
+            return ResumeReplayOutcome::Deferred;
+        }
+    }
     *next_turn_id = next_turn_id.wrapping_add(1);
     *active_turn = Some(*next_turn_id);
     *turn_stats = RuntimeTurnStats::default();
@@ -10824,22 +11008,33 @@ fn replay_pending_resume_prompt(
         runtime_phase_state(generation, RuntimePhase::InTurn),
         Ordering::Release,
     );
-    if send_agent_command(
+    let delivered = send_agent_command(
         agent,
         AgentCommand::SendMessage {
             text: prompt.text.clone(),
             images: prompt.images.clone(),
         },
-    ) {
-        binding.pending_resume_prompt = None;
-    } else {
+    );
+    if !delivered {
+        // The prepared rewind stands; put the prompt back as it came back from
+        // the log so a rebuild or a provider change can retry it instead of
+        // leaving it hidden. A rebuilt `Message::user` would drop any other
+        // field the pending prompt carries.
+        binding.pending_resume_prompt = Some(prompt);
+        let _ = event_tx.send(CodingRuntimeEvent::ControllerWarning(
+            "the resumed prompt could not be handed to the agent; \
+             it will be replayed when the runtime is rebuilt"
+                .into(),
+        ));
         *agent_available = false;
         *active_turn = None;
         runtime_state.store(
             runtime_phase_state(generation, RuntimePhase::Failed),
             Ordering::Release,
         );
+        return ResumeReplayOutcome::Deferred;
     }
+    ResumeReplayOutcome::Sent
 }
 
 async fn receive_agent_event(agent: &mut Option<AgentHandle>) -> Option<AgentEvent> {
@@ -21348,7 +21543,10 @@ type = "openai"
             &original,
             id,
             project.path(),
-            &SessionSnapshot::new(vec![Message::user("original history")]),
+            &SessionSnapshot::new(vec![
+                Message::user("original history"),
+                Message::assistant("done", Vec::new()),
+            ]),
         );
         persist_native_session(
             &elsewhere,
@@ -21433,7 +21631,10 @@ type = "openai"
             &original,
             id,
             project.path(),
-            &SessionSnapshot::new(vec![Message::user("before marker change")]),
+            &SessionSnapshot::new(vec![
+                Message::user("before marker change"),
+                Message::assistant("done", Vec::new()),
+            ]),
         );
         let mut start = native_start(false);
         start.agent.working_dir = project.path().to_path_buf();
@@ -21760,6 +21961,401 @@ type = "openai"
 
         runtime.handle.shutdown().await.unwrap();
         manager.acquire_lease("session-b").unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn session_switch_replays_an_unanswered_prompt() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let manager = atomcode_capabilities::session::SessionManager::for_project(
+            project.path(),
+            &crate::config::product_dirs_from_env(),
+        );
+        persist_native_session(
+            &manager,
+            "session-a",
+            project.path(),
+            &SessionSnapshot::new(vec![
+                Message::user("complete"),
+                Message::assistant("answer", Vec::new()),
+            ]),
+        );
+        let source = SessionSnapshot::new(vec![
+            Message::user("old question"),
+            Message::assistant("old answer", Vec::new()),
+        ]);
+        persist_native_session(&manager, "session-b", project.path(), &source);
+        let mut inflight = source.clone();
+        inflight.messages.push(Message::user("replay after switch"));
+        std::fs::write(
+            manager.root().join("session-b.snapshot.inflight"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "replay_safe": true,
+                "snapshot": inflight,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.prepare.session = crate::SessionMode::Resume("session-a".into());
+        let mut runtime = CodingRuntime::start(start).await.unwrap();
+        runtime.handle.resume_session("session-b").await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            wait_for_turn_finished(&mut runtime),
+        )
+        .await
+        .expect("the switched-to session replays its recovered prompt");
+        runtime.handle.shutdown().await.unwrap();
+        runtime.task.await.unwrap();
+
+        let loaded = manager.load_native_session("session-b").unwrap();
+        let replayed = loaded
+            .snapshot
+            .messages
+            .iter()
+            .filter(|message| message.text == "replay after switch")
+            .count();
+        assert_eq!(replayed, 1, "{:?}", loaded.snapshot.messages);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn a_failed_replay_send_keeps_the_prompt_for_a_retry() {
+        use atomcode_kernel::session::SessionEvent;
+
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let manager = Arc::new(atomcode_capabilities::session::SessionManager::for_project(
+            project.path(),
+            &crate::config::product_dirs_from_env(),
+        ));
+        let id = "replay-send-failure";
+        let source = SessionSnapshot::new(vec![
+            Message::user("old question"),
+            Message::assistant("old answer", Vec::new()),
+        ]);
+        persist_native_session(&manager, id, project.path(), &source);
+        let mut inflight = source.clone();
+        inflight.messages.push(Message::user("replay me"));
+        std::fs::write(
+            manager.root().join(format!("{id}.snapshot.inflight")),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "replay_safe": true,
+                "snapshot": inflight,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let lease = manager.acquire_lease(id).unwrap();
+        let (_loaded, pending) = manager
+            .open_for_resume_noting(&lease, &mut Vec::new())
+            .unwrap();
+        let mut pending = pending.expect("the checkpoint's prompt is handed back");
+        // A field a rebuilt `Message::user` would drop.
+        pending.meta = Some(MessageMeta {
+            turn_id: 7,
+            round: 2,
+            request_id: 9,
+            ..Default::default()
+        });
+        let mut binding = SessionBinding::test_binding(id, manager.clone(), lease, Some(pending));
+
+        // An agent whose command channel is already closed: the prepared replay
+        // cannot be handed over.
+        let (commands, commands_rx) = tokio::sync::mpsc::unbounded_channel::<AgentCommand>();
+        drop(commands_rx);
+        let (_events_tx, events) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        let agent = Some(AgentHandle {
+            commands,
+            events,
+            task: tokio::spawn(async {}),
+        });
+        let (raw_tx, mut raw_rx) = tokio::sync::mpsc::unbounded_channel::<CodingRuntimeEvent>();
+        let emitter = RuntimeEventEmitter::new(raw_tx, None, Arc::new(AtomicU64::new(0)));
+        let state = AtomicU64::new(runtime_phase_state(0, RuntimePhase::Reconfiguring));
+        let mut next_turn_id = 0;
+        let mut active_turn = None;
+        let mut turn_stats = RuntimeTurnStats::default();
+        let mut agent_available = true;
+
+        let delivered = replay_pending_resume_prompt(
+            &agent,
+            Some(&mut binding),
+            &state,
+            0,
+            &mut next_turn_id,
+            &mut active_turn,
+            &mut turn_stats,
+            &mut agent_available,
+            &emitter,
+        );
+        assert_eq!(
+            delivered,
+            ResumeReplayOutcome::Deferred,
+            "a dead agent must not report the turn open"
+        );
+
+        let restored = binding
+            .pending_resume_prompt
+            .as_ref()
+            .expect("the prompt is kept for the next rebuild");
+        assert_eq!(restored.text, "replay me");
+        assert!(
+            restored.meta.is_some(),
+            "the original message is kept, not one rebuilt from text and images"
+        );
+        assert!(!agent_available, "the dead agent must not be reused");
+        assert!(active_turn.is_none());
+        assert_eq!(
+            runtime_status(state.load(Ordering::Acquire)).phase,
+            RuntimePhase::Failed,
+            "the failure phase must survive the caller's ready store"
+        );
+        assert!(matches!(
+            raw_rx.try_recv(),
+            Ok(CodingRuntimeEvent::ControllerWarning(_))
+        ));
+
+        // The prepared rewind stands; a retry after a rebuild adds no second one.
+        let rewinds = || {
+            manager
+                .load_events(id)
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(event.event, SessionEvent::Rewound { .. }))
+                .count()
+        };
+        assert_eq!(rewinds(), 1);
+        agent_available = true;
+        let delivered = replay_pending_resume_prompt(
+            &agent,
+            Some(&mut binding),
+            &state,
+            0,
+            &mut next_turn_id,
+            &mut active_turn,
+            &mut turn_stats,
+            &mut agent_available,
+            &emitter,
+        );
+        assert_eq!(delivered, ResumeReplayOutcome::Deferred);
+        assert!(binding.pending_resume_prompt.is_some());
+        assert_eq!(rewinds(), 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn a_delivered_replay_reports_the_turn_open() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let manager = Arc::new(atomcode_capabilities::session::SessionManager::for_project(
+            project.path(),
+            &crate::config::product_dirs_from_env(),
+        ));
+        let id = "replay-delivered";
+        let source = SessionSnapshot::new(vec![
+            Message::user("old question"),
+            Message::assistant("old answer", Vec::new()),
+        ]);
+        persist_native_session(&manager, id, project.path(), &source);
+        let mut inflight = source.clone();
+        inflight.messages.push(Message::user("replay me"));
+        std::fs::write(
+            manager.root().join(format!("{id}.snapshot.inflight")),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "replay_safe": true,
+                "snapshot": inflight,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let lease = manager.acquire_lease(id).unwrap();
+        let (_loaded, pending) = manager
+            .open_for_resume_noting(&lease, &mut Vec::new())
+            .unwrap();
+        let mut binding = SessionBinding::test_binding(id, manager.clone(), lease, pending);
+
+        let (commands, mut commands_rx) = tokio::sync::mpsc::unbounded_channel::<AgentCommand>();
+        let (_events_tx, events) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        let agent = Some(AgentHandle {
+            commands,
+            events,
+            task: tokio::spawn(async {}),
+        });
+        let (raw_tx, _raw_rx) = tokio::sync::mpsc::unbounded_channel::<CodingRuntimeEvent>();
+        let emitter = RuntimeEventEmitter::new(raw_tx, None, Arc::new(AtomicU64::new(0)));
+        let state = AtomicU64::new(runtime_phase_state(0, RuntimePhase::Reconfiguring));
+        let mut next_turn_id = 0;
+        let mut active_turn = None;
+        let mut turn_stats = RuntimeTurnStats::default();
+        let mut agent_available = true;
+
+        let delivered = replay_pending_resume_prompt(
+            &agent,
+            Some(&mut binding),
+            &state,
+            0,
+            &mut next_turn_id,
+            &mut active_turn,
+            &mut turn_stats,
+            &mut agent_available,
+            &emitter,
+        );
+
+        assert_eq!(
+            delivered,
+            ResumeReplayOutcome::Sent,
+            "a handed-over replay opens the agent's turn"
+        );
+        assert!(active_turn.is_some());
+        assert_eq!(
+            runtime_status(state.load(Ordering::Acquire)).phase,
+            RuntimePhase::InTurn
+        );
+        assert!(binding.pending_resume_prompt.is_none());
+        match commands_rx.try_recv() {
+            Ok(AgentCommand::SendMessage { text, .. }) => assert_eq!(text, "replay me"),
+            _ => panic!("the replay must reach the agent"),
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn a_replay_that_cannot_prepare_stays_pending_and_blocks_ready() {
+        use atomcode_kernel::session::{LoggedEvent, SessionEvent};
+
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let manager = Arc::new(atomcode_capabilities::session::SessionManager::for_project(
+            project.path(),
+            &crate::config::product_dirs_from_env(),
+        ));
+        let id = "replay-prepare-failure";
+        let lease = manager.acquire_lease(id).unwrap();
+        let mut meta = SessionMeta::new(id, project.path().to_string_lossy(), 1);
+        meta.owner = StorageOwner::Native;
+        manager
+            .create_event_session(
+                &lease,
+                &atomcode_kernel::session::SessionHeader::new(id),
+                &meta,
+            )
+            .unwrap();
+        manager
+            .append_events(
+                &lease,
+                &[
+                    LoggedEvent {
+                        seq: 1,
+                        at: 0,
+                        event: SessionEvent::TurnStart { turn: 1 },
+                    },
+                    LoggedEvent {
+                        seq: 2,
+                        at: 0,
+                        event: SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "replay me".into(),
+                            images: vec![],
+                        },
+                    },
+                ],
+            )
+            .unwrap();
+        let (_loaded, pending) = manager
+            .open_for_resume_noting(&lease, &mut Vec::new())
+            .unwrap();
+        let mut binding = SessionBinding::test_binding(id, manager.clone(), lease, pending);
+        assert!(binding.pending_resume_prompt.is_some());
+
+        // A log this build cannot read makes the retraction unpreparable, so the
+        // replay cannot run even though the agent is healthy.
+        let events_path = manager.events_path(id).unwrap();
+        let saved = std::fs::read(&events_path).unwrap();
+        std::fs::write(&events_path, b"not a record\n").unwrap();
+
+        let (commands, mut commands_rx) = tokio::sync::mpsc::unbounded_channel::<AgentCommand>();
+        let (_events_tx, events) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        let agent = Some(AgentHandle {
+            commands,
+            events,
+            task: tokio::spawn(async {}),
+        });
+        let (raw_tx, mut raw_rx) = tokio::sync::mpsc::unbounded_channel::<CodingRuntimeEvent>();
+        let emitter = RuntimeEventEmitter::new(raw_tx, None, Arc::new(AtomicU64::new(0)));
+        let state = AtomicU64::new(runtime_phase_state(0, RuntimePhase::Reconfiguring));
+        let mut next_turn_id = 0;
+        let mut active_turn = None;
+        let mut turn_stats = RuntimeTurnStats::default();
+        let mut agent_available = true;
+
+        let outcome = replay_pending_resume_prompt(
+            &agent,
+            Some(&mut binding),
+            &state,
+            0,
+            &mut next_turn_id,
+            &mut active_turn,
+            &mut turn_stats,
+            &mut agent_available,
+            &emitter,
+        );
+        assert_eq!(outcome, ResumeReplayOutcome::Deferred);
+        assert!(
+            binding.pending_resume_prompt.is_some(),
+            "the prompt is kept for the rebuild's retry"
+        );
+        assert!(
+            !agent_available,
+            "the generation must stop instead of reporting ready"
+        );
+        assert!(active_turn.is_none());
+        assert_eq!(
+            runtime_status(state.load(Ordering::Acquire)).phase,
+            RuntimePhase::Failed,
+            "a ready store must not hide the prompt the conversation is missing"
+        );
+        assert!(matches!(
+            raw_rx.try_recv(),
+            Ok(CodingRuntimeEvent::ControllerWarning(_))
+        ));
+        assert!(
+            commands_rx.try_recv().is_err(),
+            "nothing may reach the agent before the retraction is in the log"
+        );
+
+        // A rebuild after the cause is gone replays the same prompt once.
+        std::fs::write(&events_path, saved).unwrap();
+        agent_available = true;
+        let outcome = replay_pending_resume_prompt(
+            &agent,
+            Some(&mut binding),
+            &state,
+            0,
+            &mut next_turn_id,
+            &mut active_turn,
+            &mut turn_stats,
+            &mut agent_available,
+            &emitter,
+        );
+        assert_eq!(outcome, ResumeReplayOutcome::Sent);
+        assert!(binding.pending_resume_prompt.is_none());
+        assert!(active_turn.is_some());
+        match commands_rx.try_recv() {
+            Ok(AgentCommand::SendMessage { text, .. }) => assert_eq!(text, "replay me"),
+            _ => panic!("the retry must reach the agent"),
+        }
     }
 
     #[tokio::test]

@@ -465,6 +465,27 @@ pub struct SessionBinding {
     staged_fresh: Option<(SessionMeta, SessionHeader)>,
 }
 
+#[cfg(test)]
+impl SessionBinding {
+    /// A binding for tests that exercise one runtime step without assembling
+    /// the whole capability graph.
+    pub(crate) fn test_binding(
+        id: &str,
+        manager: Arc<SessionManager>,
+        lease: SessionLease,
+        pending_resume_prompt: Option<Message>,
+    ) -> Self {
+        Self {
+            id: id.to_string(),
+            manager,
+            lease,
+            resume: None,
+            pending_resume_prompt,
+            staged_fresh: None,
+        }
+    }
+}
+
 /// A live binding carries its storage owner across rebuilds. An importer only
 /// transfers a lease, which must still match the requested project's manager.
 pub(crate) enum SessionLeaseSource {
