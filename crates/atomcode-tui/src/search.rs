@@ -39,6 +39,7 @@ use crate::frame::{Line, Span};
 use crate::moment::Moment;
 use crate::surface::{Key, KeyPress, Mods};
 use crate::theme::{self, Role};
+use std::sync::Arc;
 
 /// A reverse search, while it is up.
 ///
@@ -59,7 +60,7 @@ pub struct Search {
     before: String,
     before_caret: usize,
     before_at: Option<usize>,
-    before_pastes: Vec<String>,
+    before_pastes: Arc<Vec<String>>,
 }
 
 impl Search {
@@ -219,7 +220,7 @@ fn rematch(m: &mut Moment, s: &mut Search) {
     m.input = s.query.clone();
     // A recalled entry carries no folded pastes of its own — the log stores the
     // expanded text — so whatever the draft was holding does not belong to it.
-    m.pastes.clear();
+    Arc::make_mut(&mut m.pastes).clear();
     m.recent_folded_paste = None;
     // The history position is the search's to say now, and it says it as
     // "search 'x' 2/5". Two counters on one shoulder would be two answers.
@@ -275,7 +276,7 @@ mod tests {
 
     fn moment(history: &[&str]) -> Moment {
         Moment {
-            history: history.iter().map(|s| (*s).to_string()).collect(),
+            history: Arc::new(history.iter().map(|s| (*s).to_string()).collect()),
             ..Default::default()
         }
     }
@@ -459,7 +460,7 @@ mod tests {
     fn the_list_is_newest_at_the_bottom_and_keeps_the_lit_row_in_view() {
         let history: Vec<String> = (0..20).map(|i| format!("step {i}")).collect();
         let mut m = Moment {
-            history: history.clone(),
+            history: Arc::new(history.clone()),
             ..Default::default()
         };
         begin(&mut m);
