@@ -51,7 +51,7 @@ JSON 的对象键和字符串值均支持以下变量，数值和布尔值保持
 | `${HOME}` | 用户 home 目录 |
 | `${env:VAR}` | 已定义的环境变量 VAR；未定义时报错 |
 
-不能把本机路径直接当作 file URI。未知变量、替换后的重复对象键、坏 JSON 和不可读文件均报错，不静默发送空对象。每个 JSON 文件最大 1 MiB。配置文件路径本身支持 `~`，不展开上述 JSON 模板。
+不能把本机路径直接当作 file URI。未知变量、替换后的重复对象键、坏 JSON 和不可读文件均报错，不静默发送空对象。每个 JSON 文件最大 1 MiB。`init_options_file` 和 `settings_file` 的路径也支持以上变量；模板先展开，再按本机路径或 `file://` URI 解析。相对路径仍以用户配置目录为基准，`~` 仍可使用。非文件协议 URI、URI 查询参数和 fragment 会被拒绝，不进行网络读取。
 
 ## 工作区设置
 
@@ -97,7 +97,7 @@ hover = "on"
 - disabled=true：停用该语言服务并保留声明。
 - 能力 off：明确返回 configured_disabled，不调用该能力。auto：本地定义/悬停/引用按服务端静态或动态能力声明判断，不支持返回 unsupported；on：即使服务未声明也尝试调用，由实际响应决定结果。
 - diagnostics 支持服务端推送，不要求 diagnosticProvider；关闭时不拉取、不存储或展示该服务的诊断。
-- document_symbols 当前仍需要 IDE backend。本地能力开关不会使未实现的操作变得可用。
+- document_symbols 支持 local 与 IDE backend；local 会先同步文档，再请求标准文件大纲。
 - IDE 与本地查询都遵守配置禁用。inspect 若包含被禁用的子能力，整体拒绝并指出该能力；可改为单独调用允许的查询。
 - `[lsp] enabled` 继续控制本地进程；IDE 绑定保持原有独立启用语义。
 
@@ -117,7 +117,7 @@ atomcode lsp probe --file src/main.cj
 atomcode lsp probe --file src/main.cj --line 13 --col 26 --method definition --trace verbose
 ```
 
-method 只允许 definition、references、hover。line/col 从 1 开始，col 按 Unicode 字符计算，客户端转换为服务端协商的编码。输出连接根目录、初始化来源、服务端能力、有效策略、耗时、日志位置及查询结果；失败返回非零退出码。此入口复用模型的正式 LSP 工具。
+method 支持 definition、references、hover、document-symbols。前三项需要 line/col；大纲查询无需位置。line/col 从 1 开始，col 按 Unicode 字符计算，客户端转换为服务端协商的编码。输出连接根目录、初始化来源、服务端能力、有效策略、耗时、日志位置及查询结果；失败返回非零退出码。此入口复用模型的正式 LSP 工具。
 
 一次性二分排查：
 
@@ -138,3 +138,72 @@ atomcode lsp probe --file src/main.cj --no-lsp-init-options
 trace 默认为 off；messages 记录初始化参数、能力及消息元数据，省略普通查询正文；verbose 记录更多请求响应和服务 stderr。日志写入用户数据目录的 logs/lsp.log，常见凭据键、其对应字符串值和本次 JSON 环境替换值会脱敏（包括服务端错误文本中的回显），verbose 仍可能含源代码和其他业务信息。单条日志最大 256 KiB，日志约 8 MiB 后停止追加；排查下一次前可归档日志并 reload。服务器 stderr 在握手期间保留最近 8 KiB，持续消费以避免堵塞进程。
 
 当前仓颉 Windows SDK 尚需人工验收；模拟协议测试不能替代真实跨包查询验证。
+
+## 本地大纲与空结果重试
+
+local 后端支持 `document_symbols`：先打开或同步文件，再发送标准
+`textDocument/documentSymbol`，遵守 `features.document_symbols` 开关。
+同时兼容层级和平铺符号结果，查询无需行列：
+
+```json
+{"operation":"document_symbols","backend":"local","file_path":"src/main.cj"}
+```
+
+CLI probe 复用同一查询路径：
+
+```sh
+atomcode lsp probe --file src/main.cj --method document-symbols
+```
+
+对于首次语义查询返回空结果的服务端，可在服务器配置中开启有界重试：
+
+```toml
+[lsp.servers.cj]
+command = "C:/CangJie_HOME/cangjie/tools/bin/LSPServer.exe"
+root_markers = ["cjpm.toml"]
+retry_attempts = 3
+retry_interval_ms = 5000
+```
+
+- `retry_attempts` 是包含首次请求的总次数，默认 1，范围 1–5。
+- `retry_interval_ms` 是空结果后的等待间隔，默认 5000 毫秒，范围 0–10000。
+- 仅对成功但为空的 hover、definition、references、document_symbols 重试。
+  错误、不支持或禁用的能力、取消均不重试。
+- 初始化和文档同步后，每次查询的全部尝试与等待共享 30 秒预算。
+  重试复用同一客户端和已打开文档，不重复启动进程或 didOpen。
+- 次数用尽返回最后一次空结果；空结果不代表服务端不支持该能力。
+  diagnostics 保持原有 settle-delay 行为，IDE bridge 不使用这些重试设置。
+
+
+## 多项目初始化文件
+
+全局配置可显式指向每个项目自己的 JSON，无需切换项目时改模块名：
+
+```toml
+[lsp.servers.cj]
+command = "C:/CangJie_HOME/cangjie/tools/bin/LSPServer.exe"
+root_markers = ["cjpm.toml"]
+init_options_mode = "on"
+init_options_file = "${workspaceFolder}/.atomcode/lsp_init.json"
+# 可选：settings_file = "${workspaceFolder}/.atomcode/lsp_settings.json"
+```
+
+项目中的 `.atomcode/lsp_init.json` 使用自己的包名：
+
+```json
+{
+  "multiModuleOption": {
+    "${workspaceUri}": {
+      "name": "该项目 cjpm.toml 中的 package.name",
+      "src_path": "${workspaceUri}/src"
+    }
+  }
+}
+```
+
+优先使用 `${workspaceFolder}` 表达文件路径；也支持
+`init_options_file = "${workspaceUri}/.atomcode/lsp_init.json"`，file URI 会解码为本机路径。
+变量里的项目根由 `root_markers` 决定，不一定是启动目录。
+文件内容修改后运行 LSP `reload`，下一次查询会重读；服务命令或声明本身改变仍需重载 runtime。
+这是全局配置显式授权读取项目 JSON，不会自动加载或合并项目 `.atomcode/config.toml`。
+仓库中的初始化选项会交给本地语言服务器处理，使用前应审查其内容。

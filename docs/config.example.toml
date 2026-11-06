@@ -264,6 +264,19 @@ mode = "follow_system"
 [coding]
 max_rounds = 0
 
+# ---- Plan / Build 模式模型绑定（可选）----
+# 让 /plan 与 /build 各自使用不同的模型与思考强度；整段留空表示不绑定，行为与以前一致。
+# model 填已配置的模型选择 ID（[models.<id>] 的键名，也兼容 legacy [providers.<id>]）；
+# reasoning_effort 填该模型声明的档位，或 default（API 默认）。留空表示跟随/使用模型配置。
+# 示例里的 planner / executor 需先在 [models.*] 中定义，详见 docs/mode-models.md。
+# [modes.plan]
+# model = "planner"
+# reasoning_effort = "high"
+#
+# [modes.build]
+# model = "executor"
+# reasoning_effort = "low"
+
 [loop_config]
 max_rounds = 100
 

@@ -132,6 +132,19 @@ impl View for Settings {
                     width::take_width(&format!("  {text}"), w),
                     theme::fg(Role::Accent),
                 ),
+                Row::KeybindingEdit { value, caret } => {
+                    let prefix = " ".repeat(2.min(w.saturating_sub(1)));
+                    let room = w.saturating_sub(prefix.len());
+                    let mut spans = vec![Span::raw(prefix)];
+                    spans.extend(chrome::caret_spans(
+                        &value,
+                        caret,
+                        theme::fg(Role::Accent),
+                        room,
+                        vp.moment.caps,
+                    ));
+                    Line::from_spans(spans)
+                }
                 Row::Nothing => Line::styled(
                     width::take_width(&t(Msg::SettingsNoMatch), w),
                     theme::fg(Role::Muted),
@@ -192,6 +205,10 @@ impl View for Settings {
 #[derive(Clone, Debug, PartialEq)]
 enum Row {
     Keybinding(String),
+    KeybindingEdit {
+        value: String,
+        caret: usize,
+    },
     /// The panel's name and its pages, on one row: `设置  Config  Status …`.
     ///
     /// One row, not two. The name and the pages answer the same question —
@@ -312,6 +329,55 @@ fn layout(
         let at = rows.len() - 1;
         rows.splice(at..at, std::iter::repeat_n(Row::Blank, anchor - rows.len()));
     }
+    config_window(rows, panel.cursor, h)
+}
+
+/// Keep the pointed setting visible. Rendering and click geometry both use
+/// this window, so a scrolled row retains its index in the filtered list.
+fn config_window(mut rows: Vec<Row>, cursor: usize, h: usize) -> Vec<Row> {
+    if rows.len() <= h || h < 6 {
+        return fit(rows, h);
+    }
+    // As in fit(), give up decoration before sacrificing list entries.
+    while rows.len() > h {
+        let Some(at) = rows
+            .iter()
+            .rposition(|row| matches!(row, Row::Rule | Row::Legend | Row::Blank))
+        else {
+            break;
+        };
+        rows.remove(at);
+    }
+    if rows.len() <= h {
+        return rows;
+    }
+    let entries = rows
+        .iter()
+        .filter(|row| matches!(row, Row::Setting { .. } | Row::Editing { .. }))
+        .count();
+    if entries == 0 {
+        return fit(rows, h);
+    }
+    let fixed = rows.len() - entries;
+    let room = h.saturating_sub(fixed + 1).max(1);
+    let at = cursor
+        .min(entries - 1)
+        .saturating_sub(room - 1)
+        .min(entries.saturating_sub(room));
+    let mut index = 0;
+    rows.retain(|row| {
+        if matches!(row, Row::Setting { .. } | Row::Editing { .. }) {
+            let visible = (at..at + room).contains(&index);
+            index += 1;
+            visible
+        } else {
+            true
+        }
+    });
+    rows.push(Row::Scroll {
+        above: at,
+        below: entries.saturating_sub(at + room),
+    });
     fit(rows, h)
 }
 
@@ -352,6 +418,12 @@ fn rows_for(
     rows.push(Row::Rule);
     if let Some(editor) = panel.keybindings.as_ref() {
         rows.extend(editor.lines().into_iter().map(Row::Keybinding));
+        if let crate::settings::KeybindingMode::Manual(edit) = &editor.mode {
+            rows.push(Row::KeybindingEdit {
+                value: edit.value.clone(),
+                caret: edit.caret,
+            });
+        }
         rows.push(Row::Rule);
         return rows;
     }
@@ -547,6 +619,19 @@ fn fit(mut rows: Vec<Row>, h: usize) -> Vec<Row> {
             break;
         };
         rows.remove(at);
+    }
+    // The row taking text must survive even when the remaining contents do not
+    // fit. Use these same rows for hit testing, so scrolling to it cannot make
+    // a click refer to the setting that used to occupy its screen position.
+    if h > 0 {
+        if let Some(at) = rows.iter().position(|row| {
+            matches!(
+                row,
+                Row::Editing { .. } | Row::KeybindingEdit { .. } | Row::Search { caret: Some(_) }
+            )
+        }) {
+            rows.drain(..at.saturating_sub(h - 1));
+        }
     }
     rows.truncate(h);
     rows
@@ -2201,6 +2286,69 @@ pub fn value_column(row: &crate::settings::SettingRow) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn long_config_lists_follow_selection_and_keep_click_indices() {
+        let settings = SettingsView::new(
+            (0..60)
+                .map(|i| {
+                    row(
+                        &format!("setting.{i}"),
+                        &format!("Setting {i}"),
+                        "true",
+                        SettingKind::Boolean,
+                    )
+                })
+                .collect(),
+        );
+        let mut panel = Panel::new();
+        for h in [6, 10, 24, 50] {
+            for cursor in [0, 1, 20, 59, 30, 0] {
+                panel.cursor = cursor;
+                let rows = layout(&settings, &panel, None, None, 80, h);
+                assert!(rows.len() <= h);
+                assert!(
+                    rows.iter()
+                        .any(|r| matches!(r, Row::Setting { index } if *index == cursor)),
+                    "cursor {cursor} at height {h}"
+                );
+                assert!(rows.iter().any(|r| matches!(r, Row::Scroll { .. })));
+                let m = moment(Some(panel.clone()), settings.clone());
+                let vp = Viewport::new(
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        w: 80,
+                        h: h as u16,
+                    },
+                    &m,
+                );
+                let geom = geometry(&m, &vp);
+                for (y, row) in rows.iter().enumerate() {
+                    if let Row::Setting { index } = row {
+                        assert_eq!(geom.setting_at(y), Some(*index));
+                    }
+                }
+            }
+        }
+        panel.cursor = 0;
+        for key in [
+            Key::PageDown,
+            Key::PageDown,
+            Key::Down,
+            Key::Up,
+            Key::PageUp,
+        ] {
+            crate::settings::key(&settings, &mut panel, crate::surface::KeyPress::plain(key));
+            let rows = layout(&settings, &panel, None, None, 80, 10);
+            assert!(rows
+                .iter()
+                .any(|r| matches!(r, Row::Setting { index } if *index == panel.cursor)));
+        }
+        panel.cursor = 0;
+        panel.query = "Setting 59".into();
+        let rows = layout(&settings, &panel, None, None, 80, 10);
+        assert!(rows.iter().any(|r| matches!(r, Row::Setting { index: 0 })));
+    }
     #[test]
     fn source_details_show_loaded_state_without_hiding_the_path() {
         use atomcode_host_api::{SourceFile, SourceGroup};
@@ -4401,6 +4549,56 @@ mod tests {
             block.text, "2",
             "the caret sits on the character it is on, not past the end"
         );
+    }
+
+    #[test]
+    fn input_carets_stay_visible_while_manually_editing_long_shortcuts() {
+        use crate::settings::{KeybindingEditor, KeybindingMode, NEWLINE_KEYS};
+        let value = "alt+j, ctrl+j, shift+enter, alt+enter";
+        let mut editor = KeybindingEditor::opening("default");
+        editor.mode = KeybindingMode::Manual(Edit::opening(NEWLINE_KEYS.into(), value.into()));
+        let panel = Panel {
+            keybindings: Some(editor),
+            ..Panel::new()
+        };
+        let m = moment(Some(panel), two());
+        for w in [8, 20, 80] {
+            for h in [1, 3, 6, 24] {
+                let rows = lines(&m, w, h);
+                assert!(rows.len() <= h as usize);
+                let blocks: Vec<_> = rows
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .filter(|s| s.style.reverse)
+                    .collect();
+                assert_eq!(blocks.len(), 1, "{w}x{h}: {rows:?}");
+                assert_eq!(blocks[0].text, " ");
+            }
+        }
+    }
+
+    #[test]
+    fn a_short_settings_panel_keeps_the_active_edit_without_making_it_clickable() {
+        let panel = Panel {
+            editing: Some(Edit::opening("coding.max_rounds".into(), "123".into())),
+            cursor: 1,
+            ..Panel::new()
+        };
+        let m = moment(Some(panel), two());
+        for h in [1, 3, 6, 14] {
+            let vp = Viewport::new(Rect::sized(70, h), &m);
+            let rows = Settings::render(&State, &vp);
+            let active = rows
+                .iter()
+                .position(|line| line.spans.iter().any(|s| s.style.reverse))
+                .expect("the active edit survives clipping");
+            assert!(rows[active].plain().contains("123"));
+            assert_eq!(geometry(&m, &vp).setting_at(active), None);
+        }
+        let searching = moment(Some(Panel::new()), two());
+        let one_row = lines(&searching, 20, 1);
+        assert_eq!(one_row.len(), 1);
+        assert!(one_row[0].spans.iter().any(|s| s.style.reverse));
     }
 
     #[test]

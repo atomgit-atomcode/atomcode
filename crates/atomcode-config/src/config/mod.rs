@@ -323,6 +323,27 @@ impl DefaultExecutionMode {
     }
 }
 
+/// Human-consent policy for persistent automation management. Execution mode
+/// and the permissions of the scheduled task itself are separate decisions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationApproval {
+    #[default]
+    Always,
+    Inherit,
+}
+impl AutomationApproval {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Always => "always",
+            Self::Inherit => "inherit",
+        }
+    }
+    pub fn is_always(&self) -> bool {
+        *self == Self::Always
+    }
+}
+
 /// `[permissions]` — user-declared pre-authorization for tool calls, so the common
 /// commands in a project stop prompting without reaching for the all-or-nothing
 /// `--dangerously-skip-permissions`.
@@ -341,6 +362,9 @@ impl DefaultExecutionMode {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PermissionsConfig {
+    /// Inherit permits schedule mutations without a click only in live Auto mode.
+    #[serde(default, skip_serializing_if = "AutomationApproval::is_always")]
+    pub automation_approval: AutomationApproval,
     /// Startup mode; temporary mode changes never write this value back.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_mode: Option<DefaultExecutionMode>,
@@ -355,7 +379,10 @@ pub struct PermissionsConfig {
 impl PermissionsConfig {
     /// No startup mode or rules declared — omit the empty table on save.
     pub fn is_empty(&self) -> bool {
-        self.default_mode.is_none() && self.allow.is_empty() && self.deny.is_empty()
+        self.automation_approval.is_always()
+            && self.default_mode.is_none()
+            && self.allow.is_empty()
+            && self.deny.is_empty()
     }
 }
 
@@ -556,6 +583,11 @@ impl CompactionConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(
+        default,
+        skip_serializing_if = "crate::mode_models::ModeModels::is_empty"
+    )]
+    pub modes: crate::mode_models::ModeModels,
     #[serde(default, skip_serializing_if = "CompactionConfig::is_default")]
     pub compaction: CompactionConfig,
     #[serde(default)]
@@ -799,9 +831,9 @@ fn default_terminal_status_glyph() -> bool {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ScrollbarMode {
-    #[default]
     Auto,
     Always,
+    #[default]
     Hidden,
 }
 
@@ -832,9 +864,11 @@ pub struct UiConfig {
     /// Shift to drag-select natively when they want to. Read once at startup (like
     /// `theme`); `--no-mouse` overrides it off for one launch, Ctrl+G toggles it
     /// live. Default on locally — except on HarmonyOS, whose terminal reports no
-    /// mouse at all (see [`default_mouse`]). SSH/PuTTY start with native terminal
-    /// copy/paste even when enabled here. Ctrl+G toggles application mouse live;
-    /// ATOMCODE_MOUSE=1 explicitly opts in at startup.
+    /// mouse at all (see [`default_mouse`]). Ordinary SSH uses reported mouse
+    /// events too, so a wheel cannot be confused with input-history arrows.
+    /// Explicit PuTTY/browser terminals prefer native selection at startup;
+    /// ATOMCODE_MOUSE=1 opts in there when enabled here. Ctrl+G toggles it live.
+    /// A confirmed tmux mouse=off disables capture until this process restarts.
     #[serde(default = "default_mouse")]
     pub mouse: bool,
     /// Conversation scrollbar visibility in the full-screen UI; read at startup.
@@ -913,6 +947,9 @@ pub struct UiKeybindings {
     /// None restores shipped bindings; an empty list disables the chords.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub newline: Option<Vec<String>>,
+    /// Edit the highlighted suggested answer; absent means Ctrl+E. Interpreted by TUI.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub question_edit: Option<String>,
 }
 
 impl Default for UiConfig {
@@ -1114,6 +1151,7 @@ impl Default for Config {
             provider_accounts: HashMap::new(),
             models: HashMap::new(),
             default_model: None,
+            modes: Default::default(),
             datalog: Default::default(),
             notifications: Default::default(),
             network: Default::default(),
@@ -3940,6 +3978,7 @@ model = "missing-type"
             provider_accounts: HashMap::new(),
             models: HashMap::new(),
             default_model: None,
+            modes: Default::default(),
             datalog: DatalogConfig {
                 enabled: false,
                 dir: Some("/var/log/ac".to_string()),

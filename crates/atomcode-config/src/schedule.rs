@@ -4,11 +4,33 @@ use std::path::PathBuf;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Schedule {
-    Daily { time: String },               // "HH:MM"
-    Weekly { weekday: u8, time: String }, // weekday 1..=7 (1=Mon)
+    /// Triggered explicitly by an event, never registered with the OS.
+    Manual,
+    Daily {
+        time: String,
+    }, // "HH:MM"
+    Weekly {
+        weekday: u8,
+        time: String,
+    }, // weekday 1..=7 (1=Mon)
     Hourly,
-    Interval { every_minutes: u32 },
-    Cron { expr: String },
+    Interval {
+        every_minutes: u32,
+    },
+    Cron {
+        expr: String,
+    },
+}
+
+/// Immutable execution options for an explicitly requested one-shot follow-up.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FollowUpTask {
+    pub source_session: String,
+    pub source_turn: u64,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -18,6 +40,8 @@ pub struct ScheduleTask {
     pub prompt: String,
     pub cwd: String,
     pub schedule: Schedule,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_up: Option<FollowUpTask>,
     #[serde(default = "default_mode")]
     pub permission_mode: String, // "plan" | "accept_edits" | "auto"
     #[serde(default = "default_notify")]
@@ -166,7 +190,7 @@ pub fn next_run(schedule: &Schedule, now_epoch_secs: i64) -> Option<i64> {
                 target + 86400
             })
         }
-        Schedule::Cron { .. } => None,
+        Schedule::Manual | Schedule::Cron { .. } => None,
     }
 }
 
@@ -189,6 +213,7 @@ mod tests {
             created_at: 0,
             last_run_at: None,
             last_status: None,
+            follow_up: None,
         }
     }
 

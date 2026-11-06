@@ -143,6 +143,20 @@ impl Plan {
         self.calls.retain(|c| c.turn < turn);
     }
 
+    fn has_sources(&self, undone: &std::collections::BTreeSet<u64>) -> bool {
+        self.calls
+            .iter()
+            .rev()
+            .find(|call| {
+                !call.failed
+                    && !undone.contains(&call.turn)
+                    && atomcode_capabilities::tools::todo::is_todo_plan(&call.args)
+            })
+            .and_then(|call| serde_json::from_str(&call.args).ok())
+            .and_then(|args| atomcode_capabilities::tools::todo_sources::source_seqs(&args).ok())
+            .is_some_and(|sources| !sources.is_empty())
+    }
+
     /// How many items are not completed yet.
     pub(crate) fn open_items(&self) -> usize {
         self.fold(&std::collections::BTreeSet::new())
@@ -202,6 +216,13 @@ pub(crate) fn plan_text(events: &[atomcode_kernel::session::LoggedEvent]) -> Str
         out.push_str(todo_glyph(item.status, true));
         out.push(' ');
         out.push_str(&item.content);
+    }
+    let sources = atomcode_capabilities::tools::todo_sources::source_plan(events);
+    if !sources.source_seqs.is_empty() {
+        out.push_str(&format!(
+            "\n{}",
+            crate::i18n::product::t(crate::i18n::product::Msg::TodoSourceHint)
+        ));
     }
     out
 }
@@ -319,6 +340,14 @@ impl View for Todo {
                         open,
                     })
                     .into_owned(),
+                    counts,
+                ),
+                El::styled(
+                    if w >= 60 && state.plan.has_sources(&vp.moment.undone) {
+                        " · /todo source".to_string()
+                    } else {
+                        String::new()
+                    },
                     counts,
                 ),
                 El::styled(

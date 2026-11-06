@@ -1,8 +1,10 @@
 // Two-column layout: sidebar + chat, header with cwd breadcrumb + config.
 // VSCode design system: timeline messages, violet brand, floating input.
 
-import { useEffect, useRef, useState } from 'preact/hooks';
+import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
+import { sessionSelectionDisposition } from './lib/sessionBrowse';
 import { Chat } from './components/Chat';
+import { Workbench, hasUnsavedWorkbenchDrafts, persistWorkbenchState } from './components/Workbench';
 import { Sidebar } from './components/Sidebar';
 import { Automation } from './components/Automation';
 import { ThemeDialog, LanguageDialog, RemoteAccessDialog, NotificationsDialog } from './components/SettingsDialogs';
@@ -32,10 +34,34 @@ function shortSessionId(id: string): string {
 }
 
 export function App() {
+  const [workbenchOpen, setWorkbenchOpen] = useState(false);
+  useEffect(()=>{
+    const warn=(event:BeforeUnloadEvent)=>{persistWorkbenchState();if(hasUnsavedWorkbenchDrafts()){event.preventDefault();event.returnValue='';}};
+    window.addEventListener('beforeunload',warn);
+    return()=>window.removeEventListener('beforeunload',warn);
+  },[]);
   const t = useT();
   const { lang } = useSettings();
-  // URL 里是短 id，不能直接当完整 id 用（后端需要完整 id）；先置空，挂载后再还原。
+  const [browseSession, setBrowseSession] = useState<SessionMetaWithProject | null>(null);
+  const [executionActive, setExecutionActive] = useState(false);
+  const executionActiveRef = useRef(false);
+  const reportExecution = useCallback((active: boolean) => {
+    executionActiveRef.current = active;
+    setExecutionActive(active);
+  }, []);
+  // Bound runtime identity; history browsing never changes this value.
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [workbenchFile, setWorkbenchFile] = useState<{session:string;path:string;seq:number}|null>(null);
+  useEffect(() => {
+    const open = (event: Event) => {
+      const detail = (event as CustomEvent<{session:string;path:string}>).detail;
+      if (detail?.session !== sessionId || typeof detail.path !== 'string') return;
+      setWorkbenchFile({ ...detail, seq: Date.now() });
+      setWorkbenchOpen(true);
+    };
+    window.addEventListener('workbench-open-file', open);
+    return () => window.removeEventListener('workbench-open-file', open);
+  }, [sessionId]);
   const [activeSession, setActiveSession] = useState<SessionMetaWithProject | null>(null);
   // 首条消息发出瞬间插入的「乐观会话」：让新会话即时出现在侧栏（后端空会话不入列表，
   // 真实标题也要等回合落盘后自动命名）。其 id 与真实会话对齐后，列表刷新会用真实条目
@@ -278,6 +304,7 @@ export function App() {
   // 在指定目录下创建一个新会话并切过去（落地、侧栏可见）。
   // 先重置画布回落地页给即时反馈，再异步建会话；失败则停在落地页。
   function openNewSession(targetCwd: string | undefined) {
+    setBrowseSession(null);
     setSessionId(null);
     setActiveSession(null);
     setOptimisticSession(null);
@@ -312,6 +339,16 @@ export function App() {
   }
 
   function handleSelectSession(session: SessionMetaWithProject) {
+    const disposition = sessionSelectionDisposition(sessionId, session.id, executionActiveRef.current, browseSession !== null);
+    if (disposition === 'return') { setBrowseSession(null); setSidebarOpen(false); return; }
+    if (disposition === 'browse') {
+      setBrowseSession(session); setSidebarOpen(false); return;
+    }
+    activateSession(session);
+  }
+
+  function activateSession(session: SessionMetaWithProject) {
+    setBrowseSession(null);
     setOptimisticSession(null);
     setSessionId(session.id);
     setActiveSession(session);
@@ -372,6 +409,7 @@ export function App() {
 
   // 删除会话：若删的是当前打开的会话，回到空白新对话。
   function handleSessionDeleted(id: string) {
+    if (browseSession?.id === id) setBrowseSession(null);
     if (id === sessionId) {
       setSessionId(null);
       setActiveSession(null);
@@ -420,7 +458,8 @@ export function App() {
     <div class="app">
       {/* ===== Full-height sidebar (通栏)：品牌 + 收起按钮在其顶部 ===== */}
       <Sidebar
-        activeSessionId={sessionId}
+        activeSessionId={browseSession?.id ?? sessionId}
+        runningSessionId={executionActive ? sessionId : null}
         onSelect={handleSelectSession}
         onNew={handleNewSession}
         onOpenAutomation={() => { automationNavigation.current++; setSidebarOpen(false); setShowAutomation(true); }}
@@ -436,7 +475,7 @@ export function App() {
         projectHash={projectHash}
         onSessionRenamed={handleSessionRenamed}
         onSessionDeleted={handleSessionDeleted}
-        onPickSkill={(name) => setSkillInsert({ name, seq: Date.now() })}
+        onPickSkill={(name) => { setBrowseSession(null); setSkillInsert({ name, seq: Date.now() }); }}
         onOpenRemote={() => setSettingsSection('remote')}
         onOpenCwd={() => setShowCwd(true)}
         onOpenSourceControl={() => setShowSourceControl(true)}
@@ -449,6 +488,7 @@ export function App() {
 
       {/* ===== Main column: sticky session-title header + chat (no top bar) ===== */}
       <div class="main-column">
+        {(!workbenchOpen || !sessionId) && <button class="workbench-toggle" disabled={restoring} onClick={() => { if (!sessionId) openNewSession(cwd || undefined); setWorkbenchOpen(true); }} aria-expanded={workbenchOpen && !!sessionId}>{lang === 'zh' ? '工作区' : 'Workspace'}</button>}
         {/* Mobile-only floating menu button (the old top bar carried the ☰; the
             redesign has no top bar, so a fixed button gives mobile drawer access). */}
         <button
@@ -460,7 +500,7 @@ export function App() {
           ☰
         </button>
 
-        {activeSession?.name && !isLanding && (
+        {activeSession?.name && !isLanding && !browseSession && (
           <header class="session-header" ref={headerMenuRef}>
             <button
               class="session-title-btn"
@@ -529,7 +569,12 @@ export function App() {
         )}
 
         <div class="session-body app-sidebar">
+          <div class="session-chat-column">
           <Chat
+            browseSession={browseSession}
+            onExecutionState={reportExecution}
+            onReturnToBound={() => setBrowseSession(null)}
+            onContinueBrowse={() => { if (!executionActiveRef.current && browseSession) activateSession(browseSession); }}
             sessionId={sessionId}
             onSessionId={handleSessionAssigned}
             cwd={cwd}
@@ -550,6 +595,8 @@ export function App() {
             composerInsert={composerInsert}
             onSessionRenamed={(name) => setActiveSession((prev) => prev ? { ...prev, name } : prev)}
           />
+          </div>
+          {workbenchOpen && sessionId && <div style={{ display: browseSession ? 'none' : 'contents' }}><Workbench key={sessionId} session={sessionId} cwd={activeSession?.working_dir || cwd} requestedFile={workbenchFile} onFileOpened={() => setWorkbenchFile(null)} onClose={() => setWorkbenchOpen(false)} /></div>}
         </div>
       </div>
 

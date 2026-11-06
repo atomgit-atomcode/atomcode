@@ -149,7 +149,54 @@ impl Plugin for FsToolsPlugin {
     }
 }
 
+/// Explicit row: requires the host's artifact store before mounting either tool.
+pub struct PatchToolsPlugin;
+#[async_trait]
+impl Plugin for PatchToolsPlugin {
+    fn name(&self) -> &'static str {
+        "tool-patch"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["product-dirs", "tools", "fs", "output-artifacts"]
+    }
+    fn description(&self) -> &'static str {
+        "import immutable user diffs and apply them by verified reference"
+    }
+    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        let world = ctx
+            .require::<crate::seams::FsSvc>()
+            .map_err(|e| e.to_string())?;
+        mount(
+            ctx,
+            vec![
+                Arc::new(atomcode_capabilities::tools::ImportPatchTool::new(
+                    world.clone(),
+                    patch_input_provider(ctx),
+                    atomcode_capabilities::tools::SensitivePaths::of(&*crate::product_dirs(ctx)?),
+                )),
+                Arc::new(atomcode_capabilities::tools::ApplyPatchTool::new(
+                    world,
+                    patch_input_provider(ctx),
+                )),
+            ],
+        )
+    }
+}
+
 pub struct BashToolPlugin;
+
+pub(super) fn patch_input_provider(
+    ctx: &Context,
+) -> atomcode_capabilities::tools::output_artifact::ArtifactStoreProvider {
+    use crate::agent::OnlySession;
+    let ctx = ctx.clone();
+    Arc::new(move || {
+        let scoped = crate::agent::scoped(&ctx);
+        let session = scoped.only_session()?;
+        let store = scoped.service::<crate::seams::OutputArtifactsSvc>()?;
+        Some(Arc::new(store.scoped_inputs(session.id())))
+    })
+}
 
 pub(super) fn shell_output_provider(
     ctx: &Context,
@@ -213,7 +260,7 @@ impl Plugin for BashToolPlugin {
              Anything meant to keep running — a dev server, a watcher, `npm run dev` — goes through \
              `bash_start`: read its output with `bash_poll` and stop it with `bash_kill`. \
              Long builds/tests also use `bash_start`, then `bash_poll` with wait_ms up to 60000 \
-             (returns early on output or exit), instead of shell sleep or duplicate builds. Do not \
+             (collects output until exit, status change or timeout), instead of shell sleep or duplicate builds. Do not \
              background it inside `bash` (`&`, `nohup`, `start`); a `bash` call is for a command that \
              finishes. Preserve the original build/test exit status; output-filtering or \
              status-printing wrappers can hide failures.",

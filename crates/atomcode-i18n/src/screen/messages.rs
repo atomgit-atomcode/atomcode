@@ -7,6 +7,32 @@
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Msg<'a> {
+    ModelCardTitle,
+    ModelCardViewing,
+    ModelCardReadOnly,
+    ModelCardWebHint,
+    ModelCardScore,
+    ModelCardRank,
+    ModelCardEmpty,
+    ModelCardNoPublic,
+    ModelCardHelp,
+    ModelCardScope,
+    ModelCardConfigured,
+    ModelCardBenchmarks,
+    ModelCardTasks,
+    ModelCardNotes,
+    ModelCardDifferent,
+    ModelCardEvidence,
+    ModelCardSparse,
+    ModelCardBest,
+    ModelCardWorst,
+    ModelCardAgents,
+    ModelCardCoding,
+    ModelCardChat,
+    ModelCardMath,
+    ModelCardVision,
+    ModelCardSearch,
+
     AutomationOlder,
     AutomationTitle,
     AutomationEmpty,
@@ -244,6 +270,8 @@ pub enum Msg<'a> {
     AskLegendSwitch,
     /// Left and right, on a typing row with words in it.
     AskLegendCaret,
+    AskLegendEdit,
+    AskLegendCancelEdit,
 
     // ── the input line (`modules/input.rs`) ──
     InputAnswerKeys,
@@ -544,6 +572,13 @@ pub enum Msg<'a> {
         key: bool,
     },
     DiscoverUnreachable,
+    OllamaUnavailable {
+        endpoint: &'a str,
+        local: bool,
+    },
+    OllamaModelsFound {
+        count: usize,
+    },
     /// The word a `※ recap:` line opens with.
     RecapLabel,
     /// Ctrl+Z where it cannot stop: no job control (Windows), or started with
@@ -557,6 +592,18 @@ pub enum Msg<'a> {
     CmdAboutTodo,
     CmdAboutTeam,
     CmdAboutPaste,
+    CmdAboutPatch,
+    PatchTooLarge,
+    SpecLeadOnly,
+    SpecChanged,
+    SpecTitle,
+    SpecOlder,
+    SpecReview,
+    SpecPin,
+    SpecUnpin,
+    PatchReady,
+    PatchLeadOnly,
+    PatchContextChanged,
     CmdAboutConfig,
     CmdAboutProviderPanel,
     CmdAboutCopy,
@@ -1580,6 +1627,7 @@ pub enum Msg<'a> {
     MouseHandedBackAtStart,
     /// The terminal reports no mouse (HarmonyOS): what works instead, at start.
     MouseUnreportedAtStart,
+    MouseDisabledByTmux,
     /// ctrl-g on a terminal that reports no mouse.
     MouseUnreported,
     /// Said once, after a turn whose reasoning is off the screen: the key that
@@ -2071,6 +2119,12 @@ pub enum Msg<'a> {
     LoginCouldNotStart {
         error: &'a str,
     },
+    /// Said when the automatic browser launch at the top of the login flow
+    /// failed. `{reason}` is the opener's own explanation, which already
+    /// carries the URL for manual access.
+    LoginAutoOpenFailed {
+        reason: &'a str,
+    },
     LoginFailed {
         error: &'a str,
     },
@@ -2309,6 +2363,33 @@ pub enum Msg<'a> {
     },
     /// `/context prompt` against a host that assembles no system prompt.
     ContextNoPrompt,
+    PersonaBuiltin,
+    PersonaConfig,
+    PersonaExplicit,
+    PersonaHost,
+    PersonaAppended,
+    PersonaNotAppended,
+    PersonaAppendUnknown,
+    PersonaUnavailable,
+    HooksExit,
+    HooksIncomplete,
+    HooksTitle,
+    HooksNote,
+    HooksTest,
+    HooksPaths,
+    HooksBack,
+    HooksChanged,
+    FollowUpAbout,
+    FollowUpNew {
+        id: &'a str,
+        spec: &'a str,
+    },
+    FollowUpPending {
+        prompt: &'a str,
+    },
+    FollowUpNone,
+    FollowUpCleared,
+    FollowUpLeadOnly,
     /// The row under an empty composer offering what might be said next. It
     /// names the key, because a dim line with no key on it reads as a label.
     ComposerSuggested {
@@ -2323,6 +2404,9 @@ pub enum Msg<'a> {
     CompactAfterTurn,
     /// The runtime refused because it is busy (a turn, a compaction or a
     /// rebuild under way) — what the host says in place of its own words.
+    ModelNextTurn {
+        model: &'a str,
+    },
     RuntimeBusy,
     /// `/effort <level>` with a level this model does not take; `levels` are
     /// the ones it does.

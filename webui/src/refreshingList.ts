@@ -1,7 +1,7 @@
 /** A shared list with explicit refresh/invalidation, never a permanent empty-on-error cache. */
 export function createRefreshingList<T>(load: () => Promise<T[]>) {
-  let snapshot: { items: T[] | null; loading: boolean; failed: boolean } = {
-    items: null, loading: false, failed: false,
+  let snapshot: { items: T[] | null; loading: boolean; failed: boolean; error: string | null } = {
+    items: null, loading: false, failed: false, error: null,
   };
   const listeners = new Set<(value: typeof snapshot) => void>();
   let generation = 0;
@@ -13,11 +13,11 @@ export function createRefreshingList<T>(load: () => Promise<T[]>) {
   const refresh = (fresh = false): Promise<void> => {
     if (pending && !fresh) return pending;
     const current = ++generation;
-    publish({ ...snapshot, loading: true, failed: false });
+    publish({ ...snapshot, loading: true, failed: false, error: null });
     pending = Promise.resolve().then(load).then((items) => {
-      if (current === generation) publish({ items, loading: false, failed: false });
-    }).catch(() => {
-      if (current === generation) publish({ ...snapshot, loading: false, failed: true });
+      if (current === generation) publish({ items, loading: false, failed: false, error: null });
+    }).catch((error: unknown) => {
+      if (current === generation) publish({ ...snapshot, loading: false, failed: true, error: (error instanceof Error ? error.message : String(error)).slice(0, 300) });
     }).finally(() => {
       if (current === generation) pending = null;
     });
@@ -34,7 +34,7 @@ export function createRefreshingList<T>(load: () => Promise<T[]>) {
     invalidate() {
       ++generation;
       pending = null;
-      publish({ items: null, loading: false, failed: false });
+      publish({ items: null, loading: false, failed: false, error: null });
       if (listeners.size) void refresh();
     },
   };

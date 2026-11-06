@@ -74,7 +74,7 @@ impl View for Providers {
         }
         let view = &vp.moment.providers;
         let caps = vp.moment.caps;
-        layout(view, panel, vp.rect.h as usize)
+        layout(view, panel, vp.rect.h as usize, w)
             .into_iter()
             .map(|row| draw(view, panel, row, w, caps))
             .collect()
@@ -97,7 +97,7 @@ impl View for Providers {
         let mut open = panel.clone();
         open.query.clear();
         Height::Hug(
-            layout(&moment.providers, &open, usize::MAX)
+            layout(&moment.providers, &open, usize::MAX, width as usize)
                 .len()
                 .min(u16::MAX as usize) as u16,
         )
@@ -111,6 +111,7 @@ impl View for Providers {
 /// shape `crate::modules::settings` uses, and for the same reason.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Row {
+    Card(String),
     /// The rule the panel starts with.
     Rule,
     /// The name and the two lists: `provider  账号  模型`.
@@ -137,7 +138,7 @@ enum Row {
     BatchCount,
     BatchModel(usize),
     BatchCapabilities(usize, usize),
-    DiscoveryError,
+    DiscoveryMessage(String),
     AccountSection(bool),
     /// The model picker over the add form: the listing is on its way.
     PickLoading,
@@ -147,8 +148,35 @@ enum Row {
     Pick(usize),
 }
 
-fn layout(view: &ProvidersView, panel: &Panel, h: usize) -> Vec<Row> {
+fn layout(view: &ProvidersView, panel: &Panel, h: usize, w: usize) -> Vec<Row> {
     let mut rows = vec![Row::Rule, Row::Header];
+    if let Some(card) = &panel.card {
+        rows.push(Row::Card(t(Msg::ModelCardHelp).into_owned()));
+        let content = crate::model_cards::lines(view, card, w.saturating_sub(2).max(1));
+        let room = crate::model_cards::viewport_rows(content.len(), h);
+        let start = card.scroll.min(content.len().saturating_sub(room.max(1)));
+        rows.extend(
+            content
+                .iter()
+                .skip(start)
+                .take(room)
+                .cloned()
+                .map(Row::Card),
+        );
+        rows.push(Row::Card(format!(
+            "Esc {} · d {}",
+            t(Msg::LegendBack),
+            t(Msg::ModelCardNotes)
+        )));
+        rows.push(Row::Card(format!(
+            "{}–{} / {}",
+            start + 1,
+            (start + room).min(content.len()),
+            content.len()
+        )));
+        return rows;
+    }
+
     if let Some(Form::Model(ModelForm {
         picking: Some(picking),
         ..
@@ -226,8 +254,29 @@ fn layout(view: &ProvidersView, panel: &Panel, h: usize) -> Vec<Row> {
                 if !form.model.is_empty() {
                     rows.extend((0..3).map(Row::Capabilities));
                 }
-                if form.discovery_error.is_some() {
-                    rows.push(Row::DiscoveryError);
+                if let Some(error) = &form.discovery_error {
+                    rows.extend(
+                        width::wrap(error, w.saturating_sub(2).max(1))
+                            .into_iter()
+                            .map(Row::DiscoveryMessage),
+                    );
+                }
+            }
+            if let Form::Account(form) = form {
+                if let Some(discovery) = &form.discovery {
+                    let message = match &discovery.result {
+                        None => t(Msg::ProviderDiscovering).into_owned(),
+                        Some(Err(error)) => error.clone(),
+                        Some(Ok(models)) => t(Msg::OllamaModelsFound {
+                            count: models.len(),
+                        })
+                        .into_owned(),
+                    };
+                    rows.extend(
+                        width::wrap(&message, w.saturating_sub(2).max(1))
+                            .into_iter()
+                            .map(Row::DiscoveryMessage),
+                    );
                 }
             }
             rows.push(Row::Blank);
@@ -455,11 +504,7 @@ fn draw(view: &ProvidersView, panel: &Panel, row: Row, w: usize, caps: crate::ca
             };
             Line::styled(format!("  {text}"), theme::fg(Role::Muted)).truncate(w)
         }
-        Row::DiscoveryError => {
-            let text = match &panel.form {
-                Some(Form::Model(form)) => form.discovery_error.as_deref().unwrap_or_default(),
-                _ => "",
-            };
+        Row::DiscoveryMessage(text) => {
             Line::styled(format!("  {text}"), theme::fg(Role::Warning)).truncate(w)
         }
         Row::PickLoading => Line::styled(
@@ -484,6 +529,9 @@ fn draw(view: &ProvidersView, panel: &Panel, row: Row, w: usize, caps: crate::ca
             )
         }
         Row::Pick(at) => pick_line(panel, at, w),
+        Row::Card(text) => {
+            Line::styled(format!("  {text}"), theme::fg(Role::Secondary)).truncate(w)
+        }
         Row::Legend => {
             let mut line = Line::styled("  ", theme::fg(Role::Muted));
             for (index, (text, key)) in legend_buttons(view, panel, caps).into_iter().enumerate() {
@@ -943,13 +991,11 @@ fn account_field(
             true,
             form.caret,
         ),
-        AccountField::Key => (
-            t(Msg::FieldKey).into_owned(),
-            dots(form.key_len, form.editing.is_some(), caps),
-            focused,
-            false,
-            0,
-        ),
+        AccountField::Key => {
+            let value = dots(form.key_len, form.editing.is_some(), caps);
+            let caret = if form.key_len == 0 { 0 } else { value.len() };
+            (t(Msg::FieldKey).into_owned(), value, focused, true, caret)
+        }
     }
 }
 
@@ -968,13 +1014,11 @@ fn model_field(
             false,
             0,
         ),
-        ModelField::Key => (
-            t(Msg::FieldKey).into_owned(),
-            dots(form.key_len, false, caps),
-            focused,
-            false,
-            0,
-        ),
+        ModelField::Key => {
+            let value = dots(form.key_len, false, caps);
+            let caret = value.len();
+            (t(Msg::FieldKey).into_owned(), value, focused, true, caret)
+        }
         ModelField::Model => (
             pt(PMsg::ProviderPanelFieldModel).into_owned(),
             form.model.clone(),
@@ -1122,7 +1166,7 @@ fn levels_text(
         .join("")
 }
 
-fn legend(panel: &Panel) -> Vec<(String, String)> {
+fn legend(view: &ProvidersView, panel: &Panel) -> Vec<(String, String)> {
     let key = |k: &str, msg: Msg<'_>| (k.to_string(), t(msg).into_owned());
     match &panel.form {
         Some(Form::Model(ModelForm {
@@ -1156,6 +1200,12 @@ fn legend(panel: &Panel) -> Vec<(String, String)> {
             ),
             key("^s", Msg::ProviderSaveOnly),
             key("esc", Msg::LegendBack),
+        ],
+        Some(Form::Account(form)) if form.is_ollama(view) => vec![
+            key("⏎", Msg::ProviderContinue),
+            key("^f", Msg::ProviderDiscoverHint),
+            key("^o", Msg::ProviderAdvanced),
+            key("esc", Msg::LegendCancel),
         ],
         Some(Form::Account(form)) if form.preset.is_some() => vec![
             key("⏎", Msg::ProviderContinue),
@@ -1248,6 +1298,9 @@ fn legend(panel: &Panel) -> Vec<(String, String)> {
                 ("^d".to_string(), pt(PMsg::ProviderMenuDelete).into_owned()),
                 key("↑↓", Msg::LegendSelect),
             ];
+            if panel.tab == Tab::Models {
+                out.insert(0, key("F2", Msg::ModelCardTitle));
+            }
             if panel.tab == Tab::Accounts {
                 out.insert(1, key("^e", Msg::ProviderEdit));
             }
@@ -1282,7 +1335,7 @@ fn legend_buttons(
             .unwrap_or_default(),
         _ => (false, false),
     };
-    legend(panel)
+    legend(view, panel)
         .into_iter()
         .map(|(key, label)| {
             let press = if panel.form.is_some() {
@@ -1298,6 +1351,7 @@ fn legend_buttons(
                 }
             } else if panel.efforts.is_none() {
                 match key.as_str() {
+                    "F2" => Some(KeyPress::plain(crate::surface::Key::F(2))),
                     "^a" => Some(KeyPress::ctrl('a')),
                     "^n" => Some(KeyPress::ctrl('n')),
                     "^e" if editable => Some(KeyPress::ctrl('e')),
@@ -1328,7 +1382,12 @@ pub fn action_at(
     row: usize,
 ) -> Option<crate::surface::KeyPress> {
     let panel = moment.providers_panel.as_ref()?;
-    let rows = layout(&moment.providers, panel, vp.rect.h as usize);
+    let rows = layout(
+        &moment.providers,
+        panel,
+        vp.rect.h as usize,
+        vp.rect.w as usize,
+    );
     if let Some(Row::Listed(at)) = rows.get(row) {
         let (start, text) = row_edit_button(&moment.providers, panel, *at, vp.rect.w as usize)?;
         return (col >= start && col < start + width::str_width(&text))
@@ -1387,7 +1446,12 @@ pub fn geometry(moment: &Moment, vp: &Viewport<'_>) -> Geometry {
             header: None,
         };
     };
-    let rows = layout(&moment.providers, panel, vp.rect.h as usize);
+    let rows = layout(
+        &moment.providers,
+        panel,
+        vp.rect.h as usize,
+        vp.rect.w as usize,
+    );
     // 小标题不接鼠标:点它既不该选中它(停不住),也不该顺手把它底下那个模型
     // 换上——点一条分界线不是在挑东西。
     let listed = moment.providers.listed(panel);
@@ -1413,6 +1477,40 @@ pub fn tab_at(col: usize) -> Option<Tab> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn model_card_height_is_stable_and_has_no_model_switch_hit_rows() {
+        let row = crate::providers::ModelRow {
+            id: "card".into(),
+            account: "account".into(),
+            model: "glm-5.3-flash".into(),
+            window: 12345,
+            vision: Some(true),
+            effort: None,
+            levels: vec![],
+            current: true,
+            managed: false,
+        };
+        let view = crate::providers::ProvidersView::new(vec![], vec![row.clone()], vec![], vec![]);
+        let mut panel = crate::providers::Panel {
+            card: Some(crate::model_cards::CardPanel::new(&row)),
+            ..Default::default()
+        };
+        for width in [24, 80, 140] {
+            let height = super::layout(&view, &panel, usize::MAX, width).len();
+            let rows = super::layout(&view, &panel, height, width);
+            assert_eq!(rows.len(), height);
+            assert!(!rows.iter().any(|row| matches!(row, super::Row::Listed(_))));
+            for scroll in [1, 3, 16, usize::MAX] {
+                panel.card.as_mut().unwrap().scroll = scroll;
+                assert_eq!(
+                    super::layout(&view, &panel, usize::MAX, width).len(),
+                    height
+                );
+                assert_eq!(super::layout(&view, &panel, height, width).len(), height);
+            }
+        }
+    }
+
     use super::*;
     use crate::frame::Rect;
     use crate::providers::{AccountRow, ModelRow, Protocol};
@@ -1494,6 +1592,56 @@ mod tests {
             .flat_map(|row| (0..240).map(move |col| (col, row)))
             .find(|(col, row)| action_at(m, &vp, *col, *row) == Some(key))
             .expect("button is visible")
+    }
+
+    #[test]
+    fn ollama_startup_guidance_and_retry_are_visible_in_a_narrow_panel() {
+        let view = ProvidersView::new(
+            vec![],
+            vec![],
+            vec![Protocol {
+                id: "ollama".into(),
+                label: "Ollama".into(),
+                endpoint: Some("http://localhost:11434".into()),
+                needs_key: false,
+            }],
+            vec![],
+        );
+        let mut form = AccountForm::add(&view);
+        form.discovery = Some(crate::providers::AccountDiscovery {
+            id: 1,
+            result: Some(Err("Ollama: run ollama serve on the machine running atomcode, then retry. Default port: 11434.".into())),
+        });
+        let mut m = moment(Some(Panel {
+            form: Some(Form::Account(form)),
+            ..Panel::new()
+        }));
+        m.providers = view;
+        let rows = layout(&m.providers, m.providers_panel.as_ref().unwrap(), 40, 40);
+        let text = rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::DiscoveryMessage(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(text.contains("ollama serve"));
+        assert!(text.contains("11434"));
+        assert!(drawn(&m, 40, 40).contains("^f"));
+        // Editing an address clears its diagnostic, but must keep retry discoverable.
+        let mut edited = m.clone();
+        let Some(Form::Account(form)) = edited.providers_panel.as_mut().unwrap().form.as_mut()
+        else {
+            panic!("account");
+        };
+        form.discovery = None;
+        assert!(drawn(&edited, 40, 40).contains("^f"));
+        assert!(
+            rows.iter()
+                .filter(|row| matches!(row, Row::DiscoveryMessage(_)))
+                .count()
+                > 1
+        );
     }
 
     #[test]
@@ -1606,7 +1754,7 @@ mod tests {
         let m = moment(Some(panel));
         let vp = Viewport::new(Rect::sized(80, 30), &m);
         let mut checked = 0;
-        for (row, item) in layout(&m.providers, m.providers_panel.as_ref().unwrap(), 30)
+        for (row, item) in layout(&m.providers, m.providers_panel.as_ref().unwrap(), 30, 80)
             .iter()
             .enumerate()
         {
@@ -1813,7 +1961,7 @@ mod tests {
         let m = moment(Some(panel));
         for width in [20, 40, 80, 120] {
             let vp = Viewport::new(Rect::sized(width, 18), &m);
-            let rows = layout(&m.providers, m.providers_panel.as_ref().unwrap(), 18);
+            let rows = layout(&m.providers, m.providers_panel.as_ref().unwrap(), 18, 80);
             assert!(rows.len() <= 18);
             let at = rows
                 .iter()
@@ -1979,6 +2127,71 @@ mod tests {
         assert!(out.contains("密钥"), "{out}");
     }
 
+    #[test]
+    fn input_carets_are_visible_on_focused_account_and_model_keys() {
+        let original = view();
+        let mut accounts = original.accounts().to_vec();
+        accounts[0].has_key = false;
+        let v = ProvidersView::new(
+            accounts,
+            original.models().to_vec(),
+            original.protocols().to_vec(),
+            original.efforts().to_vec(),
+        );
+        for len in [0, 5, 128] {
+            let mut account = AccountForm::connect(&v, v.account("deepseek").unwrap());
+            account.focus = AccountField::Key;
+            account.key_len = len;
+            let mut model = ModelForm::add(&v, None).unwrap();
+            model.focus = ModelField::Key;
+            model.key_len = len;
+            for form in [Form::Account(account), Form::Model(model)] {
+                let field = match &form {
+                    Form::Account(f) => f
+                        .fields(&v)
+                        .iter()
+                        .position(|field| *field == AccountField::Key),
+                    Form::Model(f) => f
+                        .fields(&v)
+                        .iter()
+                        .position(|field| *field == ModelField::Key),
+                }
+                .expect("key field is offered");
+                let panel = Panel {
+                    form: Some(form),
+                    ..Panel::new()
+                };
+                for w in [8, 20, 40, 80] {
+                    let line = field_line(&v, &panel, field, w, crate::caps::Caps::default());
+                    assert!(line.width() <= w);
+                    assert!(
+                        line.spans.iter().any(|s| s.style.reverse && s.width() > 0),
+                        "{line:?}"
+                    );
+                }
+            }
+        }
+        let mut form = AccountForm::edit(&v, v.account("deepseek").unwrap());
+        form.focus = AccountField::Key;
+        let field = form
+            .fields(&v)
+            .iter()
+            .position(|f| *f == AccountField::Key)
+            .unwrap();
+        let mut panel = Panel {
+            form: Some(Form::Account(form)),
+            ..Panel::new()
+        };
+        let focused = field_line(&v, &panel, field, 80, crate::caps::Caps::default());
+        assert!(focused.plain().contains(&*t(Msg::KeyLeaveBlankToKeep)));
+        assert!(focused.spans.iter().any(|s| s.style.reverse));
+        if let Some(Form::Account(form)) = panel.form.as_mut() {
+            form.focus = AccountField::Name;
+        }
+        let unfocused = field_line(&v, &panel, field, 80, crate::caps::Caps::default());
+        assert!(!unfocused.spans.iter().any(|s| s.style.reverse));
+    }
+
     /// On the levels row the legend says what Space does there — turn the
     /// bracketed level on or off — which the other fields' legend does not.
     /// Off that row it is the ordinary legend again.
@@ -2083,7 +2296,7 @@ mod tests {
         let m = moment(Some(Panel::new()));
         let vp = Viewport::new(Rect::sized(80, 24), &m);
         let geom = geometry(&m, &vp);
-        let rows = layout(&m.providers, m.providers_panel.as_ref().unwrap(), 24);
+        let rows = layout(&m.providers, m.providers_panel.as_ref().unwrap(), 24, 80);
         let first = rows
             .iter()
             .position(|row| matches!(row, Row::Listed(0)))
@@ -2135,7 +2348,7 @@ mod tests {
             providers_panel: Some(panel.clone()),
             ..Moment::default()
         };
-        let rows = layout(&m.providers, &panel, 14);
+        let rows = layout(&m.providers, &panel, 14, 80);
         let shown: Vec<usize> = rows
             .iter()
             .filter_map(|row| match row {

@@ -220,3 +220,33 @@ test('/review range JSON-escapes the ref without duplicating it into prose', asy
   assert.match(prompts[0], /"base":"odd\\"ref"/);
   assert.doesNotMatch(prompts[0], /odd"ref\.\.HEAD/);
 });
+
+test('/skills query keeps completion in skills-only mode', async () => {
+  const { detectSlashMenuQuery } = await import('./slashCommands.ts');
+  const range = detectSlashMenuQuery('/skills atom');
+  assert.deepEqual(range, { start: 0, query: 'atom', skillsOnly: true });
+  const items = buildSlashMenuItems(FRONTEND_COMMANDS,
+    [{ name: 'atomcode-smoke-test:atomcode-smoke-test', description: 'smoke' }],
+    range!.query, key => key, range!.skillsOnly);
+  assert.equal(items.length, 1);
+  assert.equal(items[0].kind, 'skill');
+  assert.equal('/skills atom'.slice(0, range!.start) + `/${items[0].name} `,
+    '/atomcode-smoke-test:atomcode-smoke-test ');
+});
+
+test('plugin names beyond 30 characters remain completable, paths and arguments do not', async () => {
+  const { detectSlashMenuQuery } = await import('./slashCommands.ts');
+  const name = 'atomcode-smoke-test:atomcode-smoke-test';
+  assert.equal(detectSlashMenuQuery(`/${name}`)?.query, name);
+  assert.equal(detectSlashMenuQuery('/Users/theo/file'), null);
+  assert.equal(detectSlashMenuQuery('/review staged'), null);
+  assert.equal(detectSlashMenuQuery('/skills atom\nother'), null);
+  assert.deepEqual(detectSlashMenuQuery('hello /atom'), { start: 6, query: 'atom', skillsOnly: false });
+});
+
+test('/skills dispatch preserves its search argument', async () => {
+  let query: string | undefined;
+  const def = FRONTEND_COMMANDS.find(command => command.name === 'skills')!;
+  await def.run('atom', { openSlashSkillsMenu: value => { query = value; } } as import('./slashCommands.ts').SlashHandlers);
+  assert.equal(query, 'atom');
+});

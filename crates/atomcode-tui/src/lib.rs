@@ -54,6 +54,7 @@ pub mod el;
 pub mod frame;
 pub mod host;
 pub mod image_cache;
+mod tmux_mouse;
 
 pub mod i18n;
 pub mod keymap;
@@ -125,3 +126,5 @@ fn _tests_assert_in_chinese() {
 }
 
 mod generation;
+
+mod model_cards;

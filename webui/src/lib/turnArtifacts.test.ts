@@ -97,3 +97,11 @@ test('an artifact with no working directory and no anchor is returned unchanged'
   assert.equal(resolveArtifactPath('notes.md', ''), 'notes.md');
   assert.equal(resolveArtifactPath('  ', '/repo'), '');
 });
+
+test('archived tool metadata preserves full-turn artifact links without resident outputs', () => {
+  const messages = [
+    { role: 'assistant' as const, parts: [], archiveArtifacts: [{ path: '/project/a.ts', label: 'a.ts' }] },
+    { role: 'assistant' as const, parts: [] },
+  ];
+  assert.deepEqual(artifactsByAssistantIndex(messages).get(1), [{ path: '/project/a.ts', label: 'a.ts' }]);
+});

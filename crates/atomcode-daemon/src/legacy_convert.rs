@@ -1432,12 +1432,26 @@ pub fn prepare_catalog_session_resume_any_project(
     prepare_catalog_session_resume_any_project_in_root(
         &SessionManager::sessions_root(&atomcode_coding::config::product_dirs_from_env()),
         id,
+        false,
+    )
+}
+
+/// Interactive cross-project navigation keeps the same fork policy as an
+/// exact-bucket lookup. Strict internal restoration still uses the function above.
+pub fn prepare_catalog_session_resume_or_fork_any_project(
+    id: &str,
+) -> anyhow::Result<Option<PreparedCatalogSessionResume>> {
+    prepare_catalog_session_resume_any_project_in_root(
+        &SessionManager::sessions_root(atomcode_coding::config::product_dirs_from_env().user()),
+        id,
+        true,
     )
 }
 
 pub(crate) fn prepare_catalog_session_resume_any_project_in_root(
     sessions_root: &std::path::Path,
     id: &str,
+    fork_on_busy: bool,
 ) -> anyhow::Result<Option<PreparedCatalogSessionResume>> {
     let scan = SessionManager::scan_catalog(sessions_root);
     report_catalog_diagnostics(&scan.diagnostics);
@@ -1445,19 +1459,12 @@ pub(crate) fn prepare_catalog_session_resume_any_project_in_root(
         reject_matching_catalog_diagnostic(&scan.diagnostics, id)?;
         return Ok(None);
     };
-    let manager = SessionManager::with_root(sessions_root.join(&entry.project_bucket));
-    let lease = manager.acquire_lease(id)?;
-    let outcome = converge_session(&manager, &lease)?;
-    Ok(Some(PreparedCatalogSessionResume {
-        project_bucket: entry.project_bucket.clone(),
-        view: CatalogSessionView {
-            snapshot: outcome.snapshot,
-            meta: outcome.meta,
-            presentation: outcome.presentation,
-        },
-        lease,
-        forked_from: None,
-    }))
+    prepare_catalog_session_resume_in_project_root(
+        sessions_root,
+        &entry.project_bucket,
+        id,
+        fork_on_busy,
+    )
 }
 
 /// Shared implementation for the exact-bucket resume prepare. With
@@ -2255,6 +2262,18 @@ mod tests {
             manager.acquire_lease(id),
             Err(atomcode_capabilities::session::SessionStoreError::SessionInUse { .. })
         ));
+        // Cross-project fallback must honor both interactive and strict callers.
+        assert!(
+            prepare_catalog_session_resume_any_project_in_root(root.path(), id, false).is_err()
+        );
+        let cross_project =
+            prepare_catalog_session_resume_any_project_in_root(root.path(), id, true)
+                .unwrap()
+                .unwrap();
+        assert_eq!(cross_project.forked_from.as_deref(), Some(id));
+        assert_eq!(cross_project.project_bucket, bucket);
+        assert_ne!(cross_project.view.meta.id, id);
+        assert_eq!(cross_project.view.snapshot.messages[0].text, "original");
         drop(held_lease);
     }
 

@@ -29,6 +29,12 @@ export function getToken(): string {
  */
 async function readJson<T>(r: Response): Promise<T> {
   if (!r.ok) throw await failure(r);
+  if (r.headers.get('content-type')?.split(';')[0].trim().toLowerCase() === 'text/html') {
+    throw new ApiCallError(
+      'The API returned a page instead of data. Check the server address and relay pairing. / 接口返回了页面而不是数据，请检查服务地址与中继配对。',
+      r.status, 'unexpected_html',
+    );
+  }
   return r.json() as Promise<T>;
 }
 
@@ -65,6 +71,8 @@ export async function failure(r: Response): Promise<ApiCallError> {
 }
 
 export type SSEEvent =
+  | { type: 'context_compacting'; active: boolean }
+  | { type: 'context_summary'; count: number; record: boolean }
   | { type: 'runtime_info'; provider: string; model: string }
   | { type: 'session_assigned'; session_id: string }
   | { type: 'text'; content: string }
@@ -74,7 +82,7 @@ export type SSEEvent =
   | { type: 'tool_progress'; id: string; progress: string }
   | { type: 'tool_result'; id: string; name: string; output: string; success: boolean; duration_ms: number }
   | { type: 'tokens'; prompt: number; completion: number; total: number }
-  | { type: 'permission_request'; session_id: string; tool_name: string; reason: string; call_id: string; arguments: unknown; allow_all_bash?: boolean }
+  | { type: 'permission_request'; session_id: string; tool_name: string; reason: string; call_id: string; arguments: unknown; allow_all_bash?: boolean; project_rule?: { rule: string; file: string } }
   | UserInputRequestEvent
   | { type: 'user_input_resolved'; request_id: number }
   | { type: 'done'; tokens: unknown; tool_calls: unknown; session_id: string; stats?: TurnStats; stop_reason?: string; message?: string }
@@ -94,6 +102,10 @@ export type SSEEvent =
   | { type: 'command_output'; text: string };
 
 export interface ModelInfo {
+  model_card_id?: string | null;
+  model_card_status?: 'available' | 'no_public_data' | 'unverified';
+  context_window?: number;
+  supports_vision?: boolean | null;
   provider: string;
   model: string;
   provider_type: string;
@@ -131,6 +143,7 @@ export interface StreamChatBody {
   provider?: string;
   images?: ImageData[];
   approval_mode?: ApprovalMode;
+  reasoning_effort?: string;
 }
 
 export async function stopChat(requestId: string): Promise<void> {
@@ -259,8 +272,9 @@ export async function streamChat(
 
 export async function respondPermission(
   sessionId: string,
-  decision: 'allow' | 'deny' | 'always_allow' | 'allow_persist' | 'allow_all_bash',
+  decision: 'allow' | 'deny' | 'always_allow' | 'allow_persist' | 'allow_all_bash' | 'allow_project',
   toolName?: string,
+  callId?: string,
 ): Promise<{ success: boolean }> {
   const resp = await apiFetch('/chat/permission', {
     method: 'POST',
@@ -268,7 +282,7 @@ export async function respondPermission(
       'Content-Type': 'application/json',
       ...authHeaders(),
     },
-    body: JSON.stringify({ session_id: sessionId, decision, tool_name: toolName }),
+    body: JSON.stringify({ session_id: sessionId, decision, tool_name: toolName, call_id: callId }),
   });
   // A request that did not land throws: the card must stay up to be answered
   // again, or the person thinks it was approved while the turn waits on an
@@ -289,6 +303,7 @@ export interface SessionMeta {
   message_count: number;
   file_size?: number;
   working_directory_available?: boolean;
+  scheduled?: boolean;
 }
 
 export interface SessionMetaWithProject extends SessionMeta {
@@ -310,6 +325,8 @@ export interface ToolResultInfo {
 }
 
 export interface SessionMessage {
+  source_seq?: number;
+  task_spec_pinned?: boolean;
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
   synthetic?: boolean;
@@ -324,7 +341,24 @@ export interface SessionMessage {
   created_at?: number;
 }
 
+export interface TodoSourcePage {
+  session_id: string; seq: number; offset: number; next_offset: number | null; total_chars: number; text: string;
+}
+export interface TodoSourceView {
+  batch_seq: number | null; batch_index: number;
+  sources: { seq: number; turn: number; at: number; chars: number; preview: string }[];
+  todos: { content: string; status: 'pending' | 'in_progress' | 'completed' }[];
+  page?: TodoSourcePage;
+}
+export async function getTodoSources(project: string, session: string, signal: AbortSignal,
+  read?: { source_seq: number; batch_seq: number; batch_index: number; offset: number }): Promise<TodoSourceView> {
+  const query = read ? '?' + new URLSearchParams(Object.entries(read).map(([key,value]) => [key,String(value)])) : '';
+  const response = await apiFetch(`/projects/${encodeURIComponent(project)}/sessions/${encodeURIComponent(session)}/todo-sources${query}`, { signal, headers: authHeaders() });
+  return readJson<TodoSourceView>(response);
+}
+
 export interface SessionDetail {
+  summary_count?: number;
   id: string;
   name: string;
   working_dir: string;
@@ -670,7 +704,11 @@ export interface SkillInfo {
 
 export async function getSkills(): Promise<SkillInfo[]> {
   const resp = await apiFetch('/skills', { headers: authHeaders() });
-  return readJson(resp);
+  const value: unknown = await readJson(resp);
+  if (!Array.isArray(value) || value.some(item => !item || typeof item.name !== 'string' || typeof item.description !== 'string')) {
+    throw new Error('Invalid skill list response / 技能列表响应格式异常');
+  }
+  return value as SkillInfo[];
 }
 
 // --- Remote access (relay or local network) status ---
@@ -1067,9 +1105,12 @@ export interface LiveGoalProgress {
 }
 
 export type LiveWireEvent =
-  | { type: 'snapshot'; messages: SessionMessage[]; session_id: string; project_hash: string; provider: string; model?: string | null; mode: ApprovalMode; goal?: LiveGoalProgress | null }
+  | { type: 'context_compacting'; active: boolean }
+  | { type: 'context_summary'; count: number; record: boolean }
+  | { type: 'snapshot'; summary_count?: number; messages: SessionMessage[]; session_id: string; project_hash: string; provider: string; model?: string | null; mode: ApprovalMode; goal?: LiveGoalProgress | null }
   | ({ type: 'goal_changed' } & LiveGoalProgress)
   | { type: 'provider'; provider: string; model?: string | null }
+  | { type: 'provider_selection_pending'; current: {provider:string;model:string}|null }
   | { type: 'model'; model: string | null }
   | { type: 'reasoning_effort'; provider: string; effort: string | null; applicable: boolean }
   | { type: 'mode'; mode: ApprovalMode }
@@ -1086,7 +1127,7 @@ export type LiveWireEvent =
   | { type: 'warning'; message: string }
   | { type: 'persistence_warning'; message: string }
   | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean; server_message?: string | null }
-  | { type: 'permission_request'; tool_name: string; reason: string; call_id: string; arguments: string; allow_all_bash?: boolean }
+  | { type: 'permission_request'; tool_name: string; reason: string; call_id: string; arguments: string; allow_all_bash?: boolean; project_rule?: { rule: string; file: string } }
   | { type: 'user_input_request'; request_id: number; header: string; question: string; mode: 'single' | 'multiple' | 'text'; options: { label: string; description?: string }[] }
   | { type: 'user_input_resolved'; request_id: number }
   | PolicyInterventionEvent
@@ -1112,20 +1153,29 @@ export async function streamLive(
   const reader = resp.body!.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    onActivity?.();
-    buffer += decoder.decode(value, { stream: true });
-    const parts = buffer.split('\n\n');
-    buffer = parts.pop() ?? '';
-    for (const part of parts) {
-      const line = part.split('\n').find((l) => l.startsWith('data:'));
-      if (!line) continue;
-      const json = line.slice('data:'.length).trim();
-      if (!json) continue;
-      try { onEvent(JSON.parse(json) as LiveWireEvent); } catch { /* ignore keepalive */ }
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      onActivity?.();
+      buffer += decoder.decode(value, { stream: true });
+      const parts = buffer.split('\n\n');
+      buffer = parts.pop() ?? '';
+      for (const part of parts) {
+        const line = part.split('\n').find((l) => l.startsWith('data:'));
+        if (!line) continue;
+        const json = line.slice('data:'.length).trim();
+        if (!json) continue;
+        let event: LiveWireEvent;
+        try { event = JSON.parse(json) as LiveWireEvent; } catch { continue; }
+        onEvent(event);
+      }
     }
+  } finally {
+    // Release the response even when parsing/dispatch or an aborted read throws.
+    // A reconnect must not leave an old body locked in the mobile browser.
+    try { await reader.cancel(); } catch { /* fetch already aborted */ }
+    reader.releaseLock();
   }
 }
 
@@ -1227,7 +1277,7 @@ export async function postLiveSwitchSession(
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ session_id: sessionId }),
   });
-  if (!resp.ok) throw new Error(`switch live session failed: ${resp.status}`);
+  if (!resp.ok) throw await failure(resp);
   const body = await resp.json() as {
     ok?: boolean;
     active_turn?: boolean;
@@ -1237,7 +1287,8 @@ export async function postLiveSwitchSession(
   };
   return {
     ok: body.ok === true,
-    activeTurn: body.active_turn === true,
+    // Older embedded daemons flattened Busy into a nested debug string.
+    activeTurn: body.active_turn === true || (body.ok !== true && /\bcoding runtime is busy\b/i.test(body.error ?? '')),
     error: body.error,
     ...(body.session_id ? { sessionId: body.session_id } : {}),
     ...(body.forked_from ? { forkedFrom: body.forked_from } : {}),
@@ -1300,16 +1351,19 @@ export async function postCommand(body: {
 /** Switch the approval mode (build / accept_edits / bypass / plan). Runtime
  *  session state — the next turn's PermissionDecider follows it; broadcast to
  *  other tabs. */
+export interface ModeSelection {model:string;reasoning_effort:string|null}
+export interface ModeSelectionResult {ok:boolean;mode:ApprovalMode;error?:string;selection?:ModeSelection}
+export async function postModeSelection(mode: ApprovalMode, context: {
+  independent?: boolean; current_model?: ModeSelection; return_model?: ModeSelection; previous_mode?: ApprovalMode; running?: boolean;
+} = {}): Promise<ModeSelectionResult> {
+  const resp = await apiFetch('/approval_mode', {method:'POST', headers:{'Content-Type':'application/json',...authHeaders()}, body:JSON.stringify({mode,...context})});
+  if(!resp.ok) throw await failure(resp);
+  const body = await readJson<ModeSelectionResult>(resp);
+  if(!body.ok) throw new Error(body.error || 'live runtime rejected the mode switch');
+  return body;
+}
 export async function postLiveMode(mode: ApprovalMode): Promise<ApprovalMode> {
-  const resp = await apiFetch('/approval_mode', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ mode }),
-  });
-  if (!resp.ok) throw new Error(`switch mode failed: ${resp.status}`);
-  const body = (await resp.json()) as ApprovalModeResponse;
-  if (!body.ok) throw new Error('live runtime rejected the mode switch');
-  return body.mode;
+  return (await postModeSelection(mode)).mode;
 }
 
 export async function getApprovalMode(): Promise<ApprovalMode> {
@@ -1349,13 +1403,14 @@ export async function postLiveReasoningEffort(
 }
 
 export async function postLivePermission(
-  decision: 'allow' | 'deny' | 'always_allow' | 'allow_persist' | 'allow_all_bash',
+  decision: 'allow' | 'deny' | 'always_allow' | 'allow_persist' | 'allow_all_bash' | 'allow_project',
   toolName?: string,
+  callId?: string,
 ): Promise<{ accepted: boolean }> {
   const resp = await apiFetch('/live/permission', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ decision, tool_name: toolName }),
+    body: JSON.stringify({ decision, tool_name: toolName, call_id: callId }),
   });
   if (!resp.ok) throw new Error(`answer live permission failed: ${resp.status}`);
   return resp.json();
@@ -2030,4 +2085,95 @@ export async function setMarketBase(base: string): Promise<{ success: boolean; e
   });
   const body = await readJson<{ success?: boolean; error?: string }>(resp);
   return { success: body.success ?? false, error: body.error };
+}
+
+// User-driven workspace pane. These calls never invoke an agent.
+export async function workbenchRequest<T>(path: string, body?: unknown, method?: string): Promise<T> {
+  const response = await apiFetch('/workbench/' + path, {
+    method: method || (body === undefined ? 'GET' : 'POST'),
+    headers: { ...authHeaders(), ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+  if (response.status === 204) return undefined as T;
+  return readJson<T>(response);
+}
+export async function workbenchPreview(session: string, path: string): Promise<Blob> {
+  const response = await apiFetch('/workbench/preview?' + new URLSearchParams({ session_id: session, path }), { headers: authHeaders() });
+  if (!response.ok) throw await failure(response);
+  return response.blob();
+}
+
+/** Explicit raw upload: no text decoding, base64 or model echo. */
+export async function importPatchFile(session: string, file: File, signal?: AbortSignal): Promise<string> {
+  if (file.size > 8 * 1024 * 1024) throw new Error('Patch exceeds 8 MiB');
+  const response = await apiFetch('/live/patch?' + new URLSearchParams({ session_id: session }), {
+    method: 'POST', headers: {...authHeaders(), 'Content-Type':'application/octet-stream'}, body: file, signal,
+  });
+  if (!response.ok) throw await failure(response);
+  const value = await response.json();
+  if (typeof value.reference !== 'string') throw new Error('Invalid patch reference');
+  return value.reference;
+}
+
+export interface TaskSpecItem { seq:number; turn:number; at:number; bytes:number; preview:string; pinned:boolean }
+export interface TaskSpecView { session_id?:string; items?:TaskSpecItem[]; next_before?:number|null; pinned_count?:number; pinned_bytes:number; budget_bytes:number; seq?:number; text?:string; pinned?:boolean; bytes?:number }
+/** Explicit user action; the server validates bound session and idle mutations. */
+export async function taskSpecs(sessionId:string,args:string,signal?:AbortSignal):Promise<TaskSpecView> {
+  const response=await apiFetch('/live/spec',{method:'POST',headers:{...authHeaders(),'Content-Type':'application/json'},body:JSON.stringify({session_id:sessionId,args}),signal});
+  return readJson<TaskSpecView>(response);
+}
+
+export async function getModelCards(): Promise<import('./lib/modelCards').ModelCards> {
+  const response = await apiFetch('/model-cards', { headers: authHeaders() });
+  if (!response.ok) throw new Error(`model cards failed: ${response.status}`);
+  return response.json();
+}
+
+export interface PersonaInfo { source: string; appended: boolean | null; text: string }
+/** Inspect only the bound session; never switches the live runtime. */
+export async function getLivePersona(sessionId: string): Promise<{persona: PersonaInfo | null}> {
+  const response = await apiFetch('/live/persona', {
+    method: 'POST', headers: {...authHeaders(), 'Content-Type':'application/json'},
+    body: JSON.stringify({session_id: sessionId}),
+  });
+  return readJson<{persona: PersonaInfo | null}>(response);
+}
+
+export interface FollowUpView { prompt: string | null; current_task: boolean; new_session?: unknown; execution_id?: string | null }
+export async function followUp(sessionId: string, args: string): Promise<FollowUpView> {
+  const response = await apiFetch('/live/followup', {
+    method:'POST', headers:{...authHeaders(),'Content-Type':'application/json'},
+    body:JSON.stringify({session_id:sessionId,args}),
+  });
+  return readJson<FollowUpView>(response);
+}
+
+export interface ModeBinding { model?: string; reasoning_effort?: string }
+export interface ModeBindings { plan: ModeBinding; build: ModeBinding }
+export interface ModeModelsInfo { bindings: ModeBindings; models: Array<{id:string;label:string;effort_levels:string[]}>; reasoning_effort_levels: string[] }
+export async function getModeModels(): Promise<ModeModelsInfo> {
+  return readJson(await apiFetch('/config/modes',{headers:authHeaders()}));
+}
+export async function saveModeModels(bindings: ModeBindings): Promise<ModeModelsInfo> {
+  return readJson(await apiFetch('/config/modes',{method:'POST',headers:{...authHeaders(),'Content-Type':'application/json'},body:JSON.stringify(bindings)}));
+}
+
+export interface HookEntry {
+  id: string; name: string; event: string; matcher: string | null; command: string;
+  timeout_ms: number; source: string; scope: string; disabled: boolean; testable: boolean; args?: string[];
+}
+export interface HookCatalogue {
+  cwd: string;
+  files: Array<{ scope: string; path: string; status: { status: string; error?: string; hooks?: number; disabled?: number; unknown_events?: string[] } }>;
+  plugins: Array<{ plugin: string; trusted: boolean; invalid: boolean; hooks: number; events: string[] }>;
+  items: HookEntry[];
+}
+export interface HookTestResult { completed: boolean; exit_code: number | null; stdout: string; stderr: string }
+export async function getHooks(signal?: AbortSignal): Promise<HookCatalogue> {
+  const value = await readJson<HookCatalogue>(await apiFetch('/hooks', { headers: authHeaders(), signal }));
+  if (!value || typeof value.cwd !== 'string' || !Array.isArray(value.items) || !Array.isArray(value.files) || !Array.isArray(value.plugins)) throw new Error('Invalid hooks catalogue response');
+  return value;
+}
+export async function testHook(id: string): Promise<{ item: HookEntry; result: HookTestResult }> {
+  return readJson(await apiFetch('/hooks/test', { method: 'POST', headers: {...authHeaders(), 'Content-Type':'application/json'}, body:JSON.stringify({id}) }));
 }

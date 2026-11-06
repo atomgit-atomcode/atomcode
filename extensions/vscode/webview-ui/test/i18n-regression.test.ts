@@ -3,6 +3,9 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createTranslator, messages, normalizeLocale } from '../src/i18n';
 
+/** Windows checkouts are CRLF; the assertions below are written against LF source text. */
+const readSource = (path: string) => readFileSync(path, 'utf8').replace(/\r\n/g, '\n');
+
 function testLocaleNormalizationFollowsVSCodeLanguage() {
   assert.equal(normalizeLocale('zh-cn'), 'zh');
   assert.equal(normalizeLocale('zh-CN'), 'zh');
@@ -31,7 +34,7 @@ function testCatalogsHaveMatchingKeys() {
 
 function testVSCodeManifestUsesNlsPlaceholders() {
   const root = process.cwd();
-  const packageJson = readFileSync(join(root, 'package.json'), 'utf8');
+  const packageJson = readSource(join(root, 'package.json'));
 
   assert.match(packageJson, /"l10n":\s*"\.\/l10n"/);
   assert.match(packageJson, /"title":\s*"%atomcode\.commands\.openSidebar\.title%"/);
@@ -46,9 +49,9 @@ function testVSCodeManifestUsesNlsPlaceholders() {
 
 function testPackageNlsFilesCoverEveryManifestPlaceholder() {
   const root = process.cwd();
-  const packageJson = readFileSync(join(root, 'package.json'), 'utf8');
-  const en = JSON.parse(readFileSync(join(root, 'package.nls.json'), 'utf8')) as Record<string, string>;
-  const zhCn = JSON.parse(readFileSync(join(root, 'package.nls.zh-cn.json'), 'utf8')) as Record<string, string>;
+  const packageJson = readSource(join(root, 'package.json'));
+  const en = JSON.parse(readSource(join(root, 'package.nls.json'))) as Record<string, string>;
+  const zhCn = JSON.parse(readSource(join(root, 'package.nls.zh-cn.json'))) as Record<string, string>;
   const placeholders = Array.from(packageJson.matchAll(/%([^%]+)%/g), (match) => match[1]).sort();
 
   assert.ok(placeholders.length > 0);

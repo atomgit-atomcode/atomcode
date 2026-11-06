@@ -294,6 +294,7 @@ impl Env {
                 front_end: None,
                 review_delegate: None,
                 host_plugins: Default::default(),
+                prompt_overrides: Default::default(),
                 identity: Default::default(),
             },
             provider_factory: Arc::new(Factory(recorder.clone())),

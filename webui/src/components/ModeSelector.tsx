@@ -4,6 +4,7 @@ import { ApprovalMode } from '../api';
 import { useT } from '../settings';
 import { MsgKey } from '../i18n';
 import { useDropdown } from '../lib/useDropdown';
+import { ModeModelsDialog } from './ModeModelsDialog';
 
 // Approval modes shown in the pill dropdown. Order = display order.
 // The Auto mode keeps the `bypass` wire value for protocol compatibility and
@@ -35,6 +36,9 @@ export function ModeSelector({
     prefer: 'above',
     width: 240,
   });
+  // The bindings dialog is the upstream feature; the menu placement stays the
+  // portaled one, because a phone's pill is far narrower than the menu.
+  const [configuring, setConfiguring] = useState(false);
   const current = MODE_OPTIONS.find((o) => o.val === value) ?? MODE_OPTIONS[0];
   const isAuto = value === 'bypass';
   return (
@@ -53,6 +57,7 @@ export function ModeSelector({
         <span class="model-selector-label">{t(current.label)}</span>
         <span class="model-selector-chevron">▾</span>
       </button>
+      {configuring && <ModeModelsDialog onClose={() => setConfiguring(false)} />}
       {open && createPortal(
         <div
           ref={dropdown.menuRef}
@@ -79,6 +84,7 @@ export function ModeSelector({
               <span class="mode-item-desc">{t(o.desc)}</span>
             </button>
           ))}
+          <button class="model-item" type="button" onClick={() => { setOpen(false); setConfiguring(true); }}>{t('modeBindings.configure')}</button>
         </div>,
         document.body,
       )}

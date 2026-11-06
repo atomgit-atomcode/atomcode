@@ -105,7 +105,6 @@ unsafe fn detach_child_from_controlling_tty() {
     }
 }
 
-pub mod android_tools;
 /// Background job path (`bash_start` / `bash_poll` / `bash_kill`) for long-running
 /// commands that would exceed the foreground `timeout` ceiling. A submodule of `bash` so
 /// it can reuse the private spawn/reaper primitives (`build_command`, `PgroupChild`,
@@ -127,15 +126,6 @@ pub struct BashTool {
     output_preview: Option<super::output_artifact::ArtifactStoreProvider>,
     /// What counts as a sensitive target (the "allow all" floor and the grant scope).
     sensitive: SensitivePaths,
-    /// The tool description, built once at construction.
-    ///
-    /// On Android it ends with the device's MEASURED toolset: the old text
-    /// asserted that `git` and `sed -i` were absent, and the model acted on
-    /// that (it refused to use tools that work and offered to install ones
-    /// that cannot be installed). A description that names the real toolset
-    /// has to be computed from the real `PATH`, so it cannot be a `&'static str`
-    /// — hence it is cached here rather than rebuilt per call.
-    description: String,
 }
 
 #[cfg(test)]
@@ -153,15 +143,12 @@ impl BashTool {
 
     /// Run commands through `world` instead of this machine.
     pub fn with_world(world: Arc<dyn crate::world::Shell>, sensitive: SensitivePaths) -> Self {
-        let mut tool = Self {
-            label: "bash",
+        Self {
             world,
-            output_preview: None,
+            label: "bash",
             sensitive,
-            description: String::new(),
-        };
-        tool.rebuild_description();
-        tool
+            output_preview: None,
+        }
     }
 
     pub(crate) fn with_label(mut self, label: &'static str) -> Self {
@@ -179,27 +166,7 @@ impl BashTool {
         provider: super::output_artifact::ArtifactStoreProvider,
     ) -> Self {
         self.output_preview = Some(provider);
-        // The description advertises `output_tail_lines` only while a preview
-        // store is attached, so attaching one has to refresh the cached text.
-        self.rebuild_description();
         self
-    }
-
-    /// Rebuild the cached description from the platform and the live state.
-    ///
-    /// Android's paragraph ends with the device's MEASURED toolset, which is
-    /// computed from the real `PATH` — costly enough that it is cached in the
-    /// field rather than rebuilt per call.
-    fn rebuild_description(&mut self) {
-        self.description = shell_tool_description(
-            cfg!(target_os = "windows"),
-            windows_bash_active(),
-            askpass_active(),
-            self.output_preview
-                .as_ref()
-                .and_then(|provider| provider())
-                .is_some(),
-        );
     }
 }
 
@@ -218,10 +185,22 @@ impl Tool for BashTool {
         self.label
     }
     fn description(&self) -> &str {
-        // Cached at construction (and refreshed when a preview store is
-        // attached): on Android it ends with the device's measured toolset,
-        // computed from the real PATH, so it is not built per call.
-        &self.description
+        // Only advertise interactive password support when the askpass helper is
+        // actually wired (Unix interactive TUI); off elsewhere (webui/headless/
+        // Windows) so the model isn't told about a prompt that can't appear.
+        #[cfg(unix)]
+        let askpass_active = crate::askpass::current_env().is_some();
+        #[cfg(not(unix))]
+        let askpass_active = false;
+        shell_tool_description(
+            cfg!(target_os = "windows"),
+            windows_bash_active(),
+            askpass_active,
+            self.output_preview
+                .as_ref()
+                .and_then(|provider| provider())
+                .is_some(),
+        )
     }
     fn parameters_schema(&self) -> serde_json::Value {
         let mut schema = json!({
@@ -458,18 +437,14 @@ pub(crate) fn windows_shell_label(bash_present: bool) -> &'static str {
 /// `build_command`). Left unsaid, weak models follow the `bash` name and emit
 /// bash-only syntax — heredocs, `$(...)`, `printf '\n'`, single-quote quoting —
 /// which cmd.exe can't parse, so the model thrashes into temp-file workarounds.
-/// Naming the real shell here removes the contradiction. Pure (takes bools) so
-/// every platform's wording is unit-testable off that platform.
-///
-/// On Android the description also carries the device's MEASURED toolset — see
-/// [`android_tools`]. That cannot be a `&'static str`, so this returns a
-/// `String`; the platform choice stays a parameter, not a compile-time branch.
+/// Naming the real shell here removes the contradiction. Pure (takes a bool) so
+/// the Windows wording is unit-testable off Windows.
 fn shell_tool_description(
     is_windows: bool,
     bash_present: bool,
     askpass_active: bool,
     output_preview: bool,
-) -> String {
+) -> &'static str {
     // Single-source the base paragraph so a Windows/Unix edit can't drift. A
     // macro (not a `const`) because `concat!` only splices literals.
     macro_rules! base {
@@ -490,7 +465,7 @@ fn shell_tool_description(
              Reserve bash for real shell work — git, builds, package managers, running \
              commands — and for pipelines / aggregation (wc, sort, uniq, awk, git log) \
              the dedicated tools can't do. For long builds/tests use `bash_start`, then \
-             `bash_poll` with wait_ms (up to 60000); it returns early on output or exit. \
+             `bash_poll` with wait_ms (up to 60000); it collects output until exit, status change or timeout. \
              Do not use shell sleep to wait or duplicate a running build.\n\
              This shell is NON-INTERACTIVE: stdin is not connected to a terminal, so a \
              program cannot be driven with typed input once started. Do NOT launch REPLs (python/node/irb), \
@@ -540,23 +515,6 @@ fn shell_tool_description(
              `nul` file in the working directory."
         };
     }
-    macro_rules! android_suffix {
-        () => {
-            "\n\
-             Android: commands run via `/system/bin/sh`, which is mksh — a ksh/POSIX \
-             shell, NOT bash, and more capable than a bare POSIX sh. Verified working: \
-             `[[ … ]]`, `set -o pipefail`, arrays (both `a=(x y)` and `set -A a -- x y`), \
-             brace expansion `{a,b}`, heredocs, herestrings `<<<`, `local`, substring \
-             `${v:1:3}`, pattern substitution `${v/a/b}`, `case`, `trap`, `$((…))`, \
-             functions and subshells. NOT available: `[[ … =~ … ]]` (use `case` for \
-             glob matching), process substitution `<(…)` / `>(…)`, and `select`. \
-             Run a script with `sh script.sh`, NOT `./script.sh` — the shared \
-             storage holding the working directory is mounted `noexec`, so a \
-             directly-executed file fails with \"Permission denied\" (exit 126) \
-             even after `chmod +x`. Discard a stream with `>/dev/null`. Relative \
-             paths work (the working directory is already set)."
-        };
-    }
     // Tell the model interactive password prompts work — ONLY when the askpass
     // helper is actually active (Unix interactive TUI). Without this the model
     // assumes the shell is non-interactive, rationalises "the password prompt
@@ -599,35 +557,14 @@ fn shell_tool_description(
     }
     if is_windows {
         if bash_present {
-            describe!(bash_suffix!()).to_string()
+            describe!(bash_suffix!())
         } else {
-            describe!(cmd_suffix!()).to_string()
+            describe!(cmd_suffix!())
         }
-    } else if cfg!(target_os = "android") {
-        // The device's real toolset, measured from the shell's own PATH. The
-        // old wording asserted a hard-coded list of what a phone lacks — and
-        // it was wrong: `git` is bundled into the APK and `sed -i` works
-        // (toybox). The model believed it and refused to use tools that work.
-        let mut description = describe!(android_suffix!()).to_string();
-        description.push('\n');
-        description.push_str(android_tools::toolset_paragraph());
-        description
     } else if askpass_active {
-        describe!(askpass_suffix!()).to_string()
+        describe!(askpass_suffix!())
     } else {
-        describe!("").to_string()
-    }
-}
-
-/// Whether the askpass helper is wired (Unix interactive TUI only).
-fn askpass_active() -> bool {
-    #[cfg(unix)]
-    {
-        crate::askpass::current_env().is_some()
-    }
-    #[cfg(not(unix))]
-    {
-        false
+        describe!("")
     }
 }
 
@@ -766,12 +703,7 @@ fn build_command(command: &str) -> Result<tokio::process::Command, String> {
     // HarmonyOS / OpenHarmony does NOT ship bash — fall back to sh (mksh).
     #[cfg(target_env = "ohos")]
     let shell = "sh";
-    // Android has no bash either: `/system/bin/sh` is mksh, and it is the only POSIX
-    // shell the platform guarantees. Named by absolute path rather than `sh` because
-    // an app process's PATH does not necessarily include `/system/bin`.
-    #[cfg(target_os = "android")]
-    let shell = "/system/bin/sh";
-    #[cfg(not(any(target_env = "ohos", target_os = "android")))]
+    #[cfg(not(target_env = "ohos"))]
     let shell = "bash";
     let mut cmd = tokio::process::Command::new(shell);
     cmd.arg("-c").arg(command);
@@ -2613,27 +2545,170 @@ pub fn bash_invocations(source: &str) -> Option<Vec<BashInvocation>> {
     Some(invocations)
 }
 
-/// A flat invocation list cannot bound directories changed by loops or functions.
+/// Literal command segments whose existing user grants may be composed safely.
+/// Tests/builds are not inferred safe: policy must explicitly authorize them.
+pub(crate) fn bash_permission_segments(source: &str) -> Option<Vec<String>> {
+    let segments = literal_bash_permission_segments(source)?;
+    if bash_has_repeated_directory_changes(source) {
+        return None;
+    }
+    Some(segments)
+}
+
+fn literal_bash_permission_segments(source: &str) -> Option<Vec<String>> {
+    let tree = parse_bash(source)?;
+    let root = tree.root_node();
+    if root.has_error() {
+        return None;
+    }
+    let bytes = source.as_bytes();
+    let mut stack = vec![root];
+    let mut segments = Vec::new();
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "for_statement" => {
+                let variable = node
+                    .child_by_field_name("variable")?
+                    .utf8_text(bytes)
+                    .ok()?;
+                if variable.is_empty() || !variable.bytes().all(|c| c.is_ascii_lowercase()) {
+                    return None;
+                }
+                let mut cursor = node.walk();
+                let values: Vec<_> = node.children_by_field_name("value", &mut cursor).collect();
+                if values.is_empty()
+                    || values.len() > 64
+                    || values.iter().any(|v| {
+                        v.utf8_text(bytes).map_or(true, |text| {
+                            text.is_empty() || !text.bytes().all(|c| c.is_ascii_digit())
+                        })
+                    })
+                {
+                    return None;
+                }
+            }
+            "command" => {
+                let name = node.child_by_field_name("name")?.utf8_text(bytes).ok()?;
+                // Shell binding builtins can change PATH/CDPATH without an
+                // assignment node (printf -v, read, let, ...). Do not compose
+                // grants across their hidden shell-state effects.
+                if !name
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"_/.-".contains(&c))
+                    || matches!(
+                        name,
+                        "printf"
+                            | "read"
+                            | "readarray"
+                            | "mapfile"
+                            | "getopts"
+                            | "declare"
+                            | "typeset"
+                            | "export"
+                            | "readonly"
+                            | "local"
+                            | "unset"
+                            | "set"
+                            | "shopt"
+                            | "enable"
+                            | "hash"
+                            | "alias"
+                            | "unalias"
+                            | "let"
+                            | "eval"
+                            | "source"
+                            | "."
+                            | "command"
+                            | "builtin"
+                            | "trap"
+                            | "fc"
+                            | "bind"
+                            | "exec"
+                            | "pushd"
+                            | "popd"
+                    )
+                {
+                    return None;
+                }
+                segments.push(normalize_command_for_grant(node.utf8_text(bytes).ok()?));
+            }
+            "file_redirect" if !redirect_is_readonly(node, bytes) => return None,
+            "program"
+            | "list"
+            | "pipeline"
+            | "do_group"
+            | "comment"
+            | "command_name"
+            | "word"
+            | "raw_string"
+            | "string"
+            | "string_content"
+            | "concatenation"
+            | "number"
+            | "redirected_statement"
+            | "file_redirect"
+            | "file_descriptor" => {}
+            "variable_name" if node.parent().is_some_and(|p| p.kind() == "for_statement") => {}
+            _ if node.is_named() || node.kind() == "&" => return None,
+            _ => {}
+        }
+        for i in (0..node.child_count() as u32).rev() {
+            stack.push(node.child(i)?);
+        }
+    }
+    if segments.is_empty() {
+        return None;
+    }
+    Some(segments)
+}
+
+/// A flat invocation list cannot bound directories changed inside loops or functions.
 /// Callers doing path resolution must ask for approval for those constructs.
 pub(crate) fn bash_has_repeated_directory_changes(source: &str) -> bool {
     let Some(tree) = parse_bash(source) else {
         return true;
     };
-    let mut stack = vec![tree.root_node()];
-    while let Some(node) = stack.pop() {
+    if tree.root_node().has_error() {
+        return true;
+    }
+    let mut stack = vec![(tree.root_node(), false)];
+    let mut has_loop = false;
+    while let Some((node, in_loop)) = stack.pop() {
+        has_loop |= node.kind() == "for_statement";
         if matches!(
             node.kind(),
-            "for_statement" | "c_style_for_statement" | "while_statement" | "function_definition"
+            "c_style_for_statement" | "while_statement" | "function_definition" | "until_statement"
         ) {
             return true;
         }
+        if in_loop && node.kind() == "command" {
+            let Some(name) = node
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+            else {
+                return true;
+            };
+            if !name
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"_/.-".contains(&c))
+                || matches!(
+                    name,
+                    "cd" | "pushd" | "popd" | "eval" | "source" | "." | "command" | "builtin"
+                )
+            {
+                return true;
+            }
+        }
         for index in 0..node.named_child_count() as u32 {
             if let Some(child) = node.named_child(index) {
-                stack.push(child);
+                stack.push((child, in_loop || node.kind() == "for_statement"));
             }
         }
     }
-    false
+    // Relax the old blanket only for the same fully literal syntax the policy
+    // composer understands. An outer CDPATH assignment or expansion can alter
+    // directory resolution even when the loop body contains no explicit cd.
+    has_loop && literal_bash_permission_segments(source).is_none()
 }
 
 /// Paths read through shell input redirection (`< file`). Output redirection is a
@@ -3058,8 +3133,6 @@ impl crate::world::Shell for LocalShell {
                 "{} on this machine",
                 windows_shell_label(windows_bash_active())
             )
-        } else if cfg!(target_os = "android") {
-            "/system/bin/sh (mksh) on this device".to_string()
         } else {
             "bash on this machine".to_string()
         }
@@ -4680,65 +4753,6 @@ mod tests {
         );
     }
 
-    // The Android description used to carry a hard-coded list of what a phone
-    // lacks — "`git`, `ripgrep`, `node`/`npm`, `python3`, `jq`, `sed -i` and
-    // many coreutils are absent". It was wrong: `git` is bundled into the APK
-    // and `sed -i` works (toybox). The model believed the description, refused
-    // to use tools that work, and offered to install ones that cannot be
-    // installed. The description must now name the MEASURED toolset.
-    #[test]
-    fn android_description_names_the_measured_toolset_instead_of_a_fixed_list() {
-        let described = android_tools::describe_toolset(&["sed", "awk", "git"]);
-        assert!(
-            described.contains("ARE available"),
-            "must state what IS available: {described}"
-        );
-        assert!(
-            described.contains("NOT available"),
-            "must state what is NOT available: {described}"
-        );
-        assert!(
-            described.contains("`git`") && described.contains("`sed`"),
-            "must name the tools it found: {described}"
-        );
-        assert!(
-            described.contains("`jq`"),
-            "must name the tools it did not find: {described}"
-        );
-        // No package manager exists on a phone, so promising to install one
-        // is a promise the agent cannot keep.
-        assert!(
-            described.contains("no package manager"),
-            "must not promise to install missing tools: {described}"
-        );
-    }
-
-    #[test]
-    fn the_android_description_no_longer_claims_sed_or_git_are_absent() {
-        // The exact sentence that misled the model.
-        let paragraph = android_tools::toolset_paragraph();
-        assert!(
-            !paragraph.contains("`sed -i` and many coreutils are absent"),
-            "the old lie must be gone: {paragraph}"
-        );
-        assert!(
-            !paragraph.contains("`git`, `ripgrep`, `node`/`npm`"),
-            "the old lie must be gone: {paragraph}"
-        );
-    }
-
-    #[test]
-    fn the_android_description_keeps_the_shell_facts() {
-        // The toolset paragraph is an addition, not a replacement: the shell
-        // facts still have to be there.
-        #[cfg(target_os = "android")]
-        {
-            let d = shell_tool_description(false, false, false);
-            assert!(d.contains("mksh"));
-            assert!(d.contains("/dev/null"));
-        }
-    }
-
     // The reported Windows pain: the model thrashes across cmd / pwsh / git-bash
     // (`pwsh -Command`, `cmd //c`, `dir`) and mishandles spaced paths
     // (`if exist "C:\Program Files"` wrongly reported as not existing). The
@@ -5034,13 +5048,12 @@ mod tests {
         // workspace gate's `grantable:false` floor, which the marker-substring form MISSES
         // (`/etc`, home dotfiles, secret extensions). These must stay off the blanket or
         // "allow all bash" would silently cover the one command that must always ask.
-        //
-        // The system-protected prefix list is per platform (`/etc` on unix, `C:\Windows`
-        // on Windows), so each platform asserts the one it actually owns.
+        // The system-prefix set is platform-specific (`/etc` vs `C:\Windows`), so each
+        // build pins its own protected target.
         #[cfg(unix)]
         assert_eq!(group("rm /etc/hosts"), None);
         #[cfg(windows)]
-        assert_eq!(group(r"rm 'C:\Windows\System32\drivers\etc\hosts'"), None);
+        assert_eq!(group("rm C:/Windows/System32/drivers/etc/hosts"), None);
         assert_eq!(group("shred ~/backup.key"), None);
         assert_eq!(group("mv ~/.bashrc /tmp/x"), None);
         assert_eq!(group("truncate -s0 ./cert.crt"), None);

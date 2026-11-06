@@ -21,6 +21,33 @@ use std::borrow::Cow;
 
 pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
     match msg {
+        Msg::ModelCardViewing => "Viewing".into(),
+        Msg::ModelCardReadOnly => "Read-only scores; the current model is unchanged.".into(),
+        Msg::ModelCardWebHint => "Full scores and comparison: close this panel, run /webui, then select the model list info button.".into(),
+        Msg::ModelCardScore => "Score".into(),
+        Msg::ModelCardRank => "Rank/total".into(),
+
+        Msg::ModelCardNoPublic => "This model has no public scores in the current catalogue. Model use is unaffected; missing evidence is not a zero score.".into(),
+        Msg::ModelCardTitle => "Model card".into(),
+        Msg::ModelCardEmpty => "No verified mapping. Left/Right browses explicit catalogue models.".into(),
+        Msg::ModelCardHelp => "↑↓ scroll · ←→ browse models · d data notes · Esc back".into(),
+        Msg::ModelCardScope => "Full-population ranks; compare only the same task and comparison set. Missing evidence does not imply inability.".into(),
+        Msg::ModelCardConfigured => "Configured model".into(),
+        Msg::ModelCardBenchmarks => "Published evaluations".into(),
+        Msg::ModelCardTasks => "Task performance".into(),
+        Msg::ModelCardNotes => "Data notes".into(),
+        Msg::ModelCardDifferent => "Different conditions / comparison sets".into(),
+        Msg::ModelCardEvidence => "Evidence".into(),
+        Msg::ModelCardSparse => "Sparse evaluation evidence".into(),
+        Msg::ModelCardBest => "Relative strength".into(),
+        Msg::ModelCardWorst => "Relative weakness".into(),
+        Msg::ModelCardAgents => "Agent tasks".into(),
+        Msg::ModelCardCoding => "Coding".into(),
+        Msg::ModelCardChat => "Chat & writing".into(),
+        Msg::ModelCardMath => "Math".into(),
+        Msg::ModelCardVision => "Vision & documents".into(),
+        Msg::ModelCardSearch => "Web search".into(),
+
         Msg::AutomationOlder => "Load earlier runs".into(),
         Msg::AutomationTitle => "Automations".into(),
         Msg::AutomationEmpty => "No scheduled tasks".into(),
@@ -190,6 +217,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::AskLegendToggle => "toggle".into(),
         Msg::AskLegendSwitch => "switch question".into(),
         Msg::AskLegendCaret => "move cursor".into(),
+        Msg::AskLegendEdit => "edit option".into(),
+        Msg::AskLegendCancelEdit => "cancel edit".into(),
         Msg::AskGrantWholeTool => "every call of this tool".into(),
         Msg::AskGrantOnly { what } => format!("only {what}").into(),
 
@@ -385,6 +414,12 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             true => format!("the endpoint answered HTTP {status}; check the API key").into(),
             false => format!("the endpoint answered HTTP {status}").into(),
         },
+        Msg::OllamaUnavailable { endpoint, local } => if local {
+            format!("Could not connect to Ollama at {endpoint}. Run `ollama serve` on the machine running atomcode, then press Ctrl+F to retry. Default port: 11434; edit the address if yours differs.")
+        } else {
+            format!("Could not connect to Ollama at {endpoint}. Check `ollama serve` on the target machine, its address, port and network access, then press Ctrl+F to retry.")
+        }.into(),
+        Msg::OllamaModelsFound { count } => format!("Ollama is running · {count} models · Enter to continue · Ctrl+F to refresh").into(),
         Msg::DiscoverUnreachable => "could not reach the endpoint".into(),
         Msg::ProviderDiscoverFailed { why } => {
             format!("Could not fetch the model list: {why}. Type the model id by hand.").into()
@@ -399,6 +434,18 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdAboutKeys => "list the key bindings".into(),
         Msg::CmdAboutTodo => "print the plan; `add <task>`, `clear`; `show`/`hide` the panel".into(),
         Msg::CmdAboutTeam => "open or fold the team panel".into(),
+        Msg::CmdAboutPatch => "import a unified-diff file without copying its body; review the reference before sending".into(),
+        Msg::PatchTooLarge => "Patch exceeds the 8 MiB import limit".into(),
+        Msg::PatchLeadOnly => "Return to the lead conversation before importing a patch.".into(),
+        Msg::PatchContextChanged => "The conversation changed. Import the patch again in the intended conversation.".into(),
+        Msg::SpecLeadOnly => "Return to the lead conversation to manage task specifications.".into(),
+        Msg::SpecChanged => "The conversation changed. Reopen /spec in the intended conversation.".into(),
+        Msg::SpecTitle => "Task specifications".into(),
+        Msg::SpecOlder => "Older messages".into(),
+        Msg::SpecReview => "Review the original before selecting an action".into(),
+        Msg::SpecPin => "Pin as task specification".into(),
+        Msg::SpecUnpin => "Unpin task specification".into(),
+        Msg::PatchReady => "Apply this imported user patch with apply_patch using its artifact_id and exact file_paths. Do not reproduce its body:".into(),
         Msg::CmdAboutPaste => "put the clipboard (or a file) into the composer; for when the terminal or the system eats Ctrl+V".into(),
         Msg::CmdAboutConfig => "open the settings panel: search, change a value; esc closes it".into(),
         Msg::CmdAboutProviderPanel => "open the provider panel: accounts and models, add/edit/remove; enter switches, esc closes".into(),
@@ -671,7 +718,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ModelNoneConfigured => "no model is configured to pick from".into(),
         Msg::ModelPickerHint => "switch to which model · enter switches".into(),
         Msg::ModelSet { wanted } => format!("model → {wanted}").into(),
-        Msg::ModeWhatEachDoes => "plan looks without touching · ask asks first · edits writes files without asking · auto asks nothing".into(),
+        Msg::ModeWhatEachDoes => "plan looks without touching · ask asks first · edits writes files without asking · auto asks nothing\nMode model bindings: /config, search modes.".into(),
         Msg::ModeUnknown { what } => format!("`{what}` is not a mode; it takes plan, ask, edits or auto").into(),
         Msg::ModeSet { mode } => format!("now on {mode}").into(),
         Msg::CdUpOneLevel => "up one level".into(),
@@ -1014,6 +1061,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::RawTop => "── atomcode · the whole conversation ──".into(),
         Msg::RawBottom => "── the whole conversation, above: select, scroll and search it with the terminal · any key returns to atomcode ──".into(),
         Msg::MouseHandedBack => "mouse handed back · ctrl+g take it · /raw select across screens · wheel scroll · ↑↓/ctrl+p/n history · ctrl+t open · ctrl+o thinking".into(),
+        Msg::MouseDisabledByTmux => "tmux mouse=off · application mouse stays off · enable mouse in tmux and restart to use application scrolling".into(),
         Msg::MouseUnreportedAtStart => "this terminal reports no mouse · drag to select · wheel or Fn+Up/Down scroll · /raw select across screens · Up/Down history · ctrl+t open · ctrl+o thinking".into(),
         Msg::MouseUnreported => "this terminal reports no mouse, so it keeps it · drag to select · wheel or Fn+Up/Down scroll".into(),
         Msg::MouseHandedBackAtStart => "Mouse handed to terminal · drag to copy, right-click to paste · Ctrl+T expands/collapses tool output".into(),
@@ -1330,6 +1378,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SignedInAgainRerunningSetup => "signed in again — running setup once more…".into(),
         Msg::ConfigNotWritten { error } => format!("the config was not written: {error}").into(),
         Msg::LoginCouldNotStart { error } => format!("the login could not be started: {error}").into(),
+        Msg::LoginAutoOpenFailed { reason } => {
+            format!("  Could not open a browser automatically: {reason}").into()
+        }
         Msg::LoginFailed { error } => format!("the login failed: {error}").into(),
         Msg::LoginNoAnswer => "the login went quiet".into(),
         Msg::TokenExchangeFailed { error } => format!("exchanging the token failed: {error}").into(),
@@ -1551,6 +1602,28 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CopyHandedOver => "Copy request sent. Paste to confirm.".into(),
         Msg::CopyCouldNotStart => "Copy could not start. Please retry after the current copy finishes.".into(),
         Msg::CopyLocalUnavailable => "Could not confirm copying. On Ubuntu Wayland, install wl-clipboard (sudo apt install wl-clipboard), then retry; or use Ctrl+G to release the mouse and copy through the terminal.".into(),
+        Msg::PersonaBuiltin => "Persona: built-in".into(),
+        Msg::PersonaConfig => "Persona: model/provider configuration".into(),
+        Msg::PersonaExplicit => "Persona: launch/host override".into(),
+        Msg::PersonaHost => "Persona: custom host".into(),
+        Msg::PersonaAppended => "Appended instructions: yes".into(),
+        Msg::PersonaNotAppended => "Appended instructions: no".into(),
+        Msg::HooksExit => "Exit code:".into(),
+        Msg::HooksIncomplete => "Test timed out or script could not start".into(),
+        Msg::HooksTitle => "Hooks configuration".into(),
+        Msg::HooksNote => "Current disk configuration; reload after editing. Tests use synthetic payloads and execute scripts, with a 30-second cap.".into(),
+        Msg::HooksTest => "Run script test (up to 30 seconds)".into(),
+        Msg::HooksPaths => "Configuration paths, diagnostics and plugin trust".into(),
+        Msg::HooksBack => "Back to hooks".into(),
+        Msg::HooksChanged => "Session changed. Reopen /hooks.".into(),
+        Msg::FollowUpAbout => "One-shot follow-up: set <prompt> / new <JSON> / show / clear / history [id]".into(),
+        Msg::FollowUpNew { id, spec } => format!("New-session follow-up {id} (launches after normal task completion):\n{spec}").into(),
+        Msg::FollowUpPending { prompt } => format!("One-shot follow-up after normal task completion:\n{prompt}").into(),
+        Msg::FollowUpNone => "No follow-up is registered.".into(),
+        Msg::FollowUpLeadOnly => "Return to the lead conversation to manage follow-ups.".into(),
+        Msg::FollowUpCleared => "Pending follow-up cleared.".into(),
+        Msg::PersonaUnavailable => "This host does not provide mounted persona inspection.".into(),
+        Msg::PersonaAppendUnknown => "Appended instructions: unknown".into(),
         Msg::ContextNoPrompt => "This host assembles no system prompt.".into(),
         Msg::ComposerSuggested { text } => text.to_string().into(),
         Msg::WaitsForTheTurn { command } => format!(
@@ -1558,6 +1631,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         )
         .into(),
         Msg::CompactAfterTurn => "Will compact once this turn ends".into(),
+        Msg::ModelNextTurn { model } => format!("Current turn continues with {model}; the selected model applies next turn.").into(),
         Msg::RuntimeBusy => "Busy (a reply, a compaction or a rebuild is under way); try again shortly".into(),
         Msg::EffortNotForThisModel { wanted, levels } => {
             format!("this model does not take {wanted}; it takes {levels}, default (or auto)").into()

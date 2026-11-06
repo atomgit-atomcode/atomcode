@@ -62,6 +62,7 @@ plexus_service!(ToolDriverSvc => dyn ToolDriver, "tool-driver", Seam, "What a ru
 plexus_service!(DelegatedLlmSvc => dyn LlmProvider, "llm-delegated", Seam, "The model a delegated agent runs on when it inherits the conversation's, for a host that keeps a child's spend apart");
 plexus_service!(DelegationLaneSvc => DelegationLane, "delegation-lane", Core, "Where a delegated agent may write: the scopes it was given, on its own realm");
 plexus_service!(GrantsSvc => dyn atomcode_capabilities::tools::PermissionStore, "grants", Core, "The session's remembered always-allow answers, kept by a host that outlives the tree");
+plexus_service!(ProjectRuleStoreSvc => dyn atomcode_capabilities::tools::approval::ProjectRuleStore, "project-rule-store", Core, "Host-owned exact project approval rules");
 
 /// Which names the catalog admits, as the `tools` row was configured.
 ///

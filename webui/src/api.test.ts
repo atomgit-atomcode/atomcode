@@ -195,6 +195,20 @@ test('live session switch returns a structured active-turn rejection', async () 
   }
 });
 
+test('legacy embedded busy strings retain an actionable session-switch refusal', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    const { postLiveSwitchSession } = await import('./api.ts');
+    for (const [message, expected] of [
+      ['session switch rejected: RuntimeRejected("Failed { message: \"coding runtime is busy\" }")', true],
+      ['session switch rejected: RuntimeRejected("session not found")', false],
+    ] as const) {
+      globalThis.fetch = (async () => new Response(JSON.stringify({ok:false,error:message}), {headers:{'Content-Type':'application/json'}})) as typeof fetch;
+      assert.equal((await postLiveSwitchSession('other')).activeTurn, expected);
+    }
+  } finally { globalThis.fetch = originalFetch; }
+});
+
 test('live mode still rejects protocol-level failures', async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response(
@@ -206,7 +220,7 @@ test('live mode still rejects protocol-level failures', async () => {
     const { postLiveMode } = await import('./api.ts');
     await assert.rejects(
       () => postLiveMode('plan'),
-      /rejected the mode switch/,
+      /runtime is busy/,
     );
   } finally {
     globalThis.fetch = originalFetch;
@@ -712,4 +726,129 @@ test('discoverLocalPackages streams found packages and the final scan summary', 
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test('live stream unlocks its body on normal close and failed reads', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    const { streamLive } = await import('./api.ts');
+    for (const fail of [false, true]) {
+      const body = new ReadableStream<Uint8Array>({ start(controller) {
+        if (fail) controller.error(new Error('disconnected'));
+        else { controller.enqueue(new TextEncoder().encode('data: {"type":"text","content":"hello"}\n\n')); controller.close(); }
+      } });
+      globalThis.fetch = (async () => new Response(body)) as typeof fetch;
+      const events: unknown[] = [];
+      if (fail) await assert.rejects(streamLive(e => events.push(e)), /disconnected/);
+      else { await streamLive(e => events.push(e)); assert.equal(events.length, 1); }
+      assert.equal(body.locked, false);
+    }
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+
+test('live stream cancels and unlocks a still-open body when its activity observer fails', async () => {
+  const originalFetch = globalThis.fetch;
+  let cancelled = false;
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) { controller.enqueue(new TextEncoder().encode(': ping\n\n')); },
+    cancel() { cancelled = true; },
+  });
+  globalThis.fetch = (async () => new Response(body)) as typeof fetch;
+  try {
+    const { streamLive } = await import('./api.ts');
+    await assert.rejects(streamLive(() => {}, undefined, 'session', () => { throw new Error('observer failed'); }), /observer failed/);
+    assert.equal(cancelled, true);
+    assert.equal(body.locked, false);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+
+test('live dispatch failures cancel the old body instead of leaving a falsely healthy stream', async () => {
+  const originalFetch = globalThis.fetch;
+  let cancelled = false;
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) { controller.enqueue(new TextEncoder().encode('data: {"type":"text","content":"hello"}\n\n')); },
+    cancel() { cancelled = true; },
+  });
+  globalThis.fetch = (async () => new Response(body)) as typeof fetch;
+  try {
+    const { streamLive } = await import('./api.ts');
+    await assert.rejects(streamLive(() => { throw new Error('dispatch failed'); }), /dispatch failed/);
+    assert.equal(cancelled, true); assert.equal(body.locked, false);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('workbench reports HTML fallback with an actionable diagnostic', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response('<html>SPA</html>', { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+  try {
+    const { workbenchRequest } = await import('./api.ts');
+    await assert.rejects(workbenchRequest('files?session_id=test&path='), (error: unknown) => {
+      assert.equal((error as { code: string }).code, 'unexpected_html');
+      assert.match(String(error), /relay pairing/);
+      assert.doesNotMatch(String(error), /<html>/);
+      return true;
+    });
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('live session switch preserves the server rejection diagnostic', async () => {
+  const api = await import('./api.ts');
+  await serving(409, '{"error":"Session is open in another terminal","code":"session_in_use"}', 'application/json', async () => {
+    await assert.rejects(api.postLiveSwitchSession('occupied'), (error: unknown) => {
+      assert.equal((error as { code: string }).code, 'session_in_use');
+      assert.match(String(error), /another terminal/);
+      return true;
+    });
+  });
+});
+
+test('persona inspection scopes the live read and propagates a stale-session rejection', async () => {
+  const originalFetch = globalThis.fetch;
+  let body: unknown;
+  globalThis.fetch = (async (url, init) => {
+    assert.equal(String(url), '/live/persona');
+    body = JSON.parse(String(init?.body));
+    return new Response(JSON.stringify({persona:{source:'explicit',appended:true,text:'原文\nAPPEND'}}), {status:200});
+  }) as typeof fetch;
+  try {
+    const {getLivePersona} = await import('./api.ts');
+    assert.equal((await getLivePersona('session-a')).persona?.text, '原文\nAPPEND');
+    assert.deepEqual(body, {session_id:'session-a'});
+    globalThis.fetch = (async () => new Response('{"error":"StaleBinding"}', {status:409})) as typeof fetch;
+    await assert.rejects(getLivePersona('session-b'));
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('follow-up management scopes the explicit preset to its session', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls: unknown[] = [];
+  globalThis.fetch = (async (url, init) => {
+    assert.equal(String(url), '/live/followup');
+    calls.push(JSON.parse(String(init?.body)));
+    return new Response('{"prompt":"review once","current_task":true}', {status:200});
+  }) as typeof fetch;
+  try {
+    const {followUp} = await import('./api.ts');
+    assert.equal((await followUp('session-a','set review once')).prompt, 'review once');
+    assert.deepEqual(calls, [{session_id:'session-a',args:'set review once'}]);
+    globalThis.fetch = (async () => new Response('{"error":"StaleBinding"}', {status:409})) as typeof fetch;
+    await assert.rejects(followUp('session-b','clear'));
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('mode switches preserve independent selection context and explicit API-default effort', async () => {
+  const originalFetch=globalThis.fetch;
+  let submitted: unknown;
+  globalThis.fetch=async (_url,init)=>{
+    submitted=JSON.parse(String(init?.body));
+    return Response.json({ok:true,mode:'plan',selection:{model:'planner',reasoning_effort:'high'}});
+  };
+  try {
+    const {postModeSelection}=await import('./api.ts');
+    const result=await postModeSelection('plan',{independent:true,previous_mode:'build',current_model:{model:'fast',reasoning_effort:null},running:false});
+    assert.deepEqual(result.selection,{model:'planner',reasoning_effort:'high'});
+    assert.deepEqual(submitted,{mode:'plan',independent:true,previous_mode:'build',current_model:{model:'fast',reasoning_effort:null},running:false});
+  }finally{globalThis.fetch=originalFetch;}
 });

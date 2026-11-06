@@ -786,9 +786,20 @@ async fn an_oversized_tool_result_is_shown_head_and_tail_and_saved_whole() {
         &text[..text.len().min(400)]
     );
     let saved: Vec<_> = std::fs::read_dir(&artifacts)
-        .map(|d| d.flatten().collect())
+        .map(|d| {
+            d.flatten()
+                .filter(|e| e.file_name() != ".gitignore")
+                .collect()
+        })
         .unwrap_or_default();
     assert_eq!(saved.len(), 1, "the whole output is on disk: {saved:?}");
+    // The sentinel guards the dir on its own terms: present with the wildcard
+    // body after this spill.
+    assert_eq!(
+        std::fs::read_to_string(artifacts.join(".gitignore")).unwrap(),
+        "*\n",
+        "the git sentinel is written on first spill"
+    );
 }
 
 #[tokio::test]
@@ -810,6 +821,7 @@ async fn a_failed_shell_keeps_its_status_and_full_log_when_previewed() {
     let entries: Vec<_> = std::fs::read_dir(&artifacts)
         .unwrap()
         .map(|entry| entry.unwrap())
+        .filter(|entry| entry.file_name() != ".gitignore")
         .collect();
     assert_eq!(entries.len(), 1);
     let id = entries[0].file_name().into_string().unwrap();
@@ -854,7 +866,13 @@ async fn both_shell_rows_offer_native_tail_without_changing_execution() {
         assert!(text.contains("[exit code 23]"), "{text}");
         assert!(!text.contains("first"), "{text}");
         assert!(text.contains("fetch_output(artifact_id="), "{text}");
-        assert_eq!(std::fs::read_dir(&artifacts).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::read_dir(&artifacts)
+                .unwrap()
+                .filter(|e| e.as_ref().unwrap().file_name() != ".gitignore")
+                .count(),
+            1
+        );
     }
 }
 

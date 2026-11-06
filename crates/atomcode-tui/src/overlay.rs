@@ -33,6 +33,7 @@ pub struct Shown {
     pub id: String,
     pub title: String,
     pub lines: Vec<Line>,
+    pub scroll: usize,
 }
 
 /// What a key did to a modal.
@@ -56,6 +57,13 @@ pub trait Overlay: Send + Sync {
     fn render(&self, viewport: &Viewport<'_>) -> Vec<Line>;
     /// Take one key.
     fn key(&self, press: KeyPress) -> Step;
+    /// Move the body viewport by rows; the final operation hint stays fixed.
+    fn scroll(&self, _by: i32) {}
+    /// The host supplies the limit from the actual allocated body height.
+    fn set_scroll_limit(&self, _limit: usize) {}
+    fn scroll_offset(&self) -> usize {
+        0
+    }
     /// How much of the screen it would like, as a fraction in percent.
     fn size(&self) -> (u8, u8) {
         (70, 60)

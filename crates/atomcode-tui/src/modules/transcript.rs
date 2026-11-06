@@ -42,6 +42,7 @@ struct Open {
     /// replay and resume cannot disagree about what a turn cost — the same
     /// reason every other block is built here.
     stats: TurnStats,
+    summaries: u64,
     /// When the turn opened, on the log's own clock (`LoggedEvent::at`, in ms).
     /// The difference to the `TurnEnd` reading is the turn's duration — the log
     /// records no elapsed of its own, so it is folded from the two timestamps
@@ -211,6 +212,18 @@ impl Producer for Transcript {
         ID
     }
 
+    fn tool_progress(&self, call_id: &str, message: &str, out: &mut StreamWriter<'_>) -> bool {
+        let mut open = self.open.lock().expect("transcript poisoned");
+        let Some((id, block)) = open.calls.get_mut(call_id) else {
+            return false;
+        };
+        if block.progress.as_deref() == Some(message) {
+            return false;
+        }
+        block.progress = Some(message.to_owned());
+        out.amend(*id, Arc::new(block.with(Outcome::Pending)))
+    }
+
     fn reset(&self) {
         *self.open.lock().expect("transcript poisoned") = Open::default();
         self.turns.lock().expect("transcript poisoned").clear();
@@ -343,6 +356,15 @@ impl Producer for Transcript {
             // Chunks accumulate into one live block rather than one block per
             // token: the model said one thing, and the transcript should show
             // one thing being said.
+            SessionEvent::ReasoningDiscarded { .. } => {
+                if let Some((id, _)) = open.thought.take() {
+                    out.amend(
+                        id,
+                        Arc::new(ModelThought("[推理复读，此次推理已丢弃]".into())),
+                    );
+                    out.settle(id);
+                }
+            }
             SessionEvent::AssistantChunk {
                 delta,
                 reasoning,
@@ -544,11 +566,19 @@ impl Producer for Transcript {
             //
             // Summary folds and dropped history warrant a notice; routine
             // tool-output rewrites stay in the event log without UI noise.
-            SessionEvent::Compacted { through, .. } => {
+            SessionEvent::Compacted { .. }
+                if atomcode_harness::session::is_context_summary(fact) =>
+            {
+                open.summaries += 1;
                 out.emit(
                     at,
                     Arc::new(NoticeBlock {
-                        detail: t(Msg::TranscriptCompacted { through: *through }).into_owned(),
+                        detail: atomcode_i18n::product::t(
+                            atomcode_i18n::product::Msg::ContextSummaryRecorded {
+                                count: open.summaries,
+                            },
+                        )
+                        .into_owned(),
                     }),
                 );
             }
@@ -1147,8 +1177,8 @@ mod tests {
         ]);
         let drawn = said(&s);
         assert!(
-            drawn.contains("已压缩模型") && drawn.contains("#7") && drawn.contains("不是新指令"),
-            "the compaction says how far it reached:\n{drawn}"
+            drawn.contains("上下文已摘要") && drawn.contains("第 1 次"),
+            "a committed summary has a numbered notice:\n{drawn}"
         );
         assert!(
             !drawn.contains("工具输出被就地换短"),
@@ -2145,5 +2175,27 @@ mod tests {
             !p.is_hidden("injected:peer"),
             "a teammate's report is not the environment talking to itself"
         );
+    }
+    #[test]
+    fn discarded_reasoning_is_marked_and_not_combined_with_the_retry() {
+        let stream = fold(&[
+            SessionEvent::AssistantChunk {
+                turn: 1,
+                round: 1,
+                delta: "bad repeated prefix".into(),
+                reasoning: true,
+            },
+            SessionEvent::ReasoningDiscarded { turn: 1, round: 1 },
+            SessionEvent::AssistantChunk {
+                turn: 1,
+                round: 1,
+                delta: "fresh reasoning".into(),
+                reasoning: true,
+            },
+        ]);
+        let shown = said(&stream);
+        assert!(!shown.contains("bad repeated prefix"));
+        assert!(shown.contains("已丢弃"));
+        assert!(shown.contains("fresh reasoning"));
     }
 }

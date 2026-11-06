@@ -137,10 +137,8 @@ impl SensitivePaths {
             return false;
         };
         let mut real_user: Option<Option<PathBuf>> = None;
-        for key in ["file_path", "path"] {
-            let Some(raw) = value.get(key).and_then(|v| v.as_str()) else {
-                continue;
-            };
+        for raw in super::file_target_arg_values(args) {
+            let raw = raw.as_str();
             let path = super::resolve_path(raw, working_dir);
             let named = serde_json::json!({ "path": path }).to_string();
             if self.references(&named) {
@@ -309,14 +307,12 @@ impl SensitivePaths {
         working_dir: &Path,
         world: &dyn crate::world::FileSystem,
     ) -> Option<String> {
-        let value: serde_json::Value = serde_json::from_str(args).ok()?;
+        let _: serde_json::Value = serde_json::from_str(args).ok()?;
         let mut targets = Vec::new();
-        for key in ["file_path", "path"] {
-            if let Some(raw) = value.get(key).and_then(|v| v.as_str()) {
-                let path = super::resolve_path(raw, working_dir);
-                let real = world.canonicalize(&path).await.unwrap_or(path);
-                targets.push(crate::pathnorm::to_display(&real));
-            }
+        for raw in super::file_target_arg_values(args) {
+            let path = super::resolve_path(&raw, working_dir);
+            let real = world.canonicalize(&path).await.unwrap_or(path);
+            targets.push(crate::pathnorm::to_display(&real));
         }
         (!targets.is_empty()).then(|| targets.join("\u{1f}"))
     }
@@ -699,6 +695,12 @@ mod tests {
             "cd - && cat config.toml",
             "cd \"$DEST\" && cat config.toml",
             "for i in 1 2; do cd ..; done; cat config.toml",
+            "cd src; for i in 1 2; do command cd ..; done; cat config.toml",
+            "CDPATH=/private; cd src; for i in 1 2; do cat config.toml; done",
+            "printf -v CDPATH /private; cd src; for i in 1 2; do cat config.toml; done",
+            "trap 'cd /private' DEBUG; cd src; for i in 1 2; do cat config.toml; done",
+            "cd src; pushd /private; for i in 1 2; do cat config.toml; done",
+            "cd src; for i in 1 2; do 'c''d' ..; done; cat config.toml",
             "while true; do cd ..; done; cat config.toml",
             "move() { cd ..; }; move; cat config.toml",
         ] {
@@ -715,6 +717,10 @@ mod tests {
         }
         std::fs::create_dir(temp.path().join("src")).unwrap();
         std::fs::write(temp.path().join("src/main.rs"), "fn main() {}").unwrap();
+        assert!(!guard.references_in(
+            r#"{"command":"cd src && for i in 1 2 3; do cat main.rs 2>&1 | tail -5; done"}"#,
+            temp.path(), &world
+        ).await);
         assert!(
             !guard
                 .references_in(

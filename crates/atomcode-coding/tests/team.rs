@@ -1079,6 +1079,7 @@ async fn a_person_stops_a_member_from_the_catalog() {
                 session: session.into(),
                 name: "stop".into(),
                 args: String::new(),
+                images: Vec::new(),
             })
             .unwrap();
     }
@@ -1410,6 +1411,7 @@ async fn a_person_stopping_a_member_wakes_the_lead_only_when_it_was_owed_a_repor
             session: scout_session.clone(),
             name: "stop".into(),
             args: String::new(),
+            images: Vec::new(),
         })
         .unwrap();
     events_until(&mut handle, |e| matches!(e, AgentEvent::Invoked { .. })).await;
@@ -1462,6 +1464,7 @@ async fn a_person_stopping_a_member_wakes_the_lead_only_when_it_was_owed_a_repor
             session: scout_session.clone(),
             name: "stop".into(),
             args: String::new(),
+            images: Vec::new(),
         })
         .unwrap();
     events_until(&mut handle, |e| matches!(e, AgentEvent::Invoked { .. })).await;
@@ -2484,4 +2487,70 @@ async fn a_full_team_says_which_members_hold_the_places_and_how_to_free_one() {
         "who holds the places, and how to free one: {}",
         refused.content
     );
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_stopping_member_keeps_its_name_until_its_agent_is_removed() {
+    let dir = scratch("stop-recreate");
+    let app = start(tree(&dir, r#"{ text = "ok" }"#, r#"{ text = "looked" }"#)).await;
+    let lead = create_agent(&app).await.unwrap();
+    let delegate = r#"{"action":"delegate","name":"scout","role":"explorer","task":"look around"}"#;
+    assert!(!as_lead(&app, &lead, delegate).await.is_error);
+    let agents = app.context().service::<AgentsSvc>().unwrap();
+    let session = format!("{}/scout", lead.session_id());
+    let member = agents.by_session(&session).unwrap();
+    until_idle(&member).await;
+    member.begin_turn();
+    let mut stopping = Box::pin(as_lead(&app, &lead, r#"{"action":"stop","name":"scout"}"#));
+    tokio::select! {
+        result = &mut stopping => panic!("stop finished before the member became idle: {}", result.content),
+        _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+    }
+    let duplicate = as_lead(&app, &lead, delegate).await;
+    assert!(
+        duplicate.is_error,
+        "a member was recreated before its previous owner released it: {}",
+        duplicate.content
+    );
+    assert_eq!(agents.by_session(&session).unwrap().id(), member.id());
+    member.end_turn();
+    let stopped = stopping.await;
+    assert!(!stopped.is_error, "{}", stopped.content);
+    assert!(agents.by_session(&session).is_none());
+    let recreated = as_lead(&app, &lead, delegate).await;
+    assert!(!recreated.is_error, "{}", recreated.content);
+    assert_ne!(agents.by_session(&session).unwrap().id(), member.id());
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_stop_timeout_keeps_the_member_owned_and_does_not_commit_stopped() {
+    let dir = scratch("stop-timeout");
+    let app = start(tree(&dir, r#"{ text = "ok" }"#, r#"{ text = "looked" }"#)).await;
+    let lead = create_agent(&app).await.unwrap();
+    assert!(
+        !as_lead(
+            &app,
+            &lead,
+            r#"{"action":"delegate","name":"scout","role":"explorer","task":"look around"}"#
+        )
+        .await
+        .is_error
+    );
+    let agents = app.context().service::<AgentsSvc>().unwrap();
+    let member = agents
+        .by_session(&format!("{}/scout", lead.session_id()))
+        .unwrap();
+    until_idle(&member).await;
+    member.begin_turn();
+    let stopped = as_lead(&app, &lead, r#"{"action":"stop","name":"scout"}"#).await;
+    assert!(stopped.is_error, "{}", stopped.content);
+    assert!(agents.get(member.id()).is_some());
+    assert!(!member
+        .session()
+        .events()
+        .iter()
+        .any(|event| matches!(event.event, SessionEvent::Stopped { .. })));
+    member.end_turn();
+    let stopped = as_lead(&app, &lead, r#"{"action":"stop","name":"scout"}"#).await;
+    assert!(!stopped.is_error, "{}", stopped.content);
 }

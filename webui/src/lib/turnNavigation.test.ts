@@ -75,6 +75,17 @@ test('returning to bottom keeps following through content growth; gestures and s
   intent.jumpTo(Infinity); intent.interact();
   assert.equal(intent.onScroll(viewport), null);
 });
+test('a small upward scroll releases the held follow instead of swallowing it', async () => {
+  const { createTurnNavigationIntent } = await import('./turnNavigation.ts');
+  const intent = createTurnNavigationIntent();
+  const viewport = { scrollTop: 800, scrollHeight: 1500, clientHeight: 600 };
+  intent.followBottom();
+  assert.equal(intent.onScroll(viewport), true, 'a held follow reports following');
+  viewport.scrollTop = 775; // 25px up: the reproduction of the swallowed gesture
+  assert.equal(intent.onScroll(viewport), false, 'a real upward gesture outranks the held follow');
+  viewport.scrollHeight += 28; // the stream grows the content, as a live turn does
+  assert.equal(intent.onScroll(viewport), null, 'and it stays released while reading');
+});
 
 test('unified navigation uses timestamps, retains undone history and adds unfinished live turns', async () => {
   const { mergeTurnNavigation } = await import('./turnNavigation.ts');

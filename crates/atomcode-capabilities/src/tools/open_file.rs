@@ -15,12 +15,16 @@
 //! host-side capability the client invokes, never a `ctx.fs` method.)
 //!
 //! [`LocalOpener`] is this machine's desktop: it picks the launcher by OS + environment
-//! (`open` / `xdg-open` / `explorer.exe` / `wslview`), and a headless / SSH / CI session
-//! REFUSES with a human-readable reason (and the path) instead of pretending a window
-//! opened. `ATOMCODE_OPEN_COMMAND` overrides that guess with a launcher the person names
-//! (an editor nobody registered as the default handler); the file is appended as its last
-//! argument, so nothing goes through a shell. Launching a GUI is a user-visible side
-//! effect ⇒ the tool is always `Risky`.
+//! (`open` / `xdg-open` / `explorer.exe` / `wslview` / HarmonyOS PC's `aa`), and a
+//! headless / SSH / CI session REFUSES with a human-readable reason (and the path)
+//! instead of pretending a window opened. HarmonyOS PC is the case that stops a missing
+//! `$DISPLAY` from meaning "nobody is at a display": atomcode there usually runs inside
+//! the device's own app sandbox, which exports no `$DISPLAY`, and the system image ships
+//! no `xdg-open` — but `aa` starts the device's browser on the screen the person is
+//! looking at. `ATOMCODE_OPEN_COMMAND` overrides either guess with a launcher the person
+//! names (an editor nobody registered as the default handler); the file is appended as
+//! its last argument, so nothing goes through a shell. Launching a GUI is a user-visible
+//! side effect ⇒ the tool is always `Risky`.
 
 use super::{err, ok, resolve_path};
 use async_trait::async_trait;
@@ -114,11 +118,140 @@ enum OpenStrategy {
     WindowsStart,
     /// `wslview <path>` — wslu's WSL→Windows bridge.
     Wslview,
-    /// A launcher the person configured (`ATOMCODE_OPEN_COMMAND`), split into
+/// A launcher the person configured (`ATOMCODE_OPEN_COMMAND`), split into
     /// program and arguments. Wins over every OS guess above.
     Custom(Vec<String>),
+    /// `aa start -a <ability> -b <bundle> -U <url>` — HarmonyOS PC's device-side ability
+    /// manager, which opens the browser on the device's own screen. It is the opener left
+    /// when atomcode runs inside that device's app sandbox: no `$DISPLAY` reaches it and
+    /// the system image ships no `xdg-open`, yet the person is at a desktop.
+    OhosAa,
     /// No GUI session — refuse, naming the disqualifying signal.
     Headless(String),
+}
+
+/// The stock HarmonyOS PC browser, and the ability `aa` starts to show it a URL.
+///
+/// Both come from the system image — the device's own scene board logs the pair as
+/// `MainAbility/com.huawei.hmos.browser/entry/0`. The explicit ability plus the
+/// view-data action is what makes the browser load the page: the bundle-only
+/// implicit form answers `start ability successfully` without ever opening anything
+/// (verified on HarmonyOS PC, see #1680).
+const OHOS_BROWSER_BUNDLE: &str = "com.huawei.hmos.browser";
+const OHOS_BROWSER_ABILITY: &str = "MainAbility";
+const OHOS_BROWSER_ACTION: &str = "ohos.want.action.viewData";
+
+/// The argv that hands `url` to HarmonyOS PC's browser through the device-side
+/// ability manager. One function so the shape is assertable: drop `-a` or `-A`
+/// and `aa` still answers success while the page never loads — a regression no
+/// spawn-level test could catch, which is why the argv is pinned by a test.
+fn ohos_aa_argv(url: &str) -> Vec<String> {
+    vec![
+        "start".into(),
+        "-a".into(),
+        OHOS_BROWSER_ABILITY.into(),
+        "-b".into(),
+        OHOS_BROWSER_BUNDLE.into(),
+        "-A".into(),
+        OHOS_BROWSER_ACTION.into(),
+        "-U".into(),
+        url.into(),
+    ]
+}
+
+/// Resolve an existing script before interpreting it: ENOENT may mean the
+/// interpreter is missing, but must never turn a missing command into success.
+fn script_path(cmd: &Command) -> Option<PathBuf> {
+    use std::io::Read;
+    let program = Path::new(cmd.get_program());
+    let paths: Vec<PathBuf> = if program.components().count() > 1 || program.is_absolute() {
+        vec![program.into()]
+    } else {
+        std::env::split_paths(&std::env::var_os("PATH")?)
+            .map(|dir| dir.join(program))
+            .collect()
+    };
+    paths.into_iter().find(|path| {
+        if !path.is_file() {
+            return false;
+        }
+        let mut prefix = [0; 2];
+        std::fs::File::open(path)
+            .and_then(|mut file| file.read_exact(&mut prefix))
+            .is_ok()
+            && prefix == *b"#!"
+    })
+}
+
+/// Interpret the verified wrapper itself, rather than exec'ing it again and
+/// consulting the same broken shebang. URL arguments are never shell source.
+fn shell_fallback_command(cmd: &Command, path: &Path) -> Command {
+    let mut sh = Command::new("sh");
+    sh.arg(path).args(cmd.get_args());
+    for (key, value) in cmd.get_envs() {
+        if let Some(value) = value {
+            sh.env(key, value);
+        } else {
+            sh.env_remove(key);
+        }
+    }
+    if let Some(cwd) = cmd.get_current_dir() {
+        sh.current_dir(cwd);
+    }
+    sh
+}
+
+/// aa is a short-lived request dispatcher. Check its exit status, not just
+/// process creation. File-backed diagnostics avoid pipe-fill and inherited-pipe
+/// hangs; only a bounded prefix is read back into memory.
+fn run_aa(mut cmd: Command, timeout: std::time::Duration) -> Result<(), String> {
+    use std::io::Read;
+    let output = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
+    let diagnostics = output.reopen().map_err(|e| e.to_string())?;
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(diagnostics.try_clone().map_err(|e| e.to_string())?)
+        .stderr(diagnostics);
+    // The fallback needs the same output destination and argv; construct it here
+    // so stream configuration is not lost when the wrapper interpreter is absent.
+    let spawn = cmd.spawn();
+    let mut child = match spawn {
+        Ok(child) => child,
+        Err(error) if matches!(error.raw_os_error(), Some(2 | 8)) => {
+            let path = script_path(&cmd).ok_or_else(|| error.to_string())?;
+            let diagnostics = output.reopen().map_err(|e| e.to_string())?;
+            shell_fallback_command(&cmd, &path)
+                .stdin(std::process::Stdio::null())
+                .stdout(diagnostics.try_clone().map_err(|e| e.to_string())?)
+                .stderr(diagnostics)
+                .spawn()
+                .map_err(|e| e.to_string())?
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => {
+                let mut text = String::new();
+                let _ = output
+                    .reopen()
+                    .and_then(|file| file.take(4096).read_to_string(&mut text));
+                return Err(format!("aa exited with {status}: {}", text.trim()));
+            }
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20))
+            }
+            result => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(match result {
+                    Err(error) => error.to_string(),
+                    _ => "aa timed out while submitting the browser request".into(),
+                });
+            }
+        }
+    }
 }
 
 /// Pick a strategy from OS + env. Pure (reads env / `/proc/version`, no GUI side effects).
@@ -165,26 +298,32 @@ fn pick_open_strategy() -> OpenStrategy {
             || std::env::var("WAYLAND_DISPLAY")
                 .map(|v| !v.is_empty())
                 .unwrap_or(false);
-        // `wslview` (wslu) is the canonical WSL opener, but it is an extra package:
-        // plenty of WSL2 installs have WSLg and no wslu. Preferring it unconditionally
-        // made those fail with "failed to launch `wslview`" while `xdg-open` was right
-        // there and working (measured in a Linux container on a WSL2 host). So it is
-        // used only when it is actually installed; otherwise the display check below
-        // decides, exactly as on any other Linux.
-        if is_wsl() && command_on_path("wslview") {
-            return OpenStrategy::Wslview;
-        }
-        if !has_display {
-            return OpenStrategy::Headless(
-                "no graphical session ($DISPLAY and $WAYLAND_DISPLAY both empty — likely a \
-                 server / container / headless console)"
-                    .into(),
-            );
-        }
-        return OpenStrategy::XdgOpen;
+return pick_unix_strategy(cfg!(target_env = "ohos"), has_display);
     }
     #[allow(unreachable_code)]
     OpenStrategy::Headless("unsupported platform".into())
+}
+
+/// The Unix opener, split from the env reads above so the HarmonyOS branch is
+/// unit-testable on any host: `ohos` is `cfg!(target_env = "ohos")` at the call site,
+/// `has_display` the `$DISPLAY` / `$WAYLAND_DISPLAY` check.
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+fn pick_unix_strategy(ohos: bool, has_display: bool) -> OpenStrategy {
+    // HarmonyOS PC: the system image has no `xdg-open`, and the app sandbox atomcode
+    // runs in exports no `$DISPLAY` — so the display check would refuse a URL on a
+    // machine that has both a browser and a person in front of it. `aa` is the way to
+    // that screen, with or without a reported display.
+    if ohos {
+        return OpenStrategy::OhosAa;
+    }
+    if !has_display {
+        return OpenStrategy::Headless(
+            "no graphical session ($DISPLAY and $WAYLAND_DISPLAY both empty — likely a \
+             server / container / headless console)"
+                .into(),
+        );
+    }
+    OpenStrategy::XdgOpen
 }
 
 fn ssh_signal() -> Option<String> {
@@ -292,10 +431,11 @@ fn is_executable_file(path: &Path) -> bool {
 
 fn strategy_command_name(s: &OpenStrategy) -> String {
     match s {
-        OpenStrategy::MacOpen => "open".into(),
+OpenStrategy::MacOpen => "open".into(),
         OpenStrategy::XdgOpen => "xdg-open".into(),
         OpenStrategy::WindowsStart => "explorer.exe".into(),
         OpenStrategy::Wslview => "wslview".into(),
+        OpenStrategy::OhosAa => "aa".into(),
         // The configured program, which is a runtime string — the reason this
         // returns `String` rather than `&'static str`.
         OpenStrategy::Custom(parts) => parts
@@ -318,9 +458,10 @@ impl Tool for OpenFileTool {
          browser). USE ONLY when the user asks to preview/open/view a file or directory, or \
          when previewing is the obvious next step AND you have asked first — do NOT auto-open \
          after every write_file/edit_file. Prefer this tool over shelling out to `open`, \
-         `xdg-open`, `start`, or `wslview`. Cross-platform dispatch is built in; headless / SSH \
-         / CI sessions refuse with a clear reason so you can give the user the path instead of \
-         pretending a window opened."
+         `xdg-open`, `start`, or `wslview`. Cross-platform dispatch is built in, and on \
+         HarmonyOS PC a URL goes to the device's own browser via `aa` — where a missing \
+         display no longer means refusal; headless / SSH / CI sessions refuse with a clear \
+         reason so you can give the user the path instead of pretending a window opened."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
@@ -401,13 +542,24 @@ pub async fn open_local_path(target: &Path) -> Result<String, String> {
             c.arg(&target_str);
             c
         }
-        OpenStrategy::Custom(parts) => {
+OpenStrategy::Custom(parts) => {
             let program = parts
                 .first()
                 .ok_or_else(|| "open_file: ATOMCODE_OPEN_COMMAND names no program".to_string())?;
             let mut c = Command::new(program);
             c.args(&parts[1..]).arg(&target_str);
             c
+        }
+        OpenStrategy::OhosAa => {
+            // `aa` here carries a URL to the browser, and the device ships no `xdg-open`,
+            // so there is no file opener to hand a path to: refuse with the path rather
+            // than pretend a window opened.
+            return Err(format!(
+                "open_file: cannot open a file in GUI on HarmonyOS PC from here — `aa` \
+                 carries a URL to the device's browser, and the device ships no \
+                 `xdg-open`.\n\nFile path for manual viewing:\n  {}",
+                crate::pathnorm::to_display(&target)
+            ));
         }
         OpenStrategy::Headless(reason) => {
             return Err(format!(
@@ -440,8 +592,22 @@ pub async fn open_local_path(target: &Path) -> Result<String, String> {
     }
 }
 
+/// Sync twin of [`open_local_url`]: same strategy, same argv, same messages — for
+/// callers on a plain thread with no async runtime at hand (the login flow runs on
+/// a blocking thread, and the spawn below never awaits anything).
+pub fn open_local_url_sync(url: &str) -> Result<String, String> {
+    open_local_url_impl(url)
+}
+
 /// Open a URL in this machine's default browser. Skips file-path resolution entirely.
 pub async fn open_local_url(url: &str) -> Result<String, String> {
+    let url = url.to_string();
+    tokio::task::spawn_blocking(move || open_local_url_impl(&url))
+        .await
+        .map_err(|e| format!("URL opener failed: {e}"))?
+}
+
+fn open_local_url_impl(url: &str) -> Result<String, String> {
     let strategy = pick_open_strategy();
     let mut cmd = match &strategy {
         OpenStrategy::MacOpen => {
@@ -468,12 +634,22 @@ pub async fn open_local_url(url: &str) -> Result<String, String> {
             c.arg(url);
             c
         }
-        OpenStrategy::Custom(parts) => {
+OpenStrategy::Custom(parts) => {
             let program = parts
                 .first()
                 .ok_or_else(|| "open_file: ATOMCODE_OPEN_COMMAND names no program".to_string())?;
             let mut c = Command::new(program);
             c.args(&parts[1..]).arg(url);
+            c
+        }
+        OpenStrategy::OhosAa => {
+            // HarmonyOS PC: hand the URL to the device's own browser through the
+            // device-side ability manager — the argv shape is pinned by
+            // [`ohos_aa_argv`]'s test, because a dropped `-a`/`-A` still "succeeds".
+            let mut c = Command::new("aa");
+            for arg in ohos_aa_argv(url) {
+                c.arg(arg);
+            }
             c
         }
         OpenStrategy::Headless(reason) => {
@@ -482,15 +658,29 @@ pub async fn open_local_url(url: &str) -> Result<String, String> {
             ));
         }
     };
+    if matches!(strategy, OpenStrategy::OhosAa) {
+        return run_aa(cmd, std::time::Duration::from_secs(5))
+            .map(|()| format!("Submitted browser-open request for `{url}` via `aa`; the page may appear after a few seconds."))
+            .map_err(|error| format!("open_file: {error}.\n\nURL for manual access:\n  {url}"));
+    }
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     crate::process_utils::suppress_console_window_sync(&mut cmd);
     match cmd.spawn() {
-        Ok(_child) => Ok(format!(
-            "Opened URL `{url}` via `{}`.",
-            strategy_command_name(&strategy)
-        )),
+        Ok(_child) => {
+            let mut message = format!(
+                "Opened URL `{url}` via `{}`.",
+                strategy_command_name(&strategy)
+            );
+            if matches!(&strategy, OpenStrategy::OhosAa) {
+                // The device's ability manager answers before the browser has the page:
+                // on HarmonyOS PC it shows up seconds later, and saying so keeps a caller
+                // from reading the delay as a failure (#1680).
+                message.push_str(" The device's browser shows it a few seconds later.");
+            }
+            Ok(message)
+        }
         Err(e) => Err(format!(
             "open_file: failed to launch `{}` to open URL: {e}.\n\nURL for manual access:\n  {url}",
             strategy_command_name(&strategy),
@@ -652,14 +842,15 @@ mod tests {
             OpenStrategy::XdgOpen,
             OpenStrategy::WindowsStart,
             OpenStrategy::Wslview,
-            OpenStrategy::Custom(vec!["my-opener".into()]),
+OpenStrategy::Custom(vec!["my-opener".into()]),
+            OpenStrategy::OhosAa,
             OpenStrategy::Headless("x".into()),
         ] {
             assert!(!strategy_command_name(&s).is_empty());
         }
     }
 
-    /// A configured launcher is named by its program, which is what the message
+/// A configured launcher is named by its program, which is what the message
     /// (and `describe`) shows — not the whole command line.
     #[test]
     fn a_configured_command_is_named_by_its_program() {
@@ -690,6 +881,74 @@ mod tests {
         // Empty and whitespace-only mean "not configured", not "a program called ''".
         assert_eq!(parse_open_command(""), None);
         assert_eq!(parse_open_command("   "), None);
+    }
+
+    /// HarmonyOS PC is where the sandbox hides the display, so `aa` is the opener there
+    /// whether or not a display is reported; every other Unix keeps today's behaviour —
+    /// refuse without a display, `xdg-open` with one.
+    #[test]
+    fn unix_picks_aa_for_harmonyos_and_xdg_open_elsewhere() {
+        assert_eq!(pick_unix_strategy(true, false), OpenStrategy::OhosAa);
+        assert_eq!(pick_unix_strategy(true, true), OpenStrategy::OhosAa);
+        assert_eq!(pick_unix_strategy(false, true), OpenStrategy::XdgOpen);
+        assert!(matches!(
+            pick_unix_strategy(false, false),
+            OpenStrategy::Headless(_)
+        ));
+    }
+
+    /// The argv is the whole contract: `-a MainAbility` and the view-data action
+    /// are what make the browser actually load the page — drop either and `aa`
+    /// still answers success while nothing opens, which no spawn-level test can
+    /// catch. So the pairing is pinned flag by flag, not just "non-empty".
+    #[test]
+    fn ohos_aa_argv_carries_the_ability_and_the_view_action() {
+        let url = "https://acs.atomgit.com/s/example";
+        let argv = ohos_aa_argv(url);
+        let value = |flag: &str| {
+            let i = argv
+                .iter()
+                .position(|a| a == flag)
+                .unwrap_or_else(|| panic!("argv must carry {flag}: {argv:?}"));
+            argv[i + 1].clone()
+        };
+        assert_eq!(value("-a"), OHOS_BROWSER_ABILITY);
+        assert_eq!(value("-b"), OHOS_BROWSER_BUNDLE);
+        assert_eq!(value("-A"), OHOS_BROWSER_ACTION);
+        assert_eq!(value("-U"), url);
+    }
+
+    /// The ENOEXEC fallback must rerun exactly the same program and argv through
+    /// `sh`, with the URL still one argv entry — nothing handed to a shell for
+    /// re-parsing, so a URL with `&` in it cannot turn into a background job.
+    #[cfg(unix)]
+    #[test]
+    fn aa_checks_failures_missing_interpreters_and_literal_arguments() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aa");
+        std::fs::write(&path, "#!/missing/aa-interpreter\n[ \"$1\" = 'https://example.test/?a=1&b=$(bad)' ] || exit 9\necho rejected >&2\nexit 42\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut command = Command::new(&path);
+        command.arg("https://example.test/?a=1&b=$(bad)");
+        let error = run_aa(command, std::time::Duration::from_secs(1)).unwrap_err();
+        assert!(
+            error.contains("42") && error.contains("rejected"),
+            "{error}"
+        );
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        assert!(run_aa(Command::new(&path), std::time::Duration::from_secs(1)).is_ok());
+        std::fs::write(&path, "#!/bin/sh\nexec sleep 10\n").unwrap();
+        assert!(
+            run_aa(Command::new(&path), std::time::Duration::from_millis(40))
+                .unwrap_err()
+                .contains("timed out")
+        );
+        assert!(run_aa(
+            Command::new(dir.path().join("missing")),
+            std::time::Duration::from_secs(1)
+        )
+        .is_err());
     }
 
     #[test]

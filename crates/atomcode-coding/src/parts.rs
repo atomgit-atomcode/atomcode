@@ -93,6 +93,8 @@ impl SubagentPolicy {
 /// (fs/bash tools + codeintel). Defaults = the full production-parity agent.
 #[derive(Clone, Debug)]
 pub struct PrepareOptions {
+    /// Explicit persona overrides survive model changes and rebuilds.
+    pub prompt_overrides: crate::host::PromptOverrides,
     pub session: SessionMode,
     /// Whether this driver exposes any tools to the model. `false` keeps the
     /// normal coding runtime/provider lifecycle but publishes an empty tool
@@ -278,6 +280,7 @@ impl Default for PrepareOptions {
             front_end: None,
             review_delegate: None,
             host_plugins: HostPlugins::default(),
+            prompt_overrides: Default::default(),
             identity: crate::persona::ProductIdentity::default(),
         }
     }
@@ -437,6 +440,7 @@ pub fn prepare_from_config(cfg: &crate::config::CodingRuntimeConfig) -> PrepareO
         .map(|c| resolve_external_subagents(&c.subagent, cfg.interactive).0)
         .unwrap_or_default();
     PrepareOptions {
+        prompt_overrides: cfg.prompt_overrides.clone(),
         mcp: cfg.mcp,
         external_subagents,
         ..PrepareOptions::default()
@@ -757,6 +761,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     stage_fresh: bool,
 ) -> io::Result<CodingParts> {
     let tools_started = std::time::Instant::now();
+    let bypass_mode = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut registry = ToolRegistry::new();
     let mut names: Vec<String> = Vec::new();
     // Tools a tree takes from here as they are (see `CodingParts::host_only_tools`):
@@ -772,8 +777,17 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // toolsets below are explicitly selected and never inherit this service.
     if opts.tools {
         if let Some(service) = &cfg.automation {
-            for tool in atomcode_capabilities::tools::automation::automation_tools(service.clone())
-            {
+            for tool in atomcode_capabilities::tools::automation::automation_tools_with_approval(
+                service.clone(),
+                {
+                    let bypass = bypass_mode.clone();
+                    let policy = cfg.automation_approval;
+                    Arc::new(move || {
+                        policy == atomcode_config::config::AutomationApproval::Inherit
+                            && bypass.load(std::sync::atomic::Ordering::Acquire)
+                    })
+                },
+            ) {
                 names.push(tool.name().to_string());
                 host_only_tools.push(tool.name().to_string());
                 registry.register(tool);
@@ -1111,6 +1125,19 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             // would bypass ownership and manufacture an incomplete native session.
             // A session a released build stored as a snapshot becomes a log here,
             // once (`docs/adr/0024` §10).
+            // Only a cold acquisition can establish that the previous runtime
+            // exited. Reload/model switches reuse ownership and must not close
+            // an active turn or recover its preview as a second assistant reply.
+            let mut recovery_summary = None;
+            if !reuse_lease
+                .as_ref()
+                .is_some_and(|source| source.lease().id() == id)
+                && manager.is_event_session(id)
+            {
+                recovery_summary = manager
+                    .recover_interrupted_turn(&lease)
+                    .map_err(io::Error::from)?;
+            }
             let (loaded, pending_resume_prompt) = manager
                 .open_for_resume_noting(&lease, &mut startup_warnings)
                 .map_err(io::Error::from)?;
@@ -1118,6 +1145,15 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             // kernel's empty-start seam — that would silently fresh-start under the
             // SAME session id and corrupt on-disk state.
             check_snapshot_version(&loaded.snapshot)?;
+            if let Some(mut summary) = recovery_summary {
+                if let Some(tasks) =
+                    crate::todo::recovery_task_summary(&loaded.snapshot.messages, &manager, id)
+                {
+                    summary.push('\n');
+                    summary.push_str(&tasks);
+                }
+                startup_warnings.push(summary);
+            }
             Some(SessionBinding {
                 id: id.clone(),
                 manager,
@@ -1253,7 +1289,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         tool_catalog: Arc::new(std::sync::RwLock::new(None)),
         shared_cwd: std::sync::Arc::new(std::sync::RwLock::new(cfg.working_dir.clone())),
         plan_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        bypass_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        bypass_mode,
         accept_edits: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         turn_execution_policy,
         mcp_plan_grants: std::sync::Arc::new(
@@ -1414,10 +1450,15 @@ impl CodingParts {
         std::mem::take(&mut self.startup_warnings)
     }
 
-    /// The host-owned CodingPlan quota source, if any. Used at `/goal` start to
-    /// size the round budget from the live request quota.
-    pub(crate) fn rate_limit_source(&self) -> Option<&Arc<dyn RateLimitWindowSource>> {
-        self.rate_limit_source.as_ref()
+    /// The host-owned quota source, only for the active endpoint it meters.
+    /// Shared by usage queries, goal budgeting and the rate-limit policy.
+    pub(crate) fn rate_limit_source(
+        &self,
+        base_url: &str,
+    ) -> Option<&Arc<dyn RateLimitWindowSource>> {
+        self.rate_limit_source
+            .as_ref()
+            .filter(|source| source.applies_to(base_url))
     }
 
     pub(crate) fn take_snapshot_persistence_uncertain(&self) -> Option<String> {
@@ -2671,6 +2712,7 @@ mod tests {
             front_end: None,
             review_delegate: None,
             host_plugins: Default::default(),
+            prompt_overrides: Default::default(),
             identity: Default::default(),
         };
 
@@ -2944,6 +2986,59 @@ mod tests {
         assert!(!text.contains("disabled"), "on removes the key: {text}");
     }
 
+    #[tokio::test]
+    async fn schedule_policy_uses_the_prepared_runtime_mode_flag() {
+        use atomcode_capabilities::tools::automation::AutomationService;
+        struct Backend;
+        impl AutomationService for Backend {
+            fn call(
+                &self,
+                _: &str,
+                _: serde_json::Value,
+                _: &std::path::Path,
+                _: &tokio_util::sync::CancellationToken,
+            ) -> Result<serde_json::Value, String> {
+                Ok(serde_json::json!({"saved":true}))
+            }
+        }
+        let project = tempfile::tempdir().unwrap();
+        for policy in [
+            atomcode_config::config::AutomationApproval::Always,
+            atomcode_config::config::AutomationApproval::Inherit,
+        ] {
+            let mut cfg = CodingAgentConfig::new(
+                "k",
+                "http://localhost",
+                "m",
+                project.path(),
+                crate::config::product_dirs_from_env(),
+            );
+            cfg.automation = Some(Arc::new(Backend));
+            cfg.automation_approval = policy;
+            let parts = prepare(&cfg, io_free_opts()).await.unwrap();
+            let tool = parts
+                .registry
+                .mount(&["schedule_create"])
+                .get("schedule_create")
+                .unwrap();
+            let ctx = atomcode_kernel::tool::ToolContext {
+                working_dir: project.path().into(),
+                cancel: Default::default(),
+                progress: atomcode_kernel::tool::ProgressSink::noop(),
+                requester: None,
+            };
+            for auto in [false, true, false] {
+                parts
+                    .bypass_mode
+                    .store(auto, std::sync::atomic::Ordering::Release);
+                assert_eq!(
+                    tool.execute("{}", &ctx).await.is_error,
+                    !(auto && policy == atomcode_config::config::AutomationApproval::Inherit)
+                );
+            }
+        }
+    }
+
     /// `prepare` with all optional capabilities OFF — keeps the call I/O-free (no MCP
     /// connect, no session/skill/home scans) so the test only exercises CC-hook wiring.
     fn io_free_opts() -> PrepareOptions {
@@ -2966,6 +3061,7 @@ mod tests {
             front_end: None,
             review_delegate: None,
             host_plugins: Default::default(),
+            prompt_overrides: Default::default(),
             identity: Default::default(),
         }
     }

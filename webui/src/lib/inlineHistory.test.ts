@@ -44,3 +44,10 @@ test('normal message conversion preserves interleaved assistant rounds and actua
 test('a truncated index preview cannot identify a full legacy prompt', () => {
   assert.equal(historyBoundary([{ ...turn(1), started_at: undefined, user_truncated: true }], [user('repeat')]).joined, false);
 });
+
+
+test('mobile and desktop archive batches stay small even for long histories', () => {
+  assert.deepEqual(historyWindow(1000, undefined, 1), { start: 999, end: 1000 });
+  assert.deepEqual(historyWindow(1000, undefined, 2), { start: 998, end: 1000 });
+  assert.deepEqual(historyWindow(1000, 25, 1), { start: 25, end: 26 });
+});

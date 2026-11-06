@@ -217,14 +217,18 @@ pub(crate) async fn run_turn<W: TurnWire>(
 
     // A command the **agent** registered — goal, review, worktree, stopping a
     // member. Not a prompt: it runs in the agent and answers, and only
-    // sometimes leaves the model work to do. Never one when the prompt carries
-    // attachments, for the reason a local slash is not: a handler would drop
-    // what was attached.
-    let invoked = if has_attachments {
-        None
-    } else {
+    // sometimes leaves the model work to do. Only commands explicitly advertising
+    // image support may receive pictures; other attachments stay ordinary input.
+    let invoked = {
         let names = catalog.lock().await.clone();
         crate::acp::commands::parse_catalog_command(&text, &names)
+            .filter(|(name, _)| {
+                !has_attachments
+                    || (!images.is_empty()
+                        && names
+                            .iter()
+                            .any(|command| command.name == *name && command.accepts_images))
+            })
             .map(|(name, args)| (name, args.to_string()))
     };
 
@@ -246,6 +250,7 @@ pub(crate) async fn run_turn<W: TurnWire>(
             session: native.clone(),
             name: name.clone(),
             args: args.clone(),
+            images: images.clone(),
         }),
         _ => commands.send(AgentCommand::SendMessage {
             text: text.clone(),

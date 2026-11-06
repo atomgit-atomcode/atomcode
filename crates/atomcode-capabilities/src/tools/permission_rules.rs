@@ -43,6 +43,12 @@
 //! silently delete `~/.ssh/id_rsa`. Such a call falls through to the normal gates and still
 //! prompts. `deny` is unconditional.
 //!
+//! Bash argument rules compose per literal command segment, including fixed numeric
+//! `for` loops. Every segment must be explicitly allowed or strictly read-only, with
+//! at least one explicit grant. Unknown syntax, expansions and file-writing redirects
+//! defer to normal gates; denies also inspect nested invocations. A prefix allow never
+//! covers an unrelated chained command.
+//!
 //! ## Ordering
 //!
 //! Register AFTER the hard boundaries (turn policy, plan mode, `CredentialBashGate`,
@@ -138,6 +144,8 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
 /// One parsed rule: a tool plus an optional argument pattern.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PermissionRule {
+    raw: String,
+    source: Option<String>,
     /// Canonicalized tool name, or `*` for every tool.
     tool: String,
     /// `None` ⇒ the bare `Tool` form: matches any arguments.
@@ -158,6 +166,8 @@ impl PermissionRule {
                 return None;
             }
             return Some(Self {
+                raw: raw.into(),
+                source: None,
                 tool: canonical_tool(raw),
                 pattern: None,
             });
@@ -174,6 +184,8 @@ impl PermissionRule {
             return None;
         }
         Some(Self {
+            raw: raw.into(),
+            source: None,
             tool: canonical_tool(tool),
             pattern: Some(pattern.to_string()),
         })
@@ -204,6 +216,105 @@ pub struct PermissionRules {
 }
 
 impl PermissionRules {
+    /// Attach the actual configuration source before merging a scope.
+    pub fn with_source(mut self, source: impl Into<String>) -> Self {
+        let source = source.into();
+        for rule in self.allow.iter_mut().chain(&mut self.deny) {
+            rule.source = Some(source.clone());
+        }
+        self
+    }
+
+    /// Explain the same decision used for execution, with matching rule origins.
+    pub fn explanation(
+        &self,
+        sensitive: &SensitivePaths,
+        tool: &str,
+        args: &str,
+        cwd: &Path,
+    ) -> String {
+        let decision = self.decide(sensitive, tool, args, cwd);
+        let mut targets = match_targets(tool, args, cwd);
+        let command = serde_json::from_str::<serde_json::Value>(args)
+            .ok()
+            .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(str::to_owned));
+        let segments = if matches!(canonical_tool(tool).as_str(), "bash" | "bashstart") {
+            command
+                .as_deref()
+                .and_then(super::bash::bash_permission_segments)
+        } else {
+            None
+        };
+        if let Some(segments) = &segments {
+            targets.extend(segments.iter().cloned());
+        }
+        if matches!(canonical_tool(tool).as_str(), "bash" | "bashstart") {
+            if let Some(invocations) = command.as_deref().and_then(super::bash::bash_invocations) {
+                targets.extend(invocations.into_iter().map(|i| {
+                    normalize_command_for_grant(
+                        &std::iter::once(i.command)
+                            .chain(i.arguments)
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    )
+                }));
+            }
+        }
+        let rules = self
+            .deny
+            .iter()
+            .map(|r| ("deny", r))
+            .chain(self.allow.iter().map(|r| ("allow", r)));
+        let mut notes: Vec<String> = rules
+            .filter(|(effect, r)| {
+                r.matches(tool, &targets)
+                    || (*effect == "deny"
+                        && super::powershell::is_powershell_tool(tool)
+                        && (r.matches("bash", &targets)
+                            || (tool == "pwsh_start" && r.matches("bash_start", &targets))))
+            })
+            .map(|(effect, r)| {
+                format!(
+                    "{effect}: {} [{}]",
+                    r.raw,
+                    r.source
+                        .as_deref()
+                        .unwrap_or("startup configuration / injected rules")
+                )
+            })
+            .collect();
+        if sensitive.references(args) {
+            notes.push("Sensitive arguments require a separate safety approval; allow rules do not bypass it.".into());
+        }
+        if decision == RuleDecision::NoMatch {
+            if let Some(segments) = segments {
+                let uncovered: Vec<_> = segments
+                    .iter()
+                    .filter(|s| {
+                        !super::bash::is_read_only_bash(s)
+                            && !self
+                                .allow
+                                .iter()
+                                .any(|r| r.matches(tool, std::slice::from_ref(s)))
+                    })
+                    .cloned()
+                    .collect();
+                if !uncovered.is_empty() {
+                    notes.push(format!(
+                        "No project/user allow rule covers: {}",
+                        uncovered.join("; ")
+                    ));
+                }
+            } else if command.is_some() {
+                notes.push("Shell structure is not eligible for composed command grants.".into());
+            }
+        }
+        if notes.is_empty() {
+            "No matching project/user permission rule; ordinary safety checks apply.".into()
+        } else {
+            notes.join("\n")
+        }
+    }
     /// Merge another configuration scope. Deny remains dominant across every scope.
     pub fn extend(&mut self, other: Self) {
         self.allow.extend(other.allow);
@@ -262,13 +373,86 @@ impl PermissionRules {
             return RuleDecision::NoMatch;
         }
         let targets = match_targets(tool, args, cwd);
+        let bash = matches!(canonical_tool(tool).as_str(), "bash" | "bashstart");
+        let command = serde_json::from_str::<serde_json::Value>(args)
+            .ok()
+            .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(str::to_owned));
+        let mut deny_targets = targets.clone();
+        if bash {
+            if let Some(invocations) = command.as_deref().and_then(super::bash::bash_invocations) {
+                deny_targets.extend(invocations.into_iter().map(|i| {
+                    normalize_command_for_grant(
+                        &std::iter::once(i.command)
+                            .chain(i.arguments)
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    )
+                }));
+            }
+        }
         if self.deny.iter().any(|r| {
-            r.matches(tool, &targets)
+            r.matches(tool, &deny_targets)
                 || (super::powershell::is_powershell_tool(tool)
                     && (r.matches("bash", &targets)
                         || (tool == "pwsh_start" && r.matches("bash_start", &targets))))
         }) {
             return RuleDecision::Deny;
+        }
+        if bash {
+            if sensitive.references(args) {
+                return RuleDecision::NoMatch;
+            }
+            let Some(segments) = command
+                .as_deref()
+                .and_then(super::bash::bash_permission_segments)
+            else {
+                return RuleDecision::NoMatch;
+            };
+            // An exact grant of this complete literal script remains valid. A
+            // wildcard prefix, however, must vouch for each segment separately.
+            let exact_script = self.allow.iter().any(|r| {
+                r.pattern.as_ref().is_some_and(|p| !p.contains(['*', '?']))
+                    && r.matches(tool, &targets)
+            });
+            let mut authorized = exact_script;
+            for segment in segments {
+                let allowed = exact_script
+                    || self
+                        .allow
+                        .iter()
+                        .any(|r| r.matches(tool, std::slice::from_ref(&segment)));
+                authorized |= allowed;
+                if !allowed && !super::bash::is_read_only_bash(&segment) {
+                    return RuleDecision::NoMatch;
+                }
+            }
+            return if authorized {
+                RuleDecision::Allow
+            } else {
+                RuleDecision::NoMatch
+            };
+        }
+        if tool == "apply_patch" {
+            let Some(paths) = serde_json::from_str::<serde_json::Value>(args)
+                .ok()
+                .and_then(|v| v.get("file_paths").and_then(|v| v.as_array()).cloned())
+            else {
+                return RuleDecision::NoMatch;
+            };
+            if paths.is_empty() || sensitive.references(args) {
+                return RuleDecision::NoMatch;
+            }
+            return if paths.iter().all(|path| {
+                path.as_str().is_some_and(|path| {
+                    let one = serde_json::json!({"file_path": path}).to_string();
+                    let targets = match_targets(tool, &one, cwd);
+                    self.allow.iter().any(|r| r.matches(tool, &targets))
+                })
+            }) {
+                RuleDecision::Allow
+            } else {
+                RuleDecision::NoMatch
+            };
         }
         if self.allow.iter().any(|r| r.matches(tool, &targets)) {
             // HARD FLOOR: a user allow-rule pre-authorizes convenience, never a secret. A
@@ -388,14 +572,17 @@ impl ToolMiddleware for PermissionRuleGate {
             .decide(&self.sensitive, tool.name(), &call.arguments, &cwd)
         {
             RuleDecision::Allow => BeforeOutcome::Allow {
-                reason: Some(format!(
-                    "pre-authorized by a [permissions] allow rule for '{}'",
-                    tool.name()
+                reason: Some(self.rules.explanation(
+                    &self.sensitive,
+                    tool.name(),
+                    &call.arguments,
+                    &cwd,
                 )),
             },
             RuleDecision::Deny => BeforeOutcome::deny(format!(
-                "blocked by a [permissions] deny rule for '{}'",
-                tool.name()
+                "blocked by a [permissions] deny rule: {}",
+                self.rules
+                    .explanation(&self.sensitive, tool.name(), &call.arguments, &cwd)
             )),
             RuleDecision::NoMatch => BeforeOutcome::Proceed,
         }
@@ -450,6 +637,87 @@ mod tests {
 
     fn bash_args(cmd: &str) -> String {
         serde_json::json!({ "command": cmd }).to_string()
+    }
+
+    #[test]
+    fn permission_explanations_name_sources_uncovered_segments_and_nested_denies() {
+        let guard = crate::tools::sensitive_path::test_guard();
+        let policy = rules(&["Bash(cargo test *)"], &["Bash(rm *)"])
+            .with_source("/project/settings.local.json");
+        let partial = policy.explanation(
+            &guard,
+            "bash",
+            &bash_args("cargo test ok && touch result"),
+            &cwd(),
+        );
+        assert!(partial.contains("allow: Bash(cargo test *) [/project/settings.local.json]"));
+        assert!(partial.contains("No project/user allow rule covers: touch result"));
+        let denied = policy.explanation(
+            &guard,
+            "bash",
+            &bash_args("for i in $(seq 2); do rm -rf scratch; done"),
+            &cwd(),
+        );
+        assert!(denied.contains("deny: Bash(rm *) [/project/settings.local.json]"));
+    }
+
+    #[test]
+    fn authorized_tests_compose_with_literal_loops_and_readonly_helpers() {
+        let guard = crate::tools::sensitive_path::test_guard();
+        let policy = rules(
+            &["Bash(cargo test *)"],
+            &["Bash(cargo test blocked*)", "Bash(rm *)"],
+        );
+        let command = "cd /work && for i in 1 2 3; do cargo test --bin ponent defense_tests 2>&1 | tail -5; done";
+        assert_eq!(
+            policy.decide(&guard, "bash", &bash_args(command), &cwd()),
+            RuleDecision::Allow
+        );
+        assert!(!super::super::bash::is_read_only_bash(command));
+        let exact = "cargo test ok && touch explicitly-authorized";
+        assert_eq!(
+            rules(&[&format!("Bash({exact})")], &[]).decide(
+                &guard,
+                "bash",
+                &bash_args(exact),
+                &cwd()
+            ),
+            RuleDecision::Allow
+        );
+        assert_eq!(
+            rules(&[], &[]).decide(&guard, "bash", &bash_args(command), &cwd()),
+            RuleDecision::NoMatch
+        );
+        for command in [
+            "for i in 1 2; do cargo test blocked; done",
+            "cargo test ok && rm -rf out",
+        ] {
+            assert_eq!(
+                policy.decide(&guard, "bash", &bash_args(command), &cwd()),
+                RuleDecision::Deny
+            );
+        }
+        for command in [
+            "cargo test ok && touch unapproved",
+            "for i in 1 2; do cargo test ok; cd ..; done",
+            "cd /work && for i in 1 2; do command cd ..; cargo test ok; done",
+            "cd /work && for i in 1 2; do 'c''d' ..; cargo test ok; done",
+            "for i in $(seq 3); do cargo test ok; done",
+            "for PATH in 1 2; do cargo test ok; done",
+            "CDPATH=/private; cd src; for i in 1 2; do cargo test ok; done",
+            "printf -v CDPATH /private; cd src; for i in 1 2; do cargo test ok; done",
+            "trap 'cd /private' DEBUG; cd src; for i in 1 2; do cargo test ok; done",
+            "while true; do cargo test ok; done",
+            "cargo test $(touch bad)",
+            "cargo test ok > /tmp/unapproved",
+            "cargo test ok &",
+        ] {
+            assert_eq!(
+                policy.decide(&guard, "bash", &bash_args(command), &cwd()),
+                RuleDecision::NoMatch,
+                "{command}"
+            );
+        }
     }
 
     #[test]
@@ -889,6 +1157,33 @@ mod tests {
                 &cwd()
             ),
             RuleDecision::Allow
+        );
+    }
+    #[test]
+    fn patch_rules_require_every_target_and_deny_any_target() {
+        let sensitive = crate::tools::sensitive_path::test_guard();
+        let args = r#"{"artifact_id":"abc","file_paths":["src/a","private/b"]}"#;
+        assert_eq!(
+            rules(&["apply_patch(src/*)"], &[]).decide(&sensitive, "apply_patch", args, &cwd()),
+            RuleDecision::NoMatch
+        );
+        assert_eq!(
+            rules(&["apply_patch(src/*)", "apply_patch(private/*)"], &[]).decide(
+                &sensitive,
+                "apply_patch",
+                args,
+                &cwd()
+            ),
+            RuleDecision::Allow
+        );
+        assert_eq!(
+            rules(&["apply_patch"], &["apply_patch(private/*)"]).decide(
+                &sensitive,
+                "apply_patch",
+                args,
+                &cwd()
+            ),
+            RuleDecision::Deny
         );
     }
 }

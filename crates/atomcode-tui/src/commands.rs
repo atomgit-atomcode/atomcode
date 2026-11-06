@@ -136,7 +136,7 @@ impl CommandSet for ScreenCommands {
                     // in the harness), which writes them into the log between
                     // turns; the screen only passes the words on, as they were
                     // typed — the task keeps its case.
-                    "add" | "clear" => match client {
+                    "add" | "clear" | "source" => match client {
                         Some(client) => {
                             client.invoke("todo", args);
                             Outcome::Quiet
@@ -929,9 +929,25 @@ fn review_prompt(arg: &str) -> String {
 
 fn session_catalogue() -> Vec<Command> {
     vec![
+        Command::said_taking(
+            "hooks",
+            "[list|paths|show <id>|test <id>]".into(),
+            t(Msg::HooksTitle),
+        ),
+        Command::said_taking(
+            "followup",
+            "[set <prompt>|show|clear]".into(),
+            t(Msg::FollowUpAbout),
+        ),
+        Command::said_taking("spec", "[list|pin|unpin]".into(), t(Msg::SpecTitle)),
+        Command::said_taking("patch", t(Msg::CmdTakesPath), t(Msg::CmdAboutPatch)),
         Command::said("compact", t(Msg::CmdAboutCompact)),
         Command::said("cancel-all", t(Msg::CmdAboutCancelAll)),
-        Command::said_taking("context", "[prompt]".into(), t(Msg::CmdAboutContext)),
+        Command::said_taking(
+            "context",
+            "[prompt|persona]".into(),
+            t(Msg::CmdAboutContext),
+        ),
         Command::said("agents", t(Msg::CmdAboutAgents)),
         Command::said("transcript", t(Msg::CmdAboutTranscript)),
         Command::said("clear", t(Msg::CmdAboutClear)),
@@ -1127,7 +1143,7 @@ impl CommandSet for SessionCommands {
     /// error rather than a silent winner — so the claim is written down, the way
     /// `SetupCommands` claims `/setup`.
     fn overrides(&self) -> Vec<&'static str> {
-        vec!["review"]
+        vec!["review", "spec"]
     }
     /// What `/agents` dispatches when a row is picked. Not listed: nobody types
     /// it, and a session id in the menu would be noise (`CommandSet::hidden`).
@@ -1169,6 +1185,347 @@ impl CommandSet for SessionCommands {
                 .then(|| Outcome::Refused(t(Msg::WaitsForTheTurn { command }).into_owned()))
         };
         match name {
+            "hooks" => {
+                if client.session() != root {
+                    return Outcome::Refused(t(Msg::FollowUpLeadOnly).into_owned());
+                }
+                let control = match host(control) {
+                    Ok(c) => c,
+                    Err(e) => return e,
+                };
+                let value = match control
+                    .call(HostCommand::Hooks {
+                        session: root.clone(),
+                        args: args.into(),
+                    })
+                    .await
+                {
+                    Ok(HostReply::Hooks { value }) => value,
+                    Ok(other) => {
+                        return Outcome::Refused(format!("unexpected host reply: {other:?}"))
+                    }
+                    Err(e) => return Outcome::Refused(refusal(e)),
+                };
+                if client.root() != root || client.session() != root {
+                    return Outcome::Refused(t(Msg::HooksChanged).into_owned());
+                }
+                if args.trim() == "paths" || value.get("result").is_some() {
+                    let text = if let Some(result) = value.get("result") {
+                        let status = if result["completed"].as_bool() == Some(true) {
+                            format!("{} {}", t(Msg::HooksExit), result["exit_code"])
+                        } else {
+                            t(Msg::HooksIncomplete).into_owned()
+                        };
+                        format!(
+                            "{status}\n\nstdout\n{}\n\nstderr\n{}",
+                            result["stdout"].as_str().unwrap_or(""),
+                            result["stderr"].as_str().unwrap_or("")
+                        )
+                    } else {
+                        serde_json::to_string_pretty(&serde_json::json!({"cwd":value["cwd"],"files":value["files"],"plugins":value["plugins"]})).unwrap_or_default()
+                    };
+                    return Outcome::Do(Action::OpenSheet(crate::sheet::Sheet::read(
+                        crate::sheet::Read::file(
+                            "hooks",
+                            vec![crate::sheet::Piece::new(
+                                t(Msg::HooksTitle),
+                                crate::sheet::Tone::Plain,
+                            )],
+                            &text,
+                        ),
+                    )));
+                }
+                let preview = |value: &serde_json::Value| -> Vec<String> {
+                    serde_json::to_string_pretty(value)
+                        .unwrap_or_default()
+                        .lines()
+                        .map(str::to_owned)
+                        .collect()
+                };
+                let mut rows = Vec::new();
+                if let Some(item) = value.get("item") {
+                    if item["testable"].as_bool() == Some(true) {
+                        rows.push(
+                            crate::sheet::Row::new(
+                                format!("/hooks test {}", item["id"].as_str().unwrap_or("")),
+                                t(Msg::HooksTest),
+                            )
+                            .preview(
+                                std::iter::once(t(Msg::HooksNote).into_owned())
+                                    .chain(preview(item))
+                                    .collect(),
+                            ),
+                        );
+                    }
+                    rows.push(
+                        crate::sheet::Row::new("/hooks", t(Msg::HooksBack)).preview(preview(item)),
+                    );
+                } else {
+                    rows.push(
+                        crate::sheet::Row::new("/hooks paths", t(Msg::HooksPaths)).preview(preview(&serde_json::json!({"files":value["files"],"plugins":value["plugins"]}))),
+                    );
+                    if let Some(items) = value["items"].as_array() {
+                        for item in items {
+                            rows.push(
+                                crate::sheet::Row::new(
+                                    format!("/hooks show {}", item["id"].as_str().unwrap_or("")),
+                                    format!(
+                                        "{} · {}",
+                                        item["event"].as_str().unwrap_or(""),
+                                        item["name"].as_str().unwrap_or("")
+                                    ),
+                                )
+                                .about(format!(
+                                    "{} · {}",
+                                    item["scope"].as_str().unwrap_or(""),
+                                    item["command"].as_str().unwrap_or("")
+                                ))
+                                .preview(preview(item)),
+                            );
+                        }
+                    }
+                }
+                Outcome::Do(Action::OpenSheet(crate::sheet::Sheet::list(
+                    crate::sheet::List::new("hooks", t(Msg::HooksTitle), rows).summary(vec![
+                        crate::sheet::Piece::new(t(Msg::HooksNote), crate::sheet::Tone::Plain),
+                    ]),
+                )))
+            }
+            "followup" => {
+                if client.session() != root {
+                    return Outcome::Refused(t(Msg::FollowUpLeadOnly).into_owned());
+                }
+                let control = match host(control) {
+                    Ok(c) => c,
+                    Err(e) => return e,
+                };
+                match control
+                    .call(HostCommand::FollowUp {
+                        session: root,
+                        args: args.into(),
+                    })
+                    .await
+                {
+                    Ok(HostReply::FollowUp { value }) => {
+                        if args.trim().starts_with("history") {
+                            return Outcome::Said(
+                                value
+                                    .get("prompt")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("")
+                                    .into(),
+                            );
+                        }
+                        if let Some(id) = value
+                            .get("execution_id")
+                            .and_then(serde_json::Value::as_str)
+                        {
+                            let spec = serde_json::to_string_pretty(&value["new_session"])
+                                .unwrap_or_default();
+                            return Outcome::Said(
+                                t(Msg::FollowUpNew { id, spec: &spec }).into_owned(),
+                            );
+                        }
+                        if let Some(prompt) =
+                            value.get("prompt").and_then(serde_json::Value::as_str)
+                        {
+                            Outcome::Said(t(Msg::FollowUpPending { prompt }).into_owned())
+                        } else {
+                            Outcome::Said(
+                                t(if args.trim() == "clear" {
+                                    Msg::FollowUpCleared
+                                } else {
+                                    Msg::FollowUpNone
+                                })
+                                .into_owned(),
+                            )
+                        }
+                    }
+                    Ok(other) => Outcome::Refused(format!("unexpected host reply: {other:?}")),
+                    Err(error) => Outcome::Refused(refusal(error)),
+                }
+            }
+            "spec" => {
+                if client.session() != root {
+                    return Outcome::Refused(t(Msg::SpecLeadOnly).into_owned());
+                }
+                let control = match host(control) {
+                    Ok(c) => c,
+                    Err(e) => return e,
+                };
+                let args = args.trim();
+                let (verb, rest) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
+                let pick_mode = matches!(verb, "pin" | "unpin") && rest.trim().is_empty();
+                let request = if args.is_empty() || pick_mode {
+                    "list"
+                } else {
+                    args
+                };
+                let value = match control
+                    .call(HostCommand::TaskSpecs {
+                        session: root.clone(),
+                        args: request.into(),
+                    })
+                    .await
+                {
+                    Ok(HostReply::TaskSpecs { value }) => value,
+                    Ok(_) => return Outcome::Refused(t(Msg::RefusedUnsupported).into_owned()),
+                    Err(e) => return Outcome::Refused(refusal(e)),
+                };
+                if client.root() != root || client.session() != root {
+                    return Outcome::Refused(t(Msg::SpecChanged).into_owned());
+                }
+                if let Some(items) = value["items"].as_array() {
+                    let mut rows = Vec::new();
+                    for item in items {
+                        let Some(seq) = item["seq"].as_u64() else {
+                            continue;
+                        };
+                        let pinned = item["pinned"].as_bool().unwrap_or(false);
+                        if pick_mode && ((verb == "pin" && pinned) || (verb == "unpin" && !pinned))
+                        {
+                            continue;
+                        }
+                        rows.push(
+                            crate::sheet::Row::new(
+                                format!("/spec show {seq}"),
+                                item["preview"].as_str().unwrap_or("").replace('\n', " "),
+                            )
+                            .marked(pinned)
+                            .about(format!(
+                                "#{} · {} bytes · {}",
+                                seq,
+                                item["bytes"],
+                                item["at"]
+                                    .as_u64()
+                                    .and_then(|at| chrono::DateTime::from_timestamp_millis(
+                                        at as i64
+                                    ))
+                                    .map(|at| at
+                                        .with_timezone(&chrono::Local)
+                                        .format("%m-%d %H:%M")
+                                        .to_string())
+                                    .unwrap_or_default()
+                            ))
+                            .preview(vec![item["preview"].as_str().unwrap_or("").into()]),
+                        );
+                    }
+                    if let Some(before) = value["next_before"]
+                        .as_u64()
+                        .filter(|_| !(pick_mode && verb == "unpin"))
+                    {
+                        rows.push(crate::sheet::Row::new(
+                            format!("/spec list {before}"),
+                            t(Msg::SpecOlder).into_owned(),
+                        ));
+                    }
+                    return Outcome::Do(Action::OpenSheet(crate::sheet::Sheet::list(
+                        crate::sheet::List::new(
+                            "spec",
+                            format!(
+                                "{} · {} / {} bytes",
+                                t(Msg::SpecTitle),
+                                value["pinned_bytes"],
+                                value["budget_bytes"]
+                            ),
+                            rows,
+                        ),
+                    )));
+                }
+                if let Some(text) = value["text"].as_str() {
+                    let pinned = value["pinned"].as_bool().unwrap_or(false);
+                    let seq = value["seq"].as_u64().unwrap_or(0);
+                    let mut read = crate::sheet::Read::file(
+                        "spec",
+                        vec![crate::sheet::Piece::new(
+                            format!(
+                                "#{} · {} bytes · {}",
+                                seq,
+                                value["bytes"],
+                                t(Msg::SpecReview)
+                            ),
+                            crate::sheet::Tone::Plain,
+                        )],
+                        text,
+                    );
+                    read.action = Some((
+                        t(if pinned { Msg::SpecUnpin } else { Msg::SpecPin }).into_owned(),
+                        format!("/spec {} {}", if pinned { "unpin" } else { "pin" }, seq),
+                    ));
+                    return Outcome::Do(Action::OpenSheet(crate::sheet::Sheet::read(read)));
+                }
+                self.run("spec", "list", ctx).await
+            }
+            "patch" => {
+                if client.session() != root {
+                    return Outcome::Refused(t(Msg::PatchLeadOnly).into_owned());
+                }
+                if let Some(refusal) = waits_for_the_turn("patch") {
+                    return refusal;
+                }
+                if args.trim().is_empty() {
+                    return Outcome::Refused("/patch <file.patch>".into());
+                }
+                let typed = args.trim();
+                let typed = if typed.starts_with('"') || typed.starts_with('\'') {
+                    let quote = typed.chars().next().unwrap_or('"');
+                    match typed[1..].strip_suffix(quote) {
+                        Some(path) => path,
+                        None => return Outcome::Refused("/patch <file.patch>".into()),
+                    }
+                } else {
+                    typed
+                };
+                let full = match session_path(&client, typed).await {
+                    Ok(path) => path,
+                    Err(why) => return why,
+                };
+                if !tokio::fs::metadata(&full)
+                    .await
+                    .is_ok_and(|info| info.is_file())
+                {
+                    return Outcome::Refused(format!(
+                        "{}: expected a readable regular file",
+                        full.display()
+                    ));
+                }
+                let bytes = match tokio::fs::File::open(&full).await {
+                    Ok(file) => {
+                        use tokio::io::AsyncReadExt;
+                        let mut bytes = Vec::new();
+                        match file.take(8 * 1024 * 1024 + 1).read_to_end(&mut bytes).await {
+                            Ok(_) if bytes.len() <= 8 * 1024 * 1024 => bytes,
+                            Ok(_) => return Outcome::Refused(t(Msg::PatchTooLarge).into_owned()),
+                            Err(error) => return Outcome::Refused(error.to_string()),
+                        }
+                    }
+                    Err(error) => return Outcome::Refused(error.to_string()),
+                };
+                let control = match host(control) {
+                    Ok(control) => control,
+                    Err(why) => return why,
+                };
+                match control
+                    .call(HostCommand::ImportPatch {
+                        session: root.clone(),
+                        bytes,
+                    })
+                    .await
+                {
+                    Ok(HostReply::PatchImported { reference }) => {
+                        if client.root() != root || client.session() != root {
+                            return Outcome::Refused(t(Msg::PatchContextChanged).into_owned());
+                        }
+                        Outcome::Do(Action::Paste(format!(
+                            "{}\n{}",
+                            t(Msg::PatchReady),
+                            reference
+                        )))
+                    }
+                    Ok(_) => Outcome::Refused(t(Msg::RefusedUnsupported).into_owned()),
+                    Err(error) => Outcome::Refused(refusal(error)),
+                }
+            }
             "cancel-all" => {
                 let members = client.cancel_all();
                 Outcome::Said(
@@ -1204,7 +1561,7 @@ impl CommandSet for SessionCommands {
                 // 它的那一刻很具体 —— agent 表现得像是被告知了一件谁也不记得
                 // 告诉过它的事,而那份提示词是挂着的各行各写一段拼出来的,
                 // 没有任何一处能读到全文。
-                if args.trim() == "prompt" {
+                if matches!(args.trim(), "prompt" | "persona") {
                     let control = match host(control) {
                         Ok(control) => control,
                         Err(refusal) => return refusal,
@@ -1216,6 +1573,26 @@ impl CommandSet for SessionCommands {
                         })
                         .await
                     {
+                        Ok(HostReply::Context {
+                            persona: Some(persona),
+                            ..
+                        }) if args.trim() == "persona" => {
+                            let source = match persona.source.as_str() {
+                                "builtin" => t(Msg::PersonaBuiltin),
+                                "config" => t(Msg::PersonaConfig),
+                                "explicit" => t(Msg::PersonaExplicit),
+                                _ => t(Msg::PersonaHost),
+                            };
+                            let appended = match persona.appended {
+                                Some(true) => t(Msg::PersonaAppended),
+                                Some(false) => t(Msg::PersonaNotAppended),
+                                None => t(Msg::PersonaAppendUnknown),
+                            };
+                            Outcome::Said(format!("{} · {}\n\n{}", source, appended, persona.text))
+                        }
+                        Ok(HostReply::Context { .. }) if args.trim() == "persona" => {
+                            Outcome::Said(t(Msg::PersonaUnavailable).into_owned())
+                        }
                         Ok(HostReply::Context {
                             system_prompt: Some(prompt),
                             ..
@@ -1431,6 +1808,7 @@ impl CommandSet for SessionCommands {
                                     updated_at: stored.updated_at,
                                     turns: stored.turns,
                                     needs_newer_version: stored.needs_newer_version,
+                                    scheduled: stored.scheduled,
                                 })
                                 .collect();
                             if sessions.is_empty() {
@@ -2836,7 +3214,10 @@ async fn recent_places(
         let Some(dir) = session.working_dir else {
             continue;
         };
-        if dir == here || pinned.iter().any(|already| already == &dir) {
+        if !std::path::Path::new(&dir).is_dir()
+            || dir == here
+            || pinned.iter().any(|already| already == &dir)
+        {
             continue;
         }
         if out.iter().any(|already| already == &dir) {
@@ -3405,6 +3786,67 @@ fn as_markdown(events: &[atomcode_kernel::session::LoggedEvent]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn spec_picker_reviews_original_text_before_offering_a_mutation() {
+        let host = Arc::new(Recording::default());
+        let (app, _, all) = following(&host);
+        host.replies.lock().unwrap().extend([
+            Ok(HostReply::TaskSpecs{value:serde_json::json!({"items":[{"seq":12,"at":1700000000000u64,"bytes":24,"preview":"MUST NOT change API","pinned":false}],"pinned_bytes":0,"budget_bytes":8192})}),
+            Ok(HostReply::TaskSpecs{value:serde_json::json!({"seq":12,"text":"MUST NOT change API\nlet exact = 42;","pinned":false,"bytes":35,"pinned_bytes":0,"budget_bytes":8192})}),
+        ]);
+        let listed = sheet_of(all.dispatch("/spec", &app.context()).await);
+        let crate::sheet::Page::List(list) = listed.page else {
+            panic!("message list")
+        };
+        assert_eq!(list.rows[0].value, "/spec show 12");
+        let reviewed = sheet_of(all.dispatch(&list.rows[0].value, &app.context()).await);
+        let crate::sheet::Page::Read(read) = reviewed.page else {
+            panic!("original review")
+        };
+        assert_eq!(
+            read.lines
+                .iter()
+                .map(|l| l.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["MUST NOT change API", "let exact = 42;"]
+        );
+        assert_eq!(read.action.as_ref().unwrap().1, "/spec pin 12");
+        assert_eq!(
+            host.asked.lock().unwrap().len(),
+            2,
+            "review does not automatically pin"
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_command_preserves_file_bytes_and_only_pastes_a_reference() {
+        let host = Arc::new(Recording::default());
+        let (app, client, all) = following(&host);
+        client.status("lead", atomcode_kernel::agent::AgentStatus::Idle);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("补丁 with spaces.patch");
+        let bytes = b"--- a/f\r\n+++ b/f\r\n@@ -1 +1 @@\r\n-old\r\n+new\r\n";
+        std::fs::write(&path, bytes).unwrap();
+        host.replies
+            .lock()
+            .unwrap()
+            .push_back(Ok(HostReply::PatchImported {
+                reference: "short-reference".into(),
+            }));
+        let result = all
+            .dispatch(&format!("/patch \"{}\"", path.display()), &app.context())
+            .await;
+        match result {
+            Outcome::Do(Action::Paste(text)) => {
+                assert!(text.contains("short-reference"));
+                assert!(!text.contains("--- a/f"));
+            }
+            other => panic!("expected reference draft: {other:?}"),
+        }
+        assert!(
+            matches!(host.asked.lock().unwrap().last(), Some(HostCommand::ImportPatch { session, bytes: actual }) if session == "lead" && actual == bytes)
+        );
+    }
 
     /// The sheet a command put up at the foot of the screen.
     fn sheet_of(outcome: Outcome) -> crate::sheet::Sheet {
@@ -4904,6 +5346,7 @@ mod tests {
                 used: 50_000,
                 model: "glm-5".into(),
                 working_dir: "/w".into(),
+                persona: None,
                 system_prompt: None,
             }));
         let (app, _client, all) = following(&host);
@@ -4947,6 +5390,7 @@ mod tests {
                 used: 0,
                 model: "m".into(),
                 working_dir: "/w".into(),
+                persona: None,
                 system_prompt: Some("You are a coding agent.\nTools: …".into()),
             }),
             Ok(HostReply::Context {
@@ -4954,6 +5398,7 @@ mod tests {
                 used: 0,
                 model: "m".into(),
                 working_dir: "/w".into(),
+                persona: None,
                 system_prompt: None,
             }),
         ]);
@@ -4981,6 +5426,141 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn new_session_follow_up_shows_target_and_history_without_claiming_success() {
+        let host = Arc::new(Recording::default());
+        host.replies.lock().unwrap().extend([
+            Ok(HostReply::FollowUp { value: serde_json::json!({"prompt":"review", "execution_id":"followup-1", "new_session":{"permission_mode":"plan","model":"selection"}}) }),
+            Ok(HostReply::FollowUp { value: serde_json::json!({"prompt":"{\"state\":\"uncertain\"}"}) }),
+        ]);
+        let (app, _client, all) = following(&host);
+        match all.dispatch("/followup show", &app.context()).await {
+            Outcome::Said(text) => {
+                assert!(text.contains("followup-1"));
+                assert!(text.contains("selection"));
+                assert!(text.contains("plan"));
+            }
+            other => panic!("{other:?}"),
+        }
+        match all
+            .dispatch("/followup history followup-1", &app.context())
+            .await
+        {
+            Outcome::Said(text) => assert_eq!(text, "{\"state\":\"uncertain\"}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn hooks_browser_reviews_configuration_before_offering_script_execution() {
+        let host = Arc::new(Recording::default());
+        host.replies.lock().unwrap().extend([
+            Ok(HostReply::Hooks {value:serde_json::json!({"files":[],"plugins":[],"items":[{"id":"configured-id","name":"audit","event":"PreToolUse","scope":"project","command":"script","testable":true}]})}),
+            Ok(HostReply::Hooks {value:serde_json::json!({"item":{"id":"configured-id","name":"audit","testable":true}})}),
+        ]);
+        let (app, _client, all) = following(&host);
+        assert!(matches!(
+            all.dispatch("/hooks", &app.context()).await,
+            Outcome::Do(Action::OpenSheet(_))
+        ));
+        match all
+            .dispatch("/hooks show configured-id", &app.context())
+            .await
+        {
+            Outcome::Do(Action::OpenSheet(sheet)) => match sheet.page {
+                crate::sheet::Page::List(list) => {
+                    assert!(list
+                        .rows
+                        .iter()
+                        .all(|row| row.preview.iter().all(|line| !line.contains('\n'))));
+                    assert!(list.rows[0].value.starts_with("/hooks test "));
+                    assert!(list.rows[0].preview.len() > 3);
+                }
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        }
+        assert!(host
+            .asked
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|c| matches!(c,HostCommand::Hooks {args,..} if !args.starts_with("test"))));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn follow_up_registration_is_an_explicit_host_operation() {
+        let host = Arc::new(Recording::default());
+        host.replies.lock().unwrap().extend([
+            Ok(HostReply::FollowUp {
+                value: serde_json::json!({"prompt":"CHECK_ONCE","current_task":true}),
+            }),
+            Ok(HostReply::FollowUp {
+                value: serde_json::json!({"prompt":null,"current_task":false}),
+            }),
+        ]);
+        let (app, _client, all) = following(&host);
+        match all
+            .dispatch("/followup set CHECK_ONCE", &app.context())
+            .await
+        {
+            Outcome::Said(text) => assert!(text.contains("CHECK_ONCE")),
+            other => panic!("{other:?}"),
+        }
+        match all.dispatch("/followup clear", &app.context()).await {
+            Outcome::Said(text) => assert_eq!(text, t(Msg::FollowUpCleared)),
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            matches!(&host.asked.lock().unwrap()[0], HostCommand::FollowUp { args, .. } if args=="set CHECK_ONCE")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn context_persona_shows_provenance_and_the_exact_fragment() {
+        let host = Arc::new(Recording::default());
+        host.replies
+            .lock()
+            .unwrap()
+            .push_back(Ok(HostReply::Context {
+                window: 1,
+                used: 0,
+                model: "m".into(),
+                working_dir: "/w".into(),
+                system_prompt: Some("FULL_SYSTEM_SHOULD_NOT_BE_SHOWN".into()),
+                persona: Some(atomcode_host_api::PersonaInfo {
+                    source: "explicit".into(),
+                    appended: Some(true),
+                    text: "PERSONA\n\nAPPENDED 原文".into(),
+                }),
+            }));
+        host.replies
+            .lock()
+            .unwrap()
+            .push_back(Ok(HostReply::Context {
+                window: 1,
+                used: 0,
+                model: "m".into(),
+                working_dir: "/w".into(),
+                system_prompt: Some("OLD_HOST_PROMPT".into()),
+                persona: None,
+            }));
+        let (app, _client, all) = following(&host);
+        match all.dispatch("/context persona", &app.context()).await {
+            Outcome::Said(text) => {
+                assert!(text.contains(&*t(Msg::PersonaExplicit)));
+                assert!(text.contains(&*t(Msg::PersonaAppended)));
+                assert!(text.ends_with("PERSONA\n\nAPPENDED 原文"));
+                assert!(!text.contains("FULL_SYSTEM_SHOULD_NOT_BE_SHOWN"));
+            }
+            other => panic!("{other:?}"),
+        }
+        match all.dispatch("/context persona", &app.context()).await {
+            Outcome::Said(text) => assert_eq!(text, t(Msg::PersonaUnavailable)),
+            other => panic!("{other:?}"),
+        }
+    }
+
     /// A host that cannot say what the window is says nothing rather than
     /// `0 / 0`, and the counted half still reaches the person.
     #[tokio::test]
@@ -4994,6 +5574,7 @@ mod tests {
                 used: 0,
                 model: String::new(),
                 working_dir: "/w".into(),
+                persona: None,
                 system_prompt: None,
             }));
         let (app, _client, all) = following(&host);
@@ -5604,6 +6185,7 @@ mod tests {
                 used: 0,
                 model: "m".into(),
                 working_dir: dir.display().to_string(),
+                persona: None,
                 system_prompt: None,
             }));
         host
@@ -6006,6 +6588,7 @@ mod tests {
                     used: 0,
                     model: "m".into(),
                     working_dir: dir.path().display().to_string(),
+                    persona: None,
                     system_prompt: None,
                 }));
         }
@@ -6689,14 +7272,15 @@ mod tests {
     /// `ReviewCommand`, its reviewer run in this conversation — and it mounts
     /// after this set. `CommandSet::overrides` is the only way a name may be
     /// claimed twice, so the claim is written down rather than left to mount
-    /// order; the dispatch below is what says whose command actually runs, since
+    /// order. `spec` also has a local picker over its runtime catalog command.
+    /// The dispatch below says whose review command actually runs, since
     /// the screen's refuses for want of a host and the agent's would have said
     /// `inline`.
     #[tokio::test]
     async fn review_takes_the_name_from_the_agent_catalog() {
         assert_eq!(
             SessionCommands.overrides(),
-            vec!["review"],
+            vec!["review", "spec"],
             "the claim is what makes the overlap legal"
         );
 
@@ -6944,6 +7528,49 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn recent_places_skips_missing_paths_and_files_before_filling_the_list() {
+        let root = tempfile::tempdir().unwrap();
+        let removed = root.path().join("removed");
+        std::fs::create_dir(&removed).unwrap();
+        std::fs::remove_dir(&removed).unwrap();
+        let file = root.path().join("file");
+        std::fs::write(&file, "not a directory").unwrap();
+        let dirs: Vec<String> = (0..7)
+            .map(|n| {
+                let dir = root.path().join(format!("project-{n}"));
+                std::fs::create_dir(&dir).unwrap();
+                dir.display().to_string()
+            })
+            .collect();
+        let mut paths = vec![removed.display().to_string(); 6];
+        paths.push(file.display().to_string());
+        paths.extend([dirs[0].clone(), dirs[1].clone(), dirs[1].clone()]);
+        paths.extend(dirs[2..].iter().cloned());
+        let host = Arc::new(Recording::default());
+        host.replies
+            .lock()
+            .unwrap()
+            .push_back(Ok(HostReply::Sessions {
+                sessions: paths
+                    .into_iter()
+                    .enumerate()
+                    .map(|(n, dir)| atomcode_host_api::StoredSession {
+                        id: format!("session-{n}"),
+                        title: None,
+                        working_dir: Some(dir),
+                        created_at: 0,
+                        updated_at: 0,
+                        turns: 1,
+                        needs_newer_version: false,
+                        scheduled: false,
+                    })
+                    .collect(),
+            }));
+        let places = recent_places(Some(host), &dirs[0], &[dirs[1].clone()]).await;
+        assert_eq!(places, dirs[2..7]);
+    }
+
     /// `/cd` 先给「我要去哪儿」的答案,再给「这儿有什么」:标过的目录排最前,
     /// 其次是最近在里面干过活的,最后才是当前目录底下的东西。
     #[tokio::test]
@@ -6963,6 +7590,8 @@ mod tests {
         }
         let here = tempfile::tempdir().unwrap();
         std::fs::create_dir(here.path().join("under-here")).unwrap();
+        let recent_dir = tempfile::tempdir().unwrap();
+        let recent_path = recent_dir.path().display().to_string();
         let host = Arc::new(Recording::default());
         // 先问工作目录,再问会话目录。
         host.replies
@@ -6973,6 +7602,7 @@ mod tests {
                 used: 0,
                 model: "m".into(),
                 working_dir: here.path().display().to_string(),
+                persona: None,
                 system_prompt: None,
             }));
         host.replies
@@ -6983,11 +7613,12 @@ mod tests {
                     atomcode_host_api::StoredSession {
                         id: "one".into(),
                         title: None,
-                        working_dir: Some("/w/recent".into()),
+                        working_dir: Some(recent_path.clone()),
                         created_at: 0,
                         updated_at: 2,
                         turns: 1,
                         needs_newer_version: false,
+                        scheduled: false,
                     },
                     atomcode_host_api::StoredSession {
                         id: "two".into(),
@@ -6997,6 +7628,7 @@ mod tests {
                         updated_at: 1,
                         turns: 1,
                         needs_newer_version: false,
+                        scheduled: false,
                     },
                 ],
             }));
@@ -7011,7 +7643,7 @@ mod tests {
             .find("/w/marked")
             .unwrap_or_else(|| panic!("标过的在里面:{text}"));
         let recent = text
-            .find("/w/recent")
+            .find(&recent_path)
             .unwrap_or_else(|| panic!("最近去过的在里面:{text}"));
         assert!(marked < recent, "标过的排在最近去过的前面:\n{text}");
         assert_eq!(

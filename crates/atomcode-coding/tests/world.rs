@@ -152,6 +152,45 @@ async fn start(tree: ConfigTree) -> App {
 }
 
 #[tokio::test]
+async fn read_file_uses_extra_read_grants_without_opening_the_write_boundary() {
+    let dir = scratch("skill-resource-tool");
+    let bundle = tempfile::tempdir().unwrap();
+    let resource = bundle.path().join("docs-zh.json");
+    std::fs::write(&resource, "offline-resource-marker").unwrap();
+    let read_patch = format!(
+        "[[patch]]\nid = \"fs\"\nconfig = {{ root = {:?}, also_readable = [{:?}] }}",
+        dir.to_string_lossy(),
+        bundle.path().to_string_lossy()
+    );
+    let app = start(tree(
+        &dir,
+        &script_one(
+            "read_file",
+            &format!(r#"{{ file_path = {:?} }}"#, resource.to_string_lossy()),
+        ),
+        &[YOLO, &read_patch],
+    ))
+    .await;
+    run_turn(&app, "read the skill resource").await.unwrap();
+    let text = app
+        .context()
+        .only_session()
+        .unwrap()
+        .derive_messages()
+        .iter()
+        .map(|m| m.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("offline-resource-marker"), "{text}");
+    let fs = app.context().service::<FsSvc>().unwrap();
+    assert!(fs.write_text(&resource, "changed").await.is_err());
+    assert_eq!(
+        std::fs::read_to_string(resource).unwrap(),
+        "offline-resource-marker"
+    );
+}
+
+#[tokio::test]
 async fn the_world_fences_paths_outside_its_root() {
     let dir = scratch("fence");
     let outside = std::env::temp_dir().join("plexus-outside-the-root.txt");
@@ -463,4 +502,128 @@ async fn a_routed_world_mounts_no_process_path_that_bypasses_it() {
         vec!["npm run dev".to_string()],
         "the background job started in the mounted world, not on this machine"
     );
+}
+
+struct PatchEightK(std::sync::atomic::AtomicBool);
+#[async_trait]
+impl atomcode_plexus::Waterfall<atomcode_harness::events::AgentRequest> for PatchEightK {
+    async fn handle(
+        &self,
+        request: &mut atomcode_harness::events::ModelRequest,
+        next: atomcode_plexus::Next<'_, atomcode_harness::events::AgentRequest>,
+    ) -> Result<atomcode_harness::events::ModelResponse, atomcode_harness::events::RequestError>
+    {
+        request.options.max_tokens = Some(8192);
+        let reference = request.messages.iter().rev().find_map(|message| {
+            serde_json::from_str::<Value>(&message.text)
+                .ok()
+                .filter(|value| value.get("artifact_id").is_some())
+        });
+        let mut response = next.run(request).await?;
+        if let Some(reference) = reference {
+            if !self.0.swap(true, Ordering::SeqCst) {
+                response.tool_calls = vec![atomcode_kernel::tool::ToolCall { id: "apply-imported-patch".into(), name: "apply_patch".into(), arguments: serde_json::json!({"artifact_id":reference["artifact_id"],"file_paths":reference["file_paths"]}).to_string() }];
+            }
+        }
+        for call in &response.tool_calls {
+            assert!(
+                call.arguments.len() < 1024,
+                "patch body must never be model output"
+            );
+        }
+        Ok(response)
+    }
+}
+
+#[tokio::test]
+async fn native_patch_import_and_reference_application_do_not_reemit_patch_body() {
+    let dir = scratch("lossless-patch");
+    let mut patch = String::new();
+    let mut expected = Vec::new();
+    for file in 0..5 {
+        let before = (0..400)
+            .map(|line| format!("old-{file}-{line}\n"))
+            .collect::<String>();
+        let after = (0..400)
+            .map(|line| format!("new-{file}-{line}\n"))
+            .collect::<String>();
+        std::fs::write(dir.join(format!("f{file}")), before).unwrap();
+        patch.push_str(&format!("--- a/f{file}\n+++ b/f{file}\n"));
+        for hunk in 0..4 {
+            patch.push_str(&format!(
+                "@@ -{},100 +{},100 @@\n",
+                hunk * 100 + 1,
+                hunk * 100 + 1
+            ));
+            for line in hunk * 100..(hunk + 1) * 100 {
+                patch.push_str(&format!("-old-{file}-{line}\n"));
+            }
+            for line in hunk * 100..(hunk + 1) * 100 {
+                patch.push_str(&format!("+new-{file}-{line}\n"));
+            }
+        }
+        expected.push(after);
+    }
+    std::fs::write(dir.join("user.patch"), patch).unwrap();
+    let patch_rows = format!(
+        r#"[[insert]]
+name = "tool-output-artifact"
+config = {{ dir = {:?} }}
+[[insert]]
+name = "tool-patch"
+"#,
+        dir.join("artifacts").to_string_lossy()
+    );
+    let app = start(tree(
+        &dir,
+        &script_one("import_patch", r#"{ file_path = "user.patch" }"#),
+        &[YOLO, &patch_rows],
+    ))
+    .await;
+    let _budget = app
+        .context()
+        .on_waterfall::<atomcode_harness::events::AgentRequest>(
+            Arc::new(PatchEightK(std::sync::atomic::AtomicBool::new(false))),
+            true,
+        );
+    run_turn(&app, "Import the provided patch without copying its body")
+        .await
+        .unwrap();
+    let messages = app.context().only_session().unwrap().derive_messages();
+    let record = messages
+        .iter()
+        .find_map(|message| {
+            serde_json::from_str::<Value>(&message.text)
+                .ok()
+                .filter(|value| value.get("artifact_id").is_some())
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "import returns artifact reference: {:?}",
+                messages.iter().map(|m| &m.text).collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(
+        record["file_paths"],
+        serde_json::json!(["f0", "f1", "f2", "f3", "f4"])
+    );
+    let applied = messages
+        .iter()
+        .filter(|message| {
+            message
+                .tool_calls
+                .iter()
+                .any(|call| call.name == "apply_patch")
+        })
+        .count();
+    assert_eq!(
+        applied, 1,
+        "one reference application through runtime routing"
+    );
+    for (file, after) in expected.iter().enumerate() {
+        assert_eq!(
+            std::fs::read_to_string(dir.join(format!("f{file}"))).unwrap(),
+            *after
+        );
+    }
 }

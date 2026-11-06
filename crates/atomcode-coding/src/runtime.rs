@@ -94,8 +94,14 @@ impl Drop for StartupPhase {
     }
 }
 
-/// Runtime facts emitted by the coding engine without depending on the legacy
-/// `atomcode-core` driver protocol.
+/// Sanitized identity of the provider captured by a running turn.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RunningModelIdentity {
+    pub provider: String,
+    pub model: String,
+}
+
+/// Runtime facts emitted by the coding engine without depending on legacy drivers.
 #[non_exhaustive]
 #[derive(Clone, Debug)]
 pub enum CodingRuntimeEvent {
@@ -165,6 +171,11 @@ pub enum CodingRuntimeEvent {
     },
     Reconfigured {
         operation: ReconfigureKind,
+    },
+    /// Presentation metadata only: the current turn still owns this model,
+    /// while ProviderChanged names the selection for subsequent turns.
+    ProviderSelectionPending {
+        current: Option<RunningModelIdentity>,
     },
     ProviderChanged {
         provider: String,
@@ -643,9 +654,30 @@ pub struct RuntimeContextStats {
     /// 每个别的调用方要的都是一个数。人想看它的那一刻很具体:agent 表现得
     /// 像是被告知了一件谁也不记得告诉过它的事。
     pub system_prompt: Option<String>,
+    /// Current mounted persona, only when explicitly requested.
+    pub persona: Option<RuntimePersonaInfo>,
     /// On-demand asset status, captured from the mounted services rather than
     /// reconstructed by a driver. Populated only with `context_stats_with(true)`.
     pub assets: Option<RuntimeAssetSources>,
+}
+
+struct PendingFollowUp {
+    generation: u64,
+    session: Option<String>,
+    turn: Option<u64>,
+    prompt: String,
+    new_session: Option<crate::follow_up::NewSession>,
+}
+
+/// Inspection of the mounted persona contribution, separate from the full prompt.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct RuntimePersonaInfo {
+    /// builtin, config, explicit, or host. Unknown future sources remain extensible.
+    pub source: String,
+    /// None when the host cannot declare whether it appended instructions.
+    pub appended: Option<bool>,
+    /// Exact mounted persona fragment, including append text, not the full system prompt.
+    pub text: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -998,6 +1030,7 @@ pub enum RuntimeError {
     NoPendingPolicyIntervention,
     InvalidPolicyRecoveryAction,
     DeliveryFailed,
+    CommandRefused(String),
     Unavailable,
     ProviderUnavailable(ProviderUnavailableReason),
     SnapshotUnavailable(String),
@@ -1012,7 +1045,7 @@ pub enum RuntimeError {
 impl fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::GoalUnavailable(message) => f.write_str(message),
+            Self::GoalUnavailable(message) | Self::CommandRefused(message) => f.write_str(message),
             Self::Busy => f.write_str("coding runtime is busy"),
             Self::Cancelled => f.write_str("coding runtime operation was cancelled"),
             Self::SessionInUse { id } => {
@@ -2149,6 +2182,7 @@ impl CodingRuntimeHandle {
                 );
                 let (done, _result) = oneshot::channel();
                 CodingRuntimeControl::Submit {
+                    invocation: None,
                     generation,
                     input,
                     receipt: None,
@@ -2285,8 +2319,38 @@ impl CodingRuntimeHandle {
         self.tx.send(control).map_err(|_| RuntimeUnavailable)
     }
 
+    /// Submit a prompt-producing catalog command through normal vision/cancel handling.
+    pub fn submit_catalog(
+        &self,
+        receipt: atomcode_kernel::event::CommandId,
+        session: String,
+        name: String,
+        input: UserInput,
+    ) -> impl std::future::Future<Output = Result<SubmitReceipt, RuntimeError>> + Send + 'static
+    {
+        let state = self.state.load(Ordering::Acquire);
+        let (done, result) = oneshot::channel();
+        let sent = self
+            .tx
+            .send(CodingRuntimeControl::Submit {
+                generation: runtime_state_generation(state),
+                input,
+                invocation: Some((session.clone(), name)),
+                receipt: Some(receipt),
+                extra_context: None,
+                from: None,
+                expected_session: Some(session),
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable);
+        async move {
+            sent?;
+            result.await.map_err(|_| RuntimeError::Unavailable)?
+        }
+    }
+
     pub async fn submit(&self, input: UserInput) -> Result<SubmitReceipt, RuntimeError> {
-        self.deliver(None, input).await
+        self.deliver(None, input, None).await
     }
 
     /// As [`Self::submit`], carrying the driver's own id for this message.
@@ -2300,23 +2364,34 @@ impl CodingRuntimeHandle {
         receipt: atomcode_kernel::event::CommandId,
         input: UserInput,
     ) -> Result<SubmitReceipt, RuntimeError> {
-        self.deliver(Some(receipt), input).await
+        self.deliver(Some(receipt), input, None).await
+    }
+
+    /// Submit a real user request with separately framed reference context.
+    pub async fn submit_with_context(
+        &self,
+        input: UserInput,
+        context: Option<String>,
+    ) -> Result<SubmitReceipt, RuntimeError> {
+        self.deliver(None, input, context).await
     }
 
     async fn deliver(
         &self,
         receipt: Option<atomcode_kernel::event::CommandId>,
         input: UserInput,
+        extra_context: Option<String>,
     ) -> Result<SubmitReceipt, RuntimeError> {
         let mut timing = atomcode_harness::diagnostics::PhaseTiming::start("runtime_deliver");
         let state = self.state.load(Ordering::Acquire);
         let (done, result) = oneshot::channel();
         self.tx
             .send(CodingRuntimeControl::Submit {
+                invocation: None,
                 generation: runtime_state_generation(state),
                 input,
                 receipt,
-                extra_context: None,
+                extra_context,
                 from: None,
                 expected_session: None,
                 done,
@@ -2338,6 +2413,7 @@ impl CodingRuntimeHandle {
         let (done, result) = oneshot::channel();
         self.tx
             .send(CodingRuntimeControl::Submit {
+                invocation: None,
                 generation: runtime_state_generation(state),
                 input: UserInput::from(text),
                 receipt: None,
@@ -2362,6 +2438,7 @@ impl CodingRuntimeHandle {
         let (done, result) = oneshot::channel();
         self.tx
             .send(CodingRuntimeControl::Submit {
+                invocation: None,
                 generation: runtime_state_generation(state),
                 input: UserInput::from(text),
                 receipt: None,
@@ -2546,6 +2623,58 @@ impl CodingRuntimeHandle {
         self.tx
             .send(CodingRuntimeControl::Mode {
                 generation: runtime_state_generation(state),
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
+    /// Update future mode preferences without reconfiguring the current provider.
+    pub async fn update_mode_bindings(
+        &self,
+        bindings: atomcode_config::mode_models::ModeModels,
+    ) -> Result<(), RuntimeError> {
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::UpdateModeBindings {
+                generation: self.status().generation,
+                bindings,
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
+    /// Host-only configuration snapshot for a subsequent provider edit. Never
+    /// serialize this credential-bearing value into a row or transport response.
+    pub async fn configuration(&self) -> Result<CodingAgentConfig, RuntimeError> {
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::Configuration {
+                generation: self.status().generation,
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
+    /// Model retained by a running turn after a new selection, if any.
+    pub async fn current_turn_model(&self) -> Result<Option<RunningModelIdentity>, RuntimeError> {
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::CurrentTurnModel { done })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
+    /// Current selection and effort, ordered through the runtime owner.
+    pub async fn model_selection(
+        &self,
+    ) -> Result<atomcode_config::mode_models::ModeSelection, RuntimeError> {
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::ModelSelection {
+                generation: self.status().generation,
                 done,
             })
             .map_err(|_| RuntimeError::Unavailable)?;
@@ -3017,6 +3146,66 @@ impl CodingRuntimeHandle {
             .send(CodingRuntimeControl::Usage {
                 generation: runtime_state_generation(state),
                 windows_only,
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
+    /// Register/read/clear one user-preset continuation; never a model-facing tool.
+    pub async fn follow_up(
+        &self,
+        session: Option<String>,
+        args: String,
+    ) -> Result<serde_json::Value, RuntimeError> {
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::FollowUp {
+                generation: runtime_state_generation(self.state.load(Ordering::Acquire)),
+                session,
+                args,
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
+    /// Explicit user's specification operation, scoped to this generation/session.
+    pub async fn task_specs(
+        &self,
+        session: String,
+        args: String,
+    ) -> Result<serde_json::Value, RuntimeError> {
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::TaskSpecs {
+                generation: runtime_state_generation(self.state.load(Ordering::Acquire)),
+                session,
+                args,
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
+    /// Explicit user input; never route patch bytes through model output or shell argv.
+    pub async fn import_patch(
+        &self,
+        session: String,
+        bytes: Vec<u8>,
+    ) -> Result<String, RuntimeError> {
+        if bytes.len() > 8 * 1024 * 1024 {
+            return Err(RuntimeError::CommandRefused(
+                "patch exceeds 8 MiB import limit".into(),
+            ));
+        }
+        let state = self.state.load(Ordering::Acquire);
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::ImportPatch {
+                generation: runtime_state_generation(state),
+                session,
+                bytes,
                 done,
             })
             .map_err(|_| RuntimeError::Unavailable)?;
@@ -3758,6 +3947,7 @@ pub enum CodingRuntimeControl {
     Submit {
         generation: u64,
         input: UserInput,
+        invocation: Option<(String, String)>,
         /// Runtime-authored context admitted with this exact input.
         extra_context: Option<String>,
         /// The driver's own id for this submit, when it has one. Carried into the
@@ -3821,6 +4011,22 @@ pub enum CodingRuntimeControl {
     Mode {
         generation: u64,
         done: oneshot::Sender<Result<RuntimeMode, RuntimeError>>,
+    },
+    UpdateModeBindings {
+        generation: u64,
+        bindings: atomcode_config::mode_models::ModeModels,
+        done: oneshot::Sender<Result<(), RuntimeError>>,
+    },
+    Configuration {
+        generation: u64,
+        done: oneshot::Sender<Result<CodingAgentConfig, RuntimeError>>,
+    },
+    CurrentTurnModel {
+        done: oneshot::Sender<Result<Option<RunningModelIdentity>, RuntimeError>>,
+    },
+    ModelSelection {
+        generation: u64,
+        done: oneshot::Sender<Result<atomcode_config::mode_models::ModeSelection, RuntimeError>>,
     },
     WaitMcpReady {
         generation: u64,
@@ -3953,6 +4159,26 @@ pub enum CodingRuntimeControl {
         /// name asks: one call on the account instead of three.
         windows_only: bool,
         done: oneshot::Sender<Result<Allowance, RuntimeError>>,
+    },
+    FollowUp {
+        generation: u64,
+        session: Option<String>,
+        args: String,
+        done: oneshot::Sender<Result<serde_json::Value, RuntimeError>>,
+    },
+    /// Explicit user operations over retained task specifications.
+    TaskSpecs {
+        generation: u64,
+        session: String,
+        args: String,
+        done: oneshot::Sender<Result<serde_json::Value, RuntimeError>>,
+    },
+    /// Import explicit user bytes into the current session's input artifacts.
+    ImportPatch {
+        generation: u64,
+        session: String,
+        bytes: Vec<u8>,
+        done: oneshot::Sender<Result<String, RuntimeError>>,
     },
     /// What this session has changed in the workspace. `file` asks for one
     /// file's diff text instead of the summary of all of them.
@@ -4453,6 +4679,8 @@ fn spawn_runtime_owner_with_optional_agent(
         let mut next_turn_id = 0u64;
         let mut conversation_revision = 0u64;
         let mut active_turn = None;
+        let mut turn_model_before_selection: Option<(u64, u64, RunningModelIdentity)> = None;
+        let mut mode_model_return: Option<crate::mode_models::SavedModeModel> = None;
         // Keep each request kind until its correlated response is delivered.
         // `request_user_input` image answers need runtime-owned preprocessing.
         let mut pending_requests = BTreeMap::new();
@@ -4484,6 +4712,9 @@ fn spawn_runtime_owner_with_optional_agent(
         // to it that it will open one for. Not the same as `active_turn`: a held
         // turn is one this owner keeps open after the agent finished it, and the
         // agent can open another under it (a message typed while `/loop` waits).
+        let mut follow_up: Option<PendingFollowUp> = None;
+        let mut follow_up_elapsed = std::time::Duration::ZERO;
+        let mut follow_up_epoch = generation;
         let mut kernel_turn_open = false;
         let mut persistence_failure = None;
         // What each panel `Disable` held back, by server, for the matching
@@ -4509,7 +4740,44 @@ fn spawn_runtime_owner_with_optional_agent(
             });
         }
         loop {
+            if turn_model_before_selection
+                .as_ref()
+                .is_some_and(|(epoch, turn, _)| *epoch != generation || active_turn != Some(*turn))
+            {
+                if let Some((epoch, _, _)) = turn_model_before_selection.take() {
+                    if epoch == generation {
+                        if let Some(runtime) = resources.as_ref() {
+                            if let Some(snapshot) = runtime.parts.snapshot_hook() {
+                                snapshot.set_model_attribution(
+                                    &runtime.config.provider_name,
+                                    &runtime.config.model,
+                                );
+                            }
+                        }
+                    }
+                    let _ = runtime_event_tx
+                        .send(CodingRuntimeEvent::ProviderSelectionPending { current: None });
+                }
+            }
             background_jobs.retain_generation(generation);
+            if follow_up_epoch != generation {
+                follow_up_elapsed = std::time::Duration::ZERO;
+                follow_up_epoch = generation;
+            }
+            if follow_up.as_ref().is_some_and(|pending| {
+                pending.generation != generation
+                    || pending.session.as_deref()
+                        != resources
+                            .as_ref()
+                            .and_then(|runtime| runtime.parts.session.as_ref())
+                            .map(|binding| binding.id.as_str())
+            }) || controls.stop_now().is_cancelled()
+                || !agent_available
+                || persistence_failure.is_some()
+            {
+                follow_up = None;
+            }
+
             if cancel_pending
                 || persistence_failure.is_some()
                 || pending_policy_intervention.is_some()
@@ -4611,7 +4879,7 @@ fn spawn_runtime_owner_with_optional_agent(
                     state.active
                         && held_turn.is_some()
                         && !kernel_turn_open
-                        && background_jobs.pending()
+                        && background_jobs.uncollected()
                 })
                 .and_then(|state| {
                     if state.cap_reached().is_some() {
@@ -5033,7 +5301,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             // repeated identical observational receipts do not count as new
                             // progress; unknown commands/mutations remain conservative. Stop
                             // after the existing bounded number of stagnant rounds.
-                            if background_jobs.pending() {
+                            if background_jobs.uncollected() {
                                 if let Some(state) = goal.as_mut() {
                                     state.last_reason = Some("waiting for explicitly requested background completion".into());
                                     let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
@@ -5395,6 +5663,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         }
                     }
                     Some(CodingRuntimeControl::Submit {
+                        invocation,
                         generation: request_generation,
                         mut input,
                         extra_context,
@@ -5432,6 +5701,25 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Busy));
                             continue;
                         }
+                        let prepared_command = if let Some((session, name)) = invocation {
+                            let prepared = resources.as_ref().and_then(|r| r.harness_app.as_ref())
+                                .ok_or_else(|| "catalog unavailable".to_string())
+                                .and_then(|app| atomcode_harness::plugins::handle::catalog_command(&app.context(), &session, &name)
+                                    .map_err(|e| format!("{e:?}")))
+                                .and_then(|(target, command)| command.prepare_input(&target, &input.text)
+                                    .and_then(|prepared| prepared.ok_or_else(|| "This command does not accept images".into()))
+                                    .map(|prepared| (target, prepared)));
+                            match prepared {
+                                Ok((target, prepared)) => {
+                                    input.text = prepared.text.clone();
+                                    Some((target, prepared))
+                                }
+                                Err(message) => {
+                                    let _ = done.send(Err(RuntimeError::CommandRefused(message)));
+                                    continue;
+                                }
+                            }
+                        } else { None };
                         // Resolve historical data before changing policy, goal or turn state.
                         // Only real-user submits can request it; peer reports are data.
                         let reference_context = if from.is_none() {
@@ -5534,6 +5822,11 @@ fn spawn_runtime_owner_with_optional_agent(
                         // this conversation's policy for a turn the person never asked
                         // for.
                         if from.is_none() {
+                            if follow_up.as_ref().is_some_and(|pending| pending.turn.is_some()) {
+                                follow_up = None;
+                                let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(
+                                    "Follow-up cleared / 已撤销后续任务：new user input takes priority.".into()));
+                            }
                             if let Some(runtime) = resources.as_ref() {
                                 if !execution_intent.trim().is_empty() {
                                     runtime
@@ -5596,6 +5889,10 @@ fn spawn_runtime_owner_with_optional_agent(
                         } else {
                             next_turn_id = next_turn_id.wrapping_add(1);
                             active_turn = Some(next_turn_id);
+                            follow_up_elapsed = std::time::Duration::ZERO;
+                            if from.is_none() {
+                                if let Some(pending) = follow_up.as_mut().filter(|pending| pending.turn.is_none()) { pending.turn = Some(next_turn_id); }
+                            }
                             turn_stats = RuntimeTurnStats::default();
                             controls.state.store(
                                 runtime_phase_state(generation, RuntimePhase::InTurn),
@@ -5730,6 +6027,15 @@ fn spawn_runtime_owner_with_optional_agent(
                             if let Some(previous)=recovery_context.take() { context["recovery_context"]=serde_json::Value::String(previous); }
                             recovery_context=Some(context.to_string());
                         }
+                        if let Some((target, prepared)) = prepared_command {
+                            let (mut context, origin) = prepared.context;
+                            if let Some(extra) = recovery_context { context.push_str("\n\n"); context.push_str(&extra); }
+                            target.send_contextual(input.text, atomcode_harness::agent::MessageOrigin::User,
+                                input.images, driver_receipt, (context, origin));
+                            kernel_turn_open = true;
+                            let _ = done.send(Ok(receipt));
+                            continue;
+                        }
                         let command = match (from, recovery_context) {
                             (Some(from), _) => AgentCommand::PeerNote {
                                 from,
@@ -5831,7 +6137,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             let Some(tx) = controls.submit_tx.upgrade() else { let _ = done.send(Err(RuntimeError::Unavailable)); continue; };
                             let (submitted, accepted) = oneshot::channel();
                             let expected_session = resources.as_ref().and_then(|r| r.parts.session.as_ref()).map(|s| s.id.clone());
-                            if tx.send(CodingRuntimeControl::Submit { generation, input, extra_context: Some(goal_questions::GoalQuestions::reply_context(question)), receipt: None, from: None, expected_session, done: submitted }).is_err() {
+                            if tx.send(CodingRuntimeControl::Submit { invocation: None, generation, input, extra_context: Some(goal_questions::GoalQuestions::reply_context(question)), receipt: None, from: None, expected_session, done: submitted }).is_err() {
                                 let _ = done.send(Err(RuntimeError::Unavailable));
                                 continue;
                             }
@@ -6030,7 +6336,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         }
                         let source = resources
                             .as_ref()
-                            .and_then(|runtime| runtime.parts.rate_limit_source().cloned());
+                            .and_then(|runtime| runtime.parts.rate_limit_source(&runtime.config.base_url).cloned());
                         tokio::spawn(async move {
                             // No source at all: this really is a host that
                             // counts nothing, and an empty answer says so.
@@ -6092,6 +6398,100 @@ fn spawn_runtime_owner_with_optional_agent(
                                 spent_unavailable,
                             }));
                         });
+                    }
+                    Some(CodingRuntimeControl::FollowUp { generation: requested, session, args, done }) => {
+                        let result = (|| {
+                            if requested != generation { return Err(RuntimeError::Busy); }
+                            let runtime = resources.as_ref().ok_or(RuntimeError::Unavailable)?;
+                            if session.as_deref().is_some_and(|session| runtime.parts.session.as_ref().map(|b| b.id.as_str()) != Some(session)) {
+                                return Err(RuntimeError::CommandRefused("follow-up belongs to a different session".into()));
+                            }
+                            let arg = args.trim_start();
+                            if arg.trim() == "history" || arg.starts_with("history ") {
+                                let text = crate::follow_up::history(&runtime.config, arg.strip_prefix("history").map(str::trim).filter(|id| !id.is_empty())).map_err(RuntimeError::CommandRefused)?;
+                                return Ok(serde_json::json!({"prompt":text,"current_task":false}));
+                            }
+                            match arg.trim() {
+                                "" | "show" => {},
+                                "clear" => { follow_up = None; },
+                                _ => {
+                                    let new_session = arg.strip_prefix("new ").map(|json| crate::follow_up::NewSession::parse(json, &runtime.config)).transpose().map_err(RuntimeError::CommandRefused)?;
+                                    if new_session.is_some() && (runtime.parts.session.is_none() || runtime.config.follow_up_service.is_none()) {
+                                        return Err(RuntimeError::CommandRefused("new-session follow-up requires a persistent source session and host dispatcher".into()));
+                                    }
+                                    let prompt = if let Some(options) = &new_session { options.prompt.as_str() } else { arg.split_once(char::is_whitespace).filter(|(action,_)| *action == "set").map(|(_,prompt)|prompt).ok_or_else(|| RuntimeError::CommandRefused("usage: /followup set <prompt> | new <JSON> | show | clear | history [id]".into()))? };
+                                    if prompt.trim().is_empty() || prompt.len() > 16 * 1024 {
+                                        return Err(RuntimeError::CommandRefused("follow-up prompt must contain 1..16384 UTF-8 bytes".into()));
+                                    }
+                                    if !agent_available || compaction_suspended || cancel_pending || controls.stop_now().is_cancelled()
+                                        || goal.is_some() || loop_state.is_some() || pending_policy_intervention.is_some() || persistence_failure.is_some() {
+                                        return Err(RuntimeError::CommandRefused("follow-up requires an available ordinary task; clear goal/loop first".into()));
+                                    }
+                                    follow_up = Some(PendingFollowUp { generation, session: runtime.parts.session.as_ref().map(|binding|binding.id.clone()), turn: active_turn, prompt: prompt.into(), new_session });
+                                }
+                            }
+                            Ok(serde_json::json!({"prompt":follow_up.as_ref().map(|p|p.prompt.as_str()),"current_task":follow_up.as_ref().is_some_and(|p|p.turn.is_some()),"new_session":follow_up.as_ref().and_then(|p|p.new_session.as_ref()),"execution_id":follow_up.as_ref().and_then(|p|p.new_session.as_ref()).map(|o|o.id.as_str())}))
+                        })();
+                        let _ = done.send(result);
+                    }
+                    Some(CodingRuntimeControl::TaskSpecs { generation: requested, session, args, done }) => {
+                        let mutates=matches!(args.split_whitespace().next(),Some("pin"|"unpin"));
+                        let mut result = if requested != generation || (mutates && (active_turn.is_some() || !pending_requests.is_empty())) { Err(RuntimeError::Busy) } else {
+                            resources.as_ref().and_then(|r| r.harness_app.as_ref()).ok_or(RuntimeError::Unavailable).and_then(|app| {
+                                let context=app.context();
+                                let agents=context.service::<atomcode_harness::seams::AgentsSvc>().ok_or(RuntimeError::Unavailable)?;
+                                let target=agents.list().into_iter().find(|a|a.parent().is_none()&&a.session_id()==session).ok_or(RuntimeError::Unavailable)?;
+                                atomcode_harness::plugins::spec::execute(&target,&args).map_err(RuntimeError::CommandRefused)
+                            })
+                        };
+                        if mutates && result.is_ok() {
+                            conversation_revision=conversation_revision.wrapping_add(1);
+                            if let Some(error)=resources.as_ref().and_then(|r|r.parts.take_snapshot_persistence_uncertain()) {
+                                persistence_failure=Some(error.clone());
+                                let _=send_agent_command(&agent,AgentCommand::Shutdown);
+                                agent=None;
+                                let report=StopReport{persistence_failure:Some(error),..Default::default()};
+                                if let Some(error)=fail_close_after_stopped_persistence(&report,resources.as_ref(),&mut goal,&mut loop_state,&mut pending_wakeup,&mut held_turn,&mut active_turn,&mut terminal_reason,&mut turn_stats,&mut conversation_revision,&mut snapshot_waiters,&mut agent_available,controls.state.as_ref(),generation,&runtime_event_tx) {
+                                    result=Err(error);
+                                }
+                            }
+                        }
+                        let _=done.send(result);
+                    }
+                    Some(CodingRuntimeControl::ImportPatch { generation: requested, session, bytes, done }) => {
+                        if requested != generation || active_turn.is_some() || !pending_requests.is_empty() {
+                            let _ = done.send(Err(RuntimeError::Busy)); continue;
+                        }
+                        let stop = controls.stop_now();
+                        let imported = async {
+                            let runtime = resources.as_ref().ok_or(RuntimeError::Unavailable)?;
+                            let app = runtime.harness_app.as_ref().ok_or(RuntimeError::Unavailable)?;
+                            let context = app.context();
+                            let agents = context.service::<atomcode_harness::seams::AgentsSvc>().ok_or(RuntimeError::Unavailable)?;
+                            if !agents.list().iter().any(|agent| agent.parent().is_none() && agent.session_id() == session) { return Err(RuntimeError::CommandRefused("patch belongs to a different session".into())); }
+                            let world = context.service::<atomcode_harness::seams::FsSvc>().ok_or(RuntimeError::Unavailable)?;
+                            let store = context.service::<atomcode_harness::seams::OutputArtifactsSvc>().ok_or(RuntimeError::Unavailable)?;
+                            let store = Arc::new(store.scoped_inputs(&session));
+                            let provider: atomcode_capabilities::tools::output_artifact::ArtifactStoreProvider = Arc::new(move || Some(store.clone()));
+                            let dirs = atomcode_harness::product_dirs(&context).map_err(RuntimeError::CommandRefused)?;
+                            let tool = atomcode_capabilities::tools::ImportPatchTool::new(world, provider, atomcode_capabilities::tools::SensitivePaths::of(&dirs));
+                            let operation_cancel = stop.child_token();
+                            let tool_context = atomcode_kernel::tool::ToolContext { working_dir: runtime.config.working_dir.clone(), cancel: operation_cancel.clone(), progress: Default::default(), requester: None };
+                            // Hashing/JSON serialization and artifact fsync must not block
+                            // the owner or its stop/timeout signal. This task owns input
+                            // data and world references, never another live agent.
+                            let executor = tokio::runtime::Handle::current();
+                            let mut task = tokio::task::spawn_blocking(move || executor.block_on(tool.import_bytes(bytes, &tool_context)));
+                            tokio::select! {
+                                _ = stop.cancelled() => { operation_cancel.cancel(); task.abort(); Err(RuntimeError::Cancelled) },
+                                result = tokio::time::timeout(std::time::Duration::from_secs(10), &mut task) => match result {
+                                    Ok(Ok(result)) => result.map_err(RuntimeError::CommandRefused),
+                                    Ok(Err(error)) => Err(RuntimeError::CommandRefused(error.to_string())),
+                                    Err(_) => { operation_cancel.cancel(); task.abort(); Err(RuntimeError::CommandRefused("patch import timed out; no workspace files were written".into())) },
+                                },
+                            }
+                        }.await;
+                        let _ = done.send(imported);
                     }
                     // Reading only: unlike the rewind catalog this does not
                     // refuse while a turn is running. Looking at what has
@@ -6344,7 +6744,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         generation: request_generation,
                         done,
                     }) => {
-                        if request_generation == generation { background_jobs.reset(generation); }
+                        if request_generation == generation { background_jobs.reset(generation); follow_up = None; }
                         if request_generation == generation {
                             goal_questions.close(resources.as_ref(), &mut pending_requests, &runtime_event_tx);
                         }
@@ -6569,23 +6969,86 @@ fn spawn_runtime_owner_with_optional_agent(
                         }
                     }
                     Some(CodingRuntimeControl::SetMode {
-                        generation: request_generation,
-                        mode,
-                        done,
+                        generation: request_generation, mode, done,
                     }) => {
-                        let Some(runtime) = resources.as_ref() else {
-                            let _ = done.send(Err(RuntimeError::Unavailable));
-                            continue;
+                        let Some(runtime) = resources.as_mut() else {
+                            let _ = done.send(Err(RuntimeError::Unavailable)); continue;
                         };
                         if request_generation != generation || compaction_suspended {
-                            let _ = done.send(Err(RuntimeError::Busy));
-                            continue;
+                            let _ = done.send(Err(RuntimeError::Busy)); continue;
                         }
                         let before = current_mode(&runtime.parts);
+                        if before == mode { let _ = done.send(Ok(())); continue; }
+                        let owner = (runtime.parts.session.as_ref().map(|s| s.id.clone()), runtime.config.working_dir.clone());
+                        if mode_model_return.as_ref().is_some_and(|saved| saved.owner != owner) { mode_model_return = None; }
+                        let next = match crate::mode_models::next_config(&runtime.config, before, mode, mode_model_return.as_ref()) {
+                            Ok(next) => next,
+                            Err(error) => { let _ = done.send(Err(error)); continue; }
+                        };
+                        if let Some(next) = next {
+                            if active_turn.is_some() || !pending_requests.is_empty() || held_turn.is_some() || next_prompt_task.is_some() || pending_wakeup.is_some() {
+                                let _ = done.send(Err(RuntimeError::ReconfigureFailed("Stop the current task before changing a mode-bound model".into()))); continue;
+                            }
+                            if agent.is_none() || !agent_available { let _ = done.send(Err(RuntimeError::Unavailable)); continue; }
+                            let session_id = runtime.parts.session.as_ref().map(|s| s.id.as_str());
+                            let candidate = match runtime.provider_factory.build(&next, session_id) {
+                                Ok(provider) => provider,
+                                Err(error) => { let _ = done.send(Err(RuntimeError::ReconfigureFailed(error.to_string()))); continue; }
+                            };
+                            let (Some(app), Some(slots)) = (runtime.harness_app.as_mut(), runtime.harness_providers.as_ref()) else {
+                                let _ = done.send(Err(RuntimeError::Unavailable)); continue;
+                            };
+                            if let Err(error) = crate::on_harness::swap_provider_for(app, slots.as_ref(), candidate.clone(), &next.model, Some(&next)).await {
+                                let _ = done.send(Err(RuntimeError::ReconfigureFailed(error))); continue;
+                            }
+                            if mode == RuntimeMode::Plan {
+                                mode_model_return = Some(crate::mode_models::SavedModeModel { owner,
+                                    selection: runtime.config.provider_name.clone(), effort: runtime.config.chat_options.reasoning_effort });
+                            }
+                            let _ = crate::parts::wire_side_providers(&runtime.parts, &next, &candidate);
+                            if let Some(snapshot) = runtime.parts.snapshot_hook() { snapshot.set_model_attribution(&next.provider_name, &next.model); }
+                            tell(runtime, crate::told::reconfigured(&runtime.config, &next));
+                            runtime.config = next;
+                            // The live agent is unchanged and no turn is in flight.
+                            // Mode changes retain its generation; only the provider seam is patched.
+                            let _ = runtime_event_tx.send(CodingRuntimeEvent::ProviderChanged { provider: runtime.config.provider_name.clone(), model: current_runtime_model(runtime).unwrap_or_default() });
+                            let _ = runtime_event_tx.send(CodingRuntimeEvent::ReasoningEffortChanged { provider: runtime.config.provider_name.clone(), effort: runtime.config.chat_options.reasoning_effort, applicable: runtime.config.supports_reasoning_effort });
+                        }
+                        if before == RuntimeMode::Plan { mode_model_return = None; }
                         set_mode_flags(&runtime.parts, mode);
                         tell(runtime, crate::told::mode_changed(before, mode));
                         let _ = runtime_event_tx.send(CodingRuntimeEvent::ModeChanged { mode });
                         let _ = done.send(Ok(()));
+                    }
+                    Some(CodingRuntimeControl::UpdateModeBindings {generation:requested,bindings,done}) => {
+                        let result=resources.as_mut().ok_or(RuntimeError::Unavailable).and_then(|runtime| {
+                            if requested!=generation {return Err(RuntimeError::Busy);}
+                            let registry=runtime.config.subagent_config.as_mut().ok_or(RuntimeError::Unavailable)?;
+                            atomcode_config::mode_models::validate_binding(registry,&bindings.plan).map_err(|error|RuntimeError::ReconfigureFailed(error.to_string()))?;
+                            atomcode_config::mode_models::validate_binding(registry,&bindings.build).map_err(|error|RuntimeError::ReconfigureFailed(error.to_string()))?;
+                            Arc::make_mut(registry).modes=bindings;
+                            Ok(())
+                        });
+                        let _=done.send(result);
+                    }
+                    Some(CodingRuntimeControl::Configuration {generation:requested,done}) => {
+                        let answer=resources.as_ref().ok_or(RuntimeError::Unavailable).and_then(|runtime| {
+                            if requested!=generation {return Err(RuntimeError::Busy);}
+                            Ok(runtime.config.clone())
+                        });
+                        let _=done.send(answer);
+                    }
+                    Some(CodingRuntimeControl::CurrentTurnModel {done}) => {
+                        let result=resources.as_ref().ok_or(RuntimeError::Unavailable)
+                            .map(|_|turn_model_before_selection.as_ref().map(|(_, _, model)|model.clone()));
+                        let _=done.send(result);
+                    }
+                    Some(CodingRuntimeControl::ModelSelection { generation: requested, done }) => {
+                        let answer=resources.as_ref().ok_or(RuntimeError::Unavailable).and_then(|runtime| {
+                            if requested!=generation { return Err(RuntimeError::Busy); }
+                            Ok(atomcode_config::mode_models::ModeSelection { model:runtime.config.provider_name.clone(), reasoning_effort:runtime.config.chat_options.reasoning_effort.map(|v|v.as_str().to_string()) })
+                        });
+                        let _=done.send(answer);
                     }
                     Some(CodingRuntimeControl::Mode {
                         generation: request_generation,
@@ -6641,6 +7104,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             model: runtime.config.model.clone(),
                             working_dir: runtime.config.working_dir.clone(),
                             system_prompt,
+                            persona: prompt.then(|| runtime_persona_info(runtime)).flatten(),
                             assets: prompt.then(|| runtime_asset_sources(runtime)),
                         }));
                     }
@@ -7048,6 +7512,13 @@ fn spawn_runtime_owner_with_optional_agent(
                         // `ProviderUnavailable`: the provider had been swapped
                         // behind a seam nobody was reading.
                         if agent.is_some() {
+                                let running_model = active_turn.map(|_| {
+                                    turn_model_before_selection.as_ref().map(|(_, _, model)| model.clone())
+                                        .unwrap_or_else(|| RunningModelIdentity {
+                                            provider: runtime.config.provider_name.clone(),
+                                            model: current_runtime_model(&runtime).unwrap_or_else(|| runtime.config.model.clone()),
+                                        })
+                                });
                             if let (Some(app), Some(slots)) = (
                                 runtime.harness_app.as_mut(),
                                 runtime.harness_providers.clone(),
@@ -7113,11 +7584,12 @@ fn spawn_runtime_owner_with_optional_agent(
                                     &next,
                                     &side_provider,
                                 );
-                                // Turns from here on are billed to the new model.
-                                // The chain says the same thing from `assemble`,
-                                // which only runs once the swap has succeeded.
-                                if let Some(snapshot) = runtime.parts.snapshot_hook() {
-                                    snapshot.set_model_attribution(&next.provider_name, &next.model);
+                                // The running loop captured its provider at turn start.
+                                // Keep its accounting identity until that turn ends.
+                                if running_model.is_none() {
+                                    if let Some(snapshot) = runtime.parts.snapshot_hook() {
+                                        snapshot.set_model_attribution(&next.provider_name, &next.model);
+                                    }
                                 }
                                 tell(&runtime, crate::told::reconfigured(&runtime.config, &next));
                                 runtime.config = next;
@@ -7139,14 +7611,29 @@ fn spawn_runtime_owner_with_optional_agent(
                                 controls
                                     .provider_unavailable_reason
                                     .store(0, Ordering::Release);
+                                // Keep the generation receipt ordered even when two
+                                // drivers select concurrently. This is the same agent,
+                                // so its active steer correlations remain valid.
                                 generation = generation.wrapping_add(1);
+                                if active_turn.is_none() {
+                                    pending_steer_acknowledgements.clear();
+                                }
                                 event_generation.store(generation, Ordering::Release);
-                                pending_steer_acknowledgements.clear();
                                 controls.state.store(
                                     runtime_phase_state(generation, resumed),
                                     Ordering::Release,
                                 );
                                 runtime_event_tx.carry_live_view(generation);
+                                if let (Some(turn), Some(current)) = (active_turn, running_model) {
+                                    turn_model_before_selection = Some((generation, turn, current.clone()));
+                                    let _ = runtime_event_tx.send(CodingRuntimeEvent::ProviderSelectionPending { current: Some(current) });
+                                }
+                                if resources.as_ref().and_then(|runtime| runtime.config.subagent_config.as_ref()).is_some_and(|config| !config.modes.is_empty()) {
+                                    let text=if atomcode_config::i18n::current_locale()==atomcode_config::locale::Locale::ZhCn {
+                                        "临时使用所选模型/强度；切换到已配置的模式时重新应用绑定。"
+                                    } else { "Temporary model/effort selection; entering a configured mode reapplies its binding." };
+                                    let _=runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(text.into()));
+                                }
                                 let _ = runtime_event_tx.send(
                                     CodingRuntimeEvent::ProviderChanged {
                                         provider: provider.clone(),
@@ -7728,6 +8215,16 @@ fn spawn_runtime_owner_with_optional_agent(
                         // What the model is told once this lands: a reload, or
                         // what a reloaded config changed. A new session is not
                         // told anything — it has no conversation above it.
+                        if let ReprepareTarget::ReloadConfig(next)=&target {
+                            if crate::mode_models::only_preferences_changed(&runtime.config,next) {
+                                runtime.config.subagent_config=next.subagent_config.clone();
+                                let changed=session_changed(generation,&runtime);
+                                resources=Some(runtime);
+                                let _=runtime_event_tx.send(CodingRuntimeEvent::Reconfigured{operation:ReconfigureKind::Reprepare});
+                                let _=done.send(Ok(changed));
+                                continue;
+                            }
+                        }
                         let reloaded_from = match &target {
                             ReprepareTarget::Reload { .. } => Some(None),
                             ReprepareTarget::ReloadConfig(_) => Some(Some(runtime.config.clone())),
@@ -8114,6 +8611,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         }
                         let changed = session_changed(generation, &runtime);
                         let cwd = runtime.config.working_dir.clone();
+                        if changes_session { mode_model_return = None; }
                         resources = Some(runtime);
                         controls.state.store(
                             runtime_phase_state(generation, RuntimePhase::Ready),
@@ -8733,6 +9231,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         let _ = done.send(Ok(()));
                     }
                     Some(CodingRuntimeControl::StartGoal { generation: request_generation, condition, images, done, recovery_tx }) => {
+                        if follow_up.is_some() { let _ = done.send(Err(RuntimeError::CommandRefused("clear the pending follow-up before starting goal/loop".into()))); continue; }
                         if let Err(error) = goal_checkpoints.available() { let _ = done.send(Err(error)); continue; }
                         if !native_protocol || request_generation != generation || compaction_suspended {
                             let _ = done.send(Err(RuntimeError::Busy));
@@ -8813,6 +9312,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             // to "what is a turn".
                             let (started, _) = oneshot::channel();
                             let _ = recovery_tx.send(CodingRuntimeControl::Submit {
+                        invocation: None,
                                 generation: request_generation,
                                 input: UserInput { text: condition, images },
                                 receipt: None,
@@ -8825,7 +9325,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             // an env override short-circuits to the default, and with no live
                             // rate-limit source there is nothing to derive from.
                             if crate::config::goal_max_rounds_env().is_none() {
-                                if let Some(source) = runtime.parts.rate_limit_source().cloned() {
+                                if let Some(source) = runtime.parts.rate_limit_source(&runtime.config.base_url).cloned() {
                                     let default = runtime.config.goal_max_rounds;
                                     let tx = recovery_tx.clone();
                                     tokio::spawn(async move {
@@ -8857,7 +9357,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         }
                     }
                     Some(CodingRuntimeControl::StopGoal { generation: request_generation, done }) => {
-                        if request_generation == generation { background_jobs.reset(generation); }
+                        if request_generation == generation { background_jobs.reset(generation); follow_up = None; }
                         if request_generation == generation {
                             goal_questions.close(resources.as_ref(), &mut pending_requests, &runtime_event_tx);
                         }
@@ -8900,6 +9400,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         let _ = done.send(goal_checkpoints.commit(&runtime_event_tx));
                     }
                     Some(CodingRuntimeControl::StartLoop { generation: request_generation, prompt, every, done, recovery_tx }) => {
+                        if follow_up.is_some() { let _ = done.send(Err(RuntimeError::CommandRefused("clear the pending follow-up before starting goal/loop".into()))); continue; }
                         if !native_protocol || request_generation != generation || compaction_suspended {
                             let _ = done.send(Err(RuntimeError::Busy));
                             continue;
@@ -8952,6 +9453,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             // at all in the model-paced form.
                             let (started, _) = oneshot::channel();
                             let _ = recovery_tx.send(CodingRuntimeControl::Submit {
+                        invocation: None,
                                 generation: request_generation,
                                 input: UserInput::from(prompt),
                                 receipt: None,
@@ -8963,7 +9465,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         }
                     }
                     Some(CodingRuntimeControl::StopLoop { generation: request_generation, done }) => {
-                        if request_generation == generation { background_jobs.reset(generation); }
+                        if request_generation == generation { background_jobs.reset(generation); follow_up = None; }
                         if !native_protocol || request_generation != generation {
                             let _ = done.send(Err(RuntimeError::Unavailable));
                             continue;
@@ -9311,7 +9813,8 @@ fn spawn_runtime_owner_with_optional_agent(
                                 turn_stats.duration = turn_started_at
                                     .take()
                                     .map(|started| started.elapsed())
-                                    .unwrap_or_default();
+                                    .unwrap_or_default()
+                                    .saturating_add(std::mem::take(&mut follow_up_elapsed));
                                 if let Some(error) = resources.as_ref().and_then(|runtime| {
                                     runtime.parts.take_snapshot_persistence_uncertain()
                                 }) {
@@ -9592,6 +10095,45 @@ fn spawn_runtime_owner_with_optional_agent(
                                         if let Some(runtime) = resources.as_ref() { runtime.loop_active.store(false, Ordering::Release); }
                                         loop_state = None;
                                     }
+                                    if follow_up.as_ref().is_some_and(|pending| pending.turn == Some(turn_id)) {
+                                        let pending = follow_up.take().expect("matched follow-up");
+                                        if completion_reason == StopReason::Stopped && goal.is_none() && loop_state.is_none()
+                                            && pending_requests.is_empty() && !controls.stop_now().is_cancelled()
+                                            && persistence_failure.is_none() && pending_policy_intervention.is_none()
+                                            && !background_jobs.uncollected() && agent_available
+                                        {
+                                            if let Some(options) = pending.new_session {
+                                                let result = resources.as_ref().ok_or_else(|| "runtime unavailable".to_string()).and_then(|runtime| {
+                                                    let session = pending.session.as_deref().ok_or_else(|| "follow-up requires a persistent source session".to_string())?;
+                                                    options.launch(&runtime.config, session, turn_id, &controls.stop_now())
+                                                });
+                                                let message = result.unwrap_or_else(|error| format!("Follow-up launch not confirmed; inspect history / 后续任务启动未确认，请查看 history {}: {error}", options.id));
+                                                let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(message));
+                                            } else {
+                                            let text = format!("[Automatic follow-up / 自动后续任务 — user preset]\n{}", pending.prompt);
+                                            let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(text.clone()));
+                                            // This is a user-authored preset, not an autonomous reminder.
+                                            // Keep its automatic marker in the authoritative user message so
+                                            // history and per-turn execution restrictions retain its provenance.
+                                            if let Some(runtime) = resources.as_ref() {
+                                                runtime.parts.turn_execution_policy.update_from_user_text(&pending.prompt);
+                                            }
+                                            // Consume before dispatch: this continuation cannot schedule itself.
+                                            if send_agent_command(&agent, AgentCommand::SendMessage { text, images: Vec::new() }) {
+                                                follow_up_elapsed = stats.duration;
+                                                turn_stats = stats;
+                                                // Keep the original accepted operation open so all drivers,
+                                                // including headless, await the follow-up's real terminal.
+                                                continue;
+                                            }
+                                            agent_available = false;
+                                            completion_reason = StopReason::InternalError;
+                                            }
+                                        } else {
+                                            let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(
+                                                "Follow-up skipped / 后续任务未执行：task did not finish normally, or still has pending work.".into()));
+                                        }
+                                    }
                                     active_turn = None;
                                     if completion_reason == StopReason::Stopped
                                         && resources.as_ref().is_some_and(|runtime| {
@@ -9811,14 +10353,11 @@ fn spawn_runtime_owner_with_optional_agent(
                         break;
                     },
                 },
-                completion = background_jobs.next(), if background_jobs.pending() => {
+                completion = background_jobs.next(), if background_jobs.pending() && !kernel_turn_open && pending_requests.is_empty() => {
                     if cancel_pending || controls.stop_now().is_cancelled() || persistence_failure.is_some() || pending_policy_intervention.is_some() || !agent_available {
                         continue;
                     }
-                    let text = format!(
-                        "Background job {} has finished (exit code: {:?}, killed: {}). Use bash_poll with job_id {:?} to collect its output. This is a process completion notification, not proof that the task succeeded.",
-                        completion.job_id, completion.exit_code, completion.killed, completion.job_id,
-                    );
+                    let Some(text) = completion.notification() else { continue; };
                     if loop_state.is_some() || goal.as_ref().is_some_and(|state| !state.active) {
                         // A completion cannot shorten the person's /loop cadence
                         // or re-engage a paused goal. Carry it with the next input.
@@ -9999,6 +10538,13 @@ fn reject_runtime_control_with_error(
         | CodingRuntimeControl::SwitchTool { done, .. } => {
             let _ = done.send(Err(error));
         }
+        CodingRuntimeControl::TaskSpecs { done, .. }
+        | CodingRuntimeControl::FollowUp { done, .. } => {
+            let _ = done.send(Err(error));
+        }
+        CodingRuntimeControl::ImportPatch { done, .. } => {
+            let _ = done.send(Err(error));
+        }
         CodingRuntimeControl::SideCallProvider { done, .. } => {
             let _ = done.send(Err(error));
         }
@@ -10008,6 +10554,7 @@ fn reject_runtime_control_with_error(
         | CodingRuntimeControl::Cancel { done, .. }
         | CodingRuntimeControl::PauseGoal { done, .. }
         | CodingRuntimeControl::SetMode { done, .. }
+        | CodingRuntimeControl::UpdateModeBindings { done, .. }
         | CodingRuntimeControl::WaitMcpReady { done, .. }
         | CodingRuntimeControl::QueueLocalContext { done, .. } => {
             let _ = done.send(Err(error));
@@ -10020,6 +10567,15 @@ fn reject_runtime_control_with_error(
         }
         // A stopping runtime cannot say which mode it is in either — the flags
         // belong to a tree that is being torn down.
+        CodingRuntimeControl::Configuration { done, .. } => {
+            let _ = done.send(Err(error));
+        }
+        CodingRuntimeControl::CurrentTurnModel { done } => {
+            let _ = done.send(Err(error));
+        }
+        CodingRuntimeControl::ModelSelection { done, .. } => {
+            let _ = done.send(Err(error));
+        }
         CodingRuntimeControl::Mode { done, .. } => {
             let _ = done.send(Err(error));
         }
@@ -10850,7 +11406,7 @@ fn harness_host_state(
                 meter: crate::telemetry::McpTelemetry::new(telemetry, config.working_dir.clone()),
             },
         ),
-        rate_limit_source: parts.rate_limit_source().cloned(),
+        rate_limit_source: parts.rate_limit_source(&config.base_url).cloned(),
         front_end: prepare.front_end.clone(),
         delegated_llm: parts.delegated_provider(),
         team_events: parts.subagent_knobs().map(|_| {
@@ -10883,6 +11439,7 @@ fn harness_host_state(
             },
             plan_mcp_grants: Arc::clone(&parts.mcp_plan_grants),
             approval_grants: parts.approval.store(),
+            project_rules: None,
         }),
     })
 }
@@ -10982,6 +11539,13 @@ fn tree_inputs(
         &config.dirs,
         &config.working_dir,
     )?;
+    let project_rules = crate::permission_settings::project_rule_store(
+        parts.shared_cwd.clone(),
+        config.working_dir.clone(),
+        config.dirs.clone(),
+        config.permission_rules.clone(),
+        permissions.rules.clone(),
+    );
     let mut effective = config.clone();
     effective.permission_rules = permissions.rules.clone();
     let config = &effective;
@@ -10997,6 +11561,20 @@ fn tree_inputs(
     // patch is the last word on any row — except the explicit model-only catalog
     // closure below, which no layer may reopen.
     let mut extra = vec![crate::on_harness::config_rows(config)?];
+    extra.push(
+        atomcode_plexus::Layer::new()
+            .patch(
+                "persona-atomcode",
+                serde_json::json!({
+                    "model": config.model,
+                    "product": prepare.identity.name(),
+                    "provider": prepare.identity.provider(),
+                    "system_prompt": config.system_prompt,
+                    "prompt_overrides": prepare.prompt_overrides,
+                }),
+            )
+            .map_err(|e| e.to_string())?,
+    );
     extra.extend(prepare.host_plugins.layers.iter().cloned());
     // `tools = false` is an explicit model-only contract, not just a request
     // to skip prepare-time registrations. Native rows mount their own tools;
@@ -11024,6 +11602,9 @@ fn tree_inputs(
             current: config.provider_name.clone(),
         });
     let mut host = harness_host_state(parts, config, prepare).map_err(|error| error.to_string())?;
+    if let Some(modes) = host.modes.as_mut() {
+        modes.project_rules = Some(project_rules);
+    }
     host.permission_settings = Some(permissions);
     Ok(TreeInputs {
         presence,
@@ -11345,6 +11926,37 @@ fn record_code_rewind(live: &atomcode_harness::agent::Agent, turn: u64) {
             scope: atomcode_harness::session::RewindScope::Code,
         },
     );
+}
+
+fn runtime_persona_info(runtime: &RuntimeResources) -> Option<RuntimePersonaInfo> {
+    let app = runtime.harness_app.as_ref()?;
+    let text = app
+        .context()
+        .service::<atomcode_harness::seams::SystemPromptSvc>()?
+        .fragment("persona-atomcode")?;
+    let entry = app
+        .tree()
+        .entries
+        .iter()
+        .find(|entry| entry.id == "persona-atomcode")?;
+    let (source, appended) = if entry.name == "persona-atomcode" {
+        let row = crate::host::PersonaConfig::from_config(&entry.config).ok()?;
+        let source = if row.prompt_overrides.replace.is_some() {
+            "explicit"
+        } else if row.system_prompt.is_some() {
+            "config"
+        } else {
+            "builtin"
+        };
+        (source, Some(row.prompt_overrides.append.is_some()))
+    } else {
+        ("host", None)
+    };
+    Some(RuntimePersonaInfo {
+        source: source.into(),
+        appended,
+        text,
+    })
 }
 
 fn runtime_asset_sources(runtime: &RuntimeResources) -> RuntimeAssetSources {
@@ -12812,6 +13424,7 @@ pub mod testkit {
             front_end: None,
             review_delegate: None,
             host_plugins: Default::default(),
+            prompt_overrides: Default::default(),
             identity: Default::default(),
         };
         let plugin_hooks = Arc::new(crate::plugin_hooks::StaticPluginHookSource::default());
@@ -13984,6 +14597,7 @@ mod tests {
                 front_end: None,
                 review_delegate: None,
                 host_plugins: Default::default(),
+                prompt_overrides: Default::default(),
                 identity: Default::default(),
             },
             provider_factory: Arc::new(TestProviderFactory {
@@ -13992,6 +14606,165 @@ mod tests {
             plugin_hooks: Arc::new(crate::StaticPluginHookSource::default()),
             image_preprocessor: None,
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_patch_bytes_are_bound_to_the_current_runtime_session() {
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("中文 file.txt"), b"old\r\n").unwrap();
+        let bytes = "--- a/中文 file.txt\r\n+++ b/中文 file.txt\r\n@@ -1 +1 @@\r\n-old\r\n+new\r\n"
+            .as_bytes()
+            .to_vec();
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.agent.dirs =
+            atomcode_capabilities::ProductDirs::new(home.path(), ".patch-entry-test");
+        start.prepare.session = crate::SessionMode::Fresh;
+        let runtime = CodingRuntime::start(start).await.unwrap();
+        let current = runtime
+            .handle
+            .fresh_session()
+            .await
+            .unwrap()
+            .session_id
+            .unwrap();
+        let reference = runtime
+            .handle
+            .import_patch(current.clone(), bytes.clone())
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&reference).unwrap();
+        assert_eq!(
+            value["patch_sha256"],
+            "4fe615a217f60bf5b378edae29c60a6aa8cf5c8b29f96f64441b45cd922d34f1"
+        );
+        assert_eq!(value["file_paths"], serde_json::json!(["中文 file.txt"]));
+        assert_eq!(
+            std::fs::read(project.path().join("中文 file.txt")).unwrap(),
+            b"old\r\n"
+        );
+        assert!(runtime
+            .handle
+            .import_patch("different-session".into(), bytes.clone())
+            .await
+            .is_err());
+        let next = runtime
+            .handle
+            .fresh_session()
+            .await
+            .unwrap()
+            .session_id
+            .unwrap();
+        assert_ne!(next, current);
+        assert!(runtime.handle.import_patch(current, bytes).await.is_err());
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn task_specifications_are_session_scoped_and_resume_from_the_event_log() {
+        struct SpecProviderFactory;
+        impl CodingProviderFactory for SpecProviderFactory {
+            fn build(
+                &self,
+                _config: &CodingAgentConfig,
+                _session: Option<&str>,
+            ) -> Result<Arc<dyn LlmProvider>, crate::ProviderBuildError> {
+                Ok(Arc::new(
+                    atomcode_kernel::testkit::MockProvider::new(vec![vec![
+                        atomcode_kernel::stream::StreamEvent::TextDelta("answer".into()),
+                        atomcode_kernel::stream::StreamEvent::Done { truncated: false },
+                    ]])
+                    .with_ctx_window(64_000),
+                ))
+            }
+        }
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let dirs = atomcode_capabilities::ProductDirs::new(home.path(), ".spec-entry-test");
+        let mut start = native_start(false);
+        start.provider_factory = Arc::new(SpecProviderFactory);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.agent.dirs = dirs.clone();
+        start.prepare.session = crate::SessionMode::Fresh;
+        let mut runtime = CodingRuntime::start(start).await.unwrap();
+        let id = runtime
+            .handle
+            .fresh_session()
+            .await
+            .unwrap()
+            .session_id
+            .unwrap();
+        runtime
+            .handle
+            .submit(UserInput::from("MUST NOT change API\r\nlet exact = 42;"))
+            .await
+            .unwrap();
+        wait_for_turn_finished(&mut runtime).await;
+        let list = runtime
+            .handle
+            .task_specs(id.clone(), "list".into())
+            .await
+            .unwrap();
+        let seq = list["items"][0]["seq"].as_u64().unwrap();
+        runtime
+            .handle
+            .task_specs(id.clone(), format!("pin {seq}"))
+            .await
+            .unwrap();
+        assert!(runtime
+            .handle
+            .task_specs("other-session".into(), "list".into())
+            .await
+            .is_err());
+        runtime.handle.shutdown().await.unwrap();
+        runtime.task.await.unwrap();
+        let mut start = native_start(false);
+        start.provider_factory = Arc::new(SpecProviderFactory);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.agent.dirs = dirs.clone();
+        start.prepare.session = crate::SessionMode::Resume(id.clone());
+        let runtime = CodingRuntime::start(start).await.unwrap();
+        let show = runtime
+            .handle
+            .task_specs(id.clone(), format!("show {seq}"))
+            .await
+            .unwrap();
+        assert_eq!(show["text"], "MUST NOT change API\r\nlet exact = 42;");
+        assert_eq!(show["pinned"], true);
+        let snapshot = runtime.handle.snapshot().await.unwrap();
+        assert!(snapshot
+            .messages
+            .iter()
+            .any(|m| m.text.contains("let exact = 42;")));
+        runtime
+            .handle
+            .task_specs(id.clone(), format!("unpin {seq}"))
+            .await
+            .unwrap();
+        runtime
+            .handle
+            .task_specs(id.clone(), format!("pin {seq}"))
+            .await
+            .unwrap();
+        // A successful in-memory pin edit must not claim durable success if
+        // the authoritative event writer cannot open its target.
+        let manager =
+            atomcode_capabilities::session::SessionManager::for_project(project.path(), &dirs);
+        let path = manager.root().join(format!("{id}.events"));
+        let backup = path.with_extension("events.test-backup");
+        std::fs::rename(&path, &backup).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(runtime
+            .handle
+            .task_specs(id, format!("unpin {seq}"))
+            .await
+            .is_err());
+        assert_eq!(runtime.handle.status().phase, RuntimePhase::Failed);
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&backup, &path).unwrap();
+        runtime.handle.shutdown().await.unwrap();
+        runtime.task.await.unwrap();
     }
 
     async fn wait_for_turn_finished(runtime: &mut CodingRuntime) {
@@ -17567,6 +18340,140 @@ mod tests {
         runtime.handle.shutdown().await.unwrap();
     }
 
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn active_model_selection_keeps_the_current_request_and_uses_the_last_choice_next_turn() {
+        #[derive(Clone)]
+        struct SelectionFactory {
+            calls: Arc<std::sync::Mutex<Vec<String>>>,
+            started: Arc<tokio::sync::Notify>,
+            finish: Arc<tokio::sync::Notify>,
+        }
+        struct SelectionProvider {
+            model: String,
+            factory: SelectionFactory,
+        }
+        #[async_trait::async_trait]
+        impl LlmProvider for SelectionProvider {
+            fn model_name(&self) -> &str {
+                &self.model
+            }
+            async fn chat_stream(
+                &self,
+                _messages: &[Message],
+                _tools: &[atomcode_kernel::tool::ToolDef],
+                _options: &atomcode_kernel::provider::ChatOptions,
+            ) -> Result<
+                futures::stream::BoxStream<'static, atomcode_kernel::stream::StreamEvent>,
+                atomcode_kernel::stream::ProviderError,
+            > {
+                self.factory.calls.lock().unwrap().push(self.model.clone());
+                self.factory.started.notify_one();
+                let wait = self.model == "test";
+                let finish = self.factory.finish.clone();
+                let events = futures::stream::once(async move {
+                    if wait {
+                        finish.notified().await;
+                    }
+                    vec![
+                        atomcode_kernel::stream::StreamEvent::TextDelta("answer".into()),
+                        atomcode_kernel::stream::StreamEvent::Done { truncated: false },
+                    ]
+                });
+                Ok(Box::pin(futures::StreamExt::flat_map(
+                    events,
+                    futures::stream::iter,
+                )))
+            }
+        }
+        impl CodingProviderFactory for SelectionFactory {
+            fn build(
+                &self,
+                config: &CodingAgentConfig,
+                _session: Option<&str>,
+            ) -> Result<Arc<dyn LlmProvider>, crate::ProviderBuildError> {
+                if config.model == "invalid" {
+                    return Err(crate::ProviderBuildError::Adapter(
+                        "invalid selection".into(),
+                    ));
+                }
+                Ok(Arc::new(SelectionProvider {
+                    model: config.model.clone(),
+                    factory: self.clone(),
+                }))
+            }
+        }
+        let factory = SelectionFactory {
+            calls: Default::default(),
+            started: Default::default(),
+            finish: Default::default(),
+        };
+        let mut start = native_start(false);
+        start.provider_factory = Arc::new(factory.clone());
+        let mut next = start.agent.clone();
+        let mut runtime = CodingRuntime::start(start).await.unwrap();
+        runtime
+            .handle
+            .submit(UserInput::from("keep running"))
+            .await
+            .unwrap();
+        factory.started.notified().await;
+        let generation = runtime.handle.status().generation;
+        for (index, model) in ["second", "third"].into_iter().enumerate() {
+            next.model = model.into();
+            next.provider_name = model.into();
+            runtime
+                .handle
+                .reassemble_provider(next.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                runtime.handle.status().generation,
+                generation + index as u64 + 1
+            );
+            assert_eq!(runtime.handle.status().phase, RuntimePhase::InTurn);
+            assert_eq!(
+                runtime
+                    .handle
+                    .current_turn_model()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .model,
+                "test"
+            );
+        }
+        next.model = "invalid".into();
+        assert!(runtime.handle.reassemble_provider(next).await.is_err());
+        assert_eq!(runtime.handle.configuration().await.unwrap().model, "third");
+        assert_eq!(*factory.calls.lock().unwrap(), vec!["test"]);
+        factory.finish.notify_one();
+        loop {
+            if matches!(
+                runtime.events.recv().await.unwrap().event,
+                CodingRuntimeEvent::TurnFinished(_)
+            ) {
+                break;
+            }
+        }
+        runtime.handle.mode().await.unwrap();
+        assert!(runtime.handle.current_turn_model().await.unwrap().is_none());
+        runtime
+            .handle
+            .submit(UserInput::from("next turn"))
+            .await
+            .unwrap();
+        loop {
+            if matches!(
+                runtime.events.recv().await.unwrap().event,
+                CodingRuntimeEvent::TurnFinished(_)
+            ) {
+                break;
+            }
+        }
+        assert_eq!(*factory.calls.lock().unwrap(), vec!["test", "third"]);
+        runtime.handle.shutdown().await.unwrap();
+    }
+
     /// Stopping the loop does not stop the turn the person opened under it.
     ///
     /// The hold is this owner's bookkeeping, not work: with a turn the agent
@@ -19645,6 +20552,246 @@ mod tests {
             Some(AgentCommand::Respond { id: 43, .. })
         ));
         handle.shutdown().await.unwrap();
+    }
+
+    fn mode_model_start(build: bool) -> CodingRuntimeStart {
+        let mut start = native_start(false);
+        let config: atomcode_config::Config = toml::from_str(
+            r#"
+            default_provider = "base"
+            [providers.base]
+type = "openai"
+            model = "test"
+            api_key = "base-key"
+            base_url = "https://base.example/v1"
+            reasoning_effort_levels = ["low", "high"]
+            [providers.planner]
+type = "openai"
+            model = "plan-wire"
+            api_key = "plan-key"
+            base_url = "https://plan.example/v1"
+            reasoning_effort_levels = ["low", "high"]
+            [providers.builder]
+type = "openai"
+            model = "build-wire"
+            api_key = "build-key"
+            base_url = "https://build.example/v1"
+            reasoning_effort_levels = ["low"]
+            [modes.plan]
+            model = "planner"
+            reasoning_effort = "high"
+        "#,
+        )
+        .unwrap();
+        start.agent.provider_name = "base".into();
+        start.agent.supports_reasoning_effort = true;
+        start.agent.effort_levels = vec!["low".into(), "high".into()];
+        start.agent.chat_options.reasoning_effort =
+            Some(atomcode_kernel::provider::ReasoningEffort::Low);
+        let mut config = config;
+        if build {
+            config.modes.build = atomcode_config::mode_models::ModeModelBinding {
+                model: Some("builder".into()),
+                reasoning_effort: Some("low".into()),
+            };
+        }
+        start.agent.subagent_config = Some(Arc::new(config));
+        start
+    }
+
+    #[tokio::test]
+    async fn mode_model_plan_entry_and_build_restore_are_atomic_and_do_not_change_defaults() {
+        let runtime = CodingRuntime::start(mode_model_start(false)).await.unwrap();
+        let generation = runtime.handle.status().generation;
+        runtime.handle.set_mode(RuntimeMode::Plan).await.unwrap();
+        assert_eq!(
+            runtime.handle.model_selection().await.unwrap(),
+            atomcode_config::mode_models::ModeSelection {
+                model: "planner".into(),
+                reasoning_effort: Some("high".into())
+            }
+        );
+        assert_eq!(runtime.handle.mode().await.unwrap(), RuntimeMode::Plan);
+        assert_eq!(runtime.handle.status().generation, generation);
+        let mut temporary = runtime.handle.configuration().await.unwrap();
+        assert_eq!(temporary.provider_name, "planner");
+        temporary.chat_options.reasoning_effort =
+            Some(atomcode_kernel::provider::ReasoningEffort::Low);
+        runtime.handle.reassemble_provider(temporary).await.unwrap();
+        runtime.handle.set_mode(RuntimeMode::Plan).await.unwrap();
+        assert_eq!(
+            runtime
+                .handle
+                .model_selection()
+                .await
+                .unwrap()
+                .reasoning_effort
+                .as_deref(),
+            Some("low")
+        );
+        runtime.handle.set_mode(RuntimeMode::Build).await.unwrap();
+        assert_eq!(
+            runtime.handle.model_selection().await.unwrap().model,
+            "base"
+        );
+        assert_eq!(
+            runtime
+                .handle
+                .model_selection()
+                .await
+                .unwrap()
+                .reasoning_effort
+                .as_deref(),
+            Some("low")
+        );
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mode_model_same_mode_keeps_manual_override_and_build_binding_wins() {
+        let start = mode_model_start(true);
+        let manual = start.agent.clone();
+        start
+            .agent
+            .subagent_config
+            .as_ref()
+            .unwrap()
+            .resolve_model(Some("planner"))
+            .unwrap();
+        let runtime = CodingRuntime::start(start).await.unwrap();
+        runtime.handle.set_mode(RuntimeMode::Plan).await.unwrap();
+        runtime.handle.reassemble_provider(manual).await.unwrap();
+        runtime.handle.set_mode(RuntimeMode::Plan).await.unwrap();
+        assert_eq!(
+            runtime.handle.model_selection().await.unwrap().model,
+            "base"
+        );
+        runtime.handle.set_mode(RuntimeMode::Build).await.unwrap();
+        assert_eq!(
+            runtime.handle.model_selection().await.unwrap().model,
+            "builder"
+        );
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn mode_model_changes_are_refused_while_a_turn_is_running() {
+        let mut start = mode_model_start(false);
+        start.provider_factory = Arc::new(PendingProviderFactory);
+        let runtime = CodingRuntime::start(start).await.unwrap();
+        runtime
+            .handle
+            .submit(UserInput::from("hold"))
+            .await
+            .unwrap();
+        assert!(runtime
+            .handle
+            .set_mode(RuntimeMode::Plan)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Stop the current task"));
+        assert_eq!(runtime.handle.mode().await.unwrap(), RuntimeMode::Build);
+        assert_eq!(
+            runtime.handle.model_selection().await.unwrap().model,
+            "base"
+        );
+        runtime.handle.cancel().await.unwrap();
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mode_model_preference_updates_leave_the_current_model_and_session_untouched() {
+        let start = mode_model_start(false);
+        let mut next = start.agent.clone();
+        let runtime = CodingRuntime::start(start).await.unwrap();
+        runtime.handle.set_mode(RuntimeMode::Plan).await.unwrap();
+        Arc::make_mut(next.subagent_config.as_mut().unwrap())
+            .modes
+            .build = atomcode_config::mode_models::ModeModelBinding {
+            model: Some("builder".into()),
+            reasoning_effort: Some("low".into()),
+        };
+        let before = runtime.handle.status().generation;
+        runtime.handle.reprepare_config(next).await.unwrap();
+        assert_eq!(runtime.handle.status().generation, before);
+        assert_eq!(runtime.handle.mode().await.unwrap(), RuntimeMode::Plan);
+        assert_eq!(
+            runtime.handle.model_selection().await.unwrap().model,
+            "planner"
+        );
+        runtime.handle.set_mode(RuntimeMode::Build).await.unwrap();
+        assert_eq!(
+            runtime.handle.model_selection().await.unwrap().model,
+            "builder"
+        );
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mode_model_restores_a_fixed_profile_effort_without_switchable_levels() {
+        let mut start = mode_model_start(false);
+        start.agent.effort_levels.clear();
+        let registry = Arc::make_mut(start.agent.subagent_config.as_mut().unwrap());
+        let base = registry.providers.get_mut("base").unwrap();
+        base.reasoning_effort_levels = None;
+        base.reasoning_effort = Some("low".into());
+        let runtime = CodingRuntime::start(start).await.unwrap();
+        runtime.handle.set_mode(RuntimeMode::Plan).await.unwrap();
+        runtime.handle.set_mode(RuntimeMode::Build).await.unwrap();
+        let selection = runtime.handle.model_selection().await.unwrap();
+        assert_eq!(selection.model, "base");
+        assert_eq!(selection.reasoning_effort.as_deref(), Some("low"));
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mode_model_build_effort_only_restores_the_pre_plan_model() {
+        let mut start = mode_model_start(false);
+        Arc::make_mut(start.agent.subagent_config.as_mut().unwrap())
+            .modes
+            .build
+            .reasoning_effort = Some("high".into());
+        let runtime = CodingRuntime::start(start).await.unwrap();
+        runtime.handle.set_mode(RuntimeMode::Plan).await.unwrap();
+        runtime.handle.set_mode(RuntimeMode::Build).await.unwrap();
+        let actual = runtime.handle.model_selection().await.unwrap();
+        assert_eq!(actual.model, "base");
+        assert_eq!(actual.reasoning_effort.as_deref(), Some("high"));
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mode_model_invalid_effort_keeps_mode_and_provider() {
+        let mut start = mode_model_start(false);
+        Arc::make_mut(start.agent.subagent_config.as_mut().unwrap())
+            .modes
+            .plan
+            .model = Some("builder".into());
+        let runtime = CodingRuntime::start(start).await.unwrap();
+        assert!(runtime.handle.set_mode(RuntimeMode::Plan).await.is_err());
+        assert_eq!(runtime.handle.mode().await.unwrap(), RuntimeMode::Build);
+        assert_eq!(
+            runtime.handle.model_selection().await.unwrap().model,
+            "base"
+        );
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mode_model_provider_failure_keeps_the_old_mode_and_provider() {
+        let mut start = mode_model_start(false);
+        start.provider_factory = Arc::new(UsageProviderFactory {
+            fail_model: std::sync::Mutex::new(Some("plan-wire".into())),
+        });
+        let runtime = CodingRuntime::start(start).await.unwrap();
+        assert!(runtime.handle.set_mode(RuntimeMode::Plan).await.is_err());
+        assert_eq!(runtime.handle.mode().await.unwrap(), RuntimeMode::Build);
+        assert_eq!(
+            runtime.handle.model_selection().await.unwrap().model,
+            "base"
+        );
+        runtime.handle.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -22006,6 +23153,230 @@ mod tests {
         );
 
         handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_peer_note_cannot_claim_a_pending_follow_up() {
+        let (handle, mut commands, events, mut runtime_events, _wake, _active, adapter) =
+            controller_test_runtime(Arc::new(GoalNotMetProviderFactory::default())).await;
+        handle
+            .follow_up(None, "set HUMAN_TASK_ONLY".into())
+            .await
+            .unwrap();
+        handle
+            .note("peer".into(), "peer finished".into())
+            .await
+            .unwrap();
+        assert!(commands.recv().await.is_some());
+        events.send(AgentEvent::TurnStarted { turn: None }).unwrap();
+        events
+            .send(AgentEvent::TurnComplete {
+                turn: None,
+                reason: StopReason::Stopped,
+                provider_failure: None,
+            })
+            .unwrap();
+        assert!(matches!(
+            commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        events
+            .send(AgentEvent::Snapshot {
+                snapshot: SessionSnapshot::new(vec![
+                    Message::synthetic_user("peer finished"),
+                    Message::assistant("noted", vec![]),
+                ]),
+            })
+            .unwrap();
+        loop {
+            if matches!(
+                tokio::time::timeout(std::time::Duration::from_secs(1), runtime_events.recv())
+                    .await
+                    .unwrap(),
+                Some(CodingRuntimeEvent::TurnFinished(_))
+            ) {
+                break;
+            }
+        }
+        let pending = handle.follow_up(None, "show".into()).await.unwrap();
+        assert_eq!(pending["prompt"], "HUMAN_TASK_ONLY");
+        assert_eq!(pending["current_task"], false);
+        assert!(commands.try_recv().is_err());
+        handle.submit(UserInput::from("human task")).await.unwrap();
+        assert!(commands.recv().await.is_some());
+        assert_eq!(
+            handle.follow_up(None, "show".into()).await.unwrap()["current_task"],
+            true
+        );
+        adapter.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn explicit_follow_up_reference_uses_context_instead_of_rewriting_the_user_prompt() {
+        let (handle, mut commands, _events, _runtime_events, _wake, _active, adapter) =
+            controller_test_runtime(Arc::new(GoalNotMetProviderFactory::default())).await;
+        handle
+            .submit_with_context(
+                UserInput::from("review this"),
+                Some("reference only".into()),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(commands.recv().await,
+            Some(AgentCommand::SendMessageWithContext { text, context, .. }) if text == "review this" && serde_json::from_str::<serde_json::Value>(&context).unwrap()["runtime_context"] == "reference only"));
+        adapter.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn pending_follow_up_is_retired_on_cancel_replacement_and_new_user_input() {
+        let (handle, mut commands, events, _runtime_events, _wake, _active, adapter) =
+            controller_test_runtime(Arc::new(GoalNotMetProviderFactory::default())).await;
+        handle.follow_up(None, "set OLD".into()).await.unwrap();
+        assert!(handle.start_goal("conflict").await.is_err());
+        handle.cancel().await.unwrap();
+        assert!(handle.follow_up(None, "show".into()).await.unwrap()["prompt"].is_null());
+        handle.follow_up(None, "set OLD".into()).await.unwrap();
+        let (replacement, mut replacement_commands, _replacement_events) = fake_agent();
+        adapter.replace_agent(replacement).await.unwrap();
+        assert!(handle.follow_up(None, "show".into()).await.unwrap()["prompt"].is_null());
+        handle.submit(UserInput::from("first")).await.unwrap();
+        assert!(matches!(
+            replacement_commands.recv().await,
+            Some(AgentCommand::SendMessage { .. })
+        ));
+        handle.follow_up(None, "set OLD".into()).await.unwrap();
+        handle
+            .submit(UserInput::from("new human intent"))
+            .await
+            .unwrap();
+        assert!(handle.follow_up(None, "show".into()).await.unwrap()["prompt"].is_null());
+        drop(events);
+        while commands.try_recv().is_ok() {}
+        adapter.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn follow_up_is_one_shot_and_only_runs_after_a_normal_terminal() {
+        for reason in [
+            StopReason::Stopped,
+            StopReason::Cancelled,
+            StopReason::ProviderError,
+            StopReason::Timeout,
+            StopReason::MaxRounds,
+            StopReason::PromptRejected,
+        ] {
+            let (handle, mut commands, events, mut runtime_events, _wake, _active, adapter) =
+                controller_test_runtime(Arc::new(GoalNotMetProviderFactory::default())).await;
+            handle
+                .follow_up(None, "set PRESET_ONCE".into())
+                .await
+                .unwrap();
+            handle.submit(UserInput::from("original")).await.unwrap();
+            assert!(matches!(
+                commands.recv().await,
+                Some(AgentCommand::SendMessage { .. })
+            ));
+            events.send(AgentEvent::TurnStarted { turn: None }).unwrap();
+            events
+                .send(AgentEvent::TurnComplete {
+                    turn: None,
+                    reason,
+                    provider_failure: None,
+                })
+                .unwrap();
+            assert!(matches!(
+                commands.recv().await,
+                Some(AgentCommand::Snapshot)
+            ));
+            events
+                .send(AgentEvent::Snapshot {
+                    snapshot: SessionSnapshot::new(vec![
+                        Message::user("original"),
+                        Message::assistant("done", vec![]),
+                    ]),
+                })
+                .unwrap();
+            if reason == StopReason::Stopped {
+                assert!(
+                    matches!(commands.recv().await, Some(AgentCommand::SendMessage { text, .. }) if text.contains("PRESET_ONCE") && text.contains("Automatic follow-up"))
+                );
+                events.send(AgentEvent::TurnStarted { turn: None }).unwrap();
+                events
+                    .send(AgentEvent::TurnComplete {
+                        turn: None,
+                        reason: StopReason::Stopped,
+                        provider_failure: None,
+                    })
+                    .unwrap();
+                assert!(matches!(
+                    commands.recv().await,
+                    Some(AgentCommand::Snapshot)
+                ));
+                events
+                    .send(AgentEvent::Snapshot {
+                        snapshot: SessionSnapshot::new(vec![
+                            Message::user("original"),
+                            Message::assistant("follow-up done", vec![]),
+                        ]),
+                    })
+                    .unwrap();
+            }
+            loop {
+                if matches!(
+                    runtime_events.recv().await,
+                    Some(CodingRuntimeEvent::TurnFinished(_))
+                ) {
+                    break;
+                }
+            }
+            assert!(handle.follow_up(None, "show".into()).await.unwrap()["prompt"].is_null());
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(1), commands.recv())
+                    .await
+                    .is_err()
+            );
+            adapter.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn background_completion_waits_for_the_current_turn_to_finish() {
+        let (_handle, mut commands, events, mut runtime_events, _wake, _active, adapter) =
+            controller_test_runtime(Arc::new(GoalNotMetProviderFactory::default())).await;
+        let (call, result, finish) = crate::background_jobs::tests::job(true).await;
+        events.send(AgentEvent::TurnStarted { turn: None }).unwrap();
+        events.send(AgentEvent::ToolStarted { call }).unwrap();
+        events.send(AgentEvent::ToolResult { result }).unwrap();
+        while !matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::Agent(AgentEvent::ToolResult { .. }))
+        ) {}
+        finish.cancel();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), commands.recv())
+                .await
+                .is_err()
+        );
+        events
+            .send(AgentEvent::TurnComplete {
+                turn: None,
+                reason: StopReason::Stopped,
+                provider_failure: None,
+            })
+            .unwrap();
+        // The runtime first settles the completed turn's authoritative snapshot.
+        assert!(matches!(
+            commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        events
+            .send(AgentEvent::Snapshot {
+                snapshot: SessionSnapshot::new(vec![]),
+            })
+            .unwrap();
+        assert!(matches!(commands.recv().await,
+            Some(AgentCommand::SendSyntheticMessage { text }) if text.contains("Background job")));
+        adapter.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

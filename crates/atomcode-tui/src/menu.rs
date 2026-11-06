@@ -281,7 +281,7 @@ impl Menu {
 
     /// The pointer moved over the menu: point at the row it is over.
     ///
-    /// Returns whether a frame is owed — `false` both when the pointer is not on
+    /// Returns the changed target row, or `None` when the pointer is not on
     /// the menu at all and when it is on the row already pointed at. A move
     /// inside one row is not news, and the terminal sends a move for every cell
     /// the pointer crosses, so the cheap answer is the one that matters here.
@@ -290,17 +290,20 @@ impl Menu {
     /// whatever the menu covers — so the panel keeps the highlight it had rather
     /// than clearing it. The highlight is where a choice would land, and it
     /// should not blink out from under a pointer that has stepped off the edge.
-    pub fn hover(&mut self, x: u16, y: u16, screen_w: u16, screen_h: u16) -> bool {
+    pub fn hover_target(&self, x: u16, y: u16, screen_w: u16, screen_h: u16) -> Option<usize> {
         let rect = self.rect(screen_w, screen_h);
         if !rect.contains(x, y) {
-            return false;
+            return None;
         }
-        let Some(row) = ((y - rect.y) as usize).checked_sub(1) else {
+        let row = ((y - rect.y) as usize).checked_sub(1)?;
+        (row < self.items.len() && row != self.cursor).then_some(row)
+    }
+
+    /// Update the highlighted row, returning whether a frame is owed.
+    pub fn hover(&mut self, x: u16, y: u16, screen_w: u16, screen_h: u16) -> bool {
+        let Some(row) = self.hover_target(x, y, screen_w, screen_h) else {
             return false;
         };
-        if row >= self.items.len() || row == self.cursor {
-            return false;
-        }
         self.cursor = row;
         // Re-anchor to the row the pointer is on, without which the whole panel
         // would slide: `rect` is read off `at` and `cursor` together

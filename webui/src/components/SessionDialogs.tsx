@@ -60,7 +60,7 @@ export function RenameDialog({ session, onClose, onDone }: RenameDialogProps) {
             onInput={(e) => setName((e.target as HTMLInputElement).value)}
             onKeyDown={(e) => {
               // 忽略输入法组字阶段的回车（选词确认），避免误触发保存。
-              if (e.isComposing) return;
+              if (e.isComposing || e.keyCode === 229) return;
               if (e.key === 'Enter') submit();
             }}
           />

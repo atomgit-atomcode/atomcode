@@ -17,6 +17,7 @@ pub const ID: &str = "status";
 #[derive(Default)]
 pub struct State {
     pub turns: u64,
+    pub summaries: u64,
     pub model: String,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
@@ -82,6 +83,9 @@ impl View for Status {
     }
 
     fn absorb(state: &mut State, fact: &SessionEvent) {
+        if atomcode_harness::session::is_context_summary(fact) {
+            state.summaries += 1;
+        }
         match fact {
             SessionEvent::TurnStart { turn } => {
                 state.turns = *turn;
@@ -327,11 +331,21 @@ impl View for Status {
         let used = gauge_tokens(state, vp.moment);
         // Only what means something: a context usage segment appears once there
         // are tokens or a window to report, never as a bare zero.
-        let ctx_str = if used > 0 || vp.moment.ctx_window > 0 {
+        let mut ctx_str = if used > 0 || vp.moment.ctx_window > 0 {
             format_ctx_usage(used as usize, vp.moment.ctx_window as usize)
         } else {
             String::new()
         };
+        if state.summaries > 0 {
+            let count =
+                atomcode_i18n::product::t(atomcode_i18n::product::Msg::ContextSummaryCount {
+                    count: state.summaries,
+                });
+            if !ctx_str.is_empty() {
+                ctx_str.push_str(" · ");
+            }
+            ctx_str.push_str(&count);
+        }
         let cache_str =
             cache_indicator(state.session_cached, state.session_prompt).unwrap_or_default();
 
@@ -366,6 +380,13 @@ impl View for Status {
         for (i, (seg, text)) in segs.iter().enumerate() {
             if i > 0 {
                 row.push(El::styled(sep_text.clone(), dim));
+            }
+            if matches!(seg, StatusSeg::Ctx) {
+                if let Some((usage, count)) = text.split_once(" · ") {
+                    row.push(El::styled(usage.to_string(), style_for(*seg)));
+                    row.push(El::styled(format!(" · {count}"), dim));
+                    continue;
+                }
             }
             row.push(El::styled(text.clone(), style_for(*seg)));
         }
@@ -831,6 +852,49 @@ mod tests {
     use super::*;
     use crate::frame::Rect;
     use crate::moment::Moment;
+
+    #[test]
+    fn summary_count_shares_the_existing_token_segment_and_has_no_progress_label() {
+        let _locale = crate::i18n::test_lock();
+        let mut state = State::default();
+        let moment = Moment {
+            model: "deepseek-flash".into(),
+            cwd: "~/project".into(),
+            ctx_window: 1_000_000,
+            ..Default::default()
+        };
+        let label = atomcode_i18n::product::t(atomcode_i18n::product::Msg::ContextSummaryCount {
+            count: 1,
+        });
+        assert!(!draw::<Status>(&state, 160, &moment).contains(label.as_ref()));
+        Status::absorb(
+            &mut state,
+            &SessionEvent::MessagesRewritten {
+                turn: 1,
+                texts: vec![],
+            },
+        );
+        assert_eq!(state.summaries, 0);
+        Status::absorb(
+            &mut state,
+            &SessionEvent::Compacted {
+                turn: 1,
+                through: 7,
+                from: 1,
+                summary: "decisions".into(),
+            },
+        );
+        let line = draw::<Status>(&state, 160, &moment);
+        assert!(line.contains(label.as_ref()), "{line}");
+        assert_eq!(line.matches("tok").count(), 1, "{line}");
+        assert!(!line.contains("正在") && !line.contains("Summarizing"));
+        for width in [20, 40, 80] {
+            assert!(
+                crate::width::str_width(&draw::<Status>(&state, width, &moment)) <= width as usize
+            );
+        }
+        assert_eq!(State::default().summaries, 0);
+    }
 
     crate::tui_conformance!(view Status as status_conformance);
     crate::tui_conformance!(view Mascot as mascot_conformance);

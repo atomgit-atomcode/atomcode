@@ -671,26 +671,46 @@ fn choice_for(kind: &str, payload: &Value, events: &[LoggedEvent]) -> Option<Que
     match kind {
         APPROVAL_KIND => {
             let request: ApprovalRequest = serde_json::from_value(payload.clone()).ok()?;
-            Some(
-                asked(&|q| {
-                    q.about.as_ref().is_some_and(|a| {
-                        // Match on the exact executing bytes, not the tool NAME. A gate
-                        // renames the tool it asks about (`bash (writes outside the
-                        // workspace)`) while the wire request carries the raw call name
-                        // (`bash`), so a name compare misses and the fallback below would
-                        // synthesize a poorer question — no "allow all bash" option, the
-                        // raw header — that disagrees with the card the log already drew.
-                        // The arguments ARE the reconciliation anchor; a tool-name prefix
-                        // keeps the match scoped without demanding the gate's exact wording.
-                        a.arguments == request.args
-                            && (a.tool == request.tool
-                                || a.tool.starts_with(&format!("{} ", request.tool)))
-                    })
+            let mut question = asked(&|q| {
+                q.about.as_ref().is_some_and(|a| {
+                    // Match on the exact executing bytes, not the tool NAME. A gate
+                    // renames the tool it asks about (`bash (writes outside the
+                    // workspace)`) while the wire request carries the raw call name
+                    // (`bash`), so a name compare misses and the fallback below would
+                    // synthesize a poorer question — no "allow all bash" option, the
+                    // raw header — that disagrees with the card the log already drew.
+                    // The arguments ARE the reconciliation anchor; a tool-name prefix
+                    // keeps the match scoped without demanding the gate's exact wording.
+                    a.arguments == request.args
+                        && (a.tool == request.tool
+                            || a.tool.starts_with(&format!("{} ", request.tool)))
                 })
-                .unwrap_or_else(|| {
-                    Question::approval(&request.tool, &request.args, Some(""), None, None)
-                }),
-            )
+            })
+            .unwrap_or_else(|| {
+                Question::approval(&request.tool, &request.args, Some(""), None, None)
+            });
+            if let Some(reason) = request.reason.filter(|r| !r.is_empty()) {
+                if !question.prompt.contains(&reason) {
+                    question.prompt.push_str(&format!("\n{reason}"));
+                }
+            }
+            if let Some(proposal) = payload.get("project_rule").cloned().and_then(|v| {
+                serde_json::from_value::<
+                        atomcode_capabilities::tools::approval::ProjectRuleProposal,
+                    >(v)
+                    .ok()
+            }) {
+                if !question.options.iter().any(|a| a.value == "allow_project") {
+                    question.options.push(Answer::labelled(
+                        "allow_project",
+                        pt(PMsg::ApprovalSaveProject).into_owned(),
+                    ));
+                    question
+                        .prompt
+                        .push_str(&format!("\n{}\n{}", proposal.rule, proposal.file));
+                }
+            }
+            Some(question)
         }
         // The kernel's own two checkpoints: a turn that hit the round fuse, and
         // one whose output kept being cut off after the automatic recovery gave
@@ -852,6 +872,9 @@ pub fn response_for(kind: &str, reply: Option<Reply>) -> Value {
     let answer = reply.and_then(Reply::into_value);
     match kind {
         APPROVAL_KIND => match answer.as_deref() {
+            Some("allow_project") => {
+                serde_json::json!({"decision":"allow", "save_project_rule":true})
+            }
             Some(ANSWER_ALLOW) => serde_json::json!({ "decision": "allow" }),
             Some(ANSWER_ALWAYS) => serde_json::json!({ "decision": "allow_always" }),
             // The blanket answer carries the old front end's wire shape so a driver
@@ -921,6 +944,10 @@ pub struct Draft {
     pub cursor: usize,
     /// Which offered answers are ticked, for a multiple choice.
     pub checked: Vec<bool>,
+    /// Saved replacements, indexed by the original option, separate from free text.
+    pub replacements: Vec<Option<String>>,
+    /// An uncommitted edit. Esc drops it without changing the saved answer.
+    pub option_edit: Option<OptionEdit>,
     /// What has been typed on the page's typing row.
     pub typed: String,
     /// Where in `typed` the next character goes, as a byte offset kept on a
@@ -931,6 +958,13 @@ pub struct Draft {
     /// for and what the review page lists. A lone question is delivered the
     /// moment it is answered and never keeps one.
     pub answer: Option<Reply>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OptionEdit {
+    pub option: usize,
+    pub text: String,
+    pub caret: usize,
 }
 
 /// The panel's state while a request is on screen.
@@ -950,6 +984,7 @@ pub struct Sheet {
     pub drafts: Vec<Draft>,
     /// The review page's lit row.
     pub review: usize,
+    pub edit_key: crate::surface::KeyPress,
 }
 
 /// What a key did to the panel.
@@ -967,6 +1002,7 @@ impl Sheet {
             .iter()
             .map(|a| Draft {
                 checked: vec![false; a.question.options.len()],
+                replacements: vec![None; a.question.options.len()],
                 ..Draft::default()
             })
             .collect();
@@ -976,6 +1012,7 @@ impl Sheet {
             tab: 0,
             drafts,
             review: 0,
+            edit_key: crate::surface::KeyPress::ctrl('e'),
         }
     }
 
@@ -1051,6 +1088,11 @@ impl Sheet {
     /// Clamped rather than rejected: a pointer on the panel's last row of
     /// padding, or an arrow pressed past the end, means the nearest row.
     pub fn point_at(&mut self, row: usize) -> bool {
+        // An option edit must be saved or cancelled before moving to another row.
+        // Batch page navigation preserves it on its original page.
+        if self.option_edit().is_some() {
+            return false;
+        }
         let row = row.min(self.slots().len().saturating_sub(1));
         let reviewing = self.reviewing();
         let cursor = match reviewing {
@@ -1090,7 +1132,7 @@ impl Sheet {
 
     /// Whether the lit row takes typing.
     pub fn typing(&self) -> bool {
-        self.pointed().is_some_and(Slot::types)
+        self.option_edit().is_some() || self.pointed().is_some_and(Slot::types)
     }
 
     /// Whether the lit row takes typing and already has words in it — the one
@@ -1098,7 +1140,69 @@ impl Sheet {
     /// empty line has nowhere for a caret to go, so there the arrows keep their
     /// page-turning job.
     pub fn editing(&self) -> bool {
-        self.typing() && self.draft().is_some_and(|d| !d.typed.is_empty())
+        self.option_edit().is_some()
+            || (self.typing() && self.draft().is_some_and(|d| !d.typed.is_empty()))
+    }
+
+    pub fn option_edit(&self) -> Option<&OptionEdit> {
+        self.draft()?.option_edit.as_ref()
+    }
+
+    pub fn can_edit_option(&self) -> bool {
+        !self.typing()
+            && matches!(
+                self.page().map(Asked::form),
+                Some(Form::Single | Form::Multiple)
+            )
+            && matches!(self.pointed(), Some(Slot::Pick(_)))
+    }
+
+    pub fn edit_option(&mut self) -> bool {
+        if !self.can_edit_option() {
+            return false;
+        }
+        let Some(Slot::Pick(option)) = self.pointed() else {
+            return false;
+        };
+        let Some(label) = self.page().and_then(|a| a.question.options.get(option)) else {
+            return false;
+        };
+        let text = self
+            .draft()
+            .and_then(|d| d.replacements.get(option))
+            .and_then(Option::as_deref)
+            .unwrap_or(&label.label)
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect::<String>();
+        self.drafts[self.tab].option_edit = Some(OptionEdit {
+            option,
+            caret: text.len(),
+            text,
+        });
+        true
+    }
+
+    fn save_option_edit(&mut self) -> Step {
+        let Some(edit) = self.option_edit() else {
+            return Step::Stay;
+        };
+        let text = edit.text.trim().to_string();
+        if text.is_empty() {
+            return Step::Stay;
+        }
+        let option = edit.option;
+        let multiple = self.page().map(Asked::form) == Some(Form::Multiple);
+        let draft = &mut self.drafts[self.tab];
+        draft.replacements[option] = Some(text.clone());
+        draft.option_edit = None;
+        draft.answer = None;
+        if multiple {
+            draft.checked[option] = true;
+            Step::Stay
+        } else {
+            self.commit(Reply::typed(text))
+        }
     }
 
     /// The lit row's words and caret, when the lit row takes words.
@@ -1107,20 +1211,37 @@ impl Sheet {
             return None;
         }
         let draft = self.drafts.get_mut(self.tab)?;
+        if let Some(edit) = draft.option_edit.as_mut() {
+            return Some((&mut edit.text, &mut edit.caret));
+        }
         Some((&mut draft.typed, &mut draft.caret))
+    }
+
+    /// Inserting or deleting words invalidates a batch page's confirmation.
+    /// Option edits stay provisional until saved, so cancelling preserves it.
+    fn change_field(&mut self, change: impl FnOnce(&mut String, &mut usize)) -> bool {
+        let option_edit = self.option_edit().is_some();
+        let Some((typed, caret)) = self.field() else {
+            return false;
+        };
+        let before = typed.len();
+        change(typed, caret);
+        let changed = typed.len() != before;
+        if changed && !option_edit {
+            self.drafts[self.tab].answer = None;
+        }
+        true
     }
 
     /// Type into the lit row at its caret, when it takes words. One line: a
     /// pasted line break becomes a space.
     pub fn type_text(&mut self, text: &str) -> bool {
-        let Some((typed, caret)) = self.field() else {
-            return false;
-        };
-        for c in text.chars() {
-            let c = if c.is_control() { ' ' } else { c };
-            crate::text::insert_at(typed, caret, c);
-        }
-        true
+        self.change_field(|typed, caret| {
+            for c in text.chars() {
+                let c = if c.is_control() { ' ' } else { c };
+                crate::text::insert_at(typed, caret, c);
+            }
+        })
     }
 
     /// Answer a key. Every key is the panel's while it is up.
@@ -1133,7 +1254,13 @@ impl Sheet {
     pub fn key(&mut self, press: crate::surface::KeyPress) -> Step {
         use crate::surface::{Key, Mods};
         let form = self.page().map(Asked::form);
+        if press == self.edit_key && self.edit_option() {
+            return Step::Stay;
+        }
         match (press.key, press.mods) {
+            (Key::Esc, _) if self.option_edit().is_some() => {
+                self.drafts[self.tab].option_edit = None;
+            }
             // Esc and ctrl-c decline — the whole request. Declining is an
             // answer; it is never consent, and it is always one keystroke away.
             (Key::Esc, _) | (Key::Char('c'), Mods::CTRL) => return self.decline(),
@@ -1168,14 +1295,10 @@ impl Sheet {
             }
             (Key::Enter, _) => return self.enter(),
             (Key::Backspace, _) if self.typing() => {
-                if let Some((typed, caret)) = self.field() {
-                    crate::text::backspace_at(typed, caret);
-                }
+                self.change_field(crate::text::backspace_at);
             }
             (Key::Delete, _) if self.typing() => {
-                if let Some((typed, caret)) = self.field() {
-                    crate::text::delete_at(typed, caret);
-                }
+                self.change_field(crate::text::delete_at);
             }
             (Key::Char(c), Mods::NONE) | (Key::Char(c), Mods::SHIFT) if self.typing() => {
                 self.type_text(&c.to_string());
@@ -1210,8 +1333,22 @@ impl Sheet {
                 if matches!(form, Some(Form::Choice | Form::Single)) =>
             {
                 let at = self.page().and_then(|asked| {
-                    let value = by_prefix(&asked.question, c)?;
-                    asked.question.options.iter().position(|a| a.value == value)
+                    let c = c.to_lowercase().next()?;
+                    let draft = self.draft()?;
+                    asked
+                        .question
+                        .options
+                        .iter()
+                        .enumerate()
+                        .position(|(i, a)| {
+                            match draft.replacements.get(i).and_then(Option::as_ref) {
+                                Some(label) => label.to_lowercase().starts_with(c),
+                                None => {
+                                    a.value.to_lowercase().starts_with(c)
+                                        || a.label.to_lowercase().starts_with(c)
+                                }
+                            }
+                        })
                 });
                 if let Some(i) = at {
                     self.point_at(i);
@@ -1225,6 +1362,9 @@ impl Sheet {
 
     /// Take the lit row.
     pub fn enter(&mut self) -> Step {
+        if self.option_edit().is_some() {
+            return self.save_option_edit();
+        }
         let Some(slot) = self.pointed() else {
             return Step::Stay;
         };
@@ -1235,6 +1375,13 @@ impl Sheet {
                 Step::Stay
             }
             Slot::Pick(i) => {
+                if let Some(text) = self
+                    .draft()
+                    .and_then(|d| d.replacements.get(i))
+                    .and_then(Clone::clone)
+                {
+                    return self.commit(Reply::typed(text));
+                }
                 let value = self
                     .page()
                     .and_then(|a| a.question.options.get(i))
@@ -1268,7 +1415,29 @@ impl Sheet {
                 None => Step::Stay,
             },
             Slot::Chat => Step::Deliver(vec![Some(Reply::typed(CHAT_INSTEAD)); self.asked.len()]),
-            Slot::Send => Step::Deliver(self.drafts.iter().map(|d| d.answer.clone()).collect()),
+            Slot::Send => {
+                if let Some(tab) = self.drafts.iter().position(|d| {
+                    d.option_edit.is_some()
+                        || (d.answer.is_none()
+                            && (d.checked.iter().any(|checked| *checked)
+                                || !d.typed.trim().is_empty()))
+                }) {
+                    self.tab = tab;
+                    if self.option_edit().is_none() {
+                        let confirm = match self.page().map(Asked::form) {
+                            Some(Form::Multiple) => Slot::Submit,
+                            Some(Form::Text) => Slot::Input,
+                            _ => Slot::Other,
+                        };
+                        if let Some(row) = self.slots().iter().position(|slot| *slot == confirm) {
+                            self.point_at(row);
+                        }
+                    }
+                    Step::Stay
+                } else {
+                    Step::Deliver(self.drafts.iter().map(|d| d.answer.clone()).collect())
+                }
+            }
             Slot::Cancel => self.decline(),
         }
     }
@@ -1279,6 +1448,9 @@ impl Sheet {
     }
 
     fn toggle(&mut self, i: usize) {
+        if let Some(draft) = self.drafts.get_mut(self.tab) {
+            draft.answer = None;
+        }
         if let Some(checked) = self
             .drafts
             .get_mut(self.tab)
@@ -1294,16 +1466,22 @@ impl Sheet {
     pub fn ticked(&self) -> Option<Reply> {
         let asked = self.page()?;
         let draft = self.draft()?;
-        let selected: Vec<String> = asked
-            .question
-            .options
-            .iter()
-            .zip(&draft.checked)
-            .filter(|(_, ticked)| **ticked)
-            .map(|(a, _)| a.value.clone())
-            .collect();
+        let mut selected = Vec::new();
+        let mut custom = Vec::new();
+        for (i, answer) in asked.question.options.iter().enumerate() {
+            if !draft.checked.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            match draft.replacements.get(i).and_then(Option::as_ref) {
+                Some(text) => custom.push(text.clone()),
+                None => selected.push(answer.value.clone()),
+            }
+        }
         let typed = draft.typed.trim();
-        let text = (!typed.is_empty()).then(|| typed.to_string());
+        if !typed.is_empty() {
+            custom.push(typed.to_string());
+        }
+        let text = (!custom.is_empty()).then(|| custom.join("\n"));
         if selected.is_empty() && text.is_none() {
             return None;
         }
@@ -1363,6 +1541,7 @@ pub fn answer_label(value: &str, fallback: &str) -> String {
     // it covers, and this row has the scope on a line of its own.
     match value {
         ANSWER_ALLOW => pt(PMsg::ApprovalAllowOnce).into_owned(),
+        "allow_project" => pt(PMsg::ApprovalSaveProject).into_owned(),
         ANSWER_ALWAYS => t(Msg::AskAlwaysAllow).into_owned(),
         // The session-wide blanket — the same product words the old front end offered.
         ANSWER_ALWAYS_ALL => pt(PMsg::ApprovalAllowAllBash).into_owned(),
@@ -1805,6 +1984,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn project_approval_shows_the_bound_rule_and_uses_an_explicit_save_response() {
+        let payload = serde_json::json!({"call_id":"c", "tool":"bash", "args":r#"{"command":"rm -rf scratch"}"#, "reason":"Recursive removal requires approval", "project_rule":{"rule":"Bash(rm -rf scratch)","file":"/project/settings.local.json"}});
+        let question = q(APPROVAL_KIND, &payload, &[]).unwrap();
+        assert!(question
+            .prompt
+            .contains("Recursive removal requires approval"));
+        assert!(question.prompt.contains("Bash(rm -rf scratch)"));
+        assert!(question.prompt.contains("/project/settings.local.json"));
+        assert!(question.has("allow_project"));
+        let value = response_for(APPROVAL_KIND, Some(Reply::from("allow_project")));
+        assert_eq!(
+            value,
+            serde_json::json!({"decision":"allow", "save_project_rule":true})
+        );
+        assert!(!Sheet::one(question).can_edit_option());
+    }
+
     /// The live modal reconciles against the RENAMED gate tool. A gate asks about
     /// `bash (writes outside the workspace)` and logs that question — with the
     /// allow-all option — while the wire request carries the raw call name `bash`.
@@ -1979,6 +2176,224 @@ mod tests {
             "question": "新仓库叫什么?",
             "mode": "text",
         }))
+    }
+
+    #[test]
+    fn editing_a_single_option_sends_only_the_changed_words() {
+        use crate::surface::{Key, KeyPress};
+        let mut sheet = Sheet::one(single());
+        let original = sheet.asked.clone();
+        sheet.point_at(1);
+        assert_eq!(sheet.key(KeyPress::ctrl('e')), Step::Stay);
+        assert_eq!(sheet.option_edit().unwrap().text, "pistachio");
+        sheet.type_text("，先试一份");
+        sheet.key(KeyPress::plain(Key::Left));
+        sheet.key(KeyPress::ctrl('e'));
+        assert_eq!(
+            sheet.option_edit().unwrap().caret,
+            "pistachio，先试一份".len()
+        );
+        let sent = wire(sheet.enter());
+        assert!(sent[0].selected.is_empty());
+        assert_eq!(sent[0].text.as_deref(), Some("pistachio，先试一份"));
+        assert_eq!(sheet.asked, original);
+    }
+
+    #[test]
+    fn edited_multiple_options_replace_their_picks_and_keep_the_free_text() {
+        let mut sheet = Sheet::one(multiple());
+        sheet.drafts[0].typed = "also document it".into();
+        sheet.toggle(0);
+        sheet.edit_option();
+        sheet.type_text(" first");
+        assert_eq!(sheet.enter(), Step::Stay);
+        sheet.point_at(1);
+        sheet.edit_option();
+        sheet.type_text(" later");
+        sheet.enter();
+        sheet.point_at(2);
+        sheet.enter();
+        sheet.point_at(4);
+        let sent = wire(sheet.enter());
+        assert_eq!(sent[0].selected, ["Go"]);
+        assert_eq!(
+            sent[0].text.as_deref(),
+            Some("Python first\nRust later\nalso document it")
+        );
+        sheet.point_at(0);
+        sheet.enter();
+        assert_eq!(
+            sheet.ticked().unwrap().text.as_deref(),
+            Some("Rust later\nalso document it")
+        );
+        sheet.edit_option();
+        assert_eq!(sheet.option_edit().unwrap().text, "Python first");
+    }
+
+    #[test]
+    fn cancelling_an_option_edit_restores_the_answer_and_empty_edits_stay_open() {
+        use crate::surface::{Key, KeyPress};
+        let mut sheet = Sheet::one(multiple());
+        sheet.edit_option();
+        sheet.type_text(" first");
+        sheet.enter();
+        let before = sheet.ticked();
+        sheet.edit_option();
+        sheet.key(KeyPress::plain(Key::Home));
+        for _ in 0.."Python first".len() {
+            sheet.key(KeyPress::plain(Key::Delete));
+        }
+        assert_eq!(sheet.enter(), Step::Stay);
+        assert!(sheet.option_edit().is_some());
+        assert_eq!(sheet.key(KeyPress::plain(Key::Esc)), Step::Stay);
+        assert_eq!(sheet.ticked(), before);
+        sheet.edit_option();
+        assert!(wire(sheet.clone().key(KeyPress::ctrl('c')))[0].declined);
+        assert_eq!(sheet.key(KeyPress::plain(Key::Esc)), Step::Stay);
+        assert!(wire(sheet.key(KeyPress::plain(Key::Esc)))[0].declined);
+    }
+
+    #[test]
+    fn a_batch_keeps_unfinished_option_edits_and_returns_to_them_before_sending() {
+        use crate::surface::{Key, KeyPress};
+        let mut sheet = Sheet::new(1, vec![single(), multiple()]);
+        sheet.edit_option();
+        sheet.type_text(" first");
+        sheet.key(KeyPress::plain(Key::Tab));
+        sheet.edit_option();
+        sheet.type_text(" later");
+        sheet.enter();
+        sheet.point_at(4);
+        sheet.enter();
+        assert!(sheet.reviewing());
+        assert_eq!(sheet.enter(), Step::Stay);
+        assert_eq!(sheet.tab, 0);
+        assert_eq!(sheet.option_edit().unwrap().text, "vanilla first");
+        sheet.enter();
+        let sent = wire(sheet.enter());
+        assert_eq!(sent[0].text.as_deref(), Some("vanilla first"));
+        assert_eq!(sent[1].text.as_deref(), Some("Python later"));
+    }
+
+    #[test]
+    fn a_saved_multiple_edit_cannot_be_silently_skipped_from_the_batch_review() {
+        let mut sheet = Sheet::new(1, vec![multiple(), single()]);
+        sheet.edit_option();
+        sheet.type_text(" first");
+        sheet.enter();
+        sheet.turn(1);
+        sheet.enter();
+        assert!(sheet.reviewing());
+        assert_eq!(
+            sheet.enter(),
+            Step::Stay,
+            "saved edits need their page's confirmation"
+        );
+        assert_eq!(sheet.tab, 0);
+        assert_eq!(sheet.pointed(), Some(Slot::Submit));
+        sheet.enter();
+        let sent = wire(sheet.enter());
+        assert!(!sent[0].declined);
+        assert_eq!(sent[0].text.as_deref(), Some("Python first"));
+        assert_eq!(sent[1].selected, ["vanilla"]);
+    }
+
+    #[test]
+    fn changing_a_confirmed_free_text_draft_requires_its_latest_words_to_be_confirmed() {
+        use crate::surface::{Key, KeyPress};
+        let mut sheet = Sheet::new(1, vec![multiple(), single()]);
+        sheet.edit_option();
+        sheet.type_text(" first");
+        sheet.enter();
+        sheet.point_at(3);
+        sheet.type_text("extra");
+        sheet.point_at(4);
+        sheet.enter();
+        sheet.enter();
+        assert!(sheet.reviewing());
+        for (edit, expected) in [
+            (vec![Key::Char('!')], "extra!"),
+            (vec![Key::Backspace], "extr"),
+            (vec![Key::Home, Key::Delete], "xtra"),
+        ] {
+            let mut changed = sheet.clone();
+            changed.turn(-2);
+            changed.point_at(3);
+            keys(&mut changed, &edit);
+            changed.turn(2);
+            assert_eq!(changed.enter(), Step::Stay);
+            assert_eq!(changed.pointed(), Some(Slot::Submit));
+            changed.enter();
+            let sent = wire(changed.enter());
+            assert_eq!(sent[0].text, Some(format!("Python first\n{expected}")));
+        }
+        // Caret movement and a cancelled option edit preserve the confirmation.
+        sheet.turn(-2);
+        sheet.point_at(3);
+        sheet.key(KeyPress::plain(Key::Home));
+        sheet.point_at(0);
+        sheet.edit_option();
+        sheet.type_text(" discarded");
+        sheet.key(KeyPress::plain(Key::Esc));
+        sheet.turn(2);
+        assert_eq!(
+            wire(sheet.enter())[0].text.as_deref(),
+            Some("Python first\nextra")
+        );
+    }
+
+    #[test]
+    fn prefix_selection_uses_the_edited_label_that_is_drawn() {
+        use crate::surface::{Key, KeyPress};
+        let mut sheet = Sheet::new(1, vec![single(), text()]);
+        sheet.edit_option();
+        sheet.key(KeyPress::plain(Key::Home));
+        for _ in 0.."vanilla".len() {
+            sheet.key(KeyPress::plain(Key::Delete));
+        }
+        sheet.type_text("chocolate");
+        sheet.enter();
+        sheet.turn(-1);
+        sheet.point_at(1);
+        sheet.key(KeyPress::ch('c'));
+        assert_eq!(
+            sheet.tab, 1,
+            "the visible c-prefix selects the edited answer"
+        );
+        assert_eq!(
+            sheet.drafts[0].answer.as_ref().unwrap().text.as_deref(),
+            Some("chocolate")
+        );
+    }
+
+    #[test]
+    fn editing_is_configurable_and_never_applies_to_approval_choices() {
+        use crate::surface::{Key, KeyPress};
+        let mut sheet = Sheet::one(single());
+        sheet.edit_key = crate::keymap::parse_question_edit_key("alt+e").unwrap();
+        sheet.key(KeyPress::ctrl('e'));
+        assert!(!sheet.typing());
+        sheet.key(sheet.edit_key);
+        assert!(sheet.typing());
+        for invalid in [
+            "e", "1", "enter", "tab", "up", "ctrl+c", "ctrl+j", "ctrl+k", "ctrl+z",
+        ] {
+            assert!(
+                crate::keymap::parse_question_edit_key(invalid).is_err(),
+                "{invalid}"
+            );
+        }
+        let mut approval = Sheet::one(Question::approval("bash", "{}", None, None, None));
+        assert!(!approval.edit_option());
+        assert_eq!(approval.key(KeyPress::ctrl('e')), Step::Stay);
+        assert_eq!(
+            wire(keys(&mut Sheet::one(single()), &[Key::Char('2')]))[0].selected,
+            ["pistachio"]
+        );
+        assert_eq!(
+            wire(keys(&mut Sheet::one(single()), &[Key::Char('p')]))[0].selected,
+            ["pistachio"]
+        );
     }
 
     /// The mode the model asked in survives the trip to the screen, and each

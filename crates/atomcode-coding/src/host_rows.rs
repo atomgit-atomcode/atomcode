@@ -694,6 +694,7 @@ impl Plugin for ModesHostPlugin {
 /// session — the lifetime the chain's approval middleware already gives it.
 pub(crate) struct GrantsHostPlugin(
     pub(crate) Arc<dyn atomcode_capabilities::tools::PermissionStore>,
+    pub(crate) Option<Arc<dyn atomcode_capabilities::tools::approval::ProjectRuleStore>>,
 );
 
 #[async_trait]
@@ -702,7 +703,7 @@ impl Plugin for GrantsHostPlugin {
         "grants-host"
     }
     fn provides(&self) -> &'static [&'static str] {
-        &["grants"]
+        &["grants", "project-rule-store"]
     }
     fn description(&self) -> &'static str {
         "the coding runtime's session grants, so a rebuilt tree remembers what the person allowed"
@@ -711,6 +712,11 @@ impl Plugin for GrantsHostPlugin {
         let _ = ctx
             .provide::<atomcode_harness::seams::GrantsSvc>(self.0.clone())
             .map_err(|e| e.to_string())?;
+        if let Some(store) = &self.1 {
+            let _ = ctx
+                .provide::<atomcode_harness::seams::ProjectRuleStoreSvc>(store.clone())
+                .map_err(|e| e.to_string())?;
+        }
         Ok(())
     }
 }
@@ -1018,7 +1024,7 @@ impl SkillsHostPlugin {
                     loaded.plugins.join(", ")
                 ));
             }
-            text.push_str("`list_skills` shows what is loaded; `use_skill` loads one.");
+            text.push_str("`list_skills` shows what is loaded; `use_skill` loads one. The skills-host row can statically auto-load one eligible debugging workflow before a real user turn; auto-load: debugging opts a skill in, auto-load: off opts it out. Its auto_load:false row setting or a user [no-auto-skills] directive disables automatic loading. Automatic context never executes embedded commands or grants allowed-tools.");
         }
         text
     }
@@ -1046,7 +1052,21 @@ impl Plugin for SkillsHostPlugin {
     fn description(&self) -> &'static str {
         "the skill catalog the coding runtime loaded, plugin skills included"
     }
-    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+    async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
+        #[derive(serde::Deserialize)]
+        struct Options {
+            #[serde(default = "enabled")]
+            auto_load: bool,
+        }
+        fn enabled() -> bool {
+            true
+        }
+        let options = if config.is_null() {
+            Options { auto_load: true }
+        } else {
+            serde_json::from_value::<Options>(config.clone())
+                .map_err(|e| format!("skills-host: {e}"))?
+        };
         self.describe(ctx);
         let LoadedSkills {
             registry, catalog, ..
@@ -1069,6 +1089,7 @@ impl Plugin for SkillsHostPlugin {
             let (id, rank) = crate::on_harness::SKILLS_FRAGMENT;
             atomcode_harness::plugins::tools::contribute_prompt(ctx, id, rank, catalog);
         }
+        atomcode_harness::plugins::skill_auto_load::mount(ctx, registry.clone(), options.auto_load);
         // The command catalog half of what the harness `skills` row did: `/skills`
         // and one command per user-invocable skill — this runtime's own `/setup`
         // among them, and anything a person wrote into `.atomcode/skills/`.
@@ -2387,7 +2408,7 @@ impl Plugin for CapabilityCommandsPlugin {
             52,
             "This host supports background completion notifications. For bounded work that \
              may take a long time, including downloads, SDK installation, builds and tests, \
-             prefer bash_start with notify_on_exit=true. Keep the real operation in that \
+             use bash_start (notify_on_exit defaults to true). Keep the real operation in that \
              tracked job so its exit status and output are available. While it runs, do \
              independent work if useful; otherwise end your response and wait for the host \
              notification, then collect output with bash_poll and check the result. Do not \
@@ -2399,7 +2420,7 @@ impl Plugin for CapabilityCommandsPlugin {
              Do not claim an untracked external process is being observed by the host.",
         );
         atomcode_harness::plugins::self_knowledge::describes(ctx, "background-completion", 42,
-            "The host supports optional background-job completion notifications. It resumes this session when explicitly observed work terminates; cancellation and runtime replacement retire pending notifications. A /loop keeps its chosen cadence, and a paused goal is not resumed by a notification.");
+            "The host supports background-job completion notifications by default. Set notify_on_exit=false for servers/watchers or manual polling. It resumes this session when observed work terminates; cancellation and runtime replacement retire pending notifications. A /loop keeps its chosen cadence, and a paused goal is not resumed by a notification.");
         for command in [
             Arc::new(GoalCommand(self.0.clone()))
                 as Arc<dyn atomcode_harness::commands::CatalogCommand>,

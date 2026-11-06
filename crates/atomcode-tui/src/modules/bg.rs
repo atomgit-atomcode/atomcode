@@ -266,7 +266,10 @@ fn session_line(view: &BgView, panel: &Panel, at: usize, w: usize) -> Line {
 fn input_line(view: &BgView, panel: &Panel, w: usize, caps: crate::caps::Caps) -> Line {
     use crate::caps::Glyph;
     let lead = Span::styled(
-        format!("{} ", caps.g(Glyph::Vertical)),
+        width::take_width(
+            &format!("{} ", caps.g(Glyph::Vertical)),
+            w.saturating_sub(1),
+        ),
         theme::fg(Role::Border),
     );
     let mut spans = vec![lead];
@@ -277,23 +280,27 @@ fn input_line(view: &BgView, panel: &Panel, w: usize, caps: crate::caps::Caps) -
         .and_then(|at| view.at(at))
         .map(|s| s.title.clone())
     {
+        let left = w.saturating_sub(spans.iter().map(Span::width).sum());
         spans.push(Span::styled(
-            format!("{} ", t(Msg::BgReplyTo { title: &title })),
+            width::take_width(
+                &format!("{} ", t(Msg::BgReplyTo { title: &title })),
+                left.saturating_sub(8),
+            ),
             theme::fg(Role::Warning),
         ));
     }
+    let room = w.saturating_sub(spans.iter().map(Span::width).sum());
+    spans.extend(caret_spans(
+        &panel.input,
+        panel.input.len(),
+        theme::fg(Role::PanelFg),
+        room,
+        caps,
+    ));
     if panel.input.is_empty() && panel.replying.is_none() {
-        spans.push(Span::styled(" ", Style::new().reverse()));
         spans.push(Span::styled(
             t(Msg::BgPlaceholder).into_owned(),
             theme::fg(Role::Muted),
-        ));
-    } else {
-        spans.extend(caret_spans(
-            &panel.input,
-            panel.input.len(),
-            theme::fg(Role::PanelFg),
-            w.saturating_sub(2),
         ));
     }
     Line::from_spans(spans).truncate(w)
@@ -389,5 +396,30 @@ mod tests {
         let shown = text(&view, &panel, 80).join("\n");
         assert!(!shown.contains(&*t(Msg::BgPlaceholder)), "{shown}");
         assert!(shown.contains("跑一遍测试"), "{shown}");
+    }
+
+    #[test]
+    fn input_carets_survive_long_background_reply_titles() {
+        let view = BgView::new(vec![session(
+            "a",
+            &"long title ".repeat(10),
+            Group::NeedsInput,
+            "question",
+        )]);
+        let mut panel = Panel::new(None);
+        for replying in [None, Some("a".to_string())] {
+            panel.replying = replying;
+            for value in ["", "long reply ".repeat(10).as_str()] {
+                panel.input = value.into();
+                for w in [1, 8, 20, 80] {
+                    let line = input_line(&view, &panel, w, crate::caps::Caps::default());
+                    assert!(line.width() <= w);
+                    assert!(
+                        line.spans.iter().any(|s| s.style.reverse && s.width() > 0),
+                        "{line:?}"
+                    );
+                }
+            }
+        }
     }
 }

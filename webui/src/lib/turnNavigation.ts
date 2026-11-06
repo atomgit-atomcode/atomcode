@@ -67,12 +67,22 @@ export function turnAtReadingLine(count: number, top: (index: number) => number,
 export function createTurnNavigationIntent() {
   let target: number | null = null;
   let follow = false;
+  // Last observed position, so a genuine upward gesture can release `follow`.
+  // Without it the held follow answered "still following" for every scroll
+  // event, which swallowed the reader's small upward scroll: the reading-intent
+  // owner never saw it and the next stream update scrolled back to the bottom.
+  let lastTop: number | null = null;
   return {
-    jumpTo(top: number) { target = top; follow = false; },
-    followBottom() { target = null; follow = true; },
-    interact() { target = null; follow = false; },
+    jumpTo(top: number) { target = top; follow = false; lastTop = null; },
+    followBottom() { target = null; follow = true; lastTop = null; },
+    interact() { target = null; follow = false; lastTop = null; },
     onScroll(viewport: { scrollTop: number; scrollHeight: number; clientHeight: number }): boolean | null {
+      const movedUp = lastTop !== null && viewport.scrollTop < lastTop - 0.5;
+      lastTop = viewport.scrollTop;
       if (follow) {
+        // A hand on the wheel outranks the held follow (content growth does not:
+        // it leaves scrollTop alone). Fall through so the caller stops following.
+        if (movedUp) { follow = false; return false; }
         if (viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight <= 2) follow = false;
         return true;
       }

@@ -64,6 +64,22 @@ impl Service {
     pub fn system(root: impl Into<std::path::PathBuf>) -> Self {
         Self::new(Store::new(root), crate::os::current().ok().map(Arc::from))
     }
+    /// Read durable launch admission without starting or retrying a worker.
+    pub fn launch_receipt(&self, request_id: &str) -> Result<Option<LaunchReceipt>> {
+        if !crate::valid_id(request_id) || request_id.len() > 128 {
+            anyhow::bail!("invalid run request id");
+        }
+        match std::fs::read(
+            self.store
+                .root
+                .join("launches")
+                .join(format!("{request_id}.json")),
+        ) {
+            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
     pub fn catalog(&self) -> Result<Vec<Entry>> {
         self.store
             .list()?

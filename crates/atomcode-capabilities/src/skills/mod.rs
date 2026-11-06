@@ -12,6 +12,7 @@
 use atomcode_kernel::tool::{ToolRegistry, ToolResult};
 use std::sync::Arc;
 
+pub mod auto_load;
 pub mod catalog_hook;
 pub mod registry;
 pub mod render;
@@ -24,7 +25,7 @@ pub use registry::{
     TemplateDirectory, TemplateKind,
 };
 pub use render::{render_skill_catalog, CatalogEntry};
-pub use skill::Skill;
+pub use skill::{AutoLoad, Skill};
 pub use use_skill::{ListSkillsTool, UseSkillTool};
 
 /// Names of the skill tools — pass to [`ToolRegistry::mount`](atomcode_kernel::tool::ToolRegistry::mount).

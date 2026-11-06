@@ -14,10 +14,12 @@ use tokio::sync::oneshot;
 /// "always allow this MCP tool". The runtime waiting on the answer is the one
 /// that carries the tool out — through its own registry — so the flag travels
 /// with the decision instead of being acted on here.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChatPermission {
     pub decision: PermissionDecision,
     pub persist_mcp_tool: bool,
+    pub persist_project_rule: bool,
+    pub call_id: Option<String>,
 }
 
 impl From<PermissionDecision> for ChatPermission {
@@ -25,6 +27,8 @@ impl From<PermissionDecision> for ChatPermission {
         Self {
             decision,
             persist_mcp_tool: false,
+            persist_project_rule: false,
+            call_id: None,
         }
     }
 }
@@ -41,6 +45,7 @@ pub struct PermissionResponders {
     /// blocked". A phone needs the second one — it is the difference between
     /// "working" and "waiting for you".
     outstanding: Arc<RwLock<std::collections::HashSet<String>>>,
+    calls: Arc<RwLock<HashMap<String, String>>>,
 }
 
 /// A pending `/chat` structured-input request, keyed by the native runtime request id.
@@ -92,6 +97,31 @@ impl UserInputResponders {
 }
 
 impl PermissionResponders {
+    pub fn pending_call(&self, session: &str, call: Option<&str>) {
+        let mut calls = self.calls.write().unwrap();
+        if let Some(call) = call {
+            calls.insert(session.into(), call.into());
+        } else {
+            calls.remove(session);
+        }
+    }
+    pub fn deliver_project(&self, session: &str, call_id: &str) -> bool {
+        let mut calls = self.calls.write().unwrap();
+        if calls.get(session).map(String::as_str) != Some(call_id) {
+            return false;
+        }
+        calls.remove(session);
+        drop(calls);
+        self.deliver(
+            session,
+            ChatPermission {
+                decision: PermissionDecision::AllowOnce,
+                persist_mcp_tool: false,
+                persist_project_rule: true,
+                call_id: Some(call_id.into()),
+            },
+        )
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -103,6 +133,7 @@ impl PermissionResponders {
 
     /// `/chat` 结束时清理。
     pub fn unregister(&self, session_id: &str) {
+        self.pending_call(session_id, None);
         self.inner.write().unwrap().remove(session_id);
         self.outstanding.write().unwrap().remove(session_id);
     }
@@ -128,6 +159,7 @@ impl PermissionResponders {
         // An answer was given. Even if the send fails (the turn is gone) the
         // request is no longer waiting for a person, so the mark goes either way.
         self.outstanding.write().unwrap().remove(session_id);
+        self.pending_call(session_id, None);
         if let Some(tx) = self.inner.read().unwrap().get(session_id) {
             tx.send(answer.into()).is_ok()
         } else {
@@ -140,6 +172,26 @@ impl PermissionResponders {
 mod tests {
     use super::*;
     use atomcode_capabilities::tools::PermissionDecision;
+
+    #[tokio::test]
+    async fn project_save_rejects_stale_duplicate_and_resolved_call_ids() {
+        let registry = PermissionResponders::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        registry.register("session".into(), tx);
+        registry.pending_call("session", Some("new-call"));
+        assert!(!registry.deliver_project("session", "old-call"));
+        assert!(rx.try_recv().is_err());
+        assert!(registry.deliver_project("session", "new-call"));
+        let answer = rx.recv().await.unwrap();
+        assert!(answer.persist_project_rule);
+        assert_eq!(answer.call_id.as_deref(), Some("new-call"));
+        assert!(!registry.deliver_project("session", "new-call"));
+        registry.pending_call("session", Some("next-call"));
+        registry.deliver("session", PermissionDecision::AllowOnce);
+        assert!(!registry.deliver_project("session", "next-call"));
+        registry.unregister("session");
+        assert!(!registry.deliver_project("session", "next-call"));
+    }
 
     #[tokio::test]
     async fn routes_decision_to_registered_session() {
@@ -164,9 +216,11 @@ mod tests {
         let answer = ChatPermission {
             decision: PermissionDecision::AllowOnce,
             persist_mcp_tool: true,
+            persist_project_rule: false,
+            call_id: None,
         };
 
-        assert!(reg.deliver("sess-1", answer));
+        assert!(reg.deliver("sess-1", answer.clone()));
         assert_eq!(rx.recv().await, Some(answer));
     }
 

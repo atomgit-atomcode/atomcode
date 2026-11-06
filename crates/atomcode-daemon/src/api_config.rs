@@ -476,3 +476,28 @@ mod tests {
         assert_eq!(info.supports_vision_override, None, "Auto remains visible");
     }
 }
+
+/// Only selection IDs and effort levels are returned; account credentials stay private.
+pub(crate) async fn get_mode_models() -> axum::response::Response {
+    match load_config() {
+        Ok(config) => Json(serde_json::json!({"bindings": {"plan":config.modes.plan,"build":config.modes.build},
+            "models": atomcode_config::mode_models::model_choices(&config), "reasoning_effort_levels": atomcode_config::config::REASONING_EFFORT_LEVELS})).into_response(),
+        Err(error) => json_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    }
+}
+pub(crate) async fn set_mode_models(
+    Json(bindings): Json<atomcode_config::mode_models::ModeModels>,
+) -> axum::response::Response {
+    let result = ConfigStore::new(Config::default_path()).update_document(|document| {
+        atomcode_config::mode_models::patch_bindings(document, &bindings)
+    });
+    match result {
+        Ok(_) => {
+            match crate::native_live::update_mode_bindings(bindings).await {
+                Ok(())|Err(crate::live_hub::HubError::Unbound)=>get_mode_models().await,
+                Err(error)=>json_error(axum::http::StatusCode::CONFLICT, format!("Mode preferences saved, but live application failed: {error:?}. Reload before switching modes.")).into_response(),
+            }
+        },
+        Err(error) => json_error(axum::http::StatusCode::BAD_REQUEST, format!("{error:#}")).into_response(),
+    }
+}

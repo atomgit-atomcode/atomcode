@@ -186,8 +186,14 @@ impl WalkOptions {
         self.max_entries = self.max_entries.clamp(1, 1_000_000);
         self
     }
-    pub fn filter_hint(&self) -> String {
-        format!("respect_gitignore={}, include_hidden={}, follow_symlinks={}. For a known filename, use read_file directly. Broaden only the specified directory; use respect_gitignore=false/include_hidden=true/follow_symlinks=true when needed. These options do not bypass permissions.", self.respect_gitignore, self.include_hidden, self.follow_symlinks)
+    pub fn filter_hint(&self, scope: &str) -> String {
+        let retry = serde_json::json!({
+            "path": scope,
+            "respect_gitignore": false,
+            "include_hidden": true,
+            "follow_symlinks": true,
+        });
+        format!("Active filters: respect_gitignore={}, include_hidden={}, follow_symlinks={}. An empty filtered search does not prove the file is absent. For a known filename, use read_file directly. Retry within this same path; when relevant, adjust ignore/hidden/link switches using {retry}. Do not expand to parent directories or entire disks without the user's request. These options do not bypass permissions.", self.respect_gitignore, self.include_hidden, self.follow_symlinks)
     }
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -811,6 +817,8 @@ pub struct LocalFs {
     /// "unable to make a scratch file", and a world that broke that would break
     /// the toolchain rather than the boundary.
     also_writable: Vec<PathBuf>,
+    /// Captured real locations; bool distinguishes directory trees from exact files.
+    also_readable: Vec<(PathBuf, bool)>,
 }
 
 impl LocalFs {
@@ -825,16 +833,18 @@ impl LocalFs {
             read_only: false,
             writes_only: false,
             also_writable: Vec::new(),
+            also_readable: Vec::new(),
         }
     }
 
-    /// Local I/O fenced to `root`: anything resolving outside it is denied.
+    /// Local I/O fenced to `root`, with optional explicit read-only grants.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: Some(root.into()),
             read_only: false,
             writes_only: false,
             also_writable: Vec::new(),
+            also_readable: Vec::new(),
         }
     }
 
@@ -848,6 +858,7 @@ impl LocalFs {
             read_only: true,
             writes_only: false,
             also_writable: Vec::new(),
+            also_readable: Vec::new(),
         }
     }
 
@@ -858,6 +869,7 @@ impl LocalFs {
             read_only: true,
             writes_only: false,
             also_writable: Vec::new(),
+            also_readable: Vec::new(),
         }
     }
 
@@ -874,6 +886,7 @@ impl LocalFs {
             read_only: false,
             writes_only: true,
             also_writable: Vec::new(),
+            also_readable: Vec::new(),
         }
     }
 
@@ -884,8 +897,21 @@ impl LocalFs {
         self
     }
 
-    /// Resolve a model-supplied path inside the root, refusing anything that
-    /// escapes it. Symlinks are resolved where the path exists, so a link out of
+    /// Grant reads to an existing directory tree or one file. Capture its real
+    /// location now; a later retargeted symlink cannot widen this grant.
+    pub fn also_readable(mut self, path: impl AsRef<Path>) -> Self {
+        if let Ok(real) = path.as_ref().canonicalize() {
+            if let Ok(metadata) = std::fs::metadata(&real) {
+                if metadata.is_dir() || metadata.is_file() {
+                    self.also_readable.push((real, metadata.is_dir()));
+                }
+            }
+        }
+        self
+    }
+
+    /// Resolve a model-supplied read path inside the root or an explicit read
+    /// grant. Symlinks are resolved where the path exists, so a link out of
     /// the tree is caught rather than followed.
     ///
     /// With no root, the path is returned untouched: an unfenced world performs
@@ -914,7 +940,15 @@ impl LocalFs {
         };
         let full = Self::real_path(&joined)?;
         let root = root_dir.canonicalize().unwrap_or_else(|_| root_dir.clone());
-        if !full.starts_with(&root) {
+        if !full.starts_with(&root)
+            && !self.also_readable.iter().any(|(allowed, directory)| {
+                if *directory {
+                    full.starts_with(allowed)
+                } else {
+                    full == *allowed
+                }
+            })
+        {
             return Err(FsError::denied(format!(
                 "{} is outside the world's root {}",
                 full.display(),
@@ -1718,6 +1752,90 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch");
         dir.canonicalize().expect("canonical scratch")
+    }
+
+    #[tokio::test]
+    async fn extra_read_grants_never_grant_writes_or_neighboring_files() {
+        let dir = scratch("skill-read-grants");
+        let workspace = dir.join("workspace");
+        let skill = dir.join("skill");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&skill).unwrap();
+        let resource = skill.join("docs-zh.json");
+        std::fs::write(&resource, "offline index").unwrap();
+        let flat = dir.join("flat.md");
+        std::fs::write(&flat, "flat skill").unwrap();
+        let outside = dir.join("private.txt");
+        std::fs::write(&outside, "private").unwrap();
+        let world = LocalFs::new(&workspace)
+            .also_readable(&skill)
+            .also_readable(&flat);
+        assert_eq!(world.read_text(&resource).await.unwrap(), "offline index");
+        assert_eq!(world.read_text(&flat).await.unwrap(), "flat skill");
+        assert!(world.read_text(&outside).await.is_err());
+        assert!(world
+            .read_text(&skill.join("../private.txt"))
+            .await
+            .is_err());
+        assert!(world.write_text(&resource, "changed").await.is_err());
+        assert!(world
+            .write_text(&skill.join("new.txt"), "changed")
+            .await
+            .is_err());
+        assert!(LocalFs::new(&workspace).read_text(&resource).await.is_err());
+        assert_eq!(std::fs::read_to_string(&resource).unwrap(), "offline index");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn extra_read_grants_reject_windows_junction_escape() {
+        let dir = scratch("skill-read-junction");
+        let workspace = dir.join("workspace");
+        let skill = dir.join("skill");
+        let private = dir.join("private");
+        for path in [&workspace, &skill, &private] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(private.join("secret.txt"), "private").unwrap();
+        let junction = skill.join("escape");
+        let result = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&private)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "junction creation failed: {result:?}"
+        );
+        let world = LocalFs::new(&workspace).also_readable(&skill);
+        let result = world.read_text(&junction.join("secret.txt")).await;
+        std::fs::remove_dir(&junction).unwrap();
+        assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn extra_read_grants_reject_symlink_escape_and_retargeting() {
+        let dir = scratch("skill-read-links");
+        let workspace = dir.join("workspace");
+        let skill = dir.join("skill");
+        let outside = dir.join("private");
+        for path in [&workspace, &skill, &outside] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+        std::os::unix::fs::symlink(&outside, skill.join("escape")).unwrap();
+        let alias = dir.join("alias");
+        std::os::unix::fs::symlink(&skill, &alias).unwrap();
+        let world = LocalFs::new(&workspace).also_readable(&alias);
+        assert!(world
+            .read_text(&skill.join("escape/secret.txt"))
+            .await
+            .is_err());
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&outside, &alias).unwrap();
+        assert!(world.read_text(&alias.join("secret.txt")).await.is_err());
     }
 
     #[tokio::test]

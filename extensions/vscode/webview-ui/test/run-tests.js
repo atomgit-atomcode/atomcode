@@ -30,35 +30,55 @@ async function main() {
     'todo-regression.test.ts',
     'tab-title-truncation.test.ts',
     'daemon-client-token.test.ts',
+    'daemon-client-token-retry.test.ts',
     'effort-levels.test.ts',
   ];
 
+  // Keep going after the first failure: stopping there hides the real state of every file
+  // after it (one CRLF-sensitive assertion used to mask 21 files on Windows). The summary
+  // below still exits non-zero, so a red suite stays red.
+  const failed = [];
   try {
     for (const test of tests) {
       const input = path.join(__dirname, test);
       const output = path.join(tempDir, test.replace(/\.ts$/, '.cjs'));
-      await esbuild.build({
-        entryPoints: [input],
-        bundle: true,
-        platform: 'node',
-        format: 'cjs',
-        target: 'node20',
-        outfile: output,
-        external: ['vscode'],
-        logLevel: 'silent',
-      });
+      try {
+        await esbuild.build({
+          entryPoints: [input],
+          bundle: true,
+          platform: 'node',
+          format: 'cjs',
+          target: 'node20',
+          outfile: output,
+          external: ['vscode'],
+          logLevel: 'silent',
+        });
+      } catch (err) {
+        failed.push({ test, status: 'build failed' });
+        console.error(`\n[webview-tests] ${test} did not build: ${err?.message ?? err}`);
+        continue;
+      }
 
       const result = spawnSync(process.execPath, [output], {
         cwd: root,
         stdio: 'inherit',
       });
       if (result.status !== 0) {
-        process.exit(result.status ?? 1);
+        failed.push({ test, status: result.status ?? 'killed' });
       }
     }
   } finally {
     rmSync(tempDir, { recursive: true, force: true });
   }
+
+  if (failed.length > 0) {
+    console.error(`\n[webview-tests] ${failed.length} of ${tests.length} file(s) failed:`);
+    for (const failure of failed) {
+      console.error(`  - ${failure.test} (${failure.status})`);
+    }
+    process.exit(1);
+  }
+  console.log(`[webview-tests] all ${tests.length} file(s) passed`);
 }
 
 main().catch((err) => {

@@ -29,6 +29,7 @@ fn _isolate_atomcode_home() {
 
 fn prepare_options() -> PrepareOptions {
     PrepareOptions {
+        prompt_overrides: Default::default(),
         session: SessionMode::Disabled,
         tools: true,
         skill_dirs: None,

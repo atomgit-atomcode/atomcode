@@ -2,7 +2,7 @@
   "name": "atomcode-tools",
   "displayName": "%atomcode.displayName%",
   "description": "%atomcode.description%",
-  "version": "5.2.5",
+  "version": "5.2.6",
   "publisher": "atomcode-tools",
   "license": "MIT",
   "repository": {
@@ -15,6 +15,7 @@
   },
   "categories": [
     "Programming Languages",
+    "Machine Learning",
     "Other"
   ],
   "keywords": [
@@ -22,7 +23,19 @@
     "coding",
     "agent",
     "atomcode",
-    "llm"
+    "llm",
+    "chat",
+    "assistant",
+    "ai-chat",
+    "code-review",
+    "mcp",
+    "skills",
+    "multi-model",
+    "deepseek",
+    "claude",
+    "openai",
+    "ollama",
+    "local-first"
   ],
   "icon": "resources/icon.png",
   "main": "./out/extension.js",

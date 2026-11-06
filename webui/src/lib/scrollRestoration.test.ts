@@ -103,3 +103,42 @@ test('a session switched while hidden uses its own follow intent rather than the
   f.flush();
   assert.equal(f.viewport.scrollTop, 1500);
 });
+
+test('a small upward scroll releases following until the user reaches the bottom', () => {
+  const f = fixture();
+  f.scroll.layout();
+  f.viewport.scrollTop -= 25;
+  f.setFollowing(f.scroll.onScroll()!);
+  assert.equal(f.follows(), false);
+  f.viewport.scrollHeight += 100;
+  f.scroll.layout();
+  assert.equal(f.viewport.scrollTop, 1475);
+  f.viewport.scrollTop = 1550;
+  f.setFollowing(f.scroll.onScroll()!);
+  assert.equal(f.follows(), false, 'being within the former 80px slack does not resume following');
+  f.viewport.scrollTop = 1600;
+  f.setFollowing(f.scroll.onScroll()!);
+  assert.equal(f.follows(), true);
+  f.viewport.scrollHeight += 100;
+  f.scroll.layout();
+  assert.equal(f.viewport.scrollTop, 1700);
+});
+
+test('layout growth and a no-op scroll do not cancel follow intent', () => {
+  const f = fixture();
+  f.scroll.layout();
+  f.viewport.scrollHeight += 100;
+  f.setFollowing(f.scroll.onScroll()!);
+  assert.equal(f.follows(), true);
+  f.scroll.layout();
+  assert.equal(f.viewport.scrollTop, 1600);
+});
+
+test('layout shrink at the bottom does not look like upward reading', () => {
+  const f = fixture();
+  f.scroll.layout();
+  f.viewport.scrollHeight -= 100;
+  f.viewport.scrollTop -= 100;
+  f.setFollowing(f.scroll.onScroll()!);
+  assert.equal(f.follows(), true);
+});

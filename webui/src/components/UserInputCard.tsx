@@ -10,6 +10,7 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { isUserInputBatch, UserInputAnswer, UserInputQuestion, UserInputRequestEvent, UserInputResponseBody } from '../api';
 import { useT } from '../settings';
 import { InteractionDock } from './InteractionDock';
+import { OTHER_SENTINEL, emptyAnswer, declinedAnswer, buildAnswer, answerReady, beginOptionEdit, saveOptionEdit, cancelOptionEdit, type AnswerState } from '../lib/userInput';
 
 interface UserInputCardProps {
   req: UserInputRequestEvent;
@@ -17,210 +18,144 @@ interface UserInputCardProps {
   submitAnswer: (body: UserInputAnswer) => Promise<{ accepted: boolean }>;
 }
 
-const OTHER_SENTINEL = '__other__';
-
-/** Local editing state for one question. */
-interface AnswerState {
-  singleSelected: string | null;
-  multiSelected: Set<string>;
-  otherChecked: boolean;
-  freeText: string;
-}
-const emptyAnswer = (): AnswerState => ({
-  singleSelected: null,
-  multiSelected: new Set(),
-  otherChecked: false,
-  freeText: '',
-});
-
-/** Build the wire answer for a question from its local state (pure). */
-function buildAnswer(q: UserInputQuestion, s: AnswerState): UserInputResponseBody {
-  if (q.mode === 'text') {
-    return { declined: false, selected: [], text: s.freeText || null };
-  }
-  if (q.mode === 'single') {
-    const chosen =
-      s.singleSelected === OTHER_SENTINEL
-        ? [s.freeText.trim()]
-        : s.singleSelected
-          ? [s.singleSelected]
-          : [];
-    return { declined: false, selected: chosen, text: null };
-  }
-  const chosen = Array.from(s.multiSelected);
-  if (s.otherChecked && s.freeText.trim()) chosen.push(s.freeText.trim());
-  return { declined: false, selected: chosen, text: null };
-}
-
-/** Whether the current state is a submittable answer (pure). */
-function answerReady(q: UserInputQuestion, s: AnswerState): boolean {
-  if (q.mode === 'text') return s.freeText.trim() !== '';
-  if (q.mode === 'single') {
-    if (s.singleSelected === null) return false;
-    if (s.singleSelected === OTHER_SENTINEL) return s.freeText.trim() !== '';
-    return true;
-  }
-  return s.multiSelected.size > 0 || (s.otherChecked && s.freeText.trim() !== '');
-}
-
-/** Re-derive editing state from a previously-committed answer (for the Back button). */
-function hydrate(q: UserInputQuestion, a: UserInputResponseBody): AnswerState {
-  const s = emptyAnswer();
-  if (a.declined) return s;
-  if (q.mode === 'text') {
-    s.freeText = a.text ?? '';
-    return s;
-  }
-  if (q.mode === 'single') {
-    const sel = a.selected[0];
-    if (sel === undefined) return s;
-    if (q.options.some((o) => o.label === sel)) s.singleSelected = sel;
-    else {
-      s.singleSelected = OTHER_SENTINEL;
-      s.freeText = sel;
-    }
-    return s;
-  }
-  const known = new Set(q.options.map((o) => o.label));
-  a.selected.forEach((l) => {
-    if (known.has(l)) s.multiSelected.add(l);
-    else {
-      s.otherChecked = true;
-      s.freeText = l;
-    }
-  });
-  return s;
-}
-
-const declinedAnswer = (): UserInputResponseBody => ({ declined: true, selected: [], text: null });
-
 /** The options/text body for one question. Reused by the single card and the batch stepper. */
-function QuestionBody({
-  q,
-  nameSuffix,
-  state,
-  setState,
-  disabled,
-}: {
+function QuestionBody({ q, nameSuffix, state, setState, disabled, onConfirm }: {
   q: UserInputQuestion;
   nameSuffix: string;
   state: AnswerState;
   setState: (s: AnswerState) => void;
   disabled: boolean;
+  onConfirm: (s: AnswerState) => void;
 }) {
   const t = useT();
   const freeTextRef = useRef<HTMLInputElement>(null);
-  // Offer the "type your own answer" row unless the question opts out (custom === false).
+  const editRef = useRef<HTMLInputElement>(null);
+  const editButtons = useRef<Array<HTMLButtonElement | null>>([]);
+  const lastEdited = useRef<number | null>(null);
   const showOther = q.custom !== false;
-  const singleOtherActive = q.mode === 'single' && state.singleSelected === OTHER_SENTINEL;
-  const multiOtherActive = q.mode === 'multiple' && state.otherChecked;
+  const otherActive = q.mode === 'single' ? state.singleSelected === OTHER_SENTINEL : state.otherChecked;
   useEffect(() => {
-    if ((singleOtherActive || multiOtherActive) && freeTextRef.current) freeTextRef.current.focus();
-  }, [singleOtherActive, multiOtherActive]);
+    if (otherActive) freeTextRef.current?.focus();
+  }, [otherActive]);
+  useEffect(() => {
+    if (state.editing) {
+      const input = editRef.current;
+      input?.focus();
+      input?.setSelectionRange(input.value.length, input.value.length);
+    } else if (lastEdited.current !== null) {
+      editButtons.current[lastEdited.current]?.focus();
+    }
+    lastEdited.current = state.editing?.option ?? null;
+  }, [state.editing?.option]);
 
   const set = (patch: Partial<AnswerState>) => setState({ ...state, ...patch });
-  const toggleMulti = (label: string) => {
+  function toggle(option: number) {
+    if (q.mode === 'single') return set({ singleSelected: option });
     const next = new Set(state.multiSelected);
-    if (next.has(label)) next.delete(label);
-    else next.add(label);
+    if (next.has(option)) next.delete(option);
+    else next.add(option);
     set({ multiSelected: next });
-  };
+  }
+  function cancelEdit() {
+    setState(cancelOptionEdit(state));
+  }
+  function saveEdit() {
+    const next = saveOptionEdit(q, state);
+    if (next === state) return;
+    setState(next);
+    if (q.mode === 'single') onConfirm(next);
+  }
 
   return (
     <>
       <p class="permission-lead">{q.question}</p>
-
-      {q.mode === 'single' && q.options.length > 0 && (
+      {q.mode !== 'text' && q.options.length > 0 && (
         <div class="field-group">
-          {q.options.map((opt) => (
-            <label key={opt.label} class="user-input-option">
-              <input
-                type="radio"
-                name={`uiq-${nameSuffix}`}
-                value={opt.label}
-                checked={state.singleSelected === opt.label}
-                onChange={() => set({ singleSelected: opt.label })}
-                disabled={disabled}
-              />
-              <span class="user-input-option-body">
-                <span class="user-input-option-label">{opt.label}</span>
-                {opt.description && <span class="user-input-option-desc">{opt.description}</span>}
-              </span>
-            </label>
+          {q.options.map((opt, i) => (
+            <div key={i} class="user-input-option-row">
+              <div class="user-input-option-main">
+                <label class="user-input-option">
+                  <input
+                    type={q.mode === 'single' ? 'radio' : 'checkbox'}
+                    name={`uiq-${nameSuffix}`}
+                    checked={q.mode === 'single' ? state.singleSelected === i : state.multiSelected.has(i)}
+                    onChange={() => toggle(i)}
+                    disabled={disabled || state.editing !== null}
+                  />
+                  <span class="user-input-option-body">
+                    <span class="user-input-option-label">{state.replacements[i] ?? opt.label}</span>
+                    {opt.description && <span class="user-input-option-desc">{opt.description}</span>}
+                  </span>
+                </label>
+                {showOther && (
+                  <button
+                    ref={(el) => { editButtons.current[i] = el; }}
+                    type="button"
+                    class="btn user-input-edit-button"
+                    aria-label={`${t('userInput.edit')}: ${opt.label}`}
+                    disabled={disabled || state.editing !== null}
+                    onClick={() => setState(beginOptionEdit(q, state, i))}
+                  >{t('userInput.edit')}</button>
+                )}
+              </div>
+              {state.editing?.option === i && (
+                <div class="user-input-option-editor">
+                  <input
+                    ref={editRef}
+                    type="text"
+                    class="user-input-text"
+                    aria-label={`${t('userInput.edit')}: ${opt.label}`}
+                    value={state.editing.text}
+                    onInput={(e) => set({ editing: { option: i, text: e.currentTarget.value } })}
+                    onKeyDown={(e) => {
+                      if (e.isComposing || e.keyCode === 229) return;
+                      if (e.key === 'Enter' || e.key === 'Escape') {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        if (e.key === 'Enter') saveEdit();
+                        else cancelEdit();
+                      }
+                    }}
+                    disabled={disabled}
+                  />
+                  <div class="user-input-edit-actions">
+                    <button type="button" class="btn btn-primary" disabled={disabled || !state.editing.text.trim()} onClick={saveEdit}>
+                      {q.mode === 'single' ? t('userInput.confirmEdit') : t('userInput.saveEdit')}
+                    </button>
+                    <button type="button" class="btn" disabled={disabled} onClick={cancelEdit}>{t('userInput.cancelEdit')}</button>
+                  </div>
+                </div>
+              )}
+            </div>
           ))}
           {showOther && (
             <label class="user-input-option">
               <input
-                type="radio"
+                type={q.mode === 'single' ? 'radio' : 'checkbox'}
                 name={`uiq-${nameSuffix}`}
-                value={OTHER_SENTINEL}
-                checked={state.singleSelected === OTHER_SENTINEL}
-                onChange={() => set({ singleSelected: OTHER_SENTINEL })}
-                disabled={disabled}
+                checked={otherActive}
+                onChange={() => q.mode === 'single'
+                  ? set({ singleSelected: OTHER_SENTINEL })
+                  : set({ otherChecked: !state.otherChecked })}
+                disabled={disabled || state.editing !== null}
               />
-              <span class="user-input-option-body">
-                <span class="user-input-option-label">{t('userInput.other')}</span>
-              </span>
+              <span class="user-input-option-body"><span class="user-input-option-label">{t('userInput.other')}</span></span>
             </label>
           )}
-          {singleOtherActive && (
+          {otherActive && (
             <input
               ref={freeTextRef}
               type="text"
               class="user-input-text"
+              aria-label={t('userInput.other')}
               value={state.freeText}
-              onInput={(e) => set({ freeText: (e.target as HTMLInputElement).value })}
-              disabled={disabled}
-              placeholder="输入自己的答案…"
+              onInput={(e) => set({ freeText: e.currentTarget.value })}
+              disabled={disabled || state.editing !== null}
+              placeholder={t('userInput.placeholder')}
             />
           )}
         </div>
       )}
-
-      {q.mode === 'multiple' && q.options.length > 0 && (
-        <div class="field-group">
-          {q.options.map((opt) => (
-            <label key={opt.label} class="user-input-option">
-              <input
-                type="checkbox"
-                value={opt.label}
-                checked={state.multiSelected.has(opt.label)}
-                onChange={() => toggleMulti(opt.label)}
-                disabled={disabled}
-              />
-              <span class="user-input-option-body">
-                <span class="user-input-option-label">{opt.label}</span>
-                {opt.description && <span class="user-input-option-desc">{opt.description}</span>}
-              </span>
-            </label>
-          ))}
-          {showOther && (
-            <label class="user-input-option">
-              <input
-                type="checkbox"
-                checked={state.otherChecked}
-                onChange={() => set({ otherChecked: !state.otherChecked })}
-                disabled={disabled}
-              />
-              <span class="user-input-option-body">
-                <span class="user-input-option-label">{t('userInput.other')}</span>
-              </span>
-            </label>
-          )}
-          {multiOtherActive && (
-            <input
-              ref={freeTextRef}
-              type="text"
-              class="user-input-text"
-              value={state.freeText}
-              onInput={(e) => set({ freeText: (e.target as HTMLInputElement).value })}
-              disabled={disabled}
-              placeholder="输入自己的答案…"
-            />
-          )}
-        </div>
-      )}
-
       {q.mode === 'text' && (
         <div class="field-group">
           <textarea
@@ -229,9 +164,8 @@ function QuestionBody({
             class="user-input-textarea"
             rows={4}
             value={state.freeText}
-            onInput={(e) => set({ freeText: (e.target as HTMLTextAreaElement).value })}
+            onInput={(e) => set({ freeText: e.currentTarget.value })}
             disabled={disabled}
-            placeholder=""
           />
         </div>
       )}
@@ -290,12 +224,12 @@ function SingleCard({ req, onDone, submitAnswer }: UserInputCardProps) {
   };
   const submitDisabled = loading || !answerReady(q, state);
 
-  async function submit() {
-    if (submitDisabled) return;
+  async function submit(answer = state) {
+    if (loading || !answerReady(q, answer)) return;
     setLoading(true);
     setError(null);
     try {
-      const result = await submitAnswer({ request_id: req.request_id, ...buildAnswer(q, state) });
+      const result = await submitAnswer({ request_id: req.request_id, ...buildAnswer(q, answer) });
       if (!result.accepted) throw new Error('user input response was not accepted');
       onDone();
     } catch {
@@ -327,13 +261,13 @@ function SingleCard({ req, onDone, submitAnswer }: UserInputCardProps) {
           <button class="btn" disabled={loading} onClick={skip}>
             {t('userInput.skip')}
           </button>
-          <button class="btn btn-primary" disabled={submitDisabled} onClick={submit}>
+          <button class="btn btn-primary" disabled={submitDisabled} onClick={() => void submit()}>
             {t('userInput.submit')}
           </button>
         </>
       }
     >
-      <QuestionBody q={q} nameSuffix={String(req.request_id)} state={state} setState={setState} disabled={loading} />
+      <QuestionBody q={q} nameSuffix={String(req.request_id)} state={state} setState={setState} disabled={loading} onConfirm={(answer) => void submit(answer)} />
       {error && <p class="user-input-error">{error}</p>}
     </CardShell>
   );
@@ -343,27 +277,14 @@ function BatchCard({ req, onDone, submitAnswer }: UserInputCardProps) {
   const t = useT();
   const qs = req.questions as UserInputQuestion[];
   const [step, setStep] = useState(0);
-  const [answers, setAnswers] = useState<UserInputResponseBody[]>(qs.map(declinedAnswer));
-  const [state, setState] = useState<AnswerState>(emptyAnswer());
+  const [drafts, setDrafts] = useState<AnswerState[]>(() => qs.map(emptyAnswer));
+  const state = drafts[step];
+  const setState = (answer: AnswerState) => setDrafts((all) => all.map((old, i) => i === step ? answer : old));
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const q = qs[step];
   const isLast = step === qs.length - 1;
-
-  // Commit the current step's edits into the accumulated answers, returning the new array.
-  function commitCurrent(): UserInputResponseBody[] {
-    const a = answerReady(q, state) ? buildAnswer(q, state) : declinedAnswer();
-    const next = answers.slice();
-    next[step] = a;
-    setAnswers(next);
-    return next;
-  }
-
-  function goToStep(committed: UserInputResponseBody[], target: number) {
-    setStep(target);
-    setState(hydrate(qs[target], committed[target]));
-  }
 
   async function postAll(all: UserInputResponseBody[]) {
     setLoading(true);
@@ -378,16 +299,18 @@ function BatchCard({ req, onDone, submitAnswer }: UserInputCardProps) {
     }
   }
 
-  function next() {
-    if (loading) return;
-    const committed = commitCurrent();
-    if (isLast) void postAll(committed);
-    else goToStep(committed, step + 1);
+  function next(answer = state) {
+    if (loading || !answerReady(q, answer)) return;
+    const nextDrafts = drafts.map((old, i) => i === step ? answer : old);
+    setDrafts(nextDrafts);
+    if (isLast) {
+      const unfinished = nextDrafts.findIndex((draft) => draft.editing !== null);
+      if (unfinished >= 0) setStep(unfinished);
+      else void postAll(qs.map((question, i) => buildAnswer(question, nextDrafts[i])));
+    } else setStep(step + 1);
   }
   function back() {
-    if (loading || step === 0) return;
-    const committed = commitCurrent();
-    goToStep(committed, step - 1);
+    if (!loading && step > 0) setStep(step - 1);
   }
   async function skipAll() {
     if (loading) return;
@@ -420,13 +343,13 @@ function BatchCard({ req, onDone, submitAnswer }: UserInputCardProps) {
               ←
             </button>
           )}
-          <button class="btn btn-primary" disabled={nextDisabled} onClick={next}>
+          <button class="btn btn-primary" disabled={nextDisabled} onClick={() => next()}>
             {isLast ? t('userInput.submit') : '→'}
           </button>
         </>
       }
     >
-      <QuestionBody q={q} nameSuffix={`${req.request_id}-${step}`} state={state} setState={setState} disabled={loading} />
+      <QuestionBody key={step} q={q} nameSuffix={`${req.request_id}-${step}`} state={state} setState={setState} disabled={loading} onConfirm={next} />
       {error && <p class="user-input-error">{error}</p>}
     </CardShell>
   );
@@ -435,6 +358,6 @@ function BatchCard({ req, onDone, submitAnswer }: UserInputCardProps) {
 export function UserInputCard({ req, onDone, submitAnswer }: UserInputCardProps) {
   const isBatch = isUserInputBatch(req);
   return isBatch
-    ? <BatchCard req={req} onDone={onDone} submitAnswer={submitAnswer} />
-    : <SingleCard req={req} onDone={onDone} submitAnswer={submitAnswer} />;
+    ? <BatchCard key={`${req.session_id ?? ""}:${req.request_id}`} req={req} onDone={onDone} submitAnswer={submitAnswer} />
+    : <SingleCard key={`${req.session_id ?? ""}:${req.request_id}`} req={req} onDone={onDone} submitAnswer={submitAnswer} />;
 }

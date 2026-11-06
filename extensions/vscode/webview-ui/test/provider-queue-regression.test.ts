@@ -3,6 +3,9 @@ import Module from 'node:module';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
+/** Windows checkouts are CRLF; the source-text assertions below are written against LF. */
+const readSource = (path: string) => readFileSync(path, 'utf8').replace(/\r\n/g, '\n');
+
 declare const require: {
   (id: string): typeof import('../../src/chat/provider');
 };
@@ -56,8 +59,146 @@ const { chatReducer, initialState } = require('../../webview-ui/src/state/reduce
 
 (Module as unknown as { _load: typeof Module['_load'] })._load = originalLoad;
 
+async function testLocalCommandHistoryRaceDoesNotDuplicateCachedTranscript() {
+  for (const timing of ['before-save', 'after-save', 'after-refresh']) {
+    let resolveHistory!: (detail: { messages: unknown[] }) => void;
+    let finishSave!: () => void;
+    let reads = 0;
+    let writes = 0;
+    const disk: Array<{role: string; content: string}> = [];
+    const posted: Array<{type: string}> = [];
+    const panel = {webview: {postMessage: (m: {type: string}) => posted.push(m)}};
+    const provider: any = new ChatViewProvider({fsPath: '/extension'} as never, {
+      getSession: async () => {
+        if (++reads === 1) return new Promise(resolve => { resolveHistory = resolve; });
+        return {messages: disk.slice()};
+      },
+      appendSessionMessages: async (_id: string, request: {messages: typeof disk}) => {
+        writes++;
+        disk.push(...request.messages);
+        await new Promise<void>(resolve => { finishSave = resolve; });
+        return {project_hash: 'project-a'};
+      },
+    } as never);
+    provider._panels.set('session-a', panel);
+    provider._panelReady.set('session-a', true);
+    provider._panelSessions.set('session-a', {sessionId: 'session-a', projectHash: 'project-a'});
+    provider._refreshSessions = async () => {};
+    provider._sendSetupState = async () => {};
+    provider._sendEditorContext = () => {};
+    provider._loadSessionsForDisplay = async () => ({sessions: []});
+    provider._webviewPanels.set(panel.webview, panel);
+    const history = provider._loadPanelHistory(panel, 'session-a', 'project-a');
+    const ready = timing === 'after-refresh'
+      ? provider._sendInitialState(panel.webview, 'tab') : undefined;
+    if (timing === 'before-save') {
+      resolveHistory({messages: []});
+      await history;
+    }
+    const save = provider._persistLocalCommandTranscript('session-a', '/login', 'already logged in');
+    if (timing === 'after-save') {
+      resolveHistory({messages: disk.slice()});
+      await history;
+    }
+    const snapshots = posted.filter(m => m.type === 'sessionMessages').length;
+    finishSave();
+    await save;
+    if (timing === 'after-refresh') {
+      resolveHistory({messages: []});
+      await history;
+    }
+    assert.equal(writes, 1);
+    assert.equal(disk.length, 2);
+    const cache = provider._panelSessions.get('session-a').messages;
+    assert.deepEqual(cache, disk, timing + ': cache must contain exactly the persisted pair');
+    assert.deepEqual(provider._getRuntime('session-a').messages, disk);
+    assert.equal(posted.filter(m => m.type === 'sessionMessages').length, snapshots,
+      'refresh must not replace visible messages or publish an obsolete snapshot');
+    let state = chatReducer(initialState, {type: 'LOAD_SESSION_MESSAGES', messages: cache});
+    state = chatReducer(state, {type: 'LOAD_SESSION_MESSAGES', messages: cache});
+    assert.equal(state.messages.length, 2);
+    if (ready) {
+      await ready;
+      const snapshot = (posted as Array<{type: string; messages?: unknown[]}>).find(m => m.type === 'sessionMessages');
+      assert.deepEqual(snapshot?.messages, disk,
+        'window initialization must follow the refreshed cache after its old read is retired');
+    }
+    const second = provider._persistLocalCommandTranscript('session-a', '/login', 'already logged in');
+    finishSave();
+    await second;
+    assert.equal(writes, 2, 'two real identical commands must both be retained');
+    assert.equal(provider._panelSessions.get('session-a').messages.length, 4);
+    assert.deepEqual(provider._panelSessions.get('session-a').messages, disk);
+  }
+}
+
+async function testLocalCommandRefreshIgnoresLateReadsAndClosedPanels() {
+  const pending: Array<(detail: {messages: unknown[]}) => void> = [];
+  const disk: Array<{role: string; content: string}> = [];
+  const provider: any = new ChatViewProvider({fsPath: '/extension'} as never, {
+    getSession: () => new Promise(resolve => pending.push(resolve)),
+    appendSessionMessages: async (_id: string, request: {messages: typeof disk}) => {
+      disk.push(...request.messages);
+      return {project_hash: 'project-a'};
+    },
+  } as never);
+  const panel = {webview: {postMessage: () => { throw new Error('must not replay'); }}};
+  provider._panels.set('session-a', panel);
+  provider._panelSessions.set('session-a', {sessionId: 'session-a', projectHash: 'project-a'});
+  provider._refreshSessions = async () => {};
+  const first = provider._persistLocalCommandTranscript('session-a', '/reload', 'reloaded');
+  await Promise.resolve();
+  const firstSnapshot = disk.slice();
+  const second = provider._persistLocalCommandTranscript('session-a', '/reload', 'reloaded');
+  await Promise.resolve();
+  assert.equal(pending.length, 2);
+  pending[1]({messages: disk.slice()});
+  await second;
+  pending[0]({messages: firstSnapshot});
+  await first;
+  assert.deepEqual(provider._panelSessions.get('session-a').messages, disk,
+    'a late read must not overwrite the newer command snapshot');
+
+  const closing = provider._persistLocalCommandTranscript('session-a', '/reload', 'reloaded');
+  await Promise.resolve();
+  provider._panels.delete('session-a');
+  provider._panelSessions.delete('session-a');
+  provider._sessionRuntimes.delete('session-a');
+  pending[2]({messages: disk.slice()});
+  await closing;
+  assert.equal(provider._panelSessions.has('session-a'), false);
+  assert.equal(provider._sessionRuntimes.has('session-a'), false,
+    'a late refresh must not recreate the closed session');
+}
+
+async function testLocalCommandRefreshFailureCanRecoverWithoutWritingAgain() {
+  let reads = 0;
+  let writes = 0;
+  const disk = [{role: 'user', content: '/reload'}, {role: 'assistant', content: 'reloaded'}];
+  const provider: any = new ChatViewProvider({fsPath: '/extension'} as never, {
+    appendSessionMessages: async () => { writes++; return {project_hash: 'project-a'}; },
+    getSession: async () => {
+      if (++reads === 1) throw new Error('temporary read failure');
+      return {messages: disk};
+    },
+  } as never);
+  const panel = {webview: {postMessage: () => {}}};
+  provider._panels.set('session-a', panel);
+  provider._panelSessions.set('session-a', {sessionId: 'session-a', projectHash: 'project-a', messages: []});
+  provider._refreshSessions = async () => {};
+  const warn = console.warn;
+  try {
+    console.warn = () => {};
+    await provider._persistLocalCommandTranscript('session-a', '/reload', 'reloaded');
+  } finally { console.warn = warn; }
+  assert.equal(provider._panelSessions.get('session-a').messages, undefined);
+  await provider._loadPanelHistory(panel, 'session-a', 'project-a');
+  assert.deepEqual(provider._panelSessions.get('session-a').messages, disk);
+  assert.equal(writes, 1, 'retrying history must not save the command again');
+}
+
 function testReadyMarksPanelOnlyAfterInitialReplay() {
-  const source = readFileSync(join(process.cwd(), 'src/chat/provider.ts'), 'utf8');
+  const source = readSource(join(process.cwd(), 'src/chat/provider.ts'));
   const readyCase = source.match(/case 'ready':[\s\S]*?case 'selectModel':/)?.[0] ?? '';
   assert.ok(readyCase.indexOf('await this._sendInitialState') >= 0);
   assert.ok(
@@ -77,7 +218,7 @@ function testReadyMarksPanelOnlyAfterInitialReplay() {
 }
 
 function testPanelReadyHandlerIsInstalledBeforeWebviewBoots() {
-  const source = readFileSync(join(process.cwd(), 'src/chat/provider.ts'), 'utf8');
+  const source = readSource(join(process.cwd(), 'src/chat/provider.ts'));
   const openStart = source.indexOf('public openInTab(');
   const openEnd = source.indexOf('private _findSessionIdByPanel', openStart);
   const openInTab = source.slice(openStart, openEnd);
@@ -564,7 +705,7 @@ function testReadyDoesNotFlushHistoryAlreadyDeliveredByItsAtomicSnapshot() {
 }
 
 function testClosingTheLastSessionTabStopsTheUnobservableTurn() {
-  const source = readFileSync(join(process.cwd(), 'src/chat/provider.ts'), 'utf8');
+  const source = readSource(join(process.cwd(), 'src/chat/provider.ts'));
   const disposeHandlers = Array.from(source.matchAll(
     /panel\.onDidDispose\(\(\) => \{[\s\S]*?\n    \}\);/g,
   ), (match) => match[0]);
@@ -653,7 +794,7 @@ function testSessionSelectionDoesNotRewriteUnrelatedTabBindings() {
 }
 
 function testSessionSelectionIsNeverBroadcastToUnrelatedTabsAndCanonicalRemapPersists() {
-  const source = readFileSync(join(process.cwd(), 'src/chat/provider.ts'), 'utf8');
+  const source = readSource(join(process.cwd(), 'src/chat/provider.ts'));
   assert.doesNotMatch(
     source,
     /_broadcastMessage\(\{ type: 'sessionSelected'/,
@@ -1147,7 +1288,7 @@ function testRecoveryLockRemainsVisibleAndCannotQueueAnotherTurn() {
   state = chatReducer(state, { type: 'RECOVERY_CLEARED' } as never);
   assert.equal(state.recoveryLocked, false);
 
-  const inputSource = readFileSync(join(process.cwd(), 'webview-ui/src/components/InputArea.tsx'), 'utf8');
+  const inputSource = readSource(join(process.cwd(), 'webview-ui/src/components/InputArea.tsx'));
   assert.match(inputSource, /state\.recoveryLocked/);
   assert.match(inputSource, /state\.isGenerating && !state\.recoveryLocked/);
 }
@@ -1878,7 +2019,7 @@ async function testConcurrentPreparationQueuesTheSecondPromptInsteadOfStartingTw
 }
 
 function testWebviewBridgeClearsQueuedMessagesOnHostInstruction() {
-  const source = readFileSync(join(process.cwd(), 'webview-ui/src/state/ChatProvider.tsx'), 'utf8');
+  const source = readSource(join(process.cwd(), 'webview-ui/src/state/ChatProvider.tsx'));
   const handler = source.match(/switch \(msg\.type\) \{[\s\S]*?case 'clearChat':/)?.[0] ?? '';
 
   assert.match(handler, /case 'clearQueuedMessages':/);
@@ -1886,7 +2027,7 @@ function testWebviewBridgeClearsQueuedMessagesOnHostInstruction() {
 }
 
 function testLatePanelSessionBindingIsPersistedForRestore() {
-  const source = readFileSync(join(process.cwd(), 'webview-ui/src/state/ChatProvider.tsx'), 'utf8');
+  const source = readSource(join(process.cwd(), 'webview-ui/src/state/ChatProvider.tsx'));
   const selectedCase = source.match(/case 'sessionSelected':[\s\S]*?break;/)?.[0] ?? '';
   assert.match(selectedCase, /getVSCodeApi\(\)\.setState\(\{ sessionId: msg\.sessionId, projectHash: msg\.projectHash \}\)/);
 }
@@ -2612,7 +2753,7 @@ async function testStopRestoresQueuedMessagesToInputInsteadOfDiscarding() {
 // Invariant guard: EVERY site that clears queuedMessages on a stop/error/abnormal path
 // must restore-to-input FIRST, so a future edit can't reintroduce a silent-discard.
 function testEveryQueueClearRestoresToInputFirst() {
-  const source = readFileSync(join(process.cwd(), 'src/chat/provider.ts'), 'utf8');
+  const source = readSource(join(process.cwd(), 'src/chat/provider.ts'));
   const clearRe = /\b\w+\.queuedMessages = \[\];/g;
   let m: RegExpExecArray | null;
   let count = 0;
@@ -2628,6 +2769,9 @@ function testEveryQueueClearRestoresToInputFirst() {
 }
 
 Promise.resolve()
+  .then(testLocalCommandHistoryRaceDoesNotDuplicateCachedTranscript)
+  .then(testLocalCommandRefreshIgnoresLateReadsAndClosedPanels)
+  .then(testLocalCommandRefreshFailureCanRecoverWithoutWritingAgain)
   .then(testStopRestoresQueuedMessagesToInputInsteadOfDiscarding)
   .then(testEveryQueueClearRestoresToInputFirst)
   .then(testReadyMarksPanelOnlyAfterInitialReplay)
@@ -2694,6 +2838,7 @@ Promise.resolve()
   .then(testPollActiveSessionRecoveryResetsWhenTurnEnds)
   .then(testPollActiveSessionRecoveryDoesNotStartDuplicatePolls)
   .then(testPollActiveSessionRecoveryCancellationDoesNotForceReset)
+  .then(() => console.log('provider queue and history regression tests passed'))
   .catch((err) => {
   console.error(err);
   process.exit(1);

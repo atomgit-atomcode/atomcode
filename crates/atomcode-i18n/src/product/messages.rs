@@ -604,6 +604,7 @@ pub enum Msg<'a> {
 
     // ── Todo panel ──
     TodoPanelTitle,
+    TodoSourceHint,
     TodoPanelCompleted {
         n: usize,
     },
@@ -613,6 +614,13 @@ pub enum Msg<'a> {
 
     // ── Approval panel ──
     ApprovalAllowOnce,
+    ApprovalSaveProject,
+    ContextSummaryCount {
+        count: u64,
+    },
+    ContextSummaryRecorded {
+        count: u64,
+    },
     ApprovalAlwaysAllow {
         tool: &'a str,
     },

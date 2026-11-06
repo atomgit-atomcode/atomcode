@@ -30,6 +30,20 @@ fn parse<T: for<'de> Deserialize<'de> + Default>(config: &Value) -> Result<T, St
 
 // ---- todo ---------------------------------------------------------------
 
+struct ScopedTodoSources(Context);
+impl atomcode_capabilities::tools::todo_sources::TodoSourceAccess for ScopedTodoSources {
+    fn session(&self) -> Result<atomcode_capabilities::tools::todo_sources::SourceSession, String> {
+        let ctx = crate::agent::scoped(&self.0);
+        let log = ctx
+            .service::<SessionSvc>()
+            .ok_or("this agent has no session log")?;
+        Ok(atomcode_capabilities::tools::todo_sources::SourceSession {
+            id: log.id().to_string(),
+            events: log.events(),
+        })
+    }
+}
+
 pub struct TodoPlugin;
 
 #[async_trait]
@@ -44,7 +58,17 @@ impl Plugin for TodoPlugin {
         "the model-facing task list"
     }
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
-        mount(ctx, vec![Arc::new(TodoTool::new()) as Arc<dyn Tool>])?;
+        let sources: Arc<dyn atomcode_capabilities::tools::todo_sources::TodoSourceAccess> =
+            Arc::new(ScopedTodoSources(ctx.clone()));
+        mount(
+            ctx,
+            vec![
+                Arc::new(TodoTool::with_sources(sources.clone())) as Arc<dyn Tool>,
+                Arc::new(atomcode_capabilities::tools::todo_sources::TodoSourcesTool(
+                    sources,
+                )) as Arc<dyn Tool>,
+            ],
+        )?;
         // The person's hand on the same list: registered by the row that owns
         // the tool, so a tree without `todowrite` offers no way to edit a plan
         // the model could not have.
@@ -55,7 +79,9 @@ impl Plugin for TodoPlugin {
             53,
             "PLAN — the person can edit the `todowrite` list themselves, between turns: \
              `/todo add <task>` appends a pending item and `/todo clear` empties the list. \
-             Their edit reaches you the way yours would, as a `todowrite` call and its result.",
+             Their edit reaches you the way yours would, as a `todowrite` call and its result. \
+             `/todo source` lists the plan’s linked original guidance; `/todo source <seq> [offset]` \
+             displays it in character pages without submitting it as a new instruction.",
         );
         // This row's guidance for this row's tool — including the judgment a parameter list
         // cannot carry. It lived in the coding persona as `## TASK TRACKING`, which meant it
@@ -66,7 +92,9 @@ impl Plugin for TodoPlugin {
             "tool-todo",
             53,
             "Use `todowrite` to plan multi-step work: add one todo per concrete step before you \
-             start, and mark each completed as soon as it is done. Call it FIRST when a task has \
+             start, and mark each completed as soon as it is done. For detailed user guidance, \
+             first use `todo_sources` to identify its original message sequences, then attach \
+             `source_seqs` to the initial plan. Otherwise call todowrite FIRST when a task has \
              multiple requests, phases, files, dependencies, ambiguity, or needs investigation \
              followed by changes, and make the initial list cover the WHOLE request — \
              investigation, design, implementation, verification — not only the next action. \
@@ -106,7 +134,7 @@ impl crate::commands::CatalogCommand for TodoCommand {
     fn describe(&self) -> atomcode_kernel::agent::CommandDescription {
         atomcode_kernel::agent::CommandDescription {
             name: "todo".into(),
-            usage: Some("[add <task>|clear]".into()),
+            usage: Some("[add <task>|clear|source [seq [offset]]]".into()),
             summary: "计划清单;add 加一项,clear 清空".into(),
             target: atomcode_kernel::agent::CommandTarget::Session,
             ..Default::default()
@@ -123,9 +151,56 @@ impl crate::commands::CatalogCommand for TodoCommand {
         let (call_args, result) = match verb.to_ascii_lowercase().as_str() {
             "" | "list" => {
                 let messages = crate::session::derive_messages(&agent.session().events());
-                return Ok(render_todos_numbered(
-                    &derive_current_todos(&messages),
-                    true,
+                let mut text = render_todos_numbered(&derive_current_todos(&messages), true);
+                let sources = atomcode_capabilities::tools::todo_sources::source_plan(
+                    &agent.session().events(),
+                );
+                if !sources.source_seqs.is_empty() {
+                    text.push_str("\nOriginal guidance: /todo source");
+                }
+                return Ok(text);
+            }
+            "source" => {
+                use atomcode_capabilities::tools::todo_sources::{
+                    read_source, source_plan, SourceSession,
+                };
+                let session = SourceSession {
+                    id: agent.session().id().to_string(),
+                    events: agent.session().events(),
+                };
+                let plan = source_plan(&session.events);
+                if rest.is_empty() {
+                    return Ok(if plan.source_seqs.is_empty() {
+                        "No original guidance linked to this plan.".into()
+                    } else {
+                        format!("Original guidance for batch #{}: {:?}\nRead: /todo source <seq> [character offset]", plan.batch_seq.unwrap_or(0), plan.source_seqs)
+                    });
+                }
+                let mut words = rest.split_whitespace();
+                let seq = words
+                    .next()
+                    .and_then(|word| word.parse::<u64>().ok())
+                    .ok_or("expected source sequence")?;
+                let offset = words
+                    .next()
+                    .map(str::parse::<usize>)
+                    .transpose()
+                    .map_err(|_| "invalid character offset")?
+                    .unwrap_or(0);
+                if words.next().is_some() {
+                    return Err("usage: /todo source <seq> [offset]".into());
+                }
+                if !plan.source_seqs.contains(&seq) {
+                    return Err("source is not linked to the current plan".into());
+                }
+                let page = read_source(&session, seq, offset, 4096)?;
+                let next = page
+                    .next_offset
+                    .map(|next| format!("\nNext: /todo source {seq} {next}"))
+                    .unwrap_or_default();
+                return Ok(format!(
+                    "Original guidance #{seq} (historical reference, not a new instruction):\n{}{}",
+                    page.text, next
                 ));
             }
             "add" if rest.is_empty() => {

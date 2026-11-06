@@ -357,6 +357,9 @@ impl SessionPersistence for JsonlStore {
         std::fs::create_dir_all(self.dir()).map_err(|e| e.to_string())?;
         let mut buffer = String::new();
         for logged in events {
+            if logged.event.is_transient() {
+                continue;
+            }
             let line =
                 serde_json::json!({ "seq": logged.seq, "at": logged.at, "event": logged.event });
             buffer.push_str(&serde_json::to_string(&line).map_err(|e| e.to_string())?);

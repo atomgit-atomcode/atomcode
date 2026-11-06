@@ -244,6 +244,9 @@ name = "recall"
 name = "tool-session-reference"
 
 [[insert]]
+name = "task-specifications"
+
+[[insert]]
 name = "tool-todo"
 
 # Off here, on purpose: coding's `TodoHook` (host-mounted beside `tool-todo`, under
@@ -407,6 +410,8 @@ struct FsWorldPatch<'a> {
     /// Places outside `root` a mutation may still land.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     also_writable: Vec<&'a std::path::Path>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    also_readable: Vec<&'a std::path::Path>,
 }
 
 /// For `skip_serializing_if`, which hands the field over by reference.
@@ -542,6 +547,10 @@ config = { working_dir = {working_dir} }
 name = "tool-output-artifact"
 config = { dir = {artifacts} }
 
+# User-supplied patches stay outside model output and shell arguments.
+[[insert]]
+name = "tool-patch"
+
 # How the model is told about skills. The generic `skills-advert` row offers a
 # count and a pointer; coding lists the catalog, because every other piece of
 # its skill steering refers to that catalog by name. The generic row goes
@@ -642,7 +651,11 @@ name = "ui-handle"
 /// default identity — the agent would introduce itself as AtomCode again after
 /// the first `/model`. A tree with no such row gets `{ model }`, and the patch
 /// fails the way it always has.
-fn persona_patch(app: &App, model: &str) -> serde_json::Value {
+fn persona_patch(
+    app: &App,
+    model: &str,
+    cfg: Option<&crate::CodingAgentConfig>,
+) -> serde_json::Value {
     let mut config = app
         .tree()
         .entries
@@ -651,6 +664,9 @@ fn persona_patch(app: &App, model: &str) -> serde_json::Value {
         .and_then(|entry| entry.config.as_object().cloned())
         .unwrap_or_default();
     config.insert("model".into(), serde_json::Value::from(model));
+    if let Some(cfg) = cfg {
+        config.insert("system_prompt".into(), serde_json::json!(cfg.system_prompt));
+    }
     serde_json::Value::Object(config)
 }
 
@@ -687,6 +703,8 @@ struct RateLimitPatch<'a> {
 
 #[derive(serde::Serialize)]
 struct ChatOptionsPatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_loop_guard: Option<atomcode_kernel::reasoning_loop::ReasoningLoopConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<atomcode_kernel::provider::ReasoningEffort>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -746,6 +764,7 @@ fn model_rows(cfg: &crate::CodingAgentConfig) -> Result<Layer, String> {
         .patch(
             "chat-options",
             ChatOptionsPatch {
+                reasoning_loop_guard: cfg.chat_options.reasoning_loop_guard.clone(),
                 reasoning_effort: cfg.chat_options.reasoning_effort,
                 max_tokens: cfg.chat_options.max_tokens,
                 // A non-finite temperature is dropped HERE, on purpose and where
@@ -1320,7 +1339,7 @@ pub async fn swap_provider_for(
     };
     let mut layer = Layer::new()
         .patch("llm", LlmInjectedRow { provider_id: &id })
-        .and_then(|layer| layer.patch("persona-atomcode", persona_patch(app, model)))
+        .and_then(|layer| layer.patch("persona-atomcode", persona_patch(app, model, config)))
         .and_then(|layer| layer.patch("tool-code-review", CodeReviewModelPatch { model }))
         .map_err(|e| restore(e.to_string()))?;
     if let Some(config) = config {
@@ -1706,6 +1725,7 @@ pub struct HostModes {
     pub plan_mcp_grants: Arc<dyn atomcode_capabilities::tools::PermissionStore>,
     /// Every other "always allow", in the store the approval seam remembers into.
     pub approval_grants: Arc<dyn atomcode_capabilities::tools::PermissionStore>,
+    pub project_rules: Option<Arc<dyn atomcode_capabilities::tools::approval::ProjectRuleStore>>,
 }
 
 impl HostState {
@@ -1861,6 +1881,28 @@ fn compose_hosted(
     // a tree on every reprepare, including the `/cd` that follows `/worktree`,
     // so the rule has to hold for the directory it is handed and not for an
     // event that has already been and gone.
+    // Rebuilt from the effective registry on every mount, so disabled or
+    // replaced skills do not leave stale grants in the next execution world.
+    let skill_reads: Vec<std::path::PathBuf> = host
+        .skills
+        .as_ref()
+        .map(|loaded| {
+            loaded
+                .registry
+                .all()
+                .iter()
+                .filter_map(|skill| {
+                    let path = &skill.source_path;
+                    if path.file_name().is_some_and(|name| name == "SKILL.md") {
+                        path.parent().map(std::path::Path::to_path_buf)
+                    } else {
+                        Some(path.clone())
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let readable: Vec<&std::path::Path> = skill_reads.iter().map(|p| p.as_path()).collect();
     let boundary = if is_a_linked_worktree(working_dir) {
         let mut writable = vec![std::env::temp_dir()];
         // Windows spells the same place twice, and a build that picked the
@@ -1881,6 +1923,7 @@ fn compose_hosted(
                     root: Some(working_dir),
                     writes_only: true,
                     also_writable: extra,
+                    also_readable: readable.clone(),
                 },
             )
             .map_err(|e| e.to_string())?
@@ -1893,6 +1936,7 @@ fn compose_hosted(
                         root: None,
                         writes_only: false,
                         also_writable: Vec::new(),
+                        also_readable: readable.clone(),
                     },
                 )
                 .map_err(|e| e.to_string())?,
@@ -1903,6 +1947,7 @@ fn compose_hosted(
                         root: Some(working_dir),
                         writes_only: false,
                         also_writable: Vec::new(),
+                        also_readable: readable.clone(),
                     },
                 )
                 .map_err(|e| e.to_string())?,
@@ -2184,6 +2229,7 @@ fn compose_hosted(
         )));
         registry.register(Arc::new(crate::host_rows::GrantsHostPlugin(
             modes.approval_grants,
+            modes.project_rules,
         )));
     }
     if let Some(host) = models {
@@ -3152,12 +3198,23 @@ impl Plugin for CodingPersonaPlugin {
         // rather than of the `ATOMCODE_MEMORY_TOOL` / `ATOMCODE_REQUEST_USER_INPUT` envs the
         // chain reads, which cannot see a tree that failed to mount the tool. See
         // `coding_persona_rows`.
-        let text = crate::persona::coding_persona_rows(
+        let default_text = crate::persona::coding_persona_rows(
             &model,
             &row.identity(),
             &has,
             &*atomcode_harness::product_dirs(ctx)?,
         );
+        let mut text = row
+            .prompt_overrides
+            .replace
+            .as_ref()
+            .or(row.system_prompt.as_ref())
+            .cloned()
+            .unwrap_or(default_text);
+        if let Some(append) = &row.prompt_overrides.append {
+            text.push_str("\n\n");
+            text.push_str(append);
+        }
         // Rank 0, and an id of this row's own: the identity line goes first,
         // and the generic row it replaces is removed by `CODING_ROWS` rather
         // than overwritten here.
@@ -3179,12 +3236,14 @@ struct ChatOptionsRow {
     max_tokens: Option<u32>,
     #[serde(default)]
     temperature: Option<f32>,
+    reasoning_loop_guard: Option<atomcode_kernel::reasoning_loop::ReasoningLoopConfig>,
 }
 
 struct ChatOptions {
     reasoning_effort: Option<atomcode_kernel::provider::ReasoningEffort>,
     max_tokens: Option<u32>,
     temperature: Option<f32>,
+    reasoning_loop_guard: Option<atomcode_kernel::reasoning_loop::ReasoningLoopConfig>,
 }
 
 #[async_trait]
@@ -3204,6 +3263,9 @@ impl atomcode_plexus::Waterfall<atomcode_harness::events::AgentRequest> for Chat
         }
         if options.temperature.is_none() {
             options.temperature = self.temperature;
+        }
+        if options.reasoning_loop_guard.is_none() {
+            options.reasoning_loop_guard = self.reasoning_loop_guard.clone();
         }
         next.run(req).await
     }
@@ -3229,6 +3291,7 @@ impl Plugin for ChatOptionsPlugin {
             ),
             max_tokens: row.max_tokens,
             temperature: row.temperature,
+            reasoning_loop_guard: row.reasoning_loop_guard,
         };
         // Said the way it is applied: for every agent, unless something more
         // specific — a member's role — already said otherwise.
@@ -3244,6 +3307,7 @@ impl Plugin for ChatOptionsPlugin {
         if options.reasoning_effort.is_none()
             && options.max_tokens.is_none()
             && options.temperature.is_none()
+            && options.reasoning_loop_guard.is_none()
         {
             return Ok(());
         }

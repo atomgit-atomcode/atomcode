@@ -31,6 +31,19 @@ pub fn validate(task: &ScheduleTask) -> Result<()> {
     if !matches!(task.notify.as_str(), "off" | "important" | "all") {
         bail!("invalid notification level");
     }
+    if let Some(follow_up) = &task.follow_up {
+        if !matches!(task.schedule, Schedule::Manual)
+            || task.permission_mode == "auto"
+            || follow_up.source_session.is_empty()
+            || follow_up.model.trim().is_empty()
+            || follow_up
+                .context
+                .as_ref()
+                .is_some_and(|text| text.len() > 65536)
+        {
+            bail!("invalid one-shot follow-up execution options");
+        }
+    }
     match &task.schedule {
         Schedule::Daily { time } => {
             clock(time)?;
@@ -301,5 +314,25 @@ mod dst_tests {
                     .timestamp()
             )
         );
+    }
+}
+
+#[cfg(test)]
+mod follow_up_tests {
+    use super::*;
+    #[test]
+    fn event_only_tasks_have_no_next_fire_and_cannot_bypass_approval() {
+        let mut task: ScheduleTask = serde_json::from_value(serde_json::json!({
+            "id":"followup-test", "title":"Follow-up", "prompt":"review", "cwd":std::env::temp_dir(),
+            "schedule":{"kind":"manual"},
+            "follow_up":{"source_session":"original", "source_turn":1, "model":"configured"}
+        })).unwrap();
+        validate(&task).unwrap();
+        assert!(next(&task, 1000).is_none());
+        task.permission_mode = "auto".into();
+        assert!(validate(&task).is_err());
+        task.permission_mode = "plan".into();
+        task.schedule = Schedule::Hourly;
+        assert!(validate(&task).is_err());
     }
 }

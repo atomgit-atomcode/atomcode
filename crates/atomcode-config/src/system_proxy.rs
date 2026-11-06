@@ -142,72 +142,229 @@ pub(crate) fn parse_scutil_proxy(raw: &str) -> SystemProxy {
     }
 }
 
-/// Best-effort read of the OS static system proxy. Fail-open: any error or an
-/// unsupported OS yields an empty `SystemProxy` (callers then fall back to
-/// direct / env-var behavior).
+/// The source of a proxy read failure. Labels never contain registry values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxySetting {
+    WindowsSettings,
+    ProxyEnable,
+    ProxyServer,
+    ProxyOverride,
+    MacSettings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProxyReadFailure {
+    AccessDenied,
+    InvalidValue,
+    Incomplete,
+    Unavailable,
+}
+
+/// Safe diagnostic data: never retains an OS error message or a proxy URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyReadError {
+    setting: ProxySetting,
+    failure: ProxyReadFailure,
+    os_code: Option<i32>,
+    retryable: bool,
+}
+
+impl ProxyReadError {
+    pub fn from_io(setting: ProxySetting, error: std::io::Error) -> Self {
+        use std::io::ErrorKind;
+        let os_code = error.raw_os_error();
+        let failure = if error.kind() == ErrorKind::PermissionDenied || os_code == Some(5) {
+            ProxyReadFailure::AccessDenied
+        } else if matches!(
+            error.kind(),
+            ErrorKind::InvalidData | ErrorKind::InvalidInput
+        ) || os_code == Some(222)
+        // Win32 ERROR_BAD_FILE_TYPE from winreg decoding.
+        {
+            ProxyReadFailure::InvalidValue
+        } else if error.kind() == ErrorKind::NotFound {
+            ProxyReadFailure::Incomplete
+        } else {
+            ProxyReadFailure::Unavailable
+        };
+        let retryable = failure == ProxyReadFailure::Incomplete
+            || matches!(
+                error.kind(),
+                ErrorKind::TimedOut | ErrorKind::Interrupted | ErrorKind::WouldBlock
+            )
+            || matches!(os_code, Some(32 | 33 | 170 | 1018 | 1237));
+        Self {
+            setting,
+            failure,
+            os_code,
+            retryable,
+        }
+    }
+
+    pub fn is_retryable(&self) -> bool {
+        self.retryable
+    }
+
+    #[cfg(any(windows, test))]
+    fn incomplete(setting: ProxySetting) -> Self {
+        Self {
+            setting,
+            failure: ProxyReadFailure::Incomplete,
+            os_code: None,
+            retryable: true,
+        }
+    }
+}
+
+impl std::fmt::Display for ProxyReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let setting = match self.setting {
+            ProxySetting::WindowsSettings => "Windows Internet Settings",
+            ProxySetting::ProxyEnable => "ProxyEnable",
+            ProxySetting::ProxyServer => "ProxyServer",
+            ProxySetting::ProxyOverride => "ProxyOverride",
+            ProxySetting::MacSettings => "macOS system proxy",
+        };
+        let reason = match self.failure {
+            ProxyReadFailure::AccessDenied => "access denied",
+            ProxyReadFailure::InvalidValue => "invalid value or registry type",
+            ProxyReadFailure::Incomplete => "settings are incomplete or changing",
+            ProxyReadFailure::Unavailable => "could not read settings",
+        };
+        write!(f, "{setting}: {reason}")?;
+        if let Some(code) = self.os_code {
+            write!(f, " (OS error {code})")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ProxyReadError {}
+
+/// Best-effort startup resolution. Request refresh uses [`resolve_checked`]
+/// because a read failure does not authorize direct network access.
 pub fn resolve() -> SystemProxy {
     try_resolve().unwrap_or_default()
 }
 
-/// Fresh OS settings, distinguishing a disabled proxy from a failed read. Live
-/// refresh must not interpret a read failure as permission to bypass a proxy.
+/// Compatibility reader for callers that only need success/failure.
 pub fn try_resolve() -> Option<SystemProxy> {
-    // VPN clients change these settings while the process is running. Callers
-    // must refresh at request boundaries rather than retain a startup-only cache.
+    resolve_checked().ok()
+}
+
+/// Fresh OS settings with a redacted, classified failure.
+pub fn resolve_checked() -> Result<SystemProxy, ProxyReadError> {
     #[cfg(windows)]
     {
-        resolve_windows()
+        retry_windows_read(resolve_windows_once, std::thread::sleep)
     }
     #[cfg(target_os = "macos")]
     {
-        resolve_macos()
+        resolve_macos().ok_or(ProxyReadError {
+            setting: ProxySetting::MacSettings,
+            failure: ProxyReadFailure::Unavailable,
+            os_code: None,
+            retryable: true,
+        })
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
-        Some(SystemProxy::default())
+        Ok(SystemProxy::default())
     }
 }
 
 #[cfg(windows)]
-fn resolve_windows() -> Option<SystemProxy> {
+fn resolve_windows_once() -> Result<SystemProxy, ProxyReadError> {
     use winreg::enums::HKEY_CURRENT_USER;
     use winreg::RegKey;
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let settings =
         match hkcu.open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Internet Settings") {
             Ok(settings) => settings,
-            // A user without Internet Settings has no static system proxy. Other
-            // errors must not turn an existing proxy into a direct route.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Some(SystemProxy::default())
+                return Ok(SystemProxy::default())
             }
-            Err(_) => return None,
+            Err(error) => {
+                return Err(ProxyReadError::from_io(
+                    ProxySetting::WindowsSettings,
+                    error,
+                ))
+            }
         };
-    let enabled: u32 = optional_registry_value(settings.get_value("ProxyEnable"))?;
-    if enabled == 0 {
-        return Some(SystemProxy::default());
+    read_windows_values(
+        || settings.get_value("ProxyEnable"),
+        |name| settings.get_value(name),
+    )
+}
+
+#[cfg(any(windows, test))]
+fn read_windows_values(
+    mut enabled: impl FnMut() -> std::io::Result<u32>,
+    mut text: impl FnMut(&str) -> std::io::Result<String>,
+) -> Result<SystemProxy, ProxyReadError> {
+    let before = optional_registry_value(enabled(), ProxySetting::ProxyEnable)?;
+    if before == 0 {
+        return Ok(SystemProxy::default());
     }
-    let server: String = settings.get_value("ProxyServer").ok()?;
+    let server = text("ProxyServer")
+        .map_err(|error| ProxyReadError::from_io(ProxySetting::ProxyServer, error))?;
     if server.trim().is_empty() {
-        return None;
+        return Err(ProxyReadError::incomplete(ProxySetting::ProxyServer));
     }
     let (http, https) = parse_win_proxy_server(&server);
-    let bypass: String = optional_registry_value(settings.get_value("ProxyOverride"))?;
-    let no_proxy = parse_win_bypass(&bypass);
-    Some(SystemProxy {
+    if http.is_none() && https.is_none() {
+        return Err(ProxyReadError {
+            setting: ProxySetting::ProxyServer,
+            failure: ProxyReadFailure::InvalidValue,
+            os_code: None,
+            retryable: false,
+        });
+    }
+    let bypass = optional_registry_value(text("ProxyOverride"), ProxySetting::ProxyOverride)?;
+    let after = optional_registry_value(enabled(), ProxySetting::ProxyEnable)?;
+    if before != after {
+        return Err(ProxyReadError::incomplete(ProxySetting::ProxyEnable));
+    }
+    Ok(SystemProxy {
         http,
         https,
-        no_proxy,
+        no_proxy: parse_win_bypass(&bypass),
     })
 }
 
 #[cfg(any(windows, test))]
-fn optional_registry_value<T: Default>(value: std::io::Result<T>) -> Option<T> {
+fn optional_registry_value<T: Default>(
+    value: std::io::Result<T>,
+    setting: ProxySetting,
+) -> Result<T, ProxyReadError> {
     match value {
-        Ok(value) => Some(value),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(T::default()),
-        Err(_) => None,
+        Ok(value) => Ok(value),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
+        Err(error) => Err(ProxyReadError::from_io(setting, error)),
     }
+}
+
+#[cfg(any(windows, test))]
+fn retry_windows_read(
+    mut read: impl FnMut() -> Result<SystemProxy, ProxyReadError>,
+    mut pause: impl FnMut(std::time::Duration),
+) -> Result<SystemProxy, ProxyReadError> {
+    const DELAYS_MS: [u64; 2] = [25, 75];
+    for attempt in 0..=DELAYS_MS.len() {
+        match read() {
+            Ok(proxy) => return Ok(proxy),
+            Err(mut error) => {
+                if !error.is_retryable() || attempt == DELAYS_MS.len() {
+                    // Local recovery is complete. Do not spend five model retries
+                    // rereading the same broken registry configuration.
+                    error.retryable = false;
+                    return Err(error);
+                }
+                pause(std::time::Duration::from_millis(DELAYS_MS[attempt]));
+            }
+        }
+    }
+    unreachable!("the final attempt always returns")
 }
 
 #[cfg(target_os = "macos")]
@@ -267,18 +424,163 @@ mod tests {
     fn registry_read_errors_are_not_treated_as_disabled_proxy_settings() {
         use std::io::ErrorKind;
         assert_eq!(
-            optional_registry_value::<u32>(Err(ErrorKind::NotFound.into())),
-            Some(0)
+            optional_registry_value::<u32>(
+                Err(ErrorKind::NotFound.into()),
+                ProxySetting::ProxyEnable
+            ),
+            Ok(0)
         );
+        let error = optional_registry_value::<u32>(
+            Err(ErrorKind::PermissionDenied.into()),
+            ProxySetting::ProxyEnable,
+        )
+        .unwrap_err();
+        assert!(!error.is_retryable());
+        assert!(error.to_string().contains("ProxyEnable: access denied"));
+        assert!(optional_registry_value::<String>(
+            Err(ErrorKind::Other.into()),
+            ProxySetting::ProxyOverride
+        )
+        .is_err());
         assert_eq!(
-            optional_registry_value::<u32>(Err(ErrorKind::PermissionDenied.into())),
-            None
+            optional_registry_value(Ok(1u32), ProxySetting::ProxyEnable),
+            Ok(1)
         );
-        assert_eq!(
-            optional_registry_value::<String>(Err(ErrorKind::Other.into())),
-            None
+    }
+
+    #[test]
+    fn proxy_read_diagnostics_never_include_os_error_text_or_proxy_credentials() {
+        let secret = "http://user:password@private.example:7890";
+        let error = ProxyReadError::from_io(
+            ProxySetting::ProxyServer,
+            std::io::Error::new(std::io::ErrorKind::InvalidData, secret),
         );
-        assert_eq!(optional_registry_value(Ok(1u32)), Some(1));
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(rendered.contains("ProxyServer"));
+            assert!(!rendered.contains("password"));
+            assert!(!rendered.contains("private.example"));
+        }
+        let error = ProxyReadError::from_io(
+            ProxySetting::ProxyEnable,
+            std::io::Error::from_raw_os_error(222),
+        );
+        assert_eq!(error.failure, ProxyReadFailure::InvalidValue);
+        assert!(!error.is_retryable());
+        assert!(error.to_string().contains("OS error 222"));
+    }
+
+    fn enabled_proxy() -> SystemProxy {
+        SystemProxy {
+            http: Some("http://127.0.0.1:7890".into()),
+            https: Some("http://127.0.0.1:7890".into()),
+            no_proxy: None,
+        }
+    }
+
+    #[test]
+    fn windows_optional_values_and_disabled_proxy_remain_valid() {
+        use std::io::ErrorKind;
+        for enabled in [Ok(0), Err(ErrorKind::NotFound.into())] {
+            let mut enabled = Some(enabled);
+            let result = read_windows_values(
+                || enabled.take().unwrap(),
+                |_| panic!("disabled proxy must not read endpoints"),
+            );
+            assert_eq!(result.unwrap(), SystemProxy::default());
+        }
+        let proxy = read_windows_values(
+            || Ok(1),
+            |name| match name {
+                "ProxyServer" => Ok("127.0.0.1:7890".into()),
+                "ProxyOverride" => Err(ErrorKind::NotFound.into()),
+                _ => unreachable!(),
+            },
+        )
+        .unwrap();
+        assert_eq!(proxy, enabled_proxy());
+        let invalid =
+            read_windows_values(|| Ok(1), |_| Ok("ftp=private.example:21".into())).unwrap_err();
+        assert!(!invalid.is_retryable());
+        assert_eq!(invalid.setting, ProxySetting::ProxyServer);
+    }
+
+    #[test]
+    fn windows_snapshot_transitions_are_reread_without_falling_back_to_direct() {
+        let mut attempts = 0;
+        let mut pauses = Vec::new();
+        let recovered = retry_windows_read(
+            || {
+                attempts += 1;
+                read_windows_values(
+                    || Ok(1),
+                    |name| match name {
+                        "ProxyServer" => {
+                            Ok(if attempts == 1 { "" } else { "127.0.0.1:7890" }.into())
+                        }
+                        "ProxyOverride" => Ok(String::new()),
+                        _ => unreachable!(),
+                    },
+                )
+            },
+            |pause| pauses.push(pause),
+        )
+        .unwrap();
+        assert_eq!(recovered, enabled_proxy());
+        assert_eq!(attempts, 2);
+        assert_eq!(pauses, [std::time::Duration::from_millis(25)]);
+
+        let mut flags = [1, 0].into_iter();
+        let error = read_windows_values(
+            || Ok(flags.next().unwrap()),
+            |name| {
+                Ok(if name == "ProxyServer" {
+                    "127.0.0.1:7890"
+                } else {
+                    ""
+                }
+                .into())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.setting, ProxySetting::ProxyEnable);
+        assert!(error.is_retryable(), "changed snapshots must be read again");
+    }
+
+    #[test]
+    fn windows_read_recovery_is_bounded_and_permanent_errors_do_not_wait() {
+        let mut attempts = 0;
+        let mut waited = std::time::Duration::ZERO;
+        let error = retry_windows_read(
+            || {
+                attempts += 1;
+                Err(ProxyReadError::incomplete(ProxySetting::ProxyServer))
+            },
+            |delay| waited += delay,
+        )
+        .unwrap_err();
+        assert_eq!(attempts, 3);
+        assert_eq!(waited, std::time::Duration::from_millis(100));
+        assert!(
+            !error.is_retryable(),
+            "do not spend model retry budget after local recovery"
+        );
+        let mut attempts = 0;
+        let error = retry_windows_read(
+            || {
+                attempts += 1;
+                Err(ProxyReadError::from_io(
+                    ProxySetting::ProxyOverride,
+                    std::io::Error::from_raw_os_error(5),
+                ))
+            },
+            |_| panic!("access denied must not wait"),
+        )
+        .unwrap_err();
+        assert_eq!(attempts, 1);
+        assert!(!error.is_retryable());
+        assert!(error
+            .to_string()
+            .contains("ProxyOverride: access denied (OS error 5)"));
     }
 
     #[cfg(unix)]
