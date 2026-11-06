@@ -176,8 +176,13 @@ async fn run_turn(state: &AppState, task: &ScheduleTask) -> anyhow::Result<Outco
     }
 
     let mut denied = 0usize;
-    let mut status = "ok";
-    let mut diagnostic: Option<String> = None;
+    // A run only becomes `ok` when a terminal event says so. Starting from the
+    // failure value matters: if the event stream closes early (the runtime task died,
+    // the channel was dropped) the loop below simply ends, and a schedule run that
+    // never reported an outcome must not be recorded as a success.
+    let mut status = "error";
+    let mut diagnostic: Option<String> =
+        Some("the turn ended without a terminal event".to_string());
 
     while let Some(envelope) = events.recv().await {
         match envelope.event {
@@ -196,15 +201,30 @@ async fn run_turn(state: &AppState, task: &ScheduleTask) -> anyhow::Result<Outco
                 let _ = handle.respond(request.id, value).await;
             }
             CodingRuntimeEvent::TurnFinished(completion) => {
-                match completion {
-                    TurnCompletion::Completed { .. } => {}
-                    TurnCompletion::SnapshotUnavailable { error, .. } => {
-                        // The turn ran but its history could not be committed; the
-                        // result is not trustworthy, so it is not `ok`.
-                        status = "error";
-                        diagnostic = Some(format!("snapshot unavailable: {}", error.message));
+                // `Completed` only means the runtime produced a final snapshot — the
+                // reason is what says whether the work actually finished. A provider
+                // error, a tripped guard or a timeout all arrive here too, so
+                // classifying on the variant alone recorded failures as successes.
+                // The classification is the one the notification already uses, so a
+                // scheduled run and the turn it reports cannot disagree.
+                let (reason, snapshot_error) = match completion {
+                    TurnCompletion::Completed { reason, .. } => (reason, None),
+                    TurnCompletion::SnapshotUnavailable { reason, error, .. } => {
+                        (reason, Some(error.message))
                     }
-                }
+                };
+                status = match crate::turn_outcome::TurnOutcome::of(reason) {
+                    crate::turn_outcome::TurnOutcome::Ok => "ok",
+                    crate::turn_outcome::TurnOutcome::Cancelled => "cancelled",
+                    crate::turn_outcome::TurnOutcome::Failed => "error",
+                };
+                diagnostic = snapshot_error
+                    .map(|message| format!("snapshot unavailable: {message}"))
+                    .or_else(|| {
+                        // A failed turn earns a diagnostic even when the snapshot was
+                        // fine: "error" with no reason is not a useful ledger entry.
+                        (status != "ok").then(|| format!("turn ended: {}", stop_reason_name(reason)))
+                    });
                 break;
             }
             _ => {}
@@ -253,4 +273,16 @@ fn unix_seconds() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// The wire name of a stop reason (`provider_error`, `stopped`, …).
+///
+/// `StopReason` serializes by variant name, which is also what the session log and
+/// `/health.last_turns` use — so a run ledger entry, the log and the notification
+/// all name the same cause the same way.
+fn stop_reason_name(reason: atomcode_kernel::event::StopReason) -> String {
+    serde_json::to_value(reason)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
 }
