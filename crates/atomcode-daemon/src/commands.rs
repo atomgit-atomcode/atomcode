@@ -143,7 +143,7 @@ fn load_native_command_session(
     let bucket = command_project_bucket(working_dir, project_hash)?;
     let manager = NativeSessionManager::with_root(
         NativeSessionManager::sessions_root(&atomcode_coding::config::product_dirs_from_env())
-        .join(bucket),
+            .join(bucket),
     );
     let has_existing = [
         manager.meta_path(id)?,

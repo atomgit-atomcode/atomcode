@@ -223,7 +223,8 @@ async fn run_turn(state: &AppState, task: &ScheduleTask) -> anyhow::Result<Outco
                     .or_else(|| {
                         // A failed turn earns a diagnostic even when the snapshot was
                         // fine: "error" with no reason is not a useful ledger entry.
-                        (status != "ok").then(|| format!("turn ended: {}", stop_reason_name(reason)))
+                        (status != "ok")
+                            .then(|| format!("turn ended: {}", stop_reason_name(reason)))
                     });
                 break;
             }

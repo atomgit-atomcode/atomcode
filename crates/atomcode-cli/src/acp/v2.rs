@@ -775,7 +775,8 @@ pub(crate) fn build_v2_agent(state: SharedState) -> impl ConnectTo<Client> + 'st
                 async move |req: DeleteSessionRequest, responder, _cx| {
                     let v1_sid =
                         agent_client_protocol::schema::v1::SessionId::new(req.session_id.0.clone());
-                    let scan = SessionManager::scan_all(&atomcode_coding::config::product_dirs_from_env());
+                    let scan =
+                        SessionManager::scan_all(&atomcode_coding::config::product_dirs_from_env());
                     handle_delete_session(&sessions, &v1_sid, &scan).await?;
                     responder.respond(DeleteSessionResponse::new())
                 }
@@ -786,7 +787,8 @@ pub(crate) fn build_v2_agent(state: SharedState) -> impl ConnectTo<Client> + 'st
             {
                 let sessions = Arc::clone(&sessions);
                 async move |req: ListSessionsRequest, responder, _cx| {
-                    let scan = SessionManager::scan_all(&atomcode_coding::config::product_dirs_from_env());
+                    let scan =
+                        SessionManager::scan_all(&atomcode_coding::config::product_dirs_from_env());
                     let listed = handle_list_sessions(&sessions, &v1_list_req(&req), &scan).await?;
                     let infos = listed
                         .sessions
@@ -820,7 +822,9 @@ pub(crate) fn build_v2_agent(state: SharedState) -> impl ConnectTo<Client> + 'st
                     let cwd = std::path::PathBuf::from(AsRef::<std::path::Path>::as_ref(&req.cwd));
                     let (mcp_configs, ignored) = v2_mcp_server_configs(&req.mcp_servers);
                     crate::acp::mcp::log_ignored_mcp_server_names(&ignored);
-                    let scan = atomcode_capabilities::session::SessionManager::scan_all(&atomcode_coding::config::product_dirs_from_env());
+                    let scan = atomcode_capabilities::session::SessionManager::scan_all(
+                        &atomcode_coding::config::product_dirs_from_env(),
+                    );
                     // Validate the replay cursor BEFORE any restore side effect:
                     // an unknown/unsupported cursor is rejected outright (per the
                     // schema: "reject rather than guessing where to replay from"),

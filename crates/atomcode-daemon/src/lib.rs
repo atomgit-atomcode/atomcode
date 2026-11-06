@@ -1516,7 +1516,8 @@ fn response_project_hash(path: &std::path::Path) -> String {
 
 /// List all projects (scans sessions directory)
 fn list_projects() -> std::io::Result<Vec<ProjectInfo>> {
-    let root = NativeSessionManager::sessions_root(&atomcode_coding::config::product_dirs_from_env());
+    let root =
+        NativeSessionManager::sessions_root(&atomcode_coding::config::product_dirs_from_env());
     let scan = catalog_scan_in_root(&root)?;
     let active = active_catalog_location(&scan.entries);
     Ok(projects_from_catalog(&root, scan.entries, active.as_ref()))
@@ -1804,7 +1805,9 @@ where
 
 /// List sessions for a project
 fn list_sessions(project_hash: &str) -> std::io::Result<Vec<SessionSummary>> {
-    let scan = catalog_scan_in_root(&NativeSessionManager::sessions_root(&atomcode_coding::config::product_dirs_from_env()))?;
+    let scan = catalog_scan_in_root(&NativeSessionManager::sessions_root(
+        &atomcode_coding::config::product_dirs_from_env(),
+    ))?;
     let active = active_catalog_location(&scan.entries);
     list_sessions_in_root(
         &NativeSessionManager::sessions_root(&atomcode_coding::config::product_dirs_from_env()),
@@ -1833,7 +1836,9 @@ fn list_sessions_in_root(
 
 /// List all sessions across all projects
 fn list_all_sessions() -> std::io::Result<Vec<SessionMetaWithProject>> {
-    let scan = catalog_scan_in_root(&NativeSessionManager::sessions_root(&atomcode_coding::config::product_dirs_from_env()))?;
+    let scan = catalog_scan_in_root(&NativeSessionManager::sessions_root(
+        &atomcode_coding::config::product_dirs_from_env(),
+    ))?;
     let active = active_catalog_location(&scan.entries);
     list_all_sessions_in_root(
         &NativeSessionManager::sessions_root(&atomcode_coding::config::product_dirs_from_env()),
@@ -2473,7 +2478,7 @@ async fn get_session_transcript(
     let loaded = tokio::task::spawn_blocking(move || {
         let manager = NativeSessionManager::with_root(
             NativeSessionManager::sessions_root(&atomcode_coding::config::product_dirs_from_env())
-            .join(&task_hash),
+                .join(&task_hash),
         );
         let mut turns = transcript_view::load(&manager, &task_id, &selected, query.detail)?;
         if query.summary {
@@ -2598,7 +2603,7 @@ pub(crate) type TurnTimestamps = std::collections::BTreeMap<u64, TurnTimestamp>;
 fn load_turn_timestamps_blocking(project_hash: &str, session_id: &str) -> TurnTimestamps {
     let manager = NativeSessionManager::with_root(
         NativeSessionManager::sessions_root(&atomcode_coding::config::product_dirs_from_env())
-        .join(project_hash),
+            .join(project_hash),
     );
     match manager.load_transcript_timestamps(session_id) {
         Ok(timestamps) => timestamps
@@ -3035,7 +3040,8 @@ struct SessionReferenceQuery {
 async fn session_reference_candidates(
     Query(query): Query<SessionReferenceQuery>,
 ) -> impl IntoResponse {
-    let root = NativeSessionManager::sessions_root(&atomcode_coding::config::product_dirs_from_env());
+    let root =
+        NativeSessionManager::sessions_root(&atomcode_coding::config::product_dirs_from_env());
     let result = tokio::task::spawn_blocking(move || {
         let keyword = query.q.to_lowercase();
         let mut entries: Vec<_> = catalog_scan_in_root(&root)?
@@ -3193,7 +3199,7 @@ fn repair_session_file(
 ) -> Result<RepairSessionResponse, RepairSessionFailure> {
     let manager = NativeSessionManager::with_root(
         NativeSessionManager::sessions_root(&atomcode_coding::config::product_dirs_from_env())
-        .join(project_hash),
+            .join(project_hash),
     );
     repair_session_with_manager(&manager, session_id, apply).map_err(|error| RepairSessionFailure {
         transcript: transcript_state(&manager, session_id),
@@ -3417,7 +3423,9 @@ async fn delete_session(
             .filter(|binding| binding.session_id == id)
         {
             Some(binding) => {
-                let sessions_root = NativeSessionManager::sessions_root(&atomcode_coding::config::product_dirs_from_env());
+                let sessions_root = NativeSessionManager::sessions_root(
+                    &atomcode_coding::config::product_dirs_from_env(),
+                );
                 match run_session_catalog_io(move || catalog_scan_in_root(&sessions_root)).await {
                     Ok(scan)
                         if binding_targets_catalog_location(
@@ -8852,7 +8860,8 @@ mod tests {
         let home = ScopedChatHome::new();
         let working_dir = home._dir.path().join("project");
         std::fs::create_dir_all(&working_dir).unwrap();
-        let sessions_root = NativeSessionManager::sessions_root(&atomcode_coding::config::product_dirs_from_env());
+        let sessions_root =
+            NativeSessionManager::sessions_root(&atomcode_coding::config::product_dirs_from_env());
         std::fs::write(&sessions_root, b"block session directory creation").unwrap();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
 

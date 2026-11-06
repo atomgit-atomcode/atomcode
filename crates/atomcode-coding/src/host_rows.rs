@@ -3043,7 +3043,9 @@ impl Plugin for WorklogPlugin {
             Arc::new(WorklogCommand {
                 language: self.language,
                 product: self.identity.name().to_string(),
-                sessions_root: SessionManager::sessions_root(&*atomcode_harness::product_dirs(ctx)?),
+                sessions_root: SessionManager::sessions_root(&*atomcode_harness::product_dirs(
+                    ctx,
+                )?),
             }),
         )
     }

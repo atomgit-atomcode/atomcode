@@ -2184,12 +2184,12 @@ mod tests {
     // An upgrade must stay undoable: the whole point of keeping one generation
     // is that a version which installs fine can still turn out to be wrong.
     /// An upgrade that fails while linking must not behave like an uninstall.
-///
-/// The old tree has already been moved to `.previous-*` at that point, so dropping
-/// the new one leaves nothing at the install path — and `rollback` needs a
-/// destination. Reproduced by a reviewer: after a failed upgrade the previous
-/// version was unusable too.
-#[test]
+    ///
+    /// The old tree has already been moved to `.previous-*` at that point, so dropping
+    /// the new one leaves nothing at the install path — and `rollback` needs a
+    /// destination. Reproduced by a reviewer: after a failed upgrade the previous
+    /// version was unusable too.
+    #[test]
     fn a_failed_upgrade_keeps_the_installed_version_usable() {
         with_temp_root(|| {
             install_bytes(&bundle_v1()).unwrap();

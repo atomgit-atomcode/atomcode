@@ -1567,8 +1567,7 @@ impl RuntimeControl {
         use atomcode_capabilities::session::SessionManager;
         // Which project's store it is in: sessions are kept per working
         // directory, and the one being deleted is usually not this session's.
-        let scan =
-            SessionManager::scan_all(&atomcode_coding::config::product_dirs_from_env());
+        let scan = SessionManager::scan_all(&atomcode_coding::config::product_dirs_from_env());
         let entry = scan
             .entries
             .into_iter()
@@ -1592,8 +1591,7 @@ impl RuntimeControl {
 
     fn list(&self, working_dir: Option<String>) -> Vec<StoredSession> {
         use atomcode_capabilities::session::SessionManager;
-        let scan =
-            SessionManager::scan_all(&atomcode_coding::config::product_dirs_from_env());
+        let scan = SessionManager::scan_all(&atomcode_coding::config::product_dirs_from_env());
         // 不按 fork 谱系折叠(`collapse_fork_lineages`,daemon 的目录调了它)。那条
         // 规矩只留谱系里最新的一条,而被藏起来的那条分叉**可能带着独有内容**:两个
         // runtime 同时接着一段对话跑(自动分叉的成因就是这个)时,两条都往前走了,
@@ -2027,7 +2025,8 @@ impl HostControl for RuntimeControl {
                 // cross-bucket pin decision below — a resume walks every project's
                 // sessions once, not twice. `message_count > 0` matches what the
                 // picker offers (a 0-message phantom is not resumable).
-                let scan = SessionManager::scan_all(&atomcode_coding::config::product_dirs_from_env());
+                let scan =
+                    SessionManager::scan_all(&atomcode_coding::config::product_dirs_from_env());
                 let Some(entry) = scan
                     .entries
                     .iter()

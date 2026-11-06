@@ -4650,7 +4650,8 @@ impl StaleClaim {
             .open(&path)
         {
             Ok(mut file) => {
-                let _ = std::io::Write::write_all(&mut file, std::process::id().to_string().as_bytes());
+                let _ =
+                    std::io::Write::write_all(&mut file, std::process::id().to_string().as_bytes());
                 Some(Self(path))
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -5232,8 +5233,9 @@ mod tests {
             PathBuf::from("/data/user/0/com.atomcode.app/files/atomcode/sessions")
         );
 
-        let android = ProductDirs::new(user, ".atomcode")
-            .with_sessions_root(Some(PathBuf::from("/storage/emulated/0/AtomCode/.sessions")));
+        let android = ProductDirs::new(user, ".atomcode").with_sessions_root(Some(PathBuf::from(
+            "/storage/emulated/0/AtomCode/.sessions",
+        )));
         assert_eq!(
             SessionManager::sessions_root(&android),
             PathBuf::from("/storage/emulated/0/AtomCode/.sessions")
