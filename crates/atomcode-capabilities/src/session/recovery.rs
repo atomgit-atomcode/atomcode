@@ -173,7 +173,13 @@ impl SessionManager {
         let inherited = self.read_event_header(lease.id())?.inherited;
         // An unfinished turn inherited from a fork belongs to its parent, not
         // this agent. Only this session's own work can be recovered here.
-        let facts = recovery_facts(&events[inherited.min(events.len())..]);
+        let own_events = &events[inherited.min(events.len())..];
+        // A prompt accepted before any model processing is safe to replay. Do
+        // not close it here: resume prepares its retryable retraction instead.
+        if super::events::unanswered_prompt(own_events).is_some() {
+            return Ok(None);
+        }
+        let facts = recovery_facts(own_events);
         if facts.is_empty() {
             return Ok(None);
         }

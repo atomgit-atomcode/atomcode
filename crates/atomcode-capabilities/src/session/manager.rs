@@ -1856,9 +1856,11 @@ impl SessionManager {
     ) -> SessionResult<(LoadedSession, Option<Message>)> {
         let id = lease.id();
         let (mut loaded, events) = self.load_event_session_with_events(id)?;
+        let inherited = self.read_event_header(id)?.inherited;
+        let own_events = &events[inherited.min(events.len())..];
 
         match self.read_resume_replay(id) {
-            Ok(Some(replay)) => match pending_replay_prompt(&events, &replay) {
+            Ok(Some(replay)) => match pending_replay_prompt(own_events, &replay) {
                 PendingReplay::StillWaiting(prompt) => return Ok((loaded, Some(*prompt))),
                 PendingReplay::Started | PendingReplay::Stale => {
                     let _ = self.clear_resume_replay(id);
@@ -1895,7 +1897,7 @@ impl SessionManager {
         // own `Rewound`, and `unanswered_prompt` hands back only a turn no
         // rewind follows, so this finds a later prompt still waiting — never
         // the withdrawn one.
-        let Some((to, turn, prompt)) = super::events::unanswered_prompt(&events) else {
+        let Some((to, turn, prompt)) = super::events::unanswered_prompt(own_events) else {
             return Ok((loaded, None));
         };
         // Loading does not retract: the prompt stays visible until the runtime is
@@ -1961,6 +1963,8 @@ impl SessionManager {
             return Ok(PrepareResumeReplay::Prepared);
         }
         let events = self.load_events(id)?;
+        let inherited = self.read_event_header(id)?.inherited;
+        let own_events = &events[inherited.min(events.len())..];
         let replay = match self.read_resume_replay(id) {
             Ok(Some(replay)) => Some(replay),
             Ok(None) => None,
@@ -1977,7 +1981,7 @@ impl SessionManager {
             }
         };
         let target = if let Some(replay) = replay {
-            match pending_replay_prompt(&events, &replay) {
+            match pending_replay_prompt(own_events, &replay) {
                 PendingReplay::StillWaiting(logged) if same_accepted_prompt(pending, &logged) => {
                     return Ok(PrepareResumeReplay::Prepared);
                 }
@@ -2003,12 +2007,12 @@ impl SessionManager {
                     // The marker names a `TurnStart` at `to`. A truncated and
                     // rewritten log can reuse that sequence for another turn;
                     // retracting it there would take back the new turn instead.
-                    if super::events::turn_started_at(&events, replay.to) != Some(replay.turn) {
+                    if super::events::turn_started_at(own_events, replay.to) != Some(replay.turn) {
                         let _ = self.clear_resume_replay(id);
                         return Ok(PrepareResumeReplay::Obsolete);
                     }
                     let Some(visible) =
-                        super::events::unanswered_at(&events, replay.to, replay.turn)
+                        super::events::unanswered_at(own_events, replay.to, replay.turn)
                     else {
                         let _ = self.clear_resume_replay(id);
                         return Ok(PrepareResumeReplay::Obsolete);
@@ -2026,7 +2030,7 @@ impl SessionManager {
             // this prompt. With no such turn the replay was answered or the
             // conversation moved on; sending it would show the prompt again
             // without retracting anything.
-            let Some((to, turn, visible)) = super::events::unanswered_prompt(&events) else {
+            let Some((to, turn, visible)) = super::events::unanswered_prompt(own_events) else {
                 return Ok(PrepareResumeReplay::Obsolete);
             };
             if !same_accepted_prompt(pending, &visible) {

@@ -3194,6 +3194,143 @@ mod tests {
     }
 
     #[test]
+    fn a_fork_does_not_replay_its_parents_unstarted_turn() {
+        let (_dir, manager) = store();
+        let id = "resume-unanswered";
+        let lease = created(&manager, id);
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "hello".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+
+        let (_forked, fork_lease) = manager.fork_native_session(id, "fork", 100).unwrap();
+        manager.recover_interrupted_turn(&fork_lease).unwrap();
+        let (_, pending) = manager.open_for_resume(&fork_lease).unwrap();
+        assert!(
+            pending.is_none(),
+            "the inherited unfinished turn belongs to the parent, not the fork"
+        );
+        assert_eq!(
+            manager
+                .prepare_resume_replay(&fork_lease, &Message::user("hello"))
+                .unwrap(),
+            crate::session::manager::PrepareResumeReplay::Obsolete
+        );
+        manager
+            .append_events(
+                &fork_lease,
+                &[
+                    logged(3, 0, SessionEvent::TurnStart { turn: 2 }),
+                    logged(
+                        4,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 2,
+                            text: "the fork's own prompt".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        manager.recover_interrupted_turn(&fork_lease).unwrap();
+        let (_, pending) = manager.open_for_resume(&fork_lease).unwrap();
+        assert_eq!(pending.unwrap().text, "the fork's own prompt");
+    }
+
+    #[test]
+    fn a_cold_resume_replays_an_unanswered_prompt() {
+        let (_dir, manager) = store();
+        let id = "resume-unanswered";
+        let lease = created(&manager, id);
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "hello".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+
+        manager.recover_interrupted_turn(&lease).unwrap();
+        let (loaded, pending) = manager.open_for_resume(&lease).unwrap();
+        assert_eq!(
+            pending.map(|message| message.text),
+            Some("hello".to_string())
+        );
+        assert!(
+            !loaded
+                .snapshot
+                .messages
+                .iter()
+                .any(|message| message.text == "hello"),
+            "the pending view excludes the prompt it will replay"
+        );
+        assert!(!manager
+            .load_events(id)
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event.event, SessionEvent::Rewound { .. })));
+
+        manager
+            .prepare_resume_replay(&lease, &Message::user("hello"))
+            .unwrap();
+
+        let (loaded, pending) = manager.load_native_session_for_resume(&lease).unwrap();
+        assert_eq!(
+            pending.map(|message| message.text),
+            Some("hello".to_string())
+        );
+        assert!(
+            !loaded
+                .snapshot
+                .messages
+                .iter()
+                .any(|message| message.text == "hello"),
+            "the unanswered turn is retracted once the replay is prepared"
+        );
+        let events = manager.load_events(id).unwrap();
+        let (turn, to, scope) = events
+            .iter()
+            .find_map(|logged| match &logged.event {
+                SessionEvent::Rewound { turn, to, scope } => Some((*turn, *to, *scope)),
+                _ => None,
+            })
+            .expect("the prepared replay records a retraction");
+        assert_eq!(turn, 1, "the retraction names the unanswered turn");
+        assert_eq!(to, 1, "the retraction rewinds to that turn's TurnStart");
+        assert!(matches!(scope, RewindScope::Conversation));
+        assert!(
+            !atomcode_kernel::session::derive_messages(&events)
+                .iter()
+                .any(|message| message.text == "hello"),
+            "the retraction removes the prompt from the projection"
+        );
+    }
+
+    #[test]
     fn resume_rewinds_an_unanswered_prompt_for_replay() {
         let (_dir, manager) = store();
         let id = "resume-unanswered";

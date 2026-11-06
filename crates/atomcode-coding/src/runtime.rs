@@ -21963,6 +21963,72 @@ type = "openai"
         manager.acquire_lease("session-b").unwrap();
     }
 
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[serial_test::serial(atomcode_home)]
+    async fn cold_event_resume_replays_its_accepted_prompt_once() {
+        use atomcode_kernel::session::{LoggedEvent, SessionEvent, SessionHeader};
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let manager = atomcode_capabilities::session::SessionManager::for_project(
+            project.path(),
+            &crate::config::product_dirs_from_env(),
+        );
+        let id = "cold-event-replay";
+        let lease = manager.acquire_lease(id).unwrap();
+        let mut meta = SessionMeta::new(id, project.path().to_string_lossy(), 1);
+        meta.owner = StorageOwner::Native;
+        manager
+            .create_event_session(&lease, &SessionHeader::new(id), &meta)
+            .unwrap();
+        manager
+            .append_events(
+                &lease,
+                &[
+                    LoggedEvent {
+                        seq: 1,
+                        at: 0,
+                        event: SessionEvent::TurnStart { turn: 1 },
+                    },
+                    LoggedEvent {
+                        seq: 2,
+                        at: 0,
+                        event: SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "accepted before crash".into(),
+                            images: vec![],
+                        },
+                    },
+                ],
+            )
+            .unwrap();
+        drop(lease);
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.prepare.session = crate::SessionMode::Resume(id.into());
+        let mut runtime = CodingRuntime::start(start).await.unwrap();
+        wait_for_turn_finished(&mut runtime).await;
+        runtime.handle.shutdown().await.unwrap();
+        runtime.task.await.unwrap();
+        let loaded = manager.load_native_session(id).unwrap();
+        assert_eq!(
+            loaded
+                .snapshot
+                .messages
+                .iter()
+                .filter(|message| message.text == "accepted before crash")
+                .count(),
+            1
+        );
+        let events = manager.load_events(id).unwrap();
+        assert!(events
+            .iter()
+            .any(|logged| matches!(logged.event, SessionEvent::Rewound { .. })));
+        let lease = manager.acquire_lease(id).unwrap();
+        manager.recover_interrupted_turn(&lease).unwrap();
+        assert!(manager.open_for_resume(&lease).unwrap().1.is_none());
+    }
+
     #[tokio::test]
     #[serial_test::serial(atomcode_home)]
     async fn session_switch_replays_an_unanswered_prompt() {
