@@ -29,9 +29,9 @@ use atomcode_kernel::session::{
 };
 
 use super::manager::{
-    io_at, open_append_file, read_regular_file_bounded, retry_transient_file_access, SessionLease,
-    SessionManager, SessionMeta, SessionResult, SessionStoreError, StorageOwner, MAX_JSONL_BYTES,
-    MAX_JSONL_LINE_BYTES,
+    io_at, open_append_file, open_read_file, read_regular_file_bounded,
+    retry_transient_file_access, SessionLease, SessionManager, SessionMeta, SessionResult,
+    SessionStoreError, StorageOwner, MAX_JSONL_BYTES, MAX_JSONL_LINE_BYTES,
 };
 use super::transcript::TurnRecord;
 
@@ -255,13 +255,16 @@ impl SessionManager {
         if follow_sidecar
             && events.iter().any(|logged| match &logged.event {
                 SessionEvent::Rewound { scope, .. } => scope.takes_back_conversation(),
-                SessionEvent::Interrupted { undone, .. } => *undone,
+                // A standing cancel retires the active plan too: the fold starts
+                // after the newest interruption, so every interruption moves it.
+                SessionEvent::Interrupted { .. } => true,
                 _ => false,
             })
         {
-            // A rewind or a cancelled-and-undone turn takes its todo calls out
-            // of the projection; the list the model reads is the log's standing
-            // turns, rebuilt so the sidecar cannot keep offering undone work.
+            // A rewind, a cancel or a cancelled-and-undone turn takes its todo
+            // calls out of the projection; the list the model reads is the log's
+            // standing turns, rebuilt so the sidecar cannot keep offering work
+            // the fold no longer contains.
             if let Err(error) = self.rebuild_todo_sidecar_after_undo(id) {
                 // The append itself stands: a stale sidecar is a cache problem,
                 // not a reason to report the committed fact as failed.
@@ -479,15 +482,18 @@ impl SessionManager {
 
         // A person's cancel retires the plan without deleting its calls. Match
         // the transcript fold's boundary (`active_todo_calls`): only calls after
-        // the most recent standing interruption shape the list.
+        // the most recent standing interruption shape the list. The split is by
+        // event order, the order the message projection keeps — a sequence
+        // number is an identity, not a position.
         let boundary = events
             .iter()
-            .filter(|logged| !undone.contains(&logged.event.turn()))
-            .filter_map(|logged| match &logged.event {
+            .enumerate()
+            .filter(|(_, logged)| !undone.contains(&logged.event.turn()))
+            .filter_map(|(index, logged)| match &logged.event {
                 SessionEvent::Interrupted {
                     turn,
                     undone: false,
-                } => Some((logged.seq, *turn)),
+                } => Some((index, *turn)),
                 _ => None,
             })
             .next_back();
@@ -501,11 +507,11 @@ impl SessionManager {
         let mut failed: std::collections::HashSet<usize> = std::collections::HashSet::new();
         let mut latest: std::collections::HashMap<&str, Option<usize>> =
             std::collections::HashMap::new();
-        for logged in &events {
+        for (index, logged) in events.iter().enumerate() {
             if undone.contains(&logged.event.turn()) {
                 continue;
             }
-            if boundary.is_some_and(|(seq, _)| logged.seq <= seq) {
+            if boundary.is_some_and(|(at, _)| index <= at) {
                 continue;
             }
             match &logged.event {
@@ -1133,18 +1139,22 @@ impl SessionManager {
     }
 
     /// Whether the bytes a rollback would cut (everything after `mark`) carry an
-    /// undo fact. Only then can the todo sidecar differ from its pre-append state.
+    /// undo or cancel fact. Only then can the todo sidecar differ from its
+    /// pre-append state.
     #[cfg(feature = "tools")]
-    fn truncated_tail_has_undo(&self, id: &str, mark: u64) -> bool {
+    fn truncated_tail_moves_todo_boundary(&self, id: &str, mark: u64) -> bool {
         let Ok(path) = self.events_path(id) else {
             return true;
         };
-        let Ok(mut file) = fs::File::open(&path) else {
+        // The store's opener refuses symlinks and special files; a rollback probe
+        // holds the same rule as every other read of the log.
+        let Ok(mut file) = open_read_file(&path) else {
             return true;
         };
-        let Ok(len) = file.metadata().map(|meta| meta.len()) else {
+        let Ok(meta) = file.metadata() else {
             return true;
         };
+        let len = meta.len();
         if mark > len || file.seek(SeekFrom::Start(mark)).is_err() {
             return true;
         }
@@ -1156,10 +1166,12 @@ impl SessionManager {
         struct TailEvent {
             #[serde(default)]
             kind: Option<String>,
+            // The real enum, not its spelling: a new scope that takes back the
+            // conversation is then understood here without a second list to
+            // forget. A scope this build cannot read fails the record parse and
+            // is treated as "may have moved the boundary".
             #[serde(default)]
-            scope: Option<String>,
-            #[serde(default)]
-            undone: Option<bool>,
+            scope: Option<atomcode_kernel::session::RewindScope>,
         }
         #[derive(serde::Deserialize)]
         struct TailRecord {
@@ -1184,14 +1196,14 @@ impl SessionManager {
             };
             match event.kind.as_deref() {
                 Some("rewound") => {
-                    if matches!(
-                        event.scope.as_deref(),
-                        Some("Conversation" | "conversation" | "Both" | "both")
-                    ) {
+                    if event
+                        .scope
+                        .is_some_and(atomcode_kernel::session::RewindScope::takes_back_conversation)
+                    {
                         return true;
                     }
                 }
-                Some("interrupted") if event.undone.unwrap_or(false) => return true,
+                Some("interrupted") => return true,
                 _ => {}
             }
         }
@@ -1207,7 +1219,7 @@ impl SessionManager {
     pub fn truncate_events(&self, lease: &SessionLease, mark: u64) -> SessionResult<()> {
         self.validate_active_lease(lease)?;
         #[cfg(feature = "tools")]
-        let tail_has_undo = self.truncated_tail_has_undo(lease.id(), mark);
+        let tail_moves_boundary = self.truncated_tail_moves_todo_boundary(lease.id(), mark);
         let path = self.events_path(lease.id())?;
         let file = retry_transient_file_access(|| {
             fs::OpenOptions::new()
@@ -1233,7 +1245,7 @@ impl SessionManager {
             // Only a rollback that cuts an undo fact can have changed the list,
             // and only a session that keeps a sidecar has a cache to follow. The
             // log rollback already landed; a cache failure is reported, not fatal.
-            if tail_has_undo && self.read_todo_sidecar(lease.id()).ok().flatten().is_some() {
+            if tail_moves_boundary && self.read_todo_sidecar(lease.id()).ok().flatten().is_some() {
                 if let Err(error) = self.rebuild_todo_sidecar_after_undo(lease.id()) {
                     tracing::warn!(
                         %error,
@@ -5902,6 +5914,36 @@ mod tests {
 
     #[cfg(feature = "tools")]
     #[test]
+    fn a_standing_cancel_rebuilds_the_todo_sidecar() {
+        let (_dir, manager) = store();
+        let lease = todo_session(&manager, "cancel-rebuilds-todos");
+        // A person's cancel retires the active plan in the projection — the fold
+        // starts after the newest interruption — so the cache must follow it
+        // even though nothing was undone.
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    7,
+                    0,
+                    SessionEvent::Interrupted {
+                        turn: 2,
+                        undone: false,
+                    },
+                )],
+            )
+            .unwrap();
+
+        let sidecar = manager
+            .read_todo_sidecar("cancel-rebuilds-todos")
+            .unwrap()
+            .expect("the sidecar is rewritten, not left stale");
+        assert!(sidecar.todos.is_empty(), "{:?}", sidecar.todos);
+        assert_eq!(sidecar.through, None);
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
     fn an_undo_that_does_not_touch_the_plan_keeps_a_sidecar_only_list() {
         use crate::session::manager::{TodoCallPosition, TodoSidecarItem};
 
@@ -6774,7 +6816,7 @@ mod tests {
 
     #[cfg(feature = "tools")]
     #[test]
-    fn truncation_rebuilds_only_when_the_cut_tail_has_an_undo() {
+    fn truncation_rebuilds_only_when_the_cut_tail_moves_the_todo_boundary() {
         let (_dir, manager) = store();
         let id = "truncate-tail-plain";
         let lease = created(&manager, id);
@@ -6813,7 +6855,7 @@ mod tests {
                 ],
             )
             .unwrap();
-        assert!(!manager.truncated_tail_has_undo(id, mark));
+        assert!(!manager.truncated_tail_moves_todo_boundary(id, mark));
 
         let id = "truncate-tail-undo";
         let lease = created(&manager, id);
@@ -6849,7 +6891,28 @@ mod tests {
                 )],
             )
             .unwrap();
-        assert!(manager.truncated_tail_has_undo(id, mark));
+        assert!(manager.truncated_tail_moves_todo_boundary(id, mark));
+
+        // A standing cancel retires the plan too: cutting it back would restore
+        // the plan, so the probe must say the boundary moved.
+        let id = "truncate-tail-cancel";
+        let lease = created(&manager, id);
+        manager.append_events(&lease, &a_turn()).unwrap();
+        let mark = manager.events_mark(id).unwrap();
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    6,
+                    0,
+                    SessionEvent::Interrupted {
+                        turn: 1,
+                        undone: false,
+                    },
+                )],
+            )
+            .unwrap();
+        assert!(manager.truncated_tail_moves_todo_boundary(id, mark));
     }
 
     #[cfg(feature = "tools")]

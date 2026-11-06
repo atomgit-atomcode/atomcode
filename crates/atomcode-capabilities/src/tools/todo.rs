@@ -382,15 +382,14 @@ pub fn active_todo_calls(messages: &[Message]) -> Vec<ActiveTodoCall<'_>> {
         .iter()
         .rposition(Message::is_user_interruption)
         .map_or(messages, |index| &messages[index + 1..]);
-    // Each failed result excludes the call it answered — the nearest earlier
-    // message that made a call with that id — not every call sharing the id.
-    // A provider that reuses ids across turns must not let one turn's failure
-    // drop a later turn's call.
+    // Each result answers the nearest earlier call with its id that no earlier
+    // result has already settled — not every call sharing the id. A provider
+    // that reuses ids across turns must not let one turn's failure drop a later
+    // turn's call, and a duplicated result must not re-answer (and fail) a call
+    // a successful result already settled.
     let mut failed = std::collections::HashSet::new();
+    let mut settled = std::collections::HashSet::new();
     for (index, message) in active_messages.iter().enumerate() {
-        if !message.is_error {
-            continue;
-        }
         let Some(id) = message.tool_call_id.as_deref() else {
             continue;
         };
@@ -399,12 +398,19 @@ pub fn active_todo_calls(messages: &[Message]) -> Vec<ActiveTodoCall<'_>> {
                 earlier
                     .tool_calls
                     .iter()
-                    .position(|call| call.id == id)
-                    .map(|call_index| (message_index, call_index))
+                    .enumerate()
+                    .rev()
+                    .find_map(|(call_index, call)| {
+                        (call.id == id && !settled.contains(&(message_index, call_index)))
+                            .then_some((message_index, call_index))
+                    })
             },
         );
         if let Some(call) = answered {
-            failed.insert(call);
+            settled.insert(call);
+            if message.is_error {
+                failed.insert(call);
+            }
         }
     }
     let mut active = Vec::new();
@@ -1042,6 +1048,50 @@ mod tests {
         let calls = active_todo_calls(&messages);
         assert_eq!(calls.len(), 1);
         assert!(calls[0].call.arguments.contains("later"));
+    }
+
+    #[test]
+    fn a_duplicate_result_does_not_fail_an_already_settled_call() {
+        // One call, its successful result, then a duplicated error for the same
+        // id (a replay/repair artifact). The second result must not re-answer the
+        // call the first one settled and drop the plan.
+        let messages = vec![
+            write_call("dup", PLAN3),
+            Message::tool_result("dup", "3 tasks", false),
+            Message::tool_result("dup", "spurious failure", true),
+        ];
+        let calls = active_todo_calls(&messages);
+        assert_eq!(calls.len(), 1, "the settled plan stays active");
+        assert_eq!(calls[0].call.id, "dup");
+    }
+
+    #[test]
+    fn a_same_reply_duplicate_id_result_answers_the_nearest_call() {
+        // Two todo calls in one reply share a provider-minted id; the result is
+        // the nearest (last) call's, so the plan before it stays the active
+        // baseline instead of being dropped for the later add.
+        let reply = Message::assistant(
+            "",
+            vec![
+                ToolCall {
+                    id: "dup".into(),
+                    name: "todowrite".into(),
+                    arguments: PLAN3.into(),
+                },
+                ToolCall {
+                    id: "dup".into(),
+                    name: "todowrite".into(),
+                    arguments: r#"{"action":"add","content":"later"}"#.into(),
+                },
+            ],
+        );
+        let messages = vec![reply, Message::tool_result("dup", "rejected", true)];
+        let calls = active_todo_calls(&messages);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].call.arguments, PLAN3,
+            "the result answered the add, not the plan"
+        );
     }
 
     #[test]

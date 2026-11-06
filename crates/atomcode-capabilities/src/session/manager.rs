@@ -2929,7 +2929,27 @@ impl SessionManager {
             &forked.meta,
         )?;
         #[cfg(feature = "tools")]
-        self.carry_todo_sidecar(source_id, destination_id, u64::from(forked.meta.turn_count));
+        {
+            // `through.turn` is a turn id, and `meta.turn_count` counts finished
+            // turns: an undone or stat-less turn leaves a gap between the two. The
+            // snapshot's high-water mark, or the highest id its messages carry, is
+            // the id the fork reaches; a snapshot from before either field is
+            // bounded by its finished-turn count, as it always was.
+            let last_turn = forked
+                .snapshot
+                .turn_counter
+                .max(
+                    forked
+                        .snapshot
+                        .messages
+                        .iter()
+                        .filter_map(|message| message.meta.as_ref().map(|meta| meta.turn_id))
+                        .max()
+                        .unwrap_or(0),
+                )
+                .max(u64::from(forked.meta.turn_count));
+            self.carry_todo_sidecar(source_id, destination_id, last_turn);
+        }
         Ok((forked, destination_lease))
     }
 
@@ -5129,7 +5149,7 @@ fn reject_existing_non_regular(path: &Path) -> SessionResult<()> {
     }
 }
 
-fn open_read_file(path: &Path) -> SessionResult<File> {
+pub(super) fn open_read_file(path: &Path) -> SessionResult<File> {
     let mut options = OpenOptions::new();
     options.read(true);
     no_follow(&mut options);
@@ -6508,6 +6528,58 @@ mod tests {
             mgr.acquire_lease("destination"),
             Err(SessionStoreError::SessionInUse { .. })
         ));
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
+    fn a_fork_bounds_the_sidecar_by_the_highest_turn_id_not_the_turn_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let lease = mgr.acquire_lease("source").unwrap();
+        let mut snapshot = snap(&["first"]);
+        // Turn ids are minted even by a turn that leaves no statistic behind: the
+        // finished count is 1 while the id high-water mark is 5.
+        snapshot.turn_counter = 5;
+        let mut meta = SessionMeta::new("source", "/project", 10);
+        meta.owner = StorageOwner::Native;
+        meta.turn_count = 1;
+        meta.message_count = 1;
+        mgr.commit_native_import(
+            &lease,
+            Some(&snapshot),
+            Some(&PresentationFile::default()),
+            &meta,
+        )
+        .unwrap();
+        let through = TodoCallPosition {
+            turn: 3,
+            round: 1,
+            index: 0,
+        };
+        mgr.write_todo_sidecar(
+            "source",
+            &[TodoSidecarItem {
+                content: "a".into(),
+                status: "in_progress".into(),
+            }],
+            1,
+            Some(through),
+        )
+        .unwrap();
+
+        let _ = mgr
+            .fork_native_session("source", "destination", 20)
+            .unwrap();
+
+        let sidecar = mgr
+            .read_todo_sidecar("destination")
+            .unwrap()
+            .expect("the fork carries the plan");
+        assert_eq!(
+            sidecar.through,
+            Some(through),
+            "a through inside the fork's turn ids is kept, not clamped by the count"
+        );
     }
 
     #[test]
