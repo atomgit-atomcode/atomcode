@@ -419,7 +419,19 @@ mod tests {
         // Drain the probe before closing so the same listening port can be rebound.
         drop(listener.accept().unwrap());
         drop(listener);
-        assert!(without_dead_loopback(cfg.clone(), probe).https.is_none());
+        // A closed loopback port keeps completing connects on Windows for a while
+        // (measured here: waiting two seconds did not help), so a real probe would
+        // assert something about the OS rather than about this function. Injecting
+        // the refusal is what the sibling test does; every other platform reads the
+        // real closed port.
+        #[cfg(windows)]
+        let stopped = |_: std::net::SocketAddr| -> io::Result<()> {
+            Err(io::ErrorKind::ConnectionRefused.into())
+        };
+        #[cfg(not(windows))]
+        let stopped = probe;
+        assert!(without_dead_loopback(cfg.clone(), stopped).https.is_none());
+        // The port is free again: a live listener still wins over the fallback.
         let _restored = TcpListener::bind(addr).unwrap();
         assert!(without_dead_loopback(cfg.clone(), probe).https.is_some());
         assert_eq!(cfg.mode, ProxyMode::FollowSystem);
