@@ -142,7 +142,11 @@ impl SessionLog {
             })
     }
 
-    /// Prompt tokens of the last provider report, without copying the log.
+    /// Prompt tokens of the last request, without copying the log: what the
+    /// provider reported for it (`Usage`), or — for a session seeded from a
+    /// stored conversation, which carries no usage facts — what the stored
+    /// answer recorded on its message (`used_tokens`, skipped when zero). The
+    /// newest of those sources wins.
     ///
     /// The compaction trigger reads this before every request; cloning the whole
     /// event log for one number is the wrong trade on a long session.

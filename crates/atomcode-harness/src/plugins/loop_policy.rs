@@ -970,10 +970,11 @@ impl CompactionGate {
     /// has a settled span to summarize.
     ///
     /// Both slots are therefore spent only after the verdict flips inside the
-    /// turn: an always-true verdict keeps asking until `first_try` refuses the
-    /// spent slow slot, and an always-false verdict only spends the fast one. A
-    /// stable verdict never trips this gate and is still asked on every request;
-    /// the optimization pays off once the verdict flips and both slots are spent.
+    /// turn: an always-true verdict spends only the slow stage, so every later
+    /// request still asks and `first_try` refuses the spent slot; an
+    /// always-false verdict only spends the fast one. Neither stable verdict
+    /// trips this gate — both are still asked on every request — and the
+    /// optimization pays off once the verdict flips and both slots are spent.
     ///
     /// Read-only: the turn reset belongs to `first_try`, which every request
     /// that gets past this check still reaches. A request that cannot hit the
