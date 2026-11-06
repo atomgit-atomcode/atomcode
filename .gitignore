@@ -34,6 +34,7 @@ __pycache__/
 node_modules/
 **/node_modules/
 package-lock.json
+!/crates/atomcode-cli/assets/huaweicloud/package-lock.json
 !extensions/vscode/package-lock.json
 !tools/weixin-bridge/package-lock.json
 npm-debug.log*

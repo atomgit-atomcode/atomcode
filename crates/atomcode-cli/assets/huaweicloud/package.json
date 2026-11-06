@@ -1,0 +1,12 @@
+{
+  "name": "atomcode-huaweicloud",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "undici": "8.10.0"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}

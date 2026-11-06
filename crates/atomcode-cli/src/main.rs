@@ -14,6 +14,7 @@ use anyhow::Result;
 use clap::{ArgGroup, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 
+mod cloud_cmd;
 mod headless_json;
 mod lsp_cmd;
 mod review;
@@ -766,6 +767,9 @@ enum HeadlessOutputFormat {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Enable, disable or diagnose the bundled Huawei Cloud sandbox integration.
+    #[command(subcommand)]
+    Cloud(cloud_cmd::CloudCli),
     /// Sign in with AtomGit OAuth and claim CodingPlan models in one
     /// flow: OAuth (if needed) → claim → fetch models → register
     /// providers → fetch status. Reports each step and exits.
@@ -4077,6 +4081,7 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
             unreachable!("Setup is handled inline in run() before handle_command")
         }
         Commands::Lsp(_) => unreachable!("Lsp is handled inline in run before handle_command"),
+        Commands::Cloud(sub) => cloud_cmd::handle(sub),
         Commands::Plugin(sub) => handle_plugin_cli(sub),
         Commands::Mcp(McpCli::Add {
             name,

@@ -361,3 +361,7 @@ EOF
 `Tool schema projection result` 记录投影前的 `admitted_tools` / `admitted_schema_bytes`、实际保留的 `retained_tools` / `retained_schema_bytes` 和被隐藏的 `hidden_tools` / `hidden_schema_bytes`，用 `catalog` 区分 `builtin_search` 与 `mcp_search`。已挂载的 `auto` 投影无需延迟加载、或搜索入口被策略禁用时，保留全部、隐藏为零。显式关闭搜索时沿用原先不挂投影处理的行为，此时查看 provider 输入统计。这里统计中立 ToolDef JSON，不含 provider 封装与后续参数装饰，应与最终 wire 统计分开比较。
 
 这些是字节计量，不是分词器或计费 token 数。比较时应保持同一模型和工具配置，分别检查新会话首轮与搜索加载后的请求；真实 token 以 provider 返回的 usage 为准。
+
+## 内置华为云沙箱集成
+
+`atomcode cloud enable` 可启用预置的华为云沙箱预览适配器；`cloud status`、`cloud doctor` 和 `cloud disable` 管理本地状态。默认关闭，启用后复用本节的 MCP 搜索和审批机制。账号在本机配置，首版不向模型暴露凭据读写及通用云资源写入工具。安装要求、预览流程和范围见 [华为云 V1](huaweicloud.md)。

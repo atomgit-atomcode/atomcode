@@ -1,0 +1,39 @@
+This product contains third-party open source software.
+
+--------------------------------------------------------------------
+hwlink
+--------------------------------------------------------------------
+
+The following files in this project contain code derived from or
+originated from the hwlink project:
+
+  plugins/huaweicloud-core/src/ws-exec/hwlink-exec-client.js
+  plugins/huaweicloud-core/src/ws-exec/hwlink-fair-queue.js
+  plugins/huaweicloud-core/src/ws-exec/hwlink-multiplexer.js
+  plugins/huaweicloud-core/src/ws-exec/hwlink-packet.js
+  plugins/huaweicloud-core/src/ws-exec/hwlink-terminal-channel.js
+  plugins/huaweicloud-core/src/ws-exec/hwlink-tunnel-channel.mjs
+
+Source project:
+
+  hwlink
+  https://gitcode.com/huawei-developers/hwlink
+
+License:
+
+  ISC License
+
+Copyright (c) huawei-developers
+
+Permission to use, copy, modify, and/or distribute this software for
+any purpose with or without fee is hereby granted, provided that the
+above copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL
+WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE
+AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL
+DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR
+PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+PERFORMANCE OF THIS SOFTWARE.
