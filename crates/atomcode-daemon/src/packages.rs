@@ -799,16 +799,16 @@ pub fn install_bytes_with(
         }
     }
     if let Err(error) = install_alias_links(&manifest) {
-        let _ = std::fs::remove_dir_all(&destination);
+        restore_previous(&manifest.name, &destination, &previous, outgoing.as_ref());
         return Err(error);
     }
     if let Err(error) = install_python_links(&manifest, &destination) {
-        let _ = std::fs::remove_dir_all(&destination);
+        restore_previous(&manifest.name, &destination, &previous, outgoing.as_ref());
         return Err(error);
     }
     if let Err(error) = install_data_links(&manifest, &destination) {
         remove_python_links(&manifest);
-        let _ = std::fs::remove_dir_all(&destination);
+        restore_previous(&manifest.name, &destination, &previous, outgoing.as_ref());
         return Err(error);
     }
     // Remember what this package claims outside its own tree *before* the
@@ -818,6 +818,49 @@ pub fn install_bytes_with(
     // after install, without restarting the app.
     refresh_native_library_path();
     record_for(&destination, &manifest)
+}
+
+/// Put the previous version back after a failed upgrade.
+///
+/// An upgrade moves the old tree to `.previous-<name>` before unpacking the new
+/// one. If linking the new version then fails, dropping it and returning is
+/// **a silent uninstall**: the old tree is left in `.previous-*`, nothing is at the
+/// install path, and `rollback` has no destination to work on — so the person
+/// loses a package that worked a minute ago.
+///
+/// Restoring has to cover the links too, because the upgrade already removed the
+/// alias links the new version no longer claims. Everything here is best effort:
+/// the caller is on an error path and the error being returned is the important
+/// half.
+fn restore_previous(
+    name: &str,
+    destination: &std::path::Path,
+    previous: &std::path::Path,
+    outgoing: Option<&Manifest>,
+) {
+    // The new tree is unusable by construction; clear it so the rename has a free
+    // target even if the failure left a partial tree behind.
+    let _ = std::fs::remove_dir_all(destination);
+    if previous.exists() && std::fs::rename(previous, destination).is_err() {
+        // The tree could not be put back (a permission or space problem, which is
+        // usually why the install failed at all). Say so loudly: the package is now
+        // `destination`-less and a person needs to reinstall it deliberately.
+        tracing::warn!(
+            package = name,
+            previous = %previous.display(),
+            "cannot restore the previous version after a failed upgrade"
+        );
+        return;
+    }
+    if let Some(outgoing) = outgoing {
+        // Re-create what this version provided: the upgrade removed the links its
+        // successor no longer claims, and the restored tree needs them back.
+        let _ = install_alias_links(outgoing);
+        let _ = install_python_links(outgoing, destination);
+        let _ = install_data_links(outgoing, destination);
+        record_data_dirs(outgoing);
+        refresh_native_library_path();
+    }
 }
 
 /// Where a payload's children get linked: the directory the CPython runtime
@@ -2140,6 +2183,37 @@ mod tests {
 
     // An upgrade must stay undoable: the whole point of keeping one generation
     // is that a version which installs fine can still turn out to be wrong.
+    /// An upgrade that fails while linking must not behave like an uninstall.
+///
+/// The old tree has already been moved to `.previous-*` at that point, so dropping
+/// the new one leaves nothing at the install path — and `rollback` needs a
+/// destination. Reproduced by a reviewer: after a failed upgrade the previous
+/// version was unusable too.
+#[test]
+    fn a_failed_upgrade_keeps_the_installed_version_usable() {
+        with_temp_root(|| {
+            install_bytes(&bundle_v1()).unwrap();
+            // The new version claims a data link whose target is not in the bundle,
+            // so linking fails *after* the old tree was moved aside.
+            let broken = bundle_with(
+                r#"{"name":"demo","version":"2.0","entry":"lib/demo.so","links":{"probe-share":"share"}}"#,
+                &[("lib/demo.so", b"two")],
+            );
+            let error = install_bytes(&broken).unwrap_err();
+            assert!(error.contains("link target is missing"), "{error}");
+
+            // The previous version is back at the install path, intact.
+            assert_eq!(
+                std::fs::read(packages_root().join("demo/lib/demo.so")).unwrap(),
+                b"one",
+                "the installed version was restored"
+            );
+            let records = scan().unwrap();
+            assert_eq!(records.len(), 1, "{records:?}");
+            assert_eq!(records[0].version, "1.0");
+        });
+    }
+
     #[test]
     fn an_upgrade_keeps_the_previous_version_and_rollback_restores_it() {
         with_temp_root(|| {
