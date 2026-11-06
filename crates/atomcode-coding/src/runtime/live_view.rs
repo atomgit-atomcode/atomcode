@@ -216,6 +216,25 @@ impl RuntimeLiveView {
                             CodingRuntimeEvent::Agent(AgentEvent::Reasoning(a)),
                             CodingRuntimeEvent::Agent(AgentEvent::Reasoning(b)),
                         ) => Some((a, b)),
+                        (
+                            CodingRuntimeEvent::Agent(AgentEvent::ToolCallStreaming {
+                                index: a_index,
+                                id: a_id,
+                                name: a_name,
+                                arguments: a,
+                            }),
+                            CodingRuntimeEvent::Agent(AgentEvent::ToolCallStreaming {
+                                index: b_index,
+                                id: b_id,
+                                name: b_name,
+                                arguments: b,
+                            }),
+                        ) if a_index == b_index
+                            && (b_id.is_none() || a_id == b_id)
+                            && (b_name.is_none() || a_name == b_name) =>
+                        {
+                            Some((a, b))
+                        }
                         _ => None,
                     };
                     if let Some((a, b)) = chunks {
@@ -480,6 +499,44 @@ mod tests {
         assert!(
             matches!(&view.events[0].event, CodingRuntimeEvent::Agent(AgentEvent::TextDelta(text)) if text.len() == 20_000)
         );
+    }
+
+    #[test]
+    fn tool_argument_streams_do_not_exhaust_the_replay_budget() {
+        let mut view = view();
+        for n in 0..20_000 {
+            view.observe(
+                &event(
+                    n,
+                    CodingRuntimeEvent::Agent(AgentEvent::ToolCallStreaming {
+                        index: 0,
+                        id: (n == 0).then(|| "call".into()),
+                        name: (n == 0).then(|| "bash".into()),
+                        arguments: "x".into(),
+                    }),
+                ),
+                None,
+            );
+        }
+        assert!(view.valid);
+        assert_eq!(view.events.len(), 1);
+        assert_eq!(view.events[0].sequence, 19_999);
+        assert!(matches!(&view.events[0].event,
+            CodingRuntimeEvent::Agent(AgentEvent::ToolCallStreaming { id, name, arguments, .. })
+            if id.as_deref() == Some("call") && name.as_deref() == Some("bash") && arguments.len() == 20_000));
+        view.observe(
+            &event(
+                20_000,
+                CodingRuntimeEvent::Agent(AgentEvent::ToolCallStreaming {
+                    index: 1,
+                    id: Some("other".into()),
+                    name: Some("read".into()),
+                    arguments: "y".into(),
+                }),
+            ),
+            None,
+        );
+        assert_eq!(view.events.len(), 2, "different calls must stay separate");
     }
 
     #[test]
