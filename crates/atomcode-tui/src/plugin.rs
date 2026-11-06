@@ -923,13 +923,15 @@ fn effort_menu_options(levels: &[String]) -> Vec<crate::command::CommandOption> 
         .collect()
 }
 
-/// Lines the conversation moves per wheel notch.
-///
-/// One, not three. The terminal already sends one event per notch, so three
-/// lines an event is three times the distance the hand asked for — and the
-/// reason to reach for the wheel here is to study something that went past,
-/// which is exactly when precision beats speed.
+/// Lines panels and lists move per wheel event.
 const WHEEL_LINES: i32 = 1;
+
+/// Windows and HarmonyOS wheel notches need a larger step.
+const CONVERSATION_WHEEL_LINES: i32 = if cfg!(any(windows, target_env = "ohos")) {
+    3
+} else {
+    1
+};
 
 /// How close two presses on the same cell must be to count as a double- (then
 /// triple-) click. 400ms is the common desktop default — long enough for a
@@ -2545,7 +2547,12 @@ impl UserInterface for Tui {
                         self.arrows_reach_the_composer()
                             && !(n == 1 && self.caret_moves_within_draft(up)),
                     ) {
-                        let lines = n.min(i32::MAX as usize) as i32;
+                        let step = if crate::ansi::alternate_scroll_enabled() {
+                            CONVERSATION_WHEEL_LINES
+                        } else {
+                            1
+                        };
+                        let lines = (n.min(i32::MAX as usize) as i32).saturating_mul(step);
                         quit = self.act(Action::Scroll(if up { -lines } else { lines }), &client);
                     } else {
                         let key = crate::surface::KeyPress::plain(if up {
@@ -2687,8 +2694,8 @@ impl UserInterface for Tui {
                         continue;
                     }
                     let action = match click {
-                        Click::WheelUp => Some(Action::Scroll(-WHEEL_LINES)),
-                        Click::WheelDown => Some(Action::Scroll(WHEEL_LINES)),
+                        Click::WheelUp => Some(Action::Scroll(-CONVERSATION_WHEEL_LINES)),
+                        Click::WheelDown => Some(Action::Scroll(CONVERSATION_WHEEL_LINES)),
                         Click::Press => {
                             self.presses.fetch_add(1, Ordering::SeqCst);
                             *self.pressed_at.lock().expect("press poisoned") = Some((x, y));

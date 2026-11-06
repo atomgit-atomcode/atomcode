@@ -11195,7 +11195,13 @@ async fn a_drag_after_scrolling_away_starts_a_new_selection() {
     s.quiet().await;
     assert_eq!(s.term.clipboard_text().as_deref(), Some("  LINE-60"));
 
-    for _ in 0..40 {
+    // Keep roughly forty rows of movement with either platform wheel step.
+    let wheel_events = if cfg!(any(windows, target_env = "ohos")) {
+        13
+    } else {
+        40
+    };
+    for _ in 0..wheel_events {
         s.term.pointer(Click::WheelUp, stream.x + 2, stream.y + 2);
     }
     s.quiet().await;
