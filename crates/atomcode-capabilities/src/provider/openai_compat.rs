@@ -2183,6 +2183,32 @@ impl SseDecoder {
         }
     }
 
+    /// Assign once, after assembly: the resulting ID is then shared by execution,
+    /// persistence and every subsequent request. Never invent IDs per serialization.
+    fn take_tool_calls(&mut self) -> Vec<(String, String, String)> {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let mut calls = std::mem::take(&mut self.tool_calls);
+        let mut used: std::collections::HashSet<String> =
+            calls.iter().map(|(id, _, _)| id.clone()).collect();
+        for (id, name, _) in &mut calls {
+            if !name.is_empty() && id.trim().is_empty() {
+                loop {
+                    let sequence = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let at = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos();
+                    let candidate = format!("call_ac_{at:x}_{sequence:x}");
+                    if used.insert(candidate.clone()) {
+                        *id = candidate;
+                        break;
+                    }
+                }
+            }
+        }
+        calls
+    }
+
     /// Decode the body `url` answered, which claimed to be `content_type`.
     fn reading(mut self, url: &str, content_type: &str) -> Self {
         self.reading = Some((url.to_string(), content_type.to_string()));
@@ -2389,7 +2415,7 @@ impl SseDecoder {
         if !held.reasoning.is_empty() {
             out.push(StreamEvent::Reasoning(held.reasoning));
         }
-        for (id, name, args) in std::mem::take(&mut self.tool_calls) {
+        for (id, name, args) in self.take_tool_calls() {
             // A tool call with NO function name is UNDISPATCHABLE: executors resolve tools
             // BY NAME, so emitting one buys a guaranteed failed round trip — a 0ms
             // "unknown tool" result that burns a round and, on hosts that classify tools
@@ -2661,7 +2687,7 @@ impl SseDecoder {
                 self.tool_calls.clear();
                 return;
             }
-            for (id, name, args) in std::mem::take(&mut self.tool_calls) {
+            for (id, name, args) in self.take_tool_calls() {
                 // Same rule as `finish()`: a nameless tool call cannot be dispatched, so
                 // dropping it beats emitting a call that is certain to fail.
                 if name.is_empty() {
@@ -3643,6 +3669,145 @@ mod tests {
         }
         assert_eq!(proxy.received_requests().await.unwrap().len(), 2);
         assert_eq!(origin.received_requests().await.unwrap().len(), 2);
+    }
+
+    fn outgoing_wire_is_paired(messages: &[Value]) -> bool {
+        let mut pending = std::collections::HashSet::new();
+        for message in messages {
+            if message["role"] == "tool" {
+                if !pending.remove(message["tool_call_id"].as_str().unwrap_or("")) {
+                    return false;
+                }
+            } else {
+                if !pending.is_empty() {
+                    return false;
+                }
+                if let Some(calls) = message["tool_calls"].as_array() {
+                    for call in calls {
+                        if !pending.insert(call["id"].as_str().unwrap_or("")) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        pending.is_empty()
+    }
+
+    #[test]
+    fn outgoing_wire_pairing_matrix() {
+        let call = |id: &str| {
+            Message::assistant(
+                "",
+                vec![ToolCall {
+                    id: id.into(),
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                }],
+            )
+        };
+        let cases = [
+            Message::user("injected"),
+            call("a"),
+            call("b"),
+            Message::tool_result("a", "ok", false),
+            Message::tool_result("b", "ok", false),
+            Message::tool_result("orphan", "error", true),
+        ];
+        for n in 0..6usize.pow(6) {
+            let mut v = n;
+            let mut messages = Vec::new();
+            for _ in 0..6 {
+                messages.push(cases[v % 6].clone());
+                v /= 6;
+            }
+            atomcode_kernel::message::Conversation::repair_pairing(&mut messages);
+            let wire = format_messages(
+                &messages,
+                ReasoningPolicy::Exclude,
+                ReasoningField::ReasoningContent,
+                true,
+            );
+            assert!(outgoing_wire_is_paired(&wire), "{wire:?}");
+        }
+    }
+
+    #[test]
+    fn assembled_call_ids_preserve_late_ids_and_separate_parallel_calls() {
+        for finish_reason in [Some("tool_calls"), None] {
+            let mut decoder = SseDecoder::new();
+            let first = line(json!({"choices":[{"delta":{"tool_calls":[
+                {"index":0,"function":{"name":"read_file","arguments":"{}"}},
+                {"index":1,"id":" ","function":{"name":"read_file","arguments":"{}"}},
+                {"index":2,"function":{"name":"read_file","arguments":"{}"}}
+            ]}}]}));
+            let mut events = decoder.feed(first.as_bytes());
+            let last = line(
+                json!({"choices":[{"delta":{"tool_calls":[{"index":2,"id":"late-id"}]},"finish_reason":finish_reason}]}),
+            );
+            events.extend(decoder.feed(last.as_bytes()));
+            if finish_reason.is_none() {
+                events.extend(decoder.feed(b"data: [DONE]\n\n"));
+            }
+            events.extend(decoder.finish());
+            let calls: Vec<_> = events
+                .into_iter()
+                .filter_map(|event| match event {
+                    StreamEvent::ToolCall(call) => Some(call),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(calls.len(), 3);
+            assert_eq!(calls[2].id, "late-id");
+            let ids: std::collections::HashSet<_> = calls.iter().map(|call| &call.id).collect();
+            assert_eq!(ids.len(), 3);
+            assert!(calls.iter().all(|call| !call.id.trim().is_empty()));
+            let mut messages = vec![Message::assistant("", calls.clone())];
+            for call in calls {
+                messages.push(Message::tool_result(&call.id, "ok", false));
+            }
+            let wire = format_messages(
+                &messages,
+                ReasoningPolicy::Exclude,
+                ReasoningField::ReasoningContent,
+                true,
+            );
+            assert!(outgoing_wire_is_paired(&wire));
+        }
+    }
+
+    #[test]
+    fn a_missing_stream_call_id_is_assigned_before_execution() {
+        let mut decoder = SseDecoder::new();
+        let chunk = line(
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"read_file","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}),
+        );
+        let events = decoder.feed(chunk.as_bytes());
+        let calls: Vec<_> = events
+            .into_iter()
+            .filter_map(|event| match event {
+                StreamEvent::ToolCall(call) => Some(call),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 1, "the real SSE decoder emitted a call");
+        assert!(!calls[0].id.is_empty());
+        let id = calls[0].id.clone();
+        let mut messages = vec![
+            Message::assistant("", calls),
+            Message::tool_result(&id, "ok", false),
+        ];
+        atomcode_kernel::message::Conversation::repair_pairing(&mut messages);
+        let wire = format_messages(
+            &messages,
+            ReasoningPolicy::Exclude,
+            ReasoningField::ReasoningContent,
+            true,
+        );
+        assert!(
+            outgoing_wire_is_paired(&wire),
+            "outbound request has an unanswered tool call: {wire:?}"
+        );
     }
 
     #[test]
