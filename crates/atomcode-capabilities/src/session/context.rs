@@ -98,6 +98,12 @@ impl SessionContextHook {
                 .swap(true, std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// A fresh, bounded observation for one user input. This deliberately does
+    /// not use the cached worktree discovery or alter a resumed system prefix.
+    pub async fn task_worktree_status(&self) -> crate::worktree_status::WorktreeStatus {
+        crate::worktree_status::inspect(&self.working_dir).await
+    }
+
     /// The context block for a session, as a host that holds the prompt itself
     /// (rather than a conversation this hook inserts into) needs it.
     ///
@@ -191,20 +197,7 @@ impl SessionContextHook {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "(detached HEAD)".into());
         let head = head.unwrap_or_default().trim().to_string();
-        let raw = raw.unwrap_or_default();
-        let mut lines: Vec<&str> = raw.lines().collect();
-        let status = if lines.len() > 20 {
-            let extra = lines.len() - 20;
-            lines.truncate(20);
-            format!("{}\n... and {extra} more line(s)", lines.join("\n"))
-        } else {
-            lines.join("\n")
-        };
-        let status = if status.trim().is_empty() {
-            "(working tree clean)".to_string()
-        } else {
-            status
-        };
+        let status = snapshot_status(raw);
         Some(format!(
             "=== GIT STATUS (snapshot at session start, not live) ===\n\
              Branch: {branch}\nHEAD: {head}\n{status}\n\
@@ -322,6 +315,27 @@ impl LifecycleHooks for SessionContextHook {
     }
 }
 
+/// Unknown is not clean; this only renders a snapshot, never authorizes writes.
+fn snapshot_status(raw: Option<String>) -> String {
+    let known = raw.is_some();
+    let raw = raw.unwrap_or_default();
+    let mut lines: Vec<&str> = raw.lines().collect();
+    let status = if lines.len() > 20 {
+        let extra = lines.len() - 20;
+        lines.truncate(20);
+        format!("{}\n... and {extra} more line(s)", lines.join("\n"))
+    } else {
+        lines.join("\n")
+    };
+    if !known {
+        "(working tree status unknown: Git status probe failed; do not assume clean)".to_string()
+    } else if status.trim().is_empty() {
+        "(working tree clean)".to_string()
+    } else {
+        status
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,6 +352,14 @@ mod tests {
                 .output()
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn failed_git_status_is_rendered_as_unknown_not_clean() {
+        let failed = snapshot_status(None);
+        assert!(failed.contains("unknown") && !failed.contains("working tree clean"));
+        assert_eq!(snapshot_status(Some(String::new())), "(working tree clean)");
+        assert!(snapshot_status(Some(" M existing.txt\n".into())).contains(" M existing.txt"));
     }
 
     #[test]

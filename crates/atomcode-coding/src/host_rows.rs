@@ -1441,7 +1441,8 @@ impl Plugin for CcHooksHostPlugin {
 atomcode_plexus::plexus_service!(LoadedContextSvc => atomcode_capabilities::session::SessionContextHook, "loaded-context", Core, "The instruction snapshot this runtime mounted");
 
 /// `session-context`: environment, project instructions and a git snapshot,
-/// contributed to the system prompt once per tree.
+/// contributed to the system prompt once per tree, plus bounded per-user-input
+/// workspace observations appended as logged reminders.
 ///
 /// The chain inserts this block as a leading system message at session start.
 /// A tree has no conversation to insert into — its system prompt is the prompt
@@ -1467,6 +1468,10 @@ impl Plugin for SessionContextPlugin {
     fn provides(&self) -> &'static [&'static str] {
         &["loaded-context"]
     }
+    fn uses(&self) -> &'static [&'static str] {
+        // SessionSvc is agent-scoped and created by AgentsSvc, not a root row.
+        &["agents"]
+    }
     fn description(&self) -> &'static str {
         "environment, project instructions and a session-start git snapshot, in the system prompt"
     }
@@ -1475,9 +1480,46 @@ impl Plugin for SessionContextPlugin {
         let _ = ctx
             .provide::<LoadedContextSvc>(self.hook.clone())
             .map_err(|e| e.to_string())?;
+        let _ = ctx.on_waterfall::<PreStep>(
+            Arc::new(TaskWorktreeContext {
+                ctx: ctx.clone(),
+                hook: self.hook.clone(),
+            }),
+            false,
+        );
         // Withdrawn with the row, like every other fragment.
         atomcode_harness::plugins::tools::contribute_prompt(ctx, "project-instructions", 1, &block);
         Ok(())
+    }
+}
+
+/// Per-input observation appended through the existing logged injection seam,
+/// never a mutation of the cached system prefix or an authorization decision.
+struct TaskWorktreeContext {
+    ctx: Context,
+    hook: Arc<atomcode_capabilities::session::SessionContextHook>,
+}
+
+#[async_trait]
+impl Waterfall<PreStep> for TaskWorktreeContext {
+    async fn handle(&self, step: &mut StepDecision, next: Next<'_, PreStep>) -> StepDecision {
+        if step.step == 1
+            && matches!(step.origin, MessageOrigin::User)
+            && step.message.is_some()
+            && step.rejected.is_none()
+        {
+            let scoped = atomcode_harness::agent::scoped(&self.ctx);
+            let root = scoped
+                .service::<SessionSvc>()
+                .and_then(|session| self.ctx.service::<AgentsSvc>()?.by_session(session.id()))
+                .is_some_and(|agent| agent.parent().is_none());
+            if root {
+                if let Some(reminder) = self.hook.task_worktree_status().await.reminder(step.turn) {
+                    step.injections.push((reminder, InjectionOrigin::Reminder));
+                }
+            }
+        }
+        next.run(step).await
     }
 }
 

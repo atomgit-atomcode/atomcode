@@ -19,6 +19,9 @@
 //! judgement that needed a repository on disk to reach it would be judging
 //! `git` as much as this.
 
+mod task_probe;
+pub use task_probe::{inspect, WorktreeStatus};
+
 use std::path::Path;
 use std::process::Command;
 
