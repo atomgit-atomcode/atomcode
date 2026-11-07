@@ -988,13 +988,12 @@ fn fold_fullwidth_ascii(c: char) -> char {
 /// Append `text` to `into` with line breaks and blank lines folded to single
 /// spaces, so a call stays on one `\n`-delimited line of the transcript. Empty
 /// segments are skipped and a trailing space is dropped, so a part that starts
-/// or ends in a break does not leave a gap. Returns whether a segment was
-/// written: FS/GS/RS are transcript breaks but not Unicode whitespace, so a
-/// field made only of them survives `trim` and still folds to nothing. Written
-/// straight into the transcript because most argument lists are a borrowed
-/// slice of the message — `format!` and `String::replace` would each copy them
-/// just to reuse the text unchanged.
-fn push_single_line(into: &mut String, text: &str) -> bool {
+/// or ends in a break does not leave a gap; FS/GS/RS are transcript breaks but
+/// not Unicode whitespace, so a field made only of them survives `trim` and
+/// still folds to nothing. Written straight into the transcript because most
+/// argument lists are a borrowed slice of the message — `format!` and
+/// `String::replace` would each copy them just to reuse the text unchanged.
+fn push_single_line(into: &mut String, text: &str) {
     let start = into.len();
     let mut wrote = false;
     for_each_line(text, |line| {
@@ -1010,7 +1009,6 @@ fn push_single_line(into: &mut String, text: &str) -> bool {
     while into.len() > start && into.ends_with(' ') {
         into.pop();
     }
-    wrote
 }
 
 /// Escape `[` and `]` so a call field can neither close the call line's `]`
