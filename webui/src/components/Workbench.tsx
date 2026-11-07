@@ -210,6 +210,7 @@ export function Workbench({
     }
   }
   const [entries, setEntries] = useState<Entry[]>([]);
+  const directory = useRef<{ session: string; path: string; loaded: boolean } | null>(null);
   const [filesState, setFilesState] = useState<"loading" | "ready" | "failed">("loading");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -276,15 +277,28 @@ export function Workbench({
   }, [saved, session]);
   useEffect(() => {
     let cancelled = false;
-    setError("");
-    setEntries([]);
-    setFilesState("loading");
+    if (directory.current?.session !== session || directory.current.path !== saved.path) {
+      directory.current = { session, path: saved.path, loaded: false };
+    }
+    const scope = directory.current;
+    // Polling and focus refreshes must not unmount the current rows: doing so
+    // flashes the tree and resets its scroll/focus even when nothing changed.
+    // A new directory still clears the old rows while its first load is pending.
+    if (!scope.loaded) {
+      setError("");
+      setEntries([]);
+      setFilesState("loading");
+    }
     workbenchRequest<Entry[]>(
       "files?" + new URLSearchParams({ session_id: session, path: saved.path }),
     )
       .then((data) => {
         if (!cancelled) {
-          setEntries(data);
+          scope.loaded = true;
+          setError("");
+          setEntries(old => old.length === data.length && old.every((entry, i) =>
+            entry.name === data[i].name && entry.directory === data[i].directory,
+          ) ? old : data);
           setFilesState("ready");
         }
       })
