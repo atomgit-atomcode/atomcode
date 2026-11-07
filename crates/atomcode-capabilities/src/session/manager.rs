@@ -1600,8 +1600,6 @@ impl SessionManager {
             through,
             baseline: None,
         };
-        // Adding recovery data must not halve the accepted size of a current
-        // plan, nor allow either state to grow beyond its original budget.
         let current = serialize_bounded(&sidecar, "todo sidecar", MAX_TODO_SIDECAR_BYTES)?;
         let bytes = if let Some(baseline) = baseline {
             serialize_bounded(&baseline, "todo baseline", MAX_TODO_SIDECAR_BYTES)?;
@@ -6669,7 +6667,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "tools")]
     #[test]
     fn a_sidecar_does_not_freeze_a_state_the_conversation_has_taken_back() {
         use crate::session::manager::TodoSidecarItem;
@@ -6715,7 +6712,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "tools")]
     #[test]
     fn a_shrunk_conversation_without_a_baseline_keeps_the_state_before_the_write() {
         use crate::session::manager::TodoSidecarItem;
@@ -6748,7 +6744,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "tools")]
     #[test]
     fn a_sidecar_keeps_its_full_budget_alongside_a_baseline() {
         use crate::session::manager::TodoSidecarItem;

@@ -5583,9 +5583,9 @@ mod tests {
             name: "todowrite".into(),
             arguments: r#"{"action":"add","content":"task"}"#.into(),
         };
-        let call = |turn: u64, call: ToolCall| {
+        let call = |seq: u64, turn: u64, call: ToolCall| {
             logged(
-                2 * turn,
+                seq,
                 0,
                 SessionEvent::AssistantMessage {
                     turn,
@@ -5603,7 +5603,7 @@ mod tests {
                 &lease,
                 &[
                     logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
-                    call(1, add("a1")),
+                    call(2, 1, add("a1")),
                     logged(
                         3,
                         0,
@@ -5617,9 +5617,9 @@ mod tests {
                         },
                     ),
                     logged(4, 0, SessionEvent::TurnStart { turn: 2 }),
-                    call(2, add("a2")),
+                    call(5, 2, add("a2")),
                     logged(
-                        5,
+                        6,
                         0,
                         SessionEvent::ToolResultLogged {
                             turn: 2,
@@ -5630,9 +5630,9 @@ mod tests {
                             images: vec![],
                         },
                     ),
-                    logged(6, 0, SessionEvent::TurnStart { turn: 3 }),
+                    logged(7, 0, SessionEvent::TurnStart { turn: 3 }),
                     logged(
-                        7,
+                        8,
                         0,
                         SessionEvent::UserMessage {
                             turn: 3,
@@ -5660,11 +5660,11 @@ mod tests {
             .append_events(
                 &lease,
                 &[logged(
-                    8,
+                    9,
                     0,
                     SessionEvent::Rewound {
                         turn: 3,
-                        to: 6,
+                        to: 7,
                         scope: RewindScope::Conversation,
                     },
                 )],
