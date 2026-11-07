@@ -93,13 +93,13 @@ async fn registry_connect_discover_and_call_echo() {
 /// non-ASCII characters (a script path under a directory with a CJK name). The
 /// arg is written as `${UNICODE_ARG}` in `.mcp.json`, so the value only reaches
 /// argv through `load_mcp_config` → `expand_env_vars` — a regression of the
-/// byte-wise expansion would fail this test at connect time, not silently pass.
-/// Also exercises connect and reconnect with such args in argv.
+/// byte-wise expansion fails the byte-for-byte assertion below, before any
+/// connection is attempted. Connect and reconnect then also exercise such args
+/// in argv (the fixture ignores extra args, so they are not the guard).
 #[tokio::test]
 #[serial_test::serial(unicode_arg_env)]
 async fn stdio_survives_args_with_spaces_and_unicode_across_reconnect() {
     const UNICODE_ARG: &str = "/tmp/中文 目录/with space/server.py";
-    // The expansion must fail the test at connect time if bytes are corrupted.
     // serial(unicode_arg_env) keeps this process-wide mutation away from the
     // other tests; the guard removes it again even on assertion failure.
     struct RemoveEnvOnDrop;

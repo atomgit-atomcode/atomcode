@@ -1201,8 +1201,33 @@ mod tests {
     }
 
     #[test]
+    fn test_expand_env_vars_preserves_utf8_outside_braces() {
+        // 旧实现逐字节 `bytes[i] as char`，把非 ASCII 路径改写成 Latin-1 乱码。
+        // 这条断言钉住「${} 之外的内容逐字节原样保留」。
+        let cjk_path = "/tmp/中文 目录/with space/server.py";
+        assert_eq!(expand_env_vars(cjk_path), cjk_path);
+    }
+
+    #[test]
+    fn test_expand_env_vars_default_value_keeps_utf8() {
+        // 默认值本身含非 ASCII 时也必须逐字节保留（不查环境变量，不依赖状态）。
+        assert_eq!(
+            expand_env_vars("${MISSING_VAR:-/tmp/中文 目录/server.py}"),
+            "/tmp/中文 目录/server.py"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(expand_test_var)]
     fn test_expand_env_vars_expansion_before_unclosed_brace() {
+        struct RemoveEnvOnDrop;
+        impl Drop for RemoveEnvOnDrop {
+            fn drop(&mut self) {
+                std::env::remove_var("TEST_VAR");
+            }
+        }
         std::env::set_var("TEST_VAR", "test_value");
+        let _env_guard = RemoveEnvOnDrop;
         // 前段正常展开，后段未闭合的 `${` 按 break 路径由兜底拼接保留。
         assert_eq!(expand_env_vars("${TEST_VAR}tail${D"), "test_valuetail${D");
     }
