@@ -401,8 +401,8 @@ test('collection APIs reject server error payloads instead of returning non-arra
 
   try {
     const { getModels, getProjects } = await import('./api.ts');
-    await assert.rejects(() => getModels(), /list models failed: 500/);
-    await assert.rejects(() => getProjects(), /list projects failed: 500/);
+    await assert.rejects(() => getModels(), /session metadata is missing/);
+    await assert.rejects(() => getProjects(), /session metadata is missing/);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -822,4 +822,108 @@ test('git branch lookup encodes the checkout path and forwards auth and cancella
     assert.equal((captured!.init!.headers as Record<string, string>).Authorization, 'Bearer test-token');
     assert.ok(captured!.init!.signal);
   } finally { globalThis.fetch = original; }
+});
+
+test('HTTP refusals preserve daemon messages and codes across API domains', async () => {
+  const originalFetch = globalThis.fetch;
+  const api = await import('./api.ts');
+  const requests: Array<() => Promise<unknown>> = [
+    () => api.getModels(), () => api.getProjects(),
+    () => api.listProjectSessions('project'), () => api.searchSessions('query'),
+    () => api.createSession('/workspace'), () => api.renameSession('project', 'session', 'name'),
+    () => api.listDir('/workspace'), () => api.mkdir('/workspace/new'),
+    () => api.openWorkspaceFile('file.ts'), () => api.startTunnelRelay(),
+    () => api.getMcpStatus(), () => api.postLiveMcpTrust(),
+    () => api.stopChat('request'), () => api.getSession('project', 'session'),
+    () => api.postLiveProvider('provider'), () => api.postLiveReasoningEffort('high'),
+    () => api.streamChat({ message: 'hi' }, () => {}), () => api.streamLive(() => {}),
+  ];
+  try {
+    for (const request of requests) {
+      globalThis.fetch = (async () => Response.json({ error: 'daemon explanation', code: 'test_refusal', active_turn: true }, { status: 409 })) as typeof fetch;
+      await assert.rejects(request, (error: unknown) => {
+        assert.ok(error instanceof api.ApiCallError);
+        assert.equal(error.message, 'daemon explanation');
+        assert.equal(error.status, 409);
+        assert.equal(error.code, 'test_refusal');
+        if (error instanceof api.ReasoningEffortError) assert.equal(error.activeTurn, true);
+        return true;
+      });
+    }
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('legacy endpoints share string, text and HTML refusal handling', async () => {
+  const originalFetch = globalThis.fetch;
+  const { mkdir, ApiCallError } = await import('./api.ts');
+  try {
+    for (const [body, message] of [
+      [JSON.stringify('ambiguous directory'), 'ambiguous directory'],
+      ['access denied', 'access denied'],
+      ['<html>proxy failed</html>', 'HTTP 502'],
+    ]) {
+      globalThis.fetch = (async () => new Response(body, { status: 502 })) as typeof fetch;
+      await assert.rejects(mkdir('/workspace'), (error: unknown) => {
+        assert.ok(error instanceof ApiCallError);
+        assert.ok(error.message.includes(message));
+        assert.equal(error.status, 502);
+        return true;
+      });
+    }
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('both SSE consumers handle split UTF-8, heartbeats and malformed blocks', async () => {
+  const originalFetch = globalThis.fetch;
+  const api = await import('./api.ts');
+  try {
+    for (const live of [false, true]) {
+      const bytes = new TextEncoder().encode(': heartbeat\n\ndata: invalid\n\ndata:\n\nevent: message\ndata: {"type":"text","content":"中文"}\n\ndata: {"type":"stopped"}\n\n');
+      const body = new ReadableStream<Uint8Array>({ start(controller) {
+        // Split in the middle of both UTF-8 characters and SSE delimiters.
+        for (const byte of bytes) controller.enqueue(Uint8Array.of(byte));
+        controller.close();
+      } });
+      globalThis.fetch = (async () => new Response(body)) as typeof fetch;
+      const events: unknown[] = [];
+      let activity = 0;
+      if (live) await api.streamLive(e => events.push(e), undefined, undefined, () => activity++);
+      else await api.streamChat({ message: 'hi' }, e => events.push(e));
+      assert.deepEqual(events, [{ type: 'text', content: '中文' }, { type: 'stopped' }]);
+      if (live) assert.equal(activity, bytes.length);
+      assert.equal(body.locked, false);
+    }
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('SSE consumers retain their existing EOF and dispatch policies', async () => {
+  const originalFetch = globalThis.fetch;
+  const api = await import('./api.ts');
+  try {
+    globalThis.fetch = (async () => new Response('data: {"type":"stopped"}')) as typeof fetch;
+    const chat: unknown[] = [];
+    await api.streamChat({ message: 'hi' }, e => chat.push(e));
+    assert.deepEqual(chat, [{ type: 'stopped' }]);
+    const live: unknown[] = [];
+    await api.streamLive(e => live.push(e));
+    assert.deepEqual(live, []);
+    // Chat historically isolates callback errors while retaining its terminal.
+    await api.streamChat({ message: 'hi' }, () => { throw new Error('observer failed'); });
+    const controller = new AbortController();
+    controller.abort();
+    await assert.rejects(api.streamChat({ message: 'hi' }, () => {}, controller.signal), { name: 'AbortError' });
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('void API successes do not require a JSON response body', async () => {
+  const originalFetch = globalThis.fetch;
+  const api = await import('./api.ts');
+  globalThis.fetch = (async () => new Response(null, { status: 204 })) as typeof fetch;
+  try {
+    await api.stopChat('request');
+    await api.renameSession('project', 'session', 'name');
+    await api.deleteSession('project', 'session');
+    await api.deleteProject('project');
+    await api.openWorkspaceFile('file.ts', 'session');
+  } finally { globalThis.fetch = originalFetch; }
 });
