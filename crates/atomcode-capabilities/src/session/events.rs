@@ -29,9 +29,9 @@ use atomcode_kernel::session::{
 };
 
 use super::manager::{
-    io_at, open_append_file, read_regular_file_bounded, retry_transient_file_access, SessionLease,
-    SessionManager, SessionMeta, SessionResult, SessionStoreError, StorageOwner, MAX_JSONL_BYTES,
-    MAX_JSONL_LINE_BYTES,
+    io_at, open_append_file, open_read_file, read_regular_file_bounded,
+    retry_transient_file_access, SessionLease, SessionManager, SessionMeta, SessionResult,
+    SessionStoreError, StorageOwner, MAX_JSONL_BYTES, MAX_JSONL_LINE_BYTES,
 };
 use super::transcript::TurnRecord;
 
@@ -198,6 +198,20 @@ impl SessionManager {
     /// write, which is safe only while that lease keeps a single writer; a
     /// second writer would need the allocation moved inside the append lock.
     pub fn append_events(&self, lease: &SessionLease, events: &[LoggedEvent]) -> SessionResult<()> {
+        self.append_events_inner(lease, events, true)
+    }
+
+    /// [`Self::append_events`], optionally leaving the todo cache untouched: a
+    /// fork copies the source log and then carries the source's sidecar, so a
+    /// rebuild from the copied facts would only be overwritten — and on a
+    /// source with no sidecar it could resurrect calls compaction drained.
+    #[cfg_attr(not(feature = "tools"), allow(unused_variables))]
+    fn append_events_inner(
+        &self,
+        lease: &SessionLease,
+        events: &[LoggedEvent],
+        follow_sidecar: bool,
+    ) -> SessionResult<()> {
         self.validate_active_lease(lease)?;
         let id = lease.id();
         if !self.is_event_session(id) {
@@ -237,6 +251,30 @@ impl SessionManager {
         file.write_all(&buffer).map_err(|e| io_at(&path, e))?;
         drop(file);
         self.index_the_chosen_name(id, events);
+        #[cfg(feature = "tools")]
+        if follow_sidecar
+            && events.iter().any(|logged| match &logged.event {
+                SessionEvent::Rewound { scope, .. } => scope.takes_back_conversation(),
+                // A standing cancel retires the active plan too: the fold starts
+                // after the newest interruption, so every interruption moves it.
+                SessionEvent::Interrupted { .. } => true,
+                _ => false,
+            })
+        {
+            // A rewind, a cancel or a cancelled-and-undone turn takes its todo
+            // calls out of the projection; the list the model reads is the log's
+            // standing turns, rebuilt so the sidecar cannot keep offering work
+            // the fold no longer contains.
+            if let Err(error) = self.rebuild_todo_sidecar_after_undo(id) {
+                // The append itself stands: a stale sidecar is a cache problem,
+                // not a reason to report the committed fact as failed.
+                tracing::warn!(
+                    %error,
+                    session = id,
+                    "todo sidecar could not follow a rewind; the log append stands"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -424,6 +462,285 @@ impl SessionManager {
             None => return Err(corrupt()),
         };
         parse(line)
+    }
+
+    /// Rebuild the todo sidecar from the log after a rewind or a cancelled-and-
+    /// undone turn.
+    ///
+    /// The sidecar is the model's list once compaction has drained the
+    /// transcript's calls. An undo takes those calls out of the projection but
+    /// leaves the facts in the log, so folding the standing turns here is the
+    /// only way the cache can agree with what the model is about to be shown.
+    #[cfg(feature = "tools")]
+    fn rebuild_todo_sidecar_after_undo(&self, id: &str) -> SessionResult<()> {
+        use crate::tools::todo::{
+            apply_todo_action, is_todo_call, is_todo_plan, reduce_todos, TodoItem, TodoStatus,
+        };
+
+        let events = self.load_events(id)?;
+        let undone = atomcode_kernel::session::undone_turns(&events);
+
+        // A person's cancel retires the plan without deleting its calls. Match
+        // the transcript fold's boundary (`active_todo_calls`): only calls after
+        // the most recent standing interruption shape the list. The split is by
+        // event order, the order the message projection keeps — a sequence
+        // number is an identity, not a position.
+        let boundary = events
+            .iter()
+            .enumerate()
+            .filter(|(_, logged)| !undone.contains(&logged.event.turn()))
+            .filter_map(|(index, logged)| match &logged.event {
+                SessionEvent::Interrupted {
+                    turn,
+                    undone: false,
+                } => Some((index, *turn)),
+                _ => None,
+            })
+            .next_back();
+
+        // A failed result excludes the call it answered — the latest earlier
+        // call with that id, the same association the transcript fold makes by
+        // message order. Keyed by id alone, one turn's failure would drop a
+        // later turn that reused the id; keyed by turn and round it could miss
+        // a result filed under another round.
+        let mut calls: Vec<(u64, u32, u32, &str, &str)> = Vec::new();
+        let mut failed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut latest: std::collections::HashMap<&str, Option<usize>> =
+            std::collections::HashMap::new();
+        for (index, logged) in events.iter().enumerate() {
+            if undone.contains(&logged.event.turn()) {
+                continue;
+            }
+            if boundary.is_some_and(|(at, _)| index <= at) {
+                continue;
+            }
+            match &logged.event {
+                SessionEvent::AssistantMessage {
+                    turn,
+                    round,
+                    tool_calls,
+                    ..
+                } => {
+                    for (index, call) in tool_calls.iter().enumerate() {
+                        if is_todo_call(&call.name) {
+                            latest.insert(call.id.as_str(), Some(calls.len()));
+                            calls.push((
+                                *turn,
+                                *round,
+                                u32::try_from(index).unwrap_or(u32::MAX),
+                                call.name.as_str(),
+                                call.arguments.as_str(),
+                            ));
+                        } else {
+                            latest.insert(call.id.as_str(), None);
+                        }
+                    }
+                }
+                SessionEvent::ToolResultLogged {
+                    call_id,
+                    is_error: true,
+                    ..
+                } => {
+                    if let Some(Some(position)) = latest.get(call_id.as_str()) {
+                        failed.insert(*position);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !failed.is_empty() {
+            calls = calls
+                .into_iter()
+                .enumerate()
+                .filter(|(position, _)| !failed.contains(position))
+                .map(|(_, call)| call)
+                .collect();
+        }
+
+        let has_plan = calls
+            .iter()
+            .any(|(_, _, _, _, arguments)| is_todo_plan(arguments));
+        // A converted session's plan can live only in the sidecar: compaction
+        // removed it from the snapshot the log was built from, so no full-plan
+        // call exists anywhere in this log. Its *increments* are still log
+        // facts, so an undo of the turn they were made in must be able to take
+        // them back — from the baseline written beside the aggregate.
+        let had_plan_in_log = events.iter().any(|logged| match &logged.event {
+            SessionEvent::AssistantMessage { tool_calls, .. } => tool_calls
+                .iter()
+                .any(|call| is_todo_call(&call.name) && is_todo_plan(&call.arguments)),
+            _ => false,
+        });
+        let existing = match self.read_todo_sidecar(id) {
+            Ok(sidecar) => sidecar,
+            // An unreadable sidecar is not evidence that its plan is gone.
+            Err(_) if !has_plan => return Ok(()),
+            Err(_) => None,
+        };
+        // Whether the sidecar is still the baseline the log has not retired.
+        // A plan the log cannot source at all (a converted or compacted
+        // session) is its only copy: only an undone increment can retire it,
+        // and an undo takes a suffix of turns, so the last reflected turn says
+        // whether one was. A plan the log does hold stands only while its
+        // through turn was not undone and is newer than the last standing cancel.
+        let stands = existing
+            .as_ref()
+            .is_some_and(|sidecar| match sidecar.through {
+                Some(through) if undone.contains(&through.turn) => false,
+                Some(through) => {
+                    !had_plan_in_log || boundary.is_none_or(|(_, turn)| through.turn > turn)
+                }
+                None => true,
+            });
+
+        let to_items = |items: &[super::manager::TodoSidecarItem]| -> Vec<TodoItem> {
+            items
+                .iter()
+                .map(|item| TodoItem {
+                    content: item.content.clone(),
+                    status: match item.status.as_str() {
+                        "in_progress" => TodoStatus::InProgress,
+                        "completed" => TodoStatus::Completed,
+                        _ => TodoStatus::Pending,
+                    },
+                })
+                .collect()
+        };
+        let mut items: Vec<TodoItem> = Vec::new();
+        let mut through: Option<super::manager::TodoCallPosition> = None;
+        let mut legacy_baseline = false;
+        let mut sources: Vec<u64> = Vec::new();
+        if has_plan {
+            // A full plan in the log is authoritative for the calls after the
+            // boundary; fold them from empty.
+            items = reduce_todos(
+                calls
+                    .iter()
+                    .map(|(_, _, _, name, arguments)| (*name, *arguments)),
+            );
+            through =
+                calls.last().map(
+                    |(turn, round, index, _, _)| super::manager::TodoCallPosition {
+                        turn: *turn,
+                        round: *round,
+                        index: *index,
+                    },
+                );
+            sources = crate::tools::todo_sources::source_plan(&events).source_seqs;
+        } else {
+            if stands {
+                if let Some(sidecar) = existing.as_ref() {
+                    items = to_items(&sidecar.todos);
+                    through = sidecar.through;
+                    legacy_baseline = sidecar.through.is_none();
+                    sources = sidecar.source_seqs.clone();
+                }
+            } else if let Some(recover) = existing
+                .as_ref()
+                .and_then(|sidecar| sidecar.baseline.as_ref())
+            {
+                // The plan is gone from the log, but the increment the undo
+                // took back is not the plan: start where the list stood before
+                // it and lay the standing calls over that.
+                items = to_items(&recover.todos);
+                through = recover.through;
+                legacy_baseline = recover.through.is_none();
+                sources = existing
+                    .as_ref()
+                    .map(|sidecar| sidecar.source_seqs.clone())
+                    .unwrap_or_default();
+            } else if had_plan_in_log {
+                // The log held the plan and the undo took it back: the list
+                // goes with it, and so do its sources.
+            } else if let Some(sidecar) = existing.as_ref() {
+                // A sidecar written before baselines existed: the aggregate is
+                // all there is, so keep it rather than drop the only plan.
+                items = to_items(&sidecar.todos);
+                through = sidecar.through;
+                legacy_baseline = sidecar.through.is_none();
+                sources = sidecar.source_seqs.clone();
+            }
+            // A sidecar written before positions existed cannot say which calls
+            // it already reflects. Same content means the task it adds is
+            // already in the list: advance past the call instead of writing it
+            // twice — and without dropping the list to avoid the duplicate.
+            let already_listed = |items: &[TodoItem], arguments: &str| -> bool {
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments) else {
+                    return false;
+                };
+                if value.get("action").and_then(|action| action.as_str()) != Some("add") {
+                    return false;
+                }
+                value
+                    .get("content")
+                    .and_then(|content| content.as_str())
+                    .map(str::trim)
+                    .is_some_and(|content| {
+                        !content.is_empty() && items.iter().any(|item| item.content == content)
+                    })
+            };
+            for (turn, round, index, _, arguments) in &calls {
+                let position = super::manager::TodoCallPosition {
+                    turn: *turn,
+                    round: *round,
+                    index: *index,
+                };
+                if through.is_some_and(|current| position <= current) {
+                    continue;
+                }
+                if legacy_baseline && already_listed(&items, arguments) {
+                    through = Some(position);
+                    continue;
+                }
+                apply_todo_action(&mut items, arguments);
+                through = Some(position);
+            }
+        }
+
+        if items.is_empty() && through.is_none() && !has_plan {
+            let Some(_sidecar) = existing.as_ref() else {
+                return Ok(());
+            };
+            if stands {
+                // The list stood and no call changed it; there is nothing to
+                // rewrite.
+                return Ok(());
+            }
+            // The log holds the plan this sidecar cached and took it back
+            // (an undone through turn or a cancel boundary); write the empty
+            // list so the cache agrees.
+        }
+
+        if sources.len() > 4 || sources.contains(&0) {
+            sources.clear();
+        }
+        // The state this rebuild recovered from is still the furthest one a
+        // later undo can reach; keep it. A plan the log held and took back must
+        // not leave its baseline behind to be resurrected.
+        let baseline = if !has_plan && !stands && had_plan_in_log {
+            None
+        } else {
+            existing
+                .as_ref()
+                .and_then(|sidecar| sidecar.baseline.clone())
+        };
+        let todos: Vec<super::manager::TodoSidecarItem> = items
+            .into_iter()
+            .map(|item| super::manager::TodoSidecarItem {
+                content: item.content,
+                status: match item.status {
+                    TodoStatus::Pending => "pending",
+                    TodoStatus::InProgress => "in_progress",
+                    TodoStatus::Completed => "completed",
+                }
+                .to_string(),
+            })
+            .collect();
+        // `message_count` is the conversation size this list was written against,
+        // so it must be the projection, not a raw event count. Rewinds are rare;
+        // one projection here is cheaper than a marker with the wrong meaning.
+        let message_count = atomcode_kernel::session::derive_messages(&events).len();
+        self.write_todo_sidecar_full(id, &todos, message_count, through, &sources, baseline)
     }
 
     /// Keep the index's name with the log's when the person names the session.
@@ -758,12 +1075,22 @@ impl SessionManager {
         header.created_at = u64::try_from(now_ms).unwrap_or(0);
         self.create_event_session(destination, &header, meta)?;
         let copied = self
-            .append_events(destination, &events)
+            .append_events_inner(destination, &events, false)
             .and_then(|()| self.write_presentation(destination.id(), presentation));
         if copied.is_err() {
             // Only remove a destination we created, never an existing session
             // rejected by create_event_session. A failed copy is not offered.
             self.delete(destination)?;
+        } else {
+            #[cfg(feature = "tools")]
+            {
+                let last_turn = events
+                    .iter()
+                    .map(|logged| logged.event.turn())
+                    .max()
+                    .unwrap_or(0);
+                self.carry_todo_sidecar(source_id, destination.id(), last_turn);
+            }
         }
         copied
     }
@@ -811,6 +1138,78 @@ impl SessionManager {
             .len())
     }
 
+    /// Whether the bytes a rollback would cut (everything after `mark`) carry an
+    /// undo or cancel fact. Only then can the todo sidecar differ from its
+    /// pre-append state.
+    #[cfg(feature = "tools")]
+    fn truncated_tail_moves_todo_boundary(&self, id: &str, mark: u64) -> bool {
+        let Ok(path) = self.events_path(id) else {
+            return true;
+        };
+        // The store's opener refuses symlinks and special files; a rollback probe
+        // holds the same rule as every other read of the log.
+        let Ok(mut file) = open_read_file(&path) else {
+            return true;
+        };
+        let Ok(meta) = file.metadata() else {
+            return true;
+        };
+        let len = meta.len();
+        if mark > len || file.seek(SeekFrom::Start(mark)).is_err() {
+            return true;
+        }
+        // Only the rolled-back tail is read, one line at a time, and only the
+        // few fields this predicate asks about are deserialized: the prefix is
+        // already validated, and a tool-call-heavy line need not become a JSON
+        // tree just to read its `kind`.
+        #[derive(serde::Deserialize)]
+        struct TailEvent {
+            #[serde(default)]
+            kind: Option<String>,
+            // The real enum, not its spelling: a new scope that takes back the
+            // conversation is then understood here without a second list to
+            // forget. A scope this build cannot read fails the record parse and
+            // is treated as "may have moved the boundary".
+            #[serde(default)]
+            scope: Option<atomcode_kernel::session::RewindScope>,
+        }
+        #[derive(serde::Deserialize)]
+        struct TailRecord {
+            #[serde(default)]
+            event: Option<TailEvent>,
+        }
+
+        use std::io::{BufRead, BufReader};
+        for line in BufReader::new(file).take(MAX_JSONL_BYTES as u64).lines() {
+            let Ok(line) = line else {
+                // An unreadable tail is not evidence that no undo was cut.
+                return true;
+            };
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(record) = serde_json::from_str::<TailRecord>(&line) else {
+                return true;
+            };
+            let Some(event) = record.event else {
+                continue;
+            };
+            match event.kind.as_deref() {
+                Some("rewound") => {
+                    if event
+                        .scope
+                        .is_some_and(atomcode_kernel::session::RewindScope::takes_back_conversation)
+                    {
+                        return true;
+                    }
+                }
+                Some("interrupted") => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+
     /// Take back an append nobody has read yet: the log is cut to `mark`.
     ///
     /// The log is append-only for everyone who reads it. This exists for the one
@@ -819,6 +1218,8 @@ impl SessionManager {
     /// rolling its own transaction back under the lease, with no agent running.
     pub fn truncate_events(&self, lease: &SessionLease, mark: u64) -> SessionResult<()> {
         self.validate_active_lease(lease)?;
+        #[cfg(feature = "tools")]
+        let tail_moves_boundary = self.truncated_tail_moves_todo_boundary(lease.id(), mark);
         let path = self.events_path(lease.id())?;
         let file = retry_transient_file_access(|| {
             fs::OpenOptions::new()
@@ -837,7 +1238,24 @@ impl SessionManager {
                 ),
             });
         }
-        file.set_len(mark).map_err(|error| io_at(&path, error))
+        file.set_len(mark).map_err(|error| io_at(&path, error))?;
+        drop(file);
+        #[cfg(feature = "tools")]
+        {
+            // Only a rollback that cuts an undo fact can have changed the list,
+            // and only a session that keeps a sidecar has a cache to follow. The
+            // log rollback already landed; a cache failure is reported, not fatal.
+            if tail_moves_boundary && self.read_todo_sidecar(lease.id()).ok().flatten().is_some() {
+                if let Err(error) = self.rebuild_todo_sidecar_after_undo(lease.id()) {
+                    tracing::warn!(
+                        %error,
+                        session = lease.id(),
+                        "todo sidecar could not follow the truncated log; the log rollback stands"
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// What making this session's conversation `target` would append, stamped
@@ -3882,6 +4300,427 @@ mod tests {
             .any(|event| matches!(event.event, SessionEvent::Rewound { .. })));
     }
 
+    #[cfg(feature = "tools")]
+    #[test]
+    fn a_fork_carries_the_plans_source_references() {
+        use crate::session::manager::{TodoCallPosition, TodoSidecarItem};
+
+        let (_dir, manager) = store();
+        let lease = created(&manager, "src");
+        manager.append_events(&lease, &a_turn()).unwrap();
+        manager
+            .write_todo_sidecar_with_sources(
+                "src",
+                &[TodoSidecarItem {
+                    content: "apply the fix".into(),
+                    status: "in_progress".into(),
+                }],
+                4,
+                Some(TodoCallPosition {
+                    turn: 1,
+                    round: 1,
+                    index: 0,
+                }),
+                &[2],
+            )
+            .unwrap();
+
+        let _ = manager.fork_native_session("src", "dst", 2_000).unwrap();
+
+        let sidecar = manager
+            .read_todo_sidecar("dst")
+            .unwrap()
+            .expect("the items travel");
+        assert_eq!(sidecar.todos.len(), 1);
+        assert_eq!(
+            sidecar.source_seqs,
+            vec![2],
+            "the fork keeps the original guidance pointers, not an empty list"
+        );
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
+    fn a_fork_drops_a_sidecar_position_past_its_own_turns() {
+        use crate::session::manager::{TodoCallPosition, TodoSidecarItem};
+
+        let (_dir, manager) = store();
+        let lease = created(&manager, "s1");
+        manager.append_events(&lease, &a_turn()).unwrap();
+        manager
+            .write_todo_sidecar(
+                "s1",
+                &[TodoSidecarItem {
+                    content: "a".into(),
+                    status: "in_progress".into(),
+                }],
+                4,
+                Some(TodoCallPosition {
+                    turn: 9,
+                    round: 1,
+                    index: 0,
+                }),
+            )
+            .unwrap();
+
+        let (_forked, _fork_lease) = manager.fork_native_session("s1", "s2", 2_000).unwrap();
+
+        let sidecar = manager
+            .read_todo_sidecar("s2")
+            .unwrap()
+            .expect("the items still travel");
+        assert_eq!(sidecar.todos.len(), 1);
+        assert_eq!(sidecar.todos[0].content, "a");
+        assert_eq!(sidecar.through, None);
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
+    fn an_undo_takes_back_a_sidecar_only_increment_to_its_baseline() {
+        use crate::session::manager::{TodoCallPosition, TodoSidecarItem};
+        use atomcode_kernel::tool::ToolCall;
+
+        let (_dir, manager) = store();
+        let id = "sidecar-only-increment-undone";
+        let lease = created(&manager, id);
+        let planned_at = TodoCallPosition {
+            turn: 1,
+            round: 1,
+            index: 0,
+        };
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 10, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        11,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "first".into(),
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        3,
+                        12,
+                        SessionEvent::TurnEnd {
+                            turn: 1,
+                            stop: StopReason::Stopped,
+                            error: None,
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        // The plan exists only here: this is what a converted session's log
+        // looks like after compaction drained the plan call.
+        manager
+            .write_todo_sidecar_with_sources(
+                id,
+                &[TodoSidecarItem {
+                    content: "finish it".into(),
+                    status: "pending".into(),
+                }],
+                3,
+                Some(planned_at),
+                &[2],
+            )
+            .unwrap();
+
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(4, 20, SessionEvent::TurnStart { turn: 2 }),
+                    logged(
+                        5,
+                        21,
+                        SessionEvent::UserMessage {
+                            turn: 2,
+                            text: "done".into(),
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        6,
+                        22,
+                        SessionEvent::AssistantMessage {
+                            turn: 2,
+                            round: 1,
+                            text: String::new(),
+                            reasoning: String::new(),
+                            tool_calls: vec![ToolCall {
+                                id: "u".into(),
+                                name: "todowrite".into(),
+                                arguments: r#"{"action":"update","id":1,"status":"completed"}"#
+                                    .into(),
+                            }],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    logged(
+                        7,
+                        23,
+                        SessionEvent::ToolResultLogged {
+                            turn: 2,
+                            round: 1,
+                            call_id: "u".into(),
+                            content: "#1 [x] finish it".into(),
+                            is_error: false,
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        // The hook's write, with the previous list kept as its baseline.
+        manager
+            .write_todo_sidecar_with_sources(
+                id,
+                &[TodoSidecarItem {
+                    content: "finish it".into(),
+                    status: "completed".into(),
+                }],
+                7,
+                Some(TodoCallPosition {
+                    turn: 2,
+                    round: 1,
+                    index: 0,
+                }),
+                &[2],
+            )
+            .unwrap();
+
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    8,
+                    30,
+                    SessionEvent::Rewound {
+                        turn: 2,
+                        to: 4,
+                        scope: RewindScope::Conversation,
+                    },
+                )],
+            )
+            .unwrap();
+
+        let sidecar = manager
+            .read_todo_sidecar(id)
+            .unwrap()
+            .expect("the sidecar keeps the only copy of the plan");
+        assert_eq!(sidecar.todos.len(), 1);
+        assert_eq!(
+            sidecar.todos[0].status, "pending",
+            "the undone completion is taken back, not kept as work already done"
+        );
+        assert_eq!(
+            sidecar.through,
+            Some(planned_at),
+            "back to the position the baseline was recovered at"
+        );
+        assert_eq!(sidecar.source_seqs, vec![2], "and it keeps its sources");
+        assert!(
+            sidecar.baseline.is_some(),
+            "the recoverable state stays reachable for a later undo"
+        );
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
+    fn a_sidecar_only_plan_survives_an_undo_of_its_through_turn() {
+        use crate::session::manager::{TodoCallPosition, TodoSidecarItem};
+
+        let (_dir, manager) = store();
+        let id = "sidecar-only-plan-undone";
+        let lease = created(&manager, id);
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "first".into(),
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        3,
+                        0,
+                        SessionEvent::AssistantMessage {
+                            turn: 1,
+                            round: 1,
+                            text: "ok".into(),
+                            reasoning: String::new(),
+                            tool_calls: vec![],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    logged(
+                        4,
+                        0,
+                        SessionEvent::TurnEnd {
+                            turn: 1,
+                            stop: StopReason::Stopped,
+                            error: None,
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        let through = Some(TodoCallPosition {
+            turn: 1,
+            round: 1,
+            index: 0,
+        });
+        manager
+            .write_todo_sidecar(
+                id,
+                &[TodoSidecarItem {
+                    content: "keep me".into(),
+                    status: "in_progress".into(),
+                }],
+                3,
+                through,
+            )
+            .unwrap();
+
+        // The plan never appears in this log (a converted/compacted session);
+        // undoing the turn its through points at must not erase the only copy.
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    5,
+                    0,
+                    SessionEvent::Rewound {
+                        turn: 1,
+                        to: 1,
+                        scope: RewindScope::Conversation,
+                    },
+                )],
+            )
+            .unwrap();
+
+        let sidecar = manager
+            .read_todo_sidecar(id)
+            .unwrap()
+            .expect("a sidecar-only plan is not evidence of a taken-back plan");
+        assert_eq!(sidecar.todos.len(), 1);
+        assert_eq!(sidecar.todos[0].content, "keep me");
+        assert_eq!(sidecar.through, through);
+    }
+
+    /// A session whose turn 1 plans two tasks and turn 2 completes the second,
+    /// with the sidecar already reflecting that completion.
+    #[cfg(feature = "tools")]
+    fn todo_session(manager: &SessionManager, id: &str) -> SessionLease {
+        use crate::session::manager::{TodoCallPosition, TodoSidecarItem};
+        use atomcode_kernel::tool::ToolCall;
+
+        let lease = created(manager, id);
+        let plan = ToolCall {
+            id: "p".into(),
+            name: "todowrite".into(),
+            arguments: r#"{"todos":[{"content":"a","status":"pending"},{"content":"b","status":"in_progress"}]}"#.into(),
+        };
+        let update = ToolCall {
+            id: "u".into(),
+            name: "todowrite".into(),
+            arguments: r#"{"action":"update","id":2,"status":"completed"}"#.into(),
+        };
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::AssistantMessage {
+                            turn: 1,
+                            round: 1,
+                            text: String::new(),
+                            reasoning: String::new(),
+                            tool_calls: vec![plan],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    logged(
+                        3,
+                        0,
+                        SessionEvent::ToolResultLogged {
+                            turn: 1,
+                            round: 1,
+                            call_id: "p".into(),
+                            content: "#1 [ ] a\n#2 [~] b".into(),
+                            is_error: false,
+                            images: vec![],
+                        },
+                    ),
+                    logged(4, 0, SessionEvent::TurnStart { turn: 2 }),
+                    logged(
+                        5,
+                        0,
+                        SessionEvent::AssistantMessage {
+                            turn: 2,
+                            round: 1,
+                            text: String::new(),
+                            reasoning: String::new(),
+                            tool_calls: vec![update],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    logged(
+                        6,
+                        0,
+                        SessionEvent::ToolResultLogged {
+                            turn: 2,
+                            round: 1,
+                            call_id: "u".into(),
+                            content: "#2 [x] b".into(),
+                            is_error: false,
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        manager
+            .write_todo_sidecar(
+                id,
+                &[
+                    TodoSidecarItem {
+                        content: "a".into(),
+                        status: "pending".into(),
+                    },
+                    TodoSidecarItem {
+                        content: "b".into(),
+                        status: "completed".into(),
+                    },
+                ],
+                6,
+                Some(TodoCallPosition {
+                    turn: 2,
+                    round: 1,
+                    index: 0,
+                }),
+            )
+            .unwrap();
+        lease
+    }
+
     #[test]
     fn resume_keeps_an_unreplayed_prompt_recoverable() {
         let (_dir, manager) = store();
@@ -4109,6 +4948,155 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[cfg(feature = "tools")]
+    fn assert_todo_reverted(manager: &SessionManager, id: &str) {
+        use crate::session::manager::TodoCallPosition;
+
+        let sidecar = manager
+            .read_todo_sidecar(id)
+            .unwrap()
+            .expect("a list survives the undo");
+        let shown: Vec<(&str, &str)> = sidecar
+            .todos
+            .iter()
+            .map(|todo| (todo.content.as_str(), todo.status.as_str()))
+            .collect();
+        assert_eq!(shown, vec![("a", "pending"), ("b", "in_progress")]);
+        assert_eq!(
+            sidecar.through,
+            Some(TodoCallPosition {
+                turn: 1,
+                round: 1,
+                index: 0,
+            })
+        );
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
+    fn a_legacy_sidecar_without_a_position_does_not_double_apply_a_log_add() {
+        use crate::session::manager::TodoSidecarItem;
+        use atomcode_kernel::tool::ToolCall;
+
+        let (_dir, manager) = store();
+        let id = "legacy-sidecar-add";
+        let lease = created(&manager, id);
+        let add = ToolCall {
+            id: "a".into(),
+            name: "todowrite".into(),
+            arguments: r#"{"action":"add","content":"new"}"#.into(),
+        };
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::AssistantMessage {
+                            turn: 1,
+                            round: 1,
+                            text: String::new(),
+                            reasoning: String::new(),
+                            tool_calls: vec![add],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    logged(
+                        3,
+                        0,
+                        SessionEvent::ToolResultLogged {
+                            turn: 1,
+                            round: 1,
+                            call_id: "a".into(),
+                            content: "#1 [ ] new".into(),
+                            is_error: false,
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        4,
+                        0,
+                        SessionEvent::TurnEnd {
+                            turn: 1,
+                            stop: StopReason::Stopped,
+                            error: None,
+                        },
+                    ),
+                    logged(5, 0, SessionEvent::TurnStart { turn: 2 }),
+                    logged(
+                        6,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 2,
+                            text: "later".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        manager
+            .write_todo_sidecar(
+                id,
+                &[TodoSidecarItem {
+                    content: "new".into(),
+                    status: "pending".into(),
+                }],
+                2,
+                None,
+            )
+            .unwrap();
+
+        // Rewinding turn 2 triggers a rebuild; the legacy sidecar cannot say
+        // which calls it already reflects, so the log's add must not append a
+        // second copy on top of it.
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    7,
+                    0,
+                    SessionEvent::Rewound {
+                        turn: 2,
+                        to: 5,
+                        scope: RewindScope::Conversation,
+                    },
+                )],
+            )
+            .unwrap();
+
+        let sidecar = manager.read_todo_sidecar(id).unwrap().unwrap();
+        assert_eq!(sidecar.todos.len(), 1);
+        assert_eq!(sidecar.todos[0].content, "new");
+        assert!(sidecar.through.is_some());
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
+    fn a_rewind_rebuilds_the_todo_sidecar() {
+        let (_dir, manager) = store();
+        let lease = todo_session(&manager, "rewind-todos");
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    7,
+                    0,
+                    SessionEvent::Rewound {
+                        turn: 2,
+                        to: 4,
+                        scope: RewindScope::Conversation,
+                    },
+                )],
+            )
+            .unwrap();
+
+        assert_todo_reverted(&manager, "rewind-todos");
     }
 
     #[test]
@@ -4894,6 +5882,1175 @@ mod tests {
                 SessionEvent::UserMessage { text, .. } if text == "=== RESUME ==="
             )
         }));
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
+    fn a_rewind_before_the_plan_clears_the_todo_sidecar() {
+        let (_dir, manager) = store();
+        let lease = todo_session(&manager, "rewind-clear-todos");
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    7,
+                    0,
+                    SessionEvent::Rewound {
+                        turn: 2,
+                        to: 1,
+                        scope: RewindScope::Conversation,
+                    },
+                )],
+            )
+            .unwrap();
+
+        let sidecar = manager
+            .read_todo_sidecar("rewind-clear-todos")
+            .unwrap()
+            .expect("the sidecar is rewritten, not left stale");
+        assert!(sidecar.todos.is_empty());
+        assert_eq!(sidecar.through, None);
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
+    fn a_standing_cancel_rebuilds_the_todo_sidecar() {
+        let (_dir, manager) = store();
+        let lease = todo_session(&manager, "cancel-rebuilds-todos");
+        // A person's cancel retires the active plan in the projection — the fold
+        // starts after the newest interruption — so the cache must follow it
+        // even though nothing was undone.
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    7,
+                    0,
+                    SessionEvent::Interrupted {
+                        turn: 2,
+                        undone: false,
+                    },
+                )],
+            )
+            .unwrap();
+
+        let sidecar = manager
+            .read_todo_sidecar("cancel-rebuilds-todos")
+            .unwrap()
+            .expect("the sidecar is rewritten, not left stale");
+        assert!(sidecar.todos.is_empty(), "{:?}", sidecar.todos);
+        assert_eq!(sidecar.through, None);
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
+    fn an_undo_that_does_not_touch_the_plan_keeps_a_sidecar_only_list() {
+        use crate::session::manager::{TodoCallPosition, TodoSidecarItem};
+
+        let (_dir, manager) = store();
+        let id = "sidecar-only-plan";
+        let lease = created(&manager, id);
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "first".into(),
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        3,
+                        0,
+                        SessionEvent::AssistantMessage {
+                            turn: 1,
+                            round: 1,
+                            text: "ok".into(),
+                            reasoning: String::new(),
+                            tool_calls: vec![],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    logged(
+                        4,
+                        0,
+                        SessionEvent::TurnEnd {
+                            turn: 1,
+                            stop: StopReason::Stopped,
+                            error: None,
+                        },
+                    ),
+                    logged(5, 0, SessionEvent::TurnStart { turn: 2 }),
+                    logged(
+                        6,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 2,
+                            text: "second".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        let through = Some(TodoCallPosition {
+            turn: 1,
+            round: 1,
+            index: 0,
+        });
+        manager
+            .write_todo_sidecar(
+                id,
+                &[TodoSidecarItem {
+                    content: "keep me".into(),
+                    status: "in_progress".into(),
+                }],
+                4,
+                through,
+            )
+            .unwrap();
+
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    7,
+                    0,
+                    SessionEvent::Rewound {
+                        turn: 2,
+                        to: 5,
+                        scope: RewindScope::Conversation,
+                    },
+                )],
+            )
+            .unwrap();
+
+        let sidecar = manager
+            .read_todo_sidecar(id)
+            .unwrap()
+            .expect("a sidecar-only plan is not evidence of a taken-back plan");
+        assert_eq!(sidecar.todos.len(), 1);
+        assert_eq!(sidecar.todos[0].content, "keep me");
+        assert_eq!(sidecar.through, through);
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
+    fn a_cancel_boundary_does_not_erase_a_sidecar_only_plan() {
+        use crate::session::manager::{TodoCallPosition, TodoSidecarItem};
+
+        let (_dir, manager) = store();
+        let id = "sidecar-only-cancel";
+        let lease = created(&manager, id);
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "first".into(),
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        3,
+                        0,
+                        SessionEvent::AssistantMessage {
+                            turn: 1,
+                            round: 1,
+                            text: "ok".into(),
+                            reasoning: String::new(),
+                            tool_calls: vec![],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    logged(
+                        4,
+                        0,
+                        SessionEvent::TurnEnd {
+                            turn: 1,
+                            stop: StopReason::Stopped,
+                            error: None,
+                        },
+                    ),
+                    logged(5, 0, SessionEvent::TurnStart { turn: 2 }),
+                    logged(
+                        6,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 2,
+                            text: "second".into(),
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        7,
+                        0,
+                        SessionEvent::Interrupted {
+                            turn: 2,
+                            undone: false,
+                        },
+                    ),
+                    logged(8, 0, SessionEvent::TurnStart { turn: 3 }),
+                    logged(
+                        9,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 3,
+                            text: "third".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        let through = Some(TodoCallPosition {
+            turn: 1,
+            round: 1,
+            index: 0,
+        });
+        manager
+            .write_todo_sidecar(
+                id,
+                &[TodoSidecarItem {
+                    content: "keep me".into(),
+                    status: "in_progress".into(),
+                }],
+                4,
+                through,
+            )
+            .unwrap();
+
+        // The undo takes back turn 3. The cancel at turn 2 must not retire a
+        // plan the log never held: the sidecar is its only copy.
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    10,
+                    0,
+                    SessionEvent::Rewound {
+                        turn: 3,
+                        to: 8,
+                        scope: RewindScope::Conversation,
+                    },
+                )],
+            )
+            .unwrap();
+
+        let sidecar = manager
+            .read_todo_sidecar(id)
+            .unwrap()
+            .expect("the sidecar is the only copy of the plan");
+        assert_eq!(sidecar.todos.len(), 1, "{sidecar:?}");
+        assert_eq!(sidecar.todos[0].content, "keep me");
+        assert_eq!(sidecar.through, through);
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
+    fn a_cancel_boundary_does_not_truncate_a_sidecar_only_plan() {
+        use crate::session::manager::{TodoCallPosition, TodoSidecarItem};
+        use atomcode_kernel::tool::ToolCall;
+
+        let (_dir, manager) = store();
+        let id = "sidecar-only-cancel-call";
+        let lease = created(&manager, id);
+        let update = ToolCall {
+            id: "u".into(),
+            name: "todowrite".into(),
+            arguments: r#"{"action":"update","id":1,"status":"completed"}"#.into(),
+        };
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "first".into(),
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        3,
+                        0,
+                        SessionEvent::AssistantMessage {
+                            turn: 1,
+                            round: 1,
+                            text: "ok".into(),
+                            reasoning: String::new(),
+                            tool_calls: vec![],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    logged(
+                        4,
+                        0,
+                        SessionEvent::TurnEnd {
+                            turn: 1,
+                            stop: StopReason::Stopped,
+                            error: None,
+                        },
+                    ),
+                    logged(5, 0, SessionEvent::TurnStart { turn: 2 }),
+                    logged(
+                        6,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 2,
+                            text: "second".into(),
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        7,
+                        0,
+                        SessionEvent::Interrupted {
+                            turn: 2,
+                            undone: false,
+                        },
+                    ),
+                    logged(8, 0, SessionEvent::TurnStart { turn: 3 }),
+                    logged(
+                        9,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 3,
+                            text: "third".into(),
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        10,
+                        0,
+                        SessionEvent::AssistantMessage {
+                            turn: 3,
+                            round: 1,
+                            text: String::new(),
+                            reasoning: String::new(),
+                            tool_calls: vec![update],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    logged(
+                        11,
+                        0,
+                        SessionEvent::ToolResultLogged {
+                            turn: 3,
+                            round: 1,
+                            call_id: "u".into(),
+                            content: "#1 [x] keep me".into(),
+                            is_error: false,
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        12,
+                        0,
+                        SessionEvent::TurnEnd {
+                            turn: 3,
+                            stop: StopReason::Stopped,
+                            error: None,
+                        },
+                    ),
+                    logged(13, 0, SessionEvent::TurnStart { turn: 4 }),
+                    logged(
+                        14,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 4,
+                            text: "fourth".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        manager
+            .write_todo_sidecar(
+                id,
+                &[TodoSidecarItem {
+                    content: "keep me".into(),
+                    status: "pending".into(),
+                }],
+                4,
+                Some(TodoCallPosition {
+                    turn: 1,
+                    round: 1,
+                    index: 0,
+                }),
+            )
+            .unwrap();
+
+        // The update after the cancel still sees the sidecar's list; the undo of
+        // turn 4 must fold it over that baseline, not from an empty one.
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    15,
+                    0,
+                    SessionEvent::Rewound {
+                        turn: 4,
+                        to: 13,
+                        scope: RewindScope::Conversation,
+                    },
+                )],
+            )
+            .unwrap();
+
+        let sidecar = manager
+            .read_todo_sidecar(id)
+            .unwrap()
+            .expect("the list survives the rebuild");
+        assert_eq!(sidecar.todos.len(), 1, "{sidecar:?}");
+        assert_eq!(sidecar.todos[0].content, "keep me");
+        assert_eq!(sidecar.todos[0].status, "completed");
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
+    fn a_legacy_sidecar_keeps_its_list_when_the_log_only_updates() {
+        use crate::session::manager::TodoSidecarItem;
+        use atomcode_kernel::tool::ToolCall;
+
+        let (_dir, manager) = store();
+        let id = "legacy-sidecar-update";
+        let lease = created(&manager, id);
+        let update = ToolCall {
+            id: "u".into(),
+            name: "todowrite".into(),
+            arguments: r#"{"action":"update","id":2,"status":"completed"}"#.into(),
+        };
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "hello".into(),
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        3,
+                        0,
+                        SessionEvent::AssistantMessage {
+                            turn: 1,
+                            round: 1,
+                            text: String::new(),
+                            reasoning: String::new(),
+                            tool_calls: vec![update],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    logged(
+                        4,
+                        0,
+                        SessionEvent::ToolResultLogged {
+                            turn: 1,
+                            round: 1,
+                            call_id: "u".into(),
+                            content: "#2 [x] b".into(),
+                            is_error: false,
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        5,
+                        0,
+                        SessionEvent::TurnEnd {
+                            turn: 1,
+                            stop: StopReason::Stopped,
+                            error: None,
+                        },
+                    ),
+                    logged(6, 0, SessionEvent::TurnStart { turn: 2 }),
+                    logged(
+                        7,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 2,
+                            text: "later".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        manager
+            .write_todo_sidecar(
+                id,
+                &[
+                    TodoSidecarItem {
+                        content: "a".into(),
+                        status: "pending".into(),
+                    },
+                    TodoSidecarItem {
+                        content: "b".into(),
+                        status: "in_progress".into(),
+                    },
+                ],
+                2,
+                None,
+            )
+            .unwrap();
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    8,
+                    0,
+                    SessionEvent::Rewound {
+                        turn: 2,
+                        to: 6,
+                        scope: RewindScope::Conversation,
+                    },
+                )],
+            )
+            .unwrap();
+
+        // A sidecar from before positions existed cannot say whether the log's
+        // update is already reflected; folding from empty would erase the plan.
+        let sidecar = manager.read_todo_sidecar(id).unwrap().unwrap();
+        assert_eq!(sidecar.todos.len(), 2, "{sidecar:?}");
+        assert_eq!(sidecar.todos[0].content, "a");
+        assert_eq!(sidecar.todos[1].content, "b");
+        assert_eq!(sidecar.todos[1].status, "completed");
+        assert!(sidecar.through.is_some());
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
+    fn the_sidecar_fold_keeps_a_later_call_with_a_reused_id() {
+        use atomcode_kernel::tool::ToolCall;
+
+        let (_dir, manager) = store();
+        let id = "failed-call-id";
+        let lease = created(&manager, id);
+        // A provider that numbers calls per response can reuse an id.
+        let failed = ToolCall {
+            id: "call_0".into(),
+            name: "todowrite".into(),
+            arguments: r#"{"todos":[{"content":"failed","status":"pending"}]}"#.into(),
+        };
+        let later = ToolCall {
+            id: "call_0".into(),
+            name: "todowrite".into(),
+            arguments: r#"{"action":"add","content":"later"}"#.into(),
+        };
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "hello".into(),
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        3,
+                        0,
+                        SessionEvent::AssistantMessage {
+                            turn: 1,
+                            round: 1,
+                            text: String::new(),
+                            reasoning: String::new(),
+                            tool_calls: vec![failed],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    logged(
+                        4,
+                        0,
+                        SessionEvent::ToolResultLogged {
+                            turn: 1,
+                            round: 1,
+                            call_id: "call_0".into(),
+                            content: "denied".into(),
+                            is_error: true,
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        5,
+                        0,
+                        SessionEvent::TurnEnd {
+                            turn: 1,
+                            stop: StopReason::Stopped,
+                            error: None,
+                        },
+                    ),
+                    logged(6, 0, SessionEvent::TurnStart { turn: 2 }),
+                    logged(
+                        7,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 2,
+                            text: "retry".into(),
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        8,
+                        0,
+                        SessionEvent::AssistantMessage {
+                            turn: 2,
+                            round: 1,
+                            text: String::new(),
+                            reasoning: String::new(),
+                            tool_calls: vec![later],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    logged(
+                        9,
+                        0,
+                        SessionEvent::ToolResultLogged {
+                            turn: 2,
+                            round: 1,
+                            call_id: "call_0".into(),
+                            content: "#1 [ ] later".into(),
+                            is_error: false,
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        10,
+                        0,
+                        SessionEvent::TurnEnd {
+                            turn: 2,
+                            stop: StopReason::Stopped,
+                            error: None,
+                        },
+                    ),
+                    logged(11, 0, SessionEvent::TurnStart { turn: 3 }),
+                    logged(
+                        12,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 3,
+                            text: "undo".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    13,
+                    0,
+                    SessionEvent::Rewound {
+                        turn: 3,
+                        to: 11,
+                        scope: RewindScope::Conversation,
+                    },
+                )],
+            )
+            .unwrap();
+
+        let sidecar = manager
+            .read_todo_sidecar(id)
+            .unwrap()
+            .expect("the later call shapes the list");
+        assert_eq!(sidecar.todos.len(), 1, "{sidecar:?}");
+        assert_eq!(sidecar.todos[0].content, "later");
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
+    fn the_sidecar_fold_matches_a_result_to_the_call_it_followed() {
+        use atomcode_kernel::tool::ToolCall;
+
+        let (_dir, manager) = store();
+        let id = "failed-result-other-round";
+        let lease = created(&manager, id);
+        let plan = ToolCall {
+            id: "p".into(),
+            name: "todowrite".into(),
+            arguments: r#"{"todos":[{"content":"failed","status":"pending"}]}"#.into(),
+        };
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "hello".into(),
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        3,
+                        0,
+                        SessionEvent::AssistantMessage {
+                            turn: 1,
+                            round: 1,
+                            text: String::new(),
+                            reasoning: String::new(),
+                            tool_calls: vec![plan],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    // A rewritten transcript can file the result under another
+                    // round; the fold still binds it to the call it follows.
+                    logged(
+                        4,
+                        0,
+                        SessionEvent::ToolResultLogged {
+                            turn: 1,
+                            round: 2,
+                            call_id: "p".into(),
+                            content: "denied".into(),
+                            is_error: true,
+                            images: vec![],
+                        },
+                    ),
+                    logged(6, 0, SessionEvent::TurnStart { turn: 2 }),
+                    logged(
+                        7,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 2,
+                            text: "undo".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    8,
+                    0,
+                    SessionEvent::Rewound {
+                        turn: 2,
+                        to: 6,
+                        scope: RewindScope::Conversation,
+                    },
+                )],
+            )
+            .unwrap();
+
+        let sidecar = manager.read_todo_sidecar(id).unwrap();
+        assert!(
+            sidecar
+                .as_ref()
+                .is_none_or(|sidecar| sidecar.todos.is_empty()),
+            "the call the failed result answered is not part of the list: {sidecar:?}"
+        );
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
+    fn a_cancelled_plan_does_not_return_through_a_later_rebuild() {
+        use atomcode_kernel::tool::ToolCall;
+
+        let (_dir, manager) = store();
+        let id = "cancelled-plan";
+        let lease = created(&manager, id);
+        let plan = ToolCall {
+            id: "p".into(),
+            name: "todowrite".into(),
+            arguments: r#"{"todos":[{"content":"cancelled","status":"pending"}]}"#.into(),
+        };
+        let update = ToolCall {
+            id: "u".into(),
+            name: "todowrite".into(),
+            arguments: r#"{"action":"update","id":1,"status":"completed"}"#.into(),
+        };
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::AssistantMessage {
+                            turn: 1,
+                            round: 1,
+                            text: String::new(),
+                            reasoning: String::new(),
+                            tool_calls: vec![plan],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    logged(
+                        3,
+                        0,
+                        SessionEvent::ToolResultLogged {
+                            turn: 1,
+                            round: 1,
+                            call_id: "p".into(),
+                            content: "#1 [ ] cancelled".into(),
+                            is_error: false,
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        4,
+                        0,
+                        SessionEvent::TurnEnd {
+                            turn: 1,
+                            stop: StopReason::Cancelled,
+                            error: None,
+                        },
+                    ),
+                    logged(
+                        5,
+                        0,
+                        SessionEvent::Interrupted {
+                            turn: 1,
+                            undone: false,
+                        },
+                    ),
+                    logged(6, 0, SessionEvent::TurnStart { turn: 2 }),
+                    logged(
+                        7,
+                        0,
+                        SessionEvent::AssistantMessage {
+                            turn: 2,
+                            round: 1,
+                            text: String::new(),
+                            reasoning: String::new(),
+                            tool_calls: vec![update],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    logged(
+                        8,
+                        0,
+                        SessionEvent::ToolResultLogged {
+                            turn: 2,
+                            round: 1,
+                            call_id: "u".into(),
+                            content: "#1 already completed".into(),
+                            is_error: false,
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        9,
+                        0,
+                        SessionEvent::TurnEnd {
+                            turn: 2,
+                            stop: StopReason::Stopped,
+                            error: None,
+                        },
+                    ),
+                    logged(10, 0, SessionEvent::TurnStart { turn: 3 }),
+                    logged(
+                        11,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 3,
+                            text: "undo this".into(),
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        12,
+                        0,
+                        SessionEvent::Rewound {
+                            turn: 3,
+                            to: 10,
+                            scope: RewindScope::Conversation,
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+
+        let sidecar = manager
+            .read_todo_sidecar(id)
+            .unwrap()
+            .expect("the update after the cancel writes the current list");
+        assert!(
+            sidecar.todos.is_empty(),
+            "the plan before the cancel must not come back: {:?}",
+            sidecar.todos
+        );
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
+    fn truncation_rebuilds_only_when_the_cut_tail_moves_the_todo_boundary() {
+        let (_dir, manager) = store();
+        let id = "truncate-tail-plain";
+        let lease = created(&manager, id);
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "first".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        let mark = manager.events_mark(id).unwrap();
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(3, 0, SessionEvent::TurnStart { turn: 2 }),
+                    logged(
+                        4,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 2,
+                            text: "second".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        assert!(!manager.truncated_tail_moves_todo_boundary(id, mark));
+
+        let id = "truncate-tail-undo";
+        let lease = created(&manager, id);
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::UserMessage {
+                            turn: 1,
+                            text: "first".into(),
+                            images: vec![],
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        let mark = manager.events_mark(id).unwrap();
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    3,
+                    0,
+                    SessionEvent::Rewound {
+                        turn: 1,
+                        to: 1,
+                        scope: RewindScope::Conversation,
+                    },
+                )],
+            )
+            .unwrap();
+        assert!(manager.truncated_tail_moves_todo_boundary(id, mark));
+
+        // A standing cancel retires the plan too: cutting it back would restore
+        // the plan, so the probe must say the boundary moved.
+        let id = "truncate-tail-cancel";
+        let lease = created(&manager, id);
+        manager.append_events(&lease, &a_turn()).unwrap();
+        let mark = manager.events_mark(id).unwrap();
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    6,
+                    0,
+                    SessionEvent::Interrupted {
+                        turn: 1,
+                        undone: false,
+                    },
+                )],
+            )
+            .unwrap();
+        assert!(manager.truncated_tail_moves_todo_boundary(id, mark));
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
+    fn truncating_an_append_rolls_the_todo_sidecar_back() {
+        use crate::session::manager::{TodoCallPosition, TodoSidecarItem};
+        use atomcode_kernel::tool::ToolCall;
+
+        let (_dir, manager) = store();
+        let id = "truncate-todos";
+        let lease = created(&manager, id);
+        let plan = ToolCall {
+            id: "p".into(),
+            name: "todowrite".into(),
+            arguments: r#"{"todos":[{"content":"task","status":"in_progress"}]}"#.into(),
+        };
+        manager
+            .append_events(
+                &lease,
+                &[
+                    logged(1, 0, SessionEvent::TurnStart { turn: 1 }),
+                    logged(
+                        2,
+                        0,
+                        SessionEvent::AssistantMessage {
+                            turn: 1,
+                            round: 1,
+                            text: String::new(),
+                            reasoning: String::new(),
+                            tool_calls: vec![plan],
+                            reasoning_blocks: vec![],
+                            meta: None,
+                        },
+                    ),
+                    logged(
+                        3,
+                        0,
+                        SessionEvent::ToolResultLogged {
+                            turn: 1,
+                            round: 1,
+                            call_id: "p".into(),
+                            content: "#1 [~] task".into(),
+                            is_error: false,
+                            images: vec![],
+                        },
+                    ),
+                    logged(
+                        4,
+                        0,
+                        SessionEvent::TurnEnd {
+                            turn: 1,
+                            stop: StopReason::Stopped,
+                            error: None,
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+        let through = Some(TodoCallPosition {
+            turn: 1,
+            round: 1,
+            index: 0,
+        });
+        manager
+            .write_todo_sidecar(
+                id,
+                &[TodoSidecarItem {
+                    content: "task".into(),
+                    status: "in_progress".into(),
+                }],
+                4,
+                through,
+            )
+            .unwrap();
+        let mark = manager.events_mark(id).unwrap();
+
+        manager
+            .append_events(
+                &lease,
+                &[logged(
+                    5,
+                    0,
+                    SessionEvent::Rewound {
+                        turn: 1,
+                        to: 1,
+                        scope: RewindScope::Conversation,
+                    },
+                )],
+            )
+            .unwrap();
+        assert!(manager
+            .read_todo_sidecar(id)
+            .unwrap()
+            .expect("the rewind writes the current list")
+            .todos
+            .is_empty());
+
+        manager.truncate_events(&lease, mark).unwrap();
+        let sidecar = manager
+            .read_todo_sidecar(id)
+            .unwrap()
+            .expect("the truncated log's list is rebuilt");
+        assert_eq!(sidecar.todos.len(), 1);
+        assert_eq!(sidecar.todos[0].content, "task");
+        assert_eq!(sidecar.through, through);
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
+    fn forking_an_event_session_copies_its_todo_sidecar() {
+        use crate::session::manager::{TodoCallPosition, TodoSidecarItem};
+
+        let (_dir, manager) = store();
+        let lease = created(&manager, "s1");
+        manager.append_events(&lease, &a_turn()).unwrap();
+        let items = vec![TodoSidecarItem {
+            content: "a".into(),
+            status: "in_progress".into(),
+        }];
+        let through = Some(TodoCallPosition {
+            turn: 1,
+            round: 1,
+            index: 0,
+        });
+        manager
+            .write_todo_sidecar("s1", &items, 4, through)
+            .unwrap();
+
+        let (_forked, _fork_lease) = manager.fork_native_session("s1", "s2", 2_000).unwrap();
+
+        let sidecar = manager
+            .read_todo_sidecar("s2")
+            .unwrap()
+            .expect("the fork carries the plan");
+        assert_eq!(sidecar.todos.len(), 1);
+        assert_eq!(sidecar.todos[0].content, "a");
+        assert_eq!(sidecar.todos[0].status, "in_progress");
+        assert_eq!(sidecar.through, through);
     }
 
     #[cfg(feature = "memory")]

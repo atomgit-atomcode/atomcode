@@ -66,6 +66,23 @@ pub struct TodoSidecar {
     /// before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub through: Option<TodoCallPosition>,
+    /// The list as it stood before the calls `todos` reflects since it: what an
+    /// undo falls back to when the plan itself is no longer in the log (a
+    /// converted or compacted session). An undo takes a suffix of turns, so
+    /// recovering this one state and re-applying the standing calls is enough.
+    /// `None` in a sidecar written before this existed, or one with no earlier
+    /// state to keep.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<TodoSidecarBaseline>,
+}
+
+/// A recoverable pre-increment state of a [`TodoSidecar`].
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct TodoSidecarBaseline {
+    #[serde(default)]
+    pub todos: Vec<TodoSidecarItem>,
+    #[serde(default)]
+    pub through: Option<TodoCallPosition>,
 }
 
 /// Where in a session a todo call was made: the kernel turn, the round within it,
@@ -1473,7 +1490,32 @@ impl SessionManager {
         through: Option<TodoCallPosition>,
         source_seqs: &[u64],
     ) -> SessionResult<()> {
-        if source_seqs.len() > 4 || source_seqs.iter().any(|seq| *seq == 0) {
+        // Keep the state before this write's calls so an undo that takes one
+        // back can rebuild the list even when the plan itself is no longer in
+        // the log. An older baseline is already the furthest recoverable point.
+        let baseline = match self.read_todo_sidecar(id) {
+            Ok(Some(previous)) => previous.baseline.or(Some(TodoSidecarBaseline {
+                todos: previous.todos,
+                through: previous.through,
+            })),
+            _ => None,
+        };
+        self.write_todo_sidecar_full(id, todos, message_count, through, source_seqs, baseline)
+    }
+
+    /// The writer with the baseline chosen by the caller: an undo rebuild keeps
+    /// the state it recovered from (so a later undo can reach it again) and
+    /// clears it only when the plan it described was taken back.
+    pub(super) fn write_todo_sidecar_full(
+        &self,
+        id: &str,
+        todos: &[TodoSidecarItem],
+        message_count: usize,
+        through: Option<TodoCallPosition>,
+        source_seqs: &[u64],
+        baseline: Option<TodoSidecarBaseline>,
+    ) -> SessionResult<()> {
+        if source_seqs.len() > 4 || source_seqs.contains(&0) {
             return Err(SessionStoreError::Corrupt {
                 kind: "todo sidecar",
                 message: "invalid source references".into(),
@@ -1484,6 +1526,7 @@ impl SessionManager {
             todos: todos.to_vec(),
             message_count,
             through,
+            baseline,
         };
         let bytes = serialize_bounded(&sidecar, "todo sidecar", MAX_TODO_SIDECAR_BYTES)?;
         atomic_write(&self.todo_sidecar_path(id)?, &bytes)
@@ -1529,6 +1572,72 @@ impl SessionManager {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(io_at(&path, error)),
+        }
+    }
+
+    /// Carry a source session's todo sidecar into a fork.
+    ///
+    /// The sidecar may be the only copy of a plan compaction took out of the
+    /// transcript. Its `through` is a position in the **source** log; when it
+    /// points past the fork's last turn the sidecar was written after the
+    /// aggregate this fork copied, so the items travel without a position rather
+    /// than anchoring the panel to a call the fork does not have.
+    #[cfg(feature = "tools")]
+    pub(super) fn carry_todo_sidecar(&self, source_id: &str, destination_id: &str, last_turn: u64) {
+        let sidecar = match self.read_todo_sidecar(source_id) {
+            Ok(Some(sidecar)) => sidecar,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    source = source_id,
+                    "could not read the source todo sidecar for a fork"
+                );
+                return;
+            }
+        };
+        let through = match sidecar.through {
+            Some(through) if through.turn > last_turn => {
+                tracing::warn!(
+                    source = source_id,
+                    through = through.turn,
+                    last_turn,
+                    "source todo sidecar points past the fork's turns; carrying its items without a position"
+                );
+                None
+            }
+            other => other,
+        };
+        // The plan's original-guidance pointers travel with the items; a fork is
+        // a copy of the same conversation, so they still name its user messages.
+        // The recoverable baseline travels too, with the same position rule as
+        // `through`: past the fork's last turn it keeps its items, not its anchor.
+        let sources: &[u64] =
+            if sidecar.source_seqs.len() <= 4 && sidecar.source_seqs.iter().all(|seq| *seq > 0) {
+                &sidecar.source_seqs
+            } else {
+                &[]
+            };
+        let baseline = sidecar.baseline.map(|mut baseline| {
+            if baseline.through.is_some_and(|at| at.turn > last_turn) {
+                baseline.through = None;
+            }
+            baseline
+        });
+        if let Err(error) = self.write_todo_sidecar_full(
+            destination_id,
+            &sidecar.todos,
+            sidecar.message_count,
+            through,
+            sources,
+            baseline,
+        ) {
+            tracing::warn!(
+                %error,
+                source = source_id,
+                destination = destination_id,
+                "could not carry the todo sidecar into the fork"
+            );
         }
     }
     fn meta_lock_path(&self, id: &str) -> SessionResult<PathBuf> {
@@ -2819,6 +2928,28 @@ impl SessionManager {
             Some(&forked.presentation),
             &forked.meta,
         )?;
+        #[cfg(feature = "tools")]
+        {
+            // `through.turn` is a turn id, and `meta.turn_count` counts finished
+            // turns: an undone or stat-less turn leaves a gap between the two. The
+            // snapshot's high-water mark, or the highest id its messages carry, is
+            // the id the fork reaches; a snapshot from before either field is
+            // bounded by its finished-turn count, as it always was.
+            let last_turn = forked
+                .snapshot
+                .turn_counter
+                .max(
+                    forked
+                        .snapshot
+                        .messages
+                        .iter()
+                        .filter_map(|message| message.meta.as_ref().map(|meta| meta.turn_id))
+                        .max()
+                        .unwrap_or(0),
+                )
+                .max(u64::from(forked.meta.turn_count));
+            self.carry_todo_sidecar(source_id, destination_id, last_turn);
+        }
         Ok((forked, destination_lease))
     }
 
@@ -5018,7 +5149,7 @@ fn reject_existing_non_regular(path: &Path) -> SessionResult<()> {
     }
 }
 
-fn open_read_file(path: &Path) -> SessionResult<File> {
+pub(super) fn open_read_file(path: &Path) -> SessionResult<File> {
     let mut options = OpenOptions::new();
     options.read(true);
     no_follow(&mut options);
@@ -6334,6 +6465,23 @@ mod tests {
             &source_meta,
         )
         .unwrap();
+        #[cfg(feature = "tools")]
+        let todo_through = TodoCallPosition {
+            turn: 1,
+            round: 1,
+            index: 0,
+        };
+        #[cfg(feature = "tools")]
+        mgr.write_todo_sidecar(
+            "source",
+            &[TodoSidecarItem {
+                content: "a".into(),
+                status: "in_progress".into(),
+            }],
+            2,
+            Some(todo_through),
+        )
+        .unwrap();
 
         let (forked, fork_lease) = mgr
             .fork_native_session("source", "destination", 20)
@@ -6360,6 +6508,17 @@ mod tests {
                 base_turn_count: 2,
             })
         );
+        #[cfg(feature = "tools")]
+        {
+            let sidecar = mgr
+                .read_todo_sidecar("destination")
+                .unwrap()
+                .expect("the fork carries the plan");
+            assert_eq!(sidecar.todos.len(), 1);
+            assert_eq!(sidecar.todos[0].content, "a");
+            assert_eq!(sidecar.todos[0].status, "in_progress");
+            assert_eq!(sidecar.through, Some(todo_through));
+        }
         assert_eq!(mgr.load_native_session("source").unwrap().meta, source_meta);
         assert!(matches!(
             mgr.acquire_lease("source"),
@@ -6369,6 +6528,58 @@ mod tests {
             mgr.acquire_lease("destination"),
             Err(SessionStoreError::SessionInUse { .. })
         ));
+    }
+
+    #[cfg(feature = "tools")]
+    #[test]
+    fn a_fork_bounds_the_sidecar_by_the_highest_turn_id_not_the_turn_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let lease = mgr.acquire_lease("source").unwrap();
+        let mut snapshot = snap(&["first"]);
+        // Turn ids are minted even by a turn that leaves no statistic behind: the
+        // finished count is 1 while the id high-water mark is 5.
+        snapshot.turn_counter = 5;
+        let mut meta = SessionMeta::new("source", "/project", 10);
+        meta.owner = StorageOwner::Native;
+        meta.turn_count = 1;
+        meta.message_count = 1;
+        mgr.commit_native_import(
+            &lease,
+            Some(&snapshot),
+            Some(&PresentationFile::default()),
+            &meta,
+        )
+        .unwrap();
+        let through = TodoCallPosition {
+            turn: 3,
+            round: 1,
+            index: 0,
+        };
+        mgr.write_todo_sidecar(
+            "source",
+            &[TodoSidecarItem {
+                content: "a".into(),
+                status: "in_progress".into(),
+            }],
+            1,
+            Some(through),
+        )
+        .unwrap();
+
+        let _ = mgr
+            .fork_native_session("source", "destination", 20)
+            .unwrap();
+
+        let sidecar = mgr
+            .read_todo_sidecar("destination")
+            .unwrap()
+            .expect("the fork carries the plan");
+        assert_eq!(
+            sidecar.through,
+            Some(through),
+            "a through inside the fork's turn ids is kept, not clamped by the count"
+        );
     }
 
     #[test]
