@@ -964,11 +964,13 @@ impl CompactionGate {
             (first, entry.1.iter().all(|tried| *tried))
         };
         // The hint is advisory: publishing it after the unlock can race a
-        // concurrent update, but a stale true only sends `both_tried` back to
-        // the authoritative map under the lock, and a stale false only costs
-        // one `calls_model` projection. Neither decides a gate. Keeping the
-        // hash and atomic store outside the critical section shortens the only
-        // serialized part of the request path.
+        // concurrent update. A stale true makes `both_tried` take the lock and
+        // re-read the authoritative map, which then decides; a stale false
+        // skips that fast-path read, so the request pays one `calls_model`
+        // projection, but `first_try` below still makes the authoritative map
+        // read under the lock before deciding. Neither state changes a gate
+        // decision. Keeping the hash and atomic store outside the critical
+        // section shortens the only serialized part of the request path.
         self.hint.set(session, both);
         first
     }
