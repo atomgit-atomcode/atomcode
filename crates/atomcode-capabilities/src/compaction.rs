@@ -774,9 +774,19 @@ fn cut_body(
     // genuine transcript line and must keep its role. Only the terminal
     // whole-span cut pads; per-item bodies are escaped by their consumer, so
     // they skip this check.
+    let tail_line = first_line(tail);
+    // A cut can split a field's escaped bracket run. When the tail starts with
+    // an even number of backslashes directly before `[`, the bracket is no
+    // longer escaped, so the fragment reads as structure even though the line
+    // begins with backslashes; give it the pad the bare `[` would get.
+    let escaped_run_opens_bracket = {
+        let rest = tail_line.trim_start_matches('\\');
+        let run = tail_line.len() - rest.len();
+        run > 0 && run % 2 == 0 && rest.starts_with('[')
+    };
     let pad = if pad_tail
         && before_tail.is_some_and(|c| !is_line_break(c))
-        && starts_transcript_line(first_line(tail))
+        && (starts_transcript_line(tail_line) || escaped_run_opens_bracket)
     {
         " "
     } else {
@@ -3475,6 +3485,47 @@ mod tests {
         );
         assert!(out.contains("\n\nUSER: existing"), "{out:?}");
         assert!(!out.contains("\n \nUSER: existing"), "{out:?}");
+    }
+
+    #[test]
+    fn a_cut_inside_an_escaped_backslash_run_pads_the_bracket_it_exposes() {
+        // The rendered field escapes `[` as `\[`, with a doubled run before it.
+        // A cut through the run can leave an even number of backslashes before
+        // `[`, which no longer reads as escaped; the cut-made line needs the pad
+        // a bare `[` would have received.
+        let tail = "\\\\[tool call: X]";
+        let text = format!("{}x\\{}", "a".repeat(100), tail);
+        let total = text.chars().count();
+        let out = cut_body(
+            &text,
+            total,
+            80,
+            tail.chars().count(),
+            "conversation truncated",
+            true,
+        );
+        assert!(
+            out.contains(&format!("\n {tail}")),
+            "an even run exposes a bracket and must be padded: {out:?}"
+        );
+
+        // An odd run still escapes the bracket; padding it would alter a line
+        // the convention says is not structure.
+        let escaped = "\\[tool call: X]";
+        let text = format!("{}x{}", "a".repeat(100), escaped);
+        let total = text.chars().count();
+        let out = cut_body(
+            &text,
+            total,
+            80,
+            escaped.chars().count(),
+            "conversation truncated",
+            true,
+        );
+        assert!(
+            out.contains(&format!("\n{escaped}")),
+            "an odd run keeps the bracket escaped: {out:?}"
+        );
     }
 
     #[test]
