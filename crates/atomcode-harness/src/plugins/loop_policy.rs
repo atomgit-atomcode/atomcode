@@ -296,6 +296,72 @@ pub(crate) fn retry_backoff(
     base.saturating_mul(1u32 << shift).min(cap)
 }
 
+/// Only local backoff is randomized. Server deadlines remain authoritative.
+/// Keep 80–100% of the original interval, including at the configured cap.
+fn jittered_retry_backoff(delay: Duration, retry_after: Option<Duration>, sample: u64) -> Duration {
+    if retry_after.is_some() {
+        return delay;
+    }
+    let spread = delay / 5;
+    let extra_ns = spread.as_nanos() * u128::from(sample % 1001) / 1000;
+    let extra = Duration::new(
+        (extra_ns / 1_000_000_000) as u64,
+        (extra_ns % 1_000_000_000) as u32,
+    );
+    delay.saturating_sub(spread).saturating_add(extra)
+}
+
+/// A process-local correlation id, not a provider id, endpoint, or credential.
+static RETRY_OBSERVATION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+struct RetryObservation {
+    id: u64,
+    turn: u64,
+    round: u32,
+    started: tokio::time::Instant,
+    retries: u32,
+    reserved_wait: Duration,
+    outcome: &'static str,
+    error_kind: &'static str,
+}
+impl Drop for RetryObservation {
+    fn drop(&mut self) {
+        if self.retries == 0 {
+            return;
+        }
+        tracing::info!(
+            retry_id = self.id,
+            turn = self.turn,
+            round = self.round,
+            scope = "provider_retry_pass",
+            scheduled_retries = self.retries,
+            reserved_wait_ms = self.reserved_wait.as_millis() as u64,
+            elapsed_ms = self.started.elapsed().as_millis() as u64,
+            outcome = self.outcome,
+            error_kind = self.error_kind,
+            "provider retry outcome"
+        );
+    }
+}
+
+fn retry_error_kind(error: &RequestError) -> &'static str {
+    if error.is_rate_limited() {
+        "rate_limit"
+    } else if error.context_overflow {
+        "context_overflow"
+    } else if error.partial.is_some() {
+        "partial_response"
+    } else if error.empty_response {
+        "empty_response"
+    } else if error.is_fatal() {
+        "fatal"
+    } else if error.retryable {
+        "transient"
+    } else {
+        "non_retryable"
+    }
+}
+
 struct Retry {
     ctx: Context,
     attempts: u32,
@@ -316,13 +382,28 @@ impl Waterfall<AgentRequest> for Retry {
         req.options.request_recovery.get_or_insert_with(|| {
             atomcode_kernel::provider::RequestRecoveryBudget::new(self.attempts, self.recovery_wait)
         });
+        let mut observation = RetryObservation {
+            id: RETRY_OBSERVATION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            turn: req.turn,
+            round: req.round,
+            started: tokio::time::Instant::now(),
+            retries: 0,
+            reserved_wait: Duration::ZERO,
+            outcome: "interrupted",
+            error_kind: "none",
+        };
         let mut attempt = 1;
         loop {
             // `Next` is `Copy`, so delegating again genuinely re-runs the
             // request rather than replaying a stale answer.
             match next.run(req).await {
-                Ok(response) => return Ok(response),
+                Ok(response) => {
+                    observation.outcome = "success";
+                    return Ok(response);
+                }
                 Err(error) => {
+                    observation.outcome = "failed";
+                    observation.error_kind = retry_error_kind(&error);
                     // The provider already classified this. Deciding again from
                     // the message text is how a handler ends up retrying an
                     // auth failure or giving up on a transient one.
@@ -371,7 +452,13 @@ impl Waterfall<AgentRequest> for Retry {
                         );
                         return Err(error);
                     }
-                    let wait = retry_backoff(attempt, self.base, self.cap, error.retry_after);
+                    let baseline = retry_backoff(attempt, self.base, self.cap, error.retry_after);
+                    // RandomState supplies process-seeded randomness without a new
+                    // dependency or a seed derived from user/provider data.
+                    use std::hash::BuildHasher;
+                    let sample =
+                        std::collections::hash_map::RandomState::new().hash_one(observation.id);
+                    let wait = jittered_retry_backoff(baseline, error.retry_after, sample);
                     if let Err(why) =
                         super::recovery::reserve_recovery_wait(req, wait, "provider_retry")
                     {
@@ -390,6 +477,24 @@ impl Waterfall<AgentRequest> for Retry {
                     // sentence. The error itself is the one thing that tells a
                     // dead proxy from a silent gateway, so it is never reduced
                     // to a category here.
+                    observation.retries += 1;
+                    observation.reserved_wait = observation.reserved_wait.saturating_add(wait);
+                    observation.outcome = "interrupted";
+                    tracing::info!(
+                        retry_id = observation.id,
+                        turn = req.turn,
+                        round = req.round,
+                        scheduled_retry = observation.retries,
+                        error_kind = observation.error_kind,
+                        wait_ms = wait.as_millis() as u64,
+                        baseline_wait_ms = baseline.as_millis() as u64,
+                        source = if error.retry_after.is_some() {
+                            "server_hint"
+                        } else {
+                            "local_jitter"
+                        },
+                        "provider retry scheduled"
+                    );
                     let shared = req.options.request_recovery.as_ref().map(|b| b.snapshot());
                     let (retry_number, max_retries) = match shared {
                         Some(state) if state.attempts > 0 => {
@@ -404,7 +509,11 @@ impl Waterfall<AgentRequest> for Retry {
                         Some(crate::session::RetryAttempt {
                             attempt: retry_number,
                             max_attempts: max_retries,
-                            backoff_secs: wait.as_secs(),
+                            // Jitter introduces fractions; do not show a
+                            // countdown shorter than the actual wait.
+                            backoff_secs: wait
+                                .as_secs()
+                                .saturating_add(u64::from(wait.subsec_nanos() != 0)),
                         }),
                     );
                     tokio::time::sleep(wait).await;
@@ -1380,13 +1489,43 @@ impl Plugin for ToolLoopGuardPlugin {
 
 #[cfg(test)]
 mod focused_policy_tests {
-    use super::{exact_repeat_warning, pending_background_wait, retry_backoff};
+    use super::{
+        exact_repeat_warning, jittered_retry_backoff, pending_background_wait, retry_backoff,
+    };
     use crate::events::{Authorization, ToolExec};
     use atomcode_kernel::tool::{ToolCall, ToolResult};
     use std::time::Duration;
 
     const BASE: Duration = Duration::from_secs(3);
     const CAP: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn jitter_is_bounded_and_still_varies_at_the_cap() {
+        for baseline in [Duration::ZERO, BASE, CAP, Duration::MAX] {
+            let floor = baseline - baseline / 5;
+            assert_eq!(jittered_retry_backoff(baseline, None, 0), floor);
+            assert_eq!(jittered_retry_backoff(baseline, None, 1000), baseline);
+            for seed in [1, 500, 999, u64::MAX] {
+                let wait = jittered_retry_backoff(baseline, None, seed);
+                assert!(wait >= floor && wait <= baseline);
+            }
+        }
+        assert!(jittered_retry_backoff(CAP, None, 0) < CAP);
+    }
+
+    #[test]
+    fn jitter_never_changes_server_waits_including_the_zero_hint_floor() {
+        for hint in [
+            Duration::ZERO,
+            Duration::from_secs(20),
+            Duration::from_secs(6000),
+        ] {
+            let baseline = retry_backoff(1, BASE, CAP, Some(hint));
+            for seed in [0, 500, 1000, u64::MAX] {
+                assert_eq!(jittered_retry_backoff(baseline, Some(hint), seed), baseline);
+            }
+        }
+    }
 
     #[test]
     fn doubling_backoff_grows_and_stops_at_the_cap() {
