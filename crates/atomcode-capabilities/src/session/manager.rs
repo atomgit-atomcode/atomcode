@@ -6741,7 +6741,9 @@ mod tests {
             .unwrap();
         let sidecar = manager.read_todo_sidecar("big").unwrap().expect("written");
         assert_eq!(sidecar.todos[0].status, "completed");
-        let baseline = sidecar.baseline.expect("the baseline is stored beside the list");
+        let baseline = sidecar
+            .baseline
+            .expect("the baseline is stored beside the list");
         assert_eq!(baseline.todos[0].status, "pending");
 
         // A list over its own budget is rejected as a whole; the previously
