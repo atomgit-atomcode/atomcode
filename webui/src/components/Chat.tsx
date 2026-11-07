@@ -4316,7 +4316,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
             if (!active) setActiveHistoryTurn(null);
           }}
           onReadingTurn={id => setActiveHistoryTurn(previous => previous === id ? previous : id)}
-          renderTurn={(turn, onEdges) => <HistoricalTurnView turn={turn} compact={compactTimeline} sessionId={sessionId} search={search}
+          renderTurn={(turn, onEdges) => <HistoricalTurnView turn={turn} compact={compactTimeline} sessionId={sessionId} cwd={cwd} search={search}
             viewport={() => scrollRef.current} onBeforeRead={releaseNavigationFollow} onEdges={onEdges} />}
         />}
         {historyDisplay.showLive && range.start > liveFrom && <div class="timeline-history-status">
@@ -4664,8 +4664,8 @@ function TodoProgressPanel({ items, projectHash, sessionId, sourceRevision }: { 
  *  `.tool-list` container. This is what preserves the text→tool→text→tool
  *  interleaving (matching the TUI) instead of grouping all tools at the head. */
 /** A single archived user turn may itself contain thousands of tools. */
-function HistoricalTurnView({ turn, compact, sessionId, search, viewport, onBeforeRead, onEdges }: {
-  turn: TranscriptTurn; compact: boolean; sessionId: string | null; search: string;
+function HistoricalTurnView({ turn, compact, sessionId, cwd, search, viewport, onBeforeRead, onEdges }: {
+  turn: TranscriptTurn; compact: boolean; sessionId: string | null; cwd: string; search: string;
   viewport: () => HTMLElement | null; onBeforeRead: () => void;
   onEdges: (before: boolean, after: boolean) => void;
 }) {
@@ -4730,7 +4730,7 @@ function HistoricalTurnView({ turn, compact, sessionId, search, viewport, onBefo
         : <AssistantMessageView msg={msg} isLast={false} busy={false} lastIdx={-1}
             isLastInTurn={range.start + offset === messages.length - 1}
             copyText={() => Promise.resolve(messageFullText(historyMessages(turn)[1]))}
-            artifacts={[]} sessionId={sessionId} timeLabel={formatMsgTime(msg.ts)} search={search} isActiveSearchMatch={false} />}
+            artifacts={[]} sessionId={sessionId} cwd={cwd} timeLabel={formatMsgTime(msg.ts)} search={search} isActiveSearchMatch={false} />}
     </div>)}
     {range.end < messages.length && <div class="timeline-history-status"><button onClick={() => move(1)}>{t('chat.historyLoadNext')}</button></div>}
   </div>;
