@@ -852,6 +852,15 @@ export function PackageBrowser({ onClose }: PackageBrowserProps) {
                     </code>
                   ))}
                 </div>
+                {(entry.missing_requires?.length ?? 0) > 0 ? (
+                  <div class="pkg-health pkg-health-bad">
+                    {t('pkg.requiresMissing', { names: (entry.missing_requires ?? []).join('、') })}
+                  </div>
+                ) : (entry.requires?.length ?? 0) > 0 ? (
+                  <div class="pkg-health">
+                    {t('pkg.requires', { names: (entry.requires ?? []).join('、') })}
+                  </div>
+                ) : null}
                 {health[entry.name] && (
                   <div
                     class={

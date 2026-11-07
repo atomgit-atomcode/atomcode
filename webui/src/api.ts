@@ -1701,6 +1701,10 @@ export interface PackageRecord {
   /** The version kept beside this one; present means a rollback is possible. */
   previous_version?: string;
   size_bytes: number;
+  /** Packages this one cannot work without (the data bundle beside a provider). */
+  requires?: string[];
+  /** Declared requirements that are not installed: installed but not usable. */
+  missing_requires?: string[];
 }
 
 export async function listPackages(): Promise<PackageRecord[]> {

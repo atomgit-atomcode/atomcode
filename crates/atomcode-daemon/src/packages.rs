@@ -78,6 +78,20 @@ pub struct Manifest {
     /// 链接和 python_packages 一样登记所有者，卸载时精确移除，不留死链接。
     #[serde(default)]
     pub links: std::collections::BTreeMap<String, String>,
+    /// Packages this one cannot work without, by package name.
+    ///
+    /// A provider and the data bundle it needs are separate packages (`clang`
+    /// ships binaries, `clang-data` ships headers and `lib/`), and installing
+    /// only the provider produced a command that ran and then failed at the
+    /// first lookup — the panel showed "installed", which is the wrong answer.
+    /// Declaring the dependency makes the installer refuse up front and names
+    /// what to install first.
+    ///
+    /// Only ordering information: a requirement is checked against installed
+    /// packages, never fetched automatically (each provider needs its own
+    /// confirmation in the system installer).
+    #[serde(default)]
+    pub requires: Vec<String>,
 }
 
 fn default_symbol() -> String {
@@ -99,6 +113,16 @@ pub struct PackageRecord {
     pub previous_version: Option<String>,
     /// Size of the installed tree, so a person can see what a package costs.
     pub size_bytes: u64,
+    /// Packages this one declares a dependency on.
+    #[serde(default)]
+    pub requires: Vec<String>,
+    /// Declared requirements that are not installed.
+    ///
+    /// Reported separately from `requires` so the panel can say "install
+    /// clang-data first" instead of merely listing names: a package can be
+    /// installed and still be unusable, and those are different sentences.
+    #[serde(default)]
+    pub missing_requires: Vec<String>,
 }
 
 /// One event on the install progress stream.
@@ -742,6 +766,18 @@ pub fn install_bytes_with(
         // Check the command names before anything is moved into place: a
         // package whose alias is already taken must not install at all.
         check_aliases(&manifest)?;
+        // Same reason, different failure: a provider installed without the data
+        // bundle it needs lands as "installed" and then fails at the first
+        // lookup. Refusing here names what to install first.
+        let missing = missing_requirements(&manifest);
+        if !missing.is_empty() {
+            return Err(format!(
+                "{} requires {} — install {} before this package",
+                manifest.name,
+                missing.join(", "),
+                if missing.len() == 1 { "it" } else { "them" }
+            ));
+        }
         Ok(manifest)
     });
 
@@ -1487,6 +1523,22 @@ pub(crate) fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
             }
         }
     }
+    // A requirement is compared against installed package names, so it has to be
+    // one — and a package that requires itself can never be installed.
+    for required in &manifest.requires {
+        if !is_package_name(required) {
+            return Err(format!("requires must be a package name, got {required:?}"));
+        }
+        if *required == manifest.name {
+            return Err(format!("package {:?} requires itself", manifest.name));
+        }
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for required in &manifest.requires {
+        if !seen.insert(required) {
+            return Err(format!("requires lists {required:?} twice"));
+        }
+    }
     Ok(())
 }
 
@@ -1866,7 +1918,23 @@ fn record_for(dir: &Path, manifest: &Manifest) -> Result<PackageRecord, String> 
         commands: command_names(manifest),
         previous_version,
         size_bytes: tree_size(dir),
+        requires: manifest.requires.clone(),
+        missing_requires: missing_requirements(manifest),
     })
+}
+
+/// Declared requirements that are not installed.
+///
+/// `package.json` is the marker, not the directory: a leftover tree without one
+/// is not an install and must not satisfy a requirement.
+fn missing_requirements(manifest: &Manifest) -> Vec<String> {
+    let root = packages_root();
+    manifest
+        .requires
+        .iter()
+        .filter(|name| !root.join(name).join("package.json").is_file())
+        .cloned()
+        .collect()
 }
 
 fn tree_size(dir: &Path) -> u64 {
@@ -2183,6 +2251,91 @@ mod tests {
 
     // An upgrade must stay undoable: the whole point of keeping one generation
     // is that a version which installs fine can still turn out to be wrong.
+    fn manifest_with_requires(requires: Vec<String>) -> Manifest {
+        Manifest {
+            name: "clang".into(),
+            version: "1.0".into(),
+            description: String::new(),
+            entry: String::new(),
+            symbol: "plugin_main".into(),
+            aliases: Vec::new(),
+            data_dirs: Vec::new(),
+            python_packages: String::new(),
+            links: std::collections::BTreeMap::new(),
+            requires,
+        }
+    }
+
+    #[test]
+    fn a_package_cannot_require_itself_or_name_something_that_is_not_a_package() {
+        assert!(
+            validate_manifest(&manifest_with_requires(vec!["clang".into()]))
+                .unwrap_err()
+                .contains("requires itself")
+        );
+        assert!(
+            validate_manifest(&manifest_with_requires(vec!["../etc".into()]))
+                .unwrap_err()
+                .contains("package name")
+        );
+        assert!(validate_manifest(&manifest_with_requires(vec![
+            "clang-data".into(),
+            "clang-data".into()
+        ]))
+        .unwrap_err()
+        .contains("twice"));
+        validate_manifest(&manifest_with_requires(vec!["clang-data".into()]))
+            .expect("a plain requirement is valid");
+    }
+
+    /// A provider and the data bundle it needs are separate packages. Installing
+    /// only the provider used to land as "installed" and then fail at the first
+    /// lookup; the requirement is now checked before anything is moved.
+    #[test]
+    fn installing_without_the_declared_dependency_is_refused_and_named() {
+        with_temp_root(|| {
+            let provider = bundle_with(
+                r#"{"name":"clang","version":"1.0","entry":"lib/clang.so","requires":["clang-data"]}"#,
+                &[("lib/clang.so", b"binary")],
+            );
+            let error = install_bytes(&provider).unwrap_err();
+            assert!(error.contains("clang-data"), "{error}");
+            assert!(
+                scan().unwrap().is_empty(),
+                "a refused install leaves nothing behind"
+            );
+        });
+    }
+
+    #[test]
+    fn an_installed_dependency_satisfies_the_requirement_and_its_removal_is_reported() {
+        with_temp_root(|| {
+            install_bytes(&bundle_with(
+                r#"{"name":"clang-data","version":"1.0"}"#,
+                &[("lib/include/stdio.h", b"#define X 1")],
+            ))
+            .unwrap();
+
+            let record = install_bytes(&bundle_with(
+                r#"{"name":"clang","version":"1.0","entry":"lib/clang.so","requires":["clang-data"]}"#,
+                &[("lib/clang.so", b"binary")],
+            ))
+            .unwrap();
+            assert_eq!(record.requires, vec!["clang-data".to_string()]);
+            assert!(record.missing_requires.is_empty());
+
+            // The gap is reported, not hidden: the package stays installed, and
+            // the panel can say which dependency went away.
+            remove("clang-data").unwrap();
+            let clang = scan()
+                .unwrap()
+                .into_iter()
+                .find(|package| package.name == "clang")
+                .expect("clang is still installed");
+            assert_eq!(clang.missing_requires, vec!["clang-data".to_string()]);
+        });
+    }
+
     /// An upgrade that fails while linking must not behave like an uninstall.
     ///
     /// The old tree has already been moved to `.previous-*` at that point, so dropping
