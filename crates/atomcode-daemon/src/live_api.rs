@@ -732,6 +732,8 @@ pub(crate) enum LiveWireEvent {
         /// Goal controller state is not persisted in SessionSnapshot, so the
         /// initial wire snapshot carries it explicitly for late subscribers.
         goal: Option<LiveGoalSnapshot>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        loop_progress: Option<atomcode_coding::LoopProgress>,
     },
     #[serde(rename = "provider_selection_pending")]
     ProviderSelectionPending {
@@ -766,6 +768,11 @@ pub(crate) enum LiveWireEvent {
         phase: String,
         last_reason: Option<String>,
         recovery: Option<atomcode_coding::GoalRecoveryProgress>,
+    },
+    #[serde(rename = "loop_changed")]
+    LoopChanged {
+        #[serde(flatten)]
+        progress: atomcode_coding::LoopProgress,
     },
     /// 斜杠命令的文本输出（如 /status 报告）。`text` 首行即 `/cmd` 标头，
     /// 前端整体显示为一条系统消息即可。
@@ -1190,6 +1197,9 @@ impl NativeLiveWireProjector {
                 LiveWireEvent::Mode {
                     mode: mode.wire().into(),
                 }
+            }
+            crate::live_hub::LiveViewEvent::Runtime(Runtime::LoopChanged(progress)) => {
+                LiveWireEvent::LoopChanged { progress }
             }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::GoalChanged(progress)) => {
                 use atomcode_coding::{GoalPhase, GoalTerminal};
@@ -1633,6 +1643,7 @@ pub(crate) async fn live_stream(
             mode: live_current_mode_wire(),
             working_dir: snapshot_wd.to_string_lossy().to_string(),
             goal: initial_goal.as_ref().map(goal_snapshot),
+            loop_progress: join.loop_progress.clone(),
         },
     ));
     if let Some(current) = join.pending_turn_model.clone() {
@@ -2966,6 +2977,34 @@ pub(crate) async fn live_mcp_trust(State(state): State<AppState>) -> impl IntoRe
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn loop_quota_progress_crosses_the_live_wire_as_a_loop() {
+        let mut projector = NativeLiveWireProjector::default();
+        let wire = projector
+            .project(crate::live_hub::LiveViewEvent::Runtime(
+                CodingRuntimeEvent::LoopChanged(atomcode_coding::LoopProgress {
+                    active: true,
+                    round: 2,
+                    elapsed_secs: 10,
+                    label: "check CI".into(),
+                    last_reason: None,
+                    recovery: Some(atomcode_coding::GoalRecoveryProgress {
+                        kind: atomcode_coding::GoalRecoveryKind::Provider,
+                        waiting_for_quota: true,
+                        attempt: 1,
+                        max_attempts: 12,
+                        retry_in_secs: 30,
+                    }),
+                }),
+            ))
+            .unwrap();
+        let json = serde_json::to_value(wire).unwrap();
+        assert_eq!(json["type"], "loop_changed");
+        assert_eq!(json["label"], "check CI");
+        assert_eq!(json["recovery"]["waiting_for_quota"], true);
+        assert_eq!(json["recovery"]["retry_in_secs"], 30);
+    }
+
     #[test]
     fn normalized_runtime_compaction_progress_has_a_terminal_even_without_a_stored_count() {
         use atomcode_coding::{

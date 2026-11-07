@@ -284,6 +284,7 @@ mod tests {
             | C::UndoTarget { .. }
             | C::Autonomy { .. }
             | C::Usage { .. }
+            | C::RefreshQuotaWait { .. }
             | C::WorkspaceChanges { .. }
             | C::PendingQuestions { .. }
             | C::TaskSpecs { .. } | C::FollowUp { .. } | C::ImportPatch { .. }

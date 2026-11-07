@@ -146,6 +146,10 @@ const zh = {
   'mention.remove': '移除会话引用',
   'mention.readOnly': '只读引用 · 最多 4 个会话 · 每个最多 8000 字符',
 
+  'loop.recovery.quota': 'Loop 等待额度恢复 · {secs} 秒后核验，恢复后继续当前轮。',
+  'loop.recovery.quotaChecking': 'Loop 正在核验额度，确认可用后继续当前轮，可随时停止。',
+  'goal.recovery.quota': '目标仍在进行：等待额度恢复 · {secs} 秒后核验额度，可随时停止。',
+  'goal.recovery.quotaChecking': '目标仍在进行：正在核验额度，确认可用后自动继续，可随时停止。',
   'goal.recovery.provider': '目标仍在进行：等待模型恢复 · 第 {attempt}/{max} 次 · 计划等待 {secs} 秒后自动尝试',
   'goal.recovery.evaluator': '工作进度已保留：等待重新评估 · 第 {attempt}/{max} 次 · 计划等待 {secs} 秒后自动尝试',
   'goal.recovery.running': '目标仍在进行：正在请求模型或评估目标，可随时停止。',
@@ -933,6 +937,10 @@ const en: Record<MsgKey, string> = {
   'mention.remove': 'Remove session reference',
   'mention.readOnly': 'Read-only · up to 4 sessions · 8000 characters each',
 
+  'loop.recovery.quota': 'Loop waiting for quota · checking in {secs}s before continuing this iteration.',
+  'loop.recovery.quotaChecking': 'Checking allowance before continuing the interrupted loop iteration. You can stop at any time.',
+  'goal.recovery.quota': 'Goal retained: waiting for quota · checking in {secs}s. You can stop at any time.',
+  'goal.recovery.quotaChecking': 'Checking allowance before continuing the goal. You can stop at any time.',
   'goal.recovery.provider': 'Goal retained: waiting for model recovery · attempt {attempt}/{max} · scheduled wait {secs}s before retry',
   'goal.recovery.evaluator': 'Progress retained: waiting to reassess · attempt {attempt}/{max} · scheduled wait {secs}s before retry',
   'goal.recovery.running': 'Goal in progress: requesting the model or evaluating the goal. You can stop at any time.',

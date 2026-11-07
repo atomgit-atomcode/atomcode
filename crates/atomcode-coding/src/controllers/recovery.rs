@@ -16,10 +16,16 @@ pub enum GoalRecoveryKind {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GoalRecoveryProgress {
     pub kind: GoalRecoveryKind,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub waiting_for_quota: bool,
     pub attempt: u32,
     pub max_attempts: u32,
     /// Time remaining when this progress reading was taken.
     pub retry_in_secs: u64,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 #[derive(Debug, Default)]
@@ -94,6 +100,7 @@ impl RetryBudget {
             self.long_attempts += 1;
             return Some(GoalRecoveryProgress {
                 kind,
+                waiting_for_quota: false,
                 attempt: self.attempts + self.long_attempts,
                 max_attempts: self.attempts + long_limit,
                 retry_in_secs: delay,
@@ -102,6 +109,7 @@ impl RetryBudget {
         self.attempts = attempt;
         Some(GoalRecoveryProgress {
             kind,
+            waiting_for_quota: false,
             attempt,
             max_attempts: limit,
             retry_in_secs: delay,

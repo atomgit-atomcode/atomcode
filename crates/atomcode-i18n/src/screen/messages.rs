@@ -2132,6 +2132,17 @@ pub enum Msg<'a> {
         error: &'a str,
     },
     QuotaAvailableContinueManually,
+    QuotaRefreshCheckingCurrentConfig,
+    GoalQuotaWaiting {
+        secs: u64,
+    },
+    GoalQuotaChecking,
+    GoalQuotaShort,
+    LoopQuotaWaiting {
+        secs: u64,
+    },
+    LoopQuotaChecking,
+    LoopQuotaShort,
     SignedInSettingUpProvider,
     AlreadySignedInRefreshing,
     TokenRejectedSigningInAgain,

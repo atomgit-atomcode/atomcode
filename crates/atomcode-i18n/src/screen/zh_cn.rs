@@ -1317,6 +1317,13 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         // ── signing in, from the screen (`atomcode-cli`) ──
         Msg::CmdAboutTuiLogin => "登录并配好 provider；已登录则刷新 codingplan 配置".into(),
         Msg::SetupThreadDied => "codingplan setup 线程崩了".into(),
+        Msg::QuotaRefreshCheckingCurrentConfig => "套餐刷新已触发额度核验；当前任务沿用原配置，配置变更需在任务结束后重新加载。".into(),
+        Msg::GoalQuotaWaiting { secs } => format!("Goal 等待额度恢复 · {secs}s").into(),
+        Msg::GoalQuotaChecking => "Goal 正在核验额度".into(),
+        Msg::LoopQuotaWaiting { secs } => format!("Loop 等待额度恢复 · {secs}s").into(),
+        Msg::LoopQuotaChecking => "Loop 正在核验额度".into(),
+        Msg::LoopQuotaShort => "Loop 等待额度".into(),
+        Msg::GoalQuotaShort => "Goal 等待额度".into(),
         Msg::QuotaAvailableContinueManually => "当前额度可用。若任务仍处于暂停状态，可发送“继续”继续当前对话；已结束的 loop 需要手动重新启动。".into(),
         Msg::ConfigWrittenReloadFailedCli { error } => format!("配置已写入，但重新加载失败：{error}").into(),
         Msg::SignedInSettingUpProvider => "登录成了，正在配 provider…".into(),

@@ -40,6 +40,7 @@ use atomcode_harness::session::SessionEvent;
 
 use crate::el::El;
 use crate::frame::Line;
+use crate::i18n::{t, Msg};
 use crate::module::{Height, View};
 use crate::moment::Viewport;
 use crate::theme::{self, Role};
@@ -128,7 +129,12 @@ impl View for Tip {
         // Goal status uses the already-reserved row above the box, never the
         // rename pill's position on the input rule. Preserve a tip on the left.
         if vp.moment.secret.is_none() {
-            if let Some(goal) = vp.moment.autonomy.as_ref().filter(|a| a.kind == "goal") {
+            if let Some(goal) = vp
+                .moment
+                .autonomy
+                .as_ref()
+                .filter(|a| a.kind == "goal" || (a.kind == "loop" && a.waiting_for_quota))
+            {
                 let (mut label, mut badge_role) = if goal.paused.is_some() && !goal.recovering {
                     ("Goal paused · /goal report".to_owned(), Role::Warning)
                 } else if goal.recovering {
@@ -148,6 +154,24 @@ impl View for Tip {
                         })
                         .unwrap_or(0);
                     match goal.retry_in_secs.map(|secs| secs.saturating_sub(elapsed)) {
+                        Some(secs) if secs > 0 && goal.waiting_for_quota => (
+                            t(if goal.kind == "loop" {
+                                Msg::LoopQuotaWaiting { secs }
+                            } else {
+                                Msg::GoalQuotaWaiting { secs }
+                            })
+                            .into_owned(),
+                            Role::Warning,
+                        ),
+                        _ if goal.waiting_for_quota => (
+                            t(if goal.kind == "loop" {
+                                Msg::LoopQuotaChecking
+                            } else {
+                                Msg::GoalQuotaChecking
+                            })
+                            .into_owned(),
+                            Role::Warning,
+                        ),
                         Some(secs) if secs > 0 => {
                             (format!("Goal retrying · {secs}s"), Role::Warning)
                         }
@@ -168,14 +192,20 @@ impl View for Tip {
                 };
                 let available = w.saturating_sub(1) as usize;
                 if crate::width::str_width(&label) > available {
-                    label = if goal.recovering {
-                        "Goal recovering"
+                    label = if goal.waiting_for_quota {
+                        t(if goal.kind == "loop" {
+                            Msg::LoopQuotaShort
+                        } else {
+                            Msg::GoalQuotaShort
+                        })
+                        .into_owned()
+                    } else if goal.recovering {
+                        "Goal recovering".to_owned()
                     } else if goal.paused.is_some() {
-                        "Goal paused"
+                        "Goal paused".to_owned()
                     } else {
-                        "Goal active"
-                    }
-                    .to_owned();
+                        "Goal active".to_owned()
+                    };
                 }
                 // A quiet, wide row can keep goal state on the left and the
                 // restart reminder on the right. Narrow rows preserve the goal.
@@ -314,6 +344,7 @@ mod tests {
         m.autonomy = Some(atomcode_host_api::Running {
             usage: None,
             recovering: false,
+            waiting_for_quota: false,
             retry_in_secs: None,
             goal_stage: None,
             goal_detail: None,
@@ -341,6 +372,7 @@ mod tests {
         moment.autonomy = Some(atomcode_host_api::Running {
             usage: None,
             recovering: false,
+            waiting_for_quota: false,
             retry_in_secs: None,
             goal_stage: None,
             goal_detail: None,
@@ -365,12 +397,55 @@ mod tests {
     }
 
     #[test]
+    fn quota_wait_has_its_own_countdown_and_checking_label() {
+        for kind in ["goal", "loop"] {
+            let mut m = Moment::default();
+            m.now = Timestamp::millis(1000);
+            m.autonomy = Some(atomcode_host_api::Running {
+                usage: None,
+                recovering: true,
+                waiting_for_quota: true,
+                retry_in_secs: Some(30),
+                goal_stage: Some(atomcode_host_api::GoalStage::Recovering),
+                goal_detail: None,
+                kind: kind.into(),
+                what: "finish".into(),
+                round: 1,
+                of: None,
+                elapsed_secs: 1,
+                paused: None,
+            });
+            m.autonomy_samples
+                .insert(m.viewing.clone(), (m.autonomy.clone().unwrap(), m.now));
+            m.now = Timestamp::millis(7000);
+            assert!(draw_at(&m, 100, 1)[0].plain().contains(
+                t(if kind == "loop" {
+                    Msg::LoopQuotaWaiting { secs: 24 }
+                } else {
+                    Msg::GoalQuotaWaiting { secs: 24 }
+                })
+                .as_ref()
+            ));
+            m.now = Timestamp::millis(31000);
+            assert!(draw_at(&m, 100, 1)[0].plain().contains(
+                t(if kind == "loop" {
+                    Msg::LoopQuotaChecking
+                } else {
+                    Msg::GoalQuotaChecking
+                })
+                .as_ref()
+            ));
+        }
+    }
+
+    #[test]
     fn recovery_counts_down_without_claiming_the_goal_is_paused() {
         let mut m = Moment::default();
         m.now = Timestamp::millis(1000);
         m.autonomy = Some(atomcode_host_api::Running {
             usage: None,
             recovering: true,
+            waiting_for_quota: false,
             retry_in_secs: Some(30),
             goal_stage: None,
             goal_detail: None,

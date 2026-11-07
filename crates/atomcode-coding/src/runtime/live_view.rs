@@ -16,9 +16,33 @@ pub struct RuntimeLiveView {
     pub(crate) valid: bool,
     pending: BTreeMap<RequestId, SequencedRuntimeEvent>,
     goal: Option<SequencedRuntimeEvent>,
+    looping: Option<SequencedRuntimeEvent>,
+    goal_sampled_at: Option<tokio::time::Instant>,
+    loop_sampled_at: Option<tokio::time::Instant>,
     policy: Option<SequencedRuntimeEvent>,
     turn: Option<SequencedRuntimeEvent>,
     provider_pending: Option<SequencedRuntimeEvent>,
+}
+
+fn sample_controller(
+    event: &mut Option<SequencedRuntimeEvent>,
+    at: &mut Option<tokio::time::Instant>,
+) {
+    let now = tokio::time::Instant::now();
+    let elapsed = at
+        .map(|at| now.saturating_duration_since(at).as_secs())
+        .unwrap_or(0);
+    if let Some(event) = event.as_mut() {
+        let recovery = match &mut event.event {
+            CodingRuntimeEvent::GoalChanged(progress) => progress.recovery.as_mut(),
+            CodingRuntimeEvent::LoopChanged(progress) => progress.recovery.as_mut(),
+            _ => None,
+        };
+        if let Some(recovery) = recovery {
+            recovery.retry_in_secs = recovery.retry_in_secs.saturating_sub(elapsed);
+        }
+        *at = Some(now);
+    }
 }
 
 impl RuntimeLiveView {
@@ -49,10 +73,32 @@ impl RuntimeLiveView {
             valid: true,
             pending: BTreeMap::new(),
             goal: None,
+            looping: None,
+            goal_sampled_at: None,
+            loop_sampled_at: None,
             policy: None,
             turn: None,
             provider_pending: None,
         }
+    }
+
+    /// A presentation read ages controller countdowns without changing the
+    /// runtime or creating new facts. Late WebUI attachment must not restart a wait.
+    pub(super) fn sampled(&self) -> Self {
+        let mut view = self.clone();
+        sample_controller(&mut view.goal, &mut view.goal_sampled_at);
+        sample_controller(&mut view.looping, &mut view.loop_sampled_at);
+        for event in &mut view.events {
+            let latest = match &event.event {
+                CodingRuntimeEvent::GoalChanged(_) => view.goal.as_ref(),
+                CodingRuntimeEvent::LoopChanged(_) => view.looping.as_ref(),
+                _ => None,
+            };
+            if let Some(latest) = latest.filter(|latest| latest.sequence == event.sequence) {
+                *event = latest.clone();
+            }
+        }
+        view
     }
 
     /// A harness provider patch keeps the same running conversation and requests.
@@ -68,6 +114,7 @@ impl RuntimeLiveView {
         for event in self
             .goal
             .iter_mut()
+            .chain(self.looping.iter_mut())
             .chain(self.policy.iter_mut())
             .chain(self.turn.iter_mut())
             .chain(self.provider_pending.iter_mut())
@@ -89,6 +136,9 @@ impl RuntimeLiveView {
             self.events.clear();
             self.pending.clear();
             self.goal = None;
+            self.looping = None;
+            self.goal_sampled_at = None;
+            self.loop_sampled_at = None;
             self.policy = None;
             self.turn = None;
             self.provider_pending = None;
@@ -132,6 +182,11 @@ impl RuntimeLiveView {
                 }
                 CodingRuntimeEvent::GoalChanged(_) => {
                     self.goal = Some(envelope.clone());
+                    self.goal_sampled_at = Some(tokio::time::Instant::now());
+                }
+                CodingRuntimeEvent::LoopChanged(_) => {
+                    self.looping = Some(envelope.clone());
+                    self.loop_sampled_at = Some(tokio::time::Instant::now());
                 }
                 CodingRuntimeEvent::Agent(AgentEvent::PolicyIntervention { .. }) => {
                     self.policy = Some(envelope.clone());
@@ -185,6 +240,7 @@ impl RuntimeLiveView {
                 }
                 self.events.extend(self.provider_pending.clone());
                 self.events.extend(self.goal.clone());
+                self.events.extend(self.looping.clone());
                 if matches!(
                     &envelope.event,
                     CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
@@ -578,5 +634,48 @@ mod tests {
         assert!(
             matches!(&view.events[0].event, CodingRuntimeEvent::Request(request) if request.id == 8)
         );
+    }
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn loop_progress_survives_rebase_and_ages_on_late_attachment() {
+        let mut view = view();
+        view.observe(
+            &event(
+                1,
+                CodingRuntimeEvent::LoopChanged(LoopProgress {
+                    active: true,
+                    round: 1,
+                    elapsed_secs: 0,
+                    label: "check".into(),
+                    last_reason: None,
+                    recovery: Some(crate::GoalRecoveryProgress {
+                        kind: GoalRecoveryKind::Provider,
+                        waiting_for_quota: true,
+                        attempt: 1,
+                        max_attempts: 12,
+                        retry_in_secs: 30,
+                    }),
+                }),
+            ),
+            None,
+        );
+        tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        view.observe(
+            &event(
+                2,
+                CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
+                    turn_id: 1,
+                    reason: StopReason::Stopped,
+                    snapshot: Arc::new(SessionSnapshot::new(vec![])),
+                    stats: RuntimeTurnStats::default(),
+                }),
+            ),
+            None,
+        );
+        let read = view.sampled();
+        assert!(read.events.iter().any(|event| matches!(&event.event, CodingRuntimeEvent::LoopChanged(p) if p.recovery.as_ref().is_some_and(|r| r.retry_in_secs == 20))));
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        for read in [read.sampled(), view.sampled()] {
+            assert!(read.events.iter().any(|event| matches!(&event.event, CodingRuntimeEvent::LoopChanged(p) if p.recovery.as_ref().is_some_and(|r| r.retry_in_secs == 15))));
+        }
     }
 }

@@ -1046,6 +1046,7 @@ export interface PolicyInterventionEvent {
 }
 
 export interface GoalRecoveryProgress {
+  waiting_for_quota?: boolean;
   kind: 'provider' | 'evaluator';
   attempt: number;
   max_attempts: number;
@@ -1058,11 +1059,21 @@ export interface LiveGoalProgress {
   recovery?: GoalRecoveryProgress | null;
 }
 
+export interface LiveLoopProgress {
+  active: boolean;
+  label: string;
+  round: number;
+  elapsed_secs: number;
+  last_reason: string | null;
+  recovery?: GoalRecoveryProgress | null;
+}
+
 export type LiveWireEvent =
   | { type: 'context_compacting'; active: boolean }
   | { type: 'context_summary'; count: number; record: boolean }
-  | { type: 'snapshot'; summary_count?: number; messages: SessionMessage[]; session_id: string; project_hash: string; provider: string; model?: string | null; mode: ApprovalMode; goal?: LiveGoalProgress | null }
+  | { type: 'snapshot'; summary_count?: number; messages: SessionMessage[]; session_id: string; project_hash: string; provider: string; model?: string | null; mode: ApprovalMode; goal?: LiveGoalProgress | null; loop_progress?: LiveLoopProgress | null }
   | ({ type: 'goal_changed' } & LiveGoalProgress)
+  | ({ type: 'loop_changed' } & LiveLoopProgress)
   | { type: 'provider'; provider: string; model?: string | null }
   | { type: 'provider_selection_pending'; current: {provider:string;model:string}|null }
   | { type: 'model'; model: string | null }

@@ -126,13 +126,15 @@ pub enum GoalPhase {
     Ended,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LoopProgress {
     pub active: bool,
     pub round: u32,
     pub elapsed_secs: u64,
     pub label: String,
     pub last_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<GoalRecoveryProgress>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -179,6 +181,7 @@ pub(crate) struct GoalState {
     provider_budget: RetryBudget,
     evaluator_budget: RetryBudget,
     pub recovery: Option<GoalRecoveryProgress>,
+    pub quota_account: Option<String>,
     retry_at: Option<Instant>,
     pub async_epoch: u64,
     pub work_cancel: CancellationToken,
@@ -240,6 +243,7 @@ impl GoalState {
             provider_budget: Default::default(),
             evaluator_budget: Default::default(),
             recovery: None,
+            quota_account: None,
             retry_at: None,
             async_epoch: 0,
         }
@@ -336,6 +340,7 @@ impl GoalState {
         self.work_cancel = self.cancel.child_token();
         self.async_epoch = self.async_epoch.wrapping_add(1);
         self.recovery = None;
+        self.quota_account = None;
         self.retry_at = None;
     }
 
@@ -347,6 +352,7 @@ impl GoalState {
         self.evaluator_budget.reset();
         self.recovery = Some(GoalRecoveryProgress {
             kind: GoalRecoveryKind::Evaluator,
+            waiting_for_quota: false,
             attempt: 0,
             max_attempts: self.recovery_policy.evaluator_max_attempts.min(10),
             retry_in_secs: 0,
@@ -372,7 +378,31 @@ impl GoalState {
         let expanded = self.evidence_expanded;
         self.invalidate_work();
         self.evidence_expanded = expanded;
-        self.recovery = progress;
+        self.recovery = progress.map(|mut progress| {
+            progress.waiting_for_quota = false;
+            progress
+        });
+    }
+
+    /// Bring a pending quota check forward without granting another attempt or
+    /// resetting its budget. A check already due/in flight is coalesced.
+    pub fn expedite_quota_check(&mut self) -> Option<String> {
+        if self.retry_at.is_none_or(|at| at <= Instant::now()) {
+            return None;
+        }
+        let account = self.quota_account.clone()?;
+        let progress = self.recovery.clone()?;
+        if !self.active || !progress.waiting_for_quota {
+            return None;
+        }
+        let expanded = self.evidence_expanded;
+        self.invalidate_work();
+        self.evidence_expanded = expanded;
+        self.quota_account = Some(account.clone());
+        self.recovery = Some(progress);
+        self.retry_at = Some(Instant::now());
+        self.recovery_wait_started = Some(Instant::now());
+        Some(account)
     }
 
     pub fn recovery_window_open(&self, kind: GoalRecoveryKind) -> bool {
@@ -611,10 +641,18 @@ pub(crate) struct LoopState {
     /// or not — which is the whole difference, and why it is a field rather
     /// than a second controller.
     pub every: Option<u32>,
+    pub quota_recovery: Option<GoalRecoveryProgress>,
+    pub quota_account: Option<String>,
+    pub quota_epoch: u64,
+    pub quota_cancel: CancellationToken,
+    quota_retry_at: Option<Instant>,
+    quota_budget: RetryBudget,
+    pub recovery_policy: atomcode_config::config::GoalRecoveryConfig,
 }
 
 impl LoopState {
     pub fn new(id: u64, label: String, max_rounds: u32) -> Self {
+        let cancel = CancellationToken::new();
         Self {
             id,
             label,
@@ -623,7 +661,14 @@ impl LoopState {
             max_rounds,
             started_at: Instant::now(),
             last_reason: None,
-            cancel: CancellationToken::new(),
+            quota_cancel: cancel.child_token(),
+            cancel,
+            quota_recovery: None,
+            quota_account: None,
+            quota_epoch: 0,
+            quota_retry_at: None,
+            quota_budget: Default::default(),
+            recovery_policy: Default::default(),
             every: None,
         }
     }
@@ -663,13 +708,83 @@ impl LoopState {
             elapsed_secs: self.started_at.elapsed().as_secs(),
             label: self.label.clone(),
             last_reason: self.last_reason.clone(),
+            recovery: self
+                .active
+                .then(|| self.quota_recovery.clone())
+                .flatten()
+                .map(|mut recovery| {
+                    recovery.retry_in_secs = self
+                        .quota_retry_at
+                        .map(|at| {
+                            let remaining = at.saturating_duration_since(Instant::now());
+                            remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0)
+                        })
+                        .unwrap_or(0);
+                    recovery
+                }),
         }
+    }
+
+    pub fn invalidate_quota(&mut self) {
+        self.quota_cancel.cancel();
+        self.quota_cancel = self.cancel.child_token();
+        self.quota_epoch = self.quota_epoch.wrapping_add(1);
+        self.quota_recovery = None;
+        self.quota_account = None;
+        self.quota_retry_at = None;
+    }
+
+    pub fn schedule_quota(&mut self, account: String, reset: Option<u64>) -> Option<Duration> {
+        let mut recovery =
+            self.quota_budget
+                .next(&self.recovery_policy, GoalRecoveryKind::Provider, reset)?;
+        self.invalidate_quota();
+        recovery.waiting_for_quota = true;
+        let delay = Duration::from_secs(recovery.retry_in_secs);
+        self.quota_retry_at = Some(Instant::now() + delay);
+        self.quota_recovery = Some(recovery);
+        self.quota_account = Some(account);
+        self.last_reason = Some("waiting for quota recovery".into());
+        Some(delay)
+    }
+
+    pub fn quota_window_open(&self) -> bool {
+        self.quota_budget.within_window(&self.recovery_policy)
+    }
+
+    pub fn expedite_quota_check(&mut self) -> bool {
+        if self.quota_retry_at.is_none_or(|at| at <= Instant::now()) {
+            return false;
+        }
+        let Some(account) = self.quota_account.clone() else {
+            return false;
+        };
+        let Some(recovery) = self.quota_recovery.clone() else {
+            return false;
+        };
+        self.invalidate_quota();
+        self.quota_account = Some(account);
+        self.quota_recovery = Some(recovery);
+        self.quota_retry_at = Some(Instant::now());
+        true
+    }
+
+    pub fn completed_round(&mut self) {
+        self.invalidate_quota();
+        self.quota_budget.reset();
     }
 
     /// `0` deliberately opts out of the coarse iteration cap. Exact no-progress
     /// tool-loop detection remains active inside each coding turn.
     pub fn round_limit_reached(&self) -> bool {
         self.max_rounds != 0 && self.round >= self.max_rounds
+    }
+}
+
+impl Drop for LoopState {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        self.quota_cancel.cancel();
     }
 }
 

@@ -728,6 +728,9 @@ pub struct Running {
     /// Work is retained while the agent itself is idle (evaluation or recovery).
     #[serde(default)]
     pub recovering: bool,
+    /// Waiting for a verified quota reset, rather than a provider outage.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub waiting_for_quota: bool,
     /// Remaining automatic retry delay at the time of this sample; zero means
     /// recovery is in flight. Absent for ordinary execution and true pauses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -750,6 +753,10 @@ pub struct Running {
     /// Why it is not running right now, when it is registered but paused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paused: Option<String>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 /// Cumulative provider usage for the whole autonomous goal. Unknown history is
@@ -1971,6 +1978,7 @@ mod tests {
                 running: Some(Running {
                     usage: None,
                     recovering: false,
+                    waiting_for_quota: false,
                     retry_in_secs: None,
                     goal_stage: None,
                     goal_detail: None,
@@ -2184,6 +2192,10 @@ mod tests {
         });
         let json = serde_json::to_value(&running).unwrap();
         assert_eq!(serde_json::from_value::<Running>(json).unwrap(), running);
+        running.waiting_for_quota = true;
+        let json = serde_json::to_value(&running).unwrap();
+        assert_eq!(json["waiting_for_quota"], true);
+        assert_eq!(serde_json::from_value::<Running>(json).unwrap(), running);
         // Old goal-end events still decode without the final runtime snapshot.
         let event = HostEvent::GoalEnded {
             session: "lead".into(),
@@ -2211,6 +2223,7 @@ mod tests {
                 running: Some(Running {
                     usage: None,
                     recovering: false,
+                    waiting_for_quota: false,
                     retry_in_secs: None,
                     goal_stage: None,
                     goal_detail: None,

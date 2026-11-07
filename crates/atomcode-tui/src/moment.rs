@@ -1577,6 +1577,7 @@ mod tests {
             usage: None,
             kind: "goal".into(),
             recovering: true,
+            waiting_for_quota: false,
             retry_in_secs: None,
             goal_stage: None,
             goal_detail: None,

@@ -1015,6 +1015,8 @@ fn running_of_goal(goal: atomcode_coding::GoalProgress) -> atomcode_host_api::Ru
                 cached: usage.cached,
             }),
         recovering: goal.active && goal.recovery.is_some(),
+        waiting_for_quota: goal.active
+            && goal.recovery.as_ref().is_some_and(|r| r.waiting_for_quota),
         retry_in_secs: goal
             .recovery
             .as_ref()
@@ -1036,8 +1038,17 @@ fn running_of_goal(goal: atomcode_coding::GoalProgress) -> atomcode_host_api::Ru
 fn running_of_loop(looping: atomcode_coding::LoopProgress) -> atomcode_host_api::Running {
     atomcode_host_api::Running {
         usage: None,
-        recovering: false,
-        retry_in_secs: None,
+        recovering: looping.active && looping.recovery.is_some(),
+        waiting_for_quota: looping.active
+            && looping
+                .recovery
+                .as_ref()
+                .is_some_and(|r| r.waiting_for_quota),
+        retry_in_secs: looping
+            .recovery
+            .as_ref()
+            .filter(|_| looping.active)
+            .map(|r| r.retry_in_secs),
         goal_stage: None,
         goal_detail: None,
         kind: "loop".into(),
@@ -2751,6 +2762,14 @@ impl HostControl for RuntimeControl {
             }
             HostCommand::SignIn { session } => {
                 self.addressed(&session)?;
+                // A quota wait already owns a live foreground operation. Refresh
+                // its allowance without rebuilding the agent or silently applying
+                // changed permissions/models to the running task.
+                if self.handle.refresh_quota_wait().await.map_err(refused)? {
+                    return Ok(HostReply::DoneWithNote {
+                        note: tr(SMsg::QuotaRefreshCheckingCurrentConfig).into_owned(),
+                    });
+                }
                 let next = match self.host_config.clone() {
                     Some(source) => source
                         .after_sign_in()
@@ -3603,6 +3622,7 @@ mod tests {
             last_reason: Some("retrying provider".into()),
             recovery: Some(GoalRecoveryProgress {
                 kind: GoalRecoveryKind::Provider,
+                waiting_for_quota: false,
                 attempt: 1,
                 max_attempts: 3,
                 retry_in_secs: 30,
@@ -3618,6 +3638,10 @@ mod tests {
             running.goal_stage,
             Some(atomcode_host_api::GoalStage::Recovering)
         );
+        assert!(!running.waiting_for_quota);
+        goal.recovery.as_mut().unwrap().waiting_for_quota = true;
+        assert!(running_of_goal(goal.clone()).waiting_for_quota);
+        goal.recovery.as_mut().unwrap().waiting_for_quota = false;
         goal.recovery.as_mut().unwrap().kind = GoalRecoveryKind::Evaluator;
         assert_eq!(
             running_of_goal(goal.clone()).goal_stage,

@@ -91,6 +91,7 @@ pub struct LiveJoin {
     /// Latest Goal controller state. Unlike turn replay, this must survive a
     /// completed turn so late `/live` subscribers can restore the Goal UI.
     pub goal_progress: Option<atomcode_coding::GoalProgress>,
+    pub loop_progress: Option<atomcode_coding::LoopProgress>,
     pub pending_turn_model: Option<atomcode_coding::runtime::RunningModelIdentity>,
     pub replay: Vec<LiveObservation>,
     pub receiver: broadcast::Receiver<LiveObservation>,
@@ -143,10 +144,33 @@ struct HubState {
     snapshot_error: Option<String>,
     replay: Vec<LiveObservation>,
     goal_progress: Option<atomcode_coding::GoalProgress>,
+    loop_progress: Option<atomcode_coding::LoopProgress>,
+    loop_sampled_at: Option<tokio::time::Instant>,
+    goal_sampled_at: Option<tokio::time::Instant>,
     pending_requests: HashMap<RequestId, PendingRequest>,
     turn_active: bool,
     last_runtime_sequence: Option<u64>,
     pending_web_steers: VecDeque<PendingWebSteer>,
+}
+
+fn sampled_goal_progress(state: &HubState) -> Option<atomcode_coding::GoalProgress> {
+    let mut progress = state.goal_progress.clone()?;
+    if let (Some(recovery), Some(at)) = (progress.recovery.as_mut(), state.goal_sampled_at) {
+        recovery.retry_in_secs = recovery
+            .retry_in_secs
+            .saturating_sub(at.elapsed().as_secs());
+    }
+    Some(progress)
+}
+
+fn sampled_loop_progress(state: &HubState) -> Option<atomcode_coding::LoopProgress> {
+    let mut progress = state.loop_progress.clone()?;
+    if let (Some(recovery), Some(at)) = (progress.recovery.as_mut(), state.loop_sampled_at) {
+        recovery.retry_in_secs = recovery
+            .retry_in_secs
+            .saturating_sub(at.elapsed().as_secs());
+    }
+    Some(progress)
 }
 
 #[derive(Clone)]
@@ -497,6 +521,7 @@ impl LiveViewHub {
         state.snapshot_error = None;
         state.replay.clear();
         state.goal_progress = None;
+        state.loop_progress = None;
         state.pending_requests.clear();
         state.pending_web_steers.clear();
         state.turn_active = false;
@@ -532,7 +557,8 @@ impl LiveViewHub {
             snapshot,
             model: state.model.clone(),
             pending_turn_model: state.pending_turn_model.clone(),
-            goal_progress: state.goal_progress.clone(),
+            goal_progress: sampled_goal_progress(&state),
+            loop_progress: sampled_loop_progress(&state),
             replay: state.replay.clone(),
             receiver,
         })
@@ -568,6 +594,7 @@ impl LiveViewHub {
         state.snapshot_error = None;
         state.replay.clear();
         state.goal_progress = None;
+        state.loop_progress = None;
         state.pending_requests.clear();
         state.pending_web_steers.clear();
         state.last_runtime_sequence = None;
@@ -607,6 +634,7 @@ impl LiveViewHub {
         state.snapshot_error = None;
         state.replay.clear();
         state.goal_progress = None;
+        state.loop_progress = None;
         state.pending_requests.clear();
         state.pending_web_steers.clear();
         state.last_runtime_sequence = None;
@@ -661,6 +689,7 @@ impl LiveViewHub {
         state.snapshot_error = None;
         state.replay.clear();
         state.goal_progress = None;
+        state.loop_progress = None;
         state.pending_requests.clear();
         state.pending_web_steers.clear();
         state.turn_active = false;
@@ -834,6 +863,14 @@ impl LiveViewHub {
     pub fn dispatch(&self, command: DriverCommand) -> Result<(), HubError> {
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         Self::dispatch_locked(&state, command)
+    }
+
+    pub async fn refresh_quota_wait(&self) -> Result<bool, HubError> {
+        self.bound_handle()?
+            .1
+            .refresh_quota_wait()
+            .await
+            .map_err(|error| HubError::RuntimeRejected(error.to_string()))
     }
 
     pub async fn update_mode_bindings(
@@ -1205,6 +1242,7 @@ impl LiveViewHub {
                 state.model = None;
                 state.pending_turn_model = None;
                 state.goal_progress = None;
+                state.loop_progress = None;
                 state.pending_requests.clear();
                 state.pending_web_steers.clear();
                 state.turn_active = false;
@@ -1241,8 +1279,13 @@ impl LiveViewHub {
             }
         }
         if let CodingRuntimeEvent::GoalChanged(progress) = &event {
+            state.goal_sampled_at = Some(tokio::time::Instant::now());
             state.goal_progress =
                 (progress.phase != atomcode_coding::GoalPhase::Ended).then(|| progress.clone());
+        }
+        if let CodingRuntimeEvent::LoopChanged(progress) = &event {
+            state.loop_sampled_at = Some(tokio::time::Instant::now());
+            state.loop_progress = progress.active.then(|| progress.clone());
         }
         let mapped_steer = match &event {
             CodingRuntimeEvent::SteerAcknowledged { inputs } => {
@@ -1261,6 +1304,22 @@ impl LiveViewHub {
             _ => None,
         };
         let mut replay = state.turn_active;
+        if matches!(
+            &event,
+            CodingRuntimeEvent::GoalChanged(_) | CodingRuntimeEvent::LoopChanged(_)
+        ) {
+            // Latest controller state is seeded separately, with an aged retry
+            // countdown. Replaying older samples would reset it on reconnect.
+            state.replay.retain(|observation| {
+                !matches!(
+                    &observation.event,
+                    LiveViewEvent::Runtime(
+                        CodingRuntimeEvent::GoalChanged(_) | CodingRuntimeEvent::LoopChanged(_)
+                    )
+                )
+            });
+            replay = false;
+        }
         if matches!(
             &event,
             CodingRuntimeEvent::TurnFinished(_) | CodingRuntimeEvent::RuntimeStopped(_)
@@ -1386,6 +1445,7 @@ impl LiveViewHub {
                     state.snapshot_error = Some("session snapshot pending".into());
                     state.replay.clear();
                     state.goal_progress = None;
+                    state.loop_progress = None;
                     state.pending_requests.clear();
                     state.pending_web_steers.clear();
                     state.turn_active = false;
@@ -1473,6 +1533,7 @@ impl LiveViewHub {
         if current.identity.id != binding.id {
             return Err(HubError::StaleBinding);
         }
+        state.goal_sampled_at = Some(tokio::time::Instant::now());
         state.goal_progress = Some(progress.clone());
         self.publish_view_locked(
             &mut state,
@@ -1643,6 +1704,7 @@ impl LiveViewHub {
                 state.model = None;
                 state.pending_turn_model = None;
                 state.goal_progress = None;
+                state.loop_progress = None;
                 state.pending_requests.clear();
                 state.pending_web_steers.clear();
                 state.turn_active = false;
@@ -3850,5 +3912,109 @@ mod tests {
             hub.respond(42, serde_json::Value::Null).unwrap_err(),
             HubError::UnknownRequest(42)
         );
+    }
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn late_join_ages_the_quota_countdown_without_replaying_old_goal_samples() {
+        let hub = LiveViewHub::new();
+        let (control, _) = control();
+        let binding = hub
+            .bind("session-1", PathBuf::from("/one"), snapshot("one"), control)
+            .unwrap();
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 1,
+                event: CodingRuntimeEvent::Agent(AgentEvent::TurnStarted { turn: None }),
+            },
+        )
+        .unwrap();
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 2,
+                event: CodingRuntimeEvent::GoalChanged(GoalProgress {
+                    active: true,
+                    terminal: None,
+                    phase: GoalPhase::Pursuing,
+                    round: 1,
+                    max_rounds: None,
+                    elapsed_secs: 1,
+                    condition: "finish".into(),
+                    last_reason: None,
+                    recovery: Some(atomcode_coding::GoalRecoveryProgress {
+                        kind: atomcode_coding::GoalRecoveryKind::Provider,
+                        waiting_for_quota: true,
+                        attempt: 1,
+                        max_attempts: 12,
+                        retry_in_secs: 30,
+                    }),
+                    report: Default::default(),
+                    evaluation_ready: false,
+                }),
+            },
+        )
+        .unwrap();
+        tokio::time::advance(std::time::Duration::from_millis(10800)).await;
+        let join = hub.join().unwrap();
+        let recovery = join.goal_progress.unwrap().recovery.unwrap();
+        assert_eq!(recovery.retry_in_secs, 20);
+        assert!(recovery.waiting_for_quota);
+        assert!(!join.replay.iter().any(|observation| matches!(
+            &observation.event,
+            LiveViewEvent::Runtime(CodingRuntimeEvent::GoalChanged(_))
+        )));
+        tokio::time::advance(std::time::Duration::from_secs(30)).await;
+        assert_eq!(
+            hub.join()
+                .unwrap()
+                .goal_progress
+                .unwrap()
+                .recovery
+                .unwrap()
+                .retry_in_secs,
+            0
+        );
+    }
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_loop_quota_wait_is_aged_and_retained_for_a_late_viewer() {
+        let hub = LiveViewHub::new();
+        let (control, _) = control();
+        let binding = hub
+            .bind("loop", PathBuf::from("/one"), snapshot("one"), control)
+            .unwrap();
+        hub.publish(
+            &binding,
+            SequencedRuntimeEvent {
+                generation: 1,
+                sequence: 1,
+                event: CodingRuntimeEvent::LoopChanged(atomcode_coding::LoopProgress {
+                    active: true,
+                    round: 1,
+                    elapsed_secs: 0,
+                    label: "check".into(),
+                    last_reason: None,
+                    recovery: Some(atomcode_coding::GoalRecoveryProgress {
+                        kind: atomcode_coding::GoalRecoveryKind::Provider,
+                        waiting_for_quota: true,
+                        attempt: 1,
+                        max_attempts: 12,
+                        retry_in_secs: 30,
+                    }),
+                }),
+            },
+        )
+        .unwrap();
+        tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        let join = hub.join().unwrap();
+        assert_eq!(
+            join.loop_progress.unwrap().recovery.unwrap().retry_in_secs,
+            20
+        );
+        assert!(!join.replay.iter().any(|event| matches!(
+            &event.event,
+            LiveViewEvent::Runtime(CodingRuntimeEvent::LoopChanged(_))
+        )));
     }
 }

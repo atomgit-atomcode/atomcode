@@ -1,3 +1,4 @@
+import { GoalRecoveryStatus } from './GoalRecoveryStatus';
 import { GitBranch } from './GitBranch';
 import { HooksDialog } from './HooksDialog';
 import { TaskSpecifications } from './TaskSpecifications';
@@ -12,7 +13,7 @@ import { useTimelineMessages, useTimelinePage, useTimelineSearch } from '../lib/
 import { loadAfterSessionSwitch } from '../lib/sessionSwitch';
 import { detectSlashMenuQuery } from '../lib/slashCommands';
 import { useSkills, refreshSkills, invalidateSkills } from '../skills';
-import type { LiveGoalProgress } from '../api';
+import type { LiveGoalProgress, LiveLoopProgress } from '../api';
 // Task 13 — Chat view with streaming rendering
 // Task 15 — sessionId + cwd lifted to App
 //
@@ -502,6 +503,9 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   const composingRef = useRef(false);
   const [busy, setBusyState] = useState(false);
   const [goalProgress, setGoalProgress] = useState<LiveGoalProgress | null>(null);
+  const [goalSampledAt, setGoalSampledAt] = useState(0);
+  const [loopProgress, setLoopProgress] = useState<LiveLoopProgress | null>(null);
+  const [loopSampledAt, setLoopSampledAt] = useState(0);
   // Mirror of `busy` in a ref so pushCommandNotice can read it synchronously
   // without a stale closure (refs always reflect the latest render value).
   const busyRef = useRef(false);
@@ -683,7 +687,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   // A live connection has no conversation verdict until its first snapshot.
   // Retain this across reconnects so an already rendered conversation stays put.
   const [liveSnapshotReady, setLiveSnapshotReady] = useState(false);
-  useEffect(() => { if (!sync) setGoalProgress(null); }, [sync]);
+  useEffect(() => { if (!sync) { setGoalProgress(null); setLoopProgress(null); } }, [sync]);
   const syncRef = useRef(sync);
   syncRef.current = sync;
   useLayoutEffect(() => {
@@ -1754,7 +1758,13 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
 
   // ── Live event handler ──
   function onLiveEvent(e: LiveWireEvent) {
+    if (e.type === 'loop_changed') {
+      setLoopSampledAt(Date.now());
+      setLoopProgress(e.active ? e : null);
+      return;
+    }
     if (e.type === 'goal_changed') {
+      setGoalSampledAt(Date.now());
       setGoalProgress(e);
       return;
     }
@@ -1767,7 +1777,10 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       setCompacting(false);
       setLiveSnapshotReady(true);
       setLoading(false);
+      setGoalSampledAt(Date.now());
       setGoalProgress(e.goal ?? null);
+      setLoopSampledAt(Date.now());
+      setLoopProgress(e.loop_progress ?? null);
       liveSessionIdRef.current = e.session_id || null;
       // Historical timestamps come from the daemon's native transcript projection.
       // Older sessions may not have transcript records; leave those timestamps absent
@@ -3839,7 +3852,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
   }
 
   // 输入框只渲染一份，按落地/常规两处择一挂载（避免两个 textarea 抢同一 ref）。
-  const canStop = busy || recoveryPolicy.allowStop || Boolean(goalProgress?.recovery);
+  const canStop = busy || recoveryPolicy.allowStop || Boolean(goalProgress?.recovery) || Boolean(loopProgress?.recovery);
   const inputBox = (
     <div class={'input-box' + (messages.length > 0 ? ' can-collapse' : '') + (canStop ? ' is-running' : '') + (pendingImages.length || attachError || currentTurnModel || (!sync && busy && provider !== runtimeModel?.provider) ? ' has-input-detail' : '')}>
       {specPicker!==null&&sessionId&&createPortal(<TaskSpecifications key={sessionId} sessionId={sessionId} running={busy} initial={specPicker} onChanged={updateSpecState} onClose={()=>setSpecPicker(null)}/>,document.body)}
@@ -4559,13 +4572,10 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
       )}
       <div class="input-container">
         {goalProgress?.recovery && (
-          <div class="goal-recovery-status" role="status" aria-live="polite">
-            {t(goalProgress.recovery.retry_in_secs === 0 ? 'goal.recovery.running' : goalProgress.recovery.kind === 'evaluator' ? 'goal.recovery.evaluator' : 'goal.recovery.provider', {
-              attempt: goalProgress.recovery.attempt,
-              max: goalProgress.recovery.max_attempts,
-              secs: goalProgress.recovery.retry_in_secs,
-            })}
-          </div>
+          <GoalRecoveryStatus recovery={goalProgress.recovery} sampledAt={goalSampledAt} />
+        )}
+        {loopProgress?.recovery && (
+          <GoalRecoveryStatus recovery={loopProgress.recovery} sampledAt={loopSampledAt} kind="loop" />
         )}
         {goalProgress?.phase === 'paused_at_cap' && !goalProgress.recovery && (
           <div class="goal-recovery-status" role="status">{t('goal.recovery.paused')} {goalProgress.last_reason}</div>

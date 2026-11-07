@@ -5908,6 +5908,7 @@ mod tests {
                 running: Some(atomcode_host_api::Running {
                     usage: None,
                     recovering: false,
+                    waiting_for_quota: false,
                     retry_in_secs: None,
                     goal_stage: None,
                     goal_detail: None,
@@ -5923,6 +5924,7 @@ mod tests {
                 running: Some(atomcode_host_api::Running {
                     usage: None,
                     recovering: false,
+                    waiting_for_quota: false,
                     retry_in_secs: None,
                     goal_stage: None,
                     goal_detail: None,

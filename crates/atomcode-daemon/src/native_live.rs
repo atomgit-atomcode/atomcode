@@ -205,6 +205,10 @@ pub fn join_for_provider(expected_session_id: Option<&str>) -> Result<LiveJoin, 
     hub().join_for_provider(expected_session_id)
 }
 
+pub async fn refresh_quota_wait() -> Result<bool, HubError> {
+    hub().refresh_quota_wait().await
+}
+
 pub fn binding() -> Result<LiveBinding, HubError> {
     hub().binding()
 }

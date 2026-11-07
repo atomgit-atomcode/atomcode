@@ -11,7 +11,7 @@
 3. 保持已有 goal 时间、轮次和恢复次数/时间预算。默认 provider 恢复窗口为 30 分钟，超过此预算仍暂停；更长等待沿用显式配置的 long_wait，不静默延长。用户 submit、cancel、pause、session/provider replacement 与 shutdown 继续使旧计时/查询失效。
 4. 虚拟时间测试覆盖恢复时间、再次耗尽、查询失败/空结果、取消/用户提交、预算与安全停止。运行 coding crate 测试、workspace 编译门和格式门。
 
-本阶段补自然重置路径。刷新配置时仍沿用原有 Busy / replacement 规则，不绕过运行中的生命周期边界；提前核验入口需后续明确命令设计。
+本阶段补自然重置路径。刷新配置时仍沿用原有 Busy / replacement 规则，不绕过运行中的生命周期边界；提前核验入口及展示现已由 [后续实现](2026-11-07-quota-refresh-wakeup.md) 补齐；使用独立的 runtime 核验命令，不绕过配置重建的 Busy 规则。
 
 账号绑定：额度源新增默认未知的非敏感 account_id 查询；只有可识别账号允许自动核验。等待前后、查询完成以及 runtime 消费结果时检查身份；切换账号或退出登录后显式暂停并保留 goal。账号标识不进入配置树、协议、日志或会话持久化。CodingPlan 宿主读取 auth.user.id，token 刷新不等同于账号切换。
 

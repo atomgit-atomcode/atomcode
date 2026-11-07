@@ -337,6 +337,7 @@ impl World {
                     Err(error) => screen.say(&tr(SMsg::ConfigWrittenReloadFailedCli {
                         error: &format!("{error:?}"),
                     })),
+                    Ok(atomcode_host_api::HostReply::DoneWithNote { note }) => screen.say(&note),
                     Ok(_) => {
                         // A successful sign-in says nothing about remaining quota.
                         // Ask the newly configured provider, without submitting work.

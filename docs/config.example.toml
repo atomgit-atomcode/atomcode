@@ -412,6 +412,9 @@ theme = "auto"
 # blank to preserve it, or delete its row to remove the header.
 
 # Autonomous goals: bounded recovery while this runtime remains alive.
+# /loop quota waits share these provider-recovery limits (not the evaluator tier).
+# Known quota resets are verified before resuming the interrupted iteration;
+# refreshing the plan can bring that verification forward without resetting limits.
 # Existing goal round/time caps still apply. 0 attempts disables that retry tier.
 # Recovery does not bypass permissions, quota limits, or uncertain persistence.
 # The time budget controls scheduling; an already running model request may finish.
@@ -423,7 +426,7 @@ theme = "auto"
 # evaluator_max_attempts = 3
 # evaluator_timeout_secs = 600
 
-# Optional low-frequency goal recovery after the short retry budget is exhausted.
+# Optional low-frequency goal recovery / long loop quota waits after short recovery.
 # Omit this table to keep the default 30-minute recovery window.
 # This may incur further model costs. Goal round/time caps still apply.
 # [goal.recovery.long_wait]

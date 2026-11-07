@@ -654,6 +654,7 @@ async fn an_unknown_after_evidence_expansion_stops_without_recovery_or_main_repl
 struct QuotaSource {
     calls: AtomicU64,
     account: AtomicU64,
+    delay_check: AtomicU64,
     answers: std::sync::Mutex<
         std::collections::VecDeque<Result<Vec<crate::rate_limit::RateLimitWindow>, String>>,
     >,
@@ -672,6 +673,7 @@ impl crate::rate_limit::RateLimitWindowSource for QuotaSource {
             // Goal startup also asks this source to size its round cap.
             return Ok(vec![]);
         }
+        tokio::time::sleep(Duration::from_secs(self.delay_check.load(Ordering::SeqCst))).await;
         self.answers
             .lock()
             .unwrap()
@@ -708,6 +710,7 @@ async fn a_quota_paused_goal_checks_the_allowance_at_reset_before_continuing() {
     let source = Arc::new(QuotaSource {
         calls: AtomicU64::new(0),
         account: AtomicU64::new(1),
+        delay_check: AtomicU64::new(0),
         answers: std::sync::Mutex::new([Ok(vec![quota_window(false, 18000), retired])].into()),
     });
     let (handle, mut commands, events, mut output, _, _, _adapter) =
@@ -745,6 +748,7 @@ async fn a_quota_probe_cannot_resume_on_exhausted_unknown_or_failed_windows() {
         let source = Arc::new(QuotaSource {
             calls: AtomicU64::new(0),
             account: AtomicU64::new(1),
+            delay_check: AtomicU64::new(0),
             answers: std::sync::Mutex::new([first, Ok(vec![quota_window(false, 18000)])].into()),
         });
         let (handle, mut commands, events, mut output, _, _, _adapter) =
@@ -791,6 +795,7 @@ async fn user_actions_invalidate_a_pending_quota_wait() {
         let source = Arc::new(QuotaSource {
             calls: AtomicU64::new(0),
             account: AtomicU64::new(1),
+            delay_check: AtomicU64::new(0),
             answers: std::sync::Mutex::new([Ok(vec![quota_window(false, 0)])].into()),
         });
         let (handle, mut commands, events, mut output, _, _, _adapter) =
@@ -868,6 +873,7 @@ async fn quota_waits_do_not_bypass_existing_budgets_or_unknown_reset_times() {
         let source = Arc::new(QuotaSource {
             calls: AtomicU64::new(0),
             account: AtomicU64::new(1),
+            delay_check: AtomicU64::new(0),
             answers: std::sync::Mutex::new([Ok(vec![quota_window(false, 0)])].into()),
         });
         let mut config = super::tests::native_start(false).agent;
@@ -927,6 +933,7 @@ async fn an_opted_in_long_quota_wait_checks_before_resuming() {
     let source = Arc::new(QuotaSource {
         calls: AtomicU64::new(0),
         account: AtomicU64::new(1),
+        delay_check: AtomicU64::new(0),
         answers: std::sync::Mutex::new([Ok(vec![quota_window(false, 18000)])].into()),
     });
     let mut config = super::tests::native_start(false).agent;
@@ -955,5 +962,143 @@ async fn an_opted_in_long_quota_wait_checks_before_resuming() {
     assert!(began.elapsed() >= Duration::from_secs(7200));
     assert_eq!(source.calls.load(Ordering::SeqCst), 2);
     handle.cancel().await.unwrap();
+    handle.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_plan_refresh_checks_early_and_coalesces_duplicate_refreshes() {
+    let source = Arc::new(QuotaSource {
+        calls: AtomicU64::new(0),
+        account: AtomicU64::new(1),
+        delay_check: AtomicU64::new(1),
+        answers: std::sync::Mutex::new([Ok(vec![quota_window(false, 18000)])].into()),
+    });
+    let (handle, mut commands, events, mut output, _, _, _adapter) =
+        super::tests::controller_test_runtime_with_quota(
+            Arc::new(EvaluatorFactory::default()),
+            super::tests::native_start(false).agent,
+            Some(source.clone()),
+        )
+        .await;
+    assert!(
+        !handle.refresh_quota_wait().await.unwrap(),
+        "refresh cannot start a new goal"
+    );
+    handle.start_goal("finish").await.unwrap();
+    commands.recv().await.unwrap();
+    events.send(quota_pause(Some(301))).unwrap();
+    close_kernel_turn(&events, &mut commands, StopReason::RateLimited).await;
+    let wait = scheduled(&mut output, GoalRecoveryKind::Provider).await;
+    assert!(wait.waiting_for_quota);
+    let began = tokio::time::Instant::now();
+    assert!(handle.refresh_quota_wait().await.unwrap());
+    assert!(handle.refresh_quota_wait().await.unwrap());
+    assert!(matches!(
+        commands.recv().await,
+        Some(AgentCommand::SendSyntheticMessage { .. })
+    ));
+    assert!(began.elapsed() < Duration::from_secs(10));
+    assert_eq!(source.calls.load(Ordering::SeqCst), 2);
+    let progress = handle.autonomy().await.unwrap().goal.unwrap();
+    assert_eq!(
+        progress.recovery.unwrap().attempt,
+        wait.attempt,
+        "refresh must not reset or spend the retry attempt"
+    );
+    tokio::time::advance(Duration::from_secs(301)).await;
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        commands.try_recv().is_err(),
+        "the superseded timer must stay invalidated"
+    );
+    assert_eq!(source.calls.load(Ordering::SeqCst), 2);
+    handle.cancel().await.unwrap();
+    handle.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn an_early_quota_check_does_not_assume_a_refresh_restored_allowance() {
+    let source = Arc::new(QuotaSource {
+        calls: AtomicU64::new(0),
+        account: AtomicU64::new(1),
+        delay_check: AtomicU64::new(0),
+        answers: std::sync::Mutex::new([Ok(vec![quota_window(true, 401)])].into()),
+    });
+    let (handle, mut commands, events, mut output, _, _, _adapter) =
+        super::tests::controller_test_runtime_with_quota(
+            Arc::new(EvaluatorFactory::default()),
+            super::tests::native_start(false).agent,
+            Some(source.clone()),
+        )
+        .await;
+    handle.start_goal("finish").await.unwrap();
+    commands.recv().await.unwrap();
+    events.send(quota_pause(Some(301))).unwrap();
+    close_kernel_turn(&events, &mut commands, StopReason::RateLimited).await;
+    scheduled(&mut output, GoalRecoveryKind::Provider).await;
+    assert!(handle.refresh_quota_wait().await.unwrap());
+    let next = scheduled(&mut output, GoalRecoveryKind::Provider).await;
+    assert_eq!(next.retry_in_secs, 401);
+    assert_eq!(next.attempt, 2);
+    assert!(next.waiting_for_quota);
+    assert!(commands.try_recv().is_err());
+    handle.pause_goal().await.unwrap();
+    assert!(
+        !handle.refresh_quota_wait().await.unwrap(),
+        "manual pause is not a quota wait"
+    );
+    tokio::time::advance(Duration::from_secs(500)).await;
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(source.calls.load(Ordering::SeqCst), 2);
+    handle.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn an_early_quota_check_keeps_the_original_account_binding() {
+    let source = Arc::new(QuotaSource {
+        calls: AtomicU64::new(0),
+        account: AtomicU64::new(1),
+        delay_check: AtomicU64::new(0),
+        answers: std::sync::Mutex::new([Ok(vec![quota_window(false, 18000)])].into()),
+    });
+    let (handle, mut commands, events, mut output, _, _, _adapter) =
+        super::tests::controller_test_runtime_with_quota(
+            Arc::new(EvaluatorFactory::default()),
+            super::tests::native_start(false).agent,
+            Some(source.clone()),
+        )
+        .await;
+    handle.start_goal("finish").await.unwrap();
+    commands.recv().await.unwrap();
+    events.send(quota_pause(Some(301))).unwrap();
+    close_kernel_turn(&events, &mut commands, StopReason::RateLimited).await;
+    scheduled(&mut output, GoalRecoveryKind::Provider).await;
+    source.account.store(2, Ordering::SeqCst);
+    assert!(handle.refresh_quota_wait().await.unwrap());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(
+                output.recv().await,
+                Some(CodingRuntimeEvent::TurnFinished(_))
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        source.calls.load(Ordering::SeqCst),
+        1,
+        "another account's quota must not be consulted for the old goal"
+    );
+    let goal = handle.autonomy().await.unwrap().goal.unwrap();
+    assert!(!goal.active);
+    assert!(goal.last_reason.unwrap().contains("account changed"));
+    assert!(commands.try_recv().is_err());
     handle.shutdown().await.unwrap();
 }

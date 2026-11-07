@@ -1386,6 +1386,13 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         // ── signing in, from the screen (`atomcode-cli`) ──
         Msg::CmdAboutTuiLogin => "sign in and set up a provider; if already signed in, refresh the CodingPlan configuration".into(),
         Msg::SetupThreadDied => "the CodingPlan setup thread died".into(),
+        Msg::QuotaRefreshCheckingCurrentConfig => "Plan refresh requested an allowance check. The current task keeps its existing configuration; reload changed settings after it finishes.".into(),
+        Msg::GoalQuotaWaiting { secs } => format!("Goal waiting for quota · {secs}s").into(),
+        Msg::GoalQuotaChecking => "Goal checking quota".into(),
+        Msg::LoopQuotaWaiting { secs } => format!("Loop waiting for quota · {secs}s").into(),
+        Msg::LoopQuotaChecking => "Loop checking quota".into(),
+        Msg::LoopQuotaShort => "Loop quota wait".into(),
+        Msg::GoalQuotaShort => "Goal quota wait".into(),
         Msg::QuotaAvailableContinueManually => "Quota is currently available. If the task is still paused, send “continue” to continue this conversation; restart an ended loop manually.".into(),
         Msg::ConfigWrittenReloadFailedCli { error } => format!("the config was written, but reloading failed: {error}").into(),
         Msg::SignedInSettingUpProvider => "signed in — setting up a provider…".into(),
