@@ -838,6 +838,27 @@ pub struct Allowance {
     pub spent_unavailable: Option<String>,
 }
 
+/// The budget the light account calls (quota windows, plan) share with the
+/// page that asks for them: three seconds, the same budget a goal start gives
+/// the quota source.
+const USAGE_PAGE_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The spend query's own budget. It is the heavy call — the account's 60-day
+/// aggregate — and its HTTP client already allows 10s per attempt plus two
+/// retries. Capping it at [`USAGE_PAGE_BUDGET`] aborted it before it could
+/// answer, which the Stats tab read as "deadline has elapsed"; the light calls
+/// keep their fast budget.
+const SPEND_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Ask the source for the account's spend under `budget`; why it did not come
+/// back is kept, so a timeout and a source that reports nothing stay distinct.
+async fn fetch_spend_with(
+    source: &dyn crate::rate_limit::RateLimitWindowSource,
+    budget: std::time::Duration,
+) -> (Option<crate::rate_limit::AccountUsage>, Option<String>) {
+    spent_or_why(tokio::time::timeout(budget, source.fetch_usage()).await)
+}
+
 /// 统计取回来了就是它;没取回来,说为什么。
 ///
 /// `Ok(None)` 是来源本来就不报统计,那不是失败,两头都空。超时和请求失败
@@ -6350,7 +6371,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             // one screen is a page that feels broken. One
                             // budget each, but they run at once, so the page is
                             // late by the slowest rather than by the sum.
-                            let budget = std::time::Duration::from_secs(3);
+                            let budget = USAGE_PAGE_BUDGET;
                             // The cheap form asks for the windows and stops
                             // there. It exists for the periodic check, which
                             // wants "how much is left" and nothing else —
@@ -6366,22 +6387,23 @@ fn spawn_runtime_owner_with_optional_agent(
                                 }));
                                 return;
                             }
-                            // One budget for the spend too, though it is the
-                            // heavy one: the three come back as one answer, so
-                            // a longer wait for the figures would hold the
-                            // allowance — which a person opens to see what is
-                            // left, and which does not draw them — behind it.
-                            // A spend that misses the budget says so instead.
+                            // The spend is the heavy call and gets its own,
+                            // longer budget (see [`SPEND_BUDGET`]); the light
+                            // calls keep the page's fast one. The reply is one,
+                            // so a slow spend still holds the page — the trade
+                            // for showing the figures at all instead of the
+                            // timeout, which is what the shorter shared budget
+                            // produced. Each answer stands or falls on its own:
+                            // a plan the service would not say is not a reason
+                            // to draw no windows, and a spend that misses its
+                            // budget says why instead of claiming none is kept.
                             let (windows, plan, spent) = tokio::join!(
                                 tokio::time::timeout(budget, source.fetch_windows()),
                                 tokio::time::timeout(budget, source.fetch_plan()),
-                                tokio::time::timeout(budget, source.fetch_usage()),
+                                fetch_spend_with(source.as_ref(), SPEND_BUDGET),
                             );
-                            // Each answer stands or falls on its own: a plan
-                            // the service would not say is not a reason to draw
-                            // no windows.
                             let plan = plan.ok().and_then(|fetched| fetched.ok()).flatten();
-                            let (spent, spent_unavailable) = spent_or_why(spent);
+                            let (spent, spent_unavailable) = spent;
                             if let Some(why) = &spent_unavailable {
                                 tracing::warn!(%why, "account spend did not come back");
                             }
@@ -13926,6 +13948,40 @@ mod tests {
         let (spent, why) = spent_or_why(elapsed);
         assert!(spent.is_none());
         assert!(why.is_some(), "a timeout is a reason too");
+    }
+
+    /// The spend query is the heavy call and gets its own budget: the page's
+    /// 3 s cap used to abort it before the account's 60-day aggregate could
+    /// answer, which the Stats tab showed as "deadline has elapsed".
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn the_spend_query_gets_its_own_longer_budget() {
+        #[derive(Debug)]
+        struct SlowSpend;
+
+        #[async_trait::async_trait]
+        impl crate::rate_limit::RateLimitWindowSource for SlowSpend {
+            fn applies_to(&self, _base_url: &str) -> bool {
+                true
+            }
+            async fn fetch_windows(
+                &self,
+            ) -> Result<Vec<crate::rate_limit::RateLimitWindow>, String> {
+                Ok(Vec::new())
+            }
+            async fn fetch_usage(&self) -> Result<Option<crate::rate_limit::AccountUsage>, String> {
+                // Slower than the page budget, well inside the spend budget.
+                tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+                Ok(Some(crate::rate_limit::AccountUsage::default()))
+            }
+        }
+
+        let (spent, why) = fetch_spend_with(&SlowSpend, USAGE_PAGE_BUDGET).await;
+        assert!(spent.is_none(), "the page budget alone still cuts it off");
+        assert_eq!(why.as_deref(), Some("deadline has elapsed"));
+
+        let (spent, why) = fetch_spend_with(&SlowSpend, SPEND_BUDGET).await;
+        assert!(spent.is_some(), "{why:?}");
+        assert_eq!(why, None);
     }
 
     #[test]
