@@ -1196,7 +1196,6 @@ mod tests {
 
     #[test]
     fn test_expand_env_vars_unclosed_brace_is_kept_verbatim() {
-        std::env::remove_var("UNCLOSED");
         // 无 `}` 的 `${` 不得把后面的文本当变量名展开成空串，必须按字面保留。
         assert_eq!(expand_env_vars("${UNCLOSED"), "${UNCLOSED");
     }

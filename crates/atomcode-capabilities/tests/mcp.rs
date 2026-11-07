@@ -120,6 +120,19 @@ async fn stdio_survives_args_with_spaces_and_unicode_across_reconnect() {
     )
     .expect("the config must parse");
     assert_eq!(servers.len(), 1, "the server must be admitted: {servers:?}");
+    // The fixture server ignores extra args, so connect alone cannot catch a
+    // corrupted expansion — assert the expanded bytes before connecting.
+    let McpTransportConfig::Stdio { args, .. } = &servers[0].config else {
+        panic!(
+            "a `command` entry must load as Stdio: {:?}",
+            servers[0].config
+        );
+    };
+    assert_eq!(
+        args.as_slice(),
+        [UNICODE_ARG],
+        "expansion must preserve non-ASCII bytes byte for byte"
+    );
 
     let registry = McpRegistry::new(NO_TREE);
     registry
