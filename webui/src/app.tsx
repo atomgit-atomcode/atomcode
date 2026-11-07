@@ -594,6 +594,7 @@ export function App() {
             skillInsert={skillInsert}
             composerInsert={composerInsert}
             onSessionRenamed={(name) => setActiveSession((prev) => prev ? { ...prev, name } : prev)}
+            onOpenPackages={openPackages}
           />
           </div>
           {workbenchOpen && sessionId && <div style={{ display: browseSession ? 'none' : 'contents' }}><Workbench key={sessionId} session={sessionId} cwd={activeSession?.working_dir || cwd} requestedFile={workbenchFile} onFileOpened={() => setWorkbenchFile(null)} onClose={() => setWorkbenchOpen(false)} /></div>}

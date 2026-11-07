@@ -3906,6 +3906,38 @@ body {
 }
 .landing-chip:hover { border-color: var(--app-brand); color: var(--app-brand); }
 
+/* 首启引导：还缺哪些基础运行时。
+   APK 不带任何运行时，而市场是一张长列表；这条提示落在用户真正停留的页面上，
+   并把「装」这件事留给市场（每个 provider 都要系统安装器确认一次）。 */
+.landing-runtimes {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  align-items: center;
+  gap: 8px 12px;
+  max-width: 640px;
+  margin: 4px auto 0;
+  padding: 10px 14px;
+  border: 1px solid var(--app-primary-border-color);
+  border-radius: 12px;
+  background: var(--app-secondary-background);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  color: var(--app-secondary-foreground);
+  text-align: center;
+}
+.landing-runtimes-open {
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--app-brand);
+  background: transparent;
+  color: var(--app-brand);
+  font-family: inherit;
+  font-size: 0.8125rem;
+  cursor: pointer;
+}
+.landing-runtimes-open:hover { background: var(--app-brand); color: var(--app-primary-background); }
+
 /* 复用的输入框在落地态下居中、全宽（而非底部悬浮）。
    文本区沿用通用的两行初始高度，内容输入后仍由 textarea 自动增高。 */
 .landing-inner .input-box { width: 100%; }

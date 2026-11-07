@@ -56,3 +56,16 @@ export function recommendedNames(
 ): string {
   return missing.map((entry) => entry.provider.title || entry.name).join('、');
 }
+
+/**
+ * 落地区那条提示要不要出，以及出什么。
+ *
+ * 只有「确实缺」才返回内容：看不见（桌面浏览器没有宿主桥）或全都装了，都返回
+ * `null`——在会话说第一句话的页面上报一个可能不存在的缺口，比不说更糟。
+ */
+export function landingRuntimesNotice(
+  missing: Array<RecommendedProvider & { provider: MarketHelper }>,
+): { count: number; names: string } | null {
+  if (missing.length === 0) return null;
+  return { count: missing.length, names: recommendedNames(missing) };
+}

@@ -4,6 +4,7 @@ import { importPatchFile, taskSpecs } from '../api';
 import { createPortal } from 'preact/compat';
 import type { ComponentChildren } from 'preact';
 import { SessionBrowse } from './SessionBrowse';
+import { LandingRuntimes } from './LandingRuntimes';
 import { TodoGuidanceSources } from './TodoGuidanceSources';
 import { nextContextSummary } from '../lib/contextSummaries';
 import { adjacentTimelineStart, archivedMessage, assistantTurnRange, boundedTimelineRange, cacheSession, residentStart, segmentMessages, targetTimelineStart, timelineLimits } from '../lib/timelineMemory';
@@ -315,6 +316,8 @@ interface ChatProps {
   skillInsert?: { name: string; seq: number } | null;
   /** A scoped new-task request. Prefill only; never submits or writes a task. */
   composerInsert?: { text: string; seq: number; sessionId: string } | null;
+  /** 打开插件页：落地区「还差 N 个基础运行时」的唯一入口。 */
+  onOpenPackages?: () => void;
 }
 
 function formatArgs(args: unknown): string {
@@ -470,7 +473,7 @@ function detectSkillContent(text: string): string | null {
   return title || null;
 }
 
-export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecutionState, sessionId, onSessionId, cwd, onPermission, pendingPermission, onPermissionResolved, activeSession, restoring, onLiveTurnDone, onOptimisticSession, onOpenCwd, onCwdChanged, onLanding, skillInsert, composerInsert, onSessionRenamed }: ChatProps) {
+export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecutionState, sessionId, onSessionId, cwd, onPermission, pendingPermission, onPermissionResolved, activeSession, restoring, onLiveTurnDone, onOptimisticSession, onOpenCwd, onCwdChanged, onLanding, skillInsert, composerInsert, onSessionRenamed, onOpenPackages }: ChatProps) {
   const t = useT();
   const [compactTimeline, setCompactTimeline] = useState(() => window.matchMedia('(max-width: 767px)').matches);
   const limits = timelineLimits(compactTimeline);
@@ -4288,6 +4291,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
                 ))}
               </div>
             )}
+            {!blockingInteraction && <LandingRuntimes onOpen={onOpenPackages} />}
           </div>
         </div>
         {filePickerModal}

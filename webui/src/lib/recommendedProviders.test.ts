@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { missingRecommended, recommendedNames } from './recommendedProviders.ts';
+import { landingRuntimesNotice, missingRecommended, recommendedNames } from './recommendedProviders.ts';
 import type { MarketHelper } from '../api.ts';
 
 function helper(name: string, id?: string): MarketHelper {
@@ -61,4 +61,19 @@ test('an unknowable install state reports nothing rather than guessing', () => {
 test('the hint line names the packages a person has to install', () => {
   const missing = missingRecommended(MARKET, []);
   assert.equal(recommendedNames(missing), 'bash、unzip、tar、pkgconf、tools、ninja');
+});
+
+test('the landing notice stays silent unless something is actually missing', () => {
+  // Nothing missing: no card on the page where a person writes their first line.
+  assert.equal(landingRuntimesNotice([]), null);
+
+  const missing = missingRecommended(MARKET, []);
+  const notice = landingRuntimesNotice(missing);
+  assert.equal(notice?.count, 6);
+  assert.equal(notice?.names, 'bash、unzip、tar、pkgconf、tools、ninja');
+});
+
+test('a person who installed everything gets no landing card either', () => {
+  const installed = MARKET.map((provider) => provider.package ?? provider.name);
+  assert.equal(landingRuntimesNotice(missingRecommended(MARKET, installed)), null);
 });
