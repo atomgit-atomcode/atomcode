@@ -96,10 +96,20 @@ async fn registry_connect_discover_and_call_echo() {
 /// byte-wise expansion would fail this test at connect time, not silently pass.
 /// Also exercises connect and reconnect with such args in argv.
 #[tokio::test]
+#[serial_test::serial(unicode_arg_env)]
 async fn stdio_survives_args_with_spaces_and_unicode_across_reconnect() {
     const UNICODE_ARG: &str = "/tmp/中文 目录/with space/server.py";
     // The expansion must fail the test at connect time if bytes are corrupted.
+    // serial(unicode_arg_env) keeps this process-wide mutation away from the
+    // other tests; the guard removes it again even on assertion failure.
+    struct RemoveEnvOnDrop;
+    impl Drop for RemoveEnvOnDrop {
+        fn drop(&mut self) {
+            std::env::remove_var("UNICODE_ARG");
+        }
+    }
     std::env::set_var("UNICODE_ARG", UNICODE_ARG);
+    let _env_guard = RemoveEnvOnDrop;
     let project = tempfile::tempdir().unwrap();
     std::fs::write(
         project.path().join(".mcp.json"),
