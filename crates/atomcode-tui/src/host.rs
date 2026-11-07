@@ -2226,52 +2226,28 @@ impl Host {
         });
     }
 
-    /// Let this conversation say its first word, if any producer will.
-    ///
-    /// **Only when the stream is empty**, and that is the whole test for "opens
-    /// its top": a fresh session is empty, and a resumed one is empty too *at the
-    /// moment this is asked* — `Tui::run` asks the instant the session has been
-    /// described but before its history has begun to fold in (the stream is
-    /// append-ordered, so the welcome has to be emitted first to sit first). A
-    /// separate "is this new?" flag would be a second source of truth for one
-    /// fact.
-    ///
-    /// **It does not go through `absorb`.** That path stands for a committed fact
-    /// in the log, and what this synthesises is a way of opening, not a fact:
-    /// going through it would write to `SessionLog` and be replayed on resume. So
-    /// it writes the stream directly — the one place in this crate that does. A
-    /// resumed conversation therefore folds a log that never had the welcome, and
-    /// this re-emits it on top per view.
-    ///
-    /// The first producer with something to say wins and the loop stops: the rule
-    /// is "when the stream is empty", and once it has spoken the stream is not.
-    /// That is also why no second mechanism is needed to stop a second opener.
-    ///
-    /// `true` when a block was emitted, which is the caller's cue that a frame is
-    /// owed.
-    ///
-    /// "Empty" for this purpose is "no conversational block yet": a reply a
-    /// slash command left behind (the `commands` channel) is not a turn — the
-    /// wizard's closing line arrives through it, and a machine that finished
-    /// onboarding still owes its first word.
+    /// Emit the first producer's presentation-only opening once per view.
+    /// A paged bootstrap may render history before the agent is described;
+    /// the opener still belongs above that history and all subsequent pages.
+    /// It never enters the session log or model context.
     pub fn open_conversation(
         &self,
         at: crate::block::Coord,
         open: &crate::module::Opening,
     ) -> bool {
         let mut stream = self.stream.write().expect("stream poisoned");
-        if stream
-            .slots()
-            .iter()
-            .any(|slot| slot.block().producer != "commands")
-        {
+        if stream.has_opening() {
             return false;
         }
         for producer in self.modules.producers() {
             if let Some(content) = producer.opening(at, open) {
                 // Under the producer's own id: the block's `producer` field says
                 // who made it, and it is what would have to settle it later.
-                stream.writer(producer.id()).emit(at, content);
+                let mut opening = stream.history_buffer();
+                opening.writer(producer.id()).emit(at, content);
+                stream.prepend_opening(opening);
+                drop(stream);
+                self.forget_row_index();
                 return true;
             }
         }
@@ -9691,7 +9667,7 @@ mod tests {
     }
 
     #[test]
-    fn the_first_thing_a_conversation_says_happens_once_and_only_when_it_is_empty() {
+    fn the_first_thing_a_conversation_says_happens_once_per_view() {
         let mods = Arc::new(Modules::new());
         let opener = Arc::new(Opener {
             said: std::sync::atomic::AtomicU32::new(0),
@@ -9711,22 +9687,20 @@ mod tests {
 
         assert!(
             !h.open_conversation(crate::block::Coord::default(), &open),
-            "a stream that already has something in it is not opening"
+            "a stream with an opener must not open again"
         );
         assert_eq!(h.stream.read().unwrap().len(), 1, "still just the one");
         assert_eq!(
             opener.said.load(std::sync::atomic::Ordering::SeqCst),
             1,
-            "the producer must not be asked twice — the stream was not empty, so \
-             the loop should not have turned at all"
+            "the opening prefix already exists; the producer must not be asked twice"
         );
     }
 
     #[test]
     fn the_first_producer_with_something_to_say_wins_and_the_rest_are_not_asked() {
-        // The rule is "when the stream is empty", and the first answer makes it
-        // not-empty. So no second mechanism is needed to stop a helper opener, and
-        // the count proves the second one was never consulted.
+        // Only the first producer with an opening wins, including third-party
+        // openers whose content is not the built-in welcome kind.
         struct Silent;
         impl crate::module::Producer for Silent {
             fn id(&self) -> &'static str {

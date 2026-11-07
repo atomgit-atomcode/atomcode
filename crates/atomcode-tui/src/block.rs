@@ -468,6 +468,7 @@ pub struct Stream {
     slots: Vec<Slot>,
     next_id: AtomicU64,
     positions: Option<std::collections::HashMap<BlockId, usize>>,
+    opening: Option<BlockId>,
 }
 
 impl Stream {
@@ -482,16 +483,35 @@ impl Stream {
             slots: Vec::new(),
             next_id: AtomicU64::new(self.next_id.load(Ordering::SeqCst)),
             positions: Some(Default::default()),
+            opening: None,
         }
     }
 
-    /// Prepend read-only history without replacing live slots or reusing IDs.
+    pub(crate) fn has_opening(&self) -> bool {
+        self.opening.is_some()
+    }
+
+    /// One presentation-only opener per view, even if history arrived first.
+    pub(crate) fn prepend_opening(&mut self, opening: Self) {
+        assert!(self.opening.is_none());
+        assert_eq!(opening.slots.len(), 1);
+        let id = opening.slots[0].block().id;
+        self.prepend_history(opening);
+        self.opening = Some(id);
+    }
+
+    /// Insert read-only history below the opener, preserving live block IDs.
     pub(crate) fn prepend_history(&mut self, mut older: Self) {
         assert!(older.slots.iter().all(Slot::is_settled));
         self.next_id
             .fetch_max(older.next_id.load(Ordering::SeqCst), Ordering::SeqCst);
-        older.slots.append(&mut self.slots);
-        self.slots = older.slots;
+        let prefix = self
+            .opening
+            .and_then(|id| self.position_of(id))
+            .map_or(0, |i| i + 1);
+        let mut tail = self.slots.split_off(prefix);
+        self.slots.append(&mut older.slots);
+        self.slots.append(&mut tail);
         self.positions = Some(
             self.slots
                 .iter()
@@ -506,6 +526,13 @@ impl Stream {
     }
 
     pub(crate) fn discard_after(&mut self, count: usize) {
+        if self
+            .opening
+            .and_then(|id| self.position_of(id))
+            .is_some_and(|i| i >= count)
+        {
+            self.opening = None;
+        }
         self.slots.truncate(count);
         self.positions = Some(
             self.slots

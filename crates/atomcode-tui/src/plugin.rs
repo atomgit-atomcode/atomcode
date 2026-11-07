@@ -1800,10 +1800,8 @@ impl UserInterface for Tui {
         // every session change, which is right for a welcome and wrong for
         // news about how the process started.
         //
-        // Leaving these in the stream does not cost the welcome its place:
-        // `open_conversation` stands down only for a block some *other*
-        // producer made, and these are `commands`, like the readiness notice
-        // below that has always been able to arrive first.
+        // The welcome owns the opening prefix, even if these launch notices
+        // or paged history were rendered before its model became known.
         // The note for the welcome's foot goes to the first welcome only: it is
         // this launch's, and `owes_opening` comes round again per session.
         let mut welcome_note = ctx
@@ -1877,15 +1875,9 @@ impl UserInterface for Tui {
         // subscription just sent (`follow` above) — there is nothing to say yet
         // at this point.
         //
-        // The stream is emission-ordered (`block.rs`: positions are assigned on
-        // open and never move), so the welcome sits on top only by being emitted
-        // before any history. The feed's order (`harness/src/feed.rs`) makes that
-        // reachable: on `Subscribe` it sends `Described` first, then the status,
-        // the members, and only then the facts, one wake at a time. So the loop
-        // emits the welcome the moment `described()` first answers — into a
-        // still-empty stream — and the backfill folds in beneath it over the
-        // wakes that follow. Waiting for a drained queue instead would fold the
-        // history first and leave the welcome stranded at the bottom.
+        // A paged bootstrap can precede the description. The stream reserves
+        // its opening prefix when the model becomes known; later pages always
+        // go below that prefix, independent of event arrival order.
         let mut owes_opening = true;
 
         // Input comes from the surface when it has its own — that is what a
@@ -2085,16 +2077,8 @@ impl UserInterface for Tui {
             // new session has no facts, so nothing else would mark the screen
             // stale and the welcome would wait for a frame that never comes.
             //
-            // Asked the instant the session is described, **not** once the queue
-            // is drained. The stream is append-ordered (`block.rs`), so the
-            // welcome has to be emitted before the history to sit above it — and
-            // the feed's order makes that safe: on `Subscribe` it sends
-            // `Described` first and then, one wake at a time, the facts. So the
-            // turn after `described()` first answers, `open_conversation` finds a
-            // still-empty stream and lands the welcome on top; the backfill folds
-            // in below it over the wakes that follow. `described()` is reset by
-            // `follow` and re-answered per session, so a resume waits for the
-            // resumed session's own description rather than the outgoing one's.
+            // Open once the session's model is known. A late description still
+            // places the welcome above already rendered paged history.
             {
                 // The welcome waits for the agent's description, which never
                 // comes while no turn can be taken (no provider, no agent). The
@@ -2163,12 +2147,8 @@ impl UserInterface for Tui {
                         // or, where the history stood it down, after what is
                         // there. Once: the list is drained.
                         stale |= say_opening_notices(&mut opening_notices);
-                        // Answered once per session, whatever the answer: a
-                        // stream that was not empty will not become empty
-                        // again, and one that opened is no longer empty. It is
-                        // *per session* rather than once in a lifetime because
-                        // the `SessionChanged` arm above raises it again — the
-                        // one thing that can empty the stream under this loop.
+                        // Try once per view; SessionChanged raises this again
+                        // and replaces the stream, including its opening marker.
                         owes_opening = false;
                     }
                 }
@@ -17336,6 +17316,90 @@ mod display_history_tests {
         HostReply::DisplayHistory {
             page,
             seed: crate::history::state_seed("lead", &events[..range.start]),
+        }
+    }
+    #[test]
+    fn paged_history_keeps_one_welcome_above_every_page_in_both_arrival_orders() {
+        for opening_first in [false, true] {
+            let (host, tui) = assemble(crate::surface::Headless::new(80, 24));
+            host.modules
+                .add_producer(crate::modules::welcome::Welcome::new(Arc::new(
+                    crate::content::Brand::default(),
+                )))
+                .unwrap();
+            host.modules
+                .add_producer(Arc::new(crate::modules::transcript::Transcript::default()))
+                .unwrap();
+            tui.client.follow("lead");
+            if opening_first {
+                assert!(host.open_conversation(crate::block::Coord::default(), &Default::default()));
+            }
+            tui.client
+                .view
+                .lock()
+                .unwrap()
+                .sessions
+                .get_mut("lead")
+                .unwrap()
+                .history_request = Some(1);
+            assert!(tui.accept_history("lead", 1, true, None, Ok(reply(&events(), None))));
+            if !opening_first {
+                assert!(host.open_conversation(crate::block::Coord::default(), &Default::default()));
+            }
+            let live = host.stream.write().unwrap().writer("test-live").open(
+                crate::block::Coord::default(),
+                Arc::new(crate::content::NoticeBlock {
+                    detail: "live".into(),
+                }),
+            );
+            host.moment.write().unwrap().scroll = crate::moment::ScrollPos(7);
+            host.moment.write().unwrap().input = "draft".into();
+            let mut request = 2;
+            loop {
+                let cursor = tui.client.view.lock().unwrap().sessions["lead"]
+                    .history
+                    .clone();
+                let Some(cursor) = cursor else {
+                    break;
+                };
+                tui.client
+                    .view
+                    .lock()
+                    .unwrap()
+                    .sessions
+                    .get_mut("lead")
+                    .unwrap()
+                    .history_request = Some(request);
+                assert!(tui.accept_history(
+                    "lead",
+                    request,
+                    false,
+                    Some(cursor.clone()),
+                    Ok(reply(&events(), Some(&cursor)))
+                ));
+                let stream = host.stream.read().unwrap();
+                assert_eq!(stream.slots()[0].block().content.kind(), "welcome");
+                assert_eq!(
+                    stream
+                        .slots()
+                        .iter()
+                        .filter(|s| s.block().content.kind() == "welcome")
+                        .count(),
+                    1
+                );
+                assert!(!stream.get(live).unwrap().is_settled());
+                drop(stream);
+                assert!(
+                    !host.open_conversation(crate::block::Coord::default(), &Default::default())
+                );
+                assert_eq!(host.moment.read().unwrap().scroll.0, 7);
+                assert_eq!(host.moment.read().unwrap().input, "draft");
+                request += 1;
+            }
+            assert!(request > 2, "older pages were actually fetched");
+            host.switch_view();
+            assert!(host.open_conversation(crate::block::Coord::default(), &Default::default()));
+            assert_eq!(host.stream.read().unwrap().len(), 1);
         }
     }
     #[test]
