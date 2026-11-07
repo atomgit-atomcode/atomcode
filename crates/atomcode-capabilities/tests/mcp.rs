@@ -89,6 +89,81 @@ async fn registry_connect_discover_and_call_echo() {
     assert_eq!(result.content, "echo:hi");
 }
 
+/// Regression-style reproduction: a stdio server whose `args` contain spaces and
+/// non-ASCII characters (a script path under a directory with a CJK name).
+/// argv is passed as an array, so neither connect nor reconnect may break on it.
+#[tokio::test]
+async fn stdio_survives_args_with_spaces_and_unicode_across_reconnect() {
+    let config = {
+        let mut cfg = test_server_config("spacey-args");
+        if let McpTransportConfig::Stdio { args, .. } = &mut cfg.config {
+            args.push("/tmp/中文 目录/with space/server.py".to_string());
+        }
+        cfg
+    };
+
+    let registry = McpRegistry::new(NO_TREE);
+    registry
+        .add_server(config.clone())
+        .await
+        .expect("connect with spaces/unicode args should succeed");
+    registry
+        .reconnect_server(config)
+        .await
+        .expect("reconnect with spaces/unicode args should succeed");
+    assert_eq!(
+        registry.server_statuses().await,
+        vec![("spacey-args".to_string(), ServerStatus::Connected)]
+    );
+}
+
+/// Regression for a config copied from tools like Claude/Cursor: unknown fields
+/// (`type`, `timeout`, `description`) plus an args path containing spaces and
+/// CJK characters. Loads it through the real config parser — where `${VAR}`
+/// expansion must not corrupt non-ASCII bytes — and connects through the real
+/// registry, the full path the daemon takes.
+#[tokio::test]
+async fn config_with_unknown_fields_and_unicode_path_loads_and_connects() {
+    let unicode_arg = "/tmp/中文 目录/with space/server.py";
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join(".mcp.json"),
+        serde_json::json!({
+            "mcpServers": {
+                "unicode-cfg": {
+                    "type": "stdio",
+                    "command": env!("CARGO_BIN_EXE_mcp-test-server"),
+                    "args": [unicode_arg],
+                    "timeout": 1200000,
+                    "description": "copied from another tool"
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let servers = atomcode_capabilities::mcp::config::load_mcp_config(
+        project.path(),
+        std::path::Path::new("/nonexistent/user"),
+    )
+    .expect("config with unknown fields must parse");
+    assert_eq!(servers.len(), 1, "the server must be admitted: {servers:?}");
+    if let McpTransportConfig::Stdio { args, .. } = &servers[0].config {
+        assert_eq!(
+            args.as_slice(),
+            [unicode_arg],
+            "expansion must preserve non-ASCII bytes byte for byte"
+        );
+    }
+
+    let registry = McpRegistry::new(NO_TREE);
+    registry
+        .add_server(servers.into_iter().next().unwrap())
+        .await
+        .expect("a unicode-path config should connect through the real load path");
+}
+
 #[tokio::test]
 async fn stdio_reconnects_once_after_server_exit_for_concurrent_calls() {
     let temp = tempfile::tempdir().unwrap();
