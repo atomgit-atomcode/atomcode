@@ -964,10 +964,11 @@ impl CompactionGate {
             (first, entry.1.iter().all(|tried| *tried))
         };
         // The hint is advisory: publishing it after the unlock can race a
-        // concurrent update, but a stale bit only sends `both_tried` back to
-        // the authoritative map under the lock, never decides a gate. Keeping
-        // the hash and atomic store outside the critical section shortens the
-        // only serialized part of the request path.
+        // concurrent update, but a stale true only sends `both_tried` back to
+        // the authoritative map under the lock, and a stale false only costs
+        // one `calls_model` projection. Neither decides a gate. Keeping the
+        // hash and atomic store outside the critical section shortens the only
+        // serialized part of the request path.
         self.hint.set(session, both);
         first
     }
