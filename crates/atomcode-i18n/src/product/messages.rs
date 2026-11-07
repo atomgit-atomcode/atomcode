@@ -1819,6 +1819,19 @@ pub enum Msg<'a> {
     CtxTokensSuffix,
 
     // ── /compact ──
+    CompactSummaryFailed,
+    CompactSummaryTimedOut,
+    CompactNotSmaller,
+    CompactDiagnosticRetained {
+        reason: &'a str,
+        before: usize,
+        after: usize,
+    },
+    CompactDiagnosticReduced {
+        reason: &'a str,
+        before: usize,
+        after: usize,
+    },
     CompactNothingShort,
     CompactStarting,
     CompactInterrupted,

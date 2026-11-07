@@ -198,6 +198,7 @@ mod tests {
         };
         let report = conversation.apply_plan(
             CompactionPlan {
+                diagnostic: None,
                 drain_from: 1,
                 drain_to: 3,
                 summary: Some("short".into()),

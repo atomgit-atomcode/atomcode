@@ -2392,6 +2392,15 @@ impl atomcode_harness::seams::Compaction for CodingCompaction {
         let (strategy, _) = self.strategy();
         atomcode_harness::plugins::compaction::decide_with_strategy(&strategy, log, ask).await
     }
+
+    async fn compact_attempt(
+        &self,
+        log: &atomcode_harness::session::SessionLog,
+        ask: &atomcode_harness::seams::CompactionAsk,
+    ) -> atomcode_harness::seams::CompactionAttempt {
+        let (strategy, _) = self.strategy();
+        atomcode_harness::plugins::compaction::attempt_with_strategy(&strategy, log, ask).await
+    }
 }
 
 #[async_trait]

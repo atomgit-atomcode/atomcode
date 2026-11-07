@@ -949,6 +949,26 @@ pub struct CompactionView<'a> {
     pub sacred_floor: usize,
 }
 
+/// Why a safe compaction could not provide the requested reduction. Display-only:
+/// never persisted into the conversation or used to authorize dropping history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionDiagnostic {
+    SummaryFailed,
+    SummaryTimedOut,
+    NotSmaller,
+}
+
+impl CompactionDiagnostic {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::SummaryFailed => "summary_failed",
+            Self::SummaryTimedOut => "summary_timed_out",
+            Self::NotSmaller => "not_smaller",
+        }
+    }
+}
+
 /// A strategy's PROPOSAL for one compaction. The kernel REVALIDATES and applies it
 /// in [`Conversation::apply_plan`] (clamping, net-loss guard, epoch bump), so a
 /// malformed plan can never corrupt invariants.
@@ -971,6 +991,8 @@ pub struct CompactionView<'a> {
 /// sacred prefix (`< sacred_floor`) is SKIPPED too.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct CompactionPlan {
+    /// Read-only outcome metadata; excluded from `is_noop` and conversation state.
+    pub diagnostic: Option<CompactionDiagnostic>,
     pub drain_from: usize,
     pub drain_to: usize,
     pub summary: Option<String>,
@@ -1648,6 +1670,7 @@ mod tests {
 
         // Drain [2,5): the three middle messages → replace with a short summary.
         let plan = CompactionPlan {
+            diagnostic: None,
             drain_from: 2,
             drain_to: 5,
             summary: Some("summary".into()),
@@ -1702,6 +1725,7 @@ mod tests {
         // summary. Text-only proxy: ~0 drained text vs +100 summary → would REFUSE.
         // Counting the ~500-byte tool arguments makes it a clear net reduction.
         let plan = CompactionPlan {
+            diagnostic: None,
             drain_from: 2,
             drain_to: 4,
             summary: Some("S".repeat(100)),
@@ -1732,6 +1756,7 @@ mod tests {
 
         // Summary far longer than the 1-byte "x" it replaces → NOT net smaller.
         let plan = CompactionPlan {
+            diagnostic: None,
             drain_from: 2,
             drain_to: 3,
             summary: Some("a very long summary that is bigger".into()),
@@ -1766,6 +1791,7 @@ mod tests {
 
         // Try to drain from 0 across the whole prefix — must be clamped to floor.
         let plan = CompactionPlan {
+            diagnostic: None,
             drain_from: 0,
             drain_to: 4,
             summary: Some("s".into()),
@@ -1804,6 +1830,7 @@ mod tests {
 
         // Rewrite the tool_result (idx 3) in place to a short stub; no drain.
         let plan = CompactionPlan {
+            diagnostic: None,
             drain_from: 0,
             drain_to: 0,
             summary: None,
@@ -1830,6 +1857,7 @@ mod tests {
         let epoch2 = c2.cache_epoch;
         let report2 = c2.apply_plan(
             CompactionPlan {
+                diagnostic: None,
                 drain_from: 0,
                 drain_to: 0,
                 summary: None,
@@ -2071,6 +2099,7 @@ mod tests {
         // Rewrites at idx 0 (system) and idx 1 (first real user) MUST be ignored;
         // the in-range rewrite at idx 2 (shrinking the middle) applies → commit.
         let plan = CompactionPlan {
+            diagnostic: None,
             drain_from: 0,
             drain_to: 0,
             summary: None,
@@ -2141,6 +2170,7 @@ mod tests {
         //   (3, "SKIPPED")→ inside the drained range → must be skipped.
         //   (0, "HACKED") → sacred prefix → must be skipped.
         let plan = CompactionPlan {
+            diagnostic: None,
             drain_from: 2,
             drain_to: 4,
             summary: Some("s".into()),

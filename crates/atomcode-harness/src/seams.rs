@@ -894,19 +894,37 @@ pub struct CompactionAsk {
     pub used_tokens: u32,
 }
 
+/// One attempt, including why it could not produce a safe reduction.
+#[derive(Clone, Debug, Default)]
+pub struct CompactionAttempt {
+    pub decision: Option<CompactionDecision>,
+    pub diagnostic: Option<atomcode_kernel::message::CompactionDiagnostic>,
+}
+
 /// History compaction. A seam because the right answer differs by deployment:
 /// a model-free summary is cheap and always available, a model-written one is
 /// better and costs a call, and a token-budget-aware pruner is different again.
 #[async_trait]
 pub trait Compaction: Send + Sync {
     fn describe(&self) -> String;
-    /// `None` means "nothing worth compacting" — for an overflow, nothing
-    /// further this strategy can shrink.
+    /// `None` means no safe reduction was produced. Use `compact_attempt` to
+    /// distinguish genuinely empty work from a failed summary or refused plan.
     async fn compact(
         &self,
         log: &crate::session::SessionLog,
         ask: &CompactionAsk,
     ) -> Option<CompactionDecision>;
+    /// Detailed result; old strategies keep their existing behavior by default.
+    async fn compact_attempt(
+        &self,
+        log: &crate::session::SessionLog,
+        ask: &CompactionAsk,
+    ) -> CompactionAttempt {
+        CompactionAttempt {
+            decision: self.compact(log, ask).await,
+            diagnostic: None,
+        }
+    }
     /// Whether [`compact`](Self::compact) would call a model for this ask: a
     /// compaction slow enough that a person should see it start.
     fn calls_model(&self, log: &crate::session::SessionLog, ask: &CompactionAsk) -> bool {

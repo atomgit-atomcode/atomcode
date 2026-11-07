@@ -1045,6 +1045,7 @@ impl CompactionStrategy for SummarizeOldestStrategy {
         }
         let n = drain_to - floor;
         CompactionPlan {
+            diagnostic: None,
             drain_from: floor,
             drain_to,
             summary: Some(format!("[summary of {n} earlier messages]")),
@@ -1092,6 +1093,7 @@ impl CompactionStrategy for StubToolResultsStrategy {
             .map(|&i| (i, "[elided]".to_string()))
             .collect();
         CompactionPlan {
+            diagnostic: None,
             drain_from: 0,
             drain_to: 0,
             summary: None,
@@ -1118,6 +1120,7 @@ impl CompactionStrategy for NeverShrinksStrategy {
         // Drain exactly ONE message past the floor, but insert a summary far larger
         // than any plausible drained message → net BIGGER → refused.
         CompactionPlan {
+            diagnostic: None,
             drain_from: floor,
             drain_to: floor + 1,
             summary: Some("X".repeat(100_000)),

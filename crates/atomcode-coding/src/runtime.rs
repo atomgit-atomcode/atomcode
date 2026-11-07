@@ -1876,6 +1876,7 @@ pub enum CompactionInterruption {
 /// The driver-neutral result of a compaction attempt.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CompactionOutcome {
+    pub diagnostic: Option<atomcode_kernel::message::CompactionDiagnostic>,
     pub trigger: CompactTrigger,
     pub epoch: u64,
     pub removed_messages: usize,
@@ -1955,8 +1956,10 @@ pub async fn compact_snapshot(
         })
         .await;
     let mutation = snapshot_mutation(&conversation, &plan);
+    let diagnostic = plan.diagnostic;
+    let proposed_change = !plan.is_noop();
     let report = conversation.apply_plan(plan, floor);
-    let outcome = CompactionOutcome::from_kernel(
+    let mut outcome = CompactionOutcome::from_kernel(
         trigger,
         report.epoch_after,
         report.removed,
@@ -1965,6 +1968,10 @@ pub async fn compact_snapshot(
         report.committed,
         Some(used_tokens as usize).filter(|tokens| *tokens > 0),
     );
+    outcome.diagnostic = diagnostic.or_else(|| {
+        (!report.committed && proposed_change)
+            .then_some(atomcode_kernel::message::CompactionDiagnostic::NotSmaller)
+    });
     let mutation = if report.committed {
         mutation
     } else {
@@ -2017,6 +2024,7 @@ impl CompactionOutcome {
             estimate_after_tokens(estimated_tokens_before, bytes_before, bytes_after);
 
         Self {
+            diagnostic: None,
             trigger,
             epoch,
             removed_messages,
@@ -2027,6 +2035,17 @@ impl CompactionOutcome {
             estimated_tokens_after,
             committed_snapshot: None,
         }
+    }
+
+    pub fn diagnostic_message(&self) -> Option<String> {
+        self.diagnostic.map(|reason| {
+            atomcode_config::i18n::format_compaction_diagnostic(
+                reason.code(),
+                self.bytes_before,
+                self.bytes_after,
+                self.committed,
+            )
+        })
     }
 
     /// Whether the attempt was explicitly requested by a user.
@@ -13216,6 +13235,7 @@ fn handle_compaction_event(
             None
         }
         AgentEvent::Compacted {
+            diagnostic,
             trigger,
             epoch,
             removed,
@@ -13234,6 +13254,7 @@ fn handle_compaction_event(
                 committed,
                 *observed_tokens,
             );
+            outcome.diagnostic = diagnostic;
             outcome.committed_snapshot = snapshot.map(Arc::new);
             if committed {
                 *observed_tokens = Some(outcome.estimated_tokens_after);
@@ -13797,6 +13818,7 @@ pub fn noop_agent_handle() -> AgentHandle {
             match command {
                 AgentCommand::Compact { focus } => {
                     let _ = event_tx.send(AgentEvent::Compacted {
+                        diagnostic: None,
                         trigger: CompactTrigger::Manual { focus },
                         epoch: 0,
                         removed: 0,
@@ -17579,6 +17601,7 @@ mod tests {
                         if report_compacted {
                             if let Some(trigger) = pending.take() {
                                 let _ = event_tx.send(AgentEvent::Compacted {
+                                    diagnostic: None,
                                     trigger,
                                     epoch: 1,
                                     removed: 2,
@@ -17856,6 +17879,7 @@ mod tests {
         let committed_snapshot = SessionSnapshot::new(vec![Message::user("after compact")]);
         kernel_events
             .send(AgentEvent::Compacted {
+                diagnostic: None,
                 trigger: CompactTrigger::Manual {
                     focus: Some("files".into()),
                 },
@@ -17881,6 +17905,47 @@ mod tests {
                     && outcome.removed_messages == 4
                     && outcome.committed_snapshot.as_deref() == Some(&committed_snapshot)
         ));
+        assert!(adapter.events.try_recv().is_err());
+        adapter.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn owner_preserves_a_failed_summary_diagnostic_on_a_noop_terminal() {
+        let (agent, mut commands, events) = fake_agent();
+        let (handle, controls) = coding_runtime_control_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut adapter = spawn_runtime_owner(agent, controls, tx, true);
+        handle.compact(None).unwrap();
+        assert!(matches!(
+            commands.recv().await,
+            Some(AgentCommand::Compact { .. })
+        ));
+        events
+            .send(AgentEvent::Compacted {
+                diagnostic: Some(atomcode_kernel::message::CompactionDiagnostic::SummaryFailed),
+                trigger: CompactTrigger::Manual { focus: None },
+                epoch: 0,
+                removed: 0,
+                bytes_before: 2_000_000,
+                bytes_after: 2_000_000,
+                committed: false,
+                snapshot: None,
+            })
+            .unwrap();
+        match rx.recv().await {
+            Some(CodingRuntimeEvent::CompactionFinished {
+                completion: CompactionCompletion::Completed(outcome),
+            }) => {
+                assert!(!outcome.committed);
+                assert_eq!(
+                    outcome.diagnostic,
+                    Some(atomcode_kernel::message::CompactionDiagnostic::SummaryFailed)
+                );
+                assert!(outcome.diagnostic_message().is_some());
+                assert!(outcome.committed_snapshot.is_none());
+            }
+            other => panic!("unexpected terminal {other:?}"),
+        }
         assert!(adapter.events.try_recv().is_err());
         adapter.shutdown().await.unwrap();
     }

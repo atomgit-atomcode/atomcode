@@ -329,16 +329,30 @@ pub fn strategy_would_summarize(
 /// - a plan that does not leave the conversation strictly smaller is refused,
 ///   so a summary longer than what it replaces never lands.
 ///
-/// A drain without a written summary (no provider, a call that failed) is folded
-/// under the model-free list rather than dropped outright.
+/// An explicitly model-free drain is folded under the list rather than dropped.
+/// A configured summarizer failure retains history and carries a diagnostic.
 pub async fn decide_with_strategy(
     strategy: &dyn CompactionStrategy,
     log: &SessionLog,
     ask: &CompactionAsk,
 ) -> Option<CompactionDecision> {
+    attempt_with_strategy(strategy, log, ask).await.decision
+}
+
+/// Same invariant-checked decision, retaining display-only diagnostics on refusal.
+pub async fn attempt_with_strategy(
+    strategy: &dyn CompactionStrategy,
+    log: &SessionLog,
+    ask: &CompactionAsk,
+) -> crate::seams::CompactionAttempt {
+    use crate::seams::CompactionAttempt;
+    use atomcode_kernel::message::CompactionDiagnostic;
     let events = log.events();
-    let view = StrategyView::of(&events)?;
+    let Some(view) = StrategyView::of(&events) else {
+        return CompactionAttempt::default();
+    };
     let plan = strategy.plan(&view.kernel_view(ask)).await;
+    let diagnostic = plan.diagnostic;
 
     let len = view.messages.len();
     let floor = view.floor.min(len);
@@ -398,13 +412,26 @@ pub async fn decide_with_strategy(
     }
 
     if decision.is_empty() {
-        return None;
+        return CompactionAttempt {
+            decision: None,
+            diagnostic,
+        };
     }
     let before = wire_bytes(&crate::session::derive_messages(&events));
     let after = wire_bytes(&crate::session::derive_messages(&with_decision(
         &events, &decision,
     )));
-    (after < before).then_some(decision)
+    if after < before {
+        CompactionAttempt {
+            decision: Some(decision),
+            diagnostic,
+        }
+    } else {
+        CompactionAttempt {
+            decision: None,
+            diagnostic: diagnostic.or(Some(CompactionDiagnostic::NotSmaller)),
+        }
+    }
 }
 
 /// Where a cut can go without leaving a result whose call it removed. `None`

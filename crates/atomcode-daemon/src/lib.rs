@@ -4767,6 +4767,18 @@ impl ChatRuntimeProjector {
 
         let started = matches!(&event, CodingRuntimeEvent::CompactionStarted { .. });
         let finished = matches!(&event, CodingRuntimeEvent::CompactionFinished { .. });
+        let diagnostic = match &event {
+            CodingRuntimeEvent::CompactionFinished {
+                completion: CompactionCompletion::Completed(outcome),
+            } => outcome.diagnostic_message(),
+            _ => None,
+        };
+        if let Some(message) = diagnostic {
+            return vec![
+                ChatEvent::ContextCompacting { active: false },
+                ChatEvent::Warning { message },
+            ];
+        }
         let committed = matches!(&event,
             CodingRuntimeEvent::CompactionFinished { completion: CompactionCompletion::Completed(outcome) } if outcome.committed);
         if committed {

@@ -1396,6 +1396,11 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CtxSystemPromptHeader => "=== SYSTEM PROMPT ===".into(),
         Msg::CtxSystemPromptEmpty => "(empty — wait for one complete turn to capture)".into(),
         Msg::CtxTokensSuffix => "tokens".into(),
+        Msg::CompactSummaryFailed => "AI summary failed or returned an invalid/incomplete answer".into(),
+        Msg::CompactSummaryTimedOut => "AI summary timed out".into(),
+        Msg::CompactNotSmaller => "The proposed compaction did not reduce context".into(),
+        Msg::CompactDiagnosticRetained { reason, before, after } => format!("{reason}; history retained unchanged ({before} → {after} text bytes). Retry /compact or check model access.").into(),
+        Msg::CompactDiagnosticReduced { reason, before, after } => format!("{reason}; only tool output was folded ({before} → {after} text bytes). Conversation history retained.").into(),
         Msg::CompactNothingShort => "(nothing to compact — conversation is short)\n".into(),
         Msg::CompactStarting => "(compacting with LLM summary...)\n".into(),
         Msg::CompactInterrupted =>

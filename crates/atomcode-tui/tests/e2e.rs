@@ -8838,6 +8838,41 @@ async fn a_compaction_that_could_not_be_written_says_so() {
     task.abort();
 }
 
+/// A failed summary is not the same as a short conversation with nothing to fold.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_failed_summary_is_not_reported_as_nothing_to_compact() {
+    let dir = scratch("compact-summary-diagnostic");
+    let (s, agent) = start_with_agent_events(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    // `open`/`quiet` stabilize frames against std::time; use the existing
+    // event-driven startup path when the test's Tokio clock is paused.
+    let ui = s.ui.clone();
+    let ctx = s.app.clone();
+    let task = tokio::spawn(async move { ui.run(&ctx, None).await });
+    until(&s, "上手提示").await;
+    agent
+        .send(atomcode_kernel::event::AgentEvent::CompactionStarted {
+            trigger: atomcode_kernel::message::CompactTrigger::Manual { focus: None },
+        })
+        .unwrap();
+    agent
+        .send(atomcode_kernel::event::AgentEvent::Compacted {
+            diagnostic: Some(atomcode_kernel::message::CompactionDiagnostic::SummaryFailed),
+            trigger: atomcode_kernel::message::CompactTrigger::Manual { focus: None },
+            epoch: 0,
+            removed: 0,
+            bytes_before: 2_000_000,
+            bytes_after: 2_000_000,
+            committed: false,
+            snapshot: None,
+        })
+        .unwrap();
+    until(&s, "AI 摘要失败").await;
+    let screen = s.screen();
+    assert!(screen.contains("历史保持不变"), "{screen}");
+    assert!(!screen.contains("暂时没有值得压缩的"), "{screen}");
+    task.abort();
+}
+
 /// A compaction the turn outlived stops saying 正在压缩.
 ///
 /// `Compacted`/`CompactionFailed` are not the only way a summary ends. When the

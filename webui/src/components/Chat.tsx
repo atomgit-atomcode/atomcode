@@ -2528,9 +2528,9 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
           if (res.kind === 'compact') {
             if (res.applied) {
               if (sessionId) await reloadSessionTranscript(sessionId);
-              pushCommandNotice(t('cmd.compact.done', { n: res.removed_messages, before: res.before_tokens, after: res.after_tokens }));
+              pushCommandNotice(res.diagnostic ?? t('cmd.compact.done', { n: res.removed_messages, before: res.before_tokens, after: res.after_tokens }));
             } else {
-              pushCommandNotice(t('cmd.compact.none'));
+              pushCommandNotice(res.diagnostic ?? t('cmd.compact.none'));
             }
             return;
           }
@@ -2652,6 +2652,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
     switch (event.type) {
       case 'context_compacting':
         setCompacting(event.active);
+        if (event.diagnostic) pushCommandNotice(event.diagnostic);
         break;
       case 'context_summary':
         setCompacting(false);

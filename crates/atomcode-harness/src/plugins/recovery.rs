@@ -276,13 +276,17 @@ impl OverflowLadder {
         &self,
         req: &mut ModelRequest,
         attempt: &mut u32,
+        diagnostic: &mut Option<atomcode_kernel::message::CompactionDiagnostic>,
         what: &str,
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), String> {
         let (Some(session), Some(compaction)) = (
             crate::agent::scoped(&self.ctx).service::<SessionSvc>(),
             self.ctx.service::<CompactionSvc>(),
         ) else {
-            return Err("no compaction provider is mounted, so this cannot recover");
+            return Err(format!(
+                "no compaction provider is mounted, so this cannot recover; {}",
+                self.request_sizes(req)
+            ));
         };
         let window = self
             .ctx
@@ -306,7 +310,14 @@ impl OverflowLadder {
                     "summarizing the earlier conversation".into(),
                 );
             }
-            if let Some(decision) = compaction.compact(&session, &ask).await {
+            let result = compaction.compact_attempt(&session, &ask).await;
+            *diagnostic = result.diagnostic.or(*diagnostic);
+            if let Some(decision) = result.decision {
+                if decision.through != 0 {
+                    // A completed summary supersedes an earlier failed one;
+                    // tool-only savings do not prove the summarizer recovered.
+                    *diagnostic = result.diagnostic;
+                }
                 crate::session::apply_compaction(&self.ctx, &session, decision);
                 super::loop_policy::reproject(req, &session);
                 notice(
@@ -317,7 +328,35 @@ impl OverflowLadder {
                 return Ok(());
             }
         }
-        Err("nothing further can be compacted")
+        let why = match *diagnostic {
+            Some(atomcode_kernel::message::CompactionDiagnostic::SummaryFailed) => {
+                "AI summary failed or returned invalid/incomplete content; conversation retained"
+            }
+            Some(atomcode_kernel::message::CompactionDiagnostic::SummaryTimedOut) => {
+                "AI summary timed out; conversation retained"
+            }
+            Some(atomcode_kernel::message::CompactionDiagnostic::NotSmaller) => {
+                "compaction did not reduce context; conversation retained"
+            }
+            None => "no further safe reduction is available",
+        };
+        Err(format!("{why}; {}", self.request_sizes(req)))
+    }
+
+    fn request_sizes(&self, req: &ModelRequest) -> String {
+        let provider = self.ctx.service::<crate::seams::LlmSvc>();
+        let model = provider
+            .as_ref()
+            .map(|p| p.model_name())
+            .unwrap_or("unknown");
+        let window = provider.as_ref().map(|p| p.context_window()).unwrap_or(0);
+        let limit = atomcode_kernel::agent::effective_input_limit(window, req.options.max_tokens);
+        let output = req
+            .options
+            .max_tokens
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "default".into());
+        format!("model={model}, context_window={window} tokens, usable_input={limit} tokens, max_output={output} tokens, estimated_messages={} tokens", estimate(&req.messages))
     }
 }
 
@@ -341,21 +380,28 @@ impl Waterfall<AgentRequest> for OverflowLadder {
             .messages
             .iter()
             .any(|m| m.role == atomcode_kernel::message::Role::Assistant);
+        let mut diagnostic = None;
         if window > 0 && answered {
             let limit =
                 atomcode_kernel::agent::effective_input_limit(window, req.options.max_tokens);
             let mut attempt = 0;
+            let before = estimate(&req.messages);
             while estimate(&req.messages) >= u64::from(limit) {
                 if let Err(why) = self
-                    .shrink(req, &mut attempt, "the request would not fit")
+                    .shrink(
+                        req,
+                        &mut attempt,
+                        &mut diagnostic,
+                        "the request would not fit",
+                    )
                     .await
                 {
                     return Err(RequestError {
                         context_overflow: true,
                         code: Some("context_length_exceeded".into()),
                         ..RequestError::message(format!(
-                            "The request still exceeds the usable context window after safe compaction ({why}). \
-                             Conversation history was retained; restore the summary provider or use a model with a larger context window before retrying."
+                            "The request still exceeds the usable context window after safe compaction ({why}; estimated_messages_before={before} tokens). \
+                             Conversation history was retained. Check the compaction reason and model context/output settings before retrying."
                         ))
                     });
                 }
@@ -366,15 +412,21 @@ impl Waterfall<AgentRequest> for OverflowLadder {
         loop {
             match next.run(req).await {
                 Ok(response) => return Ok(response),
-                Err(error) if error.context_overflow && attempt < self.max_attempts => {
-                    if let Err(why) = reserve_recovery_wait(req, Duration::ZERO, "context_overflow")
-                    {
-                        return Err(RequestError {
-                            message: format!("{} ({why})", error.message),
-                            ..error
-                        });
+                Err(error) if error.context_overflow => {
+                    if attempt < self.max_attempts {
+                        if let Err(why) =
+                            reserve_recovery_wait(req, Duration::ZERO, "context_overflow")
+                        {
+                            return Err(RequestError {
+                                message: format!("{} ({why})", error.message),
+                                ..error
+                            });
+                        }
                     }
-                    if let Err(why) = self.shrink(req, &mut attempt, "context overflow").await {
+                    if let Err(why) = self
+                        .shrink(req, &mut attempt, &mut diagnostic, "context overflow")
+                        .await
+                    {
                         return Err(RequestError {
                             message: format!("{} ({why})", error.message),
                             ..error

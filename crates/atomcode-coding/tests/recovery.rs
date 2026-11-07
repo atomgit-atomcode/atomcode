@@ -525,7 +525,18 @@ async fn an_unshrinkable_preflight_overflow_stops_before_the_provider_and_keeps_
         run.attempts, 0,
         "must not send an unchanged oversized request"
     );
-    assert!(run.error.unwrap_or_default().contains("history"));
+    let error = run.error.unwrap_or_default();
+    assert!(error.contains("history"));
+    for field in [
+        "context_window=30000",
+        "usable_input=",
+        "max_output=",
+        "estimated_messages=",
+        "estimated_messages_before=",
+        "model=",
+    ] {
+        assert!(error.contains(field), "missing {field}: {error}");
+    }
     let after: Vec<_> = log.derive_messages().into_iter().map(|m| m.text).collect();
     for message in before {
         assert!(
@@ -2143,4 +2154,139 @@ async fn one_attempt_forbids_every_kind_of_automatic_replay() {
             .unwrap()
             .contains("request recovery budget exhausted"));
     }
+}
+
+/// A fallback can save some bytes without making the request fit. The final
+/// overflow must retain why the model-written summary could not finish.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_partial_tool_fold_keeps_the_summary_failure_when_the_ladder_is_exhausted() {
+    use atomcode_harness::seams::{
+        Compaction, CompactionAsk, CompactionAttempt, CompactionDecision, CompactionSvc,
+    };
+    use atomcode_kernel::message::CompactionDiagnostic;
+    use atomcode_plexus::Plugin;
+
+    struct PartialFold(Arc<AtomicU32>);
+    #[async_trait]
+    impl Compaction for PartialFold {
+        fn describe(&self) -> String {
+            "test partial fold".into()
+        }
+        async fn compact(
+            &self,
+            _: &atomcode_harness::session::SessionLog,
+            _: &CompactionAsk,
+        ) -> Option<CompactionDecision> {
+            None
+        }
+        async fn compact_attempt(
+            &self,
+            log: &atomcode_harness::session::SessionLog,
+            _: &CompactionAsk,
+        ) -> CompactionAttempt {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            let seq = log
+                .events()
+                .iter()
+                .find_map(|e| {
+                    matches!(e.event, SessionEvent::ToolResultLogged { .. }).then_some(e.seq)
+                })
+                .unwrap();
+            CompactionAttempt {
+                decision: Some(CompactionDecision {
+                    rewrites: vec![atomcode_harness::session::RewrittenText {
+                        seq,
+                        text: "x".repeat(250_000),
+                    }],
+                    ..Default::default()
+                }),
+                diagnostic: Some(CompactionDiagnostic::SummaryFailed),
+            }
+        }
+    }
+    struct PartialFoldPlugin(Arc<AtomicU32>);
+    #[async_trait]
+    impl Plugin for PartialFoldPlugin {
+        fn name(&self) -> &'static str {
+            "test-partial-fold"
+        }
+        fn provides(&self) -> &'static [&'static str] {
+            &["compaction"]
+        }
+        fn description(&self) -> &'static str {
+            "test partial fold"
+        }
+        async fn apply(
+            &self,
+            ctx: &atomcode_plexus::Context,
+            _: &serde_json::Value,
+        ) -> Result<(), String> {
+            let _ = ctx
+                .provide::<CompactionSvc>(Arc::new(PartialFold(self.0.clone())))
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        }
+    }
+    let dir = scratch("partial-fold-summary-failed");
+    let calls = Arc::new(AtomicU32::new(0));
+    let mut registry = atomcode_coding::on_harness::catalog();
+    registry.register(Arc::new(PartialFoldPlugin(calls.clone())));
+    let mut app = App::new(registry, tree(&dir, &[
+        "[[patch]]\nid = \"llm\"\nname = \"llm-replay\"\nconfig = { context_window = 30000, script = [ { text = \"ok\" } ] }",
+        "[[patch]]\nid = \"compaction-tail\"\nname = \"test-partial-fold\"\nconfig = {}",
+        "[[patch]]\nid = \"compaction-overflow\"\nconfig = { max_attempts = 1 }",
+    ]));
+    app.start().await.unwrap();
+    run_turn(&app, "first").await.unwrap();
+    let ctx = app.context();
+    let log = ctx.only_session().unwrap();
+    let turn = log.current_turn();
+    atomcode_harness::session::commit(
+        &ctx,
+        &log,
+        SessionEvent::AssistantMessage {
+            turn,
+            round: 2,
+            text: String::new(),
+            reasoning: String::new(),
+            tool_calls: vec![atomcode_kernel::tool::ToolCall {
+                id: "large".into(),
+                name: "grep".into(),
+                arguments: "{}".into(),
+            }],
+            reasoning_blocks: vec![],
+            meta: None,
+        },
+    );
+    atomcode_harness::session::commit(
+        &ctx,
+        &log,
+        SessionEvent::ToolResultLogged {
+            turn,
+            round: 2,
+            call_id: "large".into(),
+            content: "x".repeat(500_000),
+            is_error: false,
+            images: vec![],
+        },
+    );
+    let run = run_with(&app, 0, overflowing()).await;
+    let error = run.error.unwrap_or_default();
+    assert_eq!(
+        run.attempts, 0,
+        "oversized content must never reach the model"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "diagnostics must not extend the ladder"
+    );
+    assert!(error.contains("AI summary failed"), "{error}");
+    assert!(error.contains("context_window=30000"), "{error}");
+    assert!(
+        log.derive_messages()
+            .iter()
+            .any(|m| m.text.len() == 250_000),
+        "the partial savings were actually applied"
+    );
 }

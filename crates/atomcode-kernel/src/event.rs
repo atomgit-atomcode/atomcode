@@ -650,6 +650,9 @@ pub enum AgentEvent {
     /// Emitted on BOTH the auto task-boundary trigger and the manual `Compact`
     /// command. Serializable for web/daemon drivers.
     Compacted {
+        /// Display-only explanation for a degraded or refused compaction.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diagnostic: Option<crate::message::CompactionDiagnostic>,
         /// WHY this compaction ran — `Auto` (task-boundary pressure), `Manual` (`/compact`),
         /// or `Overflow { attempt }` (hard context-overflow recovery). Lets a telemetry sink
         /// distinguish normal-path compaction from emergency overflow recovery.
@@ -978,7 +981,29 @@ mod tests {
         .unwrap();
         assert!(matches!(
             event,
-            AgentEvent::Compacted { snapshot: None, .. }
+            AgentEvent::Compacted {
+                snapshot: None,
+                diagnostic: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn compacted_diagnostic_is_additive_and_round_trips() {
+        let event: AgentEvent = serde_json::from_str(
+            r#"{"Compacted":{"trigger":{"Manual":{"focus":null}},"epoch":0,"removed":0,"bytes_before":100,"bytes_after":100,"committed":false,"diagnostic":"summary_failed"}}"#,
+        ).unwrap();
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("summary_failed"));
+        let again: AgentEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            again,
+            AgentEvent::Compacted {
+                diagnostic: Some(crate::message::CompactionDiagnostic::SummaryFailed),
+                committed: false,
+                ..
+            }
         ));
     }
 

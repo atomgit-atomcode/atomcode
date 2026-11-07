@@ -7326,6 +7326,7 @@ impl Tui {
                 true
             }
             AgentEvent::Compacted {
+                diagnostic,
                 trigger,
                 committed,
                 bytes_before,
@@ -7333,6 +7334,14 @@ impl Tui {
                 ..
             } => {
                 let _ = self.host.stop_compacting();
+                if let Some(reason) = diagnostic {
+                    self.say(&atomcode_i18n::product::format_compaction_diagnostic(
+                        reason.code(),
+                        bytes_before,
+                        bytes_after,
+                        committed,
+                    ));
+                }
                 if committed {
                     // The window just emptied, and no request has reported it yet:
                     // hand the sizes to the status row so its reading scales down
@@ -7346,16 +7355,20 @@ impl Tui {
                         .note_fold(bytes_before, bytes_after);
                     // Automatic cleanup also arrives as Compacted. Genuine
                     // summary folds already have their own transcript notice.
-                    if matches!(
-                        trigger,
-                        atomcode_kernel::message::CompactTrigger::Manual { .. }
-                    ) {
+                    if diagnostic.is_none()
+                        && matches!(
+                            trigger,
+                            atomcode_kernel::message::CompactTrigger::Manual { .. }
+                        )
+                    {
                         self.say(&t(Msg::Compacted));
                     }
-                } else if matches!(
-                    trigger,
-                    atomcode_kernel::message::CompactTrigger::Manual { .. }
-                ) {
+                } else if diagnostic.is_none()
+                    && matches!(
+                        trigger,
+                        atomcode_kernel::message::CompactTrigger::Manual { .. }
+                    )
+                {
                     self.say(&t(Msg::NothingWorthCompacting));
                 }
                 true

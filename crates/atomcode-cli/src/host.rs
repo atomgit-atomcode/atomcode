@@ -1253,6 +1253,7 @@ fn translate(event: CodingRuntimeEvent) -> Option<AgentEvent> {
         }
         CodingRuntimeEvent::CompactionFinished { completion } => match completion {
             CompactionCompletion::Completed(outcome) => Some(AgentEvent::Compacted {
+                diagnostic: outcome.diagnostic,
                 trigger: outcome.trigger,
                 epoch: outcome.epoch,
                 removed: outcome.removed_messages,

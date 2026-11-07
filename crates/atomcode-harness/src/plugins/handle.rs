@@ -179,6 +179,7 @@ impl Projector {
         if !closes {
             if let Some(trigger) = self.compacting.take() {
                 out.push(AgentEvent::Compacted {
+                    diagnostic: None,
                     trigger,
                     epoch: 0,
                     removed: 0,
@@ -359,6 +360,7 @@ impl Projector {
                 });
                 let (count_before, bytes_before, count_after, bytes_after) = self.measure(seq);
                 vec![AgentEvent::Compacted {
+                    diagnostic: None,
                     trigger,
                     epoch: 0,
                     removed: count_before.saturating_sub(count_after),
@@ -1896,6 +1898,7 @@ async fn compact(
         // Refused, not failed: nothing is mounted that could compact, and the
         // history is byte-identical.
         let _ = events.send(AgentEvent::Compacted {
+            diagnostic: None,
             trigger,
             epoch: 0,
             removed: 0,
@@ -1940,9 +1943,10 @@ async fn compact(
             });
             return;
         }
-        decided = compaction.compact(&log, &ask) => decided,
+        decided = compaction.compact_attempt(&log, &ask) => decided,
     };
-    let committed = match decision {
+    let diagnostic = decision.diagnostic;
+    let committed = match decision.decision {
         Some(decision) => {
             reporting.store(true, std::sync::atomic::Ordering::SeqCst);
             crate::session::apply_compaction(ctx, &log, decision);
@@ -1954,6 +1958,7 @@ async fn compact(
     let after = log.derive_messages();
     let (count_after, bytes_after) = measure(&after);
     let _ = events.send(AgentEvent::Compacted {
+        diagnostic,
         trigger,
         epoch: 0,
         removed: count_before.saturating_sub(count_after),

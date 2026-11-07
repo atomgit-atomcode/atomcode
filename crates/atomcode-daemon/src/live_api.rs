@@ -707,7 +707,11 @@ use serde::Serialize;
 #[serde(tag = "type")]
 pub(crate) enum LiveWireEvent {
     #[serde(rename = "context_compacting")]
-    ContextCompacting { active: bool },
+    ContextCompacting {
+        active: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        diagnostic: Option<String>,
+    },
     #[serde(rename = "context_summary")]
     ContextSummary { count: u64, record: bool },
     #[serde(rename = "snapshot")]
@@ -934,11 +938,20 @@ impl NativeLiveWireProjector {
         // events before drivers see them. Read its actual production seam.
         match &event {
             crate::live_hub::LiveViewEvent::Runtime(Runtime::CompactionStarted { .. }) => {
-                return Some(LiveWireEvent::ContextCompacting { active: true })
+                return Some(LiveWireEvent::ContextCompacting {
+                    active: true,
+                    diagnostic: None,
+                })
             }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::CompactionFinished {
                 completion: CompactionCompletion::Completed(outcome),
             }) => {
+                if let Some(message) = outcome.diagnostic_message() {
+                    return Some(LiveWireEvent::ContextCompacting {
+                        active: false,
+                        diagnostic: Some(message),
+                    });
+                }
                 if outcome.committed {
                     if let Some(count) = self
                         .working_dir
@@ -952,11 +965,19 @@ impl NativeLiveWireProjector {
                         }
                     }
                 }
-                return Some(LiveWireEvent::ContextCompacting { active: false });
+                return Some(LiveWireEvent::ContextCompacting {
+                    active: false,
+                    diagnostic: None,
+                });
             }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::CompactionFinished {
                 completion: CompactionCompletion::Interrupted { .. },
-            }) => return Some(LiveWireEvent::ContextCompacting { active: false }),
+            }) => {
+                return Some(LiveWireEvent::ContextCompacting {
+                    active: false,
+                    diagnostic: None,
+                })
+            }
             _ => {}
         }
         Some(match event {
@@ -3006,6 +3027,32 @@ mod tests {
     }
 
     #[test]
+    fn failed_summary_has_a_diagnostic_and_stops_the_live_compaction_indicator() {
+        let mut outcome = atomcode_coding::runtime::CompactionOutcome::from_kernel(
+            atomcode_kernel::message::CompactTrigger::Manual { focus: None },
+            0,
+            0,
+            2_000_000,
+            2_000_000,
+            false,
+            None,
+        );
+        outcome.diagnostic = Some(atomcode_kernel::message::CompactionDiagnostic::SummaryFailed);
+        let expected = outcome.diagnostic_message().unwrap();
+        let wire = super::NativeLiveWireProjector::default()
+            .project(crate::live_hub::LiveViewEvent::Runtime(
+                CodingRuntimeEvent::CompactionFinished {
+                    completion: CompactionCompletion::Completed(outcome),
+                },
+            ))
+            .unwrap();
+        let json = serde_json::to_value(wire).unwrap();
+        assert_eq!(json["type"], "context_compacting");
+        assert_eq!(json["active"], false);
+        assert_eq!(json["diagnostic"], expected);
+    }
+
+    #[test]
     fn normalized_runtime_compaction_progress_has_a_terminal_even_without_a_stored_count() {
         use atomcode_coding::{
             runtime::{CompactionCompletion, CompactionOutcome},
@@ -3976,6 +4023,7 @@ mod tests {
         kernel_message.synthetic = true;
         let event = CodingRuntimeEvent::CompactionFinished {
             completion: CompactionCompletion::Completed(CompactionOutcome {
+                diagnostic: None,
                 trigger: CompactTrigger::Manual { focus: None },
                 epoch: 1,
                 removed_messages: 2,

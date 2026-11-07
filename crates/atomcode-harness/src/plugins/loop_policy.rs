@@ -1061,7 +1061,23 @@ impl Waterfall<AgentRequest> for CompactBeforeRequest {
                 "summarizing the earlier conversation".into(),
             );
         }
-        if let Some(decision) = compaction.compact(&session, &ask).await {
+        let result = compaction.compact_attempt(&session, &ask).await;
+        if result.decision.is_none() {
+            if let Some(reason) = result.diagnostic {
+                let bytes = session.derive_messages().iter().map(|m| m.text.len()).sum();
+                super::recovery::notice(
+                    &self.ctx,
+                    crate::session::NoticeKind::CompactionDegraded,
+                    atomcode_config::i18n::format_compaction_diagnostic(
+                        reason.code(),
+                        bytes,
+                        bytes,
+                        false,
+                    ),
+                );
+            }
+        }
+        if let Some(decision) = result.decision {
             crate::session::apply_compaction(&self.ctx, &session, decision);
             // Re-project: the request must carry the compacted history, and it
             // must still be exactly what the log says.

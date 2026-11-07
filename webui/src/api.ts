@@ -71,7 +71,7 @@ export async function failure(r: Response): Promise<ApiCallError> {
 }
 
 export type SSEEvent =
-  | { type: 'context_compacting'; active: boolean }
+  | { type: 'context_compacting'; active: boolean; diagnostic?: string }
   | { type: 'context_summary'; count: number; record: boolean }
   | { type: 'runtime_info'; provider: string; model: string }
   | { type: 'session_assigned'; session_id: string }
@@ -1069,7 +1069,7 @@ export interface LiveLoopProgress {
 }
 
 export type LiveWireEvent =
-  | { type: 'context_compacting'; active: boolean }
+  | { type: 'context_compacting'; active: boolean; diagnostic?: string }
   | { type: 'context_summary'; count: number; record: boolean }
   | { type: 'snapshot'; summary_count?: number; messages: SessionMessage[]; session_id: string; project_hash: string; provider: string; model?: string | null; mode: ApprovalMode; goal?: LiveGoalProgress | null; loop_progress?: LiveLoopProgress | null }
   | ({ type: 'goal_changed' } & LiveGoalProgress)
@@ -1255,7 +1255,7 @@ export type CommandResult =
   | { kind: 'forget'; removed: string[] }
   | { kind: 'memory'; global: string[]; project: string[]; local?: string[]; text?: string }
   | { kind: 'context'; used_tokens: number; total_messages: number; ctx_window: number; utilization: number; ctx_name: string }
-  | { kind: 'compact'; applied: boolean; removed_messages: number; before_tokens: number; after_tokens: number }
+  | { kind: 'compact'; diagnostic?: string; applied: boolean; removed_messages: number; before_tokens: number; after_tokens: number }
   | { kind: 'whoami'; logged_in: boolean; username?: string; name?: string; email?: string }
   | { kind: 'status'; logged_in: boolean; username?: string; provider: string; model: string; working_dir: string; config_path: string; text: string }
   | { kind: 'config'; path: string; provider: string }

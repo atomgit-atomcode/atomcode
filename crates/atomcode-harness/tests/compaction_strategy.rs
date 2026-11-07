@@ -471,6 +471,7 @@ async fn a_cut_never_leaves_a_result_whose_call_it_removed() {
     impl CompactionStrategy for CutAt {
         async fn plan(&self, view: &CompactionView<'_>) -> CompactionPlan {
             CompactionPlan {
+                diagnostic: None,
                 drain_from: view.sacred_floor,
                 drain_to: self.0,
                 summary: Some("S".into()),
@@ -676,4 +677,84 @@ async fn a_late_explicit_specification_survives_model_and_model_free_compaction(
             1
         );
     }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_failed_summary_keeps_its_reason_after_switching_to_a_larger_window() {
+    use atomcode_harness::plugins::compaction::attempt_with_strategy;
+    use atomcode_kernel::message::CompactionDiagnostic;
+    let mut writer = Writer::new();
+    writer.ask("keep the agreed design");
+    writer.answer(&"design details ".repeat(160_000));
+    writer.ask("continue");
+    let before = writer.log.events();
+    let provider = Arc::new(UnavailableSummary {
+        partial: false,
+        calls: Default::default(),
+    });
+    let policy = OverflowCompaction::new(StubCompaction::default(), Some(provider));
+    for window in [512_000, 1_000_000] {
+        let result = attempt_with_strategy(
+            &policy,
+            &writer.log,
+            &ask(CompactTrigger::Manual { focus: None }, window, 0),
+        )
+        .await;
+        assert!(result.decision.is_none());
+        assert_eq!(result.diagnostic, Some(CompactionDiagnostic::SummaryFailed));
+        assert_eq!(
+            writer.log.events(),
+            before,
+            "display diagnostics must not become session facts"
+        );
+    }
+    let healthy = strategy(Some(Summarizer::new()));
+    let result = attempt_with_strategy(
+        &healthy,
+        &writer.log,
+        &ask(CompactTrigger::Manual { focus: None }, 1_000_000, 0),
+    )
+    .await;
+    assert!(result.diagnostic.is_none());
+    assert!(result.decision.is_some());
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_nonshrinking_proposal_is_distinct_from_nothing_to_compact() {
+    use atomcode_harness::plugins::compaction::attempt_with_strategy;
+    use atomcode_kernel::message::CompactionDiagnostic;
+    struct Growing;
+    #[async_trait]
+    impl CompactionStrategy for Growing {
+        async fn plan(&self, view: &CompactionView<'_>) -> CompactionPlan {
+            CompactionPlan {
+                drain_from: view.sacred_floor,
+                drain_to: view.messages.len(),
+                summary: Some("x".repeat(100_000)),
+                ..Default::default()
+            }
+        }
+    }
+    let mut writer = Writer::new();
+    writer.ask("keep");
+    writer.answer("brief answer");
+    writer.ask("next");
+    let before = writer.log.events();
+    let result = attempt_with_strategy(
+        &Growing,
+        &writer.log,
+        &ask(CompactTrigger::Manual { focus: None }, 512_000, 0),
+    )
+    .await;
+    assert!(result.decision.is_none());
+    assert_eq!(result.diagnostic, Some(CompactionDiagnostic::NotSmaller));
+    assert_eq!(writer.log.events(), before);
+    let result = attempt_with_strategy(
+        &atomcode_kernel::message::NoCompaction,
+        &writer.log,
+        &ask(CompactTrigger::Manual { focus: None }, 512_000, 0),
+    )
+    .await;
+    assert!(result.decision.is_none());
+    assert!(result.diagnostic.is_none());
 }

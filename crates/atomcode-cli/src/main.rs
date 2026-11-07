@@ -3847,7 +3847,9 @@ pub(crate) async fn run_native_headless_detailed(
                 if let atomcode_coding::runtime::CompactionCompletion::Completed(outcome) =
                     completion
                 {
-                    if outcome.committed {
+                    if let Some(message) = outcome.diagnostic_message() {
+                        eprintln!("[compact] {message}");
+                    } else if outcome.committed {
                         eprintln!(
                             "[compact] {}",
                             atomcode_config::i18n::format_compaction_mark(

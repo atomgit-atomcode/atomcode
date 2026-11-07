@@ -1454,6 +1454,8 @@ impl RunningAgent {
         // still has exclusive ownership; only a successful save unlocks the final,
         // infallible ownership move below. Auto/overflow compaction keeps its
         // existing turn-owned persistence path.
+        let diagnostic = plan.diagnostic;
+        let proposed_change = !plan.is_noop();
         let prepared = convo.prepare_plan(plan, floor);
         let report = prepared.report();
         let mut snapshot = None;
@@ -1482,6 +1484,10 @@ impl RunningAgent {
 
         let report = convo.commit_prepared(prepared);
         self.rt.emit(AgentEvent::Compacted {
+            diagnostic: diagnostic.or_else(|| {
+                (!report.committed && proposed_change)
+                    .then_some(crate::message::CompactionDiagnostic::NotSmaller)
+            }),
             trigger: trigger_for_event,
             epoch: report.epoch_after,
             removed: report.removed,

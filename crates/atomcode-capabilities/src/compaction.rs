@@ -121,6 +121,7 @@ impl CompactionStrategy for StubCompaction {
         }
         // Pure in-place stubbing: no drain, no summary, no resume note.
         CompactionPlan {
+            diagnostic: None,
             drain_from: 0,
             drain_to: 0,
             summary: None,
@@ -363,6 +364,7 @@ impl OverflowCompaction {
                     return CompactionPlan::noop();
                 }
                 CompactionPlan {
+                    diagnostic: None,
                     drain_from: 0,
                     drain_to: 0,
                     summary: None,
@@ -379,6 +381,7 @@ impl OverflowCompaction {
                     return CompactionPlan::noop();
                 }
                 CompactionPlan {
+                    diagnostic: None,
                     drain_from: 0,
                     drain_to: 0,
                     summary: None,
@@ -410,6 +413,7 @@ impl OverflowCompaction {
                         return CompactionPlan::noop();
                     }
                     return CompactionPlan {
+                        diagnostic: None,
                         drain_from: 0,
                         drain_to: 0,
                         summary: None,
@@ -443,6 +447,11 @@ impl OverflowCompaction {
                             .to_string()
                         });
                         return CompactionPlan {
+                            diagnostic: Some(if timed_out {
+                                atomcode_kernel::message::CompactionDiagnostic::SummaryTimedOut
+                            } else {
+                                atomcode_kernel::message::CompactionDiagnostic::SummaryFailed
+                            }),
                             drain_from: 0,
                             drain_to: 0,
                             summary: None,
@@ -452,6 +461,7 @@ impl OverflowCompaction {
                     }
                 };
                 CompactionPlan {
+                    diagnostic: None,
                     drain_from: floor,
                     drain_to,
                     summary,
@@ -511,6 +521,11 @@ impl OverflowCompaction {
                     SUMMARY_FAILURE_NOTE
                 };
                 let mut plan = self.inner.plan(view).await;
+                plan.diagnostic = Some(if timed_out {
+                    atomcode_kernel::message::CompactionDiagnostic::SummaryTimedOut
+                } else {
+                    atomcode_kernel::message::CompactionDiagnostic::SummaryFailed
+                });
                 // Only annotate a plan that actually shrinks; adding a note to a noop plan
                 // would grow it and get (correctly) refused by the net-loss guard for nothing.
                 if !plan.rewrites.is_empty() {
@@ -523,6 +538,7 @@ impl OverflowCompaction {
             }
         };
         CompactionPlan {
+            diagnostic: None,
             drain_from: floor,
             drain_to,
             summary,
@@ -1666,6 +1682,51 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn repro_failed_summary_is_noop_even_after_512k_to_1m_switch() {
+        let strategy = OverflowCompaction::new(
+            StubCompaction::default(),
+            Some(Arc::new(FailedSummaryProvider(0))),
+        );
+        let mut conv = Conversation::new();
+        conv.messages = vec![
+            Message::system("persona"),
+            Message::user("keep the design"),
+            Message::assistant("design details ".repeat(160_000), vec![]),
+            Message::user("continue"),
+        ];
+        let original = conv.messages.clone();
+        let floor = conv.sacred_floor();
+        for window in [512_000, 1_000_000] {
+            let mut view = manual_view(&conv.messages, floor, None);
+            view.ctx_window = window;
+            assert!(strategy.will_summarize(&view), "summary must be attempted");
+            let plan = strategy.plan(&view).await;
+            assert_eq!(
+                plan.diagnostic,
+                Some(atomcode_kernel::message::CompactionDiagnostic::SummaryFailed)
+            );
+            let report = conv.apply_plan(plan, floor);
+            assert!(
+                !report.committed,
+                "failed summary becomes the UI noop result"
+            );
+            assert_eq!(conv.messages.len(), original.len());
+            assert_eq!(conv.messages[2].text, original[2].text);
+        }
+        let healthy = OverflowCompaction::new(
+            StubCompaction::default(),
+            Some(Arc::new(CannedSummaryProvider)),
+        );
+        let mut view = manual_view(&conv.messages, floor, None);
+        view.ctx_window = 1_000_000;
+        let plan = healthy.plan(&view).await;
+        assert!(
+            conv.apply_plan(plan, floor).committed,
+            "the same history must compact with a working summary provider"
+        );
+    }
+
     /// Opens the stream fine, then never yields a byte — models a thinking model (e.g.
     /// GLM-5.2) stuck in hidden reasoning on a huge prompt, where the provider's byte-idle
     /// stream timeout never fires. The manual `/compact` wall-clock cap must fire instead.
@@ -1712,6 +1773,10 @@ mod tests {
         let plan = strat.plan(&manual_view(&conv.messages, floor, None)).await;
         // Timeout → C fallback: the gentle in-place stub policy (no drain, no LLM summary),
         // so every message survives and old tool results are folded to reclaim tokens.
+        assert_eq!(
+            plan.diagnostic,
+            Some(atomcode_kernel::message::CompactionDiagnostic::SummaryTimedOut)
+        );
         assert_eq!(plan.drain_from, 0, "timeout must NOT drain-and-summarize");
         assert_eq!(plan.drain_to, 0, "timeout must NOT drain-and-summarize");
         assert!(plan.summary.is_none(), "no LLM summary on timeout");

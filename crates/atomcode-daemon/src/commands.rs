@@ -66,6 +66,8 @@ pub(crate) enum CommandResult {
         ctx_name: String,
     },
     Compact {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        diagnostic: Option<String>,
         applied: bool,
         removed_messages: usize,
         before_tokens: usize,
@@ -340,6 +342,7 @@ async fn exec_native_compact(
         commit_native_compaction(session, compacted.messages, compacted.mutation)?;
     }
     Ok(CommandResult::Compact {
+        diagnostic: compacted.outcome.diagnostic_message(),
         applied: compacted.outcome.committed,
         removed_messages: compacted.outcome.removed_messages,
         before_tokens: compacted.outcome.estimated_tokens_before,
