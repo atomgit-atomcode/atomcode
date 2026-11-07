@@ -912,48 +912,30 @@ fn with_http_oauth_server(
 /// Supports `${VAR}` and `${VAR:-default}` syntax.
 fn expand_env_vars(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
-    let bytes = s.as_bytes();
-    let mut i = 0;
+    let mut rest = s;
 
-    while i < bytes.len() {
-        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
-            i += 2; // skip ${
+    while let Some(start) = rest.find("${") {
+        result.push_str(&rest[..start]);
+        let after_brace = &rest[start + 2..];
+        let Some(end) = after_brace.find('}') else {
+            // No closing brace: keep the literal text and stop scanning.
+            result.push_str("${");
+            rest = after_brace;
+            break;
+        };
 
-            let mut var_name = String::new();
-            let mut default = String::new();
-            let mut has_default = false;
-
-            while i < bytes.len() && bytes[i] != b'}' {
-                if bytes[i] == b':' && !has_default && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
-                    i += 2; // skip :-
-                    has_default = true;
-                    continue;
-                }
-                if has_default {
-                    default.push(bytes[i] as char);
-                } else {
-                    var_name.push(bytes[i] as char);
-                }
-                i += 1;
-            }
-            if i < bytes.len() {
-                i += 1; // skip }
-            }
-
-            let value = std::env::var(&var_name).unwrap_or_else(|_| {
-                if has_default {
-                    default
-                } else {
-                    String::new()
-                }
-            });
-            result.push_str(&value);
-        } else {
-            result.push(bytes[i] as char);
-            i += 1;
-        }
+        let inner = &after_brace[..end];
+        let (var_name, default) = match inner.find(":-") {
+            Some(sep) => (&inner[..sep], Some(&inner[sep + 2..])),
+            None => (inner, None),
+        };
+        let value =
+            std::env::var(var_name).unwrap_or_else(|_| default.unwrap_or_default().to_string());
+        result.push_str(&value);
+        rest = &after_brace[end + 1..];
     }
 
+    result.push_str(rest);
     result
 }
 
@@ -1207,6 +1189,20 @@ mod tests {
         std::env::set_var("VAR2", "b");
         let result = expand_env_vars("prefix_${VAR1}_middle_${VAR2}_suffix");
         assert_eq!(result, "prefix_a_middle_b_suffix");
+    }
+
+    #[test]
+    fn test_expand_env_vars_unclosed_brace_is_kept_verbatim() {
+        std::env::remove_var("UNCLOSED");
+        // 无 `}` 的 `${` 不得把后面的文本当变量名展开成空串，必须按字面保留。
+        assert_eq!(expand_env_vars("${UNCLOSED"), "${UNCLOSED");
+    }
+
+    #[test]
+    fn test_expand_env_vars_expansion_before_unclosed_brace() {
+        std::env::set_var("TEST_VAR", "test_value");
+        // 前段正常展开，后段未闭合的 `${` 按 break 路径由兜底拼接保留。
+        assert_eq!(expand_env_vars("${TEST_VAR}tail${D"), "test_valuetail${D");
     }
 
     #[test]
