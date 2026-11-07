@@ -23,6 +23,18 @@ impl atomcode_coding::ImagePreprocessor for DaemonVlImagePreprocessor {
         atomcode_coding::UserInput,
         Option<atomcode_coding::VisionNotice>,
     ) {
+        // Upstream /chat and /live may already have read the picture. The
+        // runtime still receives originals for display capture, but must neither
+        // caption them twice nor forward them to a text-only provider.
+        if !supports_vision && crate::strip_vision_marker(&text).1 {
+            return (
+                atomcode_coding::UserInput {
+                    text,
+                    images: vec![],
+                },
+                None,
+            );
+        }
         let config = match atomcode_config::config::Config::load(
             &atomcode_config::config::Config::default_path(),
         ) {
@@ -462,6 +474,43 @@ mod tests {
                 Some(value) => std::env::set_var("ATOMCODE_HOME", value),
                 None => std::env::remove_var("ATOMCODE_HOME"),
             }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn an_already_captioned_image_is_not_read_twice_or_sent_to_a_text_model() {
+        use atomcode_coding::ImagePreprocessor;
+        let dir = tempfile::tempdir().unwrap();
+        let telemetry = atomcode_telemetry::Telemetry::init(
+            atomcode_telemetry::ResolvedConfig {
+                state: atomcode_telemetry::TelemetryState::Disabled("test"),
+                endpoint: String::new(),
+                atomcode_dir: dir.path().into(),
+            },
+            "test".into(),
+        );
+        let preprocessor = DaemonVlImagePreprocessor {
+            working_dir: dir.path().into(),
+            telemetry,
+        };
+        for text in [
+            "look\n\n[图片内容（由 vl 识别）]\na cat",
+            "look\n\n[what is in the picture, read by vl]\na cat",
+        ] {
+            let (input, notice) = preprocessor
+                .preprocess(
+                    text.into(),
+                    vec![atomcode_coding::ImageContent {
+                        media_type: "image/png".into(),
+                        data: "eA==".into(),
+                    }],
+                    false,
+                    None,
+                )
+                .await;
+            assert_eq!(input.text, text);
+            assert!(input.images.is_empty());
+            assert!(notice.is_none());
         }
     }
 

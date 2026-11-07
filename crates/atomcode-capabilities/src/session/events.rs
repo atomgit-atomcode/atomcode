@@ -1084,6 +1084,31 @@ impl SessionManager {
             // rejected by create_event_session. A failed copy is not offered.
             self.delete(destination)?;
         } else {
+            // The source facts keep their sequence numbers in a fork. Copy only
+            // verified display attachments; an auxiliary failure cannot invalidate
+            // the already committed fork or change what its model sees.
+            for logged in &events {
+                if let SessionEvent::UserMessage { text, .. } = &logged.event {
+                    match self.read_display_images(source_id, logged.seq) {
+                        Ok(Some(saved)) if saved.matches(text) => {
+                            if let Err(_error) = self.write_display_images(
+                                destination,
+                                logged.seq,
+                                text,
+                                saved.images,
+                            ) {
+                                #[cfg(feature = "tools")]
+                                tracing::warn!(error = %_error, "fork display images could not be copied");
+                            }
+                        }
+                        Err(_error) => {
+                            #[cfg(feature = "tools")]
+                            tracing::warn!(error = %_error, "fork display images could not be read");
+                        }
+                        _ => {}
+                    }
+                }
+            }
             #[cfg(feature = "tools")]
             {
                 let last_turn = events

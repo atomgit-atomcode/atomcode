@@ -913,10 +913,16 @@ impl ImageData {
 }
 
 fn strip_vision_marker(raw: &str) -> (String, bool) {
-    match raw
-        .find("[图片内容（由")
-        .or_else(|| raw.find("[图片识别失败]"))
-    {
+    let cut = [
+        "[图片内容（由",
+        "[图片识别失败]",
+        "[what is in the picture, read by ",
+        "[the picture could not be read]",
+    ]
+    .iter()
+    .filter_map(|marker| raw.find(marker))
+    .min();
+    match cut {
         Some(i) => (raw[..i].trim_end().to_string(), true),
         None => (raw.to_string(), false),
     }
@@ -2421,14 +2427,23 @@ async fn get_session_detail(
     match crate::legacy_convert::load_catalog_session_view_in_project(&hash, &id) {
         Ok(Some(session)) => {
             let turn_timestamps = load_turn_timestamps(&hash, &id).await;
-            let mut messages =
-                match merge_catalog_session_messages_for_display(&session, &turn_timestamps) {
-                    Ok(messages) => messages,
-                    Err(error) => {
-                        let msg = format!("Failed to load session: {error}");
-                        return (StatusCode::NOT_FOUND, Json(msg)).into_response();
-                    }
-                };
+            let storage = NativeSessionManager::with_root(
+                NativeSessionManager::sessions_root(
+                    atomcode_coding::config::product_dirs_from_env().user(),
+                )
+                .join(&hash),
+            );
+            let mut messages = match merge_catalog_session_messages_for_display(
+                &session,
+                &turn_timestamps,
+                Some(&storage),
+            ) {
+                Ok(messages) => messages,
+                Err(error) => {
+                    let msg = format!("Failed to load session: {error}");
+                    return (StatusCode::NOT_FOUND, Json(msg)).into_response();
+                }
+            };
             let message_count = messages.len();
             let cursor = match query
                 .before
@@ -2598,7 +2613,8 @@ async fn get_session_transcript(
             )
             .join(&task_hash),
         );
-        let mut turns = transcript_view::load(&manager, &task_id, &selected, query.detail)?;
+        let mut turns =
+            transcript_view::load(&manager, &task_id, &selected, query.detail, !query.summary)?;
         if query.summary {
             transcript_view::summarize(&mut turns);
         }
@@ -2670,6 +2686,44 @@ pub(crate) fn append_display_images(
     }
 }
 
+/// Prefer exact native-event identity over the legacy ordinal image sidecar.
+pub(crate) fn attach_native_display_images(
+    info: &mut MessageInfo,
+    manager: &NativeSessionManager,
+    id: &str,
+    raw: &str,
+) {
+    let Some(seq) = info.source_seq else { return };
+    if info.role != "user"
+        || info.images.as_ref().is_some_and(|images| {
+            images
+                .iter()
+                .any(|image| !image.missing && !image.data.is_empty())
+        })
+    {
+        return;
+    }
+    match manager.read_display_images(id, seq) {
+        Ok(Some(saved)) if saved.matches(raw) => {
+            info.images = Some(
+                saved
+                    .images
+                    .into_iter()
+                    .map(|image| ImageData {
+                        media_type: image.media_type,
+                        data: image.data,
+                        missing: false,
+                    })
+                    .collect(),
+            );
+        }
+        Err(error) => {
+            tracing::warn!(session = id, source_seq = seq, %error, "display images unavailable")
+        }
+        _ => {}
+    }
+}
+
 /// Re-attach display-only sidecar images to the VL-preprocessed user messages that
 /// currently render the "missing image" placeholder, IN ORDER. Real (vision-model)
 /// images and non-user messages are left untouched.
@@ -2691,6 +2745,19 @@ pub(crate) fn attach_display_images(
 /// non-user messages are left untouched.
 fn attach_image_sets(messages: &mut [MessageInfo], sets: Vec<Vec<ImageData>>) {
     if sets.is_empty() {
+        return;
+    }
+    let placeholders = messages
+        .iter()
+        .filter(|message| {
+            message.role == "user"
+                && message
+                    .images
+                    .as_ref()
+                    .is_some_and(|images| images.iter().any(|image| image.missing))
+        })
+        .count();
+    if placeholders != sets.len() {
         return;
     }
     let mut next = sets.into_iter();
@@ -2915,14 +2982,21 @@ fn spec_sources_from_events(
 fn merge_catalog_session_messages_for_display(
     session: &crate::legacy_convert::CatalogSessionView,
     turn_timestamps: &TurnTimestamps,
+    storage: Option<&NativeSessionManager>,
 ) -> anyhow::Result<Vec<MessageInfo>> {
     use atomcode_capabilities::session::{DisplayAnchor, PresentationRole};
 
-    let spec_sources = snapshot_spec_sources(
-        &session.snapshot,
-        std::path::Path::new(&session.meta.working_dir),
-        &session.meta.id,
-    );
+    let spec_sources = match storage {
+        Some(manager) => manager
+            .load_events(&session.meta.id)
+            .map(|events| spec_sources_from_events(&session.snapshot, &events))
+            .unwrap_or_else(|_| vec![(None, false); session.snapshot.messages.len()]),
+        None => snapshot_spec_sources(
+            &session.snapshot,
+            std::path::Path::new(&session.meta.working_dir),
+            &session.meta.id,
+        ),
+    };
     let mut presentation = std::collections::BTreeMap::<usize, Vec<_>>::new();
     for entry in &session.presentation.entries {
         let after_message = match entry.anchor {
@@ -2939,6 +3013,11 @@ fn merge_catalog_session_messages_for_display(
         };
         presentation.entry(after_message).or_default().push(entry);
     }
+    let fallback_manager = NativeSessionManager::for_project(
+        std::path::Path::new(&session.meta.working_dir),
+        &atomcode_coding::config::product_dirs_from_env(),
+    );
+    let display_manager = storage.unwrap_or(&fallback_manager);
     let mut messages =
         Vec::with_capacity(session.snapshot.messages.len() + session.presentation.entries.len());
     let mut append_presentation = |position: usize, messages: &mut Vec<MessageInfo>| {
@@ -2994,6 +3073,12 @@ fn merge_catalog_session_messages_for_display(
             (info.source_seq, info.task_spec_pinned) = spec_sources[index];
             info.created_at =
                 snapshot_message_timestamp(&session.meta, message, index, turn_timestamps);
+            attach_native_display_images(
+                &mut info,
+                &display_manager,
+                &session.meta.id,
+                &message.text,
+            );
             messages.push(info);
         }
         append_presentation(index + 1, &mut messages);
@@ -3031,11 +3116,15 @@ fn merge_catalog_session_messages_for_display(
     }
     // Re-attach display-only images (VL-preprocessed originals) stashed out of band, so a
     // reloaded session shows the thumbnail instead of the "missing image" placeholder.
-    attach_display_images(
-        &mut messages,
-        std::path::Path::new(&session.meta.working_dir),
-        &session.meta.id,
-    );
+    let legacy_sets = std::fs::read(
+        display_manager
+            .root()
+            .join(format!("{}.images.json", session.meta.id)),
+    )
+    .ok()
+    .and_then(|bytes| serde_json::from_slice::<ImageSidecar>(&bytes).ok())
+    .unwrap_or_default();
+    attach_image_sets(&mut messages, legacy_sets.sets);
     Ok(messages)
 }
 
@@ -8351,7 +8440,8 @@ mod tests {
         };
 
         let displayed =
-            merge_catalog_session_messages_for_display(&session, &TurnTimestamps::new()).unwrap();
+            merge_catalog_session_messages_for_display(&session, &TurnTimestamps::new(), None)
+                .unwrap();
         let text = displayed
             .iter()
             .map(|message| message.content.as_str())
@@ -8423,7 +8513,8 @@ mod tests {
         assert_eq!(live_messages[2].created_at, Some(1_700_000_090_000));
         assert_eq!(live_messages[3].created_at, Some(1_700_000_100_000));
 
-        let displayed = merge_catalog_session_messages_for_display(&session, &timestamps).unwrap();
+        let displayed =
+            merge_catalog_session_messages_for_display(&session, &timestamps, None).unwrap();
         assert_eq!(displayed[0].created_at, Some(1_699_999_990_000));
         assert_eq!(displayed[1].created_at, Some(1_700_000_000_000));
         assert_eq!(displayed[2].created_at, Some(1_700_000_090_000));
@@ -8452,7 +8543,8 @@ mod tests {
         };
 
         let displayed =
-            merge_catalog_session_messages_for_display(&session, &TurnTimestamps::new()).unwrap();
+            merge_catalog_session_messages_for_display(&session, &TurnTimestamps::new(), None)
+                .unwrap();
         assert_eq!(displayed.len(), 2);
         assert!(displayed.iter().all(|message| message.content == wrapped));
     }
@@ -8472,7 +8564,8 @@ mod tests {
         };
 
         let displayed =
-            merge_catalog_session_messages_for_display(&session, &TurnTimestamps::new()).unwrap();
+            merge_catalog_session_messages_for_display(&session, &TurnTimestamps::new(), None)
+                .unwrap();
         assert_eq!(displayed.len(), 2);
         assert_eq!(
             displayed[1].internal_origin.as_deref(),
@@ -11239,6 +11332,29 @@ done
             PathBuf::from("/x"),
         );
         assert_eq!(resolved, embedded);
+    }
+
+    #[test]
+    fn legacy_image_sets_do_not_shift_onto_older_tui_messages_that_never_saved_images() {
+        let mut messages = vec![
+            MessageInfo::from_kernel(&atomcode_kernel::message::Message::user(
+                "old\n\n[图片内容（由 vl 识别）]\nold caption",
+            )),
+            MessageInfo::from_kernel(&atomcode_kernel::message::Message::user(
+                "new\n\n[图片内容（由 vl 识别）]\nnew caption",
+            )),
+        ];
+        attach_image_sets(
+            &mut messages,
+            vec![vec![ImageData {
+                media_type: "image/png".into(),
+                data: "new-picture".into(),
+                missing: false,
+            }]],
+        );
+        assert!(messages
+            .iter()
+            .all(|message| message.images.as_ref().unwrap()[0].missing));
     }
 
     #[test]

@@ -292,13 +292,45 @@ impl Plugin for SessionStorePlugin {
         &["agents"]
     }
     fn provides(&self) -> &'static [&'static str] {
-        &["session-persistence"]
+        &["session-persistence", "display-input-images"]
     }
     fn description(&self) -> &'static str {
         "append the runtime's session's committed facts to its log in the session store"
     }
 
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        let display = Arc::new(crate::display_images::DisplayInputs::default());
+        let _ = ctx
+            .provide::<crate::display_images::DisplayInputs>(display.clone())
+            .map_err(|e| e.to_string())?;
+        let claimed = display.clone();
+        let claimed_ctx = ctx.clone();
+        let claimed_session = self.0.lease.id().to_string();
+        let _ = ctx.on_emit::<atomcode_harness::events::InputClaimed>(
+            move |input: &atomcode_harness::events::ClaimedInput| {
+                if claimed_ctx
+                    .service::<AgentsSvc>()
+                    .and_then(|agents| agents.get(input.agent))
+                    .is_some_and(|agent| storage_id(agent.session_id()) == claimed_session)
+                {
+                    claimed.claim(&input.receipt, input.turn);
+                }
+            },
+        );
+        let withdrawn = display.clone();
+        let withdrawn_ctx = ctx.clone();
+        let withdrawn_session = self.0.lease.id().to_string();
+        let _ = ctx.on_emit::<atomcode_harness::events::InputWithdrawn>(
+            move |input: &atomcode_harness::events::ClaimedInput| {
+                if withdrawn_ctx
+                    .service::<AgentsSvc>()
+                    .and_then(|agents| agents.get(input.agent))
+                    .is_some_and(|agent| storage_id(agent.session_id()) == withdrawn_session)
+                {
+                    withdrawn.withdraw(&input.receipt);
+                }
+            },
+        );
         let store = Arc::new(Store {
             session: self.0.clone(),
             broken: AtomicBool::new(false),
@@ -372,6 +404,26 @@ impl Plugin for SessionStorePlugin {
                 .is_err()
             {
                 agent.cancel();
+            } else {
+                match &committed.event {
+                    atomcode_harness::session::SessionEvent::UserMessage { turn, text, .. } => {
+                        let images = display.take(*turn, text);
+                        if let Err(error) = store.session.store.write_display_images(
+                            &store.session.lease,
+                            committed.seq,
+                            text,
+                            images,
+                        ) {
+                            store.warn(format!(
+                                "original images could not be kept for display: {error}"
+                            ));
+                        }
+                    }
+                    atomcode_harness::session::SessionEvent::TurnEnd { turn, .. } => {
+                        display.finish(*turn)
+                    }
+                    _ => {}
+                }
             }
         });
         Ok(())

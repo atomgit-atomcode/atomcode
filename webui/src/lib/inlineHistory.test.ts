@@ -51,3 +51,20 @@ test('mobile and desktop archive batches stay small even for long histories', ()
   assert.deepEqual(historyWindow(1000, undefined, 2), { start: 998, end: 1000 });
   assert.deepEqual(historyWindow(1000, 25, 1), { start: 25, end: 26 });
 });
+
+test('TUI VL history keeps its image marker without a broken thumbnail or warning', () => {
+  const raw = '配置 provider [Image #1]\n\n[图片内容（由 glm5.3-flash 识别）]\nprivate recognition text';
+  const [shown] = historyMessages(turn(1, raw));
+  assert.deepEqual(shown.parts, [{ kind: 'text', text: '配置 provider [Image #1]' }]);
+  assert.equal(shown.images, undefined);
+  assert.equal(raw.includes('private recognition text'), true, 'source transcript is unchanged');
+});
+
+test('inline history keeps actual attachments and supports English VL records', () => {
+  const images = [{ media_type: 'image/png', data: 'eA==' }];
+  const record = { ...turn(1, 'look\n\n[what is in the picture, read by vl]\na cat'), user_images: images };
+  const [shown] = historyMessages(record);
+  assert.deepEqual(shown.parts, [{ kind: 'text', text: 'look' }]);
+  assert.deepEqual(shown.images, images);
+  assert.deepEqual(historyMessages({ ...turn(2, 'native image'), user_images: images })[0].images, images);
+});

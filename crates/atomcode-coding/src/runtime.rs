@@ -1172,6 +1172,7 @@ struct RuntimeEventEmitter {
     /// [`Self::withdraw_unclaimed`] answers it: without that, the driver holding
     /// the receipt waits for an answer that is never coming.
     unclaimed: Mutex<Vec<atomcode_kernel::event::CommandId>>,
+    internal_display_receipts: Mutex<BTreeSet<atomcode_kernel::event::CommandId>>,
     latest_goal: Mutex<Option<GoalProgress>>,
 }
 
@@ -1203,6 +1204,7 @@ impl RuntimeEventEmitter {
             tagged,
             generation,
             unclaimed: Mutex::new(Vec::new()),
+            internal_display_receipts: Mutex::new(BTreeSet::new()),
             latest_goal: Mutex::new(None),
         }
     }
@@ -1232,6 +1234,10 @@ impl RuntimeEventEmitter {
                 error: atomcode_kernel::event::CommandError::NotRunning,
             }));
         }
+        self.internal_display_receipts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     fn carry_live_view(&self, generation: u64) {
@@ -1304,6 +1310,14 @@ impl RuntimeEventEmitter {
             AgentEvent::Accepted { command, .. } | AgentEvent::Rejected { command, .. },
         ) = &event
         {
+            if self
+                .internal_display_receipts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(command)
+            {
+                return Ok(());
+            }
             self.unclaimed
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -5869,7 +5883,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         generation: request_generation,
                         mut input,
                         extra_context,
-                        receipt: driver_receipt,
+                        receipt: mut driver_receipt,
                         from,
                         expected_session,
                         done,
@@ -6128,6 +6142,8 @@ fn spawn_runtime_owner_with_optional_agent(
                                 format!("{prefix}\n\n{}", input.text)
                             };
                         }
+                        let mut staged_display = None;
+                        let mut internal_display_receipt = false;
                         // Vision (VL) preprocessing: when the turn carries images and a
                         // preprocessor is installed, rewrite `(text, images)` before the
                         // kernel turn — a non-vision model gets a VL text description with
@@ -6158,6 +6174,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 // under a pasted image did nothing for as long
                                 // as the VL model took.
                                 let stop = controls.stop_now();
+                                let original_images = input.images.clone();
                                 let recognised = tokio::select! {
                                     biased;
                                     _ = stop.cancelled() => None,
@@ -6195,6 +6212,21 @@ fn spawn_runtime_owner_with_optional_agent(
                                     continue;
                                 };
                                 input = new_input;
+                                if from.is_none() && input.images.is_empty() && !original_images.is_empty() {
+                                    if let Some(display) = resources.as_ref().and_then(|r| r.harness_app.as_ref())
+                                        .and_then(|app| app.context().service::<crate::display_images::DisplayInputs>())
+                                    {
+                                        if driver_receipt.is_none() {
+                                            driver_receipt = Some(format!("display-image-{}", uuid::Uuid::new_v4()));
+                                            internal_display_receipt = true;
+                                            runtime_event_tx.internal_display_receipts.lock().unwrap_or_else(|e| e.into_inner())
+                                                .insert(driver_receipt.as_ref().unwrap().clone());
+                                        }
+                                        let id = driver_receipt.as_ref().unwrap().clone();
+                                        display.stage(id.clone(), input.text.clone(), original_images);
+                                        staged_display = Some((display, id));
+                                    }
+                                }
                                 // Surface the outcome as a status line, emitted
                                 // BEFORE SendMessage so it renders right under the
                                 // user message, ahead of the assistant response.
@@ -6282,8 +6314,10 @@ fn spawn_runtime_owner_with_optional_agent(
                             None => command,
                         };
                         if send_agent_command(&agent, command) {
-                            if let Some(id) = driver_receipt {
-                                runtime_event_tx.receipt_sent(id);
+                            if !internal_display_receipt {
+                                if let Some(id) = driver_receipt {
+                                    runtime_event_tx.receipt_sent(id);
+                                }
                             }
                             // The agent opens a turn for it (or folds it into
                             // the one it has): as far as a stop is concerned it
@@ -6303,6 +6337,12 @@ fn spawn_runtime_owner_with_optional_agent(
                             }
                             let _ = done.send(Ok(receipt));
                         } else {
+                            if let Some((display, id)) = staged_display {
+                                display.withdraw(&id);
+                                if internal_display_receipt {
+                                    runtime_event_tx.internal_display_receipts.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+                                }
+                            }
                             agent_available = false;
                             active_turn = None;
                             controls.state.store(

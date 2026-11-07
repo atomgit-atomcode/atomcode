@@ -271,3 +271,24 @@ mod tests {
         );
     }
 }
+
+/// Original attachments for one committed user fact. Never projected into model
+/// messages; the text digest guards against a rolled-back sequence being reused.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DisplayImages {
+    pub text_sha256: String,
+    pub images: Vec<atomcode_kernel::message::ImageContent>,
+}
+impl DisplayImages {
+    pub fn new(text: &str, images: Vec<atomcode_kernel::message::ImageContent>) -> Self {
+        use sha2::{Digest, Sha256};
+        Self {
+            text_sha256: format!("{:x}", Sha256::digest(text.as_bytes())),
+            images,
+        }
+    }
+    pub fn matches(&self, text: &str) -> bool {
+        use sha2::{Digest, Sha256};
+        self.text_sha256 == format!("{:x}", Sha256::digest(text.as_bytes()))
+    }
+}

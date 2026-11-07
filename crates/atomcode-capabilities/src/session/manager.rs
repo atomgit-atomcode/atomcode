@@ -1457,6 +1457,69 @@ impl SessionManager {
         deserialize(&bytes, "controller checkpoint").map(Some)
     }
 
+    /// UI-only originals, one bounded file per committed user-event sequence.
+    /// The active session lease is the sole writer. Never read during resume.
+    pub fn read_display_images(
+        &self,
+        id: &str,
+        seq: u64,
+    ) -> SessionResult<Option<super::presentation::DisplayImages>> {
+        let dir = self.path_for(id, "display-images")?;
+        match fs::symlink_metadata(&dir) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(io_at(&dir, e)),
+            Ok(meta) if !meta.is_dir() || meta.file_type().is_symlink() => {
+                return Err(SessionStoreError::Corrupt {
+                    kind: "display images",
+                    message: "attachment directory is not a regular directory".into(),
+                })
+            }
+            Ok(_) => {}
+        }
+        let path = dir.join(format!("{seq}.image"));
+        match fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(io_at(&path, e)),
+            Ok(_) => {}
+        }
+        let bytes = read_regular_file_bounded(&path, "display images", MAX_SNAPSHOT_BYTES)?;
+        deserialize(&bytes, "display images").map(Some)
+    }
+
+    pub fn write_display_images(
+        &self,
+        lease: &SessionLease,
+        seq: u64,
+        text: &str,
+        images: Vec<atomcode_kernel::message::ImageContent>,
+    ) -> SessionResult<()> {
+        self.validate_active_lease(lease)?;
+        let dir = self.path_for(lease.id(), "display-images")?;
+        match fs::symlink_metadata(&dir) {
+            Ok(meta) if !meta.is_dir() || meta.file_type().is_symlink() => {
+                return Err(SessionStoreError::Corrupt {
+                    kind: "display images",
+                    message: "attachment directory is not a regular directory".into(),
+                })
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound && images.is_empty() => return Ok(()),
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(io_at(&dir, e)),
+            _ => {}
+        }
+        let path = dir.join(format!("{seq}.image"));
+        if images.is_empty() {
+            return match fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(io_at(&path, e)),
+            };
+        }
+        fs::create_dir_all(&dir).map_err(|e| io_at(&dir, e))?;
+        let value = super::presentation::DisplayImages::new(text, images);
+        let bytes = serialize_bounded(&value, "display images", MAX_SNAPSHOT_BYTES)?;
+        atomic_write(&path, &bytes)
+    }
+
     /// Todo-list sidecar path: `<root>/<id>.todos.json` (sibling of meta/snapshot),
     /// `<id>.todos` for an event session.
     pub fn todo_sidecar_path(&self, id: &str) -> SessionResult<PathBuf> {
@@ -4011,6 +4074,12 @@ impl SessionManager {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => return Err(io_at(&p, e)),
             }
+        }
+        let images = self.path_for(id, "display-images")?;
+        match fs::remove_dir_all(&images) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io_at(&images, e)),
         }
         if let Ok(dir) = self.artifacts_dir(id) {
             let _ = fs::remove_dir_all(&dir); // best-effort; absent dir is fine
@@ -8109,6 +8178,40 @@ mod tests {
         ));
         assert!(mgr.snapshot_path("s1").unwrap().exists());
         assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+    }
+
+    #[test]
+    fn display_images_are_leased_bounded_sidecars_and_deleted_with_the_session() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = SessionManager::with_root(root.path());
+        let lease = manager.acquire_lease("pictures").unwrap();
+        let images = vec![atomcode_kernel::message::ImageContent {
+            media_type: "image/png".into(),
+            data: "eA==".into(),
+        }];
+        manager
+            .write_display_images(&lease, 7, "caption", images.clone())
+            .unwrap();
+        let saved = manager.read_display_images("pictures", 7).unwrap().unwrap();
+        assert!(saved.matches("caption"));
+        assert!(!saved.matches("other caption"));
+        assert_eq!(saved.images, images);
+        assert!(manager
+            .read_display_images("pictures", 8)
+            .unwrap()
+            .is_none());
+        manager
+            .write_display_images(&lease, 7, "new fact reusing sequence", vec![])
+            .unwrap();
+        assert!(manager
+            .read_display_images("pictures", 7)
+            .unwrap()
+            .is_none());
+        manager
+            .write_display_images(&lease, 9, "caption", images)
+            .unwrap();
+        manager.delete(&lease).unwrap();
+        assert!(!root.path().join("pictures.display-images").exists());
     }
 
     #[test]

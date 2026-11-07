@@ -12,6 +12,8 @@ pub(super) struct TranscriptTurn {
     steps: Option<Vec<Step>>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     user_truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_images: Option<Vec<crate::ImageData>>,
 }
 #[derive(Serialize)]
 struct Step {
@@ -33,6 +35,7 @@ pub(super) fn load(
     id: &str,
     selected: &[u64],
     detail: bool,
+    include_images: bool,
 ) -> SessionResult<Vec<TranscriptTurn>> {
     if !manager.is_event_session(id) {
         // Legacy records contain merged text only. Do not invent boundaries.
@@ -40,15 +43,43 @@ pub(super) fn load(
             .load_transcript_records(id)?
             .into_iter()
             .filter(|r| selected.is_empty() || selected.contains(&r.turn_id))
-            .map(|record| TranscriptTurn {
-                record,
-                steps: None,
-                user_truncated: false,
+            .map(|mut record| {
+                let shown = crate::MessageInfo::from_kernel(
+                    &atomcode_kernel::message::Message::user(&record.user),
+                );
+                record.user = shown.content;
+                TranscriptTurn {
+                    record,
+                    steps: None,
+                    user_truncated: false,
+                    user_images: shown.images,
+                }
             })
             .collect());
     }
     let events = manager.load_events(id)?;
     let records = atomcode_capabilities::session::events::turn_records(id, &events);
+    let (identities, mut shown): (Vec<_>, Vec<_>) =
+        project_user_display(&events, selected, include_images)
+            .into_iter()
+            .map(|(turn, raw, info)| ((turn, raw), info))
+            .unzip();
+    if include_images {
+        let sidecar = std::fs::read(manager.root().join(format!("{id}.images.json")))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<crate::ImageSidecar>(&bytes).ok())
+            .unwrap_or_default();
+        for ((turn, raw), info) in identities.iter().zip(shown.iter_mut()) {
+            if selected.is_empty() || selected.contains(turn) {
+                crate::attach_native_display_images(info, manager, id, raw);
+            }
+        }
+        crate::attach_image_sets(&mut shown, sidecar.sets);
+    }
+    let mut user_display = HashMap::new();
+    for (identity, info) in identities.into_iter().zip(shown) {
+        user_display.entry(identity).or_insert(info);
+    }
     let mut steps = if detail || !selected.is_empty() {
         project_selected_steps(&events, selected)
     } else {
@@ -57,13 +88,22 @@ pub(super) fn load(
     Ok(records
         .into_iter()
         .filter(|r| selected.is_empty() || selected.contains(&r.turn_id))
-        .map(|record| {
+        .map(|mut record| {
+            let shown = user_display
+                .remove(&(record.turn_id, record.user.clone()))
+                .unwrap_or_else(|| {
+                    crate::MessageInfo::from_kernel(&atomcode_kernel::message::Message::user(
+                        &record.user,
+                    ))
+                });
+            record.user = shown.content;
             let parts = if detail || !selected.is_empty() {
                 Some(steps.remove(&record.turn_id).unwrap_or_default())
             } else {
                 None
             };
             TranscriptTurn {
+                user_images: if include_images { shown.images } else { None },
                 record,
                 steps: parts,
                 user_truncated: false,
@@ -72,10 +112,40 @@ pub(super) fn load(
         .collect())
 }
 
+/// Replay original user facts, including turns omitted by compaction. Images are
+/// display-only and never copied into the model's reconstructed conversation.
+fn project_user_display(
+    events: &[LoggedEvent],
+    selected: &[u64],
+    include_images: bool,
+) -> Vec<(u64, String, crate::MessageInfo)> {
+    events
+        .iter()
+        .filter_map(|logged| match &logged.event {
+            SessionEvent::UserMessage { turn, text, images } => {
+                let mut info = crate::MessageInfo::from_kernel(
+                    &atomcode_kernel::message::Message::user_with_images(
+                        text,
+                        if include_images && (selected.is_empty() || selected.contains(turn)) {
+                            images.clone()
+                        } else {
+                            vec![]
+                        },
+                    ),
+                );
+                info.source_seq = Some(logged.seq);
+                Some((*turn, text.clone(), info))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// Index-only transport projection: do not send merged tool output or reasoning
 /// just to populate the navigation rail. The event log remains authoritative.
 pub(super) fn summarize(turns: &mut [TranscriptTurn]) {
     for turn in turns {
+        turn.user_images = None;
         turn.user_truncated = truncate_preview(&mut turn.record.user);
         truncate_preview(&mut turn.record.assistant);
         turn.record.reasoning.clear();
@@ -210,6 +280,51 @@ mod tests {
         }
     }
     #[test]
+    fn original_images_match_native_source_identity_and_text_not_prompt_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = SessionManager::with_root(dir.path());
+        let lease = manager.acquire_lease("pictures").unwrap();
+        let text = "look [Image #1]\n\n[图片内容（由 vl 识别）]\na picture";
+        manager
+            .write_display_images(
+                &lease,
+                7,
+                text,
+                vec![atomcode_kernel::message::ImageContent {
+                    media_type: "image/png".into(),
+                    data: "eA==".into(),
+                }],
+            )
+            .unwrap();
+        let events = vec![LoggedEvent {
+            seq: 7,
+            at: 1,
+            event: SessionEvent::UserMessage {
+                turn: 2,
+                text: text.into(),
+                images: vec![],
+            },
+        }];
+        let (_, _, mut info) = project_user_display(&events, &[2], true).pop().unwrap();
+        assert_eq!(info.content, "look [Image #1]");
+        crate::attach_native_display_images(&mut info, &manager, "pictures", text);
+        assert_eq!(info.images.as_ref().unwrap()[0].data, "eA==");
+        let mut missing =
+            crate::MessageInfo::from_kernel(&atomcode_kernel::message::Message::user(text));
+        missing.source_seq = Some(8);
+        crate::attach_native_display_images(&mut missing, &manager, "pictures", text);
+        assert!(missing.images.as_ref().unwrap()[0].missing);
+        missing.source_seq = Some(7);
+        crate::attach_native_display_images(
+            &mut missing,
+            &manager,
+            "pictures",
+            "different message at reused sequence",
+        );
+        assert!(missing.images.as_ref().unwrap()[0].missing);
+    }
+
+    #[test]
     fn summary_wire_shape_keeps_existing_fields_without_loading_steps() {
         let record = TurnRecord {
             v: 1,
@@ -229,6 +344,7 @@ mod tests {
             record,
             steps: None,
             user_truncated: false,
+            user_images: None,
         })
         .unwrap();
         assert_eq!(wire["user"], "prompt");
@@ -263,6 +379,11 @@ mod tests {
             record,
             steps: Some(vec![]),
             user_truncated: false,
+            user_images: Some(vec![crate::ImageData {
+                media_type: "image/png".into(),
+                data: "eA==".into(),
+                missing: false,
+            }]),
         }];
         summarize(&mut turns);
         let wire = serde_json::to_value(&turns[0]).unwrap();
@@ -274,6 +395,10 @@ mod tests {
         assert!(wire["tools"].as_array().unwrap().is_empty());
         assert!(wire.get("reasoning").is_none());
         assert!(wire.get("steps").is_none());
+        assert!(
+            wire.get("user_images").is_none(),
+            "navigation must not include image payloads"
+        );
     }
 
     #[test]

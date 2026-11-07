@@ -132,6 +132,7 @@ export async function getModels(): Promise<ModelInfo[]> {
 export interface ImageData {
   media_type: string;
   data: string;
+  missing?: boolean;
 }
 
 export interface StreamChatBody {
@@ -999,6 +1000,7 @@ export interface TranscriptStep {
   tools: { id: string; name: string; args: string; result: string | null; is_error: boolean | null }[];
 }
 export interface TranscriptTurn {
+  user_images?: ImageData[];
   user_truncated?: boolean;
   started_at?: number;
   ts?: number;

@@ -12,7 +12,7 @@ import { useT, useSettings, SettingsSection, Theme } from '../settings';
 import { MsgKey, Lang } from '../i18n';
 import { RenameDialog, DeleteDialog } from './SessionDialogs';
 import { useAuth } from './LoginButton';
-import { mergeOptimisticSession } from '../lib/sessionList';
+import { mergeOptimisticSession, prioritizeActiveSession } from '../lib/sessionList';
 import { sessionMessagesToMarkdownLines } from '../lib/historyMessages';
 import { sidebarRelativeTime } from '../lib/sidebarTime';
 import {
@@ -1183,7 +1183,7 @@ export function Sidebar({
       || (dir === cwdNorm ? projectHash || '' : '');
   };
 
-  const filtered = merged;
+  const filtered = prioritizeActiveSession(merged, activeSessionId);
 
   const sessionsByProject = new Map<string, SessionMetaWithProject[]>();
   for (const session of filtered) {
@@ -1193,7 +1193,7 @@ export function Sidebar({
     bucket.push(session);
     sessionsByProject.set(hash, bucket);
   }
-  const workspaceProjects = projectHash && !projects.some((project) => project.hash === projectHash)
+  const availableProjects = projectHash && !projects.some((project) => project.hash === projectHash)
     ? [{
         hash: projectHash,
         name: dirName(cwd || ''),
@@ -1203,6 +1203,12 @@ export function Sidebar({
         last_updated: 0,
       } as ProjectInfo, ...projects]
     : projects;
+  const activeProjectHash = filtered.find(s => s.id === activeSessionId);
+  const selectedProjectHash = activeProjectHash ? sessionProjectHash(activeProjectHash) : projectHash;
+  const selectedProject = availableProjects.find(p => p.hash === selectedProjectHash);
+  const workspaceProjects = selectedProject
+    ? [selectedProject, ...availableProjects.filter(p => p !== selectedProject)]
+    : availableProjects;
   const currentWorkspaceHash = projectHash || projects.find(
     (project) => normDir(project.working_dir) === cwdNorm,
   )?.hash || '';

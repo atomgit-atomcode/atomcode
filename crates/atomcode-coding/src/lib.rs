@@ -53,6 +53,7 @@ mod background_jobs;
 pub mod config;
 mod controllers;
 pub mod discipline;
+mod display_images;
 mod follow_up;
 pub mod front_end;
 pub mod host;

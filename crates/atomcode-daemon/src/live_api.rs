@@ -495,13 +495,8 @@ pub(crate) async fn run_chat_turn_v2(
         task,
         ..
     } = runtime;
-    // VL 预处理后的文本已包含图片描述，原图不再发给 kernel
-    // （非视觉模型的 provider adapter 会因原图而报 400 错误）
-    let user_images = if text_carries_vl_caption(&user_text) {
-        Vec::new()
-    } else {
-        user_images
-    };
+    // Runtime preprocessing keeps these originals in its display-only sidecar
+    // while retaining the existing text-only input for a non-vision model.
     if let Err(error) = handle.set_mode(native_runtime_mode(approval_mode)).await {
         send_chat_runtime_error(&runtime_event_tx, format!("切换模式失败：{error}"));
         return;
@@ -1636,9 +1631,23 @@ pub(crate) async fn live_stream(
         std::path::Path::new(&join.binding.working_dir),
         &join.binding.session_id,
     );
-    for (info, (seq, pinned)) in snapshot_messages.iter_mut().zip(sources) {
+    let display_manager = crate::NativeSessionManager::for_project(
+        &snapshot_wd,
+        &atomcode_coding::config::product_dirs_from_env(),
+    );
+    for ((info, (seq, pinned)), raw) in snapshot_messages
+        .iter_mut()
+        .zip(sources)
+        .zip(&join.snapshot.messages)
+    {
         info.source_seq = seq;
         info.task_spec_pinned = pinned;
+        crate::attach_native_display_images(
+            info,
+            &display_manager,
+            &join.binding.session_id,
+            &raw.text,
+        );
     }
     if let Some(meta) = session_meta.as_ref() {
         crate::attach_snapshot_message_timestamps(

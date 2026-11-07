@@ -7651,3 +7651,106 @@ async fn a_slow_spend_query_is_not_cut_off_by_the_page_budget() {
     assert_eq!(usage.spent_unavailable, None);
     runtime.handle.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn vl_originals_are_saved_for_other_clients_without_reentering_model_context() {
+    struct Caption;
+    #[async_trait::async_trait]
+    impl atomcode_coding::ImagePreprocessor for Caption {
+        async fn preprocess(
+            &self,
+            text: String,
+            _: Vec<atomcode_kernel::message::ImageContent>,
+            _: bool,
+            _: Option<String>,
+        ) -> (UserInput, Option<atomcode_coding::VisionNotice>) {
+            (
+                UserInput {
+                    text: format!("{text}\n\n[图片内容（由 test-vl 识别）]\na picture"),
+                    images: vec![],
+                },
+                None,
+            )
+        }
+    }
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut config = start(env.project.path(), &recorder, SessionMode::Fresh);
+    config.image_preprocessor = Some(Arc::new(Caption));
+    config.agent.supports_vision = false;
+    let mut runtime = CodingRuntime::start(config).await.unwrap();
+    let id = runtime.session.as_ref().unwrap().id.clone();
+    let images = vec![atomcode_kernel::message::ImageContent {
+        media_type: "image/png".into(),
+        data: "eA==".into(),
+    }];
+    runtime
+        .handle
+        .submit(UserInput {
+            text: "look [Image #1]".into(),
+            images: images.clone(),
+        })
+        .await
+        .unwrap();
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), runtime.events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !matches!(&event.event, CodingRuntimeEvent::Agent(atomcode_kernel::event::AgentEvent::Accepted { command, .. }) if command.starts_with("display-image-")),
+            "display receipts must not become product events"
+        );
+        if matches!(event.event, CodingRuntimeEvent::TurnFinished(_)) {
+            break;
+        }
+    }
+    assert!(
+        recorder.last_request().iter().all(|m| m.images.is_empty()),
+        "the text-only model must never receive original bytes"
+    );
+    let manager = SessionManager::for_project(
+        env.project.path(),
+        &atomcode_coding::config::product_dirs_from_env(),
+    );
+    let events = manager.load_events(&id).unwrap();
+    let (seq, text) = events
+        .iter()
+        .find_map(|fact| match &fact.event {
+            atomcode_kernel::session::SessionEvent::UserMessage { text, images, .. } => {
+                assert!(images.is_empty());
+                Some((fact.seq, text))
+            }
+            _ => None,
+        })
+        .unwrap();
+    let saved = manager
+        .read_display_images(&id, seq)
+        .unwrap()
+        .expect("original bytes should survive the TUI process for WebUI readers");
+    assert!(saved.matches(text));
+    assert_eq!(saved.images, images);
+    let (_, fork_lease) = manager.fork_native_session(&id, "display-fork", 1).unwrap();
+    assert_eq!(
+        manager
+            .read_display_images("display-fork", seq)
+            .unwrap()
+            .unwrap()
+            .images,
+        images
+    );
+    drop(fork_lease);
+    runtime.handle.shutdown().await.unwrap();
+    let fresh_reader = SessionManager::for_project(
+        env.project.path(),
+        &atomcode_coding::config::product_dirs_from_env(),
+    );
+    assert_eq!(
+        fresh_reader
+            .read_display_images(&id, seq)
+            .unwrap()
+            .unwrap()
+            .images,
+        images
+    );
+}

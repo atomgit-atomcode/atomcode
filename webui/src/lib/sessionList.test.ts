@@ -103,3 +103,13 @@ test('exact-name dedup still works via working_dir when no hash is present', () 
   const merged = mergeOptimisticSession(optimistic, [persisted]);
   assert.equal(merged.length, 1, 'landing-page optimistic (no hash) falls back to working_dir');
 });
+
+test('selecting a persisted old session pins it without reordering peers or mutating metadata', async () => {
+  const { prioritizeActiveSession } = await import('./sessionList.ts');
+  const list = [s({ id: 'new' }), s({ id: 'middle' }), s({ id: 'selected' })];
+  const before = structuredClone(list);
+  assert.deepEqual(prioritizeActiveSession(list, 'selected').map(s => s.id), ['selected', 'new', 'middle']);
+  assert.deepEqual(list, before);
+  assert.equal(prioritizeActiveSession(list, 'missing'), list);
+  assert.equal(prioritizeActiveSession(list, null), list);
+});

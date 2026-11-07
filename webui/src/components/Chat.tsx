@@ -1,3 +1,4 @@
+import { displayHistoryUser } from '../lib/historyMessages';
 import { preservedHistoryPrefix } from '../lib/historyPaging';
 import { GoalRecoveryStatus } from './GoalRecoveryStatus';
 import { GitBranch } from './GitBranch';
@@ -266,13 +267,7 @@ function imageDataUrl(img: ImageData): string {
  * `\n\n[图片识别失败]`（原文为空时无前导换行）。仅影响显示；存储/喂给模型的文本不变。
  */
 function stripVisionAnnotation(text: string): string {
-  const markers = ['\n\n[图片内容（由', '[图片内容（由', '\n\n[图片识别失败]', '[图片识别失败]'];
-  let cut = -1;
-  for (const m of markers) {
-    const idx = text.indexOf(m);
-    if (idx >= 0 && (cut < 0 || idx < cut)) cut = idx;
-  }
-  return cut >= 0 ? text.slice(0, cut).trimEnd() : text;
+  return displayHistoryUser(text).text;
 }
 
 interface TokenUsage {
@@ -1658,12 +1653,13 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, onExecu
         }
         if (isInternalHistoryUserMessage(msg.content ?? '', msg.synthetic)) continue;
         inputEpoch += 1;
+        const displayUser = displayHistoryUser(msg.content ?? '', msg.images);
         loaded.push({
           role: 'user',
           sourceSeq: msg.source_seq,
           specPinned: msg.task_spec_pinned,
-          parts: [{ kind: 'text', text: stripVisionAnnotation(msg.content ?? '') }],
-          images: msg.images && msg.images.length ? msg.images : undefined,
+          parts: [{ kind: 'text', text: displayUser.text }],
+          images: displayUser.images,
           ts: msg.created_at,
           retainedHistory: isRetainedHistoryUserMessage(msg),
         });

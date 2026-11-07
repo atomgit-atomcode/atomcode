@@ -1,5 +1,7 @@
-import type { TranscriptTurn } from '../api';
+import type { ImageData, TranscriptTurn } from '../api';
 import type { MsgPart } from './toolRows';
+
+import { displayHistoryUser } from './historyMessages.ts';
 
 export const HISTORY_BATCH = 6;
 export interface HistoryMessage {
@@ -7,6 +9,7 @@ export interface HistoryMessage {
   parts: MsgPart[];
   ts?: number;
   retainedHistory?: boolean;
+  images?: ImageData[];
 }
 
 /** Only join on an unambiguous identity, never on a repeated prompt alone. */
@@ -16,7 +19,7 @@ export function historyBoundary(turns: readonly TranscriptTurn[], messages: read
   const first = messages[liveStart];
   const text = first.parts.filter(p => p.kind === 'text').map(p => p.text).join('');
   const matches = turns.map((t, index) => ({ t, index })).filter(({ t }) => !t.undone &&
-    (first.ts != null && t.started_at != null ? first.ts === t.started_at : !t.user_truncated && t.user === text));
+    (first.ts != null && t.started_at != null ? first.ts === t.started_at : !t.user_truncated && displayHistoryUser(t.user, t.user_images).text === text));
   if (matches.length === 1) return { end: matches[0].index, liveStart, joined: true };
   const last = turns[turns.length - 1];
   if (first.ts != null && (!last || (last.ts != null && first.ts > last.ts))) {
@@ -48,8 +51,9 @@ export function historyMessages(turn: TranscriptTurn): HistoryMessage[] {
       status: tool.is_error ? 'error' : 'done', output: tool.result,
     } });
   }
+  const user = displayHistoryUser(turn.user, turn.user_images);
   return [
-    { role: 'user', parts: [{ kind: 'text', text: turn.user }], ts: turn.started_at },
+    { role: 'user', parts: [{ kind: 'text', text: user.text }], images: user.images, ts: turn.started_at },
     { role: 'assistant', parts, ts: turn.ts },
   ];
 }
