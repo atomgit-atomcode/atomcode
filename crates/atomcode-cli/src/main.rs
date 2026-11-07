@@ -4798,29 +4798,50 @@ async fn run_upgrade_cli(force: bool) -> Result<()> {
     // writes don't interleave unpredictably with the upgrade work.
     let driver = tokio::spawn(self_update::run_upgrade(current.clone(), force, tx));
 
-    let mut last_pct: i32 = -1;
-    while let Some(ev) = rx.recv().await {
+    use std::io::IsTerminal;
+    let interactive = io::stdout().is_terminal();
+    let mut meter = atomcode::upgrade_progress::DownloadMeter::default();
+    let mut started = None;
+    let mut progress_line = false;
+    let mut ticks = tokio::time::interval(atomcode::upgrade_progress::REFRESH);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        let next = tokio::select! {
+            event = rx.recv() => event,
+            _ = ticks.tick(), if interactive && started.is_some() => {
+                if let Some(start) = started {
+                    let frame = meter.frame(tokio::time::Instant::now() - start);
+                    let width = crossterm::terminal::size().map(|size| size.0 as usize).unwrap_or(80).saturating_sub(5);
+                    print!("\r\x1b[2K    {}", frame.download_line(width));
+                    io::stdout().flush().ok();
+                    progress_line = true;
+                }
+                continue;
+            }
+        };
+        let Some(ev) = next else {
+            break;
+        };
+        if !matches!(&ev, UpgradeEvent::Downloading { .. }) {
+            started = None;
+            if progress_line {
+                print!("\r\x1b[2K");
+                io::stdout().flush().ok();
+                progress_line = false;
+            }
+        }
         match ev {
             UpgradeEvent::ManifestFetched { version } => {
                 println!("==> Latest: {}", version);
             }
             UpgradeEvent::Downloading { bytes, total } => {
-                // Debounce to whole percents so we don't spam stdout —
-                // piping the CLI through `tee` with 10k updates is no
-                // fun for anyone.
-                let pct = if total == 0 {
-                    0
-                } else {
-                    ((bytes * 100) / total) as i32
-                };
-                if pct != last_pct {
-                    print!(
-                        "\r    downloading {}% ({} / {} bytes)   ",
-                        pct, bytes, total
-                    );
-                    io::stdout().flush().ok();
-                    last_pct = pct;
+                if started.is_none() {
+                    started = Some(tokio::time::Instant::now());
+                    if !interactive {
+                        println!("==> Downloading update");
+                    }
                 }
+                meter.update(bytes, total);
             }
             UpgradeEvent::Verifying => {
                 println!("\n==> Verifying SHA256");
@@ -4864,6 +4885,10 @@ async fn run_upgrade_cli(force: bool) -> Result<()> {
         }
     }
 
+    if progress_line {
+        print!("\r\x1b[2K");
+        io::stdout().flush().ok();
+    }
     match driver.await {
         Ok(Ok(summary)) => {
             if let Some(note) = atomcode_updater::upgrade_note(&summary.updates) {

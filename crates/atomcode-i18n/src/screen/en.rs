@@ -109,6 +109,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
 
         // ── the moment ──
         Msg::MomentHistoryClear => "History recalled · Ctrl+C clears input · Esc stops the task".into(),
+        Msg::UpgradeProgressDownloading => "Downloading update".into(),
+        Msg::UpgradeProgressEta { seconds } => format!("~{seconds}s remaining").into(),
+        Msg::UpgradeProgressEtaUnknown => "ETA —".into(),
         Msg::MomentQuitAgain => "press Ctrl+C again to quit".into(),
         Msg::MomentEofAgain => "press Ctrl+D again to quit".into(),
 

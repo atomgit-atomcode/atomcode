@@ -3479,6 +3479,52 @@ impl UserInterface for Tui {
     }
 }
 
+struct UpgradeProgressDisplay {
+    tui: std::sync::Weak<Tui>,
+    block: Mutex<Option<crate::block::BlockId>>,
+}
+
+impl crate::update::ProgressDisplay for UpgradeProgressDisplay {
+    fn finish(&self) {
+        let Some(tui) = self.tui.upgrade() else {
+            return;
+        };
+        if let Some(id) = self.block.lock().expect("upgrade progress poisoned").take() {
+            tui.host
+                .stream
+                .write()
+                .expect("stream poisoned")
+                .writer("upgrade-progress")
+                .settle(id);
+        };
+    }
+    fn draw(&self, frame: crate::update::ProgressFrame, finished: bool) {
+        let Some(tui) = self.tui.upgrade() else {
+            return;
+        };
+        let mut slot = self.block.lock().expect("upgrade progress poisoned");
+        {
+            let mut stream = tui.host.stream.write().expect("stream poisoned");
+            let mut writer = stream.writer("upgrade-progress");
+            let content: Arc<dyn crate::block::Content> =
+                Arc::new(crate::update::ProgressBlock(frame));
+            let id = match *slot {
+                Some(id) if writer.amend(id, content.clone()) => id,
+                _ => writer.open(crate::block::Coord::default(), content),
+            };
+            if finished {
+                writer.settle(id);
+                *slot = None;
+            } else {
+                *slot = Some(id);
+            }
+        }
+        if let Some(sender) = tui.wake.lock().expect("wake poisoned").clone() {
+            let _ = sender.send(Wake::Fact);
+        };
+    }
+}
+
 impl Tui {
     fn ctrl_c_copies_selection(&self, press: crate::surface::KeyPress) -> bool {
         if press != crate::surface::KeyPress::ctrl('c') {
@@ -11373,6 +11419,12 @@ impl Plugin for TuiUiPlugin {
             .provide::<McpPhaseSvc>(Arc::new(Phases(host.clone())) as Arc<dyn McpPhase>)
             .map_err(|e| e.to_string())?;
         let tui = Arc::new(tui);
+        let _ = ctx
+            .provide::<crate::update::ProgressDisplaySvc>(Arc::new(UpgradeProgressDisplay {
+                tui: Arc::downgrade(&tui),
+                block: Mutex::new(None),
+            }))
+            .map_err(|e| e.to_string())?;
         // The seam anything outside the loop asks for a frame through. Provided
         // here, with the screen itself behind it, so the slot is full from the
         // moment this row mounts; what it rings is filled in when the loop
@@ -15843,6 +15895,56 @@ mod skills_menu_tests {
         let mut m = host.moment.write().expect("moment poisoned");
         m.input = line.into();
         m.caret = line.len();
+    }
+
+    #[test]
+    fn update_progress_amends_one_card_and_freezes_only_on_completion() {
+        use crate::update::{ProgressDisplay, ProgressFrame};
+        let (host, tui) = screen();
+        let tui = Arc::new(tui);
+        let display = UpgradeProgressDisplay {
+            tui: Arc::downgrade(&tui),
+            block: Mutex::new(None),
+        };
+        for n in 0..100 {
+            display.draw(
+                ProgressFrame {
+                    title: format!("step {n}"),
+                    ..Default::default()
+                },
+                false,
+            );
+        }
+        let before = host.stream.read().unwrap().len();
+        assert_eq!(
+            host.stream
+                .read()
+                .unwrap()
+                .slots()
+                .iter()
+                .filter(|slot| slot.block().content.kind() == "upgrade_progress")
+                .count(),
+            1
+        );
+        display.draw(
+            ProgressFrame {
+                title: "done".into(),
+                ..Default::default()
+            },
+            true,
+        );
+        assert!(display.block.lock().unwrap().is_none());
+        assert_eq!(host.stream.read().unwrap().len(), before);
+        display.draw(
+            ProgressFrame {
+                title: "next update".into(),
+                ..Default::default()
+            },
+            false,
+        );
+        assert_eq!(host.stream.read().unwrap().len(), before + 1);
+        display.finish();
+        assert!(display.block.lock().unwrap().is_none());
     }
 
     #[test]

@@ -95,6 +95,9 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
 
         // ── 当下 ──
         Msg::MomentHistoryClear => "已填入历史消息 · Ctrl+C 清空输入 · Esc 停止任务".into(),
+        Msg::UpgradeProgressDownloading => "正在下载更新".into(),
+        Msg::UpgradeProgressEta { seconds } => format!("剩余约 {seconds} 秒").into(),
+        Msg::UpgradeProgressEtaUnknown => "剩余时间 —".into(),
         Msg::MomentQuitAgain => "再按 Ctrl+C 退出".into(),
         Msg::MomentEofAgain => "再按 Ctrl+D 退出".into(),
 

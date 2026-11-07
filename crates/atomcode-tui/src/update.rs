@@ -172,3 +172,151 @@ mod tests {
         task.await.unwrap();
     }
 }
+
+/// Presentation data for the launcher's update operation, unrelated to agent turns.
+#[derive(Clone, Debug, Default)]
+pub struct ProgressFrame {
+    pub title: String,
+    pub downloading: bool,
+    pub pulse: u64,
+    pub bytes: u64,
+    pub total: u64,
+    pub bytes_per_second: Option<f64>,
+    pub remaining_seconds: Option<u64>,
+}
+
+impl ProgressFrame {
+    /// ASCII is intentional: the same bar works in legacy terminals and SSH.
+    pub fn download_line(&self, width: usize) -> String {
+        use crate::i18n::{t, Msg};
+        let pct = (self.total > 0)
+            .then(|| ((u128::from(self.bytes) * 100 / u128::from(self.total)).min(100)) as usize);
+        let count = if self.total == 0 {
+            format!("{:.1} MiB", self.bytes as f64 / 1_048_576.0)
+        } else {
+            format!(
+                "{:.1}/{:.1} MiB",
+                self.bytes as f64 / 1_048_576.0,
+                self.total as f64 / 1_048_576.0
+            )
+        };
+        let speed = self
+            .bytes_per_second
+            .map(|n| format!("{:.1} MiB/s", n / 1_048_576.0))
+            .unwrap_or_else(|| "— MiB/s".into());
+        let eta = self
+            .remaining_seconds
+            .map(|seconds| t(Msg::UpgradeProgressEta { seconds }).into_owned())
+            .unwrap_or_else(|| t(Msg::UpgradeProgressEtaUnknown).into_owned());
+        let cells = width.saturating_sub(count.len() + 10).clamp(4, 24);
+        let bar = match pct {
+            Some(pct) => {
+                let filled = cells * pct / 100;
+                format!(
+                    "[{}{}] {pct}%",
+                    "#".repeat(filled),
+                    "-".repeat(cells - filled)
+                )
+            }
+            None => format!("[ ? {} ]", ['|', '/', '-', '\\'][self.pulse as usize % 4]),
+        };
+        let candidates = [
+            format!("{bar} {count} · {speed} · {eta}"),
+            format!("{bar} {count} · {speed}"),
+            format!("{bar} {count}"),
+            format!(
+                "{} {count}",
+                pct.map(|n| format!("{n}%")).unwrap_or_else(|| "?".into())
+            ),
+            pct.map(|n| format!("{n}%")).unwrap_or_else(|| "?".into()),
+        ];
+        candidates
+            .into_iter()
+            .find(|line| crate::width::str_width(line) <= width)
+            .unwrap_or_else(|| if width > 0 { ".".into() } else { String::new() })
+    }
+}
+
+/// A live card is amended in place and settled only on a terminal outcome.
+pub trait ProgressDisplay: Send + Sync {
+    fn draw(&self, frame: ProgressFrame, finished: bool);
+    fn finish(&self);
+}
+
+atomcode_plexus::plexus_service!(ProgressDisplaySvc => dyn ProgressDisplay, "tui-upgrade-progress", Seam, "Live update download progress");
+
+#[derive(Debug)]
+pub(crate) struct ProgressBlock(pub ProgressFrame);
+
+impl crate::block::Content for ProgressBlock {
+    fn kind(&self) -> &'static str {
+        "upgrade_progress"
+    }
+    fn content_hash(&self) -> crate::block::ContentHash {
+        crate::block::hash_of(&[&format!("{:?}", self.0)])
+    }
+    fn lines(&self, ctx: &crate::block::RenderCtx) -> Vec<crate::frame::Line> {
+        let text = if self.0.downloading {
+            format!(
+                "{}\n{}",
+                self.0.title,
+                self.0
+                    .download_line(usize::from(ctx.width).saturating_sub(2))
+            )
+        } else {
+            self.0.title.clone()
+        };
+        crate::content::CommandSaid {
+            text,
+            refused: false,
+        }
+        .lines(ctx)
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+    use crate::block::{Content, RenderCtx};
+    #[test]
+    fn download_layout_fits_every_terminal_width() {
+        let frame = ProgressFrame {
+            downloading: true,
+            bytes: 28 * 1_048_576,
+            total: 50 * 1_048_576,
+            bytes_per_second: Some(3.2 * 1_048_576.0),
+            remaining_seconds: Some(7),
+            ..Default::default()
+        };
+        assert!(frame.download_line(120).contains("56%"));
+        assert!(frame.download_line(120).contains("MiB/s"));
+        for width in 0..120 {
+            assert!(crate::width::str_width(&frame.download_line(width)) <= width);
+        }
+    }
+    #[test]
+    fn completed_download_is_not_a_success_until_the_phase_changes() {
+        let block = ProgressBlock(ProgressFrame {
+            title: "Downloading".into(),
+            downloading: true,
+            bytes: 100,
+            total: 100,
+            ..Default::default()
+        });
+        let lines: Vec<_> = block
+            .lines(&RenderCtx::bare(100))
+            .iter()
+            .map(|line| line.plain())
+            .collect();
+        assert!(lines.iter().any(|line| line.contains("100%")));
+        assert!(lines.iter().any(|line| line.contains("Downloading")));
+        let verify = ProgressBlock(ProgressFrame {
+            title: "Verifying".into(),
+            ..Default::default()
+        });
+        assert!(!verify
+            .lines(&RenderCtx::bare(100))
+            .iter()
+            .any(|line| line.plain().contains("100%")));
+    }
+}

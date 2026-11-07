@@ -105,6 +105,11 @@ pub enum Msg<'a> {
 
     // ── the moment (`moment.rs`) ──
     /// After the first Ctrl+C: press it again and the screen closes.
+    UpgradeProgressDownloading,
+    UpgradeProgressEta {
+        seconds: u64,
+    },
+    UpgradeProgressEtaUnknown,
     MomentQuitAgain,
     MomentHistoryClear,
     MomentEofAgain,
