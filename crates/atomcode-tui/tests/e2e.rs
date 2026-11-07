@@ -2641,6 +2641,8 @@ async fn skill_commands_and_dollar_alias_deliver_the_attached_images() {
     let skills = dir.join("image-skills");
     std::fs::create_dir_all(skills.join("picture-probe")).unwrap();
     std::fs::write(skills.join("picture-probe/SKILL.md"), "---\nname: picture-probe\ndescription: inspect pictures\n---\nInspect the attached picture. $ARGUMENTS").unwrap();
+    std::fs::create_dir_all(skills.join("secondary-probe")).unwrap();
+    std::fs::write(skills.join("secondary-probe/SKILL.md"), "---\nname: secondary-probe\ndescription: second perspective\n---\nCheck the image carefully. $ARGUMENTS").unwrap();
     let patch = format!(
         "[[patch]]\nid = \"skills\"\nconfig = {{ dirs = [{:?}] }}",
         skills.to_string_lossy()
@@ -2656,9 +2658,20 @@ async fn skill_commands_and_dollar_alias_deliver_the_attached_images() {
     .await;
     let task = s.open().await;
     s.quiet().await;
+    s.term.type_line("$picture-probe $missing inspect this");
+    s.quiet().await;
+    assert!(
+        s.screen().contains("missing"),
+        "explicit unknown skill must be visible: {}",
+        s.screen()
+    );
+    assert!(
+        images_sent(&s).is_empty(),
+        "a rejected reference must not open a model turn"
+    );
     for command in [
-        "/skills picture-probe inspect this ",
-        "$picture-probe inspect this ",
+        "/skills picture-probe secondary-probe inspect this ",
+        "$picture-probe $secondary-probe inspect this ",
         "/picture-probe inspect this ",
     ] {
         s.term.type_text(command);
@@ -2669,9 +2682,25 @@ async fn skill_commands_and_dollar_alias_deliver_the_attached_images() {
         s.quiet().await;
         assert!(!s.screen().contains("命令带不了图片"), "{}", s.screen());
     }
+    assert!(
+        s.screen().contains("本次将再次注入"),
+        "repeat notices are projected from facts: {}",
+        s.screen()
+    );
     s.term.type_line("ordinary next message");
     s.quiet().await;
     assert_eq!(images_sent(&s), vec![1, 1, 1, 0]);
+    s.term.type_line("/skills --list");
+    s.quiet().await;
+    let screen = s.screen();
+    assert!(
+        screen.contains("/skills <"),
+        "multi-skill help is visible: {screen}"
+    );
+    assert!(
+        screen.contains("本会话使用过") || screen.contains("Used in this session"),
+        "retained usage is visible: {screen}"
+    );
     task.abort();
 }
 

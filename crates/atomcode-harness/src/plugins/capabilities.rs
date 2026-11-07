@@ -5,6 +5,7 @@
 //! plugin that can be disabled, reconfigured, or replaced, and that takes its
 //! tools *and* its prompt guidance with it when it goes.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -27,7 +28,7 @@ use serde_json::Value;
 
 use crate::events::{TurnStart, TurnStarted};
 use crate::seams::{CodeIndexSvc, McpSvc, SessionSvc, SkillsSvc};
-use crate::session::{InjectionOrigin, SessionEvent};
+use crate::session::{retained_events, InjectionOrigin, LoggedEvent, SessionEvent};
 
 use super::tools::{contribute_prompt, mount};
 
@@ -676,7 +677,15 @@ impl crate::commands::CatalogCommand for RunSkill {
                     },
                 },
             ),
-            output: format!("按 `{name}` 开始"),
+            output: if self.command {
+                format!("按 `{name}` 开始")
+            } else {
+                with_skill_notice(
+                    format!("按 `{name}` 开始"),
+                    &agent.session().events(),
+                    std::slice::from_ref(&self.skill.name),
+                )
+            },
         }))
     }
 
@@ -709,6 +718,49 @@ fn missing_required_arg(
     }
 }
 
+/// History, not current authorization or a second session state owner. Retained
+/// facts survive compaction but exclude conversation rewind and undone turns.
+fn skill_history(events: &[LoggedEvent]) -> BTreeMap<String, BTreeSet<u64>> {
+    let mut history: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
+    for entry in retained_events(events) {
+        if let SessionEvent::Injected {
+            turn,
+            origin: InjectionOrigin::Skill { name },
+            ..
+        } = &entry.event
+        {
+            for name in name
+                .split(" · ")
+                .filter(|name| !name.starts_with("[command] "))
+            {
+                history.entry(name.to_string()).or_default().insert(*turn);
+            }
+        }
+    }
+    history
+}
+
+fn skill_repeat_notice(events: &[LoggedEvent], names: &[String]) -> String {
+    let history = skill_history(events);
+    names
+        .iter()
+        .filter_map(|name| {
+            let turn = *history.get(name)?.last()?;
+            Some(t(Msg::CmdSkillReload { name, turn }).into_owned())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn with_skill_notice(output: String, events: &[LoggedEvent], names: &[String]) -> String {
+    let notice = skill_repeat_notice(events, names);
+    if notice.is_empty() {
+        output
+    } else {
+        format!("{output}\n{notice}")
+    }
+}
+
 /// The leading run of skill names in `args`, and the rest as one task.
 ///
 /// `known` answers "is this token the name of a skill", canonically — the
@@ -721,18 +773,21 @@ fn missing_required_arg(
 /// both "fix the auth bug".
 ///
 /// The failure this shape has, and the reason the caller echoes what it loaded:
-/// a misspelled second name is not an error, it silently becomes the first word
+/// an unmarked misspelled second name is not an error, it becomes the first word
 /// of the task. Nothing here can tell that apart from a task that happens to
 /// start with a word — but a person reading "loaded: plan" when they asked for
 /// two can.
+///
+/// Marked `$name` / `¥name` tokens in this leading run are explicit references:
+/// unknown ones fail the entire preparation before anything can be queued.
+/// After ordinary task text begins, markers in prose are left alone.
 ///
 /// The task keeps its original spacing: it is prose being handed to a model,
 /// and re-joining on single spaces would rewrite anything with alignment in it.
 fn skills_and_task<'a>(
     args: &'a str,
     known: impl Fn(&str) -> Option<String>,
-) -> (Vec<String>, &'a str) {
-    let mut taken: Vec<String> = Vec::new();
+) -> Result<(Vec<String>, &'a str), String> {
     let mut canonical: Vec<String> = Vec::new();
     let mut rest = args.trim_start();
     loop {
@@ -740,14 +795,19 @@ fn skills_and_task<'a>(
             Some(token) => token,
             None => break,
         };
-        let Some(name) = known(token) else { break };
+        let explicit = token.strip_prefix('$').or_else(|| token.strip_prefix('¥'));
+        let Some(name) = known(explicit.unwrap_or(token)) else {
+            if let Some(name) = explicit {
+                return Err(t(Msg::CmdSkillUnknownExplicit { name }).into_owned());
+            }
+            break;
+        };
         if !canonical.contains(&name) {
             canonical.push(name);
-            taken.push(token.to_string());
         }
         rest = rest[token.len()..].trim_start();
     }
-    (canonical, rest)
+    Ok((canonical, rest))
 }
 
 /// `skills`: what is installed, and — given names — running them.
@@ -784,17 +844,17 @@ impl crate::commands::CatalogCommand for ListSkills {
 
     async fn run(&self, agent: Arc<crate::agent::Agent>, args: &str) -> Result<String, String> {
         let args = args.trim();
-        if !args.is_empty() {
+        if !args.is_empty() && args != "--list" {
             return Ok(self.prepare_them(&agent, args)?.send(&agent, Vec::new()));
         }
-        Ok(self.listing())
+        Ok(self.listing(&agent.session().events()))
     }
     fn prepare_input(
         &self,
         agent: &crate::agent::Agent,
         args: &str,
     ) -> Result<Option<crate::commands::PreparedCommandInput>, String> {
-        if args.trim().is_empty() {
+        if args.trim().is_empty() || args.trim() == "--list" {
             return Ok(None);
         }
         self.prepare_them(agent, args.trim()).map(Some)
@@ -802,7 +862,8 @@ impl crate::commands::CatalogCommand for ListSkills {
 }
 
 impl ListSkills {
-    fn listing(&self) -> String {
+    fn listing(&self, events: &[LoggedEvent]) -> String {
+        let history = skill_history(events);
         let listed = self.0.all();
         let mut sections = Vec::new();
         if listed.is_empty() {
@@ -813,10 +874,20 @@ impl ListSkills {
                     .into_iter()
                     .map(|skill| {
                         format!(
-                            "{} · {}\n  {}",
+                            "{} · {}\n  {}{}",
                             skill.name,
                             skill.description,
-                            skill.source_path.display()
+                            skill.source_path.display(),
+                            history
+                                .get(&skill.name)
+                                .and_then(|turns| turns.last().map(|turn| format!(
+                                    "\n  {}",
+                                    t(Msg::CmdSkillUsed {
+                                        count: turns.len(),
+                                        turn: *turn
+                                    })
+                                )))
+                                .unwrap_or_default()
                         )
                     })
                     .collect::<Vec<_>>()
@@ -846,6 +917,25 @@ impl ListSkills {
                     .join("\n")
             ));
         }
+        if !history.is_empty() {
+            let used = history
+                .iter()
+                .filter_map(|(name, turns)| {
+                    turns.last().map(|turn| {
+                        format!(
+                            "  {name} · {}",
+                            t(Msg::CmdSkillUsed {
+                                count: turns.len(),
+                                turn: *turn
+                            })
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            sections.push(format!("{}\n{used}", t(Msg::CmdSkillsHistory)));
+        }
+        sections.push(t(Msg::CmdSkillsHelp).into_owned());
         sections.join("\n\n")
     }
 
@@ -859,7 +949,7 @@ impl ListSkills {
                 .get(token)
                 .filter(|skill| skill.user_invocable)
                 .map(|skill| skill.name.clone())
-        });
+        })?;
         let Some(first) = args.split_whitespace().next() else {
             return Err("没说要用哪个 skill".into());
         };
@@ -902,13 +992,17 @@ impl ListSkills {
                         .join(" · "),
                 },
             ),
-            output: format!(
-                "按 {} 开始",
-                names
-                    .iter()
-                    .map(|name| bare_name(name))
-                    .collect::<Vec<_>>()
-                    .join(" · ")
+            output: with_skill_notice(
+                format!(
+                    "按 {} 开始",
+                    names
+                        .iter()
+                        .map(|name| bare_name(name))
+                        .collect::<Vec<_>>()
+                        .join(" · ")
+                ),
+                &agent.session().events(),
+                &names,
             ),
         })
     }
@@ -1551,7 +1645,7 @@ mod tests {
                 .as_path()
                 .to_path_buf()]));
         let command = super::ListSkills(registry.clone());
-        let output = command.listing();
+        let output = command.listing(&[]);
         assert!(output.contains("sample · test"));
         assert!(output.contains(&tmp.as_path().join("sample/SKILL.md").display().to_string()));
         std::fs::write(
@@ -1561,13 +1655,103 @@ mod tests {
         .unwrap();
         registry.reload_dirs(&[tmp.as_path().to_path_buf()], &[]);
         assert!(registry.is_empty());
-        let output = command.listing();
+        let output = command.listing(&[]);
         assert!(
             output.contains("SKILL.md"),
             "failures-only catalogs still have details"
         );
         assert!(output.contains("invalid"));
         std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn marked_skill_prefix_is_validated_before_any_submission() {
+        let _locale = atomcode_config::i18n::test_lock();
+        atomcode_config::i18n::set_locale(atomcode_config::i18n::Locale::En);
+        let known = |name: &str| match name {
+            "plan" | "plugin:plan" => Some("plugin:plan".into()),
+            "review" => Some("review".into()),
+            _ => None,
+        };
+        let (names, task) =
+            skills_and_task("$plan ¥review $plugin:plan fix  the bug", known).unwrap();
+        assert_eq!(names, ["plugin:plan", "review"]);
+        assert_eq!(task, "fix  the bug");
+        let error = skills_and_task("plan $typo task", known).unwrap_err();
+        assert!(error.contains("typo") && error.contains("no skills were submitted"));
+        let (_, task) = skills_and_task("plan use $HOME and $unknown", known).unwrap();
+        assert_eq!(task, "use $HOME and $unknown");
+        assert!(skills_and_task("plan $ task", known).is_err());
+    }
+
+    #[test]
+    fn skill_history_follows_retained_facts_not_compacted_context_or_commands() {
+        use crate::session::{InjectionOrigin, RewindScope, SessionEvent, SessionLog};
+        let log = SessionLog::new("history");
+        log.append(SessionEvent::Injected {
+            turn: 1,
+            text: "first".into(),
+            origin: InjectionOrigin::Skill {
+                name: "plugin:plan · review · [command] custom".into(),
+            },
+        });
+        log.append(SessionEvent::Injected {
+            turn: 1,
+            text: "again".into(),
+            origin: InjectionOrigin::Skill {
+                name: "review".into(),
+            },
+        });
+        log.append(SessionEvent::Injected {
+            turn: 1,
+            text: "auto".into(),
+            origin: InjectionOrigin::Reminder,
+        });
+        let second = log.append(SessionEvent::TurnStart { turn: 2 });
+        log.append(SessionEvent::Injected {
+            turn: 2,
+            text: "second".into(),
+            origin: InjectionOrigin::Skill {
+                name: "plugin:plan".into(),
+            },
+        });
+        log.append(SessionEvent::Compacted {
+            turn: 2,
+            through: second - 1,
+            from: 0,
+            summary: "compacted skill work".into(),
+        });
+        assert!(!log
+            .derive_messages()
+            .iter()
+            .any(|message| message.text == "first"));
+        let history = super::skill_history(&log.events());
+        assert_eq!(history["plugin:plan"].len(), 2);
+        assert_eq!(history["review"].len(), 1);
+        assert_eq!(history.len(), 2);
+        log.append(SessionEvent::Rewound {
+            turn: 2,
+            to: second,
+            scope: RewindScope::Code,
+        });
+        assert_eq!(super::skill_history(&log.events())["plugin:plan"].len(), 2);
+        log.append(SessionEvent::Rewound {
+            turn: 2,
+            to: second,
+            scope: RewindScope::Conversation,
+        });
+        let restored = SessionLog::new("resumed");
+        restored.restore(log.events());
+        let history = super::skill_history(&restored.events());
+        assert_eq!(
+            history["plugin:plan"].iter().copied().collect::<Vec<_>>(),
+            [1]
+        );
+        restored.append(SessionEvent::Interrupted {
+            turn: 1,
+            undone: true,
+        });
+        assert!(super::skill_history(&restored.events()).is_empty());
     }
 
     /// Where the names stop and the task starts.
@@ -1593,27 +1777,27 @@ mod tests {
             "plugin:plan" | "plugin:review" => Some(token.to_string()),
             _ => None,
         };
-        let (names, task) = skills_and_task("plan review fix the auth bug", known);
+        let (names, task) = skills_and_task("plan review fix the auth bug", known).unwrap();
         assert_eq!(names, vec!["plugin:plan", "plugin:review"]);
         assert_eq!(task, "fix the auth bug");
 
         // Spacing is the person's.
-        let (_, task) = skills_and_task("plan   look   at   this", known);
+        let (_, task) = skills_and_task("plan   look   at   this", known).unwrap();
         assert_eq!(task, "look   at   this");
 
         // Canonically the same skill, named twice.
-        let (names, task) = skills_and_task("plan plugin:plan go", known);
+        let (names, task) = skills_and_task("plan plugin:plan go", known).unwrap();
         assert_eq!(names, vec!["plugin:plan"], "loaded once");
         assert_eq!(task, "go");
 
         // The first word already ends it.
-        let (names, task) = skills_and_task("fix the plan", known);
+        let (names, task) = skills_and_task("fix the plan", known).unwrap();
         assert!(names.is_empty());
         assert_eq!(task, "fix the plan", "and nothing was eaten off the front");
 
         // Names and nothing else is a run with an empty task, not an error:
         // a skill that needs no argument is the ordinary case.
-        let (names, task) = skills_and_task("  plan  ", known);
+        let (names, task) = skills_and_task("  plan  ", known).unwrap();
         assert_eq!(names, vec!["plugin:plan"]);
         assert_eq!(task, "");
     }

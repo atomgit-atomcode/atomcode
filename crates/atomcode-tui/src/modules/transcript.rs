@@ -62,6 +62,9 @@ struct Open {
     /// in the authoritative log. Hold them long enough to draw them under that
     /// invocation, where a tool result would appear.
     skills: Vec<(String, String)>,
+    /// A compact view index, rebuilt on replay. It never grants permissions.
+    skill_uses: Vec<(atomcode_harness::session::SeqNo, u64, String)>,
+    skill_notices: Vec<String>,
 }
 
 /// Turns session facts into what a person reads.
@@ -257,6 +260,12 @@ impl Producer for Transcript {
             .lock()
             .expect("transcript poisoned")
             .absorb(fact);
+        if let SessionEvent::Interrupted { turn, undone: true } = fact {
+            open.skill_uses
+                .retain(|(_, used_turn, _)| used_turn != turn);
+            open.skills.clear();
+            open.skill_notices.clear();
+        }
         match fact {
             // Where the turns start, so an undo can say which one it went back
             // to; and the undo itself, as a line in the stream that says so.
@@ -273,6 +282,11 @@ impl Producer for Transcript {
                 open.last_reply.clear();
             }
             SessionEvent::Rewound { to, scope, .. } => {
+                if scope.takes_back_conversation() {
+                    open.skill_uses.retain(|(seq, _, _)| seq < to);
+                    open.skills.clear();
+                    open.skill_notices.clear();
+                }
                 let to_turn = self
                     .turns
                     .lock()
@@ -352,7 +366,15 @@ impl Producer for Transcript {
                     out.emit(
                         at,
                         Arc::new(CommandSaid {
-                            text: format!("按 {names} 开始"),
+                            text: {
+                                let notice =
+                                    open.skill_notices.drain(..).collect::<Vec<_>>().join("\n");
+                                if notice.is_empty() {
+                                    format!("按 {names} 开始")
+                                } else {
+                                    format!("按 {names} 开始\n{notice}")
+                                }
+                            },
                             refused: false,
                         }),
                     );
@@ -623,11 +645,36 @@ impl Producer for Transcript {
                 );
             }
 
-            SessionEvent::Injected { text, origin, .. } => {
+            SessionEvent::Injected { turn, text, origin } => {
                 // The log commits model context before the user message it
                 // accompanies. Keep that authority and only reorder its visual
                 // projection: `/name args`, then a folded, inspectable body.
                 if let InjectionOrigin::Skill { name } = origin {
+                    for skill in name
+                        .split(" · ")
+                        .filter(|name| !name.starts_with("[command] "))
+                    {
+                        if let Some((_, last_turn, _)) =
+                            open.skill_uses
+                                .iter()
+                                .rev()
+                                .find(|(_, used_turn, used_name)| {
+                                    used_name == skill && used_turn != turn
+                                })
+                        {
+                            let notice = crate::i18n::product::t(
+                                crate::i18n::product::Msg::CmdSkillReload {
+                                    name: skill,
+                                    turn: *last_turn,
+                                },
+                            )
+                            .into_owned();
+                            if !open.skill_notices.contains(&notice) {
+                                open.skill_notices.push(notice);
+                            }
+                        }
+                        open.skill_uses.push((logged.seq, *turn, skill.into()));
+                    }
                     open.skills.push((name.clone(), text.clone()));
                     return;
                 }
@@ -1327,6 +1374,73 @@ mod tests {
         assert!(folded.contains("⎿ Skill: review"), "{folded}");
         assert!(!folded.contains("SKILL.md body"), "{folded}");
         assert!(shown.contains("SKILL.md body"), "{shown}");
+    }
+
+    #[test]
+    fn repeated_skills_have_fact_derived_notices_and_rewind_removes_the_history() {
+        use atomcode_harness::session::RewindScope;
+        let _locale = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
+        let skill = |turn, name: &str| SessionEvent::Injected {
+            turn,
+            text: "body".into(),
+            origin: InjectionOrigin::Skill { name: name.into() },
+        };
+        let user = |turn| SessionEvent::UserMessage {
+            turn,
+            text: "/skills review task".into(),
+            images: Vec::new(),
+        };
+        let last_command = |facts: &[SessionEvent]| {
+            let stream = fold(facts);
+            stream
+                .slots()
+                .iter()
+                .rev()
+                .find(|slot| slot.block().kind() == "command")
+                .unwrap()
+                .block()
+                .content
+                .lines(&crate::block::RenderCtx::bare(200))
+                .iter()
+                .map(|line| line.plain())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let mut facts = vec![
+            SessionEvent::TurnStart { turn: 1 },
+            skill(1, "review"),
+            user(1),
+            SessionEvent::TurnStart { turn: 2 },
+            skill(2, "review · plan"),
+            user(2),
+        ];
+        let notice = crate::i18n::product::t(crate::i18n::product::Msg::CmdSkillReload {
+            name: "review",
+            turn: 1,
+        });
+        assert!(last_command(&facts).contains(notice.as_ref()));
+        facts.push(SessionEvent::Rewound {
+            turn: 2,
+            to: 1,
+            scope: RewindScope::Conversation,
+        });
+        facts.extend([
+            SessionEvent::TurnStart { turn: 3 },
+            skill(3, "review"),
+            user(3),
+        ]);
+        assert!(!last_command(&facts).contains("inject it again"));
+        // A custom command with the same name never establishes skill history.
+        assert!(!last_command(&[
+            SessionEvent::TurnStart { turn: 1 },
+            skill(1, "[command] review"),
+            user(1),
+            SessionEvent::TurnStart { turn: 2 },
+            skill(2, "review"),
+            user(2)
+        ])
+        .contains("inject it again"));
     }
 
     #[test]

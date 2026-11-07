@@ -596,8 +596,30 @@ async fn skills_with_names_on_it_runs_them_together_rather_than_listing() {
             .expect("offered, so findable")
     };
 
+    // An explicit unknown second reference must not queue the first skill,
+    // including the image command path; preparation is atomic.
+    assert!(skills()
+        .run(agent.clone(), "plan $missing task")
+        .await
+        .is_err());
+    assert!(skills()
+        .run_with_images(
+            agent.clone(),
+            "plan $missing task",
+            vec![atomcode_kernel::message::ImageContent {
+                media_type: "image/png".into(),
+                data: "aW1hZ2U=".into(),
+            }]
+        )
+        .await
+        .is_err());
+    assert!(!agent
+        .inbox()
+        .waiting_from(atomcode_harness::agent::MessageOrigin::User));
+    assert!(agent.inbox().claim().injections.is_empty());
+
     let said = skills()
-        .run(agent.clone(), "plan review fix the auth bug")
+        .run(agent.clone(), "plan $review $plan fix the auth bug")
         .await
         .expect("running two skills");
     assert!(
@@ -633,6 +655,58 @@ async fn skills_with_names_on_it_runs_them_together_rather_than_listing() {
         1,
         "one turn with a rule between them, not two turns: {queued}"
     );
+
+    agent.session().append(SessionEvent::Injected {
+        turn: 7,
+        text: queued.clone(),
+        origin: origin.clone(),
+    });
+    let before = agent.session().events();
+    let resumed = start(tree(&dir, STOP, &[])).await;
+    let restored = atomcode_harness::create_agent(&resumed).await.unwrap();
+    restored.session().restore(before);
+    let command = resumed
+        .context()
+        .service::<atomcode_harness::seams::CommandsSvc>()
+        .unwrap()
+        .find("skills", &restored)
+        .unwrap();
+    let listing = command.run(restored.clone(), "--list").await.unwrap();
+    let expected_usage =
+        atomcode_config::i18n::t(atomcode_config::i18n::Msg::CmdSkillUsed { count: 1, turn: 7 });
+    assert!(
+        listing.contains(expected_usage.as_ref()) && listing.contains("$<"),
+        "{listing}"
+    );
+    let first_use = skills()
+        .run(agent.clone(), "plan $review next task")
+        .await
+        .unwrap();
+    assert!(
+        first_use.contains("7"),
+        "repeat notice must name the logged turn: {first_use}"
+    );
+    let again = agent.inbox().claim();
+    assert_eq!(
+        again.injections.len(),
+        1,
+        "history never blocks explicit reinjection"
+    );
+    assert_eq!(
+        again.message.as_deref(),
+        Some("/skills plan review next task")
+    );
+    let direct = catalog
+        .find("plan", &agent)
+        .unwrap()
+        .run(agent.clone(), "direct task")
+        .await
+        .unwrap();
+    assert!(
+        direct.contains("7"),
+        "direct skill commands share repeat notices: {direct}"
+    );
+    agent.inbox().claim();
 
     // A name nothing answers to is refused, rather than silently becoming a
     // task nobody asked to run.

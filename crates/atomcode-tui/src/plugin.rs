@@ -845,6 +845,8 @@ fn skill_prefix(input: &str) -> Option<&str> {
 }
 
 /// Turn the composer spelling into the existing `/skills` gateway command.
+/// Preserve secondary $/¥ references: the shared gateway validates them all
+/// before queuing, rather than silently treating an unknown name as task text.
 fn skill_command(input: &str, known: impl FnOnce(&str) -> bool) -> Option<String> {
     let rest = input
         .strip_prefix('$')
@@ -9770,7 +9772,7 @@ impl Tui {
         });
         if argument_completion_bare_pick
             || command.is_some_and(|c| !c.options.is_empty() || c.require_arg)
-            || option_owner.is_some_and(|c| c.require_arg)
+            || option_owner.is_some_and(|c| c.require_arg && name != "skills --list")
         {
             self.complete_command(name);
             return false;
@@ -16175,6 +16177,19 @@ mod skills_menu_tests {
         assert_eq!(
             skill_command("¥code fix the test", known),
             Some("/skills code fix the test".into())
+        );
+        assert_eq!(
+            skill_command("$code $review fix  the test", known),
+            Some("/skills code $review fix  the test".into())
+        );
+        assert_eq!(
+            skill_command("¥code ¥review task", known),
+            Some("/skills code ¥review task".into())
+        );
+        assert_eq!(
+            skill_command("$code $unknown task", known),
+            Some("/skills code $unknown task".into()),
+            "the gateway must reject the explicit second reference"
         );
         assert_eq!(skill_command("use $code", known), None);
         assert_eq!(skill_command("$", known), None);

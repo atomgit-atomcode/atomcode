@@ -3554,11 +3554,18 @@ impl CommandSet for AgentCatalogCommands {
             .described()
             .map(|d| d.commands)
             .unwrap_or_default();
-        let skill_options: Vec<crate::command::CommandOption> = described
+        let mut skill_options: Vec<crate::command::CommandOption> = described
             .iter()
             .filter(|c| described_command_is_skill(c))
             .map(|c| crate::command::CommandOption::new(c.name.clone(), c.summary.clone()))
             .collect();
+        if !skill_options.is_empty() {
+            skill_options.push(crate::command::CommandOption::new(
+                "--list",
+                crate::i18n::product::t(crate::i18n::product::Msg::CmdSkillsListOption)
+                    .into_owned(),
+            ));
+        }
         described
             .into_iter()
             .filter(|c| !described_command_is_skill(c))
@@ -4201,7 +4208,7 @@ mod tests {
             "COMMAND"
         );
         let skills = shown.iter().find(|c| c.name == "skills").unwrap();
-        assert_eq!(skills.options.len(), 1);
+        assert_eq!(skills.options.len(), 2);
         assert_eq!(skills.options[0].value, "plugin:changelog");
         assert!(set.starts_turn("skills", "changelog task"));
         assert!(set.starts_turn("skills", "plugin:changelog task"));
@@ -4299,7 +4306,7 @@ mod tests {
                 .iter()
                 .map(|o| o.value.as_ref())
                 .collect::<Vec<_>>(),
-            ["brainstorming", "code"]
+            ["brainstorming", "code", "--list"]
         );
         assert_eq!(
             set.hidden()

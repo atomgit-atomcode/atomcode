@@ -2371,6 +2371,20 @@ pub enum Msg<'a> {
     CmdCatalogReview,
     CmdCatalogSkills,
     CmdCatalogSkillsUsage,
+    CmdSkillsHelp,
+    CmdSkillsListOption,
+    CmdSkillsHistory,
+    CmdSkillUsed {
+        count: usize,
+        turn: u64,
+    },
+    CmdSkillReload {
+        name: &'a str,
+        turn: u64,
+    },
+    CmdSkillUnknownExplicit {
+        name: &'a str,
+    },
     CmdCatalogSkillsEmpty,
     CmdCatalogSkillDirs,
     CmdCatalogSkillDiagnostics,
