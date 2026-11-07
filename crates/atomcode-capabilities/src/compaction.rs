@@ -782,7 +782,7 @@ fn cut_body(
     let escaped_run_opens_bracket = {
         let rest = tail_line.trim_start_matches('\\');
         let run = tail_line.len() - rest.len();
-        run > 0 && run % 2 == 0 && rest.starts_with('[')
+        run > 0 && run.is_multiple_of(2) && rest.starts_with('[')
     };
     let pad = if pad_tail
         && before_tail.is_some_and(|c| !is_line_break(c))
