@@ -1073,19 +1073,37 @@ fn escape_brackets(text: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-/// Append a call field after a single separating space, or nothing at all when
-/// the field folds away, so the line never ends with a dangling space. Brackets
-/// are escaped after the per-item bound, so a cut marker is escaped with the
-/// field and a cut cannot split an escape pair; the escape doubles a backslash
-/// run ending at a bracket or at the field's end and adds one per bracket, so
-/// a field carrying them renders at up to twice its bound.
-fn push_call_field(into: &mut String, text: &str) {
-    let text = escape_brackets(text.trim());
-    let start = into.len();
-    into.push(' ');
-    if !push_single_line(into, &text) {
-        into.truncate(start);
+/// Fold a call field to one transcript line before any escape runs. The
+/// escape must see the character that will actually sit next to the call
+/// line's `]`: a trailing FS/GS/RS — transcript breaks that are not Unicode
+/// whitespace, so `trim` keeps them — is dropped only here, and a backslash
+/// behind it would otherwise surface unescaped when the break is folded away.
+/// Borrowed when the field has no break, so an ordinary argument is not copied.
+fn fold_single_line(text: &str) -> Cow<'_, str> {
+    if !text.chars().any(is_line_break) {
+        return Cow::Borrowed(text);
     }
+    let mut out = String::with_capacity(text.len());
+    push_single_line(&mut out, text);
+    Cow::Owned(out)
+}
+
+/// Append a call field after a single separating space, or nothing at all when
+/// the field folds away, so the line never ends with a dangling space. The field
+/// is folded before escaping, so a break cannot reveal a trailing backslash
+/// after the escape decided it was not at the field's end. Brackets are escaped
+/// after the per-item bound, so a cut marker is escaped with the field and a
+/// cut cannot split an escape pair; the escape doubles a backslash run ending
+/// at a bracket or at the field's end and adds one per bracket, so a field
+/// carrying them renders at up to twice its bound.
+fn push_call_field(into: &mut String, text: &str) {
+    let folded = fold_single_line(text.trim());
+    let text = escape_brackets(&folded);
+    if text.is_empty() {
+        return;
+    }
+    into.push(' ');
+    into.push_str(&text);
 }
 
 /// Append a text body (dialogue or tool output) without letting it start a
@@ -3932,6 +3950,58 @@ mod tests {
                 "the name's trailing run is doubled: {line:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_folded_break_cannot_expose_a_trailing_backslash_before_the_closing_bracket() {
+        // The field's last real character is a backslash, but a transcript break
+        // follows it. FS/GS/RS are not Unicode whitespace, so `trim` keeps them
+        // and only the fold drops them; escaping before the fold used to leave
+        // the backslash single and let it swallow the call line's closing `]`.
+        // A space before the break is popped by the same fold.
+        for break_char in ['\u{001C}', '\u{001D}', '\u{001E}'] {
+            for pad in ["", " "] {
+                let call = ToolCall {
+                    id: "c1".into(),
+                    name: "n".into(),
+                    arguments: format!("path\\{pad}{break_char}"),
+                };
+                let out = render_transcript(&[Message::assistant("", vec![call])]);
+                let line = out
+                    .lines()
+                    .find(|line| line.starts_with("[tool call:"))
+                    .expect("the call line");
+                let closing = line.rfind(']').expect("the call line closes");
+                let run = line[..closing]
+                    .chars()
+                    .rev()
+                    .take_while(|c| *c == '\\')
+                    .count();
+                assert_eq!(
+                    run, 2,
+                    "the folded break must not expose the backslash: {line:?}"
+                );
+            }
+        }
+        // The name is the field next to the closing bracket when arguments fold
+        // away, and it ends with a break that the fold drops too.
+        let call = ToolCall {
+            id: "c1".into(),
+            name: "n\\\u{001C}".into(),
+            arguments: " ".into(),
+        };
+        let out = render_transcript(&[Message::assistant("", vec![call])]);
+        let line = out
+            .lines()
+            .find(|line| line.starts_with("[tool call:"))
+            .expect("the call line");
+        let closing = line.rfind(']').expect("the call line closes");
+        let run = line[..closing]
+            .chars()
+            .rev()
+            .take_while(|c| *c == '\\')
+            .count();
+        assert_eq!(run, 2, "the name's folded break is covered too: {line:?}");
     }
 
     #[test]
