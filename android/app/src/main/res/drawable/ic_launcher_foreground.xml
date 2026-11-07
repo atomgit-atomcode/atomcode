@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Launcher mark: a terminal prompt (`>` and a caret) on the app's dark surface.
+
+  Adaptive-icon foregrounds must keep their content inside the middle 72dp of the
+  108dp viewport (66dp to be safe under every mask shape), so the glyphs sit
+  around the centre rather than filling the frame.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- The prompt chevron. -->
+    <path
+        android:pathData="M38,42 L50,54 L38,66"
+        android:strokeWidth="6"
+        android:strokeColor="#5BE3C0"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <!-- The caret line. -->
+    <path
+        android:pathData="M56,66 L70,66"
+        android:strokeWidth="6"
+        android:strokeColor="#E6EDF3"
+        android:strokeLineCap="round" />
+</vector>

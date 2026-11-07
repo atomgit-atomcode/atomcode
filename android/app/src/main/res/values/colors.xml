@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Matches the app's dark surface, so the launcher tile does not flash a
+         light square while the icon loads on a dark theme. -->
+    <color name="ic_launcher_background">#12161C</color>
+</resources>
