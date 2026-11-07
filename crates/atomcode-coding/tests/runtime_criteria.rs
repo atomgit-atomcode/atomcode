@@ -7611,3 +7611,43 @@ async fn dap_processes_follow_the_production_runtime_lifecycle() {
     runtime.handle.shutdown().await.unwrap();
     gone(&pids).await;
 }
+
+/// The spend query is the heavy account-wide call: it runs past the light
+/// calls' 3 s page budget and still answers. The Stats tab used to read the
+/// shared budget's timeout ("deadline has elapsed") on every open.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_slow_spend_query_is_not_cut_off_by_the_page_budget() {
+    #[derive(Debug)]
+    struct SlowSpend;
+
+    #[async_trait::async_trait]
+    impl atomcode_coding::RateLimitWindowSource for SlowSpend {
+        fn applies_to(&self, _endpoint: &str) -> bool {
+            true
+        }
+        async fn fetch_windows(&self) -> Result<Vec<atomcode_coding::RateLimitWindow>, String> {
+            Ok(Vec::new())
+        }
+        async fn fetch_usage(&self) -> Result<Option<atomcode_coding::AccountUsage>, String> {
+            // Slower than the page budget, well inside the spend budget.
+            tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+            Ok(Some(atomcode_coding::AccountUsage::default()))
+        }
+    }
+
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut input = start(env.project.path(), &recorder, SessionMode::Fresh);
+    input.agent.base_url = "https://managed.invalid/v1".into();
+    input.prepare.rate_limit_source = Some(Arc::new(SlowSpend));
+    let runtime = CodingRuntime::start(input).await.unwrap();
+
+    let usage = runtime.handle.usage(false).await.unwrap();
+    assert!(
+        usage.spent.is_some(),
+        "the spend answers under its own budget: {:?}",
+        usage.spent_unavailable
+    );
+    assert_eq!(usage.spent_unavailable, None);
+    runtime.handle.shutdown().await.unwrap();
+}
