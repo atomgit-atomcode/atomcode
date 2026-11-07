@@ -8,6 +8,9 @@
 # ---- 默认 provider（必须匹配下方某个 [providers.*] 的键名）----
 default_provider = "deepseek"
 
+# 大+小模型协作配置见文件末尾及 docs/mixed-models.md。
+# default_model = "big"  # 可选：使用末尾示例时，以大模型为主会话
+
 # ---- 自动更新（顶层键，必须在任何 [表] 之前）----
 # auto_update: 每小时轮询新版本并预暂存，下次启动时应用（/upgrade 仍可手动）
 auto_update = true
@@ -355,6 +358,11 @@ eager = "auto"
 # 是否挂载由前端决定；环境变量 `ATOMCODE_SUBAGENT=0` 可以关掉。没有配置键控制开关。
 # max_rounds 可由 ATOMCODE_SUBAGENT_MAX_ROUNDS 覆盖。
 # （旧文件里的 enabled / initial_turns / max_turns / timeout_secs 从来没有生效过，已移除；留着也照常解析。）
+# capable_model 写在 [models.<id>]（或旧 [providers.<id>]）中，不写在 [subagent]。
+# task 不传 model 继承主会话；排名影响可委派列表，不自动判断子任务复杂度。
+# team 的 simple 角色未指定 model 时可使用同账号的最低排名辅助模型。
+# 跨账号需用户目录 agents/ 角色显式指定 model；项目角色仍受账号边界约束。
+# 详见 docs/mixed-models.md。
 [subagent]
 max_concurrent = 3      # 并发子 agent 上限（下限 1）
 max_rounds = 200        # 单个子任务模型轮次高水位（0=不设上限）
@@ -448,3 +456,23 @@ theme = "auto"
 # [dap.adapters.python]
 # command = "/path/to/venv/bin/python"
 # args = ["-m", "debugpy.adapter"]
+
+# =============================================================================
+# 可选：大+小模型协作（取消下面注释前，先替换连接信息和真实模型名）
+# 顶层 default_model = "big" 放在文件开头；勿与已有同名表重复。
+# 同账号显式委派和用户角色跨账号示例见 docs/mixed-models.md。
+# =============================================================================
+# [provider_accounts.mixed]
+# provider = "openai"
+# base_url = "https://your-gateway.example/v1"
+# api_key = "${MY_GATEWAY_API_KEY}"
+# [models.big]
+# account = "mixed"
+# model = "your-capable-model"
+# context_window = 128000
+# capable_model = 5
+# [models.small]
+# account = "mixed"
+# model = "your-fast-model"
+# context_window = 64000
+# capable_model = 0
