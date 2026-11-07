@@ -90,27 +90,46 @@ async fn registry_connect_discover_and_call_echo() {
 }
 
 /// Regression-style reproduction: a stdio server whose `args` contain spaces and
-/// non-ASCII characters (a script path under a directory with a CJK name).
-/// argv is passed as an array, so neither connect nor reconnect may break on it.
+/// non-ASCII characters (a script path under a directory with a CJK name). The
+/// arg is written as `${UNICODE_ARG}` in `.mcp.json`, so the value only reaches
+/// argv through `load_mcp_config` → `expand_env_vars` — a regression of the
+/// byte-wise expansion would fail this test at connect time, not silently pass.
+/// Also exercises connect and reconnect with such args in argv.
 #[tokio::test]
 async fn stdio_survives_args_with_spaces_and_unicode_across_reconnect() {
-    let config = {
-        let mut cfg = test_server_config("spacey-args");
-        if let McpTransportConfig::Stdio { args, .. } = &mut cfg.config {
-            args.push("/tmp/中文 目录/with space/server.py".to_string());
-        }
-        cfg
-    };
+    const UNICODE_ARG: &str = "/tmp/中文 目录/with space/server.py";
+    // The expansion must fail the test at connect time if bytes are corrupted.
+    std::env::set_var("UNICODE_ARG", UNICODE_ARG);
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join(".mcp.json"),
+        serde_json::json!({
+            "mcpServers": {
+                "spacey-args": {
+                    "command": env!("CARGO_BIN_EXE_mcp-test-server"),
+                    "args": ["${UNICODE_ARG}"]
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let servers = atomcode_capabilities::mcp::config::load_mcp_config(
+        project.path(),
+        std::path::Path::new("/nonexistent/user"),
+    )
+    .expect("the config must parse");
+    assert_eq!(servers.len(), 1, "the server must be admitted: {servers:?}");
 
     let registry = McpRegistry::new(NO_TREE);
     registry
-        .add_server(config.clone())
+        .add_server(servers[0].clone())
         .await
-        .expect("connect with spaces/unicode args should succeed");
+        .expect("connect with expanded spaces/unicode args should succeed");
     registry
-        .reconnect_server(config)
+        .reconnect_server(servers[0].clone())
         .await
-        .expect("reconnect with spaces/unicode args should succeed");
+        .expect("reconnect with expanded spaces/unicode args should succeed");
     assert_eq!(
         registry.server_statuses().await,
         vec![("spacey-args".to_string(), ServerStatus::Connected)]
